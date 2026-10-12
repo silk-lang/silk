@@ -121,7 +121,7 @@ effect fn splitProvider(firstBytes: &[u8], secondBytes: &[u8])
 ? &mut Allocator {
   let first = run Bytes.copy(firstBytes)
   let second = run Bytes.copy(secondBytes)
-  let mut reads = Vector.make<MemoryReadEvent>()
+  let mut reads = Vector<MemoryReadEvent>.make()
   run Vector.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move first,
@@ -131,12 +131,12 @@ effect fn splitProvider(firstBytes: &[u8], secondBytes: &[u8])
     bytes: move second,
   })
   run Vector.append(&mut reads, MemoryReadEvent.End {readyAt: SystemClock.make(0, 0)})
-  let mut writes = Vector.make<MemoryWriteEvent>()
+  let mut writes = Vector<MemoryWriteEvent>.make()
   run Vector.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: 256},
   })
-  return run MemoryByteDuplex.make(move reads, move writes, 256, 32, Option.none<i32>())
+  return run MemoryByteDuplex.make(move reads, move writes, 256, 32, Option<i32>.none())
 }
 
 effect<'call> fn finishResponse<
@@ -161,7 +161,7 @@ effect<'call> fn finishResponse<
     Result.Failure {error} => { fail ServerError.Value {error: move error} }
     Result.Success {value} => value
   }
-  run ResponseWriter.finish(&mut writer.*, &headers, Option.none<Instant>())
+  run ResponseWriter.finish(&mut writer.*, &headers, Option<Instant>.none())
   return 0
 }
 
@@ -181,7 +181,7 @@ effect<'call> fn handleRequest<
 ! ServerError | OutOfMemoryError
 ? &mut Allocator | &mut MonotonicClock {
   let mut body: [u8; 4] = [0, 0, 0, 0]
-  let count = run readSome(&mut request.*, &mut body, Option.none<Instant>())
+  let count = run readSome(&mut request.*, &mut body, Option<Instant>.none())
   if count != 4 || !equal(&body, b"Wiki") || !(run Request.bodyComplete(&request.*)) { return 31 }
   let callerConnection = match move Header.make("Connection", b"keep-alive", valueLimits()) {
     Result.Failure {error} => { return 32 }
@@ -199,7 +199,7 @@ effect<'call> fn handleRequest<
   let response = match move ResponseHead.make(
     Version.Http11,
     status,
-    Option.some<&'static [u8]>(b"No Content"),
+    Option<&'static [u8]>.some(b"No Content"),
     headers,
     valueLimits(),
   ) {
@@ -212,7 +212,7 @@ effect<'call> fn handleRequest<
     BodyMode.NoBody,
     ReusePolicy.Automatic,
     TrailerPolicy.defaultPolicy(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     finishResponse,
   )
 }
@@ -228,7 +228,7 @@ effect<'call> fn handleConnection<
 ? &mut Allocator | &mut MonotonicClock {
   let handled = run withRequest(
     &mut connection.*,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     handleRequest,
   )
   let code = match move handled {
