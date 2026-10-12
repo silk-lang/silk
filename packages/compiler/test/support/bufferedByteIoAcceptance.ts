@@ -81,7 +81,7 @@ impl BufferedContext<
   use: NominalContext.use
 }
 
-effect fn allocate(self: &mut CountingAllocator, layout: Layout) -> Allocation ! OutOfMemoryError {
+effect fn allocate(self: &mut CountingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.calls = self.calls + usize.ONE
   let mut system = Allocator.systemAllocatorProvider()
   return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut system)
@@ -92,7 +92,7 @@ impl Allocator for CountingAllocator { allocate: CountingAllocator.allocate }
 effect fn allocateUntilFailure(
   self: &mut FailingAllocator,
   layout: Layout,
-) -> Allocation ! OutOfMemoryError {
+) -> Intrinsic.Allocation ! OutOfMemoryError {
   self.calls = self.calls + usize.ONE
   if self.calls == self.failAt { fail OutOfMemoryError {} }
   let mut system = Allocator.systemAllocatorProvider()

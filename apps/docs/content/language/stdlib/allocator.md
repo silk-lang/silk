@@ -79,7 +79,7 @@ A mutable service that acquires owned storage described by a layout.
 ### Operation `allocate`
 
 ```silk
-effect<'static> fn allocate(layout: Layout) -> Allocation ! OutOfMemoryError ? &mut Allocator
+effect<'static> fn allocate(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError ? &mut Allocator
 ```
 
 Acquires one allocation for `layout`, or fails without returning partial storage.
