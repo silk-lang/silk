@@ -164,7 +164,7 @@ struct Other {}
 struct Fixed<S> {}
 effect fn get<S>(self: &Fixed<S>, value: &S) -> i32 { return 42 }
 impl<S> Value<S> for Fixed<S> { get: Fixed.get }
-effect fn read(value: &Token) -> i32 ? &Value<Token> { return run Value.get<Token>(value) }
+effect fn read(value: &Token) -> i32 ? &Value<Token> { return run Value<Token>.get(value) }
 pub fn main() -> i32 {
   let provider = Fixed<Token> {}
   let token = Token {}

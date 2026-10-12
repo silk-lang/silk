@@ -49,7 +49,7 @@ fn parking(value: &mut Box) -> () {
   return ()
 }
 pub fn main() -> i32 {
-  let mut map = HashMap.make<Word, Box>(Hash.seed(9))
+  let mut map = HashMap<Word, Box>.make(Hash.seed(9))
   let attempted = HashMap.withMut(&mut map, Hash.word(1), parking)
   drop attempted
   return 0

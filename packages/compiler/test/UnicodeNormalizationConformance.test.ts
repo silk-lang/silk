@@ -116,10 +116,10 @@ effect fn field(
   start: usize,
   count: usize,
 ) -> Vector<u8> ! OutOfMemoryError ? &mut Allocator {
-  let mut buffer = Vector.make<u8>()
+  let mut buffer = Vector<u8>.make()
   let mut index = usize.ZERO
   while index < count {
-    let appended = run Vector.append<u8>(&mut buffer, data[start + index])
+    let appended = run Vector<u8>.append(&mut buffer, data[start + index])
     index = index + usize.ONE
   }
   return move buffer
@@ -171,32 +171,32 @@ effect fn build() -> i32 ! OutOfMemoryError {
     let nfdBytes = run field(data, offset + usize.ONE, nfdLength)
       |> Effect.provideMut(&mut allocator)
     offset = offset + usize.ONE + nfdLength
-    let sourceText = match move String.fromUtf8(Vector.asSlice<u8>(&sourceBytes)) {
+    let sourceText = match move String.fromUtf8(Vector<u8>.asSlice(&sourceBytes)) {
         Result<string, InvalidUtf8>.Success { value } => value
         Result<string, InvalidUtf8>.Failure { error } => ""
     }
     let fromSource = run checkFrom(
       sourceText,
-      Vector.asSlice<u8>(&nfcBytes),
-      Vector.asSlice<u8>(&nfdBytes),
+      Vector<u8>.asSlice(&nfcBytes),
+      Vector<u8>.asSlice(&nfdBytes),
     ) |> Effect.provideMut(&mut allocator)
-    let nfcText = match move String.fromUtf8(Vector.asSlice<u8>(&nfcBytes)) {
+    let nfcText = match move String.fromUtf8(Vector<u8>.asSlice(&nfcBytes)) {
         Result<string, InvalidUtf8>.Success { value } => value
         Result<string, InvalidUtf8>.Failure { error } => ""
     }
     let fromNfc = run checkFrom(
       nfcText,
-      Vector.asSlice<u8>(&nfcBytes),
-      Vector.asSlice<u8>(&nfdBytes),
+      Vector<u8>.asSlice(&nfcBytes),
+      Vector<u8>.asSlice(&nfdBytes),
     ) |> Effect.provideMut(&mut allocator)
-    let nfdText = match move String.fromUtf8(Vector.asSlice<u8>(&nfdBytes)) {
+    let nfdText = match move String.fromUtf8(Vector<u8>.asSlice(&nfdBytes)) {
         Result<string, InvalidUtf8>.Success { value } => value
         Result<string, InvalidUtf8>.Failure { error } => ""
     }
     let fromNfd = run checkFrom(
       nfdText,
-      Vector.asSlice<u8>(&nfcBytes),
-      Vector.asSlice<u8>(&nfdBytes),
+      Vector<u8>.asSlice(&nfcBytes),
+      Vector<u8>.asSlice(&nfdBytes),
     ) |> Effect.provideMut(&mut allocator)
     failures = failures + fromSource + fromNfc + fromNfd
     remaining = remaining - usize.ONE

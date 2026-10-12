@@ -8432,8 +8432,8 @@ const analyzeMethodCall = (
   )
 }
 
-/** Whether a call's applied qualifier names an inherent member of a nominal owner. */
-const appliedInherentMember = (
+/** Whether a call's applied qualifier names an inherent member or a service operation. */
+const appliedOwnerMember = (
   context: SemanticContext.SemanticContext,
   node: AuthoredHir.Expression,
   resolution: ResolutionContext,
@@ -8448,12 +8448,17 @@ const appliedInherentMember = (
     resolution.scope,
     SemanticContext.nameText(context, token) ?? '',
   )
+  if (owner._tag !== 'Resolved') return false
+  const member = SemanticContext.nameText(context, parts.member) ?? ''
+  // `Service<Args>.operation(...)` applies the operation under the service's binders, like
+  // `Service.operation<Args>(...)`; an unknown operation stays on the interface path's diagnostic.
+  if (owner.declaration._tag === 'ServiceDeclaration')
+    return serviceOperation(owner.declaration, member) !== undefined
   return (
-    owner._tag === 'Resolved' &&
     Semantic.resolveAssociatedName(
       resolution.semantic,
       owner.declaration,
-      SemanticContext.nameText(context, parts.member) ?? '',
+      member,
       resolution.scope.module,
     )._tag !== 'Missing'
   )
@@ -10835,17 +10840,25 @@ function analyzeExpressionDecision(
   const methodCall = analyzeMethodCall(context, node, declarations, declaration, scope, resolution)
   if (methodCall !== undefined) return methodCall
 
-  // `Owner<Args>.member(...)` on an inherent member is the bare form with the owner arguments
-  // prepended to the explicit generic prefix; it never reaches the interface-operation path.
-  const appliedInherent = appliedInherentMember(context, node, resolution)
-  const callTypeArguments = analyzeCallTypeArguments(
+  // `Owner<Args>.member(...)` on an inherent member or service operation is the bare form with the
+  // owner arguments its member lists prepended to the explicit generic prefix (GEN-008); it never
+  // reaches the interface-operation path.
+  const appliedOwner = appliedOwnerMember(context, node, resolution)
+  const ownerApplication = appliedOwner
+    ? appliedOwnerTypeArgumentNodes(context, node, resolution)
+    : { nodes: [], diagnostics: [] }
+  const ownerTypeArguments = analyzeCallTypeArguments(
     context,
     node,
     declaration,
     resolution,
-    appliedInherent ? appliedOwnerTypeArgumentNodes(node) : [],
+    ownerApplication.nodes,
   )
-  const appliedTarget = appliedInherent
+  const callTypeArguments = {
+    ...ownerTypeArguments,
+    diagnostics: [...ownerApplication.diagnostics, ...ownerTypeArguments.diagnostics],
+  }
+  const appliedTarget = appliedOwner
     ? undefined
     : resolveAppliedInterfaceOperationTarget(context, node, declaration, resolution)
   if (appliedTarget !== undefined) {

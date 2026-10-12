@@ -86,7 +86,7 @@ fn reference<'a>(host: &'a [u8]) -> ReferenceIdentity<'a> {
 
 fn emptyTrust() -> TrustSnapshot {
   return match move TrustSnapshot.fromAnchors(
-    Vector.make<TrustAnchor>(),
+    Vector<TrustAnchor>.make(),
     SnapshotLimits {anchors: 0, encodedBytes: 0},
   ) {
     Result.Success {value} => move value
@@ -105,14 +105,14 @@ effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return 1 }
 
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let reads = Vector.make<MemoryReadEvent>()
-  let writes = Vector.make<MemoryWriteEvent>()
+  let reads = Vector<MemoryReadEvent>.make()
+  let writes = Vector<MemoryWriteEvent>.make()
   let mut transport = run MemoryByteDuplex.make(
     move reads,
     move writes,
     256,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   ) |> Effect.provideMut<Allocator>(&mut allocator)
   let trust = emptyTrust()
   let mut wall = FixedWall {}
