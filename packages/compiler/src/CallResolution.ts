@@ -2979,49 +2979,20 @@ export const builtinFunctionReference = (
   }
 }
 
-/** The written qualifier of a member path: every segment but the last, as spelled. */
-export const writtenQualifier = (
-  context: SemanticContext.SemanticContext,
-  segments: ReadonlyArray<AuthoredHir.Name>,
-): string =>
-  segments
-    .slice(0, -1)
-    .map((segment) => SemanticContext.nameText(context, segment) ?? '')
-    .join('.')
-
 /**
- * Resolves the qualifier of a member path, every segment but the last: `Owner` or `module.Owner`.
- * A parameterless alias names its target declaration (TYPE-004), so with `type Tier = Level`,
- * `Tier.High` and `order.Ordering.Less` qualify exactly as the target's own name does.
+ * Resolves the qualifier of a member path. A parameterless alias names its target declaration
+ * (TYPE-004), so with `type Tier = Level`, `Tier.High` qualifies exactly as `Level.High` does.
  */
 export const resolveMemberQualifier = (
   context: SemanticContext.SemanticContext,
   resolution: ResolutionContext,
-  segments: ReadonlyArray<AuthoredHir.Name>,
+  qualifier: AuthoredHir.Name,
 ): NameResolution.Lookup => {
-  const first = segments.at(0)
-  const second = segments.at(1)
-  if (first === undefined || segments.length > 2)
-    return {
-      _tag: 'Missing',
-      spelling: segments
-        .map((segment) => SemanticContext.nameText(context, segment) ?? '')
-        .join('.'),
-    }
-  const lookup =
-    second === undefined
-      ? Semantic.resolveName(
-          resolution.semantic,
-          resolution.scope,
-          SemanticContext.nameText(context, first) ?? '',
-        )
-      : Semantic.resolveQualifiedName(
-          resolution.semantic,
-          resolution.scope,
-          SemanticContext.nameText(context, first) ?? '',
-          SemanticContext.nameText(context, second) ?? '',
-          second.anchor,
-        )
+  const lookup = Semantic.resolveName(
+    resolution.semantic,
+    resolution.scope,
+    SemanticContext.nameText(context, qualifier) ?? '',
+  )
   return lookup._tag === 'Resolved'
     ? { ...lookup, declaration: NameResolution.erasedOwner(resolution.index, lookup.declaration) }
     : lookup
@@ -3058,10 +3029,9 @@ export const resolvedFunctionReference = (
           declaration,
         }
   }
-  const memberToken = identifiers.at(-1) ?? second
-  const qualifier = writtenQualifier(context, identifiers)
-  const member = SemanticContext.nameText(context, memberToken) ?? ''
-  const qualifierLookup = resolveMemberQualifier(context, resolution, identifiers.slice(0, -1))
+  const qualifier = SemanticContext.nameText(context, first) ?? ''
+  const member = SemanticContext.nameText(context, second) ?? ''
+  const qualifierLookup = resolveMemberQualifier(context, resolution, first)
   if (qualifierLookup._tag === 'Intrinsic') {
     const signature = builtinSignature(qualifier, member)
     if (signature === undefined) {
@@ -3080,7 +3050,7 @@ export const resolvedFunctionReference = (
       ? {
           _tag: 'Resolved',
           spelling: `${qualifier}.${member}`,
-          anchor: memberToken.anchor,
+          anchor: second.anchor,
           declaration: associated.declaration,
         }
       : undefined
@@ -3121,7 +3091,19 @@ export const analyzeFunctionItem = (
     if (qualifierLookup._tag !== 'Namespace') return undefined
     const memberLookup = DeclarationFacts.lookup(resolution.index, qualifierLookup.module, member)
     let diagnostic: Diagnostic.Located | undefined
-    if (memberLookup._tag !== 'Resolved') {
+    const typeMember = DeclarationFacts.member(resolution.index, qualifierLookup.module, member)
+    if (
+      memberLookup._tag !== 'Resolved' &&
+      typeMember._tag === 'Resolved' &&
+      typeMember.declaration.visibility === 'Public' &&
+      NameResolution.isNominalOwner(typeMember.declaration)
+    ) {
+      diagnostic = Diagnostic.namespaceQualifiedType(
+        qualifierLookup.module,
+        member,
+        Location.at(memberToken.anchor),
+      )
+    } else if (memberLookup._tag !== 'Resolved') {
       diagnostic = Diagnostic.unknownImportedMember(
         qualifierLookup.module,
         member,

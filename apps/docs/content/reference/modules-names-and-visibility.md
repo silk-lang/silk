@@ -560,7 +560,10 @@ operations and inherent members and nothing else; no lookup continues into the d
 
 **Diagnostics:** An unknown member under a nominal qualifier reports `SEM0010`. An unknown member
 under a namespace binding reports `SEM0014`. A private inherent member used outside its module
-reports `SEM0015`. A selective import that names an inherent member reports `SEM0197`.
+reports `SEM0015`. A selective import that names an inherent member reports `SEM0197`. A type
+reached through a namespace binding where a value is required, including as the qualifier of its
+own members (`order.Ordering.Less`), reports `SEM0222`; select the type and write
+`Ordering.Less`.
 
 **Evidence:** [basename has no semantic role](../../../../openspec/specs/bootstrap-name-resolution/spec.md),
 [inherent member index](../../../../openspec/specs/bootstrap-declaration-index/spec.md),

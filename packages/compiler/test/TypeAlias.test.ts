@@ -207,6 +207,34 @@ pub fn main() -> i32 { return 0 }`)
   }),
 )
 
+it.effect('elides a lifetime an alias target omits at each use, as a struct header does', () =>
+  Effect.gen(function* () {
+    const source = `type Borrow = &i32
+type Bytes = &[u8]
+type Use = fn(i32) -> i32
+type Generic<T> = &T
+fn same(value: Borrow) -> Borrow { return value }
+fn first(bytes: Bytes) -> u8 { return bytes[0] }
+fn call(callback: Use) -> i32 { return callback(1) }
+fn generic(value: Generic<i32>) -> i32 { return value.* }
+fn two(left: Borrow, right: Borrow) -> Borrow { return left }
+fn twoWritten(left: &i32, right: &i32) -> &i32 { return left }
+pub fn main() -> i32 { return 0 }`
+    const self = yield* analyze(source)
+    // Each use elides as the written-out target would. An ambiguous output is reported like one
+    // on a struct header: the elision failure, then the use's missing lifetime argument.
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&i32 { return left }')],
+      ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
+
 it.effect('rejects bounded, row-kind and unused generic alias parameters at the parameter', () =>
   Effect.gen(function* () {
     const source = `interface Marker {}
@@ -533,10 +561,9 @@ pub fn main() -> i32 { return identity(42) }`)
   }),
 )
 
-it.effect('names enum members through an alias and a module qualifier', () =>
+it.effect('names enum members through an alias in values and patterns', () =>
   Effect.gen(function* () {
-    const self = yield* analyze(`import silk.order
-import silk.order { Order, Ordering }
+    const self = yield* analyze(`import silk.order { Order, Ordering }
 enum Level { Low, High }
 type Tier = Level
 type Ord = Ordering
@@ -552,7 +579,7 @@ fn rank(tier: Tier) -> i32 {
 }
 fn compared(left: &i32, right: &i32) -> bool {
   let ordering = Order.compare(left, right)
-  return ordering == Ord.Less || ordering == order.Ordering.Greater
+  return ordering == Ord.Less || ordering == Ordering.Greater
 }
 pub fn main() -> i32 {
   let low = 1
@@ -561,5 +588,24 @@ pub fn main() -> i32 {
   return 0
 }`)
     assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
+  }),
+)
+
+it.effect('rejects an enum member qualified through a namespace-qualified type', () =>
+  Effect.gen(function* () {
+    // A namespace exposes root declarations; a type's members go through the selected type.
+    const source = `import silk.order
+fn pick() -> i32 {
+  let ordering = order.Ordering.Greater
+  drop ordering
+  return 0
+}
+pub fn main() -> i32 { return pick() }`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [[Diagnostic.namespaceQualifiedTypeCode, source.indexOf('Ordering.Greater')]],
+      Json.stringify(messages(self)),
+    )
   }),
 )
