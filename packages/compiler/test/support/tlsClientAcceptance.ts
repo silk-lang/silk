@@ -1151,7 +1151,7 @@ impl Random for ScriptedRandom {
 // TLS_CLIENT_NATIVE_EMPTY_TRUST_BEGIN
 fn emptyTrust() -> TrustSnapshot {
   let made = TrustSnapshot.fromAnchors(
-    Vector.make<TrustAnchor>(),
+    Vector<TrustAnchor>.make(),
     SnapshotLimits {anchors: 0, encodedBytes: 0},
   )
   return match move made {

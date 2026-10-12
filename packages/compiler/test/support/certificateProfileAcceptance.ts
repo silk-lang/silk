@@ -878,8 +878,8 @@ effect fn anchorConstructionSucceeded(certificate: Certificate, constraints: &[u
 ? &mut Allocator {
   let built = run TrustAnchor.fromCertificateWithConstraints(
     move certificate,
-    Option.none<usize>(),
-    Option.some<&[u8]>(constraints),
+    Option<usize>.none(),
+    Option<&[u8]>.some(constraints),
     ProfileLimits.defaults(),
   )
   return match move built {
@@ -1339,8 +1339,8 @@ effect fn suite() -> i32 ! OutOfMemoryError ? &mut Allocator {
   }
   let anchorResult = run TrustAnchor.fromCertificateWithConstraints(
     move ownedRoot,
-    Option.some<usize>(2),
-    Option.some<&[u8]>(&configured),
+    Option<usize>.some(2),
+    Option<&[u8]>.some(&configured),
     ProfileLimits.defaults(),
   )
   let anchor = match move anchorResult {
@@ -1536,8 +1536,8 @@ effect fn suite() -> i32 ! OutOfMemoryError ? &mut Allocator {
   }
   let provenanceResult = run TrustAnchor.fromCertificateWithConstraints(
     move ownedConstrained,
-    Option.none<usize>(),
-    Option.some<&[u8]>(&leadingConstraint),
+    Option<usize>.none(),
+    Option<&[u8]>.some(&leadingConstraint),
     ProfileLimits.defaults(),
   )
   let provenanceAnchor = match move provenanceResult {
