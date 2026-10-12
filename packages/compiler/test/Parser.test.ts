@@ -175,7 +175,8 @@ const diagnosticView = (result: SyntaxFile.SyntaxFile) =>
   }))
 
 it('retains distinct lifetime binders, arguments, borrowed types and callable environment syntax', () => {
-  const source = `struct Holder<'a: 'b + 'c, 'b, 'c, T: Copy + 'a> {
+  const source = `import silk.ownership { Copy }
+struct Holder<'a: 'b + 'c, 'b, 'c, T: Copy + 'a> {
   value: &'a T
   values: &'b mut [T]
   text: string<'c>
@@ -857,6 +858,7 @@ it('parses unsafe blocks and allocator and Drop conformances losslessly', () => 
   const source = `import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 struct Guard<T> { value: T }
 impl Allocator for SystemAllocator { allocate: SystemAllocator.allocate }
 impl Drop for Guard<Token> {
@@ -875,7 +877,8 @@ fn main() -> i32 { unsafe { let allocation = Allocator.allocate(Layout.make(4, 4
 })
 
 it('parses a parametric conformance losslessly', () => {
-  const source = `struct Vector<T> { count: usize }
+  const source = `import silk.ownership { Drop }
+struct Vector<T> { count: usize }
 impl<T> Drop for Vector<T> {
   fn drop(self: &mut Vector<T>) -> () { return () }
 }
@@ -968,7 +971,7 @@ fn take(state: Empty | Full) -> i32 {
 
 it('recovers from a malformed impl type-parameter list inside the declaration', () => {
   const source =
-    'import silk.vector { Vector }\nimpl<T Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } } fn after() -> i32 { return 7 }'
+    'import silk.ownership { Drop }\nimport silk.vector { Vector }\nimpl<T Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } } fn after() -> i32 { return 7 }'
   const result = parseText('memory://damaged-parametric-conformance.silk', source)
   assert.isAbove(result.parserDiagnostics.length, 0)
   assert.strictEqual(directFunctionDeclarations(result.root).length, 1)

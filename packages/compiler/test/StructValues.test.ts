@@ -427,7 +427,8 @@ it.effect('plans cleanup for omitted fields of the selected nominal-union varian
   Effect.gen(function* () {
     const self = yield* AnalysisFixture.retainingMain(
       'union-values/omitted-cleanup',
-      ascii(`struct Bomb {}
+      ascii(`import silk.ownership { Drop }
+struct Bomb {}
 impl Drop for Bomb { fn drop(self: &mut Bomb) -> () { return () } }
 union State { Empty, Ready { value: i32, bomb: Bomb } }
 fn consume(state: State) -> i32 {

@@ -69,6 +69,8 @@ types derive or request Copy behavior under their own rules. A user-defined stru
 it explicitly requests Copy conformance:
 
 ```silk
+import silk.ownership { Copy }
+
 pub struct Point {
   pub x: i32
   pub y: i32
@@ -1009,6 +1011,8 @@ fn identity<T>(value: T) -> T {
 An operation that duplicates `T` requires the sealed Copy constraint:
 
 ```silk
+import silk.ownership { Copy }
+
 fn duplicate<T: Copy>(value: T) -> [T; 2] {
   return [value, value]
 }
@@ -1663,6 +1667,8 @@ owner is dropped.
 An affine nominal type may declare one restricted cleanup hook:
 
 ```silk
+import silk.ownership { Drop }
+
 struct Guard { allocation: Intrinsic.Allocation }
 
 impl Drop for Guard {

@@ -182,7 +182,8 @@ it.effect(
   'formats lifetime bounds and environments without losing comments or elaborating omissions',
   () =>
     Effect.gen(function* () {
-      const source = `struct Holder < 'a : 'b + 'c, 'b, 'c, T : Copy + 'a > {
+      const source = `import silk.ownership { Copy }
+struct Holder < 'a : 'b + 'c, 'b, 'c, T : Copy + 'a > {
   value: & 'a T
   values: & 'b mut [T]
   text: string < 'c >
@@ -774,7 +775,8 @@ it.effect('formats unsafe blocks and conformance declarations canonically and id
     const text = formattedText(first)
     assert.strictEqual(
       text,
-      `impl Allocator for SystemAllocator {
+      `import silk.ownership { Drop }
+impl Allocator for SystemAllocator {
   allocate: SystemAllocator.allocate
 }
 
@@ -825,7 +827,8 @@ it.effect('formats parametric conformances canonically and idempotently', () =>
     const text = formattedText(first)
     assert.strictEqual(
       text,
-      `impl<T> Drop for Vector<T> {
+      `import silk.ownership { Drop }
+impl<T> Drop for Vector<T> {
   fn drop(self: &mut Vector<T>) -> () {
     return ()
   }

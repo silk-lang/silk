@@ -394,6 +394,7 @@ it.effect('cleans an owned witness operand after success or failure', () =>
     const self = yield* analyzed(
       'bound-operation-witness/owned-adapter-cleanup',
       `
+import silk.ownership { Drop }
 struct Failed {}
 struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }

@@ -428,6 +428,7 @@ pub fn main() -> i32 {
 `
 
 const deadlineResolverProviderSource = `
+import silk.ownership { Drop }
 unsafe extern "C" fn silk_deadline_stub_reset() -> ()
 unsafe extern "C" fn silk_deadline_stub_mark_check() -> ()
 unsafe extern "C" fn silk_deadline_stub_mark_work() -> ()

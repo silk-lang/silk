@@ -565,6 +565,7 @@ it.effect(
       const snapshot = yield* AnalysisFixture.retainingMain(
         'ownership/partial-cleanup-mir',
         ascii(`
+import silk.ownership { Drop }
 struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Pair { left: Token right: Token }
@@ -685,7 +686,8 @@ pub fn main() -> i32 {
 )
 
 it('restores constant array elements and rejects dynamic moves and descent through a Drop boundary', () => {
-  const source = `struct Token { value: i32 }
+  const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
 struct Guarded { token: Token }
 impl Drop for Guarded { fn drop(self: &mut Guarded) -> () { return () } }
 fn restore(mut values: [Token; 2]) -> [Token; 2] {
@@ -955,7 +957,8 @@ it('releases live let bindings in reverse binding order at the return exit', () 
 it('releases unused owned parameters in reverse declaration order', () => {
   const facts = check(
     'ownership/owned-parameter-order',
-    `struct Token { value: i32 }
+    `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 effect fn hold(first: Token, middle: Token, last: Token) -> () {
   drop middle
@@ -1287,7 +1290,8 @@ pub fn main() -> i32 {
 })
 
 it('borrows a callable callee for the life of the Effect it constructs', () => {
-  const prelude = `struct Token { value: i32 }
+  const prelude = `import silk.ownership { Drop }
+struct Token { value: i32 }
 struct Narrow { first: i32 second: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 fn spend(token: Token) -> i32 { return token.value }
@@ -1472,7 +1476,8 @@ pub fn main() -> i32 {
 it('copies an owned Copy provider so its bound Effect remains repeatable', () => {
   const facts = check(
     'ownership/copied-provider',
-    `struct Clock { tick: i32 }
+    `import silk.ownership { Copy }
+struct Clock { tick: i32 }
 impl Copy for Clock {}
 effect fn read() -> i32 ? &mut Clock { return 42 }
 pub fn main() -> i32 {
@@ -1528,7 +1533,8 @@ pub fn main() -> i32 {
   )
   const propagated = check(
     'ownership/evaluate-propagation',
-    `struct Token { value: i32 }
+    `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () { return () }
 }
@@ -1807,7 +1813,8 @@ pub fn main() -> i32 { return 0 }`,
 it('keeps a mutable owned parameter live across loop transfer and releases it once on return', () => {
   const facts = check(
     'ownership/mutable-owned-parameter-loop-transfer',
-    `struct Token { value: i32 }
+    `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () { return () }
 }
@@ -1867,7 +1874,8 @@ pub fn main() -> i32 { return 0 }`
 
 it.effect('reborrows a reference receiver for parameter zero only', () =>
   Effect.gen(function* () {
-    const source = `struct Counter { value: i32 }
+    const source = `import silk.ownership { Copy }
+struct Counter { value: i32 }
 impl Counter {
   fn read(self: &Self) -> i32 { return self.value }
   fn bump(self: &mut Self) -> () { self.value = self.value + 1 }
@@ -2058,14 +2066,16 @@ pub fn main() -> i32 { return 0 }`,
 it('admits Copy and Drop conformances on nominal union parents', () => {
   const copied = check(
     'ownership/nominal-union-copy',
-    `union Choice { First { value: i32 }, Second }
+    `import silk.ownership { Copy }
+union Choice { First { value: i32 }, Second }
 impl Copy for Choice {}
 fn duplicate(value: Choice) -> Choice { let copy = value return move copy }
 pub fn main() -> i32 { return 0 }`,
   )
   const dropped = check(
     'ownership/nominal-union-drop',
-    `union Owner { Empty, Present { value: i32 } }
+    `import silk.ownership { Drop }
+union Owner { Empty, Present { value: i32 } }
 impl Drop for Owner {
   fn drop(self: &mut Owner) -> () { return () }
 }
@@ -2219,7 +2229,8 @@ ${modifiers} fn inspect(input: Left | Right) -> i32 {
 it('reports an incompatible loop header when the while condition consumes an owner', () => {
   const facts = check(
     'ownership/while-condition-consumes',
-    `struct Token { value: i32 }
+    `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () { return () }
 }
@@ -2241,7 +2252,8 @@ pub fn main() -> i32 { return 0 }`,
 it('joins conditional owner presence and omits cleanup when every branch transfers it', () => {
   const oneArm = check(
     'ownership/if-one-arm-move',
-    `struct Token { value: i32 }
+    `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () { return () }
 }
@@ -2256,7 +2268,8 @@ pub fn main() -> i32 { return 0 }`,
   )
   const bothArms = check(
     'ownership/if-both-arms-move',
-    `struct Token { value: i32 }
+    `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () { return () }
 }
@@ -2355,7 +2368,8 @@ const checkValid = (id: string, text: string): Ownership.ModuleOwnership => {
 }
 
 it('joins only completing match arms and releases selected block owners at their exits', () => {
-  const source = `struct Token { value: i32 }
+  const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Left { kept: Token omitted: Token }
 struct Right {}
@@ -2416,7 +2430,8 @@ fn inspect(input: Left | Right, owner: Token) -> i32 {
 })
 
 it('releases abandoned earlier arguments in reverse order without storing a transferring initializer', () => {
-  const source = `struct Token { value: i32 }
+  const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Left {}
 struct Right {}
@@ -2452,7 +2467,8 @@ fn inspect(input: Left | Right) -> i32 {
 })
 
 it('cleans a provisional consumed payload on guard transfer and preserves it on Boolean fallback', () => {
-  const source = `struct Token { value: i32 }
+  const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Left { token: Token }
 struct Right {}
@@ -2493,7 +2509,8 @@ fn inspect(input: Left | Right, decision: Stop | Keep) -> i32 {
 })
 
 it('keeps enclosing argument temporaries alive when an arm breaks only its own inner loop', () => {
-  const source = `struct Token { value: i32 }
+  const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Left {}
 struct Right {}
@@ -2518,7 +2535,8 @@ fn inspect(input: Left | Right) -> i32 {
 })
 
 it('cleans abandoned operands on enclosing break continue and failure paths', () => {
-  const source = `struct Token { value: i32 }
+  const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Leave {}
 struct Again {}
@@ -2737,7 +2755,8 @@ fn bad() -> i32 { let value = 42 return choose(move value, value) }`
     }),
 )
 
-const installedDropPrelude = `struct Source { value: i32 }
+const installedDropPrelude = `import silk.ownership { Drop }
+struct Source { value: i32 }
 impl Drop for Source { fn drop(self: &mut Source) -> () { self.value = 99 return () } }
 struct Guard<'a> { value: &'a Source }
 impl<'a> Drop for Guard<'a> {
@@ -2802,7 +2821,8 @@ for (const [name, acquisition] of [
 ] as const) {
   it.effect(`resets reacquired ${name} owners inside selected execution`, () =>
     Effect.gen(function* () {
-      const source = `struct Token { value: i32 }
+      const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Pair { a: Token b: Token }
 struct Envelope { pair: Pair }

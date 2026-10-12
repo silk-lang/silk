@@ -8,6 +8,7 @@ import silk.effect {Effect}
 import silk.execution { Execution, Wake }
 import silk.http {Header, LimitKind, Method, ValueComponent, ValueError, ValueReason}
 import silk.http_body {
+import silk.ownership { Drop }
   Anomaly,
   BodyComponent,
   BodyError,

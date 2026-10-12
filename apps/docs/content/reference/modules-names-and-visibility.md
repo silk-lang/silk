@@ -833,6 +833,20 @@ standard-library struct `Effect`, and `Effect.provide` is an inherent member dec
 struct's `impl Effect` block. `silk.i32` declares no owner type: its operations are root
 declarations reached through the namespace binding `i32`.
 
+The ownership properties are ordinary standard-library names too. `Copy` and `Drop` are aliases of
+the sealed `Intrinsic.Copy` and `Intrinsic.Drop` published by `silk.ownership` (INTR-006), and a
+module that spells them imports them:
+
+```silk
+import silk.ownership { Copy }
+
+struct Point { x: i32 y: i32 }
+
+impl Copy for Point {}
+
+pub fn main() -> i32 { return 42 }
+```
+
 **Boundary:** The toolchain may resolve the reserved `silk/` source origin differently from project
 files, but that packaging privilege does not inject its declarations into every module scope.
 Tooling may add missing imports automatically; auto-import is a source edit, not invisible lookup.

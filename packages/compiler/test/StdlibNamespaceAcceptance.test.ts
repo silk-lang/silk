@@ -505,6 +505,7 @@ import silk.byte_duplex { ByteDuplex }
 import silk.effect { Effect }
 import silk.memory_byte_duplex { MemoryByteDuplex }
 import silk.monotonic_clock { MonotonicClock }
+import silk.ownership { Copy }
 import silk.random { Random }
 import silk.system_clock { SystemClock }
 import silk.tls_client { ClientConfig }

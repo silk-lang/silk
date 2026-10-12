@@ -461,7 +461,8 @@ it.effect('retains reference field loans and lifetime-erased array elements', ()
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'reference-projection/stored-reference-place',
-      ascii(`struct Box { value: i32 }
+      ascii(`import silk.ownership { Copy }
+struct Box { value: i32 }
 struct View<'a> { box: &'a mut Box }
 struct ArrayBox { values: [i32; 1] }
 struct ArrayView<'a> { box: &'a ArrayBox }

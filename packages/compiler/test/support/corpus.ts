@@ -752,7 +752,8 @@ pub fn main() -> i32 {
 }`
 
 /** Explicit referent projection preserves runtime-indexed reads and writes in native execution. */
-export const referenceProjectionAcceptance = `import silk.usize
+export const referenceProjectionAcceptance = `import silk.ownership { Copy }
+import silk.usize
 
 struct Empty {}
 impl Copy for Empty {}
@@ -1288,6 +1289,7 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 export const independentExecutionDormantDrop = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Empty {}
 struct Waiting { wake: Wake }
@@ -2558,7 +2560,8 @@ pub fn main() -> i32 {
   },
   {
     name: 'nominal-union-represented-copy-drop',
-    source: `union Parser<F: once fn<'static>(i32) -> i32> { Empty, Ready { parse: F } }
+    source: `import silk.ownership { Copy, Drop }
+union Parser<F: once fn<'static>(i32) -> i32> { Empty, Ready { parse: F } }
 union Deferred<F: once Effect<'static; i32>> { Empty, Ready { operation: F } }
 union Flag { Empty, Value { value: i32 } }
 impl Copy for Flag {}
@@ -2695,7 +2698,8 @@ pub fn main() -> i32 { return run outer(Flag.No) }`,
   // changing the original Copy value after construction must not change its captured snapshot.
   {
     name: 'finite-effect-join-capture-arity',
-    source: `struct First {}
+    source: `import silk.ownership { Copy }
+struct First {}
 struct Second {}
 struct Payload { a: i32 b: i32 c: i32 }
 impl Copy for Payload {}
@@ -2723,6 +2727,7 @@ import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct First {}
 struct Second {}
@@ -2776,6 +2781,7 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
     // its environment drops the capture once; applied, the target consumes it.
     name: 'constrained-section-owned-capture-lifecycle',
     source: `import silk.effect { Effect }
+import silk.ownership { Drop }
 unsafe extern "C" fn silk_record_event(value: i32) -> ()
 unsafe extern "C" fn silk_finish_events() -> i32
 struct Recorder { value: i32 }
@@ -2816,6 +2822,7 @@ int32_t silk_finish_events(void) { puts(""); return 42; }
     // and effect functions alike. Each drop prints two digits and a comma through libc `putchar`.
     name: 'moved-rest-pattern-omitted-field-cleanup',
     source: `import silk.effect { Effect }
+import silk.ownership { Drop }
 unsafe extern "C" fn putchar(value: i32) -> i32
 fn mark(value: i32) -> () {
   unsafe {
@@ -3537,7 +3544,8 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
   // matches, all-diverging arms, loop control from arms, whole-member bindings and a Copy bare match.
   {
     name: 'match-arm-blocks-and-bindings',
-    source: `struct Left { value: i32 }
+    source: `import silk.ownership { Copy }
+struct Left { value: i32 }
 struct Right {}
 struct Token { value: i32 }
 impl Copy for Token {}
@@ -3603,7 +3611,8 @@ pub fn main() -> i32 {
   // redundant irrefutable `if let`, a nominal variant `if let`, and an irrefutable `let` record pattern.
   {
     name: 'pattern-conditionals-and-destructuring',
-    source: `struct Left { value: i32 }
+    source: `import silk.ownership { Copy }
+struct Left { value: i32 }
 struct Right {}
 struct Point {
   x: i32
@@ -3673,7 +3682,8 @@ pub fn main() -> i32 {
   // through an explicit dereference, reborrowed exclusive references, and borrows of dereferences.
   {
     name: 'reference-projection-places',
-    source: `struct Empty {}
+    source: `import silk.ownership { Copy }
+struct Empty {}
 impl Copy for Empty {}
 struct Buffer { values: [i32; 3] }
 struct Box { value: i32 }
@@ -3708,7 +3718,8 @@ pub fn main() -> i32 {
   // value, and a consuming match with an empty-record arm.
   {
     name: 'structural-union-copy-members',
-    source: `struct Left { value: i32 }
+    source: `import silk.ownership { Copy }
+struct Left { value: i32 }
 impl Copy for Left {}
 struct Right { marker: i32 value: i32 }
 impl Copy for Right {}
@@ -4438,6 +4449,7 @@ pub fn main() -> i32 {
     name: 'effect-retry-and-provide-effect',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.result { Result }
 import silk.shared { Shared }
 
@@ -4681,6 +4693,7 @@ import silk.hash { Hash, HashKey, HashSeed, Word }
 import silk.hash_map { HashMap }
 import silk.hash_set { HashSet }
 import silk.option { Option }
+import silk.ownership { Copy }
 import silk.u64
 
 struct Counter { value: i32 calls: i32 }
@@ -4779,6 +4792,7 @@ import silk.effect { Effect }
 import silk.hash { Hash, HashKey, HashSeed }
 import silk.hash_map { HashMap }
 import silk.i32
+import silk.ownership { Drop }
 import silk.shared { Shared }
 
 struct Counts { keys: i32 values: i32 }
@@ -5251,6 +5265,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.order { Order, Ordering }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.usize
 import silk.vector { Vector }
@@ -5766,6 +5781,7 @@ import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Copy }
 import silk.raw_buffer { RawBuffer }
 import silk.slot { Slot }
 union Element { Narrow { first: i32, second: i32 }, Wide { first: i64, second: i64 } }
@@ -5849,6 +5865,7 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Copy }
 import silk.raw_buffer { RawBuffer }
 import silk.slot { Slot }
 struct Left { value: i32 }
@@ -5881,6 +5898,7 @@ pub fn main() -> i32 { return run Effect.catchAll(store(), recover) }`,
     name: 'runtime-slice-exclusive',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.usize
 struct Counter { value: i32 }
@@ -6087,6 +6105,7 @@ import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 struct Guard {
   tag: i32
   storage: Intrinsic.Allocation
@@ -6116,6 +6135,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     name: 'anonymous-capture-cleanup-count',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Counter { value: i32 }
 struct Token { value: i32 counter: Shared<Counter> }
@@ -6158,6 +6178,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     name: 'anonymous-forwarded-once-capture-cleanup',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Counter { value: i32 }
 struct Token { counter: Shared<Counter> }
@@ -6199,6 +6220,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     name: 'generic-run-cleanup-counts',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Problem { code: i32 }
 struct Counter { value: i32 }
@@ -6255,6 +6277,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recoverAllocation) }`
     name: 'stored-effect-cleanup-counts',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Problem { code: i32 }
 struct Counter { value: i32 sum: i32 }
@@ -6330,6 +6353,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recoverAllocation) }`
     name: 'drop-hook-structured-exits',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Problem {}
 struct Counts { hooks: i32 fields: i32 open: i32 valid: bool }
@@ -6407,6 +6431,7 @@ import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 struct Guard {
   tag: i32
   storage: Intrinsic.Allocation
@@ -6474,7 +6499,8 @@ pub fn main() -> i32 {
   // A non-nominal active payload still owns and releases every droppable element exactly once.
   {
     name: 'ordinary-union-droppable-array',
-    source: `struct Token { value: i32 }
+    source: `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 fn accept(value: i32 | [Token; 2]) -> i32 { drop value return 42 }
 pub fn main() -> i32 {
@@ -6526,6 +6552,7 @@ pub fn main() -> i32 {
     name: 'effect-selective-catch-cleanup-counts',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Selected {}
 struct Counter { count: i32 sum: i32 }
@@ -6591,6 +6618,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recoverAllocation) }`
     // only the unused capture. This proves synchronous cleanup ordering, not parking/cancellation.
     name: 'effect-borrowed-recovery-owned-cleanup',
     source: `import silk.effect { Effect }
+import silk.ownership { Drop }
 unsafe extern "C" fn silk_recovery_event(id: i32) -> ()
 unsafe extern "C" fn silk_recovery_verify() -> i32
 struct Owner { value: i32 }
@@ -6652,6 +6680,7 @@ int32_t silk_recovery_verify(void) {
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
+import silk.ownership { Drop }
 unsafe extern "C" fn silk_scoped_event(id: i32) -> ()
 unsafe extern "C" fn silk_scoped_verify() -> i32
 struct Owner { value: i32 }
@@ -6796,6 +6825,7 @@ int32_t silk_scoped_verify(void) {
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 unsafe extern "C" fn silk_cancel_event(id: i32) -> ()
 unsafe extern "C" fn silk_cancel_verify() -> i32
@@ -7138,6 +7168,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     name: 'stored-callable-drop-lane-mutation',
     source: `import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Cell { value: i32 }
 struct Observation { value: i32 }
@@ -7243,7 +7274,8 @@ pub fn main() -> i32 {
     // EFF-013: distinct return sites join under the declared `once Effect<i32>`; each call runs
     // the alternative its own branch constructed.
     name: 'effect-return-site-join-once',
-    source: `struct Token { value: i32 }
+    source: `import silk.ownership { Drop }
+struct Token { value: i32 }
 impl Drop for Token {
   fn drop(self: &mut Token) -> () { return () }
 }
@@ -7419,6 +7451,7 @@ const independentExecutionLatchedDestroy = readFileSync(
  */
 const diagnosticReleaseBalance = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 
 struct State {
@@ -7528,6 +7561,7 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), noMemory) }`
 const diagnosticCancelledHandlerRelease = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 
 struct State {
@@ -7953,6 +7987,7 @@ pub fn main() -> i32 { return unsafe silk_test_export_checksum() }`
 export const replaceCleanupProgram = `import silk.os_writer { StdoutWriter }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.format { Format }
 import silk.writer { Writer, WriterError }
@@ -8045,6 +8080,7 @@ pub fn main() -> i32 {
 export const replaceDropProgram = `import silk.os_writer { StdoutWriter }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.format { Format }
 import silk.writer { Writer, WriterError }
@@ -8115,6 +8151,7 @@ pub fn main() -> i32 {
 export const selectedLoopExitDropProgram = `import silk.os_writer { StdoutWriter }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.format { Format }
 import silk.writer { Writer, WriterError }
@@ -8488,7 +8525,8 @@ int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expec
     // 'static and local patterns each run the outer hook before the nested Token hook, and the
     // counters reject omitted or repeated cleanup.
     name: 'generic-lifetime-selected-cleanup',
-    source: `struct Token<'data> { value: i32 counter: &'data mut i32 }
+    source: `import silk.ownership { Drop }
+struct Token<'data> { value: i32 counter: &'data mut i32 }
 impl<'data> Drop for Token<'data> {
   fn drop(self: &mut Token<'data>) -> () {
     if self.value != 2 { let zero: i32 = 0 self.value = 1 / zero }
@@ -8556,7 +8594,8 @@ pub fn main() -> i32 {
   },
   {
     name: 'generic-record-instances',
-    source: `struct Token<'data> { drops: &'data mut i32 }
+    source: `import silk.ownership { Copy, Drop }
+struct Token<'data> { drops: &'data mut i32 }
 impl<'data> Drop for Token<'data> {
   fn drop(self: &mut Token<'data>) -> () {
     if self.drops.* != 0 {
@@ -8588,6 +8627,7 @@ pub fn main() -> i32 {
     // A user-defined Option-shaped union follows the same generic construction and match path.
     name: 'generic-union-instances',
     source: `import silk.option { Option }
+import silk.ownership { Drop }
 struct Token<'data> { drops: &'data mut i32 }
 impl<'data> Drop for Token<'data> {
   fn drop(self: &mut Token<'data>) -> () {
@@ -8687,6 +8727,7 @@ pub fn main() -> i32 {
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.option { Option }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 
 struct Audit { drops: i32 }
@@ -9033,6 +9074,7 @@ int32_t silk_finish_events(void) { puts(""); return 42; }
     name: 'vector-dependent-elements-cleanup-and-extraction',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.vector { Vector }
 import silk.layout { Layout }
 struct Quota { remaining: i32 }
@@ -9108,7 +9150,8 @@ int32_t silk_verify_drops(void) { puts(events); return 42; }
   },
   {
     name: 'partial-owner-cleanup-and-refinement',
-    source: `unsafe extern "C" fn silk_record_drop(value: i32) -> ()
+    source: `import silk.ownership { Drop }
+unsafe extern "C" fn silk_record_drop(value: i32) -> ()
 unsafe extern "C" fn silk_verify_drops() -> i32
 struct Token { value: i32 }
 impl Drop for Token {
@@ -9223,6 +9266,7 @@ pub fn main() -> i32 {
     name: 'match-statement-arm-abandoned-cleanup',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Counts { order: i32 }
 struct Guard { counts: Shared<Counts> digit: i32 }
@@ -9441,6 +9485,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     name: 'zero-sized-copy-vector-read',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Copy }
 import silk.vector { Vector }
 struct Marker {}
 impl Copy for Marker {}
@@ -9796,6 +9841,7 @@ pub fn main() -> i32 {
 import silk.effect { Effect }
 import silk.execution { Execution }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Audit { body: i32 endpoint: i32 }
 fn recordBody(audit: &mut Audit) -> i32 { audit.body = audit.body + 1 return audit.body }
@@ -10042,6 +10088,7 @@ pub fn main() -> i32 { return run make(42) }`,
 import silk.effect { Effect }
 import silk.i8
 import silk.layout { Layout }
+import silk.ownership { Drop }
 import silk.raw_buffer { RawBuffer }
 import silk.shared { Shared }
 import silk.slot { Slot }
@@ -10117,6 +10164,7 @@ pub fn main() -> i32 {
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.layout { Layout }
+import silk.ownership { Copy }
 import silk.raw_buffer { RawBuffer }
 import silk.slot { Slot }
 import silk.u8
@@ -10261,6 +10309,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recoverAllocation) }`
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.box { Box }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.usize
 struct Counter { value: i32 }
@@ -10323,6 +10372,7 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recover) }`,
     name: 'vector-move-only-cleanup-order',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.vector { Vector }
 struct Audit { count: i32 trace: i32 }
@@ -10387,6 +10437,7 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recover) }`,
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.box { Box }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.usize
 struct Counter { value: i32 }
@@ -10495,7 +10546,8 @@ pub fn main() -> i32 {
   },
   {
     name: 'method-receiver-reference-reborrow',
-    source: `struct Counter { value: i32 }
+    source: `import silk.ownership { Copy }
+struct Counter { value: i32 }
 impl Counter {
   fn read(self: &Self) -> i32 { return self.value }
   fn bump(self: &mut Self) -> () { self.value = self.value + 1 }
@@ -10630,6 +10682,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     name: 'affine-checked-callback-cleanup',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 import silk.u8
 union Checked<T> { Present { value: T }, Absent }
@@ -10695,6 +10748,7 @@ pub fn main() -> i32 { return run Effect.catchAll(measure(), recover) }`,
     name: 'stored-callable-terminal-cleanup',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.result { Result }
 import silk.shared { Shared }
 struct Problem {}
@@ -10909,6 +10963,7 @@ pub fn main() -> i32 {
     name: 'suspension-moved-owner-drop-order',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Log { digits: i32 }
 struct Token { id: i32 log: Shared<Log> }
@@ -11089,7 +11144,8 @@ pub fn main() -> i32 { return unsafe abs(-42) }`,
   {
     name: 'foreign-libc-qsort-callback',
     source: 'pub fn main() -> i32 { return 42 }',
-    nativeSource: `import silk.pointer { Pointer }
+    nativeSource: `import silk.ownership { Drop }
+import silk.pointer { Pointer }
 import silk.effect { Effect }
 struct Failed {}
 struct Guard { counter: *mut i32 }
@@ -11266,6 +11322,7 @@ pub effect fn main() ! NotFoundError {
   {
     name: 'native-termination-cleanup-preserves-primary',
     source: `import silk.effect { Effect }
+import silk.ownership { Drop }
 pub struct Primary {}
 struct Noise {}
 struct Guard {}
@@ -11799,6 +11856,7 @@ pub fn main() -> i32 { return run Effect.catchAll(construct(), recover) }`,
     name: 'local-shared-strong-cycle',
     source: `import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 struct Empty {}
 struct Bomb {}
 impl Drop for Bomb {
@@ -12014,6 +12072,7 @@ import silk.effect { Effect }
 import silk.execution { Execution }
 import silk.i8
 import silk.layout { Layout }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Counter { value: i32 }
 fn increment(counter: &mut Counter) -> i32 {
