@@ -171,8 +171,8 @@ calls `free` on its context, a raw buffer drops only its allocation, and shared-
 references and drops the value and allocation with the last handle. Raw-buffer and slot contents
 stay owned by library code. `layoutOf`, `sharedLayout` and `systemAllocationAcquire` exchange the
 standard library's `silk/layout` `Layout` record, as the bootstrap's contracts name it.
-Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary when
-reached bodies retain safety obligations. The TypeScript bootstrap compiler still builds it.
+Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary, with
+a per-reason breakdown, when reached bodies are not yet borrow-checked. The TypeScript bootstrap compiler still builds it.
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
 referent, an array element and a covariant nominal lifetime argument may differ: a `'static`
@@ -201,7 +201,7 @@ With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-bu
 <native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup together.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
-builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. The standard-library
+builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
 root contains `silk/`; it is an explicit CLI input. A package without a `[build].composition`
 takes its runtime from the library's `compositions.json` for the target and libc, so such a build
 needs the library root even without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
@@ -337,6 +337,16 @@ resolution, run the focused native checks below, and target the synchronization 
 `selfhost`. Use a merge that retains both parents; do not copy repair commits into a private
 bootstrap patch stream or reset `selfhost` onto another history. Update native feature branches
 from the synchronized `selfhost` tip as needed.
+
+### The native seed pin
+
+`compiler/native-seed.json` names the published native compiler that builds N1 (see
+[the native seed chain](docs/native-seed-chain.md)). Advance it weekly, and immediately after any
+soundness or code generation fix that N1 must not be built without. Pin only a candidate whose
+`selfhost` push run summary says **Full gate**; never pin a candidate published from a run that
+reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a pull request to
+`selfhost`; its CI proves the new seed builds the checkout, reaches the N1/N2 fixpoint and passes
+the corpus.
 
 For each bootstrap build, record the `selfhost` commit, the downloaded main compiler commit and CI
 run, the host platform and LLVM target. The focused selfhost workflow downloads the latest verified

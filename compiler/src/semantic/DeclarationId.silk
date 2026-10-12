@@ -21,7 +21,9 @@ import silk.hash {Hash}
 import silk.option {Option}
 import silk.shared {Shared}
 import silk.slice {Slice}
+import silk.pointer {Pointer}
 import silk.u8
+import silk.u64
 import silk.usize
 import silk.vector {Vector}
 import semantic.InternIndex {InternIndex}
@@ -37,11 +39,26 @@ pub struct OwnerStep {
   pub occurrence: usize
 }
 
+// The owner chain of one identity and its canonical content, shared by every copy.
+struct Chain {
+  owners: Bytes
+  count: usize
+  // The complete declaration content that runtime and instance encodings record: the module's
+  // three components, then the owner count and each step's kind, name and occurrence, every word
+  // big-endian. Computed once when the identity is built.
+  content: Bytes
+}
+
 /// A module identity and complete parent-to-child declaration owner chain.
 pub struct DeclarationId {
   module: ModuleId
-  owners: Bytes
-  count: usize
+  chain: Shared<Chain>
+  // The address of `chain`, fixed at construction. Every copy retains the record, so equal
+  // addresses are one record and decide equality without reading the bytes.
+  address: usize
+  // The hash of the module and the whole chain, fixed at construction. Unequal hashes decide
+  // inequality without reading the bytes.
+  hashed: u64
 }
 
 // One decoded owner step: its name is the byte range `start..start + length` of the chain.
@@ -188,8 +205,8 @@ fn readStep(bytes: &[u8], at: usize) -> StepView {
 }
 
 // The step at index `owner`, decoded from the start of the chain.
-fn stepAt(identity: &DeclarationId, owner: usize) -> StepView {
-  let bytes = Bytes.asSlice(&identity.owners)
+fn stepAt(chain: &Chain, owner: usize) -> StepView {
+  let bytes = Bytes.asSlice(&chain.owners)
   let mut view = readStep(bytes, usize.ZERO)
   let mut index = usize.ZERO
   while index < owner {
@@ -199,8 +216,8 @@ fn stepAt(identity: &DeclarationId, owner: usize) -> StepView {
   return view
 }
 
-fn stepName(identity: &DeclarationId, view: StepView) -> &[u8] {
-  return Slice.view<u8>(Bytes.asSlice(&identity.owners), view.start, view.length)
+fn stepName(chain: &Chain, view: StepView) -> &[u8] {
+  return Slice.view<u8>(Bytes.asSlice(&chain.owners), view.start, view.length)
 }
 
 fn isNamed(name: &Option<Bytes>) -> bool {
@@ -236,18 +253,17 @@ effect fn encodeSteps(steps: &[OwnerStep]) -> Bytes ! OutOfMemoryError ? &mut Al
 }
 
 // The chain of `parent` followed by one more step.
-effect fn extended(parent: &Bytes, kind: OwnerKind, named: bool, name: &[u8], occurrence: usize) -> Bytes
+effect fn extended(parent: &[u8], kind: OwnerKind, named: bool, name: &[u8], occurrence: usize) -> Bytes
 ! OutOfMemoryError
 ? &mut Allocator {
-  let prefix = Bytes.asSlice(&parent.*)
-  let mut bytes = run Bytes.zeroed(prefix.length + stepSize(named, name, occurrence))
+  let mut bytes = run Bytes.zeroed(parent.length + stepSize(named, name, occurrence))
   let target = Bytes.asMutSlice(&mut bytes)
   let mut index = usize.ZERO
-  while index < prefix.length {
-    target[index] = prefix[index]
+  while index < parent.length {
+    target[index] = parent[index]
     index = index + usize.ONE
   }
-  let end = writeStep(&mut bytes, prefix.length, kind, named, name, occurrence)
+  let end = writeStep(&mut bytes, parent.length, kind, named, name, occurrence)
   return move bytes
 }
 
@@ -265,18 +281,10 @@ fn sameBytes(left: &[u8], right: &[u8]) -> bool {
   return true
 }
 
-fn foldName(hashed: u64, identity: &DeclarationId, view: StepView) -> u64 {
-  if view.named {
-    return InternIndex.hashBytes(Hash.combine(hashed, 1), stepName(identity, view))
-  }
-  return Hash.combine(hashed, 0)
-}
-
 // Folds the module, the count of leading owner steps read, their names, and their occurrences,
 // except possibly the last one, which same-key siblings do not share.
-fn chainHash(identity: &DeclarationId, count: usize, lastOccurrence: bool) -> u64 {
-  let bytes = Bytes.asSlice(&identity.owners)
-  let mut hashed = Hash.combine(ModuleId.hash(&identity.module), usize.toU64(count))
+fn chainHash(module: &ModuleId, bytes: &[u8], count: usize, lastOccurrence: bool) -> u64 {
+  let mut hashed = Hash.combine(ModuleId.hash(module), usize.toU64(count))
   let mut offset = usize.ZERO
   let mut index = usize.ZERO
   while index < count {
@@ -284,115 +292,209 @@ fn chainHash(identity: &DeclarationId, count: usize, lastOccurrence: bool) -> u6
     if lastOccurrence || index + usize.ONE < count {
       hashed = Hash.combine(hashed, usize.toU64(view.occurrence))
     }
-    hashed = foldName(hashed, identity, view)
+    if view.named {
+      hashed = InternIndex.hashBytes(Hash.combine(hashed, 1), Slice.view<u8>(bytes, view.start, view.length))
+    } else {
+      hashed = Hash.combine(hashed, 0)
+    }
     offset = view.next
     index = index + usize.ONE
   }
   return hashed
 }
 
-// The chain of `parent` followed by one authored owner key, with its name copied from `module`.
-effect fn ownedChain(parent: &Bytes, module: &Module, owner: OwnerKey) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  if owner.name.present {
-    return run extended(&parent.*, owner.kind, true, Module.text(module, owner.name.symbol), owner.occurrence)
+/// The content code of a declaration category. Codes are part of every recorded identity, so they
+/// never change meaning.
+pub fn contentKind(kind: OwnerKind) -> u64 {
+  return match kind {
+    OwnerKind.Import => 1
+    OwnerKind.Conditional => 2
+    OwnerKind.ModuleProperty => 3
+    OwnerKind.Implementation => 4
+    OwnerKind.Function => 5
+    OwnerKind.Struct => 6
+    OwnerKind.Tuple => 7
+    OwnerKind.Enumeration => 8
+    OwnerKind.Union => 9
+    OwnerKind.Service => 10
+    OwnerKind.Interface => 11
+    OwnerKind.Role => 12
+    OwnerKind.Constant => 13
+    OwnerKind.PackageParameter => 14
+    OwnerKind.Alias => 15
+    OwnerKind.Static => 16
+    OwnerKind.Damaged => 17
+    OwnerKind.Anonymous => 18
+    OwnerKind.EffectBlock => 19
   }
-  return run extended(&parent.*, owner.kind, false, b"", owner.occurrence)
 }
 
-/// Owned scalar fields of a selected owner step.
-pub struct Projection {
-  pub length: usize
-  pub byte: u8
-  pub kind: OwnerKind
-  pub occurrence: usize
-  pub named: bool
+// Appends one big-endian word.
+effect fn appendWord(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes: [u8; 8] = [0, 0, 0, 0, 0, 0, 0, 0]
+  let mut at = usize.ZERO
+  while at < 8 {
+    bytes[at] = u64.toU8(u64.bitAnd(u64.shiftRight(value, usize.toU64((7 - at) * 8)), 255))
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut output.*, &bytes)
 }
 
-impl Copy for Projection {}
+fn componentLength(bytes: &[u8]) -> u64 {
+  return usize.toU64(bytes.length)
+}
+
+// The complete content of the identity of `module` and the `count` steps encoded in `owners`.
+effect fn encodeContent(module: &ModuleId, owners: &[u8], count: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run appendWord(&mut output, ModuleId.withOrigin<u64>(module, componentLength))
+  run ModuleId.appendOrigin(module, &mut output)
+  run appendWord(&mut output, ModuleId.withPackage<u64>(module, componentLength))
+  run ModuleId.appendPackage(module, &mut output)
+  run appendWord(&mut output, ModuleId.withPath<u64>(module, componentLength))
+  run ModuleId.appendPath(module, &mut output)
+  run appendWord(&mut output, usize.toU64(count))
+  let mut offset = usize.ZERO
+  let mut index = usize.ZERO
+  while index < count {
+    let view = readStep(owners, offset)
+    run appendWord(&mut output, contentKind(view.kind))
+    if view.named {
+      run appendWord(&mut output, 1)
+      run appendWord(&mut output, usize.toU64(view.length))
+      run Bytes.append(&mut output, Slice.view<u8>(owners, view.start, view.length))
+    } else {
+      run appendWord(&mut output, 0)
+    }
+    run appendWord(&mut output, usize.toU64(view.occurrence))
+    offset = view.next
+    index = index + usize.ONE
+  }
+  return move output
+}
+
+fn chainAddress(value: &Chain) -> usize {
+  return Pointer.address<Chain>(Pointer.fromRef<Chain>(value))
+}
+
+// Builds the shared record of `module` and the `count` steps encoded in `owners`.
+effect fn assemble(module: ModuleId, owners: Bytes, count: usize) -> DeclarationId ! OutOfMemoryError ? &mut Allocator {
+  let hashed = chainHash(&module, Bytes.asSlice(&owners), count, true)
+  let content = run encodeContent(&module, Bytes.asSlice(&owners), count)
+  let chain = run Shared.make<Chain>(Chain {owners: move owners, count: count, content: move content})
+  let address = Shared.with<Chain, usize>(&chain, chainAddress)
+  return DeclarationId {module: move module, chain: move chain, address: address, hashed: hashed}
+}
+
+// The chain of `parent` followed by one authored owner key, with its name copied from `module`.
+effect fn ownedChain(parent: &[u8], module: &Module, owner: OwnerKey) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  if owner.name.present {
+    return run extended(parent, owner.kind, true, Module.text(module, owner.name.symbol), owner.occurrence)
+  }
+  return run extended(parent, owner.kind, false, b"", owner.occurrence)
+}
+
+fn ownersLength(value: &Chain) -> usize {
+  return Bytes.length(&value.owners)
+}
+
+fn fillOwners(value: &Chain, target: &mut Bytes) -> bool {
+  let source = Bytes.asSlice(&value.owners)
+  let output = Bytes.asMutSlice(&mut target.*)
+  let mut at = usize.ZERO
+  while at < source.length {
+    output[at] = source[at]
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// A copy of the encoded owner chain, made outside the borrow of the shared record.
+effect fn copyOwners(chain: &Shared<Chain>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut owners = run Bytes.zeroed(Shared.with<Chain, usize>(chain, ownersLength))
+  let filled = Shared.with<Chain, bool>(chain, fn(value: &Chain) -> bool { return fillOwners(value, &mut owners) })
+  return move owners
+}
+
+fn countOf(value: &Chain) -> usize {
+  return value.count
+}
+
+fn lastKind(value: &Chain) -> OwnerKind {
+  if value.count == usize.ZERO {
+    return OwnerKind.Damaged
+  }
+  return stepAt(value, value.count - usize.ONE).kind
+}
+
+fn sameChains(left: &Chain, right: &Chain) -> bool {
+  return left.count == right.count && sameBytes(Bytes.asSlice(&left.owners), Bytes.asSlice(&right.owners))
+}
+
+// Whether `prefix` is a leading part of `full`, including equality.
+fn chainPrefix(prefix: &Chain, full: &Chain) -> bool {
+  let leading = Bytes.asSlice(&prefix.owners)
+  let whole = Bytes.asSlice(&full.owners)
+  if prefix.count > full.count || leading.length > whole.length {
+    return false
+  }
+  return sameBytes(leading, Slice.view<u8>(whole, usize.ZERO, leading.length))
+}
+
+fn siblingChains(left: &Chain, right: &Chain) -> bool {
+  if left.count == usize.ZERO || left.count != right.count {
+    return false
+  }
+  let leftBytes = Bytes.asSlice(&left.owners)
+  let rightBytes = Bytes.asSlice(&right.owners)
+  let mut leftOffset = usize.ZERO
+  let mut rightOffset = usize.ZERO
+  let mut index = usize.ZERO
+  while index < left.count {
+    let first = readStep(leftBytes, leftOffset)
+    let second = readStep(rightBytes, rightOffset)
+    if first.kind != second.kind || first.named != second.named || !sameBytes(stepName(left, first), stepName(right, second)) {
+      return false
+    }
+    if index + usize.ONE < left.count && first.occurrence != second.occurrence {
+      return false
+    }
+    leftOffset = first.next
+    rightOffset = second.next
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn pairWith<A>(left: &Shared<Chain>, right: &Shared<Chain>, use: once fn(&Chain, &Chain) -> A) -> A {
+  return Shared.with<Chain, A>(
+    left,
+    fn(first: &Chain) -> A {
+      return withSecond<A>(first, right, move use)
+    },
+  )
+}
+
+fn withSecond<A>(first: &Chain, right: &Shared<Chain>, use: once fn(&Chain, &Chain) -> A) -> A {
+  return Shared.with<Chain, A>(
+    right,
+    fn(second: &Chain) -> A {
+      return use(first, second)
+    },
+  )
+}
 
 impl DeclarationId {
-  /// Reads scalar owner-step fields without returning a reference to a shared declaration.
-  ///
-  /// # Details
-  ///
-  /// An `owner` at or past the last step reports the step count as its length.
-  pub fn project(self: &Self, owner: usize, offset: usize) -> Projection {
-    if owner >= self.count {
-      return Projection {
-        length: self.count,
-        byte: 0,
-        kind: OwnerKind.Damaged,
-        occurrence: usize.ZERO,
-        named: false,
-      }
-    }
-    let step = stepAt(self, owner)
-    let mut projected = Projection {
-      length: usize.ZERO,
-      byte: 0,
-      kind: step.kind,
-      occurrence: step.occurrence,
-      named: false,
-    }
-    if step.named {
-      let bytes = stepName(self, step)
-      projected.length = bytes.length
-      projected.named = true
-      if offset < bytes.length {
-        projected.byte = bytes[offset]
-      }
-    }
-    return projected
-  }
   /// Reassembles exact parts copied from an existing canonical declaration.
   pub effect fn fromParts(module: ModuleId, owners: Vector<OwnerStep>) -> DeclarationId
   ! OutOfMemoryError
   ? &mut Allocator {
     let steps = Vector.asSlice<OwnerStep>(&owners)
-    return DeclarationId {module: move module, owners: run encodeSteps(steps), count: steps.length}
+    return run assemble(move module, run encodeSteps(steps), steps.length)
   }
-  /// Copies a shared declaration; its one allocator effect runs outside the borrow.
-  pub effect fn copyShared(source: &Shared<DeclarationId>) -> DeclarationId
-  ! OutOfMemoryError
-  ? &mut Allocator {
-    let module = Shared.with<DeclarationId, ModuleId>(source, fn(value: &DeclarationId) -> ModuleId {
-      return ModuleId.copy(&value.module)
-    })
-    let length = Shared.with<DeclarationId, usize>(source, fn(value: &DeclarationId) -> usize {
-      return DeclarationId.chainLength(value)
-    })
-    let mut chain = run Bytes.zeroed(length)
-    let count = Shared.with<DeclarationId, usize>(source, fn(value: &DeclarationId) -> usize {
-      return DeclarationId.fillChain(value, &mut chain)
-    })
-    return DeclarationId.fromChain(move module, move chain, count)
-  }
-  /// Reports the byte length of the encoded owner chain.
-  ///
-  /// # Details
-  ///
-  /// A declaration reached through a borrow that cannot allocate is copied by reserving this many
-  /// bytes outside the borrow, filling them with [`fillChain`] inside it, and joining the module
-  /// and the filled chain with [`fromChain`].
-  pub fn chainLength(self: &Self) -> usize {
-    return Bytes.length(&self.owners)
-  }
-  /// Copies the encoded owner chain into `target`, which holds [`chainLength`] bytes, and reports
-  /// the number of owner steps.
-  pub fn fillChain(self: &Self, target: &mut Bytes) -> usize {
-    let source = Bytes.asSlice(&self.owners)
-    let output = Bytes.asMutSlice(&mut target.*)
-    let mut at = usize.ZERO
-    while at < source.length {
-      output[at] = source[at]
-      at = at + usize.ONE
-    }
-    return self.count
-  }
-  /// Joins a module with an owner chain that [`fillChain`] copied from a declaration of `count`
-  /// owner steps.
-  pub fn fromChain(module: ModuleId, chain: Bytes, count: usize) -> DeclarationId {
-    return DeclarationId {module: move module, owners: move chain, count: count}
+  /// Copies a shared declaration. The copy retains the same record.
+  pub fn copyShared(source: &Shared<DeclarationId>) -> DeclarationId {
+    return Shared.with<DeclarationId, DeclarationId>(source, DeclarationId.copy)
   }
   /// Borrows the canonical module identity that owns this declaration.
   pub fn moduleId(self: &Self) -> &ModuleId {
@@ -400,21 +502,22 @@ impl DeclarationId {
   }
   /// Reports the declaration category of the identified declaration itself.
   pub fn kind(self: &Self) -> OwnerKind {
-    if self.count == usize.ZERO {
-      return OwnerKind.Damaged
-    }
-    return stepAt(self, self.count - usize.ONE).kind
+    return Shared.with<Chain, OwnerKind>(&self.chain, lastKind)
   }
-  /// Borrows the identified declaration's own name, empty for an unnamed declaration.
-  pub fn spelling(self: &Self) -> &[u8] {
-    if self.count == usize.ZERO {
-      return b""
-    }
-    return stepName(self, stepAt(self, self.count - usize.ONE))
+  /// Runs `use` with the identified declaration's own name, empty for an unnamed declaration.
+  pub fn withSpelling<A>(self: &Self, use: once fn(&[u8]) -> A) -> A {
+    return Shared.with<Chain, A>(&self.chain, fn(value: &Chain) -> A { return use(ownSpelling(value)) })
+  }
+  /// Copies the identified declaration's own name, empty for an unnamed declaration.
+  pub effect fn copySpelling(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let length = DeclarationId.withSpelling<usize>(self, fn(name: &[u8]) -> usize { return name.length })
+    let mut bytes = run Bytes.zeroed(length)
+    let filled = DeclarationId.withSpelling<bool>(self, fn(name: &[u8]) -> bool { return fillName(name, &mut bytes) })
+    return move bytes
   }
   /// Reports the number of steps in the complete canonical owner chain.
   pub fn ownerCount(self: &Self) -> usize {
-    return self.count
+    return Shared.with<Chain, usize>(&self.chain, countOf)
   }
   /// Reports the declaration category of owner step `owner`, parent first.
   ///
@@ -422,56 +525,96 @@ impl DeclarationId {
   ///
   /// `owner` must be less than [`ownerCount`].
   pub fn ownerKind(self: &Self, owner: usize) -> OwnerKind {
-    return stepAt(self, owner).kind
+    return Shared.with<Chain, OwnerKind>(&self.chain, fn(value: &Chain) -> OwnerKind { return stepAt(value, owner).kind })
   }
   /// Reports the same-key occurrence of owner step `owner`.
   pub fn ownerOccurrence(self: &Self, owner: usize) -> usize {
-    return stepAt(self, owner).occurrence
+    return Shared.with<Chain, usize>(&self.chain, fn(value: &Chain) -> usize { return stepAt(value, owner).occurrence })
   }
   /// Reports whether owner step `owner` is named.
   pub fn ownerNamed(self: &Self, owner: usize) -> bool {
-    return stepAt(self, owner).named
+    return Shared.with<Chain, bool>(&self.chain, fn(value: &Chain) -> bool { return stepAt(value, owner).named })
   }
-  /// Borrows the name of owner step `owner`, empty when it is unnamed.
-  pub fn ownerName(self: &Self, owner: usize) -> &[u8] {
-    return stepName(self, stepAt(self, owner))
+  /// Runs `use` with the name of owner step `owner`, empty when it is unnamed.
+  pub fn withOwnerName<A>(self: &Self, owner: usize, use: once fn(&[u8]) -> A) -> A {
+    return Shared.with<Chain, A>(&self.chain, fn(value: &Chain) -> A { return use(stepName(value, stepAt(value, owner))) })
   }
-  /// Copies owner step `owner` into an owned step value.
-  pub effect fn ownerStep(self: &Self, owner: usize) -> OwnerStep ! OutOfMemoryError ? &mut Allocator {
-    let view = stepAt(self, owner)
-    let mut name = Option.none<Bytes>()
-    if view.named {
-      name = Option.some<Bytes>(run Bytes.copy(stepName(self, view)))
+  /// Copies the name of owner step `owner`, empty when it is unnamed.
+  pub effect fn copyOwnerName(self: &Self, owner: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let length = DeclarationId.withOwnerName<usize>(self, owner, fn(name: &[u8]) -> usize { return name.length })
+    let mut bytes = run Bytes.zeroed(length)
+    let filled = DeclarationId.withOwnerName<bool>(self, owner, fn(name: &[u8]) -> bool { return fillName(name, &mut bytes) })
+    return move bytes
+  }
+  /// Reports whether owner step `owner` is named exactly `name`.
+  pub fn ownerNamedAs(self: &Self, owner: usize, name: &[u8]) -> bool {
+    return Shared.with<Chain, bool>(&self.chain, fn(value: &Chain) -> bool {
+      let view = stepAt(value, owner)
+      return view.named && sameBytes(stepName(value, view), name)
+    })
+  }
+  /// Reports whether two declarations have the same own name, both empty when unnamed.
+  pub fn sameSpelling(self: &Self, other: &DeclarationId) -> bool {
+    if self.address == other.address {
+      return true
     }
-    return OwnerStep {kind: view.kind, name: move name, occurrence: view.occurrence}
+    return pairWith<bool>(&self.chain, &other.chain, spellingsMatch)
+  }
+  /// Reports whether owner step `owner` of both declarations has the same name, both empty when
+  /// unnamed.
+  ///
+  /// # Gotchas
+  ///
+  /// `owner` must be less than both declarations' [`ownerCount`].
+  pub fn sameOwnerName(self: &Self, other: &DeclarationId, owner: usize) -> bool {
+    if self.address == other.address {
+      return true
+    }
+    return pairWith<bool>(&self.chain, &other.chain, fn(left: &Chain, right: &Chain) -> bool {
+      return sameBytes(stepName(left, stepAt(left, owner)), stepName(right, stepAt(right, owner)))
+    })
   }
   /// Reports whether the identified declaration itself is named exactly `name`.
   pub fn named(self: &Self, name: &[u8]) -> bool {
-    if self.count == usize.ZERO {
-      return false
-    }
-    let view = stepAt(self, self.count - usize.ONE)
-    return view.named && sameBytes(stepName(self, view), name)
+    return Shared.with<Chain, bool>(&self.chain, fn(value: &Chain) -> bool {
+      if value.count == usize.ZERO {
+        return false
+      }
+      let view = stepAt(value, value.count - usize.ONE)
+      return view.named && sameBytes(stepName(value, view), name)
+    })
+  }
+  /// Runs `use` with the complete declaration content: the module's three components, then the
+  /// owner count and each step's kind, name and occurrence, every word big-endian.
+  pub fn withContent<A>(self: &Self, use: once fn(&[u8]) -> A) -> A {
+    return Shared.with<Chain, A>(&self.chain, fn(value: &Chain) -> A { return use(Bytes.asSlice(&value.content)) })
+  }
+  /// Appends the complete declaration content to `output`.
+  pub effect fn appendContent(self: &Self, output: &mut Bytes) -> () ! OutOfMemoryError ? &mut Allocator {
+    let length = DeclarationId.withContent<usize>(self, fn(content: &[u8]) -> usize { return content.length })
+    let start = run extend(&mut output.*, length)
+    let filled = DeclarationId.withContent<bool>(self, fn(content: &[u8]) -> bool { return fillAt(content, &mut output.*, start) })
+    return ()
   }
   /// Creates a canonical identity for a top-level authored declaration.
   pub effect fn root(id: &ModuleId, module: &Module, owner: OwnerKey) -> DeclarationId
   ! OutOfMemoryError
   ? &mut Allocator {
-    let empty = Bytes.make()
-    let owners = run ownedChain(&empty, module, owner)
-    return DeclarationId {module: ModuleId.copy(id), owners: move owners, count: usize.ONE}
+    let owners = run ownedChain(b"", module, owner)
+    return run assemble(ModuleId.copy(id), move owners, usize.ONE)
   }
   /// Creates a canonical identity for a declaration inside `self`.
   pub effect fn child(self: &Self, module: &Module, owner: OwnerKey) -> DeclarationId
   ! OutOfMemoryError
   ? &mut Allocator {
-    let owners = run ownedChain(&self.owners, module, owner)
-    return DeclarationId {module: ModuleId.copy(&self.module), owners: move owners, count: self.count + usize.ONE}
+    let parent = run copyOwners(&self.chain)
+    let owners = run ownedChain(Bytes.asSlice(&parent), module, owner)
+    return run assemble(ModuleId.copy(&self.module), move owners, DeclarationId.ownerCount(self) + usize.ONE)
   }
-  /// Copies one canonical identity without retaining a HIR-local symbol.
-  pub effect fn copy(self: &Self) -> DeclarationId ! OutOfMemoryError ? &mut Allocator {
-    return DeclarationId {module: ModuleId.copy(&self.module), owners: run Bytes.copy(Bytes.asSlice(&self.owners)),
-      count: self.count}
+  /// Copies one canonical identity; the copy retains the same record.
+  pub fn copy(self: &Self) -> DeclarationId {
+    return DeclarationId {module: ModuleId.copy(&self.module), chain: Shared.clone<Chain>(&self.chain), address: self.address,
+      hashed: self.hashed}
   }
   /// Creates a temporary binder owner for one call's inference transaction.
   ///
@@ -481,15 +624,19 @@ impl DeclarationId {
   pub effect fn inference(self: &Self, scope: &[u8]) -> DeclarationId
   ! OutOfMemoryError
   ? &mut Allocator {
-    let owners = run extended(&self.owners, OwnerKind.Damaged, true, scope, usize.ZERO)
-    return DeclarationId {module: ModuleId.copy(&self.module), owners: move owners, count: self.count + usize.ONE}
+    let parent = run copyOwners(&self.chain)
+    let owners = run extended(Bytes.asSlice(&parent), OwnerKind.Damaged, true, scope, usize.ZERO)
+    return run assemble(ModuleId.copy(&self.module), move owners, DeclarationId.ownerCount(self) + usize.ONE)
   }
   /// Reports whether two values have the same module and complete owner chain.
   pub fn equals(self: &Self, other: &DeclarationId) -> bool {
-    return self.count == other.count && ModuleId.equals(&self.module, &other.module) && sameBytes(
-      Bytes.asSlice(&self.owners),
-      Bytes.asSlice(&other.owners),
-    )
+    if self.hashed != other.hashed {
+      return false
+    }
+    if self.address == other.address {
+      return true
+    }
+    return ModuleId.equals(&self.module, &other.module) && pairWith<bool>(&self.chain, &other.chain, sameChains)
   }
   /// Returns a hash that two identities share whenever [`equals`] reports them equal.
   ///
@@ -497,7 +644,7 @@ impl DeclarationId {
   ///
   /// The hash reads the module and every owner step's name and occurrence.
   pub fn hash(self: &Self) -> u64 {
-    return chainHash(self, self.count, true)
+    return self.hashed
   }
   /// Returns [`hash`] of the identity made of this module and the first `count` owner steps, so
   /// a declaration whose identity is that prefix can be found without building it.
@@ -506,7 +653,9 @@ impl DeclarationId {
   ///
   /// `count` must not exceed the number of owner steps.
   pub fn prefixHash(self: &Self, count: usize) -> u64 {
-    return chainHash(self, count, true)
+    return Shared.with<Chain, u64>(&self.chain, fn(value: &Chain) -> u64 {
+      return chainHash(&self.module, Bytes.asSlice(&value.owners), count, true)
+    })
   }
   /// Returns a hash that two identities share whenever [`sameSiblingKey`] reports them equal.
   ///
@@ -514,7 +663,9 @@ impl DeclarationId {
   ///
   /// The hash reads the module, every owner step's name, and every occurrence but the last.
   pub fn siblingHash(self: &Self) -> u64 {
-    return chainHash(self, self.count, false)
+    return Shared.with<Chain, u64>(&self.chain, fn(value: &Chain) -> u64 {
+      return chainHash(&self.module, Bytes.asSlice(&value.owners), value.count, false)
+    })
   }
   /// Reports whether this exact owner chain is a prefix of another identity, including equality.
   ///
@@ -523,12 +674,13 @@ impl DeclarationId {
   /// A duplicate owner makes every declaration below it ambiguous across revisions, even when
   /// the nested declaration itself has a unique local name.
   pub fn isPrefixOf(self: &Self, other: &DeclarationId) -> bool {
-    let prefix = Bytes.asSlice(&self.owners)
-    let full = Bytes.asSlice(&other.owners)
-    if self.count > other.count || prefix.length > full.length {
+    if !ModuleId.equals(&self.module, &other.module) {
       return false
     }
-    return sameBytes(prefix, Slice.view<u8>(full, usize.ZERO, prefix.length)) && ModuleId.equals(&self.module, &other.module)
+    if self.address == other.address {
+      return true
+    }
+    return pairWith<bool>(&self.chain, &other.chain, chainPrefix)
   }
   /// Reports whether two declarations are same-key siblings, regardless of occurrence.
   ///
@@ -539,27 +691,57 @@ impl DeclarationId {
     if !ModuleId.equals(&self.module, &other.module) {
       return false
     }
-    if self.count == usize.ZERO || self.count != other.count {
-      return false
+    if self.address == other.address {
+      return DeclarationId.ownerCount(self) != usize.ZERO
     }
-    let leftBytes = Bytes.asSlice(&self.owners)
-    let rightBytes = Bytes.asSlice(&other.owners)
-    let mut leftOffset = usize.ZERO
-    let mut rightOffset = usize.ZERO
-    let mut index = usize.ZERO
-    while index < self.count {
-      let left = readStep(leftBytes, leftOffset)
-      let right = readStep(rightBytes, rightOffset)
-      if left.kind != right.kind || left.named != right.named || !sameBytes(stepName(self, left), stepName(other, right)) {
-        return false
-      }
-      if index + usize.ONE < self.count && left.occurrence != right.occurrence {
-        return false
-      }
-      leftOffset = left.next
-      rightOffset = right.next
-      index = index + usize.ONE
-    }
-    return true
+    return pairWith<bool>(&self.chain, &other.chain, siblingChains)
   }
+}
+
+fn ownSpelling(value: &Chain) -> &[u8] {
+  if value.count == usize.ZERO {
+    return b""
+  }
+  return stepName(value, stepAt(value, value.count - usize.ONE))
+}
+
+fn spellingsMatch(left: &Chain, right: &Chain) -> bool {
+  return sameBytes(ownSpelling(left), ownSpelling(right))
+}
+
+fn fillName(name: &[u8], target: &mut Bytes) -> bool {
+  let output = Bytes.asMutSlice(&mut target.*)
+  let mut at = usize.ZERO
+  while at < name.length {
+    output[at] = name[at]
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Appends `count` zero bytes to fill under a borrow and returns where they start.
+effect fn extend(output: &mut Bytes, count: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let start = Bytes.length(&output.*)
+  run Bytes.reserveExact(&mut output.*, count)
+  let zeroes = b"\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0"
+  let mut remaining = count
+  while remaining > usize.ZERO {
+    let mut chunk = remaining
+    if chunk > zeroes.length {
+      chunk = zeroes.length
+    }
+    run Bytes.append(&mut output.*, Slice.view<u8>(zeroes, usize.ZERO, chunk))
+    remaining = remaining - chunk
+  }
+  return start
+}
+
+fn fillAt(input: &[u8], output: &mut Bytes, start: usize) -> bool {
+  let target = Bytes.asMutSlice(&mut output.*)
+  let mut at = usize.ZERO
+  while at < input.length {
+    target[start + at] = input[at]
+    at = at + usize.ONE
+  }
+  return true
 }
