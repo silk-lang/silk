@@ -16,11 +16,11 @@ $ pnpm --filter @silklang/compiler documentation:generate
 | `LEX`  | Lexical   | 12    |
 | `PAR`  | Parser    | 5     |
 | `MOD`  | Module    | 2     |
-| `SEM`  | Semantic  | 204   |
+| `SEM`  | Semantic  | 205   |
 | `OWN`  | Ownership | 19    |
 | `LAY`  | Layout    | 1     |
 
-There are 243 codes in total.
+There are 244 codes in total.
 
 ## Lexical (`LEX`)
 
@@ -264,6 +264,7 @@ There are 243 codes in total.
 | `SEM0219` | Emitted code references a function instance whose valid body native lowering does not support yet.           | `Native lowering does not support this function body yet`                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `SEM0220` | A sealed Drop or Copy head names `'static`, repeats one region, or bounds a region.                          | `<head> selects by region: it <selection>`                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | `SEM0221` | A member list follows an unwritten owner whose parameters the member uses (GEN-008).                         | `<owner>.<member> uses <owner>'s parameters, so its type arguments follow a written owner: <owner><...>.<member><...>`                                                                                                                                                                                                                                                                                                                                                     |
+| `SEM0222` | Stable code for a namespace-qualified type named where a value is required (NAME-005).                       | `<member> in <module> is a type, not a value; select it with an import and write <member>.<member> for its members`                                                                                                                                                                                                                                                                                                                                                        |
 
 ## Ownership (`OWN`)
 
