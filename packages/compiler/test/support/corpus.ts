@@ -5017,7 +5017,7 @@ struct Slot {
 struct RawBuffer { bytes: i32 }
 struct Allocation { granted: bool }
 
-fn measure(buffer: &RawBuffer, allocation: &Allocation) -> i32 {
+fn measure(buffer: &RawBuffer, allocation: &Allocation) -> i32 { // ordinary: user types
   if allocation.granted { return buffer.bytes }
   return 0
 }

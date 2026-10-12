@@ -10,8 +10,8 @@
 // actors and are left alone, as is a name already qualified by any owner. `Allocation` is a type
 // position only after `:`, `->`, `<`, `,`, `(`, `&`, `|` or `mut`. Only source text is migrated:
 // `.silk` code outside `//` comments, `.ts` lines that are not `//` comments, and `silk` fences in
-// `.md` files. A line whose `//` comment contains `invalid:` is an intentional counterexample and is
-// left alone. The script is idempotent.
+// `.md` files. A line whose `//` comment contains `invalid:` or `ordinary:` is an intentional
+// counterexample or a user declaration of a bare name and is left alone. The script is idempotent.
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs'
 import { join, relative } from 'node:path'
 
@@ -38,10 +38,10 @@ const splitComment = (line) => {
 const rewriteLine = (line, kind) => {
   if (kind === 'ts') {
     if (line.trimStart().startsWith('//')) return line
-    return /\/\/.*invalid:/.test(line) ? line : rewriteCode(line)
+    return /\/\/.*(invalid|ordinary):/.test(line) ? line : rewriteCode(line)
   }
   const [code, comment] = splitComment(line)
-  if (comment.includes('invalid:')) return line
+  if (/(invalid|ordinary):/.test(comment)) return line
   return rewriteCode(code) + comment
 }
 
