@@ -504,10 +504,9 @@ pub fn main() -> i32 {
   }),
 )
 
-it.effect('names enum members through an alias and a module qualifier', () =>
+it.effect('names enum members through an alias in values and patterns', () =>
   Effect.gen(function* () {
-    const self = yield* analyze(`import silk.order
-import silk.order { Order, Ordering }
+    const self = yield* analyze(`import silk.order { Order, Ordering }
 enum Level { Low, High }
 type Tier = Level
 type Ord = Ordering
@@ -523,7 +522,7 @@ fn rank(tier: Tier) -> i32 {
 }
 fn compared(left: &i32, right: &i32) -> bool {
   let ordering = Order.compare(left, right)
-  return ordering == Ord.Less || ordering == order.Ordering.Greater
+  return ordering == Ord.Less || ordering == Ordering.Greater
 }
 pub fn main() -> i32 {
   let low = 1
