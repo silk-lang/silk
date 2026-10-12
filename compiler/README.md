@@ -201,7 +201,7 @@ With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-bu
 <native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup together.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
-builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. The standard-library
+builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
 root contains `silk/`; it is an explicit CLI input. A package without a `[build].composition`
 takes its runtime from the library's `compositions.json` for the target and libc, so such a build
 needs the library root even without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
