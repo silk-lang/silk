@@ -20,9 +20,9 @@ its own initialization map.
 
 ## Gotchas
 
-Selecting an out-of-bounds slot, writing twice, or reading an uninitialized slot violates the
-raw-storage contract. Debug execution may diagnose these mistakes; portable code must not rely
-on a runtime check.
+[`take`](#declaration-73696c6b2f736c6f743a3a536c6f742e74616b65), [`copy`](#declaration-73696c6b2f736c6f743a3a536c6f742e636f7079), and [`dropValue`](#declaration-73696c6b2f736c6f743a3a536c6f742e64726f7056616c7565) are `unsafe`: the caller must prove that the slot is
+initialized. Writing twice without a state transition overwrites the earlier value without
+dropping it. Selecting an out-of-bounds slot traps.
 
 ## Examples
 
@@ -89,7 +89,7 @@ reaches `Slot.write(...)` and the rest. It is unrelated to the builtin `Slot<'st
 ### Associated function `Slot.address`
 
 ```silk
-pub fn address<'storage, T>(slot: silk/core.Slot<'storage, T>) -> *mut T
+pub fn address<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> *mut T
 ```
 
 Forms a non-null writable address without reading or initializing the selected storage.
@@ -104,7 +104,7 @@ A later memory access must prove its own lifetime, initialization, and access re
 ### Associated function `Slot.write`
 
 ```silk
-pub fn write<'storage, T>(slot: silk/core.Slot<'storage, T>, value: T) -> ()
+pub fn write<'storage, T>(slot: Intrinsic.Slot<'storage, T>, value: T) -> ()
 ```
 
 Moves one value into a selected uninitialized raw slot.
@@ -119,7 +119,7 @@ invalid. The value must satisfy the unchanged slot type, including every payload
 ### Associated function `Slot.take`
 
 ```silk
-pub fn take<'storage, T>(slot: silk/core.Slot<'storage, T>) -> T
+pub unsafe fn take<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> T
 ```
 
 Moves a value out of a selected initialized raw slot and leaves the slot uninitialized.
@@ -130,32 +130,32 @@ The result retains every lifetime inside `T`. It does not retain the slot select
 
 #### Gotchas
 
-The slot must be in bounds and initialized.
+The caller must prove that the slot is initialized.
 
 <a id="declaration-73696c6b2f736c6f743a3a536c6f742e636f7079"></a>
 
 ### Associated function `Slot.copy`
 
 ```silk
-pub fn copy<'storage, T>(slot: silk/core.Slot<'storage, T>) -> T
+pub unsafe fn copy<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> T
 ```
 
 Copies a `Copy` value from a selected initialized raw slot without changing its state.
 
 #### Gotchas
 
-The slot must be in bounds and initialized.
+The caller must prove that the slot is initialized.
 
 <a id="declaration-73696c6b2f736c6f743a3a536c6f742e64726f7056616c7565"></a>
 
 ### Associated function `Slot.dropValue`
 
 ```silk
-pub fn dropValue<'storage, T>(slot: silk/core.Slot<'storage, T>) -> ()
+pub unsafe fn dropValue<'storage, T>(slot: Intrinsic.Slot<'storage, T>) -> ()
 ```
 
 Drops a value in a selected initialized raw slot and leaves the slot uninitialized.
 
 #### Gotchas
 
-The slot must be in bounds and initialized.
+The caller must prove that the slot is initialized.

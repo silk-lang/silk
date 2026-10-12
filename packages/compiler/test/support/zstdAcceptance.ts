@@ -173,11 +173,14 @@ fn limitsFor(code: usize) -> ZstdLimits {
 ${limitCases}
   return move limits
 }
-effect fn buffer(length: usize) -> RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+effect fn buffer(length: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
   let allocation = run Allocator.allocate(Layout { bytes: length, alignment: 1 })
-  let mut value = RawBuffer.from<u8>(move allocation, length)
-  let initialized = RawBuffer.fill(&mut value, 0, length, 0)
-  return move value
+  // The allocation was requested for \`length\` bytes with byte alignment.
+  unsafe {
+    let mut value = RawBuffer.from<u8>(move allocation, length)
+    let initialized = RawBuffer.fill(&mut value, 0, length, 0)
+    return move value
+  }
 }
 struct Case {
   inputLength: usize
@@ -230,8 +233,11 @@ effect fn cases() -> i32 ! ZstdError | OutOfMemoryError ? &mut Allocator {
     let mut decoder = run Zstd.make(limitsFor(expected.code))
     let mut outputLength = expected.outputLength
     if expected.code != 0 { outputLength = 8 }
-    let result = Zstd.step(&mut decoder, RawBuffer.view<u8>(&input, 0, inputLength), RawBuffer.viewMut<u8>(&mut output, 0, outputLength), true)
-    if !inspectCase(move result, &mut decoder, RawBuffer.view<u8>(&output, 0, outputLength), data, &expected) { return ordinal }
+    // Both buffers are sized for the longest case and zero-filled by \`buffer\`.
+    unsafe {
+      let result = Zstd.step(&mut decoder, RawBuffer.view<u8>(&input, 0, inputLength), RawBuffer.viewMut<u8>(&mut output, 0, outputLength), true)
+      if !inspectCase(move result, &mut decoder, RawBuffer.view<u8>(&output, 0, outputLength), data, &expected) { return ordinal }
+    }
     offset = offset + inputLength + expected.outputLength
     ordinal = ordinal + 1
   }
@@ -294,22 +300,26 @@ fn inspectProgress(value: ZstdProgress, output: &[u8], expected: &[u8], state: &
 effect fn chunked(input: &[u8], expected: &[u8]) -> bool ! ZstdError | OutOfMemoryError ? &mut Allocator {
   let mut decoder = run Zstd.make(configuration())
   let allocation = run Allocator.allocate(Layout { bytes: 3, alignment: 1 })
-  let mut chunk = RawBuffer.from<u8>(move allocation, 3)
-  let mut output: [u8; 7] = [0,0,0,0,0,0,0]
-  let mut state = ChunkProgress { input: 0, output: 0, finished: false }
-  while !state.finished {
-    let mut length = input.length - state.input
-    if length > 3 { length = 3 }
-    let mut index: usize = 0
-    while index < length {
-      let filled = RawBuffer.fill(&mut chunk, index, 1, input[state.input + index])
-      index = index + 1
+  // The allocation was requested for three bytes with byte alignment, and each view covers only
+  // the \`length <= 3\` bytes the loop just wrote.
+  unsafe {
+    let mut chunk = RawBuffer.from<u8>(move allocation, 3)
+    let mut output: [u8; 7] = [0,0,0,0,0,0,0]
+    let mut state = ChunkProgress { input: 0, output: 0, finished: false }
+    while !state.finished {
+      let mut length = input.length - state.input
+      if length > 3 { length = 3 }
+      let mut index: usize = 0
+      while index < length {
+        let filled = RawBuffer.fill(&mut chunk, index, 1, input[state.input + index])
+        index = index + 1
+      }
+      let finalInput = state.input + length == input.length
+      let result = Zstd.step(&mut decoder, RawBuffer.view<u8>(&chunk, 0, length), &mut output, finalInput)
+      if !inspectChunk(move result, &output, expected, &mut state, length, finalInput) { return false }
     }
-    let finalInput = state.input + length == input.length
-    let result = Zstd.step(&mut decoder, RawBuffer.view<u8>(&chunk, 0, length), &mut output, finalInput)
-    if !inspectChunk(move result, &output, expected, &mut state, length, finalInput) { return false }
+    return state.input == input.length
   }
-  return state.input == input.length
 }
 effect fn boundary() -> bool ! ZstdError | OutOfMemoryError ? &mut Allocator {
   let mut decoder = run Zstd.make(configuration())
