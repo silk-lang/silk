@@ -1125,7 +1125,7 @@ struct SuspendingAllocator {}
 effect fn allocate(
   self: &mut SuspendingAllocator,
   layout: Layout
-) -> Allocation ! OutOfMemoryError {
+) -> Intrinsic.Allocation ! OutOfMemoryError {
   let delayed = Effect.suspend(effect {
     return run Intrinsic.systemAllocationAcquire(move layout)
   })
@@ -1164,7 +1164,7 @@ it.effect('allows ordinary allocator implementations to suspend', () =>
 import silk.effect { Effect }
 ${suspendingAllocator}
 
-effect fn acquire() -> Allocation ! OutOfMemoryError ? &mut Allocator {
+effect fn acquire() -> Intrinsic.Allocation ! OutOfMemoryError ? &mut Allocator {
   return run Allocator.allocate(Layout.of<i32>())
 }
 effect fn program() -> i32 ! OutOfMemoryError {
