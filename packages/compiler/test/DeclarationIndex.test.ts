@@ -1681,15 +1681,15 @@ it.effect('accepts Drop for unmarked structs and rejects malformed headers', () 
     const index = yield* collect('drop-hooks', [
       [
         'drop-hooks',
-        `struct Guard { allocation: Allocation }
+        `struct Guard { allocation: Intrinsic.Allocation }
 struct CopyValue { value: i32 }
 struct Left { value: i32 }
 struct Right { value: i32 }
 struct UnionHolder { value: Left | Right }
-struct Malformed { allocation: Allocation }
-struct Missing { allocation: Allocation }
+struct Malformed { allocation: Intrinsic.Allocation }
+struct Missing { allocation: Intrinsic.Allocation }
 struct Problem {}
-struct Fallible { allocation: Allocation }
+struct Fallible { allocation: Intrinsic.Allocation }
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
 impl Drop for CopyValue { fn drop(self: &mut CopyValue) -> () { return () } }
 impl Drop for UnionHolder { fn drop(self: &mut UnionHolder) -> () { return () } }
@@ -1825,7 +1825,7 @@ struct Pair<T> { first: T, second: T }
 impl<T: Copy> Copy for Pair<T> {}
 struct Bad { token: Token }
 impl Copy for Bad {}
-struct Owned { allocation: Allocation }
+struct Owned { allocation: Intrinsic.Allocation }
 impl Copy for Owned {}
 struct Droppable { value: i32 }
 impl Drop for Droppable { fn drop(self: &mut Droppable) -> () { return () } }
@@ -1884,7 +1884,7 @@ it.effect('validates Copy over every specialized nominal union variant field', (
         `union Choice<T> { Empty, Present { value: T } }
 impl<T: Copy> Copy for Choice<T> {}
 union Implicit { Left { value: i32 }, Right }
-union Owned { Empty, Present { allocation: Allocation } }
+union Owned { Empty, Present { allocation: Intrinsic.Allocation } }
 impl Copy for Owned {}`,
       ],
     ])
@@ -1911,7 +1911,7 @@ it.effect('indexes parametric conformances with bound parameters', () =>
     const index = yield* collect('parametric', [
       [
         'parametric',
-        `struct Vector<T> { storage: Allocation }
+        `struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }
 pub fn main() -> i32 { return 0 }`,
       ],
@@ -1941,7 +1941,7 @@ it.effect('rejects unbound, duplicate, and overlapping parametric conformances',
     const unbound = yield* collect('parametric-unbound', [
       [
         'parametric-unbound',
-        `struct Vector<T> { storage: Allocation }
+        `struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T, U> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }`,
       ],
     ])
@@ -1952,7 +1952,7 @@ impl<T, U> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () 
     const duplicate = yield* collect('parametric-duplicate', [
       [
         'parametric-duplicate',
-        `struct Vector<T> { storage: Allocation }
+        `struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T, T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }`,
       ],
     ])
@@ -1964,7 +1964,7 @@ impl<T, T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () 
     const overlapping = yield* collect('parametric-overlap', [
       [
         'parametric-overlap',
-        `struct Vector<T> { storage: Allocation }
+        `struct Vector<T> { storage: Intrinsic.Allocation }
 impl<T> Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } }
 impl<U> Drop for Vector<U> { fn drop(self: &mut Vector<U>) -> () { return () } }`,
       ],

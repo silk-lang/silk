@@ -173,7 +173,7 @@ fn limitsFor(code: usize) -> ZstdLimits {
 ${limitCases}
   return move limits
 }
-effect fn buffer(length: usize) -> RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
+effect fn buffer(length: usize) -> Intrinsic.RawBuffer<u8> ! OutOfMemoryError ? &mut Allocator {
   let allocation = run Allocator.allocate(Layout { bytes: length, alignment: 1 })
   let mut value = RawBuffer.from<u8>(move allocation, length)
   let initialized = RawBuffer.fill(&mut value, 0, length, 0)

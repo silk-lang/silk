@@ -12,18 +12,18 @@ import silk.layout { Layout }
 ${source.replaceAll(storageAcquire, 'testStorageAcquire')}
 effect fn testStorageRefused(
   error: Intrinsic.StorageFailure
-) -> Allocation ! OutOfMemoryError {
+) -> Intrinsic.Allocation ! OutOfMemoryError {
   drop error
   fail OutOfMemoryError {}
 }
 effect fn testRawStorageAcquire(
   layout: Layout
-) -> Allocation ! Intrinsic.StorageFailure {
+) -> Intrinsic.Allocation ! Intrinsic.StorageFailure {
   return run Intrinsic.systemAllocationAcquire(move layout)
 }
 effect fn testStorageAcquire(
   layout: Layout
-) -> Allocation ! OutOfMemoryError {
+) -> Intrinsic.Allocation ! OutOfMemoryError {
   return run Intrinsic.catchFailure<Intrinsic.StorageFailure>(
     testRawStorageAcquire(move layout),
     testStorageRefused
