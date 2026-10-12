@@ -14,28 +14,28 @@ const messages = (self: Analysis.FrontendSnapshot): ReadonlyArray<string> =>
   Analysis.diagnostics(self).map((diagnostic) => diagnostic.message)
 
 /**
- * Two operations on one bound. `combine` calls both — `+` selects `add` and `-` selects
- * `subtract` — over the canonical parameter, once, before any concrete argument exists.
+ * Two operations on one bound. `combine` calls both, `add` and then `subtract`, over the
+ * canonical parameter, once, before any concrete argument exists.
  */
 const twoOperations = `pub interface Arith {
-  operator + fn add(left: Self, right: Self) -> Self
-  operator - fn subtract(left: Self, right: Self) -> Self
+  fn add(left: Self, right: Self) -> Self
+  fn subtract(left: Self, right: Self) -> Self
 }
 impl Arith for i32 { add: Intrinsic.i32Add subtract: Intrinsic.i32Subtract }
 pub fn combine<T: Arith>(left: T, right: T, offset: T) -> T {
-  return (move left + move right) - move offset
+  return Arith.subtract(Arith.add(move left, move right), move offset)
 }
 pub fn main() -> i32 { return combine(40, 44, 40) }`
 
 it.effect('rejects a type argument whose witness omits one bound operation', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`pub interface Arith {
-  operator + fn add(left: Self, right: Self) -> Self
-  operator - fn subtract(left: Self, right: Self) -> Self
+  fn add(left: Self, right: Self) -> Self
+  fn subtract(left: Self, right: Self) -> Self
 }
 impl Arith for i32 { add: Intrinsic.i32Add }
 pub fn combine<T: Arith>(left: T, right: T, offset: T) -> T {
-  return (move left + move right) - move offset
+  return Arith.subtract(Arith.add(move left, move right), move offset)
 }
 pub fn main() -> i32 { return combine(40, 44, 40) }`)
     // The specialization names the operation the witness never supplied, not just the interface.
@@ -46,12 +46,12 @@ pub fn main() -> i32 { return combine(40, 44, 40) }`)
 it.effect('rejects a type argument with no witness for the bound', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`pub interface Arith {
-  operator + fn add(left: &Self, right: &Self) -> Self
-  operator - fn subtract(left: &Self, right: &Self) -> Self
+  fn add(left: &Self, right: &Self) -> Self
+  fn subtract(left: &Self, right: &Self) -> Self
 }
 impl Arith for i32 { add: Intrinsic.i32Add subtract: Intrinsic.i32Subtract }
 pub fn combine<T: Arith>(left: T, right: T) -> T {
-  return &((&left) + (&right)) - (&left)
+  return Arith.subtract(&Arith.add(&left, &right), &left)
 }
 pub fn main() -> i32 {
   let wide = combine<i64>(40, 44)
