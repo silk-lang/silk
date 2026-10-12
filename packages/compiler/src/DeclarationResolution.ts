@@ -1142,26 +1142,43 @@ export const resolveBounds = (
             : resolvers.type(candidateModule, path),
       }
     }
+    // A bound that names an interface but fails to apply it, such as one written with the wrong
+    // number of arguments, keeps that application diagnostic (INTF-003). A bound that names no
+    // interface remains an invalid bound.
+    const reported = new Set<BoundFact>()
+    const namesContract = (candidateModule: string, application: DeclaredTypeFact): boolean => {
+      const target =
+        application._tag === 'Applied' && application.target._tag === 'Unresolved'
+          ? application.target
+          : application
+      if (target._tag !== 'Unresolved') return false
+      const named = boundResolvers.type(candidateModule, target.path).fact
+      if (named._tag !== 'Resolved' || !Type.isNominal(named.type)) return false
+      const declaration = memberByNominal(modules, named.type)
+      return (
+        declaration?._tag === 'InterfaceDeclaration' || declaration?._tag === 'ServiceDeclaration'
+      )
+    }
     const bounds = parameter.bounds.map((bound): BoundFact => {
-      const unresolvedCapability =
-        bound._tag === 'ResolvedBound'
-          ? bound.application.capability
-          : (() => {
-              const resolved = resolveDeclaredType(
-                spanOf,
-                module,
-                bound.application,
-                boundResolvers,
-                modules,
-              ).fact
-              if (resolved._tag === 'Resolved' && Type.isNominal(resolved.type))
-                return resolved.type
-              return resolved._tag === 'Unresolved' &&
-                resolved.candidate !== undefined &&
-                Type.isNominal(resolved.candidate)
-                ? resolved.candidate
-                : undefined
-            })()
+      let unresolvedCapability: Type.Nominal | undefined
+      if (bound._tag === 'ResolvedBound') unresolvedCapability = bound.application.capability
+      else {
+        const resolved = resolveDeclaredType(
+          spanOf,
+          module,
+          bound.application,
+          boundResolvers,
+          modules,
+        )
+        unresolvedCapability =
+          resolved.fact._tag === 'Resolved' && Type.isNominal(resolved.fact.type)
+            ? resolved.fact.type
+            : undefined
+        if (resolved.diagnostics.length > 0 && namesContract(module, bound.application)) {
+          diagnostics.push(...resolved.diagnostics)
+          reported.add(bound)
+        }
+      }
       const declaration =
         unresolvedCapability === undefined
           ? undefined
@@ -1196,6 +1213,7 @@ export const resolveBounds = (
     const seen = new Set<string>()
     for (const bound of bounds) {
       if (bound._tag !== 'ResolvedBound') {
+        if (reported.has(bound)) continue
         diagnostics.push(
           Diagnostic.invalidConformance(
             `unknown interface constraint ${bound.spelling}`,
