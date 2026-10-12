@@ -175,7 +175,7 @@ const diagnosticView = (result: SyntaxFile.SyntaxFile) =>
   }))
 
 it('retains distinct lifetime binders, arguments, borrowed types and callable environment syntax', () => {
-  const source = `import silk.ownership { Copy }
+  const source = `import silk.ownership {Copy}
 struct Holder<'a: 'b + 'c, 'b, 'c, T: Copy + 'a> {
   value: &'a T
   values: &'b mut [T]
@@ -877,7 +877,7 @@ fn main() -> i32 { unsafe { let allocation = Allocator.allocate(Layout.make(4, 4
 })
 
 it('parses a parametric conformance losslessly', () => {
-  const source = `import silk.ownership { Drop }
+  const source = `import silk.ownership {Drop}
 struct Vector<T> { count: usize }
 impl<T> Drop for Vector<T> {
   fn drop(self: &mut Vector<T>) -> () { return () }

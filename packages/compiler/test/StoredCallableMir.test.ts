@@ -42,7 +42,7 @@ it.effect(
   'retains anonymous source inputs and lexical captures under a contextual invocation',
   () =>
     Effect.gen(function* () {
-      const source = `import silk.ownership { Drop }
+      const source = `import silk.ownership {Drop}
 struct Owner { value: i32 }
 struct Guard { offset: i32 }
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
@@ -197,7 +197,7 @@ pub fn main() -> i32 {
 
 it.effect('resolves stored owned-capture cleanup before MIR', () =>
   Effect.gen(function* () {
-    const source = `import silk.ownership { Drop }
+    const source = `import silk.ownership {Drop}
 struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Holder<F: once fn<'static>(i32) -> i32> { step: F }
@@ -296,7 +296,7 @@ pub fn main() -> i32 {
 // authored annotation exposes only one input; the actual incoming instance retains all three.
 it.effect('opens an incoming staged callable and retains every original stored input', () =>
   Effect.gen(function* () {
-    const source = `import silk.ownership { Drop }
+    const source = `import silk.ownership {Drop}
 effect<'held> fn combine<'held>(first: &'held i32, second: &'held i32, third: &'held i32) -> i32 {
   return first.* + second.* + third.*
 }

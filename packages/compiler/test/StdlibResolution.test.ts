@@ -381,7 +381,7 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`),
   }),
 )
 
-it.effect('closes source helper providers over pointer and option only', () =>
+it.effect('closes source helper providers over pointer, option and ownership only', () =>
   Effect.gen(function* () {
     // Every uncached no-libc native build realizes its selected helpers as a separate program, so
     // one stray import (such as `silk.i32`) re-elaborates the numeric, format and allocator closure
@@ -392,7 +392,7 @@ it.effect('closes source helper providers over pointer and option only', () =>
       )
       assert.deepEqual(
         [...closure.sources.keys()].sort(),
-        ['silk/option', 'silk/pointer', `silk/support/${symbol}`],
+        ['silk/option', 'silk/ownership', 'silk/pointer', `silk/support/${symbol}`],
         symbol,
       )
     }
@@ -625,6 +625,7 @@ it.effect('resolves standard-library imports without vendoring source', () =>
         'silk/monotonic_clock',
         'silk/option',
         'silk/order',
+        'silk/ownership',
         'silk/raw_buffer',
         'silk/reflect',
         'silk/result',

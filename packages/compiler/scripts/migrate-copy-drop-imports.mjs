@@ -90,7 +90,8 @@ const classify = (text) => {
     const previous = all[index - 1]?.text
     const next = all[index + 1]?.text
     if (previous === '.' || next === '.') continue
-    if (previous !== undefined && declarers.has(previous)) return { conflict: `declares ${token.text}` }
+    if (previous !== undefined && declarers.has(previous))
+      return { conflict: `declares ${token.text}` }
     if (previous === '<' || previous === ',' || previous === '{' || previous === '(') {
       const opener = enclosing(all, index)
       if (opener?.text === '<') return { conflict: `binds ${token.text}` }
@@ -121,14 +122,20 @@ const migrateUnit = (text, separator, spacing) => {
   )
   const missing = [...result.used].filter((name) => !already.has(name))
   if (missing.length === 0) return { text, sites: 0 }
-  const names = [...new Set([...already, ...missing])].sort()
+  const names = [...new Set([...already, ...missing])].sort((left, right) =>
+    left.localeCompare(right),
+  )
+  // A unit that already spaces its braced imports keeps that style; the canonical form is tight.
+  const list = /import\s+[\w.]+\s*\{ /.test(text)
+    ? `{ ${names.join(', ')} }`
+    : `{${names.join(', ')}}`
   if (existing !== null)
     return {
-      text: text.replace(ownershipImport, `import silk.ownership { ${names.join(', ')} }`),
+      text: text.replace(ownershipImport, `import silk.ownership ${list}`),
       sites: missing.length,
     }
   const lines = text.split(separator)
-  const statement = (indent) => `${indent}import silk.ownership { ${names.join(', ')} }`
+  const statement = (indent) => `${indent}import silk.ownership ${list}`
   // Import statements as [first line, last line]; a braced list may span several lines.
   const statements = []
   for (let at = 0; at < lines.length; at += 1) {
@@ -142,7 +149,8 @@ const migrateUnit = (text, separator, spacing) => {
   if (statements.length > 0) {
     // The first block is the run of statements with nothing but statements between them.
     let last = 0
-    while (last + 1 < statements.length && statements[last + 1][0] === statements[last][1] + 1) last += 1
+    while (last + 1 < statements.length && statements[last + 1][0] === statements[last][1] + 1)
+      last += 1
     const block = statements.slice(0, last + 1)
     const before = block.find(([start]) => importPath(lines[start]) > 'silk.ownership')
     const at = before === undefined ? block[last][1] + 1 : before[0]
@@ -183,7 +191,9 @@ const migrateFences = (text, prefix, report) => {
       at += 1
     }
     const bare = body.map((content) =>
-      content.startsWith(lead) ? content.slice(lead.length) : content.trimStart().slice(prefix.trim().length).replace(/^ /, ''),
+      content.startsWith(lead)
+        ? content.slice(lead.length)
+        : content.trimStart().slice(prefix.trim().length).replace(/^ /, ''),
     )
     const migrated = migrateUnit(bare.join('\n'), '\n', true)
     report(migrated, `${prefix.trim() || 'fence'} at line ${at - body.length}`)
@@ -252,7 +262,10 @@ const migrateTypeScript = (text, report) => {
     if (!raw.includes(separator)) {
       const single = migrateUnit(raw, separator, false)
       if (single.sites > 0)
-        report({ conflict: 'is one line; migrate its program by hand', sites: 0 }, `literal at line ${text.slice(0, start).split('\n').length}`)
+        report(
+          { conflict: 'is one line; migrate its program by hand', sites: 0 },
+          `literal at line ${text.slice(0, start).split('\n').length}`,
+        )
       continue
     }
     const migrated = migrateUnit(raw, separator, false)
@@ -260,10 +273,21 @@ const migrateTypeScript = (text, report) => {
     if (migrated.sites > 0) edits.push({ start, end, text: migrated.text })
   }
   return edits
-    .filter((edit) => !edits.some((outer) => outer !== edit && outer.start <= edit.start && edit.end <= outer.end))
+    .filter(
+      (edit) =>
+        !edits.some(
+          (outer) => outer !== edit && outer.start <= edit.start && edit.end <= outer.end,
+        ),
+    )
     .sort((left, right) => right.start - left.start)
-    .reduce((current, edit) => current.slice(0, edit.start) + edit.text + current.slice(edit.end), text)
+    .reduce(
+      (current, edit) => current.slice(0, edit.start) + edit.text + current.slice(edit.end),
+      text,
+    )
 }
+
+// Syntax-only suites format or highlight source without resolving names, so they need no import.
+const syntaxOnly = ['SyntaxFormatter.test.ts', 'CodeMirror.test.ts', 'parser-cases.mjs']
 
 const kindOf = (path) =>
   ['silk', 'md'].find((kind) => path.endsWith(`.${kind}`)) ??
@@ -276,7 +300,8 @@ const files = (path) => {
       .flatMap((name) => files(join(path, name)))
   return kindOf(path) === undefined ||
     path.endsWith('.generated.ts') ||
-    path.endsWith('migrate-copy-drop-imports.mjs')
+    path.endsWith('migrate-copy-drop-imports.mjs') ||
+    syntaxOnly.some((name) => path.endsWith(name))
     ? []
     : [path]
 }

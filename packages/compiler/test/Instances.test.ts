@@ -717,7 +717,7 @@ pub fn main() -> i32 { return expand<i32>(0, 1) }`)
 
 it.effect('discovers cleanup hooks called by source failure recovery', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`import silk.ownership { Drop }
+    const result = yield* snapshot(`import silk.ownership {Drop}
 struct SomeError { storage: Intrinsic.RawBuffer<i32> }
 impl Drop for SomeError {
   fn drop(self: &mut SomeError) -> () { return () }
@@ -1309,7 +1309,7 @@ pub fn main() -> i32 { return left<i32>(0) }`)
 
 it.effect('rejects hidden callable identity growth reached through cleanup', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`import silk.ownership { Drop }
+    const result = yield* snapshot(`import silk.ownership {Drop}
 struct Guard {}
 fn invoke(value: i32, callback: once fn(i32) -> i32) -> i32 { return callback(value) }
 fn loop(seed: i32, callback: once fn(i32) -> i32) -> i32 {
@@ -1340,7 +1340,7 @@ pub fn main() -> i32 {
 
 it.effect('keeps composite Effect representations guarded at a terminal cleanup callable', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`import silk.ownership { Drop }
+    const result = yield* snapshot(`import silk.ownership {Drop}
 struct First {}
 struct Second {}
 struct Guard {}
@@ -2229,7 +2229,7 @@ pub fn main() -> i32 {
 
 it.effect('shares runtime instances and layouts across distinct proven lifetime arguments', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`import silk.ownership { Drop }
+    const result = yield* snapshot(`import silk.ownership {Drop}
 struct View<'a> { value: &'a i32 }
 struct Exclusive<'a> { value: &'a mut i32 }
 impl<'a> Drop for Exclusive<'a> { fn drop(self: &mut Exclusive<'a>) -> () { return () } }

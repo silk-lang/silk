@@ -29,7 +29,7 @@ pub effect fn main() ! Problem {
   {
     name: 'failure-payload-cleanup',
     expected: 'Trap',
-    source: `import silk.ownership { Drop }
+    source: `import silk.ownership {Drop}
 pub struct Problem { divisor: i32 }
 impl Drop for Problem {
   fn drop(self: &mut Problem) -> () { let checked = 1 / self.divisor return () }

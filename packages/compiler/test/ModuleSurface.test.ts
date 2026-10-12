@@ -278,7 +278,7 @@ it.effect('distinguishes every cross-module observable header family', () =>
       ['pub struct Pair { pub left: i32 }', 'pub struct Pair { pub left: i32 pub right: i32 }'],
       ['pub const answer: i32 = 1', 'pub const answer: i32 = 2'],
       [
-        `import silk.ownership { Drop }
+        `import silk.ownership {Drop}
 struct Guard {}
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }`,
         'struct Guard {}',
@@ -339,10 +339,10 @@ pub fn inspect(value: Envelope<i32, ${failure}>) -> i32 { return 0 }`
 
 it.effect('excludes conformance hook bodies from the exported semantic surface', () =>
   Effect.gen(function* () {
-    const first = yield* surface(`import silk.ownership { Drop }
+    const first = yield* surface(`import silk.ownership {Drop}
 struct Guard {}
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }`)
-    const second = yield* surface(`import silk.ownership { Drop }
+    const second = yield* surface(`import silk.ownership {Drop}
 struct Guard {}
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { unsafe { return () } } }`)
 

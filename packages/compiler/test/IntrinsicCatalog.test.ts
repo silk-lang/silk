@@ -627,7 +627,7 @@ it.effect(
           false,
         ],
       ] as const) {
-        const source = `import silk.ownership { Drop }
+        const source = `import silk.ownership {Drop}
 ${observationWrapper}
 struct Failure {}
 struct State {}
@@ -793,7 +793,7 @@ it.effect('rejects observation in the executed callback closure', () =>
       ['lazy-body', 'let ignored = guarded() drop ignored return 0', false],
       ['executed-body', 'return run guarded()', true],
     ] as const) {
-      const source = `import silk.ownership { Drop }
+      const source = `import silk.ownership {Drop}
 ${observationWrapper}
 ${observationWrapper.replaceAll('observing', 'nestedObserving')}
 struct State {}
@@ -842,7 +842,7 @@ it.effect('retains distinct protected bodies in owned observer environments', ()
   Effect.gen(function* () {
     const frontend = yield* AnalysisFixture.frontend(
       'intrinsic/observer-captures',
-      encoder.encode(`import silk.ownership { Drop }
+      encoder.encode(`import silk.ownership {Drop}
 ${observationWrapper}
 struct Observer { value: i32 }
 impl Drop for Observer { fn drop(self: &mut Observer) -> () { return () } }

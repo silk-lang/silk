@@ -687,7 +687,7 @@ fn after() -> i32 { return 42 }`
 
 it.effect('publishes sealed local-shared identity, affinity, and structural obligations', () =>
   Effect.gen(function* () {
-    const source = `import silk.ownership { Copy }
+    const source = `import silk.ownership {Copy}
 struct Token { value: i32 }
 struct Generic<T> { value: T }
 struct Pair<T> { first: Intrinsic.SharedCore<T> second: Intrinsic.SharedCore<T> }
