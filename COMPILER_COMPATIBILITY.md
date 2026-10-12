@@ -509,6 +509,26 @@ Each entry records:
 - **Evidence:** the `placed` and `droppedPlaced` fixtures of `unextractablePlacesAreRejected` in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 
+### Bootstrap roots a pattern binding's borrow at the binding
+
+- **Status:** known bootstrap soundness gap, found on 2026-10-12 by the native `patterns`
+  borrow-check slice; the bootstrap fix lands on `main` next and retires this entry.
+- **Rule:** a binding of `match &` or `match &mut` is a projection of the subject's selected payload,
+  and an exclusive binding mutates that payload (MATCH-002). Borrowing such a binding therefore
+  borrows the subject's place, and conflicts with a live loan of that place (BORROW-001).
+- **Compilers:** the native borrow checker treats every `match place`, `&` or `&mut` binding as the
+  subject place plus its pattern path. The bootstrap's loan pass roots a borrow of a binding at the
+  binding itself, so a binding borrow never conflicts with a loan of the subject. In an arm of
+  `match &mut held` that binds `value`, `let other = &held` followed by `increment(&mut value)` and
+  a later use of `other` is accepted by the bootstrap and rejected natively with `LoanConflict`
+  (OWN0010) at `&mut value`, relating `&held`.
+- **Source migration:** none; no stdlib, corpus or compiler source relies on the acceptance (the
+  native self-build and the full corpus report no rejection).
+- **Evidence:** the `bindingDuringLoan` case of `matchAccessesAreChecked` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`; the bootstrap accepts the same program through
+  `Analysis.ofSource`.
+- **Open questions:** none.
+
 ### Selfhost reports cleanup it cannot lower yet as the `cleanup` gap
 
 - **Status:** narrowed on 2026-10-03 by Step 6c, which lowers drops at every scope exit, and by
@@ -1222,6 +1242,26 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   reference identically.
 - **Evidence:** `parser/ParserCases.referencesToFixedArrays` asserts the reference, its fixed-array
   operand, the following parameter and a slice parameter, with no diagnostics.
+
+### Bootstrap rejections of valid compiler sources
+
+- **Status:** Verified on 2026-10-12 (#1508). These are known bootstrap divergences. Compiling
+  `compiler/src` with the bootstrap is no longer a gate (retired with #1467).
+- **Rule:** OWN-004 keeps disjoint initialized siblings usable, so an exclusive loan of
+  `resource.*.owner.*` passed to a call leaves the sibling Copy field `resource.key` readable in a
+  later argument. BORROW-004's OWN0011 covers reading the borrowed owner itself. An `if let`
+  scrutinee may be any expression, including `move Shared.with<Lifetime, Option<DeclarationId>>(...)`.
+- **Compilers:** the native frontend accepts both forms, which is correct. The bootstrap reports
+  OWN0011 for the sibling read, because it treats a field loan as a loan of its parent. It
+  misparses the generic-call scrutinee (PAR0002 with a cascade).
+- **Source migration:** none required. #1508 respells the three affected sites
+  (`semantic/Query.silk` twice, `semantic/RuntimeEncoding.silk` once) so the bootstrap can still
+  compile the compiler for diagnosis.
+- **Diagnostics and limits:** only those two bootstrap behaviors. Retire this entry when the
+  bootstrap accepts disjoint sibling reads under a field loan and parses the scrutinee.
+- **Evidence:** on `selfhost` fc7582f a bootstrap Cases root failed to compile with 13 errors at the
+  three sites; with #1508, bootstrap CallableResultCases passes 60/0.
+- **Open questions:** none.
 
 ## Maintaining this file
 
