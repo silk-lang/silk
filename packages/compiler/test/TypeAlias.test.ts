@@ -414,7 +414,8 @@ pub fn main() -> i32 {
 
 it.effect('treats Copy and Drop as ordinary names that need an import and can be shadowed', () =>
   Effect.gen(function* () {
-    const unimported = `struct Point { x: i32 }
+    const unimported = `// bare: no silk.ownership import
+struct Point { x: i32 }
 impl Copy for Point {}
 fn twice<T: Drop>(value: T) -> i32 { return 0 }
 pub fn main() -> i32 { return 0 }`
