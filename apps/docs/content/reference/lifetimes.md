@@ -236,9 +236,9 @@ reports `SEM0076`; invalid retention uses the ordinary lifetime or ownership dia
 
 **Status:** Confirmed
 
-`RawBuffer<T>` is invariant in its payload type. `Slot<'storage, T>` adds the exclusive storage
-access lifetime; that lifetime may shorten, while `T` remains invariant. The elided spelling
-`Slot<T>` follows ordinary nominal lifetime elision. A slot cannot escape the buffer that supplied
+`Intrinsic.RawBuffer<T>` is invariant in its payload type. `Intrinsic.Slot<'storage, T>` adds the
+exclusive storage access lifetime; that lifetime may shorten, while `T` remains invariant. The elided
+spelling `Intrinsic.Slot<T>` follows ordinary nominal lifetime elision. A slot cannot escape the buffer that supplied
 it. Slot projection checks the recorded element count; the caller still proves that the underlying
 allocation fits that count. Taking an initialized element transfers `T`, including its external referent lifetimes;
 copying one requires `T: Copy` and retains those same lifetimes. Neither operation extends a
