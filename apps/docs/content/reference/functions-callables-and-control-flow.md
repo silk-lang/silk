@@ -290,7 +290,7 @@ the temporary. A receiver of a generic parameter type resolves only through the 
 member keeps the field diagnostic `SEM0027`. Receiver ownership uses the ordinary loan and move
 diagnostics (`SEM0057`, `OWN0001`); binding a borrowed temporary reports `SEM0056`. Through a
 reference receiver, the diagnostics are those of the explicit spelling: a `self: &mut Self` method
-called through a shared reference reports `SEM0056` as `&mut counter` does, a `self: Self` method on
+called through a shared reference reports `SEM0058` as `&mut counter` does, a `self: Self` method on
 an affine referent reports `OWN0012`, and an outstanding loan of the referent that conflicts with
 the reborrow reports `OWN0010`.
 
