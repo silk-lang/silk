@@ -87,7 +87,7 @@ export const provesInvocationInput = (
 export const region = (
   self: BodyLifetime,
   anchor: AuthoredHir.Anchor,
-  role: 'Borrow' | 'Annotation' | 'Environment' | 'Call',
+  role: 'Borrow' | 'Annotation' | 'Environment' | 'Call' | 'Join',
   binderOrdinal = 0,
 ): Lifetime.Local | undefined => {
   const ordinal = self.points.get(AuthoredIdentity.anchorKey(anchor))
