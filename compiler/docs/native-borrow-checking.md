@@ -295,7 +295,9 @@ cover first:
 
 - `awaiting`: no checker covers the unit yet (selected static bodies, member bodies, and the
   compile-time prefixes static evaluation copies).
-- `regions`: loans and moves are proved; region and contents obligations wait for slice 3.
+- `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
+  exclusive views forwarded without `&mut` and region and contents obligations wait for later
+  slices.
 - `effects`, `patterns`, `storage`: the body uses that form, which the loan and move walk does
   not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or reached through a
