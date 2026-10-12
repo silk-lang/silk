@@ -298,10 +298,6 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
   exclusive views forwarded without `&mut` and region and contents obligations wait for later
   slices.
-- `effects`: the body runs a stored Effect. An immediate `run f(..)` of an `effect fn` call, an
-  interface operation call or an `effect fn` value's invocation is checked as that one call
-  (EFF-003), and invoking an `effect fn` value without `run` is checked as the construction of an
-  Effect that borrows its callee (EFFECT-OWN-001).
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local.
@@ -367,6 +363,16 @@ copied or moved binding, or a binding of a subject with no place, is a projectio
 own storage, bound at the match (MATCH-002). Whether a binding's view outlives a later access is the
 region slice's to prove. A subject or arm result that carries a loan answers `stored-loans`, as a
 branch does.
+
+`effects` is retired. A `run` reaches its operand as `RunAccess` records it. An immediate run of an
+`effect fn` call, an `effect fn` interface operation call or an `effect fn` value's invocation is
+that one call (EFF-003): the Effect it constructs is a temporary only the run consumes, so its
+operands are the call's arguments. Invoking an `effect fn` value without `run` constructs an Effect
+that owns a `once fn` callee and borrows any other callee place, shared or exclusive, with the
+callee's own loans, until the Effect's last run or drop (EFFECT-OWN-001). A run of a stored Effect
+invokes it with the access its contract grants: a shared Effect is read, a `mut Effect` place is
+borrowed exclusively, and a `once Effect` is moved, so the loans its environment holds stay live
+through the run (EFFECT-OWN-002, CALLABLE-003).
 
 The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
 the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
