@@ -66,7 +66,7 @@ impl NominalContext {
     let filled = run BufferedDuplex.fill(
       &mut session.*,
       usize.ZERO,
-      Option.none<Instant>(),
+      Option<Instant>.none(),
     )
     drop filled
     return context.expected
@@ -440,10 +440,10 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let oversized = run Effect.result(BufferedDuplex.fill(
     &mut session.*,
     9,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   if fillResultCode(move oversized) != 717 { return 1 }
-  let first = run BufferedDuplex.fill(&mut session.*, 6, Option.none<Instant>())
+  let first = run BufferedDuplex.fill(&mut session.*, 6, Option<Instant>.none())
   let available = match move first {
     FillOutcome.Available {count} => count
     FillOutcome.End {available} => available
@@ -458,21 +458,21 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   if !equal(preserved, b"head\\r\\nbo") { drop preserved return 5 }
   drop preserved
   run BufferedDuplex.consume(&mut session.*, 6)
-  let compacted = run BufferedDuplex.fill(&mut session.*, 4, Option.none<Instant>())
+  let compacted = run BufferedDuplex.fill(&mut session.*, 4, Option<Instant>.none())
   drop compacted
   let retainedBody = BufferedDuplex.peek(&session.*)
   if !equal(retainedBody, b"body") { drop retainedBody return 6 }
   drop retainedBody
   let mut body: [u8; 4] = [0, 0, 0, 0]
-  run BufferedDuplex.readExact(&mut session.*, &mut body, Option.none<Instant>())
+  run BufferedDuplex.readExact(&mut session.*, &mut body, Option<Instant>.none())
   if !equal(&body, b"body") { return 7 }
-  let ended = run BufferedDuplex.fill(&mut session.*, usize.ONE, Option.none<Instant>())
+  let ended = run BufferedDuplex.fill(&mut session.*, usize.ONE, Option<Instant>.none())
   let firstEnd = match move ended {
     FillOutcome.Available {count} => count + usize.ONE
     FillOutcome.End {available: remainingAtEnd} => remainingAtEnd
   }
   if firstEnd != usize.ZERO { return 8 }
-  let sticky = run BufferedDuplex.fill(&mut session.*, usize.ONE, Option.none<Instant>())
+  let sticky = run BufferedDuplex.fill(&mut session.*, usize.ONE, Option<Instant>.none())
   let stickyEnd = match move sticky {
     FillOutcome.Available {count} => count + usize.ONE
     FillOutcome.End {available: remainingAtStickyEnd} => remainingAtStickyEnd
@@ -481,18 +481,18 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let firstOutput = run Bytes.copy(&b"ab")
   let secondOutput = run Bytes.copy(&b"cd")
   let outputs: [Bytes; 2] = [move firstOutput, move secondOutput]
-  run BufferedDuplex.writeVecAll(&mut session.*, &outputs, Option.none<Instant>())
+  run BufferedDuplex.writeVecAll(&mut session.*, &outputs, Option<Instant>.none())
   drop outputs
   let shutdownDeadline = SystemClock.make(7, 9)
   run BufferedDuplex.shutdownWrite(
     &mut session.*,
-    Option.some<Instant>(move shutdownDeadline),
+    Option<Instant>.some(move shutdownDeadline),
   )
-  run BufferedDuplex.shutdownWrite(&mut session.*, Option.none<Instant>())
+  run BufferedDuplex.shutdownWrite(&mut session.*, Option<Instant>.none())
   let rejectedOutput = run Effect.result(BufferedDuplex.writeSome(
     &mut session.*,
     b"x",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return match move rejectedOutput {
     Result<usize, BufferError>.Success {value} => { drop value return 10 }
@@ -501,7 +501,7 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
       let readable = run BufferedDuplex.fill(
         &mut session.*,
         usize.ONE,
-        Option.none<Instant>(),
+        Option<Instant>.none(),
       )
       return match move readable {
         FillOutcome.Available {count} => { drop count return 12 }
@@ -523,13 +523,13 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let reading = run Effect.result(BufferedDuplex.readExact(
     &mut session.*,
     &mut output,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   if unitResultCode(move reading) != 102 { return false }
   let writing = run Effect.result(BufferedDuplex.writeSome(
     &mut session.*,
     b"x",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return match move writing {
     Result<usize, BufferError>.Success {value} => { drop value return false }
@@ -544,13 +544,13 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let writing = run Effect.result(BufferedDuplex.writeAll(
     &mut session.*,
     b"abcd",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   if !writeFailureMatches(move writing, 2, usize.ONE) { return false }
   let reading = run Effect.result(BufferedDuplex.fill(
     &mut session.*,
     usize.ONE,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return fillResultCode(move reading) == 1100
 }
@@ -559,27 +559,27 @@ effect<'session> fn abandon<'session, P>(
   session: &'session mut BufferedDuplex<'session, P>,
 ) -> i32 ! BufferError ? &mut MonotonicClock
 where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
-  let zeroFill = run BufferedDuplex.fill(&mut session.*, usize.ZERO, Option.none<Instant>())
+  let zeroFill = run BufferedDuplex.fill(&mut session.*, usize.ZERO, Option<Instant>.none())
   drop zeroFill
   let mut empty: [u8; 0] = []
-  let zeroRead = run BufferedDuplex.readSome(&mut session.*, &mut empty, Option.none<Instant>())
+  let zeroRead = run BufferedDuplex.readSome(&mut session.*, &mut empty, Option<Instant>.none())
   drop zeroRead
   let zeroDiscard = run BufferedDuplex.discardAtMost(
     &mut session.*,
     usize.ZERO,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if zeroDiscard.count != usize.ZERO || zeroDiscard.endObserved { return 5 }
   let zeroWrite = run BufferedDuplex.writeSome(
     &mut session.*,
     b"",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if zeroWrite != usize.ZERO { return 6 }
   let pending = run BufferedDuplex.writeSome(
     &mut session.*,
     b"x",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if pending != usize.ONE { return 7 }
   return 42
@@ -593,7 +593,7 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let retained = run BufferedDuplex.fill(
     &mut session.*,
     usize.ONE,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   let available = match move retained {
     FillOutcome.Available {count} => count
@@ -603,7 +603,7 @@ where &'session mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let accepted = run BufferedDuplex.writeSome(
     &mut session.*,
     b"x",
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if accepted != usize.ONE { return false }
   let first = run Effect.result(BufferedDuplex.close(&mut session.*))
@@ -636,13 +636,13 @@ where &'source mut SP provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let sourceFill = run BufferedDuplex.fill(
     &mut source.*,
     usize.ZERO,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   drop sourceFill
   let destinationFill = run BufferedDuplex.fill(
     &mut destination.*,
     usize.ZERO,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   drop destinationFill
   return true
@@ -657,7 +657,7 @@ where &'source mut SP provides &ByteDuplex from &mut ByteDuplex | &mut Monotonic
   let sourceFill = run BufferedDuplex.fill(
     &mut source.*,
     usize.ZERO,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   drop sourceFill
   drop destination
@@ -679,17 +679,17 @@ effect<'source & 'destination> fn parkPair<'source, 'destination>(
 effect<'session> fn failShutdown<'session>(
   session: &'session mut BufferedDuplex<'session, PairParkingDuplex>,
 ) -> bool ! BufferError ? &mut MonotonicClock {
-  run BufferedDuplex.writeAll(&mut session.*, b"ok", Option.none<Instant>())
+  run BufferedDuplex.writeAll(&mut session.*, b"ok", Option<Instant>.none())
   let deadline = SystemClock.make(7, 9)
   let attempted = run Effect.result(BufferedDuplex.shutdownWrite(
     &mut session.*,
-    Option.some<Instant>(move deadline),
+    Option<Instant>.some(move deadline),
   ))
   if !shutdownFailureMatches(move attempted) { return false }
   let afterFailure = run Effect.result(BufferedDuplex.fill(
     &mut session.*,
     usize.ONE,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   return fillResultCode(move afterFailure) == 1100
 }
@@ -700,7 +700,7 @@ effect<'session> fn parkShutdown<'session>(
   let deadline = SystemClock.make(7, 9)
   run BufferedDuplex.shutdownWrite(
     &mut session.*,
-    Option.some<Instant>(move deadline),
+    Option<Instant>.some(move deadline),
   )
   return true
 }
@@ -762,7 +762,7 @@ where &'source mut MemoryByteDuplex provides &ByteDuplex
     &mut source.*,
     &mut destination.*,
     usize.ZERO,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if zero.count != usize.ZERO || zero.endObserved { return false }
   if BufferedDuplex.unread(&source.*) != usize.ZERO { return false }
@@ -772,7 +772,7 @@ where &'source mut MemoryByteDuplex provides &ByteDuplex
     &mut source.*,
     &mut destination.*,
     6,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   ))
   if !transferFailureMatches(move attempted) { return false }
   if BufferedDuplex.unread(&source.*) != 4 { return false }
@@ -786,39 +786,39 @@ effect fn filledProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(&b"head\\r\\nbody")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.End {
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.End {
     readyAt: SystemClock.make(0, 0),
   })
-  let mut writes = Vector.make<MemoryWriteEvent>()
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: usize.ONE},
   })
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: 2},
   })
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: usize.ONE},
   })
-  return run MemoryByteDuplex.make(move reads, move writes, 8, 16, Option.none<i32>())
+  return run MemoryByteDuplex.make(move reads, move writes, 8, 16, Option<i32>.none())
 }
 
 effect fn emptyProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   return run MemoryByteDuplex.make(
-    Vector.make<MemoryReadEvent>(),
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryReadEvent>.make(),
+    Vector<MemoryWriteEvent>.make(),
     1,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
@@ -826,8 +826,8 @@ effect fn emptyProviderWithCloseFailure(closeFailure: Option<i32>) -> MemoryByte
 ! OutOfMemoryError
 ? &mut Allocator {
   return run MemoryByteDuplex.make(
-    Vector.make<MemoryReadEvent>(),
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryReadEvent>.make(),
+    Vector<MemoryWriteEvent>.make(),
     usize.ONE,
     4,
     move closeFailure,
@@ -838,59 +838,59 @@ effect fn closeFixtureProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(&b"data")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
-  let mut writes = Vector.make<MemoryWriteEvent>()
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: usize.ONE},
   })
-  return run MemoryByteDuplex.make(move reads, move writes, 4, 4, Option.some<i32>(93))
+  return run MemoryByteDuplex.make(move reads, move writes, 4, 4, Option<i32>.some(93))
 }
 
 effect fn failingInputProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(&b"ab")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Failure {
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Failure {
     readyAt: SystemClock.make(0, 0),
     code: 17,
   })
   return run MemoryByteDuplex.make(
     move reads,
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryWriteEvent>.make(),
     1,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
 effect fn failingOutputProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut writes = Vector.make<MemoryWriteEvent>()
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: usize.ONE},
   })
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Failure {code: 18},
   })
   return run MemoryByteDuplex.make(
-    Vector.make<MemoryReadEvent>(),
+    Vector<MemoryReadEvent>.make(),
     move writes,
     2,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
@@ -898,21 +898,21 @@ effect fn failingSessionInputProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(&b"ab")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Failure {
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Failure {
     readyAt: SystemClock.make(0, 0),
     code: 31,
   })
   return run MemoryByteDuplex.make(
     move reads,
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryWriteEvent>.make(),
     usize.ONE,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
@@ -920,59 +920,59 @@ effect fn failingSessionOutputProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(&b"z")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
-  let mut writes = Vector.make<MemoryWriteEvent>()
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: usize.ONE},
   })
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Failure {code: 32},
   })
-  return run MemoryByteDuplex.make(move reads, move writes, 4, 6, Option.none<i32>())
+  return run MemoryByteDuplex.make(move reads, move writes, 4, 6, Option<i32>.none())
 }
 
 effect fn transferSourceProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(&b"abcdef")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
   return run MemoryByteDuplex.make(
     move reads,
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryWriteEvent>.make(),
     6,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
 effect fn transferDestinationProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut writes = Vector.make<MemoryWriteEvent>()
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: usize.ONE},
   })
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Failure {code: 23},
   })
   return run MemoryByteDuplex.make(
-    Vector.make<MemoryReadEvent>(),
+    Vector<MemoryReadEvent>.make(),
     move writes,
     usize.ONE,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
@@ -1056,7 +1056,7 @@ effect fn canceledShutdown(state: Shared<PairCancellationState>) -> bool
 
 effect fn cancelSuspendedPair() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let state = run Shared.make<PairCancellationState>(PairCancellationState {
+  let state = run Shared<PairCancellationState>.make(PairCancellationState {
     sourceCloses: usize.ZERO,
     destinationCloses: usize.ZERO,
     flushCalls: usize.ZERO,
@@ -1081,7 +1081,7 @@ effect fn cancelSuspendedPair() -> i32 ! OutOfMemoryError {
 
 effect fn cancelSuspendedShutdown() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let state = run Shared.make<PairCancellationState>(PairCancellationState {
+  let state = run Shared<PairCancellationState>.make(PairCancellationState {
     sourceCloses: usize.ZERO,
     destinationCloses: usize.ZERO,
     flushCalls: usize.ZERO,
@@ -1207,7 +1207,7 @@ effect fn program() -> i32 ! BufferError | OutOfMemoryError {
   let inputOperation = BufferedInput.readExact(
     &mut input,
     &mut exact,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
     |> Effect.provideMut<ByteDuplex>(&mut failingInput)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
@@ -1220,11 +1220,11 @@ effect fn program() -> i32 ! BufferError | OutOfMemoryError {
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut output = run BufferedOutput.make(2)
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let buffered = BufferedOutput.writeAll(&mut output, b"ab", Option.none<Instant>())
+  let buffered = BufferedOutput.writeAll(&mut output, b"ab", Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut failingOutput)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   run buffered
-  let flush = BufferedOutput.flush(&mut output, Option.none<Instant>())
+  let flush = BufferedOutput.flush(&mut output, Option<Instant>.none())
     |> Effect.provideMut<ByteDuplex>(&mut failingOutput)
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   let outputResult = run Effect.result(move flush)
@@ -1318,7 +1318,7 @@ effect fn program() -> i32 ! BufferError | OutOfMemoryError {
   if MemoryByteDuplex.closeAttempts(&callbackSource) != usize.ONE { return 82 }
   if MemoryByteDuplex.closeAttempts(&callbackDestination) != usize.ONE { return 83 }
 
-  let mut sourceCloseFailure = run emptyProviderWithCloseFailure(Option.some<i32>(91))
+  let mut sourceCloseFailure = run emptyProviderWithCloseFailure(Option<i32>.some(91))
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut sourceCloseDestination = run emptyProvider()
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -1333,7 +1333,7 @@ effect fn program() -> i32 ! BufferError | OutOfMemoryError {
 
   let mut destinationCloseSource = run emptyProvider()
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let mut destinationCloseFailure = run emptyProviderWithCloseFailure(Option.some<i32>(92))
+  let mut destinationCloseFailure = run emptyProviderWithCloseFailure(Option<i32>.some(92))
     |> Effect.provideMut<Allocator>(&mut allocator)
   let destinationCloseResult = run useMemoryPair(
     &mut destinationCloseSource, 4, 4, &mut destinationCloseFailure, 4, 4, abandonPair,
@@ -1350,7 +1350,7 @@ effect fn program() -> i32 ! BufferError | OutOfMemoryError {
   let shutdownCanceled = run cancelSuspendedShutdown()
   if shutdownCanceled != 42 { return 91 }
 
-  let shutdownFailureState = run Shared.make<PairCancellationState>(PairCancellationState {
+  let shutdownFailureState = run Shared<PairCancellationState>.make(PairCancellationState {
     sourceCloses: usize.ZERO,
     destinationCloses: usize.ZERO,
     flushCalls: usize.ZERO,
@@ -1482,38 +1482,38 @@ effect fn sourceProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
   let bytes = run Bytes.copy(&b"abcdef")
-  let mut reads = Vector.make<MemoryReadEvent>()
-  run Vector.append<MemoryReadEvent>(&mut reads, MemoryReadEvent.Data {
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
     readyAt: SystemClock.make(0, 0),
     bytes: move bytes,
   })
   return run MemoryByteDuplex.make(
     move reads,
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryWriteEvent>.make(),
     usize.ONE,
     4,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
 effect fn destinationProvider() -> MemoryByteDuplex
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut writes = Vector.make<MemoryWriteEvent>()
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: 2},
   })
-  run Vector.append<MemoryWriteEvent>(&mut writes, MemoryWriteEvent {
+  run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
     readyAt: SystemClock.make(0, 0),
     action: MemoryWriteAction.Accept {count: 2},
   })
   return run MemoryByteDuplex.make(
-    Vector.make<MemoryReadEvent>(),
+    Vector<MemoryReadEvent>.make(),
     move writes,
     4,
     8,
-    Option.none<i32>(),
+    Option<i32>.none(),
   )
 }
 
@@ -1529,7 +1529,7 @@ where &'source mut MemoryByteDuplex provides &ByteDuplex
     &mut source.*,
     &mut destination.*,
     usize.ZERO,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if zero.count != usize.ZERO || zero.endObserved { return 1 }
   if BufferedDuplex.unread(&source.*) != usize.ZERO { return 2 }
@@ -1539,7 +1539,7 @@ where &'source mut MemoryByteDuplex provides &ByteDuplex
     &mut source.*,
     &mut destination.*,
     4,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
   )
   if moved.count != 4 || moved.endObserved { return 4 }
   if BufferedDuplex.unread(&source.*) != 2 { return 5 }
@@ -1550,9 +1550,9 @@ where &'source mut MemoryByteDuplex provides &ByteDuplex
   let deadline = SystemClock.make(7, 9)
   run BufferedDuplex.shutdownWrite(
     &mut destination.*,
-    Option.some<Instant>(move deadline),
+    Option<Instant>.some(move deadline),
   )
-  run BufferedDuplex.shutdownWrite(&mut destination.*, Option.none<Instant>())
+  run BufferedDuplex.shutdownWrite(&mut destination.*, Option<Instant>.none())
   return 42
 }
 

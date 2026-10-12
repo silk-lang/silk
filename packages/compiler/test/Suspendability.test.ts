@@ -1515,7 +1515,7 @@ where &mut P provides &Transport from &mut Transport {
   }
   let release = effect fn(owned: &mut Guard<P>) -> () { drop owned return () }
   return run Effect.useReleaseNonParking(
-    Guard<P> {provider: Option.some<P>(move provider)},
+    Guard<P> {provider: Option<P>.some(move provider)},
     move use,
     move release,
   )

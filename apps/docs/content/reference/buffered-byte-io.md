@@ -78,7 +78,7 @@ impl Inspection {
     let filled = run BufferedDuplex.fill(
       &mut session.*,
       context.minimum,
-      Option.none<Instant>(),
+      Option<Instant>.none(),
     )
     return match move filled {
       FillOutcome.Available { count } => count
@@ -99,11 +99,11 @@ effect fn program() -> usize ! BufferError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut clock = FixedClock {}
   let mut transport = run MemoryByteDuplex.make(
-    Vector.make<MemoryReadEvent>(),
-    Vector.make<MemoryWriteEvent>(),
+    Vector<MemoryReadEvent>.make(),
+    Vector<MemoryWriteEvent>.make(),
     usize.ONE,
     usize.ONE,
-    Option.none<i32>(),
+    Option<i32>.none(),
   ) |> Effect.provideMut<Allocator>(&mut allocator)
   return run withBufferedCapacityContext(
     &mut transport,

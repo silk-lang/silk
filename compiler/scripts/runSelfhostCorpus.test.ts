@@ -19,13 +19,13 @@ const literal: CorpusProgram = {
   expected: { _tag: 'Completes', result: 42 },
 }
 
-const withStub = (body: string, run: (path: string) => void): void => {
+const withStub = async (body: string, run: (path: string) => Promise<void>): Promise<void> => {
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-stub-'))
   try {
     const path = join(directory, 'silkc')
     writeFileSync(path, `#!/bin/sh\n${body}\n`)
     chmodSync(path, 0o755)
-    run(path)
+    await run(path)
   } finally {
     rmSync(directory, { recursive: true, force: true })
   }
@@ -39,9 +39,9 @@ output="$2"
 printf '#!/bin/sh\\nexit 42\\n' > "$output"
 chmod +x "$output"`
 
-void it('runs a pinned native corpus program through the build command', () => {
-  withStub(compiled, (silkc) => {
-    assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
+void it('runs a pinned native corpus program through the build command', async () => {
+  await withStub(compiled, async (silkc) => {
+    assert.deepStrictEqual(await runCase(silkc, literal), { name: 'literal', status: 'pass' })
     const profiled = {
       ...literal,
       nativeProfiles: [
@@ -49,12 +49,15 @@ void it('runs a pinned native corpus program through the build command', () => {
         { name: 'optimized', optimization: 'speed', debug: false },
       ],
     } as const
-    withStub(
+    await withStub(
       `if [ "$7" != --optimization ] || [ "$9" != --debug ]; then exit 6; fi
 printf '%s:%s\\n' "$8" "\${10}" >> "$0.profiles"
 ${compiled}`,
-      (profileSilkc) => {
-        assert.deepStrictEqual(runCase(profileSilkc, profiled), { name: 'literal', status: 'pass' })
+      async (profileSilkc) => {
+        assert.deepStrictEqual(await runCase(profileSilkc, profiled), {
+          name: 'literal',
+          status: 'pass',
+        })
         assert.strictEqual(
           readFileSync(`${profileSilkc}.profiles`, 'utf8'),
           'none:true\nspeed:false\n',
@@ -64,26 +67,26 @@ ${compiled}`,
   })
 })
 
-void it('declares compiled corpus C units and libraries as manifest link inputs', () => {
+void it('declares compiled corpus C units and libraries as manifest link inputs', async () => {
   const linked = {
     ...literal,
     nativeCSources: { fixture: 'int silk_fixture(void) { return 42; }\n' },
     nativeDynamicLibraries: ['custom'],
   }
-  withStub(
+  await withStub(
     `[ -s fixture.o ] || exit 7
 grep -qxF 'native-link-inputs = [{ object = "fixture.o" }, { library = "custom", mode = "dynamic" }]' silk.toml || exit 8
 ${compiled}`,
-    (silkc) => {
-      assert.deepStrictEqual(runCase(silkc, linked), { name: 'literal', status: 'pass' })
+    async (silkc) => {
+      assert.deepStrictEqual(await runCase(silkc, linked), { name: 'literal', status: 'pass' })
     },
   )
-  withStub(`grep -q native-link-inputs silk.toml && exit 9\n${compiled}`, (silkc) => {
-    assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
+  await withStub(`grep -q native-link-inputs silk.toml && exit 9\n${compiled}`, async (silkc) => {
+    assert.deepStrictEqual(await runCase(silkc, literal), { name: 'literal', status: 'pass' })
   })
 })
 
-void it('supplies corpus runtime components as the host default composition', () => {
+void it('supplies corpus runtime components as the host default composition', async () => {
   const composed: CorpusProgram = {
     ...literal,
     nativeImports: { 'test/refusing': 'pub fn refuse() -> i32 { return 0 }' },
@@ -94,34 +97,64 @@ void it('supplies corpus runtime components as the host default composition', ()
       },
     ],
   }
-  withStub(
+  await withStub(
     `[ -f test/refusing.silk ] || exit 7
 grep -qxF 'composition = { runtimes = [{ name = "hosted", module = "silk/native_start" }], defaults = ["hosted"], retention = [], requirements = [], components = [{ capability = "execution-storage", bindings = [{ operation = "acquire", module = "test/refusing", declaration = "refuse" }] }] }' silk.toml || exit 8
 ${compiled}`,
-    (silkc) => {
-      assert.deepStrictEqual(runCase(silkc, composed), { name: 'literal', status: 'pass' })
+    async (silkc) => {
+      assert.deepStrictEqual(await runCase(silkc, composed), { name: 'literal', status: 'pass' })
     },
   )
-  withStub(`grep -q composition silk.toml && exit 9\n${compiled}`, (silkc) => {
-    assert.deepStrictEqual(runCase(silkc, literal), { name: 'literal', status: 'pass' })
+  await withStub(`grep -q composition silk.toml && exit 9\n${compiled}`, async (silkc) => {
+    assert.deepStrictEqual(await runCase(silkc, literal), { name: 'literal', status: 'pass' })
   })
 })
 
-void it('requires the full track in supplied materialized scenarios', () => {
-  withStub(compiled, (silkc) => {
-    assert.throws(
+void it('requires the full track in supplied materialized scenarios', async () => {
+  await withStub(compiled, async (silkc) => {
+    await assert.rejects(
       () => runCorpus(silkc, [literal], ['trivial-features', 'other']),
       /selfhost track names absent from corpus: trivial-features,/,
     )
   })
 })
 
-void it('classifies only a structured build gap as unsupported', () => {
-  withStub(
+void it('reports concurrent cases in corpus order', async (context) => {
+  // The first case builds slowest, so the cases finish in reverse order.
+  const programs = ['0.2', '0.1', '0'].map((delay, index) => ({
+    ...literal,
+    name: `case-${index}`,
+    source: delay,
+  }))
+  // The test runner reports through the same stream, in buffers; the corpus log writes strings.
+  const lines: string[] = []
+  const write = process.stdout.write.bind(process.stdout)
+  context.mock.method(process.stdout, 'write', (chunk: string | Uint8Array) =>
+    typeof chunk === 'string' ? lines.push(chunk) > 0 : write(chunk),
+  )
+  await withStub(`sleep "$(cat memory/driver.silk)"\n${compiled}`, async (silkc) => {
+    assert.strictEqual(
+      await runCorpus(silkc, programs, ['case-1'], undefined, undefined, undefined, 3),
+      0,
+    )
+  })
+  context.mock.restoreAll()
+  assert.deepStrictEqual(
+    lines.map((line) => line.replace(/"elapsedMs":\d+/, '"elapsedMs":0')),
+    [
+      ...programs.map(({ name }) => `SELFHOST_CASE_TIMING={"name":"${name}","elapsedMs":0}\n`),
+      ...programs.map(({ name }) => `PASS ${name}\n`),
+      'Selfhost corpus: pass=3 fail=0 unsupported=0 track=1\n',
+    ],
+  )
+})
+
+void it('classifies only a structured build gap as unsupported', async () => {
+  await withStub(
     `echo 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"MIR_AGGREGATE","reason":"aggregates are not lowered"}]}' >&2
 exit 2`,
-    (silkc) => {
-      assert.deepStrictEqual(runCase(silkc, literal), {
+    async (silkc) => {
+      assert.deepStrictEqual(await runCase(silkc, literal), {
         name: 'literal',
         status: 'unsupported',
         gaps: [{ code: 'MIR_AGGREGATE', reason: 'aggregates are not lowered' }],
@@ -132,7 +165,7 @@ exit 2`,
   assert.strictEqual(parseUnsupported('unsupported: aggregates'), undefined)
 })
 
-void it('records the per-reason borrow-check gap of a successful build', () => {
+void it('records the per-reason borrow-check gap of a successful build', async () => {
   assert.deepStrictEqual(
     parseBorrowGap(
       'SILK_GAP borrow-check: 3 bodies not borrow-checked (regions 2, stored-loans 1; native borrow checking is roadmap step 14)\n',
@@ -147,11 +180,11 @@ void it('records the per-reason borrow-check gap of a successful build', () => {
   )
   assert.strictEqual(parseBorrowGap('SILK_GAP test-result-cache: off'), undefined)
   assert.throws(() => parseBorrowGap('SILK_GAP borrow-check: many'))
-  withStub(
+  await withStub(
     `echo 'SILK_GAP borrow-check: 1 bodies not borrow-checked (captures 1; native borrow checking is roadmap step 14)' >&2
 ${compiled}`,
-    (silkc) => {
-      assert.deepStrictEqual(runCase(silkc, literal), {
+    async (silkc) => {
+      assert.deepStrictEqual(await runCase(silkc, literal), {
         name: 'literal',
         status: 'pass',
         borrowGap: { total: 1, reasons: { captures: 1 } },
@@ -186,13 +219,13 @@ void it('retains exact gap source locations and rejects malformed location recor
   )
 })
 
-void it('keeps build and runtime regressions in the failure count', () => {
-  withStub('echo "compiler crashed" >&2; exit 2', (silkc) => {
-    const result = runCase(silkc, literal)
+void it('keeps build and runtime regressions in the failure count', async () => {
+  await withStub('echo "compiler crashed" >&2; exit 2', async (silkc) => {
+    const result = await runCase(silkc, literal)
     assert.strictEqual(result.status, 'fail')
   })
-  withStub(compiled.replace('exit 42', 'exit 41'), (silkc) => {
-    const result = runCase(silkc, literal)
+  await withStub(compiled.replace('exit 42', 'exit 41'), async (silkc) => {
+    const result = await runCase(silkc, literal)
     assert.deepStrictEqual(result, {
       name: 'literal',
       status: 'fail',
@@ -224,7 +257,7 @@ void it('fails the gate only for cases on the ordered selfhost track', () => {
   assert.deepStrictEqual(summarize(results, ['literal', 'later']).trackFailures, ['later'])
 })
 
-void it('passes native run arguments and closes stderr when requested', () => {
+void it('passes native run arguments and closes stderr when requested', async () => {
   const argumentAndStderrStub = `while [ "$1" != "-o" ]; do shift; done
 output="$2"
 cat > "$output" <<'SCRIPT'
@@ -234,31 +267,31 @@ if printf '' >&2; then exit 2; fi
 exit 42
 SCRIPT
 chmod +x "$output"`
-  withStub(argumentAndStderrStub, (silkc) => {
+  await withStub(argumentAndStderrStub, async (silkc) => {
     const program: CorpusProgram = {
       ...literal,
       nativeRuns: [{ closeStderr: true, arguments: ['one', 'two'] }],
     }
-    assert.strictEqual(runCase(silkc, program).status, 'pass')
+    assert.strictEqual((await runCase(silkc, program)).status, 'pass')
     assert.strictEqual(
-      runCase(silkc, { ...program, nativeRuns: [{ arguments: ['one', 'two'] }] }).status,
+      (await runCase(silkc, { ...program, nativeRuns: [{ arguments: ['one', 'two'] }] })).status,
       'fail',
     )
     assert.strictEqual(
-      runCase(silkc, { ...program, nativeRuns: [{ closeStderr: true }] }).status,
+      (await runCase(silkc, { ...program, nativeRuns: [{ closeStderr: true }] })).status,
       'fail',
     )
   })
 })
 
-void it('retains build diagnostic codes and byte spans without turning rejections into gaps', () => {
+void it('retains build diagnostic codes and byte spans without turning rejections into gaps', async () => {
   const record =
     'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34},"module":"main.silk"}'
   const other =
     'SILK_BUILD_ERROR={"code":"TypeMismatch","span":{"start":6,"end":9},"module":"silk/uri.silk"}'
   const gaps = 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"typed-form","reason":"not lowered"}]}'
-  withStub(`echo '${record}' >&2; exit 1`, (silkc) => {
-    const result = runCase(silkc, literal)
+  await withStub(`echo '${record}' >&2; exit 1`, async (silkc) => {
+    const result = await runCase(silkc, literal)
     assert.strictEqual(result.status, 'fail')
     if (result.status !== 'fail') throw new Error('expected rejection')
     assert.strictEqual(result.code, 'UnknownName')
@@ -270,18 +303,21 @@ void it('retains build diagnostic codes and byte spans without turning rejection
     ])
   })
   // A build walk prints every refusal beside the gaps it reached; gaps never hide a refusal.
-  withStub(`printf '%s\\n' '${record}' '${other}' '${record}' '${gaps}' >&2; exit 1`, (silkc) => {
-    const result = runCase(silkc, literal)
-    assert.strictEqual(result.status, 'fail')
-    if (result.status !== 'fail') throw new Error('expected rejection')
-    assert.strictEqual(result.code, 'UnknownName')
-    assert.deepStrictEqual(
-      result.diagnostics.map((diagnostic) => diagnostic.code),
-      ['UnknownName', 'TypeMismatch'],
-    )
-  })
-  withStub(`echo '${gaps}' >&2; exit 1`, (silkc) => {
-    assert.strictEqual(runCase(silkc, literal).status, 'unsupported')
+  await withStub(
+    `printf '%s\\n' '${record}' '${other}' '${record}' '${gaps}' >&2; exit 1`,
+    async (silkc) => {
+      const result = await runCase(silkc, literal)
+      assert.strictEqual(result.status, 'fail')
+      if (result.status !== 'fail') throw new Error('expected rejection')
+      assert.strictEqual(result.code, 'UnknownName')
+      assert.deepStrictEqual(
+        result.diagnostics.map((diagnostic) => diagnostic.code),
+        ['UnknownName', 'TypeMismatch'],
+      )
+    },
+  )
+  await withStub(`echo '${gaps}' >&2; exit 1`, async (silkc) => {
+    assert.strictEqual((await runCase(silkc, literal)).status, 'unsupported')
   })
   assert.strictEqual(parseBuildDiagnostics('unsupported: aggregates'), undefined)
   assert.strictEqual(

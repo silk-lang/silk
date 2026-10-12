@@ -30,9 +30,9 @@ import silk.result { Result }
 
 fn half(value: i32) -> Result<i32, i32> {
   if value == 0 {
-    return Result.failResult<i32, i32>(2)
+    return Result<i32, i32>.failResult(2)
   }
-  return Result.succeed<i32, i32>(value / 2)
+  return Result<i32, i32>.succeed(value / 2)
 }
 
 fn addTwo(value: i32) -> i32 {
@@ -40,10 +40,10 @@ fn addTwo(value: i32) -> i32 {
 }
 
 pub fn main() -> i32 {
-  let initial = Result.succeed<i32, i32>(80)
-  let halved = Result.flatMap<i32, i32, i32>(move initial, half)
-  let answer = Result.map<i32, i32, i32>(move halved, addTwo)
-  return Result.unwrapOr<i32, i32>(move answer, 0)
+  let initial = Result<i32, i32>.succeed(80)
+  let halved = Result<i32, i32>.flatMap<i32>(move initial, half)
+  let answer = Result<i32, i32>.map<i32>(move halved, addTwo)
+  return Result<i32, i32>.unwrapOr(move answer, 0)
 }
 ```
 
