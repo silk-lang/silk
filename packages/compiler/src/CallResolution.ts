@@ -472,11 +472,21 @@ export const appliedOwnerTypeArgumentNodes = (
   const diagnostics: Array<Diagnostic.Located> = []
   if (writtenOrdinary !== ordinary.length)
     diagnostics.push(
-      Diagnostic.typeArgumentArity(selected.owner, ordinary.length, writtenOrdinary, Location.at(owner.anchor)),
+      Diagnostic.typeArgumentArity(
+        selected.owner,
+        ordinary.length,
+        writtenOrdinary,
+        Location.at(owner.anchor),
+      ),
     )
   else if (writtenLifetimes !== 0 && writtenLifetimes !== lifetimes.length)
     diagnostics.push(
-      Diagnostic.typeArgumentArity(selected.owner, lifetimes.length, writtenLifetimes, Location.at(owner.anchor)),
+      Diagnostic.typeArgumentArity(
+        selected.owner,
+        lifetimes.length,
+        writtenLifetimes,
+        Location.at(owner.anchor),
+      ),
     )
   let lifetimeOrdinal = 0
   let ordinaryOrdinal = 0

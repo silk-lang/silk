@@ -288,9 +288,9 @@ it.effect('resolves Option, Result, and Vector operations through their namespac
     const snapshot = yield* AnalysisFixture.retainingMain(module, ascii(namespaceProgram))
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     for (const [spelling, expectedModule] of [
-      ['Vector.make', 'silk/vector'],
-      ['Option.some', 'silk/option'],
-      ['Result.succeed', 'silk/result'],
+      ['Vector<i32>.make', 'silk/vector'],
+      ['Option<i32>.some', 'silk/option'],
+      ['Result<i32, i32>.succeed', 'silk/result'],
     ] as const) {
       const offset = namespaceProgram.indexOf(spelling) + spelling.indexOf('.') + 1
       const occurrence = Analysis.semanticOccurrenceAt(snapshot, module, offset)
