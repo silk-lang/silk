@@ -735,9 +735,9 @@ value type.
 conformance through any spelling reports `SEM0083` at the later `impl`. A property in a value
 type position receives that position's wrong-kind diagnostic.
 
-**Current compiler:** Partially aligned. Both compilers still resolve a bare `Copy` or `Drop` with no
-declaration or import to the property, and that spelling takes precedence over a generic parameter
-of the same name.
+**Current compiler:** Partially aligned. The bootstrap compiler is aligned. The self-hosted compiler
+still resolves a bare `Copy` or `Drop` with no declaration or import to the property, and that
+spelling takes precedence over a generic parameter of the same name.
 
 **Evidence:** [type alias tests](../../../../packages/compiler/test/TypeAlias.test.ts).
 

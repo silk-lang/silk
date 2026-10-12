@@ -152,7 +152,8 @@ pub fn main() -> i32 {
 
 it.effect('does not retain unrelated call borrows in an effect loop', () =>
   Effect.gen(function* () {
-    const self = yield* snapshot(`import silk.vector { Vector }
+    const self = yield* snapshot(`import silk.ownership { Copy }
+import silk.vector { Vector }
 union Attempt<'a> { Retry, Ready { view: &'a i32 } }
 struct Profile<'a> { view: &'a i32 }
 impl<'a> Copy for Profile<'a> {}
