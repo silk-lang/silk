@@ -10,7 +10,7 @@ impl<A> SliceStream<A> {
 }
 impl<A: Copy> Stream<A, never ? never> for SliceStream<A> {
   effect fn take(self: &mut Self) -> Option<A> {
-    if self.index >= self.slice.length { return Option.none<A>() }
+    if self.index >= self.slice.length { return Option<A>.none() }
     let i = self.index
     self.index = self.index + 1
     return Option.some(self.slice[i])

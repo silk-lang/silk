@@ -812,7 +812,7 @@ standard-library API it names.
 import silk.option { Option }
 
 pub fn main() -> i32 {
-  let value = Option.some<i32>(42)
+  let value = Option<i32>.some(42)
   drop value
   return 42
 }

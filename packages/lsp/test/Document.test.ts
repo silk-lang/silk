@@ -1088,7 +1088,7 @@ fn identity(value: Vector<i32>) -> Vector<i32> {
 }
 
 pub fn main() -> () {
-  let value = Vector.make<i32>()
+  let value = Vector<i32>.make()
   drop Effect.of(move value)
     |> Effect.map(identity)
 }`

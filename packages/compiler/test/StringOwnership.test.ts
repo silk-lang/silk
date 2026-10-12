@@ -127,10 +127,10 @@ fn validate(bytes: &[u8], accepted: bool) -> Result<string, InvalidUtf8> {
   if accepted {
     unsafe {
       let text = Intrinsic.stringFromUtf8Unchecked(bytes)
-      return Result.succeed<string, InvalidUtf8>(text)
+      return Result<string, InvalidUtf8>.succeed(text)
     }
   }
-  return Result.failResult<string, InvalidUtf8>(InvalidUtf8 { offset: 0 })
+  return Result<string, InvalidUtf8>.failResult(InvalidUtf8 { offset: 0 })
 }
 fn observe(result: Result<string, InvalidUtf8>) -> usize {
   return match move result {

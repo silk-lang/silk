@@ -156,13 +156,13 @@ effect fn memo<'env, A, R, E, ?Requirements>(
   let use = effect fn(resource: &mut Lease) -> Shared<Result<A, R>>
   ! E | OutOfMemoryError ? Requirements | &mut Allocator {
     let answer = run provide()
-    return run Shared.make<Result<A, R>>(move answer)
+    return run Shared<Result<A, R>>.make(move answer)
   }
   let release = effect fn(resource: &mut Lease) -> () { return () }
   return run Effect.useReleaseNonParking(Lease {}, move use, move release)
 }
 effect fn accepted() -> Result<i32, Rejection> {
-  return Result.succeed<i32, Rejection>(41)
+  return Result<i32, Rejection>.succeed(41)
 }
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()

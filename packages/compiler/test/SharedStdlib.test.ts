@@ -25,14 +25,14 @@ effect fn badAllocate(self: &mut BadAllocator, layout: Layout) -> Allocation ! O
 impl Allocator for BadAllocator { allocate: BadAllocator.badAllocate }
 effect fn good() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let shared = run (Shared.make<i32>(41)
+  let shared = run (Shared<i32>.make(41)
     |> Effect.provideMut<Allocator>(&mut allocator))
   drop shared
   return 1
 }
 effect fn bad() -> i32 ! OutOfMemoryError {
   let mut allocator = BadAllocator {}
-  let shared = run (Shared.make<i32>(42)
+  let shared = run (Shared<i32>.make(42)
     |> Effect.provideMut<Allocator>(&mut allocator))
   drop shared
   return 1
@@ -93,10 +93,10 @@ fn aggregateMut(value: &mut Pair) -> Box<&mut Pair> {
   return Box<&mut Pair> { value: move value }
 }
 fn failed(value: &Pair) -> Result<i32, &Pair> {
-  return Result.failResult<i32, &Pair>(move value)
+  return Result<i32, &Pair>.failResult(move value)
 }
 fn failedMut(value: &mut Pair) -> Result<i32, &mut Pair> {
-  return Result.failResult<i32, &mut Pair>(move value)
+  return Result<i32, &mut Pair>.failResult(move value)
 }
 fn delayed(value: &Pair) -> Effect<i32> { return effect { return value.first } }
 fn delayedMut(value: &mut Pair) -> Effect<i32> { return effect { return value.first } }
@@ -109,7 +109,7 @@ effect fn readMut(value: &mut Pair) -> i32 { return value.first }
 fn suspended(value: &Pair) -> i32 { return run read(value) }
 fn suspendedMut(value: &mut Pair) -> i32 { return run readMut(move value) }
 unsafe fn sharedDirect(self: &Shared<Pair>) -> &Pair {
-  return Shared.with<Pair, &Pair>(self, direct)
+  return Shared<Pair>.with<&Pair>(self, direct)
 }
 unsafe fn mutDirect(self: &Shared<Pair>) -> &mut Pair {
   return Shared.withMut(self, directMut)
@@ -231,10 +231,10 @@ effect fn allocate(self: &mut ReconstructingAllocator, layout: Layout) -> Alloca
 impl Allocator for ReconstructingAllocator { allocate: ReconstructingAllocator.allocate }
 effect fn construct() -> i32 ! OutOfMemoryError {
   let mut allocator = ReconstructingAllocator {}
-  let shared = run (Shared.make<i32>(42) |> Effect.provideMut<Allocator>(&mut allocator))
+  let shared = run (Shared<i32>.make(42) |> Effect.provideMut<Allocator>(&mut allocator))
   drop shared
   let mut standard = Allocator.systemAllocatorProvider()
-  let sibling = run (Shared.make<i32>(43) |> Effect.provideMut<Allocator>(&mut standard))
+  let sibling = run (Shared<i32>.make(43) |> Effect.provideMut<Allocator>(&mut standard))
   drop sibling
   return 42
 }
