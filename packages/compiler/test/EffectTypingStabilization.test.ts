@@ -996,7 +996,7 @@ fn callable(cell: &mut i32) -> fn() -> i32 { return fn() -> i32 { cell.* = 1 ret
 fn operation<T: Decoder>(value: &mut T) -> Effect<i32> { return Decoder.decode(value) }
 fn blockMut(cell: &mut Cell) -> mut Effect<i32> { return effect { cell.code = 3 return 1 } }
 fn callableMut(cell: &mut i32) -> mut fn() -> i32 { return fn() -> i32 { cell.* = 1 return 1 } }
-fn operationMut<T: Decoder>(value: &mut T) -> mut Effect<i32> { return Decoder.decode(value) }
+fn operationMut<T: Decoder>(value: &mut T) -> mut Effect<i32> { return Decoder.decode(&mut value) }
 pub fn main() -> i32 { return 0 }`
     const snapshot = yield* snapshotOf('effect-typing/exclusive-capture-contract', source)
     const spanOf = (text: string) => {
