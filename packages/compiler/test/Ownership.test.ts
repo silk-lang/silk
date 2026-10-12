@@ -1886,6 +1886,7 @@ fn exclusive(counter: &mut Counter) -> i32 {
 fn shared(counter: &Counter) -> i32 { return counter.read() + counter.read() }
 fn copied(pair: &Pair) -> i32 { return pair.take() + pair.take() }
 fn strengthened(counter: &Counter) -> () { counter.bump() }
+fn strengthenedExplicit(counter: &Counter) -> () { Counter.bump(&mut counter) }
 fn moved(counter: &mut Counter) -> i32 { return counter.take() }
 fn conflicting(counter: &mut Counter) -> i32 {
   let held = &counter.value
@@ -1912,7 +1913,8 @@ pub fn main() -> i32 { return 0 }`
         start: diagnostic.span.start,
       })),
       [
-        { code: 'SEM0056', start: at('counter.bump()', 'fn strengthened') },
+        { code: 'SEM0058', start: at('counter.bump()', 'fn strengthened') },
+        { code: 'SEM0058', start: at('&mut counter', 'fn strengthenedExplicit') },
         { code: 'OWN0012', start: at('counter.take()', 'fn moved') },
         { code: 'OWN0010', start: at('counter.bump()', 'fn conflicting') },
         { code: 'OWN0010', start: at('counter.slot()', 'let second') },

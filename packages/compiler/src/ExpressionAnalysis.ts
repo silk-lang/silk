@@ -1277,13 +1277,21 @@ export const borrowSubject = (
       contextFreeReborrow)
   ) {
     const target = parentReference.target
+    // Reborrowing never strengthens access (BORROW-005).
+    if (parentReference.access === 'Shared' && access === 'Exclusive')
+      return unavailableBorrow(
+        node,
+        access,
+        subject,
+        diagnostics,
+        Diagnostic.invalidReborrow(parentReference.access, access, Location.at(node.anchor)),
+      )
     if (
-      (expected !== undefined &&
-        !contextFreeReborrow &&
-        (!Type.isReference(expected) ||
-          !TypeInference.infer(expected.target, target, new Map()) ||
-          expected.access !== access)) ||
-      (parentReference.access === 'Shared' && access === 'Exclusive')
+      expected !== undefined &&
+      !contextFreeReborrow &&
+      (!Type.isReference(expected) ||
+        !TypeInference.infer(expected.target, target, new Map()) ||
+        expected.access !== access)
     ) {
       return unavailableBorrow(
         node,
@@ -1446,7 +1454,7 @@ export const borrowSubject = (
         access,
         subject,
         diagnostics,
-        Diagnostic.invalidSliceReborrow(sourceType.access, access, Location.at(node.anchor)),
+        Diagnostic.invalidReborrow(sourceType.access, access, Location.at(node.anchor)),
       )
     }
     const type = Type.slice(access, sourceType.element, lifetime)
