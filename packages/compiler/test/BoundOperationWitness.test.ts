@@ -591,7 +591,7 @@ impl Pending<i32> for Cell {
   effect fn read(value: &Self) -> i32 { return value.value }
 }
 fn consume(value: Cell) -> i32 { return Access<i32>.consume(move value) }
-fn mutate(value: &mut Cell) -> i32 { return Access<i32>.mutate(value) }
+fn mutate(value: &mut Cell) -> i32 { return Access<i32>.mutate(&mut value) }
 fn pending(value: &Cell) -> Effect<i32 ! Problem ? &Clock> {
   return Pending<i32>.read(value)
 }
@@ -746,7 +746,7 @@ effect fn readClock() -> i32 ? &Clock { return 42 }
 effect fn decodeCell(value: &Cell) -> i32 ? &Clock { return run readClock() }
 impl Decoder for Cell { decode: Cell.decodeCell }
 fn pending<T: Decoder>(value: &mut T) -> mut Effect<i32 ? &mut Clock | &Meter> {
-  return Decoder.decode(value)
+  return Decoder.decode(&mut value)
 }
 pub fn main() -> i32 { return 0 }`,
     )

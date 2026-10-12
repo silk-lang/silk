@@ -298,10 +298,6 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
   exclusive views forwarded without `&mut` and region and contents obligations wait for later
   slices.
-- `effects`: the body runs a stored Effect. An immediate `run f(..)` of an `effect fn` call, an
-  interface operation call or an `effect fn` value's invocation is checked as that one call
-  (EFF-003), and invoking an `effect fn` value without `run` is checked as the construction of an
-  Effect that borrows its callee (EFFECT-OWN-001).
 - `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local.
@@ -314,15 +310,22 @@ cover first:
 A slice that meets an unsupported form answers that reason. It never answers `Checked` and skips
 the form.
 
-CI holds the count in two ways. Both read `compiler/borrow-check-gap.json`.
+CI holds the count in two ways. Both read `compiler/borrow-check-gap.txt`, which has one line per
+corpus program with unchecked bodies, `<program> <reason>=<count> ...`, and one `retired` line.
 
-- The selfhost corpus job sums each program's per-reason gap (the runner's `SELFHOST_BORROW_GAP`
-  receipts) and fails when any reason rises above its baseline. The corpus is a fixed program set,
-  so its counts change only when checking changes or a program is added. A PR that adds a corpus
-  program, or a slice that checks more bodies, updates the baseline in the same diff.
-- A reason that a slice retires is listed under `retired` and must be zero everywhere. The corpus
-  job and the N2 self-build step both fail if a retired reason reappears. The self-build totals
-  grow with the compiler, so they are printed as a receipt and never compared.
+- The selfhost corpus job compares each program's per-reason gap (the runner's `SELFHOST_BORROW_GAP`
+  receipts) with its line and fails on any difference, a fall as well as a rise, so a line never
+  goes stale and a later rise cannot hide under an old high count. A PR that changes checking or the
+  corpus reruns `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only
+  writer, and `diff <old> <new>` prints the per-program transition table for its description. The
+  corpus job builds its programs from main's verification harness, which can differ from a local run
+  on this branch's `corpus.ts`; the file must match CI, so when they disagree, run `update` on the
+  job's `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file
+  with `merge=union`; two branches that changed the same program leave two lines for it, which fail
+  until `update` reruns.
+- A reason that a slice retires is listed on the `retired` line and must be zero everywhere. The
+  corpus job and the N2 self-build step both fail if a retired reason reappears. The self-build
+  totals grow with the compiler, so they are printed as a receipt and never recorded.
 
 `captures` is retired. The walk checks callable construction, sections and invocation, and each
 anonymous body is checked where it is built: a borrowed capture's loan begins at construction and
@@ -346,6 +349,16 @@ own storage, bound at the match (MATCH-002). Whether a binding's view outlives a
 region slice's to prove. A subject or arm result that carries a loan answers `stored-loans`, as a
 branch does.
 
+`effects` is retired. A `run` reaches its operand as `RunAccess` records it. An immediate run of an
+`effect fn` call, an `effect fn` interface operation call or an `effect fn` value's invocation is
+that one call (EFF-003): the Effect it constructs is a temporary only the run consumes, so its
+operands are the call's arguments. Invoking an `effect fn` value without `run` constructs an Effect
+that owns a `once fn` callee and borrows any other callee place, shared or exclusive, with the
+callee's own loans, until the Effect's last run or drop (EFFECT-OWN-001). A run of a stored Effect
+invokes it with the access its contract grants: a shared Effect is read, a `mut Effect` place is
+borrowed exclusively, and a `once Effect` is moved, so the loans its environment holds stay live
+through the run (EFFECT-OWN-002, CALLABLE-003).
+
 The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
 the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
 
@@ -368,8 +381,8 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
   expected-diagnostic mode today (`CorpusProgram.expected` is only `Completes` or `Trap`). Adding
   one changes guarded inputs (`runSelfhostCorpus.ts`, `corpus.ts`), so it lands on `main` first.
 - **Where the reference and the bootstrap disagree**, the reference wins (it is prescriptive over
-  both compilers). The bootstrap gets a `main` fix in the same slice. A difference is never added to
-  `acceptedFailures`.
+  both compilers). The bootstrap gets a `main` fix in the same slice. The corpus job fails on any
+  `FAIL`, so a difference is never tolerated as a corpus failure.
 - **Positive parity:** the stdlib, the corpus and the compiler itself must pass the native checker
   with zero rejections, because they pass the bootstrap's.
 
