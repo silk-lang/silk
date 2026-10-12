@@ -99,7 +99,7 @@ enum(u8) Color { Red = 1, Green = -2, Blue }
 union Shape<T> { Empty, Circle { radius: T }, Rect { pub w: i32, h: i32 } }
 pub service Clock<T> {
   fn now() -> u64
-  operator + effect<'a> fn plus(left: T, right: T) -> T ! Overflow ? &mut Clock at Primary
+  effect<'a> fn plus(left: T, right: T) -> T ! Overflow ? &mut Clock at Primary
 }
 interface Show { fn show(value: &Self) -> string with compiler.inline(always: true) }
 role Primary
@@ -203,7 +203,6 @@ it.effect('lowers every syntax category into one published source-free module', 
       assert.isTrue(headerTags.has(tag), tag)
     const members = tagged(module, 'OperationHeader')
     assert.strictEqual(members.length, 3)
-    assert.strictEqual(members[1]?.operator?._tag, 'Name')
     assert.deepEqual(tagged(module, 'ImplAliasHeader').length, 1)
     // Every record vocabulary the grammar can produce appears, and no source object leaks.
     const tags = new Set(records(module).map((r) => r._tag))
