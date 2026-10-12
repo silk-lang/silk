@@ -295,9 +295,8 @@ cover first:
 
 - `awaiting`: no checker covers the unit yet (selected static bodies, member bodies, and the
   compile-time prefixes static evaluation copies).
-- `regions`: loans, explicit moves and by-value uses of owned affine values (OWN0003) are proved;
-  exclusive views forwarded without `&mut` and region and contents obligations wait for later
-  slices.
+- `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
+  exclusive views included, are proved; region and contents obligations wait for later slices.
 - `effects`: the body runs a stored Effect. An immediate `run f(..)` of an `effect fn` call, an
   interface operation call or an `effect fn` value's invocation is checked as that one call
   (EFF-003), and invoking an `effect fn` value without `run` is checked as the construction of an
