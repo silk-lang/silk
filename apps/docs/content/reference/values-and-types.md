@@ -148,8 +148,8 @@ fields `SEM0025`, array elements `SEM0030`, assignments `SEM0037`, and incompati
 `type Name = Target` declares a module-level name for one existing type, one interface
 application, or one unapplied generic declaration. `pub type` publishes the name like any other
 declaration. The target is anything the use site could spell directly: a primitive or nominal type,
-an applied generic such as `Point<i32>`, a union, a reference type, an interface, or the bare name of
-a generic struct, union, enum or interface.
+an applied generic such as `Point<i32>`, a union, a reference type, an interface, a sealed property
+such as `Intrinsic.Copy` (INTR-006), or the bare name of a generic struct, union, enum or interface.
 
 ```silk
 interface Measured {

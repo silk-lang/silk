@@ -733,6 +733,10 @@ export const resolveType = (
       const intrinsicType = Type.intrinsicNominals.get(`Intrinsic.${second.spelling}`)
       if (intrinsicType !== undefined) return resolvedType(path, intrinsicType)
     }
+    if (result.actor === 'Intrinsic' && path.segments.length === 2) {
+      if (second?.spelling === 'Copy') return resolvedType(path, Type.copyCapability)
+      if (second?.spelling === 'Drop') return resolvedType(path, Type.dropCapability)
+    }
     if (Type.isBuiltin(result.actor)) return resolvedType(path, result.actor)
     return unresolved(
       path,

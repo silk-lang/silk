@@ -356,3 +356,58 @@ pub fn main() -> i32 { return sum(Tag { value: 1 }, 2) }`
     )
   }),
 )
+
+it.effect('names the sealed Copy and Drop properties through Intrinsic and silk.ownership', () =>
+  Effect.gen(function* () {
+    const self = yield* analyze(`import silk.ownership
+import silk.ownership { Copy }
+type Dup = Intrinsic.Copy
+struct Pixel { value: i32 }
+impl ownership.Copy for Pixel {}
+struct Point { x: i32 }
+impl Copy for Point {}
+struct Cell { value: i32 }
+impl Dup for Cell {}
+struct Handle { value: i32 }
+impl Intrinsic.Drop for Handle { fn drop(self: &mut Handle) -> () { return () } }
+struct Guard { value: i32 }
+impl ownership.Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
+fn qualified<T: Intrinsic.Copy>(value: T) -> i32 { let first = value let second = value return 1 }
+fn imported<T: ownership.Copy>(value: T) -> i32 { let first = value let second = value return 1 }
+fn aliased<T: Dup>(value: T) -> i32 { let first = value let second = value return 1 }
+pub fn main() -> i32 {
+  return qualified(Pixel { value: 1 }) + imported(Point { x: 1 }) + aliased(Cell { value: 1 })
+}`)
+    assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
+  }),
+)
+
+it.effect('treats every spelling of Copy as one conformance and one bound', () =>
+  Effect.gen(function* () {
+    const source = `import silk.ownership
+type Dup = Intrinsic.Copy
+struct Pixel { value: i32 }
+impl ownership.Copy for Pixel {}
+impl Intrinsic.Copy for Pixel {}
+impl Dup for Pixel {}
+struct Owned { value: i32 }
+fn qualified<T: Intrinsic.Copy>(value: T) -> i32 { return 0 }
+fn imported<T: ownership.Copy>(value: T) -> i32 { return 0 }
+pub fn main() -> i32 {
+  let first = qualified(Owned { value: 1 })
+  let second = imported(Owned { value: 2 })
+  return 0
+}`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.invalidConformanceCode, source.indexOf('impl Intrinsic.Copy for Pixel')],
+        [Diagnostic.invalidConformanceCode, source.indexOf('impl Dup for Pixel')],
+        [Diagnostic.invalidConformanceCode, source.indexOf('qualified(Owned')],
+        [Diagnostic.invalidConformanceCode, source.indexOf('imported(Owned')],
+      ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
