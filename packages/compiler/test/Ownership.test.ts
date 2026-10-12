@@ -1889,6 +1889,7 @@ fn strengthened(counter: &Counter) -> () { counter.bump() }
 fn strengthenedExplicit(counter: &Counter) -> () { Counter.bump(&mut counter) }
 fn clear(values: &mut [i32]) -> () { return () }
 fn strengthenedArray(source: &([i32; 2])) -> () { clear(&mut source) }
+fn strengthenedReferent<'a>(value: &'a i32) -> &'a mut i32 { return &mut value.* }
 fn moved(counter: &mut Counter) -> i32 { return counter.take() }
 fn conflicting(counter: &mut Counter) -> i32 {
   let held = &counter.value
@@ -1918,6 +1919,7 @@ pub fn main() -> i32 { return 0 }`
         { code: 'SEM0058', start: at('counter.bump()', 'fn strengthened') },
         { code: 'SEM0058', start: at('&mut counter', 'fn strengthenedExplicit') },
         { code: 'SEM0058', start: at('&mut source', 'fn strengthenedArray') },
+        { code: 'SEM0058', start: at('&mut value.*', 'fn strengthenedReferent') },
         { code: 'OWN0012', start: at('counter.take()', 'fn moved') },
         { code: 'OWN0010', start: at('counter.bump()', 'fn conflicting') },
         { code: 'OWN0010', start: at('counter.slot()', 'let second') },
