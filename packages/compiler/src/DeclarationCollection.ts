@@ -1762,13 +1762,8 @@ const collectTypeParameters = (
             return [
               {
                 _tag: 'UnresolvedBound' as const,
-                spelling: segment.spelling,
-                path: {
-                  _tag: 'TypePath' as const,
-                  spelling: segment.spelling,
-                  segments: [{ spelling: segment.spelling, anchor: segment.anchor }],
-                  anchor: candidate.anchor,
-                },
+                spelling: path.spelling,
+                path: { ...path, anchor: candidate.anchor },
                 application: resolution.fact,
               },
             ]
