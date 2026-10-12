@@ -671,11 +671,11 @@ export const analyzeEnumMember = (
 ): ExpressionResult | undefined => {
   const identifiers = nameSegments(node)
   const qualifierToken = identifiers.at(0)
-  const memberToken = identifiers.at(-1)
-  if (qualifierToken === undefined || memberToken === undefined || identifiers.length < 2)
+  const memberToken = identifiers.at(1)
+  if (qualifierToken === undefined || memberToken === undefined || identifiers.length !== 2)
     return undefined
-  const qualifier = writtenQualifier(context, identifiers)
-  const enumLookup = resolveMemberQualifier(context, resolution, identifiers.slice(0, -1))
+  const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
+  const enumLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (enumLookup._tag !== 'Resolved' || enumLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const enum_ = enumLookup.declaration
@@ -760,12 +760,12 @@ const analyzeEnumValueCall = (
 ): ExpressionResult | undefined => {
   const identifiers = referenceNames(node)
   const qualifierToken = identifiers.at(0)
-  const operationToken = identifiers.at(-1)
-  if (qualifierToken === undefined || operationToken === undefined || identifiers.length < 2)
+  const operationToken = identifiers.at(1)
+  if (qualifierToken === undefined || operationToken === undefined || identifiers.length !== 2)
     return undefined
-  const qualifier = writtenQualifier(context, identifiers)
+  const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
   const operationName = SemanticContext.nameText(context, operationToken) ?? ''
-  const qualifierLookup = resolveMemberQualifier(context, resolution, identifiers.slice(0, -1))
+  const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (qualifierLookup._tag !== 'Resolved' || qualifierLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const operation = qualifierLookup.declaration.associatedOperations.find(
@@ -2256,12 +2256,15 @@ export const analyzePattern = (
   if (node._tag === 'EnumPattern' && bareUnionPatternTarget === undefined) {
     const identifiers = nameSegments(node)
     const qualifierToken = identifiers.at(0)
-    const memberToken = identifiers.length < 2 ? undefined : identifiers.at(-1)
-    const qualifier = memberToken === undefined ? undefined : writtenQualifier(context, identifiers)
-    const enumLookup =
-      memberToken === undefined
+    const memberToken = identifiers.at(1)
+    const qualifier =
+      qualifierToken === undefined
         ? undefined
-        : resolveMemberQualifier(context, resolution, identifiers.slice(0, -1))
+        : (SemanticContext.nameText(context, qualifierToken) ?? '')
+    const enumLookup =
+      qualifierToken === undefined
+        ? undefined
+        : resolveMemberQualifier(context, resolution, qualifierToken)
     const enum_ =
       enumLookup?._tag === 'Resolved' && enumLookup.declaration._tag === 'EnumDeclaration'
         ? enumLookup.declaration
@@ -4860,7 +4863,6 @@ import {
   resolveMemberQualifier,
   serviceOperation,
   sourceCallable,
-  writtenQualifier,
 } from './CallResolution.js'
 export function analyzePlaceReplace(
   context: SemanticContext.SemanticContext,
@@ -9769,6 +9771,8 @@ const analyzeAnonymousCallable = (
     initial.fact,
     (path) => {
       const resolved = resolvers.type(AuthoredWalk.moduleName(context), path)
+      const aliased = DeclarationResolution.aliasUseParameters(resolved.fact)
+      if (aliased !== undefined) return aliased
       if (
         resolved.fact._tag !== 'Resolved' ||
         !Type.isNominal(resolved.fact.type) ||
@@ -9787,6 +9791,10 @@ const analyzeAnonymousCallable = (
     node._tag === 'CallableExpression'
       ? DeclarationCollection.anonymousDeclaration(node)
       : undefined,
+    (path) =>
+      DeclarationResolution.borrowedAliasUse(
+        resolvers.type(AuthoredWalk.moduleName(context), path).fact,
+      ),
   )
   const collected = {
     ...initial,
@@ -11076,7 +11084,7 @@ function analyzeExpressionDecision(
       return analyzePlaceReplace(context, node, declarations, declaration, scope, resolution)
     }
     // A transparent alias qualifier names its target declaration (TYPE-004).
-    const qualifierLookup = resolveMemberQualifier(context, resolution, [qualifierToken])
+    const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
     if (qualifierLookup._tag === 'Intrinsic') {
       return analyzeBuiltinCall(
         context,
