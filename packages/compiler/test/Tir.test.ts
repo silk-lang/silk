@@ -1178,7 +1178,7 @@ it('retains explicit unsafe boundaries as typed TIR regions', () => {
 it('retains generic raw-buffer operations and whole-value borrows', () => {
   const result = elaborate(
     'tir://raw-storage.silk',
-    `fn destroy(buffer: RawBuffer<i32>) -> () {
+    `fn destroy(buffer: Intrinsic.RawBuffer<i32>) -> () {
   let mut owner = move buffer
   unsafe { return Intrinsic.slotDrop(Intrinsic.rawBufferSlot(&mut owner, 0)) }
 }`,
@@ -1203,8 +1203,8 @@ it('retains generic raw-buffer operations and whole-value borrows', () => {
 it('retains shared pattern-field reborrows and raw-buffer reads', () => {
   const result = elaborate(
     'tir://shared-pattern-read.silk',
-    `struct Box { buffer: RawBuffer<i32> }
-fn read(buffer: &RawBuffer<i32>) -> i32 {
+    `struct Box { buffer: Intrinsic.RawBuffer<i32> }
+fn read(buffer: &Intrinsic.RawBuffer<i32>) -> i32 {
   unsafe { return Intrinsic.rawBufferRead<i32>(buffer, 0) }
 }
 fn inspect(input: Box) -> i32 {

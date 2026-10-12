@@ -717,7 +717,7 @@ pub fn main() -> i32 { return expand<i32>(0, 1) }`)
 
 it.effect('discovers cleanup hooks called by source failure recovery', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(`struct SomeError { storage: RawBuffer<i32> }
+    const result = yield* snapshot(`struct SomeError { storage: Intrinsic.RawBuffer<i32> }
 impl Drop for SomeError {
   fn drop(self: &mut SomeError) -> () { return () }
 }
