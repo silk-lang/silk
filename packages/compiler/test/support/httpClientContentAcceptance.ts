@@ -238,7 +238,7 @@ effect fn clientContentCase(corrupt: bool) -> i32
     origin,
     Version.Http11,
     ClientLimits.defaults(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     ClientContentHandler {request: move request, corrupt: corrupt},
   )
 }
