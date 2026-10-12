@@ -38,7 +38,7 @@ effect fn read() -> i32 ! JsonError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let document = run Json.parse(b"{\"id\":42}")
     |> Effect.provideMut<Allocator>(&mut allocator)
-  return Json.field(&document, "id") |> Json.asI32 |> Option.unwrapOr<i32>(0)
+  return Json.field(&document, "id") |> Json.asI32 |> Option<i32>.unwrapOr(0)
 }
 
 effect fn recover(error: JsonError | OutOfMemoryError) -> i32 { return 0 }

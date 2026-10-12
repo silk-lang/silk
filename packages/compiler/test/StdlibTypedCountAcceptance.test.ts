@@ -58,10 +58,10 @@ import silk.vector { Vector }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut values = Vector.make<i32>()
-  run Vector.append<i32>(&mut values, 10) |> Effect.provideMut(&mut allocator)
-  run Vector.append<i32>(&mut values, 32) |> Effect.provideMut(&mut allocator)
-  return Vector.get<i32>(&values, 0) + Vector.get<i32>(&values, 1)
+  let mut values = Vector<i32>.make()
+  run Vector<i32>.append(&mut values, 10) |> Effect.provideMut(&mut allocator)
+  run Vector<i32>.append(&mut values, 32) |> Effect.provideMut(&mut allocator)
+  return Vector<i32>.get(&values, 0) + Vector<i32>.get(&values, 1)
 }
 effect fn recover(error: OutOfMemoryError) -> i32 { return 7 }
 pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`

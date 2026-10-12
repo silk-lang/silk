@@ -105,7 +105,7 @@ fn bodyLimits() -> BodyLimits {
 }
 
 effect fn providerFor() -> MemoryByteDuplex ! OutOfMemoryError ? &mut Allocator {
-  return run MemoryByteDuplex.make(Vector.make<MemoryReadEvent>(), Vector.make<MemoryWriteEvent>(), 256, 8, Option.none<i32>())
+  return run MemoryByteDuplex.make(Vector<MemoryReadEvent>.make(), Vector<MemoryWriteEvent>.make(), 256, 8, Option<i32>.none())
 }
 
 fn limits() -> Limits {
@@ -141,7 +141,7 @@ impl Drop for TestTransport {
       audit.closes = closes
       return ()
     }
-    Shared.withMut<CancellationAudit, ()>(&self.audit, move record)
+    Shared<CancellationAudit>.withMut<()>(&self.audit, move record)
     return ()
   }
 }
@@ -306,7 +306,7 @@ effect fn cancellationBody(audit: Shared<CancellationAudit>) -> i32
     origin,
     Version.Http11,
     limits(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     CancellationHandler {request: move request},
   )
     |> Effect.provideMut<Random>(&mut random)
@@ -316,7 +316,7 @@ effect fn cancellationBody(audit: Shared<CancellationAudit>) -> i32
 
 effect fn structuredCancellation() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let audit = run Shared.make<CancellationAudit>(
+  let audit = run Shared<CancellationAudit>.make(
     CancellationAudit {drops: usize.ZERO, closes: usize.ZERO},
   )
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -360,7 +360,7 @@ effect<'transport> fn withBorrowedMarker<'marker, 'transport>(
     origin,
     Version.Http11,
     limits(),
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     LoanHandler<'marker, 'transport> {marker: marker},
   )
 }
@@ -371,7 +371,7 @@ effect fn borrowedLoan() -> i32 ! ClientError | RequestError | OutOfMemoryError 
   let mut random = FixedRandom {}
   let memory = run providerFor()
     |> Effect.provideMut<Allocator>(&mut allocator)
-  let audit = run Shared.make<CancellationAudit>(CancellationAudit {drops: usize.ZERO, closes: usize.ZERO})
+  let audit = run Shared<CancellationAudit>.make(CancellationAudit {drops: usize.ZERO, closes: usize.ZERO})
     |> Effect.provideMut<Allocator>(&mut allocator)
   let mut transport = TestTransport {
     audit: move audit,

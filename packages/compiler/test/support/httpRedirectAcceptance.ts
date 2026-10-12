@@ -468,16 +468,16 @@ fn redirectOrigin(text: string) -> Option<Origin> {
   let uri = match move Uri.parse(text) {
     Result.Failure {error} => {
       drop error
-      return Option.none<Origin>()
+      return Option<Origin>.none()
     }
     Result.Success {value} => value
   }
   return match move Origin.fromUri(&uri) {
     Result.Failure {error} => {
       drop error
-      return Option.none<Origin>()
+      return Option<Origin>.none()
     }
-    Result.Success {value} => Option.some<Origin>(value)
+    Result.Success {value} => Option<Origin>.some(value)
   }
 }
 
@@ -781,7 +781,7 @@ effect fn redirectEmptyContractWitness<
     move client,
     move request,
     policy,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     move scratch,
     RedirectFinalUse {},
   )
@@ -817,7 +817,7 @@ effect fn redirectBytesContractWitness<
     move request,
     policy,
     bytes,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     move scratch,
     RedirectFinalUse {},
   )
@@ -854,7 +854,7 @@ effect fn redirectOneShotContractWitness<
     move request,
     policy,
     move producer,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     move scratch,
     RedirectFinalUse {},
   )
@@ -893,7 +893,7 @@ effect fn redirectReplayContractWitness<
     move request,
     policy,
     move factory,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     move scratch,
     RedirectFinalUse {},
   )
@@ -998,7 +998,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
     RedirectComponent.Policy,
     RedirectReasonTag.HopLimit,
     usize.ZERO,
-    Option.some<u16>(301),
+    Option<u16>.some(301),
   ) { return 121 }
   if !redirectFailureIs(RedirectPolicy.make(
     RedirectMode.Follow,
@@ -1009,7 +1009,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
     PreviousResponsePolicy.Close,
     NameList.empty(),
     NameList.empty(),
-  ), RedirectComponent.History, RedirectReasonTag.SizeOverflow, usize.ZERO, Option.none<u16>()) {
+  ), RedirectComponent.History, RedirectReasonTag.SizeOverflow, usize.ZERO, Option<u16>.none()) {
     return 122
   }
 
@@ -1050,7 +1050,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
       RedirectComponent.Origin,
       RedirectReasonTag.RedirectOriginDenied,
       usize.ONE,
-      Option.some<u16>(302),
+      Option<u16>.some(302),
     ) {
       return 142
     }
@@ -1072,7 +1072,7 @@ const redirectPolicyCompileWitness = `pub fn redirectPolicyCompileWitness() -> i
     RedirectComponent.Origin,
     RedirectReasonTag.DowngradeDenied,
     usize.ONE,
-    Option.some<u16>(302),
+    Option<u16>.some(302),
   ) {
     return 147
   }
@@ -1096,17 +1096,17 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     &oneName,
     NameListLimits {maxNames: 1, maxNameBytes: 6, maxOwnedBytes: exactOwned - usize.ONE},
   ), RedirectComponent.Policy, RedirectLimit.PolicyOwnedBytes, exactOwned - usize.ONE, exactOwned,
-    usize.ZERO, Option.none<u16>()) { return false }
+    usize.ZERO, Option<u16>.none()) { return false }
   if !redirectLimitFailureIs(run NameList.copy(
     &oneName,
     NameListLimits {maxNames: usize.ZERO, maxNameBytes: 6, maxOwnedBytes: exactOwned},
   ), RedirectComponent.Policy, RedirectLimit.PolicyNames, usize.ZERO, usize.ONE,
-    usize.ZERO, Option.none<u16>()) { return false }
+    usize.ZERO, Option<u16>.none()) { return false }
   if !redirectLimitFailureIs(run NameList.copy(
     &oneName,
     NameListLimits {maxNames: 1, maxNameBytes: 5, maxOwnedBytes: exactOwned},
   ), RedirectComponent.Policy, RedirectLimit.PolicyNameBytes, 5, 6,
-    usize.ZERO, Option.none<u16>()) { return false }
+    usize.ZERO, Option<u16>.none()) { return false }
   let overlapNames = ["X-SAFE"]
   let overlapSensitive = run redirectTakeRedirect(run NameList.copy(&overlapNames, nameLimits))
   if !redirectFailureIs(RedirectPolicy.make(
@@ -1119,7 +1119,7 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     move probe,
     move overlapSensitive,
   ), RedirectComponent.Policy, RedirectReasonTag.NameListOverlap, usize.ZERO,
-    Option.none<u16>()) { return false }
+    Option<u16>.none()) { return false }
 
   let locations = [
     RedirectLocationCase {
@@ -1161,7 +1161,7 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     &relativeHeaders,
     resolvedBytes - usize.ONE,
   ), RedirectComponent.Uri, RedirectLimit.UriBytes, resolvedBytes - usize.ONE, resolvedBytes,
-    usize.ONE, Option.some<u16>(302)) { return false }
+    usize.ONE, Option<u16>.some(302)) { return false }
 
   let noEntries: [Header<'static>; 0] = []
   let noHeaders = run redirectTakeValue(Headers.make(&noEntries, redirectHeaderLimits()))
@@ -1184,9 +1184,9 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
   let ownedNextUri = run nextContextUri.copy()
   let ownedContext = RedirectContext {
     hop: 3,
-    status: Option.some<Status>(redirectStatus(302)),
-    currentUri: Option.some<OwnedUri>(move ownedContextUri),
-    nextUri: Option.some<OwnedUri>(move ownedNextUri),
+    status: Option<Status>.some(redirectStatus(302)),
+    currentUri: Option<OwnedUri>.some(move ownedContextUri),
+    nextUri: Option<OwnedUri>.some(move ownedNextUri),
   }
   drop request
   let currentContextCopied = match & ownedContext.currentUri {
@@ -1198,27 +1198,27 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     Option.Some {value} => redirectOwnedUriIs(&value, "https://next.example/b#next")
   }
   if !currentContextCopied || !nextContextCopied
-    || !redirectContextIs(move ownedContext, 3, Option.some<u16>(302), true, true) {
+    || !redirectContextIs(move ownedContext, 3, Option<u16>.some(302), true, true) {
     return false
   }
   if !redirectFailureIs(run redirectResolve("https://example/a", &noHeaders, 128),
     RedirectComponent.Location, RedirectReasonTag.LocationMissing, usize.ONE,
-    Option.some<u16>(302)) { return false }
+    Option<u16>.some(302)) { return false }
   let duplicates = [run redirectHeader("Location", b"/a"), run redirectHeader("location", b"/b")]
   let duplicateHeaders = run redirectTakeValue(Headers.make(&duplicates, redirectHeaderLimits()))
   if !redirectFailureIs(run redirectResolve("https://example/a", &duplicateHeaders, 128),
     RedirectComponent.Location, RedirectReasonTag.LocationAmbiguous, usize.ONE,
-    Option.some<u16>(302)) { return false }
+    Option<u16>.some(302)) { return false }
   let invalidOwner = run redirectHeaders(b"/%")
   let invalidHeaders = OwnedHeaders.view(&invalidOwner)
   if !redirectFailureIs(run redirectResolve("https://example/a", &invalidHeaders, 128),
     RedirectComponent.Location, RedirectReasonTag.LocationInvalid, usize.ONE,
-    Option.some<u16>(302)) { return false }
+    Option<u16>.some(302)) { return false }
   let schemeOwner = run redirectHeaders(b"ftp://example/a")
   let schemeHeaders = OwnedHeaders.view(&schemeOwner)
   if !redirectFailureIs(run redirectResolve("https://example/a", &schemeHeaders, 128),
     RedirectComponent.Origin, RedirectReasonTag.RedirectSchemeDenied, usize.ONE,
-    Option.some<u16>(302)) { return false }
+    Option<u16>.some(302)) { return false }
 
   let exactUri = "https://b.example/"
   let exactOwner = run redirectHeaders(String.utf8Bytes(exactUri))
@@ -1243,7 +1243,7 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     status,
   ), RedirectComponent.Location, RedirectLimit.UriBytes,
     String.byteLength(exactUri) - usize.ONE, String.byteLength(exactUri),
-    usize.ONE, Option.some<u16>(302)) {
+    usize.ONE, Option<u16>.some(302)) {
     return false
   }
 
@@ -1264,7 +1264,7 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     RedirectComponent.History,
     RedirectReasonTag.RedirectLoop,
     usize.ONE,
-    Option.none<u16>(),
+    Option<u16>.none(),
   ) { return false }
 
   let singleLimits = HistoryLimits {maxHops: usize.ZERO, maxUriBytes: 128, maxHistoryBytes: 4096}
@@ -1290,7 +1290,7 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     usize.ONE,
     2,
     usize.ZERO,
-    Option.none<u16>(),
+    Option<u16>.none(),
   ) { return false }
   let mut belowHistory = run redirectTakeRedirect(run History.make(HistoryLimits {
     maxHops: usize.ZERO,
@@ -1304,7 +1304,7 @@ const verifyRedirectPolicy = `pub effect fn verifyRedirectPolicy() -> bool
     exactHistoryBytes - usize.ONE,
     exactHistoryBytes,
     usize.ZERO,
-    Option.none<u16>(),
+    Option<u16>.none(),
   ) { return false }
 
   let safeNames = ["authorization", "cookie", "origin", "referer", "proxy-authorization", "x-safe"]
@@ -1732,7 +1732,7 @@ export const httpRedirectAffineDuplicationDiagnosticSource = `effect fn redirect
     redirectOperationRequest(uri, headers),
     &policy,
     move producer,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     &mut scratch,
     RedirectFinalUse {},
   )
@@ -1742,7 +1742,7 @@ export const httpRedirectAffineDuplicationDiagnosticSource = `effect fn redirect
     redirectOperationRequest(uri, headers),
     &policy,
     move producer,
-    Option.none<Instant>(),
+    Option<Instant>.none(),
     &mut scratch,
     RedirectFinalUse {},
   )
