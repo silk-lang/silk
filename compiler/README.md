@@ -11,7 +11,10 @@ literal, or a field of one) addresses a compiler temporary holding the evaluated
 owner follows the owned-rvalue temporary rules below, and a mutable loan of it needs no named
 mutable owner (BORROW-006). A borrowing binding, including a destructuring `let P = &e`, keeps its
 initializer's temporaries until its scope exits. A `match &mut`, `match place` or `let P = &mut e`
-subject must name an existing place (`InvalidMatchScrutineePlace`, the bootstrap's `OWN0009`).
+subject must name an existing place (`InvalidMatchScrutineePlace`, the bootstrap's `OWN0009`), and
+a `match &mut` or `let P = &mut e` subject must be a mutable place (`ExclusiveMatchRequiresMutable`,
+the bootstrap's `OWN0007`). A guard cannot move or drop a binding of its consuming arm
+(`GuardConsumesPattern`, the bootstrap's `OWN0008`).
 Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
 `unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
