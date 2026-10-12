@@ -491,22 +491,25 @@ fn written() -> i32 { return Pair<bool, i32>.second(42) }  // any A selects the 
 ```
 
 **Boundary:** The member's written list never names the owner's parameters, and an owner
-application never names the member's. A partial owner application is an incomplete type and is
+application never names the member's. A member list on an unwritten owner is invalid when the
+member names an owner parameter: its own arguments are written after a written owner, and with no
+list at all every argument is inferred. A partial owner application is an incomplete type and is
 invalid.
 
 ```silk,ignore
 let prefixed = Maybe.some<i32>(1)    // invalid: T belongs to Maybe
+let listed = Maybe.pair<bool>(1, true) // invalid: pair names T; write Maybe<i32>.pair<bool>
 struct Pair<A, B> { first: A second: B }
 let partial = Pair<i32>.make(1, true) // invalid: Pair<i32> is incomplete
 ```
 
-**Diagnostics:** A member list that writes owner arguments reports the owner-argument placement
-diagnostic at the list, with the corrected spelling `Owner<...>.member<...>`. An incomplete owner
-application reports the GEN-002 arity diagnostic.
+**Diagnostics:** A member list on an unwritten owner whose parameters the member names reports
+`SEM0221` at the list, with the corrected spelling `Owner<...>.member<...>`. An incomplete owner application reports the GEN-002
+arity diagnostic `SEM0051`.
 
 **Current compiler:** Both compilers accept owner applications, including omitted owner
-lifetimes. Until the migration finishes, both also still accept the member-prefix spelling
-`Owner.member<OwnerArguments..., OwnArguments...>`; the placement diagnostic is unimplemented.
+lifetimes. The bootstrap reports `SEM0221`; the native compiler still accepts the
+member-prefix spelling `Owner.member<OwnerArguments..., OwnArguments...>`.
 
 **Evidence:** [call specialization](../../../../packages/compiler/src/CallResolution.ts),
 [generic call inference](#gen-003--a-generic-call-infers-only-from-supplied-arguments-and-declared-constraints).
