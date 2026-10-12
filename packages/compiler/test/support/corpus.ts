@@ -3020,27 +3020,38 @@ pub fn main() -> i32 {
   },
   {
     name: 'generic-interface-runtime-contracts',
-    source: `import silk.numeric { Numeric }
-import silk.order { Order }
+    source: `import silk.equal { Equal }
+import silk.numeric { Numeric }
+import silk.ops { Add }
+import silk.order { Order, Ordering }
 struct Box<T> { value: T }
 interface Marker { fn mark(value: &Self) -> i32 }
 impl<T> Marker for Box<T> { fn mark(value: &Self) -> i32 { return 42 } }
 fn throughMarker<T: Marker>(value: &T) -> i32 { return Marker.mark(value) }
-interface Blend {
-  operator + fn add(left: &Self, right: &Self) -> Self
-  operator < fn lessThan(left: &Self, right: &Self) -> bool
-}
 struct Cell { weight: i32 }
-fn cellAdd(left: &Cell, right: &Cell) -> Cell {
+fn cellAdd(left: Cell, right: Cell) -> Cell {
   return Cell { weight: left.weight + right.weight }
 }
-fn cellLess(left: &Cell, right: &Cell) -> bool { return left.weight < right.weight }
-impl Blend for Cell { add: Cell.cellAdd lessThan: Cell.cellLess }
-impl Order for Cell { lessThan: Cell.cellLess }
-fn merged<T: Blend>(left: T, right: T) -> T {
-  if (&left) < (&right) { return (&left) + (&right) }
-  return (&right) + (&left)
+fn cellCompare(left: &Cell, right: &Cell) -> Ordering {
+  if left.weight < right.weight { return Ordering.Less }
+  if right.weight < left.weight { return Ordering.Greater }
+  return Ordering.Equal
 }
+fn cellEquals(left: &Cell, right: &Cell) -> bool { return left.weight == right.weight }
+impl Add<Cell, Cell> for Cell { add: Cell.cellAdd }
+impl Order for Cell { compare: Cell.cellCompare }
+impl Equal for Cell { equals: Cell.cellEquals }
+fn merged<T: Add<T, T> + Order>(left: T, right: T) -> T {
+  if (&left) < (&right) { return move left + move right }
+  return move right + move left
+}
+// Each comparison operator, in written order, through one Order bound.
+fn comparisons<T: Order>(low: &T, high: &T) -> i32 {
+  if !(low < high) || low > high || !(low <= high) || low >= high { return 1 }
+  if !(high > low) || !(high >= low) || !(low <= low) || !(low >= low) { return 2 }
+  return 0
+}
+fn same<T: Equal>(left: &T, right: &T) -> bool { return left == right && !(left != right) }
 interface Mixer { fn mix(left: Self, right: Self) -> Self }
 impl Mixer for i32 { mix: Intrinsic.i32WrappingAdd }
 impl Mixer for u8 { mix: Intrinsic.u8SaturatingAdd }
@@ -3065,15 +3076,22 @@ pub fn main() -> i32 {
   if combined.weight != 42 { return 6 }
   if blend<u8>(200, 100) != 255 { return 7 }
   if blend<i32>(40, 2) != 42 { return 8 }
-  if !Order.less<i32>(1, 2) { return 9 }
-  if !Order.less<Cell>(Cell { weight: 4 }, Cell { weight: 5 }) { return 10 }
+  let one: i32 = 1
+  let two: i32 = 2
+  if comparisons<i32>(&one, &two) != 0 { return 9 }
+  let light = Cell { weight: 4 }
+  let heavy = Cell { weight: 5 }
+  if comparisons<Cell>(&light, &heavy) != 0 { return 10 }
+  if !same<Cell>(&light, &light) || same<Cell>(&light, &heavy) { return 11 }
+  if &light == &heavy || &light >= &heavy { return 12 }
   return 42
 }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
     name: 'nominal-union-operator-provider',
-    source: `struct Narrow {first: i32 second: i32}
+    source: `import silk.ops { Add }
+struct Narrow {first: i32 second: i32}
 struct Wide {first: i64 second: i64}
 union Choice { Left { value: Narrow }, Right { value: Wide } }
 union ScalarChoice { Value {value: i32} }
@@ -3091,9 +3109,8 @@ fn nested(input: &Outer) -> i32 {
   }
 }
 struct Choices { values: [Choice; 1] }
-interface Merge { operator + fn add(left: Self, right: Self) -> Self }
 impl Choice { fn add(left: Choice, right: Choice) -> Choice { return move left } }
-impl Merge for Choice { add: Choice.add }
+impl Add<Choice, Choice> for Choice { add: Choice.add }
 fn increment(value: &mut Narrow) -> () {
   value.first = value.first + 1
   value.second = value.second + 1
@@ -3171,7 +3188,8 @@ pub fn main() -> i32 {
   },
   {
     name: 'operator-interface-contract',
-    source: `struct Vector { value: i32 }
+    source: `import silk.ops { Multiply }
+struct Vector { value: i32 }
 impl Vector {
   fn scale(left: Self, right: i32) -> Self {
     return Vector { value: left.value * right }
@@ -3179,9 +3197,6 @@ impl Vector {
   fn dot(left: Self, right: Self) -> i32 {
     return left.value * right.value
   }
-}
-interface Multiply<Right, Output> {
-  operator * fn multiply(left: Self, right: Right) -> Output
 }
 impl Multiply<i32, Vector> for Vector { multiply: Vector.scale }
 impl Multiply<Vector, i32> for Vector { multiply: Vector.dot }
@@ -5124,13 +5139,17 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), outer) }`,
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.option { Option }
-import silk.order { Order }
+import silk.order { Order, Ordering }
 import silk.usize
 import silk.vector { Vector }
 
 struct Item { key: i32 tag: i32 }
-fn itemLess(left: &Item, right: &Item) -> bool { return left.key < right.key }
-impl Order for Item { lessThan: Item.itemLess }
+fn itemCompare(left: &Item, right: &Item) -> Ordering {
+  if left.key < right.key { return Ordering.Less }
+  if right.key < left.key { return Ordering.Greater }
+  return Ordering.Equal
+}
+impl Order for Item { compare: Item.itemCompare }
 
 effect fn build() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -5193,15 +5212,19 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     name: 'vector-move-only-sort-and-cleanup',
     source: `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
-import silk.order { Order }
+import silk.order { Order, Ordering }
 import silk.shared { Shared }
 import silk.usize
 import silk.vector { Vector }
 
 struct Counts { dropped: i32 }
 struct Tracked { key: i32 payload: Vector<i32> counts: Shared<Counts> }
-fn trackedLess(left: &Tracked, right: &Tracked) -> bool { return left.key < right.key }
-impl Order for Tracked { lessThan: Tracked.trackedLess }
+fn trackedCompare(left: &Tracked, right: &Tracked) -> Ordering {
+  if left.key < right.key { return Ordering.Less }
+  if right.key < left.key { return Ordering.Greater }
+  return Ordering.Equal
+}
+impl Order for Tracked { compare: Tracked.trackedCompare }
 fn countDrop(counts: &mut Counts) -> i32 {
   counts.dropped = counts.dropped + 1
   return counts.dropped
@@ -8423,8 +8446,9 @@ int32_t silk_allocation_check(size_t size, int32_t expected_calls, int32_t expec
     expected: { _tag: 'Completes', result: 1 },
   },
   {
-    // Same erased Guard layout, distinct selected hooks. Counters also reject omitted cleanup.
-    // Separate callers isolate generic glue from the bootstrap's lifetime-erased caller reuse.
+    // One Guard hook serves every region pattern (IMPL-007: heads never select by region). The
+    // 'static and local patterns each run the outer hook before the nested Token hook, and the
+    // counters reject omitted or repeated cleanup.
     name: 'generic-lifetime-selected-cleanup',
     source: `struct Token<'data> { value: i32 counter: &'data mut i32 }
 impl<'data> Drop for Token<'data> {
@@ -8436,14 +8460,14 @@ impl<'data> Drop for Token<'data> {
   }
 }
 struct Guard<'a, 'data> { token: Token<'data> }
-impl<'data> Drop for Guard<'static, 'data> {
-  fn drop(self: &mut Guard<'static, 'data>) -> () {
+impl<'a, 'data> Drop for Guard<'a, 'data> {
+  fn drop(self: &mut Guard<'a, 'data>) -> () {
     self.token.value = self.token.value + 1
     return ()
   }
 }
 fn localGuard<'a, 'data>(value: &'a i32, counter: &'data mut i32) -> Guard<'a, 'data> {
-  return Guard<'a, 'data> { token: Token { value: 2, counter: move counter } }
+  return Guard<'a, 'data> { token: Token { value: 1, counter: move counter } }
 }
 fn consume<'a, 'data>(value: Guard<'a, 'data>) -> () { drop value return () }
 fn consumeStatic<'data>(value: Guard<'static, 'data>) -> () { drop value return () }
