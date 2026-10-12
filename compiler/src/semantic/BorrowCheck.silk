@@ -25,10 +25,14 @@
 //!
 //! # Gotchas
 //! A body that runs an Effect or invokes an `effect fn` value, uses a storage primitive, borrows a
-//! place that is not rooted in a local, stores a loan anywhere but an immutable `let` (or a `let
-//! mut` of a callable, which holds its capture loans until its last use), or lets a loan reach a
-//! return, a branch or match result, or a match binding answers [`Outcome.NotChecked`] with the
-//! [`BorrowStatus`] reason: it is neither accepted nor rejected here. A call result that retains a
+//! place that is not rooted in a local, or lets a loan of a body local reach a `let mut` (other than
+//! a callable, which holds its capture loans until its last use), an assignment, a return, a branch
+//! or match result, or a match binding answers [`Outcome.NotChecked`] with the [`BorrowStatus`]
+//! reason: it is neither accepted nor rejected here, since the walk does not yet end a local's
+//! storage at its scope. A loan of a referent, storage behind a reference that the body does not
+//! own, may cross those boundaries: a joined value restarts its loans at the join, and a replaced
+//! holder's loans become approximate. The regions such a value names are the region slice's to
+//! prove, so a body clear of conflicts answers `regions`. A call result that retains a
 //! region keeps the loans its instantiated regions can hold: exactly when one operand's loans name
 //! them, approximately when several may, and none of a body local when every region is a lifetime
 //! parameter of the checked declaration. This trusts each callee's contract; the regions slice
@@ -314,6 +318,56 @@ effect fn appendCarried(target: &mut Vector<Carry>, source: &[Carry]) -> () ! Ou
   let mut at = usize.ZERO
   while at < source.length {
     run Vector<Carry>.append(&mut target.*, source[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether every carried loan borrows a referent: storage behind a reference, which the body does
+// not own, so no scope end in the body ends it and the value may cross one. A loan of a body local
+// may outlive its root's scope there, which the walk does not model yet.
+fn referentsOnly(walker: &Walker, carried: &[Carry]) -> bool {
+  let loans = Vector<Loan>.asSlice(&walker.loans)
+  let mut at = usize.ZERO
+  while at < carried.length {
+    if loans[carried[at].loan].local {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Ends the loans one path carries at its end `end` and restarts them at the join `joined`. Points
+// are numbered in creation order, not by path, so a joined value's carries restart at the join. A
+// path that ends at `usize.MAX` never reaches the join.
+effect fn rejoin(walker: &mut Walker, carried: &[Carry], end: usize, joined: usize, onward: &mut Vector<Carry>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if end == usize.MAX {
+    return ()
+  }
+  run consume(&mut walker.*, carried, end)
+  let mut at = usize.ZERO
+  while at < carried.length {
+    run Vector<Carry>.append(&mut onward.*, Carry {loan: carried[at].loan, since: joined, operand: usize.MAX})
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Marks the loans `local` holds approximate. A replaced holder releases the loans of its earlier
+// value, but its loans are not tracked per assignment, so each one would stay live wherever the
+// holder is: a conflict with one is not decided.
+fn approximateHeld(walker: &mut Walker, local: usize) -> () {
+  if !holds(&walker.*, local) {
+    return ()
+  }
+  let held = Vector<Vector<usize>>.asSlice(&walker.held)
+  let loans = Vector<usize>.asSlice(&held[local])
+  let mut all = Vector<Loan>.asMutSlice(&mut walker.loans)
+  let mut at = usize.ZERO
+  while at < loans.length {
+    all[loans[at]].approximate = true
     at = at + usize.ONE
   }
   return ()
@@ -1431,7 +1485,7 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
         if retained {
           // A `mut fn` is invoked through a mutable binding. Its capture loans stay held until the
           // local's last use even if it is replaced, and a replacement that carries loans leaves.
-          if mutable && !callable {
+          if mutable && !callable && !referentsOnly(&walker.*, Vector<Carry>.asSlice(&flow.carried)) {
             leave(&mut walker.*, BorrowStatus.StoredLoans)
             return flowAt(point)
           }
@@ -1443,10 +1497,11 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
     Shape.Assignment {local, value} => {
       let since = Vector<Event>.length(&walker.events)
       let flow = run visit(nodes, locals, owner, &mut walker.*, value, at)
+      let ty = localType(locals, local)
+      let mut retained = false
       if Vector<Carry>.length(&flow.carried) > usize.ZERO {
-        let ty = localType(locals, local)
-        let retained = run retains(&ty, owner)
-        if retained {
+        retained = run retains(&ty, owner)
+        if retained && !referentsOnly(&walker.*, Vector<Carry>.asSlice(&flow.carried)) {
           leave(&mut walker.*, BorrowStatus.StoredLoans)
           return flowAt(flow.at)
         }
@@ -1455,6 +1510,14 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       let point = run access(&mut walker.*, &path, Kind.Write, span, flow.at, usize.MAX)
       markConsumedTarget(&mut walker.*, since, point, span)
       run consume(&mut walker.*, Vector<Carry>.asSlice(&flow.carried), point)
+      // A replaced `mut fn` keeps its capture loans until the local's last use, as bound.
+      if !Shared<Type>.with<bool>(&ty, callableValue) {
+        approximateHeld(&mut walker.*, local)
+        if retained {
+          run hold(&mut walker.*, local, Vector<Carry>.asSlice(&flow.carried), point)
+          approximateHeld(&mut walker.*, local)
+        }
+      }
       return flowAt(point)
     }
     Shape.PlaceAssignment {target, value} => {
@@ -1490,9 +1553,14 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       let mut current = at
       if let Option<NodeId>.Some {value: operand} = &value {
         let flow = run visit(nodes, locals, owner, &mut walker.*, operand, at)
-        if Vector<Carry>.length(&flow.carried) > usize.ZERO {
+        // A returned value may carry referent loans out of the body, whose regions typing related
+        // to the result; a loan of a body local would outlive its root.
+        if !referentsOnly(&walker.*, Vector<Carry>.asSlice(&flow.carried)) {
           leave(&mut walker.*, BorrowStatus.StoredLoans)
           return flowAt(usize.MAX)
+        }
+        if flow.at != usize.MAX {
+          run consume(&mut walker.*, Vector<Carry>.asSlice(&flow.carried), flow.at)
         }
         current = flow.at
       }
@@ -1526,13 +1594,16 @@ effect fn visit(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
       if let Option<NodeId>.Some {value: alternative} = &elseBranch {
         other = run visit(nodes, locals, owner, &mut walker.*, alternative, split)
       }
-      if Vector<Carry>.length(&taken.carried) > usize.ZERO || Vector<Carry>.length(&other.carried) > usize.ZERO {
+      if !referentsOnly(&walker.*, Vector<Carry>.asSlice(&taken.carried)) || !referentsOnly(&walker.*, Vector<Carry>.asSlice(&other.carried)) {
         leave(&mut walker.*, BorrowStatus.StoredLoans)
         return flowAt(usize.MAX)
       }
       let joined = run newPoint(&mut walker.*, taken.at)
       run edge(&mut walker.*, other.at, joined)
-      return flowAt(joined)
+      let mut onward = Vector<Carry>.make()
+      run rejoin(&mut walker.*, Vector<Carry>.asSlice(&taken.carried), taken.at, joined, &mut onward)
+      run rejoin(&mut walker.*, Vector<Carry>.asSlice(&other.carried), other.at, joined, &mut onward)
+      return Flow {at: joined, carried: move onward}
     }
     Shape.While {condition, body} => {
       let header = run newPoint(&mut walker.*, at)
@@ -1640,6 +1711,8 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
   let mut points = Vector<Point>.asMutSlice(&mut walker.points)
   points[tested].initializes = subjectRoot(subject)
   let mut ends = Vector<usize>.make()
+  // The referent loans the selected arms' results carry to the join.
+  let mut joining = Vector<Carry>.make()
   let mut rejected = Vector<usize>.make()
   run Vector<usize>.append(&mut rejected, tested)
   let mut index = usize.ZERO
@@ -1661,15 +1734,20 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       run Vector<usize>.append(&mut rejected, selected)
     }
     let taken = run visit(nodes, locals, owner, &mut walker.*, arms[index].result, selected)
+    let point = run newPoint(&mut walker.*, taken.at)
     if Vector<Carry>.length(&taken.carried) > usize.ZERO {
       // A loan carried out of an arm is joined across the arms.
       let retained = run nodeRetains(nodes, result, owner)
       if retained {
-        leave(&mut walker.*, BorrowStatus.StoredLoans)
-        return flowAt(usize.MAX)
+        if !referentsOnly(&walker.*, Vector<Carry>.asSlice(&taken.carried)) {
+          leave(&mut walker.*, BorrowStatus.StoredLoans)
+          return flowAt(usize.MAX)
+        }
+        if taken.at != usize.MAX {
+          run appendCarried(&mut joining, Vector<Carry>.asSlice(&taken.carried))
+        }
       }
     }
-    let point = run newPoint(&mut walker.*, taken.at)
     run consume(&mut walker.*, Vector<Carry>.asSlice(&taken.carried), point)
     run Vector<usize>.append(&mut ends, point)
     index = index + usize.ONE
@@ -1681,7 +1759,14 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
     run edge(&mut walker.*, selected[index], joined)
     index = index + usize.ONE
   }
-  return flowAt(joined)
+  let carried = Vector<Carry>.asSlice(&joining)
+  let mut onward = Vector<Carry>.make()
+  index = usize.ZERO
+  while index < carried.length {
+    run Vector<Carry>.append(&mut onward, Carry {loan: carried[index].loan, since: joined, operand: usize.MAX})
+    index = index + usize.ONE
+  }
+  return Flow {at: joined, carried: move onward}
 }
 
 // A field, index or dereference of a value that is not a written place: its operand is evaluated
@@ -2000,8 +2085,11 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
   if walker.outside {
     return verdict(Outcome.NotChecked, walker.reason)
   }
-  if Vector<Carry>.length(&flow.carried) > usize.ZERO {
+  if !referentsOnly(&walker, Vector<Carry>.asSlice(&flow.carried)) {
     return verdict(Outcome.NotChecked, BorrowStatus.StoredLoans)
+  }
+  if flow.at != usize.MAX {
+    run consume(&mut walker, Vector<Carry>.asSlice(&flow.carried), flow.at)
   }
   // Exit carries no events: scope-end storage ends are not modeled yet, so a `run`'s failure path
   // needs no edge to it. The regions slice adds both.
