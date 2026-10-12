@@ -1298,6 +1298,16 @@ const checkExpressionOperation = (
       )
         return false
       return true
+    // Comparisons and enum or string views read their operands without consuming them, so a
+    // moved operand is a use after move (OWN-003).
+    case 'EnumEquality':
+    case 'StringEquality':
+      if (!checkExpression(state, live, expression.left, false, guard, escaping)) return false
+      return checkExpression(state, live, expression.right, false, guard, escaping)
+    case 'EnumValue':
+      return checkExpression(state, live, expression.value, false, guard, escaping)
+    case 'RuntimeStringView':
+      return checkExpression(state, live, expression.source, false, guard, escaping)
     case 'ShortCircuit': {
       if (!checkExpression(state, live, expression.left, false, guard, escaping)) return false
       const rightLive = new Map(live)
