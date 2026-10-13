@@ -532,6 +532,35 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('treats Copy and Drop as ordinary names that need an import and can be shadowed', () =>
+  Effect.gen(function* () {
+    const unimported = `// bare: no silk.ownership import
+struct Point { x: i32 }
+impl Copy for Point {}
+fn twice<T: Drop>(value: T) -> i32 { return 0 }
+pub fn main() -> i32 { return 0 }`
+    const bare = yield* analyze(unimported)
+    const unknown = yield* analyze(unimported.replace('Copy', 'Kopy').replace('Drop', 'Drip'))
+    assert.deepEqual(
+      Analysis.diagnostics(bare).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      Analysis.diagnostics(unknown).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      Json.stringify(messages(bare)),
+    )
+    assert.include(
+      Analysis.diagnostics(bare).map((diagnostic) => diagnostic.span.start),
+      unimported.indexOf('Copy for'),
+    )
+    const declared = yield* analyze(`struct Copy { value: i32 }
+fn keep(value: Copy) -> i32 { return value.value }
+pub fn main() -> i32 { return keep(Copy { value: 42 }) }`)
+    assert.deepEqual(codes(declared), [], Json.stringify(messages(declared)))
+    const bound = yield* analyze(`import silk.ownership {Copy}
+fn identity<Copy>(value: Copy) -> Copy { return move value }
+pub fn main() -> i32 { return identity(42) }`)
+    assert.deepEqual(codes(bound), [], Json.stringify(messages(bound)))
+  }),
+)
+
 it.effect('names enum members through an alias in values and patterns', () =>
   Effect.gen(function* () {
     const self = yield* analyze(`import silk.order { Order, Ordering }

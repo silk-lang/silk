@@ -123,6 +123,7 @@ import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.layout { Layout }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 service Counter {
   effect fn increment() -> i32 ? &mut Counter
@@ -182,6 +183,7 @@ import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.layout { Layout }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 import silk.shared { Shared }
 struct Problem { code: i32 }
 struct Drops { value: i32 }
