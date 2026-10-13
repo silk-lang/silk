@@ -5056,6 +5056,35 @@ pub fn main() -> i32 { return run Effect.catchAll(build(), recover) }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'user-declared-copy',
+    source: `import silk.ownership {Copy as Duplicable, Drop as Release}
+
+struct Copy { count: i32 }
+struct Point { x: i32 y: i32 }
+struct Guard { value: i32 }
+
+impl Duplicable for Point {}
+
+impl Release for Guard {
+  fn drop(self: &mut Guard) -> () { return () }
+}
+
+fn twice<T: Duplicable>(value: T) -> [T; 2] { return [value, value] }
+
+fn consume(copy: Copy) -> i32 { return copy.count }
+
+fn held(guard: &Guard) -> i32 { return guard.value }
+
+pub fn main() -> i32 {
+  let points = twice(Point { x: 10, y: 4 })
+  let guard = Guard { value: 6 }
+  let kept = held(&guard)
+  drop guard
+  return points[0].x + points[1].x + points[0].y + kept + consume(Copy { count: 12 })
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'vector-growth-reads',
     source: `import silk.allocator { OutOfMemoryError }
 import silk.allocator { Allocator }
