@@ -385,8 +385,11 @@ borrowed exclusively, and a `once Effect` is moved, so the loans its environment
 through the run (EFFECT-OWN-002, CALLABLE-003).
 
 A body the walk clears is `Checked` when it is region-closed and typing left nothing pending. It is
-region-closed when every region its locals and values name is `'static` or a loan region of the
-body itself. A call result keeps an operand's region only by naming it, and conformance holds an
+region-closed when every region its locals and values name is `'static`, a loan region of the
+body itself, or a universal region of the body's own declaration: one of its lifetime parameters.
+No loan of the body has a lifetime parameter's region, and typing defers every relation that would
+make a body loan outlive one as a pending region obligation, so a body with nothing pending relies
+on none. A call result keeps an operand's region only by naming it, and conformance holds an
 interface witness to exactly the regions its operation names, so a result typed by an open
 parameter keeps no loan of the body. Such a body's
 loans and their scopes are its whole region proof, because no loan of a cleared body outlives its
@@ -406,8 +409,8 @@ Pending means a region relation or capture contents typing retained. `Checked` i
 one body: its own loans and regions are sound. A rule that blames a body for its callers' context
 is not part of that claim. OWN0016 (SHARED-003) blames a suspending callee reached under a
 local-shared access, such as a value-free `fn parks()` that runs `Execution.park`. Such a callee
-can be `Checked` while every boundary caller, which takes the access's `&mut T` parameter region,
-stays `regions` until local sharing lands (§10), so no violating program is ever fully checked.
+and its boundary caller, which takes the access's `&mut T` parameter region, can each be `Checked`;
+the native build-time OWN0016 pass rejects the program, so no violating program is ever accepted.
 Scope ends as events,
 OWN0019 and the `run` failure edge arrive with the slice that lifts the `stored-loans` exits above,
 the first point at which a loan can outlive its root.
@@ -511,8 +514,9 @@ rejects is never accepted.
    - Universal regions, outlives assumptions, and discharge of `RegionRelation` and `Contents`
      obligations.
    - Delete the `TypeMismatch` stand-in for region escapes.
-   - Region-closed bodies are `Checked` (§6). Then universal regions (lifetime parameters,
-     invocation lifetimes, outlives assumptions), then region relations and returned regions.
+   - Region-closed bodies are `Checked` (§6), lifetime parameters of the body's own declaration
+     included. Then invocation lifetimes and outlives assumptions, then region relations and
+     returned regions.
    - With the slice that lifts the `stored-loans` exits for joins and assignments: scope-end storage
      ends as events at a match arm's end, a block's end and body exit, OWN0019 at the first required
      point outside the root's scope (a consuming arm yielding `&value` of its arm-local binding is
