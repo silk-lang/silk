@@ -618,3 +618,8 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 - 2026-10-12 · This cloud image's old gh pr edit failed while reading deprecated GraphQL projectCards · Update PR descriptions through gh api PATCH repos/OWNER/REPO/pulls/NUMBER with a JSON input file · Silk PR workflow
 2026-10-13 · The checkout fetch refspec tracks only main, so `git fetch origin main selfhost` left origin/selfhost stale while updating FETCH_HEAD · Fetch explicit heads-to-remote-ref mappings before branching a selfhost sync; verify against the remote head · Silk.
 2026-10-13 · Cloud GitHub CLI and git transport began returning401 after the session credential expired · Use the connected GitHub tools for metadata and Git object publication; for public source reads import the official codeload archive only after reproducing its Git tree and commit SHAs exactly · Silk.
+
+- 2026-10-13 · Spike Node CLI failed board reads despite working curl through the managed proxy · Set NODE_USE_ENV_PROXY=1 alongside the pinned CLI and worker environment · Silk.
+- 2026-10-13 · Rootless Debian worker lacked Clang and GNU time; NativeBuild strips library overrides and defaults to /usr/bin/time · Extract matching Debian Clang 19 packages and GNU time, select an explicit linker wrapper and --time-command, and keep the seed immutable · Silk.
+- 2026-10-13 · Native build CLI required -o before optional flags, and format required the package cwd with a file-valued package.root · Use the documented argument order and a small proper package manifest for format fragments · Silk.
+- 2026-10-13 · Native test receipts omitted assertion messages, hiding which scope proof failed · Give distinct falsifiable claims their own Case names and retain the complete runner receipts · Silk.
