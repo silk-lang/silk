@@ -55,7 +55,7 @@ and exits with the runner's status:
 6. Remove the plan and receipt and exit with the process status: 0 or 1 from an admitted
    receipt; 2 for an operational failure (an invalid or missing receipt, or the runner's own 2);
    the raw status of any other exit, and 128 plus the signal for a signal. Compile refusals keep `build`'s statuses and
-   output: `SILK_BUILD_ERROR=` lines and status 1 for a rejection, `SILK_UNSUPPORTED_JSON=` and
+   output: `SILK_BUILD_ERROR=` lines with numeric catalog codes and status 1 for a rejection, `SILK_UNSUPPORTED_JSON=` with an uncoded internal reason and
    status 2 for a gap.
 
 The plan and receipt formats are the bootstrap's (`packages/cli/src/TestExchange.ts`); the runner
@@ -132,15 +132,15 @@ A `test` header is checked in the Signature query, where the qualifiers, binders
 result are already resolved. An invalid entry is a rejection, `InvalidTestDeclaration`, at the span
 the reference names:
 
-| Conflict | Span |
-| --- | --- |
-| declared in an `impl`, `interface` or `service` (associated) | the `test` qualifier |
-| `static` | the `static` qualifier |
-| `unsafe` | the `unsafe` qualifier |
-| `extern` or `export` linkage | the linkage qualifier |
-| generic or lifetime binder | the first binder |
-| parameter | the first parameter |
-| non-unit success type | the written success type |
+| Conflict                                                     | Span                     |
+| ------------------------------------------------------------ | ------------------------ |
+| declared in an `impl`, `interface` or `service` (associated) | the `test` qualifier     |
+| `static`                                                     | the `static` qualifier   |
+| `unsafe`                                                     | the `unsafe` qualifier   |
+| `extern` or `export` linkage                                 | the linkage qualifier    |
+| generic or lifetime binder                                   | the first binder         |
+| parameter                                                    | the first parameter      |
+| non-unit success type                                        | the written success type |
 
 The checks run in that order and the first conflict is reported. Anonymous callables cannot carry
 the marker; the parser already rejects it there. Today the native compiler marks such a header

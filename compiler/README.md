@@ -1170,7 +1170,8 @@ coverage identifiers such as `typed-form` are internal reasons, never catalog co
 inventory writes them as `coverage_reason`. Deleted or inactive exact query identities report
 `IdentityUnavailable`, also uncoded. There is no native diagnostic namespace. A missing retained
 fact or an instance-symbol conflict is a compiler bug: its producer writes a report request to
-stderr and calls C `abort`, before creating or caching a rejection. Lexical diagnostics and static execution faults have separate exhaustive tables.
+stderr and calls C `abort`, before creating or caching a rejection. Lexical diagnostics and static
+execution faults have separate exhaustive tables.
 
 Choose a diagnostic at the producer that knows the failed condition. Expected-value checking
 carries its diagnostic purpose through nested expressions: a bad return value and a bad argument
