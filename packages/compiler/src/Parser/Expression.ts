@@ -1373,6 +1373,10 @@ export function parsePattern(
     : parseNominalPattern(initial)
 }
 
+/** A field's nested pattern is a qualified nominal-union variant or a nominal pattern (PATT-021). */
+const parseNestedFieldPattern = (initial: State): NodeResult =>
+  hasAppliedMember(initial) ? parseUnionVariantPattern(initial) : parseNominalPattern(initial)
+
 export function parseUnionVariantPattern(initial: State): NodeResult {
   const selector = parseAppliedMemberSelector(initial, [
     'LeftBrace',
@@ -1425,9 +1429,7 @@ export function parseUnionVariantPattern(initial: State): NodeResult {
         ])
         state = colon.state
         if (isNominalPatternStart(state)) {
-          const nested = hasAppliedMember(state)
-            ? parseUnionVariantPattern(state)
-            : parseNominalPattern(state)
+          const nested = parseNestedFieldPattern(state)
           fieldChildren = [...fieldChildren, ...colon.elements, nested.node]
           state = nested.state
         } else {
@@ -1511,7 +1513,7 @@ export function parseNominalPattern(initial: State): NodeResult {
         ])
         state = colon.state
         if (isNominalPatternStart(state)) {
-          const nested = parseNominalPattern(state)
+          const nested = parseNestedFieldPattern(state)
           fieldChildren = [...fieldChildren, ...colon.elements, nested.node]
           state = nested.state
         } else {
@@ -1878,9 +1880,26 @@ export function parsePrimaryExpression(
     }
   }
   if (kind === 'Move') {
-    const keyword = expect(initial, 'MoveKeyword', ['Identifier', ...expressionFollowing])
-    const projected = parseChildExpression(keyword.state, depth, true, (childDepth) =>
-      parseProjectionChain(parseIdentifierExpression(keyword.state), childDepth),
+    // The operand is a primary expression with its postfix operations (OWN-003); a `run`
+    // operand extends greedily, so `move run f()` moves the whole `run f()`.
+    const keyword = expect(initial, 'MoveKeyword', expressionStarts)
+    const operandStarts = expressionStarts.includes(
+      nextSignificantKind(keyword.state) ?? 'EndOfFile',
+    )
+    const projected = parseChildExpression(keyword.state, depth, allowStructLiteral, (childDepth) =>
+      parseProjectionChain(
+        // A missing operand recovers as the missing name of the simplest movable place.
+        operandStarts
+          ? parsePrimaryExpression(
+              keyword.state,
+              reservedForEnclosingCalls,
+              recoveryKind,
+              allowStructLiteral,
+              childDepth,
+            )
+          : parseIdentifierExpression(keyword.state),
+        childDepth,
+      ),
     )
     return {
       state: projected.state,

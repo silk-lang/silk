@@ -207,6 +207,34 @@ pub fn main() -> i32 { return 0 }`)
   }),
 )
 
+it.effect('elides a lifetime an alias target omits at each use, as a struct header does', () =>
+  Effect.gen(function* () {
+    const source = `type Borrow = &i32
+type Bytes = &[u8]
+type Use = fn(i32) -> i32
+type Generic<T> = &T
+fn same(value: Borrow) -> Borrow { return value }
+fn first(bytes: Bytes) -> u8 { return bytes[0] }
+fn call(callback: Use) -> i32 { return callback(1) }
+fn generic(value: Generic<i32>) -> i32 { return value.* }
+fn two(left: Borrow, right: Borrow) -> Borrow { return left }
+fn twoWritten(left: &i32, right: &i32) -> &i32 { return left }
+pub fn main() -> i32 { return 0 }`
+    const self = yield* analyze(source)
+    // Each use elides as the written-out target would. An ambiguous output is reported like one
+    // on a struct header: the elision failure, then the use's missing lifetime argument.
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [
+        [Diagnostic.typeArgumentArityCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('Borrow { return left }')],
+        [Diagnostic.ambiguousLifetimeElisionCode, source.indexOf('&i32 { return left }')],
+      ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
+
 it.effect('rejects bounded, row-kind and unused generic alias parameters at the parameter', () =>
   Effect.gen(function* () {
     const source = `interface Marker {}
@@ -499,6 +527,84 @@ pub fn main() -> i32 {
         [Diagnostic.invalidConformanceCode, source.indexOf('qualified(Owned')],
         [Diagnostic.invalidConformanceCode, source.indexOf('imported(Owned')],
       ],
+      Json.stringify(messages(self)),
+    )
+  }),
+)
+
+it.effect('treats Copy and Drop as ordinary names that need an import and can be shadowed', () =>
+  Effect.gen(function* () {
+    const unimported = `// bare: no silk.ownership import
+struct Point { x: i32 }
+impl Copy for Point {}
+fn twice<T: Drop>(value: T) -> i32 { return 0 }
+pub fn main() -> i32 { return 0 }`
+    const bare = yield* analyze(unimported)
+    const unknown = yield* analyze(unimported.replace('Copy', 'Kopy').replace('Drop', 'Drip'))
+    assert.deepEqual(
+      Analysis.diagnostics(bare).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      Analysis.diagnostics(unknown).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      Json.stringify(messages(bare)),
+    )
+    assert.include(
+      Analysis.diagnostics(bare).map((diagnostic) => diagnostic.span.start),
+      unimported.indexOf('Copy for'),
+    )
+    const declared = yield* analyze(`struct Copy { value: i32 }
+fn keep(value: Copy) -> i32 { return value.value }
+pub fn main() -> i32 { return keep(Copy { value: 42 }) }`)
+    assert.deepEqual(codes(declared), [], Json.stringify(messages(declared)))
+    const bound = yield* analyze(`import silk.ownership {Copy}
+fn identity<Copy>(value: Copy) -> Copy { return move value }
+pub fn main() -> i32 { return identity(42) }`)
+    assert.deepEqual(codes(bound), [], Json.stringify(messages(bound)))
+  }),
+)
+
+it.effect('names enum members through an alias in values and patterns', () =>
+  Effect.gen(function* () {
+    const self = yield* analyze(`import silk.order { Order, Ordering }
+enum Level { Low, High }
+type Tier = Level
+type Ord = Ordering
+fn pick(flag: bool) -> Tier {
+  if flag { return Tier.High }
+  return Tier.Low
+}
+fn rank(tier: Tier) -> i32 {
+  return match tier {
+    Tier.Low => 1
+    Tier.High => 2
+  }
+}
+fn compared(left: &i32, right: &i32) -> bool {
+  let ordering = Order.compare(left, right)
+  return ordering == Ord.Less || ordering == Ordering.Greater
+}
+pub fn main() -> i32 {
+  let low = 1
+  let high = 2
+  if compared(&low, &high) { return rank(pick(true)) + 40 }
+  return 0
+}`)
+    assert.deepEqual(codes(self), [], Json.stringify(messages(self)))
+  }),
+)
+
+it.effect('rejects an enum member qualified through a namespace-qualified type', () =>
+  Effect.gen(function* () {
+    // A namespace exposes root declarations; a type's members go through the selected type.
+    const source = `import silk.order
+fn pick() -> i32 {
+  let ordering = order.Ordering.Greater
+  drop ordering
+  return 0
+}
+pub fn main() -> i32 { return pick() }`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+      [[Diagnostic.namespaceQualifiedTypeCode, source.indexOf('Ordering.Greater')]],
       Json.stringify(messages(self)),
     )
   }),

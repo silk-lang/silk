@@ -639,7 +639,8 @@ it.effect(
           false,
         ],
       ] as const) {
-        const source = `${observationWrapper}
+        const source = `import silk.ownership {Drop}
+${observationWrapper}
 struct Failure {}
 struct State {}
 ${name === 'owner-cleanup' ? 'impl Drop for State { fn drop(self: &mut State) -> () { let policy = terminal() return () } }' : ''}
@@ -743,6 +744,7 @@ for (const [name, body, rejected] of [
       const call = `observing(${state}, observer, application())`
       const source = `${observationWrapper}
 import silk.effect { Effect }
+import silk.ownership { Drop }
 struct Observer { ${name === 'replacement-cleanup' ? 'guard: Guard' : ''} }
 effect fn value() -> usize { return 0 }
 struct Guard {}
@@ -803,7 +805,8 @@ it.effect('rejects observation in the executed callback closure', () =>
       ['lazy-body', 'let ignored = guarded() drop ignored return 0', false],
       ['executed-body', 'return run guarded()', true],
     ] as const) {
-      const source = `${observationWrapper}
+      const source = `import silk.ownership {Drop}
+${observationWrapper}
 ${observationWrapper.replaceAll('observing', 'nestedObserving')}
 struct State {}
 effect fn value() -> usize { return 0 }
@@ -851,7 +854,8 @@ it.effect('retains distinct protected bodies in owned observer environments', ()
   Effect.gen(function* () {
     const frontend = yield* AnalysisFixture.frontend(
       'intrinsic/observer-captures',
-      encoder.encode(`${observationWrapper}
+      encoder.encode(`import silk.ownership {Drop}
+${observationWrapper}
 struct Observer { value: i32 }
 impl Drop for Observer { fn drop(self: &mut Observer) -> () { return () } }
 fn observer(state: &mut Observer, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize { return 0 }
@@ -1060,6 +1064,7 @@ effect fn risky() -> i32 ! Problem {
   fail Problem { code: resumed }
 }
 import silk.effect { Effect }
+import silk.ownership { Drop }
 effect fn recover(problem: Problem) -> i32 {
   let deferred = effect { return 42 + problem.code }
   let offset = run Intrinsic.suspendEffect(effect { return 0 })

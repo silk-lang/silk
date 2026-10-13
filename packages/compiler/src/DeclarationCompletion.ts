@@ -36,6 +36,8 @@ import * as DeclarationCollection from './DeclarationCollection.js'
 import * as DeclarationIndex from './DeclarationIndex.js'
 import * as NameResolution from './NameResolution.js'
 import {
+  aliasUseParameters,
+  borrowedAliasUse,
   attachExposure,
   canonicalKey,
   closeOpaqueReturnType,
@@ -309,6 +311,9 @@ export const complete = (
   ): ReadonlyArray<Type.Parameter> | undefined => {
     if (module === undefined) return undefined
     const resolved = resolvers.type(module, path)
+    // An alias's parameters, implicit lifetimes included, are elided at a use like a nominal's.
+    const aliased = aliasUseParameters(resolved.fact)
+    if (aliased !== undefined) return aliased
     if (
       resolved.fact._tag !== 'Resolved' ||
       !Type.isNominal(resolved.fact.type) ||
@@ -396,6 +401,8 @@ export const complete = (
             member,
             (path) => nominalParameters(module, path),
             conformance !== undefined ? finalizeConformance(conformance) : completedHead,
+            undefined,
+            (path) => module !== undefined && borrowedAliasUse(resolvers.type(module, path).fact),
           )
         : member
     const closed =
@@ -427,6 +434,8 @@ export const complete = (
   let modules = headers.map((module): ModuleHeaders => {
     const nominalParameters = (path: TypePathFact): ReadonlyArray<Type.Parameter> | undefined => {
       const resolved = resolvers.type(module.module, path)
+      const aliased = aliasUseParameters(resolved.fact)
+      if (aliased !== undefined) return aliased
       if (
         resolved.fact._tag !== 'Resolved' ||
         !Type.isNominal(resolved.fact.type) ||
@@ -697,6 +706,9 @@ export const complete = (
                   operationContext,
                   collectedOperation,
                   nominalParameters,
+                  undefined,
+                  undefined,
+                  (path) => borrowedAliasUse(resolvers.type(module.module, path).fact),
                 )
           const operation =
             finalizedOperation._tag === 'ServiceOperation' ? finalizedOperation : collectedOperation
