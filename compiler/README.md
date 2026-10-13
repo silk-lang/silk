@@ -297,7 +297,7 @@ manifest failures propagate rather than becoming backend coverage gaps.
 A reached sealed runtime primitive that the canonical intrinsic catalog defines but selfhost has
 not implemented reports `intrinsic-member`. `semantic.IntrinsicCatalog` retains the exact runtime
 and mixed-phase member spellings; the corpus runner check compares them with the bootstrap catalog.
-An unknown spelling remains `UnknownMember`. This classification adds no primitive implementation.
+An unknown operation spelling reports `SEM0010`. This classification adds no primitive implementation.
 Selfhost implements `isizeToUsize`, which traps on a negative value (CONV-002), and the raw-pointer
 primitives `pointerFromSlice`, `pointerAt`, `pointerRead` and `pointerRequalify`, instantiated from
 their written type arguments. The unsafe members need an `unsafe` boundary or call acknowledgement;
@@ -1155,6 +1155,40 @@ available stack in the bootstrap-generated debug executable before recovery coul
 Grammar rules are ordinary Silk functions. They consume `State` and return it with either an
 unfinished element list or a completed node ID. Replacement values are evaluated before assigning
 them back to a local owner, as required by Silk's ownership rules.
+
+## Diagnostic catalog
+
+`semantic/Rejection.silk` owns native semantic reason identities. Its exhaustive module-level
+`stableCode` table assigns each language rejection its numeric catalog code; build and strict-inventory
+output preserve its original module and source span. Non-alias resolution cycles use SEM0223;
+alias cycles keep SEM0183. Braces on a unit variant pattern use SEM0224; missing payload fields
+keep SEM0046.
+
+Unimplemented native features have one uncoded "not supported by this compiler yet" outcome,
+transported by `SILK_UNSUPPORTED_JSON` with the internal reason and authored source. Backend
+coverage identifiers such as `typed-form` are internal reasons, never catalog codes; strict
+inventory writes them as `coverage_reason`. Deleted or inactive exact query identities report
+`IdentityUnavailable` with the uncoded reason "Identity unavailable in this revision". There is no native diagnostic namespace. A missing retained
+fact or an instance-symbol conflict is a compiler bug: its producer writes a report request to
+stderr and calls C `abort`, before creating or caching a rejection. Lexical diagnostics and static
+execution faults have separate exhaustive tables.
+
+Choose a diagnostic at the producer that knows the failed condition. Expected-value checking
+carries its diagnostic purpose through nested expressions: a bad return value and a bad argument
+inside that return have different codes. Do not relabel a propagated failure by comparing spans.
+
+While both compilers exist, `packages/compiler/src/Diagnostic.ts` remains the authoritative code
+and message-template catalog, and its generated documentation keeps the existing wording gate.
+New allocations land on `main` with complete templates and generated documentation, then reach
+`selfhost` through a sync. Full parameterized native message rendering is a separate migration
+that must finish before removing the bootstrap catalog and its generation checks.
+
+Run `node compiler/scripts/DiagnosticCatalog.mjs` to check each annotated native mapping against
+its exact bootstrap constant, all lexical/static mappings, and the generated catalog. The guard
+rejects missing, duplicate, default and unregistered mappings. `compiler/diagnostic-coverage.json`
+records every catalog code without a dedicated native producer, including its reference rules.
+A coverage gap does not mean the compiler accepts the invalid program; another reason may reject
+it earlier, or the native compiler may lack the feature. Tests assert codes and source spans.
 
 ## Verification
 

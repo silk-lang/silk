@@ -2127,3 +2127,20 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   `compiler/` bind the slice to a local before indexing it, which both compilers accept. Declaration
   handle Cases use the same direct-view form.
 - The bootstrap is not extended for this. Retire this entry with the bootstrap.
+
+### Braced unit-variant patterns
+
+- **Status:** approved by Julia on 2026-10-13; SEM0224 allocated on main in #1648. Native
+  enforcement is implemented; bootstrap enforcement remains incomplete.
+- **Rule:** PATT-021 writes a unit nominal-union variant as a bare selector. A braced payload
+  pattern is invalid even when its field list is empty. Missing fields of a payload-bearing
+  variant remain SEM0046.
+- **Compilers:** native rejects plain, applied, nested-field and structural-union member forms
+  with SEM0224. The synchronized bootstrap accepts the plain braced-unit fixture.
+- **Source migration:** write `Shape.Empty` instead of `Shape.Empty {}`. The compiler's
+  `Node.UnitType` pattern and coverage/refutability fixtures use the bare form; their distinct
+  assertions remain.
+- **Evidence:** the bootstrap's focused manifest check accepts a `Shape.Empty {}` arm; the
+  branch's N1 CLI rejects the same arm with SEM0224 at bytes 116–130. The native payload-control
+  probe retains SEM0046 at bytes 116–126. The source-written lowering actor checks all four
+  grammar/subject routes at exact spans. Full exact-head native Cases remain the execution gate.
