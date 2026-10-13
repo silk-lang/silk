@@ -64,6 +64,7 @@ pub fn main() -> i32 {
 }`
 
 export const affineBorrowedStream = `import silk.option { Option }
+import silk.ownership { Drop }
 interface Stream<Item> { effect fn take<'call>(self: &'call mut Self) -> Option<Item> }
 struct Item<'data> { value: &'data mut i32 }
 impl<'data> Drop for Item<'data> { fn drop(self: &mut Item<'data>) -> () { self.value.* = 42 return () } }

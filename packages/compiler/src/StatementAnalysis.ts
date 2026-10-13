@@ -577,6 +577,11 @@ export const analyzeStatements = (
       },
     ])
     const complete = pattern.fact._tag === 'UniversalPattern' ? true : pattern.fact.complete
+    // Borrowed bindings are the selection's loans and end with their scope (PATT-009). A pattern
+    // that binds nothing holds no loan past its test.
+    let loanEndAt: AuthoredHir.Anchor = element.anchor
+    if (pattern.fact.bindings.length === 0) loanEndAt = initializerNode.anchor
+    else if (element._tag === 'PatternBindingStatement') loanEndAt = blockNode.anchor
     return {
       _tag: 'PatternSelection',
       tests,
@@ -589,11 +594,8 @@ export const analyzeStatements = (
       pattern: pattern.fact,
       bindings: pattern.fact.bindings,
       irrefutable: coverage.exhaustive && complete,
-      loanEnd:
-        element._tag === 'PatternBindingStatement'
-          ? context.context.spanOf(blockNode.anchor)
-          : context.context.spanOf(element.anchor),
-      loanEndAt: element._tag === 'PatternBindingStatement' ? blockNode.anchor : element.anchor,
+      loanEnd: context.context.spanOf(loanEndAt),
+      loanEndAt,
       anchor: element.anchor,
     }
   }

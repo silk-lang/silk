@@ -1,6 +1,7 @@
 // RFC5903 §8.1, NIST ECCCDH P-256 COUNT0, and independent algebraic boundaries.
 // Exact provenance and expected hex bytes: implement-p256-key-agreement/fixtures.json.
-export const p256AcceptanceSource = `import silk.p256 { P256, P256Error }
+export const p256AcceptanceSource = `import silk.ownership { Copy }
+import silk.p256 { P256, P256Error }
 import silk.result { Result }
 import silk.random { Random }
 import silk.effect { Effect }
