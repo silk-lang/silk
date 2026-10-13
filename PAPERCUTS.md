@@ -633,3 +633,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-13 · Reusing docgen dist across linked worktrees loaded two compiler SemanticQuery module instances and failed documentation lookup · Give the docgen worktree its own dist and local @silklang/compiler dependency link so analysis and rendering share one compiler module graph · Silk operator alias migration
 
 - 2026-10-13 · The installed gh pr edit queried deprecated GraphQL projectCards and failed to update a PR body · Update the pull request through gh api PATCH with a JSON input file, then verify its body and head · agent workflow
+
+- 2026-10-13 · Main-first provenance could not read historical trees after a credential outage required importing GitHub commit objects and selected verified source archives · Once Git transport recovered, git fetch --refetch origin main selfhost restored complete reachable objects without changing history, allowing the provenance audit to run · Silk operator sync.
