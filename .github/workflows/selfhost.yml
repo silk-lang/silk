@@ -428,6 +428,136 @@ jobs:
   # aarch64-apple-darwin, so macOS needs no seed of its own. macOS links that IR as M1, M1 emits the
   # compiler again and the bytes must be equal, then M1 runs the native corpus. It runs on selfhost
   # pushes and manual dispatches only, which keeps PR latency and macOS runner minutes down.
+  # Anti-lock-in gate (compiler/docs/native-seed-chain.md#bootstrap-ddc): the TypeScript bootstrap
+  # that selfhost last synced from main builds this compiler (T1), and T1 must emit the compiler's
+  # LLVM IR byte for byte as the seed chain's N1 does. Every push runs it and records a receipt; a
+  # pull request runs it only when it bumps the seed pin, and a bump merges only with it green.
+  bootstrap-ddc:
+    name: Bootstrap builds the compiler (T1 DDC)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Decide whether this run checks the bootstrap
+        id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          run=true
+          if [ "$EVENT" = pull_request ] && ! git diff --name-only "$BASE_SHA" "$HEAD_SHA" | grep -qx compiler/native-seed.json; then
+            run=false
+            echo "Not a seed bump; the bootstrap DDC runs on selfhost pushes and seed-bump pull requests."
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+      # The newest main commit this tree contains carries the bootstrap matching its language and
+      # standard library; main HEAD can be ahead of the last sync.
+      - name: Find the main commit selfhost last synced
+        if: steps.scope.outputs.run == 'true'
+        id: sync
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          echo "sha=$(git merge-base HEAD origin/main)" >> "$GITHUB_OUTPUT"
+      - if: steps.scope.outputs.run == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - if: steps.scope.outputs.run == 'true'
+        uses: ./.github/actions/setup-linux-llvm
+      - name: Install GNU time for native process receipts
+        if: steps.scope.outputs.run == 'true'
+        run: sudo apt-get install -y time
+      - if: steps.scope.outputs.run == 'true'
+        id: bootstrap
+        continue-on-error: true
+        uses: ./.github/actions/download-bootstrap
+        with:
+          sha: ${{ steps.sync.outputs.sha }}
+      - name: Require the synced bootstrap
+        if: steps.scope.outputs.run == 'true' && steps.bootstrap.outcome != 'success'
+        env:
+          SYNC_SHA: ${{ steps.sync.outputs.sha }}
+        run: |
+          echo "::error title=No verified bootstrap for the synced main commit::Main CI published no verified silk-bootstrap artifact for $SYNC_SHA (it expires after 90 days, or main was red there). Sync main into selfhost so a verified bootstrap artifact exists."
+          exit 1
+      - name: Read the seed pin
+        if: steps.scope.outputs.run == 'true'
+        id: pin
+        run: node compiler/scripts/NativeSeed.mjs outputs compiler/native-seed.json >> "$GITHUB_OUTPUT"
+      - name: Download and verify the pinned seed before execution
+        if: steps.scope.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.pin.outputs.tag }}
+          ASSET: ${{ steps.pin.outputs.asset }}
+        run: |
+          set -euo pipefail
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir "$RUNNER_TEMP/seed-download"
+          mkdir "$RUNNER_TEMP/seed"
+          node compiler/scripts/NativeSeed.mjs verify compiler/native-seed.json "$RUNNER_TEMP/seed-download/$ASSET" "$RUNNER_TEMP/seed/seed"
+      - name: Build T1 with the synced bootstrap and N1 with the seed, then compare their compiler IR
+        if: steps.scope.outputs.run == 'true'
+        env:
+          BOOTSTRAP: ${{ steps.bootstrap.outputs.path }}
+          BOOTSTRAP_RUN: ${{ steps.bootstrap.outputs.run-id }}
+          SYNC_SHA: ${{ steps.sync.outputs.sha }}
+          SILKC_CLANG: ${{ env.SILK_TEST_CLANG }}
+          NODE_OPTIONS: --max-old-space-size=12288
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/ddc"
+          mkdir -p "$out"
+          stage() {
+            local name="$1"
+            shift
+            /usr/bin/time -f '%e %M' -o "$out/$name-time.txt" "$@" > "$out/$name.log" 2>&1 || {
+              tail -n 60 "$out/$name.log"
+              echo "::error title=Bootstrap DDC stage $name failed::See the bootstrap-ddc artifact."
+              exit 1
+            }
+          }
+          (cd compiler && stage t1 node "$BOOTSTRAP" build --manifest-path silk.toml --release --target x86_64-unknown-linux-gnu)
+          t1="$(find "$PWD/compiler/build/llvm/x86_64-unknown-linux-gnu" -type f -name 'silk-compiler*' -perm -u+x | head -n 1)"
+          [ -n "$t1" ] || { echo "::error title=T1 missing::The bootstrap build produced no compiler executable."; exit 1; }
+          args=(--stdlib "$PWD/packages/compiler/stdlib" --optimization speed --debug false)
+          (cd compiler && stage n1 "$RUNNER_TEMP/seed/seed" build src/main.silk -o "$out/N1" "${args[@]}")
+          (cd compiler && stage t1-ir "$t1" build src/main.silk -o "$out/t1.ll" --emit llvm-ir "${args[@]}")
+          (cd compiler && stage n1-ir "$out/N1" build src/main.silk -o "$out/n1.ll" --emit llvm-ir "${args[@]}")
+          identical=true
+          if ! cmp -s "$out/t1.ll" "$out/n1.ll"; then
+            identical=false
+            diff "$out/n1.ll" "$out/t1.ll" | head -n 200 | cut -c 1-300 > "$out/ir-diff.txt" || true
+          fi
+          jq -n --arg sync "$SYNC_SHA" --arg run "$BOOTSTRAP_RUN" --arg head "$(git rev-parse HEAD)" \
+            --arg t1 "$(cat "$out/t1-time.txt")" --arg n1 "$(cat "$out/n1-time.txt")" \
+            --arg t1ir "$(cat "$out/t1-ir-time.txt")" --arg n1ir "$(cat "$out/n1-ir-time.txt")" \
+            --arg t1sha "$(sha256sum "$out/t1.ll" | cut -d' ' -f1)" --arg n1sha "$(sha256sum "$out/n1.ll" | cut -d' ' -f1)" \
+            --argjson identical "$identical" \
+            '{head: $head, syncedMain: $sync, bootstrapRun: $run, identical: $identical,
+              stages: {t1: $t1, n1: $n1, t1Ir: $t1ir, n1Ir: $n1ir}, irSha256: {t1: $t1sha, n1: $n1sha}}' \
+            | tee "$out/receipt.json"
+          if [ "$identical" != true ]; then
+            cat "$out/ir-diff.txt"
+            echo "::error title=Bootstrap DDC mismatch::T1 and N1 emit different compiler IR; see ir-diff.txt in the bootstrap-ddc artifact."
+            exit 1
+          fi
+      - name: Preserve the DDC receipt and logs
+        if: always() && steps.scope.outputs.run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-bootstrap-ddc
+          path: |
+            ${{ runner.temp }}/ddc/*.json
+            ${{ runner.temp }}/ddc/*.log
+            ${{ runner.temp }}/ddc/*.txt
+          if-no-files-found: ignore
+          retention-days: 90
+
   macos-ir:
     name: macOS arm64 compiler IR from N1
     if: >-
