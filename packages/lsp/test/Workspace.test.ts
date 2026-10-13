@@ -151,7 +151,7 @@ it.effect('analyzes imports against sibling files on disk', () =>
     assert.deepEqual(
       Analysis.modules(snapshot)
         .map((module) => module.name)
-        .filter((name) => !name.startsWith('silk/')),
+        .filter((name) => !Stdlib.isReserved(name)),
       ['Main', 'Util'],
     )
     assert.include(
@@ -252,7 +252,7 @@ it.effect('shares one project frontend across overlapping open roots', () =>
     assert.deepEqual(
       Analysis.modules(mainSession.snapshot)
         .map(({ name }) => name)
-        .filter((name) => !name.startsWith('silk/')),
+        .filter((name) => !Stdlib.isReserved(name)),
       ['Main', 'Shared', 'Util'],
     )
     const closure = Analysis.phases(mainSession.snapshot).at(0)
@@ -293,7 +293,7 @@ it.effect('shares one project frontend across overlapping open roots', () =>
     assert.strictEqual(revisedMain.project.syntaxRevisions.get('Shared')?._tag, 'Reused')
     assert.deepEqual(
       revisedMain.project.semanticInvalidation.observations.filter(
-        ({ module }) => !module.startsWith('silk/'),
+        ({ module }) => !Stdlib.isReserved(module),
       ),
       [
         {
@@ -338,7 +338,7 @@ it.effect('excludes closed modules from semantic roots and defers catalog select
     assert.deepEqual(
       Analysis.modules(session.snapshot)
         .map((module) => module.name)
-        .filter((name) => !name.startsWith('silk/')),
+        .filter((name) => !Stdlib.isReserved(name)),
       ['Main'],
     )
     // A committed semantic snapshot must not perform whole-workspace catalog selection.
