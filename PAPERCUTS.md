@@ -649,3 +649,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 - 2026-10-13 · Codex share_thread repeatedly timed out reading ASB history, so no real session URL was produced · Record the limitation and attach the real PR URL; never invent a session link · Silk diagnostic catalog.
 
 2026-10-13 · Running the x86-64 seed with qemu-x86_64 -L redirected filesystem root opens into the cross-libc prefix, falsely reporting missing silk.toml · Invoke the x86-64 ld-linux loader explicitly with --library-path and omit -L · Silk ARM64 bootstrap
+- 2026-10-13 · The corpus harness C-link fixture hard-codes /usr/bin/clang, absent in the managed worker, and ignores SILKC_CLANG · Run the remaining focused harness tests locally and require the C-link fixture to pass in exact-head CI with its installed Clang; do not change unrelated compiler behavior to bypass the fixture · Silk native diagnostic catalog
