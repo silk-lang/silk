@@ -482,7 +482,13 @@ it.effect('loads the sealed operator source only for a module that names one of 
       yield* load(`fn sum<T: Intrinsic.Add<T, T>>(value: T) -> T { return move value }\n${fn}`),
       ['intrinsic/operators', 'root'],
     )
-    assert.deepEqual(calls, ['root', 'root'])
+    for (const member of ['Intrinsic . Add', 'Intrinsic // qualifier\n . // member\n Add']) {
+      assert.deepEqual(yield* load(`pub type Plus = ${member}\n${fn}`), [
+        'intrinsic/operators',
+        'root',
+      ])
+    }
+    assert.deepEqual(calls, ['root', 'root', 'root', 'root'])
   }),
 )
 
