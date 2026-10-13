@@ -3620,8 +3620,7 @@ const analyzeLoans = (
             let argumentEnd: LoanEndpoint | undefined = endpointAt(expression.anchor, region)
             if (argument.type._tag === 'Available' && Type.isEffect(argument.type.type))
               argumentEnd = delayedEnd
-            else if (returnedOrdinal.has(argumentOrdinal))
-              argumentEnd = delayedEnd ?? argumentEnd
+            else if (returnedOrdinal.has(argumentOrdinal)) argumentEnd = delayedEnd ?? argumentEnd
             inspect(candidate, region, callActive, naturalAccess(candidate), argumentEnd)
           }
         }
