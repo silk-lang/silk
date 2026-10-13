@@ -675,7 +675,7 @@ export const analyzeEnumMember = (
   if (qualifierToken === undefined || memberToken === undefined || identifiers.length !== 2)
     return undefined
   const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
-  const enumLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const enumLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (enumLookup._tag !== 'Resolved' || enumLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const enum_ = enumLookup.declaration
@@ -765,7 +765,7 @@ const analyzeEnumValueCall = (
     return undefined
   const qualifier = SemanticContext.nameText(context, qualifierToken) ?? ''
   const operationName = SemanticContext.nameText(context, operationToken) ?? ''
-  const qualifierLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
   if (qualifierLookup._tag !== 'Resolved' || qualifierLookup.declaration._tag !== 'EnumDeclaration')
     return undefined
   const operation = qualifierLookup.declaration.associatedOperations.find(
@@ -1270,20 +1270,28 @@ export const borrowSubject = (
     parentReference.access === 'Exclusive' &&
     (expected === undefined || (!Type.isReference(expected) && !Type.isSlice(expected))) &&
     !exclusiveBorrowRoot(root)
+  const placeBorrowAccess =
+    subjectFact._tag === 'FieldProjection' ||
+    subjectFact._tag === 'ReferentProjection' ||
+    subjectFact._tag === 'IndexProjection'
+      ? subjectFact.placeBorrowAccess
+      : undefined
   // A view context reborrows the referent, and reborrowing never strengthens access (BORROW-005).
+  // A place reached through a shared view is likewise never borrowed exclusively.
   if (
-    parentReference !== undefined &&
-    parentReference.access === 'Shared' &&
     access === 'Exclusive' &&
-    (projectedReference !== undefined ||
-      (expected !== undefined && (Type.isReference(expected) || Type.isSlice(expected))))
+    (placeBorrowAccess === 'Shared' ||
+      (parentReference !== undefined &&
+        parentReference.access === 'Shared' &&
+        (projectedReference !== undefined ||
+          (expected !== undefined && (Type.isReference(expected) || Type.isSlice(expected))))))
   )
     return unavailableBorrow(
       node,
       access,
       subject,
       diagnostics,
-      Diagnostic.invalidReborrow(parentReference.access, access, Location.at(node.anchor)),
+      Diagnostic.invalidReborrow('Shared', access, Location.at(node.anchor)),
     )
   if (
     parentReference !== undefined &&
@@ -2262,9 +2270,9 @@ export const analyzePattern = (
         ? undefined
         : (SemanticContext.nameText(context, qualifierToken) ?? '')
     const enumLookup =
-      qualifier === undefined
+      qualifierToken === undefined
         ? undefined
-        : Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+        : resolveMemberQualifier(context, resolution, qualifierToken)
     const enum_ =
       enumLookup?._tag === 'Resolved' && enumLookup.declaration._tag === 'EnumDeclaration'
         ? enumLookup.declaration
@@ -2779,6 +2787,38 @@ export const patternCoverage = (pattern: PatternFact): Match.CoverageIdentity | 
     : undefined
 }
 
+const isView = (type: Type.Type): type is Type.String | Type.Reference | Type.Slice =>
+  Type.isString(type) || Type.isReference(type) || Type.isSlice(type)
+
+/**
+ * Joins views that differ only in their outer region into one view of a fresh region that every
+ * arm's region outlives, so each arm's loan stays live while the result is used (MATCH-005). An
+ * arm view that already outlives the others is kept as the result instead.
+ */
+const joinViewRegions = (
+  joined: Match.Join,
+  reachable: ReadonlyArray<Type.Type>,
+  resolution: ResolutionContext,
+  anchor: AuthoredHir.Anchor,
+): Match.Join => {
+  if (joined._tag === 'Joined' && isView(joined.type)) return joined
+  const contributing = reachable.filter((type) => !Type.isNever(type))
+  const views = contributing.filter(isView)
+  const first = views.at(0)
+  if (
+    first === undefined ||
+    views.length !== contributing.length ||
+    resolution.bodyLifetimes === undefined
+  )
+    return joined
+  const region = BodyLifetime.region(resolution.bodyLifetimes, anchor, 'Join')
+  if (region === undefined) return joined
+  const type: Type.Type = { ...first, lifetime: region }
+  if (!views.every((view) => Type.equals({ ...view, lifetime: region }, type))) return joined
+  for (const view of views) BodyLifetime.constrain(resolution.bodyLifetimes, view.lifetime, region)
+  return { _tag: 'Joined', type }
+}
+
 export const analyzeMatch = (
   context: SemanticContext.SemanticContext,
   node: Extract<AuthoredHir.Expression, { readonly _tag: 'MatchExpression' }>,
@@ -3143,6 +3183,7 @@ export const analyzeMatch = (
       reachableTypes,
       BodyLifetime.environment(resolution?.bodyLifetimes, node.anchor, reachableTypes),
     )
+  joined = joinViewRegions(joined, reachableTypes, resolution, node.anchor)
   if (joined._tag === 'Incompatible') {
     let divergentRepresentations:
       | {
@@ -4710,7 +4751,7 @@ export const analyzeProjection = (
     subject.fact._tag === 'IndexProjection'
       ? subject.fact.placeBorrowAccess
       : undefined
-  const placeBorrowAccess = combinedBorrowAccess(inheritedAccess, undefined)
+  const placeBorrowAccess = combinedBorrowAccess(inheritedAccess, reference?.access)
   const baseBorrowRoot = borrowRoot(context, subject.fact)
   const projectedBorrowRoot =
     state._tag === 'Resolved' && baseBorrowRoot !== undefined
@@ -4860,6 +4901,7 @@ import {
   isSectionArity,
   ownedProviderCaptureAccess,
   recoveryInvocationRecipe,
+  resolveMemberQualifier,
   serviceOperation,
   sourceCallable,
 } from './CallResolution.js'
@@ -8576,6 +8618,20 @@ const aliasedInterfaceOperationTarget = (
     SemanticContext.nameText(context, qualifier) ?? '',
   )
   if (lookup._tag !== 'Resolved' || lookup.declaration._tag !== 'AliasDeclaration') return undefined
+  // A generic alias qualifier must write its arguments (`Alias<Args>.member`), which the applied
+  // owner path resolves; written bare it names no application.
+  if (lookup.declaration.typeParameters.length > 0)
+    return {
+      _tag: 'Invalid',
+      diagnostics: [
+        Diagnostic.typeArgumentArity(
+          SemanticContext.nameText(context, qualifier) ?? '',
+          lookup.declaration.typeParameters.length,
+          0,
+          Location.at(qualifier.anchor),
+        ),
+      ],
+    }
   // An alias without arguments is its target's spelling, so the plain qualified path takes it.
   const target = lookup.declaration.target
   if (
@@ -9756,6 +9812,8 @@ const analyzeAnonymousCallable = (
     initial.fact,
     (path) => {
       const resolved = resolvers.type(AuthoredWalk.moduleName(context), path)
+      const aliased = DeclarationResolution.aliasUseParameters(resolved.fact)
+      if (aliased !== undefined) return aliased
       if (
         resolved.fact._tag !== 'Resolved' ||
         !Type.isNominal(resolved.fact.type) ||
@@ -9774,6 +9832,10 @@ const analyzeAnonymousCallable = (
     node._tag === 'CallableExpression'
       ? DeclarationCollection.anonymousDeclaration(node)
       : undefined,
+    (path) =>
+      DeclarationResolution.borrowedAliasUse(
+        resolvers.type(AuthoredWalk.moduleName(context), path).fact,
+      ),
   )
   const collected = {
     ...initial,
@@ -11062,12 +11124,8 @@ function analyzeExpressionDecision(
     if (intrinsicOperationTarget(context, node)?.rule._tag === 'PlaceRule') {
       return analyzePlaceReplace(context, node, declarations, declaration, scope, resolution)
     }
-    const named = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
     // A transparent alias qualifier names its target declaration (TYPE-004).
-    const qualifierLookup =
-      named._tag === 'Resolved'
-        ? { ...named, declaration: NameResolution.erasedOwner(resolution.index, named.declaration) }
-        : named
+    const qualifierLookup = resolveMemberQualifier(context, resolution, qualifierToken)
     if (qualifierLookup._tag === 'Intrinsic') {
       return analyzeBuiltinCall(
         context,

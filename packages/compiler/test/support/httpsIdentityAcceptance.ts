@@ -306,6 +306,7 @@ const groups = Array.from({ length: Math.ceil(fixtures.length / 10) }, (_, group
 
 export const httpsIdentityAcceptanceSource = `
 import silk.https_identity { HttpsIdentity, OriginHost, ReferenceIdentity, PresentedIdentity, CertificateIdentities, IdentityLimits, IdentityMatch, IdentityError, NameError, CertificateIdentityError, CertificateStructureError, UnsupportedForm, LimitKind }
+import silk.ownership { Copy }
 import silk.result { Result }
 import silk.slice { Slice }
 import silk.bytes { Bytes }

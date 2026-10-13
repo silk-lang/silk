@@ -560,7 +560,10 @@ operations and inherent members and nothing else; no lookup continues into the d
 
 **Diagnostics:** An unknown member under a nominal qualifier reports `SEM0010`. An unknown member
 under a namespace binding reports `SEM0014`. A private inherent member used outside its module
-reports `SEM0015`. A selective import that names an inherent member reports `SEM0197`.
+reports `SEM0015`. A selective import that names an inherent member reports `SEM0197`. A type
+reached through a namespace binding where a value is required, including as the qualifier of its
+own members (`order.Ordering.Less`), reports `SEM0222`; select the type and write
+`Ordering.Less`.
 
 **Evidence:** [basename has no semantic role](../../../../openspec/specs/bootstrap-name-resolution/spec.md),
 [inherent member index](../../../../openspec/specs/bootstrap-declaration-index/spec.md),
@@ -832,6 +835,20 @@ import silk.i32
 standard-library struct `Effect`, and `Effect.provide` is an inherent member declared in that
 struct's `impl Effect` block. `silk.i32` declares no owner type: its operations are root
 declarations reached through the namespace binding `i32`.
+
+The ownership properties are ordinary standard-library names too. `Copy` and `Drop` are aliases of
+the sealed `Intrinsic.Copy` and `Intrinsic.Drop` published by `silk.ownership` (INTR-006), and a
+module that spells them imports them:
+
+```silk
+import silk.ownership { Copy }
+
+struct Point { x: i32 y: i32 }
+
+impl Copy for Point {}
+
+pub fn main() -> i32 { return 42 }
+```
 
 **Boundary:** The toolchain may resolve the reserved `silk/` source origin differently from project
 files, but that packaging privilege does not inject its declarations into every module scope.
