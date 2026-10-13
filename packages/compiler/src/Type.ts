@@ -1564,6 +1564,15 @@ export const requirementRowParameters = (
     self._tag === 'EffectType' ? self.requirementRow : self.row,
   ).rows
 
+/** Symbolic service capabilities retained in one requirement row. */
+export const requirementMemberParameters = (
+  self: Effect | RequirementRowArgument,
+): ReadonlyArray<Parameter> =>
+  RowAlgebra.parameters(
+    requirementRowPolicy(),
+    self._tag === 'EffectType' ? self.requirementRow : self.row,
+  ).members
+
 export const effectIdentityArgument = (
   identity: string,
   owner?: ExecutableSpecializationOwner,

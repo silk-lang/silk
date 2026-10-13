@@ -772,6 +772,79 @@ struct Tree<'a> { children: &'a [Tree<'a>] }`),
   }),
 )
 
+it.effect('keeps lifetimes inside nominal requirement-row arguments invariant', () =>
+  Effect.gen(function* () {
+    const source = `import silk.effect { Effect }
+service Gate<'a> {}
+struct Needs<?R> { task: Effect<'static; i32 ? R> }
+struct Wrapped<'a> { value: Needs<&Gate<'a>> }
+fn shorten<'long: 'short, 'short>(value: Wrapped<'long>) -> Wrapped<'short> {
+  return move value
+}`
+    const self = yield* analyze(source)
+    const variance = NominalVariance.derive(self.index)
+    assert.deepEqual(
+      variance.summaries.get(
+        TypeCompatibility.nominalVarianceKey(Type.nominal('slices/Ownership', 'Wrapped')),
+      ),
+      ['Invariant'],
+    )
+    const diagnostics = Analysis.diagnostics(self)
+    assert.deepEqual(
+      diagnostics.map((diagnostic) => ({
+        code: diagnostic.code,
+        span: { start: diagnostic.span.start, end: diagnostic.span.end },
+      })),
+      [
+        {
+          code: 'SEM0129',
+          span: {
+            start: source.indexOf('move value'),
+            end: source.indexOf('move value') + 'move value'.length,
+          },
+        },
+      ],
+    )
+  }),
+)
+
+it.effect('keeps stored and phantom requirement rows exact', () =>
+  Effect.gen(function* () {
+    const source = `import silk.effect { Effect }
+service A {}
+service B {}
+struct Needs<?R> { task: Effect<'static; i32 ? R> }
+struct Phantom<?R> {}
+fn changeStored(value: Needs<&A>) -> i32 {
+  let changed: Needs<&B> = move value
+  return 0
+}
+fn changePhantom(value: Phantom<&A>) -> i32 {
+  let changed: Phantom<&B> = move value
+  return 0
+}`
+    const self = yield* analyze(source)
+    const variance = NominalVariance.derive(self.index)
+    for (const name of ['Needs', 'Phantom'])
+      assert.deepEqual(
+        variance.summaries.get(
+          TypeCompatibility.nominalVarianceKey(Type.nominal('slices/Ownership', name)),
+        ),
+        ['Invariant'],
+      )
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => ({
+        code: diagnostic.code,
+        span: { start: diagnostic.span.start, end: diagnostic.span.end },
+      })),
+      [source.indexOf('move value'), source.lastIndexOf('move value')].map((start) => ({
+        code: 'SEM0037',
+        span: { start, end: start + 'move value'.length },
+      })),
+    )
+  }),
+)
+
 it.effect(
   'projects independent borrowed fields while rejecting unrelated and owned-inline escapes',
   () =>
@@ -1475,6 +1548,176 @@ pub fn main() -> i32 { return 0 }`)
     assert.deepEqual(
       Analysis.diagnostics(self).map((diagnostic) => diagnostic.code),
       ['OWN0012'],
+    )
+  }),
+)
+
+it.effect('allows a Drop-observed replacement before the borrowed source ends', () =>
+  Effect.gen(function* () {
+    const source = `import silk.ownership { Drop }
+struct Observed<'a> { value: &'a i32 }
+struct View<'a> { value: &'a i32 }
+impl<'a> Drop for Observed<'a> {
+  fn drop(self: &mut Observed<'a>) -> () { let read = self.value.* return () }
+}
+fn replacedAlive(flag: bool) -> () {
+  let outer = 1
+  let mut held = Observed { value: &outer }
+  if flag {
+    let inner = 2
+    held = Observed { value: &inner }
+    held = Observed { value: &outer }
+  }
+}
+fn unobserved(flag: bool) -> () {
+  let outer = 1
+  let mut held = View { value: &outer }
+  if flag { let inner = 2 held = View { value: &inner } }
+  held = View { value: &outer }
+}`
+    const self = yield* analyze(source)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
+it.effect('retains Drop-observed loans when replacement is too late or optional', () =>
+  Effect.gen(function* () {
+    const prefix = `import silk.ownership { Drop }
+struct Observed<'a> { value: &'a i32 }
+impl<'a> Drop for Observed<'a> {
+  fn drop(self: &mut Observed<'a>) -> () { let read = self.value.* return () }
+}`
+    const sources = [
+      `${prefix}
+fn displaced(flag: bool) -> () {
+  let outer = 1
+  let mut held = Observed { value: &outer }
+  if flag { let inner = 2 held = Observed { value: &inner } }
+  held = Observed { value: &outer }
+}`,
+      `${prefix}
+fn maybeReplaced(flag: bool, replace: bool) -> () {
+  let outer = 1
+  let mut held = Observed { value: &outer }
+  if flag {
+    let inner = 2
+    held = Observed { value: &inner }
+    if replace { held = Observed { value: &outer } }
+  }
+}`,
+    ]
+    for (const source of sources) {
+      const self = yield* analyze(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => ({
+          code: diagnostic.code,
+          span: { start: diagnostic.span.start, end: diagnostic.span.end },
+        })),
+        [{ code: 'OWN0019', span: { start: source.length - 2, end: source.length - 2 } }],
+      )
+    }
+    const dropped = `${prefix}
+fn explicitlyDropped(flag: bool) -> () {
+  let outer = 1
+  let mut held = Observed { value: &outer }
+  if flag {
+    let inner = 2
+    held = Observed { value: &inner }
+    drop inner
+    held = Observed { value: &outer }
+  }
+}`
+    const self = yield* analyze(dropped)
+    const start = dropped.indexOf('drop inner') + 'drop '.length
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => ({
+        code: diagnostic.code,
+        span: { start: diagnostic.span.start, end: diagnostic.span.end },
+      })),
+      [{ code: 'OWN0011', span: { start, end: start + 'inner'.length } }],
+    )
+  }),
+)
+
+it.effect('does not retire Drop-observed loans through copies or partial writes', () =>
+  Effect.gen(function* () {
+    const prefix = `import silk.ownership { Drop }
+struct Observed<'a> { value: &'a i32 }
+impl<'a> Drop for Observed<'a> {
+  fn drop(self: &mut Observed<'a>) -> () { let read = self.value.* return () }
+}`
+    const sources = [
+      `${prefix}
+fn copied(flag: bool) -> () {
+  let outer = 1
+  let mut held = Observed { value: &outer }
+  if flag {
+    let inner = 2
+    held = Observed { value: &inner }
+    held = Observed { value: held.value }
+  }
+}`,
+      `${prefix}
+struct Pair<'a> { first: Observed<'a> second: Observed<'a> }
+fn partial(flag: bool) -> () {
+  let outer = 1
+  let mut held = Pair {
+    first: Observed { value: &outer }, second: Observed { value: &outer }
+  }
+  if flag {
+    let inner = 2
+    held = Pair {
+      first: Observed { value: &inner }, second: Observed { value: &outer }
+    }
+    held.second = Observed { value: &outer }
+  }
+}`,
+    ]
+    for (const source of sources) {
+      const self = yield* analyze(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => ({
+          code: diagnostic.code,
+          span: { start: diagnostic.span.start, end: diagnostic.span.end },
+        })),
+        [{ code: 'OWN0019', span: { start: source.length - 2, end: source.length - 2 } }],
+      )
+    }
+  }),
+)
+
+it.effect('keeps loop-exit cleanup dependent on a guaranteed replacement', () =>
+  Effect.gen(function* () {
+    const source = `import silk.ownership { Drop }
+struct Observed<'a> { value: &'a i32 }
+impl<'a> Drop for Observed<'a> {
+  fn drop(self: &mut Observed<'a>) -> () { let read = self.value.* return () }
+}
+fn loopExit(flag: bool) -> () {
+  let outer = 1
+  let mut held = Observed { value: &outer }
+  while flag {
+    let inner = 2
+    held = Observed { value: &inner }
+    held = Observed { value: &outer }
+    break
+  }
+}`
+    const self = yield* analyze(source)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    const optional = source
+      .replace('fn loopExit(flag: bool)', 'fn loopMaybe(flag: bool, replace: bool)')
+      .replace(
+        '    held = Observed { value: &outer }\n    break',
+        '    if replace { held = Observed { value: &outer } }\n    break',
+      )
+    const maybe = yield* analyze(optional)
+    assert.deepEqual(
+      Analysis.diagnostics(maybe).map((diagnostic) => ({
+        code: diagnostic.code,
+        span: { start: diagnostic.span.start, end: diagnostic.span.end },
+      })),
+      [{ code: 'OWN0019', span: { start: optional.length - 2, end: optional.length - 2 } }],
     )
   }),
 )

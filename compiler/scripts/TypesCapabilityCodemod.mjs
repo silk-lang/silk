@@ -200,7 +200,7 @@ for (const target of roots) {
   for (let round = 1; ; round += 1) {
     const found = diagnostics(target)
     const actionable = found.filter((error) =>
-      error.code === 'UnhandledRequirement' || error.code === 'UnknownName' || error.code === 'MissingProvidedKey')
+      error.code === 'SEM0071' || error.code === 'SEM0006' || error.code === 'SEM0123')
     const other = found.filter((error) => !actionable.includes(error))
     console.log(`${target.root} round ${round}: ${actionable.length} sites, ${other.length} other errors`)
     if (actionable.length === 0) {
@@ -226,7 +226,7 @@ for (const target of roots) {
       const edits = new Map()
       const imports = new Set()
       for (const error of errors) {
-        if (error.code === 'UnknownName') {
+        if (error.code === 'SEM0006') {
           const name = before.slice(error.span.start, error.span.end)
           if (name.startsWith('TypeTable')) imports.add('TypeTable')
           else if (name.startsWith('Types')) imports.add('Types')
