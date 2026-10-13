@@ -644,3 +644,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 - 2026-10-13 · Main-first provenance could not read historical trees after a credential outage required importing GitHub commit objects and selected verified source archives · Once Git transport recovered, git fetch --refetch origin main selfhost restored complete reachable objects without changing history, allowing the provenance audit to run · Silk operator sync.
 2026-10-13 · Scratch corpus runner bundled with packages external could not resolve effect outside the repo, and a shell command sequence masked its failure with the later guard exit · Bundle dependencies and use checked subprocess calls so corpus must succeed before gap guards run · Silk selfhost OWN0018
+
+2026-10-13 · Running the x86-64 seed with qemu-x86_64 -L redirected filesystem root opens into the cross-libc prefix, falsely reporting missing silk.toml · Invoke the x86-64 ld-linux loader explicitly with --library-path and omit -L · Silk ARM64 bootstrap
