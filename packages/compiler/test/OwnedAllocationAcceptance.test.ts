@@ -6,12 +6,9 @@ import * as Analysis from '../src/Analysis.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as Tir from '../src/Tir.js'
-import * as Lifetime from '../src/Lifetime.js'
 import * as CleanupPlan from '../src/CleanupPlan.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as Mir from '../src/Mir.js'
-import * as Ownership from '../src/Ownership.js'
-import * as Type from '../src/Type.js'
 import { ordinaryStorageSource } from './support/ordinaryStorageSource.js'
 import { independentExecutionFinalizedDestroy } from './support/corpus.js'
 
@@ -140,36 +137,219 @@ unsafe fn access(core: &Intrinsic.SharedCore<Pair>) -> i32 {
   }),
 )
 
-it('classifies inexpressible local-shared escape containers at the ownership-fact tier', () => {
-  const narrowed = Type.slice('Shared', 'i32', Lifetime.staticLifetime)
-  const genericAggregate = Type.nominal('test', 'Box', [narrowed])
-  const failureValue = Type.effect('i32', [Type.nominal('test', 'Problem', [narrowed])], {
-    environment: Lifetime.staticLifetime,
-    lifetimeBinders: [],
-  })
-  const storedCallable = Type.callable(
-    [],
-    narrowed,
-    { environment: Lifetime.staticLifetime, lifetimeBinders: [] },
-    'Take',
-  )
-  for (const resultType of [narrowed, genericAggregate, failureValue, storedCallable]) {
-    assert.isTrue(
-      Ownership.localSharedResultEscapes({
-        resultType,
-        capturesRestrictedParameter: false,
-        referencesRestrictedParameter: true,
-      }),
+it.effect('rejects every retained access reference in typing at the callback operand', () =>
+  Effect.gen(function* () {
+    // SHARED-003's escape routes, each retaining the exclusive input: a view, a callable, an
+    // Effect, a failure value, an aggregate, a union, Box of each, and a failing effect fn. The
+    // callback fails the access's quantified contract (CALLABLE-001, LIFE-004) before any escape.
+    const source = `struct Pair { first: i32 second: i32 }
+struct Box<A> { value: A }
+struct Holder<'a> { view: &'a mut Pair }
+union Choice<'a> { Empty, Held { view: &'a mut Pair } }
+struct Problem<'a> { view: &'a i32 }
+struct Taken<'a> { view: &'a mut Pair }
+fn wrap<A>(value: A) -> Box<A> { return Box<A> { value: move value } }
+fn viewMut<'a>(value: &'a mut Pair) -> &'a mut Pair { return move value }
+fn viewMutConflict<'b>() -> &'b mut Pair { return viewMutConflict() }
+unsafe fn viewMutAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, &'scope mut Pair>(core, viewMut, viewMutConflict)
+  drop made
+  return ()
+}
+fn boxedViewMut<'a>(value: &'a mut Pair) -> Box<&'a mut Pair> {
+  let escaped = move value
+  return wrap<&'a mut Pair>(move escaped)
+}
+fn boxedViewMutConflict<'b>() -> Box<&'b mut Pair> { return boxedViewMutConflict() }
+unsafe fn boxedViewMutAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<&'scope mut Pair>>(core, boxedViewMut, boxedViewMutConflict)
+  drop made
+  return ()
+}
+fn viewShared<'a>(value: &'a mut Pair) -> &'a Pair { return &value.* }
+fn viewSharedConflict<'b>() -> &'b Pair { return viewSharedConflict() }
+unsafe fn viewSharedAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, &'scope Pair>(core, viewShared, viewSharedConflict)
+  drop made
+  return ()
+}
+fn boxedViewShared<'a>(value: &'a mut Pair) -> Box<&'a Pair> {
+  let escaped = &value.*
+  return wrap<&'a Pair>(move escaped)
+}
+fn boxedViewSharedConflict<'b>() -> Box<&'b Pair> { return boxedViewSharedConflict() }
+unsafe fn boxedViewSharedAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<&'scope Pair>>(core, boxedViewShared, boxedViewSharedConflict)
+  drop made
+  return ()
+}
+fn viewField<'a>(value: &'a mut Pair) -> &'a i32 { return &value.first }
+fn viewFieldConflict<'b>() -> &'b i32 { return viewFieldConflict() }
+unsafe fn viewFieldAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, &'scope i32>(core, viewField, viewFieldConflict)
+  drop made
+  return ()
+}
+fn boxedViewField<'a>(value: &'a mut Pair) -> Box<&'a i32> {
+  let escaped = &value.first
+  return wrap<&'a i32>(move escaped)
+}
+fn boxedViewFieldConflict<'b>() -> Box<&'b i32> { return boxedViewFieldConflict() }
+unsafe fn boxedViewFieldAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<&'scope i32>>(core, boxedViewField, boxedViewFieldConflict)
+  drop made
+  return ()
+}
+fn callable<'a>(value: &'a mut Pair) -> once fn<'a>() -> i32 { return fn() -> i32 { return value.first } }
+fn callableConflict<'b>() -> once fn<'b>() -> i32 { return callableConflict() }
+unsafe fn callableAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, once fn<'scope>() -> i32>(core, callable, callableConflict)
+  drop made
+  return ()
+}
+fn boxedCallable<'a>(value: &'a mut Pair) -> Box<once fn<'a>() -> i32> {
+  let escaped = fn() -> i32 { return value.first }
+  return wrap<once fn<'a>() -> i32>(move escaped)
+}
+fn boxedCallableConflict<'b>() -> Box<once fn<'b>() -> i32> { return boxedCallableConflict() }
+unsafe fn boxedCallableAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<once fn<'scope>() -> i32>>(core, boxedCallable, boxedCallableConflict)
+  drop made
+  return ()
+}
+fn deferred<'a>(value: &'a mut Pair) -> Effect<'a; i32> { return effect { return value.first } }
+fn deferredConflict<'b>() -> Effect<'b; i32> { return deferredConflict() }
+unsafe fn deferredAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Effect<'scope; i32>>(core, deferred, deferredConflict)
+  drop made
+  return ()
+}
+fn boxedDeferred<'a>(value: &'a mut Pair) -> Box<Effect<'a; i32>> {
+  let escaped = effect { return value.first }
+  return wrap<Effect<'a; i32>>(move escaped)
+}
+fn boxedDeferredConflict<'b>() -> Box<Effect<'b; i32>> { return boxedDeferredConflict() }
+unsafe fn boxedDeferredAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<Effect<'scope; i32>>>(core, boxedDeferred, boxedDeferredConflict)
+  drop made
+  return ()
+}
+fn failure<'a>(value: &'a mut Pair) -> Effect<'a; i32 ! Problem<'a>> { return effect { fail Problem<'a> { view: &value.first } } }
+fn failureConflict<'b>() -> Effect<'b; i32 ! Problem<'b>> { return failureConflict() }
+unsafe fn failureAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Effect<'scope; i32 ! Problem<'scope>>>(core, failure, failureConflict)
+  drop made
+  return ()
+}
+fn boxedFailure<'a>(value: &'a mut Pair) -> Box<Effect<'a; i32 ! Problem<'a>>> {
+  let escaped = effect { fail Problem<'a> { view: &value.first } }
+  return wrap<Effect<'a; i32 ! Problem<'a>>>(move escaped)
+}
+fn boxedFailureConflict<'b>() -> Box<Effect<'b; i32 ! Problem<'b>>> { return boxedFailureConflict() }
+unsafe fn boxedFailureAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<Effect<'scope; i32 ! Problem<'scope>>>>(core, boxedFailure, boxedFailureConflict)
+  drop made
+  return ()
+}
+fn holder<'a>(value: &'a mut Pair) -> Holder<'a> { return Holder<'a> { view: move value } }
+fn holderConflict<'b>() -> Holder<'b> { return holderConflict() }
+unsafe fn holderAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Holder<'scope>>(core, holder, holderConflict)
+  drop made
+  return ()
+}
+fn boxedHolder<'a>(value: &'a mut Pair) -> Box<Holder<'a>> {
+  let escaped = Holder<'a> { view: move value }
+  return wrap<Holder<'a>>(move escaped)
+}
+fn boxedHolderConflict<'b>() -> Box<Holder<'b>> { return boxedHolderConflict() }
+unsafe fn boxedHolderAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<Holder<'scope>>>(core, boxedHolder, boxedHolderConflict)
+  drop made
+  return ()
+}
+fn choice<'a>(value: &'a mut Pair) -> Choice<'a> { return Choice<'a>.Held { view: move value } }
+fn choiceConflict<'b>() -> Choice<'b> { return choiceConflict() }
+unsafe fn choiceAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Choice<'scope>>(core, choice, choiceConflict)
+  drop made
+  return ()
+}
+fn boxedChoice<'a>(value: &'a mut Pair) -> Box<Choice<'a>> {
+  let escaped = Choice<'a>.Held { view: move value }
+  return wrap<Choice<'a>>(move escaped)
+}
+fn boxedChoiceConflict<'b>() -> Box<Choice<'b>> { return boxedChoiceConflict() }
+unsafe fn boxedChoiceAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Box<Choice<'scope>>>(core, boxedChoice, boxedChoiceConflict)
+  drop made
+  return ()
+}
+effect fn failing<'a>(value: &'a mut Pair) -> i32 ! Taken<'a> {
+  fail Taken<'a> { view: move value }
+}
+fn failingConflict<'b>() -> Effect<'b; i32 ! Taken<'b>> { return failingConflict() }
+unsafe fn failingAccess<'scope>(core: &'scope Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Effect<'scope; i32 ! Taken<'scope>>>(core, failing, failingConflict)
+  drop made
+  return ()
+}
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* Analysis.ofSource('local-shared-lifecycle/result-routes', ascii(source))
+    const callbacks = [
+      'viewMut',
+      'boxedViewMut',
+      'viewShared',
+      'boxedViewShared',
+      'viewField',
+      'boxedViewField',
+      'callable',
+      'boxedCallable',
+      'deferred',
+      'boxedDeferred',
+      'failure',
+      'boxedFailure',
+      'holder',
+      'boxedHolder',
+      'choice',
+      'boxedChoice',
+      'failing',
+    ]
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => [
+        diagnostic.code,
+        source.slice(diagnostic.span.start, diagnostic.span.end),
+      ]),
+      callbacks.map((name) => ['SEM0076', name]),
     )
-  }
-  assert.isFalse(
-    Ownership.localSharedResultEscapes({
-      resultType: 'i32',
-      capturesRestrictedParameter: false,
-      referencesRestrictedParameter: true,
-    }),
-  )
-})
+    for (const diagnostic of Analysis.diagnostics(snapshot))
+      assert.strictEqual(
+        diagnostic.span.start,
+        source.indexOf(`core, ${source.slice(diagnostic.span.start, diagnostic.span.end)}, `) + 6,
+      )
+  }),
+)
+
+it.effect('accepts a callback result that copies out of the access', () =>
+  Effect.gen(function* () {
+    const snapshot = yield* Analysis.ofSource(
+      'local-shared-lifecycle/copied-result',
+      ascii(`struct Pair { first: i32 second: i32 }
+fn deferred(value: &mut Pair) -> Effect<'static; i32> {
+  let copied = value.first
+  return effect { return copied }
+}
+fn fallback() -> Effect<'static; i32> { return effect { return 0 } }
+unsafe fn construct(core: &Intrinsic.SharedCore<Pair>) -> () {
+  let made = Intrinsic.sharedWithMut<Pair, Effect<'static; i32>>(core, deferred, fallback)
+  drop made
+  return ()
+}
+pub fn main() -> i32 { return 0 }`),
+    )
+    assert.deepEqual(Analysis.diagnostics(snapshot), [])
+  }),
+)
 
 it.effect('rejects a direct callback-dependent reference at a local-shared boundary', () =>
   Effect.gen(function* () {

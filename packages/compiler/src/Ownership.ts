@@ -3978,7 +3978,6 @@ const checkFunction = (
   causes: Elaboration.BodyResults['causes'],
   lifetimes?: LifetimeFlow.LifetimeFlow,
   localSharedBoundaries: ReadonlyArray<SourceSpan.SourceSpan> = [],
-  localSharedResultBoundaries: ReadonlyArray<SourceSpan.SourceSpan> = [],
 ): CheckedFunction => {
   const declaration = fn.declaration
   const copyAssumptions = new Set(
@@ -4046,95 +4045,6 @@ const checkFunction = (
             boundary,
           ),
         )
-  }
-
-  if (localSharedResultBoundaries.length > 0) {
-    const parameter = fn.declaration.parameters.at(0)?.id
-    if (parameter !== undefined) {
-      const bindings = new Map<number, Tir.Expression>()
-      const collectBindings = (statements: ReadonlyArray<Tir.Statement>): void => {
-        for (const statement of statements) {
-          if (statement._tag === 'Bind')
-            bindings.set(statement.binding.ordinal, statement.initializer)
-          if (statement._tag === 'Unsafe') collectBindings(statement.statements)
-          if (statement._tag === 'If' || statement._tag === 'IfLet') {
-            collectBindings(statement.taken)
-            collectBindings(statement.otherwise)
-          }
-          if (statement._tag === 'While') collectBindings(statement.body)
-        }
-      }
-      collectBindings(fn.statements)
-      const referencesParameter = (
-        expression: Tir.Expression,
-        seen = new Set<number>(),
-      ): boolean => {
-        if (
-          expression._tag === 'ParameterReference' &&
-          expression.parameter.ordinal === parameter.ordinal
-        )
-          return true
-        if (expression._tag === 'BindingReference') {
-          if (seen.has(expression.binding.ordinal)) return false
-          const initializer = bindings.get(expression.binding.ordinal)
-          return initializer === undefined
-            ? false
-            : referencesParameter(initializer, new Set(seen).add(expression.binding.ordinal))
-        }
-        return Tir.expressionChildren(expression).some((child) => referencesParameter(child, seen))
-      }
-      const exits = (statements: ReadonlyArray<Tir.Statement>): ReadonlyArray<Tir.Expression> =>
-        statements.flatMap((statement): ReadonlyArray<Tir.Expression> => {
-          switch (statement._tag) {
-            case 'Return':
-            case 'Fail':
-              return [statement.expression]
-            case 'Unsafe':
-              return exits(statement.statements)
-            case 'If':
-            case 'IfLet':
-              return [...exits(statement.taken), ...exits(statement.otherwise)]
-            case 'While':
-              return exits(statement.body)
-            default:
-              return []
-          }
-        })
-      const capturesParameter = (expression: Tir.Expression, seen = new Set<number>()): boolean => {
-        if (expression._tag === 'BindingReference') {
-          if (seen.has(expression.binding.ordinal)) return false
-          const initializer = bindings.get(expression.binding.ordinal)
-          return initializer === undefined
-            ? false
-            : capturesParameter(initializer, new Set(seen).add(expression.binding.ordinal))
-        }
-        if (
-          (expression._tag === 'EffectBlock' || expression._tag === 'CallableSection') &&
-          referencesParameter(expression)
-        )
-          return true
-        return Tir.expressionChildren(expression).some((child) => capturesParameter(child, seen))
-      }
-      const escapeSites = exits(fn.statements).filter((returned) => {
-        const capturesRestrictedParameter = capturesParameter(returned)
-        if (
-          'type' in returned &&
-          localSharedResultEscapes({
-            resultType: returned.type,
-            capturesRestrictedParameter,
-            referencesRestrictedParameter: referencesParameter(returned),
-          })
-        )
-          return true
-        return false
-      })
-      for (const boundary of localSharedResultBoundaries) {
-        for (const escapeSite of escapeSites)
-          state.diagnostics.push(
-            Diagnostic.localSharedAccessEscape('Result', escapeSite.span, boundary),
-          )
-      }
-    }
   }
 
   const initialLive: FlowState = new Map()
@@ -5414,7 +5324,6 @@ export interface CheckInput {
   /** Spans and evaluation order of this function's authored module. */
   readonly context: SemanticContext.SemanticContext
   readonly boundaries: ReadonlyArray<SourceSpan.SourceSpan>
-  readonly resultBoundaries: ReadonlyArray<SourceSpan.SourceSpan>
 }
 
 /** Resolves ownership inputs without running the checker or reconstructing prior diagnostics. */
@@ -5436,12 +5345,6 @@ export const input = (
   boundaries:
     fn.declaration.canonical._tag === 'Canonical'
       ? (accessBoundaryPlan.boundaries.get(localSharedTargetKey(fn.declaration.canonical.id)) ?? [])
-      : [],
-  resultBoundaries:
-    fn.declaration.canonical._tag === 'Canonical'
-      ? (accessBoundaryPlan.resultBoundaries.get(
-          localSharedTargetKey(fn.declaration.canonical.id),
-        ) ?? [])
       : [],
 })
 
@@ -5468,8 +5371,7 @@ export const matchesInput = (self: CheckInput, other: CheckInput): boolean =>
   self.lifetimes === other.lifetimes &&
   self.index === other.index &&
   self.context === other.context &&
-  sameBoundarySpans(self.boundaries, other.boundaries) &&
-  sameBoundarySpans(self.resultBoundaries, other.resultBoundaries)
+  sameBoundarySpans(self.boundaries, other.boundaries)
 
 /** Executes ownership checking with exactly the supplied semantic authorities. */
 export const check = (self: CheckInput): CheckedFunction =>
@@ -5481,7 +5383,6 @@ export const check = (self: CheckInput): CheckedFunction =>
     self.causes,
     self.lifetimes,
     self.boundaries,
-    self.resultBoundaries,
   )
 
 interface SourceProof {
@@ -5513,19 +5414,6 @@ const publishSourceProof = (self: CheckInput, checked: CheckedFunction): void =>
   functions.set(self.function, proofs)
 }
 
-/** Classifies the result-side ownership facts of one access-scoped callback invocation. */
-export const localSharedResultEscapes = (facts: {
-  readonly resultType: Type.Type
-  readonly capturesRestrictedParameter: boolean
-  readonly referencesRestrictedParameter: boolean
-}): boolean =>
-  Type.containsBorrowWrapper(facts.resultType) ||
-  facts.capturesRestrictedParameter ||
-  ((Type.isEffect(facts.resultType) ||
-    Type.isCallable(facts.resultType) ||
-    Type.containsExecutableRepresentation(facts.resultType)) &&
-    facts.referencesRestrictedParameter)
-
 /**
  * Exact ordinary callback bodies reached from the sealed local-shared access operation.
  *
@@ -5535,7 +5423,6 @@ export const localSharedResultEscapes = (facts: {
 export interface LocalSharedAccessBoundaryPlan {
   readonly _tag: 'LocalSharedAccessBoundaryPlan'
   readonly boundaries: ReadonlyMap<string, ReadonlyArray<SourceSpan.SourceSpan>>
-  readonly resultBoundaries: ReadonlyMap<string, ReadonlyArray<SourceSpan.SourceSpan>>
 }
 
 const localSharedTargetKey = (target: DeclarationFacts.CanonicalId): string =>
@@ -5618,7 +5505,6 @@ export const localSharedAccessBoundaryPlan = (
     return {
       _tag: 'LocalSharedAccessBoundaryPlan',
       boundaries: new Map(),
-      resultBoundaries: new Map(),
     }
   let changed = true
   while (changed) {
@@ -5694,11 +5580,6 @@ export const localSharedAccessBoundaryPlan = (
       }
     }
   }
-  // Only a callback's result crosses the access boundary. A helper may return an intermediate
-  // borrow to that callback, provided the callback consumes it before returning its own result.
-  const resultBoundaries = new Map(
-    [...boundaries].map(([key, spans]) => [key, [...spans]] as const),
-  )
   // Every synchronous helper called by a restricted callback still runs while the original access
   // loan is live, even when it does not receive the borrowed parameter. Propagate the sealed
   // boundary through the complete ordinary call graph so transitive park or wake is judged exactly
@@ -5731,7 +5612,6 @@ export const localSharedAccessBoundaryPlan = (
   }
   return {
     _tag: 'LocalSharedAccessBoundaryPlan',
-    resultBoundaries,
     boundaries: new Map([...boundaries].map(([key, spans]) => [key, spans] as const)),
   }
 }
