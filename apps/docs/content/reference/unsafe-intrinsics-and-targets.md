@@ -805,10 +805,10 @@ that does not match the sealed signature, and a second conformance for the same 
 `SEM0083`. An unknown member such as `Intrinsic.Plus` reports the unknown-intrinsic diagnostic of
 INTR-001, or `SEM0083` where it is written as a bound.
 
-**Current compiler:** Partially aligned. The bootstrap reads the sealed file and resolves its
-members. The self-hosted compiler does not load it yet. Operator syntax still binds to the
-`silk.ops`, `silk.equal` and `silk.order` interfaces (OP-009) until those modules name the sealed
-members.
+**Current compiler:** Aligned. Both compilers read the shared sealed file on demand and resolve
+its members, including through the transparent aliases in `silk.ops`, `silk.equal` and
+`silk.order`. Operator syntax binds to the sealed identities (OP-009). The native compiler
+retains its old declared-interface binding until the separate native cleanup lands.
 
 **Evidence:** [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts),
 [module closure tests](../../../../packages/compiler/test/ModuleClosure.test.ts).
@@ -831,7 +831,7 @@ while `Order.compare` is total.
 because IMPL-004 places it in the interface's module. A misplaced conformance does not participate
 in coherence, so overlap with a sealed conformance does not produce a second diagnostic.
 
-**Current compiler:** Partially aligned, as INTR-007.
+**Current compiler:** Aligned, as INTR-007.
 
 **Evidence:** [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts).
 
