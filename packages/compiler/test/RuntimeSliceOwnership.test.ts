@@ -263,7 +263,8 @@ it.effect('transfers affine borrowed items out of an ordinary owning stream', ()
 
 it.effect('copies fixed stream items while retaining their nested external borrow', () =>
   Effect.gen(function* () {
-    const source = `interface Stream<Item> { effect fn take<'call>(self: &'call mut Self) -> Item }
+    const source = `import silk.ownership {Copy}
+interface Stream<Item> { effect fn take<'call>(self: &'call mut Self) -> Item }
 struct View<'data> { value: &'data i32 }
 impl<'data> Copy for View<'data> {}
 struct Repeated<'data> { item: View<'data> }
@@ -412,6 +413,7 @@ it.effect('propagates nested borrowed failures through ordinary recovery', () =>
 it.effect('retains dependent remainder cleanup after a non-suspending incoming failure', () =>
   Effect.gen(function* () {
     const source = `import silk.effect { Effect }
+import silk.ownership { Drop }
 struct Problem {}
 struct Guard<'a> { value: &'a mut i32 code: i32 }
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { self.value.* = self.value.* + 1 return () } }
@@ -494,7 +496,8 @@ it.effect(
   'keeps exclusive replacement and whole Drop-field extraction within their declared boundaries',
   () =>
     Effect.gen(function* () {
-      const source = `struct Guard<'a> { value: &'a mut i32 }
+      const source = `import silk.ownership {Drop}
+struct Guard<'a> { value: &'a mut i32 }
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }
 struct Outer<'a> { guard: Guard<'a> code: i32 }
 fn extract<'a>(outer: Outer<'a>) -> Guard<'a> { return move outer.guard }
@@ -569,7 +572,8 @@ fn restored() -> i32 {
 
 it.effect('keeps dependent destructor uses live even without explicit payload reads', () =>
   Effect.gen(function* () {
-    const source = `struct Guard<'a> { value: &'a i32 }
+    const source = `import silk.ownership {Drop}
+struct Guard<'a> { value: &'a i32 }
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }
 fn valid() -> i32 { let mut source = 1 let guard = Guard { value: &source } drop guard source = 2 return source }
 fn invalid() -> i32 { let mut source = 1 let guard = Guard { value: &source } source = 2 return 0 }`
@@ -589,7 +593,8 @@ fn invalid() -> i32 { let mut source = 1 let guard = Guard { value: &source } so
 
 it.effect('rejects destructor-only exclusive aliases until dependent cleanup completes', () =>
   Effect.gen(function* () {
-    const source = `struct Guard<'a> { value: &'a mut i32 }
+    const source = `import silk.ownership {Drop}
+struct Guard<'a> { value: &'a mut i32 }
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }
 fn invalid() -> i32 { let mut source = 1 let guard = Guard { value: &mut source } let child = &source return child.* }`
     const self = yield* analyze(source)
@@ -839,7 +844,8 @@ fn text<'a>(value: &'a [u8]) -> string<'a> { unsafe { return Intrinsic.stringFro
 
 it.effect('requires opt-in Copy for borrowed aggregates and preserves copied dependencies', () =>
   Effect.gen(function* () {
-    const source = `struct View<'a> { value: &'a i32 }
+    const source = `import silk.ownership {Copy}
+struct View<'a> { value: &'a i32 }
 impl<'a> Copy for View<'a> {}
 struct Affine<'a> { value: &'a i32 }
 fn duplicate<'a>(value: &'a i32) -> i32 { let holder = View { value: value } let copy = holder return holder.value.* + copy.value.* }
@@ -982,7 +988,8 @@ pub fn main() -> i32 {
 
 it.effect('retains a hidden array owner through a stored borrowed holder', () =>
   Effect.gen(function* () {
-    const self = yield* snapshot(`struct Guard { value: i32 }
+    const self = yield* snapshot(`import silk.ownership {Drop}
+struct Guard { value: i32 }
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
 struct Holder { values: &[Guard] }
 fn make(values: &[Guard]) -> Holder { return Holder { values: values } }
@@ -1059,7 +1066,8 @@ fn escapeRetainedEffect() -> once Effect<'static; i32> { let holder = make(&[1, 
 
 it.effect('cleans a hidden temporary owner after its loan ends', () =>
   Effect.gen(function* () {
-    const self = yield* snapshot(`struct Guard { value: i32 }
+    const self = yield* snapshot(`import silk.ownership {Drop}
+struct Guard { value: i32 }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () { return () }
 }
@@ -1473,7 +1481,8 @@ pub fn main() -> i32 { return 0 }`)
 
 it.effect('plans exactly one displaced cleanup for exclusive borrowed replacement', () =>
   Effect.gen(function* () {
-    const self = yield* snapshot(`struct Token { value: i32 }
+    const self = yield* snapshot(`import silk.ownership {Drop}
+struct Token { value: i32 }
 struct Empty {}
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 fn replace(values: &mut [Token], index: usize) -> i32 {

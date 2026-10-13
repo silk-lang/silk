@@ -1880,9 +1880,26 @@ export function parsePrimaryExpression(
     }
   }
   if (kind === 'Move') {
-    const keyword = expect(initial, 'MoveKeyword', ['Identifier', ...expressionFollowing])
-    const projected = parseChildExpression(keyword.state, depth, true, (childDepth) =>
-      parseProjectionChain(parseIdentifierExpression(keyword.state), childDepth),
+    // The operand is a primary expression with its postfix operations (OWN-003); a `run`
+    // operand extends greedily, so `move run f()` moves the whole `run f()`.
+    const keyword = expect(initial, 'MoveKeyword', expressionStarts)
+    const operandStarts = expressionStarts.includes(
+      nextSignificantKind(keyword.state) ?? 'EndOfFile',
+    )
+    const projected = parseChildExpression(keyword.state, depth, allowStructLiteral, (childDepth) =>
+      parseProjectionChain(
+        // A missing operand recovers as the missing name of the simplest movable place.
+        operandStarts
+          ? parsePrimaryExpression(
+              keyword.state,
+              reservedForEnclosingCalls,
+              recoveryKind,
+              allowStructLiteral,
+              childDepth,
+            )
+          : parseIdentifierExpression(keyword.state),
+        childDepth,
+      ),
     )
     return {
       state: projected.state,
