@@ -446,6 +446,10 @@ export const regionSelectiveConformanceCode = 'SEM0220' as const
 export const ownerArgumentPlacementCode = 'SEM0221' as const
 /** Stable code for a namespace-qualified type named where a value is required (NAME-005). */
 export const namespaceQualifiedTypeCode = 'SEM0222' as const
+/** A non-alias resolution dependency cycle prevents resolving a declaration or value. */
+export const nonAliasResolutionCycleCode = 'SEM0223' as const
+/** A unit nominal-union variant is written with a braced payload pattern (PATT-021). */
+export const unitVariantPayloadPatternCode = 'SEM0224' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -472,8 +476,6 @@ export const storedCallableInvocationAccessCode = 'OWN0014' as const
 export const storedEffectRunAccessCode = 'OWN0015' as const
 /** Stable code for an access-scoped local-shared borrow escaping or crossing suspension. */
 export const localSharedAccessEscapeCode = 'OWN0016' as const
-/** Stable code for an owner consumed in only some arms of a branch merge. */
-export const incompatibleArmMergeCode = 'OWN0017' as const
 /** Stable code for returning a callable or Effect that borrows storage owned by the returning function. */
 export const executableBorrowEscapeCode = 'OWN0018' as const
 
@@ -492,6 +494,8 @@ export type Code =
   | typeof regionSelectiveConformanceCode
   | typeof ownerArgumentPlacementCode
   | typeof namespaceQualifiedTypeCode
+  | typeof nonAliasResolutionCycleCode
+  | typeof unitVariantPayloadPatternCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -723,7 +727,6 @@ export type Code =
   | typeof storedCallableInvocationAccessCode
   | typeof storedEffectRunAccessCode
   | typeof localSharedAccessEscapeCode
-  | typeof incompatibleArmMergeCode
   | typeof executableBorrowEscapeCode
   | typeof wordLiteralOutOfRangeCode
 
@@ -753,6 +756,8 @@ export type ParserContext = 'syntax' | 'statement' | 'expression' | 'parameter' 
 
 /** Structured per-code data explaining why the originating phase diagnosed. */
 export type Reason<L = SourceSpan.SourceSpan> =
+  | { readonly _tag: 'NonAliasResolutionCycle' }
+  | { readonly _tag: 'UnitVariantPayloadPattern'; readonly variant: string }
   | {
       readonly _tag: 'InvalidPointerQualifier'
       readonly qualifier: string
@@ -1398,7 +1403,6 @@ export type Reason<L = SourceSpan.SourceSpan> =
   | { readonly _tag: 'ExplicitMoveRequired'; readonly spelling: string }
   | { readonly _tag: 'OverlappingAssignment'; readonly spelling: string }
   | { readonly _tag: 'IncompatibleLoopHeader'; readonly loop: number }
-  | { readonly _tag: 'IncompatibleArmMerge'; readonly spelling: string }
   | { readonly _tag: 'MatchBorrowEscape'; readonly spelling: string }
   | {
       readonly _tag: 'ExecutableBorrowEscape'
@@ -2819,6 +2823,28 @@ export const namespaceQualifiedType = <L>(
   severity: 'error',
   message: `${member} in ${module} is a type, not a value; select it with an import and write ${member}.<member> for its members`,
   reason: { _tag: 'NamespaceQualifiedType' as const, module, member },
+  span,
+})
+
+/** Reports a semantic dependency cycle outside alias expansion; alias cycles retain SEM0183. */
+export const nonAliasResolutionCycle = <L>(span: L): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: nonAliasResolutionCycleCode,
+  severity: 'error',
+  message: 'Cannot resolve a non-alias dependency cycle',
+  reason: { _tag: 'NonAliasResolutionCycle' as const },
+  span,
+})
+
+/** Reports braces on a unit variant, separately from missing fields of a payload variant. */
+export const unitVariantPayloadPattern = <L>(variant: string, span: L): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: unitVariantPayloadPatternCode,
+  severity: 'error',
+  message: `Unit variant ${variant} does not accept a payload pattern`,
+  reason: { _tag: 'UnitVariantPayloadPattern' as const, variant },
   span,
 })
 
@@ -5315,16 +5341,6 @@ export const incompatibleLoopHeader = <L>(loop: number, span: L): Diagnostic<L> 
   severity: 'error',
   message: `Loop ${loop} repeats with incompatible owner liveness`,
   reason: { _tag: 'IncompatibleLoopHeader' as const, loop },
-  span,
-})
-
-export const incompatibleArmMerge = <L>(spelling: string, span: L): Diagnostic<L> => ({
-  _tag: 'Diagnostic',
-  phase: 'ownership',
-  code: incompatibleArmMergeCode,
-  severity: 'error',
-  message: `Branches merge with incompatible owner liveness for ${spelling}`,
-  reason: { _tag: 'IncompatibleArmMerge' as const, spelling },
   span,
 })
 

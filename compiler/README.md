@@ -42,6 +42,17 @@ descriptor as a slice. Slice subranges and unions with string or f64 members rem
 Runtime string `==` and `!=` compare byte lengths and then exact UTF-8 bytes with a bounded MIR
 loop. Both operands are evaluated once, left to right; empty views and unequal lengths require no
 backing-byte reads. Comparison does not allocate, normalize text, or compare descriptor identity.
+The sealed operator declarations and `Intrinsic.Ordering` load on demand from the same
+`packages/compiler/stdlib/intrinsic/operators.silk` file used by the bootstrap. A reachable
+reference to a declared member, including through a public alias, triggers semantic loading;
+ordinary intrinsic calls and comments do not. Preload reads and lexes the fixed compiler-owned
+file once to derive its public interface and enum names, and retains those same bytes for
+publication when referenced. There is no separate native declaration-name list. The file cannot be imported, selected as an entry or runtime
+root, or replaced by a project source. Operators bind both to these sealed interfaces and to the
+existing `silk.ops`, `silk.equal`, and `silk.order` interfaces during the staged migration.
+`Intrinsic.Add<i32, i32>.add(40, 2)` is an ordinary interface operation call. Enum values and
+patterns use a single-segment alias such as `type Ordering = Intrinsic.Ordering`, then `Ordering.Less`;
+direct `Intrinsic.Ordering.Less` remains invalid under NAME-005.
 Native source elaboration includes finite static-for expansion over genuine phase-only sealed
 `Intrinsic.StaticSequence` values with homogeneous scalar elements. Each evaluated element owns
 separate static-selection facts and ordinary local/node ranges; the emitted blocks follow element
@@ -369,6 +380,43 @@ build the CLI. To use the same CI bootstrap locally instead, download `silk-boot
 verified main run and use `node /absolute/path/silk.mjs` in place of `node packages/cli/dist/bin.js`
 in the commands below. See [bundled CLI downloads](../packages/cli/README.md) for retention and
 pinning instructions.
+
+### ARM64 Linux development
+
+Both compilers support `aarch64-unknown-linux-gnu`, including ARM64 Debian and Ubuntu VMs.
+The native compiler selects this host automatically. The release pinned in `native-seed.json`
+currently contains an **x86-64** executable; its architecture is a distribution constraint, not
+the list of targets the compiler supports. It cannot run directly on ARM64.
+
+For the first ARM64 compiler, use the TypeScript bootstrap from this synchronized checkout (or
+the verified main bundle described above). Install Node 24, the repository's pnpm version,
+`build-essential`, and LLVM 22.1.8 for Linux ARM64. Put the complete LLVM `bin` directory on
+`PATH`, then run these commands from the repository root:
+
+```sh
+pnpm install --frozen-lockfile
+pnpm --filter @silklang/cli... run build
+node --max-old-space-size=16384 packages/cli/dist/bin.js build \
+  --manifest-path compiler/silk.toml --release
+export SILKC_CLANG="$(command -v clang)"
+export SILKC="$PWD/compiler/build/llvm/aarch64-unknown-linux-gnu/release/silk-compiler"
+```
+
+The initial bootstrap can take several minutes. `SILKC_CLANG` selects the LLVM 22 compiler for
+native linking; the selfhost CLI otherwise uses `/usr/bin/clang`. Subsequent development builds
+can use the ARM64 executable directly, with no JavaScript compiler or CPU emulation:
+
+```sh
+mkdir -p .scratch
+"$SILKC" build compiler/src/main.silk -o .scratch/silkc-next \
+  --stdlib "$PWD/packages/compiler/stdlib" --optimization speed
+"$SILKC" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
+  --stdlib "$PWD/packages/compiler/stdlib" --no-cache --filter frozenTarget
+```
+
+Use the existing source-written `*Cases.silk` roots and their filters for focused changes.
+This local bootstrap does not change the pinned release or claim the CI seed-chain fixpoint;
+the pin and its provenance remain governed by [the native seed chain](docs/native-seed-chain.md).
 
 ## Anonymous declaration identities
 

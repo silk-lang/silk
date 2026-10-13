@@ -133,9 +133,9 @@ pub fn main() -> i32 {
   }),
 )
 
-it.effect('binds operators to the stdlib operator interfaces', () =>
+it.effect('binds operators through the stdlib aliases to sealed interfaces', () =>
   Effect.gen(function* () {
-    // `*` reads only `silk.ops.Multiply`; `Right` selects among conformances, and `==`, `!=`, `<`,
+    // `*` selects only the sealed Multiply identity; `Right` selects among conformances, and `==`, `!=`, `<`,
     // and `>=` use `Equal.equals` and `Order.compare` in written order.
     const self = yield* snapshot(`import silk.equal { Equal }
 import silk.ops { Multiply }
@@ -170,6 +170,26 @@ pub fn main() -> i32 {
   }),
 )
 
+it.effect('resolves a user type plus through silk.ops without naming Intrinsic in the module', () =>
+  Effect.gen(function* () {
+    const self = yield* snapshot(`import silk.ops { Add }
+struct Meters { value: i32 }
+impl Meters {
+  fn plus(left: Meters, right: Meters) -> Meters {
+    return Meters { value: left.value + right.value }
+  }
+}
+impl Add<Meters, Meters> for Meters { add: Meters.plus }
+fn sum<T: Add<T, T>>(left: T, right: T) -> T { return move left + move right }
+pub fn main() -> i32 {
+  let total = Meters { value: 40 } + Meters { value: 2 }
+  let scalar = sum<i32>(40, 2)
+  return total.value - scalar + 42
+}`)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
 it.effect('rejects two conformances that accept the same operands', () =>
   Effect.gen(function* () {
     const source = `import silk.ops { Multiply }
@@ -198,7 +218,7 @@ pub fn main() -> i32 {
 
 it.effect('names the sealed operator interfaces and scalar conformances as Intrinsic members', () =>
   Effect.gen(function* () {
-    // Library aliases name the sealed members the way `silk.ops` and `silk.order` will.
+    // Library aliases and direct qualification name the same sealed members.
     const self = yield* snapshot(`type Order = Intrinsic . Order
 struct Meters { value: i32 }
 impl Meters {

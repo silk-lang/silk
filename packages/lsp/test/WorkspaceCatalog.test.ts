@@ -1,3 +1,4 @@
+import * as Stdlib from '@silklang/compiler/Stdlib'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -47,6 +48,12 @@ it.effect(
       })
 
       assert.deepEqual([...inventory.project.keys()], ['Main', 'nested/Util'])
+      assert.isFalse(inventory.project.has(Stdlib.sealedModule.module))
+      assert.isFalse(inventory.toolchain.has(Stdlib.sealedModule.module))
+      assert.deepEqual(
+        WorkspaceInventory.candidates(inventory, 'Add').map((candidate) => candidate.module),
+        ['silk/ops'],
+      )
       assert.deepEqual(
         WorkspaceInventory.candidates(inventory, 'main').map((candidate) => candidate.module),
         ['Main', 'silk/test_runner'],

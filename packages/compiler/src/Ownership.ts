@@ -3010,7 +3010,7 @@ const analyzeLoans = (
       }
       case 'Call': {
         if (expression.type._tag !== 'Available' || !Type.isEffect(expression.type.type)) return []
-        return expression.arguments.flatMap((argument) => {
+        return LoanView.retainedResultArguments(expression, assumptions).flatMap((argument) => {
           const candidate = argument.expression
           if (candidate._tag !== 'Borrow' || candidate.formation._tag === 'Unavailable')
             return effectEscapes(candidate, seen)
@@ -3087,13 +3087,16 @@ const analyzeLoans = (
     expression: LoanView.Expression,
     active: ReadonlyArray<LoanFact>,
     access: 'Read' | 'Write' | 'Move',
+    destination = false,
   ): LoanFact | undefined => {
     const direct = directSite(expression)
     const place = physicalPlace(expression)
     if (direct === undefined || place === undefined) return undefined
     loanAccessChecks += 1
     const places =
-      borrowedRootType(expression) === undefined ? [place] : rootsOf(place.root, place.path)
+      destination || borrowedRootType(expression) === undefined
+        ? [place]
+        : rootsOf(place.root, place.path)
     return active.find(
       (loan) =>
         !grantsParentCapability(loan, direct.site, expression.anchor) &&
@@ -3109,9 +3112,10 @@ const analyzeLoans = (
     expression: LoanView.Expression,
     active: ReadonlyArray<LoanFact>,
     access: 'Read' | 'Write' | 'Move',
+    destination = false,
   ): void => {
     const direct = directSite(expression)
-    const conflict = directAccessConflict(expression, active, access)
+    const conflict = directAccessConflict(expression, active, access, destination)
     if (direct !== undefined && conflict !== undefined) {
       diagnostics.push(
         Diagnostic.ownerAccessDuringLoan(
@@ -3122,6 +3126,18 @@ const analyzeLoans = (
         ),
       )
     }
+  }
+
+  // Loans an earlier argument opened and its value retains stay active while the later arguments
+  // of the same call are evaluated (EVAL-001, BORROW-001).
+  const absorbRetainedLoans = (
+    callActive: Array<LoanFact>,
+    from: number,
+    call: SourceSpan.SourceSpan,
+  ): number => {
+    for (const loan of loans.slice(from))
+      if (loan.endSpan.end >= call.end && !callActive.includes(loan)) callActive.push(loan)
+    return loans.length
   }
 
   const naturalAccess = (expression: LoanView.Expression): 'Read' | 'Move' =>
@@ -3152,6 +3168,7 @@ const analyzeLoans = (
     active: ReadonlyArray<LoanFact>,
     access: 'Read' | 'Write' | 'Move' = 'Read',
     delayedEnd?: LoanEndpoint,
+    destination = false,
   ): void => {
     switch (expression._tag) {
       case 'Integer':
@@ -3162,6 +3179,7 @@ const analyzeLoans = (
           expression,
           [...active, ...delayedLoansAt(context.spanOf(expression.anchor), access === 'Write')],
           access,
+          destination,
         )
         return
       case 'Borrow': {
@@ -3547,7 +3565,9 @@ const analyzeLoans = (
           })
         }
         const inspectArguments = (): void => {
+          let opened = loans.length
           for (const argument of expression.arguments) {
+            opened = absorbRetainedLoans(callActive, opened, context.spanOf(expression.anchor))
             const argumentOrdinal = argument.id.ordinal
             const candidate = argument.expression
             if (candidate._tag === 'Borrow' && candidate.formation._tag !== 'Unavailable') {
@@ -3602,11 +3622,11 @@ const analyzeLoans = (
               callActive.push(loan)
               continue
             }
-            let argumentEnd: LoanEndpoint | undefined
+            // An argument value lives through the call; a returned one through the result.
+            let argumentEnd: LoanEndpoint | undefined = endpointAt(expression.anchor, region)
             if (argument.type._tag === 'Available' && Type.isEffect(argument.type.type))
               argumentEnd = delayedEnd
-            else if (returnedOrdinal.has(argumentOrdinal))
-              argumentEnd = delayedEnd ?? endpointAt(expression.anchor, region)
+            else if (returnedOrdinal.has(argumentOrdinal)) argumentEnd = delayedEnd ?? argumentEnd
             inspect(candidate, region, callActive, naturalAccess(candidate), argumentEnd)
           }
         }
@@ -3627,25 +3647,19 @@ const analyzeLoans = (
           ...active,
           ...delayedLoansAt(context.spanOf(expression.anchor)),
         ]
-        const consumesSlot =
-          expression._tag === 'Call' &&
-          expression.reference._tag === 'ResolvedBuiltin' &&
-          (expression.reference.operation === 'SlotWrite' ||
-            expression.reference.operation === 'SlotTake' ||
-            expression.reference.operation === 'SlotCopy' ||
-            expression.reference.operation === 'SlotDrop')
+        let opened = loans.length
         for (const argument of expression.arguments) {
+          opened = absorbRetainedLoans(callActive, opened, context.spanOf(expression.anchor))
           const argumentOrdinal = argument.id.ordinal
           const candidate = argument.expression
           const returnedOrdinal = returnedArgumentOrdinals(expression)
           if (candidate._tag !== 'Borrow' || candidate.formation._tag === 'Unavailable') {
             const preservesEffectLifetime =
               argument.type._tag === 'Available' && Type.isEffect(argument.type.type)
-            let argumentEnd: LoanEndpoint | undefined
+            // An argument value lives through the call; a returned one through the result.
+            let argumentEnd: LoanEndpoint | undefined = endpointAt(expression.anchor, region)
             if (preservesEffectLifetime) argumentEnd = delayedEnd
-            else if (returnedOrdinal.has(argumentOrdinal))
-              argumentEnd = delayedEnd ?? endpointAt(expression.anchor, region)
-            else if (consumesSlot) argumentEnd = endpointAt(expression.anchor, region)
+            else if (returnedOrdinal.has(argumentOrdinal)) argumentEnd = delayedEnd ?? argumentEnd
             inspect(candidate, region, callActive, naturalAccess(candidate), argumentEnd)
             continue
           }
@@ -3916,7 +3930,9 @@ const analyzeLoans = (
           statements(statement.otherwise, active)
           break
         case 'WriteStatement':
-          inspect(statement.destination, statement.region, active, 'Write')
+          // Replacing a descriptor writes its binding storage; an explicit referent
+          // projection still checks the borrowed allocation (OWN-005, BORROW-008).
+          inspect(statement.destination, statement.region, active, 'Write', undefined, true)
           inspect(statement.value, statement.region, active, naturalAccess(statement.value))
           break
         case 'WhileStatement':
