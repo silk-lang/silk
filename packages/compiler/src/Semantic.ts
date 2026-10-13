@@ -850,9 +850,7 @@ export const ownership = (
   ])
   const runtime = runtimeOf(self)
   const provider = {
-    boundary: `${boundaryFingerprint(ownershipInput.boundaries)}:${boundaryFingerprint(
-      ownershipInput.resultBoundaries,
-    )}`,
+    boundary: boundaryFingerprint(ownershipInput.boundaries),
     build: compute,
   }
   runtime.ownership.set(request.address, provider)
