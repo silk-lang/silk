@@ -20,9 +20,13 @@
 //! declaration order must be marked outdated whenever that module changes. The graph cannot see
 //! key meaning; the store marks those units through [`markOutdated`].
 
+import semantic.InternIndex {InternIndex}
 import silk.allocator {Allocator, OutOfMemoryError}
+import silk.hash {Hash}
+import silk.layout {Layout}
 import silk.ownership {Copy}
 import silk.u32
+import silk.u64
 import silk.usize
 import silk.vector {Vector}
 
@@ -38,8 +42,17 @@ pub enum UnitState {
 
 /// One thing a unit can consume.
 pub union Dependee {
-  /// The presence and exact bytes of one module, by the store's module ordinal.
+  /// The current conservative source read of one module. Reader migration will narrow this to
+  /// presence once every content reader records its approved property.
   SourceFile {pub module: usize},
+  /// The whole token fingerprint of one stable declaration handle.
+  DeclSource {pub declaration: usize},
+  /// The header token fingerprint of one stable declaration handle.
+  DeclPrototype {pub declaration: usize},
+  /// A complete written candidate bucket, including its empty state.
+  Name {pub module: usize, pub name: usize},
+  /// The module's written names and visibility.
+  Namespace {pub module: usize},
   /// The completed result of another unit.
   UnitResult {pub unit: usize},
 }
@@ -58,15 +71,34 @@ struct UnitRecord {
 
 impl Copy for UnitRecord {}
 
+enum DependeeKind {
+  SourceFile,
+  DeclSource,
+  DeclPrototype,
+  Name,
+  Namespace,
+  UnitResult,
+}
+
+struct PropertyKey {
+  kind: DependeeKind
+  subject: u32
+  other: u32
+  record: u32
+}
+
+impl Copy for PropertyKey {}
+
 struct DependeeRecord {
   // The newest edge that consumes this dependee, or `u32.MAX`.
   head: u32
   // The unit and run that last recorded this dependee.
   lastUnit: u32
   lastRun: u32
-  // The dependee's key: a module ordinal for a source file, otherwise a unit.
-  source: bool
+  // The dependee's complete key. `other` is the name ordinal for Name, otherwise zero.
+  kind: DependeeKind
   subject: u32
+  other: u32
 }
 
 impl Copy for DependeeRecord {}
@@ -92,6 +124,8 @@ pub struct DependencyGraph {
   // Dependee indices by module ordinal and by unit, or `u32.MAX`.
   sourceFiles: Vector<u32>
   unitResults: Vector<u32>
+  propertyKeys: Vector<PropertyKey>
+  propertyLookup: InternIndex
   edges: Vector<Edge>
   free: u32
   runs: u32
@@ -123,6 +157,8 @@ pub fn make(recording: bool) -> DependencyGraph {
     dependees: Vector<DependeeRecord>.make(),
     sourceFiles: Vector<u32>.make(),
     unitResults: Vector<u32>.make(),
+    propertyKeys: Vector<PropertyKey>.make(),
+    propertyLookup: InternIndex.make(),
     edges: Vector<Edge>.make(),
     free: u32.MAX,
     runs: 0,
@@ -159,46 +195,114 @@ pub fn state(graph: &DependencyGraph, unit: usize) -> UnitState {
   return Vector.get(&graph.units, unit).state
 }
 
+fn kindOf(dependee: Dependee) -> DependeeKind {
+  return match &dependee {
+    Dependee.SourceFile {..} => DependeeKind.SourceFile
+    Dependee.DeclSource {..} => DependeeKind.DeclSource
+    Dependee.DeclPrototype {..} => DependeeKind.DeclPrototype
+    Dependee.Name {..} => DependeeKind.Name
+    Dependee.Namespace {..} => DependeeKind.Namespace
+    Dependee.UnitResult {..} => DependeeKind.UnitResult
+  }
+}
+
 fn subjectOf(dependee: Dependee) -> usize {
   return match &dependee {
     Dependee.SourceFile {module} => module
+    Dependee.DeclSource {declaration} => declaration
+    Dependee.DeclPrototype {declaration} => declaration
+    Dependee.Name {module, ..} => module
+    Dependee.Namespace {module} => module
     Dependee.UnitResult {unit} => unit
   }
 }
 
-fn isSourceFile(dependee: Dependee) -> bool {
+fn otherOf(dependee: Dependee) -> usize {
   return match &dependee {
-    Dependee.SourceFile {..} => true
-    Dependee.UnitResult {..} => false
+    Dependee.Name {name, ..} => name
+    _ => usize.ZERO
   }
+}
+
+fn kindTag(kind: DependeeKind) -> u64 {
+  return match kind {
+    DependeeKind.SourceFile => 1
+    DependeeKind.DeclSource => 2
+    DependeeKind.DeclPrototype => 3
+    DependeeKind.Name => 4
+    DependeeKind.Namespace => 5
+    DependeeKind.UnitResult => 6
+  }
+}
+
+fn propertyHash(kind: DependeeKind, subject: usize, other: usize) -> u64 {
+  return Hash.combine(
+    Hash.combine(kindTag(kind), usize.toU64(subject)), usize.toU64(other),
+  )
 }
 
 effect fn dependeeIndex(graph: &mut DependencyGraph, dependee: Dependee) -> usize ! OutOfMemoryError ? &mut Allocator {
   let found = knownDependee(&graph.*, dependee)
   if found != usize.MAX { return found }
-  let table = subjectOf(dependee)
-  let isSource = isSourceFile(dependee)
+  let kind = kindOf(dependee)
+  let subject = subjectOf(dependee)
+  let other = otherOf(dependee)
   let created = Vector.length(&graph.dependees)
-  run Vector.append(&mut graph.dependees, DependeeRecord {head: u32.MAX, lastUnit: u32.MAX, lastRun: u32.MAX,
-    source: isSource, subject: usize.toU32(table)})
-  if isSource {
-    while Vector.length(&graph.sourceFiles) <= table { run Vector.append(&mut graph.sourceFiles, u32.MAX) }
-    Vector.set(&mut graph.sourceFiles, table, usize.toU32(created))
+  let record = DependeeRecord {
+    head: u32.MAX, lastUnit: u32.MAX, lastRun: u32.MAX,
+    kind: kind, subject: usize.toU32(subject), other: usize.toU32(other),
+  }
+  if kind == DependeeKind.SourceFile || kind == DependeeKind.UnitResult {
+    if kind == DependeeKind.SourceFile {
+      let length = Vector.length(&graph.sourceFiles)
+      if length <= subject { run Vector.reserveExact(&mut graph.sourceFiles, subject + usize.ONE - length) }
+    } else {
+      let length = Vector.length(&graph.unitResults)
+      if length <= subject { run Vector.reserveExact(&mut graph.unitResults, subject + usize.ONE - length) }
+    }
+    run Vector.reserveExact(&mut graph.dependees, usize.ONE)
+    run Vector.append(&mut graph.dependees, move record)
+    if kind == DependeeKind.SourceFile {
+      while Vector.length(&graph.sourceFiles) <= subject { run Vector.append(&mut graph.sourceFiles, u32.MAX) }
+      Vector.set(&mut graph.sourceFiles, subject, usize.toU32(created))
+    } else {
+      while Vector.length(&graph.unitResults) <= subject { run Vector.append(&mut graph.unitResults, u32.MAX) }
+      Vector.set(&mut graph.unitResults, subject, usize.toU32(created))
+    }
   } else {
-    while Vector.length(&graph.unitResults) <= table { run Vector.append(&mut graph.unitResults, u32.MAX) }
-    Vector.set(&mut graph.unitResults, table, usize.toU32(created))
+    run Vector.reserveExact(&mut graph.dependees, usize.ONE)
+    run Vector.reserveExact(&mut graph.propertyKeys, usize.ONE)
+    run InternIndex.record(&mut graph.propertyLookup, propertyHash(kind, subject, other))
+    run Vector.append(&mut graph.dependees, move record)
+    run Vector.append(&mut graph.propertyKeys, PropertyKey {
+      kind: kind, subject: usize.toU32(subject), other: usize.toU32(other), record: usize.toU32(created),
+    })
   }
   return created
 }
 
 // The dependee record of `dependee` when one exists, or `usize.MAX`.
 fn knownDependee(graph: &DependencyGraph, dependee: Dependee) -> usize {
+  let kind = kindOf(dependee)
   let table = subjectOf(dependee)
   let mut found = u32.MAX
-  if isSourceFile(dependee) {
+  if kind == DependeeKind.SourceFile {
     if table < Vector.length(&graph.sourceFiles) { found = Vector.get(&graph.sourceFiles, table) }
-  } else if table < Vector.length(&graph.unitResults) {
-    found = Vector.get(&graph.unitResults, table)
+  } else if kind == DependeeKind.UnitResult {
+    if table < Vector.length(&graph.unitResults) { found = Vector.get(&graph.unitResults, table) }
+  } else {
+    let other = otherOf(dependee)
+    let hash = propertyHash(kind, table, other)
+    let keys = Vector.asSlice(&graph.propertyKeys)
+    let mut at = InternIndex.first(&graph.propertyLookup, hash)
+    while at != usize.MAX {
+      if keys[at].kind == kind && keys[at].subject == usize.toU32(table)
+        && keys[at].other == usize.toU32(other) {
+        found = keys[at].record
+        break
+      }
+      at = InternIndex.after(&graph.propertyLookup, at)
+    }
   }
   if found == u32.MAX { return usize.MAX }
   return u32.toUsize(found)
@@ -324,13 +428,20 @@ pub fn visit(graph: &mut DependencyGraph, unit: usize) -> bool {
 /// The dependee one edge consumes.
 pub fn dependeeOf(graph: &DependencyGraph, edge: usize) -> Dependee {
   let record = Vector.get(&graph.dependees, u32.toUsize(Vector.get(&graph.edges, edge).dependee))
-  if record.source { return Dependee.SourceFile {module: u32.toUsize(record.subject)} }
-  return Dependee.UnitResult {unit: u32.toUsize(record.subject)}
+  return match record.kind {
+    DependeeKind.SourceFile => Dependee.SourceFile {module: u32.toUsize(record.subject)}
+    DependeeKind.DeclSource => Dependee.DeclSource {declaration: u32.toUsize(record.subject)}
+    DependeeKind.DeclPrototype => Dependee.DeclPrototype {declaration: u32.toUsize(record.subject)}
+    DependeeKind.Name => Dependee.Name {module: u32.toUsize(record.subject), name: u32.toUsize(record.other)}
+    DependeeKind.Namespace => Dependee.Namespace {module: u32.toUsize(record.subject)}
+    DependeeKind.UnitResult => Dependee.UnitResult {unit: u32.toUsize(record.subject)}
+  }
 }
 
-/// Marks every depender of a changed source file outdated, and every transitive depender of those.
-pub effect fn sourceChanged(graph: &mut DependencyGraph, module: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  let target = knownDependee(&graph.*, Dependee.SourceFile {module: module})
+/// Marks every depender of one changed input property outdated, then propagates through unit
+/// results. A property that no unit recorded costs no allocation and marks nothing.
+pub effect fn inputChanged(graph: &mut DependencyGraph, dependee: Dependee) -> () ! OutOfMemoryError ? &mut Allocator {
+  let target = knownDependee(&graph.*, dependee)
   if target == usize.MAX { return () }
   let mut edge = Vector.get(&graph.dependees, target).head
   while edge != u32.MAX {
@@ -339,6 +450,11 @@ pub effect fn sourceChanged(graph: &mut DependencyGraph, module: usize) -> () ! 
     edge = current.next
   }
   return ()
+}
+
+/// Marks consumers of the current conservative whole-source input.
+pub effect fn sourceChanged(graph: &mut DependencyGraph, module: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run inputChanged(&mut graph.*, Dependee.SourceFile {module: module})
 }
 
 /// Marks `unit` outdated, and every transitive depender of its result.
@@ -378,9 +494,14 @@ pub fn counters(graph: &DependencyGraph) -> Counters {
     freeEdges = freeEdges + usize.ONE
     edge = Vector.get(&graph.edges, u32.toUsize(edge)).next
   }
-  let bytes = Vector.capacity(&graph.units) * 16 + Vector.capacity(&graph.dependees) * 20
-    + Vector.capacity(&graph.sourceFiles) * 4 + Vector.capacity(&graph.unitResults) * 4
-    + Vector.capacity(&graph.edges) * 20 + Vector.capacity(&graph.pending) * 4
+  let bytes = Vector.capacity(&graph.units) * Layout.of<UnitRecord>().bytes
+    + Vector.capacity(&graph.dependees) * Layout.of<DependeeRecord>().bytes
+    + Vector.capacity(&graph.sourceFiles) * Layout.of<u32>().bytes
+    + Vector.capacity(&graph.unitResults) * Layout.of<u32>().bytes
+    + Vector.capacity(&graph.edges) * Layout.of<Edge>().bytes
+    + Vector.capacity(&graph.pending) * Layout.of<u32>().bytes
+    + Vector.capacity(&graph.propertyKeys) * Layout.of<PropertyKey>().bytes
+    + InternIndex.retainedBytes(&graph.propertyLookup)
   return Counters {
     units: Vector.length(&graph.units),
     dependees: Vector.length(&graph.dependees),
