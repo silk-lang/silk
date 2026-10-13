@@ -239,7 +239,7 @@ void it('keeps build and runtime regressions in the failure count', async () => 
 void it('fails the gate only for cases on the ordered selfhost track', () => {
   const results = [
     { name: 'literal', status: 'pass' },
-    { name: 'future', status: 'fail', code: 'UnknownName', diagnostics: [], reason: 'not ready' },
+    { name: 'future', status: 'fail', code: 'SEM0006', diagnostics: [], reason: 'not ready' },
     {
       name: 'later',
       status: 'unsupported',
@@ -250,7 +250,7 @@ void it('fails the gate only for cases on the ordered selfhost track', () => {
     pass: 1,
     fail: 1,
     unsupported: 1,
-    failureCounts: [{ code: 'UnknownName', count: 1 }],
+    failureCounts: [{ code: 'SEM0006', count: 1 }],
     gapCounts: [{ code: 'MIR_AGGREGATE', count: 1 }],
     trackFailures: [],
   })
@@ -286,21 +286,19 @@ chmod +x "$output"`
 
 void it('retains build diagnostic codes and byte spans without turning rejections into gaps', async () => {
   const record =
-    'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34},"module":"main.silk"}'
+    'SILK_BUILD_ERROR={"code":"SEM0006","span":{"start":28,"end":34},"module":"main.silk"}'
   const other =
-    'SILK_BUILD_ERROR={"code":"TypeMismatch","span":{"start":6,"end":9},"module":"silk/uri.silk"}'
+    'SILK_BUILD_ERROR={"code":"SEM0012","span":{"start":6,"end":9},"module":"silk/uri.silk"}'
   const gaps = 'SILK_UNSUPPORTED_JSON={"gaps":[{"code":"typed-form","reason":"not lowered"}]}'
   await withStub(`echo '${record}' >&2; exit 1`, async (silkc) => {
     const result = await runCase(silkc, literal)
     assert.strictEqual(result.status, 'fail')
     if (result.status !== 'fail') throw new Error('expected rejection')
-    assert.strictEqual(result.code, 'UnknownName')
+    assert.strictEqual(result.code, 'SEM0006')
     assert.deepStrictEqual(result.diagnostics, [
-      { code: 'UnknownName', span: { start: 28, end: 34 }, module: 'main.silk' },
+      { code: 'SEM0006', span: { start: 28, end: 34 }, module: 'main.silk' },
     ])
-    assert.deepStrictEqual(summarize([result], []).failureCounts, [
-      { code: 'UnknownName', count: 1 },
-    ])
+    assert.deepStrictEqual(summarize([result], []).failureCounts, [{ code: 'SEM0006', count: 1 }])
   })
   // A build walk prints every refusal beside the gaps it reached; gaps never hide a refusal.
   await withStub(
@@ -309,10 +307,10 @@ void it('retains build diagnostic codes and byte spans without turning rejection
       const result = await runCase(silkc, literal)
       assert.strictEqual(result.status, 'fail')
       if (result.status !== 'fail') throw new Error('expected rejection')
-      assert.strictEqual(result.code, 'UnknownName')
+      assert.strictEqual(result.code, 'SEM0006')
       assert.deepStrictEqual(
         result.diagnostics.map((diagnostic) => diagnostic.code),
-        ['UnknownName', 'TypeMismatch'],
+        ['SEM0006', 'SEM0012'],
       )
     },
   )
@@ -322,13 +320,48 @@ void it('retains build diagnostic codes and byte spans without turning rejection
   assert.strictEqual(parseBuildDiagnostics('unsupported: aggregates'), undefined)
   assert.strictEqual(
     parseBuildDiagnostics(
-      `${record}\nSILK_BUILD_ERROR={"code":"UnknownName","span":{"start":34,"end":28},"module":"main.silk"}`,
+      `${record}\nSILK_BUILD_ERROR={"code":"SEM0006","span":{"start":34,"end":28},"module":"main.silk"}`,
     ),
     undefined,
   )
   assert.strictEqual(parseBuildDiagnostics('SILK_BUILD_ERROR=semantic-rejection'), undefined)
   assert.strictEqual(
-    parseBuildDiagnostics('SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":28,"end":34}}'),
+    parseBuildDiagnostics('SILK_BUILD_ERROR={"code":"SEM0006","span":{"start":28,"end":34}}'),
+    undefined,
+  )
+})
+
+void it('keeps uncoded refusal reasons separate from catalog diagnostics', () => {
+  const gap = {
+    code: 'StaticRecursionNotProven',
+    reason: 'Not supported by this compiler yet: StaticRecursionNotProven',
+    source: { module: 'main.silk', span: { start: 1, end: 4 } },
+  }
+  const record = `SILK_UNSUPPORTED_JSON=${JSON.stringify({ gaps: [gap] })}`
+  const backend = { code: 'typed-form', reason: 'Not supported by this compiler yet: typed-form' }
+  assert.deepStrictEqual(
+    parseUnsupported(
+      `${record}\n${record}\nSILK_UNSUPPORTED_JSON=${JSON.stringify({ gaps: [backend] })}`,
+    ),
+    [gap, backend],
+  )
+  assert.strictEqual(parseUnsupported(`${record}\nSILK_UNSUPPORTED_JSON=invalid`), undefined)
+  assert.strictEqual(
+    parseUnsupported(
+      `SILK_UNSUPPORTED_JSON=${JSON.stringify({ gaps: [{ ...gap, code: 'SEM0006' }] })}`,
+    ),
+    undefined,
+  )
+  assert.strictEqual(
+    parseBuildDiagnostics(
+      'SILK_BUILD_ERROR={"code":"UnknownName","span":{"start":1,"end":4},"module":"main.silk"}',
+    ),
+    undefined,
+  )
+  assert.strictEqual(
+    parseBuildDiagnostics(
+      'Internal compiler error: MissingRetainedFact; this is a compiler bug, please report',
+    ),
     undefined,
   )
 })
