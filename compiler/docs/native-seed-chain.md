@@ -115,11 +115,12 @@ in its `native-seed.json` and `output.sha256` of N2 in `chain-receipt.json`.
 
 ### Retention
 
-One prerelease per green push accumulates. Older candidates are the recovery path, so pruning must
-leave enough of them. Proposed rule, not automated yet: keep the release named by the pin on
-`selfhost`, every release named by a pin in the last 30 days of `selfhost` history (so a revert can
-return to it), and the 20 newest candidates; delete the rest. Deletion, when added, must read the
-current pin first and never touch its tag. Until then candidates are pruned by hand.
+One prerelease per green push accumulates. **A release that any `selfhost` pin has ever named is
+never deleted**: [hop replay](#hop-replay) rebuilds each pinned seed from the one before it, so the
+chain back to the first seed needs every hop. The rule also keeps the 20 newest candidates and lets
+the rest go. `native-seed-retention.yml` (on `main`, weekly) applies it with
+`prune-native-seeds.mjs`, which reads the whole pin history of `selfhost` first; it only reports
+until deletion is enabled, and candidates are pruned by hand until then.
 
 ## Advancing the pin
 
@@ -147,6 +148,25 @@ on `main` first and reach `selfhost` through a sync, and the pinned seed compile
 checkout. A sync that brings stdlib source the seed cannot compile waits until the compiler support
 has landed on `selfhost` and the pin has advanced. A toolchain change, such as an LLVM upgrade that
 the seed's output must follow, lands the same way.
+
+### Hop replay
+
+The chain is reproducible one hop at a time, not by jumping: an old seed rarely compiles current
+source, because a language or standard-library spelling the compiler adopts invalidates every seed
+older than its native support. Each pinned seed's own `native-seed.json` names the commit it was
+built from, and that commit's `compiler/native-seed.json` names the seed that built it. To
+reproduce or recover pinned seed S(k):
+
+1. Check out the source commit S(k) names, and download and verify the seed its pin names, S(k-1).
+2. Build N1 from that checkout with S(k-1), then N2 with N1.
+3. N2 must emit the compiler's LLVM IR byte for byte as the published S(k) does on the same
+   checkout. Replay is established at the IR level; executables can differ with the link
+   toolchain.
+
+Repeating from the first pinned seed rebuilds the whole chain, which is why retention keeps every
+pinned release. `native-seed-hop-drill.yml` (on `main`, weekly) replays the current pin's hop this
+way and fails if the IR differs. To recover a chain whose newest seed is lost or suspect, replay
+forward from the newest seed that still verifies and pin the result.
 
 ### Earlier published seed
 
