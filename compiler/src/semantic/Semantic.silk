@@ -170,7 +170,7 @@ import semantic.ModuleIndex {
   NameObservation,
 }
 import semantic.Operator
-import semantic.BorrowCheck {Outcome as LoanOutcome, check as checkLoans, regionClosed}
+import semantic.BorrowCheck {Outcome as LoanOutcome, check as checkLoans, regionClosed, LoanCleanup}
 import semantic.ReturnFlow
 import semantic.OpaqueRealization
 import semantic.CallableOrigin
@@ -29304,8 +29304,13 @@ effect fn checkBorrowOperand<'scope>(
           if !admitted
             || !run retainRegionPairs(&mut resolver.*, run originAt(cursor, expression, span),
               Vector<RegionPair>.asSlice(&deferred)) {
+            // Authored local storage cannot fulfill a validity promise chosen outside the body.
+            // This is the stored-borrow retention boundary (BORROW-008, LIFE-001), not a mismatch
+            // of referent types. Unrooted temporary owners remain the temporary-loan slice.
+            let mut code = RejectionCode.TypeMismatch
+            if !described && !temporary { code = RejectionCode.ExpiredLifetime }
             return Result<CheckedBorrow, Shared<Rejection>>.failResult(run reject(&resolver.*, module,
-              RejectionCode.TypeMismatch, span))
+              code, span))
           }
         }
         region = move requested
@@ -35570,7 +35575,14 @@ effect fn finishLiteral(
   let mut unchecked = BodyBorrowStatus.Regions
   let pending = openRegionObligation(Vector<BodySafetyObligation>.asSlice(&obligations))
   if bodyHasLoans(Vector<BodyNode>.asSlice(&checkedNodes)) {
-    let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes), root, pending)
+    let cleanupAnchor = run cursorAnchor(cursor)
+    let observers = match move run borrowCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &identity,
+      Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes), bodyConstraints, &cleanupAnchor) {
+      Result<Vector<LoanCleanup>, Shared<Rejection>>.Success {value} => move value
+      Result<Vector<LoanCleanup>, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    }
+    let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes), root, pending,
+      move observers)
     unchecked = verdict.status
     if verdict.outcome == LoanOutcome.Conflict {
       let mut related = Option<RelatedSite>.none()
@@ -53903,6 +53915,267 @@ fn runtimeProjectionType(body: &Shared<TypedBody>, result: &Shared<Type>, parame
 
 // Which locals and node values of a typed body need cleanup under the caller's bindings and the
 // body's declared premises.
+effect fn copyCleanupRegions(regions: &[Shared<Lifetime>]) -> Vector<Shared<Lifetime>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut copied = Vector<Shared<Lifetime>>.make()
+  let mut at = usize.ZERO
+  while at < regions.length {
+    run Vector<Shared<Lifetime>>.append(&mut copied, Shared<Lifetime>.clone(&regions[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// The Body query demands only cleanup/type summaries. A composite owner observes the borrowed
+// regions of hook-bearing parts, not every borrowed field merely because another part has Drop.
+effect fn cleanupLoanRegions(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  identity: &DeclarationId,
+  ty: &Shared<Type>,
+  constraints: &[Constraint],
+  span: Span,
+  regions: &mut Vector<Shared<Lifetime>>
+) -> Result<bool, Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut visiting = Vector<Shared<Type>>.make()
+  let free = run cleanupFree(
+    &mut resolver.*,
+    &mut owner.*,
+    &mut dependencies.*,
+    ty,
+    constraints,
+    &mut visiting,
+    span
+  )
+  match move free {
+    Result<bool, Shared<Rejection>>.Success { value } => {
+      if value {
+        return Result<bool, Shared<Rejection>>.succeed(true)
+      }
+    }
+    Result<bool, Shared<Rejection>>.Failure { error } => {
+      return Result<bool, Shared<Rejection>>.failResult(move error)
+    }
+  }
+  let mut whole = false
+  let mut parts = Vector<Shared<Type>>.make()
+  if let Option<SealedKind>.Some { .. } = move SealedCore.coreOf(ty) {
+    whole = true
+  } else {
+    let node = run Type.copy(ty)
+    match &node {
+      // An outside type parameter cannot store a region created by this body (parametricity).
+      Type.Parameter { declaration, .. } => {
+        if DeclarationId.isPrefixOf(&declaration, identity) {
+          return Result<bool, Shared<Rejection>>.succeed(true)
+        }
+        whole = true
+      }
+      Type.Nominal { .. } => {
+        let dropped = run implementsSealed(
+          &mut resolver.*,
+          &mut owner.*,
+          &mut dependencies.*,
+          ty,
+          SealedProperty.Drop,
+          constraints,
+          span
+        )
+        whole = match move dropped {
+          Result<bool, Shared<Rejection>>.Success { value } => value
+          Result<bool, Shared<Rejection>>.Failure { error } => {
+            return Result<bool, Shared<Rejection>>.failResult(move error)
+          }
+        }
+        if
+          !whole {
+          let gathered = run nominalParts(
+            &mut resolver.*,
+            &mut owner.*,
+            &mut dependencies.*,
+            ty,
+            span
+          )
+          parts = match move gathered {
+            Result<Vector<Shared<Type>>, Shared<Rejection>>.Success { value } => move value
+            Result<Vector<Shared<Type>>, Shared<Rejection>>.Failure { error } => {
+              return Result<bool, Shared<Rejection>>.failResult(move error)
+            }
+          }
+        }
+      }
+      Type.Array { element, .. } => {
+        run Vector<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&element))
+      }
+      Type.Union { members } => {
+        parts = run copyTypes(Vector<Shared<Type>>.asSlice(&members))
+      }
+      Type.Anonymous { members, .. } => {
+        parts = run copyTypes(Vector<Shared<Type>>.asSlice(&members))
+      }
+      Type.CallableValue { captures, .. } => {
+        parts = run copyTypes(Vector<Shared<Type>>.asSlice(&captures))
+      }
+      Type.CallableSchema { captures, .. } => {
+        parts = run copyTypes(Vector<Shared<Type>>.asSlice(&captures))
+      }
+      Type.EffectComposite { parts: stored, .. } => {
+        parts = run copyTypes(Vector<Shared<Type>>.asSlice(&stored))
+      }
+      Type.EffectJoin { alternatives, .. } => {
+        parts = run copyTypes(Vector<Shared<Type>>.asSlice(&alternatives))
+      }
+      Type.CallableStage { base, captures, .. } => {
+        run Vector<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&base))
+        let stored = Vector<Shared<Type>>.asSlice(&captures)
+        let mut at = usize.ZERO
+        while at < stored.length {
+          run Vector<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&stored[at]))
+          at = at + usize.ONE
+        }
+      }
+      _ => {
+        whole = true
+      }
+    }
+  }
+  if whole {
+    let representations = Vector<Option<Shared<Type>>>.make()
+    let known = run Type.retainedRegions(
+      ty,
+      identity,
+      Vector<Option<Shared<Type>>>.asSlice(&representations),
+      &mut regions.*
+    )
+    return Result<bool, Shared<Rejection>>.succeed(known)
+  }
+  let listed = Vector<Shared<Type>>.asSlice(&parts)
+  let mut at = usize.ZERO
+  let mut known = true
+  while at < listed.length {
+    let answer = run cleanupLoanRegions(
+      &mut resolver.*,
+      &mut owner.*,
+      &mut dependencies.*,
+      identity,
+      &listed[at],
+      constraints,
+      span,
+      &mut regions.*
+    )
+    match move answer {
+      Result<bool, Shared<Rejection>>.Success { value } => {
+        known = known && value
+      }
+      Result<bool, Shared<Rejection>>.Failure { error } => {
+        return Result<bool, Shared<Rejection>>.failResult(move error)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Result<bool, Shared<Rejection>>.succeed(known)
+}
+
+effect fn borrowCleanup(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>,
+  identity: &DeclarationId,
+  locals: &[BodyLocal],
+  nodes: &[BodyNode],
+  constraints: &[Constraint],
+  anchor: &Anchor
+) -> Result<Vector<LoanCleanup>, Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut observed = Vector<LoanCleanup>.make()
+  let mut known = Vector<Shared<Type>>.make()
+  let mut verdicts = Vector<LoanCleanup>.make()
+  // Only locals and match subjects own storage that the loan walk ends. Preserve the dense
+  // local/node indexing, but do not demand cleanup contracts for transient expression results.
+  let mut subjects = Vector<bool>.make()
+  let mut node = usize.ZERO
+  while node < nodes.length {
+    run Vector<bool>.append(&mut subjects, false)
+    node = node + usize.ONE
+  }
+  node = usize.ZERO
+  while node < nodes.length {
+    if let BodyNodeKind.Expression {form: BodyExpression.Match {subject, ..}, ..} = &nodes[node].kind {
+      let marked = Vector<bool>.asMutSlice(&mut subjects)
+      marked[subject.index] = true
+    }
+    node = node + usize.ONE
+  }
+  let mut at = usize.ZERO
+  while at < locals.length + nodes.length {
+    let mut selected = Option<Shared<Type>>.none()
+    let mut span = Span.make(usize.ZERO, usize.ZERO)
+    if at < locals.length {
+      selected = Option<Shared<Type>>.some(Shared<Type>.clone(&locals[at].ty))
+      span = BodyOrigin.span(locals[at].origin, anchor)
+    } else {
+      let node = at - locals.length
+      if Vector<bool>.asSlice(&subjects)[node] {
+        if let BodyNodeKind.Expression { ty, .. } = &nodes[node].kind {
+          selected = Option<Shared<Type>>.some(Shared<Type>.clone(&ty))
+          span = BodyOrigin.span(nodes[node].origin, anchor)
+        }
+      }
+    }
+    let mut regions = Vector<Shared<Lifetime>>.make()
+    let mut unknown = false
+    if let Option<Shared<Type>>.Some { value: ty } = move selected {
+      let listed = Vector<Shared<Type>>.asSlice(&known)
+      let mut scan = usize.ZERO
+      while scan < listed.length && !run Type.equalsShared(&listed[scan], &ty) {
+        scan = scan + usize.ONE
+      }
+      if scan < listed.length {
+        let cached = Vector<LoanCleanup>.asSlice(&verdicts)
+        regions = run copyCleanupRegions(Vector<Shared<Lifetime>>.asSlice(&cached[scan].regions))
+        unknown = cached[scan].unknown
+      } else {
+        let answer = run cleanupLoanRegions(
+          &mut resolver.*,
+          &mut owner.*,
+          &mut dependencies.*,
+          identity,
+          &ty,
+          constraints,
+          span,
+          &mut regions
+        )
+        unknown = match move answer {
+          Result<bool, Shared<Rejection>>.Success { value } => !value
+          Result<bool, Shared<Rejection>>.Failure { error } => {
+            return Result<Vector<LoanCleanup>, Shared<Rejection>>.failResult(move error)
+          }
+        }
+        run Vector<Shared<Type>>.append(&mut known, move ty)
+        run Vector<
+          LoanCleanup
+        >.append(
+          &mut verdicts,
+          LoanCleanup {
+            regions: run copyCleanupRegions(Vector<Shared<Lifetime>>.asSlice(&regions)),
+            unknown: unknown
+          }
+        )
+      }
+    }
+    run Vector<
+      LoanCleanup
+    >.append(&mut observed, LoanCleanup { regions: move regions, unknown: unknown })
+    at = at + usize.ONE
+  }
+  return Result<Vector<LoanCleanup>, Shared<Rejection>>.succeed(move observed)
+}
+
 effect fn cleanupNeeds(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, bindings: &[Binding], projections: &[RuntimeProjection],
@@ -58944,7 +59217,7 @@ effect fn checkPreparedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
       return rejectedBody(move rejection, move dependencies)
     }
   }
-  return run finishCheckedBody(&mut resolver.*, key, BodyFinishInput {
+  return run finishCheckedBody(&mut resolver.*, &mut owner.*, key, BodyFinishInput {
     module: move module,
     resultType: move resultType,
     constraints: move constraints,
@@ -59001,7 +59274,7 @@ effect fn selectStaticBodyApplication(
   return ()
 }
 
-effect fn finishCheckedBody(resolver: &mut Resolver, key: Key, finished: BodyFinishInput)
+effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key, finished: BodyFinishInput)
 -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let BodyFinishInput {module, resultType, constraints, sourceAnswer, staticIterations: preparedIterations, block, identity, locals: preparedLocals, initialLocals, nodes: preparedNodes, signatureDependencies: preparedSignatureDependencies, requiredBodies: preparedRequiredBodies, cursor, abstractBody, staticBody, dependencies: preparedDependencies, control, relations} = move finished
   let mut staticIterations = move preparedIterations
@@ -59106,7 +59379,14 @@ effect fn finishCheckedBody(resolver: &mut Resolver, key: Key, finished: BodyFin
   } else {
     let pending = openRegionObligation(Vector<BodySafetyObligation>.asSlice(&relations))
     if bodyHasLoans(Vector<BodyNode>.asSlice(&nodes)) {
-      let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes), control.node, pending)
+      let cleanupAnchor = run cursorAnchor(&cursor)
+      let observers = match move run borrowCleanup(&mut resolver.*, &mut owner.*, &mut dependencies, &identity,
+        Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes), Vector<Constraint>.asSlice(&constraints), &cleanupAnchor) {
+        Result<Vector<LoanCleanup>, Shared<Rejection>>.Success {value} => move value
+        Result<Vector<LoanCleanup>, Shared<Rejection>>.Failure {error} => { return rejectedBody(move error, move dependencies) }
+      }
+      let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes), control.node, pending,
+        move observers)
       unchecked = verdict.status
       if verdict.outcome == LoanOutcome.Conflict {
         let mut related = Option<RelatedSite>.none()
