@@ -508,8 +508,9 @@ let partial = Pair<i32>.make(1, true) // invalid: Pair<i32> is incomplete
 arity diagnostic `SEM0051`.
 
 **Current compiler:** Both compilers accept owner applications, including omitted owner
-lifetimes. The bootstrap reports `SEM0221`; the native compiler still accepts the
-member-prefix spelling `Owner.member<OwnerArguments..., OwnArguments...>`.
+lifetimes. Both reject a member list on an unwritten owner whose parameters the member names
+with `SEM0221`, and an incomplete owner application with `SEM0051`. Owner-independent members
+keep their own generic list.
 
 **Evidence:** [call specialization](../../../../packages/compiler/src/CallResolution.ts),
 [generic call inference](#gen-003--a-generic-call-infers-only-from-supplied-arguments-and-declared-constraints).
