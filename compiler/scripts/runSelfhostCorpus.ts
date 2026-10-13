@@ -147,6 +147,7 @@ const validGap = (gap: unknown): gap is Gap => {
     !('code' in gap) ||
     typeof gap.code !== 'string' ||
     gap.code.length === 0 ||
+    /^[A-Z]{3}[0-9]{4}$/.test(gap.code) ||
     !('reason' in gap) ||
     typeof gap.reason !== 'string' ||
     gap.reason.length === 0
@@ -185,25 +186,34 @@ export const parseBorrowGap = (stderr: string): BorrowGap | undefined => {
   return { total: Number(match[1]), reasons }
 }
 
-/** Only B1's machine-readable gap record can classify a failed build as unsupported. */
+/** Reads every structured support refusal; internal reason IDs are not language codes. */
 export const parseUnsupported = (stderr: string): ReadonlyArray<Gap> | undefined => {
   const records = stderr.split('\n').filter((line) => line.startsWith(unsupportedPrefix))
-  const record = records[0]
-  if (records.length !== 1 || record === undefined) return undefined
-  try {
-    const value: unknown = JSON.parse(record.slice(unsupportedPrefix.length))
-    if (typeof value !== 'object' || value === null || !('gaps' in value)) return undefined
-    const gaps = value.gaps
-    if (!Array.isArray(gaps) || gaps.length === 0) return undefined
-    if (!gaps.every(validGap)) return undefined
-    return gaps.map((gap) => ({
-      code: gap.code,
-      reason: gap.reason,
-      ...(gap.source === undefined ? {} : { source: gap.source }),
-    }))
-  } catch {
-    return undefined
+  if (records.length === 0) return undefined
+  const result: Gap[] = []
+  const seen = new Set<string>()
+  for (const record of records) {
+    try {
+      const value: unknown = JSON.parse(record.slice(unsupportedPrefix.length))
+      if (typeof value !== 'object' || value === null || !('gaps' in value)) return undefined
+      const gaps = value.gaps
+      if (!Array.isArray(gaps) || gaps.length === 0 || !gaps.every(validGap)) return undefined
+      for (const gap of gaps) {
+        const copied = {
+          code: gap.code,
+          reason: gap.reason,
+          ...(gap.source === undefined ? {} : { source: gap.source }),
+        }
+        const key = JSON.stringify(copied)
+        if (seen.has(key)) continue
+        seen.add(key)
+        result.push(copied)
+      }
+    } catch {
+      return undefined
+    }
   }
+  return result
 }
 
 const parseBuildRecord = (record: string): BuildDiagnostic | undefined => {
@@ -214,7 +224,7 @@ const parseBuildRecord = (record: string): BuildDiagnostic | undefined => {
       value === null ||
       !('code' in value) ||
       typeof value.code !== 'string' ||
-      value.code.length === 0 ||
+      !/^[A-Z]{3}[0-9]{4}$/.test(value.code) ||
       !('span' in value) ||
       !('module' in value) ||
       typeof value.module !== 'string' ||
