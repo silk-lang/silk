@@ -62,8 +62,10 @@ pointer weakening removes mutation capability, adds nullability, and weakens ali
 bootstrap does (any requirement to `align(1)`, a written alignment to a smaller written one),
 preserving invariant pointee/extent; it does not implement reverse access, nested pointee
 covariance, or other qualifier conversions. Ownership, lifetime, and cleanup
-checking remains step 14. The TypeScript bootstrap still builds the native compiler and remains the
-complete language oracle.
+checking remains step 14. The TypeScript bootstrap that selfhost last synced from main builds the
+native compiler; the bootstrap DDC job in `selfhost.yml` enforces that it does and that the result
+emits the same compiler IR as the seed chain. Known bootstrap-only rejections and the compiler
+spellings that avoid them are recorded as entries in this file.
 
 ## Entry format
 

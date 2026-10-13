@@ -410,9 +410,12 @@ root's scope:
   an initializer, so the holder is bound after its root, in the same scope or a nested one, and is
   released no later than its root; releases run in reverse declaration order, so a holder whose
   cleanup observes the loan is released first (LIFE-005).
-- Every value that would carry a loan across a scope boundary leaves the walk with `stored-loans`:
-  a block, branch or arm result, a subject that carries a loan, a return, an assignment and a
-  `let mut` holder.
+- Every value that would carry a loan of a body local across a scope boundary leaves the walk with
+  `stored-loans`: a block, branch or arm result, a subject that carries a loan, a return, an
+  assignment and a `let mut` holder. A referent loan (storage behind a reference, which the body
+  does not own) may cross a join, a `let mut` holder, a replacement or a return; such a body is
+  marked crossed and is never `Checked`, because its region relations are the region slices' to
+  prove.
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
   literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
 
