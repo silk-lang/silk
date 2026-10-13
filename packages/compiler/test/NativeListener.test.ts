@@ -22,6 +22,7 @@ import silk.monotonic_clock {MonotonicClock}
 import silk.native_socket {Accepted, ListenOptions, Listener, NativeSocketError, accept, listen, withListener}
 import silk.network_address {Endpoint}
 import silk.option {Option}
+import silk.ownership { Drop }
 import silk.system_clock {Instant, SystemClock}
 import silk.u64
 
@@ -71,6 +72,7 @@ const ownershipSource = `import silk.byte_duplex {ByteDuplex, ByteIoError}
 import silk.monotonic_clock {MonotonicClock}
 import silk.native_socket {Accepted, AcceptedContext, AcceptedView, Connection, Listener, NativeSocketError, PeerAddress, accept, withAccepted, withAcceptedContext, withListener}
 import silk.option {Option}
+import silk.ownership {Copy}
 import silk.system_clock {Instant}
 
 impl Copy for Listener {}

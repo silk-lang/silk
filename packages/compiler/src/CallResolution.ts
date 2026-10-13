@@ -2979,6 +2979,25 @@ export const builtinFunctionReference = (
   }
 }
 
+/**
+ * Resolves the qualifier of a member path. A parameterless alias names its target declaration
+ * (TYPE-004), so with `type Tier = Level`, `Tier.High` qualifies exactly as `Level.High` does.
+ */
+export const resolveMemberQualifier = (
+  context: SemanticContext.SemanticContext,
+  resolution: ResolutionContext,
+  qualifier: AuthoredHir.Name,
+): NameResolution.Lookup => {
+  const lookup = Semantic.resolveName(
+    resolution.semantic,
+    resolution.scope,
+    SemanticContext.nameText(context, qualifier) ?? '',
+  )
+  return lookup._tag === 'Resolved'
+    ? { ...lookup, declaration: NameResolution.erasedOwner(resolution.index, lookup.declaration) }
+    : lookup
+}
+
 export const resolvedFunctionReference = (
   context: SemanticContext.SemanticContext,
   node: AuthoredHir.Expression,
@@ -3012,7 +3031,7 @@ export const resolvedFunctionReference = (
   }
   const qualifier = SemanticContext.nameText(context, first) ?? ''
   const member = SemanticContext.nameText(context, second) ?? ''
-  const qualifierLookup = Semantic.resolveName(resolution.semantic, resolution.scope, qualifier)
+  const qualifierLookup = resolveMemberQualifier(context, resolution, first)
   if (qualifierLookup._tag === 'Intrinsic') {
     const signature = builtinSignature(qualifier, member)
     if (signature === undefined) {
@@ -3072,7 +3091,19 @@ export const analyzeFunctionItem = (
     if (qualifierLookup._tag !== 'Namespace') return undefined
     const memberLookup = DeclarationFacts.lookup(resolution.index, qualifierLookup.module, member)
     let diagnostic: Diagnostic.Located | undefined
-    if (memberLookup._tag !== 'Resolved') {
+    const typeMember = DeclarationFacts.member(resolution.index, qualifierLookup.module, member)
+    if (
+      memberLookup._tag !== 'Resolved' &&
+      typeMember._tag === 'Resolved' &&
+      typeMember.declaration.visibility === 'Public' &&
+      NameResolution.isNominalOwner(typeMember.declaration)
+    ) {
+      diagnostic = Diagnostic.namespaceQualifiedType(
+        qualifierLookup.module,
+        member,
+        Location.at(memberToken.anchor),
+      )
+    } else if (memberLookup._tag !== 'Resolved') {
       diagnostic = Diagnostic.unknownImportedMember(
         qualifierLookup.module,
         member,

@@ -73,6 +73,9 @@ import semantic.Specialization {
 }
 import backend.Mir {
   Lowered,
+  AccessEscape as MirAccessEscape,
+  EscapeSite as MirEscapeSite,
+  SharedAccess as MirSharedAccess,
   Reference as MirReference,
   CallTarget as MirCallTarget,
   ProviderSource as MirProviderSource,
@@ -165,7 +168,7 @@ import semantic.ModuleIndex {
   NameObservation,
 }
 import semantic.Operator
-import semantic.BorrowCheck {Outcome as LoanOutcome, check as checkLoans}
+import semantic.BorrowCheck {Outcome as LoanOutcome, check as checkLoans, regionClosed}
 import semantic.ReturnFlow
 import semantic.OpaqueRealization
 import semantic.CallableOrigin
@@ -260,6 +263,7 @@ import semantic.Type {
 import semantic.TypedBody {
   Environment as BodyEnvironment,
   EnvironmentCapture as BodyEnvironmentCapture,
+  ReferentCapture as BodyReferentCapture,
   BindingAccess as BodyBindingAccess,
   RunAccess,
   Expression as BodyExpression,
@@ -300,6 +304,7 @@ import silk.bytes {Bytes}
 import silk.effect {Effect}
 import silk.hash {Hash, Word}
 import silk.option {Option}
+import silk.ownership {Copy}
 import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.shared {Shared}
@@ -6060,15 +6065,6 @@ struct DeclarationApplication {
   ownerPremises: Vector<Constraint>
 }
 
-fn declarationApplicationResult(result: Result<Shared<Type>, Shared<Rejection>>, premises: Vector<Constraint>) -> Result<DeclarationApplication, Shared<Rejection>> {
-  return match move result {
-    Result<Shared<Type>, Shared<Rejection>>.Success {value} => Result<DeclarationApplication, Shared<Rejection>>.succeed(
-      DeclarationApplication {ty: move value, ownerPremises: move premises},
-    )
-    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => Result<DeclarationApplication, Shared<Rejection>>.failResult(move error)
-  }
-}
-
 effect fn declarationApplication(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -6375,20 +6371,33 @@ effect fn declarationApplication(
           }
         }
       }
+      // An alias (TYPE-004) instantiates the target its query resolved over its own parameters;
+      // substitution renormalizes a union target. A lifetime the target omits is an implicit
+      // alias parameter that this use elides, as a struct header's is.
       if family == Family.Alias {
-        if let Node.AliasHeader {target, ..} = value.header {
-          // The alias query validates the declaration. A use expands under the caller's
-          // elision context, so an omitted alias lifetime remains fresh per use.
-          let expanded = run resolveType(
-            &mut resolver.*,
-            &mut owner.*,
-            &mut dependencies.*,
-            moduleOrdinal,
-            target,
-            Vector<Binder>.asSlice(&binders),
-            &mut callerElision.*,
+        let found = run declarationAt(&mut resolver.*, &module, declaration)
+        if let Option<DeclarationId>.Some {value: aliasId} = move found {
+          let mut types = Vector<usize>.make()
+          let mut lifetimes = Vector<usize>.make()
+          let mut rows = Vector<usize>.make()
+          run Type.collectOwned(&resolved, &aliasId, &mut types, &mut lifetimes, &mut rows)
+          let mut implicit = expected
+          while containsOrdinal(&lifetimes, implicit) {
+            let elided = run elidedLifetime(&mut resolver.*, anchor, span, &mut callerElision.*)
+            match move elided {
+              Result<Shared<Lifetime>, Shared<Rejection>>.Success {value: lifetime} => {
+                run Vector<Argument>.append(&mut arguments, Argument.Lifetime {value: move lifetime})
+              }
+              Result<Shared<Lifetime>, Shared<Rejection>>.Failure {error} => {
+                return Result<DeclarationApplication, Shared<Rejection>>.failResult(move error)
+              }
+            }
+            implicit = implicit + usize.ONE
+          }
+          let expanded = run Type.instantiate(&resolved, &aliasId, Vector<Argument>.asSlice(&arguments))
+          return Result<DeclarationApplication, Shared<Rejection>>.succeed(
+            DeclarationApplication {ty: move expanded, ownerPremises: move ownerPremises},
           )
-          return declarationApplicationResult(move expanded, move ownerPremises)
         }
       }
       if expected > usize.ZERO {
@@ -9464,22 +9473,13 @@ effect fn resolveAlias(
   let written = run header(&mut resolver.*, &module, declarationPosition(key))
   if let Option<HeaderSyntax>.Some {value} = move written {
     if let Node.AliasHeader {target, isPublic, generics, ..} = value.header {
-      // TYPE-004: an alias is not generic. It fixes every argument or names an unapplied
-      // declaration whose arguments each use supplies.
+      // TYPE-004: a generic alias resolves its target once over its own parameters; each use
+      // instantiates that type with its written arguments.
       if generics.length > usize.ZERO {
-        let mut span = value.span
-        if let Option<HirId>.Some {value: first} = move run typeChild(&mut resolver.*, &module, generics, usize.ZERO) {
-          if let Option<HeaderSyntax>.Some {value: parameter} = move run typeNode(&mut resolver.*, &module, first) {
-            span = parameter.span
-          }
-        }
-        return Answer {
-          outcome: Outcome.Rejected {diagnostic: run reject(&resolver.*, &module, RejectionCode.AliasParameters, span)},
-          dependencies: move dependencies,
-        }
+        return run resolveGenericAlias(&mut resolver.*, &mut owner.*, move dependencies, key, &module,
+          generics, target, isPublic)
       }
-      let noTargetBinders = Vector<Binder>.make()
-      let property = run sealedPropertyName(&mut resolver.*, &module, target, Vector<Binder>.asSlice(&noTargetBinders))
+      let property = run sealedPropertyName(&mut resolver.*, &module, target)
       if let Option<SealedProperty>.Some {value: sealed} = move property {
         return Answer {
           outcome: Outcome.Success {value: Value.Property {property: sealed}},
@@ -9496,8 +9496,8 @@ effect fn resolveAlias(
           }
           if exposed {
             let mut span = value.span
-            if let Option<HeaderSyntax>.Some {value: written} = move run typeNode(&mut resolver.*, &module, target) {
-              span = written.span
+            if let Option<HeaderSyntax>.Some {value: targetSyntax} = move run typeNode(&mut resolver.*, &module, target) {
+              span = targetSyntax.span
             }
             return Answer {
               outcome: Outcome.Rejected {diagnostic: run reject(&resolver.*, &module, RejectionCode.PrivateTypeExposure, span)},
@@ -9577,6 +9577,108 @@ effect fn resolveAlias(
     outcome: Outcome.Rejected {diagnostic: move diagnostic},
     dependencies: move dependencies,
   }
+}
+
+// The span of the first generic alias parameter TYPE-004 refuses: one that is not an unbounded
+// type or lifetime parameter.
+effect fn refusedAliasParameter(resolver: &mut Resolver, module: &ModuleId, generics: Range) -> Option<Span>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < generics.length {
+    if let Option<HirId>.Some {value: parameterId} = move run typeChild(&mut resolver.*, module, generics, at) {
+      if let Option<HeaderSyntax>.Some {value: parameter} = move run typeNode(&mut resolver.*, module, parameterId) {
+        let accepted = match parameter.header {
+          Node.TypeParameter {bounds, ..} => bounds.length == usize.ZERO
+          Node.LifetimeParameter {bounds, ..} => bounds.length == usize.ZERO
+          _ => false
+        }
+        if !accepted { return Option<Span>.some(parameter.span) }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Span>.none()
+}
+
+// The span of generic alias parameter `at`, or `fallback` when its syntax is unavailable.
+effect fn aliasParameterSpan(resolver: &mut Resolver, module: &ModuleId, generics: Range, at: usize, fallback: Span) -> Span
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  if let Option<HirId>.Some {value: parameterId} = move run typeChild(&mut resolver.*, module, generics, at) {
+    if let Option<HeaderSyntax>.Some {value: parameter} = move run typeNode(&mut resolver.*, module, parameterId) {
+      return parameter.span
+    }
+  }
+  return fallback
+}
+
+effect fn resolveGenericAlias(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: Vector<Dependency>,
+  key: Key,
+  module: &ModuleId,
+  generics: Range,
+  target: HirId,
+  isPublic: bool,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = move dependencies
+  if let Option<Span>.Some {value: span} = move run refusedAliasParameter(&mut resolver.*, module, generics) {
+    return Answer {
+      outcome: Outcome.Rejected {diagnostic: run reject(&resolver.*, module, RejectionCode.AliasParameters, span)},
+      dependencies: move dependencies,
+    }
+  }
+  let binders = match move run templateBinders(&mut resolver.*, module, declarationPosition(key)) {
+    Result<Vector<Binder>, Shared<Rejection>>.Success {value: found} => move found
+    Result<Vector<Binder>, Shared<Rejection>>.Failure {error} => {
+      return Answer {outcome: Outcome.Rejected {diagnostic: move error}, dependencies: move dependencies}
+    }
+  }
+  let identity = run declarationAt(&mut resolver.*, module, declarationPosition(key))
+  let mut elision = LifetimeElision {
+    owner: run declarationAt(&mut resolver.*, module, declarationPosition(key)),
+    nextOrdinal: Vector<Binder>.length(&binders),
+    output: false,
+    resultDefault: Option<Shared<Lifetime>>.none(),
+    generated: Vector<Shared<Lifetime>>.make(),
+    invocation: false,
+    nested: false,
+    renumber: Vector<usize>.make(),
+    staticEnvironment: false,
+    supplied: Option<Vector<Argument>>.none(),
+    assumptions: Option<Vector<Constraint>>.some(Vector<Constraint>.make()),
+    deferred: Option<Vector<DeferredBounds>>.none(),
+  }
+  let resolved = run resolveType(&mut resolver.*, &mut owner.*, &mut dependencies, key.module, target,
+    Vector<Binder>.asSlice(&binders), &mut elision)
+  let ty = match move resolved {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value: found} => move found
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+      return Answer {outcome: Outcome.Rejected {diagnostic: move error}, dependencies: move dependencies}
+    }
+  }
+  if let Option<Shared<Rejection>>.Some {value: diagnostic} = move run exposedPrivate(&mut resolver.*, module, target, &ty, isPublic) {
+    return Answer {outcome: Outcome.Rejected {diagnostic: move diagnostic}, dependencies: move dependencies}
+  }
+  // Every parameter occurs in the target: an unused one would name distinct spellings of one type.
+  if let Option<DeclarationId>.Some {value: aliasId} = &identity {
+    let mut types = Vector<usize>.make()
+    let mut lifetimes = Vector<usize>.make()
+    let mut rows = Vector<usize>.make()
+    run Type.collectOwned(&ty, &aliasId, &mut types, &mut lifetimes, &mut rows)
+    let mut at = usize.ZERO
+    while at < Vector<Binder>.length(&binders) {
+      if !containsOrdinal(&types, at) && !containsOrdinal(&lifetimes, at) {
+        let span = run aliasParameterSpan(&mut resolver.*, module, generics, at, Span.make(usize.ZERO, usize.ZERO))
+        return Answer {
+          outcome: Outcome.Rejected {diagnostic: run reject(&resolver.*, module, RejectionCode.AliasParameters, span)},
+          dependencies: move dependencies,
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return Answer {outcome: Outcome.Success {value: Value.Type {resolved: move ty}}, dependencies: move dependencies}
 }
 
 // The generic declaration an alias names without arguments (`type Pointed = Point`), so each use
@@ -12311,23 +12413,16 @@ effect fn intrinsicBound(resolver: &mut Resolver, module: &ModuleId, id: HirId) 
   return move found
 }
 
-// The sealed property a written `Copy` or `Drop` names: a bare spelling (a language binding that
-// needs no import and that only a binder shadows), `Intrinsic.Copy` or `Intrinsic.Drop`.
-effect fn sealedPropertyName(resolver: &mut Resolver, module: &ModuleId, id: HirId, binders: &[Binder]) -> Option<
-  SealedProperty,
-> ! Cycle | OutOfMemoryError ? &mut Allocator {
+// The sealed property a written `Intrinsic.Copy` or `Intrinsic.Drop` names (INTR-006). The bare
+// `Copy` and `Drop` are ordinary names, such as the `silk.ownership` aliases.
+effect fn sealedPropertyName(resolver: &mut Resolver, module: &ModuleId, id: HirId) -> Option<SealedProperty>
+! Cycle | OutOfMemoryError ? &mut Allocator {
   let syntax = run typeNode(&mut resolver.*, module, id)
   if let Option<HeaderSyntax>.Some {value} = move syntax {
     if let Node.NamedType {path: typeName, hasMode, ..} = value.header {
       if !hasMode {
         let parsed = run path(&mut resolver.*, module, typeName)
         let segments = Vector<Bytes>.asSlice(&parsed.segments)
-        if parsed.valid && segments.length == usize.ONE {
-          let name = Bytes.asSlice(&segments[usize.ZERO])
-          if !hasBinder(binders, name) {
-            return propertyNamed(name)
-          }
-        }
         if parsed.valid && segments.length == 2 && same(Bytes.asSlice(&segments[usize.ZERO]), b"Intrinsic") {
           return propertyNamed(Bytes.asSlice(&segments[usize.ONE]))
         }
@@ -12360,7 +12455,7 @@ effect fn sealedProperty(
 ) -> Option<SealedProperty>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  let direct = run sealedPropertyName(&mut resolver.*, module, id, binders)
+  let direct = run sealedPropertyName(&mut resolver.*, module, id)
   if let Option<SealedProperty>.Some {..} = &direct {
     return move direct
   }
@@ -27694,11 +27789,12 @@ effect fn selectScalarEnum(
   if candidate.count != usize.ONE || (candidate.kind != CandidateKind.Declaration && candidate.kind != CandidateKind.ImportMember) {
     return Option<Result<SelectedScalarEnum, Shared<Rejection>>>.none()
   }
-  let selected = run selectDeclaration(&mut resolver.*, &mut owner.*, &mut dependencies.*,
-    moduleOrdinal, module, namespace, false, span, RejectionCode.NotType)
+  // A transparent alias qualifier names its target enum (TYPE-004).
+  let selected = run qualifierDeclaration(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+    moduleOrdinal, module, namespace, span)
   let declaration = match move selected {
-    Result<SelectedDeclaration, Shared<Rejection>>.Success {value} => move value
-    Result<SelectedDeclaration, Shared<Rejection>>.Failure {error} => {
+    Result<QualifierDeclaration, Shared<Rejection>>.Success {value} => move value.selected
+    Result<QualifierDeclaration, Shared<Rejection>>.Failure {error} => {
       drop error
       return Option<Result<SelectedScalarEnum, Shared<Rejection>>>.none()
     }
@@ -28682,7 +28778,7 @@ effect fn checkBorrowOperand<'scope>(
     Vector<BodyLocal>.asSlice(&statementScope.locals.*),
     operandNode,
   ) {
-    // `&mut value.*` through a shared reference strengthens that reference (BORROW-005).
+    // A borrow through a shared reference or slice cannot strengthen its access (BORROW-005).
     let mut code = RejectionCode.ExclusiveBorrowRequiresMutable
     if sharedReferent(Vector<BodyNode>.asSlice(&nodes.*), operandNode) { code = RejectionCode.InvalidReborrow }
     return Result<CheckedBorrow, Shared<Rejection>>.failResult(run reject(&resolver.*, module, code, span))
@@ -28751,25 +28847,45 @@ effect fn checkBorrowOperand<'scope>(
   return Result<CheckedBorrow, Shared<Rejection>>.succeed(CheckedBorrow {ty: move ty, value: operandNode})
 }
 
+// Whether a place is reached through shared access. Field and array-element projections
+// preserve their parent's access; slice elements are governed by the descriptor's access.
+fn sharedReferent(nodes: &[BodyNode], id: BodyNodeId) -> bool {
+  return match &nodes[id.index].kind {
+    BodyNodeKind.Expression {
+      form: BodyExpression.Field { value, .. },
+      ..
+    } => sharedReferent(nodes, value)
+    BodyNodeKind.Expression { form: BodyExpression.Index { value, .. }, .. } => {
+      if let BodyNodeKind.Expression { ty, .. } = &nodes[value.index].kind {
+        if let Option<Shared<Type>>.Some { value: element } = move Type.sliceElement(&ty) {
+          return !Shared<Type>.with<bool>(&ty, mutableSlice)
+        }
+      }
+      return sharedReferent(nodes, value)
+    }
+    BodyNodeKind.Expression {
+      form: BodyExpression.Dereference { value },
+      ..
+    } => match &nodes[value.index].kind {
+      BodyNodeKind.Expression { ty, .. } => Shared<Type>.with<bool>(
+        &ty,
+        fn(value: &Type) -> bool {
+          return match &value.* {
+            Type.Reference { access, .. } => access == Access.Shared
+            _ => false
+          }
+        }
+      )
+      _ => false
+    }
+    _ => false
+  }
+}
+
 // Whether a loan addresses storage that already has an owner: a local, a match binding, or the
 // referent of a reference or slice, reached through field and element projections. Any other
 // operand, such as a call result, a literal or a projection of one, is evaluated into a temporary
 // that the loan's hidden owner keeps for the full expression or a borrowing binding (BORROW-006).
-// Whether a place is the referent of a shared reference, read through it directly.
-fn sharedReferent(nodes: &[BodyNode], id: BodyNodeId) -> bool {
-  if let BodyNodeKind.Expression {form: BodyExpression.Dereference {value}, ..} = &nodes[id.index].kind {
-    if let BodyNodeKind.Expression {ty, ..} = &nodes[value.index].kind {
-      return Shared<Type>.with<bool>(&ty, fn(value: &Type) -> bool {
-        return match &value.* {
-          Type.Reference {access, ..} => access == Access.Shared
-          _ => false
-        }
-      })
-    }
-  }
-  return false
-}
-
 fn existingStorage(nodes: &[BodyNode], id: BodyNodeId) -> bool {
   return match &nodes[id.index].kind {
     BodyNodeKind.Expression {form: BodyExpression.Local {..}, ..} => true
@@ -33082,6 +33198,12 @@ effect fn checkRecordMatch<'scope>(
   if (access == MatchAccess.Mutable || access == MatchAccess.Place) && !checkedPlace(Vector<BodyNode>.asSlice(&nodes.*), subjectNode) {
     return run bodyRejection(&resolver.*, module, RejectionCode.InvalidMatchScrutineePlace, span)
   }
+  // An exclusive match lends its subject's place to its bindings, so like `&mut` it needs a mutable
+  // place (MATCH-001).
+  if access == MatchAccess.Mutable && !mutablePlace(Vector<BodyNode>.asSlice(&nodes.*),
+    Vector<BodyLocal>.asSlice(&statementScope.locals.*), subjectNode) {
+    return run bodyRejection(&resolver.*, module, RejectionCode.ExclusiveMatchRequiresMutable, span)
+  }
   // A consuming match transfers the subject's place into the selected arm (MATCH-002).
   let mut subjectAccess = BodySubjectAccess.Copy
   if place { subjectAccess = BodySubjectAccess.Place {access: bindingAccess(access)} }
@@ -34819,6 +34941,7 @@ effect fn finishLiteral(
   let mut fieldTypes = Vector<Shared<Type>>.make()
   let mut fields = Vector<BodyAggregateField>.make()
   let mut aliases = Vector<BodyEnvironmentCapture>.make()
+  let mut referents = Vector<BodyReferentCapture>.make()
   let mut regions = Vector<Shared<Lifetime>>.make()
   let mut at = usize.ZERO
   while at < captured.length {
@@ -34857,6 +34980,20 @@ effect fn finishLiteral(
       operand = BodyNodeId {index: Vector<BodyNode>.length(&nodes.*)}
       run Vector<BodyNode>.append(&mut nodes.*, BodyNode {origin: capture.firstUse, kind: BodyNodeKind.Expression {
         ty: Shared<Type>.clone(&fieldType), form: BodyExpression.Borrow {access: access, value: local}}})
+    }
+    // A captured exclusive descriptor the body reads or writes through stays in its field, and its
+    // referent is reborrowed with that access for as long as the callable lives (CAPTURE-002).
+    let exclusiveView = Shared<Type>.with<bool>(&capture.ty, fn(ty: &Type) -> bool {
+      return match &ty.* {
+        Type.Reference {access, ..} => access == Access.Mutable
+        Type.Slice {access, ..} => access == Access.Mutable
+        _ => false
+      }
+    })
+    if exclusiveView && (capture.access == CaptureAccess.Shared || capture.access == CaptureAccess.Mutable) {
+      let mut access = Access.Shared
+      if capture.access == CaptureAccess.Mutable { access = Access.Mutable }
+      run Vector<BodyReferentCapture>.append(&mut referents, BodyReferentCapture {field: at, access: access})
     }
     if capture.access == CaptureAccess.Move {
       let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
@@ -34927,8 +35064,9 @@ effect fn finishLiteral(
   // The anonymous body is checked like any body: its outer locals are the captured places, and
   // its own loans and moves are proved before it is published (ANON-OWN-001).
   let mut unchecked = BodyBorrowStatus.Regions
+  let pending = openRegionObligation(Vector<BodySafetyObligation>.asSlice(&obligations))
   if bodyHasLoans(Vector<BodyNode>.asSlice(&checkedNodes)) {
-    let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes), root)
+    let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes), root, pending)
     unchecked = verdict.status
     if verdict.outcome == LoanOutcome.Conflict {
       let mut related = Option<RelatedSite>.none()
@@ -34938,9 +35076,15 @@ effect fn finishLiteral(
       }
       return Result<BodyNodeId, Shared<Rejection>>.failResult(run rejectWithRelated(&resolver.*, module, verdict.code, Anchor.absoluteSpan(run cursorAnchor(cursor), verdict.access), move related))
     }
+  } else if !pending && run regionClosed(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes)) {
+    unchecked = BodyBorrowStatus.Checked
+  }
+  let mut stage = BodyStage.ContractTyped {obligations: move obligations}
+  if unchecked == BodyBorrowStatus.Checked {
+    stage = BodyStage.FullyChecked
   }
   let mut body = run TypedBody.make(&identity, move locals, move checkedNodes, root, move signatures,
-    move required, BodyStage.ContractTyped {obligations: move obligations}, unchecked, Vector<SelectedFact>.make())
+    move required, move stage, unchecked, Vector<SelectedFact>.make())
   let preparedEnvironment = run TypedBody.materializeEnvironment(move body, BodyEnvironment {ty: Shared<Type>.clone(&exact), outerCount: outerCount, captures: move aliases})
   let ready = match move preparedEnvironment {
     Option<TypedBody>.Some {value} => move value
@@ -34948,7 +35092,7 @@ effect fn finishLiteral(
   }
   let id = BodyNodeId {index: Vector<BodyNode>.length(&nodes.*)}
   run Vector<BodyNode>.append(&mut nodes.*, BodyNode {origin: run originAt(cursor, expression, span), kind: BodyNodeKind.Expression {
-    ty: move exact, form: BodyExpression.Callable {fields: move fields, body: run Shared<TypedBody>.make(move ready)}}})
+    ty: move exact, form: BodyExpression.Callable {fields: move fields, referents: move referents, body: run Shared<TypedBody>.make(move ready)}}})
   return run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints, &mut nodes.*,
     id, expected, span)
 }
@@ -40717,6 +40861,22 @@ effect fn appendByValueFields(fields: &[BodyAggregateField], operands: &mut Vect
   }
   return ()
 }
+
+// Whether typing retained a region obligation the borrow stage does not discharge yet: a region
+// relation it admitted without proof, or the unresolved contents of a capture.
+fn openRegionObligation(obligations: &[BodySafetyObligation]) -> bool {
+  let mut at = usize.ZERO
+  while at < obligations.length {
+    match &obligations[at] {
+      BodySafetyObligation.RegionRelation {..} => { return true }
+      BodySafetyObligation.Contents {..} => { return true }
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 
 // An affine place taken by value must say `move`: the first such operand in node order is
 // `ExplicitMoveRequired` at that operand (OWN-002, the bootstrap's `OWN0003`). An exclusive
@@ -57865,33 +58025,44 @@ effect fn finishCheckedBody(resolver: &mut Resolver, key: Key, finished: BodyFin
       move dependencies,
     )
   }
-  // A body without loans or moves has only region and contents obligations left.
+  // A body without loans or moves has only its regions left to prove.
   let mut unchecked = BodyBorrowStatus.Regions
   if staticBody {
     unchecked = BodyBorrowStatus.Awaiting
-  } else if bodyHasLoans(Vector<BodyNode>.asSlice(&nodes)) {
-    let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes), control.node)
-    unchecked = verdict.status
-    if verdict.outcome == LoanOutcome.Conflict {
-      let mut related = Option<RelatedSite>.none()
-      if let Option<Span>.Some {value: earlier} = &verdict.earlier {
-        let earlier = Anchor.absoluteSpan(run cursorAnchor(&cursor), earlier)
-        related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&module), span: earlier})
+  } else {
+    let pending = openRegionObligation(Vector<BodySafetyObligation>.asSlice(&relations))
+    if bodyHasLoans(Vector<BodyNode>.asSlice(&nodes)) {
+      let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes), control.node, pending)
+      unchecked = verdict.status
+      if verdict.outcome == LoanOutcome.Conflict {
+        let mut related = Option<RelatedSite>.none()
+        if let Option<Span>.Some {value: earlier} = &verdict.earlier {
+          let earlier = Anchor.absoluteSpan(run cursorAnchor(&cursor), earlier)
+          related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&module), span: earlier})
+        }
+        return rejectedBody(run rejectWithRelated(&resolver.*, &module, verdict.code, Anchor.absoluteSpan(run cursorAnchor(&cursor), verdict.access), move related), move dependencies)
       }
-      return rejectedBody(run rejectWithRelated(&resolver.*, &module, verdict.code, Anchor.absoluteSpan(run cursorAnchor(&cursor), verdict.access), move related), move dependencies)
+    } else if !pending && run regionClosed(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes)) {
+      unchecked = BodyBorrowStatus.Checked
     }
   }
   let mut stage = BodyStage.FullyChecked
   if abstractBody || Vector<BodySafetyObligation>.length(&relations) > usize.ZERO
     || bodyHasReceiverPass(Vector<BodyNode>.asSlice(&nodes)) || bodyHasLoans(Vector<BodyNode>.asSlice(&nodes)) {
-    stage = BodyStage.ContractTyped {
-      obligations: run bodySafetyObligations(
-        &identity,
-        Vector<BodyLocal>.asSlice(&locals),
-        Vector<BodyNode>.asSlice(&nodes),
-        Vector<Constraint>.asSlice(&constraints),
-        move relations,
-      ),
+    let obligations = run bodySafetyObligations(
+      &identity,
+      Vector<BodyLocal>.asSlice(&locals),
+      Vector<BodyNode>.asSlice(&nodes),
+      Vector<Constraint>.asSlice(&constraints),
+      move relations,
+    )
+    // A checked body has discharged every obligation typing retained; a capture's open contents
+    // are not discharged yet.
+    if unchecked == BodyBorrowStatus.Checked && openRegionObligation(Vector<BodySafetyObligation>.asSlice(&obligations)) {
+      unchecked = BodyBorrowStatus.Regions
+    }
+    if unchecked != BodyBorrowStatus.Checked {
+      stage = BodyStage.ContractTyped {obligations: move obligations}
     }
   }
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
@@ -63138,7 +63309,8 @@ effect fn proveAppliedBounds(
   let mut steps = Vector<ConformanceStep>.make()
   let avoid = Option<Shared<DeclarationId>>.none()
   // Contents premises' outlives edges are derived once per proof, on its first outlives bound.
-  let mut implied = Option<Vector<Constraint>>.none()
+  let mut implied = Vector<Constraint>.make()
+  let mut derived = false
   let mut at = usize.ZERO
   while at < bounds.length {
     let assumptions = Vector<Constraint>.asSlice(declared)
@@ -63166,13 +63338,11 @@ effect fn proveAppliedBounds(
       continue
     }
     if let Constraint.Outlives {longer, shorter} = &bounds[at] {
-      if let Option<Vector<Constraint>>.None = &implied {
-        implied = Option<Vector<Constraint>>.some(run contentsOutlives(assumptions))
+      if !derived {
+        implied = run contentsOutlives(assumptions)
+        derived = true
       }
-      let edges = match &implied {
-        Option<Vector<Constraint>>.Some {value} => Vector<Constraint>.asSlice(&value)
-        Option<Vector<Constraint>>.None => assumptions
-      }
+      let edges = Vector<Constraint>.asSlice(&implied)
       if !run knownOutlives(edges, &longer, &shorter) {
         if Lifetime.anyAtom(&longer, localLifetime) && Shared<Lifetime>.with<bool>(&shorter, staticLifetime) {
           return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnsatisfiedLifetimeBound, span))
@@ -66182,6 +66352,14 @@ impl Semantic {
         }
         caller = caller + usize.ONE
       }
+      // A local-shared access is held while its callback runs, so nothing that callback reaches
+      // may run an Effect or notify an execution (SHARED-003). The pass covers every reached
+      // access, before any code is emitted.
+      let mut escapes = run localSharedEscapes(&self.resolver, reached)
+      if Vector<Shared<Rejection>>.length(&escapes) > usize.ZERO {
+        let first = Vector<Shared<Rejection>>.remove(&mut escapes, usize.ZERO)
+        return BackendBuild.Rejected {first: move first, further: move escapes, gaps: Vector<Shared<BackendGap>>.make()}
+      }
       let mut first = usize.MAX
       let mut at = usize.ZERO
       while at < marked.length && first == usize.MAX {
@@ -66723,26 +66901,37 @@ struct CallbackBoundary {
   span: Span
 }
 
-// One reached instance's suspension summary: the boundary it runs, if any, and its direct Silk
-// callees.
+// One escape site of a reached instance's own body (SHARED-003).
+struct SummaryEscape {
+  kind: MirAccessEscape
+  span: Span
+}
+
+// One reached instance's suspension summary: the boundary it runs, if any, its direct Silk
+// callees and each call's span, and the local-shared accesses it holds with their callbacks.
 struct SuspensionSummary {
   key: InstanceKey
   module: ModuleId
   boundary: Option<Span>
   callees: Vector<InstanceKey>
+  calls: Vector<Span>
   callbacks: Vector<CallbackBoundary>
+  accesses: Vector<CallbackBoundary>
+  escapes: Vector<SummaryEscape>
 }
 
 impl SuspensionSummary {
   effect fn make(function: &MirFunction, instance: &InstanceKey, module: &ModuleId, anchor: &Option<Anchor>) -> SuspensionSummary
   ! OutOfMemoryError ? &mut Allocator {
     let mut callees = Vector<InstanceKey>.make()
+    let mut calls = Vector<Span>.make()
     let mut callbacks = Vector<CallbackBoundary>.make()
     let blocks = Vector<MirBlock>.asSlice(&function.blocks)
     let mut at = usize.ZERO
     while at < blocks.length {
-      if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+      if let MirTerminator.Call {callee: MirCallee.Instance {key}, origin, ..} = &blocks[at].terminator {
         run Vector<InstanceKey>.append(&mut callees, InstanceKey.copy(&key))
+        run Vector<Span>.append(&mut calls, anchoredSpan(anchor, origin))
       }
       let statements = Vector<MirStatement>.asSlice(&blocks[at].statements)
       let mut statement = usize.ZERO
@@ -66758,12 +66947,29 @@ impl SuspensionSummary {
     }
     let mut boundary = Option<Span>.none()
     if let Option<BodyOrigin>.Some {value: origin} = &function.suspension { boundary = Option<Span>.some(anchoredSpan(anchor, origin)) }
+    let mut accesses = Vector<CallbackBoundary>.make()
+    let held = Vector<MirSharedAccess>.asSlice(&function.accesses)
+    at = usize.ZERO
+    while at < held.length {
+      run Vector<CallbackBoundary>.append(&mut accesses, CallbackBoundary {key: InstanceKey.copy(&held[at].callback), span: anchoredSpan(anchor, held[at].origin)})
+      at = at + usize.ONE
+    }
+    let mut escapes = Vector<SummaryEscape>.make()
+    let sites = Vector<MirEscapeSite>.asSlice(&function.escapes)
+    at = usize.ZERO
+    while at < sites.length {
+      run Vector<SummaryEscape>.append(&mut escapes, SummaryEscape {kind: sites[at].kind, span: anchoredSpan(anchor, sites[at].origin)})
+      at = at + usize.ONE
+    }
     return SuspensionSummary {
       key: InstanceKey.copy(instance),
       module: ModuleId.copy(module),
       boundary: move boundary,
       callees: move callees,
+      calls: move calls,
       callbacks: move callbacks,
+      accesses: move accesses,
+      escapes: move escapes,
     }
   }
 }
@@ -66791,15 +66997,50 @@ effect fn callbackSuspends(summaries: &[SuspensionSummary], marked: &[bool], key
   return false
 }
 
+// One resolved call of a summary: the callee's summary position and the call's index.
+struct CallEdge {
+  target: usize
+  call: usize
+}
+
+// Each summary's direct callees as summary positions, in call order.
+effect fn summaryEdges(summaries: &[SuspensionSummary]) -> Vector<Vector<CallEdge>> ! OutOfMemoryError ? &mut Allocator {
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < summaries.length {
+    run InternIndex.record(&mut lookup, InstanceKey.runtimeHash(&summaries[at].key))
+    at = at + usize.ONE
+  }
+  let mut edges = Vector<Vector<CallEdge>>.make()
+  at = usize.ZERO
+  while at < summaries.length {
+    let mut targets = Vector<CallEdge>.make()
+    let callees = Vector<InstanceKey>.asSlice(&summaries[at].callees)
+    let mut callee = usize.ZERO
+    while callee < callees.length {
+      let mut found = InternIndex.first(&lookup, InstanceKey.runtimeHash(&callees[callee]))
+      while found != usize.MAX {
+        if run InstanceKey.sameInstance(&summaries[found].key, &callees[callee]) {
+          run Vector<CallEdge>.append(&mut targets, CallEdge {target: found, call: callee})
+          break
+        }
+        found = InternIndex.after(&lookup, found)
+      }
+      callee = callee + usize.ONE
+    }
+    run Vector<Vector<CallEdge>>.append(&mut edges, move targets)
+    at = at + usize.ONE
+  }
+  return move edges
+}
+
 // Marks the reached instances that can suspend: each one that runs a boundary, then each one
 // that calls a marked instance directly, to a fixed point. Fixed-linkage shims are never marked;
 // they call a suspendable instance's ordinary symbol, which drives its frames.
 effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
-  let mut lookup = InternIndex.make()
   let mut marked = Vector<bool>.make()
   let mut at = usize.ZERO
   while at < summaries.length {
-    run InternIndex.record(&mut lookup, InstanceKey.runtimeHash(&summaries[at].key))
     let origin = match &summaries[at].boundary {
       Option<Span>.Some {..} => true
       Option<Span>.None => false
@@ -66807,28 +67048,8 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
     run Vector<bool>.append(&mut marked, origin && !InstanceKey.fixedLinkage(&summaries[at].key))
     at = at + usize.ONE
   }
-  // Each summary's callees as summary positions.
-  let mut edges = Vector<Vector<usize>>.make()
-  at = usize.ZERO
-  while at < summaries.length {
-    let mut targets = Vector<usize>.make()
-    let callees = Vector<InstanceKey>.asSlice(&summaries[at].callees)
-    let mut callee = usize.ZERO
-    while callee < callees.length {
-      let mut found = InternIndex.first(&lookup, InstanceKey.runtimeHash(&callees[callee]))
-      while found != usize.MAX {
-        if run InstanceKey.sameInstance(&summaries[found].key, &callees[callee]) {
-          run Vector<usize>.append(&mut targets, found)
-          break
-        }
-        found = InternIndex.after(&lookup, found)
-      }
-      callee = callee + usize.ONE
-    }
-    run Vector<Vector<usize>>.append(&mut edges, move targets)
-    at = at + usize.ONE
-  }
-  let following = Vector<Vector<usize>>.asSlice(&edges)
+  let edges = run summaryEdges(summaries)
+  let following = Vector<Vector<CallEdge>>.asSlice(&edges)
   let mut changed = true
   while changed {
     changed = false
@@ -66836,11 +67057,11 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
     while at < summaries.length {
       let current = Vector<bool>.asSlice(&marked)
       if !current[at] && !InstanceKey.fixedLinkage(&summaries[at].key) {
-        let targets = Vector<usize>.asSlice(&following[at])
+        let targets = Vector<CallEdge>.asSlice(&following[at])
         let mut edge = usize.ZERO
         let mut reaches = false
         while edge < targets.length {
-          if current[targets[edge]] { reaches = true }
+          if current[targets[edge].target] { reaches = true }
           edge = edge + usize.ONE
         }
         if reaches {
@@ -66853,6 +67074,192 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
     }
   }
   return move marked
+}
+
+// One reported local-shared access escape: the escape's own site and the call it relates to.
+struct EscapeReport {
+  module: ModuleId
+  span: Span
+  relatedModule: ModuleId
+  related: Span
+}
+
+fn runCall(escapes: &[SummaryEscape], span: Span) -> bool {
+  let mut at = usize.ZERO
+  while at < escapes.length {
+    if escapes[at].kind == MirAccessEscape.Suspension && sameSpan(escapes[at].span, span) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn sameSpan(left: Span, right: Span) -> bool {
+  return left.start == right.start && left.end == right.end
+}
+
+fn reportedEscape(reports: &[EscapeReport], module: &ModuleId, span: Span, site: &RelatedSite) -> bool {
+  let mut at = usize.ZERO
+  while at < reports.length {
+    if sameSpan(reports[at].span, span) && sameSpan(reports[at].related, site.span) && ModuleId.equals(&reports[at].module, module)
+      && ModuleId.equals(&reports[at].relatedModule, &site.module) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn sharesDeclaration(left: &[DeclarationId], right: &[DeclarationId]) -> bool {
+  let mut at = usize.ZERO
+  while at < left.length {
+    let mut other = usize.ZERO
+    while other < right.length {
+      if DeclarationId.equals(&left[at], &right[other]) { return true }
+      other = other + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The callable declarations an instance's application carries: what its callable parameters were
+// specialized over.
+effect fn carriedCallables(key: &InstanceKey) -> Vector<DeclarationId> ! OutOfMemoryError ? &mut Allocator {
+  let mut carried = Vector<DeclarationId>.make()
+  if let Option<Shared<Application>>.Some {value: application} = move InstanceKey.application(key) {
+    let count = Shared<Application>.with<usize>(&application, Application.typeCount)
+    let mut at = usize.ZERO
+    while at < count {
+      let argument = Shared<Application>.with<Option<Shared<Type>>>(&application, fn(selected: &Application) -> Option<Shared<Type>> {
+        return Application.typeAt(selected, at)
+      })
+      if let Option<Shared<Type>>.Some {value} = move argument { run Type.appendCallableTargets(&value, &mut carried) }
+      at = at + usize.ONE
+    }
+  }
+  return move carried
+}
+
+// The calls where a held access's callback entered its access wrappers (SHARED-003). A wrapper
+// instance is specialized over the callable it forwards, so callers are walked upward while they
+// carry a callable the instance they call carries; the first caller that carries none of them named
+// the callback itself. An access holder that carries no callable names its callback at the access.
+effect fn accessEntries(summaries: &[SuspensionSummary], calls: &[Vector<CallEdge>], carried: &[Vector<DeclarationId>],
+  holder: usize, access: Span) -> Vector<RelatedSite> ! OutOfMemoryError ? &mut Allocator {
+  let mut sites = Vector<RelatedSite>.make()
+  let mut pending = Vector<usize>.make()
+  let mut visited = Vector<bool>.make()
+  while Vector<bool>.length(&visited) < summaries.length { run Vector<bool>.append(&mut visited, false) }
+  if Vector<DeclarationId>.length(&carried[holder]) > usize.ZERO { run Vector<usize>.append(&mut pending, holder) }
+  else { run Vector<RelatedSite>.append(&mut sites, RelatedSite {module: ModuleId.copy(&summaries[holder].module), span: access}) }
+  let mut head = usize.ZERO
+  while head < Vector<usize>.length(&pending) {
+    let current = Vector<usize>.get(&pending, head)
+    head = head + usize.ONE
+    let mut called = false
+    let mut caller = usize.ZERO
+    while caller < summaries.length {
+      let edges = Vector<CallEdge>.asSlice(&calls[caller])
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        if edges[edge].target == current {
+          called = true
+          if sharesDeclaration(Vector<DeclarationId>.asSlice(&carried[caller]), Vector<DeclarationId>.asSlice(&carried[current])) {
+            let marks = Vector<bool>.asMutSlice(&mut visited)
+            if !marks[caller] {
+              marks[caller] = true
+              run Vector<usize>.append(&mut pending, caller)
+            }
+          } else {
+            let span = Vector<Span>.get(&summaries[caller].calls, edges[edge].call)
+            run Vector<RelatedSite>.append(&mut sites, RelatedSite {module: ModuleId.copy(&summaries[caller].module), span: span})
+          }
+        }
+        edge = edge + usize.ONE
+      }
+      caller = caller + usize.ONE
+    }
+    if !called && current == holder {
+      run Vector<RelatedSite>.append(&mut sites, RelatedSite {module: ModuleId.copy(&summaries[holder].module), span: access})
+    }
+  }
+  return move sites
+}
+
+// Every local-shared access escape of the reached instances (SHARED-003). From each held access,
+// its callback and every instance the callback reaches through direct calls are walked
+// breadth-first in call order. Each escape site found is reported at its own span and related to
+// the call where the callback entered its access wrappers, once per pair.
+effect fn localSharedEscapes(resolver: &Resolver, summaries: &[SuspensionSummary]) -> Vector<Shared<Rejection>>
+! OutOfMemoryError ? &mut Allocator {
+  let mut found = Vector<Shared<Rejection>>.make()
+  let mut reports = Vector<EscapeReport>.make()
+  let edges = run summaryEdges(summaries)
+  let calls = Vector<Vector<CallEdge>>.asSlice(&edges)
+  let mut carriedBy = Vector<Vector<DeclarationId>>.make()
+  let mut at = usize.ZERO
+  while at < summaries.length {
+    run Vector<Vector<DeclarationId>>.append(&mut carriedBy, run carriedCallables(&summaries[at].key))
+    at = at + usize.ONE
+  }
+  let carried = Vector<Vector<DeclarationId>>.asSlice(&carriedBy)
+  let mut holder = usize.ZERO
+  while holder < summaries.length {
+    let accesses = Vector<CallbackBoundary>.asSlice(&summaries[holder].accesses)
+    let mut access = usize.ZERO
+    while access < accesses.length {
+      let mut callback = usize.MAX
+      at = usize.ZERO
+      while at < summaries.length && callback == usize.MAX {
+        if run InstanceKey.sameInstance(&summaries[at].key, &accesses[access].key) { callback = at }
+        at = at + usize.ONE
+      }
+      if callback != usize.MAX {
+        let entries = run accessEntries(summaries, calls, carried, holder, accesses[access].span)
+        let sites = Vector<RelatedSite>.asSlice(&entries)
+        let mut queue = Vector<usize>.make()
+        let mut queued = Vector<bool>.make()
+        while Vector<bool>.length(&queued) < summaries.length { run Vector<bool>.append(&mut queued, false) }
+        run Vector<usize>.append(&mut queue, callback)
+        let start = Vector<bool>.asMutSlice(&mut queued)
+        start[callback] = true
+        let mut head = usize.ZERO
+        while head < Vector<usize>.length(&queue) {
+          let reached = Vector<usize>.get(&queue, head)
+          head = head + usize.ONE
+          let escapes = Vector<SummaryEscape>.asSlice(&summaries[reached].escapes)
+          let mut escape = usize.ZERO
+          while escape < escapes.length {
+            let mut site = usize.ZERO
+            while site < sites.length {
+              if !reportedEscape(Vector<EscapeReport>.asSlice(&reports), &summaries[reached].module, escapes[escape].span, &sites[site]) {
+                run Vector<EscapeReport>.append(&mut reports, EscapeReport {module: ModuleId.copy(&summaries[reached].module),
+                  span: escapes[escape].span, relatedModule: ModuleId.copy(&sites[site].module), related: sites[site].span})
+                run Vector<Shared<Rejection>>.append(&mut found, run rejectWithRelated(resolver, &summaries[reached].module,
+                  RejectionCode.LocalSharedAccessEscape, escapes[escape].span,
+                  Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&sites[site].module), span: sites[site].span})))
+              }
+              site = site + usize.ONE
+            }
+            escape = escape + usize.ONE
+          }
+          // A run's own calls are the escape already reported at the run, so they are not walked.
+          let next = Vector<CallEdge>.asSlice(&calls[reached])
+          let mut edge = usize.ZERO
+          while edge < next.length {
+            let marks = Vector<bool>.asMutSlice(&mut queued)
+            let span = Vector<Span>.get(&summaries[reached].calls, next[edge].call)
+            if !marks[next[edge].target] && !runCall(escapes, span) {
+              marks[next[edge].target] = true
+              run Vector<usize>.append(&mut queue, next[edge].target)
+            }
+            edge = edge + usize.ONE
+          }
+        }
+      }
+      access = access + usize.ONE
+    }
+    holder = holder + usize.ONE
+  }
+  return move found
 }
 
 // The closed suspendable set of one build and the storage export symbols its frames use.
