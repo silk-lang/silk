@@ -310,7 +310,14 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
   exclusive views included, are proved, but the body is not region-closed (below), or retains a
   region relation or capture contents; later slices prove those.
-- `storage`: the body uses a storage operation, which the loan and move walk does not enter yet.
+- `storage`: the body uses a storage operation the loan and move walk does not enter yet:
+  `slotAddress`, `replace`, `sharedWithMut`, `executionNotify` (an external readiness callback,
+  which a local-shared access callback must not run: OWN0016), `executionFromAllocation`,
+  `executionDrive`, `relinquish` or `executionCurrent`. Every other storage operation is checked
+  as a call to its contract. Each such contract names the operand region every result view
+  reaches (a raw-buffer view or slot carries its buffer reference's region, a string view its
+  text's region), and `unsafe` discharges only the operation's memory obligations, never its
+  aliasing.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local. One such form must reject rather than stay unchecked: a
   view of a temporary receiver used past its statement, such as `let left = make().left()`, is
@@ -407,9 +414,12 @@ root's scope:
   an initializer, so the holder is bound after its root, in the same scope or a nested one, and is
   released no later than its root; releases run in reverse declaration order, so a holder whose
   cleanup observes the loan is released first (LIFE-005).
-- Every value that would carry a loan across a scope boundary leaves the walk with `stored-loans`:
-  a block, branch or arm result, a subject that carries a loan, a return, an assignment and a
-  `let mut` holder.
+- Every value that would carry a loan of a body local across a scope boundary leaves the walk with
+  `stored-loans`: a block, branch or arm result, a subject that carries a loan, a return, an
+  assignment and a `let mut` holder. A referent loan (storage behind a reference, which the body
+  does not own) may cross a join, a `let mut` holder, a replacement or a return; such a body is
+  marked crossed and is never `Checked`, because its region relations are the region slices' to
+  prove.
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
   literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
 
