@@ -44,8 +44,10 @@ loop. Both operands are evaluated once, left to right; empty views and unequal l
 backing-byte reads. Comparison does not allocate, normalize text, or compare descriptor identity.
 The sealed operator declarations and `Intrinsic.Ordering` load on demand from the same
 `packages/compiler/stdlib/intrinsic/operators.silk` file used by the bootstrap. A reachable
-reference to a declared member, including through a public alias, triggers loading; ordinary
-intrinsic calls and comments do not. The file cannot be imported, selected as an entry or runtime
+reference to a declared member, including through a public alias, triggers semantic loading;
+ordinary intrinsic calls and comments do not. Preload reads and lexes the fixed compiler-owned
+file once to derive its public interface and enum names, and retains those same bytes for
+publication when referenced. There is no separate native declaration-name list. The file cannot be imported, selected as an entry or runtime
 root, or replaced by a project source. Operators bind both to these sealed interfaces and to the
 existing `silk.ops`, `silk.equal`, and `silk.order` interfaces during the staged migration.
 `Intrinsic.Add<i32, i32>.add(40, 2)` is an ordinary interface operation call. Enum values and
