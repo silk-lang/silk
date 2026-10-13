@@ -57,10 +57,19 @@ const annotatedArms = (source, functionName, enumName, issues) => {
     'gm',
   )
   const content = match[1].replace(/\/\*[\s\S]*?\*\//g, '')
-  const remainder = content.replace(expression, (_text, classification, symbol, member, code) => {
-    arms.push({ classification, symbol, member, code })
-    return ''
-  })
+  const remainder = content
+    .replace(expression, (_text, classification, symbol, member, code) => {
+      arms.push({ classification, symbol, member, code })
+      return ''
+    })
+    .replace(
+      new RegExp(`^[ \\t]*// refusal: (\\w+)\\s+${enumName}\\.(\\w+)\\s*=>\\s*b""`, 'gm'),
+      (_text, reason, member) => {
+        if (reason !== member) issues.push(`${functionName}: refusal reason differs from ${member}`)
+        arms.push({ classification: 'refusal', member, code: '' })
+        return ''
+      },
+    )
   if (mask(remainder).trim().length > 0)
     issues.push(`${functionName}: unannotated, default, or nonliteral arm`)
   return arms
@@ -125,7 +134,7 @@ export const verify = ({
     if (named.has(arm.member)) issues.push(`duplicate native arm ${arm.member}`)
     if (!members.includes(arm.member)) issues.push(`unknown native arm ${arm.member}`)
     named.add(arm.member)
-    checkCode(arm.member, arm.symbol, arm.code)
+    if (arm.classification !== 'refusal') checkCode(arm.member, arm.symbol, arm.code)
   }
   for (const member of members) if (!named.has(member)) issues.push(`missing native arm ${member}`)
 
@@ -152,7 +161,7 @@ export const verify = ({
     if (staticReasons.has(arm.member)) issues.push(`duplicate static fault ${arm.member}`)
     if (!faults.includes(arm.member)) issues.push(`unknown static fault ${arm.member}`)
     staticReasons.add(arm.member)
-    checkCode(`Fault.${arm.member}`, arm.symbol, arm.code)
+    if (arm.classification !== 'refusal') checkCode(`Fault.${arm.member}`, arm.symbol, arm.code)
   }
   for (const fault of faults)
     if (!staticReasons.has(fault)) issues.push(`missing static fault ${fault}`)
