@@ -269,7 +269,8 @@ pub fn main() -> i32 { return run build() }`)
 
 it.effect('lowers fully handled intrinsic catches in ordinary functions and destructors', () =>
   Effect.gen(function* () {
-    const self = yield* analyze(`${preamble}
+    const self = yield* analyze(`import silk.ownership {Drop}
+${preamble}
 struct Guard {}
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {
