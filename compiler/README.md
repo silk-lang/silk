@@ -42,6 +42,15 @@ descriptor as a slice. Slice subranges and unions with string or f64 members rem
 Runtime string `==` and `!=` compare byte lengths and then exact UTF-8 bytes with a bounded MIR
 loop. Both operands are evaluated once, left to right; empty views and unequal lengths require no
 backing-byte reads. Comparison does not allocate, normalize text, or compare descriptor identity.
+The sealed operator declarations and `Intrinsic.Ordering` load on demand from the same
+`packages/compiler/stdlib/intrinsic/operators.silk` file used by the bootstrap. A reachable
+reference to a declared member, including through a public alias, triggers loading; ordinary
+intrinsic calls and comments do not. The file cannot be imported, selected as an entry or runtime
+root, or replaced by a project source. Operators bind both to these sealed interfaces and to the
+existing `silk.ops`, `silk.equal`, and `silk.order` interfaces during the staged migration.
+`Intrinsic.Add<i32, i32>.add(40, 2)` is an ordinary interface operation call. Enum values and
+patterns use a single-segment alias such as `type Ordering = Intrinsic.Ordering`, then `Ordering.Less`;
+direct `Intrinsic.Ordering.Less` remains invalid under NAME-005.
 Native source elaboration includes finite static-for expansion over genuine phase-only sealed
 `Intrinsic.StaticSequence` values with homogeneous scalar elements. Each evaluated element owns
 separate static-selection facts and ordinary local/node ranges; the emitted blocks follow element
