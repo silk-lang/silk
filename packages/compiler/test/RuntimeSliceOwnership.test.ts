@@ -1759,3 +1759,130 @@ fn good(flag: bool) -> i32 {
     }
   }),
 )
+
+for (const [name, before, after, valid] of [
+  ['self-copy', '', 'held = held', false],
+  ['current-alias', '', 'let alias = held\n    held = alias', false],
+  ['saved-alias', 'let saved = held', 'held = saved', true],
+  [
+    'loop-copy',
+    '',
+    'let mut count = 0\n    while count < 2 { held = held count = count + 1 }',
+    false,
+  ],
+] as const) {
+  it.effect(`keeps copied pattern loans through later descriptor copies: ${name}`, () =>
+    Effect.gen(function* () {
+      const source = `struct View<T> { value: T }
+fn check(flag: bool) -> i32 {
+  let outer = 1
+  let mut held = &outer
+  ${before}
+  if flag {
+    let inner = 2
+    let wrapped = View { value: &inner }
+    held = match move wrapped { View<&i32> { value: selected } => selected }
+    ${after}
+  }
+  return held.*
+}`
+      const self = yield* analyze(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => ({
+          code: diagnostic.code,
+          span: source.slice(diagnostic.span.start, diagnostic.span.end),
+        })),
+        valid
+          ? []
+          : [
+              { code: 'OWN0019', span: 'held.*' },
+              { code: 'OWN0019', span: 'held.*' },
+            ],
+      )
+    }),
+  )
+}
+
+for (const [name, restored, valid] of [
+  ['retained-field', 'held = pair.first', false],
+  ['safe-field', 'held = pair.second', true],
+  ['safe-move', 'held = move pair.second', true],
+  [
+    'safe-destructure',
+    'let Pair<&i32, &i32> { first: _, second: safe } = move pair held = safe',
+    true,
+  ],
+] as const) {
+  it.effect(`tracks the selected aggregate field when copying pattern loans: ${name}`, () =>
+    Effect.gen(function* () {
+      const source = `struct View<T> { value: T }
+struct Pair<A, B> { first: A second: B }
+fn check(flag: bool) -> i32 {
+  let outer = 1
+  let mut held = &outer
+  if flag {
+    let inner = 2
+    let wrapped = View { value: &inner }
+    held = match move wrapped { View<&i32> { value: selected } => selected }
+    let pair = Pair { first: held, second: &outer }
+    ${restored}
+  }
+  return held.*
+}`
+      const self = yield* analyze(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => ({
+          code: diagnostic.code,
+          span: source.slice(diagnostic.span.start, diagnostic.span.end),
+        })),
+        valid
+          ? []
+          : [
+              { code: 'OWN0019', span: 'held.*' },
+              { code: 'OWN0019', span: 'held.*' },
+            ],
+      )
+    }),
+  )
+}
+
+it.effect('keeps descriptor-storage and referent writes subject to their own active loans', () =>
+  Effect.gen(function* () {
+    for (const [name, source, expected] of [
+      [
+        'descriptor',
+        `fn check() -> i32 {
+  let outer = 1
+  let mut held = &outer
+  let descriptor = &held
+  held = &outer
+  return descriptor.*.*
+}`,
+        [
+          { code: 'OWN0011', span: 'held' },
+          { code: 'OWN0019', span: 'descriptor.*' },
+        ],
+      ],
+      [
+        'referent',
+        `fn check() -> i32 {
+  let mut outer = 1
+  let held = &mut outer
+  let copy = &held.*
+  held.* = 2
+  return copy.*
+}`,
+        [{ code: 'OWN0011', span: 'held' }],
+      ],
+    ] as const) {
+      const self = yield* Analysis.ofSource(`slices/storage-write-${name}`, ascii(source))
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => ({
+          code: diagnostic.code,
+          span: source.slice(diagnostic.span.start, diagnostic.span.end),
+        })),
+        [...expected],
+      )
+    }
+  }),
+)
