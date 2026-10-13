@@ -452,6 +452,46 @@ it.effect('loads a diamond once per module and excludes unreachable sources', ()
   }),
 )
 
+it.effect('loads the sealed operator source only for a module that names one of its members', () =>
+  Effect.gen(function* () {
+    const calls: Array<string> = []
+    const load = (source: string) =>
+      ModuleClosure.load({ root: 'root' }).pipe(
+        Effect.provide(
+          Layer.succeed(SourceResolver.SourceResolver, {
+            resolveStandardLibrary: SourceResolver.resolveEmbeddedStandardLibrary,
+            resolve: (module: string) =>
+              Effect.sync(() => {
+                calls.push(module)
+                return module === 'root'
+                  ? Option.some(SourceResolver.resolved(ascii(source), SourceOrigin.memory()))
+                  : Option.none()
+              }),
+          }),
+        ),
+        Effect.map((closure) => closure.modules.map((module) => module.name)),
+      )
+    // A comment or another Intrinsic member is not a reference to the sealed source.
+    assert.deepEqual(
+      yield* load(
+        `// Intrinsic.Add\nfn add(a: i32) -> i32 { return Intrinsic.i32Add(a, a) }\n${fn}`,
+      ),
+      ['root'],
+    )
+    assert.deepEqual(
+      yield* load(`fn sum<T: Intrinsic.Add<T, T>>(value: T) -> T { return move value }\n${fn}`),
+      ['intrinsic/operators', 'root'],
+    )
+    for (const member of ['Intrinsic . Add', 'Intrinsic // qualifier\n . // member\n Add']) {
+      assert.deepEqual(yield* load(`pub type Plus = ${member}\n${fn}`), [
+        'intrinsic/operators',
+        'root',
+      ])
+    }
+    assert.deepEqual(calls, ['root', 'root', 'root', 'root'])
+  }),
+)
+
 it.effect('is deterministic across resolver supply order', () =>
   Effect.gen(function* () {
     const entries: ReadonlyArray<readonly [string, string]> = [
@@ -585,6 +625,7 @@ it.effect('preserves case and rejects malformed explicit root identities', () =>
       'empty//segment',
       'dot/../segment',
       'scheme://module',
+      'intrinsic/operators',
     ]) {
       const error = yield* Effect.flip(
         ModuleClosure.load({ root: invalid }).pipe(Effect.provide(SourceResolver.empty)),

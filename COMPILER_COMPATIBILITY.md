@@ -1832,6 +1832,21 @@ repeated invocation and capture-only drop glue.
   This correction does not establish native self-build success.
 - **Source migration:** none.
 
+## Sealed operator interfaces
+
+INTR-007 and INTR-008 declare the thirteen operator interfaces, `Ordering`, and the twenty scalar
+conformances in `packages/compiler/stdlib/intrinsic/operators.silk`, reachable only as
+`Intrinsic.<Name>`.
+
+- **Bootstrap:** reads the file, rejects an import of it, and resolves its members. A closure holds
+  it only when one of its modules spells an `Intrinsic` member the file declares.
+- **Native:** does not load the file yet, and reports `Intrinsic.Add` and the other members as
+  unknown. Its pinned seed ignores the unimported file.
+- **Source migration:** none yet. `silk.ops`, `silk.equal` and `silk.order` still declare their own
+  interfaces and scalar conformances, and operator syntax binds to them (OP-009).
+- Retire this entry when the native compiler loads the same file and both compilers bind operators
+  to the sealed interfaces.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
@@ -2094,3 +2109,35 @@ inferred exclusive bindings for independent filesystem and allocator providers.
 - **Rule:** STATIC-012 reuses equal target, generic arguments, evidence and canonical static arguments. Distinct generic arguments retain distinct checked helper applications even when their current scalar results happen to agree.
 - **Coordinator fixture:** `selectedBodiesRouteStaticWorkAndEmbedValues` demands `scaled<i32>` and `scaled<bool>`, each calling `tagged<T>`. It checks one selected caller and one checked helper body for each distinct application, both exact embedded results of 42, and no new body demands when either equal application is repeated. Abstract-body rejection, other selected shapes, selected caller reuse and MIR's absence of runtime static-helper references remain checked.
 - **Evidence:** canonical selfhost 522d020d CI executed 69 of 70 static cases successfully; the single failure expected the bool application to reuse the i32 helper's checked body. An unchanged-actor C7 diagnostic reproduced that exact assertion failure with stable full source inputs. This fixture change preserves the compiler implementation and does not implement per-declaration invalidation in #1359.
+
+## Bootstrap loop invalidation of pattern-derived views
+
+VIEW-002 ends a loan at its last use. A view derived from a borrowed match binding that leaves its
+arm, such as `let edges = match &owner { Some {value} => asSlice(&value) None => fallback }`, is
+dead before a later iteration reassigns `owner`.
+
+- **Bootstrap:** conservative. Inside a `while`, a write to the borrowed owner that the loan's
+  creation reaches over the back-edge invalidates every point reachable from the write without
+  passing the creation again. That includes uses on the path where the arm did not create the
+  loan, so the reassignment reports OWN0019. The same code without the loop, or with a direct
+  view instead of a pattern-derived one, is accepted.
+- **Native:** accepts it, with loans ending at last use.
+- **Source migration:** `proveAppliedBounds` in `compiler/` derives its outlives edges into a
+  plain vector once and views it directly, a form both compilers accept. No other site is known.
+- The bootstrap is an oracle scheduled for retirement and is not loosened for this. Retire this
+  entry with the bootstrap, or when its invalidation follows loans in scope at the write.
+
+## Bootstrap borrows through a view-valued temporary
+
+BORROW-005 makes an element or field reached through a view a place in the view's referent, and
+BORROW-006 keeps a temporary alive for as long as a borrow of it, so
+`kind(&Vector<Entry>.asSlice(&entries)[i].identity)` is valid.
+
+- **Bootstrap:** rejects it with OWN0002. A borrow whose place starts at a call result
+  materializes the whole projected place as an owned temporary instead of rooting the borrow at the
+  view the call returns. Accepting it also needs MIR loan ends for the loans that temporary
+  retains, so the rejection currently prevents a miscompile.
+- **Native:** accepts it.
+- **Source migration:** `ModuleIndex.fingerprint` in `compiler/` binds the slice to a local before
+  indexing it, which both compilers accept and compile identically. No other site is known.
+- The bootstrap is not extended for this. Retire this entry with the bootstrap.
