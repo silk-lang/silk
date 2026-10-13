@@ -36,6 +36,17 @@ export interface Origin {
 export interface LifetimeFlow {
   readonly controlFlow: BodyControlFlow.BodyControlFlow
   readonly retiredUses: ReadonlyMap<string, ReadonlySet<number>>
+  /** Full writes that retire one installed storage bound before a later destructor. */
+  readonly cleanupRetirements: ReadonlyMap<
+    number,
+    {
+      readonly site: string
+      readonly sourceSite: string
+      readonly installedBefore: number
+      readonly installedAfter: number
+      readonly barriers: ReadonlyArray<number>
+    }
+  >
   readonly retirementWork: { readonly comparisons: number; readonly comparisonCacheHits: number }
   readonly syntaxPointCount: number
   readonly input: Lifetime.Input
@@ -1145,6 +1156,16 @@ export const analyze = (
     }
   }
   const retiredUses = new Map<string, ReadonlySet<number>>()
+  const cleanupRetirements: Map<
+    number,
+    {
+      readonly site: string
+      readonly sourceSite: string
+      readonly installedBefore: number
+      readonly installedAfter: number
+      readonly barriers: ReadonlyArray<number>
+    }
+  > = new Map()
   const storageDependencies = Lifetime.assumptions([
     ...constraints.values(),
     ...body.activatedConstraints.map(({ bound }) => bound),
@@ -1209,6 +1230,53 @@ export const analyze = (
     return [{ path: [], type }]
   }
   if (replacements.length > 0) {
+    const wholeByAnchor = new Map<string, (typeof replacements)[number]>()
+    const replacementsBySite = new Map<string, Array<(typeof replacements)[number]>>()
+    for (const replacement of replacements) {
+      const site = Ownership.siteKey(replacement.root)
+      const selected = replacementsBySite.get(site) ?? []
+      selected.push(replacement)
+      replacementsBySite.set(site, selected)
+      const anchor = AuthoredIdentity.anchorKey(replacement.anchor)
+      if (replacement.path.length === 0 && !wholeByAnchor.has(anchor))
+        wholeByAnchor.set(anchor, replacement)
+    }
+    const activationsByLonger = new Map<
+      string,
+      Array<{ readonly ordinal: number; readonly installed: AuthoredHir.Anchor }>
+    >()
+    for (const [ordinal, { bound, installed }] of body.activatedConstraints.entries()) {
+      const key = Lifetime.key(bound.longer)
+      const selected = activationsByLonger.get(key) ?? []
+      selected.push({ ordinal, installed })
+      activationsByLonger.set(key, selected)
+    }
+    // Certify only payloads that cannot contain the displaced loan: storage-free values or
+    // direct new borrows of storage-free bindings. Copies, projections and reborrows stay unknown.
+    const freshReplacement = (
+      value: Elaboration.ExpressionDecision | Tir.Expression,
+      site: string,
+    ): boolean => {
+      if (!('origin' in value)) return false
+      const fresh = (expression: Tir.Expression): boolean => {
+        const type = Elaboration.constructionExpressionType(expression)
+        if (type._tag !== 'Available') return false
+        if (Type.storageLifetimes(type.type).length === 0) return true
+        if (expression._tag === 'Construct' || expression._tag === 'ConstructUnionVariant')
+          return expression.fields.every((field) => fresh(field.value))
+        if (expression._tag !== 'ValueBorrow' || expression.reborrow) return false
+        const root = expressionRoot(expression, context, builder)
+        return (
+          Type.storageLifetimes(expression.source).length === 0 &&
+          root?._tag === 'BindingRoot' &&
+          root.path.length === 0 &&
+          root.binding.inferredType._tag === 'Available' &&
+          Type.storageLifetimes(root.binding.inferredType.type).length === 0 &&
+          Ownership.siteKey(rootSite(root, builder)) !== site
+        )
+      }
+      return fresh(value)
+    }
     for (const [identity, origin] of origins) {
       const created = BodyControlFlow.at(controlFlow, origin.span)
       if (created === undefined || origin.parent !== undefined) continue
@@ -1347,6 +1415,38 @@ export const analyze = (
             transported = true
           }
         }
+      }
+      // A full replacement can stop this value's storage obligation at a later Drop. Keep
+      // only structurally fresh replacements as barriers; copied or projected carriers may
+      // preserve the old loan even when their immediate expression has no root.
+      for (const { ordinal, installed } of activationsByLonger.get(identity) ?? []) {
+        const installedKey = AuthoredIdentity.anchorKey(installed)
+        const carrier = wholeByAnchor.get(installedKey)
+        const installation = controlFlow.boundaries.get(installedKey)
+        if (carrier === undefined || installation === undefined || origin.root === undefined)
+          continue
+        const site = Ownership.siteKey(carrier.root)
+        const barriers = (replacementsBySite.get(site) ?? []).flatMap((replacement) => {
+          if (
+            replacement === carrier ||
+            replacement.path.length !== 0 ||
+            carries.has(replacement) ||
+            !freshReplacement(replacement.value, site)
+          )
+            return []
+          const boundary = controlFlow.boundaries.get(
+            AuthoredIdentity.anchorKey(replacement.anchor),
+          )
+          return boundary === undefined ? [] : [boundary.after]
+        })
+        if (barriers.length > 0)
+          cleanupRetirements.set(ordinal, {
+            site,
+            sourceSite: Ownership.siteKey(origin.root),
+            installedBefore: installation.before,
+            installedAfter: installation.after,
+            barriers,
+          })
       }
       const retired = new Set<number>()
       for (const [position, point] of entries) {
@@ -1555,25 +1655,29 @@ export const analyze = (
     (resolvedSpanUses ??= [...spans].map(
       ([point, span]) => [point, BodyControlFlow.at(controlFlow, span)] as const,
     ))
-  const activatedConstraints = body.activatedConstraints.flatMap(({ bound, installed, owner }) => {
-    ensure(bound.longer)
-    ensure(bound.shorter)
-    const installation = controlFlow.boundaries.get(AuthoredIdentity.anchorKey(installed))
-    if (installation === undefined) return []
-    const ownerBoundary =
-      owner === undefined
-        ? undefined
-        : controlFlow.boundaries.get(AuthoredIdentity.anchorKey(owner))
-    const barriers = [
-      installation.before,
-      ...(ownerBoundary === undefined ? [] : [ownerBoundary.before]),
-    ]
-    const reachable = BodyControlFlow.reachable(controlFlow, installation.after, barriers)
-    const points = new Set<number>()
-    for (const [point, use] of spanUses())
-      if (use !== undefined && BodyControlFlow.includes(reachable, use.after)) points.add(point)
-    return [{ ...bound, points }]
-  })
+  const retainedActivatedOrdinals: Array<number> = []
+  const activatedConstraints = body.activatedConstraints.flatMap(
+    ({ bound, installed, owner }, ordinal) => {
+      ensure(bound.longer)
+      ensure(bound.shorter)
+      const installation = controlFlow.boundaries.get(AuthoredIdentity.anchorKey(installed))
+      if (installation === undefined) return []
+      retainedActivatedOrdinals.push(ordinal)
+      const ownerBoundary =
+        owner === undefined
+          ? undefined
+          : controlFlow.boundaries.get(AuthoredIdentity.anchorKey(owner))
+      const barriers = [
+        installation.before,
+        ...(ownerBoundary === undefined ? [] : [ownerBoundary.before]),
+      ]
+      const reachable = BodyControlFlow.reachable(controlFlow, installation.after, barriers)
+      const points = new Set<number>()
+      for (const [point, use] of spanUses())
+        if (use !== undefined && BodyControlFlow.includes(reachable, use.after)) points.add(point)
+      return [{ ...bound, points }]
+    },
+  )
   const input: Lifetime.Input = {
     pointCount,
     regions: [...regions.values()],
@@ -1600,6 +1704,12 @@ export const analyze = (
   return {
     controlFlow,
     retiredUses,
+    cleanupRetirements: new Map(
+      retainedActivatedOrdinals.flatMap((original, ordinal) => {
+        const retirement = cleanupRetirements.get(original)
+        return retirement === undefined ? [] : [[ordinal, retirement] as const]
+      }),
+    ),
     retirementWork,
     syntaxPointCount: entries.length,
     input,
@@ -2023,6 +2133,35 @@ export const validateCleanup = (
     readonly release: number
   }> = []
   let pointCount = firstPoint
+  const sourceReleases = new Map<string, Array<number>>()
+  const unknownSourceReleases = new Set<string>()
+  if (self.cleanupRetirements.size > 0) {
+    for (const exit of ownership.exits) {
+      const boundary = BodyControlFlow.at(self.controlFlow, exit.span)
+      for (const release of exit.releases) {
+        const site = Ownership.siteKey(release.binding.site)
+        if (boundary === undefined) {
+          unknownSourceReleases.add(site)
+          continue
+        }
+        const points = sourceReleases.get(site) ?? []
+        points.push(boundary.after)
+        sourceReleases.set(site, points)
+      }
+    }
+  }
+  const expiresBeforeRetirement = new Map<number, boolean>()
+  for (const [ordinal, retirement] of self.cleanupRetirements) {
+    const barriers = [retirement.installedBefore, ...retirement.barriers]
+    expiresBeforeRetirement.set(
+      ordinal,
+      unknownSourceReleases.has(retirement.sourceSite) ||
+        (sourceReleases.get(retirement.sourceSite) ?? []).length === 0 ||
+        (sourceReleases.get(retirement.sourceSite) ?? []).some((point) =>
+          BodyControlFlow.reaches(self.controlFlow, retirement.installedAfter, point, barriers),
+        ),
+    )
+  }
   for (const exit of ownership.exits) {
     const sourcePoint = cleanupSourcePoint(self, exit.span)
     // Fresh destructor points never equal the source point, so membership tests against it
@@ -2030,16 +2169,37 @@ export const validateCleanup = (
     const activeBounds =
       sourcePoint === undefined
         ? []
-        : activatedConstraints.filter((bound) => bound.points.has(sourcePoint))
+        : activatedConstraints.flatMap((bound, ordinal) =>
+            bound.points.has(sourcePoint) ? [{ bound, ordinal }] : [],
+          )
+    const sourceSpan = sourcePoint === undefined ? undefined : self.spans.get(sourcePoint)
+    const sourceBoundary =
+      sourceSpan === undefined ? undefined : BodyControlFlow.at(self.controlFlow, sourceSpan)
     // The first release ordinal of each root within this exit.
     const releases = new Map<string, number>()
     for (const [ordinal, release] of exit.releases.entries()) {
       const point = pointCount++
       spans.set(point, exit.span)
       fresh.push({ sourcePoint, releases, release: ordinal })
-      // Ordered destructor points inherit the bounds active at this exit, including
-      // dependencies installed after the holder's original acquisition.
-      for (const bound of activeBounds) bound.points.add(point)
+      // A displaced whole value cannot contribute its old storage bound to this release. Keep
+      // the bound if even one path from its installation reaches Drop without full replacement.
+      for (const { bound, ordinal: boundOrdinal } of activeBounds) {
+        const retirement = self.cleanupRetirements.get(boundOrdinal)
+        if (
+          retirement !== undefined &&
+          retirement.site === Ownership.siteKey(release.binding.site) &&
+          expiresBeforeRetirement.get(boundOrdinal) === false &&
+          sourceBoundary !== undefined &&
+          !BodyControlFlow.reaches(
+            self.controlFlow,
+            retirement.installedAfter,
+            sourceBoundary.after,
+            [retirement.installedBefore, ...retirement.barriers],
+          )
+        )
+          continue
+        bound.points.add(point)
+      }
       for (const lifetime of cleanupLifetimes(release.cleanup, release.initialization))
         regions.get(Lifetime.key(lifetime))?.required.add(point)
       const root = Ownership.siteKey(release.binding.site)
