@@ -131,8 +131,16 @@ Each entry records:
   invariant: the lifetime still follows the declaration's fields (LIFE-002). Requirement keys that
   mention the binder, including either side of an unresolved row subtraction, remain invariant;
   row arguments themselves must still match exactly.
+  A call lifetime fixed by earlier operands may also shorten to their meet with a later operand
+  when every parameter stores it covariantly. Ordinary outlives and contents bounds admit that
+  inference step when their longer side or subject does not mention the shortened binder; every
+  final applied bound is still proved. This includes captured service operations without relaxing
+  exclusive referents or requirement-key identity.
 - **Evidence:** `sharedLoanParametersShortenOnlyMatchingAccess` in
-  `compiler/src/semantic/SemanticLoweringCases.silk`.
+  `compiler/src/semantic/SemanticLoweringCases.silk`, and
+  `loadedDeclarationSweepKeepsRowsInvariantDuringLifetimeInference` and
+  `capturedServiceCallShortensOnlyCovariantLifetimes` in
+  `compiler/src/semantic/SemanticConformanceCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
 
