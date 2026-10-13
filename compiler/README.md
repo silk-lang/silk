@@ -297,7 +297,7 @@ manifest failures propagate rather than becoming backend coverage gaps.
 A reached sealed runtime primitive that the canonical intrinsic catalog defines but selfhost has
 not implemented reports `intrinsic-member`. `semantic.IntrinsicCatalog` retains the exact runtime
 and mixed-phase member spellings; the corpus runner check compares them with the bootstrap catalog.
-An unknown spelling remains `UnknownMember`. This classification adds no primitive implementation.
+An unknown operation spelling reports `SEM0010`. This classification adds no primitive implementation.
 Selfhost implements `isizeToUsize`, which traps on a negative value (CONV-002), and the raw-pointer
 primitives `pointerFromSlice`, `pointerAt`, `pointerRead` and `pointerRequalify`, instantiated from
 their written type arguments. The unsafe members need an `unsafe` boundary or call acknowledgement;
@@ -1118,6 +1118,30 @@ available stack in the bootstrap-generated debug executable before recovery coul
 Grammar rules are ordinary Silk functions. They consume `State` and return it with either an
 unfinished element list or a completed node ID. Replacement values are evaluated before assigning
 them back to a local owner, as required by Silk's ownership rules.
+
+## Diagnostic catalog
+
+`semantic/Rejection.silk` owns native semantic reason identities. Its exhaustive module-level
+`stableCode` table assigns each reason its public diagnostic code; build and strict-inventory
+output use that code with the original module and source span. Internal reason names are not an
+output format. Lexical diagnostics and static execution faults have separate exhaustive tables.
+
+Choose a diagnostic at the producer that knows the failed condition. Expected-value checking
+carries its diagnostic purpose through nested expressions: a bad return value and a bad argument
+inside that return have different codes. Do not relabel a propagated failure by comparing spans.
+
+While both compilers exist, `packages/compiler/src/Diagnostic.ts` remains the authoritative code
+and message-template catalog, and its generated documentation keeps the existing wording gate.
+New allocations land on `main` with complete templates and generated documentation, then reach
+`selfhost` through a sync. Full parameterized native message rendering is a separate migration
+that must finish before removing the bootstrap catalog and its generation checks.
+
+Run `node compiler/scripts/DiagnosticCatalog.mjs` to check each annotated native mapping against
+its exact bootstrap constant, all lexical/static mappings, and the generated catalog. The guard
+rejects missing, duplicate, default and unregistered mappings. `compiler/diagnostic-coverage.json`
+records every catalog code without a dedicated native producer, including its reference rules.
+A coverage gap does not mean the compiler accepts the invalid program; another reason may reject
+it earlier, or the native compiler may lack the feature. Tests assert codes and source spans.
 
 ## Verification
 
