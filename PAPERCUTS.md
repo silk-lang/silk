@@ -650,3 +650,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-13 · Spike updates and progress writes returned HTTP500 Decode errors; direct curl confirmed server InternalError rather than a proxy failure · Preserve local proof receipts, retry uncertain mutations with the same request ID after recovery, and do not infer lease renewal from an HTTP500 · Silk Spike board trial
 
 2026-10-13 · Running the x86-64 seed with qemu-x86_64 -L redirected filesystem root opens into the cross-libc prefix, falsely reporting missing silk.toml · Invoke the x86-64 ld-linux loader explicitly with --library-path and omit -L · Silk ARM64 bootstrap
+
+2026-10-13 · The machine's older gh lacks api --slurp used by the artifact-selection workflow · Query one artifact page with gh api and its built-in --jq selector; use gh api PATCH with a JSON file for PR body updates · Silk stable-location validation
