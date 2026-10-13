@@ -644,3 +644,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 - 2026-10-13 · Main-first provenance could not read historical trees after a credential outage required importing GitHub commit objects and selected verified source archives · Once Git transport recovered, git fetch --refetch origin main selfhost restored complete reachable objects without changing history, allowing the provenance audit to run · Silk operator sync.
 2026-10-13 · Scratch corpus runner bundled with packages external could not resolve effect outside the repo, and a shell command sequence masked its failure with the later guard exit · Bundle dependencies and use checked subprocess calls so corpus must succeed before gap guards run · Silk selfhost OWN0018
+
+2026-10-13 · Spike returned HTTP 500 for board/question reads and progress/handoff writes, preventing approval and claim verification · Saved the census, design and cursor locally; stopped implementation at the last confirmed lease expiry and published the saved handoff on direct user instruction · Silk St4 coordination
