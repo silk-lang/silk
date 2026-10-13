@@ -1560,6 +1560,8 @@ struct Resolver {
   // The request-selected application module ordinal, or MAX when no binding was supplied.
   currentApplication: usize
   active: Vector<Word>
+  // Recording-only epoch: a provider and its ancestors cannot retain unscoped syntax reads.
+  unscopedReads: usize
   // What the units of a revisable store consumed. A one-shot store records nothing into it.
   graph: DependencyGraph
   // Source revision publication can succeed before declaration and graph refresh. Retain its
@@ -4869,19 +4871,34 @@ fn unsupportedSite(gap: &BackendGap) -> Option<DeclarationId> {
 }
 
 
+// A present authored read without a sound input owner is valid for this demand only.
+// Ancestor providers observe the same epoch change, even when a child wraps its result.
+fn markUnscopedRead(resolver: &mut Resolver) -> () {
+  if Graph.recording(&resolver.graph) && Vector<Word>.length(&resolver.active) > usize.ZERO {
+    resolver.unscopedReads = resolver.unscopedReads + usize.ONE
+  }
+  return ()
+}
+
+struct ProviderResult {
+  answer: Result<Answer, NoRejection>
+  transient: bool
+}
+
 effect fn withRunning<'a, 'b>(
   resolver: &'a mut Resolver,
   query: &'b mut Query<Answer, NoRejection>,
   key: Word,
-) -> Result<Answer, NoRejection>
+) -> ProviderResult
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
   let base = Vector<Word>.length(&resolver.active)
   let bodies = Vector<BodyFrame>.length(&resolver.bodies)
   let running = Running {resolver: move resolver, query: move query, key: key, base: base, bodies: bodies}
-  let use = effect fn(resource: &mut Running<'a, 'b>) -> Result<Answer, NoRejection>
+  let use = effect fn(resource: &mut Running<'a, 'b>) -> ProviderResult
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
+    let readEpoch = resource.resolver.unscopedReads
     run Vector<Word>.append(&mut resource.resolver.*.active, resource.key)
     resource.resolver.runs = resource.resolver.runs + usize.ONE
     let unit = u64.toUsize(resource.key.value)
@@ -4910,7 +4927,8 @@ effect fn withRunning<'a, 'b>(
     // A provider records one edge per demand, cache hits included; the answer keeps one of each.
     value.dependencies = run distinctDependencies(Vector<Dependency>.asSlice(&value.dependencies))
     run Graph.finishRun(&mut resource.resolver.*.graph, unit)
-    return Result<Answer, NoRejection>.succeed(move value)
+    return ProviderResult {answer: Result<Answer, NoRejection>.succeed(move value),
+      transient: resource.resolver.unscopedReads != readEpoch}
   }
   let release = effect fn(resource: &mut Running<'a, 'b>) -> () {
     Vector<Word>.truncate(&mut resource.resolver.*.active, resource.base)
@@ -4994,10 +5012,12 @@ effect fn demandUnit(
     > ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | StaticBudgetRefusal ? &mut Allocator | &mut Types {
       run emit(&mut resolver.*, EventKind.Start, demanded)
       let resolved = run withRunning(&mut resolver.*, &mut query.*, demanded)
-      if isTransientStaticBudgetAnswer(&resolved) {
-        fail StaticBudgetRefusal {answer: move resolved}
+      if resolved.transient || isTransientStaticBudgetAnswer(&resolved.answer) {
+        // The child has left its running frame; propagate transient evidence to its ancestors.
+        markUnscopedRead(&mut resolver.*)
+        fail StaticBudgetRefusal {answer: move resolved.answer}
       }
-      return move resolved
+      return move resolved.answer
     },
   ))
   let answer = match move attempted {
@@ -51638,6 +51658,52 @@ fn bodyCoverageGap(hir: &Module, span: Span) -> GapCode {
 }
 
 
+// The rejection supplies the module of its site. Classify the exact current HIR as before,
+// and record the narrowest containing authored declaration, independently of the MIR owner.
+effect fn coverageAtRejection(resolver: &mut Resolver, module: &ModuleId,
+  answer: &Shared<Result<SourceResult, NoRejection>>, span: Span) -> GapCode
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let mut owner = Option<DeclarationId>.none()
+  let mut ordinal = usize.MAX
+  let mut width = usize.MAX
+  let mut code = GapCode.TypedForm
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, answer, module) {
+    let hir = IndexedSource.authored(indexed)
+    code = bodyCoverageGap(hir, span)
+    // Generated and zero-width sites do not establish an authored owner.
+    if Graph.recording(&resolver.graph) && span.start < span.end {
+      let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+      let mut at = usize.ZERO
+      while at < declarations.length {
+        let own = Module.span(hir, declarations[at].local)
+        if own.start <= span.start && span.start <= span.end && span.end <= own.end
+          && own.end - own.start <= width {
+          ordinal = at
+          width = own.end - own.start
+        }
+        at = at + usize.ONE
+      }
+      if ordinal != usize.MAX {
+        // Anonymous syntax is owned by its enclosing authored declaration's whole input.
+        if let Option<SyntaxInput>.Some {value: input} = move ModuleIndex.syntaxInput(
+          IndexedSource.moduleIndex(indexed), hir, declarations[ordinal].local,
+        ) {
+          ordinal = input.ordinal
+          owner = Option<DeclarationId>.some(DeclarationId.copy(&declarations[ordinal].identity))
+        }
+      }
+    }
+  }
+  if let Option<DeclarationId>.Some {value: declaration} = move owner {
+    run recordSyntaxDeclaration(&mut resolver.*, module, answer, ordinal, true)
+    run recordLocationIdentity(&mut resolver.*, &declaration)
+  } else {
+    // Preserve the same gap for ownerless and generated sites, without caching guessed input.
+    markUnscopedRead(&mut resolver.*)
+  }
+  return code
+}
+
 // MIR preparation either lacks a lowering form or failed to canonicalize a complete semantic
 // region domain. The latter is a source diagnostic, never an invented declaration-level gap.
 union PreparationFailure {
@@ -56793,19 +56859,19 @@ effect fn lowerMir(
       let authoredOrdinal = rejectionModuleOrdinal(&resolver.*, &value)
       if authoredOrdinal == usize.MAX { return memberRejected(move value, move dependencies) }
       let authoredModule = resolvedModule(&resolver.*, authoredOrdinal)
-      let sourceAnswer = run source(&mut resolver.*, &authoredModule)
-      let coverage = match move sourceOf(&resolver.*, &sourceAnswer, &authoredModule) {
-        Option<&IndexedSource>.Some {value: indexed} => bodyCoverageGap(
-          IndexedSource.authored(indexed),
-          span,
-        )
-        Option<&IndexedSource>.None => {
+      let sourceAnswer = run demandSource(&mut resolver.*, &authoredModule)
+      let present = match move sourceOf(&resolver.*, &sourceAnswer, &authoredModule) {
+        Option<&IndexedSource>.Some {..} => true
+        Option<&IndexedSource>.None => false
+      }
+      if !present {
+        run recordSyntaxDeclaration(&mut resolver.*, &authoredModule, &sourceAnswer, usize.MAX, false)
           return memberRejected(
             run reject(&resolver.*, &authoredModule, RejectionCode.MissingModule, span),
             move dependencies,
           )
-        }
       }
+      let coverage = run coverageAtRejection(&mut resolver.*, &authoredModule, &sourceAnswer, span)
       return memberSuccess(
         Value.Unsupported {
           gap: run Shared<BackendGap>.make(BackendGap.fromRejection(coverage, &identity, &value)),
@@ -66237,6 +66303,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       keyLookup: InternIndex.make(),
       currentApplication: usize.MAX,
       active: Vector<Word>.make(),
+      unscopedReads: usize.ZERO,
       graph: Graph.make(revisable),
       pendingChanges: Vector<SourceChange>.make(),
       pendingOrdinal: usize.ZERO,
