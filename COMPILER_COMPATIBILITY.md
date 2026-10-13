@@ -1840,12 +1840,16 @@ conformances in `packages/compiler/stdlib/intrinsic/operators.silk`, reachable o
 
 - **Bootstrap:** reads the file, rejects an import of it, and resolves its members. A closure holds
   it only when one of its modules spells an `Intrinsic` member the file declares.
-- **Native:** does not load the file yet, and reports `Intrinsic.Add` and the other members as
-  unknown. Its pinned seed ignores the unimported file.
-- **Source migration:** none yet. `silk.ops`, `silk.equal` and `silk.order` still declare their own
-  interfaces and scalar conformances, and operator syntax binds to them (OP-009).
-- Retire this entry when the native compiler loads the same file and both compilers bind operators
-  to the sealed interfaces.
+- **Native:** reads the same file on demand, resolves public generic aliases and applied interface
+  calls, and refuses imports, entry/runtime roots and project replacements for the sealed path.
+  Operator syntax recognizes its sealed interfaces alongside the declared library interfaces.
+  Enum values and patterns use a single-segment alias; `Intrinsic.Ordering.Less` stays invalid
+  under NAME-005.
+- **Source migration:** pending. `silk.ops`, `silk.equal` and `silk.order` still declare their own
+  interfaces and scalar conformances. The staged native dual binding remains until those modules
+  publish aliases and the later deletion removes the library-spelling paths (OP-009).
+- Retire this entry when both compilers bind operators only to the sealed interfaces and the
+  declared library interfaces have been replaced by aliases.
 
 ## Explicit synchronous source startup
 
