@@ -628,3 +628,8 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-13 · The lifetime benchmark runner calls removed Elaboration.executableFunctions and Instances.discover APIs, preventing end-to-end smoke runs of repaired Copy/Drop literals · Validate the five generated programs directly with Analysis.ofSource; leave runner API migration to its own change · compiler
 2026-10-13 · NativeBuild rejected an underscore in the exploratory BASE_N1 generation label before any build · Use the supported N1 label in a distinct baseline output directory; generation labels accept only the tool's path-safe spelling · Silk.
 - 2026-10-13 · gh pr edit failed on the retired Projects classic projectCards GraphQL field while push and PR reads still worked · update the PR body with the REST PATCH pulls endpoint and a JSON input file · Silk selfhost
+- 2026-10-13 · Spike CLI board reads timed out while curl succeeded through the managed proxy · Set NODE_USE_ENV_PROXY=1 for Node 24 CLI invocations and preserve inherited proxy/CA settings · session coordination
+
+2026-10-13 · Reusing docgen dist across linked worktrees loaded two compiler SemanticQuery module instances and failed documentation lookup · Give the docgen worktree its own dist and local @silklang/compiler dependency link so analysis and rendering share one compiler module graph · Silk operator alias migration
+
+- 2026-10-13 · The installed gh pr edit queried deprecated GraphQL projectCards and failed to update a PR body · Update the pull request through gh api PATCH with a JSON input file, then verify its body and head · agent workflow

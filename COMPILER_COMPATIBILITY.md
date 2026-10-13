@@ -1832,25 +1832,6 @@ repeated invocation and capture-only drop glue.
   This correction does not establish native self-build success.
 - **Source migration:** none.
 
-## Sealed operator interfaces
-
-INTR-007 and INTR-008 declare the thirteen operator interfaces, `Ordering`, and the twenty scalar
-conformances in `packages/compiler/stdlib/intrinsic/operators.silk`, reachable only as
-`Intrinsic.<Name>`.
-
-- **Bootstrap:** reads the file, rejects an import of it, and resolves its members. A closure holds
-  it only when one of its modules spells an `Intrinsic` member the file declares.
-- **Native:** reads the same file on demand, resolves public generic aliases and applied interface
-  calls, and refuses imports, entry/runtime roots and project replacements for the sealed path.
-  Operator syntax recognizes its sealed interfaces alongside the declared library interfaces.
-  Enum values and patterns use a single-segment alias; `Intrinsic.Ordering.Less` stays invalid
-  under NAME-005.
-- **Source migration:** pending. `silk.ops`, `silk.equal` and `silk.order` still declare their own
-  interfaces and scalar conformances. The staged native dual binding remains until those modules
-  publish aliases and the later deletion removes the library-spelling paths (OP-009).
-- Retire this entry when both compilers bind operators only to the sealed interfaces and the
-  declared library interfaces have been replaced by aliases.
-
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
