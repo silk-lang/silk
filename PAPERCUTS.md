@@ -647,3 +647,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-12 · GNU /usr/bin/time is absent in this rootless worker, so a region baseline measurement exited127 before starting · Capture the exact child wall/user/system time and peakRSS with Python os.wait4 rusage in a fresh process · Silk native borrow checking R3
 
 2026-10-13 · Running the x86-64 seed with qemu-x86_64 -L redirected filesystem root opens into the cross-libc prefix, falsely reporting missing silk.toml · Invoke the x86-64 ld-linux loader explicitly with --library-path and omit -L · Silk ARM64 bootstrap
+2026-10-13 · R3 name receipts passed a pointer in a C variadic tail, which native deliberately admits only for integer lanes (ForeignType) · Keep the numeric dprintf prefix and write label bytes through a fixed C write contract · Silk R3 census
