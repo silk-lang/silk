@@ -87,7 +87,8 @@ let result = run pending return result.* }`,
   partialSuspension: (size, invalid = false) => ({
     dimensions: { conditionalFields: size, suspensionPoints: 1 },
     invalid,
-    source: `struct Token { value: i32 }
+    source: `import silk.ownership {Drop}
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Record { ${range(size)
       .map((i) => `f${i}: Token`)
@@ -125,18 +126,20 @@ ${range(size + 1)
   }),
   dependentCleanup: (size) => ({
     dimensions: { recursiveTypeComponent: size, dependentHooks: size },
-    source: `${range(size)
-      .map(
-        (index) => `struct N${index}<'a> { next: &'a mut N${(index + 1) % size}<'a> }
-impl<'a> Drop for N${index}<'a> { fn drop(self: &mut N${index}<'a>) -> () { return () } }
+    source: `import silk.ownership
+${range(size)
+  .map(
+    (index) => `struct N${index}<'a> { next: &'a mut N${(index + 1) % size}<'a> }
+impl<'a> ownership.Drop for N${index}<'a> { fn drop(self: &mut N${index}<'a>) -> () { return () } }
 fn consume${index}<'a>(value: N${index}<'a>) { drop value }`,
-      )
-      .join('\n')}`,
+  )
+  .join('\n')}`,
   }),
   exclusiveReplacements: (size, invalid = false) => ({
     dimensions: { replacements: size, genericTypeComparisons: size },
     invalid,
-    source: `struct Guard<'a> { value: &'a mut i32 }
+    source: `import silk.ownership {Drop}
+struct Guard<'a> { value: &'a mut i32 }
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }
 fn inspect<'a, 'b>(slot: &mut Guard<'a>, incoming: Guard<${invalid ? "'b" : "'a"}>) {
 ${range(size)
@@ -149,7 +152,8 @@ ${range(size)
   }),
   dependentPartial: (size) => ({
     dimensions: { dependentFields: size, independentlyJoinedFields: size },
-    source: `struct Guard<'a> { value: &'a mut i32 }
+    source: `import silk.ownership {Drop}
+struct Guard<'a> { value: &'a mut i32 }
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }
 struct Record<'a> { ${range(size)
       .map((index) => `f${index}: Guard<'a>`)
@@ -658,7 +662,8 @@ const resolutionExamples = (results) => {
 const residualGenerators = {
   dependentOwners: (size) => ({
     dimensions: { dependentOwnerCalls: size, distinctLifetimeArguments: size },
-    source: `struct Guard<'a> { value: &'a mut i32 }
+    source: `import silk.ownership {Drop}
+struct Guard<'a> { value: &'a mut i32 }
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }
 fn owner<T>(value: T) { drop value }
 pub fn main() -> i32 {

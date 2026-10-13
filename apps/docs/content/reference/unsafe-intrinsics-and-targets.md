@@ -497,9 +497,10 @@ let previous = Intrinsic.replace(place, value)
 let text = unsafe Intrinsic.stringFromUtf8Unchecked(bytes)
 ```
 
-The namespace is sealed. Source cannot declare, import as, alias as, shadow, reopen, extend, or
-implement `Intrinsic`. A `type` alias may name an individual member under TYPE-004; that names the
-member and does not alias the namespace. Its operations have canonical compiler identities
+The namespace is sealed. Source cannot declare, import as, alias as, shadow, reopen, or extend
+`Intrinsic`. A `type` alias may name an individual member under TYPE-004; that names the member and
+does not alias the namespace. A provider may conform to a sealed interface member under that
+interface's own rule (INTR-007); the conformance adds no member to the namespace. Its operations have canonical compiler identities
 independent of source paths or packages.
 
 An ordinary actor or function with a matching member spelling receives no privilege:
@@ -735,11 +736,104 @@ value type.
 conformance through any spelling reports `SEM0083` at the later `impl`. A property in a value
 type position receives that position's wrong-kind diagnostic.
 
-**Current compiler:** Partially aligned. The bootstrap compiler is aligned. The self-hosted compiler
-still resolves a bare `Copy` or `Drop` with no declaration or import to the property, and that
-spelling takes precedence over a generic parameter of the same name.
+**Current compiler:** Aligned.
 
-**Evidence:** [type alias tests](../../../../packages/compiler/test/TypeAlias.test.ts).
+**Evidence:** [type alias tests](../../../../packages/compiler/test/TypeAlias.test.ts), the
+`user-declared-copy` program in the [native corpus](../../../../packages/compiler/test/support/corpus.ts).
+
+### INTR-007 — The operator interfaces are sealed `Intrinsic` interfaces with ordinary conformance
+
+**Status:** Confirmed
+
+`Intrinsic` declares thirteen operator interfaces and the `Ordering` enum. Each has a fixed
+canonical signature:
+
+```silk,ignore
+interface Intrinsic.Add<Right, Output> { fn add(left: Self, right: Right) -> Output }
+interface Intrinsic.Subtract<Right, Output> { fn subtract(left: Self, right: Right) -> Output }
+interface Intrinsic.Multiply<Right, Output> { fn multiply(left: Self, right: Right) -> Output }
+interface Intrinsic.Divide<Right, Output> { fn divide(left: Self, right: Right) -> Output }
+interface Intrinsic.Remainder<Right, Output> { fn remainder(left: Self, right: Right) -> Output }
+interface Intrinsic.BitAnd<Right, Output> { fn bitAnd(left: Self, right: Right) -> Output }
+interface Intrinsic.BitOr<Right, Output> { fn bitOr(left: Self, right: Right) -> Output }
+interface Intrinsic.BitXor<Right, Output> { fn bitXor(left: Self, right: Right) -> Output }
+interface Intrinsic.Negate<Output> { fn negate(value: Self) -> Output }
+interface Intrinsic.BitNot<Output> { fn bitNot(value: Self) -> Output }
+interface Intrinsic.Not<Output> { fn not(value: Self) -> Output }
+interface Intrinsic.Equal { fn equals(left: &Self, right: &Self) -> bool }
+interface Intrinsic.Order { fn compare(left: &Self, right: &Self) -> Ordering }
+enum Intrinsic.Ordering { Less, Equal, Greater }
+```
+
+The declarations live in one compiler-owned source file, `packages/compiler/stdlib/intrinsic/operators.silk`,
+which every compiler reads. That file is not a module path. No import can name it, no resolver
+supplies it, and its public declarations are reachable only as `Intrinsic.<Name>`. Its content is
+part of the toolchain's catalog identity, never of a user module's identity.
+
+Only the identity and signature are sealed. A provider conforms like it would to any interface:
+the module that declares the provider writes `impl Intrinsic.Add<Right, Output> for Provider`, with
+ordinary witness mapping, generic heads, bounds and coherence (IMPL-004). A type alias may name a
+member, and a bound or `impl` head through that alias names the same interface:
+
+```silk
+type Order = Intrinsic.Order
+
+struct Meters { value: i32 }
+
+impl Meters {
+  fn plus(left: Meters, right: Meters) -> Meters { return Meters { value: left.value + right.value } }
+}
+
+impl Intrinsic.Add<Meters, Meters> for Meters { add: Meters.plus }
+
+fn sum<T: Intrinsic.Add<T, T>>(left: T, right: T) -> T {
+  return Intrinsic.Add<T, T>.add(move left, move right)
+}
+
+fn rank<T: Order>(left: &T, right: &T) -> Intrinsic.Ordering { return Order.compare(left, right) }
+```
+
+The compiler adds no policy to these interfaces. It does not require operator laws,
+commutativity, or agreement between `Equal` and `Order`.
+
+**Boundary:** Unlike `Copy` and `Drop` (INTR-006), which the compiler verifies, an operator
+interface is an ordinary contract whose behavior each conformance supplies. Source cannot declare,
+extend or reopen any of them.
+
+**Diagnostics:** An import of the sealed file's path reports `MOD0001` at the import. A witness
+that does not match the sealed signature, and a second conformance for the same operands, report
+`SEM0083`. An unknown member such as `Intrinsic.Plus` reports the unknown-intrinsic diagnostic of
+INTR-001, or `SEM0083` where it is written as a bound.
+
+**Current compiler:** Partially aligned. The bootstrap reads the sealed file and resolves its
+members. The self-hosted compiler does not load it yet. Operator syntax still binds to the
+`silk.ops`, `silk.equal` and `silk.order` interfaces (OP-009) until those modules name the sealed
+members.
+
+**Evidence:** [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts),
+[module closure tests](../../../../packages/compiler/test/ModuleClosure.test.ts).
+
+### INTR-008 — Scalar operator conformances are sealed built-ins
+
+**Status:** Confirmed
+
+The ten integer types (`u8` to `u64`, `usize`, `i8` to `i64`, `isize`) have sealed conformances to
+`Intrinsic.Add<T, T>`, witnessed by `Intrinsic.<type>Add`, and to `Intrinsic.Order`, which compares
+with the built-in integer comparison. They are declared in the sealed file, so generic code reaches
+the same operation as concrete code: `T: Intrinsic.Add<T, T>` at `T = i32` selects
+`Intrinsic.i32Add`, the operation `40 + 2` uses.
+
+**Boundary:** Source cannot declare a conformance of a scalar provider to an operator interface.
+Floating types have no sealed `Order` conformance: their built-in comparison is partial (NaN),
+while `Order.compare` is total.
+
+**Diagnostics:** A source conformance for a scalar provider reports one `SEM0083` at that declaration,
+because IMPL-004 places it in the interface's module. A misplaced conformance does not participate
+in coherence, so overlap with a sealed conformance does not produce a second diagnostic.
+
+**Current compiler:** Partially aligned, as INTR-007.
+
+**Evidence:** [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts).
 
 ## Target availability
 
