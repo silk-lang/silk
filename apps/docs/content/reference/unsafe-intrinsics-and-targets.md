@@ -807,8 +807,7 @@ INTR-001, or `SEM0083` where it is written as a bound.
 
 **Current compiler:** Aligned. Both compilers read the shared sealed file on demand and resolve
 its members, including through the transparent aliases in `silk.ops`, `silk.equal` and
-`silk.order`. Operator syntax binds to the sealed identities (OP-009). The native compiler
-retains its old declared-interface binding until the separate native cleanup lands.
+`silk.order`. Operator syntax binds to the sealed identities (OP-009).
 
 **Evidence:** [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts),
 [module closure tests](../../../../packages/compiler/test/ModuleClosure.test.ts).
