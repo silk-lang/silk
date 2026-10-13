@@ -652,3 +652,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-13 · Running the x86-64 seed with qemu-x86_64 -L redirected filesystem root opens into the cross-libc prefix, falsely reporting missing silk.toml · Invoke the x86-64 ld-linux loader explicitly with --library-path and omit -L · Silk ARM64 bootstrap
 
 2026-10-13 · The machine's older gh lacks api --slurp used by the artifact-selection workflow · Query one artifact page with gh api and its built-in --jq selector; use gh api PATCH with a JSON file for PR body updates · Silk stable-location validation
+2026-10-13 · The shared ARM64 VM has no /usr/bin/time, so the native validation launcher failed before invoking the compiler · Use Python monotonic wall-time measurements for the local checks; GNU-time NativeBuild receipts remain a CI concern · Silk stable-location validation
