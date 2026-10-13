@@ -772,6 +772,79 @@ struct Tree<'a> { children: &'a [Tree<'a>] }`),
   }),
 )
 
+it.effect('keeps lifetimes inside nominal requirement-row arguments invariant', () =>
+  Effect.gen(function* () {
+    const source = `import silk.effect { Effect }
+service Gate<'a> {}
+struct Needs<?R> { task: Effect<'static; i32 ? R> }
+struct Wrapped<'a> { value: Needs<&Gate<'a>> }
+fn shorten<'long: 'short, 'short>(value: Wrapped<'long>) -> Wrapped<'short> {
+  return move value
+}`
+    const self = yield* analyze(source)
+    const variance = NominalVariance.derive(self.index)
+    assert.deepEqual(
+      variance.summaries.get(
+        TypeCompatibility.nominalVarianceKey(Type.nominal('slices/Ownership', 'Wrapped')),
+      ),
+      ['Invariant'],
+    )
+    const diagnostics = Analysis.diagnostics(self)
+    assert.deepEqual(
+      diagnostics.map((diagnostic) => ({
+        code: diagnostic.code,
+        span: { start: diagnostic.span.start, end: diagnostic.span.end },
+      })),
+      [
+        {
+          code: 'SEM0129',
+          span: {
+            start: source.indexOf('move value'),
+            end: source.indexOf('move value') + 'move value'.length,
+          },
+        },
+      ],
+    )
+  }),
+)
+
+it.effect('keeps stored and phantom requirement rows exact', () =>
+  Effect.gen(function* () {
+    const source = `import silk.effect { Effect }
+service A {}
+service B {}
+struct Needs<?R> { task: Effect<'static; i32 ? R> }
+struct Phantom<?R> {}
+fn changeStored(value: Needs<&A>) -> i32 {
+  let changed: Needs<&B> = move value
+  return 0
+}
+fn changePhantom(value: Phantom<&A>) -> i32 {
+  let changed: Phantom<&B> = move value
+  return 0
+}`
+    const self = yield* analyze(source)
+    const variance = NominalVariance.derive(self.index)
+    for (const name of ['Needs', 'Phantom'])
+      assert.deepEqual(
+        variance.summaries.get(
+          TypeCompatibility.nominalVarianceKey(Type.nominal('slices/Ownership', name)),
+        ),
+        ['Invariant'],
+      )
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => ({
+        code: diagnostic.code,
+        span: { start: diagnostic.span.start, end: diagnostic.span.end },
+      })),
+      [source.indexOf('move value'), source.lastIndexOf('move value')].map((start) => ({
+        code: 'SEM0037',
+        span: { start, end: start + 'move value'.length },
+      })),
+    )
+  }),
+)
+
 it.effect(
   'projects independent borrowed fields while rejecting unrelated and owned-inline escapes',
   () =>
