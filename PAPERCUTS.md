@@ -191,3 +191,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 - 2026-10-13 · The installed gh pr edit queried deprecated GraphQL projectCards and failed to update a PR body · Update the pull request through gh api PATCH with a JSON input file, then verify its body and head · agent workflow
 - 2026-10-13 · Fresh ARM64 development VM had no Git author identity, blocking the first commit · Set repository-local user.name and the authenticated GitHub account’s public noreply address · Silk cloud setup
+- 2026-10-13 · The corpus harness C-link fixture hard-codes /usr/bin/clang, absent in the managed worker, and ignores SILKC_CLANG · Run the remaining focused harness tests locally and require the C-link fixture to pass in exact-head CI with its installed Clang; do not change unrelated compiler behavior to bypass the fixture · Silk native diagnostic catalog
