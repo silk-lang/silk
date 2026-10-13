@@ -291,6 +291,7 @@ fn privateValue() -> i32 { return 1 }`
     const cleanupSource =
       exclusiveSource +
       `
+import silk.ownership {Drop}
 impl<'a> Drop for Guard<'a> { fn drop(self: &mut Guard<'a>) -> () { return () } }`
     const cleanup = yield* ProjectAnalysis.revise(exclusive, [root.id]).pipe(
       Effect.provide(
