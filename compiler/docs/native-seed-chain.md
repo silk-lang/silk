@@ -83,6 +83,31 @@ N1 and N2 are compiled from the same source by different compilers, so identical
 seed and N1 agree on the meaning of the compiler. A change to code generation still reaches a
 fixpoint at N1/N2; only a seed miscompile or nondeterminism breaks it.
 
+### Bootstrap DDC
+
+**Bootstrap builds the compiler (T1 DDC)** keeps the chain from depending only on itself. It finds
+the newest `main` commit this tree contains (`git merge-base HEAD origin/main`), downloads the
+verified `silk-bootstrap` artifact main's CI published for exactly that commit, and builds
+`compiler/silk.toml` with it. The result, T1, and N1 built by the pinned seed each emit the
+compiler's LLVM IR. The two files must be byte-identical: a compiler built by an independent
+compiler agrees with the chain on the meaning of the compiler source. The job records a receipt
+(synced main commit, bootstrap run, stage times and peak memory, IR hashes) as the
+`selfhost-bootstrap-ddc` artifact on every push run, so drift stays visible.
+
+It runs on every `selfhost` push and on pull requests that change `compiler/native-seed.json`; on
+other pull requests it exits at once. It is not a branch-protection requirement, since selfhost
+pull requests merge on local evidence, but **a seed bump merges only with this job green on its
+head**. Measured locally on 4 cores, the T1 build took 19 minutes at 10.6 GB peak; the receipt
+records the runner figures.
+
+The bootstrap comes from the synced commit, never from `main` HEAD, which may already carry
+main-first changes selfhost has not merged. Main's artifact expires after 90 days, so selfhost
+must sync `main` at least that often. Without a verified artifact for the synced commit the job
+fails rather than falling back to another bootstrap; sync main into selfhost so one exists. A red
+job on a push means selfhost uses something the synced bootstrap cannot compile or compiles
+differently: land a main-first bootstrap fix, or respell the compiler source and record the
+divergence in `COMPILER_COMPATIBILITY.md`. Seed bumps wait until it is green again.
+
 ### Reusing a pull request run
 
 Every `selfhost` push runs in its own concurrency group, so no merge's run is replaced while it
@@ -115,18 +140,20 @@ in its `native-seed.json` and `output.sha256` of N2 in `chain-receipt.json`.
 
 ### Retention
 
-One prerelease per green push accumulates. Older candidates are the recovery path, so pruning must
-leave enough of them. Proposed rule, not automated yet: keep the release named by the pin on
-`selfhost`, every release named by a pin in the last 30 days of `selfhost` history (so a revert can
-return to it), and the 20 newest candidates; delete the rest. Deletion, when added, must read the
-current pin first and never touch its tag. Until then candidates are pruned by hand.
+One prerelease per green push accumulates. **A release that any `selfhost` pin has ever named is
+never deleted**: [hop replay](#hop-replay) rebuilds each pinned seed from the one before it, so the
+chain back to the first seed needs every hop. The rule also keeps the 20 newest candidates and lets
+the rest go. `native-seed-retention.yml` (on `main`, weekly) applies it with
+`prune-native-seeds.mjs`, which reads the whole pin history of `selfhost` first; it only reports
+until deletion is enabled, and candidates are pruned by hand until then.
 
 ## Advancing the pin
 
 Advance when the compiler needs a feature that the pinned seed cannot compile, and otherwise
 whenever convenient (a fresher seed builds faster code). Copy the candidate's `native-seed.json` to
 `compiler/native-seed.json` in a PR to `selfhost`. Its CI proves the new seed builds this checkout,
-reaches the fixpoint and passes the corpus.
+reaches the fixpoint and passes the corpus. The bump merges only once
+[the bootstrap DDC](#bootstrap-ddc) is green on its head.
 
 ## Recovery
 
@@ -148,6 +175,25 @@ checkout. A sync that brings stdlib source the seed cannot compile waits until t
 has landed on `selfhost` and the pin has advanced. A toolchain change, such as an LLVM upgrade that
 the seed's output must follow, lands the same way.
 
+### Hop replay
+
+The chain is reproducible one hop at a time, not by jumping: an old seed rarely compiles current
+source, because a language or standard-library spelling the compiler adopts invalidates every seed
+older than its native support. Each pinned seed's own `native-seed.json` names the commit it was
+built from, and that commit's `compiler/native-seed.json` names the seed that built it. To
+reproduce or recover pinned seed S(k):
+
+1. Check out the source commit S(k) names, and download and verify the seed its pin names, S(k-1).
+2. Build N1 from that checkout with S(k-1), then N2 with N1.
+3. N2 must emit the compiler's LLVM IR byte for byte as the published S(k) does on the same
+   checkout. Replay is established at the IR level; executables can differ with the link
+   toolchain.
+
+Repeating from the first pinned seed rebuilds the whole chain, which is why retention keeps every
+pinned release. `native-seed-hop-drill.yml` (on `main`, weekly) replays the current pin's hop this
+way and fails if the IR differs. To recover a chain whose newest seed is lost or suspect, replay
+forward from the newest seed that still verifies and pin the result.
+
 ### Earlier published seed
 
 For a broken chain: the pinned seed miscompiles, the fixpoint fails for a reason a different seed
@@ -164,7 +210,8 @@ feature again by staged landing. The orchestrator, or the author whose change ne
 ## What this replaces
 
 - The **Authored native seed (N0)** job and **Restore authored native seed** job are removed, and
-  so is the bootstrap re-seed: no CI path builds a compiler with the TypeScript bootstrap.
+  so is the bootstrap re-seed: no seed is built with the TypeScript bootstrap. Only
+  [the bootstrap DDC](#bootstrap-ddc) builds a compiler with it, as an independent check.
 - `NativeSeed.mjs` owns the pin: reading it, verifying a downloaded seed, and writing a candidate.
   `NativeBuild.ts` builds any generation from a hash-verified compiler.
 - `SourceSnapshot.mjs` still defines the exact inputs.

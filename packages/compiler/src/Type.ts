@@ -1045,8 +1045,8 @@ export const containsStaticPhaseOnly = (self: Type): boolean => {
 
 export const intrinsicNominals: ReadonlyMap<string, Nominal> = new Map([
   ['Intrinsic.Allocation', allocation],
-  [copyCapability.name, copyCapability],
-  [dropCapability.name, dropCapability],
+  ['Intrinsic.Copy', copyCapability],
+  ['Intrinsic.Drop', dropCapability],
   ['Intrinsic.RawBuffer', sealedRawBuffer([])],
   ['Intrinsic.Slot', sealedSlot([])],
   ['Intrinsic.SharedCore', sealedSharedCore([])],
@@ -2925,6 +2925,8 @@ export const opaqueRepresentationEvidence = (
 }
 
 interface FoldVisitor<A> {
+  /** Whether requirement-row capabilities are visited; they are by default. */
+  readonly requirements?: boolean
   readonly descendArgument?: (self: GenericArgument) => boolean
   readonly descend?: (self: Type) => boolean
   readonly type?: (self: Type, inBinderScope: (parameterKey: string) => boolean) => A | undefined
@@ -2981,6 +2983,7 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
       for (const typeArgument of argument.environment?.owner.typeArguments ?? [])
         visitArgument(typeArgument)
     } else if (isRequirementRowArgument(argument)) {
+      if (visitor.requirements === false) return
       for (const requirement of RowAlgebra.concreteMembers(requirementRowPolicy(), argument.row))
         visitType(requirement.capability)
       const parameters_ = RowAlgebra.parameters(requirementRowPolicy(), argument.row)
@@ -2993,6 +2996,7 @@ const fold = <A>(self: Type, visitor: FoldVisitor<A>): ReadonlyArray<A> => {
     for (const parameter_ of [...parameters_.rows, ...parameters_.members]) visitType(parameter_)
   }
   const visitRequirementRow = (row: RequirementsRow): void => {
+    if (visitor.requirements === false) return
     for (const requirement of RowAlgebra.concreteMembers(requirementRowPolicy(), row))
       visitType(requirement.capability)
     const parameters_ = RowAlgebra.parameters(requirementRowPolicy(), row)
@@ -3341,6 +3345,13 @@ export const exactRepresentationDeclarations = (
 /** Returns every canonical nominal nested in a type, in deterministic preorder. */
 export const nominals = (self: Type): ReadonlyArray<Nominal> =>
   fold(self, { type: (type) => (isNominal(type) ? type : undefined) })
+
+/**
+ * Returns every nominal a value of this type can hold, skipping requirement-row capabilities,
+ * which name the services an Effect needs rather than values it stores.
+ */
+export const valueNominals = (self: Type): ReadonlyArray<Nominal> =>
+  fold(self, { requirements: false, type: (type) => (isNominal(type) ? type : undefined) })
 
 /** Visits every structural type occurrence in deterministic pre-order. */
 export const visit = (self: Type, visitor: (type: Type) => void): void => {

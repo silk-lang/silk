@@ -175,7 +175,8 @@ const diagnosticView = (result: SyntaxFile.SyntaxFile) =>
   }))
 
 it('retains distinct lifetime binders, arguments, borrowed types and callable environment syntax', () => {
-  const source = `struct Holder<'a: 'b + 'c, 'b, 'c, T: Copy + 'a> {
+  const source = `import silk.ownership {Copy}
+struct Holder<'a: 'b + 'c, 'b, 'c, T: Copy + 'a> {
   value: &'a T
   values: &'b mut [T]
   text: string<'c>
@@ -857,6 +858,7 @@ it('parses unsafe blocks and allocator and Drop conformances losslessly', () => 
   const source = `import silk.allocator { Allocator }
 import silk.allocator { SystemAllocator }
 import silk.layout { Layout }
+import silk.ownership { Drop }
 struct Guard<T> { value: T }
 impl Allocator for SystemAllocator { allocate: SystemAllocator.allocate }
 impl Drop for Guard<Token> {
@@ -875,7 +877,8 @@ fn main() -> i32 { unsafe { let allocation = Allocator.allocate(Layout.make(4, 4
 })
 
 it('parses a parametric conformance losslessly', () => {
-  const source = `struct Vector<T> { count: usize }
+  const source = `import silk.ownership {Drop}
+struct Vector<T> { count: usize }
 impl<T> Drop for Vector<T> {
   fn drop(self: &mut Vector<T>) -> () { return () }
 }
@@ -968,7 +971,7 @@ fn take(state: Empty | Full) -> i32 {
 
 it('recovers from a malformed impl type-parameter list inside the declaration', () => {
   const source =
-    'import silk.vector { Vector }\nimpl<T Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } } fn after() -> i32 { return 7 }'
+    'import silk.ownership { Drop }\nimport silk.vector { Vector }\nimpl<T Drop for Vector<T> { fn drop(self: &mut Vector<T>) -> () { return () } } fn after() -> i32 { return 7 }'
   const result = parseText('memory://damaged-parametric-conformance.silk', source)
   assert.isAbove(result.parserDiagnostics.length, 0)
   assert.strictEqual(directFunctionDeclarations(result.root).length, 1)
@@ -2318,6 +2321,48 @@ it('parses a move operand with its keyword and name', () => {
   assert.deepEqual(result.parserDiagnostics, [])
 })
 
+it('parses a primary move operand with its postfix operations (OWN-003)', () => {
+  const source = `pub fn main() -> i32 {
+  let bare = move run find(1)
+  let grouped = move (run find(1))
+  let applied = move Holder<Token>.make(token)
+  let field = move holder.value
+  let compared = move left < right
+  return 0
+}`
+  const result = parseText('fixture://move-operands.silk', source)
+  const fn = directFunctionDeclarations(result.root).at(0)
+  const block = fn === undefined ? undefined : SyntaxTree.directNode(fn, 'Block')
+  const initializers = (
+    block === undefined ? [] : SyntaxTree.directNodes(block, 'BindingStatement')
+  )
+    .map((binding) => binding.children.filter(SyntaxTree.isNode).at(-1))
+    .map((node) => node ?? raise('expected a binding initializer'))
+  const operand = (move: SyntaxTree.Node): SyntaxTree.Node =>
+    move.children.filter(SyntaxTree.isNode).at(0) ?? raise('expected a move operand')
+  const [bare, grouped, applied, field, compared] = initializers
+
+  assert.deepEqual(
+    initializers.map((node) => node.kind),
+    ['MoveExpression', 'MoveExpression', 'MoveExpression', 'MoveExpression', 'InfixExpression'],
+  )
+  // `run` extends greedily, so both spellings move the same `run find(1)`.
+  const groupedRun = operand(grouped ?? raise('expected grouped move'))
+  assert.strictEqual(operand(bare ?? raise('expected bare move')).kind, 'RunExpression')
+  assert.strictEqual(groupedRun.kind, 'GroupedExpression')
+  assert.strictEqual(SyntaxTree.directNode(groupedRun, 'RunExpression')?.kind, 'RunExpression')
+  assert.strictEqual(operand(applied ?? raise('expected applied move')).kind, 'CallExpression')
+  assert.strictEqual(
+    operand(field ?? raise('expected field move')).kind,
+    'FieldProjectionExpression',
+  )
+  // A comparison next to `move` still applies to the moved operand.
+  assert.strictEqual(compared?.children.filter(SyntaxTree.isNode).at(0)?.kind, 'MoveExpression')
+  assert.deepEqual(result.parserDiagnostics, [])
+  assertOriginalTokenTraversal(result)
+  assert.deepEqual(reconstructedBytes(result), ascii(source))
+})
+
 it('recovers a missing initializer at the return boundary', () => {
   const result = parseText(
     'fixture://missing-initializer.silk',
@@ -3257,6 +3302,32 @@ pub fn inspect(result: Result<i32, bool>) -> i32 {
   assert.deepEqual(reconstructedBytes(result), ascii(source))
 })
 
+it('nests applied union variant patterns inside nominal and variant field patterns', () => {
+  const source = `fn inspect(slot: Slot, form: Form) -> i32 {
+  let first = match move slot {
+    Slot { choice: Choice<i32>.Held { value }, marker } => value
+    Slot { choice: Choice<i32>.Vacant, .. } => 0
+  }
+  return match move form {
+    Form.Move { value: moved, consumed: Option<Place>.None } => first
+    Form.Move { consumed: Option<Place>.Some { value: place }, .. } => 1
+    Form.Other => 2
+  }
+}`
+  const result = parseText('memory/nested-variant-patterns', source)
+  const nestedVariants = descendants(result.root).filter(
+    (element): element is SyntaxTree.Node =>
+      SyntaxTree.isNode(element) &&
+      element.kind === 'PatternField' &&
+      SyntaxTree.directNode(element, 'UnionVariantPattern') !== undefined,
+  )
+
+  assert.strictEqual(nestedVariants.length, 4)
+  assert.deepEqual(result.parserDiagnostics, [])
+  assertOriginalTokenTraversal(result)
+  assert.deepEqual(reconstructedBytes(result), ascii(source))
+})
+
 it('accepts empty field blocks and recovers at sibling variants and declarations', () => {
   const source =
     'union Broken { Empty {}, Good, Bad { value: }, Last { value: i32 } } pub fn after() -> i32 { return 1 }'
@@ -4076,6 +4147,19 @@ it('recovers a type alias without a target at the next declaration', () => {
   assert.strictEqual(missingLeaves(declaration ?? result.root).length > 0, true)
   assert.notStrictEqual(SyntaxTree.directNode(result.root, 'StructDeclaration'), undefined)
   assert.notStrictEqual(result.parserDiagnostics.length, 0)
+  assertOriginalTokenTraversal(result)
+  assert.deepEqual(reconstructedBytes(result), ascii(source))
+})
+
+it('rejects a bound list as a type alias target at the first plus', () => {
+  const source = 'type Both = A + B + C\npub fn after() -> i32 { return 1 }'
+  const result = parseText('memory/bound-list-type-alias', source)
+
+  assert.deepEqual(
+    diagnosticView(result).map((diagnostic) => [diagnostic.code, diagnostic.start]),
+    [['PAR0002', source.indexOf('+')]],
+  )
+  assert.notStrictEqual(SyntaxTree.directNode(result.root, 'FunctionDeclaration'), undefined)
   assertOriginalTokenTraversal(result)
   assert.deepEqual(reconstructedBytes(result), ascii(source))
 })

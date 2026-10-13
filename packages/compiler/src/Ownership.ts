@@ -785,6 +785,19 @@ const placeSite = (expression: Tir.Expression): BindingSite | undefined => {
   return useSite(expression)
 }
 
+/**
+ * The weakest view a scrutinee place dereferences on its path, if any. Every dereference must be
+ * exclusive for `&mut view.*` to select an exclusive scrutinee (BORROW-005, PATT-002).
+ */
+const referentAccess = (expression: Tir.Expression): Type.BorrowAccess | undefined => {
+  if (expression._tag === 'Project' || expression._tag === 'IndexPlace')
+    return referentAccess(expression.subject)
+  if (expression._tag !== 'ReferentPlace') return undefined
+  return expression.reference.access === 'Shared'
+    ? 'Shared'
+    : (referentAccess(expression.subject) ?? 'Exclusive')
+}
+
 const retainedBinding = (
   state: CheckState,
   expression: Tir.Expression,
@@ -1232,6 +1245,17 @@ const checkExpressionOperation = (
     }
     return true
   }
+  // A staged argument is captured into the section's environment. An exclusive reference or slice
+  // staged by value is consumed like any other by-value forward: it is written `&mut values` or
+  // `move values` (BORROW-005, CALLABLE-002).
+  const captureConsumes = (
+    capture: { readonly access: 'Copy' | 'Shared' | 'Exclusive' | 'Take' },
+    value: Tir.Expression,
+  ): boolean =>
+    capture.access === 'Take' ||
+    (value._tag !== 'Unavailable' &&
+      (Type.isReference(value.type) || Type.isSlice(value.type)) &&
+      value.type.access === 'Exclusive')
   // An interface operation borrows an owned argument for a reference or slice operand. An
   // argument that already is an exclusive reference or slice is forwarded by value instead, so it
   // is consumed: forwarding is written `&mut values` (BORROW-005).
@@ -1474,7 +1498,16 @@ const checkExpressionOperation = (
       }
       for (const capture of expression.captures) {
         if (
-          !checkExpression(state, live, capture.value, capture.access === 'Take', guard, escaping)
+          !checkExpression(
+            state,
+            live,
+            capture.value,
+            expression.lexical === true
+              ? capture.access === 'Take'
+              : captureConsumes(capture, capture.value),
+            guard,
+            escaping,
+          )
         )
           return false
       }
@@ -1529,7 +1562,9 @@ const checkExpressionOperation = (
               state,
               live,
               argument,
-              capture === undefined ? argumentConsumes(argument) : capture.access === 'Take',
+              capture === undefined
+                ? argumentConsumes(argument)
+                : captureConsumes(capture, argument),
               guard,
               escaping,
             )
@@ -4201,7 +4236,7 @@ const checkFunction = (
       return true
     }
     if (!checkExpression(state, live, selection.subject, false)) return false
-    if (selection.access === 'Exclusive') {
+    if (selection.access === 'Exclusive' && referentAccess(selection.subject) !== 'Exclusive') {
       if (subjectSite === undefined)
         state.diagnostics.push(Diagnostic.invalidMatchScrutineePlace('Exclusive', selection.span))
       else if (!supportsExclusiveAccess(subjectBinding))
@@ -4881,7 +4916,10 @@ const checkFunction = (
         state.diagnostics.push(
           Diagnostic.explicitMoveRequired(scrutineeBinding?.name ?? '?', expression.span),
         )
-      if (expression.access === 'Exclusive') {
+      if (
+        expression.access === 'Exclusive' &&
+        referentAccess(expression.scrutinee) !== 'Exclusive'
+      ) {
         if (scrutineeSite === undefined)
           state.diagnostics.push(
             Diagnostic.invalidMatchScrutineePlace('Exclusive', expression.span),

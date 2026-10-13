@@ -498,8 +498,9 @@ let text = unsafe Intrinsic.stringFromUtf8Unchecked(bytes)
 ```
 
 The namespace is sealed. Source cannot declare, import as, alias as, shadow, reopen, extend, or
-implement `Intrinsic`. Its operations have canonical compiler identities independent of source
-paths or packages.
+implement `Intrinsic`. A `type` alias may name an individual member under TYPE-004; that names the
+member and does not alias the namespace. Its operations have canonical compiler identities
+independent of source paths or packages.
 
 An ordinary actor or function with a matching member spelling receives no privilege:
 
@@ -687,6 +688,58 @@ storage spelling with no ordinary declaration in scope reports an ordinary unkno
 **Current compiler:** Aligned.
 
 **Evidence:** [intrinsic catalog tests](../../../../packages/compiler/test/IntrinsicCatalog.test.ts).
+
+### INTR-006 — `Copy` and `Drop` are sealed `Intrinsic` properties published by `silk.ownership`
+
+**Status:** Confirmed
+
+The two ownership properties are members of the sealed namespace:
+
+- `Intrinsic.Copy`: values of the type duplicate without user code (OWN-001, STRUCT-005).
+- `Intrinsic.Drop`: an affine type runs one cleanup operation when it is dropped.
+
+The standard library publishes them under ordinary names through TYPE-004 aliases:
+
+```silk,ignore
+// silk/ownership.silk
+pub type Copy = Intrinsic.Copy
+pub type Drop = Intrinsic.Drop
+```
+
+A module imports `Copy` and `Drop` like any other standard-library API. Every spelling names the
+same property, so `impl Copy for Point {}` and `impl Intrinsic.Copy for Point {}` are one
+conformance, and a second one is a duplicate:
+
+```silk
+import silk.ownership { Copy }
+
+struct Point { x: i32 y: i32 }
+
+impl Copy for Point {}
+
+fn twice<T: Intrinsic.Copy>(value: T) -> i32 {
+  let first = value
+  let second = value
+  return 42
+}
+
+pub fn main() -> i32 { return twice(Point { x: 1, y: 2 }) }
+```
+
+**Boundary:** `Copy` and `Drop` are ordinary names. A module that declares its own `Copy`, or a
+generic parameter named `Drop`, shadows the imported name. Without a declaration or import, a bare
+`Copy` does not name the property. The properties are bounds and `impl` heads only; neither one is a
+value type.
+
+**Diagnostics:** An unknown `Intrinsic` member reports an unknown-intrinsic diagnostic. A second
+conformance through any spelling reports `SEM0083` at the later `impl`. A property in a value
+type position receives that position's wrong-kind diagnostic.
+
+**Current compiler:** Partially aligned. The bootstrap compiler is aligned. The self-hosted compiler
+still resolves a bare `Copy` or `Drop` with no declaration or import to the property, and that
+spelling takes precedence over a generic parameter of the same name.
+
+**Evidence:** [type alias tests](../../../../packages/compiler/test/TypeAlias.test.ts).
 
 ## Target availability
 

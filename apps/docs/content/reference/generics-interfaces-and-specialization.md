@@ -1007,9 +1007,9 @@ construct a union or interface value, imply inheritance, add Effect requirements
 ownership of the bounded provider. A service declaration may participate as an ordinary
 compile-time contract; merely naming it in a bound does not request that service at runtime.
 
-The first stable model has no bound aliases, named bound sets, or `where` clause. Reusable behavior
-may be extracted into an ordinary generic actor function, while each public generic declaration
-states the bounds it actually uses.
+The first stable model has no named bound sets or `where` clause. One interface may be named
+through a `type` alias (TYPE-004). Reusable behavior may be extracted into an ordinary generic actor
+function, while each public generic declaration states the bounds it actually uses.
 
 **Diagnostics:** Repeating the same normalized application, such as `T: Display + Display`, reports
 a duplicate-bound diagnostic at the later occurrence. An invalid member retains its unknown-
@@ -1602,6 +1602,8 @@ allowed. The one exception is a bound the provider's declaration already places 
 parameter: every value of the type satisfies it, so repeating it on the head selects nothing.
 
 ```silk,ignore
+import silk.ownership {Drop}
+
 struct Guard<'a> { value: &'a i32 }
 
 impl<'a> Drop for Guard<'a> { /* ... */ }        // valid
