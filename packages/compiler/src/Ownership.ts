@@ -3124,6 +3124,18 @@ const analyzeLoans = (
     }
   }
 
+  // Loans an earlier argument opened and its value retains stay active while the later arguments
+  // of the same call are evaluated (EVAL-001, BORROW-001).
+  const absorbRetainedLoans = (
+    callActive: Array<LoanFact>,
+    from: number,
+    call: SourceSpan.SourceSpan,
+  ): number => {
+    for (const loan of loans.slice(from))
+      if (loan.endSpan.end >= call.end && !callActive.includes(loan)) callActive.push(loan)
+    return loans.length
+  }
+
   const naturalAccess = (expression: LoanView.Expression): 'Read' | 'Move' =>
     expression.type._tag === 'Available' &&
     categoryOf(index, expression.type.type, copyAssumptions)._tag === 'MoveOnly'
@@ -3547,7 +3559,9 @@ const analyzeLoans = (
           })
         }
         const inspectArguments = (): void => {
+          let opened = loans.length
           for (const argument of expression.arguments) {
+            opened = absorbRetainedLoans(callActive, opened, context.spanOf(expression.anchor))
             const argumentOrdinal = argument.id.ordinal
             const candidate = argument.expression
             if (candidate._tag === 'Borrow' && candidate.formation._tag !== 'Unavailable') {
@@ -3602,11 +3616,12 @@ const analyzeLoans = (
               callActive.push(loan)
               continue
             }
-            let argumentEnd: LoanEndpoint | undefined
+            // An argument value lives through the call; a returned one through the result.
+            let argumentEnd: LoanEndpoint | undefined = endpointAt(expression.anchor, region)
             if (argument.type._tag === 'Available' && Type.isEffect(argument.type.type))
               argumentEnd = delayedEnd
             else if (returnedOrdinal.has(argumentOrdinal))
-              argumentEnd = delayedEnd ?? endpointAt(expression.anchor, region)
+              argumentEnd = delayedEnd ?? argumentEnd
             inspect(candidate, region, callActive, naturalAccess(candidate), argumentEnd)
           }
         }
@@ -3627,25 +3642,19 @@ const analyzeLoans = (
           ...active,
           ...delayedLoansAt(context.spanOf(expression.anchor)),
         ]
-        const consumesSlot =
-          expression._tag === 'Call' &&
-          expression.reference._tag === 'ResolvedBuiltin' &&
-          (expression.reference.operation === 'SlotWrite' ||
-            expression.reference.operation === 'SlotTake' ||
-            expression.reference.operation === 'SlotCopy' ||
-            expression.reference.operation === 'SlotDrop')
+        let opened = loans.length
         for (const argument of expression.arguments) {
+          opened = absorbRetainedLoans(callActive, opened, context.spanOf(expression.anchor))
           const argumentOrdinal = argument.id.ordinal
           const candidate = argument.expression
           const returnedOrdinal = returnedArgumentOrdinals(expression)
           if (candidate._tag !== 'Borrow' || candidate.formation._tag === 'Unavailable') {
             const preservesEffectLifetime =
               argument.type._tag === 'Available' && Type.isEffect(argument.type.type)
-            let argumentEnd: LoanEndpoint | undefined
+            // An argument value lives through the call; a returned one through the result.
+            let argumentEnd: LoanEndpoint | undefined = endpointAt(expression.anchor, region)
             if (preservesEffectLifetime) argumentEnd = delayedEnd
-            else if (returnedOrdinal.has(argumentOrdinal))
-              argumentEnd = delayedEnd ?? endpointAt(expression.anchor, region)
-            else if (consumesSlot) argumentEnd = endpointAt(expression.anchor, region)
+            else if (returnedOrdinal.has(argumentOrdinal)) argumentEnd = delayedEnd ?? argumentEnd
             inspect(candidate, region, callActive, naturalAccess(candidate), argumentEnd)
             continue
           }
