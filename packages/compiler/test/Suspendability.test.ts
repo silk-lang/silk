@@ -1199,6 +1199,7 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`)
 it.effect('suspends where a binding scope exit runs a suspending drop hook', () =>
   Effect.gen(function* () {
     const self = yield* snapshot(`import silk.effect { Effect }
+import silk.ownership { Drop }
 struct Guard { value: i32 }
 impl Drop for Guard {
   fn drop(self: &mut Guard) -> () {

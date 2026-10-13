@@ -48,6 +48,7 @@ import silk.layout {Layout}
 import silk.memory_byte_duplex {MemoryByteDuplex, MemoryReadEvent, MemoryWriteEvent}
 import silk.monotonic_clock {MonotonicClock}
 import silk.option {Option}
+import silk.ownership {Drop}
 import silk.result {Result}
 import silk.shared {Shared}
 import silk.system_clock {Instant, SystemClock}

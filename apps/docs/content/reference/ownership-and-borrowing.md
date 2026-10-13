@@ -69,6 +69,8 @@ types derive or request Copy behavior under their own rules. A user-defined stru
 it explicitly requests Copy conformance:
 
 ```silk
+import silk.ownership {Copy}
+
 pub struct Point {
   pub x: i32
   pub y: i32
@@ -150,6 +152,11 @@ the source binding. Reading a Copy leaf is valid and produces no ownership diagn
 
 `move value` transfers the complete value and its future cleanup responsibility to the receiving
 owner. After the move, the source binding is unavailable on every path where the move occurred.
+
+The operand of `move` is a primary expression with its postfix operations: a place such as
+`value.field`, a call such as `Holder<Token>.make(token)`, a grouped expression, or `run`. A `run`
+operand extends greedily (OP-001), so `move run f()` moves the whole `run f()` and has the same
+effect as `move (run f())`.
 
 ```silk
 struct Token { kind: i32 }
@@ -548,7 +555,8 @@ An exclusive parent cannot be used through the parent parameter during a child r
 child call returns, the parent becomes available with its original access.
 
 **Boundary:** Reborrowing never strengthens access. `&mut values` is invalid when `values` is only
-`&[T]`. An exclusive reference is not copied when forwarded; the nested call receives a temporary
+`&[T]`, and so is `&mut values[0]` or `&mut view.field` reached through a shared view, even when
+the binding holding the view is `mut`. An exclusive reference is not copied when forwarded; the nested call receives a temporary
 exclusive reborrow. Forwarding an exclusive reference is written `&mut values`; passing the binding
 by value without `move` reports `OWN0003`. Method syntax is the one implicit reborrow:
 `counter.bump()` with `counter: &mut Counter` reborrows the referent for the receiver parameter
@@ -1009,6 +1017,8 @@ fn identity<T>(value: T) -> T {
 An operation that duplicates `T` requires the sealed Copy constraint:
 
 ```silk
+import silk.ownership {Copy}
+
 fn duplicate<T: Copy>(value: T) -> [T; 2] {
   return [value, value]
 }
@@ -1663,6 +1673,8 @@ owner is dropped.
 An affine nominal type may declare one restricted cleanup hook:
 
 ```silk
+import silk.ownership {Drop}
+
 struct Guard { allocation: Intrinsic.Allocation }
 
 impl Drop for Guard {

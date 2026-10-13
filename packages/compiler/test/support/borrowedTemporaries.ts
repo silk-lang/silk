@@ -3,6 +3,7 @@ export const borrowedTemporaryStream = `import silk.option { Option }
 import silk.effect { Effect }
 import silk.monotonic_clock { MonotonicClock }
 import silk.os_monotonic_clock { OsMonotonicClock }
+import silk.ownership { Copy }
 interface Stream<A, E, ?R> { effect fn take(self: &mut Self) -> Option<A> ! E ? R }
 pub struct SliceStream<A> { slice: &[A] index: usize }
 impl<A> SliceStream<A> {
@@ -40,6 +41,7 @@ pub fn main() -> i32 {
 export const borrowedTemporaryLifecycle = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
+import silk.ownership { Drop }
 unsafe extern "C" fn silk_record_event(value: i32) -> ()
 unsafe extern "C" fn silk_finish_events() -> i32
 struct Token { value: i32 }
