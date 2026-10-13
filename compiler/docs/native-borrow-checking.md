@@ -311,10 +311,11 @@ cover first:
   exclusive views included, are proved, but the body is not region-closed (below), or retains a
   region relation or capture contents; later slices prove those.
 - `storage`: the body uses a storage operation the loan and move walk does not enter yet:
-  `slotAddress`, `replace`, `sharedWithMut`, `executionNotify` (an external readiness callback,
-  which a local-shared access callback must not run: OWN0016), `executionFromAllocation`,
-  `executionDrive`, `relinquish` or `executionCurrent`. Every other storage operation is checked
-  as a call to its contract. Each such contract names the operand region every result view
+  `slotAddress`, `sharedWithMut`, `executionNotify` (an external readiness callback, which a
+  local-shared access callback must not run: OWN0016), `executionFromAllocation`,
+  `executionDrive`, `relinquish` or `executionCurrent`. `replace` is checked as a write to its
+  place operand that yields the displaced value, and every other storage operation as a call to
+  its contract. Each such contract names the operand region every result view
   reaches (a raw-buffer view or slot carries its buffer reference's region, a string view its
   text's region), and `unsafe` discharges only the operation's memory obligations, never its
   aliasing.
