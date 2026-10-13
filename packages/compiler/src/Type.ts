@@ -1045,8 +1045,8 @@ export const containsStaticPhaseOnly = (self: Type): boolean => {
 
 export const intrinsicNominals: ReadonlyMap<string, Nominal> = new Map([
   ['Intrinsic.Allocation', allocation],
-  [copyCapability.name, copyCapability],
-  [dropCapability.name, dropCapability],
+  ['Intrinsic.Copy', copyCapability],
+  ['Intrinsic.Drop', dropCapability],
   ['Intrinsic.RawBuffer', sealedRawBuffer([])],
   ['Intrinsic.Slot', sealedSlot([])],
   ['Intrinsic.SharedCore', sealedSharedCore([])],

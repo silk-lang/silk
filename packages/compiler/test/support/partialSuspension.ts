@@ -2,6 +2,7 @@
 export const partialSuspension = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
+import silk.ownership { Drop }
 unsafe extern "C" fn silk_record_drop(value: i32) -> ()
 unsafe extern "C" fn silk_verify_drops() -> i32
 struct Token { value: i32 }
