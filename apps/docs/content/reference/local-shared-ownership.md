@@ -123,7 +123,7 @@ release operation.
 
 **Diagnostics:** A callback whose result retains the access reference fails the access's
 quantified callback contract and reports `SEM0076` at the callback operand (CALLABLE-001,
-LIFE-004), before any escape exists; Julia decided this precedence on 2026-10-13. A suspension
+LIFE-004), before any escape exists. A suspension
 reached from the callback reports `OWN0016` at the escape and relates it to the local-shared access
 boundary. A direct `Intrinsic.executionNotify` inside the callback reports `OWN0016` too. Signaling
 a `Wake` through `Execution.wake` is ordinary source and is not rejected statically; if the
