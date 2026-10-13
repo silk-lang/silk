@@ -1,11 +1,13 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
+import * as Layer from 'effect/Layer'
 import * as Analysis from '../src/Analysis.js'
 import * as Diagnostic from '../src/Diagnostic.js'
 import * as Lexer from '../src/Lexer.js'
 import * as Parser from '../src/Parser.js'
 import * as SourceFile from '../src/SourceFile.js'
+import * as SourceResolver from '../src/SourceResolver.js'
 
 const encoder = new TextEncoder()
 
@@ -192,6 +194,92 @@ pub fn main() -> i32 {
       [[Diagnostic.ambiguousOperatorCode, operator, operator + 1]],
     )
   }),
+)
+
+it.effect('names the sealed operator interfaces and scalar conformances as Intrinsic members', () =>
+  Effect.gen(function* () {
+    // Library aliases name the sealed members the way `silk.ops` and `silk.order` will.
+    const self = yield* snapshot(`type Order = Intrinsic.Order
+struct Meters { value: i32 }
+impl Meters {
+  fn plus(left: Meters, right: Meters) -> Meters { return Meters { value: left.value + right.value } }
+}
+impl Intrinsic.Add<Meters, Meters> for Meters { add: Meters.plus }
+fn sum<T: Intrinsic.Add<T, T>>(left: T, right: T) -> T {
+  return Intrinsic.Add<T, T>.add(move left, move right)
+}
+fn rank<T: Order>(left: &T, right: &T) -> Intrinsic.Ordering { return Order.compare(left, right) }
+pub fn main() -> i32 {
+  let total = sum(Meters { value: 40 }, Meters { value: 2 })
+  let scalar = sum<i32>(40, 2)
+  let low: u8 = 1
+  let high: u8 = 2
+  let ordering: Intrinsic.Ordering = rank(&low, &high)
+  drop ordering
+  return total.value - scalar + 42
+}`)
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
+it.effect('reaches the sealed operator source from a module that never spells Intrinsic', () =>
+  Effect.gen(function* () {
+    // Only `numeric` names the sealed member; the closure must still hold the sealed source for
+    // the root's bound, conformance and scalar instantiation.
+    const root = 'operator-contracts/reached'
+    const selected = AnalysisFixture.configuration(root)
+    const self = yield* Analysis.make({ root, configuration: selected }).pipe(
+      Effect.flatMap((frontend) => Analysis.realize(frontend, selected)),
+      Effect.provide(
+        SourceResolver.overlay([
+          SourceFile.make(
+            root,
+            encoder.encode(`import numeric { Plus }
+struct Meters { value: i32 }
+impl Meters {
+  fn plus(left: Meters, right: Meters) -> Meters { return Meters { value: left.value + right.value } }
+}
+impl Plus<Meters, Meters> for Meters { add: Meters.plus }
+fn sum<T: Plus<T, T>>(left: T, right: T) -> T { return Plus<T, T>.add(move left, move right) }
+pub fn main() -> i32 {
+  let total = sum(Meters { value: 40 }, Meters { value: 2 })
+  return total.value + sum<i32>(1, 2) - 3
+}`),
+          ),
+        ]).pipe(
+          Layer.provideMerge(
+            SourceResolver.memory(
+              new Map([['numeric', encoder.encode('pub type Plus = Intrinsic.Add\n')]]),
+            ),
+          ),
+        ),
+      ),
+    )
+    assert.deepEqual(Analysis.diagnostics(self), [])
+  }),
+)
+
+it.effect(
+  'seals the operator source against imports, unknown members and scalar conformances',
+  () =>
+    Effect.gen(function* () {
+      const source = `import intrinsic.operators
+fn unknown<T: Intrinsic.Plus<T, T>>(value: T) -> T { return move value }
+fn same(left: i32, right: i32) -> i32 { return left }
+impl Intrinsic.Add<i32, i32> for i32 { add: same }
+pub fn main() -> i32 { return 0 }`
+      const self = yield* snapshot(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => [diagnostic.code, diagnostic.span.start]),
+        [
+          [Diagnostic.unknownModuleCode, source.indexOf('intrinsic.operators')],
+          [Diagnostic.invalidConformanceCode, source.indexOf('T: Intrinsic.Plus')],
+          // IMPL-004 places no source conformance of a scalar provider outside the interface's
+          // module; the sealed i32 conformance it would duplicate is not reported again.
+          [Diagnostic.invalidConformanceCode, source.indexOf('impl Intrinsic.Add')],
+        ],
+      )
+    }),
 )
 
 it('has no operator declaration syntax', () => {
