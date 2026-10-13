@@ -3087,13 +3087,16 @@ const analyzeLoans = (
     expression: LoanView.Expression,
     active: ReadonlyArray<LoanFact>,
     access: 'Read' | 'Write' | 'Move',
+    destination = false,
   ): LoanFact | undefined => {
     const direct = directSite(expression)
     const place = physicalPlace(expression)
     if (direct === undefined || place === undefined) return undefined
     loanAccessChecks += 1
     const places =
-      borrowedRootType(expression) === undefined ? [place] : rootsOf(place.root, place.path)
+      destination || borrowedRootType(expression) === undefined
+        ? [place]
+        : rootsOf(place.root, place.path)
     return active.find(
       (loan) =>
         !grantsParentCapability(loan, direct.site, expression.anchor) &&
@@ -3109,9 +3112,10 @@ const analyzeLoans = (
     expression: LoanView.Expression,
     active: ReadonlyArray<LoanFact>,
     access: 'Read' | 'Write' | 'Move',
+    destination = false,
   ): void => {
     const direct = directSite(expression)
-    const conflict = directAccessConflict(expression, active, access)
+    const conflict = directAccessConflict(expression, active, access, destination)
     if (direct !== undefined && conflict !== undefined) {
       diagnostics.push(
         Diagnostic.ownerAccessDuringLoan(
@@ -3164,6 +3168,7 @@ const analyzeLoans = (
     active: ReadonlyArray<LoanFact>,
     access: 'Read' | 'Write' | 'Move' = 'Read',
     delayedEnd?: LoanEndpoint,
+    destination = false,
   ): void => {
     switch (expression._tag) {
       case 'Integer':
@@ -3174,6 +3179,7 @@ const analyzeLoans = (
           expression,
           [...active, ...delayedLoansAt(context.spanOf(expression.anchor), access === 'Write')],
           access,
+          destination,
         )
         return
       case 'Borrow': {
@@ -3924,7 +3930,9 @@ const analyzeLoans = (
           statements(statement.otherwise, active)
           break
         case 'WriteStatement':
-          inspect(statement.destination, statement.region, active, 'Write')
+          // Replacing a descriptor writes its binding storage; an explicit referent
+          // projection still checks the borrowed allocation (OWN-005, BORROW-008).
+          inspect(statement.destination, statement.region, active, 'Write', undefined, true)
           inspect(statement.value, statement.region, active, naturalAccess(statement.value))
           break
         case 'WhileStatement':
