@@ -116,7 +116,7 @@ The installer selects x86-64 or ARM64 from the running host and verifies the LLV
 SHA-256. Native compilation selects the host target automatically. Keep the LLVM `bin` directory
 on `PATH` in development shells; an older distribution Clang may not read Silk's LLVM 22 bitcode.
 For the source-written compiler, use the `selfhost` branch and its
-[bootstrap instructions](compiler/README.md#development-branches-and-bootstrap). The published
+[bootstrap instructions](https://github.com/silk-lang/silk/blob/selfhost/compiler/README.md#development-branches-and-bootstrap). The published
 native seed's host architecture is separate from the compiler's supported output targets.
 
 Effect-returning tests use `it.effect` from `@effect/vitest`; pure tests use ordinary `it` with
