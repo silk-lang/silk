@@ -446,6 +446,10 @@ export const regionSelectiveConformanceCode = 'SEM0220' as const
 export const ownerArgumentPlacementCode = 'SEM0221' as const
 /** Stable code for a namespace-qualified type named where a value is required (NAME-005). */
 export const namespaceQualifiedTypeCode = 'SEM0222' as const
+/** A non-alias resolution dependency cycle prevents resolving a declaration or value. */
+export const nonAliasResolutionCycleCode = 'SEM0223' as const
+/** A unit nominal-union variant is written with a braced payload pattern (PATT-021). */
+export const unitVariantPayloadPatternCode = 'SEM0224' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
 /** An owner cannot be preserved by the suspension frame at this run boundary. */
@@ -490,6 +494,8 @@ export type Code =
   | typeof regionSelectiveConformanceCode
   | typeof ownerArgumentPlacementCode
   | typeof namespaceQualifiedTypeCode
+  | typeof nonAliasResolutionCycleCode
+  | typeof unitVariantPayloadPatternCode
   | typeof expiredLifetimeCode
   | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
@@ -750,6 +756,8 @@ export type ParserContext = 'syntax' | 'statement' | 'expression' | 'parameter' 
 
 /** Structured per-code data explaining why the originating phase diagnosed. */
 export type Reason<L = SourceSpan.SourceSpan> =
+  | { readonly _tag: 'NonAliasResolutionCycle' }
+  | { readonly _tag: 'UnitVariantPayloadPattern'; readonly variant: string }
   | {
       readonly _tag: 'InvalidPointerQualifier'
       readonly qualifier: string
@@ -2815,6 +2823,28 @@ export const namespaceQualifiedType = <L>(
   severity: 'error',
   message: `${member} in ${module} is a type, not a value; select it with an import and write ${member}.<member> for its members`,
   reason: { _tag: 'NamespaceQualifiedType' as const, module, member },
+  span,
+})
+
+/** Reports a semantic dependency cycle outside alias expansion; alias cycles retain SEM0183. */
+export const nonAliasResolutionCycle = <L>(span: L): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: nonAliasResolutionCycleCode,
+  severity: 'error',
+  message: 'Cannot resolve a non-alias dependency cycle',
+  reason: { _tag: 'NonAliasResolutionCycle' as const },
+  span,
+})
+
+/** Reports braces on a unit variant, separately from missing fields of a payload variant. */
+export const unitVariantPayloadPattern = <L>(variant: string, span: L): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'semantic',
+  code: unitVariantPayloadPatternCode,
+  severity: 'error',
+  message: `Unit variant ${variant} does not accept a payload pattern`,
+  reason: { _tag: 'UnitVariantPayloadPattern' as const, variant },
   span,
 })
 

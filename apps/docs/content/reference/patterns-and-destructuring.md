@@ -572,6 +572,8 @@ variant cannot be used as a type, projected before selection, or flattened into 
 structural union. A false guarded move leaves the whole active payload available to later arms.
 
 **Diagnostics:** An unknown variant reports `SEM0167`; a non-union qualifier reports `SEM0168`.
+Writing a unit variant with a braced payload pattern reports `SEM0224`; omitting a required field
+of a named-field variant retains `SEM0046`.
 Missing, duplicate, unreachable, field, and ownership errors use the ordinary match, aggregate, and
 ownership diagnostics while naming the complete hierarchical selection path.
 
