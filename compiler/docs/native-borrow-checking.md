@@ -318,6 +318,13 @@ cover first:
   names the operand region every result view reaches (a raw-buffer view or slot carries its buffer
   reference's region, a string view its text's region), and `unsafe` discharges only the
   operation's memory obligations, never its aliasing.
+
+  `sharedWithMut` consumes both take-once callbacks and holds their capture loans through the
+  invocation. Its exclusive value reference comes from the SHARED-004 runtime conflict check,
+  and its callback contract prevents retaining that reference in the result. Independently of a
+  calling body's `Checked` status, `Semantic.buildFrom` checks every reached access callback and
+  its callees for suspension and readiness-notification escapes before emitting code (OWN0016,
+  SHARED-003).
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
   place that is not rooted in a local. One such form must reject rather than stay unchecked: a
   view of a temporary receiver used past its statement, such as `let left = make().left()`, is
