@@ -3010,7 +3010,7 @@ const analyzeLoans = (
       }
       case 'Call': {
         if (expression.type._tag !== 'Available' || !Type.isEffect(expression.type.type)) return []
-        return expression.arguments.flatMap((argument) => {
+        return LoanView.retainedResultArguments(expression, assumptions).flatMap((argument) => {
           const candidate = argument.expression
           if (candidate._tag !== 'Borrow' || candidate.formation._tag === 'Unavailable')
             return effectEscapes(candidate, seen)
