@@ -190,7 +190,8 @@ feature again by staged landing. The orchestrator, or the author whose change ne
 ## What this replaces
 
 - The **Authored native seed (N0)** job and **Restore authored native seed** job are removed, and
-  so is the bootstrap re-seed: no CI path builds a compiler with the TypeScript bootstrap.
+  so is the bootstrap re-seed: no seed is built with the TypeScript bootstrap. Only
+  [the bootstrap DDC](#bootstrap-ddc) builds a compiler with it, as an independent check.
 - `NativeSeed.mjs` owns the pin: reading it, verifying a downloaded seed, and writing a candidate.
   `NativeBuild.ts` builds any generation from a hash-verified compiler.
 - `SourceSnapshot.mjs` still defines the exact inputs.
