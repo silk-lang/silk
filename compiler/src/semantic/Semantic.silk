@@ -73,6 +73,9 @@ import semantic.Specialization {
 }
 import backend.Mir {
   Lowered,
+  AccessEscape as MirAccessEscape,
+  EscapeSite as MirEscapeSite,
+  SharedAccess as MirSharedAccess,
   Reference as MirReference,
   CallTarget as MirCallTarget,
   ProviderSource as MirProviderSource,
@@ -66321,6 +66324,14 @@ impl Semantic {
         }
         caller = caller + usize.ONE
       }
+      // A local-shared access is held while its callback runs, so nothing that callback reaches
+      // may run an Effect or notify an execution (SHARED-003). The pass covers every reached
+      // access, before any code is emitted.
+      let mut escapes = run localSharedEscapes(&self.resolver, reached)
+      if Vector<Shared<Rejection>>.length(&escapes) > usize.ZERO {
+        let first = Vector<Shared<Rejection>>.remove(&mut escapes, usize.ZERO)
+        return BackendBuild.Rejected {first: move first, further: move escapes, gaps: Vector<Shared<BackendGap>>.make()}
+      }
       let mut first = usize.MAX
       let mut at = usize.ZERO
       while at < marked.length && first == usize.MAX {
@@ -66862,26 +66873,37 @@ struct CallbackBoundary {
   span: Span
 }
 
-// One reached instance's suspension summary: the boundary it runs, if any, and its direct Silk
-// callees.
+// One escape site of a reached instance's own body (SHARED-003).
+struct SummaryEscape {
+  kind: MirAccessEscape
+  span: Span
+}
+
+// One reached instance's suspension summary: the boundary it runs, if any, its direct Silk
+// callees and each call's span, and the local-shared accesses it holds with their callbacks.
 struct SuspensionSummary {
   key: InstanceKey
   module: ModuleId
   boundary: Option<Span>
   callees: Vector<InstanceKey>
+  calls: Vector<Span>
   callbacks: Vector<CallbackBoundary>
+  accesses: Vector<CallbackBoundary>
+  escapes: Vector<SummaryEscape>
 }
 
 impl SuspensionSummary {
   effect fn make(function: &MirFunction, instance: &InstanceKey, module: &ModuleId, anchor: &Option<Anchor>) -> SuspensionSummary
   ! OutOfMemoryError ? &mut Allocator {
     let mut callees = Vector<InstanceKey>.make()
+    let mut calls = Vector<Span>.make()
     let mut callbacks = Vector<CallbackBoundary>.make()
     let blocks = Vector<MirBlock>.asSlice(&function.blocks)
     let mut at = usize.ZERO
     while at < blocks.length {
-      if let MirTerminator.Call {callee: MirCallee.Instance {key}, ..} = &blocks[at].terminator {
+      if let MirTerminator.Call {callee: MirCallee.Instance {key}, origin, ..} = &blocks[at].terminator {
         run Vector<InstanceKey>.append(&mut callees, InstanceKey.copy(&key))
+        run Vector<Span>.append(&mut calls, anchoredSpan(anchor, origin))
       }
       let statements = Vector<MirStatement>.asSlice(&blocks[at].statements)
       let mut statement = usize.ZERO
@@ -66897,12 +66919,29 @@ impl SuspensionSummary {
     }
     let mut boundary = Option<Span>.none()
     if let Option<BodyOrigin>.Some {value: origin} = &function.suspension { boundary = Option<Span>.some(anchoredSpan(anchor, origin)) }
+    let mut accesses = Vector<CallbackBoundary>.make()
+    let held = Vector<MirSharedAccess>.asSlice(&function.accesses)
+    at = usize.ZERO
+    while at < held.length {
+      run Vector<CallbackBoundary>.append(&mut accesses, CallbackBoundary {key: InstanceKey.copy(&held[at].callback), span: anchoredSpan(anchor, held[at].origin)})
+      at = at + usize.ONE
+    }
+    let mut escapes = Vector<SummaryEscape>.make()
+    let sites = Vector<MirEscapeSite>.asSlice(&function.escapes)
+    at = usize.ZERO
+    while at < sites.length {
+      run Vector<SummaryEscape>.append(&mut escapes, SummaryEscape {kind: sites[at].kind, span: anchoredSpan(anchor, sites[at].origin)})
+      at = at + usize.ONE
+    }
     return SuspensionSummary {
       key: InstanceKey.copy(instance),
       module: ModuleId.copy(module),
       boundary: move boundary,
       callees: move callees,
+      calls: move calls,
       callbacks: move callbacks,
+      accesses: move accesses,
+      escapes: move escapes,
     }
   }
 }
@@ -66930,15 +66969,50 @@ effect fn callbackSuspends(summaries: &[SuspensionSummary], marked: &[bool], key
   return false
 }
 
+// One resolved call of a summary: the callee's summary position and the call's index.
+struct CallEdge {
+  target: usize
+  call: usize
+}
+
+// Each summary's direct callees as summary positions, in call order.
+effect fn summaryEdges(summaries: &[SuspensionSummary]) -> Vector<Vector<CallEdge>> ! OutOfMemoryError ? &mut Allocator {
+  let mut lookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < summaries.length {
+    run InternIndex.record(&mut lookup, InstanceKey.runtimeHash(&summaries[at].key))
+    at = at + usize.ONE
+  }
+  let mut edges = Vector<Vector<CallEdge>>.make()
+  at = usize.ZERO
+  while at < summaries.length {
+    let mut targets = Vector<CallEdge>.make()
+    let callees = Vector<InstanceKey>.asSlice(&summaries[at].callees)
+    let mut callee = usize.ZERO
+    while callee < callees.length {
+      let mut found = InternIndex.first(&lookup, InstanceKey.runtimeHash(&callees[callee]))
+      while found != usize.MAX {
+        if run InstanceKey.sameInstance(&summaries[found].key, &callees[callee]) {
+          run Vector<CallEdge>.append(&mut targets, CallEdge {target: found, call: callee})
+          break
+        }
+        found = InternIndex.after(&lookup, found)
+      }
+      callee = callee + usize.ONE
+    }
+    run Vector<Vector<CallEdge>>.append(&mut edges, move targets)
+    at = at + usize.ONE
+  }
+  return move edges
+}
+
 // Marks the reached instances that can suspend: each one that runs a boundary, then each one
 // that calls a marked instance directly, to a fixed point. Fixed-linkage shims are never marked;
 // they call a suspendable instance's ordinary symbol, which drives its frames.
 effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
-  let mut lookup = InternIndex.make()
   let mut marked = Vector<bool>.make()
   let mut at = usize.ZERO
   while at < summaries.length {
-    run InternIndex.record(&mut lookup, InstanceKey.runtimeHash(&summaries[at].key))
     let origin = match &summaries[at].boundary {
       Option<Span>.Some {..} => true
       Option<Span>.None => false
@@ -66946,28 +67020,8 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
     run Vector<bool>.append(&mut marked, origin && !InstanceKey.fixedLinkage(&summaries[at].key))
     at = at + usize.ONE
   }
-  // Each summary's callees as summary positions.
-  let mut edges = Vector<Vector<usize>>.make()
-  at = usize.ZERO
-  while at < summaries.length {
-    let mut targets = Vector<usize>.make()
-    let callees = Vector<InstanceKey>.asSlice(&summaries[at].callees)
-    let mut callee = usize.ZERO
-    while callee < callees.length {
-      let mut found = InternIndex.first(&lookup, InstanceKey.runtimeHash(&callees[callee]))
-      while found != usize.MAX {
-        if run InstanceKey.sameInstance(&summaries[found].key, &callees[callee]) {
-          run Vector<usize>.append(&mut targets, found)
-          break
-        }
-        found = InternIndex.after(&lookup, found)
-      }
-      callee = callee + usize.ONE
-    }
-    run Vector<Vector<usize>>.append(&mut edges, move targets)
-    at = at + usize.ONE
-  }
-  let following = Vector<Vector<usize>>.asSlice(&edges)
+  let edges = run summaryEdges(summaries)
+  let following = Vector<Vector<CallEdge>>.asSlice(&edges)
   let mut changed = true
   while changed {
     changed = false
@@ -66975,11 +67029,11 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
     while at < summaries.length {
       let current = Vector<bool>.asSlice(&marked)
       if !current[at] && !InstanceKey.fixedLinkage(&summaries[at].key) {
-        let targets = Vector<usize>.asSlice(&following[at])
+        let targets = Vector<CallEdge>.asSlice(&following[at])
         let mut edge = usize.ZERO
         let mut reaches = false
         while edge < targets.length {
-          if current[targets[edge]] { reaches = true }
+          if current[targets[edge].target] { reaches = true }
           edge = edge + usize.ONE
         }
         if reaches {
@@ -66992,6 +67046,192 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
     }
   }
   return move marked
+}
+
+// One reported local-shared access escape: the escape's own site and the call it relates to.
+struct EscapeReport {
+  module: ModuleId
+  span: Span
+  relatedModule: ModuleId
+  related: Span
+}
+
+fn runCall(escapes: &[SummaryEscape], span: Span) -> bool {
+  let mut at = usize.ZERO
+  while at < escapes.length {
+    if escapes[at].kind == MirAccessEscape.Suspension && sameSpan(escapes[at].span, span) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn sameSpan(left: Span, right: Span) -> bool {
+  return left.start == right.start && left.end == right.end
+}
+
+fn reportedEscape(reports: &[EscapeReport], module: &ModuleId, span: Span, site: &RelatedSite) -> bool {
+  let mut at = usize.ZERO
+  while at < reports.length {
+    if sameSpan(reports[at].span, span) && sameSpan(reports[at].related, site.span) && ModuleId.equals(&reports[at].module, module)
+      && ModuleId.equals(&reports[at].relatedModule, &site.module) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn sharesDeclaration(left: &[DeclarationId], right: &[DeclarationId]) -> bool {
+  let mut at = usize.ZERO
+  while at < left.length {
+    let mut other = usize.ZERO
+    while other < right.length {
+      if DeclarationId.equals(&left[at], &right[other]) { return true }
+      other = other + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The callable declarations an instance's application carries: what its callable parameters were
+// specialized over.
+effect fn carriedCallables(key: &InstanceKey) -> Vector<DeclarationId> ! OutOfMemoryError ? &mut Allocator {
+  let mut carried = Vector<DeclarationId>.make()
+  if let Option<Shared<Application>>.Some {value: application} = move InstanceKey.application(key) {
+    let count = Shared<Application>.with<usize>(&application, Application.typeCount)
+    let mut at = usize.ZERO
+    while at < count {
+      let argument = Shared<Application>.with<Option<Shared<Type>>>(&application, fn(selected: &Application) -> Option<Shared<Type>> {
+        return Application.typeAt(selected, at)
+      })
+      if let Option<Shared<Type>>.Some {value} = move argument { run Type.appendCallableTargets(&value, &mut carried) }
+      at = at + usize.ONE
+    }
+  }
+  return move carried
+}
+
+// The calls where a held access's callback entered its access wrappers (SHARED-003). A wrapper
+// instance is specialized over the callable it forwards, so callers are walked upward while they
+// carry a callable the instance they call carries; the first caller that carries none of them named
+// the callback itself. An access holder that carries no callable names its callback at the access.
+effect fn accessEntries(summaries: &[SuspensionSummary], calls: &[Vector<CallEdge>], carried: &[Vector<DeclarationId>],
+  holder: usize, access: Span) -> Vector<RelatedSite> ! OutOfMemoryError ? &mut Allocator {
+  let mut sites = Vector<RelatedSite>.make()
+  let mut pending = Vector<usize>.make()
+  let mut visited = Vector<bool>.make()
+  while Vector<bool>.length(&visited) < summaries.length { run Vector<bool>.append(&mut visited, false) }
+  if Vector<DeclarationId>.length(&carried[holder]) > usize.ZERO { run Vector<usize>.append(&mut pending, holder) }
+  else { run Vector<RelatedSite>.append(&mut sites, RelatedSite {module: ModuleId.copy(&summaries[holder].module), span: access}) }
+  let mut head = usize.ZERO
+  while head < Vector<usize>.length(&pending) {
+    let current = Vector<usize>.get(&pending, head)
+    head = head + usize.ONE
+    let mut called = false
+    let mut caller = usize.ZERO
+    while caller < summaries.length {
+      let edges = Vector<CallEdge>.asSlice(&calls[caller])
+      let mut edge = usize.ZERO
+      while edge < edges.length {
+        if edges[edge].target == current {
+          called = true
+          if sharesDeclaration(Vector<DeclarationId>.asSlice(&carried[caller]), Vector<DeclarationId>.asSlice(&carried[current])) {
+            let marks = Vector<bool>.asMutSlice(&mut visited)
+            if !marks[caller] {
+              marks[caller] = true
+              run Vector<usize>.append(&mut pending, caller)
+            }
+          } else {
+            let span = Vector<Span>.get(&summaries[caller].calls, edges[edge].call)
+            run Vector<RelatedSite>.append(&mut sites, RelatedSite {module: ModuleId.copy(&summaries[caller].module), span: span})
+          }
+        }
+        edge = edge + usize.ONE
+      }
+      caller = caller + usize.ONE
+    }
+    if !called && current == holder {
+      run Vector<RelatedSite>.append(&mut sites, RelatedSite {module: ModuleId.copy(&summaries[holder].module), span: access})
+    }
+  }
+  return move sites
+}
+
+// Every local-shared access escape of the reached instances (SHARED-003). From each held access,
+// its callback and every instance the callback reaches through direct calls are walked
+// breadth-first in call order. Each escape site found is reported at its own span and related to
+// the call where the callback entered its access wrappers, once per pair.
+effect fn localSharedEscapes(resolver: &Resolver, summaries: &[SuspensionSummary]) -> Vector<Shared<Rejection>>
+! OutOfMemoryError ? &mut Allocator {
+  let mut found = Vector<Shared<Rejection>>.make()
+  let mut reports = Vector<EscapeReport>.make()
+  let edges = run summaryEdges(summaries)
+  let calls = Vector<Vector<CallEdge>>.asSlice(&edges)
+  let mut carriedBy = Vector<Vector<DeclarationId>>.make()
+  let mut at = usize.ZERO
+  while at < summaries.length {
+    run Vector<Vector<DeclarationId>>.append(&mut carriedBy, run carriedCallables(&summaries[at].key))
+    at = at + usize.ONE
+  }
+  let carried = Vector<Vector<DeclarationId>>.asSlice(&carriedBy)
+  let mut holder = usize.ZERO
+  while holder < summaries.length {
+    let accesses = Vector<CallbackBoundary>.asSlice(&summaries[holder].accesses)
+    let mut access = usize.ZERO
+    while access < accesses.length {
+      let mut callback = usize.MAX
+      at = usize.ZERO
+      while at < summaries.length && callback == usize.MAX {
+        if run InstanceKey.sameInstance(&summaries[at].key, &accesses[access].key) { callback = at }
+        at = at + usize.ONE
+      }
+      if callback != usize.MAX {
+        let entries = run accessEntries(summaries, calls, carried, holder, accesses[access].span)
+        let sites = Vector<RelatedSite>.asSlice(&entries)
+        let mut queue = Vector<usize>.make()
+        let mut queued = Vector<bool>.make()
+        while Vector<bool>.length(&queued) < summaries.length { run Vector<bool>.append(&mut queued, false) }
+        run Vector<usize>.append(&mut queue, callback)
+        let start = Vector<bool>.asMutSlice(&mut queued)
+        start[callback] = true
+        let mut head = usize.ZERO
+        while head < Vector<usize>.length(&queue) {
+          let reached = Vector<usize>.get(&queue, head)
+          head = head + usize.ONE
+          let escapes = Vector<SummaryEscape>.asSlice(&summaries[reached].escapes)
+          let mut escape = usize.ZERO
+          while escape < escapes.length {
+            let mut site = usize.ZERO
+            while site < sites.length {
+              if !reportedEscape(Vector<EscapeReport>.asSlice(&reports), &summaries[reached].module, escapes[escape].span, &sites[site]) {
+                run Vector<EscapeReport>.append(&mut reports, EscapeReport {module: ModuleId.copy(&summaries[reached].module),
+                  span: escapes[escape].span, relatedModule: ModuleId.copy(&sites[site].module), related: sites[site].span})
+                run Vector<Shared<Rejection>>.append(&mut found, run rejectWithRelated(resolver, &summaries[reached].module,
+                  RejectionCode.LocalSharedAccessEscape, escapes[escape].span,
+                  Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&sites[site].module), span: sites[site].span})))
+              }
+              site = site + usize.ONE
+            }
+            escape = escape + usize.ONE
+          }
+          // A run's own calls are the escape already reported at the run, so they are not walked.
+          let next = Vector<CallEdge>.asSlice(&calls[reached])
+          let mut edge = usize.ZERO
+          while edge < next.length {
+            let marks = Vector<bool>.asMutSlice(&mut queued)
+            let span = Vector<Span>.get(&summaries[reached].calls, next[edge].call)
+            if !marks[next[edge].target] && !runCall(escapes, span) {
+              marks[next[edge].target] = true
+              run Vector<usize>.append(&mut queue, next[edge].target)
+            }
+            edge = edge + usize.ONE
+          }
+        }
+      }
+      access = access + usize.ONE
+    }
+    holder = holder + usize.ONE
+  }
+  return move found
 }
 
 // The closed suspendable set of one build and the storage export symbols its frames use.
