@@ -1883,6 +1883,37 @@ pub fn main() -> i32 { return 0 }`
   }),
 )
 
+it.effect('keeps loans an argument value retains active through the call', () =>
+  Effect.gen(function* () {
+    const source = `struct Store { first: i32 second: i32 }
+fn view(store: &Store) -> &i32 { return &store.first }
+fn read(store: &Store) -> i32 { return store.first }
+fn both(first: &i32, store: &mut Store) -> () { store.second = first.* }
+fn write(first: i32, store: &mut Store) -> () { store.second = first }
+fn aliased(store: &mut Store) -> () { both(view(&store), &mut store) }
+fn copied(store: &mut Store) -> () { write(read(&store), &mut store) }
+fn separate(store: &mut Store, other: &Store) -> () { both(view(other), &mut store) }
+fn ended(store: &mut Store) -> () {
+  let first = view(&store).*
+  write(first, &mut store)
+}
+pub fn main() -> i32 { return 0 }`
+    const snapshot = yield* Analysis.ofSource('ownership/argument-retained-loans', ascii(source))
+    const at = (text: string, after: string) => source.indexOf(text, source.indexOf(after))
+
+    // A view passed by value keeps its owner borrowed until the call returns (BORROW-001), so a
+    // later exclusive argument of the same owner conflicts; a copied value or another owner does
+    // not, and neither does a view whose last use precedes the call (VIEW-002).
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+      })),
+      [{ code: 'OWN0010', start: at('&mut store', 'fn aliased') }],
+    )
+  }),
+)
+
 it.effect('reborrows a reference receiver for parameter zero only', () =>
   Effect.gen(function* () {
     const source = `import silk.ownership {Copy}

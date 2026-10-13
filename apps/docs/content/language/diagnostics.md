@@ -17,10 +17,10 @@ $ pnpm --filter @silklang/compiler documentation:generate
 | `PAR`  | Parser    | 5     |
 | `MOD`  | Module    | 2     |
 | `SEM`  | Semantic  | 205   |
-| `OWN`  | Ownership | 19    |
+| `OWN`  | Ownership | 18    |
 | `LAY`  | Layout    | 1     |
 
-There are 244 codes in total.
+There are 243 codes in total.
 
 ## Lexical (`LEX`)
 
@@ -285,7 +285,6 @@ There are 244 codes in total.
 | `OWN0014` | Stable code for invoking a stored callable through too weak an aggregate receiver access.            | `Cannot invoke field <field> of <aggregate> through <toLowerCase> aggregate access: <contract> requires <toLowerCase> access to the whole aggregate`                             |
 | `OWN0015` | Stable code for running a stored Effect through too weak an aggregate receiver access.               | `Cannot run field <field> of <aggregate> through <toLowerCase> aggregate access: <contract> requires <toLowerCase> access to the whole aggregate`                                |
 | `OWN0016` | Stable code for an access-scoped local-shared borrow escaping or crossing suspension.                | `Local-shared access cannot suspend while its exclusive borrow is live`<br>`Local-shared access cannot invoke an external readiness callback while its exclusive borrow is live` |
-| `OWN0017` | Stable code for an owner consumed in only some arms of a branch merge.                               | `Branches merge with incompatible owner liveness for <spelling>`                                                                                                                 |
 | `OWN0018` | Stable code for returning a callable or Effect that borrows storage owned by the returning function. | `<executable> cannot escape with a <toLowerCase> borrow of local <spelling>`                                                                                                     |
 | `OWN0019` | A borrowed value is used beyond the validity of its referent.                                        | `Lifetime <lifetime> does not remain valid at this use`                                                                                                                          |
 | `OWN0020` | An owner cannot be preserved by the suspension frame at this run boundary.                           | `Cannot preserve ownership across suspension: <detail>`                                                                                                                          |

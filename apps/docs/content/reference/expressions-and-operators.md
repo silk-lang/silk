@@ -443,7 +443,7 @@ lookup, service requirement, provider slot, truthiness conversion, numeric promo
 execution, or hidden allocation.
 
 **Boundary:** The closed concrete contracts on this page require no user declaration. An ordinary
-user-defined type participates only through the operator's standard-library interface under OP-009;
+user-defined type participates only through the operator's sealed Intrinsic interface under OP-009;
 an operation named `add` or `lessThan` on another interface does not acquire operator syntax.
 
 **Diagnostics:** When no admitted concrete operation accepts the operands, the current compiler
@@ -686,25 +686,26 @@ results themselves do not produce arithmetic traps.
 [operator metadata](../../../../packages/compiler/src/Operator.ts),
 [integer actor modules](../../../../packages/compiler/stdlib/silk).
 
-### OP-009 — Each overloadable operator is bound to one standard-library interface
+### OP-009 — Each overloadable operator is bound to one sealed Intrinsic interface
 
 **Status:** Confirmed
 
-A user-defined type gets an operator by implementing that operator's interface from the standard
-library. The table is closed and fixed; no declaration can bind an operator, and no other interface
-or operation name has operator meaning.
+A user-defined type gets an operator by implementing that operator's sealed `Intrinsic` interface
+(INTR-007). The standard-library modules `silk.ops`, `silk.equal` and `silk.order` re-export these
+identities through transparent type aliases. The table is closed and fixed; no declaration can
+bind an operator, and no other interface or operation name has operator meaning.
 
-| Operator                             | Interface operation                                                          |
-| ------------------------------------ | ---------------------------------------------------------------------------- |
-| `a + b`                              | `silk.ops.Add<Right, Output>.add(left: Self, right: Right) -> Output`        |
-| `a - b`                              | `silk.ops.Subtract<Right, Output>.subtract`                                  |
-| `a * b`                              | `silk.ops.Multiply<Right, Output>.multiply`                                  |
-| `a / b`                              | `silk.ops.Divide<Right, Output>.divide`                                      |
-| `a % b`                              | `silk.ops.Remainder<Right, Output>.remainder`                                |
-| `a & b`, `a \| b`, `a ^ b`           | `silk.ops.BitAnd`, `BitOr`, `BitXor` `<Right, Output>`                       |
-| `-a`, `~a`, `!a`                     | `silk.ops.Negate<Output>.negate`, `BitNot<Output>.bitNot`, `Not<Output>.not` |
-| `a == b`, `a != b`                   | `silk.equal.Equal.equals(left: &Self, right: &Self) -> bool`                 |
-| `a < b`, `a <= b`, `a > b`, `a >= b` | `silk.order.Order.compare(left: &Self, right: &Self) -> Ordering`            |
+| Operator                             | Interface operation                                                           |
+| ------------------------------------ | ----------------------------------------------------------------------------- |
+| `a + b`                              | `Intrinsic.Add<Right, Output>.add(left: Self, right: Right) -> Output`        |
+| `a - b`                              | `Intrinsic.Subtract<Right, Output>.subtract`                                  |
+| `a * b`                              | `Intrinsic.Multiply<Right, Output>.multiply`                                  |
+| `a / b`                              | `Intrinsic.Divide<Right, Output>.divide`                                      |
+| `a % b`                              | `Intrinsic.Remainder<Right, Output>.remainder`                                |
+| `a & b`, `a \| b`, `a ^ b`           | `Intrinsic.BitAnd`, `BitOr`, `BitXor` `<Right, Output>`                       |
+| `-a`, `~a`, `!a`                     | `Intrinsic.Negate<Output>.negate`, `BitNot<Output>.bitNot`, `Not<Output>.not` |
+| `a == b`, `a != b`                   | `Intrinsic.Equal.equals(left: &Self, right: &Self) -> bool`                   |
+| `a < b`, `a <= b`, `a > b`, `a >= b` | `Intrinsic.Order.compare(left: &Self, right: &Self) -> Ordering`              |
 
 The left (or only) operand is the provider: `a * b` means `Multiply<B, Output>.multiply(a, b)` for
 the conformance of `a`'s type, where `B` is `b`'s type and `Output` is whatever that conformance
@@ -737,7 +738,7 @@ conformance must accept the operands. Its declared result becomes the expression
 generic body, a bound such as `T: Add<T, T>` or `T: Order` supplies the operation.
 
 Concrete scalar and `string` operands always use the built-in operators of OP-002 to OP-008; the
-standard library's own conformances for scalars, such as `Add<i32, i32> for i32`, serve generic
+sealed conformances for scalars (INTR-008), such as `Add<i32, i32> for i32`, serve generic
 bounds.
 
 The interface operation remains available by name, independently of the operator:
@@ -757,8 +758,8 @@ assignment, and other control forms are not overloadable. A type may implement o
 interface for several `Right` types, but two conformances that accept the same operand types are
 ambiguous; the expected result type never chooses between them.
 
-This table is the one place the compiler knows standard-library declarations by name (the operator
-exception to minimal compiler privilege). Conformance selection after the binding is ordinary.
+The compiler binds only to sealed `Intrinsic` identities. It does not recognize library modules or
+alias declarations by spelling. Conformance selection after the binding is ordinary.
 
 **Diagnostics:** No conformance accepting the operands reports `SEM0135` at the operator. More than
 one reports `SEM0136`, listing the competing conformances. A missing bound in a generic body reports
@@ -768,7 +769,8 @@ writing one reports the parser's unexpected-token diagnostic.
 **Current compiler:** Aligned. Generic bounds and concrete conformances use the same fixed binding
 and static witness selection.
 
-**Evidence:** [operator interfaces](../../../../packages/compiler/stdlib/silk/ops.silk),
+**Evidence:** [sealed interfaces](../../../../packages/compiler/stdlib/intrinsic/operators.silk),
+[operator aliases](../../../../packages/compiler/stdlib/silk/ops.silk),
 [equality](../../../../packages/compiler/stdlib/silk/equal.silk),
 [ordering](../../../../packages/compiler/stdlib/silk/order.silk),
 [operator contract tests](../../../../packages/compiler/test/OperatorContracts.test.ts),

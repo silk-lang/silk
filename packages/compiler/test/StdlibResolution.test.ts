@@ -607,6 +607,7 @@ it.effect('resolves standard-library imports without vendoring source', () =>
     assert.deepEqual(
       Analysis.modules(snapshot).map((module) => module.name),
       [
+        Stdlib.sealedModule.module,
         'silk/allocator',
         'silk/bool',
         'silk/bytes',
