@@ -32,12 +32,12 @@ pub fn stableCode(code: RejectionCode) -> &'static [u8] {
 }
 run writeLine("LEX0001", "UnsupportedBytes", span)`,
   staticExecution: `pub enum Fault {
-  Unsupported,
+  StaticPhaseViolation,
 }
 fn faultCode(fault: Fault) -> &'static [u8] {
   return match fault {
     // bootstrap: staticPhaseViolationCode
-    Fault.Unsupported => b"SEM0176"
+    Fault.StaticPhaseViolation => b"SEM0176"
   }
 }`,
   documentation: definitions
@@ -51,6 +51,24 @@ fn faultCode(fault: Fault) -> &'static [u8] {
 
 it('accepts an exhaustive catalog and explicitly recorded diagnostic gap', () => {
   assert.deepStrictEqual(verify(fixture()), [])
+})
+
+it('accepts an explicitly uncoded refusal and rejects coding or misnaming it', () => {
+  const input = fixture()
+  input.rejection = input.rejection
+    .replace('  PatternBindingConflict,', '  Unsupported,\n  PatternBindingConflict,')
+    .replace(
+      '  return match code {',
+      '  return match code {\n    // refusal: Unsupported\n    RejectionCode.Unsupported => b""',
+    )
+  assert.deepStrictEqual(verify(input), [])
+  const coded = { ...input, rejection: input.rejection.replace('b""', 'b"NAT0001"') }
+  assert.ok(verify(coded).some((issue) => issue.includes('unannotated')))
+  const wrongReason = {
+    ...input,
+    rejection: input.rejection.replace('refusal: Unsupported', 'refusal: Other'),
+  }
+  assert.ok(verify(wrongReason).some((issue) => issue.includes('refusal reason differs')))
 })
 
 it('rejects a wrong code even when it exists in the bootstrap catalog', () => {
@@ -108,8 +126,8 @@ it('requires new lexical and static reasons to have a catalog mapping', () => {
   assert.ok(verify(lexical).some((issue) => issue.includes('missing lexical reason NewReason')))
   const fault = fixture()
   fault.staticExecution = fault.staticExecution.replace(
-    '  Unsupported,',
-    '  Unsupported,\n  NewFault,',
+    '  StaticPhaseViolation,',
+    '  StaticPhaseViolation,\n  NewFault,',
   )
   assert.ok(verify(fault).some((issue) => issue.includes('missing static fault NewFault')))
 })
