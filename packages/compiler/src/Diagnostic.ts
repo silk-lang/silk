@@ -472,8 +472,6 @@ export const storedCallableInvocationAccessCode = 'OWN0014' as const
 export const storedEffectRunAccessCode = 'OWN0015' as const
 /** Stable code for an access-scoped local-shared borrow escaping or crossing suspension. */
 export const localSharedAccessEscapeCode = 'OWN0016' as const
-/** Stable code for an owner consumed in only some arms of a branch merge. */
-export const incompatibleArmMergeCode = 'OWN0017' as const
 /** Stable code for returning a callable or Effect that borrows storage owned by the returning function. */
 export const executableBorrowEscapeCode = 'OWN0018' as const
 
@@ -723,7 +721,6 @@ export type Code =
   | typeof storedCallableInvocationAccessCode
   | typeof storedEffectRunAccessCode
   | typeof localSharedAccessEscapeCode
-  | typeof incompatibleArmMergeCode
   | typeof executableBorrowEscapeCode
   | typeof wordLiteralOutOfRangeCode
 
@@ -1398,7 +1395,6 @@ export type Reason<L = SourceSpan.SourceSpan> =
   | { readonly _tag: 'ExplicitMoveRequired'; readonly spelling: string }
   | { readonly _tag: 'OverlappingAssignment'; readonly spelling: string }
   | { readonly _tag: 'IncompatibleLoopHeader'; readonly loop: number }
-  | { readonly _tag: 'IncompatibleArmMerge'; readonly spelling: string }
   | { readonly _tag: 'MatchBorrowEscape'; readonly spelling: string }
   | {
       readonly _tag: 'ExecutableBorrowEscape'
@@ -5315,16 +5311,6 @@ export const incompatibleLoopHeader = <L>(loop: number, span: L): Diagnostic<L> 
   severity: 'error',
   message: `Loop ${loop} repeats with incompatible owner liveness`,
   reason: { _tag: 'IncompatibleLoopHeader' as const, loop },
-  span,
-})
-
-export const incompatibleArmMerge = <L>(spelling: string, span: L): Diagnostic<L> => ({
-  _tag: 'Diagnostic',
-  phase: 'ownership',
-  code: incompatibleArmMergeCode,
-  severity: 'error',
-  message: `Branches merge with incompatible owner liveness for ${spelling}`,
-  reason: { _tag: 'IncompatibleArmMerge' as const, spelling },
   span,
 })
 

@@ -55,17 +55,7 @@ Public declarations: 1.
 ## `Equal`
 
 ```silk
-pub interface Equal
+pub type Equal = Intrinsic.Equal
 ```
 
 The interface behind `==` and `!=`.
-
-<a id="declaration-73696c6b2f657175616c3a3a457175616c3a3a6f7065726174696f6e3a657175616c73"></a>
-
-### Operation `equals`
-
-```silk
-fn equals<'life0, 'life1>(left: &'life0 Self, right: &'life1 Self) -> bool
-```
-
-Reports whether `left` and `right` are equal.

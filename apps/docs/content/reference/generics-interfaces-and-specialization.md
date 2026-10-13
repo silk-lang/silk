@@ -1168,12 +1168,12 @@ unknown-interface-member diagnostic and does not fall back to a module function 
 
 **Current compiler:** Aligned for qualified static operation calls. Bound and concrete calls use
 the same `Self` substitution and witness selection. Operator syntax binds to its fixed
-standard-library interface under OP-009.
+sealed `Intrinsic` interface under OP-009.
 
 **Evidence:** [bound operation resolution](../../../../packages/compiler/src/CallResolution.ts),
 [bound witness lowering](../../../../packages/compiler/src/WitnessLowering.ts),
 [bound-operation tests](../../../../packages/compiler/test/BoundOperationWitness.test.ts),
-[explicit operator eligibility](expressions-and-operators.md#op-009--each-overloadable-operator-is-bound-to-one-standard-library-interface).
+[explicit operator eligibility](expressions-and-operators.md#op-009--each-overloadable-operator-is-bound-to-one-sealed-intrinsic-interface).
 
 ### INTF-007 — A bounded generic receiver calls its bound's operations as methods
 
@@ -1749,9 +1749,9 @@ The later interface rules must preserve decisions already confirmed elsewhere:
   blanket reference adaptation.
 - Effectful operations preserve ordinary failure types, requirement rows, and explicit Effect
   nesting.
-- Operator syntax may select only an explicitly operator-eligible interface operation. Operation
-  names alone have no operator meaning. See
-  [OP-009](expressions-and-operators.md#op-009--each-overloadable-operator-is-bound-to-one-standard-library-interface).
+- Operator syntax selects only its fixed sealed `Intrinsic` interface operation. Library aliases
+  preserve that identity; operation names alone have no operator meaning. See
+  [OP-009](expressions-and-operators.md#op-009--each-overloadable-operator-is-bound-to-one-sealed-intrinsic-interface).
 - Interfaces are not storable existential values and do not introduce runtime dispatch in the first
   stable model.
 
@@ -1765,7 +1765,7 @@ does not give any one of those areas a second interface model.
 | Services                   | A service first passes the declaration-level eligibility check that permits it in a requirement row. Bounds, `impl`, overlap, conditional proof, and operation selection then use the ordinary interface rules. Proving `T: Logger` does not request, provide, or run a logger.                     |
 | Effects                    | Selecting an effectful operation constructs the one Effect layer declared by its contract. Proof does not execute, flatten, handle failures, satisfy requirements, or change a reusable Effect into a consuming one.                                                                                |
 | Ownership                  | A proof is compile-time evidence and does not move, borrow, copy, or drop a value. The selected operation still applies its declared owned, shared, or exclusive operands literally.                                                                                                                |
-| Operators                  | Operator syntax invokes only its fixed standard-library interface operation (OP-009). Bounds and conformances select its static implementation; operation names and provider types receive no hidden numeric privilege.                                                                             |
+| Operators                  | Operator syntax invokes only its fixed sealed `Intrinsic` interface operation (OP-009). Bounds and conformances select its static implementation; operation names and provider types receive no hidden numeric privilege.                                                                           |
 | Modules                    | A nominal interface conformance belongs in the interface's or provider's defining module; service implementations remain provider-owned. Imports make declarations nameable but never activate, replace, prioritize, or hide an `impl`; endpoint visibility determines whether a goal can be named. |
 | Specialization and targets | Every admitted concrete proof selects the same static operation target before LLVM lowering. No target performs interface lookup, receives a witness dictionary, or chooses a different conformance.                                                                                                |
 | Static values              | A generic helper such as `Schema.of<User>()` may select `User: SchemaOf` statically, but that fact alone does not execute the call at compile time. Const evaluation and global static composition are not defined by these rules.                                                                  |
@@ -1784,7 +1784,7 @@ selection.
 | Failure parameters      | Generic OpenSpec and compiler use separate `!E` failure-row binders.                                         | Use ordinary type parameter `E`; only `?R` remains a special Effect-channel kind.                                                            |
 | Explicit call arguments | Older type-system decision requires all arguments or none; current compiler accepts an ordered prefix.       | Keep the current ordered-prefix model for calls and struct literals; the older rule is superseded.                                           |
 | Provider application    | `Decoder<Schema> for Schema` repeats the provider while `T: Decoder` hides an application.                   | Give every interface implicit `Self`; write only additional interface arguments and bind the provider after `for` or to the left of a bound. |
-| Generic operator calls  | Current tests and call resolution infer bound operations from names such as `add`.                           | Use [OP-009](expressions-and-operators.md#op-009--each-overloadable-operator-is-bound-to-one-standard-library-interface).                    |
+| Generic operator calls  | Operator syntax binds to sealed `Intrinsic` identities; library aliases preserve those identities.           | Use [OP-009](expressions-and-operators.md#op-009--each-overloadable-operator-is-bound-to-one-sealed-intrinsic-interface).                    |
 | Service conformance     | A service first passes dependency eligibility, then uses ordinary conformance proof and operation selection. | Keep only dependency eligibility special; do not introduce service-only witness behavior.                                                    |
 | Inline implementations  | General `impl` parsing accepts mappings; a narrow hook form accepts one inline function.                     | Implement the already confirmed general inline-or-mapped rule.                                                                               |
 
