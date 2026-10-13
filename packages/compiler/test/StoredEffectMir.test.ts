@@ -133,6 +133,7 @@ it.effect('retains borrowed anonymous effect captures as loans', () =>
     const { snapshot, layout } = yield* lowerStored(
       'stored-effect-mir/borrowed-provider',
       `import silk.effect {Effect}
+import silk.ownership {Drop}
 struct Marker { value: i32 }
 impl Drop for Marker { fn drop(self: &mut Marker) -> () { return () } }
 effect fn discard<'env>(provide: once fn<'env>() -> once Effect<'env; i32>) -> i32 {

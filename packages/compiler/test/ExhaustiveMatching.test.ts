@@ -469,6 +469,32 @@ pub fn inspect(point: Point) -> i32 {
   assert.deepEqual(shared.diagnostics, [])
   assert.deepEqual(ownership(shared).diagnostics, [])
 
+  // Only bindings are pattern loans (PATT-009): a pattern that binds nothing holds no loan in
+  // its selected body.
+  const unbound = analyze(
+    'unbound-pattern-loan',
+    `pub union Slot<T> { Held { value: T }, Vacant }
+pub struct Token { kind: i32 }
+fn take(slot: Slot<Token>) -> i32 { return 0 }
+pub fn tested(input: Slot<Token>) -> i32 {
+  let direct = move input
+  if let Slot<Token>.Held { .. } = &direct { return take(move direct) }
+  return take(move direct)
+}
+pub fn refilled(input: Slot<Token>) -> i32 {
+  let mut slot = move input
+  if let Slot<Token>.Vacant = &slot { slot = Slot<Token>.Held { value: Token { kind: 1 } } }
+  return take(move slot)
+}
+pub fn destructured(token: Token) -> i32 {
+  let Token { .. } = &token
+  let consumed = move token
+  return consumed.kind
+}`,
+  )
+  assert.deepEqual(unbound.diagnostics, [])
+  assert.deepEqual(ownership(unbound).diagnostics, [])
+
   const exclusive = analyze(
     'exclusive-pattern-loan',
     `pub struct Point { x: i32 y: i32 }
@@ -496,6 +522,21 @@ pub fn inspect(value: Point | i32) -> i32 {
     ownership(moved).diagnostics.map((diagnostic) => diagnostic.code),
     'OWN0001',
   )
+
+  // `move` takes a primary operand with its postfix operations (OWN-003).
+  const fresh = analyze(
+    'moved-fresh-selection',
+    `pub struct Token { kind: i32 }
+pub union Slot<T> { Held { value: T }, Vacant }
+effect fn find(kind: i32) -> Slot<Token> { return Slot<Token>.Held { value: Token { kind: kind } } }
+pub effect fn inspect() -> i32 {
+  if let Slot<Token>.Held { value } = move run find(1) { return value.kind }
+  if let Slot<Token>.Held { value } = move (run find(2)) { return value.kind }
+  return 0
+}`,
+  )
+  assert.deepEqual(fresh.diagnostics, [])
+  assert.deepEqual(ownership(fresh).diagnostics, [])
 })
 
 it('keeps borrowed owners live, consumes move matches, and requires mutable exclusive roots', () => {
@@ -545,6 +586,21 @@ pub fn inspect(event: Token) -> i32 { return match &mut event { Token { kind } =
     ownership(exclusive).diagnostics.map((diagnostic) => diagnostic.code),
     'OWN0007',
   )
+
+  // An exclusive view's referent is an exclusive scrutinee place (BORROW-005, PATT-002).
+  const referent = analyze(
+    'exclusive-referent',
+    `pub union Choice { Held { kind: i32 }, Vacant }
+pub fn matched(slot: &mut Choice) -> i32 {
+  return match &mut slot.* { Choice.Held { kind } => kind Choice.Vacant => 0 }
+}
+pub fn tested(slot: &mut Choice) -> i32 {
+  if let Choice.Held { kind } = &mut slot.* { return kind }
+  return 0
+}`,
+  )
+  assert.deepEqual(referent.diagnostics, [])
+  assert.deepEqual(ownership(referent).diagnostics, [])
 })
 
 it('requires move for a bare by-value use of a consuming pattern owner', () => {
@@ -904,6 +960,52 @@ fn conflict(value: Holder) { match value { Holder { item } => { let item = 1 dro
     result.diagnostics.some((diagnostic) => diagnostic.span.start >= source.indexOf('fn illegal')),
   )
 })
+
+it.effect('joins arm views of distinct regions into one view that keeps both loans live', () =>
+  Effect.gen(function* () {
+    const source = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.option { Option }
+import silk.vector { Vector }
+enum Side { Left, Right }
+fn count(items: &[i32]) -> usize { return items.length }
+fn edges(implied: Option<Vector<i32>>, assumptions: &[i32]) -> usize {
+  let joined = match &implied {
+    Option<Vector<i32>>.Some {value} => Vector<i32>.asSlice(&value)
+    Option<Vector<i32>>.None => assumptions
+  }
+  return count(joined)
+}
+effect fn pick(side: Side, write: Side) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut left = Vector<i32>.make()
+  let mut right = Vector<i32>.make()
+  let joined = match side {
+    Side.Left => Vector<i32>.asSlice(&left)
+    Side.Right => Vector<i32>.asSlice(&right)
+  }
+  match write {
+    Side.Left => { run Vector<i32>.append(&mut left, 1) }
+    Side.Right => { run Vector<i32>.append(&mut right, 1) }
+  }
+  let size = count(joined)
+  run Vector<i32>.append(&mut left, 2)
+  run Vector<i32>.append(&mut right, 2)
+  return size
+}`
+    const snapshot = yield* Analysis.ofSource('view-region-join', new TextEncoder().encode(source))
+    // Writing either borrowed source while the joined view is live conflicts; after its last use
+    // both owners are free again (MATCH-005).
+    assert.deepEqual(
+      Analysis.diagnostics(snapshot).map((diagnostic) => ({
+        code: diagnostic.code,
+        start: diagnostic.span.start,
+      })),
+      [
+        { code: 'OWN0010', start: source.indexOf('&mut left, 1') },
+        { code: 'OWN0010', start: source.indexOf('&mut right, 1') },
+      ],
+    )
+  }),
+)
 
 it.effect('borrows exclusive match payloads from the original projected owner', () =>
   Effect.gen(function* () {

@@ -889,7 +889,9 @@ diagnostic. Escaping a borrowed narrowed binding reports `OWN0006`.
 **Status:** Confirmed
 
 The type of a match expression is computed from reachable arm results. Equal types remain that
-type. Distinct source-declared nominal value types form one normalized structural union. An arm of
+type. Views that differ only in their outer region join into one view: arms of `&'a T` and `&'b T`
+form `&'r T`, where `'a` and `'b` both outlive `'r`, so both loans stay live while the result is
+used. Distinct source-declared nominal value types form one normalized structural union. An arm of
 type `never` contributes no result member. Separate occurrence-generated anonymous tuple or record
 types do not implicitly join; they require an independently known named aggregate expectation that
 is supplied to every arm before analysis.
