@@ -1168,7 +1168,7 @@ Unimplemented native features have one uncoded "not supported by this compiler y
 transported by `SILK_UNSUPPORTED_JSON` with the internal reason and authored source. Backend
 coverage identifiers such as `typed-form` are internal reasons, never catalog codes; strict
 inventory writes them as `coverage_reason`. Deleted or inactive exact query identities report
-`IdentityUnavailable`, also uncoded. There is no native diagnostic namespace. A missing retained
+`IdentityUnavailable` with the uncoded reason "Identity unavailable in this revision". There is no native diagnostic namespace. A missing retained
 fact or an instance-symbol conflict is a compiler bug: its producer writes a report request to
 stderr and calls C `abort`, before creating or caching a rejection. Lexical diagnostics and static
 execution faults have separate exhaustive tables.
