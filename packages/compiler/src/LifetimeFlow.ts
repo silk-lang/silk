@@ -409,8 +409,39 @@ export const analyze = (
     readonly root: Ownership.BindingSite
     readonly path: ReadonlyArray<Elaboration.BorrowSelectorFact>
     readonly lifetimes: ReadonlyArray<Lifetime.Lifetime>
+    readonly incoming: ReadonlyArray<Lifetime.Lifetime>
+    readonly value: Elaboration.ExpressionDecision | Tir.Expression
     readonly anchor: AuthoredHir.Anchor
   }> = []
+  const installedRelations = new Map<string, Array<Lifetime.Outlives>>()
+  for (const { bound, installed } of body.activatedConstraints) {
+    const key = AuthoredIdentity.anchorKey(installed)
+    const relations = installedRelations.get(key) ?? []
+    relations.push(bound)
+    installedRelations.set(key, relations)
+  }
+  // A write can introduce a loan made earlier, including through a copied pattern binding.
+  // Follow only this write's checked storage relations; it cannot retire an incoming loan.
+  const incomingStorage = (
+    lifetimes: ReadonlyArray<Lifetime.Lifetime>,
+    installed: AuthoredHir.Anchor,
+  ): ReadonlyArray<Lifetime.Lifetime> => {
+    const relations = installedRelations.get(AuthoredIdentity.anchorKey(installed)) ?? []
+    const required = new Set(lifetimes.map(Lifetime.key))
+    const incoming = new Map<string, Lifetime.Lifetime>()
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const { longer, shorter } of relations) {
+        const key = Lifetime.key(longer)
+        if (!required.has(Lifetime.key(shorter)) || incoming.has(key)) continue
+        incoming.set(key, longer)
+        required.add(key)
+        changed = true
+      }
+    }
+    return [...incoming.values()]
+  }
   const invalidations: Array<{
     readonly root: Ownership.BindingSite
     readonly path: ReadonlyArray<Elaboration.BorrowSelectorFact>
@@ -1036,6 +1067,8 @@ export const analyze = (
                 root: rootSite(source, builder),
                 path: source.path,
                 lifetimes,
+                incoming: incomingStorage(lifetimes, statement.origin.anchor),
+                value: statement.value,
                 anchor: statement.origin.anchor,
               })
           }
@@ -1179,6 +1212,142 @@ export const analyze = (
     for (const [identity, origin] of origins) {
       const created = BodyControlFlow.at(controlFlow, origin.span)
       if (created === undefined || origin.parent !== undefined) continue
+      const carries = new Set(
+        replacements.filter(
+          (replacement) =>
+            (origin.anchor !== undefined && encloses(context, replacement.anchor, origin.anchor)) ||
+            replacement.incoming.some((lifetime) =>
+              Lifetime.atoms(lifetime).some((atom) => Lifetime.equals(atom, origin.lifetime)),
+            ),
+        ),
+      )
+      const covers = (
+        left: ReadonlyArray<Elaboration.BorrowSelectorFact>,
+        right: ReadonlyArray<Elaboration.BorrowSelectorFact>,
+      ): boolean =>
+        left.length <= right.length &&
+        left.every((selector, ordinal) => {
+          const selected = right.at(ordinal)
+          if (selector._tag === 'Field')
+            return (
+              selected?._tag === 'Field' &&
+              DeclarationFacts.sameFieldId(selector.field, selected.field)
+            )
+          return (
+            selector._tag === 'Index' &&
+            selected?._tag === 'Index' &&
+            selector.bounds._tag === 'Proven' &&
+            selected.bounds._tag === 'Proven' &&
+            selector.bounds.index === selected.bounds.index
+          )
+        })
+      const carrierHolds = (
+        source: Elaboration.BorrowRootFact,
+        at: number,
+        seen: ReadonlySet<string> = new Set(),
+      ): boolean => {
+        const root = canonicalRoot(source)
+        const key = Ownership.siteKey(rootSite(root, builder))
+        const selected = replacements.filter(
+          (replacement) =>
+            Ownership.siteKey(replacement.root) === key && covers(replacement.path, root.path),
+        )
+        const barriers = [
+          created.before,
+          ...selected.flatMap((replacement) => {
+            if (carries.has(replacement)) return []
+            const boundary = controlFlow.boundaries.get(
+              AuthoredIdentity.anchorKey(replacement.anchor),
+            )
+            return boundary === undefined ? [] : [boundary.after]
+          }),
+        ]
+        if (
+          selected.some((replacement) => {
+            if (!carries.has(replacement)) return false
+            const boundary = controlFlow.boundaries.get(
+              AuthoredIdentity.anchorKey(replacement.anchor),
+            )
+            return (
+              boundary !== undefined &&
+              BodyControlFlow.reaches(controlFlow, boundary.after, at, barriers)
+            )
+          })
+        )
+          return true
+        if (root._tag !== 'BindingRoot' || seen.has(key)) return false
+        const initializer = root.binding.initializer
+        const initialized = BodyControlFlow.at(controlFlow, initializer.span)
+        if (
+          initialized === undefined ||
+          !BodyControlFlow.reaches(controlFlow, initialized.after, at, barriers)
+        )
+          return false
+        let payload = initializer
+        let path = root.path
+        while (path.length > 0) {
+          if (payload._tag === 'Move') {
+            payload = payload.subject
+            continue
+          }
+          if (payload._tag === 'UnionConvert') {
+            payload = payload.source
+            continue
+          }
+          const first = path.at(0)
+          let nested: Tir.Expression | undefined
+          if (
+            (payload._tag === 'Construct' || payload._tag === 'ConstructUnionVariant') &&
+            first?._tag === 'Field'
+          ) {
+            nested = payload.fields.find((field) =>
+              DeclarationFacts.sameFieldId(field.field, first.field),
+            )?.value
+          } else if (
+            payload._tag === 'ArrayConstruct' &&
+            first?._tag === 'Index' &&
+            first.bounds._tag === 'Proven'
+          ) {
+            nested = payload.elements.at(first.bounds.index)
+          }
+          if (nested === undefined) break
+          payload = nested
+          path = path.slice(1)
+        }
+        if (origin.anchor !== undefined && encloses(context, payload.origin.anchor, origin.anchor))
+          return true
+        const previous = expressionRoot(payload, context, builder)
+        const captured = BodyControlFlow.at(controlFlow, payload.span)?.before ?? initialized.before
+        return (
+          previous !== undefined &&
+          carrierHolds(
+            { ...previous, path: [...previous.path, ...path] },
+            captured,
+            new Set(seen).add(key),
+          )
+        )
+      }
+      // Copying a stored descriptor transfers its current loan, not the destination's old
+      // lifetime spelling. Initialization points distinguish an earlier saved copy from it.
+      let transported = true
+      while (transported) {
+        transported = false
+        for (const replacement of replacements) {
+          if (carries.has(replacement)) continue
+          const source = expressionRoot(replacement.value, context, builder)
+          const boundary = controlFlow.boundaries.get(
+            AuthoredIdentity.anchorKey(replacement.anchor),
+          )
+          if (
+            source !== undefined &&
+            boundary !== undefined &&
+            carrierHolds(source, boundary.before)
+          ) {
+            carries.add(replacement)
+            transported = true
+          }
+        }
+      }
       const retired = new Set<number>()
       for (const [position, point] of entries) {
         const span = context.spanOf(position)
@@ -1192,31 +1361,9 @@ export const analyze = (
             ? Elaboration.unavailableExpressionType
             : Elaboration.constructionExpressionType(value)
         if (carrier === undefined || use === undefined || valueType._tag !== 'Available') continue
-        const prefix = (
-          left: ReadonlyArray<Elaboration.BorrowSelectorFact>,
-          right: ReadonlyArray<Elaboration.BorrowSelectorFact>,
-        ): boolean =>
-          left.length <= right.length &&
-          left.every((selector, ordinal) => {
-            const selected = right.at(ordinal)
-            if (selector._tag === 'Field')
-              return (
-                selected?._tag === 'Field' &&
-                DeclarationFacts.sameFieldId(selector.field, selected.field)
-              )
-            return (
-              selector._tag === 'Index' &&
-              selected?._tag === 'Index' &&
-              selector.bounds._tag === 'Proven' &&
-              selected.bounds._tag === 'Proven' &&
-              selector.bounds.index === selected.bounds.index
-            )
-          })
         const relevant = replacements.filter(
           (replacement) =>
-            !(
-              origin.anchor !== undefined && encloses(context, replacement.anchor, origin.anchor)
-            ) &&
+            !carries.has(replacement) &&
             Ownership.siteKey(replacement.root) === Ownership.siteKey(rootSite(carrier, builder)) &&
             replacement.lifetimes.some((lifetime) => storageOutlives(origin.lifetime, lifetime)),
         )
@@ -1225,7 +1372,7 @@ export const analyze = (
           type: Type.Type,
         ): boolean => {
           const barriers = relevant.flatMap((replacement) => {
-            if (!prefix(replacement.path, path)) return []
+            if (!covers(replacement.path, path)) return []
             const installed = BodyControlFlow.at(controlFlow, context.spanOf(replacement.anchor))
             return installed === undefined ? [] : [installed.after]
           })
@@ -1233,7 +1380,7 @@ export const analyze = (
             if (
               Ownership.siteKey(rootSite(branch.root, builder)) !==
                 Ownership.siteKey(rootSite(carrier, builder)) ||
-              !prefix(branch.root.path, path)
+              !covers(branch.root.path, path)
             )
               continue
             const field = path.at(branch.root.path.length)
@@ -1257,7 +1404,7 @@ export const analyze = (
           if (!Type.isFixedArray(type)) return false
           const selectedIndices = new Map<number, Elaboration.BorrowSelectorFact>()
           for (const replacement of relevant) {
-            if (!prefix(path, replacement.path)) continue
+            if (!covers(path, replacement.path)) continue
             const selector = replacement.path.at(path.length)
             if (
               selector?._tag === 'Index' &&
