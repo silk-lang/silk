@@ -17,6 +17,7 @@ import silk.monotonic_clock {MonotonicClock}
 import silk.native_socket {Accepted, AcceptedContext, AcceptedView, BoundAddress, Connection, ConnectionPhase, InvalidBindReason, ListenOptions, ListenOptionsError, ListenOptionsReason, Listener, ListenerPhase, NativeSocketError, NativeSocketOperation, PeerAddress, UnixPeerAddress, UnixSocketPath, accept, listen, listenUnix, withAccepted, withAcceptedContext, withListener}
 import silk.network_address {Endpoint, IpAddress, Ipv4Address, Ipv6Address, Port}
 import silk.option {Option}
+import silk.ownership { Drop }
 import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.system_clock {Instant, SystemClock}
