@@ -23,6 +23,26 @@ const build = () => {
   return { lexical, parser, semantic }
 }
 
+it('distinguishes non-alias cycles and unit-variant payload patterns with exact spans', () => {
+  const cycle = Diagnostic.nonAliasResolutionCycle(spanAt(2, 7))
+  const pattern = Diagnostic.unitVariantPayloadPattern('Option<i32>.None', spanAt(10, 24))
+  assert.deepEqual(
+    [cycle, pattern].map(({ code, reason, span }) => ({
+      code,
+      reason,
+      span: [span.start, span.end],
+    })),
+    [
+      { code: 'SEM0223', reason: { _tag: 'NonAliasResolutionCycle' }, span: [2, 7] },
+      {
+        code: 'SEM0224',
+        reason: { _tag: 'UnitVariantPayloadPattern', variant: 'Option<i32>.None' },
+        span: [10, 24],
+      },
+    ],
+  )
+})
+
 it('publishes structured duration diagnostics with focused spans', () => {
   const diagnostics = [
     Diagnostic.invalidDurationAmount(spanAt(0, 3)),
