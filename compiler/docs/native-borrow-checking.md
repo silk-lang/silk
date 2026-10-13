@@ -97,7 +97,8 @@ The bootstrap is the behavioral reference, not the architectural one.
   checker runs".
 - Some move-side rules already reject natively with bootstrap-equivalent codes:
   `ExtractionBoundary` (OWN0002), `ExplicitMoveRequired` (OWN0003), `MatchBorrowEscape`
-  (OWN0006), `GuardConsumesPattern` (OWN0008), `InvalidMatchScrutineePlace` (OWN0009),
+  (OWN0006), `ExclusiveMatchRequiresMutable` (OWN0007), `GuardConsumesPattern` (OWN0008),
+  `InvalidMatchScrutineePlace` (OWN0009),
   `BorrowedExtraction` (OWN0012), `ExclusiveBorrowRequiresMutable` (SEM0057) and
   `UnsatisfiedLifetimeBound` (SEM0212).
 - `UseAfterMove` (OWN0001), `OverlappingAssignment` (OWN0004) and `IncompatibleLoopHeader`
@@ -256,8 +257,19 @@ until the provided Effect completes. There are no two-phase borrows, as in the b
 - A returned callable or Effect whose region contains a loan of a local is OWN0018.
 - A run or invocation through an aggregate place weaker than the environment's access is OWN0015 or
   OWN0014, checked at the `Call` that runs it.
-- A local-shared access callback gets a region bounded by the access call. A loan into the shared
-  contents that outlives it is OWN0016.
+- A local-shared access callback gets a region bounded by the access call; a loan into the shared
+  contents cannot outlive it, which typing already enforces on the callback's result.
+- OWN0016 (SHARED-003) is not part of the per-body verdict. Whether an access escapes depends on
+  every function its callback reaches, which a body's checking unit never reads. The build enforces
+  it once over the reached instances, in the same pass that rejects suspending foreign callbacks,
+  before any code is emitted. Each held access walks its callback's call graph; every `run` outside
+  an Effect block and every execution readiness notification it reaches is reported at its own span
+  and module, related to the call where the callback entered its access wrappers, once per pair.
+  Both code-producing entries, `silkc build` and `silkc test`, build through that pass. A body's
+  `Checked` verdict therefore covers loans and regions only.
+- Only reached accesses are judged. An access in a declaration no root reaches is judged once the
+  native compiler checks every loaded declaration (MODULE-004), and that work must include this
+  pass.
 - OWN0020 (ownership across suspension) is out of scope until suspension lowering exists
   (`mir-core-shape.md` §6), and is reported as a named gap if reached.
 
@@ -296,17 +308,21 @@ cover first:
 - `awaiting`: no checker covers the unit yet (selected static bodies, member bodies, and the
   compile-time prefixes static evaluation copies).
 - `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
-  exclusive views included, are proved; region and contents obligations wait for later slices.
+  exclusive views included, are proved, but the body is not region-closed (below), or retains a
+  region relation or capture contents; later slices prove those.
 - `storage`: the body uses a storage operation the loan and move walk does not enter yet:
-  `slotAddress`, `sharedWithMut`, `executionNotify` (an external readiness callback, which a
-  local-shared access callback must not run: OWN0016), `executionFromAllocation`,
-  `executionDrive`, `relinquish` or `executionCurrent`. `replace` is checked as a write to its
-  place operand that yields the displaced value, and every other storage operation as a call to its
-  contract. Each such contract names the operand region every result view reaches (a raw-buffer
-  view or slot carries its buffer reference's region, a string view its text's region), and
-  `unsafe` discharges only the operation's memory obligations, never its aliasing.
+  `slotAddress`, `replace`, `sharedWithMut`, `executionNotify` (an external readiness callback,
+  which a local-shared access callback must not run: OWN0016), `executionFromAllocation`,
+  `executionDrive`, `relinquish` or `executionCurrent`. Every other storage operation is checked
+  as a call to its contract. Each such contract names the operand region every result view
+  reaches (a raw-buffer view or slot carries its buffer reference's region, a string view its
+  text's region), and `unsafe` discharges only the operation's memory obligations, never its
+  aliasing.
 - `stored-loans`: a loan is stored in a value, joined across paths, returned, or borrowed from a
-  place that is not rooted in a local.
+  place that is not rooted in a local. One such form must reject rather than stay unchecked: a
+  view of a temporary receiver used past its statement, such as `let left = make().left()`, is
+  OWN0019 at the use under BORROW-006, as in the bootstrap. The native compiler accepts it today
+  and counts the body here; the slice that lifts these exits rejects it.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
@@ -386,6 +402,37 @@ invokes it with the access its contract grants: a shared Effect is read, a `mut 
 borrowed exclusively, and a `once Effect` is moved, so the loans its environment holds stay live
 through the run (EFFECT-OWN-002, CALLABLE-003).
 
+A body the walk clears is `Checked` when it is region-closed and typing left nothing pending. It is
+region-closed when every region its locals and values name is `'static` or a loan region of the
+body itself. A call result keeps an operand's region only by naming it, and conformance holds an
+interface witness to exactly the regions its operation names, so a result typed by an open
+parameter keeps no loan of the body. Such a body's
+loans and their scopes are its whole region proof, because no loan of a cleared body outlives its
+root's scope:
+
+- A loan lives past the expression that creates it only through a `let` holder. Every binding has
+  an initializer, so the holder is bound after its root, in the same scope or a nested one, and is
+  released no later than its root; releases run in reverse declaration order, so a holder whose
+  cleanup observes the loan is released first (LIFE-005).
+- Every value that would carry a loan of a body local across a scope boundary leaves the walk with
+  `stored-loans`: a block, branch or arm result, a subject that carries a loan, a return, an
+  assignment and a `let mut` holder. A referent loan (storage behind a reference, which the body
+  does not own) may cross a join, a `let mut` holder, a replacement or a return; such a body is
+  marked crossed and is never `Checked`, because its region relations are the region slices' to
+  prove.
+- A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
+  literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
+
+Pending means a region relation or capture contents typing retained. `Checked` is a claim about
+one body: its own loans and regions are sound. A rule that blames a body for its callers' context
+is not part of that claim. OWN0016 (SHARED-003) blames a suspending callee reached under a
+local-shared access, such as a value-free `fn parks()` that runs `Execution.park`. Such a callee
+can be `Checked` while every boundary caller, which takes the access's `&mut T` parameter region,
+stays `regions` until local sharing lands (§10), so no violating program is ever fully checked.
+Scope ends as events,
+OWN0019 and the `run` failure edge arrive with the slice that lifts the `stored-loans` exits above,
+the first point at which a loan can outlive its root.
+
 The count must reach zero on the self-build before the TypeScript compiler is deleted. At zero,
 the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
 
@@ -393,10 +440,10 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
 
 - **One `RejectionCode` per bootstrap code**, documented with the bootstrap code it mirrors, as the
   existing ownership codes are: `LoanConflict` (OWN0010), `AccessDuringLoan` (OWN0011),
-  `StoredCallableAccess` (OWN0014), `StoredEffectAccess` (OWN0015), `SharedAccessEscape` (OWN0016),
-  `CaptureEscape` (OWN0018) and `LifetimeInvalidAtUse` (OWN0019). The bootstrap's own wording and
-  the generated diagnostic catalog stay authoritative for text. OWN0017 has no bootstrap call site
-  and is dropped from the catalog (Q5).
+  `StoredCallableAccess` (OWN0014), `StoredEffectAccess` (OWN0015), `LocalSharedAccessEscape`
+  (OWN0016), `CaptureEscape` (OWN0018) and `LifetimeInvalidAtUse` (OWN0019). The bootstrap's own
+  wording and the generated diagnostic catalog stay authoritative for text. OWN0017 has no
+  bootstrap call site and is dropped from the catalog (Q5).
 - **Spelling.** During the transition the native CLI prints each native name together with its
   bootstrap code, for example `AccessDuringLoan (OWN0011)` (Q7).
 - **Spans:** the primary span is the later conflicting access for OWN0010 and OWN0011, relating
@@ -485,21 +532,22 @@ rejects is never accepted.
    - Universal regions, outlives assumptions, and discharge of `RegionRelation` and `Contents`
      obligations.
    - Delete the `TypeMismatch` stand-in for region escapes.
-   - Scope-end storage ends as events: at a match arm's end, at a block's end and at body exit.
-     Until then a loan can outlive its root's scope unseen. For example, a consuming match arm can
-     yield `&value` of its arm-local binding. Every such body answers `regions` or `stored-loans`,
-     never `Checked`; this slice rejects that program with OWN0019.
-   - The failure edge from each `run` to body exit, beside the one `fail` already takes. Exit
-     carries no events before this slice, so the edge cannot change a verdict yet. Add it here with
-     a program whose failure path reaches a scope-end drop of a root whose loan is held across the
-     run.
+   - Region-closed bodies are `Checked` (§6). Then universal regions (lifetime parameters,
+     invocation lifetimes, outlives assumptions), then region relations and returned regions.
+   - With the slice that lifts the `stored-loans` exits for joins and assignments: scope-end storage
+     ends as events at a match arm's end, a block's end and body exit, OWN0019 at the first required
+     point outside the root's scope (a consuming arm yielding `&value` of its arm-local binding is
+     rejected at the `match`), and the failure edge from each `run` to body exit, beside the one
+     `fail` already takes, with a program whose failure path alone releases a root while a holder
+     whose cleanup observes its loan is still live.
 4. **Generic bodies**, checked abstractly in the same pass (§3, item 8). Type properties are read
    through the per-declaration summaries of v2 P5(a); this slice adds the summary for whatever it
    needs if v2 has not landed it yet.
 5. **Selected static bodies**, per interned selection, including type-specific ones.
 6. **Captures, callables, Effects and providers** (OWN0014, OWN0015, OWN0018, CALLABLE-003,
    EFFECT-OWN-002, provider loans).
-7. **Local sharing** (OWN0016). Suspension stays a named reason until suspension lowering lands.
+7. **Local sharing** (OWN0016), enforced at build scope over the reached instances (§4.5), not in
+   the per-body verdict.
 8. **Parity and closure.**
    - Expected-diagnostic corpus mode (`main` first), the invalid-ownership set, zero unchecked on
      the self-build.
@@ -514,8 +562,9 @@ v2 slice: the checker uses today's `Body` key and the v2 slices attach their edg
 Julia decided the open questions in the joint review with #1433 (2026-10-11):
 
 1. **Unit of checking IR.** The typed body, inside the `Body` unit (v2 option S1). No checking MIR.
-2. **Span parity.** Code plus primary-span parity on the differential corpus. Answers store spans
-   relative to their declaration, so parity compares rendered spans.
+2. **Span parity.** Code plus primary-span parity on the differential corpus. Accepted answers store
+   positions relative to their declaration; rejections and gaps keep absolute spans and record a
+   `DeclLocation` dependency (incremental v2 §3.5). Parity compares rendered spans.
 3. **Two-phase borrows.** None. BORROW-004 stays as written: `Vector.append(&mut v, f(&v))` is
    rejected.
 4. **One owner for move rules.** Move and initialization checks stay in typing; loan and region

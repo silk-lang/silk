@@ -62,8 +62,10 @@ pointer weakening removes mutation capability, adds nullability, and weakens ali
 bootstrap does (any requirement to `align(1)`, a written alignment to a smaller written one),
 preserving invariant pointee/extent; it does not implement reverse access, nested pointee
 covariance, or other qualifier conversions. Ownership, lifetime, and cleanup
-checking remains step 14. The TypeScript bootstrap still builds the native compiler and remains the
-complete language oracle.
+checking remains step 14. The TypeScript bootstrap that selfhost last synced from main builds the
+native compiler; the bootstrap DDC job in `selfhost.yml` enforces that it does and that the result
+emits the same compiler IR as the seed chain. Known bootstrap-only rejections and the compiler
+spellings that avoid them are recorded as entries in this file.
 
 ## Entry format
 
@@ -666,27 +668,32 @@ Each entry records:
 - **Evidence:** positive complete/partial prefixes and the local-to-static negative in
   `genericNominalBorrowArgumentsPreserveActualRegions`; reduced-fixture native execution pending.
 
-### Selfhost guard ownership checking is limited to callable availability
+### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
-- **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d.
+- **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
+  provisional bindings checked in every body with moves since 2026-10-12.
 - **Rule:** the reference reports OWN0008 for moving a provisional pattern binding inside its guard
   (ownership-and-borrowing.md, MATCH-002); it states no rule for other places a guard moves.
 - **Compilers:** the bootstrap checks explicit moves, callable captures and consuming arguments
   in guard mode, including ordinary locals, which is broader than the reference. Both compilers
   admit the implicit receiver transfer of an ordinary stored once invocation or staging while
   preserving guard checks on nested explicit moves and supplied arguments. Selfhost reports
-  `GuardConsumesPattern` at a forbidden transfer span in bodies checked by callable availability,
-  including environments that need no drop glue. It also rejects implicit receiver transfer from
-  a provisional matched subject, following MATCH-002; the bootstrap currently bypasses its guard
-  check for that receiver path. Other bodies still type a guard that moves an owner; MIR
-  reports the `cleanup` gap when the guard changes an acquired cleanup owner's state. General
-  ownership checking outside callable availability remains incomplete.
+  `GuardConsumesPattern` when a guard moves or drops a provisional binding of its consuming match,
+  in every body the borrow stage walks, including a binding passed to a consuming argument. It
+  also reports it at a forbidden transfer span in bodies checked by callable availability,
+  including environments that need no drop glue, and rejects implicit receiver transfer from a
+  provisional matched subject, following MATCH-002; the bootstrap currently bypasses its guard
+  check for that receiver path. A guard that moves an ordinary local still types in selfhost;
+  MIR reports the `cleanup` gap when the guard changes an acquired cleanup owner's state.
 - **Source migration:** none.
-- **Evidence:** `plainCallableParameterRejectsCleanupFreeGuardTransfer` checks retained guard
-  control flow independently of layout and Drop, with an unguarded transfer control.
-  `plainCallableParameterDistinguishesGuardTransfers` checks source argument, invocation and nested
-  explicit callee moves with diagnostic spans. The
-  `guardMoves` fixture of `cleanupFollowsLoopsAndConditionalPaths` retains the ordinary-body gap.
+- **Evidence:** `guardMoves` and `guardReads` of `cleanupStackDropsWhatEachExitLeaves` reject a
+  provisional binding passed to a consuming call in a guard and admit the same binding read in
+  the guard and moved in the arm. `guarded` of `consumedBindingsOwnTheirParts` rejects a union
+  payload binding moved in its guard. `plainCallableParameterRejectsCleanupFreeGuardTransfer`
+  checks retained guard control flow independently of layout and Drop, with an unguarded transfer
+  control. `plainCallableParameterDistinguishesGuardTransfers` checks source argument, invocation
+  and nested explicit callee moves with diagnostic spans. The `guardMoves` fixture of
+  `cleanupFollowsLoopsAndConditionalPaths` retains the ordinary-local gap.
   Source callable-bearing record patterns are not claimed as native runtime coverage here;
   unexamined record-pattern combinations retain explicit callable availability/lowering follow-ups,
   rather than being counted as proven generic-record or closure coverage.
