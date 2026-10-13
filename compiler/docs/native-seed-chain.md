@@ -83,6 +83,31 @@ N1 and N2 are compiled from the same source by different compilers, so identical
 seed and N1 agree on the meaning of the compiler. A change to code generation still reaches a
 fixpoint at N1/N2; only a seed miscompile or nondeterminism breaks it.
 
+### Bootstrap DDC
+
+**Bootstrap builds the compiler (T1 DDC)** keeps the chain from depending only on itself. It finds
+the newest `main` commit this tree contains (`git merge-base HEAD origin/main`), downloads the
+verified `silk-bootstrap` artifact main's CI published for exactly that commit, and builds
+`compiler/silk.toml` with it. The result, T1, and N1 built by the pinned seed each emit the
+compiler's LLVM IR. The two files must be byte-identical: a compiler built by an independent
+compiler agrees with the chain on the meaning of the compiler source. The job records a receipt
+(synced main commit, bootstrap run, stage times and peak memory, IR hashes) as the
+`selfhost-bootstrap-ddc` artifact on every push run, so drift stays visible.
+
+It runs on every `selfhost` push and on pull requests that change `compiler/native-seed.json`; on
+other pull requests it exits at once. It is not a branch-protection requirement, since selfhost
+pull requests merge on local evidence, but **a seed bump merges only with this job green on its
+head**. Measured locally on 4 cores, the T1 build took 19 minutes at 10.6 GB peak; the receipt
+records the runner figures.
+
+The bootstrap comes from the synced commit, never from `main` HEAD, which may already carry
+main-first changes selfhost has not merged. Main's artifact expires after 90 days, so selfhost
+must sync `main` at least that often. Without a verified artifact for the synced commit the job
+fails rather than falling back to another bootstrap; sync main into selfhost so one exists. A red
+job on a push means selfhost uses something the synced bootstrap cannot compile or compiles
+differently: land a main-first bootstrap fix, or respell the compiler source and record the
+divergence in `COMPILER_COMPATIBILITY.md`. Seed bumps wait until it is green again.
+
 ### Reusing a pull request run
 
 Every `selfhost` push runs in its own concurrency group, so no merge's run is replaced while it
@@ -126,7 +151,8 @@ current pin first and never touch its tag. Until then candidates are pruned by h
 Advance when the compiler needs a feature that the pinned seed cannot compile, and otherwise
 whenever convenient (a fresher seed builds faster code). Copy the candidate's `native-seed.json` to
 `compiler/native-seed.json` in a PR to `selfhost`. Its CI proves the new seed builds this checkout,
-reaches the fixpoint and passes the corpus.
+reaches the fixpoint and passes the corpus. The bump merges only once
+[the bootstrap DDC](#bootstrap-ddc) is green on its head.
 
 ## Recovery
 
