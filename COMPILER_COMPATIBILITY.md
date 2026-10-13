@@ -2142,6 +2142,7 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   view the call returns. Accepting it also needs MIR loan ends for the loans that temporary
   retains, so the rejection currently prevents a miscompile.
 - **Native:** accepts it.
-- **Source migration:** `ModuleIndex.fingerprint` in `compiler/` binds the slice to a local before
-  indexing it, which both compilers accept and compile identically. No other site is known.
+- **Source migration:** `ModuleIndex.fingerprint` and `Semantic.reconcileDeclarationChange` in
+  `compiler/` bind the slice to a local before indexing it, which both compilers accept. Declaration
+  handle Cases use the same direct-view form.
 - The bootstrap is not extended for this. Retire this entry with the bootstrap.
