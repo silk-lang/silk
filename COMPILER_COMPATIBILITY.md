@@ -1836,21 +1836,6 @@ repeated invocation and capture-only drop glue.
   This correction does not establish native self-build success.
 - **Source migration:** none.
 
-## Sealed operator interfaces
-
-INTR-007 and INTR-008 declare the thirteen operator interfaces, `Ordering`, and the twenty scalar
-conformances in `packages/compiler/stdlib/intrinsic/operators.silk`, reachable only as
-`Intrinsic.<Name>`.
-
-- **Bootstrap:** reads the file, rejects an import of it, and resolves its members. A closure holds
-  it only when one of its modules spells an `Intrinsic` member the file declares.
-- **Native:** does not load the file yet, and reports `Intrinsic.Add` and the other members as
-  unknown. Its pinned seed ignores the unimported file.
-- **Source migration:** none yet. `silk.ops`, `silk.equal` and `silk.order` still declare their own
-  interfaces and scalar conformances, and operator syntax binds to them (OP-009).
-- Retire this entry when the native compiler loads the same file and both compilers bind operators
-  to the sealed interfaces.
-
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
@@ -2142,6 +2127,7 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   view the call returns. Accepting it also needs MIR loan ends for the loans that temporary
   retains, so the rejection currently prevents a miscompile.
 - **Native:** accepts it.
-- **Source migration:** `ModuleIndex.fingerprint` in `compiler/` binds the slice to a local before
-  indexing it, which both compilers accept and compile identically. No other site is known.
+- **Source migration:** `ModuleIndex.fingerprint` and `Semantic.reconcileDeclarationChange` in
+  `compiler/` bind the slice to a local before indexing it, which both compilers accept. Declaration
+  handle Cases use the same direct-view form.
 - The bootstrap is not extended for this. Retire this entry with the bootstrap.

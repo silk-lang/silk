@@ -3096,7 +3096,8 @@ export const analyzeFunctionItem = (
       memberLookup._tag !== 'Resolved' &&
       typeMember._tag === 'Resolved' &&
       typeMember.declaration.visibility === 'Public' &&
-      NameResolution.isNominalOwner(typeMember.declaration)
+      (NameResolution.isNominalOwner(typeMember.declaration) ||
+        typeMember.declaration._tag === 'AliasDeclaration')
     ) {
       diagnostic = Diagnostic.namespaceQualifiedType(
         qualifierLookup.module,
