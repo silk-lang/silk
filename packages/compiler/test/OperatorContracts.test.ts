@@ -199,7 +199,7 @@ pub fn main() -> i32 {
 it.effect('names the sealed operator interfaces and scalar conformances as Intrinsic members', () =>
   Effect.gen(function* () {
     // Library aliases name the sealed members the way `silk.ops` and `silk.order` will.
-    const self = yield* snapshot(`type Order = Intrinsic.Order
+    const self = yield* snapshot(`type Order = Intrinsic . Order
 struct Meters { value: i32 }
 impl Meters {
   fn plus(left: Meters, right: Meters) -> Meters { return Meters { value: left.value + right.value } }
@@ -249,7 +249,12 @@ pub fn main() -> i32 {
         ]).pipe(
           Layer.provideMerge(
             SourceResolver.memory(
-              new Map([['numeric', encoder.encode('pub type Plus = Intrinsic.Add\n')]]),
+              new Map([
+                [
+                  'numeric',
+                  encoder.encode('pub type Plus = Intrinsic // qualifier\n . // member\n Add\n'),
+                ],
+              ]),
             ),
           ),
         ),

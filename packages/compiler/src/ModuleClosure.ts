@@ -390,16 +390,27 @@ const tokenText = (syntax: SyntaxFile.SyntaxFile, token: Token.Token | undefined
 const namesSealedMember = (syntax: SyntaxFile.SyntaxFile): boolean => {
   const cached = sealedReferences.get(syntax)
   if (cached !== undefined) return cached
-  const tokens = syntax.tokens
-  const names = tokens.some(
-    (token, at) =>
-      tokens[at + 1]?.kind === 'Dot' &&
+  let qualifier = false
+  let dot = false
+  for (const token of syntax.tokens) {
+    if (
+      token.kind === 'Whitespace' ||
+      token.kind === 'LineComment' ||
+      token.kind === 'DocComment' ||
+      token.kind === 'ModuleDocComment'
+    )
+      continue
+    if (dot && Stdlib.sealedModule.members.has(tokenText(syntax, token))) {
+      sealedReferences.set(syntax, true)
+      return true
+    }
+    dot = qualifier && token.kind === 'Dot'
+    qualifier =
       token.span.end - token.span.start === 'Intrinsic'.length &&
-      tokenText(syntax, token) === 'Intrinsic' &&
-      Stdlib.sealedModule.members.has(tokenText(syntax, tokens[at + 2])),
-  )
-  sealedReferences.set(syntax, names)
-  return names
+      tokenText(syntax, token) === 'Intrinsic'
+  }
+  sealedReferences.set(syntax, false)
+  return false
 }
 
 const resolvedTargets = (module: Module): ReadonlyArray<string> =>
