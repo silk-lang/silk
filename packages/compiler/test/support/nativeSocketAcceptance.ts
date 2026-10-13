@@ -10,6 +10,7 @@ import silk.monotonic_clock {MonotonicClock}
 import silk.native_socket {AttemptFailure, ConnectOptions, ConnectOptionsError, ConnectOptionsReason, Connection, ConnectionPhase, InvalidEndpointReason, NativeSocketError, NativeSocketOperation, connectResolved, connectResolvedOwned, connectUnix, connectUnixOwned}
 import silk.network_address {Endpoint, IpAddress, Ipv4Address, Port}
 import silk.option {Option}
+import silk.ownership { Drop }
 import silk.result {Result}
 import silk.scheduler {Scheduler, TaskIdExhaustedError}
 import silk.system_clock {Instant, SystemClock}

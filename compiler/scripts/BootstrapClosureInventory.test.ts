@@ -47,7 +47,8 @@ const retainingMain = Effect.fnUntraced(function* (root: string, bytes: Uint8Arr
   )
 })
 
-const inlineSource = `interface Read<T> { fn read(self: &Self) -> T }
+const inlineSource = `import silk.ownership {Copy}
+interface Read<T> { fn read(self: &Self) -> T }
 struct Box<T> { value: T }
 impl<T: Copy> Read<T> for Box<T> { fn read(self: &Self) -> T { return self.value } }
 struct Other { value: i32 }
@@ -644,7 +645,8 @@ it.effect(
   'preserves actual cleanup/provider edges and intrinsic spans without inventing generated names',
   () =>
     Effect.gen(function* () {
-      const source = `service Source { effect fn load() -> i32 ? &mut Source }
+      const source = `import silk.ownership {Drop}
+service Source { effect fn load() -> i32 ? &mut Source }
 struct Provider {}
 impl Provider { effect fn load(self: &mut Self) -> i32 { return 42 } }
 impl Source for Provider { load: Provider.load }
