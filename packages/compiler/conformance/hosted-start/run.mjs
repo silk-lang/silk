@@ -182,6 +182,7 @@ const program = Effect.gen(function* () {
               receiver +
               '\nstatic int finalizations;\nvoid mark_finalizer(void) { ++finalizations; }\nvoid check_finalizer(void) { if (finalizations != 1) __builtin_trap(); }\n',
             text: `import silk.effect { Effect }
+import silk.ownership { Drop }
 unsafe extern "C" fn mark_finalizer() -> ()
 unsafe extern "C" fn check_finalizer() -> ()
 pub struct Problem {}

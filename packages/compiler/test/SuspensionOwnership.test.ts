@@ -266,7 +266,8 @@ pub fn main() -> i32 { return run application(42) }`
 
 it.effect('preserves partial owner state across suspension and cancellation', () =>
   Effect.gen(function* () {
-    const source = `struct Token { value: i32 }
+    const source = `import silk.ownership {Drop}
+struct Token { value: i32 }
 impl Drop for Token { fn drop(self: &mut Token) -> () { return () } }
 struct Pair { left: Token right: Token }
 effect fn delayed() -> i32 { return run Intrinsic.suspendEffect(effect { return 2 }) }
@@ -430,6 +431,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const self = yield* snapshot(`import silk.effect { Effect }
+import silk.ownership { Drop }
 struct Owner { value: i32 }
 impl Drop for Owner { fn drop(self: &mut Owner) -> () { return () } }
 struct Borrowed<'a> { owner: &'a Owner }

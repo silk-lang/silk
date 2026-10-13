@@ -3,6 +3,7 @@ export const httpClientOwnershipAcceptanceSource = `import silk.allocator {Alloc
 import silk.byte_duplex {ByteDuplex, ReadTransfer}
 import silk.effect {Effect}
 import silk.execution { Execution, Wake }
+import silk.ownership { Drop }
 import silk.shared {Shared}
 import silk.http {Method, Version, Header}
 import silk.http_body {Limits as BodyLimits}

@@ -183,7 +183,9 @@ export const forHeader = (
   declaration: AuthoredHir.Declaration,
   parameters: ReadonlyMap<string, Type.Parameter>,
   nominalParameters?: NominalParameters,
-): Context => elaborate(context, owner, declaration, parameters, undefined, nominalParameters)
+  borrowedAlias?: (type: AuthoredHir.Type) => boolean,
+): Context =>
+  elaborate(context, owner, declaration, parameters, undefined, nominalParameters, borrowedAlias)
 
 const elaborate = (
   context: SemanticContext.SemanticContext,
@@ -192,6 +194,7 @@ const elaborate = (
   parameters: ReadonlyMap<string, Type.Parameter>,
   body: BodyLifetime.BodyLifetime | undefined,
   nominalParameters: NominalParameters | undefined,
+  borrowedAlias?: (type: AuthoredHir.Type) => boolean,
 ): Context => {
   const nominalArguments = new Map<string, ReadonlyArray<Lifetime.Lifetime>>()
   const regions = new Map<string, Lifetime.Lifetime>()
@@ -606,7 +609,9 @@ const elaborate = (
     type._tag === 'ReferenceType' ||
     type._tag === 'SliceType' ||
     isStringType(context, type) ||
-    (type._tag === 'AppliedType' && isStringType(context, type.target))
+    (type._tag === 'AppliedType' && isStringType(context, type.target)) ||
+    // An alias of one borrow is that borrow (TYPE-004).
+    borrowedAlias?.(type) === true
 
   for (const parameter of headerGenerics(declaration)) {
     if (parameter._tag === 'RowParameter') continue
