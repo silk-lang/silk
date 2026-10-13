@@ -1654,3 +1654,108 @@ pub fn main() -> i32 { return 0 }`
     )
   }),
 )
+
+// BORROW-008 / LIFE-001: extracting a view preserves its external referent, even by Copy.
+for (const [name, wrapper, selection] of [
+  [
+    'match',
+    'View { value: &inner }',
+    'held = match move wrapped { View<&i32> { value: selected } => selected }',
+  ],
+  [
+    'if-let',
+    'View { value: &inner }',
+    'if let View<&i32> { value: selected } = move wrapped { held = selected }',
+  ],
+  [
+    'destructure',
+    'View { value: &inner }',
+    'let View<&i32> { value: selected } = move wrapped\n    held = selected',
+  ],
+  [
+    'nested',
+    'View { value: &inner, marker: Marker { code: 42 } }',
+    'held = match move wrapped { View<&i32> { value: selected, marker: Marker { code: _ } } => selected }',
+  ],
+] as const) {
+  it.effect(`retains copied pattern view loans after their source scope: ${name}`, () =>
+    Effect.gen(function* () {
+      const declaration =
+        name === 'nested'
+          ? 'struct Marker { code: i32 }\nstruct View<T> { value: T marker: Marker }'
+          : 'struct View<T> { value: T }'
+      const source = `${declaration}
+fn bad(flag: bool) -> i32 {
+  let outer = 1
+  let mut held = &outer
+  if flag {
+    let inner = 2
+    let wrapped = ${wrapper}
+    ${selection}
+  }
+  return held.*
+}`
+      const self = yield* analyze(source)
+      assert.deepEqual(
+        Analysis.diagnostics(self).map((diagnostic) => ({
+          code: diagnostic.code,
+          span: source.slice(diagnostic.span.start, diagnostic.span.end),
+        })),
+        [
+          { code: 'OWN0019', span: 'held.*' },
+          { code: 'OWN0019', span: 'held.*' },
+        ],
+      )
+    }),
+  )
+}
+
+it.effect('retains moved pattern view loans after their source scope', () =>
+  Effect.gen(function* () {
+    const source = `struct View<T> { value: T }
+fn bad(flag: bool) -> i32 {
+  let mut outer = 1
+  let mut held = &mut outer
+  if flag {
+    let mut inner = 2
+    let wrapped = View { value: &mut inner }
+    held = match move wrapped { View<&mut i32> { value: selected } => move selected }
+  }
+  return held.*
+}`
+    const self = yield* analyze(source)
+    assert.deepEqual(
+      Analysis.diagnostics(self).map((diagnostic) => ({
+        code: diagnostic.code,
+        span: source.slice(diagnostic.span.start, diagnostic.span.end),
+      })),
+      [
+        { code: 'OWN0019', span: 'held.*' },
+        { code: 'OWN0019', span: 'held.*' },
+      ],
+    )
+  }),
+)
+
+it.effect('accepts copied pattern values with owned or sufficiently long-lived storage', () =>
+  Effect.gen(function* () {
+    for (const [name, initial, value, type, returned] of [
+      ['owned', 'outer', 'persistent', 'i32', 'held'],
+      ['view', '&outer', '&persistent', '&i32', 'held.*'],
+    ] as const) {
+      const source = `struct View<T> { value: T }
+fn good(flag: bool) -> i32 {
+  let outer = 1
+  let persistent = 2
+  let mut held = ${initial}
+  if flag {
+    let wrapped = View { value: ${value} }
+    held = match move wrapped { View<${type}> { value: selected } => selected }
+  }
+  return ${returned}
+}`
+      const self = yield* Analysis.ofSource(`slices/pattern-${name}`, ascii(source))
+      assert.deepEqual(Analysis.diagnostics(self), [])
+    }
+  }),
+)
