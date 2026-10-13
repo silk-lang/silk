@@ -827,9 +827,9 @@ the same operation as concrete code: `T: Intrinsic.Add<T, T>` at `T = i32` selec
 Floating types have no sealed `Order` conformance: their built-in comparison is partial (NaN),
 while `Order.compare` is total.
 
-**Diagnostics:** A source conformance for a scalar provider reports `SEM0083` at that declaration,
-because IMPL-004 places it in the interface's module. When it overlaps a sealed conformance, the
-duplicate is also reported as `SEM0083`.
+**Diagnostics:** A source conformance for a scalar provider reports one `SEM0083` at that declaration,
+because IMPL-004 places it in the interface's module. A misplaced conformance does not participate
+in coherence, so overlap with a sealed conformance does not produce a second diagnostic.
 
 **Current compiler:** Partially aligned, as INTR-007.
 
