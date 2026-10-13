@@ -315,8 +315,8 @@ cover first:
   Immediate `executionDrive`, `executionNotify`, `executionCurrent` and `relinquish`, together
   with the other supported storage operations, are calls to their catalog contracts. An immediate
   drive keeps every operand and callback capture loan alive through its S2 call point; current and
-  relinquish have no operand loans. Each such contract
-  names the operand region every result view reaches (a raw-buffer view or slot carries its buffer
+  relinquish have no operand loans. Each such contract names the operand region every result view
+  reaches (a raw-buffer view or slot carries its buffer
   reference's region, a string view its text's region), and `unsafe` discharges only the
   operation's memory obligations, never its aliasing.
 
@@ -329,8 +329,9 @@ cover first:
 - `stored-loans`: opaque `executionFromAllocation` packages and stored or delayed
   `executionDrive` constructions retain captures the walk cannot prove. They stay unchecked even
   when their result types name no environment region. Other cases include a loan stored in a value,
-  joined across paths, returned, or borrowed from a place that is not rooted in a local. One such form must reject rather than stay unchecked: a
-  view of a temporary receiver used past its statement, such as `let left = make().left()`, is
+  joined across paths, returned, or borrowed from a place that is not rooted in a local. One such
+  form must reject rather than stay unchecked: a view of a temporary receiver used past its
+  statement, such as `let left = make().left()`, is
   OWN0019 at the use under BORROW-006, as in the bootstrap. The native compiler accepts it today
   and counts the body here; the slice that lifts these exits rejects it.
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
