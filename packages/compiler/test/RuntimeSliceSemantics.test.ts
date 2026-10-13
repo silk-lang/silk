@@ -110,6 +110,7 @@ it.effect('checks transitive generic storage admission without realizing the cal
     const snapshot = yield* Analysis.ofSource(
       'lifetimes/GenericStorageAdmission',
       ascii(`
+import silk.ownership {Drop}
 struct Guard<T> { value: T }
 impl<T> Drop for Guard<T> { fn drop(self: &mut Guard<T>) -> () { return () } }
 fn forward<T>(value: T) -> () { return hidden(move value) }
@@ -125,7 +126,8 @@ it.effect(
   'checks storage admission through selected generic and concrete interface implementations',
   () =>
     Effect.gen(function* () {
-      const source = `struct Guard<T> { value: T }
+      const source = `import silk.ownership {Drop}
+struct Guard<T> { value: T }
 impl<T> Drop for Guard<T> { fn drop(self: &mut Guard<T>) -> () { return () } }
 interface Consume { fn consume(value: Self) -> () }
 struct Wrapper<T> { value: T }

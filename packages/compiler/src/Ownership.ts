@@ -785,6 +785,19 @@ const placeSite = (expression: Tir.Expression): BindingSite | undefined => {
   return useSite(expression)
 }
 
+/**
+ * The weakest view a scrutinee place dereferences on its path, if any. Every dereference must be
+ * exclusive for `&mut view.*` to select an exclusive scrutinee (BORROW-005, PATT-002).
+ */
+const referentAccess = (expression: Tir.Expression): Type.BorrowAccess | undefined => {
+  if (expression._tag === 'Project' || expression._tag === 'IndexPlace')
+    return referentAccess(expression.subject)
+  if (expression._tag !== 'ReferentPlace') return undefined
+  return expression.reference.access === 'Shared'
+    ? 'Shared'
+    : (referentAccess(expression.subject) ?? 'Exclusive')
+}
+
 const retainedBinding = (
   state: CheckState,
   expression: Tir.Expression,
@@ -4223,7 +4236,7 @@ const checkFunction = (
       return true
     }
     if (!checkExpression(state, live, selection.subject, false)) return false
-    if (selection.access === 'Exclusive') {
+    if (selection.access === 'Exclusive' && referentAccess(selection.subject) !== 'Exclusive') {
       if (subjectSite === undefined)
         state.diagnostics.push(Diagnostic.invalidMatchScrutineePlace('Exclusive', selection.span))
       else if (!supportsExclusiveAccess(subjectBinding))
@@ -4903,7 +4916,10 @@ const checkFunction = (
         state.diagnostics.push(
           Diagnostic.explicitMoveRequired(scrutineeBinding?.name ?? '?', expression.span),
         )
-      if (expression.access === 'Exclusive') {
+      if (
+        expression.access === 'Exclusive' &&
+        referentAccess(expression.scrutinee) !== 'Exclusive'
+      ) {
         if (scrutineeSite === undefined)
           state.diagnostics.push(
             Diagnostic.invalidMatchScrutineePlace('Exclusive', expression.span),

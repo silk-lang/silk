@@ -1045,6 +1045,23 @@ type GenericArgumentResolution = TypeResolution & {
   readonly argument?: Type.GenericArgument
 }
 
+/** The parameters a use of an alias elides like a nominal's, implicit lifetimes included. */
+export const aliasUseParameters = (
+  fact: DeclaredTypeFact,
+): ReadonlyArray<Type.Parameter> | undefined =>
+  fact._tag === 'Resolved' ? fact.aliasParameters?.parameters : undefined
+
+/**
+ * Whether a use of an alias is one borrowed input for header elision (LIFE-003), as its written-out
+ * target is: the target is a reference, slice or string whose one lifetime the use elides.
+ */
+export const borrowedAliasUse = (fact: DeclaredTypeFact): boolean =>
+  fact._tag === 'Resolved' &&
+  fact.aliasParameters !== undefined &&
+  fact.aliasParameters.parameters.filter((parameter) => parameter.kind === 'Lifetime').length ===
+    1 &&
+  (Type.isReference(fact.type) || Type.isSlice(fact.type) || Type.isString(fact.type))
+
 /**
  * Applies a generic alias (TYPE-004) to the arguments written at one use. Every parameter takes a
  * written argument, except that lifetimes may all be elided like a nominal's. The substituted

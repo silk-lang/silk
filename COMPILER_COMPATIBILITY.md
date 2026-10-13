@@ -37,8 +37,7 @@ occur in the target, every argument written at the use, no inference, no bounds,
 re-normalization after substitution (`Fallible<IoError>` is `IoError`).
 
 - **Bootstrap:** implemented. Each distinct instantiation is expanded once per alias.
-- **Native:** not implemented yet. It still rejects alias parameters. The native half follows the
-  hash-consed type table, so expansion can be memoized on interned handles.
+- **Native:** not implemented yet. It still rejects alias parameters.
 - **Source migration:** none. No standard-library module or corpus program uses a generic alias
   until the native half lands.
 - Retire this entry when the native compiler accepts the same rules with the same conformance cases.
@@ -86,3 +85,35 @@ and validation details. Fatal traps retain their existing behavior and do not pr
 - **Compilers:** checked-prefix replay now updates a static condition after preceding assignments, ordinary branches and complete loops, including nested static arms and finite static iterations. Static control contained inside ordinary control still selects its arm while analyzing the deferred body, before that execution's local replacements occur. Evaluation retains the checked selection and rejects a condition that changes at execution; it does not elaborate the inactive arm. This entry does not claim native static-control coverage.
 - **Evidence:** a static function starts `count = 0`, `total = 0`, repeats twice, increments `count`, and uses `static if count == 1` to add 20, otherwise 22. Its required result is 42; the earlier bootstrap returned 44. The selection-consistency check now rejects this form with SEM0176 at the changed condition. Invariant loop selections remain accepted. The checked-prefix repair's separate positive controls and bounded-evaluation negative remain passing.
 - **Source migration:** none; the bootstrap compiler must repair per-iteration static selection. The bootstrap static-control task owns complete per-iteration selection.
+
+## Bootstrap loop invalidation of pattern-derived views
+
+VIEW-002 ends a loan at its last use. A view derived from a borrowed match binding that leaves its
+arm, such as `let edges = match &owner { Some {value} => asSlice(&value) None => fallback }`, is
+dead before a later iteration reassigns `owner`.
+
+- **Bootstrap:** conservative. Inside a `while`, a write to the borrowed owner that the loan's
+  creation reaches over the back-edge invalidates every point reachable from the write without
+  passing the creation again. That includes uses on the path where the arm did not create the
+  loan, so the reassignment reports OWN0019. The same code without the loop, or with a direct
+  view instead of a pattern-derived one, is accepted.
+- **Native:** accepts it, with loans ending at last use.
+- **Source migration:** `proveAppliedBounds` in `compiler/` derives its outlives edges into a
+  plain vector once and views it directly, a form both compilers accept. No other site is known.
+- The bootstrap is an oracle scheduled for retirement and is not loosened for this. Retire this
+  entry with the bootstrap, or when its invalidation follows loans in scope at the write.
+
+## Bootstrap borrows through a view-valued temporary
+
+BORROW-005 makes an element or field reached through a view a place in the view's referent, and
+BORROW-006 keeps a temporary alive for as long as a borrow of it, so
+`kind(&Vector<Entry>.asSlice(&entries)[i].identity)` is valid.
+
+- **Bootstrap:** rejects it with OWN0002. A borrow whose place starts at a call result
+  materializes the whole projected place as an owned temporary instead of rooting the borrow at the
+  view the call returns. Accepting it also needs MIR loan ends for the loans that temporary
+  retains, so the rejection currently prevents a miscompile.
+- **Native:** accepts it.
+- **Source migration:** `ModuleIndex.fingerprint` in `compiler/` binds the slice to a local before
+  indexing it, which both compilers accept and compile identically. No other site is known.
+- The bootstrap is not extended for this. Retire this entry with the bootstrap.

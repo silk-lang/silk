@@ -70,7 +70,8 @@ it.effect(
         const module = `effect-typing/anonymous-data-${prefix.length === 0 ? 'implicit' : 'explicit'}`
         const snapshot = yield* AnalysisFixture.retainingMain(
           module,
-          ascii(`struct Owner { value: i32 }
+          ascii(`import silk.ownership {Drop}
+struct Owner { value: i32 }
 struct Guard { offset: i32 }
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
 effect<'data> fn applyOwned<'data>(owner: &'data Owner,
@@ -127,7 +128,8 @@ it.effect(
       const module = 'effect-typing/staged-deferred-input'
       const snapshot = yield* snapshotOf(
         module,
-        `struct Owner { value: i32 }
+        `import silk.ownership {Drop}
+struct Owner { value: i32 }
 struct Guard { offset: i32 }
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
 effect<'held> fn recovered<'data: 'held, 'held>(owner: &'data Owner, guard: Guard) -> i32 {
@@ -179,7 +181,8 @@ for (const [name, formation] of [
       const module = `effect-typing/stored-${name}`
       const snapshot = yield* AnalysisFixture.retainingMain(
         module,
-        ascii(`struct Owner { value: i32 }
+        ascii(`import silk.ownership {Drop}
+struct Owner { value: i32 }
 struct Guard { offset: i32 }
 impl Drop for Guard { fn drop(self: &mut Guard) -> () { return () } }
 effect<'held> fn recovered<'data: 'held, 'held>(owner: &'data Owner, guard: Guard) -> i32 {
