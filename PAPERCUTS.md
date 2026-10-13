@@ -191,3 +191,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 - 2026-10-13 · The installed gh pr edit queried deprecated GraphQL projectCards and failed to update a PR body · Update the pull request through gh api PATCH with a JSON input file, then verify its body and head · agent workflow
 - 2026-10-13 · The corpus harness C-link fixture hard-codes /usr/bin/clang, absent in the managed worker, and ignores SILKC_CLANG · Run the remaining focused harness tests locally and require the C-link fixture to pass in exact-head CI with its installed Clang; do not change unrelated compiler behavior to bypass the fixture · Silk native diagnostic catalog
+- 2026-10-13 · gh artifact downloads failed at blob redirects in managed workspace · Downloaded through GitHub connector and fetched its returned artifact URL with proxy settings intact · Silk continuation
+- 2026-10-13 · A fresh compiler worktree could not run focused Vitest until generated integrity and built LLVM dist existed · Reused the local LLVM dist for the focused check and generated ToolchainIntegrity.generated.ts; exact-head CI rebuilds them · Silk compiler variance audit
