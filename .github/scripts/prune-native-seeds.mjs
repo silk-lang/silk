@@ -1,7 +1,7 @@
 // Applies the native seed retention rule from compiler/docs/native-seed-chain.md to the
-// `native-seed-<commit>` prereleases. Keeps the release named by the current `selfhost` pin, every
-// release named by a pin in effect during the last 30 days of `selfhost` history, and the 20 newest
-// candidates. Prints a Markdown report of everything else; deletes it only with --delete.
+// `native-seed-<commit>` prereleases. Keeps every release a `selfhost` pin has ever named, since hop
+// replay rebuilds each pinned seed from the one before it, and the 20 newest candidates. Prints a
+// Markdown report of everything else; deletes it only with --delete.
 import { execFileSync } from 'node:child_process'
 
 const usage = 'usage: node prune-native-seeds.mjs <repository> <selfhost-ref> [--delete]\n'
@@ -11,7 +11,6 @@ if (!repository || !ref || flags.some((flag) => flag !== '--delete')) {
   process.exit(2)
 }
 const remove = flags.includes('--delete')
-const windowDays = 30
 const newest = 20
 const pinPath = 'compiler/native-seed.json'
 const candidateTag = /^native-seed-[a-f0-9]{40}$/
@@ -34,17 +33,16 @@ const pinnedTag = (commit) => {
   }
 }
 
-const since = `${windowDays}.days.ago`
 const current = pinnedTag(ref)
 if (!current) {
   process.stderr.write(`${ref}:${pinPath} names no native seed release\n`)
   process.exit(1)
 }
-// Pins in effect during the window: the one in effect when it opened, then every later change.
-const opening = lines(run('git', ['rev-list', '-1', `--before=${since}`, ref]))
-const changes = lines(run('git', ['rev-list', `--since=${since}`, ref, '--', pinPath]))
-const windowPins = new Set(
-  [...opening, ...changes].map(pinnedTag).filter((tag) => tag !== undefined),
+// Every pin in history is one hop of the replay chain back to the first seed.
+const historyPins = new Set(
+  lines(run('git', ['rev-list', ref, '--', pinPath]))
+    .map(pinnedTag)
+    .filter((tag) => tag !== undefined),
 )
 
 const releases = lines(
@@ -66,7 +64,7 @@ const releases = lines(
 const reasons = new Map()
 const keep = (tag, reason) => reasons.set(tag, [...(reasons.get(tag) ?? []), reason])
 for (const { tag } of releases.slice(0, newest)) keep(tag, `${newest} newest`)
-for (const tag of windowPins) keep(tag, `pinned within ${windowDays} days`)
+for (const tag of historyPins) keep(tag, 'pinned in selfhost history')
 keep(current, 'current pin')
 
 const published = new Set(releases.map(({ tag }) => tag))
@@ -91,7 +89,7 @@ const report = [
 process.stdout.write(report)
 
 // The current pin must name a published release; otherwise the listing is wrong, so delete nothing.
-// An older window pin may name a release already pruned by hand; that is only reported.
+// An older pin may name a release already pruned by hand; that is only reported.
 if (!published.has(current)) {
   process.stderr.write(`The current pin ${current} names no published release\n`)
   process.exit(1)
