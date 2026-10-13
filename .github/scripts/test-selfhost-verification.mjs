@@ -446,6 +446,16 @@ chmod +x program
   const defaultReceipt = JSON.parse(defaultResult.stdout)
   assert.deepStrictEqual(defaultReceipt.inputs, defaultRequest.inputs)
   assert.deepStrictEqual(defaultReceipt.bootstrap, defaultRequest.bootstrap)
+  assert.ok(defaultReceipt.compilation, JSON.stringify(defaultReceipt.failure))
+  const sealedPath = 'packages/compiler/stdlib/intrinsic/operators.silk'
+  assert.deepStrictEqual(
+    defaultReceipt.consumedSources.find((source) => source.module === 'intrinsic/operators'),
+    {
+      module: 'intrinsic/operators',
+      path: sealedPath,
+      sha256: hash(readFileSync(join(inventoryCheckout, sealedPath))),
+    },
+  )
   assert.strictEqual(defaultReceipt.compilation.requestedProfile.target, request.profile.target)
   assert.strictEqual(
     defaultReceipt.compilation.requestedProfile.optimization,
@@ -464,6 +474,23 @@ chmod +x program
     assert.deepStrictEqual(defaultReceipt.selected.missingProvenance, [])
   }
   assert.deepStrictEqual(sourceDigests(inventoryCheckout), defaultSourceBefore)
+  // A self-consistent snapshot receipt must not substitute bytes for the embedded sealed file.
+  const sealedFile = join(inventoryCheckout, sealedPath)
+  const originalSealed = readFileSync(sealedFile)
+  try {
+    writeFileSync(
+      sealedFile,
+      Buffer.concat([originalSealed, Buffer.from('\n// changed fixture\n')]),
+    )
+    const changedSealed = invokeInventory(makeRequest())
+    assert.notStrictEqual(changedSealed.status, 0)
+    const changedReceipt = JSON.parse(changedSealed.stdout)
+    assert.strictEqual(changedReceipt.status, 'Incomplete')
+    assert.strictEqual(changedReceipt.failure.stage, 'Verification')
+    assert.strictEqual(changedReceipt.selected, undefined)
+  } finally {
+    writeFileSync(sealedFile, originalSealed)
+  }
   process.stdout.write(
     `Default startup selected inventory observed ${defaultReceipt.status}; strict/native readiness unclaimed\n`,
   )

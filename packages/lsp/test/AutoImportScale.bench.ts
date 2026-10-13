@@ -1,3 +1,4 @@
+import * as Stdlib from '@silklang/compiler/Stdlib'
 import * as SourceResolver from '@silklang/compiler/SourceResolver'
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -49,7 +50,7 @@ it.live(
       assert.deepEqual(
         Analysis.modules(session.snapshot)
           .map((module) => module.name)
-          .filter((name) => !name.startsWith('silk/')),
+          .filter((name) => !Stdlib.isReserved(name)),
         ['Main'],
       )
       const inventory = yield* session.inventory.get

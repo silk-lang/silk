@@ -105,6 +105,7 @@ import * as NameResolution from './NameResolution.js'
 import * as Operator from './Operator.js'
 import * as RowAlgebra from './RowAlgebra.js'
 import * as Scalar from './Scalar.js'
+import * as Stdlib from './Stdlib.js'
 import * as SourceSpan from './SourceSpan.js'
 import {
   analyzeFunctionBody,
@@ -6956,7 +6957,7 @@ export const operatorContractSelection = (
   }
 }
 
-/** The one stdlib interface operation an overloadable operator stands for (OP-009). */
+/** The one sealed Intrinsic interface operation an overloadable operator stands for (OP-009). */
 export interface OperatorBinding {
   readonly module: string
   readonly interface: string
@@ -6964,13 +6965,12 @@ export interface OperatorBinding {
 }
 
 /**
- * Binds each overloadable operator to its stdlib interface operation. This table is the compiler's
- * only knowledge of those interfaces (the documented operator exception to minimal compiler
- * privilege); everything after it is ordinary conformance selection.
+ * Binds each overloadable operator to its sealed Intrinsic interface operation. Everything after
+ * this fixed binding is ordinary conformance selection; library aliases carry no compiler privilege.
  */
 export const operatorBinding = (operator: Operator.Eligible): OperatorBinding => {
   const ops = (name: string, operation: string): OperatorBinding => ({
-    module: 'silk/ops',
+    module: Stdlib.sealedModule.module,
     interface: name,
     operation,
   })
@@ -6999,12 +6999,12 @@ export const operatorBinding = (operator: Operator.Eligible): OperatorBinding =>
       return ops('Not', 'not')
     case 'Equals':
     case 'NotEquals':
-      return { module: 'silk/equal', interface: 'Equal', operation: 'equals' }
+      return ops('Equal', 'equals')
     case 'LessThan':
     case 'LessOrEqual':
     case 'GreaterThan':
     case 'GreaterOrEqual':
-      return { module: 'silk/order', interface: 'Order', operation: 'compare' }
+      return ops('Order', 'compare')
   }
 }
 

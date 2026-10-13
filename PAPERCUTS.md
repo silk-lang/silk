@@ -186,4 +186,7 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 - 2026-10-11 · Stdlib code accepted by the native compiler failed the bootstrap with OWN0011 because an argument read `self` after an earlier `&mut self.*` argument · Compute such arguments into locals before the reborrowing call; native has no borrow check yet (step 14) · Silk stdlib
 - 2026-10-12 · A simulated selfhost sync failed in the seed build (raw_buffer TypeMismatch, then string.silk body-lifetime-elision) because the local .scratch seed binary predated the pinned compiler/native-seed.json seed · check sha256 against native-seed.json and fetch the pinned asset with gh api repos/silk-lang/silk/releases/assets/<id> (gh release download is GraphQL and refused) · native borrow checking
 - 2026-10-13 · Spike CLI board reads timed out while curl succeeded through the managed proxy · Set NODE_USE_ENV_PROXY=1 for Node 24 CLI invocations and preserve inherited proxy/CA settings · session coordination
+
+2026-10-13 · Reusing docgen dist across linked worktrees loaded two compiler SemanticQuery module instances and failed documentation lookup · Give the docgen worktree its own dist and local @silklang/compiler dependency link so analysis and rendering share one compiler module graph · Silk operator alias migration
+
 - 2026-10-13 · The installed gh pr edit queried deprecated GraphQL projectCards and failed to update a PR body · Update the pull request through gh api PATCH with a JSON input file, then verify its body and head · agent workflow
