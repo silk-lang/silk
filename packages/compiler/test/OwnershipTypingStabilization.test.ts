@@ -71,6 +71,65 @@ pub fn main() -> i32 { return run make() }`,
   }),
 )
 
+// EFFECT-OWN-001 / LIFE-004: an ordinary helper retains only its result contract's inputs.
+const secondEffect = `effect fn inspect<'a>(values: &'a [i32]) -> i32 { return values[0] }
+fn second<'a, 'b>(first: &'a [i32], kept: &'b [i32]) -> Effect<'b; i32> {
+  drop first
+  return inspect(kept)
+}`
+
+it.effect('accepts an Effect helper result that does not retain its local argument', () =>
+  Effect.gen(function* () {
+    const source = `${secondEffect}
+fn make(staticKept: &'static [i32]) -> Effect<'static; i32> {
+  let localFirst = [1]
+  return second(&localFirst, staticKept)
+}`
+    assert.deepEqual(yield* diagnostics('effect-helper-unretained-local', source), [])
+  }),
+)
+
+it.effect('attributes an escaping Effect helper result only to its retained local argument', () =>
+  Effect.gen(function* () {
+    const source = `${secondEffect}
+fn make() -> Effect<'static; i32> {
+  let localFirst = [1]
+  let localKept = [2]
+  return second(&localFirst, &localKept)
+}`
+    const start = source.indexOf('&localKept')
+    const actual = yield* diagnostics('effect-helper-retained-local', source)
+    assert.deepEqual(
+      actual.filter(([code]) => code === 'OWN0018'),
+      [['OWN0018', start, start + '&localKept'.length]],
+    )
+  }),
+)
+
+it.effect('rejects both local inputs when an Effect helper result retains both', () =>
+  Effect.gen(function* () {
+    const source = `effect fn inspectBoth<'a, 'b>(first: &'a [i32], kept: &'b [i32]) -> i32 {
+  return first[0] + kept[0]
+}
+fn both<'a, 'b>(first: &'a [i32], kept: &'b [i32]) -> Effect<'a & 'b; i32> {
+  return inspectBoth(first, kept)
+}
+fn make() -> Effect<'static; i32> {
+  let localFirst = [1]
+  let localKept = [2]
+  return both(&localFirst, &localKept)
+}`
+    const actual = yield* diagnostics('effect-helper-both-local', source)
+    assert.deepEqual(
+      actual.filter(([code]) => code === 'OWN0018'),
+      ['&localFirst', '&localKept'].map((spelling) => {
+        const start = source.indexOf(spelling)
+        return ['OWN0018', start, start + spelling.length]
+      }),
+    )
+  }),
+)
+
 // ISSUE-103 — CONST-001: a constant has no address and cannot be borrowed.
 it.effect('rejects borrowing a constant', () =>
   Effect.gen(function* () {

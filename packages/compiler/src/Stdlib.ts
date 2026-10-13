@@ -10,9 +10,9 @@ export const compositions = {
 /** The reserved namespace prefix. User resolvers are never consulted for these identities. */
 export const namespacePrefix = 'silk/'
 
-/** Tests whether a module identity claims the reserved standard-library namespace. */
+/** Tests whether a module identity is reserved for compiler-owned source. */
 export const isReserved = (module: string): boolean =>
-  module === 'silk' || module.startsWith(namespacePrefix)
+  module === 'silk' || module.startsWith(namespacePrefix) || module === sealed.module
 
 /** One generated view of a canonical, compiler-shipped Silk source file. */
 export interface Module {
