@@ -9,6 +9,7 @@ import * as Canonical from './internal/Canonical.js'
 import * as ModuleSummary from './ModuleSummary.js'
 import type * as ProjectAnalysis from './ProjectAnalysis.js'
 import * as SourceFile from './SourceFile.js'
+import * as Stdlib from './Stdlib.js'
 import * as ToolchainIntegrity from './ToolchainIntegrity.js'
 
 /** Importable selected source facts for one completed compilation profile. */
@@ -25,16 +26,19 @@ const projectCatalog = (
   previous?: ReadonlyMap<string, ModuleSummary.ModuleSummary>,
 ): SourceCatalog => {
   const modules = new Map(
-    closure.modules.map((module) => {
-      const selected = ModuleSummary.selected(module, index)
-      const prior = previous?.get(module.name)
-      const reusable =
-        prior !== undefined &&
-        SourceFile.equals(prior.source, selected.source) &&
-        JSON.stringify(prior.imports) === JSON.stringify(selected.imports) &&
-        JSON.stringify(prior.publicDeclarations) === JSON.stringify(selected.publicDeclarations)
-      return [module.name, reusable ? prior : selected] as const
-    }),
+    // Sealed declarations enter through Intrinsic or public aliases, never an import or a root.
+    closure.modules
+      .filter((module) => !Stdlib.isSealed(module.name))
+      .map((module) => {
+        const selected = ModuleSummary.selected(module, index)
+        const prior = previous?.get(module.name)
+        const reusable =
+          prior !== undefined &&
+          SourceFile.equals(prior.source, selected.source) &&
+          JSON.stringify(prior.imports) === JSON.stringify(selected.imports) &&
+          JSON.stringify(prior.publicDeclarations) === JSON.stringify(selected.publicDeclarations)
+        return [module.name, reusable ? prior : selected] as const
+      }),
   )
   const identity = ToolchainIntegrity.contentDigest(
     Canonical.record('SourceCatalog', [

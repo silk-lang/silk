@@ -13,10 +13,10 @@ Implement [`Add`](#declaration-73696c6b2f6f70733a3a416464) to give a type `+`, [
 
 ## Details
 
-Each operator is bound to exactly one interface operation here (OP-009); `a + b` means
+These aliases name the sealed `Intrinsic` interfaces bound to operators (OP-009); `a + b` means
 `Add.add(a, b)` for the conformance of `a`'s type. A conformance is found as for any other
-interface: in this module or in the module that declares the provider. Operands are taken by
-value, and `Right` and `Output` let one type combine with another, as in `Vector * f64`.
+interface: in the sealed interface source or in the module that declares the provider. Operands
+are taken by value, and `Right` and `Output` let one type combine with another, as in `Vector * f64`.
 Concrete scalar operands always use the built-in operators. Comparison operators are bound to
 [`Equal`](silk.equal) and [`Order`](silk.order).
 
@@ -55,377 +55,107 @@ Public declarations: 11.
 ## `Add`
 
 ```silk
-pub interface Add<Right, Output>
+pub type Add = Intrinsic.Add
 ```
 
 The interface behind `left + right`.
-
-<a id="declaration-73696c6b2f6f70733a3a4164643a3a6f7065726174696f6e3a616464"></a>
-
-### Operation `add`
-
-```silk
-fn add(left: Self, right: Right) -> Output
-```
-
-Adds `right` to `left`.
 
 <a id="declaration-73696c6b2f6f70733a3a5375627472616374"></a>
 
 ## `Subtract`
 
 ```silk
-pub interface Subtract<Right, Output>
+pub type Subtract = Intrinsic.Subtract
 ```
 
 The interface behind `left - right`.
-
-<a id="declaration-73696c6b2f6f70733a3a53756274726163743a3a6f7065726174696f6e3a7375627472616374"></a>
-
-### Operation `subtract`
-
-```silk
-fn subtract(left: Self, right: Right) -> Output
-```
-
-Subtracts `right` from `left`.
 
 <a id="declaration-73696c6b2f6f70733a3a4d756c7469706c79"></a>
 
 ## `Multiply`
 
 ```silk
-pub interface Multiply<Right, Output>
+pub type Multiply = Intrinsic.Multiply
 ```
 
 The interface behind `left * right`.
-
-<a id="declaration-73696c6b2f6f70733a3a4d756c7469706c793a3a6f7065726174696f6e3a6d756c7469706c79"></a>
-
-### Operation `multiply`
-
-```silk
-fn multiply(left: Self, right: Right) -> Output
-```
-
-Multiplies `left` by `right`.
 
 <a id="declaration-73696c6b2f6f70733a3a446976696465"></a>
 
 ## `Divide`
 
 ```silk
-pub interface Divide<Right, Output>
+pub type Divide = Intrinsic.Divide
 ```
 
 The interface behind `left / right`.
-
-<a id="declaration-73696c6b2f6f70733a3a4469766964653a3a6f7065726174696f6e3a646976696465"></a>
-
-### Operation `divide`
-
-```silk
-fn divide(left: Self, right: Right) -> Output
-```
-
-Divides `left` by `right`.
 
 <a id="declaration-73696c6b2f6f70733a3a52656d61696e646572"></a>
 
 ## `Remainder`
 
 ```silk
-pub interface Remainder<Right, Output>
+pub type Remainder = Intrinsic.Remainder
 ```
 
 The interface behind `left % right`.
-
-<a id="declaration-73696c6b2f6f70733a3a52656d61696e6465723a3a6f7065726174696f6e3a72656d61696e646572"></a>
-
-### Operation `remainder`
-
-```silk
-fn remainder(left: Self, right: Right) -> Output
-```
-
-Returns the remainder of dividing `left` by `right`.
 
 <a id="declaration-73696c6b2f6f70733a3a4e6567617465"></a>
 
 ## `Negate`
 
 ```silk
-pub interface Negate<Output>
+pub type Negate = Intrinsic.Negate
 ```
 
 The interface behind `-value`.
-
-<a id="declaration-73696c6b2f6f70733a3a4e65676174653a3a6f7065726174696f6e3a6e6567617465"></a>
-
-### Operation `negate`
-
-```silk
-fn negate(value: Self) -> Output
-```
-
-Negates `value`.
 
 <a id="declaration-73696c6b2f6f70733a3a426974416e64"></a>
 
 ## `BitAnd`
 
 ```silk
-pub interface BitAnd<Right, Output>
+pub type BitAnd = Intrinsic.BitAnd
 ```
 
 The interface behind `left & right`.
-
-<a id="declaration-73696c6b2f6f70733a3a426974416e643a3a6f7065726174696f6e3a626974416e64"></a>
-
-### Operation `bitAnd`
-
-```silk
-fn bitAnd(left: Self, right: Right) -> Output
-```
-
-Combines `left` and `right` with bitwise AND.
 
 <a id="declaration-73696c6b2f6f70733a3a4269744f72"></a>
 
 ## `BitOr`
 
 ```silk
-pub interface BitOr<Right, Output>
+pub type BitOr = Intrinsic.BitOr
 ```
 
 The interface behind `left | right`.
-
-<a id="declaration-73696c6b2f6f70733a3a4269744f723a3a6f7065726174696f6e3a6269744f72"></a>
-
-### Operation `bitOr`
-
-```silk
-fn bitOr(left: Self, right: Right) -> Output
-```
-
-Combines `left` and `right` with bitwise OR.
 
 <a id="declaration-73696c6b2f6f70733a3a426974586f72"></a>
 
 ## `BitXor`
 
 ```silk
-pub interface BitXor<Right, Output>
+pub type BitXor = Intrinsic.BitXor
 ```
 
 The interface behind `left ^ right`.
-
-<a id="declaration-73696c6b2f6f70733a3a426974586f723a3a6f7065726174696f6e3a626974586f72"></a>
-
-### Operation `bitXor`
-
-```silk
-fn bitXor(left: Self, right: Right) -> Output
-```
-
-Combines `left` and `right` with bitwise exclusive OR.
 
 <a id="declaration-73696c6b2f6f70733a3a4269744e6f74"></a>
 
 ## `BitNot`
 
 ```silk
-pub interface BitNot<Output>
+pub type BitNot = Intrinsic.BitNot
 ```
 
 The interface behind `~value`.
-
-<a id="declaration-73696c6b2f6f70733a3a4269744e6f743a3a6f7065726174696f6e3a6269744e6f74"></a>
-
-### Operation `bitNot`
-
-```silk
-fn bitNot(value: Self) -> Output
-```
-
-Inverts every bit of `value`.
 
 <a id="declaration-73696c6b2f6f70733a3a4e6f74"></a>
 
 ## `Not`
 
 ```silk
-pub interface Not<Output>
+pub type Not = Intrinsic.Not
 ```
 
 The interface behind `!value`.
-
-<a id="declaration-73696c6b2f6f70733a3a4e6f743a3a6f7065726174696f6e3a6e6f74"></a>
-
-### Operation `not`
-
-```silk
-fn not(value: Self) -> Output
-```
-
-Returns the logical negation of `value`.
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a30"></a>
-
-## Implementation `silk/ops.Add<u8, u8> for u8`
-
-```silk
-impl silk/ops.Add<u8, u8> for u8
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a303a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u8Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a31"></a>
-
-## Implementation `silk/ops.Add<u16, u16> for u16`
-
-```silk
-impl silk/ops.Add<u16, u16> for u16
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a313a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u16Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a32"></a>
-
-## Implementation `silk/ops.Add<u32, u32> for u32`
-
-```silk
-impl silk/ops.Add<u32, u32> for u32
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a323a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u32Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a33"></a>
-
-## Implementation `silk/ops.Add<u64, u64> for u64`
-
-```silk
-impl silk/ops.Add<u64, u64> for u64
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a333a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.u64Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a34"></a>
-
-## Implementation `silk/ops.Add<usize, usize> for usize`
-
-```silk
-impl silk/ops.Add<usize, usize> for usize
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a343a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.usizeAdd
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a35"></a>
-
-## Implementation `silk/ops.Add<i8, i8> for i8`
-
-```silk
-impl silk/ops.Add<i8, i8> for i8
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a353a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i8Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a36"></a>
-
-## Implementation `silk/ops.Add<i16, i16> for i16`
-
-```silk
-impl silk/ops.Add<i16, i16> for i16
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a363a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i16Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a37"></a>
-
-## Implementation `silk/ops.Add<i32, i32> for i32`
-
-```silk
-impl silk/ops.Add<i32, i32> for i32
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a373a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i32Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a38"></a>
-
-## Implementation `silk/ops.Add<i64, i64> for i64`
-
-```silk
-impl silk/ops.Add<i64, i64> for i64
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a383a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.i64Add
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a39"></a>
-
-## Implementation `silk/ops.Add<isize, isize> for isize`
-
-```silk
-impl silk/ops.Add<isize, isize> for isize
-```
-
-<a id="declaration-73696c6b2f6f70733a3a696d706c656d656e746174696f6e3a393a3a6f7065726174696f6e3a30"></a>
-
-### Operation `add`
-
-```silk
-add = Intrinsic.isizeAdd
-```

@@ -149,7 +149,7 @@ export const verifyInputs = Effect.fn('BootstrapClosureInventory.verifyInputs')(
     return yield* invalid('Input receipt digests do not match the authored files')
   if (self.bootstrap.stdlibDigest !== self.inputs.stdlibDigest)
     return yield* invalid('Analysis stdlib differs from the verified bootstrap embedded stdlib')
-  for (const module of Stdlib.manifest) {
+  for (const module of [...Stdlib.manifest, Stdlib.sealedModule]) {
     const file = sorted.find((entry) => entry.path === `packages/compiler/stdlib/${module.path}`)
     if (file === undefined || (yield* digest(module.bytes)) !== file.sha256)
       return yield* invalid(
@@ -509,7 +509,11 @@ const analyzeVerified = Effect.fnUntraced(function* (
   for (const [module, source] of snapshot.closure.sources) {
     const origin = source.origin
     let file: string | undefined
-    if (origin._tag === 'ProjectFile') file = origin.path
+    // The sealed source is embedded rather than resolver-supplied. Its only physical identity
+    // is the compiler-owned file, whose bytes verifyInputs and the consumed-source hash check.
+    if (Stdlib.isSealed(module))
+      file = path.join(self.directory, 'packages/compiler/stdlib', Stdlib.sealedModule.path)
+    else if (origin._tag === 'ProjectFile') file = origin.path
     else if (origin._tag === 'ToolchainFile') {
       const url = yield* Effect.try({
         try: () => new URL(origin.uri),

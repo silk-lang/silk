@@ -358,7 +358,7 @@ it.effect(
         ],
         ['compiler/src/main.silk', ascii('pub fn main() -> i32 { return 0 }')],
         ['packages/compiler/stdlib/manifest.json', ascii('[]')],
-        ...Stdlib.manifest.map((value): [string, Uint8Array] => [
+        ...[...Stdlib.manifest, Stdlib.sealedModule].map((value): [string, Uint8Array] => [
           `packages/compiler/stdlib/${value.path}`,
           value.bytes,
         ]),
