@@ -127,6 +127,10 @@ Each entry records:
   rows, callable and Effect positions, services, interfaces, recursive declarations still being
   summarized, and declarations whose member shape is unavailable are treated as invariant. Such
   calls keep the original `TypeMismatch` at the call.
+  An unchanged requirement-row argument does not by itself make an unrelated nominal lifetime
+  invariant: the lifetime still follows the declaration's fields (LIFE-002). Requirement keys that
+  mention the binder, including either side of an unresolved row subtraction, remain invariant;
+  row arguments themselves must still match exactly.
 - **Evidence:** `sharedLoanParametersShortenOnlyMatchingAccess` in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
