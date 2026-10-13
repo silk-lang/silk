@@ -46,9 +46,35 @@ pub struct SourceChange {
   pub current: Shared<Result<SourceResult, NoRejection>>
 }
 
-struct PriorChange {
+struct StagedChange {
   module: ModuleId
-  previous: Option<ModuleIndex>
+  key: Word
+  oldSlot: usize
+  source: Option<IndexedSource>
+  current: Shared<Result<SourceResult, NoRejection>>
+}
+
+struct PreparedSource {
+  source: Option<IndexedSource>
+  current: Shared<Result<SourceResult, NoRejection>>
+  present: bool
+}
+
+effect fn indexPresent(
+  id: &ModuleId,
+  number: usize,
+  observation: &Observation,
+  bytes: Bytes,
+  fingerprinted: bool,
+) -> IndexedSource ! OutOfMemoryError ? &mut Allocator {
+  let unit = run SourceUnit.parse(id, number, move bytes)
+  let index = run ModuleIndex.build(&unit, fingerprinted)
+  return IndexedSource {
+    observation: run Observation.copy(observation),
+    unit: move unit,
+    index: move index,
+    identities: Vector<Option<Shared<DeclarationId>>>.make(),
+  }
 }
 
 /// One parser diagnostic of a loaded source. A syntax error rejects the program whether or not any
@@ -169,14 +195,7 @@ effect fn demandSource(
       run record(&mut events.*, EventKind.SourceRead, id, number, present)
       let content = run Observation.copyContent(&observed)
       if let Option<Bytes>.Some {value} = move content {
-        let unit = run SourceUnit.parse(id, number, move value)
-        let index = run ModuleIndex.build(&unit, fingerprinted)
-        let source = IndexedSource {
-          observation: run Observation.copy(&observed),
-          unit: move unit,
-          index: move index,
-          identities: Vector<Option<Shared<DeclarationId>>>.make(),
-        }
+        let source = run indexPresent(id, number, &observed, move value, fingerprinted)
         let slot = Vector<SourceSlot>.length(&sources.*)
         run Vector<SourceSlot>.append(
           &mut sources.*,
@@ -318,6 +337,42 @@ effect fn record(
     },
   )
   return ()
+}
+
+effect fn prepareChangedSource(
+  revision: &Revision,
+  id: &ModuleId,
+  number: usize,
+  slot: usize,
+  fingerprinted: bool,
+  events: &mut Vector<Event>,
+) -> PreparedSource ! OutOfMemoryError ? &mut Allocator {
+  run record(&mut events.*, EventKind.QueryStart, id, number, false)
+  let observed = run Revision.observe(revision, id)
+  let present = Observation.isPresent(&observed)
+  run record(&mut events.*, EventKind.SourceRead, id, number, present)
+  let content = run Observation.copyContent(&observed)
+  if let Option<Bytes>.Some {value: bytes} = move content {
+    let source = run indexPresent(id, number, &observed, move bytes, fingerprinted)
+    let current = run Shared<Result<SourceResult, NoRejection>>.make(
+      Result<SourceResult, NoRejection>.succeed(
+        SourceResult.Present {slot: slot, observation: move observed},
+      ),
+    )
+    run record(&mut events.*, EventKind.QueryFinish, id, number, false)
+    return PreparedSource {
+      source: Option<IndexedSource>.some(move source), current: move current, present: true,
+    }
+  }
+  let current = run Shared<Result<SourceResult, NoRejection>>.make(
+    Result<SourceResult, NoRejection>.succeed(
+      SourceResult.Absent {observation: move observed},
+    ),
+  )
+  run record(&mut events.*, EventKind.QueryFinish, id, number, false)
+  return PreparedSource {
+    source: Option<IndexedSource>.none(), current: move current, present: false,
+  }
 }
 
 effect fn keyFor(store: &mut SourceIndex, id: &ModuleId) -> Word ! OutOfMemoryError ? &mut Allocator {
@@ -545,17 +600,16 @@ impl SourceIndex {
   /// source slots. Changed sources are reindexed before returning, so callers can diff the old
   /// and new declaration sets before any cached semantic answer is reused. Content observations,
   /// rather than paths or revision numbers, decide reuse. Every authored cursor is invalidated.
-  pub effect fn revise(self: &mut Self, revision: Revision) -> Vector<SourceChange> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  pub effect fn revise(self: &mut Self, revision: Revision) -> Vector<SourceChange> ! OutOfMemoryError ? &mut Allocator {
     if !self.revisions {
       oneShotRevised()
     }
-    let mut changed = Vector<PriorChange>.make()
-    if let Option<Shared<CursorStamp>>.Some {value} = &self.cursorToken {
-      Shared<CursorStamp>.withMut<()>(&value, fn(stamp: &mut CursorStamp) -> () {
-        stamp.generation = stamp.generation + usize.ONE
-        return ()
-      })
-    }
+    // Prepare every successor while the old revision, queries, source slots and cursors remain
+    // valid. A parser or allocator failure must let the caller retry this exact revision.
+    let mut changed = Vector<StagedChange>.make()
+    let mut events = Vector<Event>.make()
+    let mut nextSlot = Vector<SourceSlot>.length(&self.sources)
+    let number = Revision.revisionNumber(&revision)
     let mut at = usize.ZERO
     while at < Vector<ModuleId>.length(&self.keys) {
       let key = Hash.word(usize.toU64(at))
@@ -568,32 +622,53 @@ impl SourceIndex {
           },
         )
         if !valid {
-          let slot = Shared<Result<SourceResult, NoRejection>>.with<usize>(&value, answerSlot)
-          let mut previous = Option<ModuleIndex>.none()
-          if slot < Vector<SourceSlot>.length(&self.sources) {
-            let mut sources = Vector<SourceSlot>.asMutSlice(&mut self.sources)
-            let held = Intrinsic.replace(sources[slot].source, Option<IndexedSource>.none())
-            if let Option<IndexedSource>.Some {value: prior} = move held {
-              previous = Option<ModuleIndex>.some(move prior.index)
-            }
-          }
-          Query.forget(&mut self.query, key)
+          let oldSlot = Shared<Result<SourceResult, NoRejection>>.with<usize>(&value, answerSlot)
           let keys = Vector<ModuleId>.asSlice(&self.keys)
-          run Vector<PriorChange>.append(&mut changed, PriorChange {module: ModuleId.copy(&keys[at]), previous: move previous})
+          let id = &keys[at]
+          let prepared = run prepareChangedSource(
+            &revision, id, number, nextSlot, self.revisions, &mut events,
+          )
+          if prepared.present { nextSlot = nextSlot + usize.ONE }
+          run Vector<StagedChange>.append(&mut changed, StagedChange {
+            module: ModuleId.copy(id), key: key, oldSlot: oldSlot,
+            source: move prepared.source, current: move prepared.current,
+          })
         }
       }
       at = at + usize.ONE
     }
-    self.revision = move revision
-    self.events = Vector<Event>.make()
+    let count = Vector<StagedChange>.length(&changed)
+    let added = nextSlot - Vector<SourceSlot>.length(&self.sources)
+    run Vector<SourceSlot>.reserveExact(&mut self.sources, added)
     let mut reindexed = Vector<SourceChange>.make()
-    while Vector<PriorChange>.length(&changed) > usize.ZERO {
-      let change = Vector<PriorChange>.remove(&mut changed, usize.ZERO)
-      let current = run SourceIndex.demand(&mut self.*, &change.module)
+    run Vector<SourceChange>.reserveExact(&mut reindexed, count)
+    if let Option<Shared<CursorStamp>>.Some {value} = &self.cursorToken {
+      Shared<CursorStamp>.withMut<()>(&value, fn(stamp: &mut CursorStamp) -> () {
+        stamp.generation = stamp.generation + usize.ONE
+        return ()
+      })
+    }
+    // From here every destination has capacity, and query replacement is allocation-free.
+    self.revision = move revision
+    self.events = move events
+    while Vector<StagedChange>.length(&changed) > usize.ZERO {
+      let change = Vector<StagedChange>.remove(&mut changed, usize.ZERO)
+      let mut previous = Option<ModuleIndex>.none()
+      if change.oldSlot < Vector<SourceSlot>.length(&self.sources) {
+        let mut sources = Vector<SourceSlot>.asMutSlice(&mut self.sources)
+        let held = Intrinsic.replace(sources[change.oldSlot].source, Option<IndexedSource>.none())
+        if let Option<IndexedSource>.Some {value: prior} = move held {
+          previous = Option<ModuleIndex>.some(move prior.index)
+        }
+      }
+      if let Option<IndexedSource>.Some {value} = move change.source {
+        run Vector<SourceSlot>.append(&mut self.sources, SourceSlot {source: Option<IndexedSource>.some(move value)})
+      }
+      Query.replaceCompleted(&mut self.query, change.key, Shared<Result<SourceResult, NoRejection>>.clone(&change.current))
       run Vector<SourceChange>.append(&mut reindexed, SourceChange {
         module: move change.module,
-        previous: move change.previous,
-        current: move current,
+        previous: move previous,
+        current: move change.current,
       })
     }
     return move reindexed

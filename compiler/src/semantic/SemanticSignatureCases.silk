@@ -39,6 +39,7 @@ import semantic.TypedBody {
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
+import silk.layout {Layout}
 import silk.option {Option}
 import silk.result {Result}
 import silk.shared {Shared}
@@ -4499,8 +4500,24 @@ effect fn stableDeclarationUnitClaims() -> ()
     agreesWithFresh(&next, &expected),
     "retargeted body and selected callee agree with fresh analysis"
   )
-  let deletedSource = run present("fn leaf() -> i32 { return 2 }\n")
+  let deletedText = "fn leaf() -> i32 { return 2 }\n// unique changed-source parse failure\n"
+  let deletedSource = run present(deletedText)
   let deleted = run Revision.publish(&initial, &entry, &deletedSource)
+  let mut fault = NestedFailureAllocator {
+    targetBytes: String.utf8Bytes(deletedText).length,
+    rejected: false,
+  }
+  let failedUpdate = run Effect.result(Semantic.update(&mut semantic, run Revision.copy(&deleted)))
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let parseFailed = match move failedUpdate {
+    Result<(), Cycle | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError {} => true
+      Cycle {} => false
+    }
+    Result<(), Cycle | OutOfMemoryError>.Success {value: ignored} => false
+  }
+  run Testing.expect(parseFailed && fault.rejected,
+    "failed eager changed-source parse is reported before semantic state advances")
   run Semantic.update(&mut semantic, move deleted)
 
   // The intermediate deletion is never demanded, but still ends the old handle's lifetime.
@@ -4524,6 +4541,13 @@ effect fn stableDeclarationUnitClaims() -> ()
       && Shared<Result<Answer, NoRejection>>.with<AnswerView>(&reintroducedMir, inspect).success,
     "the old backend unit cannot revive through its unchanged emitted name"
   )
+  let mut freshRestored = makeSemantic(run Revision.publish(&initial, &entry, &inserted))
+  let mut freshRestoredRequest = Request.make()
+  let freshBody = run Semantic.demandBody(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  let freshMir = run Semantic.demandMir(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  run Testing.expect(agreesWithFresh(&reintroduced, &freshBody)
+      && agreesWithFresh(&reintroducedMir, &freshMir),
+    "after failed update and retry, restored body and MIR agree with a fresh store")
   return ()
 }
 
@@ -4532,5 +4556,120 @@ test effect fn preservesDeclarationUnitThroughInsertionAndReordering() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut typeTable = TypeTable.make()
   return run stableDeclarationUnitClaims() |> Effect.provideMut<Types>(&mut typeTable)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Fails the last allocation of an update. With a loaded body and MIR, this is the dependency
+// graph's first traversal-queue reservation, after the source and declaration refresh.
+struct UpdateAllocationProbe {
+  failAt: usize
+  allocations: usize
+  lastAlignment: usize
+  rejected: bool
+}
+
+impl UpdateAllocationProbe {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if self.allocations == self.failAt {
+      self.rejected = true
+      fail OutOfMemoryError {}
+    }
+    self.allocations = self.allocations + usize.ONE
+    self.lastAlignment = layout.alignment
+    let mut system = Allocator.systemAllocatorProvider()
+    return run Allocator.allocate(move layout)
+      |> Effect.provideMut<Allocator>(&mut system)
+  }
+}
+
+impl Allocator for UpdateAllocationProbe {
+  allocate: UpdateAllocationProbe.allocate
+}
+
+effect fn loadedForUpdateRecovery(revision: Revision, entry: &ModuleId) -> Semantic
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch
+? &mut Allocator | &mut Types {
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  drop run Semantic.demandBody(&mut semantic, &mut request, entry, b"entry")
+  drop run Semantic.demandMir(&mut semantic, &mut request, entry, b"entry")
+  drop run Semantic.demandBody(&mut semantic, &mut request, entry, b"entry")
+  drop run Semantic.demandMir(&mut semantic, &mut request, entry, b"entry")
+  return move semantic
+}
+
+effect fn postCommitFailureClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("update-recovery.silk")
+  let original = run present("fn leaf() -> i32 { return 1 }\nfn entry() -> i32 { return leaf() }\n")
+  let initial = run Revision.publish(&Revision.make(), &entry, &original)
+  let deleted = run present("fn leaf() -> i32 { return 2 }\n")
+  let revised = run Revision.publish(&initial, &entry, &deleted)
+  let mut measured = run loadedForUpdateRecovery(run Revision.copy(&initial), &entry)
+  let mut count = UpdateAllocationProbe {
+    failAt: usize.MAX, allocations: usize.ZERO, lastAlignment: usize.ZERO, rejected: false,
+  }
+  let measuredRevision = run Revision.copy(&revised)
+  run Semantic.update(&mut measured, move measuredRevision)
+    |> Effect.provideMut<Allocator>(&mut count)
+  run Testing.expect(count.allocations > usize.ZERO && count.lastAlignment == Layout.of<u32>().alignment,
+    "the final update allocation is the graph's u32 traversal queue")
+
+  let mut warm = run loadedForUpdateRecovery(run Revision.copy(&initial), &entry)
+  let oldBodyUnit = lastDeclarationUnit(&warm, Family.Body)
+  let oldMirUnit = lastDeclarationUnit(&warm, Family.Mir)
+  let mut fault = UpdateAllocationProbe {
+    failAt: count.allocations - usize.ONE,
+    allocations: usize.ZERO,
+    lastAlignment: usize.ZERO,
+    rejected: false,
+  }
+  let attemptedRevision = run Revision.copy(&revised)
+  let attempt = run Effect.result(Semantic.update(&mut warm, move attemptedRevision))
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let failed = match move attempt {
+    Result<(), Cycle | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError {} => true
+      Cycle {} => false
+    }
+    Result<(), Cycle | OutOfMemoryError>.Success {value: ignored} => false
+  }
+  let sourceEvents = Semantic.sourceEvents(&warm)
+  run Testing.expect(failed && fault.rejected && sourceEvents.length == 3
+      && sourceEvents[1].revision == Revision.revisionNumber(&revised),
+    "graph queue failure occurs after source revision commits")
+
+  // A demand immediately after failure must finish publication before it can reuse a cached body.
+  let mut failedRequest = Request.make()
+  let missing = run Semantic.demandBody(&mut warm, &mut failedRequest, &entry, b"entry")
+  let mut freshDeleted = makeSemantic(run Revision.copy(&revised))
+  let mut freshDeletedRequest = Request.make()
+  let freshMissing = run Semantic.demandBody(&mut freshDeleted, &mut freshDeletedRequest, &entry, b"entry")
+  run Testing.expect(agreesWithFresh(&missing, &freshMissing) && !succeeded(&missing),
+    "a demand after graph-stage failure settles pending invalidation before cache reuse")
+  run Semantic.update(&mut warm, run Revision.copy(&revised))
+
+  let restored = run Revision.publish(&revised, &entry, &original)
+  run Semantic.update(&mut warm, run Revision.copy(&restored))
+  let mut restoredRequest = Request.make()
+  let body = run Semantic.demandBody(&mut warm, &mut restoredRequest, &entry, b"entry")
+  let mir = run Semantic.demandMir(&mut warm, &mut restoredRequest, &entry, b"entry")
+  let mut freshRestored = makeSemantic(move restored)
+  let mut freshRestoredRequest = Request.make()
+  let freshBody = run Semantic.demandBody(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  let freshMir = run Semantic.demandMir(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  run Testing.expect(lastDeclarationUnit(&warm, Family.Body) != oldBodyUnit
+      && lastDeclarationUnit(&warm, Family.Mir) != oldMirUnit
+      && agreesWithFresh(&body, &freshBody) && agreesWithFresh(&mir, &freshMir),
+    "same-revision retry and reintroduction never revive lost body or MIR handles")
+  return ()
+}
+
+test effect fn graphStageFailureReplaysBeforeDemandAndSameRevisionRetry() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run postCommitFailureClaims() |> Effect.provideMut<Types>(&mut typeTable)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
