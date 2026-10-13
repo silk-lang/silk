@@ -409,8 +409,38 @@ export const analyze = (
     readonly root: Ownership.BindingSite
     readonly path: ReadonlyArray<Elaboration.BorrowSelectorFact>
     readonly lifetimes: ReadonlyArray<Lifetime.Lifetime>
+    readonly incoming: ReadonlyArray<Lifetime.Lifetime>
     readonly anchor: AuthoredHir.Anchor
   }> = []
+  const installedRelations = new Map<string, Array<Lifetime.Outlives>>()
+  for (const { bound, installed } of body.activatedConstraints) {
+    const key = AuthoredIdentity.anchorKey(installed)
+    const relations = installedRelations.get(key) ?? []
+    relations.push(bound)
+    installedRelations.set(key, relations)
+  }
+  // A write can introduce a loan made earlier, including through a copied pattern binding.
+  // Follow only this write's checked storage relations; it cannot retire an incoming loan.
+  const incomingStorage = (
+    lifetimes: ReadonlyArray<Lifetime.Lifetime>,
+    installed: AuthoredHir.Anchor,
+  ): ReadonlyArray<Lifetime.Lifetime> => {
+    const relations = installedRelations.get(AuthoredIdentity.anchorKey(installed)) ?? []
+    const required = new Set(lifetimes.map(Lifetime.key))
+    const incoming = new Map<string, Lifetime.Lifetime>()
+    let changed = true
+    while (changed) {
+      changed = false
+      for (const { longer, shorter } of relations) {
+        const key = Lifetime.key(longer)
+        if (!required.has(Lifetime.key(shorter)) || incoming.has(key)) continue
+        incoming.set(key, longer)
+        required.add(key)
+        changed = true
+      }
+    }
+    return [...incoming.values()]
+  }
   const invalidations: Array<{
     readonly root: Ownership.BindingSite
     readonly path: ReadonlyArray<Elaboration.BorrowSelectorFact>
@@ -1036,6 +1066,7 @@ export const analyze = (
                 root: rootSite(source, builder),
                 path: source.path,
                 lifetimes,
+                incoming: incomingStorage(lifetimes, statement.origin.anchor),
                 anchor: statement.origin.anchor,
               })
           }
@@ -1216,6 +1247,9 @@ export const analyze = (
           (replacement) =>
             !(
               origin.anchor !== undefined && encloses(context, replacement.anchor, origin.anchor)
+            ) &&
+            !replacement.incoming.some((lifetime) =>
+              Lifetime.atoms(lifetime).some((atom) => Lifetime.equals(atom, origin.lifetime)),
             ) &&
             Ownership.siteKey(replacement.root) === Ownership.siteKey(rootSite(carrier, builder)) &&
             replacement.lifetimes.some((lifetime) => storageOutlives(origin.lifetime, lifetime)),
