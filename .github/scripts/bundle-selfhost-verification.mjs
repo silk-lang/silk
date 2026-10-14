@@ -63,17 +63,17 @@ const result = await build({
     {
       name: 'repository-source-urls',
       setup(build) {
-        build.onLoad({ filter: /\.ts$/ }, async ({ path }) => {
+        build.onLoad({ filter: /\.m?[jt]s$/ }, async ({ path }) => {
           if (path.includes('/node_modules/')) return undefined
           const source = await readFile(path, 'utf8')
-          // Corpus fixtures and live stdlib lookups retain their original source locations when
-          // the bundle is downloaded into a different checkout or directory.
+          // The corpus, its fixtures and live stdlib lookups retain their original source locations
+          // when the bundle is downloaded into a different checkout or directory.
           return {
             contents: source.replaceAll(
               'import.meta.url',
               `new URL(${JSON.stringify(relative(repository, path))}, selfhostRepositoryUrl).href`,
             ),
-            loader: 'ts',
+            loader: path.endsWith('.ts') ? 'ts' : 'js',
           }
         })
       },
