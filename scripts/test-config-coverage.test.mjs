@@ -118,7 +118,13 @@ void test('every Linux native test job selects the complete verified LLVM toolch
     join(workspaceRoot, '.github/actions/setup-linux-llvm/action.yml'),
     'utf8',
   )
-  assert.match(setup, /sha256sum -c -/, 'Downloaded tools must be checked against a pinned digest')
+  assert.match(setup, /bash scripts\/setup-linux-llvm\.sh/)
+  const installer = readFileSync(join(workspaceRoot, 'scripts/setup-linux-llvm.sh'), 'utf8')
+  assert.match(
+    installer,
+    /sha256sum -c -/,
+    'Downloaded tools must be checked against a pinned digest',
+  )
   assert.match(
     setup,
     /bin.*GITHUB_PATH/,
