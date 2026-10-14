@@ -374,6 +374,17 @@ hide until the regions slice proves it.
   a region cannot outlive what the caller chose, typing already rejects a body-local borrow given a
   caller's region or type, and safe code obtains a type parameter's value only as such a value.
 - When exactly one operand's loans name a result region, the result retains them exactly.
+- A loan whose regions are all body regions is not retained by a call to a declaration or interface
+  operation when none of its regions can outlive a result region. Typing relates two body regions
+  only by equality or a meet, which share an atom, or by a region relation it leaves open. So the
+  callee can reach a result region only through those relations, taken as premises (offered
+  outlives wanted), and the outlives facts its argument and result types imply: a reference's or
+  slice's referent outlives its region, and a nominal's arguments may outlive one another. If
+  those facts lead a loan region to a result region, or to a region from outside the body, the
+  loan stays carried, approximately. A body that retains capture contents keeps every such loan.
+  `stream.take()` returning `Option<&'data A>` therefore releases its `&'call mut` receiver loan,
+  while `unshelve(&shelf)` returning `&'a Token` from `&'a Shelf<'b>` keeps the shelf's `'b`
+  contents loan, since `'b` outlives `'a`.
 - Otherwise each loan is carried approximately: every fresh borrow of one call shares the call's
   region, so several operands may name it, and a callable retains its capture loans whatever its
   type names.
