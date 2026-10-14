@@ -60,13 +60,22 @@ Checkpoint note for the A4 / S3 ticket. Delete this file in the final PR of the 
   differences: `&mut (f(&mut x).*)` then using `x` reports OWN0011 at `x` where the bootstrap reports
   OWN0019 at the later use; `&LIMIT` reports OWN0019 where the bootstrap reports SEM0086.
 
+## Step 5: retained displacements (in flight)
+
+- Branch `selfhost-stored-loans-s3-displacement`, stacked on step 2 (#1676).
+- `Intrinsic.replace` behind a reference whose value retains a region yields a value carrying what
+  the reference reaches; a retaining write through a referent or a retaining displacement out of
+  a local holder still leaves.
+- Corpus with the step-5 compiler: 423/423 pass; stored-loans 6 → 0, regions +4. Self-build
+  stored-loans 0.
+
 ## Next action
 
-Step 2 PR open (draft until its `selfhost.yml` dispatch passes and its review is done). Step 5
-(retained displacements through a reference, branch `selfhost-stored-loans-s3-displacement`,
-stacked on step 2) is implemented: its corpus run passes 423/423 with stored-loans 0; open its PR
-after step 2 merges. Steps 3, 4 and 6 were covered by step 1 (self-build stored-loans already 0).
-Then delete this file in the last PR of the series.
+Step 2 (#1676): wait for its `selfhost.yml` dispatch and adversarial review, then mark ready and
+merge. Then merge `origin/selfhost` into the step-5 branch, open its PR, dispatch CI, review, delete
+this file as the last commit, merge. `stored-loans` is then 0 on the corpus and the self-build;
+the reason stays in code for forms no emitted body uses (stored drives, loop-carried loans,
+retaining writes through referents, unrooted moves), so it is not added to `retired`.
 
 ## Local tooling
 
