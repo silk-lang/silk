@@ -338,10 +338,12 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
   exclusive views included, are proved, but the body is not region-closed (below), or retains a
   region relation or capture contents; later slices prove those.
-- `storage`: the body uses `slotAddress`, whose raw pointer result names no region of the slot
-  it reaches. `replace` is checked as a write to its place operand that yields the displaced value.
-  Immediate `executionDrive`, `executionNotify`, `executionCurrent` and `relinquish`, together
-  with the other supported storage operations, are calls to their catalog contracts.
+- Storage operations have no reason of their own. `replace` is checked as a write to its place
+  operand that yields the displaced value. Immediate `executionDrive`, `executionNotify`,
+  `executionCurrent`, `relinquish` and `slotAddress`, together with the other supported storage
+  operations, are calls to their catalog contracts. `slotAddress` consumes its slot, and its
+  `*mut T` result names no region, so the address holds no loan, as in the bootstrap: it keeps no
+  storage alive, and every access through it is `unsafe` and proves its own validity.
   `executionFromAllocation` is one too: it consumes its allocation, body, readiness state and
   endpoint, and typing proves the last three `Intrinsic.Detached` at the call (EXEC-004, SEM0139),
   so the package retains no loan of its constructor beyond what its `Intrinsic.Execution<A>`
