@@ -38,6 +38,9 @@ import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, Inval
 import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput}
 import driver.CommandPath
 import driver.NativeToolchain
+import driver.ProcessImage
+import driver.Project as Projects {Project, ProjectError}
+import driver.ProjectCommand as ProjectCommands {InvalidProjectCommand, Run as RunCommand}
 import silk.toml_scanner { TomlError }
 import semantic.Semantic {
   BackendBuild,
@@ -105,6 +108,7 @@ union Request {
   Dump {source: Bytes, hir: bool},
   Build {source: Bytes, output: Bytes, kind: BuildOutput, standardLibrary: Option<Bytes>, profile: InitialProfile, stats: bool},
   Test {source: Bytes, output: Bytes, standardLibrary: Option<Bytes>, profile: InitialProfile, filter: Option<Bytes>, file: Option<Bytes>, noCache: bool},
+  Run {command: RunCommand},
 }
 
 /// Reports whether `argument` spells the `hir` mode selector.
@@ -220,6 +224,26 @@ effect fn invalidBuildProfile() -> never ! ApplicationError {
   fail ApplicationError.InvalidBuildProfile
 }
 
+// Reads the arguments after `run`; a malformed command line reports the usage.
+effect fn runRequest(count: usize) -> RunCommand
+! ApplicationError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator {
+  let mut arguments = Vector<Bytes>.make()
+  let mut at = usize.add(0, 2)
+  while at < count {
+    run Vector<Bytes>.append(&mut arguments, run argumentAt(at, count))
+    at = at + usize.ONE
+  }
+  let parsed = run Effect.result(ProjectCommands.parseRun(Vector<Bytes>.asSlice(&arguments)))
+  return match move parsed {
+    Result<RunCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => move value
+    Result<RunCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidProjectCommand invalid => run invalidArgumentCount(count)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
 /// Reads `build <source> -o <output> [--emit executable|llvm-ir] [--target <triple>] [--stats]`, `test
 /// <root> -o <output> [--filter <text>] [--file <path>] --no-cache`, and dump modes. Only the host
 /// target links an executable; another target emits LLVM IR.
@@ -227,6 +251,12 @@ effect fn request() -> Request
 ! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError
 ? &mut HostInput | &mut Allocator {
   let count = run HostInput.argumentCount()
+  if count >= usize.add(0, 2) {
+    let command = run argumentAt(usize.ONE, count)
+    if same(Bytes.asSlice(&command), b"run") {
+      return Request.Run {command: run runRequest(count)}
+    }
+  }
   if count == usize.add(0, 2) {
     let source = run argumentAt(usize.ONE, count)
     return Request.Dump {source: move source, hir: false}
@@ -842,6 +872,88 @@ effect fn test(sourcePath: &Path, output: &Path, standardLibrary: Option<Path>, 
   return status
 }
 
+// Writes one project failure as the TypeScript CLI words it.
+effect fn reportProject(problem: &ProjectError) -> () ! WriterError {
+  return match &problem.* {
+    ProjectError.ManifestNotFound {start} => {
+      run writeError(b"No silk.toml found from ")
+      run writeError(Path.rawBytes(&start))
+      run writeError(b"; create one\n")
+    }
+    ProjectError.InvalidManifest {manifest, detail} => {
+      run writeError(b"Invalid Silk project manifest ")
+      run writeError(Path.rawBytes(&manifest))
+      run writeError(b": ")
+      run writeError(Bytes.asSlice(&detail))
+      run writeError(b"\n")
+    }
+  }
+}
+
+// Finds and loads the project whose manifest is nearest above `working`.
+effect fn locateProject(working: &Path) -> Project
+! ProjectError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let manifest = run Projects.discover(working)
+  return run Projects.load(&manifest)
+}
+
+// Builds the nearest project's executable for the host in the debug profile, at
+// `<output-dir>/llvm/<target>/debug/<name>`, then replaces this process with it. A project that
+// cannot be loaded or run is status 2; a refused build keeps the build's status.
+effect fn runProject(working: &Path, command: RunCommand) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let RunCommand {standardLibrary: configured, arguments} = move command
+  let located = run Effect.result(locateProject(working))
+  let project = match move located {
+    Result<Project, ProjectError | FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Project, ProjectError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+      ProjectError problem => {
+        run reportProject(&problem)
+        return 2
+      }
+      FileError file => { fail move file }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  if !Projects.runnable(&project) {
+    run writeError(b"Cannot run ")
+    run writeError(Projects.artifact(&project))
+    run writeError(b" artifact\n")
+    return 2
+  }
+  let standardLibrary = match move configured {
+    Option<Bytes>.Some {value} => Option<Path>.some(run pathArgument(working, Bytes.asSlice(&value)))
+    Option<Bytes>.None => Option<Path>.none()
+  }
+  let target = hostTarget()
+  let mut input = ProfileInput.make()
+  input.target = Option<Bytes>.some(run Bytes.copy(Target.name(&target)))
+  input.optimization = Option<Bytes>.some(run Bytes.copy(b"none"))
+  input.debug = Option<bool>.some(true)
+  let profile = run InitialProfile.freeze(&input)
+  let executable = run Projects.executable(&project, Target.name(&target), Projects.profileName(b"none", true))
+  if let Option<Path>.Some {value: directory} = move run Path.parent(&executable) {
+    run FileSystem.createDirectoriesRecursively(&directory)
+  }
+  let built = run build(Projects.entry(&project), &executable, BuildOutput.Executable, move standardLibrary, move profile, false, false)
+  match move built {
+    Compiled.Finished {status} => {
+      if status != 0 { return status }
+    }
+    Compiled.Tests {identities} => {
+      drop identities
+      return 2
+    }
+  }
+  let failure = run ProcessImage.replace(&executable, Vector<Bytes>.asSlice(&arguments))
+  drop failure
+  run writeError(b"Cannot run compiled program ")
+  run writeError(Path.rawBytes(&executable))
+  run writeError(b"\n")
+  return 2
+}
+
 /// Resolves one command-line path, naming the rejected argument when no path can spell it.
 effect fn pathArgument(working: &Path, argument: &[u8]) -> Path
 ! ApplicationError | OutOfMemoryError ? &mut Allocator {
@@ -934,6 +1046,12 @@ effect fn program() -> i32
         |> Effect.provideMut<FileSystem>(&mut files)
         |> Effect.provideMut<ChildProcess>(&mut process)
     }
+    Request.Run {command: invocation} => {
+      let mut process = OsChildProcess.make()
+      return run runProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
     Request.Dump {source: argument, hir: dumpHir} => {
       let path = run pathArgument(&working, Bytes.asSlice(&argument))
       let source = run FileSystem.readFile(&path)
@@ -989,7 +1107,7 @@ effect fn report(failure: ApplicationError | InitialProfileProblem | HostInputEr
   return match move failure {
     ApplicationError application => match move application {
       ApplicationError.InvalidArgumentCount {actual: _} => run writeError(
-        b"silkc: usage: silkc build <source> -o <output> [--emit executable|llvm-ir] [--target <triple>] [--stdlib <directory>] [--optimization none|speed] [--debug true|false] [--stats]\n       silkc test <root> -o <executable> [--stdlib <directory>] [--filter <text>] [--file <path>] [--optimization none|speed] [--debug true|false] --no-cache\n",
+        b"silkc: usage: silkc build <source> -o <output> [--emit executable|llvm-ir] [--target <triple>] [--stdlib <directory>] [--optimization none|speed] [--debug true|false] [--stats]\n       silkc test <root> -o <executable> [--stdlib <directory>] [--filter <text>] [--file <path>] [--optimization none|speed] [--debug true|false] --no-cache\n       silkc run [--stdlib <directory>] [arguments...] [-- arguments...]\n",
       )
       ApplicationError.InvalidWorkingDirectoryEncoding => run writeError(b"silkc: the working directory is not UTF-8\n")
       ApplicationError.InvalidBuildProfile => run writeError(b"silkc: invalid build profile\n")
