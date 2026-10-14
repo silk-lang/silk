@@ -266,12 +266,10 @@ const program = Effect.gen(function* () {
     assert.ok(!exported(crossed.symbols, 'main'), `${target}: an object form acquires no startup`)
   }
   // A stage carries the manifest's form: the object form's IR has its export and no startup.
-  const formIr = yield* invoke(
-    silkc,
-    libraryArguments('form.ll', '--emit', 'llvm-ir'),
-    library,
-    { ...process.env, SILKC_CLANG: sentinel },
-  )
+  const formIr = yield* invoke(silkc, libraryArguments('form.ll', '--emit', 'llvm-ir'), library, {
+    ...process.env,
+    SILKC_CLANG: sentinel,
+  })
   assert.equal(formIr.status, 0, formIr.stderr)
   const formText = yield* fs.readFileString(join(library, 'form.ll'))
   assert.match(formText, /^define [^\n]*@"?silk_answer"?\(/m)
@@ -293,7 +291,12 @@ const program = Effect.gen(function* () {
     { ...process.env, SILKC_CLANG: clang },
   )
   assert.equal(bitcode.status, 0, bitcode.stderr)
-  assert.equal(Buffer.from(yield* fs.readFile(join(library, 'form.bc'))).subarray(0, 2).toString(), 'BC')
+  assert.equal(
+    Buffer.from(yield* fs.readFile(join(library, 'form.bc')))
+      .subarray(0, 2)
+      .toString(),
+    'BC',
+  )
   const stagedObject = yield* invoke(
     silkc,
     libraryArguments('staged.o', '--emit', 'object'),
