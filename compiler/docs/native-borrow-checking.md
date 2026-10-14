@@ -315,7 +315,12 @@ cover first:
 - `storage`: the body uses `slotAddress`, whose raw pointer result names no region of the slot
   it reaches. `replace` is checked as a write to its place operand that yields the displaced value.
   Immediate `executionDrive`, `executionNotify`, `executionCurrent` and `relinquish`, together
-  with the other supported storage operations, are calls to their catalog contracts. An immediate
+  with the other supported storage operations, are calls to their catalog contracts.
+  `executionFromAllocation` is one too: it consumes its allocation, body, readiness state and
+  endpoint, and typing proves the last three `Intrinsic.Detached` at the call (EXEC-004, SEM0139),
+  so the package retains no loan of its constructor beyond what its `Intrinsic.Execution<A>`
+  result names. The proof uses the calling body's premises, as `Execution.make` declares them;
+  the bootstrap checks the same property on each reached instance instead. An immediate
   drive keeps every operand and callback capture loan alive through its S2 call point; current and
   relinquish have no operand loans. Each such contract names the operand region every result view
   reaches (a raw-buffer view or slot carries its buffer
@@ -328,14 +333,27 @@ cover first:
   calling body's `Checked` status, `Semantic.buildFrom` checks every reached access callback and
   its callees for suspension and readiness-notification escapes before emitting code (OWN0016,
   SHARED-003).
-- `stored-loans`: opaque `executionFromAllocation` packages and stored or delayed
-  `executionDrive` constructions retain captures the walk cannot prove. They stay unchecked even
-  when their result types name no environment region. Other cases include a loan stored in a value,
-  joined across paths, returned, or borrowed from a place that is not rooted in a local. One such
-  form must reject rather than stay unchecked: a view of a temporary receiver used past its
-  statement, such as `let left = make().left()`, is
-  OWN0019 at the use under BORROW-006, as in the bootstrap. The native compiler accepts it today
-  and counts the body here; the slice that lifts these exits rejects it.
+- `stored-loans`: a stored or delayed `executionDrive` construction retains captures its empty
+  native environment does not describe, so it stays unchecked even when its result type names no
+  environment region; lowering runs only an immediate drive, so no emitted body has one. Other
+  cases include a loan carried around a loop, a retaining write through a referent, a retaining
+  value displaced out of a local holder, a move or drop of a place with no local root, and cleanup
+  with unknown retained contents. A retaining value displaced from behind a reference carries
+  what that reference reaches, as a read through it does.
+
+  A borrow of a value with no place (a call result, a literal, a projection or dereference of
+  one, or a temporary receiver) lends that value's hidden owner (BORROW-006). The walk evaluates
+  the value into a root of its own, which holds the value's loans and observes its cleanup like a
+  local, and ends it where lowering drops it: with the innermost statement or match arm that
+  evaluates it, or with the `if` or `while` condition, guard or `&&`/`||` right operand that does.
+  A view of a temporary used past its statement, such as `let left = make().left()` followed by
+  `left.*`, is OWN0019 at the use (CALL-003), where the bootstrap reports it. Lowering keeps every
+  temporary of the initializer of a binding whose type can hold a view (`Type.holdsView`) for the
+  binding's scope, so their storage and cleanup end there, and likewise for the subject of a
+  borrowing destructuring `let` and, since it may view at an instance, a binding typed by a type
+  parameter. Only a viewing binding's borrowed fixed array stays valid that long, so `let view =
+  identity(&[1, 2])` is valid; any other such temporary's loans expire with its statement (an
+  `Expire` event, which ends validity without ending storage).
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
@@ -437,7 +455,10 @@ root's scope:
   marked crossed and is never `Checked`, because its region relations are the region slices' to
   prove.
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
-  literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
+  literal or a temporary receiver, borrows a hidden owner the walk roots at the borrowed value. It
+  is released with its statement or arm, or with the binding's scope for an array kept by a
+  viewing binding, and that release is an ordinary storage end: a holder that still requires its
+  loan afterwards is OWN0019 at that use.
 
 Pending means a region relation or capture contents typing retained. `Checked` is a claim about
 one body: its own loans and regions are sound. A rule that blames a body for its callers' context
