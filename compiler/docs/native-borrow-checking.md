@@ -315,7 +315,12 @@ cover first:
 - `storage`: the body uses `slotAddress`, whose raw pointer result names no region of the slot
   it reaches. `replace` is checked as a write to its place operand that yields the displaced value.
   Immediate `executionDrive`, `executionNotify`, `executionCurrent` and `relinquish`, together
-  with the other supported storage operations, are calls to their catalog contracts. An immediate
+  with the other supported storage operations, are calls to their catalog contracts.
+  `executionFromAllocation` is one too: it consumes its allocation, body, readiness state and
+  endpoint, and typing proves the last three `Intrinsic.Detached` at the call (EXEC-004, SEM0139),
+  so the package retains no loan of its constructor beyond what its `Intrinsic.Execution<A>`
+  result names. The proof uses the calling body's premises, as `Execution.make` declares them;
+  the bootstrap checks the same property on each reached instance instead. An immediate
   drive keeps every operand and callback capture loan alive through its S2 call point; current and
   relinquish have no operand loans. Each such contract names the operand region every result view
   reaches (a raw-buffer view or slot carries its buffer
@@ -328,10 +333,10 @@ cover first:
   calling body's `Checked` status, `Semantic.buildFrom` checks every reached access callback and
   its callees for suspension and readiness-notification escapes before emitting code (OWN0016,
   SHARED-003).
-- `stored-loans`: opaque `executionFromAllocation` packages and stored or delayed
-  `executionDrive` constructions retain captures the walk cannot prove. They stay unchecked even
-  when their result types name no environment region. Other cases include a loan carried around a
-  loop, a retaining write through a referent, a displaced value that retains a region, a move or
+- `stored-loans`: a stored or delayed `executionDrive` construction retains captures its empty
+  native environment does not describe, so it stays unchecked even when its result type names no
+  environment region; lowering runs only an immediate drive, so no emitted body has one. Other
+  cases include a loan carried around a loop, a retaining write through a referent, a displaced value that retains a region, a move or
   drop of a place with no local root, and cleanup with unknown retained contents.
 
   A borrow of a value with no place (a call result, a literal, a projection or dereference of
