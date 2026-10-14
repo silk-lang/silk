@@ -103,6 +103,28 @@ const program = Effect.gen(function* () {
   )
   assert.equal(explicit.status, 0, explicit.stderr)
   assert.equal(yield* fs.exists(join(directory, 'explicit.silkc.ll')), false)
+  // Without SILKC_CLANG the compiler runs the first `clang` on PATH, also through a symbolic link
+  // as PATH entries usually are, and with none there it refuses before linking.
+  const ambient = Object.fromEntries(
+    Object.entries(process.env).filter(([name]) => name !== 'SILKC_CLANG'),
+  )
+  const tools = join(directory, 'tools')
+  yield* fs.makeDirectory(tools)
+  yield* fs.symlink(sentinel, join(tools, 'clang'))
+  const onPath = yield* invoke(silkc, argumentsFor('on-path'), directory, {
+    ...ambient,
+    PATH: `${tools}:${process.env.PATH ?? ''}`,
+  })
+  assert.notEqual(onPath.status, 0, 'the sentinel clang fails the link')
+  assert.equal(yield* fs.exists(marker), true, 'the clang on PATH must run')
+  yield* fs.remove(marker)
+  yield* fs.makeDirectory(join(directory, 'no-tools'))
+  const clangless = yield* invoke(silkc, argumentsFor('clangless'), directory, {
+    ...ambient,
+    PATH: join(directory, 'no-tools'),
+  })
+  assert.equal(clangless.status, 2, 'a missing clang is an operational failure')
+  assert.equal(yield* fs.exists(join(directory, 'clangless')), false)
   // Another target emits its IR without linking; only the host target links an executable.
   const foreign =
     process.platform === 'darwin' ? 'x86_64-unknown-linux-gnu' : 'aarch64-apple-darwin'
@@ -313,7 +335,7 @@ const program = Effect.gen(function* () {
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings and installed standard library passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library and clang on PATH passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
