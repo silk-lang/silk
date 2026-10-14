@@ -473,10 +473,10 @@ the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first g
 ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
 verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-With `SILKC` pointing at the verified ARM64 executable and `SILKC_CLANG` pointing at LLVM 22
-`clang`, development builds use the native compiler directly: Without
-`SILKC_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI does, and
-refuses with status 2 when there is none.
+Without `SILKC_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
+does, and refuses with status 2 when there is none. With `SILKC` pointing at the verified ARM64
+executable and `SILKC_CLANG` pointing at LLVM 22 `clang`, development builds use the native
+compiler directly:
 
 ```sh
 mkdir -p .scratch
