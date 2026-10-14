@@ -251,6 +251,11 @@ existing manifest or entry, a `src` that is not a directory or an ancestor that 
 with status 2 before anything is written, and a failure part-way removes everything initialization
 created and restores the previous `.gitignore`.
 
+Clean invocation: `silkc clean`. It removes the nearest project's `[build].output-dir` and
+everything below it, as the TypeScript `silk clean` does, and prints `Removed <directory>`. An
+absent output directory is already clean. Only builds write there, and the manifest decoder keeps
+the directory inside the project. A missing or invalid manifest, or a failed removal, exits 2.
+
 ### One native generation and its smoke receipt
 
 `NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored compiler/stdlib
