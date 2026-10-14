@@ -195,3 +195,7 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 - 2026-10-13 · gh artifact downloads failed at blob redirects in managed workspace · Downloaded through GitHub connector and fetched its returned artifact URL with proxy settings intact · Silk continuation
 - 2026-10-13 · A fresh compiler worktree could not run focused Vitest until generated integrity and built LLVM dist existed · Reused the local LLVM dist for the focused check and generated ToolchainIntegrity.generated.ts; exact-head CI rebuilds them · Silk compiler variance audit
 - 2026-10-13 · pnpm exec in a linked worktree tried to purge symlinked shared node_modules and aborted without a TTY · Invoked the shared Vitest and TypeScript binaries directly for focused checks · Silk Drop cleanup audit
+
+2026-10-14 · ARM64 Linux native seed CI exposed a pre-existing C listener fixture using the unavailable SYS_poll syscall · Use SYS_ppoll with a converted timeout on all Linux hosts, add the existing listener corpus case to the three native platform jobs, and land the fixture repair on main first · Silk per-target native seeds
+
+2026-10-14 · The added macOS listener acceptance step reached a C library fixture whose direct Clang link could not find libSystem because the platform job exported only SILK_SUPPLY_ROOT · Export the same pinned SDK as SDKROOT before native acceptance so direct C compile/link calls use it · Silk ARM64 seed prerequisites
