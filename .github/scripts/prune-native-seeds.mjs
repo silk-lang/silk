@@ -1,99 +1,89 @@
-// Applies the native seed retention rule from compiler/docs/native-seed-chain.md to the
-// `native-seed-<commit>` prereleases. Keeps every release a `selfhost` pin has ever named, since hop
-// replay rebuilds each pinned seed from the one before it, and the 20 newest candidates. Prints a
-// Markdown report of everything else; deletes it only with --delete.
+// Releases are indivisible. Retain the union of every target's pinned history and 20 newest
+// candidates containing that target's asset. Reporting only: this script cannot delete releases.
 import { execFileSync } from 'node:child_process'
+import { historicalSeeds } from './native-seed-history.mjs'
+import * as NativeSeedRetention from './native-seed-retention.mjs'
 
-const usage = 'usage: node prune-native-seeds.mjs <repository> <selfhost-ref> [--delete]\n'
-const [repository, ref, ...flags] = process.argv.slice(2)
-if (!repository || !ref || flags.some((flag) => flag !== '--delete')) {
-  process.stderr.write(usage)
+const [repository, ref, ...extra] = process.argv.slice(2)
+if (!repository || !ref || extra.length > 0) {
+  process.stderr.write('usage: node prune-native-seeds.mjs <repository> <selfhost-ref>\n')
   process.exit(2)
 }
-const remove = flags.includes('--delete')
 const newest = 20
+const targets = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu', 'aarch64-apple-darwin']
 const pinPath = 'compiler/native-seed.json'
 const candidateTag = /^native-seed-[a-f0-9]{40}$/
-
 const run = (command, args) => execFileSync(command, args, { encoding: 'utf8' }).trim()
 const lines = (text) => text.split('\n').filter(Boolean)
-
-// A historical pin may predate the Release-only shape; only a release tag names a seed.
-const pinnedTag = (commit) => {
-  try {
-    // A commit older than the pin file has no pin; git's complaint about the missing path is noise.
-    const pin = execFileSync('git', ['show', `${commit}:${pinPath}`], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-    const tag = JSON.parse(pin).seed?.tag
-    return typeof tag === 'string' && candidateTag.test(tag) ? tag : undefined
-  } catch {
-    return undefined
-  }
-}
-
-const current = pinnedTag(ref)
-if (!current) {
-  process.stderr.write(`${ref}:${pinPath} names no native seed release\n`)
+const currentPin = JSON.parse(run('git', ['show', `${ref}:${pinPath}`]))
+if (currentPin.schemaVersion !== 2 || Object.keys(currentPin.seeds).length === 0) {
+  process.stderr.write(`${ref}:${pinPath} must name per-target native seed releases\n`)
   process.exit(1)
 }
-// Every pin in history is one hop of the replay chain back to the first seed.
-const historyPins = new Set(
-  lines(run('git', ['rev-list', ref, '--', pinPath]))
-    .map(pinnedTag)
-    .filter((tag) => tag !== undefined),
-)
-
+const current = Object.entries(currentPin.seeds)
+for (const [target, seed] of current) {
+  if (
+    !targets.includes(target) ||
+    seed.target !== target ||
+    !candidateTag.test(seed.tag) ||
+    seed.tag !== `native-seed-${seed.sourceCommit}` ||
+    seed.asset !== `silk-compiler-${target}`
+  ) {
+    process.stderr.write(`Invalid current native seed for ${target}\n`)
+    process.exit(1)
+  }
+}
+const historyPins = new Map(targets.map((target) => [target, new Set()]))
+// Only absent pre-pin files are ignored; malformed history and failed Git commands fail the report.
+for (const commit of lines(run('git', ['rev-list', ref, '--', pinPath]))) {
+  const paths = run('git', ['ls-tree', '--name-only', commit, '--', pinPath])
+  if (!paths) continue
+  const pin = JSON.parse(run('git', ['show', `${commit}:${pinPath}`]))
+  for (const seed of historicalSeeds(pin)) {
+    if (candidateTag.test(seed.tag) && historyPins.has(seed.target))
+      historyPins.get(seed.target).add(seed.tag)
+  }
+}
 const releases = lines(
   run('gh', [
     'api',
     '--paginate',
     `repos/${repository}/releases`,
     '--jq',
-    '.[] | select(.prerelease) | [.tag_name, .created_at] | @tsv',
+    '.[] | select(.prerelease) | {tag: .tag_name, created: .created_at, assets: [.assets[].name]} | @json',
   ]),
 )
-  .map((line) => {
-    const [tag, created] = line.split('\t')
-    return { tag, created }
-  })
+  .map((line) => JSON.parse(line))
   .filter(({ tag }) => candidateTag.test(tag))
   .sort((a, b) => b.created.localeCompare(a.created))
-
-const reasons = new Map()
-const keep = (tag, reason) => reasons.set(tag, [...(reasons.get(tag) ?? []), reason])
-for (const { tag } of releases.slice(0, newest)) keep(tag, `${newest} newest`)
-for (const tag of historyPins) keep(tag, 'pinned in selfhost history')
-keep(current, 'current pin')
-
-const published = new Set(releases.map(({ tag }) => tag))
+const reasons = NativeSeedRetention.reasons(releases, historyPins, current, newest)
+const published = new Map(releases.map((release) => [release.tag, release]))
 const missing = [...reasons.keys()].filter((tag) => !published.has(tag))
 const pruned = releases.filter(({ tag }) => !reasons.has(tag))
-
-const decision = (tag) => {
-  if (reasons.has(tag)) return `keep: ${reasons.get(tag).join(', ')}`
-  return remove ? 'delete' : 'would delete'
-}
 const report = [
-  `### Native seed retention${remove ? '' : ' (dry run)'}`,
+  '### Native seed retention (report only)',
   '',
-  `${releases.length} candidates; keeping ${releases.length - pruned.length}, ${remove ? 'deleting' : 'would delete'} ${pruned.length}. Current pin: \`${current}\`.`,
+  `${releases.length} candidates; keeping ${releases.length - pruned.length}, would delete ${pruned.length}.`,
   '',
-  '| Release | Created | Decision |',
-  '| --- | --- | --- |',
-  ...releases.map(({ tag, created }) => `| \`${tag}\` | ${created} | ${decision(tag)} |`),
-  ...missing.map((tag) => `| \`${tag}\` | missing | kept tag names no published release |`),
+  ...targets.map(
+    (target) =>
+      `- ${target}: current pin ${currentPin.seeds[target] ? `\`${currentPin.seeds[target].tag}\`` : 'not yet pinned'}.`,
+  ),
+  '',
+  '| Release | Created | Targets | Decision |',
+  '| --- | --- | --- | --- |',
+  ...releases.map(
+    ({ tag, created, assets }) =>
+      `| \`${tag}\` | ${created} | ${targets.filter((target) => assets.includes(`silk-compiler-${target}`)).join(', ')} | ${reasons.has(tag) ? `keep: ${reasons.get(tag).join('; ')}` : 'would delete'} |`,
+  ),
+  ...missing.map((tag) => `| \`${tag}\` | missing | | kept tag names no published release |`),
   '',
 ].join('\n')
 process.stdout.write(report)
-
-// The current pin must name a published release; otherwise the listing is wrong, so delete nothing.
-// An older pin may name a release already pruned by hand; that is only reported.
-if (!published.has(current)) {
-  process.stderr.write(`The current pin ${current} names no published release\n`)
-  process.exit(1)
+// Every active target's asset must exist, not merely its release tag.
+for (const [target, seed] of current) {
+  if (!published.get(seed.tag)?.assets.includes(seed.asset)) {
+    process.stderr.write(`The current ${target} pin ${seed.tag} names no published seed asset\n`)
+    process.exitCode = 1
+  }
 }
-if (remove)
-  for (const { tag } of pruned)
-    run('gh', ['release', 'delete', tag, '--repo', repository, '--yes', '--cleanup-tag'])
