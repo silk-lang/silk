@@ -1,0 +1,1351 @@
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.effect {Effect}
+import silk.http {Method, Version, Header}
+import silk.http_target {RequestTarget}
+import silk.http_body {BodyComponent, BodyReason, Limits as BodyLimits, Trailers}
+import silk.http_head {Limits as HeadLimits}
+import silk.http_headers {Headers, Limits as ValueLimits}
+import silk.http_origin {Origin}
+import silk.http_request {PreparedRequest, HeaderPolicy, BodyMode, RequestError}
+import silk.http_request as Request
+import silk.http_client {
+  Connection,
+  ConnectionHandler,
+  Exchange,
+  Limits,
+  ClientError,
+  ConnectionPhase,
+  DiscardOutcome,
+  RequestOptions,
+  ContinuePolicy,
+  Tunnel,
+  TransferredTunnel,
+}
+import silk.http_client as Client
+import silk.http_transport {HttpTransport, TransportError}
+import silk.monotonic_clock {MonotonicClock}
+import silk.random {Random}
+import silk.option {Option}
+import silk.result {Result}
+import silk.system_clock {Instant, SystemClock}
+import silk.uri {Uri}
+import silk.u64
+import silk.usize
+
+
+struct FixedClock {
+  mark: Instant
+}
+
+struct FixedRandom {}
+
+impl Random for FixedRandom {
+  effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+    drop output
+    return ()
+  }
+}
+
+impl MonotonicClock for FixedClock {
+  effect fn now(self: &mut Self) -> Instant {
+    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
+  }
+  effect fn getResolution(self: &mut Self) -> u64 {
+    return u64.toU64(1)
+  }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    self.mark = move when
+    return ()
+  }
+  effect fn waitFor(self: &mut Self, duration: u64) -> () {
+    self.mark = MonotonicClock.deadlineAfter(&self.mark, duration)
+    return ()
+  }
+}
+
+fn valueLimits() -> ValueLimits {
+  return ValueLimits {
+    maxMethodBytes: 32,
+    maxTargetBytes: 128,
+    maxNameBytes: 64,
+    maxValueBytes: 256,
+    maxFields: 12,
+    maxFieldBytes: 512,
+    maxOwnedBytes: 2048,
+  }
+}
+
+fn headLimits() -> HeadLimits {
+  return HeadLimits {
+    maxHeadBytes: 1024,
+    maxStartLineBytes: 256,
+    maxFieldLineBytes: 256,
+    maxOwnedBytes: 2048,
+    values: valueLimits(),
+  }
+}
+
+fn bodyLimits() -> BodyLimits {
+  return BodyLimits {
+    maxWireBytes: 1024,
+    maxPayloadBytes: 512,
+    maxChunkBytes: 64,
+    maxChunks: 8,
+    maxChunkLineBytes: 64,
+    maxExtensionBytes: 128,
+    maxTrailerBytes: 256,
+    maxTrailerFields: 4,
+    maxOwnedBytes: 2048,
+    trailerValues: valueLimits(),
+  }
+}
+
+fn limits() -> Limits {
+  return Limits {
+    head: headLimits(),
+    requestBody: bodyLimits(),
+    responseBody: bodyLimits(),
+    readCapacity: 128,
+    writeCapacity: 128,
+    maxRequests: 2,
+    maxInformationalResponses: 16,
+    maxInformationalWireBytes: 65536,
+    maxDiscardWireBytes: 256,
+  }
+}
+
+// Only the fixed scripts used below are modeled; accepted bytes are counted, not retained.
+struct TestTransport {
+  scenario: i32
+  input: &'static [u8]
+  readOffset: usize
+  writeOrdinal: usize
+  accepted: usize
+  closeCount: usize
+  shutdownCount: usize
+  writeShutdown: bool
+  closed: bool
+
+}
+
+fn reached(now: &Instant, target: &Instant) -> bool {
+  if SystemClock.seconds(now) > SystemClock.seconds(target) {
+    return true
+  }
+  if SystemClock.seconds(now) < SystemClock.seconds(target) {
+    return false
+  }
+  return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(target)
+}
+
+effect fn checkTransportDeadline(deadline: &Option<Instant>, operation: ByteIoOperation) -> ()
+! TransportError
+? &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  if let Option<Instant>.Some {value} = &deadline.* {
+    if reached(&now, &value) {
+      fail TransportError.Plain {error: ByteIoError.Timeout {operation: move operation}}
+    }
+  }
+  return ()
+}
+
+impl HttpTransport for TestTransport {
+  effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+    if output.length == usize.ZERO {
+      return ReadTransfer.Data {count: usize.ZERO}
+    }
+    if self.closed {
+      fail TransportError.Plain {error: ByteIoError.Closed {operation: ByteIoOperation.Read}}
+    }
+    run checkTransportDeadline(&deadline, ByteIoOperation.Read)
+    if self.scenario == 10 {
+      let ready = SystemClock.make(20, 0)
+      if let Option<Instant>.Some {value} = &deadline {
+        if reached(&ready, &value) {
+          run MonotonicClock.waitUntil(
+            SystemClock.make(SystemClock.seconds(&value), SystemClock.nanoseconds(&value)),
+          )
+          fail TransportError.Plain {error: ByteIoError.Timeout {operation: ByteIoOperation.Read}}
+        }
+      }
+      let now = run MonotonicClock.now()
+      if !reached(&now, &ready) {
+        run MonotonicClock.waitUntil(move ready)
+      }
+      return ReadTransfer.End
+    }
+    if self.readOffset == self.input.length {
+      return ReadTransfer.End
+    }
+    let mut count = self.input.length - self.readOffset
+    if count > output.length {
+      count = output.length
+    }
+    let mut index = usize.ZERO
+    while index < count {
+      output[index] = self.input[self.readOffset + index]
+      index = index + usize.ONE
+    }
+    self.readOffset = self.readOffset + count
+
+    return ReadTransfer.Data {count: count}
+  }
+  effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+    if input.length == usize.ZERO {
+      return usize.ZERO
+    }
+    if self.closed {
+      fail TransportError.Plain {error: ByteIoError.Closed {operation: ByteIoOperation.Write}}
+    }
+    run checkTransportDeadline(&deadline, ByteIoOperation.Write)
+
+    let ordinal = self.writeOrdinal
+    self.writeOrdinal = ordinal + usize.ONE
+    let mut maximum: usize = 256
+    let mut exhausted = ordinal >= 16
+    let mut failed = false
+    if self.scenario == 9 {
+      if ordinal == usize.ONE {
+        maximum = 2
+      }
+      failed = ordinal == 2
+      exhausted = ordinal >= 3
+    } else if self.scenario == 10 {
+      exhausted = ordinal >= usize.ONE
+    } else if self.scenario == 18 {
+      maximum = 2
+      exhausted = ordinal >= usize.ONE
+    } else if self.scenario == 21 {
+      if ordinal == 2 {
+        maximum = 2
+      }
+      failed = ordinal == 3
+      exhausted = ordinal >= 4
+    }
+    if failed || exhausted {
+      self.closed = true
+      let mut code = 1
+      if failed {
+        code = 88
+      }
+      fail TransportError.Plain {
+        error: ByteIoError.Provider {operation: ByteIoOperation.Write, code: code},
+      }
+    }
+    let mut count = input.length
+    if count > maximum {
+      count = maximum
+    }
+    let mut capacity: usize = 256
+    if self.scenario == 22 { capacity = 512 }
+    if count > capacity - self.accepted {
+      self.closed = true
+      fail TransportError.Plain {
+        error: ByteIoError.Provider {operation: ByteIoOperation.Write, code: 2},
+      }
+    }
+    self.accepted = self.accepted + count
+    if self.scenario == 18 {
+      run MonotonicClock.waitUntil(SystemClock.make(5, 0))
+    }
+    return count
+  }
+  effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+    if self.scenario == 19 || self.scenario == 20 {
+      fail TransportError.Plain {
+        error: ByteIoError.Provider {operation: ByteIoOperation.Flush, code: 93},
+      }
+    }
+    if self.closed {
+      fail TransportError.Plain {error: ByteIoError.Closed {operation: ByteIoOperation.Flush}}
+    }
+    run checkTransportDeadline(&deadline, ByteIoOperation.Flush)
+    return ()
+  }
+  effect fn close(self: &mut Self) -> () ! TransportError {
+    if self.closed {
+      return ()
+    }
+    self.closed = true
+    self.closeCount = self.closeCount + usize.ONE
+    return ()
+  }
+}
+
+effect fn checkByteDeadline(deadline: &Option<Instant>, operation: ByteIoOperation) -> ()
+! ByteIoError
+? &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  if let Option<Instant>.Some {value} = &deadline.* {
+    if reached(&now, &value) {
+      fail ByteIoError.Timeout {operation: move operation}
+    }
+  }
+  return ()
+}
+
+impl TestTransport {
+  unsafe effect fn readBytes(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    if output.length == usize.ZERO {
+      return ReadTransfer.Data {count: usize.ZERO}
+    }
+    if self.closed {
+      fail ByteIoError.Closed {operation: ByteIoOperation.Read}
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.Read)
+    if self.readOffset == self.input.length {
+      return ReadTransfer.End
+    }
+    let mut count = self.input.length - self.readOffset
+    if count > output.length {
+      count = output.length
+    }
+    let mut index = usize.ZERO
+    while index < count {
+      output[index] = self.input[self.readOffset + index]
+      index = index + usize.ONE
+    }
+    self.readOffset = self.readOffset + count
+
+    return ReadTransfer.Data {count: count}
+  }
+
+  unsafe effect fn writeBytes(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    if input.length == usize.ZERO {
+      return usize.ZERO
+    }
+    if self.closed || self.writeShutdown {
+      fail ByteIoError.Closed {operation: ByteIoOperation.Write}
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.Write)
+
+    self.writeOrdinal = self.writeOrdinal + usize.ONE
+    let mut capacity: usize = 256
+    if self.scenario == 22 { capacity = 512 }
+    if input.length > capacity - self.accepted {
+      self.closed = true
+      fail ByteIoError.Provider {operation: ByteIoOperation.Write, code: 2}
+    }
+    self.accepted = self.accepted + input.length
+    return input.length
+  }
+
+  unsafe effect fn flushBytes(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    if self.closed || self.writeShutdown {
+      fail ByteIoError.Closed {operation: ByteIoOperation.Flush}
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.Flush)
+
+    return ()
+  }
+
+  unsafe effect fn shutdownBytes(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    if self.closed {
+      fail ByteIoError.Closed {operation: ByteIoOperation.ShutdownWrite}
+    }
+    if self.writeShutdown {
+      return ()
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.ShutdownWrite)
+
+    self.writeShutdown = true
+    self.shutdownCount = self.shutdownCount + usize.ONE
+    return ()
+  }
+
+  unsafe effect fn closeBytes(self: &mut Self) -> () ! ByteIoError {
+    if self.closed {
+      return ()
+    }
+
+    self.closed = true
+    self.closeCount = self.closeCount + usize.ONE
+    return ()
+  }
+}
+
+impl ByteDuplex for TestTransport {
+  readSomeRaw: TestTransport.readBytes
+  writeSomeRaw: TestTransport.writeBytes
+  flushRaw: TestTransport.flushBytes
+  shutdownWriteRaw: TestTransport.shutdownBytes
+  closeRaw: TestTransport.closeBytes
+}
+
+
+
+struct CallbackFailure {
+  code: i32
+}
+
+struct Handler {
+  request: PreparedRequest
+  scenario: i32
+}
+
+impl ConnectionHandler<TestTransport, i32, ClientError | OutOfMemoryError | CallbackFailure ? &mut Allocator | &mut MonotonicClock | &mut Random> for Handler {
+  effect<'call> fn handle<'call>(handler: Self, connection: &'call mut Connection<TestTransport>) -> i32
+  ! ClientError | OutOfMemoryError | CallbackFailure
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let Handler {request, scenario} = move handler
+    let mut options = RequestOptions.defaults()
+    if scenario == 1 || scenario == 2 || scenario == 10 || scenario == 19 {
+      options.continuePolicy = ContinuePolicy.Require100 {deadline: SystemClock.make(10, 0)}
+    }
+    if scenario == 13 || scenario == 18 {
+      options.deadline = Option<Instant>.some(SystemClock.make(5, 0))
+    }
+    let attempted = run Effect.result(
+      invokeExchange(&mut connection.*, &request, move options, scenario),
+    )
+    let result = match move attempted {
+      Result.Success {value} => value
+      Result.Failure {error} => match move error {
+        CallbackFailure cause => {
+          if scenario == 17 && (cause.code != 739 || connection.phase() != ConnectionPhase.Closed) {
+            return 125
+          }
+          fail move cause
+        }
+        ClientError cause => {
+          fail move cause
+        }
+        OutOfMemoryError allocation => {
+          fail move allocation
+        }
+      }
+    }
+    if scenario == 17 {
+      return 124
+    }
+    if scenario == 0 {
+      if result != 200 {
+        return result
+      }
+      if connection.phase() != ConnectionPhase.Ready {
+        return 12
+      }
+      let second = run invokeExchange(
+        &mut connection.*,
+        &request,
+        RequestOptions.defaults(),
+        scenario,
+      )
+      if second != 404 {
+        return second
+      }
+      return 0
+    }
+    if result != 0 {
+      return result
+    }
+    if scenario == 18 {
+      if connection.phase() != ConnectionPhase.Closed {
+        return 128
+      }
+    } else if scenario == 19 || scenario == 20 || scenario == 21 {
+      if connection.phase() != ConnectionPhase.Closed {
+        return 132
+      }
+    } else if scenario == 2 || scenario == 4 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 8 || scenario == 9 || scenario == 10 || scenario == 12 || scenario == 13 {
+      if connection.phase() != ConnectionPhase.Closed {
+        return 18
+      }
+    }
+    return 0
+  }
+}
+
+// One callback identity shares the exchange bracket across runtime scenarios.
+service Scenario {
+  effect fn selected() -> i32 ? &Scenario
+}
+struct SelectedScenario {
+  value: i32
+}
+impl Scenario for SelectedScenario {
+  effect fn selected(self: &Self) -> i32 {
+    return self.value
+  }
+}
+
+effect fn invokeExchange(
+  connection: &mut Connection<TestTransport>,
+  request: &PreparedRequest,
+  options: RequestOptions,
+  scenario: i32,
+) -> i32 ! ClientError | OutOfMemoryError | CallbackFailure
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let selected = SelectedScenario {value: scenario}
+  return run Client.withExchange(&mut connection.*, request, move options, dispatchExchange)
+    |> Effect.provide<Scenario>(&selected)
+}
+
+effect<'call> fn dispatchExchange<'call, 'exchange: 'call>(
+  value: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError | CallbackFailure
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  if scenario == 6 {
+    return run receiveBoundaryExchange(&mut value.*)
+  }
+  if scenario == 8 {
+    return run deadlineExchange(&mut value.*)
+  }
+  if scenario == 10 {
+    return run receiveBoundaryExchange(&mut value.*)
+  }
+  if scenario == 12 {
+    return run receiveBoundaryExchange(&mut value.*)
+  }
+  if scenario == 13 {
+    return run deadlineExchange(&mut value.*)
+  }
+  return 143
+}
+
+effect<'call> fn exchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let status = run Client.receive(&mut exchangeValue.*)
+  if status != 200 && status != 404 {
+    return 21
+  }
+  let mut bytes: [u8; 4] = [0, 0, 0, 0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut bytes)
+  if count != 4 || bytes[0] != 87 || bytes[3] != 105 {
+    return 22
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  if status == 200 {
+    return 200
+  }
+  return 404
+}
+
+effect fn runOwned(transport: TestTransport, origin: Origin, scenario: i32, handler: Handler) -> i32
+! ClientError | OutOfMemoryError | CallbackFailure
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  if scenario == 0 {
+    let mut owner = run Client.makeOwned(
+      move transport,
+      origin,
+      Version.Http11,
+      limits(),
+      Option<Instant>.none(),
+    )
+    let result = run Effect.result(
+      ConnectionHandler<TestTransport, i32, ClientError | OutOfMemoryError | CallbackFailure ? &mut Allocator | &mut MonotonicClock | &mut Random>.handle(
+        move handler,
+        &mut owner,
+      ),
+    )
+    let closed = run Effect.result(Client.close(&mut owner))
+    drop closed
+    return match move result {
+      Result.Success {value} => value
+      Result.Failure {error} => {
+        fail move error
+      }
+    }
+  }
+  let mut selectedLimits = limits()
+  if scenario == 6 {
+    selectedLimits.maxInformationalResponses = usize.ONE
+  }
+  if scenario == 12 {
+    selectedLimits.maxInformationalWireBytes = 10
+  }
+  let mut overall = Option<Instant>.none()
+  if scenario == 8 {
+    overall = Option<Instant>.some(SystemClock.make(0, 0))
+  }
+  return run Client.withOwned(
+    move transport,
+    origin,
+    Version.Http11,
+    selectedLimits,
+    move overall,
+    move handler,
+  )
+}
+
+effect fn runCase(scenario: i32) -> i32 ! ClientError | RequestError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = FixedClock {mark: SystemClock.make(0, 0)}
+  let mut random = FixedRandom {}
+  let uri = match move Uri.parse("http://example.test/") {
+    Result.Failure {error} => {
+      drop error
+      return 31
+    }
+    Result.Success {value} => value
+  }
+  let headerEntries: [Header<'static>; 0] = []
+  let headers = match move Headers.make(&headerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 32
+    }
+    Result.Success {value} => value
+  }
+  let policy = HeaderPolicy.defaults()
+  let origin = match move Origin.fromUri(&uri) {
+    Result.Failure {error} => {
+      drop error
+      return 33
+    }
+    Result.Success {value} => value
+  }
+  let mut method = Method.get()
+  if scenario == 4 {
+    method = Method.connect()
+  } else if scenario == 1 || scenario == 2 || scenario == 3 || scenario == 9 || scenario == 10 || scenario == 19 || scenario == 20 || scenario == 21 {
+    method = Method.post()
+  }
+  let mut targetText = "/"
+  if scenario == 4 {
+    targetText = "example.test:80"
+  }
+  let target = match move RequestTarget.parse(&method, targetText, 128) {
+    Result.Failure {error} => {
+      drop error
+      return 34
+    }
+    Result.Success {value} => value
+  }
+  let mut mode = BodyMode.Empty
+  if scenario == 3 || scenario == 20 || scenario == 21 {
+    mode = BodyMode.Chunked
+  } else if scenario == 1 || scenario == 2 || scenario == 9 || scenario == 10 || scenario == 19 || scenario == 20 {
+    mode = BodyMode.KnownLength {length: 4}
+  }
+  let request = run Request.prepare(
+    &origin,
+    Version.Http11,
+    method,
+    target,
+    &headers,
+    &policy,
+    mode,
+    scenario == 1 || scenario == 2 || scenario == 10 || scenario == 19,
+    valueLimits(),
+    1024,
+    512,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut input = inputFor(scenario)
+  if scenario == 9 || scenario == 10 || scenario == 18 || scenario == 21 { input = b"" }
+  let adapter = TestTransport {
+    scenario: scenario,
+    input: input,
+    readOffset: usize.ZERO,
+    writeOrdinal: usize.ZERO,
+    accepted: usize.ZERO,
+    closeCount: usize.ZERO,
+    shutdownCount: usize.ZERO,
+    writeShutdown: false,
+    closed: false,
+
+  }
+
+  let handler = Handler {request: move request, scenario: scenario}
+  let attempted = run Effect.result(runOwned(move adapter, origin, scenario, move handler))
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let code = match move attempted {
+    Result.Success {value} => value
+    Result.Failure {error} => match move error {
+      CallbackFailure cause => {
+        if scenario != 17 || cause.code != 739 {
+          return 126
+        }
+        return 0
+      }
+      ClientError cause => {
+        fail move cause
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+  if code != 0 {
+    return code
+  }
+  if scenario == 17 {
+    return 127
+  }
+  return 0
+}
+
+effect<'call> fn failExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! CallbackFailure {
+  drop exchangeValue
+  fail CallbackFailure {code: 739}
+}
+
+effect<'call> fn continueExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let observed1 = run Client.receive(&mut exchangeValue.*)
+  if observed1 != 103 {
+    return 63
+  }
+  let observed2 = run Client.receive(&mut exchangeValue.*)
+  if observed2 != 100 {
+    return 64
+  }
+  let progress = run Client.writeSome(&mut exchangeValue.*, b"Wiki")
+  if progress.consumed != 4 {
+    return 65
+  }
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed3 = run Client.receive(&mut exchangeValue.*)
+  if observed3 != 417 {
+    return 66
+  }
+  let mut output: [u8; 1] = [0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut output)
+  if count != usize.ZERO {
+    return 62
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  return 0
+}
+
+effect<'call> fn earlyExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let observed4 = run Client.receive(&mut exchangeValue.*)
+  if observed4 != 103 {
+    return 67
+  }
+  let observed5 = run Client.receive(&mut exchangeValue.*)
+  if observed5 != 417 {
+    return 68
+  }
+  let rejected = run Effect.result(Client.writeSome(&mut exchangeValue.*, b"Wiki"))
+  match move rejected {
+    Result.Success {value} => {
+      drop value
+      return 69
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => {
+        if !invalidState(move cause) {
+          return 70
+        }
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+  let mut output: [u8; 1] = [0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut output)
+  if count != usize.ZERO {
+    return 62
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  return 0
+}
+
+effect<'call> fn chunkedExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let progress = run Client.writeSome(&mut exchangeValue.*, b"Wiki")
+  if progress.consumed != 4 {
+    return 71
+  }
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed6 = run Client.receive(&mut exchangeValue.*)
+  if observed6 != 200 {
+    return 72
+  }
+  let mut body: [u8; 4] = [0, 0, 0, 0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut body)
+  if count != 4 || body[0] != 87 || body[3] != 105 {
+    return 73
+  }
+  let mut empty: [u8; 1] = [0]
+  let observed7 = run Client.readSome(&mut exchangeValue.*, &mut empty)
+  if observed7 != usize.ZERO {
+    return 74
+  }
+  let responseTrailers = run Client.trailers(&exchangeValue.*)
+  match move responseTrailers {
+    Option.None => {
+      return 75
+    }
+    Option.Some {value} => {
+      if Trailers.count(&value) != usize.ONE {
+        return 76
+      }
+    }
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  return 0
+}
+
+effect<'call> fn tunnelExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed8 = run Client.receive(&mut exchangeValue.*)
+  if observed8 != 204 {
+    return 77
+  }
+  return run Client.withTunnel(&mut exchangeValue.*, tunnel)
+}
+
+effect<'call> fn tunnel<'call, 'tunnel: 'call>(channel: &'call mut Tunnel<'tunnel, TestTransport>) -> i32
+! ClientError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  return run Tunnel.transferByteDuplex(&mut channel.*, transferredTunnel)
+}
+
+effect<'call> fn transferredTunnel<'call, 'tunnel: 'call>(
+  channel: &'call mut TransferredTunnel<'tunnel, TestTransport>,
+) -> i32 ? &mut MonotonicClock {
+  let mut output: [u8; 4] = [0, 0, 0, 0]
+  let reading = ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut channel.*)
+  let attempted = run Effect.result(move reading)
+  return match move attempted {
+    Result.Failure {error} => {
+      drop error
+      return 78
+    }
+    Result.Success {value} => match move value {
+      ReadTransfer.End => 78
+      ReadTransfer.Data {count} => {
+        if count == 4 && output[0] == 84 && output[3] == 78 {
+          return 0
+        }
+        return 79
+      }
+    }
+  }
+}
+
+effect<'call> fn abandonExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed9 = run Client.receive(&mut exchangeValue.*)
+  if observed9 != 200 {
+    return 80
+  }
+  return 0
+}
+
+effect<'call> fn upgradeExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let result = run Effect.result(Client.receive(&mut exchangeValue.*))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      return 82
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => match move cause {
+        ClientError.UnsupportedUpgrade => 0
+        _ => 83
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+effect<'call> fn flushFailureExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let sent = run Effect.result(Client.send(&mut exchangeValue.*))
+  match move sent {
+    Result.Failure {error} => {
+      return run checkFlushFailure(move error, false)
+    }
+    Result.Success {value} => {
+      drop value
+    }
+  }
+  let progress = run Client.writeSome(&mut exchangeValue.*, b"Wiki")
+  if progress.consumed != 4 {
+    return 133
+  }
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      drop error
+      return 134
+    }
+  }
+  let finished = run Effect.result(Client.finishRequest(&mut exchangeValue.*, &trailers))
+  return match move finished {
+    Result.Success {value} => {
+      drop value
+      return 135
+    }
+    Result.Failure {error} => {
+      return run checkFlushFailure(move error, true)
+    }
+  }
+}
+
+effect fn checkFlushFailure(error: ClientError | OutOfMemoryError, finishing: bool) -> i32
+! OutOfMemoryError {
+  return match move error {
+    OutOfMemoryError allocation => {
+      fail move allocation
+    }
+    ClientError cause => match move cause {
+      ClientError.Output {error: transport, progress} => {
+        if progress.consumed != usize.ZERO || progress.written == usize.ZERO {
+          return 136
+        }
+        if finishing && (progress.totalPayload != 4 || progress.totalWire != 14) {
+          return 137
+        }
+        return match move transport {
+          TransportError.Plain {error: plain} => match move plain {
+            ByteIoError.Provider {operation, code} => {
+              if operation == ByteIoOperation.Write && code == 88 {
+                if !finishing || progress.written != 2 {
+                  return 142
+                }
+                return 0
+              }
+              if operation != ByteIoOperation.Flush || code != 93 || (finishing && progress.written != 5) {
+                return 138
+              }
+              return 0
+            }
+            _ => 139
+          }
+          _ => 140
+        }
+      }
+      _ => 141
+    }
+  }
+}
+
+effect<'call> fn outputTimeoutExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let result = run Effect.result(Client.send(&mut exchangeValue.*))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      return 129
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => match move cause {
+        ClientError.OutputTimeout {progress} => {
+          if progress.written != 2 || progress.totalWire != 2 || progress.consumed != usize.ZERO {
+            return 130
+          }
+          return 0
+        }
+        _ => 131
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+effect<'call> fn receiveBoundaryExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32
+! ClientError | OutOfMemoryError
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  run Client.send(&mut exchangeValue.*)
+  if scenario != 10 {
+    let trailerEntries: [Header<'static>; 0] = []
+    let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+      Result.Failure {error} => {
+        drop error
+        return 23
+      }
+      Result.Success {value} => value
+    }
+    run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  }
+  if scenario == 6 {
+    let observed = run Client.receive(&mut exchangeValue.*)
+    if observed != 103 {
+      return 81
+    }
+  }
+  let result = run Effect.result(Client.receive(&mut exchangeValue.*))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      if scenario == 6 {
+        return 82
+      }
+      if scenario == 10 {
+        return 92
+      }
+      return 95
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => {
+        let matched = match move cause {
+          ClientError.ContinueTimeout => scenario == 10
+          ClientError.LimitExceeded => scenario == 6 || scenario == 12
+          _ => false
+        }
+        if matched {
+          return 0
+        }
+        if scenario == 6 {
+          return 83
+        }
+        if scenario == 10 {
+          return 93
+        }
+        return 96
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+
+effect<'call> fn deadlineOperation<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+  stage: i32,
+  output: &mut [u8],
+) -> () ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  if stage == 0 {
+    run Client.send(&mut exchangeValue.*)
+  } else if stage == 1 {
+    let count = run Client.readSome(&mut exchangeValue.*, move output)
+    drop count
+  } else {
+    run Client.finishResponse(&mut exchangeValue.*)
+  }
+  return ()
+}
+
+effect<'call> fn deadlineExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32
+! ClientError | OutOfMemoryError
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  let mut body: [u8; 4] = [0, 0, 0, 0]
+  let mut stage = 0
+  if scenario == 13 {
+    run Client.send(&mut exchangeValue.*)
+    let trailerEntries: [Header<'static>; 0] = []
+    let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+      Result.Failure {error} => {
+        drop error
+        return 23
+      }
+      Result.Success {value} => value
+    }
+    run Client.finishRequest(&mut exchangeValue.*, &trailers)
+    let status = run Client.receive(&mut exchangeValue.*)
+    if status != 200 {
+      return 97
+    }
+    let read = run Client.readSome(&mut exchangeValue.*, &mut body)
+    if read != 4 {
+      return 98
+    }
+    run MonotonicClock.waitUntil(SystemClock.make(10, 0))
+    stage = 1
+  }
+  while stage < 3 {
+    let result = run Effect.result(deadlineOperation(&mut exchangeValue.*, stage, &mut body))
+    match move result {
+      Result.Success {value} => {
+        drop value
+        if stage == 0 {
+          return 84
+        }
+        if stage == 1 {
+          return 99
+        }
+        return 101
+      }
+      Result.Failure {error} => match move error {
+        OutOfMemoryError allocation => {
+          fail move allocation
+        }
+        ClientError cause => {
+          let expected = match move cause {
+            ClientError.Timeout => stage == 0 || stage == 1
+            ClientError.InvalidState => stage == 2
+            _ => false
+          }
+          if !expected {
+            if stage == 0 {
+              return 85
+            }
+            if stage == 1 {
+              return 100
+            }
+            return 102
+          }
+        }
+      }
+    }
+    if stage == 0 {
+      return 0
+    }
+    stage = stage + 1
+  }
+  return 0
+}
+
+effect<'call> fn partialExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let result = run Effect.result(Client.writeSome(&mut exchangeValue.*, b"Wiki"))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      return 86
+    }
+    Result.Failure {error} => match move error {
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+      ClientError cause => match move cause {
+        ClientError.Output {error: transport, progress} => {
+          if progress.consumed != 4 || progress.written != 2 || progress.totalPayload != 4 {
+            return 87
+          }
+          return match move transport {
+            TransportError.Plain {error: plain} => match move plain {
+              ByteIoError.Provider {operation, code} => {
+                if code == 88 {
+                  return 0
+                }
+                return 88
+              }
+              _ => 89
+            }
+            _ => 90
+          }
+        }
+        _ => 91
+      }
+    }
+  }
+}
+
+effect<'call> fn discardExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32
+! ClientError | OutOfMemoryError
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let status = run Client.receive(&mut exchangeValue.*)
+  if scenario == 11 {
+    if status != 200 {
+      return 94
+    }
+    run Client.discardRemaining(&mut exchangeValue.*, 4)
+    run Client.finishResponse(&mut exchangeValue.*)
+    return 0
+  }
+  let budget = u64.toU64(4)
+  let attempted = run Effect.result(Client.discardRemainingAtMost(
+    &mut exchangeValue.*,
+    budget,
+    Option<Instant>.none(),
+  ))
+  return match move attempted {
+    Result.Success {value} => match move value {
+      DiscardOutcome.CapReached => {
+        if scenario == 24 { return 0 }
+        return 158
+      }
+      DiscardOutcome.Completed => 159
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => match move cause {
+        ClientError.Body {error: body} => match move body.reason {
+          BodyReason.ChunkSyntax => match move body.component {
+            BodyComponent.ChunkDelimiter => {
+              if scenario == 25 { return 0 }
+              return 160
+            }
+            _ => 161
+          }
+          _ => 162
+        }
+        _ => 163
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+
+fn invalidState(error: ClientError) -> bool {
+  return match move error {
+    ClientError.InvalidState => true
+    _ => false
+  }
+}
+
+fn inputFor(scenario: i32) -> &'static [u8] {
+
+  if scenario == 1 {
+    return b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 417 Rejected\r\nContent-Length: 0\r\n\r\n"
+  }
+  if scenario == 2 {
+    return b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 417 Rejected\r\nContent-Length: 0\r\n\r\n"
+  }
+  if scenario == 3 {
+    return b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Content-Digest\r\n\r\n4\r\nWiki\r\n0\r\nContent-Digest: yes\r\n\r\n"
+  }
+  if scenario == 4 {
+    return b"HTTP/1.1 204 Connected\r\nContent-Length: ignored\r\nTransfer-Encoding: ignored\r\n\r\nTUNN"
+  }
+  if scenario == 6 || scenario == 12 {
+    return b"HTTP/1.1 103 Hint\r\n\r\nHTTP/1.1 103 Hint\r\n\r\n"
+  }
+  if scenario == 7 {
+    return b"HTTP/1.1 101 Switching\r\n\r\n"
+  }
+  if scenario == 24 {
+    return b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n"
+  }
+  if scenario == 25 {
+    return b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxX"
+  }
+  return b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nWikiHTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nWiki"
+}
+
+effect fn allCases() -> i32 ! ClientError | RequestError | OutOfMemoryError {
+  let scenarios: [i32; 5] = [6, 8, 10, 12, 13]
+  let mut index = usize.ZERO
+  while index < 5 {
+    let result = run runCase(scenarios[index])
+    if result != 0 {
+      return result
+    }
+    index = index + usize.ONE
+  }
+  return 0
+}
+
+effect fn recover(error: ClientError | RequestError | OutOfMemoryError) -> i32 {
+  drop error
+  return 51
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(allCases(), recover)
+}
