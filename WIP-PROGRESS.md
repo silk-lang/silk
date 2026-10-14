@@ -172,16 +172,18 @@ process.exit(await runCorpus(process.argv[2], nativeCorpus, [], selected, undefi
 
 ## Status 2026-10-14 (later session)
 
-- #1680: TS bootstrap check clean (0 `error[`). DDC dispatched: run 38604023044 (T1 DDC job green).
-- failure-identity: implemented on `selfhost-native-traps-2` @ 147ebc3, draft PR #1686 (stacked on
-  #1680). Static regions spelled; non-static regions OMITTED, not gapped: the bootstrap prints
-  inference regions (`Problem<'_local9>`) that native cannot reproduce, and gapping regressed
-  corpus `borrowed-outcome-failure`. Question to Julia via coordinator: canonical spelling for
-  non-static regions. Bootstrap check + DDC for #1686 pending.
-- Probe dirs: /tmp/fi/<name> (holder, array, slice, pointer, aligned, region).
+- #1680: ready, handed off (DDC 38604023044 green).
+- #1686 failure-identity: ready, handed off (DDC 38610051143 green). Region omission is the
+  coordinator's decision (intended native behavior).
+- observer-callback: draft #1694 (`selfhost-native-traps-3` @ 817706b, stacked on #1686) plus
+  main-first #1693 (`main-native-observer-capturing-callback`, corpus program
+  `diagnostic-observer-capturing-callback`). Adapter helpers (InstanceKey.Helper, role Observe).
+  Pending: full corpus result, TS bootstrap check, DDC, then ready + handoff.
+- Probe dirs: /tmp/fi/*, /tmp/oc/{lambda,section,corpus}.
 
 ## Exact next action
 
-1. When run 38604023044 is green: mark #1680 ready, hand off to coordinator.
-2. #1686: bootstrap check, DDC on `selfhost-native-traps-2`, ready, hand off.
-3. Start observer-callback.
+1. Full corpus with the traps-3 compiler; bootstrap check on traps-3; DDC on traps-3.
+2. Mark #1694 ready, hand off with merge order: #1680, #1686, #1694 on selfhost; #1677 and #1693 on
+   main; then sync + gap file regen.
+3. Final report to coordinator.
