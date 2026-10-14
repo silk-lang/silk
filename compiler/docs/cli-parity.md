@@ -39,16 +39,17 @@ Snapshot: 2026-10-14, selfhost `54303d8`, with PRs #1687, #1689, #1699 and #1704
 
 ## Manifest (`silk.toml`)
 
-| Key                                                      | Status                                                                   |
-| -------------------------------------------------------- | ------------------------------------------------------------------------ |
-| `[package] name`, `root`                                 | done                                                                     |
-| `[package] version` (semver, required by TS)             | needed: native accepts a missing or invalid version; validate as TS does |
-| `[build] targets`, `profile`, `bindings`, `[profiles.*]` | PR #1687, PR #1689                                                       |
-| `[build] output-dir`, `artifact`, `stage`                | done (non-host executables and libraries wait for B8)                    |
-| `[build] composition`, `native-link-inputs`              | done                                                                     |
-| `[build] native-bindings`                                | needed: native ignores it                                                |
-| `[build] platform-supply`                                | needed for macOS (SDK selection); native reads only `SDKROOT`            |
-| Unknown `[build]` keys refused (TS)                      | needed: native ignores unknown keys                                      |
+| Key                                                                    | Status                                                                                         |
+| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `[package] name`, `root`                                               | done                                                                                           |
+| `[package] source-root` (module root other than the entry's directory) | needed: native ignores it today; the manifest-strictness PR refuses it until it is implemented |
+| `[package] version` (semver, required by TS)                           | needed: native accepts a missing or invalid version; validate as TS does                       |
+| `[build] targets`, `profile`, `bindings`, `[profiles.*]`               | PR #1687, PR #1689                                                                             |
+| `[build] output-dir`, `artifact`, `stage`                              | done (non-host executables and libraries wait for B8)                                          |
+| `[build] composition`, `native-link-inputs`                            | done                                                                                           |
+| `[build] native-bindings`                                              | needed: native ignores it                                                                      |
+| `[build] platform-supply`                                              | needed for macOS (SDK selection); native reads only `SDKROOT`                                  |
+| Unknown `[build]` keys refused (TS)                                    | needed: native ignores unknown keys                                                            |
 
 ## Environment and toolchain
 
