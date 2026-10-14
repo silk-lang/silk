@@ -171,3 +171,62 @@ it('fails removed and regressed pins while allowing observations for unpinned pr
     ['regressed', 'removed'],
   )
 })
+
+it.effect(
+  'materializes corpus fixtures and records a complete sweep with pinned passes and observed rejections',
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-coverage-receipt-' })
+      const files = {
+        'packages/compiler/test/support/corpus.ts':
+          'import { readFileSync } from "node:fs"; export const nativeCorpus = [{ source: readFileSync(new URL("fixture.silk", import.meta.url), "utf8") }]',
+        'packages/compiler/test/support/fixture.silk': 'pub fn main() -> i32 { return 7 }',
+        'examples/new/main.silk': 'pub fn main() -> i32 { return 42 }',
+        'packages/compiler/conformance/new/library.silk': 'pub fn answer() -> i32 { return 42 }',
+        'compiler/scripts/repository-coverage-track.json': '["examples/new/main.silk"]',
+      }
+      for (const [path, source] of Object.entries(files)) {
+        yield* fs.makeDirectory(join(root, path, '..'), { recursive: true })
+        yield* fs.writeFileString(join(root, path), source)
+      }
+      for (const args of [
+        ['init', '-q'],
+        ['add', '.'],
+        [
+          '-c',
+          'user.name=Fixture',
+          '-c',
+          'user.email=fixture@example.com',
+          'commit',
+          '-qm',
+          'fixture',
+        ],
+      ])
+        assert.strictEqual((yield* NativeProcess.execute('git', args, { cwd: root })).status, 0)
+      const compiler = join(root, 'compiler-fixture')
+      yield* fs.writeFileString(
+        compiler,
+        `#!${process.execPath}
+import { readFileSync, writeFileSync } from 'node:fs'
+if (readFileSync(process.argv[3], 'utf8').includes('pub fn main')) {
+  writeFileSync(process.argv[process.argv.indexOf('-o') + 1], 'fixture IR')
+} else {
+  console.error('SILK_BUILD_ERROR={"code":"SEM0014"}')
+  process.exitCode = 1
+}
+`,
+      )
+      yield* fs.chmod(compiler, 0o755)
+      const output = join(root, 'out')
+      const receipt = yield* Coverage.run({ repository: root, compiler, output })
+      assert.deepStrictEqual(receipt.summary, { pass: 1, unsupported: 0, rejected: 1, track: 1 })
+      assert.deepStrictEqual(receipt.regressions, [])
+      assert.strictEqual(receipt.outcomes.length, 2)
+      assert.isTrue(
+        receipt.excluded.some(({ reason }) => reason.startsWith('Exact source already measured')),
+      )
+      assert.isTrue(yield* fs.exists(join(output, 'receipt.json')))
+      assert.isTrue((yield* fs.readFileString(join(output, 'baseline.md'))).includes('SEM0014'))
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
