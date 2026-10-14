@@ -9,7 +9,7 @@ This file is self-contained for someone who only has GitHub access.
 1. **`silkc run`.** Done. PR #1672 is merged into selfhost. Its T1 DDC, run 38573039547, was green.
 2. **`silkc init`.** PR #1675 is a draft. Its branch `selfhost-native-cli-init` is rebased onto selfhost `3a8ae4877` (after S3 #1674), at head `a5eb62e65`.
    - No T1 DDC has run on it yet. Run 38579301820 is a `pull_request` run, and those skip the DDC.
-   - A native N1 self-build of this head with the seed succeeded (exit 0). A local TypeScript-bootstrap check of it was started but not confirmed before the checkpoint.
+   - A native N1 self-build of this head with the seed succeeded (exit 0). A local TypeScript-bootstrap check of it was interrupted (exit 130, no output), so there is no bootstrap verdict yet.
 3. **`silkc clean`.** The branch `selfhost-native-cli-clean` (commit "Add silkc clean ...") is based on the *old* init commit `0e74b0ac0`. No PR yet; the PR body draft is below.
    - Self-build smoke and the `test-native-build.ts` clean check have NOT run on this commit yet. Only the `ProjectCommandCases` and `ProjectCases` Cases passed.
 4. **Manifest and project flags.** Work in progress on `wip/selfhost-native-cli-flags-checkpoint` (never merge). It sits on top of the clean commit:
