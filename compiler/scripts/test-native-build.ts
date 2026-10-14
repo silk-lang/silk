@@ -305,19 +305,95 @@ const program = Effect.gen(function* () {
   )
   assert.equal(stagedObject.status, 0, stagedObject.stderr)
   assert.ok(!exported((yield* inspect('staged.o')).symbols, 'offset'), 'a stage merged an input')
-  // A form that is not native yet is refused before any tool runs.
-  for (const artifact of ['shared-library', 'static-library']) {
-    yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', artifact))
-    const refused = yield* invoke(silkc, libraryArguments('refused'), library, {
-      ...process.env,
-      SILKC_CLANG: sentinel,
-    })
-    assert.equal(refused.status, 2, `${artifact}: ${refused.stderr}`)
-    assert.equal(yield* fs.exists(join(library, 'refused')), false)
-    assert.equal(yield* fs.exists(marker), false)
+  // A static library archives the compiled object beside the declared objects, and only those.
+  const members = Effect.fnUntraced(function* (archive: string) {
+    const listed = yield* invoke(join(tools, 'llvm-ar'), ['t', archive], library)
+    assert.equal(listed.status, 0, listed.stderr)
+    return listed.stdout.split('\n').filter((line) => line.length > 0)
+  })
+  // The default archiver is the llvm-ar beside the configured Clang.
+  const { SILKC_AR: _configuredArchiver, ...inherited } = process.env
+  const archiveEnvironment = { ...inherited, SILKC_CLANG: clang }
+  yield* fs.writeFileString(
+    join(library, 'silk.toml'),
+    manifest('{ object = "offset.o" }', 'static-library'),
+  )
+  const bundled = yield* invoke(silkc, libraryArguments('libsilk.a'), library, archiveEnvironment)
+  assert.equal(bundled.status, 0, bundled.stderr)
+  assert.deepEqual(yield* members('libsilk.a'), ['libsilk.a.silkc.o', 'offset.o'])
+  const bundledConsumer = yield* invoke(
+    clang,
+    ['consumer.c', 'libsilk.a', '-o', 'bundled-consumer'],
+    library,
+  )
+  assert.equal(bundledConsumer.status, 0, bundledConsumer.stderr)
+  assert.equal((yield* invoke(join(library, 'bundled-consumer'), [], library)).status, 0)
+  // Rebuilding replaces the archive, so a member the build no longer declares disappears.
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', 'static-library'))
+  const rebuilt = yield* invoke(silkc, libraryArguments('libsilk.a'), library, archiveEnvironment)
+  assert.equal(rebuilt.status, 0, rebuilt.stderr)
+  assert.deepEqual(yield* members('libsilk.a'), ['libsilk.a.silkc.o'])
+  for (const intermediate of ['libsilk.a.silkc.o', 'libsilk.a.silkc.ll'])
+    assert.equal(yield* fs.exists(join(library, intermediate)), false, intermediate)
+  const archived = yield* inspect('libsilk.a')
+  assert.ok(exported(archived.symbols, 'silk_answer') && !exported(archived.symbols, 'main'))
+  const archiveConsumer = yield* invoke(
+    clang,
+    ['consumer.c', 'libsilk.a', 'offset.o', '-o', 'archive-consumer'],
+    library,
+  )
+  assert.equal(archiveConsumer.status, 0, archiveConsumer.stderr)
+  assert.equal((yield* invoke(join(library, 'archive-consumer'), [], library)).status, 0)
+  // A static library for each supported native target needs no linker either.
+  for (const [target, machine] of [
+    ['x86_64-unknown-linux-gnu', /Format: elf64-x86-64/],
+    ['aarch64-unknown-linux-gnu', /Format: elf64-littleaarch64/],
+    ['aarch64-apple-darwin', /Format: Mach-O arm64/],
+  ] as const) {
+    const crossArchive = yield* invoke(
+      silkc,
+      libraryArguments(`lib${target}.a`, '--target', target),
+      library,
+      archiveEnvironment,
+    )
+    assert.equal(crossArchive.status, 0, crossArchive.stderr)
+    const crossed = yield* inspect(`lib${target}.a`)
+    assert.match(crossed.header, machine)
+    assert.ok(exported(crossed.symbols, 'silk_answer'), crossed.symbols.join('\n'))
   }
+  // An archive is not nested in another, and a failing archiver leaves no archive or member.
+  yield* fs.writeFileString(
+    join(library, 'silk.toml'),
+    manifest('{ static-archive = "libsilk.a" }', 'static-library'),
+  )
+  const nested = yield* invoke(silkc, libraryArguments('nested.a'), library, {
+    ...process.env,
+    SILKC_CLANG: sentinel,
+  })
+  assert.notEqual(nested.status, 0, 'an archive input was nested in a static library')
+  assert.equal(yield* fs.exists(join(library, 'nested.a')), false)
+  assert.equal(yield* fs.exists(marker), false)
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', 'static-library'))
+  const unarchived = yield* invoke(silkc, libraryArguments('unarchived.a'), library, {
+    ...process.env,
+    SILKC_CLANG: clang,
+    SILKC_AR: sentinel,
+  })
+  assert.notEqual(unarchived.status, 0, 'a failed archiver reported success')
+  assert.equal(yield* fs.exists(join(library, 'unarchived.a')), false)
+  assert.equal(yield* fs.exists(join(library, 'unarchived.a.silkc.o')), false)
+  yield* fs.remove(marker)
+  // The shared library form is not native yet and is refused before any tool runs.
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', 'shared-library'))
+  const refused = yield* invoke(silkc, libraryArguments('refused'), library, {
+    ...process.env,
+    SILKC_CLANG: sentinel,
+  })
+  assert.equal(refused.status, 2, refused.stderr)
+  assert.equal(yield* fs.exists(join(library, 'refused')), false)
+  assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, object artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
