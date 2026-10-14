@@ -242,6 +242,15 @@ environment and the working directory, and its exit status or terminating signal
 A missing or invalid manifest, a non-executable `[build].artifact` or a non-final `[build].stage`
 exits 2; a refused build keeps `build`'s status.
 
+Init invocation: `silkc init [path] [--name <name>]`. It creates a project as the TypeScript
+initializer does: `silk.toml` (`[package]` name, version `0.1.0`, root `src/main.silk`), a
+`src/main.silk` that logs a greeting, and a `.gitignore` holding `/build/` (appended to an existing
+one that lacks the rule). The directory defaults to the working directory and is created with its
+missing ancestors; the package name defaults to its last component and must be portable. An
+existing manifest or entry, a `src` that is not a directory or an ancestor that is a file refuses
+with status 2 before anything is written, and a failure part-way removes everything initialization
+created and restores the previous `.gitignore`.
+
 ### One native generation and its smoke receipt
 
 `NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored compiler/stdlib
@@ -1137,6 +1146,12 @@ Siblings restore their parent's depth. Exceeding the budget reports `NestingLimi
 damaged branch without recursive recovery. The budget is an implementation resource limit, not
 a Silk grammar restriction or a limit on file size. The previous value of 256 exceeded the
 available stack in the bootstrap-generated debug executable before recovery could run.
+
+Two parser diagnostics leave the tree intact. A primary expression that starts template syntax
+(`<` followed by `>`, a lifetime, or a type start) becomes one error node covering the skipped
+tokens, through the first top-level `>` or up to a statement or declaration boundary, and reports
+`ReservedTemplate` (PAR0003). A keyword-spelled final import segment without an alias or member
+list reports `ReservedImportBinding` (PAR0004, IMPORT-007).
 
 ## Grammar modules
 
