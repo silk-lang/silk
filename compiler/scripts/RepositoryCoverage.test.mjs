@@ -24,6 +24,7 @@ it('discovers exported top-level entries without matching comments, literals, or
   assert.isTrue(
     Coverage.hasMain("fn character() -> char { return '{' } pub fn main() -> i32 { return 0 }"),
   )
+  assert.isTrue(Coverage.hasMain(String.raw`let slash = r"\" pub fn main() -> i32 { return 0 }`))
   for (const source of [
     'fn main() -> i32 { return 0 }',
     '// pub fn main() -> i32 {}',
