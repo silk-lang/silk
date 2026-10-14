@@ -465,7 +465,8 @@ export SILKC="$PWD/compiler/build/llvm/aarch64-unknown-linux-gnu/release/silk-co
 ```
 
 The initial bootstrap can take several minutes. `SILKC_CLANG` selects the LLVM 22 compiler for
-native linking; the selfhost CLI otherwise uses `/usr/bin/clang`. Subsequent development builds
+native linking; without it the native compiler runs the first `clang` on `PATH`, as the
+TypeScript CLI does, and refuses with status 2 when there is none. Subsequent development builds
 can use the ARM64 executable directly, with no JavaScript compiler or CPU emulation:
 
 ```sh
