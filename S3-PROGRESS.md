@@ -30,6 +30,19 @@ Checkpoint note for the A4 / S3 ticket. Delete this file in the final PR of the 
 - Hidden-owner roots live after the match-subject roots (`temporaryRoot = MAX/4 + nodes + base`)
   so no node can collide; `storageNodes` returns `2 * nodes` holder slots.
 
+## Step 2: package construction contract (in flight)
+
+- Branch `selfhost-stored-loans-s3-execution`, stacked on step 1 (retarget/merge after #1674).
+- `executionFromAllocation` is a `contractCall`: it consumes its four operands and its result
+  retains only the regions `Intrinsic.Execution<A>` names. Typing now proves `F`, `O` and `R`
+  `Intrinsic.Detached` at the call with the body's premises (EXEC-004, `UnsatisfiedExecutableProperty`
+  / SEM0139), so the contract is enforced, not trusted. The bootstrap checks the property on each
+  reached instance instead; an unreached generic misuse is accepted there and rejected natively.
+- A stored (non-immediate) `executionDrive` stays `StoredLoans`: lowering refuses it
+  (`GapCode.EffectForm`), so no emitted body has one.
+- Probe `.scratch/probe/x1` (generic package with a non-detached readiness state): SEM0139 at the
+  intrinsic call. Probe s2's `Execution.make` is now Checked.
+
 ## Next action
 
 Finish step 1: corpus run with the step-1 N1, `check-borrow-gap.mjs update`/`diff`, run the
