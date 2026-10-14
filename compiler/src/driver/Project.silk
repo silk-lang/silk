@@ -1,0 +1,356 @@
+//! One Silk project: its manifest, package name, entry, artifact and build output directory.
+//!
+//! Project commands (`run`) find the nearest `silk.toml` above the working directory, as the
+//! TypeScript CLI's `Project.load` does, and place their artifacts below `[build].output-dir`.
+
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.option { Option }
+import silk.result { Result }
+import silk.string { String }
+import silk.toml_scanner { TomlError }
+import silk.toml_value { Toml, Value as TomlValue }
+import silk.usize
+
+/// A project that cannot be located or whose manifest a project command cannot use.
+pub union ProjectError {
+  /// No `silk.toml` in the starting directory or any of its parents.
+  ManifestNotFound { pub start: Path },
+  /// The manifest is not TOML or one of its fields is invalid; `detail` names the field.
+  InvalidManifest { pub manifest: Path, pub detail: Bytes },
+}
+
+/// A loaded project manifest with every path resolved against its directory.
+pub struct Project {
+  manifest: Path
+  directory: Path
+  name: Bytes
+  entry: Path
+  outputDirectory: Path
+  artifact: Bytes
+  stage: Bytes
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Whether `name` is a portable package name: a lowercase letter, then lowercase letters, digits
+/// or hyphens. It names the project's artifacts, so it must be one portable file name.
+pub fn isPackageName(name: &[u8]) -> bool {
+  if name.length == usize.ZERO {
+    return false
+  }
+  if name[usize.ZERO] < 97 || name[usize.ZERO] > 122 {
+    return false
+  }
+  let mut at = usize.ONE
+  while at < name.length {
+    let byte = name[at]
+    let lower = byte >= 97 && byte <= 122
+    let digit = byte >= 48 && byte <= 57
+    if
+      !lower && !digit && byte != 45 {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// A manifest-relative directory: nonempty, relative, without NUL, and never climbing above the
+// manifest's directory at any component. `/` and `\` both separate components.
+fn isContainedDirectory(text: &[u8]) -> bool {
+  if text.length == usize.ZERO || text[usize.ZERO] == 47 || text[usize.ZERO] == 92 {
+    return false
+  }
+
+  // A drive-letter prefix such as `C:/` is absolute on Windows.
+  let second = usize.ONE + usize.ONE
+  if text.length > second && text[usize.ONE] == 58 && (text[second] == 47 || text[second] == 92) {
+    return false
+  }
+  let mut depth = usize.ZERO
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= text.length {
+    let boundary = at == text.length || text[at] == 47 || text[at] == 92
+    if at < text.length && text[at] == 0 {
+      return false
+    }
+    if boundary {
+      let length = at - start
+      if length == 2 && text[start] == 46 && text[start + usize.ONE] == 46 {
+        if depth == usize.ZERO {
+          return false
+        }
+        depth = depth - usize.ONE
+      } else if length > usize.ZERO && !(length == usize.ONE && text[start] == 46) {
+        depth = depth + usize.ONE
+      }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn invalid(manifest: &Path, detail: &[u8]) -> never
+  ! ProjectError | OutOfMemoryError
+  ? &mut Allocator {
+  fail ProjectError.InvalidManifest {
+    manifest: run copyPath(manifest),
+    detail: run Bytes.copy(detail)
+  }
+}
+
+effect fn copyPath(path: &Path) -> Path
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let copied = run Effect.result(Path.fromBytes(Path.rawBytes(path)))
+  return match move copied {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      // A normalized path always spells a normalized path.
+      FileError impossible => {
+        drop impossible
+        return run Path.root()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// Resolves manifest-relative `text` against `directory`, or reports `detail` for the manifest.
+effect fn resolved(manifest: &Path, directory: &Path, text: string, detail: &[u8]) -> Path
+  ! ProjectError | OutOfMemoryError
+  ? &mut Allocator {
+  let attempted = run Effect.result(Path.resolve(directory, text))
+  return match move attempted {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError rejected => {
+        drop rejected
+        return run invalid(manifest, detail)
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// Reads an optional `[build]` text field: `fallback` when absent, or a failure with `detail` when it
+// is present but not text.
+effect fn buildText<
+  'document
+>(
+  manifest: &Path,
+  document: &'document TomlValue,
+  name: string,
+  fallback: string<'static>,
+  detail: &[u8]
+) -> string<'document>
+  ! ProjectError | OutOfMemoryError
+  ? &mut Allocator {
+  let field = Toml.fieldAt(Toml.field(document, "build"), name)
+  return match move field {
+    Option<&TomlValue>.None => fallback
+    Option<&TomlValue>.Some { value } => match move Toml.asString(Option<&TomlValue>.some(value)) {
+      Option<string>.Some { value: text } => text
+      Option<string>.None => run invalid(manifest, detail)
+    }
+  }
+}
+
+/// Decodes the manifest at `manifest` from its exact bytes. `[package].name` must be a portable
+/// package name and `[package].root` names the entry. `[build].output-dir` defaults to `build` and
+/// must stay inside the project; `[build].artifact` and `[build].stage` take their manifest
+/// spellings and default to `executable` and `final`.
+pub effect fn decode(manifest: &Path, text: &[u8]) -> Project
+  ! ProjectError | OutOfMemoryError
+  ? &mut Allocator {
+  let directory = match move run Path.parent(manifest) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => run invalid(manifest, b"the manifest path names no file")
+  }
+  let parsed = run Effect.result(Toml.parse(text))
+  let document = match move parsed {
+    Result<TomlValue, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<TomlValue, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      TomlError malformed => {
+        drop malformed
+        return run invalid(manifest, b"the manifest is not valid TOML")
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let name = match move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "name")) {
+    Option<string>.Some { value } => String.utf8Bytes(value)
+    Option<
+      string
+    >.None => run invalid(
+      manifest,
+      b"package.name must start with a lowercase letter and contain only lowercase letters, digits, or hyphens"
+    )
+  }
+  if
+    !isPackageName(name) {
+    return run invalid(
+      manifest,
+      b"package.name must start with a lowercase letter and contain only lowercase letters, digits, or hyphens"
+    )
+  }
+  let root = match move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "root")) {
+    Option<string>.Some { value } => value
+    Option<string>.None => run invalid(manifest, b"package.root must be a non-empty string")
+  }
+  if String.utf8Bytes(root).length == usize.ZERO {
+    return run invalid(manifest, b"package.root must be a non-empty string")
+  }
+  let entry = run resolved(
+    manifest,
+    &directory,
+    root,
+    b"package.root must name a file inside the project"
+  )
+  let outputDetail = b"build.output-dir must be a non-empty manifest-relative directory that does not escape the project"
+  let output = run buildText(manifest, &document, "output-dir", "build", outputDetail)
+  if
+    !isContainedDirectory(String.utf8Bytes(output)) {
+    return run invalid(manifest, outputDetail)
+  }
+  let outputDirectory = run resolved(manifest, &directory, output, outputDetail)
+  let artifactDetail = b"build.artifact must be executable, shared-library, static-library, or object"
+  let kind = String.utf8Bytes(
+    run buildText(manifest, &document, "artifact", "executable", artifactDetail)
+  )
+  if
+    !same(kind, b"executable") && !same(kind, b"shared-library") && !same(kind, b"static-library")
+      && !same(kind, b"object") {
+    return run invalid(manifest, artifactDetail)
+  }
+  let stageDetail = b"build.stage is not an admitted emission stage"
+  let emitted = String.utf8Bytes(run buildText(manifest, &document, "stage", "final", stageDetail))
+  if
+    !same(emitted, b"final") && !same(emitted, b"llvm-ir") && !same(emitted, b"llvm-bitcode")
+      && !same(emitted, b"assembly")
+      && !same(emitted, b"object") {
+    return run invalid(manifest, stageDetail)
+  }
+  return Project {
+    manifest: run copyPath(manifest),
+    directory: move directory,
+    name: run Bytes.copy(name),
+    entry: move entry,
+    outputDirectory: move outputDirectory,
+    artifact: run Bytes.copy(kind),
+    stage: run Bytes.copy(emitted),
+  }
+}
+
+/// Finds the nearest `silk.toml`, beginning at `start` and walking up to the root.
+pub effect fn discover(start: &Path) -> Path
+  ! ProjectError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut directory = run copyPath(start)
+  while true {
+    let candidate = run Path.join(&directory, "silk.toml")
+    let found = run FileSystem.exists(&candidate)
+    if found {
+      return move candidate
+    }
+    match move run Path.parent(&directory) {
+      Option<Path>.Some { value } => {
+        directory = move value
+      }
+      Option<Path>.None => {
+        break
+      }
+    }
+  }
+  fail ProjectError.ManifestNotFound { start: run copyPath(start) }
+}
+
+/// Reads and decodes the manifest at `manifest`.
+pub effect fn load(manifest: &Path) -> Project
+  ! ProjectError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let text = run FileSystem.readFile(manifest)
+  return run decode(manifest, Bytes.asSlice(&text))
+}
+
+/// Borrows the manifest path.
+pub fn manifest(self: &Project) -> &Path {
+  return &self.manifest
+}
+
+/// Borrows the directory that holds the manifest.
+pub fn directory(self: &Project) -> &Path {
+  return &self.directory
+}
+
+/// Borrows the package name.
+pub fn name(self: &Project) -> &[u8] {
+  return Bytes.asSlice(&self.name)
+}
+
+/// Borrows the resolved `[package].root` entry.
+pub fn entry(self: &Project) -> &Path {
+  return &self.entry
+}
+
+/// Borrows the resolved `[build].output-dir`.
+pub fn outputDirectory(self: &Project) -> &Path {
+  return &self.outputDirectory
+}
+
+/// Borrows the manifest spelling of `[build].artifact`.
+pub fn artifact(self: &Project) -> &[u8] {
+  return Bytes.asSlice(&self.artifact)
+}
+
+/// Whether the project's final artifact is an executable that `run` can start.
+pub fn runnable(self: &Project) -> bool {
+  return same(Bytes.asSlice(&self.artifact), b"executable")
+    && same(Bytes.asSlice(&self.stage), b"final")
+}
+
+/// Names the build directory of one logical optimization profile, as the TypeScript CLI does:
+/// `debug` without optimization, otherwise `release` or, with debug information, `release-with-debug`.
+pub fn profileName(optimization: &[u8], debug: bool) -> &'static [u8] {
+  if
+    !same(optimization, b"speed") {
+    return b"debug"
+  }
+  if debug {
+    return b"release-with-debug"
+  }
+  return b"release"
+}
+
+/// The executable's path for `target` and `profile`: `<output-dir>/llvm/<target>/<profile>/<name>`.
+pub effect fn executable(self: &Project, target: &[u8], profile: &[u8]) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let llvm = run Path.join(&self.outputDirectory, "llvm")
+  let targeted = run Path.joinBytes(&llvm, target)
+  let profiled = run Path.joinBytes(&targeted, profile)
+  return run Path.joinBytes(&profiled, Bytes.asSlice(&self.name))
+}
