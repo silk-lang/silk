@@ -30,7 +30,7 @@ import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as ToolchainIntegrity from '../src/ToolchainIntegrity.js'
 import * as TestExecution from '../src/TestExecution.js'
-import { independentExecutionFinalizedDestroy, invalidGenericCorpus } from './support/corpus.js'
+import { corpusProgram, invalidCorpus } from './support/corpus.js'
 import { ecdsaP256WasmSource } from './support/ecdsaP256Acceptance.js'
 import { p256WasmAcceptanceSource } from './support/p256Acceptance.js'
 import { chacha20Poly1305WasmSource } from './support/chacha20Poly1305Acceptance.js'
@@ -638,7 +638,7 @@ it.effect('names the failing native stage with command provenance', () =>
   }),
 )
 
-for (const program of invalidGenericCorpus) {
+for (const program of invalidCorpus.filter((program) => program.name.startsWith('generic-'))) {
   it.effect(`rejects ${program.name} before layout and MIR`, () =>
     Effect.gen(function* () {
       const outcome = yield* compileSource(program.name, program.source)
@@ -1051,7 +1051,7 @@ it.effect(
     Effect.gen(function* () {
       const outcome = yield* compileSource(
         'execution-finalized-destroy.wasm',
-        independentExecutionFinalizedDestroy,
+        corpusProgram('independent-execution-finalized-destroy').source,
         {
           compilation: {
             root: 'memory/execution-finalized-destroy-wasm',
