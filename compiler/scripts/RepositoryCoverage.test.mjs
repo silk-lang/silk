@@ -21,10 +21,14 @@ const processOutcome = (status, stderr = '', signal = null) => ({
 
 it('discovers exported top-level entries without matching comments, literals, or members', () => {
   assert.isTrue(Coverage.hasMain('pub effect fn main() -> i32 { return 0 }'))
+  assert.isTrue(
+    Coverage.hasMain("fn character() -> char { return '{' } pub fn main() -> i32 { return 0 }"),
+  )
   for (const source of [
     'fn main() -> i32 { return 0 }',
     '// pub fn main() -> i32 {}',
     'let text = "pub fn main() -> i32 {}"',
+    'let text = r"""quoted " text pub fn main() -> i32 {}"""',
     'impl Entry { pub fn main() -> i32 { return 0 } }',
   ])
     assert.isFalse(Coverage.hasMain(source))
