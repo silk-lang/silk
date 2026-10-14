@@ -368,6 +368,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       })
     const stdlib = join(snapshot, 'packages/compiler/stdlib')
     const compilerRoot = join(snapshot, 'compiler/src/main.silk')
+    // The compiler's manifest selects a final executable, so only IR emission names a stage.
     const argumentsFor = (
       source: string,
       output: string,
@@ -377,8 +378,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       source,
       '-o',
       output,
-      '--emit',
-      emit,
+      ...(emit === 'llvm-ir' ? ['--emit', 'llvm-ir'] : []),
       '--stdlib',
       stdlib,
       '--optimization',
