@@ -1,0 +1,538 @@
+//! Project initialization writes the TypeScript initializer's files, refuses collisions and undoes a
+//! failed attempt, over an in-memory filesystem.
+
+import driver.ProjectInitializer as Initializers { InitializationError, Initialized }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem {
+  DirectoryEntry,
+  DirectoryEntryKind,
+  DirectoryInfo,
+  FileError,
+  FileInfo,
+  FileSystem,
+  Path
+}
+import silk.option { Option }
+import silk.result { Result }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import silk.vector { Vector }
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+struct Entry {
+  path: Bytes
+  directory: bool
+  contents: Bytes
+}
+
+// A whole in-memory tree. `failing` names one path whose write fails.
+struct Files {
+  entries: Vector<Entry>
+  failing: Bytes
+}
+
+fn find(files: &Files, path: &[u8]) -> Option<usize> {
+  let entries = Vector<Entry>.asSlice(&files.entries)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if same(Bytes.asSlice(&entries[at].path), path) {
+      return Option<usize>.some(at)
+    }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+// The parent of a normalized absolute path, as bytes.
+fn parentLength(path: &[u8]) -> usize {
+  let mut at = path.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if path[at] == 47 {
+      if at == usize.ZERO {
+        return usize.ONE
+      }
+      return at
+    }
+  }
+  return usize.ZERO
+}
+
+fn isDirectoryAt(files: &Files, path: &[u8]) -> bool {
+  return match move find(files, path) {
+    Option<usize>.Some { value } => Vector<Entry>.asSlice(&files.entries)[value].directory
+    Option<usize>.None => false
+  }
+}
+
+fn hasParent(files: &Files, path: &[u8]) -> bool {
+  let length = parentLength(path)
+  let mut at = usize.ZERO
+  let entries = Vector<Entry>.asSlice(&files.entries)
+  while at < entries.length {
+    let candidate = Bytes.asSlice(&entries[at].path)
+    if entries[at].directory && candidate.length == length {
+      let mut matched = true
+      let mut offset = usize.ZERO
+      while offset < length {
+        if candidate[offset] != path[offset] {
+          matched = false
+        }
+        offset = offset + usize.ONE
+      }
+      if matched {
+        return true
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn removeAt(files: &mut Files, index: usize) -> () {
+  let removed = Vector<Entry>.remove(&mut files.entries, index)
+  drop removed
+  return ()
+}
+
+fn kindOf(directory: bool) -> DirectoryEntryKind {
+  if directory {
+    return FileSystem.directory()
+  }
+  return FileSystem.file()
+}
+
+impl Files {
+  effect fn readFile(self: &mut Self, path: &Path) -> Bytes
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    return match move find(&self.*, Path.rawBytes(path)) {
+      Option<usize>.Some { value } => {
+        let entry = &Vector<Entry>.asSlice(&self.entries)[value]
+        if entry.directory {
+          fail FileSystem.error(FileSystem.readFileOperation(), FileSystem.wrongType())
+        }
+        return run Bytes.copy(Bytes.asSlice(&entry.contents))
+      }
+      Option<usize>.None => {
+        fail FileSystem.error(FileSystem.readFileOperation(), FileSystem.notFound())
+      }
+    }
+  }
+
+  effect fn writeFile(self: &mut Self, path: &Path, bytes: &[u8]) -> ()
+    ! FileError {
+    let name = Path.rawBytes(path)
+    if same(name, Bytes.asSlice(&self.failing)) {
+      fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.noSpace())
+    }
+    if
+      !hasParent(&self.*, name) {
+      fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.notFound())
+    }
+
+    // The service writes without an allocator requirement, so the tree owns its copies itself.
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let replaced = run Effect.result(Bytes.copy(bytes))
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    let contents = match move replaced {
+      Result<Bytes, OutOfMemoryError>.Success { value } => move value
+      Result<Bytes, OutOfMemoryError>.Failure { error } => {
+        drop error
+        fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.other())
+      }
+    }
+    match move find(&self.*, name) {
+      Option<usize>.Some { value } => {
+        let entries = Vector<Entry>.asMutSlice(&mut self.entries)
+        if entries[value].directory {
+          fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.wrongType())
+        }
+        entries[value].contents = move contents
+      }
+      Option<usize>.None => {
+        let named = run Effect.result(Bytes.copy(name))
+          |> Effect.provideMut<Allocator>(&mut allocator)
+        if let Result<Bytes, OutOfMemoryError>.Success { value: owned } = move named {
+          let appended = run Effect.result(
+            Vector<
+              Entry
+            >.append(
+              &mut self.entries,
+              Entry { path: move owned, directory: false, contents: move contents }
+            )
+          )
+            |> Effect.provideMut<Allocator>(&mut allocator)
+          drop appended
+        }
+      }
+    }
+    return ()
+  }
+
+  effect fn stat(self: &mut Self, path: &Path) -> FileInfo | DirectoryInfo
+    ! FileError {
+    return match move find(&self.*, Path.rawBytes(path)) {
+      Option<usize>.Some { value } => {
+        if Vector<Entry>.asSlice(&self.entries)[value].directory {
+          return FileSystem.directoryInfo()
+        }
+        return FileSystem.fileInfo(usize.ZERO)
+      }
+      Option<usize>.None => {
+        fail FileSystem.error(FileSystem.statOperation(), FileSystem.notFound())
+      }
+    }
+  }
+
+  effect fn listDirectory(self: &mut Self, path: &Path) -> Vector<DirectoryEntry>
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    let name = Path.rawBytes(path)
+    let mut listed = Vector<DirectoryEntry>.make()
+    let entries = Vector<Entry>.asSlice(&self.entries)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      let candidate = Bytes.asSlice(&entries[at].path)
+      if candidate.length > name.length && parentLength(candidate) == name.length {
+        let mut matched = true
+        let mut offset = usize.ZERO
+        while offset < name.length {
+          if candidate[offset] != name[offset] {
+            matched = false
+          }
+          offset = offset + usize.ONE
+        }
+        if matched {
+          run Vector<
+            DirectoryEntry
+          >.append(
+            &mut listed,
+            FileSystem.directoryEntry(run Path.fromBytes(candidate), kindOf(entries[at].directory))
+          )
+        }
+      }
+      at = at + usize.ONE
+    }
+    return move listed
+  }
+
+  effect fn createDirectory(self: &mut Self, path: &Path) -> ()
+    ! FileError {
+    let name = Path.rawBytes(path)
+    if let Option<usize>.Some { .. } = move find(&self.*, name) {
+      fail FileSystem.error(FileSystem.createDirectoryOperation(), FileSystem.alreadyExists())
+    }
+    if
+      !hasParent(&self.*, name) {
+      fail FileSystem.error(FileSystem.createDirectoryOperation(), FileSystem.notFound())
+    }
+    let mut allocator = Allocator.systemAllocatorProvider()
+    let named = run Effect.result(Bytes.copy(name)) |> Effect.provideMut<Allocator>(&mut allocator)
+    if let Result<Bytes, OutOfMemoryError>.Success { value: owned } = move named {
+      let appended = run Effect.result(
+        Vector<
+          Entry
+        >.append(
+          &mut self.entries,
+          Entry { path: move owned, directory: true, contents: Bytes.make() }
+        )
+      )
+        |> Effect.provideMut<Allocator>(&mut allocator)
+      drop appended
+    }
+    return ()
+  }
+
+  effect fn removeFile(self: &mut Self, path: &Path) -> ()
+    ! FileError {
+    return match move find(&self.*, Path.rawBytes(path)) {
+      Option<usize>.Some { value } => removeAt(&mut self.*, value)
+      Option<usize>.None => {
+        fail FileSystem.error(FileSystem.removeFileOperation(), FileSystem.notFound())
+      }
+    }
+  }
+
+  effect fn removeDirectory(self: &mut Self, path: &Path) -> ()
+    ! FileError {
+    return match move find(&self.*, Path.rawBytes(path)) {
+      Option<usize>.Some { value } => removeAt(&mut self.*, value)
+      Option<usize>.None => {
+        fail FileSystem.error(FileSystem.removeDirectoryOperation(), FileSystem.notFound())
+      }
+    }
+  }
+
+  effect fn createTemporaryDirectory(self: &mut Self, path: &Path, prefix: &[u8]) -> Path
+    ! FileError | OutOfMemoryError
+    ? &mut Allocator {
+    fail FileSystem.error(FileSystem.createTemporaryDirectoryOperation(), FileSystem.unsupported())
+  }
+}
+
+impl FileSystem for Files {
+  readFile: Files.readFile
+
+  writeFile: Files.writeFile
+
+  stat: Files.stat
+
+  listDirectory: Files.listDirectory
+
+  createDirectory: Files.createDirectory
+
+  removeFile: Files.removeFile
+
+  removeDirectory: Files.removeDirectory
+
+  createTemporaryDirectory: Files.createTemporaryDirectory
+}
+
+// A tree holding `/` and `/work`.
+effect fn tree() -> Files
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut entries = Vector<Entry>.make()
+  run Vector<
+    Entry
+  >.append(
+    &mut entries,
+    Entry { path: run Bytes.copy(b"/"), directory: true, contents: Bytes.make() }
+  )
+  run Vector<
+    Entry
+  >.append(
+    &mut entries,
+    Entry { path: run Bytes.copy(b"/work"), directory: true, contents: Bytes.make() }
+  )
+  return Files { entries: move entries, failing: Bytes.make() }
+}
+
+effect fn add(files: &mut Files, path: &[u8], directory: bool, contents: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run Vector<
+    Entry
+  >.append(
+    &mut files.entries,
+    Entry { path: run Bytes.copy(path), directory: directory, contents: run Bytes.copy(contents) }
+  )
+}
+
+fn holds(files: &Files, path: &[u8], contents: &[u8]) -> bool {
+  return match move find(files, path) {
+    Option<usize>.Some { value } => {
+      let entry = &Vector<Entry>.asSlice(&files.entries)[value]
+      return !entry.directory && same(Bytes.asSlice(&entry.contents), contents)
+    }
+    Option<usize>.None => false
+  }
+}
+
+fn absent(files: &Files, path: &[u8]) -> bool {
+  return match move find(files, path) {
+    Option<usize>.Some { .. } => false
+    Option<usize>.None => true
+  }
+}
+
+effect fn attempt(
+  files: &mut Files,
+  directory: string,
+  name: Option<Bytes>
+) -> Result<Initialized, InitializationError>
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let path = run Path.make(directory)
+  let initialized = run Effect.result(
+    Initializers.initialize(&path, move name) |> Effect.provideMut<FileSystem>(&mut files.*)
+  )
+  return match move initialized {
+    Result<Initialized, InitializationError | OutOfMemoryError>.Success {
+      value
+    } => Result<Initialized, InitializationError>.succeed(move value)
+    Result<Initialized, InitializationError | OutOfMemoryError>.Failure {
+      error
+    } => match move error {
+      InitializationError refused => Result<
+        Initialized,
+        InitializationError
+      >.failResult(move refused)
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+fn entryText() -> &'static [u8] {
+  return b"import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n\n  run Effect.log(\"Hello, world!\", &())\n    |> Effect.provideMut(&mut logger)\n}\n"
+}
+
+effect fn creationPolicy() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut fresh = run tree()
+  let created = run attempt(&mut fresh, "/work/new/hello", Option<Bytes>.none())
+  let named = match &created {
+    Result<Initialized, InitializationError>.Success {
+      value
+    } => same(Bytes.asSlice(&value.name), b"hello")
+      && same(Path.rawBytes(&value.directory), b"/work/new/hello")
+    Result<Initialized, InitializationError>.Failure { .. } => false
+  }
+  run Testing.expect(named, "the package name derives from the new project directory")
+  run Testing.expect(
+    isDirectoryAt(&fresh, b"/work/new") && isDirectoryAt(&fresh, b"/work/new/hello")
+      && isDirectoryAt(&fresh, b"/work/new/hello/src"),
+    "missing ancestors, the project and its source directory are created"
+  )
+  run Testing.expect(
+    holds(
+      &fresh,
+      b"/work/new/hello/silk.toml",
+      b"[package]\nname = \"hello\"\nversion = \"0.1.0\"\nroot = \"src/main.silk\"\n"
+    )
+      && holds(&fresh, b"/work/new/hello/src/main.silk", entryText())
+      && holds(&fresh, b"/work/new/hello/.gitignore", b"/build/\n"),
+    "the manifest, entry and ignore file match the TypeScript initializer"
+  )
+  let mut existing = run tree()
+  run add(&mut existing, b"/work/Odd", true, b"")
+  run add(&mut existing, b"/work/Odd/.gitignore", false, b"node_modules")
+  run add(&mut existing, b"/work/Odd/src", true, b"")
+  let renamed = run attempt(
+    &mut existing,
+    "/work/Odd",
+    Option<Bytes>.some(run Bytes.copy(b"odd-2"))
+  )
+  let succeeded = match &renamed {
+    Result<Initialized, InitializationError>.Success { .. } => true
+    Result<Initialized, InitializationError>.Failure { .. } => false
+  }
+  run Testing.expect(
+    succeeded && holds(&existing, b"/work/Odd/.gitignore", b"node_modules\n/build/\n")
+      && holds(
+      &existing,
+      b"/work/Odd/silk.toml",
+      b"[package]\nname = \"odd-2\"\nversion = \"0.1.0\"\nroot = \"src/main.silk\"\n"
+    ),
+    "an explicit name overrides the directory and an existing ignore file gains the build rule"
+  )
+  let mut ignored = run tree()
+  run add(&mut ignored, b"/work/kept", true, b"")
+  run add(&mut ignored, b"/work/kept/.gitignore", false, b"a\r\n/build/\r\nb\n")
+  let kept = run attempt(&mut ignored, "/work/kept", Option<Bytes>.none())
+  drop kept
+  run Testing.expect(
+    holds(&ignored, b"/work/kept/.gitignore", b"a\r\n/build/\r\nb\n"),
+    "an existing build rule leaves the ignore file unchanged"
+  )
+}
+
+test effect fn initializationWritesTheProjectFiles() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run creationPolicy() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn refusedWith(outcome: &Result<Initialized, InitializationError>, expected: usize) -> bool {
+  return match &outcome.* {
+    Result<Initialized, InitializationError>.Success { .. } => false
+    Result<Initialized, InitializationError>.Failure { error } => match &error {
+      InitializationError.InvalidPackageName {
+        derived,
+        ..
+      } => (expected == 0 && derived) || (expected == 1 && !derived)
+      InitializationError.ExistingFile { .. } => expected == 2
+      InitializationError.SourceNotDirectory { .. } => expected == 3
+      InitializationError.AncestorNotDirectory { .. } => expected == 4
+      InitializationError.Failed {
+        path
+      } => expected == 5 && same(Path.rawBytes(&path), b"/work/p/src/main.silk")
+    }
+  }
+}
+
+effect fn refusalPolicy() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut files = run tree()
+  let derived = run attempt(&mut files, "/work/Hello", Option<Bytes>.none())
+  let explicit = run attempt(
+    &mut files,
+    "/work/hello",
+    Option<Bytes>.some(run Bytes.copy(b"9lives"))
+  )
+  run Testing.expect(
+    refusedWith(&derived, 0) && refusedWith(&explicit, 1) && absent(&files, b"/work/Hello")
+      && absent(&files, b"/work/hello"),
+    "a non-portable derived or explicit package name is refused before anything is created"
+  )
+  run add(&mut files, b"/work/m", true, b"")
+  run add(&mut files, b"/work/m/silk.toml", false, b"[package]\n")
+  let manifest = run attempt(&mut files, "/work/m", Option<Bytes>.none())
+  run add(&mut files, b"/work/e", true, b"")
+  run add(&mut files, b"/work/e/src", true, b"")
+  run add(&mut files, b"/work/e/src/main.silk", false, b"")
+  let entry = run attempt(&mut files, "/work/e", Option<Bytes>.none())
+  run Testing.expect(
+    refusedWith(&manifest, 2) && refusedWith(&entry, 2) && absent(&files, b"/work/m/.gitignore")
+      && absent(&files, b"/work/e/silk.toml"),
+    "an existing manifest or entry is never overwritten"
+  )
+  run add(&mut files, b"/work/s", true, b"")
+  run add(&mut files, b"/work/s/src", false, b"")
+  let source = run attempt(&mut files, "/work/s", Option<Bytes>.none())
+  run add(&mut files, b"/work/file", false, b"")
+  let ancestor = run attempt(&mut files, "/work/file/inner", Option<Bytes>.none())
+  run Testing.expect(
+    refusedWith(&source, 3) && refusedWith(&ancestor, 4),
+    "a source path that is a file and a file ancestor are refused"
+  )
+}
+
+test effect fn initializationRefusesCollisions() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run refusalPolicy() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn rollbackPolicy() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut files = run tree()
+  run add(&mut files, b"/work/p", true, b"")
+  run add(&mut files, b"/work/p/.gitignore", false, b"target/\n")
+  files.failing = run Bytes.copy(b"/work/p/src/main.silk")
+  let failed = run attempt(&mut files, "/work/p", Option<Bytes>.none())
+  run Testing.expect(refusedWith(&failed, 5), "a failed write names its path")
+  run Testing.expect(
+    absent(&files, b"/work/p/src") && absent(&files, b"/work/p/silk.toml")
+      && isDirectoryAt(&files, b"/work/p")
+      && holds(&files, b"/work/p/.gitignore", b"target/\n"),
+    "a failed initialization removes what it created and restores the ignore file"
+  )
+}
+
+test effect fn failedInitializationLeavesNoProject() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run rollbackPolicy() |> Effect.provideMut<Allocator>(&mut allocator)
+}
