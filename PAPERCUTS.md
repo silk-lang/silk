@@ -690,6 +690,7 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-14 · /usr/bin/go in the cloud image is the GNU Go game engine, so go install cannot install actionlint · Download the pinned actionlint release binary with gh and verify workflows locally · Silk per-target native seeds
 2026-10-14 · The new macOS native chain reached SourceSnapshot export but BSD tar rejected --mtime=@0 · Select GNU tar in setup-native-llvm before snapshot creation and hop replay · Silk per-target native seeds
 2026-10-14 · gh pr edit failed while reading deprecated GraphQL projectCards even for a body-only update · Update the pull request with gh api PATCH and a JSON body file instead · Silk per-target native seeds
+2026-10-14 · TypeScript silk format aborted the repository batch with SyntaxFormatterImplementationError: Requirement has no Ampersand token · Run the main CLI on each tracked source independently to collect complete formatter parity findings without changing formatter source · native repository coverage sweep
 
 2026-10-14 · ARM64 Linux native seed CI exposed a pre-existing C listener fixture using the unavailable SYS_poll syscall · Use SYS_ppoll with a converted timeout on all Linux hosts, add the existing listener corpus case to the three native platform jobs, and land the fixture repair on main first · Silk per-target native seeds
 
