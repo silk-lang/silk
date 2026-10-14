@@ -1373,6 +1373,7 @@ export const nativeListenerHelperSource = `
 #include <sys/time.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 #include <dlfcn.h>
@@ -1686,7 +1687,15 @@ int accept4(int fd, struct sockaddr *address, socklen_t *length, int flags) {
 }
 
 int poll(struct pollfd *fds, nfds_t count, int timeout) {
-  if (!silk_listener_scripted()) return (int)syscall(SYS_poll, fds, count, timeout);
+  if (!silk_listener_scripted()) {
+    // ARM64 Linux has ppoll rather than the legacy poll syscall. Use it on every Linux host.
+    struct timespec duration = { 0, 0 };
+    if (timeout >= 0) {
+      duration.tv_sec = timeout / 1000;
+      duration.tv_nsec = (timeout % 1000) * 1000000L;
+    }
+    return (int)syscall(SYS_ppoll, fds, count, timeout < 0 ? NULL : &duration, NULL, (size_t)0);
+  }
   silk_listener_polls += 1;
   if (fds == NULL || count != 1 || timeout != 0 || fds[0].fd != 40
       || fds[0].events != POLLIN)
@@ -2056,6 +2065,7 @@ export const nativeListenerDarwinWitnessSource = `
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 _Static_assert(sizeof(socklen_t) == 4, "Darwin socklen_t width");
@@ -2106,6 +2116,7 @@ export const nativeListenerGnuWitnessSource = `
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <time.h>
 #include <unistd.h>
 #if defined(__linux__) && defined(__GLIBC__)
 _Static_assert(sizeof(socklen_t) == 4, "GNU socklen_t width");
