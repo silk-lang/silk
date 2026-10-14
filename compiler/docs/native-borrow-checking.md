@@ -552,6 +552,16 @@ units than that, because instances share a unit.
 Budget: the borrow stage adds at most **10% of front-end time (about 30 s) and 0.5 GiB peak RSS**
 to the self-build. That is about 1.6 ms per emitted body on average, and more per unit.
 
+For R3, the approved remaining cumulative share is **3.28 s wall / 2.83 s user CPU / 0.486 GiB
+peak RSS**. Compare at least five alternating clean/R3 pairs with the same producers, command,
+source and one-shot LLVM-IR endpoint. Before each run, require one-minute load below 1 and no
+other Node, Silk compiler or Clang process. Report every sample, the median of adjacent R3-minus-clean
+differences, and the spread. The paired median is the gate, not maximum-minus-minimum. If clean
+timings vary by more than about 5%, investigate cache, memory, thermal and background scheduling
+effects before trusting a delta; VM host steal time can remain even when guest processes are idle.
+If the median exceeds the cap, profile the slice before proposing a cost decision. Negative or
+noisy timing does not increase the remaining share. A real overrun returns to Julia; the cap is fixed.
+
 How it stays within budget:
 
 - **Scalar fast path.** A body with no loans, no reference-typed locals and no obligations (today's
