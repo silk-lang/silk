@@ -9,7 +9,7 @@ Checkpoint note for the A4 / S3 ticket. Delete this file in the final PR of the 
 - Self-build (baseline N1 builds `compiler/src/main.silk --emit llvm-ir`): 9,218 unchecked
   (regions 9,058, stored-loans 160); 78.3 s wall, 3,918,452 KiB peak RSS.
 
-## Step 1: temporary receivers and hidden owners (in flight)
+## Step 1: temporary receivers and hidden owners (merged, #1674)
 
 - Branch `claude/vibrant-faraday-0oc1r5` (the session's designated branch; target `selfhost`).
 - `BorrowCheck.borrow` no longer leaves for an unrooted borrow. `holdTemporary` evaluates the
@@ -30,6 +30,23 @@ Checkpoint note for the A4 / S3 ticket. Delete this file in the final PR of the 
 - Hidden-owner roots live after the match-subject roots (`temporaryRoot = MAX/4 + nodes + base`)
   so no node can collide; `storageNodes` returns `2 * nodes` holder slots.
 
+## Step 2: package construction contract (in flight)
+
+- Corpus with the step-2 compiler: 423/423 pass; stored-loans 520 → 6 (the 6 are retained
+  displacements in `http-client` and `borrowed-outcome-affine-stream`); no other reason changes.
+  Self-build: stored-loans 0, 75.4 s, 3,923,744 KiB.
+
+- Branch `selfhost-stored-loans-s3-execution`, stacked on step 1 (retarget/merge after #1674).
+- `executionFromAllocation` is a `contractCall`: it consumes its four operands and its result
+  retains only the regions `Intrinsic.Execution<A>` names. Typing now proves `F`, `O` and `R`
+  `Intrinsic.Detached` at the call with the body's premises (EXEC-004, `UnsatisfiedExecutableProperty`
+  / SEM0139), so the contract is enforced, not trusted. The bootstrap checks the property on each
+  reached instance instead; an unreached generic misuse is accepted there and rejected natively.
+- A stored (non-immediate) `executionDrive` stays `StoredLoans`: lowering refuses it
+  (`GapCode.EffectForm`), so no emitted body has one.
+- Probe `.scratch/probe/x1` (generic package with a non-detached readiness state): SEM0139 at the
+  intrinsic call. Probe s2's `Execution.make` is now Checked.
+
 ## Review findings
 
 - Review 1 (step 1): a viewing binding's retained Drop temporary was observed at statement end
@@ -45,9 +62,11 @@ Checkpoint note for the A4 / S3 ticket. Delete this file in the final PR of the 
 
 ## Next action
 
-Finish step 1: corpus run with the step-1 N1, `check-borrow-gap.mjs update`/`diff`, run the
-`SemanticCaptureCases` filter `borrowStatusNamesWhatRemains`, adversarial review, open the draft
-PR, dispatch `selfhost.yml`. Then step 2 (`executionFromAllocation`/`executionDrive` contract).
+Step 2 PR open (draft until its `selfhost.yml` dispatch passes and its review is done). Step 5
+(retained displacements through a reference, branch `selfhost-stored-loans-s3-displacement`,
+stacked on step 2) is implemented: its corpus run passes 423/423 with stored-loans 0; open its PR
+after step 2 merges. Steps 3, 4 and 6 were covered by step 1 (self-build stored-loans already 0).
+Then delete this file in the last PR of the series.
 
 ## Local tooling
 
