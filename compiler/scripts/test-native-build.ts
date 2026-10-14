@@ -249,11 +249,36 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
+  // A full JSON profile replaces the target selection and adds its own bindings after them.
+  const overridden = yield* invoke(
+    silkc,
+    [
+      'run',
+      '--profile-input',
+      JSON.stringify({
+        target: hostTarget,
+        bindings: [
+          {
+            package: 'bound@0.1.0',
+            module: 'main',
+            parameter: 'limit',
+            value: { kind: 'integer', value: '5' },
+            origin: { source: 'cli', provenance: 'literal' },
+          },
+        ],
+      }),
+      '--stdlib',
+      standardLibrary,
+    ],
+    join(directory, 'bound'),
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(overridden.status, 5, overridden.stderr)
   const cleanedByPath = yield* invoke(silkc, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles and bindings passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input and bindings passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))

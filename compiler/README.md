@@ -233,7 +233,7 @@ plan, admits its receipt and exits with its status; see [Native `silkc test`](do
 
 Project build invocation: `silkc build [--manifest-path <path>] [--target <host|triple>]...
 [--release] [--optimization <debug|release|release-with-debug>] [--profile <name>]
-[--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
+[--profile-input <json>] [--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
 `silk.toml` above the working directory, or exactly the manifest `--manifest-path` names, as the
 TypeScript CLI's `silk build` does, and builds `[package].root` once per selected target: the
 `--target` selectors in order, or else `[build].targets` (default `["host"]`), where `host` names
@@ -252,8 +252,10 @@ refused, else 0. A missing or invalid manifest or an unknown target exits 2 befo
 Named profiles follow the TypeScript `ProjectProfile`: a `[profiles.<name>]` table is a complete
 logical profile (`target` is required; `cpu`, `optimization`, `debug` and the other profile fields
 are optional) with optional profile-tier `bindings`, and `[build].profile` names the default one.
-`--profile <name>`, or else the default when no `--target` is given, builds exactly that profile
-once, in the profile directory its optimization and debug choices name; it conflicts with
+`--profile-input <json>` supplies a complete profile as a JSON object with the same fields and
+`bindings` (`Invalid --profile-input JSON` exits 2), and naming it together with `--profile` is
+refused as `ConflictingBindings: profile selection modes`. `--profile-input`, or `--profile
+<name>`, or else the default when no `--target` is given, builds exactly that profile once, in the profile directory its optimization and debug choices name; it conflicts with
 `--target`, `--release` and `--optimization` (status 2). `[build].bindings` holds project-tier package-parameter
 bindings (`package`, `module`, `parameter`, a `value` such as `{ kind = "integer", value = "3" }`
 and an `origin` with `source` and a public `provenance`) that every project build receives, before
@@ -261,8 +263,8 @@ the selected profile's own. Loading a project validates the whole catalog; a ref
 TypeScript `<code>: <subject>`, such as `InvalidInput: profile name`, and exits 2.
 
 Run invocation: `silkc run [--manifest-path <path>] [--target <host|triple>]... [--release]
-[--optimization <profile>] [--profile <name>] [--stdlib <directory>] [arguments...]
-[-- arguments...]`. It builds the
+[--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>]
+[arguments...] [-- arguments...]`. It builds the
 project's executable as the project build does, for the named profile, else the first `--target`,
 else the host (it ignores `[build].targets`), and a target other than the host exits 2. Options are read until `--`; other arguments before it
 and every argument after it go to the program in order. The compiler then replaces its own process
