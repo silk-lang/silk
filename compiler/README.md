@@ -150,8 +150,8 @@ place (D4): the protected Effect fails into a temporary, a switch sends members 
 handler and injects the rest into the residual failure. `finalizeEffect`, its NonParking variant
 and `useReleaseNonParking` expand the same way: both exits of the protected run (or of `use`, lent
 the owned resource) run the `() ! never` finalizer (or `release`, which drops the resource), and a
-held failure is raised afterwards. `Intrinsic.NonParking` bounds hold until the suspension stage,
-since reaching parking is itself the `suspension` gap (D6). An `effect {}` block or anonymous
+held failure is raised afterwards. Reached parking lowers through `Intrinsic.relinquish` (D6), but
+`Intrinsic.NonParking` bounds are still admitted without proof (#1665). An `effect {}` block or anonymous
 `effect fn` is an exact representation like an anonymous closure: its environment holds its
 captures, and running it (or an invoked anonymous `effect fn`) calls its own instance with the
 environment as parameter 0. A block derives its success, failure and requirement row from its
@@ -366,8 +366,10 @@ the corpus.
 For each bootstrap build, record the `selfhost` commit, the downloaded main compiler commit and CI
 run, the host platform and LLVM target. The focused selfhost workflow downloads the latest verified
 `silk-bootstrap` artifact using `.github/actions/download-bootstrap` and records its provenance in
-the job summary. Invoke its `silk.mjs` with Node 24; native builds also require LLVM. No workspace
-dependency install, TypeScript compiler build, or verification packaging job runs on selfhost.
+the job summary. Invoke its `silk.mjs` with Node 24; native builds also require LLVM. Selfhost jobs
+install workspace dependencies only for Node tooling (seed verification, source snapshots, generated
+contract checks); no selfhost job builds the TypeScript compiler from source or packages the verifier.
+The bootstrap DDC job runs the downloaded `silk-bootstrap` artifact.
 Main also publishes `silk-selfhost-verification`; the download action fetches it from the same run
 as the compiler. The verifier reads `compiler/scripts/selfhost-track.json` from this checkout and
 checks its intrinsic catalog, authored corpus fixtures, and live formatted standard library,
@@ -751,8 +753,8 @@ value at the declared type. The read demands the constant's content-keyed initia
 that value edge, so every reader shares one evaluation, and a rejected initializer rejects the reader
 with the initializer's own diagnostic. MIR materializes the value at its use: integers with their
 exact sign and magnitude, `bool`, floats (an `f32` widened exactly to the f64 operand bits), `char`
-as its scalar value, and text as a descriptor over its program-lifetime bytes. A `char` value still
-has no runtime layout and reports the `scalar-layout` gap.
+as its scalar value, and text as a descriptor over its program-lifetime bytes. A `char` value has a
+runtime layout: parameters, locals, returns and comparisons lower as its scalar value.
 
 The sealed `Intrinsic` surface supplies target and final-profile facts and static text operations.
 One explicit final build profile controls selected static-if arms; inactive arms contribute no

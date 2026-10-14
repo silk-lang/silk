@@ -1,7 +1,9 @@
 # Native borrow checking
 
-Roadmap step 14 (#567, "Implement native borrow checking, then remove TypeScript"). Nothing here is
-implemented yet. It relies on [`region-erased-identity.md`](region-erased-identity.md) and
+Roadmap step 14 (#567, "Implement native borrow checking, then remove TypeScript"). Slices 1, 2 and 7
+have landed and slice 6's `captures`, `effects` and `patterns` reasons are retired; slice 3 is partial
+(regions remain for R3) and slice 8 has not started. `compiler/borrow-check-gap.txt` is the current
+per-program record of unchecked bodies. It relies on [`region-erased-identity.md`](region-erased-identity.md) and
 follows [`incremental-architecture-v2.md`](incremental-architecture-v2.md) (§8.3, the
 checking-unit rule).
 
