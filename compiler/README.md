@@ -1166,6 +1166,12 @@ damaged branch without recursive recovery. The budget is an implementation resou
 a Silk grammar restriction or a limit on file size. The previous value of 256 exceeded the
 available stack in the bootstrap-generated debug executable before recovery could run.
 
+Two parser diagnostics leave the tree intact. A primary expression that starts template syntax
+(`<` followed by `>`, a lifetime, or a type start) becomes one error node covering the skipped
+tokens, through the first top-level `>` or up to a statement or declaration boundary, and reports
+`ReservedTemplate` (PAR0003). A keyword-spelled final import segment without an alias or member
+list reports `ReservedImportBinding` (PAR0004, IMPORT-007).
+
 ## Grammar modules
 
 | Module                                         | Responsibility                                                                                                                                 |
