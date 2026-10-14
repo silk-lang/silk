@@ -71,6 +71,11 @@ Current specifications live under [`openspec/specs`](openspec/specs); active cha
 
 ## Development
 
+Supported native hosts are ARM64 Linux (`aarch64-unknown-linux-gnu`), x86-64 Linux
+(`x86_64-unknown-linux-gnu`), and Apple Silicon macOS (`aarch64-apple-darwin`). Both the
+TypeScript compiler and the source-written compiler support ARM64 Linux, including Debian cloud
+VMs. WebAssembly (`wasm32-unknown-unknown`) is an output target.
+
 CI uses standard GitHub-hosted `ubuntu-24.04` (x86-64), `ubuntu-24.04-arm` (ARM64), and
 `macos-15` (Apple Silicon) runners. Both [repository CI](.github/workflows/ci.yml) and
 [selfhost CI](.github/workflows/selfhost.yml) are maintained on `main`, so shared workflow
@@ -90,6 +95,29 @@ pnpm check
 
 `pnpm dev` runs package compilers in watch mode alongside the documentation app. `pnpm build`
 creates a dependency-ordered production build of every workspace package and app.
+
+### Linux compiler development
+
+Install Node 24 and the pnpm version in `package.json`. On Debian or Ubuntu, install the host C
+development libraries and the verified LLVM tools, then build the CLI:
+
+```sh
+sudo apt-get update
+sudo apt-get install build-essential curl xz-utils ca-certificates
+bash scripts/setup-linux-llvm.sh
+export PATH="$PWD/.scratch/llvm-22.1.8/bin:$PATH"
+pnpm install --frozen-lockfile
+pnpm --filter @silklang/cli... run build
+node packages/cli/dist/bin.js init /tmp/silk-hello
+node packages/cli/dist/bin.js run --manifest-path /tmp/silk-hello/silk.toml
+```
+
+The installer selects x86-64 or ARM64 from the running host and verifies the LLVM archive's
+SHA-256. Native compilation selects the host target automatically. Keep the LLVM `bin` directory
+on `PATH` in development shells; an older distribution Clang may not read Silk's LLVM 22 bitcode.
+For the source-written compiler, use the `selfhost` branch and its
+[bootstrap instructions](https://github.com/silk-lang/silk/blob/selfhost/compiler/README.md#development-branches-and-bootstrap). The published
+native seed's host architecture is separate from the compiler's supported output targets.
 
 Effect-returning tests use `it.effect` from `@effect/vitest`; pure tests use ordinary `it` with
 `assert`.
