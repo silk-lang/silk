@@ -145,7 +145,10 @@ const program = Effect.gen(function* () {
   assert.equal(project.status, 42, project.stderr)
   const [hostTarget] = yield* fs.readDirectory(join(directory, 'build/llvm'))
   assert.ok(hostTarget, 'run must place its executable below build/llvm/<target>')
-  assert.equal(yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')), true)
+  assert.equal(
+    yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')),
+    true,
+  )
   // `clean` removes the whole output directory; a project already clean stays clean.
   const cleaned = yield* invoke(silkc, ['clean'], directory)
   assert.equal(cleaned.status, 0, cleaned.stderr)
@@ -166,8 +169,43 @@ const program = Effect.gen(function* () {
   assert.match(greeted.stdout, /Hello, world!/)
   const repeated = yield* invoke(silkc, ['init', 'greeting'], directory)
   assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
+  // A project `build` names its manifest instead of discovering one, and `--release` selects the
+  // release profile directory; `run` refuses a foreign target before building anything.
+  const manifest = join('greeting', 'silk.toml')
+  const released = yield* invoke(
+    silkc,
+    [
+      'build',
+      '--manifest-path',
+      manifest,
+      '--release',
+      '--target',
+      'host',
+      '--stdlib',
+      standardLibrary,
+    ],
+    directory,
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(released.status, 0, released.stderr)
+  assert.match(released.stdout, /Build summary: 1 succeeded, 0 failed/)
+  assert.equal(
+    yield* fs.exists(join(directory, 'greeting/build/llvm', hostTarget, 'release/greeting')),
+    true,
+  )
+  const foreignRun = yield* invoke(
+    silkc,
+    ['run', '--manifest-path', manifest, '--target', foreign, '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILKC_CLANG: sentinel },
+  )
+  assert.equal(foreignRun.status, 2, 'run must refuse a foreign target')
+  assert.equal(yield* fs.exists(marker), false)
+  const cleanedByPath = yield* invoke(silkc, ['clean', '--manifest-path', manifest], directory)
+  assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
+  assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean and init passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init and manifest flags passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
