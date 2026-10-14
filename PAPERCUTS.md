@@ -687,3 +687,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 2026-10-14 · Native Cases print FAIL without the AssertionError message, which obscured a region-control fixture using the wrong inference path · Inspect the typed argument kind: String takes binder shortening, while a string-first/slice-second call exercises provisional static relation retention; pin the latter as Regions · selfhost R3
 2026-10-14 · /usr/bin/go in the cloud image is the GNU Go game engine, so go install cannot install actionlint · Download the pinned actionlint release binary with gh and verify workflows locally · Silk per-target native seeds
+2026-10-14 · The new macOS native chain reached SourceSnapshot export but BSD tar rejected --mtime=@0 · Select GNU tar in setup-native-llvm before snapshot creation and hop replay · Silk per-target native seeds

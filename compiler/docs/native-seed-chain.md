@@ -206,6 +206,14 @@ every current pin names an existing asset. Candidates can be pruned by hand afte
 single-seed Git records still supply historical release facts; they are never accepted as an active
 pin by `NativeSeed.mjs`.
 
+### Default-branch schedule routing
+
+GitHub runs schedules from `main`, while pins and compiler tooling live on `selfhost`. The
+companion schedule-routing change makes the two `main` workflows dispatch their matching
+`selfhost` workflows, preserving their weekly times. Land that routing change before the
+per-target schema change: otherwise main's older readers would still expect the former pin.
+Keep the branch roles when synchronizing workflows: `main` dispatches and `selfhost` executes.
+
 ## Advancing the pin
 
 Advance when the compiler needs a feature that the pinned seed cannot compile, and otherwise
