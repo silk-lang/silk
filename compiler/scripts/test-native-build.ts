@@ -233,6 +233,55 @@ const program = Effect.gen(function* () {
   )
   assert.notEqual(uninstalled.status, 0, 'a compiler without an installation needs --stdlib')
   assert.equal(yield* fs.exists(marker), false)
+  // `check` analyzes every planned target without producing an artifact, a foreign one too, and
+  // reports rejections of unreached declarations as `silk check` does.
+  const checked = yield* invoke(
+    silkc,
+    ['check', '--target', 'host', '--target', foreign, '--stdlib', standardLibrary],
+    join(directory, 'greeting'),
+    { ...process.env, SILKC_CLANG: sentinel },
+  )
+  assert.equal(checked.status, 0, checked.stderr)
+  assert.match(checked.stdout, new RegExp(`check ${hostTarget}: ok\n`))
+  assert.match(
+    checked.stdout,
+    new RegExp(`check ${foreign}: ok\nCheck summary: 2 succeeded, 0 failed\n$`),
+  )
+  assert.equal(yield* fs.exists(marker), false, 'check must not invoke Clang')
+  yield* fs.makeDirectory(join(directory, 'rejected/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'rejected/silk.toml'),
+    '[package]\nname = "rejected"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'rejected/src/main.silk'),
+    'pub fn main() -> i32 {\n  return 0\n}\n\nfn unused() -> i32 {\n  let x: i32 = true\n  return x\n}\n',
+  )
+  const rejected = yield* invoke(
+    silkc,
+    ['check', '--stdlib', standardLibrary],
+    join(directory, 'rejected'),
+  )
+  assert.equal(rejected.status, 1, rejected.stderr)
+  assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`))
+  assert.match(rejected.stderr, /src\/main\.silk:6:16: error\[SEM0037\]/)
+  assert.match(rejected.stdout, new RegExp(`check ${hostTarget}: failed \\(exit 1\\)\n`))
+  const json = yield* invoke(
+    silkc,
+    ['check', '--json', '--stdlib', standardLibrary],
+    join(directory, 'rejected'),
+  )
+  assert.equal(json.status, 1, json.stderr)
+  const reported = json.stderr
+    .split('\n')
+    .filter((line) => line.startsWith('{'))
+    .map(
+      (line) => JSON.parse(line) as { code: string; line: number; column: number; target: string },
+    )
+  assert.ok(
+    reported.some((entry) => entry.code === 'SEM0037' && entry.line === 6 && entry.column === 16),
+    json.stderr,
+  )
   const repeated = yield* invoke(silkc, ['init', 'greeting'], directory)
   assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
   // A project `build` names its manifest instead of discovering one, and `--release` selects the
@@ -585,7 +634,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library, clang on PATH, version, help, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library, clang on PATH, version, help, check, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
