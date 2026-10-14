@@ -231,16 +231,30 @@ Test invocation: `silkc test <root> -o <executable> --stdlib <directory> [--filt
 bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it with an uncached
 plan, admits its receipt and exits with its status; see [Native `silkc test`](docs/native-test.md).
 
-Run invocation: `silkc run [--stdlib <directory>] [arguments...] [-- arguments...]`. It finds the
-nearest `silk.toml` above the working directory, as the TypeScript CLI's `silk run` does, and
-builds `[package].root` for the host target in the debug profile (no optimization, debug
-information) at `<output-dir>/llvm/<target>/debug/<name>`, where `[build].output-dir` defaults to
-`build` and must stay inside the project. Options are read until `--`; other arguments before it
+Project build invocation: `silkc build [--manifest-path <path>] [--target <host|triple>]...
+[--release] [--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
+`silk.toml` above the working directory, or exactly the manifest `--manifest-path` names, as the
+TypeScript CLI's `silk build` does, and builds `[package].root` once per selected target: the
+`--target` selectors in order, or else `[build].targets` (default `["host"]`), where `host` names
+the compiler's host and a repeated target builds once. The debug profile (no optimization, debug
+information) is the default and `--release` selects optimization without debug information. Each
+artifact lands at `<output-dir>/llvm/<target>/<debug|release>/<name>`, where `[build].output-dir`
+defaults to `build` and must stay inside the project; an `llvm-ir` `[build].stage` writes
+`<name>.ll` there instead. Only the host target links an executable, and library artifacts and the
+other intermediate stages are not native yet; each such target fails with status 2. The command
+prints one `build llvm/<target>: ok <artifact>` or `failed (exit <status>)` line per target and a
+`Build summary`; its status is 2 when any target failed operationally, else 1 when any build was
+refused, else 0. A missing or invalid manifest or an unknown target exits 2 before building.
+
+Run invocation: `silkc run [--manifest-path <path>] [--target <host|triple>]... [--release]
+[--stdlib <directory>] [arguments...] [-- arguments...]`. It builds the project's executable as the
+project build does, for the first `--target` or else the host (it ignores `[build].targets`), and a
+first target other than the host exits 2. Options are read until `--`; other arguments before it
 and every argument after it go to the program in order. The compiler then replaces its own process
 with the program (`execv`), so the program inherits standard input, output and error, the
 environment and the working directory, and its exit status or terminating signal is the command's.
-A missing or invalid manifest, a non-executable `[build].artifact` or a non-final `[build].stage`
-exits 2; a refused build keeps `build`'s status.
+A non-executable `[build].artifact` or a non-final `[build].stage` exits 2; a refused build keeps
+`build`'s status.
 
 Init invocation: `silkc init [path] [--name <name>]`. It creates a project as the TypeScript
 initializer does: `silk.toml` (`[package]` name, version `0.1.0`, root `src/main.silk`), a
@@ -251,7 +265,7 @@ existing manifest or entry, a `src` that is not a directory or an ancestor that 
 with status 2 before anything is written, and a failure part-way removes everything initialization
 created and restores the previous `.gitignore`.
 
-Clean invocation: `silkc clean`. It removes the nearest project's `[build].output-dir` and
+Clean invocation: `silkc clean [--manifest-path <path>]`. It removes the project's `[build].output-dir` and
 everything below it, as the TypeScript `silk clean` does, and prints `Removed <directory>`. An
 absent output directory is already clean. Only builds write there, and the manifest decoder keeps
 the directory inside the project. A missing or invalid manifest, or a failed removal, exits 2.
