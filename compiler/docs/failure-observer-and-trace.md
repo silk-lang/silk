@@ -182,10 +182,12 @@ origin }`, then the drop chain and `Fail`. The texts it stores live in the funct
 Layout gives every failure slot a fixed-size companion of five words: `[string<'static>; 2]`
 (identity, label), then the observer pool handle (N7). The `Failure` local's companion is the caller's
 `%context` out-address; every other failure slot that a statement, a `ContextOf` or an observing
-call edge names gets its own companion in the frame. Identity is the canonical type name
-(`module.Name<Arguments>`, primitives by spelling, `()`); other failure types report the
-`failure-identity` gap. Texts are rendered while building MIR, where module source and declaration
-names are available.
+call edge names gets its own companion in the frame. Identity is the bootstrap's type encoding
+(`module.Name<Arguments>`, primitives by spelling, `()`, `string<'static>`, `Array<T, N>`, `&'static
+mut [T]`, `?[*]const align(N) T`). A region other than `'static` has no source spelling after
+instance selection and is omitted. Anonymous aggregates, callables, Effects, foreign functions and
+requirement-row arguments report the `failure-identity` gap. Texts are rendered while building MIR,
+where module source and declaration names are available.
 
 ABI of a function in an observing program, after the written parameters and providers:
 
@@ -265,8 +267,10 @@ by a non-null observer and calls the callback as an independent edge, like `obse
   loads the observer and cause locals and calls one module-wide `noinline cold` helper,
   `silk.diagnostic.fatal(observer, cause, reason, origin)`, which passes the cause's pool handle as
   `first` when a cause is selected, the reason, and the site label. Division traps report zero and
-  overflow from separate blocks. Traps MIR lowers as a `Trap` terminator (bounds, layout,
-  execution, outcome tag) stay bare; they follow by giving the terminator a reason.
+  overflow from separate blocks. A `Trap` terminator (bounds, layout, shared count, execution
+  control) carries a `TrapReason`, records its site label the same way, and reports through the
+  same helper before `llvm.trap`. Native call edges branch on a two-state status, so the
+  bootstrap's invalid-outcome-tag trap has no counterpart.
 
 Drop glue already takes the hidden pair in observing programs, so `Drop` hooks observe like any
 other function; N7 needs no drop-glue key change.
@@ -293,12 +297,12 @@ callable-value follow-up owns it.
 
 ## 4. Gap codes
 
-| Code                | Change    | Raised where                                                               | Exit condition                       |
-| ------------------- | --------- | -------------------------------------------------------------------------- | ------------------------------------ |
-| `intrinsic-member`  | narrower  | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled` | suspension stage                     |
-| `observer-callback` | **new**   | an `observeDiagnostics` callback that is not a direct function             | callback environments in the record  |
-| `failure-identity`  | **new**   | an observed `fail` of a type other than a nominal, primitive, string or unit type | identity rendering for the remainder |
-| `entry-signature`   | removed   | no generated entry; every build roots at its runtime's C exports           | default runtime selection            |
+| Code                | Change   | Raised where                                                                                                         | Exit condition                       |
+| ------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `intrinsic-member`  | narrower | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled`                                           | suspension stage                     |
+| `observer-callback` | **new**  | an `observeDiagnostics` callback that is not a direct function                                                       | callback environments in the record  |
+| `failure-identity`  | **new**  | an observed `fail` of an anonymous aggregate, callable, Effect or foreign function, or a nominal with a row argument | identity rendering for the remainder |
+| `entry-signature`   | removed  | no generated entry; every build roots at its runtime's C exports                                                     | default runtime selection            |
 
 ## 5. Bootstrap parity and COMPILER_COMPATIBILITY.md
 
@@ -307,15 +311,15 @@ callable-value follow-up owns it.
 | observer reach                      | whole-program switch, every function, callback dispatch through a pointer                          | the same: whole-program switch, every function, callback called through the record's address     | no                                                 |
 | context content                     | pool handle plus fallback identity and origin                                                      | the same                                                                                         | no                                                 |
 | causes (TERM-006)                   | `while handling` chains                                                                            | the same                                                                                         | no                                                 |
-| fatal traps (TERM-008)              | observed traps report event 6                                                                      | arithmetic traps report event 6; MIR `Trap` terminators stay bare                                 | yes, for bounds, layout, execution and tag traps   |
+| fatal traps (TERM-008)              | observed traps report event 6                                                                      | the same reasons and sites; native also checks an adopted execution allocation's layout          | no                                                 |
 | SEM0216, SEM0217                    | executable-closure analysis                                                                        | not diagnosed; a context-free `observeUnhandled` returns `0`                                     | yes: missing compile-time diagnostics              |
 | `observeDiagnostics` type arguments | required (SEM0051 when omitted); a fallible body or misshapen callback is SEM0012 at that argument | inferred from the operands when omitted; the same mismatches are `TypeMismatch` at that argument | yes: selfhost accepts the omitted form             |
 
 **COMPILER_COMPATIBILITY.md:** the PR that first lowered `observeUnhandled` added the entry
 "Selfhost failure reports carry origin only". N7's frames, causes and arithmetic event 6 retired
-those rows; the entry is now "Selfhost reports only arithmetic observed traps and checks
-observations partially" and lists the remaining rows with their exit conditions (event 6 for MIR
-`Trap` terminators; the suspension-stage analysis pass for SEM0216 and SEM0217). The entry-shim entry is unchanged.
+those rows, and event 6 for MIR `Trap` terminators retired the fatal-trap row; the entry is now
+"Selfhost checks observations partially" and lists the remaining rows with their exit conditions
+(the suspension-stage analysis pass for SEM0216 and SEM0217). The entry-shim entry is unchanged.
 
 ## 6. Tests and corpus
 
@@ -340,7 +344,7 @@ and every pinned program passing.
 2. **Origin-only context and both readers.** Typing of both intrinsics, `Composition.Observe`,
    `RunPlan.Observe`, the whole-program switch, hidden locals, `FailureContext`, companions, recipe
    and LLVM, the compatibility entry, and the Effect note's §4, §5 and §7 updated.
-3. **Frames and causes** (N7, done), arithmetic fatal traps (done), then MIR `Trap` terminators.
+3. **Frames and causes** (N7, done), arithmetic fatal traps (done), MIR `Trap` terminators (done).
 4. **SEM0216 and SEM0217**, with the suspension stage's executable-closure summary.
 
 ## 8. Privilege
