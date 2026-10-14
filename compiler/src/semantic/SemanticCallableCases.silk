@@ -4,7 +4,7 @@ import semantic.SourceLocations {Location}
 import semantic.Anchor {Anchor}
 import semantic.Types {TypeTable, Types}
 import hir.Hir {Access, CallableMode, HirId, InfixOperator, Module, Multiplicity, OwnerKind}
-import backend.InstanceKey {InstanceKey, ProviderEntry}
+import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
 import backend.InstanceRecipe {InstanceRecipe}
 import backend.Layout {
   Field as LayoutField,
@@ -187,6 +187,7 @@ import semantic.SemanticCaseSupport {
   rejectsFrom,
   rejectsRelated,
   rejectsSpan,
+  backendGapAt,
   rejectsWith,
   requireIndexedIdentity,
   retainsRegionRelation,
@@ -6951,6 +6952,129 @@ fn nested() -> i32 { return run Intrinsic.observeDiagnostics(Log { reports: 0 },
   return ()
 }
 
+// Every observation records an adapter helper that invokes its stored callback through a shared
+// loan of the callable (N1): a staged section's stored lane, a capturing anonymous body's
+// environment, and one adapter per observation at a run site. A consuming callable keeps the gap.
+test effect fn observerCallbacksRunThroughAdapters() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let id = run module("observer-adapter.silk") |> Effect.provideMut<Allocator>(&mut allocator)
+  let text = """
+struct Tally { events: usize }
+struct Guard { code: i32 }
+fn counted(self: &mut Tally, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>, weight: usize) -> usize {
+  self.events = self.events + weight
+  return 0
+}
+fn guarded(self: &mut Tally, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>, guard: Guard) -> usize { return 0 }
+effect fn body() -> i32 { return 7 }
+fn staged() -> i32 { return run Intrinsic.observeDiagnostics(Tally { events: 0 }, counted(2), body()) }
+fn captured() -> i32 {
+  let weight: usize = 3
+  return run Intrinsic.observeDiagnostics(Tally { events: 0 }, fn(self: &mut Tally, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize { return weight }, body())
+}
+fn paired() -> i32 { return run Intrinsic.observeDiagnostics(Tally { events: 0 }, counted(1), Intrinsic.observeDiagnostics(Tally { events: 0 }, counted(2), body())) }
+fn consumed() -> i32 { return run Intrinsic.observeDiagnostics(Tally { events: 0 }, guarded(Guard { code: 1 }), body()) }
+"""
+  let mut store = run staticSemantic(&id, text, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.make()
+  let staged = run observingMir(&mut store, &mut request, &id, b"staged") |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(observerAdapters(&store, &staged) == usize.ONE, "an observation records one adapter address")
+  run Testing.expect(adapterCall(&store, &staged) == 7 && adapterReadsStoredField(&store, &staged),
+    "a section's adapter passes the six event operands and the stored lane read through the callable's loan")
+  let captured = run observingMir(&mut store, &mut request, &id, b"captured") |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(observerAdapters(&store, &captured) == usize.ONE && adapterCall(&store, &captured) == 7,
+    "an anonymous callback's adapter lends the environment first, then the six event operands")
+  let paired = run observingMir(&mut store, &mut request, &id, b"paired") |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(observerAdapters(&store, &paired) == 2, "two observations at one run site record distinct adapters")
+  let consumed = run observingMir(&mut store, &mut request, &id, b"consumed") |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(backendGapAt(&consumed, GapCode.ObserverCallback, text,
+    "run Intrinsic.observeDiagnostics(Tally { events: 0 }, guarded(Guard { code: 1 }), body())", usize.ZERO),
+    "a callback that consumes its stored argument keeps the observer-callback gap")
+  return ()
+}
+
+// The distinct observation adapters whose addresses one MIR function stores.
+fn observerAdapters(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> usize {
+  let selected = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(answer, selectedMirIndex)
+  let mut first = usize.MAX
+  let mut count = usize.ZERO
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index) {
+      let blocks = Vector<MirBlock>.asSlice(&function.blocks)
+      let mut at = usize.ZERO
+      while at < blocks.length {
+        let statements = Vector<MirStatement>.asSlice(&blocks[at].statements)
+        let mut step = usize.ZERO
+        while step < statements.length {
+          if let MirStatement.Assign {value: MirRvalue.FunctionAddress {key: InstanceKey.Helper {ordinal, purpose, ..}}, ..} = &statements[step] {
+            if purpose == HelperRole.Observe && ordinal != first {
+              if count == usize.ZERO { first = ordinal }
+              count = count + usize.ONE
+            }
+          }
+          step = step + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return count
+}
+
+// The observation adapter lowered with this function, which its creator's MIR answer precedes.
+fn adapterOf<'a>(store: &'a Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> Option<&'a MirFunction> {
+  let selected = Shared<Result<Answer, NoRejection>>.with<Option<usize>>(answer, selectedMirIndex)
+  if let Option<usize>.Some {value: index} = move selected {
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(store, index + usize.ONE) {
+      if let InstanceKey.Helper {purpose, ..} = &function.key {
+        if purpose == HelperRole.Observe { return Option<&MirFunction>.some(function) }
+      }
+    }
+  }
+  return Option<&MirFunction>.none()
+}
+
+// The argument count of the adapter's call of its callback, or `usize.MAX` without one.
+fn adapterCall(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> usize {
+  if let Option<&MirFunction>.Some {value: adapter} = move adapterOf(store, answer) {
+    let blocks = Vector<MirBlock>.asSlice(&adapter.blocks)
+    let mut at = usize.ZERO
+    while at < blocks.length {
+      if let MirTerminator.Call {callee: MirCallee.Instance {..}, arguments, ..} = &blocks[at].terminator {
+        return Vector<MirOperand>.length(&arguments)
+      }
+      at = at + usize.ONE
+    }
+  }
+  return usize.MAX
+}
+
+// Whether the adapter's callback call reads a stored lane through the callable's loan.
+fn adapterReadsStoredField(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>) -> bool {
+  if let Option<&MirFunction>.Some {value: adapter} = move adapterOf(store, answer) {
+    let blocks = Vector<MirBlock>.asSlice(&adapter.blocks)
+    let mut at = usize.ZERO
+    while at < blocks.length {
+      if let MirTerminator.Call {callee: MirCallee.Instance {..}, arguments, ..} = &blocks[at].terminator {
+        let listed = Vector<MirOperand>.asSlice(&arguments)
+        let mut operand = usize.ZERO
+        while operand < listed.length {
+          if let MirOperand.Copy {place} = &listed[operand] {
+            let steps = Vector<MirProjection>.asSlice(&place.projections)
+            if place.local == usize.ONE && steps.length == 2 && mirProjectionIsDeref(&steps[usize.ZERO]) { return true }
+          }
+          operand = operand + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return false
+}
+
 // A fallible function of an observing program takes the observer and cause after its parameters
 // and providers, then the success, failure and context out-addresses, and `fail` stores its
 // context through the caller's `%context` (N3).
@@ -7097,8 +7221,9 @@ effect fn pick(values: &[i32], at: usize) -> i32 { return values[at] }
     "an unchanged byte offset uses the current line map for the emitted site label")
   let declarations = run LlvmText.declarations(&target) |> Effect.provideMut<Allocator>(&mut allocator)
   run Testing.expect(containsIr(Bytes.asSlice(&declarations), b"define internal void @\"silk.diagnostic.fatal\"(ptr %observer, ptr %cause, ptr %reason, ptr %origin) noinline cold {")
-    && containsIr(Bytes.asSlice(&declarations), b"call i64 %callback(ptr %state, i8 6, i64 %first, i64 0, ptr %reason, ptr %origin, ptr null, ptr null)"),
-    "the fatal dispatch helper reports event 6 with the selected cause handle")
+    && containsIr(Bytes.asSlice(&declarations), b"%callableAddress = getelementptr i8, ptr %observer, i64 16")
+    && containsIr(Bytes.asSlice(&declarations), b"call i64 %callback(ptr %callable, ptr %state, i8 6, i64 %first, i64 0, ptr %reason, ptr %origin, ptr null, ptr null)"),
+    "the fatal dispatch helper reports event 6 through the record's adapter with the selected cause handle")
   return ()
 }
 
@@ -7338,8 +7463,9 @@ fn observerEvents(store: &Semantic, answer: &Shared<Result<Answer, NoRejection>>
       while at < blocks.length {
         if let MirTerminator.Call {callee: MirCallee.Indirect {..}, arguments, ..} = &blocks[at].terminator {
           let listed = Vector<MirOperand>.asSlice(&arguments)
-          if listed.length > usize.ONE {
-            if let MirOperand.Integer {decimal, ..} = &listed[usize.ONE] {
+          // The adapter takes the callback's address and the state's before the event.
+          if listed.length > 2 {
+            if let MirOperand.Integer {decimal, ..} = &listed[2] {
               if sameText(Bytes.asSlice(&decimal), event) { count = count + usize.ONE }
             }
           }
