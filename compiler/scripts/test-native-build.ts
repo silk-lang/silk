@@ -171,6 +171,41 @@ const program = Effect.gen(function* () {
   assert.match(greeted.stdout, /Hello, world!/)
   const repeated = yield* invoke(silkc, ['init', 'greeting'], directory)
   assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
+  // A project `build` names its manifest instead of discovering one, and `--release` selects the
+  // release profile directory; `run` refuses a foreign target before building anything.
+  const manifest = join('greeting', 'silk.toml')
+  const released = yield* invoke(
+    silkc,
+    [
+      'build',
+      '--manifest-path',
+      manifest,
+      '--release',
+      '--target',
+      'host',
+      '--stdlib',
+      standardLibrary,
+    ],
+    directory,
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(released.status, 0, released.stderr)
+  assert.match(released.stdout, /Build summary: 1 succeeded, 0 failed/)
+  assert.equal(
+    yield* fs.exists(join(directory, 'greeting/build/llvm', hostTarget, 'release/greeting')),
+    true,
+  )
+  const foreignRun = yield* invoke(
+    silkc,
+    ['run', '--manifest-path', manifest, '--target', foreign, '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILKC_CLANG: sentinel },
+  )
+  assert.equal(foreignRun.status, 2, 'run must refuse a foreign target')
+  assert.equal(yield* fs.exists(marker), false)
+  const cleanedByPath = yield* invoke(silkc, ['clean', '--manifest-path', manifest], directory)
+  assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
+  assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
   // An object form needs no `main` and no runtime: the application's C exports are its roots.
   const library = join(directory, 'library')
   yield* fs.makeDirectory(join(library, 'src'), { recursive: true })
@@ -186,7 +221,7 @@ const program = Effect.gen(function* () {
     join(library, 'consumer.c'),
     'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
   )
-  const manifest = (inputs: string, artifact = 'object') =>
+  const libraryManifest = (inputs: string, artifact = 'object') =>
     `[package]\nname = "library"\nroot = "src/Main.silk"\n\n[build]\nartifact = "${artifact}"\nnative-link-inputs = [${inputs}]\n`
   const tools = dirname(clang)
   const inspect = Effect.fnUntraced(function* (object: string) {
@@ -213,7 +248,7 @@ const program = Effect.gen(function* () {
     standardLibrary,
     ...selectors,
   ]
-  yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
+  yield* fs.writeFileString(join(library, 'silk.toml'), libraryManifest(''))
   const object = yield* invoke(silkc, libraryArguments('silk.o'), library, {
     ...process.env,
     SILKC_CLANG: clang,
@@ -237,7 +272,7 @@ const program = Effect.gen(function* () {
   assert.equal(consumer.status, 0, consumer.stderr)
   assert.equal((yield* invoke(join(library, 'consumer'), [], library)).status, 0)
   // Declared objects are merged into the object by a relocatable link.
-  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('{ object = "offset.o" }'))
+  yield* fs.writeFileString(join(library, 'silk.toml'), libraryManifest('{ object = "offset.o" }'))
   const merged = yield* invoke(silkc, libraryArguments('merged.o'), library, {
     ...process.env,
     SILKC_CLANG: clang,
@@ -257,7 +292,7 @@ const program = Effect.gen(function* () {
   // A library input cannot be merged into a relocatable object.
   yield* fs.writeFileString(
     join(library, 'silk.toml'),
-    manifest('{ library = "m", mode = "dynamic" }'),
+    libraryManifest('{ library = "m", mode = "dynamic" }'),
   )
   const unmergeable = yield* invoke(silkc, libraryArguments('unmergeable.o'), library, {
     ...process.env,
@@ -267,7 +302,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'unmergeable.o')), false)
   assert.equal(yield* fs.exists(marker), false)
   // An object for each supported native target is compiled for that target without a linker.
-  yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
+  yield* fs.writeFileString(join(library, 'silk.toml'), libraryManifest(''))
   for (const [target, machine] of [
     ['x86_64-unknown-linux-gnu', /Format: elf64-x86-64/],
     ['aarch64-unknown-linux-gnu', /Format: elf64-littleaarch64/],
@@ -295,7 +330,7 @@ const program = Effect.gen(function* () {
   assert.match(formText, /^define [^\n]*@"?silk_answer"?\(/m)
   assert.doesNotMatch(formText, /^define [^\n]*@"?main"?\(/m)
   // Intermediate stages compile for their target and merge no declared inputs.
-  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('{ object = "offset.o" }'))
+  yield* fs.writeFileString(join(library, 'silk.toml'), libraryManifest('{ object = "offset.o" }'))
   const assembly = yield* invoke(
     silkc,
     libraryArguments('form.s', '--emit', 'assembly', '--target', 'aarch64-unknown-linux-gnu'),
@@ -336,7 +371,7 @@ const program = Effect.gen(function* () {
   const archiveEnvironment = { ...inherited, SILKC_CLANG: clang }
   yield* fs.writeFileString(
     join(library, 'silk.toml'),
-    manifest('{ object = "offset.o" }', 'static-library'),
+    libraryManifest('{ object = "offset.o" }', 'static-library'),
   )
   const bundled = yield* invoke(silkc, libraryArguments('libsilk.a'), library, archiveEnvironment)
   assert.equal(bundled.status, 0, bundled.stderr)
@@ -349,7 +384,7 @@ const program = Effect.gen(function* () {
   assert.equal(bundledConsumer.status, 0, bundledConsumer.stderr)
   assert.equal((yield* invoke(join(library, 'bundled-consumer'), [], library)).status, 0)
   // Rebuilding replaces the archive, so a member the build no longer declares disappears.
-  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', 'static-library'))
+  yield* fs.writeFileString(join(library, 'silk.toml'), libraryManifest('', 'static-library'))
   const rebuilt = yield* invoke(silkc, libraryArguments('libsilk.a'), library, archiveEnvironment)
   assert.equal(rebuilt.status, 0, rebuilt.stderr)
   assert.deepEqual(yield* members('libsilk.a'), ['libsilk.a.silkc.o'])
@@ -384,7 +419,7 @@ const program = Effect.gen(function* () {
   // An archive is not nested in another, and a failing archiver leaves no archive or member.
   yield* fs.writeFileString(
     join(library, 'silk.toml'),
-    manifest('{ static-archive = "libsilk.a" }', 'static-library'),
+    libraryManifest('{ static-archive = "libsilk.a" }', 'static-library'),
   )
   const nested = yield* invoke(silkc, libraryArguments('nested.a'), library, {
     ...process.env,
@@ -393,7 +428,7 @@ const program = Effect.gen(function* () {
   assert.notEqual(nested.status, 0, 'an archive input was nested in a static library')
   assert.equal(yield* fs.exists(join(library, 'nested.a')), false)
   assert.equal(yield* fs.exists(marker), false)
-  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', 'static-library'))
+  yield* fs.writeFileString(join(library, 'silk.toml'), libraryManifest('', 'static-library'))
   const unarchived = yield* invoke(silkc, libraryArguments('unarchived.a'), library, {
     ...process.env,
     SILKC_CLANG: clang,
@@ -404,7 +439,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'unarchived.a.silkc.o')), false)
   yield* fs.remove(marker)
   // The shared library form is not native yet and is refused before any tool runs.
-  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', 'shared-library'))
+  yield* fs.writeFileString(join(library, 'silk.toml'), libraryManifest('', 'shared-library'))
   const refused = yield* invoke(silkc, libraryArguments('refused'), library, {
     ...process.env,
     SILKC_CLANG: sentinel,
@@ -413,7 +448,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
