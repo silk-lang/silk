@@ -55,7 +55,7 @@
 //! Replacement is a write to its place; supported primitives are calls to their contracts.
 
 import semantic.Types {Types}
-import hir.Hir {Access, CallableMode, InfixOperator}
+import hir.Hir {Access, CallableMode, InfixOperator, OwnerKind}
 import semantic.SourceLocations {Location}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime}
@@ -82,6 +82,8 @@ import semantic.TypedBody {
   SubjectAccess,
 }
 import silk.allocator {Allocator, OutOfMemoryError}
+import silk.effect {Effect}
+import silk.testing {AssertionError, Testing}
 import silk.option {Option}
 import silk.ownership {Copy}
 import silk.shared {Shared}
@@ -3141,8 +3143,7 @@ fn reaches(entering: &[u64], width: usize, point: usize, bit: usize) -> bool {
 /// `owner` is the body's declaration, `locals` and `nodes` its typed locals and nodes, and `root`
 /// its root node. Conflicts and uses of moved places are reported in evaluation order; the first
 /// one is returned.
-pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], root: NodeId, pending: bool,
-  obligations: &[SafetyObligation], cleanup: Vector<LoanCleanup>) -> Verdict
+pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], root: NodeId, pending: bool, obligations: &[SafetyObligation], cleanup: Vector<LoanCleanup>) -> Verdict
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   // Each region relation typing left open is a premise of the calls it admitted: its offered
   // region outlives its wanted one. Retained capture contents relate regions this walk does not
@@ -3366,10 +3367,284 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
   if unknown {
     return verdict(Outcome.NotChecked, BorrowStatus.Imprecise)
   }
-  if !pending && !walker.crossed && run regionClosed(owner, locals, nodes) {
+  let mut relationsProved = !pending
+  if pending && !walker.crossed {
+    relationsProved = run localRelationsProved(&walker, owner, obligations, Vector<usize>.asSlice(&bits),
+      Vector<u64>.asSlice(&liveOut), width, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
+  }
+  if relationsProved && !walker.crossed && run regionClosed(owner, locals, nodes) {
     return verdict(Outcome.Clear, BorrowStatus.Checked)
   }
   return verdict(Outcome.Clear, BorrowStatus.Regions)
+}
+
+// R3 uses the Walker's points and edges. Required sets over-approximate its exact loan flow;
+// available sets under-approximate storage validity. A successful inclusion is a proof. A failed
+// inclusion in this conservative slice stays pending: the exact End/access walk above owns
+// OWN0019/conflict diagnostics. No approximate result can upgrade a body to Checked.
+struct RegionPoints {
+  region: Shared<Lifetime>
+  required: Vector<u64>
+  available: Vector<u64>
+}
+
+struct RegionEdge {
+  shorter: usize
+  longer: usize
+}
+
+impl Copy for RegionEdge {}
+
+enum RegionDomain { Universal, Local, Unknown }
+
+fn regionDomain(region: &Shared<Lifetime>, owner: &DeclarationId) -> RegionDomain {
+  return Shared<Lifetime>.with<RegionDomain>(region, fn(atom: &Lifetime) -> RegionDomain {
+    return match &atom.* {
+      Lifetime.Static => RegionDomain.Universal
+      Lifetime.Parameter {declaration, ..} => {
+        let kind = DeclarationId.kind(&declaration)
+        if DeclarationId.equals(&declaration, owner) && kind != OwnerKind.Anonymous && kind != OwnerKind.EffectBlock {
+          return RegionDomain.Universal
+        }
+        return RegionDomain.Unknown
+      }
+      Lifetime.Local {declaration, ..} => {
+        if DeclarationId.equals(&declaration, owner) { return RegionDomain.Local }
+        return RegionDomain.Unknown
+      }
+      _ => RegionDomain.Unknown
+    }
+  })
+}
+
+fn includeRegionPoint(bits: &mut Vector<u64>, point: usize) -> bool {
+  let words = Vector<u64>.asMutSlice(&mut bits.*)
+  let word = wordOf(point)
+  let before = words[word]
+  words[word] = u64.bitOr(before, maskOf(point))
+  return before != words[word]
+}
+
+fn excludeRegionPoint(bits: &mut Vector<u64>, point: usize) -> bool {
+  let words = Vector<u64>.asMutSlice(&mut bits.*)
+  let word = wordOf(point)
+  let before = words[word]
+  words[word] = u64.bitAnd(before, u64.bitNot(maskOf(point)))
+  return before != words[word]
+}
+
+// Availability is a must fact: an entry path without the loan, or any overlapping storage end,
+// write, move or drop, removes validity on every following path until this borrow is created
+// again. Propagating exclusions on the existing CFG handles joins and loop back edges without
+// flattening scope ends into numeric ranges. Extra exclusions merely keep a relation pending.
+effect fn localAvailable(walker: &Walker, loan: &Loan, available: &mut Vector<u64>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut queue = Vector<usize>.make()
+  // check() creates exit at zero and entry at one; neither is a separate region graph.
+  if loan.created != usize.ONE && excludeRegionPoint(&mut available.*, usize.ONE) {
+    run Vector<usize>.append(&mut queue, usize.ONE)
+  }
+  let events = Vector<Event>.asSlice(&walker.events)
+  let mut at = usize.ZERO
+  while at < events.length {
+    let event = &events[at]
+    let ends = event.kind == Kind.End || event.kind == Kind.Expire || event.kind == Kind.Write
+      || event.kind == Kind.Move || event.kind == Kind.Drop
+    let descriptorWrite = event.kind == Kind.Write && behind(&event.place, &loan.place)
+    if ends && !descriptorWrite && event.point != loan.created && overlap(&event.place, &loan.place) != usize.ZERO
+      && excludeRegionPoint(&mut available.*, event.point) {
+      run Vector<usize>.append(&mut queue, event.point)
+    }
+    at = at + usize.ONE
+  }
+  let points = Vector<Point>.asSlice(&walker.points)
+  at = usize.ZERO
+  while at < Vector<usize>.length(&queue) {
+    let point = Vector<usize>.asSlice(&queue)[at]
+    let next = Vector<usize>.asSlice(&points[point].next)
+    let mut edge = usize.ZERO
+    while edge < next.length {
+      if next[edge] != loan.created && excludeRegionPoint(&mut available.*, next[edge]) {
+        run Vector<usize>.append(&mut queue, next[edge])
+      }
+      edge = edge + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Each local atom must authenticate to one exact Walker loan. Ambiguous, absent, outside-owner,
+// invocation, supplied and meet terms remain pending. This covers the shared parameter-reborrow
+// floor first, without assigning validity to a source ordinal that has no loan in this walk.
+effect fn regionPoints(walker: &Walker, owner: &DeclarationId, region: &Shared<Lifetime>,
+  bits: &[usize], liveOut: &[u64], width: usize, definitions: &[u64], definitionWidth: usize,
+  regions: &mut Vector<RegionPoints>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let existing = Vector<RegionPoints>.asSlice(&regions.*)
+  let mut at = usize.ZERO
+  while at < existing.length {
+    if Lifetime.equalsShared(&existing[at].region, region) { return at }
+    at = at + usize.ONE
+  }
+  let domain = regionDomain(region, owner)
+  if domain == RegionDomain.Unknown { return usize.MAX }
+  let loans = Vector<Loan>.asSlice(&walker.loans)
+  let mut selected = usize.MAX
+  if domain == RegionDomain.Local {
+    at = usize.ZERO
+    while at < loans.length {
+      let named = Vector<Shared<Lifetime>>.asSlice(&loans[at].regions)
+      let mut atom = usize.ZERO
+      let mut found = false
+      while atom < named.length {
+        if Lifetime.equalsShared(&named[atom], region) { found = true }
+        atom = atom + usize.ONE
+      }
+      if found {
+        if selected != usize.MAX || loans[at].approximate { return usize.MAX }
+        selected = at
+      }
+      at = at + usize.ONE
+    }
+    if selected == usize.MAX { return usize.MAX }
+  }
+  let pointCount = Vector<Point>.length(&walker.points)
+  let words = (pointCount + 63) / 64
+  let mut required = Vector<u64>.make()
+  let mut available = Vector<u64>.make()
+  at = usize.ZERO
+  while at < words {
+    let mut initial: u64 = 0
+    if domain == RegionDomain.Universal { initial = u64.bitNot(0) }
+    run Vector<u64>.append(&mut required, initial)
+    run Vector<u64>.append(&mut available, u64.bitNot(0))
+    at = at + usize.ONE
+  }
+  if selected != usize.MAX {
+    let loan = &loans[selected]
+    if loan.created >= pointCount { return usize.MAX }
+    run localAvailable(walker, loan, &mut available)
+    includeRegionPoint(&mut required, loan.created)
+    let intervals = Vector<Interval>.asSlice(&loan.intervals)
+    at = usize.ZERO
+    while at < intervals.length {
+      let interval = intervals[at]
+      if interval.from >= pointCount || interval.to >= pointCount { return usize.MAX }
+      if interval.definition == usize.MAX || reaches(definitions, definitionWidth, interval.read, interval.definition) {
+        // Numeric interval interiors may include sibling-arm points. Requiring those extra points
+        // is conservative; it cannot prove a relation that its actual paths violate.
+        let mut point = interval.from
+        while point <= interval.to {
+          includeRegionPoint(&mut required, point)
+          point = point + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+    if width > usize.ZERO {
+      at = usize.ZERO
+      while at < pointCount {
+        if heldLive(walker, selected, bits, liveOut, width, definitions, definitionWidth, at) {
+          includeRegionPoint(&mut required, at)
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  let index = Vector<RegionPoints>.length(&regions.*)
+  run Vector<RegionPoints>.append(&mut regions.*, RegionPoints {region: Shared<Lifetime>.clone(region),
+    required: move required, available: move available})
+  return index
+}
+
+// Worklist edges point shorter -> longer (§4.3). Keeping a boundary's edge active everywhere
+// over-approximates its location-sensitive requirements. Failed inclusions therefore stay pending
+// until that finer proof exists; successful inclusions discharge the complete original relation.
+effect fn localRelationsProved(walker: &Walker, owner: &DeclarationId, obligations: &[SafetyObligation],
+  bits: &[usize], liveOut: &[u64], width: usize, definitions: &[u64], definitionWidth: usize) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let loans = Vector<Loan>.asSlice(&walker.loans)
+  let mut at = usize.ZERO
+  while at < loans.length {
+    if loans[at].approximate { return false }
+    at = at + usize.ONE
+  }
+  let mut regions = Vector<RegionPoints>.make()
+  let mut edges = Vector<RegionEdge>.make()
+  at = usize.ZERO
+  while at < obligations.length {
+    match &obligations[at] {
+      SafetyObligation.RegionRelation {offered, wanted, provisionalStatic, ..} => {
+        if provisionalStatic { return false }
+        let longer = regionDomain(&offered, owner)
+        let shorter = regionDomain(&wanted, owner)
+        // The caller's 2a check has already proved these rigid relations from declared premises.
+        if longer != RegionDomain.Universal || shorter != RegionDomain.Universal {
+          let source = run regionPoints(walker, owner, &wanted, bits, liveOut, width, definitions, definitionWidth, &mut regions)
+          let target = run regionPoints(walker, owner, &offered, bits, liveOut, width, definitions, definitionWidth, &mut regions)
+          if source == usize.MAX || target == usize.MAX { return false }
+          run Vector<RegionEdge>.append(&mut edges, RegionEdge {shorter: source, longer: target})
+        }
+      }
+      SafetyObligation.Contents {..} => { return false }
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  return run solveRegionRequirements(&mut regions, Vector<RegionEdge>.asSlice(&edges))
+}
+
+effect fn solveRegionRequirements(regions: &mut Vector<RegionPoints>, links: &[RegionEdge]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut queue = Vector<usize>.make()
+  let mut queued = Vector<bool>.make()
+  let mut at = usize.ZERO
+  while at < Vector<RegionPoints>.length(&regions.*) {
+    run Vector<usize>.append(&mut queue, at)
+    run Vector<bool>.append(&mut queued, true)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < Vector<usize>.length(&queue) {
+    let source = Vector<usize>.asSlice(&queue)[at]
+    Vector<bool>.asMutSlice(&mut queued)[source] = false
+    let mut edge = usize.ZERO
+    while edge < links.length {
+      let link = links[edge]
+      if link.shorter == source && link.longer != source {
+        let count = Vector<u64>.length(&Vector<RegionPoints>.asSlice(&regions.*)[source].required)
+        let mut word = usize.ZERO
+        let mut changed = false
+        while word < count {
+          let added = Vector<u64>.asSlice(&Vector<RegionPoints>.asSlice(&regions.*)[source].required)[word]
+          let words = Vector<u64>.asMutSlice(&mut Vector<RegionPoints>.asMutSlice(&mut regions.*)[link.longer].required)
+          let before = words[word]
+          words[word] = u64.bitOr(before, added)
+          if before != words[word] { changed = true }
+          word = word + usize.ONE
+        }
+        if changed && !Vector<bool>.asSlice(&queued)[link.longer] {
+          Vector<bool>.asMutSlice(&mut queued)[link.longer] = true
+          run Vector<usize>.append(&mut queue, link.longer)
+        }
+      }
+      edge = edge + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let solved = Vector<RegionPoints>.asSlice(&regions.*)
+  at = usize.ZERO
+  while at < solved.length {
+    let required = Vector<u64>.asSlice(&solved[at].required)
+    let available = Vector<u64>.asSlice(&solved[at].available)
+    let mut word = usize.ZERO
+    while word < required.length {
+      if u64.bitAnd(required[word], u64.bitNot(available[word])) != 0 { return false }
+      word = word + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return true
 }
 
 /// Whether every region a body's locals and values name is `'static`, a loan region of the body or
@@ -3425,4 +3700,42 @@ effect fn typeRegionClosed(ty: &Shared<Type>, owner: &DeclarationId) -> bool ! O
     at = at + usize.ONE
   }
   return true
+}
+
+
+test effect fn regionWorklistPropagatesThroughCycles() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run regionWorklistClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn regionWorklistClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut regions = Vector<RegionPoints>.make()
+  let mut at = usize.ZERO
+  while at < 3 {
+    let mut required = Vector<u64>.make()
+    let mut available = Vector<u64>.make()
+    let mut seed: u64 = 0
+    let mut permitted: u64 = 2
+    if at == 2 { seed = 2 }
+    if at == usize.ZERO { permitted = 0 }
+    run Vector<u64>.append(&mut required, seed)
+    run Vector<u64>.append(&mut available, permitted)
+    // The set solver uses opaque region indices; domain authentication is tested by source Cases.
+    run Vector<RegionPoints>.append(&mut regions, RegionPoints {
+      region: run Shared<Lifetime>.make(Lifetime.Invocation {ordinal: at}), required: move required, available: move available})
+    at = at + usize.ONE
+  }
+  let mut edges = Vector<RegionEdge>.make()
+  run Vector<RegionEdge>.append(&mut edges, RegionEdge {shorter: 1, longer: 0})
+  run Vector<RegionEdge>.append(&mut edges, RegionEdge {shorter: 2, longer: 1})
+  run Vector<RegionEdge>.append(&mut edges, RegionEdge {shorter: 1, longer: 2})
+  let impossible = run solveRegionRequirements(&mut regions, Vector<RegionEdge>.asSlice(&edges))
+  run Testing.expect(!impossible, "a required point reaches an unavailable region through a transitive cycle")
+  let required = Vector<u64>.asSlice(&Vector<RegionPoints>.asSlice(&regions)[usize.ZERO].required)[usize.ZERO]
+  run Testing.expect(required == 2, "requirements propagate from shorter to longer even after its first queue visit")
+  let entries = Vector<RegionPoints>.asMutSlice(&mut regions)
+  Vector<u64>.asMutSlice(&mut entries[usize.ZERO].available)[usize.ZERO] = 2
+  let possible = run solveRegionRequirements(&mut regions, Vector<RegionEdge>.asSlice(&edges))
+  run Testing.expect(possible, "the same obligations are proved when all propagated points are available")
+  return ()
 }

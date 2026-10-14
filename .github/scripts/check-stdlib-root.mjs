@@ -29,6 +29,18 @@ for (const module of startup) {
   if (!modules.includes(module)) throw new Error(`Missing startup module ${module}`)
 }
 
+// A keyword-spelled final segment cannot become the implicit binding (IMPORT-007, PAR0004).
+const keywords = new Set(
+  'pub struct enum union type service interface role effect fn run fail drop unsafe impl for return import as let const mut once move match if else while break continue true false'.split(
+    ' ',
+  ),
+)
+const importOf = (module) => {
+  const segment = module.slice(module.lastIndexOf('/') + 1)
+  const path = module.replaceAll('/', '.')
+  return keywords.has(segment) ? `import ${path} as ${segment}Module` : `import ${path}`
+}
+
 const source = [
   '//! Ordinary package root that loads every standard-library module except application startup.',
   '//! Regenerate with `node .github/scripts/check-stdlib-root.mjs --write`.',
@@ -36,7 +48,7 @@ const source = [
   ...modules
     .filter((module) => !startup.has(module))
     .sort()
-    .map((module) => `import ${module.replaceAll('/', '.')}`),
+    .map(importOf),
   '',
   'pub fn main() -> i32 { return 0 }',
   '',
