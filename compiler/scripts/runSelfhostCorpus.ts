@@ -468,6 +468,7 @@ export const runCase = async (
           reason: `profile ${profile.name}: build: ${processFailure(built)}`,
         }
       }
+      if (profile === profiles[0]) for (const line of built.stderr.split('\n')) if (line.startsWith('; PROBE R3 ')) console.log(`R3_PROGRAM=${program.name} ${line}`)
       borrowGap ??= parseBorrowGap(built.stderr)
 
       for (const [ordinal, invocation] of (program.nativeRuns ?? [{}]).entries()) {
