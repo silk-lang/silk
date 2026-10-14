@@ -157,7 +157,7 @@ to approve, without waiving those gates.
   [Semantic.silk](https://github.com/silk-lang/silk/blob/91c27eb4d20d7da3f4b7a7fe4759c2eb27c74cb7/compiler/src/semantic/Semantic.silk#L3743-L3950)
   records scoped declaration, name, namespace, and location reads and marks unscoped present
   reads transient.
-- [Incremental architecture v2](incremental-architecture-v2.md#3-1-fingerprints) §3.1–3.5
+- [Incremental architecture v2](incremental-architecture-v2.md#31-fingerprints) §3.1–3.5
   defines fingerprint and identity intent, §5 the one-shot recording policy, and §11 the
   earlier disk-cache decision. The note is an approved architecture, not a statement that
   every slice has landed.
@@ -167,5 +167,5 @@ to approve, without waiving those gates.
   [declaration sweep](https://github.com/silk-lang/silk/blob/4be687d5cf5b28f460bfc6c27eb75f9352824605/compiler/src/semantic/Semantic.silk#L67008-L67074),
   [analysis-only closure](https://github.com/silk-lang/silk/blob/4be687d5cf5b28f460bfc6c27eb75f9352824605/compiler/src/semantic/Semantic.silk#L67337),
   and [build pass](https://github.com/silk-lang/silk/blob/4be687d5cf5b28f460bfc6c27eb75f9352824605/compiler/src/semantic/Semantic.silk#L69676-L69700)
-  keep those checks distinct. [Native borrow checking](native-borrow-checking.md#4-5-captures-effects-and-local-sharing)
+  keep those checks distinct. [Native borrow checking](native-borrow-checking.md#45-captures-effects-and-local-sharing)
   §4.5 explicitly excludes OWN0016 from a per-body `Checked` verdict.
