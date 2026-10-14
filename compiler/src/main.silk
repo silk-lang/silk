@@ -34,14 +34,14 @@ import semantic.ExecutionStorage {ExecutionStorage}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.Query {Cycle}
 import semantic.TypedBody {uncheckedReasonName}
-import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, MissingManifest}
+import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, MissingManifest, ModuleSources}
 import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput}
 import driver.CommandPath
 import driver.NativeToolchain
 import driver.InstalledCompiler
 import driver.ProcessImage
 import driver.Project as Projects {Project, ProjectError}
-import driver.ProjectCommand as ProjectCommands {Build as BuildCommand, Clean as CleanCommand, Init as InitCommand, InvalidProjectCommand, Options as ProjectOptions, Run as RunCommand}
+import driver.ProjectCommand as ProjectCommands {Build as BuildCommand, Check as CheckCommand, Clean as CleanCommand, Init as InitCommand, InvalidProjectCommand, Options as ProjectOptions, Run as RunCommand}
 import driver.ProjectProfile as ProjectProfiles {Code as ProfileCode}
 import driver.ProjectPlan as ProjectPlans {PlanError, ProjectPlan}
 import driver.ProjectInitializer as ProjectInitializers {InitializationError, Initialized}
@@ -82,7 +82,7 @@ import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.InstanceKey {InstanceKey}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
-import semantic.Rejection as Rejections {Rejection, RejectionCode}
+import semantic.Rejection as Rejections {RelatedSite, Rejection, RejectionCode}
 import silk.shared {Shared}
 import silk.u8
 
@@ -118,6 +118,7 @@ union Request {
   Init {command: InitCommand},
   Clean {command: CleanCommand},
   ProjectBuild {command: BuildCommand},
+  Check {command: CheckCommand},
   Help,
   Version,
 }
@@ -283,7 +284,7 @@ effect fn runRequest(count: usize) -> RunCommand
 /// target links an executable; another target emits LLVM IR.
 // The command-line synopsis that `--help` prints and a malformed command line repeats.
 fn usage() -> &'static [u8] {
-  return b"silkc: usage: silkc build <source> -o <output> [--emit executable|llvm-ir] [--target <triple>] [--stdlib <directory>] [--optimization none|speed] [--debug true|false] [--stats]\n       silkc test <root> -o <executable> [--stdlib <directory>] [--filter <text>] [--file <path>] [--optimization none|speed] [--debug true|false] --no-cache\n       silkc build [--manifest-path <path>] [--target <host|triple>]... [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>]\n       silkc run [--manifest-path <path>] [--target <host|triple>] [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>] [arguments...] [-- arguments...]\n       silkc init [path] [--name <name>]\n       silkc clean [--manifest-path <path>]\n       silkc --help | --version\n"
+  return b"silkc: usage: silkc build <source> -o <output> [--emit executable|llvm-ir] [--target <triple>] [--stdlib <directory>] [--optimization none|speed] [--debug true|false] [--stats]\n       silkc test <root> -o <executable> [--stdlib <directory>] [--filter <text>] [--file <path>] [--optimization none|speed] [--debug true|false] --no-cache\n       silkc build [--manifest-path <path>] [--target <host|triple>]... [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>]\n       silkc run [--manifest-path <path>] [--target <host|triple>] [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>] [arguments...] [-- arguments...]\n       silkc check [--manifest-path <path>] [--target <host|triple>]... [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>] [--json]\n       silkc init [path] [--name <name>]\n       silkc clean [--manifest-path <path>]\n       silkc --help | --version\n"
 }
 
 // The compiler's release, its package version in `compiler/silk.toml`.
@@ -319,6 +320,17 @@ effect fn request() -> Request
       return match move parsed {
         Result<CleanCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.Clean {command: move value}
         Result<CleanCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+          InvalidProjectCommand invalid => run invalidArgumentCount(count)
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    if same(Bytes.asSlice(&command), b"check") {
+      let arguments = run commandArguments(count)
+      let parsed = run Effect.result(ProjectCommands.parseCheck(Vector<Bytes>.asSlice(&arguments)))
+      return match move parsed {
+        Result<CheckCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.Check {command: move value}
+        Result<CheckCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
           InvalidProjectCommand invalid => run invalidArgumentCount(count)
           OutOfMemoryError exhausted => { fail move exhausted }
         }
@@ -682,11 +694,40 @@ union Compiled {
   Tests {identities: Vector<Bytes>},
 }
 
-effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, kind: BuildOutput, standardLibrary: Option<Path>, profile: InitialProfile, bindings: Vector<Supplied>, testing: bool, stats: bool) -> Compiled
+// How a command writes the language rejections and refusals of one analysis.
+union DiagnosticFormat {
+  /// One `SILK_BUILD_ERROR=` or `SILK_UNSUPPORTED_JSON=` line each, for the build harnesses.
+  Machine,
+  /// `path:line:col: error[CODE]`, as the TypeScript CLI prints a diagnostic without its message.
+  Human,
+  /// One JSON object per line, naming the analysis `target`.
+  Json {target: Bytes},
+}
+
+// The analysis state a build or check holds once its profile is assembled.
+struct Analysis {
+  sources: ModuleSources
+  store: Semantic
+  request: SemanticRequest
+  rootPackage: Vector<ModuleId>
+  identity: ModuleId
+  runtime: ModuleId
+}
+
+union Prepared {
+  Ready {analysis: Analysis},
+  Finished {status: i32},
+}
+
+// Loads the program rooted at `sourcePath` (within `manifest`'s package when given), publishes
+// every module reachable through imports, and assembles the final profile with `bindings`. A test
+// analysis is rooted at the bundled runner. A refused profile is reported in `format` and answers
+// its status instead, appended to `out`.
+effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: Option<Path>, profile: &InitialProfile, bindings: Vector<Supplied>, testing: bool, format: &DiagnosticFormat, out: &mut Bytes) -> Prepared
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
-  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
-  let libc = match move InitialProfile.text(&profile, b"libc") {
+  let target = Target.forId(Target.id(InitialProfile.target(profile)))
+  let libc = match move InitialProfile.text(profile, b"libc") {
     Option<&[u8]>.Some {value} => run Bytes.copy(value)
     Option<&[u8]>.None => run invalidBuildProfile()
   }
@@ -699,14 +740,6 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, kind:
   // A test build's application is the bundled runner; the source file is its discovery root.
   let mut application = ModuleId.copy(&identity)
   if testing { application = run ModuleSourceFiles.module(&sources, b"silk/test_runner.silk") }
-  let optimization = match move InitialProfile.text(&profile, b"optimization") {
-    Option<&[u8]>.Some {value} => run Bytes.copy(value)
-    Option<&[u8]>.None => run invalidBuildProfile()
-  }
-  let debug = match move InitialProfile.flag(&profile, b"debug") {
-    Option<bool>.Some {value} => value
-    Option<bool>.None => run invalidBuildProfile()
-  }
   // One build sees the whole program: every module reachable through imports from the build's
   // roots is published before semantic analysis starts.
   run ModuleSourceFiles.preloadProgram(&mut sources, &application)
@@ -723,7 +756,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, kind:
   let shapes = run registeredShapes(&mut store, &mut request, &target)
   let assembled = match move shapes {
     Result<Registered, ShapeProblem>.Success {value} => run assembleProfile(
-      run InitialProfile.copy(&profile), &mut store, &mut request, &value, move bindings)
+      run InitialProfile.copy(profile), &mut store, &mut request, &value, move bindings)
     Result<Registered, ShapeProblem>.Failure {error: _} => Result<FinalProfile, AssemblyProblem>.failResult(
       AssemblyProblem.InputMismatch)
   }
@@ -733,15 +766,42 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, kind:
     }
     Result<FinalProfile, AssemblyProblem>.Failure {error} => {
       if let AssemblyProblem.Default {rejection} = move error {
-        let message = run rejectionSummary(&rejection)
-        run writeError(Bytes.asSlice(&message))
-        return Compiled.Finished {status: diagnosticStatus(&rejection)}
+        return Prepared.Finished {status: run reportRejection(&sources, &rejection, format, out)}
       } else {
         run writeError(b"silkc: invalid package parameter profile\n")
       }
-      return Compiled.Finished {status: 1}
+      return Prepared.Finished {status: 1}
     }
   }
+  return Prepared.Ready {analysis: Analysis {
+    sources: move sources, store: move store, request: move request, rootPackage: move rootPackage,
+    identity: move identity, runtime: move runtime,
+  }}
+}
+
+effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, kind: BuildOutput, standardLibrary: Option<Path>, profile: InitialProfile, bindings: Vector<Supplied>, testing: bool, stats: bool) -> Compiled
+! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
+  let optimization = match move InitialProfile.text(&profile, b"optimization") {
+    Option<&[u8]>.Some {value} => run Bytes.copy(value)
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let debug = match move InitialProfile.flag(&profile, b"debug") {
+    Option<bool>.Some {value} => value
+    Option<bool>.None => run invalidBuildProfile()
+  }
+  let machine = DiagnosticFormat.Machine
+  let mut refused = Bytes.make()
+  let prepared = run prepare(sourcePath, manifest, move standardLibrary, &profile, move bindings, testing, &machine, &mut refused)
+  run writeError(Bytes.asSlice(&refused))
+  let analysis = match move prepared {
+    Prepared.Ready {analysis} => move analysis
+    Prepared.Finished {status} => { return Compiled.Finished {status: status} }
+  }
+  let Analysis {sources, store: prepared, request: requested, rootPackage, identity, runtime} = move analysis
+  let mut store = move prepared
+  let mut request = move requested
   let compiled = run Semantic.buildRuntime(&mut store, &mut request, &runtime, Vector<ModuleId>.asSlice(&rootPackage), staticClosureNodes)
   if stats {
     run writeStatistics(&Semantic.statistics(&store))
@@ -767,7 +827,9 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, kind:
     return Compiled.Finished {status: failureStatus}
   }
   // A reached module's selected imports are checked whole as well, used or not (IMPORT-003).
-  let importStatus = run reportedImportRejections(&mut store, &mut request)
+  let mut imported = Bytes.make()
+  let importStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut imported)
+  run writeError(Bytes.asSlice(&imported))
   if importStatus != 0 { return Compiled.Finished {status: importStatus} }
   let mut status = 0
   match move compiled {
@@ -855,25 +917,167 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, kind:
     }
   }
   // Discovery reaches the test modules, whose selected imports are checked like the build's.
-  let discoveredImportStatus = run reportedImportRejections(&mut store, &mut request)
+  let mut discovered = Bytes.make()
+  let discoveredImportStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut discovered)
+  run writeError(Bytes.asSlice(&discovered))
   if discoveredImportStatus != 0 { return Compiled.Finished {status: discoveredImportStatus} }
   return Compiled.Tests {identities: run Semantic.testIdentities(&catalog)}
 }
 
-// Writes selected import refusals; 0 when absent, 1 for a language rejection, 2 for uncoded coverage.
-effect fn reportedImportRejections(store: &mut Semantic, request: &mut SemanticRequest) -> i32
-! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | WriterError ? &mut Allocator | &mut Types {
+// Appends selected import refusals to `out`; 0 when absent, 1 for a language rejection, 2 for
+// uncoded coverage.
+effect fn reportedImportRejections(store: &mut Semantic, request: &mut SemanticRequest, sources: &ModuleSources, format: &DiagnosticFormat, out: &mut Bytes) -> i32
+! Cycle | InvalidModulePath | RevisionMismatch | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
   let rejections = run Semantic.importRejections(&mut store.*, &mut request.*)
   let listed = Vector<Shared<Rejection>>.asSlice(&rejections)
   let mut status = 0
   let mut at = usize.ZERO
   while at < listed.length {
-    let current = diagnosticStatus(&listed[at])
+    let current = run reportRejection(sources, &listed[at], format, out)
     if status != 1 { status = current }
-    let message = run rejectionSummary(&listed[at])
-    run writeError(Bytes.asSlice(&message))
     at = at + usize.ONE
   }
+  return status
+}
+
+// The 1-based line and byte column of `offset` in `text`, clamped to its end.
+fn lineColumn(text: &[u8], offset: usize) -> [usize; 2] {
+  let mut end = offset
+  if end > text.length { end = text.length }
+  let mut line = usize.ONE
+  let mut column = usize.ONE
+  let mut at = usize.ZERO
+  while at < end {
+    if text[at] == 10 {
+      line = line + usize.ONE
+      column = usize.ONE
+    } else {
+      column = column + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return [line, column]
+}
+
+// The source file and text of `module`, when the analysis reads it from disk.
+effect fn moduleSource(sources: &ModuleSources, module: &ModuleId) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run ModuleSourceFiles.sourceLocation(sources, module)
+  return match &location.path {
+    Option<Path>.Some {value} => {
+      let read = run Effect.result(FileSystem.readFile(&value))
+      return match move read {
+        Result<Bytes, FileError | OutOfMemoryError>.Success {value: text} => Option<Bytes>.some(move text)
+        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError unreadable => {
+            drop unreadable
+            return Option<Bytes>.none()
+          }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    Option<Path>.None => Option<Bytes>.none()
+  }
+}
+
+// Appends `path:line:col` for `span` in `module`, `path:?:?` when its source cannot be read.
+effect fn appendLocation(line: &mut Bytes, sources: &ModuleSources, module: &ModuleId, span: Span, json: bool) -> ()
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run ModuleSourceFiles.sourceLocation(sources, module)
+  let path = match &location.path {
+    Option<Path>.Some {value} => run Bytes.copy(Path.rawBytes(&value))
+    Option<Path>.None => run ModuleId.copyPath(module)
+  }
+  let text = run moduleSource(sources, module)
+  if json {
+    run Bytes.append(&mut line.*, b"\"path\":")
+    run JsonText.appendString(&mut line.*, Bytes.asSlice(&path))
+    if let Option<Bytes>.Some {value} = &text {
+      let position = lineColumn(Bytes.asSlice(&value), span.start)
+      run Bytes.append(&mut line.*, b",\"line\":")
+      run JsonText.appendDecimal(&mut line.*, position[0])
+      run Bytes.append(&mut line.*, b",\"column\":")
+      run JsonText.appendDecimal(&mut line.*, position[1])
+    } else {
+      run Bytes.append(&mut line.*, b",\"line\":null,\"column\":null")
+    }
+    run Bytes.append(&mut line.*, b",\"start\":")
+    run JsonText.appendDecimal(&mut line.*, span.start)
+    run Bytes.append(&mut line.*, b",\"end\":")
+    run JsonText.appendDecimal(&mut line.*, span.end)
+    return ()
+  }
+  run Bytes.append(&mut line.*, Bytes.asSlice(&path))
+  if let Option<Bytes>.Some {value} = &text {
+    let position = lineColumn(Bytes.asSlice(&value), span.start)
+    run Bytes.append(&mut line.*, b":")
+    run JsonText.appendDecimal(&mut line.*, position[0])
+    run Bytes.append(&mut line.*, b":")
+    run JsonText.appendDecimal(&mut line.*, position[1])
+  } else {
+    run Bytes.append(&mut line.*, b":?:?")
+  }
+}
+
+// Appends one rejection or refusal to `out` in `format` and answers its status: 1 for a language
+// rejection, 2 for a construct this compiler does not support yet.
+effect fn reportRejection(sources: &ModuleSources, diagnostic: &Shared<Rejection>, format: &DiagnosticFormat, out: &mut Bytes) -> i32
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let status = diagnosticStatus(diagnostic)
+  let target = match &format.* {
+    DiagnosticFormat.Machine => {
+      let message = run rejectionSummary(diagnostic)
+      run Bytes.append(&mut out.*, Bytes.asSlice(&message))
+      return status
+    }
+    DiagnosticFormat.Human => Option<&[u8]>.none()
+    DiagnosticFormat.Json {target} => Option<&[u8]>.some(Bytes.asSlice(&target))
+  }
+  let code = Shared<Rejection>.with<RejectionCode>(diagnostic, fn(value: &Rejection) -> RejectionCode { return value.code })
+  let span = Shared<Rejection>.with<Span>(diagnostic, fn(value: &Rejection) -> Span { return value.span })
+  let module = Shared<Rejection>.with<ModuleId>(diagnostic, fn(value: &Rejection) -> ModuleId { return ModuleId.copy(&value.module) })
+  let related = Shared<Rejection>.with<Option<RelatedSite>>(diagnostic, fn(value: &Rejection) -> Option<RelatedSite> {
+    return match &value.related {
+      Option<RelatedSite>.Some {value: site} => Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&site.module), span: site.span})
+      Option<RelatedSite>.None => Option<RelatedSite>.none()
+    }
+  })
+  // A refusal has no catalog code; it names the unsupported construct instead.
+  let mut name = Rejections.stableCode(code)
+  if name.length == usize.ZERO { name = Rejection.name(code) }
+  let mut line = Bytes.make()
+  if let Option<&[u8]>.Some {value: targetName} = move target {
+    run Bytes.append(&mut line, b"{\"target\":")
+    run JsonText.appendString(&mut line, targetName)
+    run Bytes.append(&mut line, b",\"code\":")
+    run JsonText.appendString(&mut line, name)
+    if status == 1 {
+      run Bytes.append(&mut line, b",\"severity\":\"error\",")
+    } else {
+      run Bytes.append(&mut line, b",\"severity\":\"unsupported\",")
+    }
+    run appendLocation(&mut line, sources, &module, span, true)
+    run Bytes.append(&mut line, b",\"message\":null,\"notes\":[],\"related\":[")
+    if let Option<RelatedSite>.Some {value: site} = &related {
+      run Bytes.append(&mut line, b"{")
+      run appendLocation(&mut line, sources, &site.module, site.span, true)
+      run Bytes.append(&mut line, b",\"label\":null}")
+    }
+    run Bytes.append(&mut line, b"]}\n")
+  } else {
+    run appendLocation(&mut line, sources, &module, span, false)
+    if status == 1 {
+      run Bytes.append(&mut line, b": error[")
+      run Bytes.append(&mut line, name)
+      run Bytes.append(&mut line, b"]\n")
+    } else {
+      run Bytes.append(&mut line, b": unsupported[")
+      run Bytes.append(&mut line, name)
+      run Bytes.append(&mut line, b"] not supported by the native compiler yet\n")
+    }
+  }
+  run Bytes.append(&mut out.*, Bytes.asSlice(&line))
   return status
 }
 
@@ -1241,6 +1445,135 @@ effect fn buildProject(working: &Path, command: BuildCommand) -> i32
   return status
 }
 
+// Writes one target's diagnostics to standard error: after a `[<target>]` header in the human
+// format, as the TypeScript `silk check` does, and only when there are any.
+effect fn writeDiagnostics(target: &Target, json: bool, diagnostics: &Bytes) -> () ! WriterError {
+  if Bytes.length(diagnostics) == usize.ZERO {
+    return ()
+  }
+  if !json {
+    run writeError(b"[")
+    run writeError(Target.name(target))
+    run writeError(b"]\n")
+  }
+  run writeError(Bytes.asSlice(diagnostics))
+}
+
+// Analyzes the project for one planned compilation without producing an artifact: every
+// root-package declaration is checked, used or not (MODULE-004), with the syntax of every loaded
+// module and the imports of every reached one. Diagnostics go to standard error in `format`,
+// after a `[<target>]` header in the human format, as the TypeScript `silk check` writes them.
+// The status is 0, 1 when a declaration is rejected, or 2 for an unsupported construct.
+effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool) -> ProjectArtifact
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let ProjectPlan {input, bindings} = move plan
+  let profile = run InitialProfile.freeze(&input)
+  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
+  let path = run Path.fromBytes(Path.rawBytes(Projects.manifest(project)))
+  let library = match &standardLibrary.* {
+    Option<Path>.Some {value} => Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
+    Option<Path>.None => Option<Path>.none()
+  }
+  let mut format = DiagnosticFormat.Human
+  if json { format = DiagnosticFormat.Json {target: run Bytes.copy(Target.name(&target))} }
+  let mut out = Bytes.make()
+  let prepared = run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, &format, &mut out)
+  let analysis = match move prepared {
+    Prepared.Ready {analysis} => move analysis
+    Prepared.Finished {status} => {
+      run writeDiagnostics(&target, json, &out)
+      return ProjectArtifact {status: status, target: target, path: move path}
+    }
+  }
+  let Analysis {sources, store: prepared, request: requested, rootPackage, identity: _, runtime: _} = move analysis
+  let mut store = move prepared
+  let mut request = move requested
+  let checked = run Semantic.checkDeclarations(&mut store, &mut request, Vector<ModuleId>.asSlice(&rootPackage))
+  let mut status = 0
+  let syntax = run Semantic.syntaxRejections(&store)
+  let malformed = Vector<Shared<Rejection>>.asSlice(&syntax)
+  let mut at = usize.ZERO
+  while at < malformed.length {
+    status = worse(status, run reportRejection(&sources, &malformed[at], &format, &mut out))
+    at = at + usize.ONE
+  }
+  status = worse(status, run reportedImportRejections(&mut store, &mut request, &sources, &format, &mut out))
+  let rejected = Vector<Shared<Rejection>>.asSlice(&checked.rejections)
+  at = usize.ZERO
+  while at < rejected.length {
+    status = worse(status, run reportRejection(&sources, &rejected[at], &format, &mut out))
+    at = at + usize.ONE
+  }
+  if Vector<Shared<Gap>>.length(&checked.gaps) > usize.ZERO {
+    let message = run gapSummary(Vector<Shared<Gap>>.asSlice(&checked.gaps))
+    run Bytes.append(&mut out, Bytes.asSlice(&message))
+    status = 2
+  }
+  run writeDiagnostics(&target, json, &out)
+  return ProjectArtifact {status: status, target: target, path: move path}
+}
+
+// The combined status of two outcomes: 2 dominates 1, which dominates 0.
+fn worse(left: i32, right: i32) -> i32 {
+  if left == 2 || right == 2 { return 2 }
+  if left == 1 || right == 1 { return 1 }
+  return 0
+}
+
+// Analyzes every planned compilation of the project in order and writes one `check <target>:`
+// line per target and a `Check summary` on standard output, as the TypeScript `silk check` does.
+effect fn checkProject(working: &Path, command: CheckCommand) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let CheckCommand {options, json} = move command
+  if ProjectCommands.conflicting(&options) {
+    run reportOptimizationConflict(&options)
+    return 2
+  }
+  let project = match move run locateProject(working, &options.manifestPath) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  let mut plans = match move run projectPlans(&project, &options, Projects.targets(&project)) {
+    Option<Vector<ProjectPlan>>.Some {value} => move value
+    Option<Vector<ProjectPlan>>.None => { return 2 }
+  }
+  let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
+  let mut attempts = Vector<ProjectArtifact>.make()
+  while Vector<ProjectPlan>.length(&plans) > usize.ZERO {
+    let plan = Vector<ProjectPlan>.remove(&mut plans, usize.ZERO)
+    run Vector<ProjectArtifact>.append(&mut attempts, run checkTarget(&project, move plan, &standardLibrary, json))
+  }
+  let attempted = Vector<ProjectArtifact>.asSlice(&attempts)
+  let mut succeeded = usize.ZERO
+  let mut status = 0
+  let mut at = usize.ZERO
+  while at < attempted.length {
+    let mut line = run Bytes.copy(b"check ")
+    run Bytes.append(&mut line, Target.name(&attempted[at].target))
+    if attempted[at].status == 0 {
+      succeeded = succeeded + usize.ONE
+      run Bytes.append(&mut line, b": ok")
+    } else {
+      run Bytes.append(&mut line, b": failed (exit ")
+      run JsonText.appendDecimal(&mut line, i32.toUsize(attempted[at].status))
+      run Bytes.append(&mut line, b")")
+      status = worse(status, attempted[at].status)
+    }
+    run Bytes.append(&mut line, b"\n")
+    run Writer.writeAll(Bytes.asSlice(&line))
+    at = at + usize.ONE
+  }
+  let mut summary = run Bytes.copy(b"Check summary: ")
+  run JsonText.appendDecimal(&mut summary, succeeded)
+  run Bytes.append(&mut summary, b" succeeded, ")
+  run JsonText.appendDecimal(&mut summary, attempted.length - succeeded)
+  run Bytes.append(&mut summary, b" failed\n")
+  run Writer.writeAll(Bytes.asSlice(&summary))
+  return status
+}
+
 // Builds the project's executable for the host, then replaces this process with it. `run` ignores
 // `[build].targets`: it builds the named profile, else the first `--target`, else the host, and a
 // foreign target is refused before building. A project that cannot be loaded or run is status 2;
@@ -1460,6 +1793,12 @@ effect fn program() -> i32
     Request.Clean {command: invocation} => {
       return run cleanProject(&working, move invocation)
         |> Effect.provideMut<FileSystem>(&mut files)
+    }
+    Request.Check {command: invocation} => {
+      let mut process = OsChildProcess.make()
+      return run checkProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
     }
     Request.ProjectBuild {command: invocation} => {
       let mut process = OsChildProcess.make()
