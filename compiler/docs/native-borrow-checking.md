@@ -215,16 +215,19 @@ Declared outlives bounds and `where` premises become assumptions between univers
 are given, not proved, in the body itself (LIFE-002).
 
 Region closure (§6) accepts the universal regions of enclosing declarations as atoms; it never
-relates them to each other. A relation that names an enclosing declaration's parameter, an
-invocation binder or an enclosing body's local stays pending.
+relates them to each other. The premise proof authenticates a named parameter by its exact
+owner chain: the declaration must be this body or a named declaration enclosing it. An invocation
+binder, an unrelated declaration's parameter, or an enclosing body's local stays pending.
 
-The R3 2a premise check runs inside the body query. It checks retained relations made solely
-of `'static` and that named body's declared lifetime atoms against `BodyPremises`, including
-input well-formedness edges. Goals never become premises. A rigid relation absent from that
-closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained origin; local, invocation,
-supplied, and outside-owner atoms remain pending. An anonymous body's enclosing atoms retain
-their identity and are left for the environment proof. Open capture contents still prevent
-`Checked`. This is groundwork, with no promised gap-count reduction.
+The R3 premise check runs inside the body query. It checks retained relations made solely
+of `'static` and authenticated declared lifetime atoms against `BodyPremises`, including
+inherited impl/function constraints and input well-formedness edges. Goals never become premises.
+A rigid relation absent from that closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained
+origin. The point proof treats those same authenticated parameters as universal, relying on the
+prior premise check for universal-to-universal relations. Anonymous bodies keep their enclosing
+function's lifetime identities and premises; storing the callable in a local does not change them.
+Local, invocation, supplied, and unrelated-owner atoms remain pending. Open capture contents still
+prevent `Checked`.
 
 An inferred binder initially holding `'static` is not a declared static requirement. Retained
 relations record that provisional origin explicitly and remain pending. Inference behavior is
