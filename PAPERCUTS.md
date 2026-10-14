@@ -687,6 +687,7 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 - 2026-10-14 · A local Cases root run from `compiler/` failed three SemanticLoweringCases (stdlib fixtures read relative to the working directory), and a `pkill -f <pattern>` issued in the same shell as the rerun killed that rerun because the shell's own command line matched · Run Cases roots from the repository root with absolute root paths, as CI does, and stop stray jobs by PID rather than by pattern · native borrow checking S3
 
 2026-10-14 · Native Cases print FAIL without the AssertionError message, which obscured a region-control fixture using the wrong inference path · Inspect the typed argument kind: String takes binder shortening, while a string-first/slice-second call exercises provisional static relation retention; pin the latter as Regions · selfhost R3
+2026-10-14 · TypeScript silk format aborted the repository batch with SyntaxFormatterImplementationError: Requirement has no Ampersand token · Run the main CLI on each tracked source independently to collect complete formatter parity findings without changing formatter source · native repository coverage sweep
 
 2026-10-14 · ARM64 Linux native seed CI exposed a pre-existing C listener fixture using the unavailable SYS_poll syscall · Use SYS_ppoll with a converted timeout on all Linux hosts, add the existing listener corpus case to the three native platform jobs, and land the fixture repair on main first · Silk per-target native seeds
 
