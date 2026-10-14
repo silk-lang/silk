@@ -330,12 +330,23 @@ cover first:
   SHARED-003).
 - `stored-loans`: opaque `executionFromAllocation` packages and stored or delayed
   `executionDrive` constructions retain captures the walk cannot prove. They stay unchecked even
-  when their result types name no environment region. Other cases include a loan stored in a value,
-  joined across paths, returned, or borrowed from a place that is not rooted in a local. One such
-  form must reject rather than stay unchecked: a view of a temporary receiver used past its
-  statement, such as `let left = make().left()`, is
-  OWN0019 at the use under BORROW-006, as in the bootstrap. The native compiler accepts it today
-  and counts the body here; the slice that lifts these exits rejects it.
+  when their result types name no environment region. Other cases include a loan carried around a
+  loop, a retaining write through a referent, a displaced value that retains a region, a move or
+  drop of a place with no local root, and cleanup with unknown retained contents.
+
+  A borrow of a value with no place (a call result, a literal, a projection or dereference of
+  one, or a temporary receiver) lends that value's hidden owner (BORROW-006). The walk evaluates
+  the value into a root of its own, which holds the value's loans and observes its cleanup like a
+  local, and ends it where lowering drops it: with the innermost statement or match arm that
+  evaluates it, or with the `if` or `while` condition, guard or `&&`/`||` right operand that does.
+  A view of a temporary used past its statement, such as `let left = make().left()` followed by
+  `left.*`, is OWN0019 at the use (CALL-003), where the bootstrap reports it. Lowering keeps every
+  temporary of the initializer of a binding whose type can hold a view (`Type.holdsView`) for the
+  binding's scope, so their storage and cleanup end there, and likewise for the subject of a
+  borrowing destructuring `let` and, since it may view at an instance, a binding typed by a type
+  parameter. Only a viewing binding's borrowed fixed array stays valid that long, so `let view =
+  identity(&[1, 2])` is valid; any other such temporary's loans expire with its statement (an
+  `Expire` event, which ends validity without ending storage).
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
@@ -437,7 +448,10 @@ root's scope:
   marked crossed and is never `Checked`, because its region relations are the region slices' to
   prove.
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
-  literal's hidden owner or a temporary receiver, also leaves with `stored-loans`.
+  literal or a temporary receiver, borrows a hidden owner the walk roots at the borrowed value. It
+  is released with its statement or arm, or with the binding's scope for an array kept by a
+  viewing binding, and that release is an ordinary storage end: a holder that still requires its
+  loan afterwards is OWN0019 at that use.
 
 Pending means a region relation or capture contents typing retained. `Checked` is a claim about
 one body: its own loans and regions are sound. A rule that blames a body for its callers' context
