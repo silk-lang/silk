@@ -277,6 +277,9 @@ environment and the working directory, and its exit status or terminating signal
 A non-executable `[build].artifact` or a non-final `[build].stage` exits 2; a refused build keeps
 `build`'s status.
 
+`silkc --help` (or `-h`) prints the command synopsis and `silkc --version` (or `-v`) prints
+`silkc v<version>`, both on standard output with status 0.
+
 Init invocation: `silkc init [path] [--name <name>]`. It creates a project as the TypeScript
 initializer does: `silk.toml` (`[package]` name, version `0.1.0`, root `src/main.silk`), a
 `src/main.silk` that logs a greeting, and a `.gitignore` holding `/build/` (appended to an existing
