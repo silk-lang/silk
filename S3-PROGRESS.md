@@ -43,6 +43,19 @@ Checkpoint note for the A4 / S3 ticket. Delete this file in the final PR of the 
 - Probe `.scratch/probe/x1` (generic package with a non-detached readiness state): SEM0139 at the
   intrinsic call. Probe s2's `Execution.make` is now Checked.
 
+## Review findings
+
+- Review 1 (step 1): a viewing binding's retained Drop temporary was observed at statement end
+  (use after drop accepted); condition/guard/short-circuit temporaries were kept too long (false
+  OWN0011). Fixed: `Kind.Expire`, retention to scope exit, `settled` operands.
+- Review 2 (step 1): no unsafe body marked Checked. Fixed: borrowing destructuring `let` subjects
+  and bindings typed by a type parameter now keep their temporaries like a viewing binding
+  (`Retention.Storage`). Pre-existing, not fixed here (follow-up; bodies stay `regions`, never
+  `Checked`): unborrowed temporaries read through a projection (`readValue`) and a shared match
+  subject with no place have their Drop observation earlier than lowering drops them. Diagnostic
+  differences: `&mut (f(&mut x).*)` then using `x` reports OWN0011 at `x` where the bootstrap reports
+  OWN0019 at the later use; `&LIMIT` reports OWN0019 where the bootstrap reports SEM0086.
+
 ## Next action
 
 Finish step 1: corpus run with the step-1 N1, `check-borrow-gap.mjs update`/`diff`, run the
