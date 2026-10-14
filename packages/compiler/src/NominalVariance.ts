@@ -71,12 +71,26 @@ export const derive = (index: DeclarationIndex.Index): NominalVariance => {
       const parameters = new Map(
         declaration.typeParameters.map((parameter, ordinal) => [Type.key(parameter.type), ordinal]),
       )
-      const found: Array<Variance> = declaration.typeParameters.map(() => 'Bivariant')
+      // A row argument is an exact service-key set even when the declaration stores no fields.
+      const found: Array<Variance> = declaration.typeParameters.map((parameter) =>
+        parameter.type.kind === 'RequirementRow' ? 'Invariant' : 'Bivariant',
+      )
       const visited = new Set<string>()
       const record = (key: string, variance: Variance): void => {
         const ordinal = parameters.get(key)
         if (ordinal === undefined) return
         found[ordinal] = join(found.at(ordinal) ?? 'Bivariant', variance)
+      }
+      const visitRequirementRow = (row: Type.Effect | Type.RequirementRowArgument): void => {
+        Type.requirementMembers(row).forEach((requirement) =>
+          visit(requirement.capability, 'Invariant'),
+        )
+        Type.requirementRowParameters(row).forEach((parameter) =>
+          record(Type.key(parameter), 'Invariant'),
+        )
+        Type.requirementMemberParameters(row).forEach((parameter) =>
+          record(Type.key(parameter), 'Invariant'),
+        )
       }
       const visitArgument = (argument: Type.GenericArgument, variance: Variance): void => {
         if (Lifetime.isLifetime(argument)) record(Lifetime.key(argument), variance)
@@ -87,6 +101,7 @@ export const derive = (index: DeclarationIndex.Index): NominalVariance => {
           (typeof argument !== 'string' && argument._tag === 'RepresentedType')
         )
           visit(argument, variance)
+        else if (Type.isRequirementRowArgument(argument)) visitRequirementRow(argument)
         else if (Type.isRepresentationParameterArgument(argument))
           record(Type.key(argument.parameter), 'Invariant')
         else if (Type.isRepresentationArgument(argument)) {
@@ -132,9 +147,7 @@ export const derive = (index: DeclarationIndex.Index): NominalVariance => {
           record(Lifetime.key(type.environment), variance)
           visit(type.success, variance)
           Type.failureMembers(type).forEach((failure) => visit(failure, variance))
-          Type.requirementMembers(type).forEach((requirement) =>
-            visit(requirement.capability, 'Invariant'),
-          )
+          visitRequirementRow(type)
         } else if (Type.isRepresented(type)) {
           visit(type.contract, variance)
           visitArgument(type.representation.argument, 'Invariant')
