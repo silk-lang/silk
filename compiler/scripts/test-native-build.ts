@@ -59,6 +59,13 @@ const program = Effect.gen(function* () {
     '--stdlib',
     standardLibrary,
   ]
+  // `--version` and `--help` answer on standard output without reading any source.
+  const versioned = yield* invoke(silkc, ['--version'], directory)
+  assert.equal(versioned.status, 0, versioned.stderr)
+  assert.match(versioned.stdout, /^silkc v\d+\.\d+\.\d+\n$/)
+  const helped = yield* invoke(silkc, ['--help'], directory)
+  assert.equal(helped.status, 0, helped.stderr)
+  assert.match(helped.stdout, /usage: silkc build/)
   const ir = yield* invoke(silkc, [...argumentsFor('module.ll'), '--emit', 'llvm-ir'], directory, {
     ...process.env,
     SILKC_CLANG: sentinel,
@@ -335,7 +342,7 @@ const program = Effect.gen(function* () {
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library and clang on PATH passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library, clang on PATH, version and help passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
