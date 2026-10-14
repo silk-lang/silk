@@ -34,16 +34,15 @@ const program = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem
   const directory = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-native-build-' })
   const repository = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
-  const corpus = yield* fs.readFileString(
-    join(repository, 'packages/compiler/test/support/corpus.ts'),
+  // Reuse the existing small shared acceptance program without importing the bootstrap.
+  const source = yield* fs.readFileString(
+    join(repository, 'corpus/native/operator-precedence/main.silk'),
   )
-  // Reuse the existing small shared acceptance fixture without importing the bootstrap.
-  const source = corpus.match(/name: 'operator-precedence',\s+source: '([^']+)'/)?.[1]
-  assert.ok(source && !source.includes('\\'), 'expected the plain operator-precedence fixture')
+  assert.ok(!source.includes('/*@splice'), 'expected the plain operator-precedence program')
   yield* fs.writeFileString(join(directory, 'main.silk'), source)
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "native-build"\nroot = "main.silk"\n',
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nroot = "main.silk"\n',
   )
   const sentinel = join(directory, 'clang-sentinel')
   const marker = join(directory, 'clang-called')

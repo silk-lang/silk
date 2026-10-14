@@ -1,0 +1,3129 @@
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.effect {Effect}
+import silk.http {Method, Version, Header}
+import silk.http_target {RequestTarget}
+import silk.http_body {BodyComponent, BodyReason, Limits as BodyLimits, Trailers}
+import silk.http_head {Limits as HeadLimits}
+import silk.http_headers {Headers, Limits as ValueLimits}
+import silk.http_origin {Origin}
+import silk.http_request {PreparedRequest, HeaderPolicy, BodyMode, RequestError}
+import silk.http_request as Request
+import silk.http_client {
+  Connection,
+  ConnectionHandler,
+  Exchange,
+  Limits,
+  ClientError,
+  ConnectionPhase,
+  DiscardOutcome,
+  RequestOptions,
+  ContinuePolicy,
+  Tunnel,
+  TransferredTunnel,
+}
+import silk.http_client as Client
+import silk.http_transport {HttpTransport, TransportError}
+import silk.monotonic_clock {MonotonicClock}
+import silk.random {Random}
+import silk.option {Option}
+import silk.result {Result}
+import silk.system_clock {Instant, SystemClock}
+import silk.uri {Uri}
+import silk.u64
+import silk.usize
+import silk.bytes {Bytes}
+import silk.http {OwnedResponseHead, ResponseHead as ValueResponseHead, Status, ValueError}
+import silk.http_head {
+  Limits as ResponseParserLimits,
+  ParseError as HeadParseError,
+  ParsedResponse,
+  ResponseParser,
+  parseResponse,
+  responseSerializedSize,
+  writeResponseInto,
+}
+import silk.http_headers {HeaderIterator, Limits as ProxyValueLimits}
+import silk.http_origin {OriginError}
+import silk.http_proxy {
+  BypassPolicy,
+  ProxyAuth,
+  ProxyAuthContextId,
+  ProxyAdmissionError,
+  ProxyComponent,
+  ProxyConfig,
+  ProxyConfigId,
+  ProxyError,
+  ProxyLimit,
+  ProxyReason,
+  Route,
+  RouteKey,
+  RouteMode,
+  classifyConnect,
+  selectRoute,
+}
+import silk.http_request {
+  Authorization,
+  BasicSecurity,
+  HeaderControl,
+  prepareConnect,
+  prepareForward,
+}
+import silk.uri_reference {ParseError}
+
+import silk.https_identity {IdentityError}
+import silk.http_head {ParseLimitKind, ParseReason}
+import silk.http_client {
+  AcquiredRouteContext,
+  RouteClient,
+  RouteHandler,
+  RouteProtocol,
+  RouteSettings,
+  RouteTransport,
+}
+import silk.shared {Shared}
+import silk.tls_client {CertificateIdentityFailure, ClientLimits, TlsError}
+import silk.tls_connection as Tls {ConnectionError}
+import silk.trust_snapshot {TrustLoadLimits, TrustSnapshot, TrustSourceError}
+import silk.u8
+
+
+struct FixedClock {
+  mark: Instant
+}
+
+struct FixedRandom {}
+
+impl Random for FixedRandom {
+  effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+    drop output
+    return ()
+  }
+}
+
+impl MonotonicClock for FixedClock {
+  effect fn now(self: &mut Self) -> Instant {
+    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
+  }
+  effect fn getResolution(self: &mut Self) -> u64 {
+    return u64.toU64(1)
+  }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    self.mark = move when
+    return ()
+  }
+  effect fn waitFor(self: &mut Self, duration: u64) -> () {
+    self.mark = MonotonicClock.deadlineAfter(&self.mark, duration)
+    return ()
+  }
+}
+
+fn valueLimits() -> ValueLimits {
+  return ValueLimits {
+    maxMethodBytes: 32,
+    maxTargetBytes: 128,
+    maxNameBytes: 64,
+    maxValueBytes: 256,
+    maxFields: 12,
+    maxFieldBytes: 512,
+    maxOwnedBytes: 2048,
+  }
+}
+
+fn headLimits() -> HeadLimits {
+  return HeadLimits {
+    maxHeadBytes: 1024,
+    maxStartLineBytes: 256,
+    maxFieldLineBytes: 256,
+    maxOwnedBytes: 2048,
+    values: valueLimits(),
+  }
+}
+
+fn bodyLimits() -> BodyLimits {
+  return BodyLimits {
+    maxWireBytes: 1024,
+    maxPayloadBytes: 512,
+    maxChunkBytes: 64,
+    maxChunks: 8,
+    maxChunkLineBytes: 64,
+    maxExtensionBytes: 128,
+    maxTrailerBytes: 256,
+    maxTrailerFields: 4,
+    maxOwnedBytes: 2048,
+    trailerValues: valueLimits(),
+  }
+}
+
+fn limits() -> Limits {
+  return Limits {
+    head: headLimits(),
+    requestBody: bodyLimits(),
+    responseBody: bodyLimits(),
+    readCapacity: 128,
+    writeCapacity: 128,
+    maxRequests: 2,
+    maxInformationalResponses: 16,
+    maxInformationalWireBytes: 65536,
+    maxDiscardWireBytes: 256,
+  }
+}
+
+// Only the fixed scripts used below are modeled; accepted bytes are counted, not retained.
+struct TestTransport {
+  scenario: i32
+  input: &'static [u8]
+  readOffset: usize
+  writeOrdinal: usize
+  accepted: usize
+  closeCount: usize
+  shutdownCount: usize
+  writeShutdown: bool
+  closed: bool
+  routeAudit: Option<Shared<RouteAudit>>
+}
+
+fn reached(now: &Instant, target: &Instant) -> bool {
+  if SystemClock.seconds(now) > SystemClock.seconds(target) {
+    return true
+  }
+  if SystemClock.seconds(now) < SystemClock.seconds(target) {
+    return false
+  }
+  return SystemClock.nanoseconds(now) >= SystemClock.nanoseconds(target)
+}
+
+effect fn checkTransportDeadline(deadline: &Option<Instant>, operation: ByteIoOperation) -> ()
+! TransportError
+? &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  if let Option<Instant>.Some {value} = &deadline.* {
+    if reached(&now, &value) {
+      fail TransportError.Plain {error: ByteIoError.Timeout {operation: move operation}}
+    }
+  }
+  return ()
+}
+
+impl HttpTransport for TestTransport {
+  effect fn readSomeRaw(self: &mut Self, output: &mut [u8], deadline: Option<Instant>) -> ReadTransfer
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+    if output.length == usize.ZERO {
+      return ReadTransfer.Data {count: usize.ZERO}
+    }
+    if self.closed {
+      fail TransportError.Plain {error: ByteIoError.Closed {operation: ByteIoOperation.Read}}
+    }
+    run checkTransportDeadline(&deadline, ByteIoOperation.Read)
+    if self.scenario == 10 {
+      let ready = SystemClock.make(20, 0)
+      if let Option<Instant>.Some {value} = &deadline {
+        if reached(&ready, &value) {
+          run MonotonicClock.waitUntil(
+            SystemClock.make(SystemClock.seconds(&value), SystemClock.nanoseconds(&value)),
+          )
+          fail TransportError.Plain {error: ByteIoError.Timeout {operation: ByteIoOperation.Read}}
+        }
+      }
+      let now = run MonotonicClock.now()
+      if !reached(&now, &ready) {
+        run MonotonicClock.waitUntil(move ready)
+      }
+      return ReadTransfer.End
+    }
+    if self.readOffset == self.input.length {
+      return ReadTransfer.End
+    }
+    let mut count = self.input.length - self.readOffset
+    if count > output.length {
+      count = output.length
+    }
+    let mut index = usize.ZERO
+    while index < count {
+      output[index] = self.input[self.readOffset + index]
+      index = index + usize.ONE
+    }
+    self.readOffset = self.readOffset + count
+    recordRouteConnectAccepted(
+      &self.routeAudit,
+      self.input,
+      self.readOffset,
+    )
+    return ReadTransfer.Data {count: count}
+  }
+  effect fn writeSomeRaw(self: &mut Self, input: &[u8], deadline: Option<Instant>) -> usize
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+    if input.length == usize.ZERO {
+      return usize.ZERO
+    }
+    if self.closed {
+      fail TransportError.Plain {error: ByteIoError.Closed {operation: ByteIoOperation.Write}}
+    }
+    run checkTransportDeadline(&deadline, ByteIoOperation.Write)
+    if !recordRouteOutput(&self.routeAudit, input) {
+      self.closed = true
+      fail TransportError.Plain {
+        error: ByteIoError.Provider {operation: ByteIoOperation.Write, code: 122},
+      }
+    }
+    let ordinal = self.writeOrdinal
+    self.writeOrdinal = ordinal + usize.ONE
+    let mut maximum: usize = 256
+    let mut exhausted = ordinal >= 16
+    let mut failed = false
+    if self.scenario == 9 {
+      if ordinal == usize.ONE {
+        maximum = 2
+      }
+      failed = ordinal == 2
+      exhausted = ordinal >= 3
+    } else if self.scenario == 10 {
+      exhausted = ordinal >= usize.ONE
+    } else if self.scenario == 18 {
+      maximum = 2
+      exhausted = ordinal >= usize.ONE
+    } else if self.scenario == 21 {
+      if ordinal == 2 {
+        maximum = 2
+      }
+      failed = ordinal == 3
+      exhausted = ordinal >= 4
+    }
+    if failed || exhausted {
+      self.closed = true
+      let mut code = 1
+      if failed {
+        code = 88
+      }
+      fail TransportError.Plain {
+        error: ByteIoError.Provider {operation: ByteIoOperation.Write, code: code},
+      }
+    }
+    let mut count = input.length
+    if count > maximum {
+      count = maximum
+    }
+    let mut capacity: usize = 256
+    if self.scenario == 22 { capacity = 512 }
+    if count > capacity - self.accepted {
+      self.closed = true
+      fail TransportError.Plain {
+        error: ByteIoError.Provider {operation: ByteIoOperation.Write, code: 2},
+      }
+    }
+    self.accepted = self.accepted + count
+    if self.scenario == 18 {
+      run MonotonicClock.waitUntil(SystemClock.make(5, 0))
+    }
+    return count
+  }
+  effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
+  ! TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+    if self.scenario == 19 || self.scenario == 20 {
+      fail TransportError.Plain {
+        error: ByteIoError.Provider {operation: ByteIoOperation.Flush, code: 93},
+      }
+    }
+    if self.closed {
+      fail TransportError.Plain {error: ByteIoError.Closed {operation: ByteIoOperation.Flush}}
+    }
+    run checkTransportDeadline(&deadline, ByteIoOperation.Flush)
+    return ()
+  }
+  effect fn close(self: &mut Self) -> () ! TransportError {
+    if self.closed {
+      return ()
+    }
+    self.closed = true
+    self.closeCount = self.closeCount + usize.ONE
+    return ()
+  }
+}
+
+effect fn checkByteDeadline(deadline: &Option<Instant>, operation: ByteIoOperation) -> ()
+! ByteIoError
+? &mut MonotonicClock {
+  let now = run MonotonicClock.now()
+  if let Option<Instant>.Some {value} = &deadline.* {
+    if reached(&now, &value) {
+      fail ByteIoError.Timeout {operation: move operation}
+    }
+  }
+  return ()
+}
+
+impl TestTransport {
+  unsafe effect fn readBytes(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    if output.length == usize.ZERO {
+      return ReadTransfer.Data {count: usize.ZERO}
+    }
+    if self.closed {
+      fail ByteIoError.Closed {operation: ByteIoOperation.Read}
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.Read)
+    if self.readOffset == self.input.length {
+      return ReadTransfer.End
+    }
+    let mut count = self.input.length - self.readOffset
+    if count > output.length {
+      count = output.length
+    }
+    let mut index = usize.ZERO
+    while index < count {
+      output[index] = self.input[self.readOffset + index]
+      index = index + usize.ONE
+    }
+    self.readOffset = self.readOffset + count
+    recordProxyConcreteRead(&self.routeAudit, self.scenario)
+    return ReadTransfer.Data {count: count}
+  }
+
+  unsafe effect fn writeBytes(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    if input.length == usize.ZERO {
+      return usize.ZERO
+    }
+    if self.closed || self.writeShutdown {
+      fail ByteIoError.Closed {operation: ByteIoOperation.Write}
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.Write)
+    if !recordRouteTlsOutput(&self.routeAudit, self.scenario, input) {
+      self.closed = true
+      fail ByteIoError.Provider {operation: ByteIoOperation.Write, code: 122}
+    }
+    self.writeOrdinal = self.writeOrdinal + usize.ONE
+    let mut capacity: usize = 256
+    if self.scenario == 22 { capacity = 512 }
+    if input.length > capacity - self.accepted {
+      self.closed = true
+      fail ByteIoError.Provider {operation: ByteIoOperation.Write, code: 2}
+    }
+    self.accepted = self.accepted + input.length
+    return input.length
+  }
+
+  unsafe effect fn flushBytes(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    if self.closed || self.writeShutdown {
+      fail ByteIoError.Closed {operation: ByteIoOperation.Flush}
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.Flush)
+    recordProxyConcreteFlush(&self.routeAudit, self.scenario)
+    return ()
+  }
+
+  unsafe effect fn shutdownBytes(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    if self.closed {
+      fail ByteIoError.Closed {operation: ByteIoOperation.ShutdownWrite}
+    }
+    if self.writeShutdown {
+      return ()
+    }
+    run checkByteDeadline(&deadline, ByteIoOperation.ShutdownWrite)
+    recordProxyConcreteShutdown(&self.routeAudit, self.scenario)
+    self.writeShutdown = true
+    self.shutdownCount = self.shutdownCount + usize.ONE
+    return ()
+  }
+
+  unsafe effect fn closeBytes(self: &mut Self) -> () ! ByteIoError {
+    if self.closed {
+      return ()
+    }
+    if recordProxyConcreteClose(&self.routeAudit, self.scenario) {
+      fail ByteIoError.Provider {operation: ByteIoOperation.Close, code: 811}
+    }
+    self.closed = true
+    self.closeCount = self.closeCount + usize.ONE
+    return ()
+  }
+}
+
+impl ByteDuplex for TestTransport {
+  readSomeRaw: TestTransport.readBytes
+  writeSomeRaw: TestTransport.writeBytes
+  flushRaw: TestTransport.flushBytes
+  shutdownWriteRaw: TestTransport.shutdownBytes
+  closeRaw: TestTransport.closeBytes
+}
+
+fn proxyBytesEqual(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if left[index] != right[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn proxyReasonEquals(head: &ValueResponseHead, expected: &[u8]) -> bool {
+  return match move ValueResponseHead.reason(head) {
+    Option.None => false
+    Option.Some {value} => proxyBytesEqual(value, expected)
+  }
+}
+
+fn proxyValueLimits() -> ProxyValueLimits {
+  return ProxyValueLimits {
+    maxMethodBytes: 32,
+    maxTargetBytes: 256,
+    maxNameBytes: 64,
+    maxValueBytes: 512,
+    maxFields: 16,
+    maxFieldBytes: 2048,
+    maxOwnedBytes: 4096,
+  }
+}
+
+fn proxyConnectInputLimits() -> ProxyValueLimits {
+  return ProxyValueLimits {
+    maxMethodBytes: 32,
+    maxTargetBytes: 512,
+    maxNameBytes: 256,
+    maxValueBytes: 8192,
+    maxFields: 100,
+    maxFieldBytes: 32768,
+    maxOwnedBytes: 65536,
+  }
+}
+
+fn proxyResponseParserLimits() -> ResponseParserLimits {
+  return ResponseParserLimits {
+    maxHeadBytes: 65536,
+    maxStartLineBytes: 8192,
+    maxFieldLineBytes: 16384,
+    maxOwnedBytes: 70000,
+    values: proxyConnectInputLimits(),
+  }
+}
+
+effect fn proxyClassifyConnect(
+  head: &ValueResponseHead,
+) -> () ! ProxyError | ValueError | HeadParseError | OutOfMemoryError ? &mut Allocator {
+  let required = match move responseSerializedSize(head, proxyConnectInputLimits()) {
+    Result.Failure {error} => { fail move error }
+    Result.Success {value} => value
+  }
+  let mut encoded = run Bytes.zeroed(required)
+  let output = Bytes.asMutSlice(&mut encoded)
+  let written = match move writeResponseInto(head, &mut output, proxyConnectInputLimits()) {
+    Result.Failure {error} => { fail move error }
+    Result.Success {value} => value
+  }
+  drop output
+  if written != required { fail ProxyError.ProxyMetadataLimit }
+  let parsed = match move run parseResponse(Bytes.asSlice(&encoded), proxyResponseParserLimits()) {
+    Result.Failure {error} => { fail move error }
+    Result.Success {value} => move value
+  }
+  let ParsedResponse {parser, progress} = move parsed
+  drop progress
+  let head = match move ResponseParser.head(&parser) {
+    Result.Failure {error} => { fail move error }
+    Result.Success {value} => value
+  }
+  return run classifyConnect(&head)
+}
+
+effect fn proxyFilled(length: usize) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut bytes = run Bytes.zeroed(length)
+  let output = Bytes.asMutSlice(&mut bytes)
+  let mut index = usize.ZERO
+  while index < output.length {
+    output[index] = 97
+    index = index + usize.ONE
+  }
+  drop output
+  return move bytes
+}
+
+fn proxyCheckedOrigin<'text>(text: string<'text>) -> Result<Origin, ProxyError> {
+  let uri = match move Uri.parse(text) {
+    Result<Uri<'text>, ParseError>.Failure {error} => {
+      return Result<Origin, ProxyError>.failResult(ProxyError.Admission {error: ProxyAdmissionError {
+        component: ProxyComponent.Configuration,
+        reason: ProxyReason.InvalidProxyUri,
+      }})
+    }
+    Result<Uri<'text>, ParseError>.Success {value} => value
+  }
+  return match move Origin.fromUri(&uri) {
+    Result<Origin, OriginError>.Failure {error} => Result<Origin, ProxyError>.failResult(
+      ProxyError.Admission {error: ProxyAdmissionError {
+        component: ProxyComponent.Configuration,
+        reason: ProxyReason.InvalidProxyUri,
+      }},
+    )
+    Result<Origin, OriginError>.Success {value} => Result<Origin, ProxyError>.succeed(value)
+  }
+}
+
+fn proxyModeIs<'configuration>(route: &Route<'configuration>, expected: RouteMode) -> bool {
+  return Route.mode(route) == expected
+}
+
+fn proxyIsReason(error: ProxyError, expected: ProxyReason) -> bool {
+  let admission = match move error {
+    ProxyError.Admission {error: admissionError} => admissionError
+    _ => { return false }
+  }
+  return match move expected {
+    ProxyReason.InvalidProxyUri => match move admission.reason {
+      ProxyReason.InvalidProxyUri => true
+      _ => false
+    }
+    ProxyReason.InvalidAuthentication => match move admission.reason {
+      ProxyReason.InvalidAuthentication => true
+      _ => false
+    }
+    ProxyReason.UnsupportedProxyTransport => match move admission.reason {
+      ProxyReason.UnsupportedProxyTransport => true
+      _ => false
+    }
+    _ => false
+  }
+}
+
+fn proxyIsOwnedCapacityFailure(error: ProxyError) -> bool {
+  let admission = match move error {
+    ProxyError.Admission {error: admissionError} => admissionError
+    _ => { return false }
+  }
+  return match move admission.reason {
+    ProxyReason.LimitExceeded {limit, allowed, attempted} => {
+      return limit == ProxyLimit.OwnedConfigurationBytes && allowed == 0 && attempted > 0
+    }
+    _ => false
+  }
+}
+
+
+effect fn verifyProxyPolicy() -> bool ! OutOfMemoryError ? &mut Allocator {
+  let bypassOrigin = match move proxyCheckedOrigin("http://[2001:0db8::1]") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  let bypassEntries = [bypassOrigin]
+  let bypass = match move run BypassPolicy.copy(&bypassEntries) {
+    Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
+  }
+  let configId = ProxyConfigId.make(11)
+  let authId = ProxyAuthContextId.make(21)
+  let authentication = match move run ProxyAuth.preparedBasic(
+    authId,
+    b"QWxhZGRpbjpvcGVuIHNlc2FtZQ==",
+  ) {
+    Result<ProxyAuth, ProxyError>.Failure {error} => { return false }
+    Result<ProxyAuth, ProxyError>.Success {value} => move value
+  }
+  let config = match move ProxyConfig.fromUri(
+    configId,
+    "http://proxy.example:3128",
+    move authentication,
+    move bypass,
+    65536,
+  ) {
+    Result<ProxyConfig, ProxyError>.Failure {error} => { return false }
+    Result<ProxyConfig, ProxyError>.Success {value} => move value
+  }
+
+  let numericEquivalent = match move proxyCheckedOrigin("http://[2001:db8::1]:80") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  let direct = selectRoute(&config, numericEquivalent)
+  if !proxyModeIs(&direct, RouteMode.Direct) { return false }
+  if !ProxyConfigId.equals(&Route.configId(&direct), &configId) { return false }
+  if !ProxyAuthContextId.equals(&Route.authContextId(&direct), &authId) { return false }
+
+  let insecure = match move proxyCheckedOrigin("http://service.example") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  let forward = selectRoute(&config, insecure)
+  if !proxyModeIs(&forward, RouteMode.Forward) { return false }
+  let proxyOrigin = match move proxyCheckedOrigin("http://proxy.example:3128") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  let equalEndpointRoute = selectRoute(&config, proxyOrigin)
+  if !proxyModeIs(&equalEndpointRoute, RouteMode.Forward) { return false }
+
+  let secure = match move proxyCheckedOrigin("https://service.example") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  let tunnel = selectRoute(&config, secure)
+  if !proxyModeIs(&tunnel, RouteMode.Tunnel) { return false }
+
+  let differentScheme = match move proxyCheckedOrigin("https://[2001:db8::1]") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  let schemeRoute = selectRoute(&config, differentScheme)
+  if !proxyModeIs(&schemeRoute, RouteMode.Tunnel) { return false }
+  let differentPort = match move proxyCheckedOrigin("http://[2001:db8::1]:81") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  let portRoute = selectRoute(&config, differentPort)
+  if !proxyModeIs(&portRoute, RouteMode.Forward) { return false }
+
+  let recomputed = Route.recompute(&forward, secure)
+  if !proxyModeIs(&recomputed, RouteMode.Tunnel) { return false }
+  if !ProxyAuthContextId.equals(&Route.authContextId(&recomputed), &authId) { return false }
+  let copiedRoute = direct
+  if !RouteKey.equals(&Route.key(&direct), &Route.key(&copiedRoute)) { return false }
+
+  let forwardUri = match move Uri.parse("http://example.com/a?b#discard") {
+    Result<Uri<'static>, ParseError>.Failure {error} => { return false }
+    Result<Uri<'static>, ParseError>.Success {value} => value
+  }
+  let forwardOrigin = match move Origin.fromUri(&forwardUri) {
+    Result<Origin, OriginError>.Failure {error} => { return false }
+    Result<Origin, OriginError>.Success {value} => value
+  }
+  let selectedForward = selectRoute(&config, forwardOrigin)
+  let emptyFields: [Header<'static>; 0] = []
+  let emptyHeaders = match move Headers.make(&emptyFields, proxyValueLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let headerPolicy = HeaderPolicy.defaults()
+  let forwarded = match move run Effect.result(prepareForward(
+    &selectedForward,
+    &forwardUri,
+    Version.Http11,
+    Method.get(),
+    &emptyHeaders,
+    &headerPolicy,
+    BodyMode.Empty,
+    false,
+    proxyValueLimits(),
+    4096,
+    128,
+  )) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  if !proxyBytesEqual(
+    PreparedRequest.bytes(&forwarded),
+    b"GET http://example.com/a?b HTTP/1.1\r\nProxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nHost: example.com\r\nUser-Agent: silk-http/1\r\nAccept: */*\r\n\r\n",
+  ) {
+    return false
+  }
+  let ipv6Connect = match move run Effect.result(prepareConnect(
+    &schemeRoute,
+    proxyValueLimits(),
+    4096,
+    128,
+  )) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  if !proxyBytesEqual(
+    PreparedRequest.bytes(&ipv6Connect),
+    b"CONNECT [2001:db8::1]:443 HTTP/1.1\r\nProxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nHost: [2001:db8::1]:443\r\nUser-Agent: silk-http/1\r\nAccept: */*\r\n\r\n",
+  ) {
+    return false
+  }
+  if !Origin.equals(&PreparedRequest.origin(&forwarded), &forwardOrigin) { return false }
+  let expectedProxyPeer = match move proxyCheckedOrigin("http://proxy.example:3128") {
+    Result<Origin, ProxyError>.Failure {error} => { return false }
+    Result<Origin, ProxyError>.Success {value} => value
+  }
+  if !Origin.equals(&PreparedRequest.physicalPeer(&forwarded), &expectedProxyPeer) { return false }
+  if Origin.equals(&PreparedRequest.origin(&forwarded), &PreparedRequest.physicalPeer(&forwarded)) {
+    return false
+  }
+
+  let tunnelAdmission = match move run Effect.result(prepareConnect(
+    &tunnel,
+    proxyValueLimits(),
+    4096,
+    128,
+  )) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  if !Origin.equals(&PreparedRequest.origin(&tunnelAdmission), &secure) { return false }
+  if !Origin.equals(&PreparedRequest.physicalPeer(&tunnelAdmission), &expectedProxyPeer) { return false }
+  if Origin.equals(&PreparedRequest.origin(&tunnelAdmission), &PreparedRequest.physicalPeer(&tunnelAdmission)) {
+    return false
+  }
+  if !proxyBytesEqual(
+    PreparedRequest.bytes(&tunnelAdmission),
+    b"CONNECT service.example:443 HTTP/1.1\r\nProxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nHost: service.example:443\r\nUser-Agent: silk-http/1\r\nAccept: */*\r\n\r\n",
+  ) {
+    return false
+  }
+
+  let successStatus = match move Status.fromCode(204) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let successHead = match move ValueResponseHead.make(
+    Version.Http11,
+    successStatus,
+    Option<&'static [u8]>.none(),
+    emptyHeaders,
+    proxyConnectInputLimits(),
+  ) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  match move run Effect.result(proxyClassifyConnect(&successHead)) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => {}
+  }
+
+  let upgradeFields: [Header<'static>; 0] = []
+  let upgradeHeaders = match move Headers.make(&upgradeFields, proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let upgradeStatus = match move Status.fromCode(101) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let upgradeHead = match move ValueResponseHead.make(
+    Version.Http11,
+    upgradeStatus,
+    Option<&'static [u8]>.none(),
+    upgradeHeaders,
+    proxyConnectInputLimits(),
+  ) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  match move run Effect.result(proxyClassifyConnect(&upgradeHead)) {
+    Result.Success {value} => { return false }
+    Result.Failure {error} => match move error {
+      ProxyError.InvalidConnectResponse => {}
+      _ => { return false }
+    }
+  }
+
+  let challengeOne = match move Header.make("Proxy-Authenticate", b"Basic realm=one", proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let unrelated = match move Header.make("X-Ignored", b"not retained", proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let challengeTwo = match move Header.make("proxy-authenticate", b"Negotiate", proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let challengeFields = [challengeOne, unrelated, challengeTwo]
+  let challengeHeaders = match move Headers.make(&challengeFields, proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let authenticationStatus = match move Status.fromCode(407) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let authenticationHead = match move ValueResponseHead.make(
+    Version.Http11,
+    authenticationStatus,
+    Option<&'static [u8]>.some(b"Proxy Authentication Required"),
+    challengeHeaders,
+    proxyConnectInputLimits(),
+  ) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  match move run Effect.result(proxyClassifyConnect(&authenticationHead)) {
+    Result.Success {value} => { return false }
+    Result.Failure {error} => match move error {
+      ProxyError.ProxyAuthenticationRequired {response} => {
+        let view = OwnedResponseHead.view(&response)
+        let status = ValueResponseHead.status(&view)
+        if Status.code(&status) != 407 || !proxyReasonEquals(&view, b"Proxy Authentication Required") {
+          return false
+        }
+        let fields = ValueResponseHead.headers(&view)
+        if Headers.count(&fields) != 2 { return false }
+        let mut selected = Headers.getAll(&fields, "Proxy-Authenticate")
+        let first = match move HeaderIterator.next(&mut selected) {
+          Option.None => { return false }
+          Option.Some {value} => value
+        }
+        if !proxyBytesEqual(Header.value(&first), b"Basic realm=one") { return false }
+        let second = match move HeaderIterator.next(&mut selected) {
+          Option.None => { return false }
+          Option.Some {value} => value
+        }
+        if !proxyBytesEqual(Header.value(&second), b"Negotiate") { return false }
+      }
+      _ => { return false }
+    }
+  }
+
+  let retainedOne = match move Header.make("Retry-After", b"5", proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let retainedTwo = match move Header.make("X-Trace", b"later", proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let rejectionFields = [retainedOne, retainedTwo]
+  let rejectionHeaders = match move Headers.make(&rejectionFields, proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let rejectionStatus = match move Status.fromCode(502) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let rejectionHead = match move ValueResponseHead.make(
+    Version.Http11,
+    rejectionStatus,
+    Option<&'static [u8]>.some(b"Bad Gateway"),
+    rejectionHeaders,
+    proxyConnectInputLimits(),
+  ) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  match move run Effect.result(proxyClassifyConnect(&rejectionHead)) {
+    Result.Success {value} => { return false }
+    Result.Failure {error} => match move error {
+      ProxyError.ProxyRejected {response} => {
+        let view = OwnedResponseHead.view(&response)
+        let status = ValueResponseHead.status(&view)
+        if Status.code(&status) != 502 || !proxyReasonEquals(&view, b"Bad Gateway") { return false }
+        let fields = ValueResponseHead.headers(&view)
+        if Headers.count(&fields) != 2 { return false }
+        let mut ordered = Headers.iter(&fields)
+        let first = match move HeaderIterator.next(&mut ordered) {
+          Option.None => { return false }
+          Option.Some {value} => value
+        }
+        if Header.name(&first) != "Retry-After"
+          || !proxyBytesEqual(Header.value(&first), b"5") { return false }
+        let second = match move HeaderIterator.next(&mut ordered) {
+          Option.None => { return false }
+          Option.Some {value} => value
+        }
+        if Header.name(&second) != "X-Trace"
+          || !proxyBytesEqual(Header.value(&second), b"later") { return false }
+      }
+      _ => { return false }
+    }
+  }
+
+  // The wire head fits 32768 bytes, but payload plus four field records exceeds the 32768-byte
+  // owned bound even with 32-bit records, so the overflow holds on native and wasm32 targets.
+  let largeOne = run proxyFilled(8178)
+  let largeTwo = run proxyFilled(8178)
+  let largeThree = run proxyFilled(8178)
+  let largeFour = run proxyFilled(8178)
+  let overflowOne = match move Header.make("A", Bytes.asSlice(&largeOne), proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let overflowTwo = match move Header.make("B", Bytes.asSlice(&largeTwo), proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let overflowThree = match move Header.make("C", Bytes.asSlice(&largeThree), proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let overflowFour = match move Header.make("D", Bytes.asSlice(&largeFour), proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let overflowFields = [overflowOne, overflowTwo, overflowThree, overflowFour]
+  let overflowHeaders = match move Headers.make(&overflowFields, proxyConnectInputLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let overflowHead = match move ValueResponseHead.make(
+    Version.Http11,
+    rejectionStatus,
+    Option<&'static [u8]>.none(),
+    overflowHeaders,
+    proxyConnectInputLimits(),
+  ) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  match move run Effect.result(proxyClassifyConnect(&overflowHead)) {
+    Result.Success {value} => { return false }
+    Result.Failure {error} => match move error {
+      ProxyError.ProxyMetadataLimit => {}
+      _ => { return false }
+    }
+  }
+
+  let omittedHostPolicy = HeaderPolicy {
+    host: HeaderControl<'static>.Omit,
+    userAgent: HeaderControl<'static>.Omit,
+    accept: HeaderControl<'static>.Omit,
+    authorization: Authorization<'static>.Absent,
+    basicSecurity: BasicSecurity.RequireTls,
+    http10KeepAlive: false,
+  }
+  let forwardedHttp10 = match move run Effect.result(prepareForward(
+    &selectedForward,
+    &forwardUri,
+    Version.Http10,
+    Method.get(),
+    &emptyHeaders,
+    &omittedHostPolicy,
+    BodyMode.Empty,
+    false,
+    proxyValueLimits(),
+    4096,
+    128,
+  )) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => move value
+  }
+  if !proxyBytesEqual(
+    PreparedRequest.bytes(&forwardedHttp10),
+    b"GET http://example.com/a?b HTTP/1.0\r\nProxy-Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==\r\nHost: example.com\r\nConnection: close\r\n\r\n",
+  ) {
+    return false
+  }
+
+  let proxyField = match move Header.make("Proxy-Authorization", b"Basic override", proxyValueLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let proxyFields = [proxyField]
+  let proxyHeaders = match move Headers.make(&proxyFields, proxyValueLimits()) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let directTarget = match move RequestTarget.parse(&Method.get(), "/", 256) {
+    Result.Failure {error} => { return false }
+    Result.Success {value} => value
+  }
+  let rejectedDirect = run Effect.result(Request.prepare(
+    &forwardOrigin,
+    Version.Http11,
+    Method.get(),
+    directTarget,
+    &proxyHeaders,
+    &headerPolicy,
+    BodyMode.Empty,
+    false,
+    proxyValueLimits(),
+    4096,
+    128,
+  ))
+  match move rejectedDirect {
+    Result.Failure {error} => match move error {
+      RequestError.ProxyAuthorization => {}
+      _ => { return false }
+    }
+    Result.Success {value} => { return false }
+  }
+  let rejectedOverride = run Effect.result(prepareForward(
+    &selectedForward,
+    &forwardUri,
+    Version.Http11,
+    Method.get(),
+    &proxyHeaders,
+    &headerPolicy,
+    BodyMode.Empty,
+    false,
+    proxyValueLimits(),
+    4096,
+    128,
+  ))
+  match move rejectedOverride {
+    Result.Failure {error} => match move error {
+      RequestError.ProxyAuthorization => {}
+      _ => { return false }
+    }
+    Result.Success {value} => { return false }
+  }
+
+  let emptyOrigins: [Origin; 0] = []
+  let emptyForHttps = match move run BypassPolicy.copy(&emptyOrigins) {
+    Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
+  }
+  match move ProxyConfig.fromUri(
+    ProxyConfigId.make(12),
+    "https://proxy.example:443",
+    ProxyAuth.none(ProxyAuthContextId.make(22)),
+    move emptyForHttps,
+    65536,
+  ) {
+    Result<ProxyConfig, ProxyError>.Success {value} => { return false }
+    Result<ProxyConfig, ProxyError>.Failure {error} => {
+      if !proxyIsReason(move error, ProxyReason.UnsupportedProxyTransport) { return false }
+    }
+  }
+
+  let emptyForPath = match move run BypassPolicy.copy(&emptyOrigins) {
+    Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
+  }
+  match move ProxyConfig.fromUri(
+    ProxyConfigId.make(13),
+    "http://proxy.example/path",
+    ProxyAuth.none(ProxyAuthContextId.make(23)),
+    move emptyForPath,
+    65536,
+  ) {
+    Result<ProxyConfig, ProxyError>.Success {value} => { return false }
+    Result<ProxyConfig, ProxyError>.Failure {error} => {
+      if !proxyIsReason(move error, ProxyReason.InvalidProxyUri) { return false }
+    }
+  }
+
+  match move run ProxyAuth.preparedBasic(ProxyAuthContextId.make(24), b"not base64") {
+    Result<ProxyAuth, ProxyError>.Success {value} => { return false }
+    Result<ProxyAuth, ProxyError>.Failure {error} => {
+      if !proxyIsReason(move error, ProxyReason.InvalidAuthentication) { return false }
+    }
+  }
+
+  let emptyForCapacity = match move run BypassPolicy.copy(&emptyOrigins) {
+    Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
+  }
+  match move ProxyConfig.fromUri(
+    ProxyConfigId.make(14),
+    "http://proxy.example:3128",
+    ProxyAuth.none(ProxyAuthContextId.make(25)),
+    move emptyForCapacity,
+    0,
+  ) {
+    Result<ProxyConfig, ProxyError>.Success {value} => { return false }
+    Result<ProxyConfig, ProxyError>.Failure {error} => {
+      if !proxyIsOwnedCapacityFailure(move error) { return false }
+    }
+  }
+
+  let emptyForRotated = match move run BypassPolicy.copy(&emptyOrigins) {
+    Result<BypassPolicy, ProxyError>.Failure {error} => { return false }
+    Result<BypassPolicy, ProxyError>.Success {value} => move value
+  }
+  let rotated = match move ProxyConfig.fromUri(
+    configId,
+    "http://proxy.example:3128",
+    ProxyAuth.none(ProxyAuthContextId.make(99)),
+    move emptyForRotated,
+    65536,
+  ) {
+    Result<ProxyConfig, ProxyError>.Failure {error} => { return false }
+    Result<ProxyConfig, ProxyError>.Success {value} => move value
+  }
+  let rotatedRoute = selectRoute(&rotated, insecure)
+  let retainedRoute = Route.recompute(&forward, insecure)
+  if !ProxyAuthContextId.equals(&Route.authContextId(&retainedRoute), &authId) { return false }
+  return !RouteKey.equals(&Route.key(&forward), &Route.key(&rotatedRoute))
+}
+
+struct RouteAudit {
+  output: [u8; 512]
+  outputLength: usize
+  connectAccepted: bool
+  handlerCount: usize
+  publicationCount: usize
+  concreteReadCount: usize
+  concreteWriteCount: usize
+  concreteFlushCount: usize
+  concreteShutdownCount: usize
+  concreteCloseCount: usize
+  rejectedExchangeCallbackCount: usize
+}
+
+fn emptyRouteAudit() -> RouteAudit {
+  return RouteAudit {
+    output: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    outputLength: usize.ZERO,
+    connectAccepted: false,
+    handlerCount: usize.ZERO,
+    publicationCount: usize.ZERO,
+    concreteReadCount: usize.ZERO,
+    concreteWriteCount: usize.ZERO,
+    concreteFlushCount: usize.ZERO,
+    concreteShutdownCount: usize.ZERO,
+    concreteCloseCount: usize.ZERO,
+    rejectedExchangeCallbackCount: usize.ZERO,
+  }
+}
+
+fn appendRouteOutput(state: &mut RouteAudit, input: &[u8]) -> bool {
+  if input.length > 512 - state.outputLength { return false }
+  let mut index = usize.ZERO
+  while index < input.length {
+    state.output[state.outputLength + index] = input[index]
+    index = index + usize.ONE
+  }
+  state.outputLength = state.outputLength + input.length
+  return true
+}
+
+fn recordRouteOutput(audit: &Option<Shared<RouteAudit>>, input: &[u8]) -> bool {
+  return match & audit.* {
+    Option.None => true
+    Option.Some {value} => Shared<RouteAudit>.withMut<bool>(&value, fn(state: &mut RouteAudit) -> bool {
+      return appendRouteOutput(&mut state.*, input)
+    })
+  }
+}
+
+fn recordRouteTlsOutput(
+  audit: &Option<Shared<RouteAudit>>,
+  scenario: i32,
+  input: &[u8],
+) -> bool {
+  return match & audit.* {
+    Option.None => true
+    Option.Some {value} => Shared<RouteAudit>.withMut<bool>(&value, fn(state: &mut RouteAudit) -> bool {
+      if scenario == 23 {
+        state.concreteWriteCount = state.concreteWriteCount + usize.ONE
+        return true
+      }
+      if !state.connectAccepted { return false }
+      return appendRouteOutput(&mut state.*, input)
+    })
+  }
+}
+
+fn recordProxyConcreteRead(audit: &Option<Shared<RouteAudit>>, scenario: i32) -> () {
+  if scenario != 23 { return () }
+  match & audit.* {
+    Option.None => {}
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
+      state.concreteReadCount = state.concreteReadCount + usize.ONE
+      return ()
+    })
+  }
+  return ()
+}
+
+fn recordProxyConcreteFlush(audit: &Option<Shared<RouteAudit>>, scenario: i32) -> () {
+  if scenario != 23 { return () }
+  match & audit.* {
+    Option.None => {}
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
+      state.concreteFlushCount = state.concreteFlushCount + usize.ONE
+      return ()
+    })
+  }
+  return ()
+}
+
+fn recordProxyConcreteShutdown(audit: &Option<Shared<RouteAudit>>, scenario: i32) -> () {
+  if scenario != 23 { return () }
+  match & audit.* {
+    Option.None => {}
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
+      state.concreteShutdownCount = state.concreteShutdownCount + usize.ONE
+      return ()
+    })
+  }
+  return ()
+}
+
+fn recordProxyConcreteClose(audit: &Option<Shared<RouteAudit>>, scenario: i32) -> bool {
+  if scenario != 23 { return false }
+  return match & audit.* {
+    Option.None => false
+    Option.Some {value} => Shared<RouteAudit>.withMut<bool>(&value, fn(state: &mut RouteAudit) -> bool {
+      state.concreteCloseCount = state.concreteCloseCount + usize.ONE
+      return true
+    })
+  }
+}
+
+fn recordRouteConnectAccepted(
+  audit: &Option<Shared<RouteAudit>>,
+  input: &[u8],
+  readOffset: usize,
+) -> () {
+  let head = b"HTTP/1.1 299 Connection Established\r\n\r\n"
+  if readOffset < head.length || !sameRouteBytes(input, usize.ZERO, head) { return () }
+  match & audit.* {
+    Option.None => {}
+    Option.Some {value} => Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
+      state.connectAccepted = true
+      return ()
+    })
+  }
+  return ()
+}
+
+enum RouteAcquisitionError { Failed }
+
+struct ScriptedRouteClient<A, E, ?R> {
+  provider: TestTransport
+  settingsValue: RouteSettings
+}
+
+impl<A, E, ?R> ScriptedRouteClient<A, E, R> {
+  fn settings(client: &Self) -> RouteSettings {
+    return client.settingsValue
+  }
+
+  effect<'env> fn acquire<'env>(client: Self, peer: Origin, deadline: Option<Instant>) -> A
+  ! E | RouteAcquisitionError
+  ? R | &mut AcquiredRouteContext<TestTransport, A, E ? R>
+  where R in Without<R, ByteDuplex>, R in Without<R, HttpTransport> {
+    drop peer
+    drop deadline
+    let ScriptedRouteClient<A, E, R> {provider, settingsValue} = move client
+    drop settingsValue
+    return run AcquiredRouteContext<TestTransport, A, E, R>.use(move provider)
+  }
+}
+
+impl<A, E, ?R> RouteClient<TestTransport, A, E, RouteAcquisitionError, never ? R> for ScriptedRouteClient<
+  A,
+  E,
+  R,
+> {
+  settings: ScriptedRouteClient.settings
+  acquire: ScriptedRouteClient.acquire
+}
+
+struct RoutedNoop { audit: Option<Shared<RouteAudit>> }
+
+impl RoutedNoop {
+  effect<'call> fn handle<
+    'configuration,
+    'call,
+    'transport: 'call,
+    'provider: 'transport,
+    'tunnel: 'provider,
+  >(
+    handler: Self,
+    route: Route<'configuration>,
+    connection: &'call mut Connection<
+      RouteTransport<'transport, 'provider, 'tunnel, TestTransport>,
+    >,
+  ) -> i32 {
+    if let Option.Some {value} = &handler.audit {
+      Shared<RouteAudit>.withMut<()>(&value, fn(state: &mut RouteAudit) -> () {
+        state.handlerCount = state.handlerCount + usize.ONE
+        return ()
+      })
+    }
+    drop handler
+    drop route
+    drop connection
+    return 0
+  }
+}
+
+impl<'configuration> RouteHandler<'configuration, TestTransport, i32, never ? never> for RoutedNoop {
+  handle: RoutedNoop.handle
+}
+
+struct RouteRandom { filled: usize }
+
+impl Random for RouteRandom {
+  effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+    let mut index = usize.ZERO
+    while index < output.length {
+      output[index] = usize.toU8((self.filled + index + usize.ONE) % 251 + usize.ONE)
+      index = index + usize.ONE
+    }
+    self.filled = self.filled + output.length
+    return ()
+  }
+}
+
+struct RouteWallClock {}
+
+impl RouteWallClock {
+  effect fn now(self: &mut Self) -> Instant {
+    return SystemClock.make(1789156800, 123456789)
+  }
+
+  effect fn resolution(self: &mut Self) -> u64 {
+    return u64.toU64(1)
+  }
+}
+
+impl SystemClock for RouteWallClock {
+  now: RouteWallClock.now
+  getResolution: RouteWallClock.resolution
+}
+
+fn routeInput() -> &'static [u8] {
+  return b"\x48\x54\x54\x50\x2f\x31\x2e\x31\x20\x32\x39\x39\x20\x43\x6f\x6e\x6e\x65\x63\x74\x69\x6f\x6e\x20\x45\x73\x74\x61\x62\x6c\x69\x73\x68\x65\x64\x0d\x0a\x0d\x0a\x16\x03\x03\x00\x5a\x02\x00\x00\x56\x03\x03\x79\xc3\x2d\x95\x5f\xc5\xbd\x8d\xb4\xb1\x24\xa5\x41\xd6\x25\xde\x3c\x69\xd2\x33\xeb\xdb\x34\x2d\xfb\xb5\xcc\x3a\x56\x27\x04\x90\x00\x13\x03\x00\x00\x2e\x00\x33\x00\x24\x00\x1d\x00\x20\x94\x08\x61\xdb\x5f\x0e\xf8\xe6\xcb\x65\x96\x47\xde\xc1\x41\xc6\xd8\x29\x32\x3b\xea\x06\x55\x06\x22\xc4\x8f\xb9\x74\x5d\x80\x4e\x00\x2b\x00\x02\x03\x04\x14\x03\x03\x00\x01\x01\x17\x03\x03\x07\xe9\x23\x11\xf9\x6d\xa8\xd9\x25\xec\x44\x84\xe8\x86\xbe\x2d\xec\xbd\x9d\x93\xb6\x2f\xde\x89\xe7\x0e\x88\x31\xbe\x73\xb6\x14\x4a\x96\x3a\x41\xa8\x89\x4b\xee\xc0\x8c\x9b\xc5\x4d\x6a\x7f\x2c\x81\x3b\xb9\xa6\x18\x1b\xce\x60\x3c\x5b\x1a\xf9\x21\xc9\xed\x6a\xc9\xca\xa2\xad\xa9\x59\x04\x0c\x2a\x9f\xfa\xbe\xa1\x2c\x4b\x5e\x4b\x6a\x4f\x4d\xdd\x31\x6d\x01\x5a\xff\x24\xae\xba\x22\x83\xbd\x68\xce\x03\x9e\x2c\xe0\x91\x94\xec\xa3\x50\x61\xac\xfc\xa8\x93\xef\x73\x2e\x61\xda\x4e\xc6\x72\x0e\x42\x06\x97\x58\xdc\x11\x33\x6a\x57\x23\x13\xf0\x0a\x0d\xea\xf0\x80\x1e\x83\xa4\xb1\xa2\xd9\x6a\x93\x85\x25\x29\x8b\x8c\xeb\x48\x23\xa1\x78\x9b\x12\xc2\x4c\xc8\x32\x2d\x01\x40\xcb\x8f\x59\x63\xe6\x52\xf9\x72\xdf\x23\xbb\xa5\xc5\x23\x97\x8f\x88\xdc\x60\x16\xd5\x33\xfc\xfc\x90\x8a\x9e\x26\xd1\x44\x9e\x6e\xa7\x67\x28\x7b\x8b\xc6\x9b\x09\x26\x8e\x8f\x68\x13\x85\xec\x81\x26\x78\xe6\xf3\x73\x08\x99\xe6\x69\x1c\x44\x6a\x2d\xaa\x16\xb8\x2a\x62\x05\x88\x02\x6b\xc6\xdc\x37\x64\x87\x2a\xa9\x4f\x9c\x09\x5f\x67\x3f\xd3\x9d\x6c\x7b\x04\x67\xe0\xad\x2b\x71\x71\xf4\xce\xcb\x6b\x7e\xa6\x31\x24\x3e\x4d\x60\x0f\xd2\x0a\xfd\xb1\x31\xea\x59\xcf\x62\xa0\x35\x17\x61\xa5\xb8\xb9\x0a\xbc\x80\x0d\xf7\xfb\x9f\x97\xd8\x13\x30\xe6\x08\x1c\x45\x57\xfe\x59\x96\x53\x5a\x4f\x39\x96\x17\xbd\xd2\xe7\x76\x19\x21\x4f\x8e\x53\xe3\xf8\xb8\x22\x12\x0b\x3d\x49\x45\x10\x6d\x97\x96\xcc\x97\x2a\xfa\xa8\x2b\x02\x5e\x7e\x83\x24\xe1\xa6\x57\xf8\x7a\xb3\x25\xe4\xc0\xdc\xa9\x6c\xc5\xac\x67\xd6\xee\x16\xdd\xd2\x0f\xc6\xa4\xc6\xd1\x45\xc1\x30\xd6\xd3\x8e\x41\x3a\xcc\x8f\x81\x88\xce\x12\xc3\x7d\xa6\x60\x1b\xdc\xc2\xb5\xd4\x16\x92\x7b\x9d\xa8\x16\x2a\xdb\x34\xcb\x08\x71\xfd\x83\x21\xf5\xe4\x28\xd4\x0f\xb8\xfa\xcf\xa6\x71\x3d\xdc\xda\xf8\x9a\xda\x10\x88\x9a\x1f\x1f\xf5\x25\x88\xc4\x44\x4e\x7a\x19\x9b\x21\xa6\x95\x30\xe7\xa4\x8f\xdd\xb0\xda\x46\xcd\x0c\x67\xe8\xe2\x15\x22\xa0\x01\x17\x74\x91\x77\xbd\x92\xdf\x3c\xdb\xeb\x72\xc5\x25\xdc\x8f\xef\x97\x4f\x7f\x95\x9b\xf8\x64\xb4\xb8\x93\x6f\xcd\xb3\x9a\x92\x39\xa0\x15\x97\xb7\xe8\x86\xda\xa8\x18\x08\xd3\x0e\xdb\x2a\xbe\x76\xc9\xdc\x2e\x76\x69\x84\xa2\xc4\x53\x5c\x76\x41\xa5\x00\x66\x6c\xa0\xef\x26\x8d\x4a\xaf\xc4\x6c\xc2\x26\xca\x17\xc9\xf1\xcf\x8e\xc2\x1f\x83\xa3\xfc\xdb\xe3\x7c\x57\x59\xdf\xff\x95\x06\x9b\x8e\x74\x09\x93\xf1\xca\xd0\x1f\xfc\xf7\x32\x50\x60\xae\xc1\x5f\xe6\xb8\xcf\x56\x95\x2c\x86\xa8\x07\x20\x8e\xc5\x8b\x4b\xc2\xff\x6d\x66\x5d\xe0\xa3\x56\x44\xdf\x18\xa3\x47\xa2\xaa\x04\x29\x34\xcd\xc3\x89\x1f\xa5\x56\xa4\x98\x8c\xf4\x41\x07\x22\x6d\xdc\xc9\x15\x3d\xd5\x40\x2b\x9e\x6b\x58\x5d\x6b\x23\xb8\xb7\xba\x65\x7f\x5e\x0c\x64\xd5\xe2\x70\xa8\xf2\xac\x42\x8e\x8a\x81\x89\x81\x74\x5c\x99\xd8\x90\x6c\xa3\x82\xe8\xeb\xd3\x2b\x19\xfc\xaf\xfe\x17\x6d\x53\x07\xbe\xdc\xba\x79\x45\x71\x46\x38\xb8\xd4\xcd\x53\x1c\x91\x68\xe2\xc4\x73\x8c\xfb\x1c\x93\x34\x24\x6f\x3a\xb1\x14\x71\x08\x43\x02\x10\x09\x8d\x32\x8e\xf7\xa3\x94\xf5\x39\x49\xa8\xfe\x39\x34\x08\x63\x3d\x1d\xa1\x6f\xbe\x7c\x2e\xd9\x5e\xf6\x43\xaa\xbb\x7a\x21\x11\x94\xca\x90\x14\x93\x75\x03\xdd\xec\xb9\xd9\xfa\xf3\x9e\xeb\xf0\x65\x84\x3b\xf1\xa0\x6f\x3c\x6d\xd8\x7f\xc8\x51\xb5\x17\x66\x31\x4d\xc5\x48\x75\xa5\x4f\x9d\xd0\x72\x47\xba\xc7\xe8\x7b\xff\x70\x0e\x8d\x53\xc4\xcd\x61\xf4\xda\xb6\xef\x51\xb7\xc6\x7c\x8e\x4e\x2f\x04\x3b\xa6\x0a\x2f\x0c\x33\x89\x3b\xdd\x1c\xb7\x1c\x7a\x50\xe1\xfa\x2b\xb3\xe9\x0e\xc5\x65\xf4\xe7\xa4\xdc\xc7\x36\xb7\xc7\x67\x91\xdb\x9e\x11\xc8\x16\x9a\x91\xdd\x3b\xb0\x01\x66\x41\x5a\xc2\x70\x4b\xd5\xa9\x51\xd5\x26\x6f\x41\xf5\xa2\x9c\x5b\xd3\x37\x84\x9d\xdf\xfc\x3b\x69\xc1\x6e\xbd\x5d\x11\x91\xaa\x93\x87\x91\x2c\xc3\x6e\xe0\x77\x24\x7a\x61\xdc\x06\x5d\x49\x85\xe2\xc2\x6f\x41\xd7\x3e\x88\x4b\x9f\x0a\x08\x6d\xb7\xa2\xbf\x14\x15\xf7\xc3\x4d\xf5\x75\x24\xda\x93\x91\x25\x93\x8f\xf1\xa5\x0b\xc1\x72\xf7\xcd\xcd\x31\x88\x82\xdd\x36\x95\xb3\xb4\xaa\x80\x81\x27\xda\x75\xe3\x89\x91\xea\xb1\x7d\xc7\x75\xe8\x70\x80\x66\x92\x79\xd7\x3d\x5b\x81\x14\x19\x72\x19\x47\xc5\x98\x9b\x8b\xdd\xc5\x38\xcc\xdb\x90\xdb\x87\x5d\x24\xe6\x7d\x81\x39\x8a\x1b\xd1\xbc\xdd\x8d\xed\x3e\x6d\x58\x1e\x71\x3d\x91\xd5\xd2\xfd\x81\x7a\x56\xc0\x3e\x6a\xbd\x45\x5c\x18\x62\xbb\x29\xed\xc3\x17\x08\x49\x0f\x73\x18\x27\x8a\x25\x15\xf4\x9d\xe1\x5b\x88\xa5\x0d\xac\xee\x3c\xac\xe3\xd5\xf8\x4c\xbd\x06\x43\x7a\x02\x2a\x85\x35\xd5\x06\xee\x58\x2e\x42\x9f\x0f\xd0\xf6\xbc\xbf\xe4\x49\xee\xb1\x3d\xa5\xac\x43\x9a\x18\xa4\x20\x50\x1d\x32\x5e\x19\xd7\x9f\x20\x1e\xc6\xe5\x30\x21\xe8\x41\x1d\xf8\x27\xe7\xca\xaa\x65\x85\x4f\x0c\xf8\x60\x7f\xeb\x65\x21\x73\x59\x22\x0c\xd3\x24\x65\xfd\x2e\x01\x4d\xf3\x56\x85\xba\x67\x24\x0b\x02\xdb\x25\x3e\xc5\xd6\x78\x37\xec\xe1\xcb\xfe\x51\xc5\x5a\x3a\x3a\x1e\xc4\x22\x85\xc8\xa4\x3d\x09\x4f\xaa\x14\xab\x09\x1f\x82\xc9\x90\x4a\xea\xe6\x00\x3c\x7b\x56\x67\x68\x8b\x2c\xd1\xe1\xfa\x50\x46\xdd\x83\x5f\x9a\x1e\xb7\xcd\xa3\xf6\xfa\x66\xfd\x7e\xde\xf9\x32\x60\xbc\xa2\x18\x9b\x34\x46\x40\xbf\xbf\x35\x59\xae\xc8\x9c\x89\x5b\xc0\x12\xd2\x43\xb6\x24\x5a\x7b\xb4\xb4\x2f\xad\x2e\x0b\x02\x72\xfb\xe4\x36\xa7\x19\xb3\x95\x34\x5d\x55\x47\x66\x96\x56\xff\x1e\x11\xc4\x5f\x77\x3c\x42\xe4\xda\x13\x6d\x6a\xc0\xaa\xca\x51\xde\xa3\x46\x9a\xdd\xb6\x60\x45\x10\x3f\x5e\xb3\xb7\xd4\x68\xa3\x21\x90\x89\xb4\xb1\x8f\x51\xbf\x93\x06\x7d\x01\x5b\x31\x17\xba\x8e\x67\xd0\x9b\x32\x84\x2d\x82\xf3\xf8\x5d\xe0\x4b\x0d\x28\x0f\x3e\x4c\x6c\x0b\xdf\x01\x41\x37\x52\x64\x2a\x5f\xca\x10\xac\x30\x7c\x68\xba\xf3\x19\xa0\x21\xd0\x5e\x32\xa3\xf0\xe8\x36\x46\xa3\x10\xab\xe9\xd3\xe0\x6f\x15\x10\x84\xd0\x82\xe0\xbe\x4c\x11\x87\x8c\xc2\x18\x97\x64\xc7\x79\x70\xec\x9a\x1d\xd6\x0e\x06\x0e\x74\x99\xd5\xf1\x2d\x0e\xdc\x03\x2b\x9c\xc7\x98\x42\x89\x21\x27\xbd\x23\xb2\xc5\x37\xc4\x73\xac\x40\x70\xdf\x6f\x3a\xfb\x23\xc0\x66\x18\xdb\xb2\x78\x05\xa6\x75\xb0\xf6\x56\xee\x62\xe9\x36\xc3\x4c\x40\x1f\xc1\xfd\x96\x70\x61\x3d\x8f\x3d\x99\x04\x38\xb4\x85\x56\xb0\x5b\xa2\x08\x9e\xef\xee\xe8\x77\x78\xe3\x01\x7e\x69\x4c\x23\x78\x84\xe1\x3b\xb2\x16\x74\x21\x3c\xaf\x54\x49\x99\xc1\x20\x87\xe2\x06\xe3\xe9\x64\x31\x81\xfc\xde\x7b\x8c\x2e\x89\x44\x42\xf1\x8d\x63\xd9\x5a\x6b\x7e\x25\x6e\x55\x4c\x43\xe1\x8e\x6b\xdd\x3c\x24\xb8\xb6\xdd\xd3\x22\x87\x9b\x5f\x7f\x78\xd7\xc5\x14\x08\x53\xd6\x17\x43\x8b\xf6\x3d\x4b\xe9\x5d\x09\x2e\xc7\x77\x60\x85\x79\xc5\x1a\xb8\xd9\x79\x9d\x62\xc8\xc6\x7b\x47\xca\x45\x33\x1c\x74\xf1\x01\xd8\xa6\x97\xce\xc4\x50\x90\xbb\xe1\x46\xc5\xcb\xb9\xc9\x4c\x5e\x08\x4d\xf5\x63\x58\x72\xfc\x7d\x62\x82\x9c\xc0\xd9\xe6\x5a\x68\x2b\x28\x10\xc7\xa0\x8e\x24\x3f\xba\x20\xa8\x8d\xf0\x49\x1a\xad\xaf\x0d\xc4\xcc\xf4\x52\x0e\x97\xab\xb4\x21\xab\x3e\x9f\x42\x22\x87\x90\xc5\x7f\xc8\xb4\x3f\x68\xee\x31\x51\xad\xf6\x57\x03\x56\x1b\xe1\x85\xbd\xc5\xaf\x59\x6b\xce\xa5\x37\x84\x72\x3e\xc9\x41\x7a\x1d\xb5\x2d\x09\x48\x05\x74\x11\xb4\xb6\x68\xbf\xa0\x2c\x81\xba\x64\x80\x39\x10\x7d\x4b\x7a\xfd\x66\x86\xa5\x12\x64\x4f\x82\x97\xa5\xb1\x6a\xb2\x40\x9b\x4a\xf6\xc1\x96\x85\x20\xed\xae\x21\x6b\x35\xd7\x54\x5b\x5e\xed\x1f\x85\x3d\x4d\xf1\x09\x34\xf7\x2e\x10\x39\x50\xa8\xce\x29\x14\xe2\xa0\x1f\xd8\x0d\x4d\xb3\x82\x12\x31\xb6\x13\x8d\x2c\x3f\xcc\xd6\x7a\x62\x5f\x0b\xc9\x12\x01\xea\xee\xdd\x6f\xdb\xc7\xc7\x26\x32\x9f\x04\xc2\xa5\x18\xc4\xa4\xf8\x97\x12\x4e\x12\xcb\xee\xe9\x56\x0f\x0c\x67\xc2\xcc\x77\x14\xc9\x22\xc7\x5d\x51\x61\x8a\x02\xb4\x46\xe1\xb3\x1a\x0e\xde\x8c\xf0\x50\xa5\x43\x6a\xc4\xe4\xbf\x39\x59\xe6\x2d\xcb\xba\xa3\x32\xb3\x7f\x13\x22\x96\x0e\x16\xa3\x40\x12\xdd\x45\x59\x3a\x1c\x50\x4e\x8b\xcd\x0b\xf8\x67\x8c\xd2\x52\xd6\xcb\x31\xe8\xcf\xca\xe3\x28\xeb\x73\x51\xd3\xb6\x03\xec\x84\x52\x87\x21\x6d\xa6\xaa\x1f\x21\xa4\xd5\x8c\x3d\x8b\xfd\x98\x76\x5f\x4f\x29\x41\xf4\xd8\x72\x33\x66\x01\xa6\xcf\x95\xbf\xcb\xbc\x64\x5a\xee\xdb\x3f\x4a\x36\x80\x10\x6d\x74\xa2\x5d\xb7\x67\xf1\x08\xd3\x73\x45\x83\x6d\x57\xe7\xa9\x90\x76\xbb\xb2\x90\xfd\x94\x24\xb6\x6c\xd0\xd7\x9d\x82\xb4\x14\x12\x07\x8b\x44\xbe\x07\x1e\xd9\xcf\xf7\x70\x1f\x38\xb3\x79\xc2\xed\x04\x79\xaa\xc9\x27\x37\x04\xcf\x8a\x6a\x78\xa2\x77\x2e\x0b\xa7\x91\x2f\x18\x3d\x03\x1f\x75\x8d\x82\xc3\xef\x6a\x22\x69\x63\x5e\xf8\x55\x3d\x8a\xa5\xea\xad\x93\x3e\xb6\x38\xb0\x7f\xe1\x60\x01\x6a\xa7\xcc\xaa\xf6\x68\xc1\x44\xad\x39\xbc\xad\xcc\x6c\x7d\xf7\xe3\xb4\xa3\x42\x7d\xdc\x7c\x40\x3b\x1e\x29\x99\x50\xd2\x5f\x70\x93\xa1\xb2\xd2\xb1\x8f\x94\xb5\x43\x88\xf8\xb3\x03\xe2\x03\xb5\x82\x88\xec\x52\x7c\x17\x03\x03\x00\x32\x55\x3b\x85\x24\xd9\xdb\xb9\x79\x69\x93\x6b\xd5\xfc\xbe\xa6\x88\xf2\xd4\x93\xb0\x1f\x0e\x84\xc7\xfe\x9d\x1e\xd2\xdd\xa6\x86\x40\xa9\x64\xa2\x74\xba\x6f\xf2\xee\x6c\x36\x8f\xa4\x98\xad\x11\x7b\x8d\x3a"
+}
+
+fn sameRouteBytes(actual: &[u8], offset: usize, expected: &[u8]) -> bool {
+  if expected.length > actual.length - offset { return false }
+  let mut index = usize.ZERO
+  while index < expected.length {
+    if actual[offset + index] != expected[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn sameRouteHello(actual: &[u8], offset: usize, expected: &[u8]) -> bool {
+  if expected.length < 5 || offset + expected.length > actual.length { return false }
+  if actual[offset] != 22 || actual[offset + 1] != 3 || actual[offset + 2] != 3 {
+    return false
+  }
+  if u8.toUsize(actual[offset + 3]) * 256 + u8.toUsize(actual[offset + 4]) + 5
+    != expected.length { return false }
+  let mut index: usize = 5
+  while index < expected.length {
+    if actual[offset + index] != expected[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn routedAuditPassed(state: &RouteAudit) -> bool {
+  let connect = b"\x43\x4f\x4e\x4e\x45\x43\x54\x20\x77\x72\x6f\x6e\x67\x2e\x65\x78\x61\x6d\x70\x6c\x65\x3a\x34\x34\x33\x20\x48\x54\x54\x50\x2f\x31\x2e\x31\x0d\x0a\x50\x72\x6f\x78\x79\x2d\x41\x75\x74\x68\x6f\x72\x69\x7a\x61\x74\x69\x6f\x6e\x3a\x20\x42\x61\x73\x69\x63\x20\x64\x58\x4e\x6c\x63\x6a\x70\x77\x59\x58\x4e\x7a\x0d\x0a\x48\x6f\x73\x74\x3a\x20\x77\x72\x6f\x6e\x67\x2e\x65\x78\x61\x6d\x70\x6c\x65\x3a\x34\x34\x33\x0d\x0a\x55\x73\x65\x72\x2d\x41\x67\x65\x6e\x74\x3a\x20\x73\x69\x6c\x6b\x2d\x68\x74\x74\x70\x2f\x31\x0d\x0a\x41\x63\x63\x65\x70\x74\x3a\x20\x2a\x2f\x2a\x0d\x0a\x0d\x0a"
+  let hello = b"\x16\x03\x01\x00\x9a\x01\x00\x00\x96\x03\x03\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x00\x00\x06\x13\x03\x13\x01\x13\x02\x01\x00\x00\x67\x00\x00\x00\x12\x00\x10\x00\x00\x0d\x77\x72\x6f\x6e\x67\x2e\x65\x78\x61\x6d\x70\x6c\x65\x00\x2b\x00\x03\x02\x03\x04\x00\x0d\x00\x06\x00\x04\x04\x03\x08\x04\x00\x32\x00\x08\x00\x06\x04\x03\x08\x04\x04\x01\x00\x0a\x00\x06\x00\x04\x00\x1d\x00\x17\x00\x33\x00\x26\x00\x24\x00\x1d\x00\x20\x86\xc1\x5a\x11\x19\x20\x1d\x2a\x9a\x60\x23\xac\xee\xaf\x49\x66\x4a\x54\x18\x6a\xd2\xdb\x46\x58\x45\x33\x17\x07\xb6\xda\x2b\x0d"
+  let expected = connect.length + hello.length
+  return state.outputLength == expected
+    && sameRouteBytes(&state.output, usize.ZERO, connect)
+    && sameRouteHello(&state.output, connect.length, hello)
+    && state.connectAccepted
+    && state.handlerCount == usize.ZERO
+}
+
+fn identityFailure(error: ConnectionError) -> bool {
+  return match move error {
+    ConnectionError.Tls {error: tls} => match move tls {
+      TlsError.CertificateIdentity {error: certificate} => match move certificate {
+        CertificateIdentityFailure.Match {error: identity} => match move identity {
+          IdentityError.NoMatch => true
+          _ => false
+        }
+        _ => false
+      }
+      _ => false
+    }
+    _ => false
+  }
+}
+
+service ProxyLifecycle {
+  effect fn audit() -> Shared<RouteAudit> ? &ProxyLifecycle
+}
+
+struct SelectedProxyLifecycle { value: Shared<RouteAudit> }
+
+impl ProxyLifecycle for SelectedProxyLifecycle {
+  effect fn audit(self: &Self) -> Shared<RouteAudit> {
+    return Shared<RouteAudit>.clone(&self.value)
+  }
+}
+
+fn proxyInvalidRequest(error: ClientError) -> bool {
+  return match move error {
+    ClientError.InvalidRequest => true
+    _ => false
+  }
+}
+
+fn proxyInvalidState(error: ClientError) -> bool {
+  return match move error {
+    ClientError.InvalidState => true
+    _ => false
+  }
+}
+
+fn proxyLifecycleAuditPassed(state: &RouteAudit) -> bool {
+  return state.publicationCount == usize.ONE
+    && state.concreteReadCount == usize.ONE
+    && state.concreteWriteCount == usize.ONE
+    && state.concreteFlushCount == 2
+    && state.concreteShutdownCount == usize.ONE
+    && state.concreteCloseCount == usize.ONE
+    && state.rejectedExchangeCallbackCount == usize.ZERO
+}
+
+fn proxyNoOutputOrCallback(state: &RouteAudit) -> bool {
+  return state.outputLength == usize.ZERO
+    && state.rejectedExchangeCallbackCount == usize.ZERO
+}
+
+effect<'call> fn rejectedProxyExchange<'call, 'exchange: 'call>(
+  exchange: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ? &ProxyLifecycle {
+  drop exchange
+  let audit = run ProxyLifecycle.audit()
+  Shared<RouteAudit>.withMut<()>(&audit, fn(state: &mut RouteAudit) -> () {
+    state.rejectedExchangeCallbackCount = state.rejectedExchangeCallbackCount + usize.ONE
+    return ()
+  })
+  return 161
+}
+
+effect<'call> fn unexpectedProxyPublication<'call, 'tunnel: 'call>(
+  channel: &'call mut TransferredTunnel<'tunnel, TestTransport>,
+) -> i32 ? &ProxyLifecycle {
+  drop channel
+  let audit = run ProxyLifecycle.audit()
+  Shared<RouteAudit>.withMut<()>(&audit, fn(state: &mut RouteAudit) -> () {
+    state.publicationCount = state.publicationCount + usize.ONE
+    return ()
+  })
+  return 162
+}
+
+effect<'call> fn exerciseProxyDuplex<'call, 'tunnel: 'call>(
+  channel: &'call mut TransferredTunnel<'tunnel, TestTransport>,
+) -> i32 ! CallbackFailure ? &ProxyLifecycle | &mut MonotonicClock {
+  let audit = run ProxyLifecycle.audit()
+  Shared<RouteAudit>.withMut<()>(&audit, fn(state: &mut RouteAudit) -> () {
+    state.publicationCount = state.publicationCount + usize.ONE
+    return ()
+  })
+
+  let writing = ByteDuplex.writeSome(b"PING", Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut channel.*)
+  match move run Effect.result(move writing) {
+    Result.Failure {error} => { return 163 }
+    Result.Success {value} => {
+      if value != 4 { return 164 }
+    }
+  }
+  let flushing = ByteDuplex.flush(Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut channel.*)
+  let flushed = run Effect.result(move flushing)
+  if let Result.Failure {error} = move flushed {
+    drop error
+    return 165
+  }
+  let shutdown = ByteDuplex.shutdownWrite(Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut channel.*)
+  let shutDown = run Effect.result(move shutdown)
+  if let Result.Failure {error} = move shutDown {
+    drop error
+    return 166
+  }
+
+  let mut remaining: [u8; 4] = [0, 0, 0, 0]
+  let remainingRead = ByteDuplex.readSome(&mut remaining, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut channel.*)
+  match move run Effect.result(move remainingRead) {
+    Result.Failure {error} => { return 167 }
+    Result.Success {value} => match move value {
+      ReadTransfer.End => { return 168 }
+      ReadTransfer.Data {count} => {
+        if count != 4 || remaining[0] != 77 || remaining[3] != 69 { return 169 }
+      }
+    }
+  }
+  fail CallbackFailure {code: 811}
+}
+
+effect<'call> fn exerciseProxyTunnel<'call, 'tunnel: 'call>(
+  channel: &'call mut Tunnel<'tunnel, TestTransport>,
+) -> i32 ! ClientError | CallbackFailure ? &ProxyLifecycle | &mut MonotonicClock {
+  let first = run Effect.result(
+    Tunnel.transferByteDuplex(&mut channel.*, exerciseProxyDuplex),
+  )
+  let original = match move first {
+    Result.Success {value} => { return 173 }
+    Result.Failure {error} => match move error {
+      CallbackFailure cause => move cause
+      ClientError cause => { return 175 }
+    }
+  }
+  if original.code != 811 { return 174 }
+  let repeated = run Effect.result(
+    Tunnel.transferByteDuplex(&mut channel.*, unexpectedProxyPublication),
+  )
+  match move repeated {
+    Result.Success {value} => { return 176 }
+    Result.Failure {error} => {
+      if !proxyInvalidState(move error) { return 177 }
+    }
+  }
+  fail move original
+}
+
+effect<'call> fn exerciseProxyConnect<'call, 'exchange: 'call>(
+  exchange: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32
+! ClientError | OutOfMemoryError | CallbackFailure
+? &ProxyLifecycle | &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchange.*)
+  let emptyEntries: [Header<'static>; 0] = []
+  let empty = match move Headers.make(&emptyEntries, valueLimits()) {
+    Result.Failure {error} => { return 178 }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchange.*, &empty)
+  let status = run Client.receive(&mut exchange.*)
+  if status != 204 { return 179 }
+  return run Client.withTunnel(&mut exchange.*, exerciseProxyTunnel)
+}
+
+struct ProxyLifecycleHandler {
+  ordinary: PreparedRequest
+  connect: PreparedRequest
+  audit: Shared<RouteAudit>
+}
+
+impl ProxyLifecycleHandler {
+  effect<'call> fn handle<'call>(
+    handler: Self,
+    connection: &'call mut Connection<TestTransport>,
+  ) -> i32
+  ! ClientError | OutOfMemoryError | CallbackFailure
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let ProxyLifecycleHandler {ordinary, connect, audit} = move handler
+    let selected = SelectedProxyLifecycle {value: Shared<RouteAudit>.clone(&audit)}
+    let rejected = Client.withExchange(
+      &mut connection.*,
+      &ordinary,
+      RequestOptions.defaults(),
+      rejectedProxyExchange,
+    ) |> Effect.provide<ProxyLifecycle>(&selected)
+    match move run Effect.result(move rejected) {
+      Result.Success {value} => { return 180 }
+      Result.Failure {error} => match move error {
+        ClientError cause => {
+          if !proxyInvalidRequest(move cause) { return 181 }
+        }
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+    if !Shared<RouteAudit>.with<bool>(&audit, proxyNoOutputOrCallback) { return 182 }
+    let connected = Client.withExchange(
+      &mut connection.*,
+      &connect,
+      RequestOptions.defaults(),
+      exerciseProxyConnect,
+    ) |> Effect.provide<ProxyLifecycle>(&selected)
+    return run move connected
+  }
+}
+
+impl ConnectionHandler<
+  TestTransport,
+  i32,
+  ClientError | OutOfMemoryError | CallbackFailure
+    ? &mut Allocator | &mut MonotonicClock | &mut Random
+> for ProxyLifecycleHandler {
+  handle: ProxyLifecycleHandler.handle
+}
+
+fn proxyLifecycleInput() -> &'static [u8] {
+  return b"\x48\x54\x54\x50\x2f\x31\x2e\x31\x20\x32\x30\x34\x20\x43\x6f\x6e\x6e\x65\x63\x74\x69\x6f\x6e\x20\x45\x73\x74\x61\x62\x6c\x69\x73\x68\x65\x64\x0d\x0a\x0d\x0a\x4d\x4f\x52\x45"
+}
+
+fn proxyHeadLimitInput() -> &'static [u8] {
+  return b"\x48\x54\x54\x50\x2f\x31\x2e\x31\x20\x34\x30\x37\x20\x50\x72\x6f\x78\x79\x20\x41\x75\x74\x68\x65\x6e\x74\x69\x63\x61\x74\x69\x6f\x6e\x20\x52\x65\x71\x75\x69\x72\x65\x64\x0d\x0a\x50\x72\x6f\x78\x79\x2d\x41\x75\x74\x68\x65\x6e\x74\x69\x63\x61\x74\x65\x3a\x20\x42\x61\x73\x69\x63\x20\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x61\x0d\x0a\x0d\x0a"
+}
+
+fn proxyHeadFailure(error: ClientError) -> bool {
+  return match move error {
+    ClientError.Head {error: head} => match move head.reason {
+      ParseReason.LimitExceeded {limit, allowed, attempted} => {
+        return limit == ParseLimitKind.HeadBytes && allowed == 160 && attempted == 161
+      }
+      _ => false
+    }
+    _ => false
+  }
+}
+
+effect<'call> fn receiveProxyHeadLimit<'call, 'exchange: 'call>(
+  exchange: &'call mut Exchange<'exchange, TestTransport>,
+) -> bool
+! ClientError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchange.*)
+  let entries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&entries, valueLimits()) {
+    Result.Success {value} => value
+    Result.Failure {error} => { return false }
+  }
+  run Client.finishRequest(&mut exchange.*, &trailers)
+  let status = run Client.receive(&mut exchange.*)
+  drop status
+  return false
+}
+
+struct ProxyHeadLimitHandler { request: PreparedRequest }
+
+impl ProxyHeadLimitHandler {
+  effect<'call> fn handle<'call>(
+    handler: Self,
+    connection: &'call mut Connection<TestTransport>,
+  ) -> bool
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let attempted = run Effect.result(Client.withExchange(
+      &mut connection.*,
+      &handler.request,
+      RequestOptions.defaults(),
+      receiveProxyHeadLimit,
+    ))
+    return match move attempted {
+      Result.Success {value} => false
+      Result.Failure {error} => match move error {
+        ClientError cause => proxyHeadFailure(move cause)
+        OutOfMemoryError allocation => { fail move allocation }
+      }
+    }
+  }
+}
+
+impl ConnectionHandler<
+  TestTransport,
+  bool,
+  OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random
+> for ProxyHeadLimitHandler {
+  handle: ProxyHeadLimitHandler.handle
+}
+
+effect fn verifyProxyHeadLimit(
+  request: PreparedRequest,
+  peer: Origin,
+) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let provider = TestTransport {
+    scenario: 23,
+    input: proxyHeadLimitInput(),
+    readOffset: usize.ZERO,
+    writeOrdinal: usize.ZERO,
+    accepted: usize.ZERO,
+    closeCount: usize.ZERO,
+    shutdownCount: usize.ZERO,
+    writeShutdown: false,
+    closed: false,
+    routeAudit: Option<Shared<RouteAudit>>.none(),
+  }
+  let mut selectedLimits = limits()
+  selectedLimits.head.maxHeadBytes = 160
+  let attempted = run Effect.result(Client.withOwned(
+    move provider,
+    peer,
+    Version.Http11,
+    move selectedLimits,
+    Option<Instant>.none(),
+    ProxyHeadLimitHandler {request: move request},
+  ))
+  return match move attempted {
+    Result.Success {value} => value
+    Result.Failure {error} => match move error {
+      OutOfMemoryError allocation => { fail move allocation }
+      ClientError cause => false
+    }
+  }
+}
+
+effect fn routedProxyLifecycle() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let policyVerification = verifyProxyPolicy()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if !run move policyVerification { return 183 }
+  let audit = run Shared<RouteAudit>.make(emptyRouteAudit())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let emptyOrigins: [Origin; 0] = []
+  let bypass = match move run BypassPolicy.copy(&emptyOrigins)
+    |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 184 }
+  }
+  let authentication = match move run ProxyAuth.preparedBasic(
+    ProxyAuthContextId.make(200),
+    b"dXNlcjpwYXNz",
+  ) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 185 }
+  }
+  let config = match move ProxyConfig.fromUri(
+    ProxyConfigId.make(199),
+    "http://proxy.example:3128",
+    move authentication,
+    move bypass,
+    4096,
+  ) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 186 }
+  }
+  let uri = match move Uri.parse("https://service.example/") {
+    Result.Success {value} => value
+    Result.Failure {error} => { return 187 }
+  }
+  let origin = match move Origin.fromUri(&uri) {
+    Result.Success {value} => value
+    Result.Failure {error} => { return 188 }
+  }
+
+  let mut clock = FixedClock {mark: SystemClock.make(0, 0)}
+  let mut random = RouteRandom {filled: usize.ZERO}
+  let headRoute = selectRoute(&config, origin)
+  let headRequest = match move run Effect.result(prepareConnect(
+    &headRoute,
+    valueLimits(),
+    1024,
+    512,
+  )) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 189 }
+  }
+  let headPeer = match move Route.physicalPeer(&headRoute) {
+    Result.Success {value} => value
+    Result.Failure {error} => { return 190 }
+  }
+  let bounded = run verifyProxyHeadLimit(move headRequest, headPeer)
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  if !bounded { return 191 }
+
+  let route = selectRoute(&config, origin)
+  let connect = match move run Effect.result(prepareConnect(
+    &route,
+    valueLimits(),
+    1024,
+    512,
+  )) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 192 }
+  }
+  let fields: [Header<'static>; 0] = []
+  let headers = match move Headers.make(&fields, valueLimits()) {
+    Result.Success {value} => value
+    Result.Failure {error} => { return 193 }
+  }
+  let policy = HeaderPolicy.defaults()
+  let ordinary = match move run Effect.result(Request.fromUri(
+    &uri,
+    Version.Http11,
+    Method.get(),
+    &headers,
+    &policy,
+    BodyMode.Empty,
+    false,
+    valueLimits(),
+    1024,
+    512,
+  )) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 194 }
+  }
+  let peer = match move Route.physicalPeer(&route) {
+    Result.Success {value} => value
+    Result.Failure {error} => { return 195 }
+  }
+  let provider = TestTransport {
+    scenario: 23,
+    input: proxyLifecycleInput(),
+    readOffset: usize.ZERO,
+    writeOrdinal: usize.ZERO,
+    accepted: usize.ZERO,
+    closeCount: usize.ZERO,
+    shutdownCount: usize.ZERO,
+    writeShutdown: false,
+    closed: false,
+    routeAudit: Option<Shared<RouteAudit>>.some(Shared<RouteAudit>.clone(&audit)),
+  }
+  let mut selectedLimits = limits()
+  selectedLimits.readCapacity = 39
+  let attempted = run Effect.result(Client.withOwned(
+    move provider,
+    peer,
+    Version.Http11,
+    move selectedLimits,
+    Option<Instant>.none(),
+    ProxyLifecycleHandler {
+      ordinary: move ordinary,
+      connect: move connect,
+      audit: Shared<RouteAudit>.clone(&audit),
+    },
+  ))
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let preserved = match move attempted {
+    Result.Success {value} => false
+    Result.Failure {error} => match move error {
+      CallbackFailure cause => cause.code == 811
+      _ => false
+    }
+  }
+  if !preserved { return 196 }
+  if !Shared<RouteAudit>.with<bool>(&audit, proxyLifecycleAuditPassed) { return 197 }
+  return 0
+}
+
+effect fn routedWrongName() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let audit = run Shared<RouteAudit>.make(emptyRouteAudit())
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let provider = TestTransport {
+    scenario: 22,
+    input: routeInput(),
+    readOffset: usize.ZERO,
+    writeOrdinal: usize.ZERO,
+    accepted: usize.ZERO,
+    closeCount: usize.ZERO,
+    shutdownCount: usize.ZERO,
+    writeShutdown: false,
+    closed: false,
+    routeAudit: Option<Shared<RouteAudit>>.some(Shared<RouteAudit>.clone(&audit)),
+  }
+  let empty: [Origin; 0] = []
+  let bypass = match move run BypassPolicy.copy(&empty)
+    |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 151 }
+  }
+  let authentication = match move run ProxyAuth.preparedBasic(
+    ProxyAuthContextId.make(100),
+    b"dXNlcjpwYXNz",
+  ) |> Effect.provideMut<Allocator>(&mut allocator) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 152 }
+  }
+  let config = match move ProxyConfig.fromUri(
+    ProxyConfigId.make(99),
+    "http://example.com",
+    move authentication,
+    move bypass,
+    4096,
+  ) {
+    Result.Success {value} => move value
+    Result.Failure {error} => { return 153 }
+  }
+  let target = match move Uri.parse("https://wrong.example/") {
+    Result.Success {value} => value
+    Result.Failure {error} => { return 154 }
+  }
+  let origin = match move Origin.fromUri(&target) {
+    Result.Success {value} => value
+    Result.Failure {error} => { return 155 }
+  }
+  let route = selectRoute(&config, origin)
+  let trustResult = run TrustSnapshot.fromPem(
+    b"\x2d\x2d\x2d\x2d\x2d\x42\x45\x47\x49\x4e\x20\x43\x45\x52\x54\x49\x46\x49\x43\x41\x54\x45\x2d\x2d\x2d\x2d\x2d\x0a\x4d\x49\x49\x44\x53\x54\x43\x43\x41\x6a\x47\x67\x41\x77\x49\x42\x41\x67\x49\x4a\x41\x4c\x6f\x64\x4b\x48\x7a\x68\x5a\x30\x32\x77\x4d\x41\x30\x47\x43\x53\x71\x47\x53\x49\x62\x33\x44\x51\x45\x42\x43\x77\x55\x41\x4d\x44\x41\x78\x4c\x6a\x41\x73\x42\x67\x4e\x56\x0a\x42\x41\x4d\x4d\x4a\x56\x4e\x70\x62\x47\x73\x67\x56\x45\x78\x54\x49\x45\x4e\x73\x61\x57\x56\x75\x64\x43\x42\x55\x5a\x58\x4e\x30\x49\x46\x4a\x76\x62\x33\x51\x67\x4c\x53\x42\x55\x52\x56\x4e\x55\x49\x45\x39\x4f\x54\x46\x6b\x77\x48\x68\x63\x4e\x4d\x6a\x59\x77\x0a\x4f\x54\x45\x78\x4d\x54\x55\x31\x4e\x6a\x45\x33\x57\x68\x63\x4e\x4d\x7a\x59\x77\x4f\x54\x41\x34\x4d\x54\x55\x31\x4e\x6a\x45\x33\x57\x6a\x41\x77\x4d\x53\x34\x77\x4c\x41\x59\x44\x56\x51\x51\x44\x44\x43\x56\x54\x61\x57\x78\x72\x49\x46\x52\x4d\x55\x79\x42\x44\x0a\x62\x47\x6c\x6c\x62\x6e\x51\x67\x56\x47\x56\x7a\x64\x43\x42\x53\x62\x32\x39\x30\x49\x43\x30\x67\x56\x45\x56\x54\x56\x43\x42\x50\x54\x6b\x78\x5a\x4d\x49\x49\x42\x49\x6a\x41\x4e\x42\x67\x6b\x71\x68\x6b\x69\x47\x39\x77\x30\x42\x41\x51\x45\x46\x41\x41\x4f\x43\x0a\x41\x51\x38\x41\x4d\x49\x49\x42\x43\x67\x4b\x43\x41\x51\x45\x41\x77\x50\x38\x75\x4c\x31\x74\x33\x72\x65\x79\x6f\x63\x50\x57\x67\x41\x6d\x61\x34\x49\x54\x42\x33\x35\x6e\x64\x46\x78\x59\x49\x2b\x51\x35\x62\x34\x48\x4f\x64\x74\x33\x4b\x4a\x51\x38\x4e\x5a\x53\x0a\x49\x4a\x48\x37\x2f\x76\x48\x4d\x2f\x45\x6e\x31\x78\x31\x2b\x7a\x47\x47\x66\x2f\x31\x4c\x4f\x59\x7a\x75\x64\x44\x52\x7a\x48\x78\x41\x69\x69\x78\x52\x35\x57\x71\x42\x37\x31\x31\x41\x6f\x77\x45\x46\x4e\x75\x36\x6b\x31\x4a\x4d\x7a\x4a\x62\x48\x64\x58\x38\x6f\x0a\x73\x63\x30\x50\x70\x31\x2b\x50\x57\x54\x46\x56\x71\x38\x6e\x71\x4d\x37\x73\x30\x55\x52\x64\x73\x36\x48\x59\x37\x50\x73\x6c\x6c\x62\x70\x7a\x64\x4e\x76\x37\x64\x6a\x4c\x38\x4b\x43\x2b\x36\x6f\x62\x46\x33\x53\x36\x4a\x47\x43\x74\x7a\x77\x37\x33\x5a\x54\x59\x0a\x54\x65\x2b\x64\x57\x53\x71\x6b\x35\x4a\x77\x6c\x66\x67\x4c\x6c\x62\x6b\x56\x79\x69\x65\x54\x50\x49\x6b\x69\x6c\x67\x51\x79\x36\x44\x72\x68\x48\x36\x4a\x43\x49\x4c\x53\x42\x33\x57\x78\x77\x51\x48\x35\x64\x42\x50\x50\x6f\x4b\x5a\x56\x69\x66\x48\x36\x4f\x4f\x0a\x6c\x73\x6a\x42\x33\x37\x78\x39\x74\x64\x42\x61\x73\x4d\x37\x6a\x75\x35\x64\x56\x2f\x4b\x2f\x41\x34\x2f\x31\x76\x30\x57\x75\x4c\x6f\x74\x36\x49\x7a\x4c\x70\x77\x42\x67\x47\x43\x71\x69\x71\x6d\x52\x47\x59\x35\x31\x45\x6b\x68\x44\x6a\x70\x61\x50\x54\x6b\x65\x0a\x73\x45\x64\x36\x6e\x56\x55\x55\x68\x35\x74\x65\x36\x65\x46\x75\x67\x6d\x51\x4c\x39\x46\x37\x67\x6f\x32\x48\x6b\x43\x2f\x6f\x51\x54\x33\x75\x34\x30\x77\x49\x44\x41\x51\x41\x42\x6f\x32\x59\x77\x5a\x44\x41\x53\x42\x67\x4e\x56\x48\x52\x4d\x42\x41\x66\x38\x45\x0a\x43\x44\x41\x47\x41\x51\x48\x2f\x41\x67\x45\x42\x4d\x41\x34\x47\x41\x31\x55\x64\x44\x77\x45\x42\x2f\x77\x51\x45\x41\x77\x49\x42\x42\x6a\x41\x64\x42\x67\x4e\x56\x48\x51\x34\x45\x46\x67\x51\x55\x63\x77\x54\x56\x49\x43\x31\x55\x4e\x74\x76\x73\x78\x31\x65\x6f\x0a\x62\x53\x48\x4e\x69\x65\x39\x50\x52\x64\x34\x77\x48\x77\x59\x44\x56\x52\x30\x6a\x42\x42\x67\x77\x46\x6f\x41\x55\x63\x77\x54\x56\x49\x43\x31\x55\x4e\x74\x76\x73\x78\x31\x65\x6f\x62\x53\x48\x4e\x69\x65\x39\x50\x52\x64\x34\x77\x44\x51\x59\x4a\x4b\x6f\x5a\x49\x0a\x68\x76\x63\x4e\x41\x51\x45\x4c\x42\x51\x41\x44\x67\x67\x45\x42\x41\x45\x4f\x4e\x43\x37\x65\x75\x4b\x77\x59\x30\x46\x71\x67\x4b\x79\x75\x53\x41\x4f\x72\x2f\x53\x68\x4f\x66\x62\x67\x79\x5a\x78\x61\x36\x6d\x50\x57\x70\x6c\x76\x78\x42\x32\x4a\x2b\x39\x2f\x49\x0a\x4e\x59\x6c\x65\x74\x49\x66\x47\x47\x65\x6f\x63\x46\x75\x58\x54\x76\x32\x68\x78\x4d\x52\x76\x34\x2f\x43\x76\x43\x38\x48\x6d\x2b\x58\x34\x61\x49\x52\x50\x45\x4b\x67\x6f\x56\x39\x51\x47\x74\x5a\x51\x70\x32\x76\x56\x58\x39\x56\x49\x45\x34\x64\x63\x33\x2f\x55\x0a\x69\x74\x38\x41\x35\x74\x6b\x52\x34\x48\x43\x5a\x31\x5a\x33\x79\x42\x72\x67\x55\x31\x52\x52\x32\x4f\x2b\x4b\x35\x62\x6b\x70\x33\x53\x2f\x54\x50\x2f\x4d\x59\x6f\x63\x36\x54\x72\x79\x57\x63\x35\x5a\x43\x54\x51\x46\x2b\x53\x6f\x6f\x32\x71\x2f\x53\x35\x68\x71\x0a\x53\x78\x6e\x33\x73\x32\x6c\x2f\x39\x57\x6e\x48\x4d\x75\x4d\x79\x36\x79\x70\x4c\x59\x31\x33\x59\x43\x39\x41\x31\x4f\x50\x50\x4e\x64\x55\x54\x42\x4f\x4d\x46\x4a\x73\x31\x2f\x6c\x79\x6b\x53\x69\x41\x33\x4c\x69\x53\x69\x6f\x51\x62\x4e\x67\x47\x58\x4b\x35\x66\x0a\x50\x72\x73\x52\x4d\x64\x6b\x47\x34\x67\x37\x55\x6e\x69\x56\x6f\x43\x31\x33\x6e\x43\x6f\x4c\x77\x5a\x59\x2f\x62\x76\x6e\x31\x70\x2f\x54\x78\x79\x6c\x36\x69\x4c\x7a\x71\x4c\x35\x33\x48\x6b\x33\x2f\x2b\x36\x64\x39\x77\x6a\x45\x76\x6f\x49\x32\x36\x46\x6d\x4c\x0a\x33\x4d\x75\x51\x5a\x46\x47\x61\x2f\x2f\x5a\x31\x4b\x5a\x44\x39\x4e\x48\x4c\x34\x64\x6f\x4f\x5a\x37\x62\x77\x6b\x35\x66\x61\x59\x46\x6f\x30\x6e\x4d\x35\x30\x3d\x0a\x2d\x2d\x2d\x2d\x2d\x45\x4e\x44\x20\x43\x45\x52\x54\x49\x46\x49\x43\x41\x54\x45\x2d\x2d\x2d\x2d\x2d\x0a",
+    TrustLoadLimits.defaults(),
+  ) |> Effect.provideMut<Allocator>(&mut allocator)
+  let trust = match move trustResult {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => { return 156 }
+  }
+  let client = ScriptedRouteClient<
+    i32,
+    ProxyError | ClientError | ConnectionError | IdentityError | OutOfMemoryError,
+    &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random,
+  > {
+    provider: move provider,
+    settingsValue: RouteSettings {
+      http: limits(),
+      request: valueLimits(),
+      maxRequestHeadBytes: 1024,
+      maxProxyCredentialBytes: 512,
+      protocol: RouteProtocol.Http10,
+      tls: ClientLimits.defaults(),
+      handshakeDurationNanoseconds: u64.toU64(30000000000),
+    },
+  }
+  let mut wall = RouteWallClock {}
+  let mut clock = FixedClock {mark: SystemClock.make(0, 0)}
+  let mut random = RouteRandom {filled: usize.ZERO}
+  let attempted = run Effect.result(Client.withRoute(
+    move client,
+    route,
+    Option<TrustSnapshot>.some(move trust),
+    Option<Instant>.none(),
+    RoutedNoop {audit: Option<Shared<RouteAudit>>.some(Shared<RouteAudit>.clone(&audit))},
+  ))
+    |> Effect.provideMut<SystemClock>(&mut wall)
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let failedByIdentity = match move attempted {
+    Result<i32, ProxyError | ClientError | ConnectionError | IdentityError | RouteAcquisitionError | OutOfMemoryError>.Success {value} => false
+    Result<i32, ProxyError | ClientError | ConnectionError | IdentityError | RouteAcquisitionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError cause => identityFailure(move cause)
+      _ => false
+    }
+  }
+  if !failedByIdentity { return 157 }
+  if !Shared<RouteAudit>.with<bool>(&audit, routedAuditPassed) { return 158 }
+  return 0
+}
+
+effect fn typecheckRoute(transport: TestTransport) -> i32
+! ProxyError
+  | ClientError
+  | Tls.ConnectionError
+  | IdentityError
+  | RouteAcquisitionError
+  | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random {
+  let empty: [Origin; 0] = []
+  let bypass = match move run BypassPolicy.copy(&empty) {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      fail move error
+    }
+  }
+  let config = match move ProxyConfig.fromUri(
+    ProxyConfigId.make(99),
+    "http://proxy.example:3128",
+    ProxyAuth.none(ProxyAuthContextId.make(100)),
+    move bypass,
+    4096,
+  ) {
+    Result.Success {value} => move value
+    Result.Failure {error} => {
+      fail move error
+    }
+  }
+  let target = match move Uri.parse("http://origin.example/") {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      drop error
+      return 141
+    }
+  }
+  let origin = match move Origin.fromUri(&target) {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      drop error
+      return 142
+    }
+  }
+  let route = selectRoute(&config, origin)
+  let client = ScriptedRouteClient<
+    i32,
+    ProxyError | ClientError | ConnectionError | IdentityError | OutOfMemoryError,
+    &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random,
+  > {
+    provider: move transport,
+    settingsValue: RouteSettings {
+      http: limits(),
+      request: valueLimits(),
+      maxRequestHeadBytes: 1024,
+      maxProxyCredentialBytes: 512,
+      protocol: RouteProtocol.OptionalHttp11,
+      tls: ClientLimits.defaults(),
+      handshakeDurationNanoseconds: u64.toU64(30000000000),
+    },
+  }
+  return run Client.withRoute(
+    move client,
+    route,
+    Option<TrustSnapshot>.none(),
+    Option<Instant>.none(),
+    RoutedNoop {audit: Option<Shared<RouteAudit>>.none()},
+  )
+}
+
+
+struct CallbackFailure {
+  code: i32
+}
+
+struct Handler {
+  request: PreparedRequest
+  scenario: i32
+}
+
+impl ConnectionHandler<TestTransport, i32, ClientError | OutOfMemoryError | CallbackFailure ? &mut Allocator | &mut MonotonicClock | &mut Random> for Handler {
+  effect<'call> fn handle<'call>(handler: Self, connection: &'call mut Connection<TestTransport>) -> i32
+  ! ClientError | OutOfMemoryError | CallbackFailure
+  ? &mut Allocator | &mut MonotonicClock | &mut Random {
+    let Handler {request, scenario} = move handler
+    if scenario == 17 {
+      let attempted = run Effect.result(
+        invokeExchange(&mut connection.*, &request, RequestOptions.defaults(), scenario),
+      )
+      match move attempted {
+        Result.Success {value} => {
+          drop value
+          return 124
+        }
+        Result.Failure {error} => match move error {
+          CallbackFailure cause => {
+            if cause.code != 739 || connection.phase() != ConnectionPhase.Closed {
+              return 125
+            }
+            fail move cause
+          }
+          ClientError cause => {
+            fail move cause
+          }
+          OutOfMemoryError allocation => {
+            fail move allocation
+          }
+        }
+      }
+    }
+    if scenario == 1 {
+      let selectedOptions = RequestOptions {
+        deadline: Option<Instant>.none(),
+        continuePolicy: ContinuePolicy.Require100 {deadline: SystemClock.make(10, 0)},
+      }
+      let result = run invokeExchange(
+        &mut connection.*,
+        &request,
+        move selectedOptions,
+        scenario,
+      )
+      if result != 0 {
+        return result
+      }
+      return 0
+    }
+    if scenario == 2 {
+      let selectedOptions = RequestOptions {
+        deadline: Option<Instant>.none(),
+        continuePolicy: ContinuePolicy.Require100 {deadline: SystemClock.make(10, 0)},
+      }
+      let result = run invokeExchange(
+        &mut connection.*,
+        &request,
+        move selectedOptions,
+        scenario,
+      )
+      if result != 0 {
+        return result
+      }
+      if connection.phase() != ConnectionPhase.Closed {
+        return 18
+      }
+      return 0
+    }
+    if scenario == 3 {
+      let selectedOptions = RequestOptions.defaults()
+      let result = run invokeExchange(
+        &mut connection.*,
+        &request,
+        move selectedOptions,
+        scenario,
+      )
+      if result != 0 {
+        return result
+      }
+      return 0
+    }
+    if scenario == 4 {
+      let selectedOptions = RequestOptions.defaults()
+      let result = run invokeExchange(
+        &mut connection.*,
+        &request,
+        move selectedOptions,
+        scenario,
+      )
+      if result != 0 {
+        return result
+      }
+      if connection.phase() != ConnectionPhase.Closed {
+        return 18
+      }
+      return 0
+    }
+    if scenario == 5 {
+      let selectedOptions = RequestOptions.defaults()
+      let result = run invokeExchange(
+        &mut connection.*,
+        &request,
+        move selectedOptions,
+        scenario,
+      )
+      if result != 0 {
+        return result
+      }
+      if connection.phase() != ConnectionPhase.Closed {
+        return 18
+      }
+      return 0
+    }
+    if scenario == 7 {
+      let selectedOptions = RequestOptions.defaults()
+      let result = run invokeExchange(
+        &mut connection.*,
+        &request,
+        move selectedOptions,
+        scenario,
+      )
+      if result != 0 {
+        return result
+      }
+      if connection.phase() != ConnectionPhase.Closed {
+        return 18
+      }
+      return 0
+    }
+    if scenario == 11 || scenario == 24 || scenario == 25 {
+      let result = run invokeExchange(
+        &mut connection.*,
+        &request,
+        RequestOptions.defaults(),
+        scenario,
+      )
+      if result != 0 {
+        return result
+      }
+      if scenario != 11 && connection.phase() != ConnectionPhase.Closed {
+        return 18
+      }
+      return 0
+    }
+    let options = RequestOptions {
+      deadline: Option<Instant>.none(),
+      continuePolicy: ContinuePolicy.Disabled,
+    }
+    let result = run invokeExchange(&mut connection.*, &request, move options, scenario)
+    if result != 200 {
+      return result
+    }
+    if connection.phase() != ConnectionPhase.Ready {
+      return 12
+    }
+    let options2 = RequestOptions {
+      deadline: Option<Instant>.none(),
+      continuePolicy: ContinuePolicy.Disabled,
+    }
+    let second = run invokeExchange(&mut connection.*, &request, move options2, scenario)
+    if second != 404 {
+      return second
+    }
+    return 0
+  }
+}
+
+// One callback identity shares the exchange bracket across runtime scenarios.
+service Scenario {
+  effect fn selected() -> i32 ? &Scenario
+}
+struct SelectedScenario {
+  value: i32
+}
+impl Scenario for SelectedScenario {
+  effect fn selected(self: &Self) -> i32 {
+    return self.value
+  }
+}
+
+effect fn invokeExchange(
+  connection: &mut Connection<TestTransport>,
+  request: &PreparedRequest,
+  options: RequestOptions,
+  scenario: i32,
+) -> i32 ! ClientError | OutOfMemoryError | CallbackFailure
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let selected = SelectedScenario {value: scenario}
+  return run Client.withExchange(&mut connection.*, request, move options, dispatchExchange)
+    |> Effect.provide<Scenario>(&selected)
+}
+
+effect<'call> fn dispatchExchange<'call, 'exchange: 'call>(
+  value: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError | CallbackFailure
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  if scenario == 0 {
+    return run exchange(&mut value.*)
+  }
+  if scenario == 1 {
+    return run continueExchange(&mut value.*)
+  }
+  if scenario == 2 {
+    return run earlyExchange(&mut value.*)
+  }
+  if scenario == 3 {
+    return run chunkedExchange(&mut value.*)
+  }
+  if scenario == 4 {
+    return run tunnelExchange(&mut value.*)
+  }
+  if scenario == 5 {
+    return run abandonExchange(&mut value.*)
+  }
+  if scenario == 7 {
+    return run upgradeExchange(&mut value.*)
+  }
+  if scenario == 11 {
+    return run discardExchange(&mut value.*)
+  }
+  if scenario == 17 {
+    return run failExchange(&mut value.*)
+  }
+  if scenario == 24 {
+    return run discardExchange(&mut value.*)
+  }
+  if scenario == 25 {
+    return run discardExchange(&mut value.*)
+  }
+  return 143
+}
+
+effect<'call> fn exchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let status = run Client.receive(&mut exchangeValue.*)
+  if status != 200 && status != 404 {
+    return 21
+  }
+  let mut bytes: [u8; 4] = [0, 0, 0, 0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut bytes)
+  if count != 4 || bytes[0] != 87 || bytes[3] != 105 {
+    return 22
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  if status == 200 {
+    return 200
+  }
+  return 404
+}
+
+effect fn runOwned(transport: TestTransport, origin: Origin, scenario: i32, handler: Handler) -> i32
+! ClientError | OutOfMemoryError | CallbackFailure
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  if scenario == 0 {
+    let mut owner = run Client.makeOwned(
+      move transport,
+      origin,
+      Version.Http11,
+      limits(),
+      Option<Instant>.none(),
+    )
+    let result = run Effect.result(
+      ConnectionHandler<TestTransport, i32, ClientError | OutOfMemoryError | CallbackFailure ? &mut Allocator | &mut MonotonicClock | &mut Random>.handle(
+        move handler,
+        &mut owner,
+      ),
+    )
+    let closed = run Effect.result(Client.close(&mut owner))
+    drop closed
+    return match move result {
+      Result.Success {value} => value
+      Result.Failure {error} => {
+        fail move error
+      }
+    }
+  }
+  let mut selectedLimits = limits()
+  if scenario == 6 {
+    selectedLimits.maxInformationalResponses = usize.ONE
+  }
+  if scenario == 12 {
+    selectedLimits.maxInformationalWireBytes = 10
+  }
+  let mut overall = Option<Instant>.none()
+  if scenario == 8 {
+    overall = Option<Instant>.some(SystemClock.make(0, 0))
+  }
+  return run Client.withOwned(
+    move transport,
+    origin,
+    Version.Http11,
+    selectedLimits,
+    move overall,
+    move handler,
+  )
+}
+
+effect fn runCase(scenario: i32) -> i32 ! ClientError | RequestError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = FixedClock {mark: SystemClock.make(0, 0)}
+  let mut random = FixedRandom {}
+  let uri = match move Uri.parse("http://example.test/") {
+    Result.Failure {error} => {
+      drop error
+      return 31
+    }
+    Result.Success {value} => value
+  }
+  let headerEntries: [Header<'static>; 0] = []
+  let headers = match move Headers.make(&headerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 32
+    }
+    Result.Success {value} => value
+  }
+  let policy = HeaderPolicy.defaults()
+  let origin = match move Origin.fromUri(&uri) {
+    Result.Failure {error} => {
+      drop error
+      return 33
+    }
+    Result.Success {value} => value
+  }
+  let mut method = Method.get()
+  if scenario == 4 {
+    method = Method.connect()
+  } else if scenario == 1 || scenario == 2 || scenario == 3 || scenario == 9 || scenario == 10 || scenario == 19 || scenario == 20 || scenario == 21 {
+    method = Method.post()
+  }
+  let mut targetText = "/"
+  if scenario == 4 {
+    targetText = "example.test:80"
+  }
+  let target = match move RequestTarget.parse(&method, targetText, 128) {
+    Result.Failure {error} => {
+      drop error
+      return 34
+    }
+    Result.Success {value} => value
+  }
+  let mut mode = BodyMode.Empty
+  if scenario == 3 || scenario == 20 || scenario == 21 {
+    mode = BodyMode.Chunked
+  } else if scenario == 1 || scenario == 2 || scenario == 9 || scenario == 10 || scenario == 19 || scenario == 20 {
+    mode = BodyMode.KnownLength {length: 4}
+  }
+  let request = run Request.prepare(
+    &origin,
+    Version.Http11,
+    method,
+    target,
+    &headers,
+    &policy,
+    mode,
+    scenario == 1 || scenario == 2 || scenario == 10 || scenario == 19,
+    valueLimits(),
+    1024,
+    512,
+  )
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut input = inputFor(scenario)
+  if scenario == 9 || scenario == 10 || scenario == 18 || scenario == 21 { input = b"" }
+  let adapter = TestTransport {
+    scenario: scenario,
+    input: input,
+    readOffset: usize.ZERO,
+    writeOrdinal: usize.ZERO,
+    accepted: usize.ZERO,
+    closeCount: usize.ZERO,
+    shutdownCount: usize.ZERO,
+    writeShutdown: false,
+    closed: false,
+    routeAudit: Option<Shared<RouteAudit>>.none(),
+  }
+  // Compile-only witness: the runtime corpus does not select this scenario.
+  if scenario == -1 {
+    let mut wall = RouteWallClock {}
+    let attempted = run Effect.result(typecheckRoute(move adapter))
+      |> Effect.provideMut<SystemClock>(&mut wall)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    return match move attempted {
+      Result.Success {value} => value
+      Result.Failure {error} => {
+        drop error
+        return 140
+      }
+    }
+  }
+  if scenario == 22 {
+    drop adapter
+    return run routedWrongName()
+  }
+  if scenario == 23 {
+    drop adapter
+    return run routedProxyLifecycle()
+  }
+  let handler = Handler {request: move request, scenario: scenario}
+  let attempted = run Effect.result(runOwned(move adapter, origin, scenario, move handler))
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let code = match move attempted {
+    Result.Success {value} => value
+    Result.Failure {error} => match move error {
+      CallbackFailure cause => {
+        if scenario != 17 || cause.code != 739 {
+          return 126
+        }
+        return 0
+      }
+      ClientError cause => {
+        fail move cause
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+  if code != 0 {
+    return code
+  }
+  if scenario == 17 {
+    return 127
+  }
+  return 0
+}
+
+effect<'call> fn failExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! CallbackFailure {
+  drop exchangeValue
+  fail CallbackFailure {code: 739}
+}
+
+effect<'call> fn continueExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let observed1 = run Client.receive(&mut exchangeValue.*)
+  if observed1 != 103 {
+    return 63
+  }
+  let observed2 = run Client.receive(&mut exchangeValue.*)
+  if observed2 != 100 {
+    return 64
+  }
+  let progress = run Client.writeSome(&mut exchangeValue.*, b"Wiki")
+  if progress.consumed != 4 {
+    return 65
+  }
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed3 = run Client.receive(&mut exchangeValue.*)
+  if observed3 != 417 {
+    return 66
+  }
+  let mut output: [u8; 1] = [0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut output)
+  if count != usize.ZERO {
+    return 62
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  return 0
+}
+
+effect<'call> fn earlyExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let observed4 = run Client.receive(&mut exchangeValue.*)
+  if observed4 != 103 {
+    return 67
+  }
+  let observed5 = run Client.receive(&mut exchangeValue.*)
+  if observed5 != 417 {
+    return 68
+  }
+  let rejected = run Effect.result(Client.writeSome(&mut exchangeValue.*, b"Wiki"))
+  match move rejected {
+    Result.Success {value} => {
+      drop value
+      return 69
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => {
+        if !invalidState(move cause) {
+          return 70
+        }
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+  let mut output: [u8; 1] = [0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut output)
+  if count != usize.ZERO {
+    return 62
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  return 0
+}
+
+effect<'call> fn chunkedExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let progress = run Client.writeSome(&mut exchangeValue.*, b"Wiki")
+  if progress.consumed != 4 {
+    return 71
+  }
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed6 = run Client.receive(&mut exchangeValue.*)
+  if observed6 != 200 {
+    return 72
+  }
+  let mut body: [u8; 4] = [0, 0, 0, 0]
+  let count = run Client.readSome(&mut exchangeValue.*, &mut body)
+  if count != 4 || body[0] != 87 || body[3] != 105 {
+    return 73
+  }
+  let mut empty: [u8; 1] = [0]
+  let observed7 = run Client.readSome(&mut exchangeValue.*, &mut empty)
+  if observed7 != usize.ZERO {
+    return 74
+  }
+  let responseTrailers = run Client.trailers(&exchangeValue.*)
+  match move responseTrailers {
+    Option.None => {
+      return 75
+    }
+    Option.Some {value} => {
+      if Trailers.count(&value) != usize.ONE {
+        return 76
+      }
+    }
+  }
+  run Client.finishResponse(&mut exchangeValue.*)
+  return 0
+}
+
+effect<'call> fn tunnelExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed8 = run Client.receive(&mut exchangeValue.*)
+  if observed8 != 204 {
+    return 77
+  }
+  return run Client.withTunnel(&mut exchangeValue.*, tunnel)
+}
+
+effect<'call> fn tunnel<'call, 'tunnel: 'call>(channel: &'call mut Tunnel<'tunnel, TestTransport>) -> i32
+! ClientError | OutOfMemoryError
+? &mut Allocator | &mut MonotonicClock | &mut Random {
+  return run Tunnel.transferByteDuplex(&mut channel.*, transferredTunnel)
+}
+
+effect<'call> fn transferredTunnel<'call, 'tunnel: 'call>(
+  channel: &'call mut TransferredTunnel<'tunnel, TestTransport>,
+) -> i32 ? &mut MonotonicClock {
+  let mut output: [u8; 4] = [0, 0, 0, 0]
+  let reading = ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut channel.*)
+  let attempted = run Effect.result(move reading)
+  return match move attempted {
+    Result.Failure {error} => {
+      drop error
+      return 78
+    }
+    Result.Success {value} => match move value {
+      ReadTransfer.End => 78
+      ReadTransfer.Data {count} => {
+        if count == 4 && output[0] == 84 && output[3] == 78 {
+          return 0
+        }
+        return 79
+      }
+    }
+  }
+}
+
+effect<'call> fn abandonExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let observed9 = run Client.receive(&mut exchangeValue.*)
+  if observed9 != 200 {
+    return 80
+  }
+  return 0
+}
+
+effect<'call> fn upgradeExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let result = run Effect.result(Client.receive(&mut exchangeValue.*))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      return 82
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => match move cause {
+        ClientError.UnsupportedUpgrade => 0
+        _ => 83
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+effect<'call> fn flushFailureExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let sent = run Effect.result(Client.send(&mut exchangeValue.*))
+  match move sent {
+    Result.Failure {error} => {
+      return run checkFlushFailure(move error, false)
+    }
+    Result.Success {value} => {
+      drop value
+    }
+  }
+  let progress = run Client.writeSome(&mut exchangeValue.*, b"Wiki")
+  if progress.consumed != 4 {
+    return 133
+  }
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Success {value} => value
+    Result.Failure {error} => {
+      drop error
+      return 134
+    }
+  }
+  let finished = run Effect.result(Client.finishRequest(&mut exchangeValue.*, &trailers))
+  return match move finished {
+    Result.Success {value} => {
+      drop value
+      return 135
+    }
+    Result.Failure {error} => {
+      return run checkFlushFailure(move error, true)
+    }
+  }
+}
+
+effect fn checkFlushFailure(error: ClientError | OutOfMemoryError, finishing: bool) -> i32
+! OutOfMemoryError {
+  return match move error {
+    OutOfMemoryError allocation => {
+      fail move allocation
+    }
+    ClientError cause => match move cause {
+      ClientError.Output {error: transport, progress} => {
+        if progress.consumed != usize.ZERO || progress.written == usize.ZERO {
+          return 136
+        }
+        if finishing && (progress.totalPayload != 4 || progress.totalWire != 14) {
+          return 137
+        }
+        return match move transport {
+          TransportError.Plain {error: plain} => match move plain {
+            ByteIoError.Provider {operation, code} => {
+              if operation == ByteIoOperation.Write && code == 88 {
+                if !finishing || progress.written != 2 {
+                  return 142
+                }
+                return 0
+              }
+              if operation != ByteIoOperation.Flush || code != 93 || (finishing && progress.written != 5) {
+                return 138
+              }
+              return 0
+            }
+            _ => 139
+          }
+          _ => 140
+        }
+      }
+      _ => 141
+    }
+  }
+}
+
+effect<'call> fn outputTimeoutExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  let result = run Effect.result(Client.send(&mut exchangeValue.*))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      return 129
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => match move cause {
+        ClientError.OutputTimeout {progress} => {
+          if progress.written != 2 || progress.totalWire != 2 || progress.consumed != usize.ZERO {
+            return 130
+          }
+          return 0
+        }
+        _ => 131
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+effect<'call> fn receiveBoundaryExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32
+! ClientError | OutOfMemoryError
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  run Client.send(&mut exchangeValue.*)
+  if scenario != 10 {
+    let trailerEntries: [Header<'static>; 0] = []
+    let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+      Result.Failure {error} => {
+        drop error
+        return 23
+      }
+      Result.Success {value} => value
+    }
+    run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  }
+  if scenario == 6 {
+    let observed = run Client.receive(&mut exchangeValue.*)
+    if observed != 103 {
+      return 81
+    }
+  }
+  let result = run Effect.result(Client.receive(&mut exchangeValue.*))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      if scenario == 6 {
+        return 82
+      }
+      if scenario == 10 {
+        return 92
+      }
+      return 95
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => {
+        let matched = match move cause {
+          ClientError.ContinueTimeout => scenario == 10
+          ClientError.LimitExceeded => scenario == 6 || scenario == 12
+          _ => false
+        }
+        if matched {
+          return 0
+        }
+        if scenario == 6 {
+          return 83
+        }
+        if scenario == 10 {
+          return 93
+        }
+        return 96
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+
+effect<'call> fn deadlineOperation<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+  stage: i32,
+  output: &mut [u8],
+) -> () ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  if stage == 0 {
+    run Client.send(&mut exchangeValue.*)
+  } else if stage == 1 {
+    let count = run Client.readSome(&mut exchangeValue.*, move output)
+    drop count
+  } else {
+    run Client.finishResponse(&mut exchangeValue.*)
+  }
+  return ()
+}
+
+effect<'call> fn deadlineExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32
+! ClientError | OutOfMemoryError
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  let mut body: [u8; 4] = [0, 0, 0, 0]
+  let mut stage = 0
+  if scenario == 13 {
+    run Client.send(&mut exchangeValue.*)
+    let trailerEntries: [Header<'static>; 0] = []
+    let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+      Result.Failure {error} => {
+        drop error
+        return 23
+      }
+      Result.Success {value} => value
+    }
+    run Client.finishRequest(&mut exchangeValue.*, &trailers)
+    let status = run Client.receive(&mut exchangeValue.*)
+    if status != 200 {
+      return 97
+    }
+    let read = run Client.readSome(&mut exchangeValue.*, &mut body)
+    if read != 4 {
+      return 98
+    }
+    run MonotonicClock.waitUntil(SystemClock.make(10, 0))
+    stage = 1
+  }
+  while stage < 3 {
+    let result = run Effect.result(deadlineOperation(&mut exchangeValue.*, stage, &mut body))
+    match move result {
+      Result.Success {value} => {
+        drop value
+        if stage == 0 {
+          return 84
+        }
+        if stage == 1 {
+          return 99
+        }
+        return 101
+      }
+      Result.Failure {error} => match move error {
+        OutOfMemoryError allocation => {
+          fail move allocation
+        }
+        ClientError cause => {
+          let expected = match move cause {
+            ClientError.Timeout => stage == 0 || stage == 1
+            ClientError.InvalidState => stage == 2
+            _ => false
+          }
+          if !expected {
+            if stage == 0 {
+              return 85
+            }
+            if stage == 1 {
+              return 100
+            }
+            return 102
+          }
+        }
+      }
+    }
+    if stage == 0 {
+      return 0
+    }
+    stage = stage + 1
+  }
+  return 0
+}
+
+effect<'call> fn partialExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32 ! ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
+  run Client.send(&mut exchangeValue.*)
+  let result = run Effect.result(Client.writeSome(&mut exchangeValue.*, b"Wiki"))
+  return match move result {
+    Result.Success {value} => {
+      drop value
+      return 86
+    }
+    Result.Failure {error} => match move error {
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+      ClientError cause => match move cause {
+        ClientError.Output {error: transport, progress} => {
+          if progress.consumed != 4 || progress.written != 2 || progress.totalPayload != 4 {
+            return 87
+          }
+          return match move transport {
+            TransportError.Plain {error: plain} => match move plain {
+              ByteIoError.Provider {operation, code} => {
+                if code == 88 {
+                  return 0
+                }
+                return 88
+              }
+              _ => 89
+            }
+            _ => 90
+          }
+        }
+        _ => 91
+      }
+    }
+  }
+}
+
+effect<'call> fn discardExchange<'call, 'exchange: 'call>(
+  exchangeValue: &'call mut Exchange<'exchange, TestTransport>,
+) -> i32
+! ClientError | OutOfMemoryError
+? &Scenario | &mut Allocator | &mut MonotonicClock | &mut Random {
+  let scenario = run Scenario.selected()
+  run Client.send(&mut exchangeValue.*)
+  let trailerEntries: [Header<'static>; 0] = []
+  let trailers = match move Headers.make(&trailerEntries, valueLimits()) {
+    Result.Failure {error} => {
+      drop error
+      return 23
+    }
+    Result.Success {value} => value
+  }
+  run Client.finishRequest(&mut exchangeValue.*, &trailers)
+  let status = run Client.receive(&mut exchangeValue.*)
+  if scenario == 11 {
+    if status != 200 {
+      return 94
+    }
+    run Client.discardRemaining(&mut exchangeValue.*, 4)
+    run Client.finishResponse(&mut exchangeValue.*)
+    return 0
+  }
+  let budget = u64.toU64(4)
+  let attempted = run Effect.result(Client.discardRemainingAtMost(
+    &mut exchangeValue.*,
+    budget,
+    Option<Instant>.none(),
+  ))
+  return match move attempted {
+    Result.Success {value} => match move value {
+      DiscardOutcome.CapReached => {
+        if scenario == 24 { return 0 }
+        return 158
+      }
+      DiscardOutcome.Completed => 159
+    }
+    Result.Failure {error} => match move error {
+      ClientError cause => match move cause {
+        ClientError.Body {error: body} => match move body.reason {
+          BodyReason.ChunkSyntax => match move body.component {
+            BodyComponent.ChunkDelimiter => {
+              if scenario == 25 { return 0 }
+              return 160
+            }
+            _ => 161
+          }
+          _ => 162
+        }
+        _ => 163
+      }
+      OutOfMemoryError allocation => {
+        fail move allocation
+      }
+    }
+  }
+}
+
+
+fn invalidState(error: ClientError) -> bool {
+  return match move error {
+    ClientError.InvalidState => true
+    _ => false
+  }
+}
+
+fn inputFor(scenario: i32) -> &'static [u8] {
+
+  if scenario == 1 {
+    return b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 417 Rejected\r\nContent-Length: 0\r\n\r\n"
+  }
+  if scenario == 2 {
+    return b"HTTP/1.1 103 Early Hints\r\n\r\nHTTP/1.1 417 Rejected\r\nContent-Length: 0\r\n\r\n"
+  }
+  if scenario == 3 {
+    return b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: Content-Digest\r\n\r\n4\r\nWiki\r\n0\r\nContent-Digest: yes\r\n\r\n"
+  }
+  if scenario == 4 {
+    return b"HTTP/1.1 204 Connected\r\nContent-Length: ignored\r\nTransfer-Encoding: ignored\r\n\r\nTUNN"
+  }
+  if scenario == 6 || scenario == 12 {
+    return b"HTTP/1.1 103 Hint\r\n\r\nHTTP/1.1 103 Hint\r\n\r\n"
+  }
+  if scenario == 7 {
+    return b"HTTP/1.1 101 Switching\r\n\r\n"
+  }
+  if scenario == 24 {
+    return b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n0\r\n\r\n"
+  }
+  if scenario == 25 {
+    return b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nxX"
+  }
+  return b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nWikiHTTP/1.1 404 Not Found\r\nContent-Length: 4\r\n\r\nWiki"
+}
+
+effect fn allCases() -> i32 ! ClientError | RequestError | OutOfMemoryError {
+  let scenarios: [i32; 13] = [0, 1, 2, 3, 4, 5, 7, 11, 17, 22, 23, 24, 25]
+  let mut index = usize.ZERO
+  while index < 13 {
+    let result = run runCase(scenarios[index])
+    if result != 0 {
+      return result
+    }
+    index = index + usize.ONE
+  }
+  return 0
+}
+
+effect fn recover(error: ClientError | RequestError | OutOfMemoryError) -> i32 {
+  drop error
+  return 51
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(allCases(), recover)
+}
