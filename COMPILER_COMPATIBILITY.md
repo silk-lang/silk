@@ -124,19 +124,21 @@ Each entry records:
   reborrow to satisfy a shared parameter or binding annotation.
 - **Source migration:** none.
 - **Diagnostics and limits:** selfhost is stricter than the bootstrap. Type arguments, requirement
-  row arguments, callable and Effect positions, services, recursive declarations still being
-  summarized, and declarations whose member shape is unavailable are treated as invariant. Such
-  calls keep the original `TypeMismatch` at the call. An unchanged row argument does not make an
-  unrelated nominal lifetime invariant: the declaration's fields decide its variance. A
-  requirement key mentioning that lifetime, including either side of row subtraction, still
-  prevents shortening. Qualified interface operations now use the same operand-region matcher as
-  direct calls. A call lifetime fixed by earlier operands may shorten when every parameter stores
-  it covariantly and an outlives or contents bound's longer side or subject does not mention it;
-  the final applied bounds must still prove. Newly inferred inner lifetimes cannot replace an
+  row arguments, callable and Effect positions, recursive declarations still being summarized,
+  and declarations whose member shape is unavailable are treated as invariant. Such calls keep
+  the original `TypeMismatch` at the call. An unchanged requirement-row argument does not make
+  an unrelated nominal lifetime invariant: the declaration's fields decide its variance
+  (LIFE-002). Requirement keys mentioning that lifetime, including either side of an unresolved
+  row subtraction, remain invariant; row arguments themselves still match exactly. Qualified
+  interface and captured service operations use the same operand-region matcher as direct calls.
+  A call lifetime fixed by earlier operands may shorten to their meet with a later operand only
+  when every parameter stores it covariantly. Ordinary outlives and contents bounds admit that
+  inference step only when their longer side or subject does not mention the shortened binder;
+  every final applied bound is still proved. Newly inferred inner lifetimes cannot replace an
   explicitly supplied lifetime, and exclusive referents remain invariant.
 - **Evidence:** `sharedLoanParametersShortenOnlyMatchingAccess` in
-  `compiler/src/semantic/SemanticLoweringCases.silk`, and the `standalone*` direct-demand Cases in
-  `compiler/src/semantic/SemanticConformanceCases.silk`.
+  `compiler/src/semantic/SemanticLoweringCases.silk`, and the loaded-declaration sweep and
+  `standalone*` direct-demand Cases in `compiler/src/semantic/SemanticConformanceCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
 
