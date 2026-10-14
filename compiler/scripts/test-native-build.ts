@@ -134,8 +134,20 @@ const program = Effect.gen(function* () {
     assert.equal(yield* fs.exists(join(directory, 'rejected')), false)
     assert.equal(yield* fs.exists(marker), false)
   }
+  // `run` builds the nearest project's debug executable below its output directory, then
+  // becomes that program: the program's arguments and exit status pass through unchanged.
+  const project = yield* invoke(
+    silkc,
+    ['run', '--stdlib', standardLibrary, 'first', '--', '--stdlib'],
+    directory,
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(project.status, 42, project.stderr)
+  const [hostTarget] = yield* fs.readDirectory(join(directory, 'build/llvm'))
+  assert.ok(hostTarget, 'run must place its executable below build/llvm/<target>')
+  assert.equal(yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')), true)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup and selector validation passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation and project run passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
