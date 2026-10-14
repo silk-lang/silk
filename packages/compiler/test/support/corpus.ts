@@ -11418,6 +11418,20 @@ pub effect fn main() {
     expected: { _tag: 'Trap' },
   },
   {
+    name: 'native-termination-fatal-bounds',
+    source: `fn pick(values: &[i32], at: usize) -> i32 {
+  return values[at]
+}
+
+pub effect fn main() {
+  let values = [1, 2, 3]
+  let z = pick(&values, 5)
+  return ()
+}`,
+    nativeStderr: 'fatal trap: index out of bounds\n  at memory/driver.pick (memory/driver:2:10)\n',
+    expected: { _tag: 'Trap' },
+  },
+  {
     name: 'native-termination-cross-module-frame',
     source: 'pub fn main() -> i32 { return 42 }',
     nativeSource: `import errors.kinds { NotFoundError, load }
