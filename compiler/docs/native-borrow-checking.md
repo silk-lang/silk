@@ -214,6 +214,18 @@ Region variables live only in the side table. Each is one of:
 Declared outlives bounds and `where` premises become assumptions between universal regions. They
 are given, not proved, in the body itself (LIFE-002).
 
+The R3 2a premise check runs inside the body query. It checks retained relations made solely
+of `'static` and that named body's declared lifetime atoms against `BodyPremises`, including
+input well-formedness edges. Goals never become premises. A rigid relation absent from that
+closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained origin; local, invocation,
+supplied, and outside-owner atoms remain pending. An anonymous body's enclosing atoms retain
+their identity and are left for the environment proof. Open capture contents still prevent
+`Checked`. This is groundwork, with no promised gap-count reduction.
+
+An inferred binder initially holding `'static` is not a declared static requirement. Retained
+relations record that provisional origin explicitly and remain pending. Inference behavior is
+unchanged; a provisional static relation must not cause SEM0212 or become a declared premise.
+
 ### 4.2 Points
 
 Points are the typed body's evaluation points (§3), plus one exit point per `Return` and `Fail`.
@@ -233,6 +245,20 @@ Solving uses the bootstrap's algorithm on the new domain:
 A region becomes unavailable at points after its owner's `StorageDead`, and after a write or move
 that invalidates an overlapping place. A violation is OWN0019 at the use's origin. Point sets are
 bitsets over the body's location count.
+
+The R3 2b worklist uses these same Walker points and successor edges. A local term must map to
+one exact loan; its required set includes the walk's in-flight intervals and live holder points.
+Availability excludes paths before creation and after overlapping End, Expire, write, move or drop
+events, restarting at creation on a loop back edge. Own declared parameters and `'static` are
+available throughout this body. Required bitsets propagate from shorter to longer to a fixed point.
+
+This first point proof uses conservative sets: numeric interval interiors may require extra
+points, and retained edges stay active throughout the body. Inclusion still proves the original
+relation; failed inclusion remains pending until location-sensitive requirements resolve it.
+The existing exact End/access walk retains OWN0019 and conflict diagnostics. Missing or ambiguous
+loan mappings, approximate loans, meets, provisional static inference, outside-owner atoms,
+crossed referent loans and Contents are not promoted to Checked. The shared parameter-to-local
+reborrow floor is the first target; no callee body's stage or MIR participates in its proof.
 
 ### 4.4 Liveness and conflicts
 
@@ -536,6 +562,16 @@ units than that, because instances share a unit.
 
 Budget: the borrow stage adds at most **10% of front-end time (about 30 s) and 0.5 GiB peak RSS**
 to the self-build. That is about 1.6 ms per emitted body on average, and more per unit.
+
+For R3, the approved remaining cumulative share is **3.28 s wall / 2.83 s user CPU / 0.486 GiB
+peak RSS**. Compare at least five alternating clean/R3 pairs with the same producers, command,
+source and one-shot LLVM-IR endpoint. Before each run, require one-minute load below 1 and no
+other Node, Silk compiler or Clang process. Report every sample, the median of adjacent R3-minus-clean
+differences, and the spread. The paired median is the gate, not maximum-minus-minimum. If clean
+timings vary by more than about 5%, investigate cache, memory, thermal and background scheduling
+effects before trusting a delta; VM host steal time can remain even when guest processes are idle.
+If the median exceeds the cap, profile the slice before proposing a cost decision. Negative or
+noisy timing does not increase the remaining share. A real overrun returns to Julia; the cap is fixed.
 
 How it stays within budget:
 
