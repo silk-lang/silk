@@ -397,27 +397,20 @@ pinning instructions.
 ### ARM64 Linux development
 
 Both compilers support `aarch64-unknown-linux-gnu`, including ARM64 Debian and Ubuntu VMs.
-The native compiler selects this host automatically. The release pinned in `native-seed.json`
-currently contains an **x86-64** executable; its architecture is a distribution constraint, not
-the list of targets the compiler supports. It cannot run directly on ARM64.
+The native compiler selects this host automatically. Install Node 24, the repository's pnpm
+version, GitHub CLI, `jq`, `build-essential`, and LLVM 22.1.8 for Linux ARM64. Put the complete
+LLVM `bin` directory on `PATH`.
 
-For the first ARM64 compiler, use the TypeScript bootstrap from this synchronized checkout (or
-the verified main bundle described above). Install Node 24, the repository's pnpm version,
-`build-essential`, and LLVM 22.1.8 for Linux ARM64. Put the complete LLVM `bin` directory on
-`PATH`, then run these commands from the repository root:
+Start with the ARM64 entry in `native-seed.json` once a reviewed pin exists, following
+[Install a verified native seed](docs/native-seed-chain.md#install-a-verified-native-seed) with
+`target=aarch64-unknown-linux-gnu`. The script verifies SHA-256 before creating the executable;
+no TypeScript compiler or CPU emulation is needed. The initial per-target schema change preserves
+the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first green push publishes
+ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
+verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-```sh
-pnpm install --frozen-lockfile
-pnpm --filter @silklang/cli... run build
-node --max-old-space-size=16384 packages/cli/dist/bin.js build \
-  --manifest-path compiler/silk.toml --release
-export SILKC_CLANG="$(command -v clang)"
-export SILKC="$PWD/compiler/build/llvm/aarch64-unknown-linux-gnu/release/silk-compiler"
-```
-
-The initial bootstrap can take several minutes. `SILKC_CLANG` selects the LLVM 22 compiler for
-native linking; the selfhost CLI otherwise uses `/usr/bin/clang`. Subsequent development builds
-can use the ARM64 executable directly, with no JavaScript compiler or CPU emulation:
+With `SILKC` pointing at the verified ARM64 executable and `SILKC_CLANG` pointing at LLVM 22
+`clang`, development builds use the native compiler directly:
 
 ```sh
 mkdir -p .scratch
@@ -428,8 +421,9 @@ mkdir -p .scratch
 ```
 
 Use the existing source-written `*Cases.silk` roots and their filters for focused changes.
-This local bootstrap does not change the pinned release or claim the CI seed-chain fixpoint;
-the pin and its provenance remain governed by [the native seed chain](docs/native-seed-chain.md).
+ARM64 Linux CI on `ubuntu-24.04-arm` checks N1/N2 compiler IR identity and the native corpus;
+macOS arm64 has the same seed verification and native chain on `macos-15`. The pin and its
+provenance remain governed by [the native seed chain](docs/native-seed-chain.md).
 
 ## Anonymous declaration identities
 
