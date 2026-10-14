@@ -125,8 +125,8 @@ query, not part of `InstanceKey`, so no instance is specialized or duplicated pe
 **Hidden parameters.** In observing mode every Silk function, including drop glue and the observer
 callbacks themselves, takes two trailing addresses after its providers:
 
-- `LocalKind.Observer`: the address of the current observer record `[callback address, state
-address]`, or null;
+- `LocalKind.Observer`: the address of the current observer record `[adapter address, state
+address, callback address]`, or null;
 - `LocalKind.Cause`: the address of the selected failure's context companion (§N2), or null.
 
 Fallible functions also take a third failure out-address for the context (§N3). `Call.diagnostics`
@@ -134,10 +134,16 @@ and `Drop.diagnostics` carry both operands. Ordinary calls pass the caller's cur
 Independent calls pass null for both: the callback call in `observeUnhandled` and the entry shim's
 call of `main`. C exports and C callbacks are not lowered by selfhost yet.
 
-**Running an observation.** The `RunPlan.Observe` step stores `FunctionAddress(callback)` and
-`AddressOf(env.0)` into a record temporary, runs `body` (part 2) with that record's address and a
-null cause, then drops the state. The callback must be a direct function, because its address is
-what the record holds; a capturing callback reports `observer-callback`.
+**Running an observation.** The `RunPlan.Observe` step stores `FunctionAddress(adapter)`,
+`AddressOf(env.0)` and `AddressOf(env.1)` into a record temporary, runs `body` (part 2) with that
+record's address and a null cause, then drops the callback and the state, in that order, as the
+bootstrap does. The adapter is an `InstanceKey.Helper` with role `Observe`, lowered with the
+function that runs the observation and keyed by its run node and plan step. It takes the callback's
+address first, then the six event operands, and invokes the callback through a shared loan of the
+stored callable, so a direct function, a staged section and a capturing anonymous body all answer
+the same event call `adapter(callback, state, event, first, second, identity, origin)`. A callable
+that consumes or exclusively lends its environment, or that needs providers, reports
+`observer-callback`.
 
 ### N2. The selected failure is a hidden cause address
 
@@ -297,12 +303,12 @@ callable-value follow-up owns it.
 
 ## 4. Gap codes
 
-| Code                | Change   | Raised where                                                                                                         | Exit condition                       |
-| ------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| `intrinsic-member`  | narrower | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled`                                           | suspension stage                     |
-| `observer-callback` | **new**  | an `observeDiagnostics` callback that is not a direct function                                                       | callback environments in the record  |
-| `failure-identity`  | **new**  | an observed `fail` of an anonymous aggregate, callable, Effect or foreign function, or a nominal with a row argument | identity rendering for the remainder |
-| `entry-signature`   | removed  | no generated entry; every build roots at its runtime's C exports                                                     | default runtime selection            |
+| Code                | Change   | Raised where                                                                                                         | Exit condition                                                       |
+| ------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------- |
+| `intrinsic-member`  | narrower | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled`                                           | suspension stage                                                     |
+| `observer-callback` | **new**  | an `observeDiagnostics` callback whose callable consumes or exclusively lends its environment, or needs providers    | none; an adapter calls the callback repeatedly through a shared loan |
+| `failure-identity`  | **new**  | an observed `fail` of an anonymous aggregate, callable, Effect or foreign function, or a nominal with a row argument | identity rendering for the remainder                                 |
+| `entry-signature`   | removed  | no generated entry; every build roots at its runtime's C exports                                                     | default runtime selection                                            |
 
 ## 5. Bootstrap parity and COMPILER_COMPATIBILITY.md
 
