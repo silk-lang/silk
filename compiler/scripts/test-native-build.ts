@@ -201,11 +201,59 @@ const program = Effect.gen(function* () {
   )
   assert.equal(foreignRun.status, 2, 'run must refuse a foreign target')
   assert.equal(yield* fs.exists(marker), false)
+  // A named profile builds once in the directory its optimization names, and conflicts with
+  // --release before anything is built.
+  yield* fs.writeFileString(
+    join(directory, manifest),
+    (yield* fs.readFileString(join(directory, manifest))) +
+      `\n[profiles.fast]\ntarget = "${hostTarget}"\noptimization = "speed"\ndebug = true\n`,
+  )
+  const profiled = yield* invoke(
+    silkc,
+    ['build', '--manifest-path', manifest, '--profile', 'fast', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(profiled.status, 0, profiled.stderr)
+  assert.equal(
+    yield* fs.exists(
+      join(directory, 'greeting/build/llvm', hostTarget, 'release-with-debug/greeting'),
+    ),
+    true,
+  )
+  const conflicting = yield* invoke(
+    silkc,
+    ['build', '--manifest-path', manifest, '--profile', 'fast', '--release'],
+    directory,
+    { ...process.env, SILKC_CLANG: sentinel },
+  )
+  assert.equal(conflicting.status, 2, 'a named profile must conflict with --release')
+  assert.equal(yield* fs.exists(marker), false)
+  // `[build].bindings` reach the package parameters of every project build.
+  yield* fs.makeDirectory(join(directory, 'bound/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'bound/src/main.silk'),
+    'pub param limit: i32 = 1\n\npub fn main() -> i32 {\n  return limit\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'bound/silk.toml'),
+    '[package]\nname = "bound"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[[build.bindings]]\npackage = "bound@0.1.0"\nmodule = "main"\nparameter = "limit"\nvalue = { kind = "integer", value = "7" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+  )
+  const bound = yield* invoke(
+    silkc,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'bound'),
+    {
+      ...process.env,
+      SILKC_CLANG: clang,
+    },
+  )
+  assert.equal(bound.status, 7, bound.stderr)
   const cleanedByPath = yield* invoke(silkc, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init and manifest flags passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles and bindings passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))

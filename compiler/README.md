@@ -232,13 +232,16 @@ bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it w
 plan, admits its receipt and exits with its status; see [Native `silkc test`](docs/native-test.md).
 
 Project build invocation: `silkc build [--manifest-path <path>] [--target <host|triple>]...
-[--release] [--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
+[--release] [--optimization <debug|release|release-with-debug>] [--profile <name>]
+[--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
 `silk.toml` above the working directory, or exactly the manifest `--manifest-path` names, as the
 TypeScript CLI's `silk build` does, and builds `[package].root` once per selected target: the
 `--target` selectors in order, or else `[build].targets` (default `["host"]`), where `host` names
 the compiler's host and a repeated target builds once. The debug profile (no optimization, debug
-information) is the default and `--release` selects optimization without debug information. Each
-artifact lands at `<output-dir>/llvm/<target>/<debug|release>/<name>`, where `[build].output-dir`
+information) is the default; `--optimization release` (or `--release`) selects optimization without
+debug information and `--optimization release-with-debug` keeps it, as the TypeScript CLI does, and
+`--release` with another `--optimization` exits 2. Each
+artifact lands at `<output-dir>/llvm/<target>/<profile>/<name>`, where `[build].output-dir`
 defaults to `build` and must stay inside the project; an `llvm-ir` `[build].stage` writes
 `<name>.ll` there instead. Only the host target links an executable, and library artifacts and the
 other intermediate stages are not native yet; each such target fails with status 2. The command
@@ -246,10 +249,22 @@ prints one `build llvm/<target>: ok <artifact>` or `failed (exit <status>)` line
 `Build summary`; its status is 2 when any target failed operationally, else 1 when any build was
 refused, else 0. A missing or invalid manifest or an unknown target exits 2 before building.
 
+Named profiles follow the TypeScript `ProjectProfile`: a `[profiles.<name>]` table is a complete
+logical profile (`target` is required; `cpu`, `optimization`, `debug` and the other profile fields
+are optional) with optional profile-tier `bindings`, and `[build].profile` names the default one.
+`--profile <name>`, or else the default when no `--target` is given, builds exactly that profile
+once, in the profile directory its optimization and debug choices name; it conflicts with
+`--target`, `--release` and `--optimization` (status 2). `[build].bindings` holds project-tier package-parameter
+bindings (`package`, `module`, `parameter`, a `value` such as `{ kind = "integer", value = "3" }`
+and an `origin` with `source` and a public `provenance`) that every project build receives, before
+the selected profile's own. Loading a project validates the whole catalog; a refusal prints the
+TypeScript `<code>: <subject>`, such as `InvalidInput: profile name`, and exits 2.
+
 Run invocation: `silkc run [--manifest-path <path>] [--target <host|triple>]... [--release]
-[--stdlib <directory>] [arguments...] [-- arguments...]`. It builds the project's executable as the
-project build does, for the first `--target` or else the host (it ignores `[build].targets`), and a
-first target other than the host exits 2. Options are read until `--`; other arguments before it
+[--optimization <profile>] [--profile <name>] [--stdlib <directory>] [arguments...]
+[-- arguments...]`. It builds the
+project's executable as the project build does, for the named profile, else the first `--target`,
+else the host (it ignores `[build].targets`), and a target other than the host exits 2. Options are read until `--`; other arguments before it
 and every argument after it go to the program in order. The compiler then replaces its own process
 with the program (`execv`), so the program inherits standard input, output and error, the
 environment and the working directory, and its exit status or terminating signal is the command's.
