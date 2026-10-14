@@ -508,9 +508,9 @@ root's scope:
 - Every value that would carry a loan of a body local across a scope boundary leaves the walk with
   `stored-loans`: a block, branch or arm result, a subject that carries a loan, a return, an
   assignment and a `let mut` holder. A referent loan (storage behind a reference, which the body
-  does not own) may cross a join, a `let mut` holder, a replacement or a return; such a body is
-  marked crossed and is never `Checked`, because its region relations are the region slices' to
-  prove.
+  does not own) may cross a join, a `let mut` holder, a replacement or a return. The source-bound
+  proof in §4.3 admits that crossing only when an authenticated universal parent bounds the
+  reborrow; otherwise the body remains `regions`. Every retained relation still needs its own proof.
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
   literal or a temporary receiver, borrows a hidden owner the walk roots at the borrowed value. It
   is released with its statement or arm, or with the binding's scope for an array kept by a
