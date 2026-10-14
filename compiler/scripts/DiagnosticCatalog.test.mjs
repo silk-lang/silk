@@ -2,42 +2,59 @@ import { assert, it } from '@effect/vitest'
 import { verify } from './DiagnosticCatalog.mjs'
 
 const definitions = [
-  ['patternBindingConflictCode', 'SEM0048'],
-  ['argumentTypeMismatchCode', 'SEM0012'],
-  ['unsupportedBytesCode', 'LEX0001'],
-  ['staticPhaseViolationCode', 'SEM0176'],
-  ['unknownTypeCode', 'SEM0001'],
+  ['patternBindingConflict', 'SEM0048', 'Binding conflicts with {name}'],
+  ['argumentTypeMismatch', 'SEM0012', 'Expected {expected} but received {actual}'],
+  ['unsupportedBytes', 'LEX0001', 'Unsupported bytes'],
+  ['staticPhaseViolation', 'SEM0176', 'Static phase violation: {detail}'],
+  ['unknownType', 'SEM0001', 'Unknown type {spelling}'],
 ]
+const member = (name) => `${name.slice(0, 1).toUpperCase()}${name.slice(1)}`
+const typescript = (template) => template.replace(/\{(\w+)\}/g, (_text, hole) => `\${${hole}}`)
 const fixture = () => ({
   bootstrap: definitions
     .map(
-      ([symbol, code]) =>
-        `export const ${symbol} = '${code}' as const\nconst factory${symbol} = { code: ${symbol}, message: 'A complete message' }`,
+      ([name, code, template]) =>
+        `/** Meaning of ${code}. */\nexport const ${name}Code = '${code}' as const\nconst ${name} = (span) => ({ code: ${name}Code, message: \`${typescript(template)}\`, span })`,
     )
     .join('\n'),
+  catalog: `pub enum Code {
+${definitions.map(([name]) => `  ${member(name)},`).join('\n')}
+}
+pub fn spelling(code: Code) -> string<'static> {
+  return match code {
+${definitions.map(([name, code]) => `    Code.${member(name)} => "${code}"`).join('\n')}
+  }
+}
+pub fn meaning(code: Code) -> string<'static> {
+  return match code {
+${definitions.map(([name, code]) => `    Code.${member(name)} => "Meaning of ${code}."`).join('\n')}
+  }
+}
+pub fn template(code: Code, choice: usize) -> string<'static> {
+  return match code {
+${definitions.map(([name, , template]) => `    Code.${member(name)} => "${template}"`).join('\n')}
+  }
+}`,
   rejection: `pub enum RejectionCode {
   PatternBindingConflict,
   ArgumentTypeMismatch,
 }
-pub fn stableCode(code: RejectionCode) -> &'static [u8] {
+pub fn catalogCode(code: RejectionCode) -> Option<Code> {
   return match code {
-    // bootstrap: patternBindingConflictCode
-    RejectionCode.PatternBindingConflict => b"SEM0048"
-    // bootstrap: argumentTypeMismatchCode
-    RejectionCode.ArgumentTypeMismatch => b"SEM0012"
+    RejectionCode.PatternBindingConflict => Option<Code>.some(Code.PatternBindingConflict)
+    RejectionCode.ArgumentTypeMismatch => Option<Code>.some(Code.ArgumentTypeMismatch)
   }
 }`,
   lexical: `pub union LexicalDiagnostic {
   UnsupportedBytes {pub span: Span},
 }
-run writeLine("LEX0001", "UnsupportedBytes", span)`,
+run writeLine(Code.UnsupportedBytes, "UnsupportedBytes", span)`,
   staticExecution: `pub enum Fault {
   StaticPhaseViolation,
 }
-fn faultCode(fault: Fault) -> &'static [u8] {
+fn faultCatalogCode(fault: Fault) -> Option<Code> {
   return match fault {
-    // bootstrap: staticPhaseViolationCode
-    Fault.StaticPhaseViolation => b"SEM0176"
+    Fault.StaticPhaseViolation => Option<Code>.some(Code.StaticPhaseViolation)
   }
 }`,
   documentation: definitions
@@ -49,72 +66,72 @@ fn faultCode(fault: Fault) -> &'static [u8] {
   ],
 })
 
+const reports = (input, expected) =>
+  assert.ok(
+    verify(input).some((issue) => issue.includes(expected)),
+    `${expected}: ${verify(input).join('; ')}`,
+  )
+
 it('accepts an exhaustive catalog and explicitly recorded diagnostic gap', () => {
   assert.deepStrictEqual(verify(fixture()), [])
 })
 
-it('accepts an explicitly uncoded refusal and rejects coding or misnaming it', () => {
+it('accepts a refusal without a catalog code and rejects a default arm', () => {
   const input = fixture()
   input.rejection = input.rejection
     .replace('  PatternBindingConflict,', '  Unsupported,\n  PatternBindingConflict,')
     .replace(
       '  return match code {',
-      '  return match code {\n    // refusal: Unsupported\n    RejectionCode.Unsupported => b""',
+      '  return match code {\n    RejectionCode.Unsupported => Option<Code>.none()',
     )
   assert.deepStrictEqual(verify(input), [])
-  const coded = { ...input, rejection: input.rejection.replace('b""', 'b"NAT0001"') }
-  assert.ok(verify(coded).some((issue) => issue.includes('unannotated')))
-  const wrongReason = {
+  const defaulted = {
     ...input,
-    rejection: input.rejection.replace('refusal: Unsupported', 'refusal: Other'),
+    rejection: input.rejection.replace('  }\n}', '    _ => Option<Code>.none()\n  }\n}'),
   }
-  assert.ok(verify(wrongReason).some((issue) => issue.includes('refusal reason differs')))
+  reports(defaulted, 'default or non-catalog arm')
 })
 
-it('rejects a wrong code even when it exists in the bootstrap catalog', () => {
-  const input = fixture()
-  input.rejection = input.rejection.replace('b"SEM0048"', 'b"SEM0012"')
-  assert.ok(
-    verify(input).some((issue) => issue.includes('differs from patternBindingConflictCode')),
-  )
-})
-
-it('rejects missing, duplicate, default and unregistered native arms', () => {
+it('rejects missing, duplicate and unknown native arms and unknown codes', () => {
   for (const [replace, expected] of [
     [
       (text) =>
         text.replace(
-          /    \/\/ bootstrap: patternBindingConflictCode\n    RejectionCode.PatternBindingConflict => b"SEM0048"\n/,
+          /    RejectionCode.PatternBindingConflict => Option<Code>.some\(Code.PatternBindingConflict\)\n/,
           '',
         ),
-      'missing native arm',
+      'missing arm PatternBindingConflict',
     ],
-    [(text) => text.replace('  }\n}', '    _ => b"SEM0048"\n  }\n}'), 'default'],
     [
       (text) =>
         text.replace(
           'RejectionCode.ArgumentTypeMismatch =>',
           'RejectionCode.PatternBindingConflict =>',
         ),
-      'duplicate native arm',
+      'duplicate arm',
     ],
-    [(text) => text.replace('b"SEM0048"', 'b"SEM9999"'), 'unregistered code'],
+    [
+      (text) => text.replace('RejectionCode.ArgumentTypeMismatch =>', 'RejectionCode.Elsewhere =>'),
+      'unknown arm Elsewhere',
+    ],
+    [
+      (text) => text.replace('some(Code.ArgumentTypeMismatch)', 'some(Code.NoSuchCode)'),
+      'unknown catalog code Code.NoSuchCode',
+    ],
   ]) {
     const input = fixture()
     input.rejection = replace(input.rejection)
-    assert.ok(
-      verify(input).some((issue) => issue.includes(expected)),
-      expected,
-    )
+    reports(input, expected)
   }
 })
 
-it('rejects lexical and static mapping drift by semantic identity', () => {
-  for (const key of ['lexical', 'staticExecution']) {
-    const input = fixture()
-    input[key] = input[key].replace(/(?:LEX0001|SEM0176)/, 'SEM0012')
-    assert.ok(verify(input).some((issue) => issue.includes('differs from')))
-  }
+it('ties a lexical reason to the code of the same name', () => {
+  const input = fixture()
+  input.lexical = input.lexical.replace(
+    'writeLine(Code.UnsupportedBytes',
+    'writeLine(Code.UnknownType',
+  )
+  reports(input, 'lexical reason UnsupportedBytes reports Code.UnknownType')
 })
 
 it('requires new lexical and static reasons to have a catalog mapping', () => {
@@ -123,47 +140,108 @@ it('requires new lexical and static reasons to have a catalog mapping', () => {
     '  UnsupportedBytes',
     '  NewReason {pub span: Span},\n  UnsupportedBytes',
   )
-  assert.ok(verify(lexical).some((issue) => issue.includes('missing lexical reason NewReason')))
+  reports(lexical, 'missing lexical reason NewReason')
   const fault = fixture()
   fault.staticExecution = fault.staticExecution.replace(
     '  StaticPhaseViolation,',
     '  StaticPhaseViolation,\n  NewFault,',
   )
-  assert.ok(verify(fault).some((issue) => issue.includes('missing static fault NewFault')))
+  reports(fault, 'faultCatalogCode: missing arm NewFault')
+})
+
+it('requires the native catalog to match the bootstrap template for template', () => {
+  for (const [replace, expected] of [
+    [
+      (text) => text.replace('"Unknown type {spelling}"', '"Unknown kind {spelling}"'),
+      'template 0 differs',
+    ],
+    [
+      (text) => text.replace('"Expected {expected} but', '"Expected {expected}{actual} but'),
+      'template 0 differs',
+    ],
+    [(text) => text.replace('"Meaning of SEM0012."', '"Another meaning."'), 'meaning differs'],
+    [(text) => text.replace('=> "SEM0001"', '=> "SEM0002"'), 'spelled SEM0002'],
+    [
+      (text) => text.replace('  UnknownType,\n', '  UnknownType,\n  Extra,\n'),
+      'Code.Extra: not in the bootstrap',
+    ],
+    [(text) => text.replace('  UnknownType,\n', ''), 'Catalog.silk has no Code.UnknownType'],
+  ]) {
+    const input = fixture()
+    input.catalog = replace(input.catalog)
+    reports(input, expected)
+  }
+  const renamed = fixture()
+  renamed.catalog = renamed.catalog.replace('"Unknown type {spelling}"', '"Unknown type {name}"')
+  assert.deepStrictEqual(verify(renamed), [])
+})
+
+it('compares every template of a code that chooses among several', () => {
+  const input = fixture()
+  input.bootstrap = input.bootstrap.replace(
+    'message: `Unknown type ${spelling}`',
+    'message: generic ? `Unknown generic ${spelling}` : `Unknown type ${spelling}`',
+  )
+  reports(input, '1 templates, bootstrap 2')
+  input.catalog = input.catalog.replace(
+    '    Code.UnknownType => "Unknown type {spelling}"',
+    '    Code.UnknownType => {\n      if choice == 1 { return "Unknown type {spelling}" }\n      return "Unknown generic {spelling}"\n    }',
+  )
+  assert.deepStrictEqual(verify(input), [])
+  input.catalog = input.catalog.replace(
+    'return "Unknown type {spelling}"',
+    'return "Unknown {spelling}"',
+  )
+  reports(input, 'template 1 differs')
 })
 
 it('rejects removed messages, missing documentation, and duplicate catalog codes', () => {
   const missingMessage = fixture()
   missingMessage.bootstrap = missingMessage.bootstrap.replace(
-    "message: 'A complete message'",
+    'message: `Unknown type ${spelling}`',
     'templateRemoved: true',
   )
-  assert.ok(verify(missingMessage).some((issue) => issue.includes('message template')))
+  reports(missingMessage, 'message template')
   const missingDocumentation = fixture()
   missingDocumentation.documentation = ''
-  assert.ok(
-    verify(missingDocumentation).some((issue) => issue.includes('missing generated documentation')),
-  )
+  reports(missingDocumentation, 'missing generated documentation')
   const collision = fixture()
   collision.bootstrap = collision.bootstrap.replace("'SEM0048' as const", "'SEM0012' as const")
-  assert.ok(verify(collision).some((issue) => issue.includes('duplicate catalog code')))
+  reports(collision, 'duplicate catalog code')
 })
 
 it('requires gaps to have rules and reasons and rejects stale or missing gap entries', () => {
   const missing = fixture()
   missing.coverage = []
-  assert.ok(verify(missing).some((issue) => issue.includes('no native producer or explicit gap')))
+  reports(missing, 'no native producer or explicit gap')
   const unexplained = fixture()
   unexplained.coverage = [{ code: 'SEM0001', rules: [], reason: '' }]
-  assert.ok(verify(unexplained).some((issue) => issue.includes('no reference rule')))
-  assert.ok(verify(unexplained).some((issue) => issue.includes('no explanation')))
+  reports(unexplained, 'no reference rule')
+  reports(unexplained, 'no explanation')
   const stale = fixture()
   stale.coverage.push({ code: 'SEM0048', rules: ['PATT-005'], reason: 'Already covered' })
-  assert.ok(verify(stale).some((issue) => issue.includes('covered code still listed')))
+  reports(stale, 'covered code still listed')
 })
 
 it('rejects coverage entries that cite a nonexistent reference rule', () => {
   const input = fixture()
   input.coverage = [{ code: 'SEM0001', rules: ['TYPE-999'], reason: 'A missing rule' }]
-  assert.ok(verify(input).some((issue) => issue.includes('unknown reference rule TYPE-999')))
+  reports(input, 'unknown reference rule TYPE-999')
+})
+
+it('reads arms and template choices in the formatter wrapped layout', () => {
+  const input = fixture()
+  input.rejection = input.rejection.replace(
+    'RejectionCode.ArgumentTypeMismatch => Option<Code>.some(Code.ArgumentTypeMismatch)',
+    'RejectionCode.ArgumentTypeMismatch => Option<\n      Code\n    >.some(Code.ArgumentTypeMismatch)',
+  )
+  input.bootstrap = input.bootstrap.replace(
+    'message: `Unknown type ${spelling}`',
+    'message: generic ? `Unknown generic ${spelling}` : `Unknown type ${spelling}`',
+  )
+  input.catalog = input.catalog.replace(
+    '    Code.UnknownType => "Unknown type {spelling}"',
+    '    Code.UnknownType => {\n      if choice == 1 {\n        return "Unknown type {spelling}"\n      }\n      return "Unknown generic {spelling}"\n    }',
+  )
+  assert.deepStrictEqual(verify(input), [])
 })
