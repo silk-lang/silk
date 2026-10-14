@@ -43,7 +43,7 @@ const withStub = async (body: string, run: (path: string) => Promise<void>): Pro
   }
 }
 
-const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/i32.silk" ] || [ ! -f silk.toml ]; then exit 4; fi
+const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/i32.silk" ] || ! grep -qxF 'version = "0.1.0"' silk.toml; then exit 4; fi
 case "$6" in */) exit 5;; esac
 if [ "$1" != build ] || [ "$2" != memory/driver.silk ] || [ ! -f memory/driver.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
 while [ "$1" != "-o" ]; do shift; done
