@@ -43,7 +43,7 @@ const hash = (source: string) => createHash('sha256').update(source.trim()).dige
 /** Remove comments and quoted literals before recognizing an exported entry declaration. */
 export const hasMain = (source: string) => {
   const masked = source.replace(
-    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|\br"""[\s\S]*?"""|"""(?:\\[\s\S]|(?!""")[\s\S])*"""|"(?:\\.|[^"\\])*"|'(?:\\(?:u\{[0-9a-f]+\}|x[0-9a-f]{2}|.)|[^'\\\r\n])'/giu,
+    /\/\/[^\n]*|\/\*[\s\S]*?\*\/|\br"""[\s\S]*?"""|"""(?:\\[\s\S]|(?!""")[\s\S])*"""|\br"[^"\r\n]*"|"(?:\\.|[^"\\])*"|'(?:\\(?:u\{[0-9a-f]+\}|x[0-9a-f]{2}|.)|[^'\\\r\n])'/giu,
     (text) => text.replace(/[^\n]/g, ' '),
   )
   let depth = 0
