@@ -146,8 +146,21 @@ const program = Effect.gen(function* () {
   const [hostTarget] = yield* fs.readDirectory(join(directory, 'build/llvm'))
   assert.ok(hostTarget, 'run must place its executable below build/llvm/<target>')
   assert.equal(yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')), true)
+  // `init` writes a project whose generated entry `run` builds and runs.
+  const initialized = yield* invoke(silkc, ['init', 'greeting'], directory)
+  assert.equal(initialized.status, 0, initialized.stderr)
+  const greeted = yield* invoke(
+    silkc,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'greeting'),
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(greeted.status, 0, greeted.stderr)
+  assert.match(greeted.stdout, /Hello, world!/)
+  const repeated = yield* invoke(silkc, ['init', 'greeting'], directory)
+  assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation and project run passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run and init passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
