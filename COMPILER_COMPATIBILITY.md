@@ -1058,8 +1058,8 @@ Each entry records:
   catalog runtime for the target and libc stops an executable build. An object form
   (`[build].artifact = "object"`) acquires no catalog runtime or catalog storage component, so a
   package without a `main` builds; a composition without a default selects no runtime for it, and
-  its application's C exports are its only roots, possibly none. Static and shared library forms
-  are not yet native. Selfhost does not yet read profile `runtime` requests
+  its application's C exports are its only roots, possibly none. A static library form takes the
+  same roots and archives its object with `llvm-ar`. The shared library form is not yet native. Selfhost does not yet read profile `runtime` requests
   (`none` or a named runtime), composition `retention` or `requirements`, and it does not make
   exports declared in other imported modules build roots. A Silk call to an exported
   definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
