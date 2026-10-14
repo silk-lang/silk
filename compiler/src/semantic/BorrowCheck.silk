@@ -30,9 +30,13 @@
 //! keeps that slot until its enclosing block, while match and if-let end it with the selected arm.
 //! A required local loan beyond its storage end is `ExpiredLifetime` (OWN0019).
 //!
-//! Borrowing an unrooted temporary, a retaining write through a referent, replacing an exact
-//! callable environment with new capture loans, or cleanup with unknown retained contents leaves
-//! the supported slice as `StoredLoans`. A projected replacement conservatively retains sibling
+//! A borrow of a value with no place lends its hidden owner (BORROW-006), a root the walk ends
+//! with the innermost statement or match arm that evaluates it, so a view of a temporary used past
+//! its statement is OWN0019 at the use (CALL-003). A borrowed array in the initializer of a binding
+//! that can hold a view lives as long as the binding's scope instead, as lowering keeps it.
+//!
+//! A retaining write through a referent, replacing an exact callable environment with new capture
+//! loans, or cleanup with unknown retained contents leaves the supported slice as `StoredLoans`. A projected replacement conservatively retains sibling
 //! loans. Conflicts with approximate retention or an unknown index answer `Imprecise`, never a
 //! definitive rejection. A referent loan which crosses a scope boundary still leaves its external
 //! validity relation to the region proof. Call results and projections retain precisely the
@@ -274,8 +278,12 @@ struct Holding {
 
 impl Copy for Holding {}
 
+// The roots a lexical scope releases on every path out of it. A statement scope holds only the
+// hidden owners of the temporaries its statement borrows (BORROW-006); bindings belong to the
+// nearest enclosing ordinary scope.
 struct Scope {
   roots: Vector<usize>
+  statement: bool
 }
 
 /// The borrowed regions an initialized owner can observe during cleanup. Structural cleanup
@@ -318,6 +326,9 @@ struct Walker {
   // Whether a referent loan crossed a scope boundary: its region relation is the region slice's
   // to prove, so the body is never `Checked` on the walk alone.
   crossed: bool
+  // Whether the walk is in the initializer of a binding whose type can hold a view, which keeps a
+  // borrowed array temporary for the binding's scope (BORROW-006).
+  viewing: bool
 }
 
 fn flowAt(at: usize) -> Flow {
@@ -472,11 +483,74 @@ fn sliceValue(nodes: &[Node], id: NodeId) -> bool {
 // Reads the written place of `id`, or a path with root `usize.MAX` when it names no place.
 effect fn pathOf(nodes: &[Node], id: NodeId) -> Path ! OutOfMemoryError ? &mut Allocator {
   let mut path = Path {root: usize.MAX, through: false, steps: Vector<usize>.make(), indexes: Vector<NodeId>.make()}
-  run extendPath(nodes, id, &mut path)
+  run extendPath(nodes, id, usize.MAX, &mut path)
   return move path
 }
 
-effect fn extendPath(nodes: &[Node], id: NodeId, path: &mut Path) -> () ! OutOfMemoryError ? &mut Allocator {
+// Reads the place `id` names when the value of `base`, which names no place, is held by its hidden
+// owner (BORROW-006): `base`'s projections, indexes and dereferences extend that owner's root.
+effect fn temporaryPath(nodes: &[Node], id: NodeId, base: NodeId) -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut path = Path {root: usize.MAX, through: false, steps: Vector<usize>.make(), indexes: Vector<NodeId>.make()}
+  run extendPath(nodes, id, base.index, &mut path)
+  return move path
+}
+
+// The innermost operand of a place expression's projections, indexes and dereferences.
+fn projectedBase(nodes: &[Node], id: NodeId) -> NodeId {
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    return match &form {
+      Expression.Field {value, ..} => projectedBase(nodes, value)
+      Expression.Index {value, ..} => projectedBase(nodes, value)
+      Expression.Dereference {value} => projectedBase(nodes, value)
+      _ => id
+    }
+  }
+  return id
+}
+
+// The root of a temporary's hidden owner, keyed by the node that produces the temporary. A node
+// is a borrowed temporary or a match subject, never both, so it shares the subject root space.
+fn temporaryRoot(base: usize) -> usize {
+  return usize.MAX / 4 + base
+}
+
+/// Which typed nodes own storage the loan walk ends, beside the locals: match subjects and the
+/// temporaries a borrow lends from their hidden owners (BORROW-006). Their cleanup is observed
+/// like a local's.
+pub effect fn storageNodes(nodes: &[Node]) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut owning = Vector<bool>.make()
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    run Vector<bool>.append(&mut owning, false)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < nodes.length {
+    let mut owned = usize.MAX
+    if let NodeKind.Expression {form, ..} = &nodes[at].kind {
+      match &form {
+        Expression.Match {subject, ..} => { owned = subject.index }
+        Expression.Borrow {value, ..} => {
+          let path = run pathOf(nodes, value)
+          if path.root == usize.MAX { owned = projectedBase(nodes, value).index }
+        }
+        _ => {}
+      }
+    }
+    if owned != usize.MAX {
+      let mut marked = Vector<bool>.asMutSlice(&mut owning)
+      marked[owned] = true
+    }
+    at = at + usize.ONE
+  }
+  return move owning
+}
+
+effect fn extendPath(nodes: &[Node], id: NodeId, temporary: usize, path: &mut Path) -> () ! OutOfMemoryError ? &mut Allocator {
+  if id.index == temporary {
+    path.root = temporaryRoot(temporary)
+    return ()
+  }
   if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
     match &form {
       Expression.Local {local} => {
@@ -484,14 +558,14 @@ effect fn extendPath(nodes: &[Node], id: NodeId, path: &mut Path) -> () ! OutOfM
         return ()
       }
       Expression.Field {value, index} => {
-        run extendPath(nodes, value, &mut path.*)
+        run extendPath(nodes, value, temporary, &mut path.*)
         if path.root != usize.MAX {
           run Vector<usize>.append(&mut path.steps, index)
         }
         return ()
       }
       Expression.Index {value, index} => {
-        run extendPath(nodes, value, &mut path.*)
+        run extendPath(nodes, value, temporary, &mut path.*)
         if path.root != usize.MAX {
           // A slice's elements live in its referent: indexing one reads through the slice as `.*`
           // does, so it reads the holder and keeps the loans it holds live.
@@ -505,7 +579,7 @@ effect fn extendPath(nodes: &[Node], id: NodeId, path: &mut Path) -> () ! OutOfM
         return ()
       }
       Expression.Dereference {value} => {
-        run extendPath(nodes, value, &mut path.*)
+        run extendPath(nodes, value, temporary, &mut path.*)
         if path.root != usize.MAX {
           run Vector<usize>.append(&mut path.steps, referent())
           path.through = true
@@ -734,9 +808,12 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
   node: usize, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut path = run pathOf(nodes, place)
+  let mut current = at
   if path.root == usize.MAX {
-    leave(&mut walker.*, BorrowStatus.StoredLoans)
-    return flowAt(at)
+    // A borrow of a value with no place lends its hidden owner (BORROW-006).
+    let base = projectedBase(nodes, place)
+    current = run holdTemporary(nodes, locals, owner, &mut walker.*, base, at)
+    path = run temporaryPath(nodes, place, base)
   }
   // A slice borrow reborrows its backing storage; it never lends the local descriptor slot.
   // Reference reborrows already have an explicit typed Dereference from checkBorrowOperand.
@@ -744,7 +821,7 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     run Vector<usize>.append(&mut path.steps, referent())
     path.through = true
   }
-  let mut evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, at)
+  let mut evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, current)
   // A reference to a whole holder, or a reborrow through one, reaches what its loans borrow, so
   // the holder's loans travel with the reference: the parent loan outlives every reborrow of it,
   // and borrowing a callable to invoke it keeps its capture loans live.
@@ -755,6 +832,44 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     evaluated = used.at
   }
   return run takeLoan(nodes, owner, &mut walker.*, &path, exclusive, span, node, evaluated, move carried)
+}
+
+// Evaluates `base`, a value with no place, into its hidden owner and returns the point after it.
+// The owner holds the loans that value carries and ends with the innermost statement or arm that
+// evaluates it. A borrowed array in the initializer of a binding that can hold a view instead
+// lives as long as the binding's scope, as the lowering keeps it (BORROW-006).
+effect fn holdTemporary(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, base: NodeId, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let flow = run visit(nodes, locals, owner, &mut walker.*, base, at)
+  let root = temporaryRoot(base.index)
+  let point = run newPoint(&mut walker.*, flow.at)
+  let holder = holderOf(&walker.*, root)
+  let mut initialized = Vector<Point>.asMutSlice(&mut walker.points)
+  initialized[point].initializes = root
+  initialized[point].defines = holder
+  let extended = walker.viewing && arrayValue(nodes, base)
+  run registerTemporary(&mut walker.*, root, extended)
+  if Vector<Carry>.length(&flow.carried) > usize.ZERO {
+    run consume(&mut walker.*, Vector<Carry>.asSlice(&flow.carried), point)
+    let retained = run nodeRetains(nodes, base, owner)
+    if retained {
+      run hold(&mut walker.*, root, Vector<Carry>.asSlice(&flow.carried), point)
+    }
+  }
+  return point
+}
+
+// Whether `id` is a fixed array value.
+fn arrayValue(nodes: &[Node], id: NodeId) -> bool {
+  if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, id) {
+    return Shared<Type>.with<bool>(&value, fn(node: &Type) -> bool {
+      return match &node.* {
+        Type.Array {..} => true
+        _ => false
+      }
+    })
+  }
+  return false
 }
 
 // A captured exclusive descriptor's referent, reborrowed by the environment it was read into
@@ -1598,7 +1713,19 @@ fn contractCall(operation: StorageOperation) -> bool {
 effect fn registerRoot(walker: &mut Walker, root: usize) -> ()
   ! OutOfMemoryError
   ? &mut Allocator {
-  let at = Vector<Scope>.length(&walker.scopes) - usize.ONE
+  run registerTemporary(&mut walker.*, root, true)
+  return ()
+}
+
+// Registers a root in the innermost scope, or in the innermost scope that is not a statement's
+// when `lexical`.
+effect fn registerTemporary(walker: &mut Walker, root: usize, lexical: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at = Vector<Scope>.length(&walker.scopes) - usize.ONE
+  while lexical && at > usize.ZERO && Vector<Scope>.asSlice(&walker.scopes)[at].statement {
+    at = at - usize.ONE
+  }
   let mut scopes = Vector<Scope>.asMutSlice(&mut walker.scopes)
   run Vector<usize>.append(&mut scopes[at].roots, root)
   return ()
@@ -1814,7 +1941,10 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       return run defer(nodes, locals, owner, &mut walker.*, callee, Vector<NodeId>.asSlice(&arguments), pipeline, mode, at)
     }
     Shape.Binding {local, initializer, mutable} => {
+      let declared = localType(locals, local)
+      walker.viewing = Shared<Type>.with<bool>(&declared, Type.holdsView)
       let flow = run visit(nodes, locals, owner, &mut walker.*, initializer, at)
+      walker.viewing = false
       let point = run newPoint(&mut walker.*, flow.at)
       let mut initialized = Vector<Point>.asMutSlice(&mut walker.points)
       initialized[point].initializes = local
@@ -2026,12 +2156,21 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
     }
     Shape.Block {statements} => {
       let enclosing = Vector<Scope>.length(&walker.scopes)
-      run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make()})
+      run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make(), statement: false})
       let list = Vector<NodeId>.asSlice(&statements)
       let mut flow = flowAt(at)
+      let viewing = walker.viewing
       let mut index = usize.ZERO
       while index < list.length {
+        // A statement's temporaries end with it (BORROW-006); a statement of a nested block is
+        // never a binding initializer of an enclosing one.
+        let statement = Vector<Scope>.length(&walker.scopes)
+        run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make(), statement: true})
+        walker.viewing = false
         flow = run visit(nodes, locals, owner, &mut walker.*, list[index], flow.at)
+        let ended = run releaseScopes(&mut walker.*, statement, nodes[list[index].index].origin.location, flow.at)
+        Vector<Scope>.truncate(&mut walker.scopes, statement)
+        flow.at = ended
         if index + usize.ONE < list.length && flow.at != usize.MAX {
           let point = run newPoint(&mut walker.*, flow.at)
           run consume(&mut walker.*, Vector<Carry>.asSlice(&flow.carried), point)
@@ -2039,6 +2178,7 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         }
         index = index + usize.ONE
       }
+      walker.viewing = viewing
       let released = run releaseScopes(&mut walker.*, enclosing, span, flow.at)
       Vector<Scope>.truncate(&mut walker.scopes, enclosing)
       return Flow {at: released, carried: move flow.carried}
@@ -2120,7 +2260,7 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
   // A destructuring let's bindings belong to its enclosing block (PATT-008), rather than the
   // synthetic arm used by typing. Match and if-let bindings end on their selected arm path.
   if syntax != MatchSyntax.Let {
-    run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make()})
+    run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make(), statement: false})
   }
   run registerRoot(&mut walker.*, subjectRoot(subject))
   // The subject's own storage is bound here, so moves of its parts in an earlier iteration of an
@@ -2692,8 +2832,9 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(),
     crossed: false,
+    viewing: false,
   }
-  run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make()})
+  run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make(), statement: false})
   let mut parameter = usize.ZERO
   while parameter < locals.length {
     let mut bound = false
