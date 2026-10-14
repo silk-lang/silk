@@ -219,13 +219,16 @@ for its target with the profile's relocation model (`-fPIC` by default) and need
 intermediate stage merges no declared inputs. An `object` form acquires no catalog runtime or
 storage component: the application's `export "C"` functions are its roots, so a package without
 `main` builds, and a `[build].composition` may omit `defaults`. Its final stage merges declared
-object and archive inputs by a relocatable link and refuses any other declared input. The static
-and shared library forms stop with `SILK_GAP artifact-form` before any tool runs. Invalid or
+object and archive inputs by a relocatable link and refuses any other declared input. A
+`static-library` form acquires no catalog runtime either; its final stage compiles one object and
+archives it with `llvm-ar rcsD` beside the declared object inputs, refusing any other declared input.
+The archiver is `SILKC_AR`, or else the `llvm-ar` beside the configured Clang. The shared library
+form stops with `SILK_GAP artifact-form` before any tool runs. Invalid or
 repeated output selectors fail before source loading.
 With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
-<native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup, an
-object linked with a separately compiled C caller, objects for every native target and the
-intermediate stages together; the selfhost workflow runs it on N1.
+<native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup, objects
+and static libraries linked with a separately compiled C caller, both forms for every native target
+and the intermediate stages together; the selfhost workflow runs it on N1.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
