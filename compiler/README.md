@@ -232,10 +232,13 @@ and the intermediate stages together; the selfhost workflow runs it on N1.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
-root contains `silk/`; it is an explicit CLI input. An executable package without a
-`[build].composition` takes its runtime from the library's `compositions.json` for the target and
-libc, so such a build needs the library root even without standard-library imports; no listed
-runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
+root contains `silk/`. `--stdlib` names it explicitly; without the flag, every command uses the
+library an installation keeps at `<prefix>/lib/silk/stdlib` beside `<prefix>/bin/silkc`. The
+compiler finds its executable from argument zero (a path, or a bare name searched in `PATH`) and
+resolves symbolic links with `realpath`, so a link to it in another directory finds the same
+library. An executable package without a `[build].composition` takes its runtime from the
+library's `compositions.json` for the target and libc, so such a build needs the library root even
+without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
 is the root for local module paths. Every module identity names the package by its logical
 identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
