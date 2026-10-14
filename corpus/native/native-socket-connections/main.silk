@@ -1,0 +1,1523 @@
+
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.effect {Effect}
+import silk.execution { Execution, Wake }
+import silk.fiber {Fiber}
+import silk.i64
+import silk.local_scheduler {LocalScheduler, StalledError}
+import silk.monotonic_clock {MonotonicClock}
+import silk.native_socket {AttemptFailure, ConnectOptions, ConnectOptionsError, ConnectOptionsReason, Connection, ConnectionPhase, InvalidEndpointReason, NativeSocketError, NativeSocketOperation, connectResolved, connectResolvedOwned, connectUnix, connectUnixOwned}
+import silk.network_address {Endpoint, IpAddress, Ipv4Address, Port}
+import silk.option {Option}
+import silk.ownership { Drop }
+import silk.result {Result}
+import silk.scheduler {Scheduler, TaskIdExhaustedError}
+import silk.system_clock {Instant, SystemClock}
+import silk.u64
+import silk.usize
+
+unsafe extern "C" fn silk_socket_stub_reset(mode: i32) -> ()
+unsafe extern "C" fn silk_socket_stub_sockets() -> i32
+unsafe extern "C" fn silk_socket_stub_connects() -> i32
+unsafe extern "C" fn silk_socket_stub_closes() -> i32
+unsafe extern "C" fn silk_socket_stub_polls() -> i32
+unsafe extern "C" fn silk_socket_stub_recvs() -> i32
+unsafe extern "C" fn silk_socket_stub_sends() -> i32
+unsafe extern "C" fn silk_socket_stub_fcntls() -> i32
+unsafe extern "C" fn silk_socket_stub_setsockopts() -> i32
+unsafe extern "C" fn silk_socket_stub_getsockopts() -> i32
+unsafe extern "C" fn silk_socket_stub_close_attempts() -> i32
+unsafe extern "C" fn silk_socket_stub_shutdowns() -> i32
+unsafe extern "C" fn silk_socket_stub_callbacks() -> i32
+unsafe extern "C" fn silk_socket_stub_callback_event() -> i32
+unsafe extern "C" fn silk_socket_stub_close_event() -> i32
+unsafe extern "C" fn silk_socket_stub_first_close_event() -> i32
+unsafe extern "C" fn silk_socket_stub_second_socket_event() -> i32
+unsafe extern "C" fn silk_socket_stub_guard_drops() -> i32
+unsafe extern "C" fn silk_socket_stub_guard_drop_event() -> i32
+unsafe extern "C" fn silk_socket_stub_wait_registrations() -> i32
+unsafe extern "C" fn silk_socket_stub_wait_registration_event() -> i32
+unsafe extern "C" fn silk_socket_stub_completions() -> i32
+unsafe extern "C" fn silk_socket_stub_mark_guard_drop() -> ()
+unsafe extern "C" fn silk_socket_stub_mark_wait_registration() -> ()
+unsafe extern "C" fn silk_socket_stub_mark_callback() -> ()
+unsafe extern "C" fn silk_socket_stub_mark_completion() -> ()
+unsafe extern "C" fn silk_socket_stub_nodelay() -> i32
+unsafe extern "C" fn silk_socket_stub_configuration_ok() -> i32
+unsafe extern "C" fn silk_socket_stub_transfer_ok() -> i32
+unsafe extern "C" fn silk_socket_darwin_witness() -> i32
+unsafe extern "C" fn silk_socket_gnu_witness() -> i32
+
+struct FixtureClock {
+  nowValue: Instant
+  waits: usize
+}
+
+impl MonotonicClock for FixtureClock {
+  effect fn now(self: &mut Self) -> Instant {
+    return SystemClock.make(
+      SystemClock.seconds(&self.nowValue),
+      SystemClock.nanoseconds(&self.nowValue),
+    )
+  }
+  effect fn getResolution(self: &mut Self) -> u64 { return 1 }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () with Intrinsic.nonParking() {
+    self.nowValue = move when
+    self.waits = self.waits + usize.ONE
+    return ()
+  }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () with Intrinsic.nonParking() { return () }
+}
+
+struct SequencedClock {
+  calls: usize
+  expireAt: usize
+  waits: usize
+}
+
+impl MonotonicClock for SequencedClock {
+  effect fn now(self: &mut Self) -> Instant {
+    self.calls = self.calls + usize.ONE
+    if self.calls >= self.expireAt { return SystemClock.make(0, 1) }
+    return SystemClock.make(0, 0)
+  }
+  effect fn getResolution(self: &mut Self) -> u64 { return 1 }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () with Intrinsic.nonParking() {
+    drop when
+    self.waits = self.waits + usize.ONE
+    return ()
+  }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () with Intrinsic.nonParking() {
+    drop howLong
+    return ()
+  }
+}
+
+struct CancellationLifetime {active: bool}
+impl Drop for CancellationLifetime {
+  fn drop(self: &mut CancellationLifetime) -> () {
+    if self.active { unsafe { silk_socket_stub_mark_guard_drop() } }
+    return ()
+  }
+}
+
+struct AcquisitionParkGuard {wake: Wake}
+impl Drop for AcquisitionParkGuard {
+  fn drop(self: &mut AcquisitionParkGuard) -> () {
+    unsafe { silk_socket_stub_mark_guard_drop() }
+    return ()
+  }
+}
+
+fn retainAcquisitionWake(wake: Wake) -> AcquisitionParkGuard {
+  unsafe { silk_socket_stub_mark_wait_registration() }
+  return AcquisitionParkGuard {wake: move wake}
+}
+
+struct AcquisitionClock {}
+impl MonotonicClock for AcquisitionClock {
+  effect fn now(self: &mut Self) -> Instant { return SystemClock.make(0, 0) }
+  effect fn getResolution(self: &mut Self) -> u64 { return 1 }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    drop when
+    run Execution.park(retainAcquisitionWake)
+    unsafe { silk_socket_stub_mark_completion() }
+    return ()
+  }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    drop howLong
+    run Execution.park(retainAcquisitionWake)
+    unsafe { silk_socket_stub_mark_completion() }
+    return ()
+  }
+}
+
+fn endpoint(last: u8) -> Endpoint {
+  return Endpoint.make(
+    IpAddress.V4 {value: Ipv4Address.fromOctets([192, 0, 2, last])},
+    Port.fromU16(443),
+  )
+}
+
+effect fn exerciseConnection(connection: &mut Connection) -> i32
+! ByteIoError
+? &mut MonotonicClock {
+  if Connection.phase(&connection.*) != ConnectionPhase.Open { return 1 }
+  let mut output: [u8; 4] = [0, 0, 0, 0]
+  let first = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  match move first {
+    ReadTransfer.Data {count} => {
+      if count != 2 || output[0] != 104 || output[1] != 105 { return 2 }
+    }
+    ReadTransfer.End => { return 3 }
+  }
+  let second = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  match move second {
+    ReadTransfer.Data {count} => { return 4 }
+    ReadTransfer.End => {}
+  }
+  let third = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  match move third {
+    ReadTransfer.Data {count} => { return 5 }
+    ReadTransfer.End => {}
+  }
+  let written = run ByteDuplex.writeSome(b"hello", Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  if written != 2 { return 6 }
+  run ByteDuplex.flush(Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  run ByteDuplex.shutdownWrite(Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  run ByteDuplex.shutdownWrite(Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  if Connection.phase(&connection.*) != ConnectionPhase.WriteClosed { return 7 }
+  let afterShutdown = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  match move afterShutdown {
+    ReadTransfer.Data {count} => { return 8 }
+    ReadTransfer.End => {}
+  }
+  let laterWrite = run Effect.result(
+    ByteDuplex.writeSome(b"later", Option<Instant>.none())
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  match move laterWrite {
+    Result<usize, ByteIoError>.Success {value} => { return 9 }
+    Result<usize, ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Closed {operation} => {
+        if operation != ByteIoOperation.Write { return 10 }
+      }
+      _ => { return 11 }
+    }
+  }
+  return 42
+}
+
+effect fn runResolved(mode: i32, two: bool, expectedWaits: usize) -> i32
+! NativeSocketError | ByteIoError {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {
+    nowValue: SystemClock.make(0, 0),
+    waits: usize.ZERO,
+  }
+  let first = endpoint(1)
+  let second = endpoint(2)
+  let mut result = 0
+  if two {
+    let endpoints = [first, second]
+    result = run connectResolved(
+      &endpoints,
+      ConnectOptions.defaults(),
+      Option<Instant>.none(),
+      exerciseConnection,
+    ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  } else {
+    let endpoints = [first]
+    result = run connectResolved(
+      &endpoints,
+      ConnectOptions.defaults(),
+      Option<Instant>.none(),
+      exerciseConnection,
+    ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  }
+  if result != 42 { return result }
+  if clock.waits != expectedWaits { return 20 }
+  if unsafe silk_socket_stub_configuration_ok() != 1 { return 21 }
+  if unsafe silk_socket_stub_transfer_ok() != 1 { return 22 }
+  if unsafe silk_socket_stub_shutdowns() != 1 { return 23 }
+  if unsafe silk_socket_stub_closes() != unsafe silk_socket_stub_sockets() { return 24 }
+  return 42
+}
+
+effect fn runUnixRetry() -> i32 ! NativeSocketError | ByteIoError {
+  unsafe { silk_socket_stub_reset(3) }
+  let mut clock = FixtureClock {
+    nowValue: SystemClock.make(0, 0),
+    waits: usize.ZERO,
+  }
+  let result = run connectUnix(
+    b"/tmp/silk-jul-146.sock",
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    exerciseConnection,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if result != 42 { return result }
+  if clock.waits != usize.ONE { return 30 }
+  if unsafe silk_socket_stub_sockets() != 2 || unsafe silk_socket_stub_connects() != 2 { return 31 }
+  if unsafe silk_socket_stub_closes() != 2 { return 32 }
+  return 42
+}
+
+effect fn noTransfer(connection: &mut Connection) -> i32 { return 42 }
+
+effect fn markedSuccess(connection: &mut Connection) -> i32 {
+  unsafe { silk_socket_stub_mark_callback() }
+  return 42
+}
+
+effect fn markedFailure(connection: &mut Connection) -> i32 ! ByteIoError {
+  unsafe { silk_socket_stub_mark_callback() }
+  fail ByteDuplex.provider(ByteIoOperation.Flush, 777)
+}
+
+effect fn explicitClose(connection: &mut Connection) -> i32 {
+  unsafe { silk_socket_stub_mark_callback() }
+  let attempted = run Effect.result(Connection.close(move connection))
+  return match move attempted {
+    Result<(), NativeSocketError>.Success {value} => 1
+    Result<(), NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.NativeFailure {operation, errno} => {
+        if operation == NativeSocketOperation.Close && errno == 5 { return 42 }
+        return 2
+      }
+      _ => 3
+    }
+  }
+}
+
+effect fn explicitByteClose(connection: &mut Connection) -> i32 {
+  unsafe { silk_socket_stub_mark_callback() }
+  let attempted = run Effect.result(
+    ByteDuplex.close() |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  return match move attempted {
+    Result<(), ByteIoError>.Success {value} => 1
+    Result<(), ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Provider {operation, code} => {
+        if operation == ByteIoOperation.Close && code == 5 { return 42 }
+        return 2
+      }
+      _ => 3
+    }
+  }
+}
+
+fn invalidUnixMatches(
+  attempted: Result<i32, NativeSocketError>,
+  expected: InvalidEndpointReason,
+  expectedOffset: usize,
+) -> bool {
+  return match move attempted {
+    Result<i32, NativeSocketError>.Success {value} => false
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.InvalidEndpoint {reason, offset, limit} => {
+        return reason == expected && offset == expectedOffset
+      }
+      _ => false
+    }
+  }
+}
+
+effect fn invalidCases() -> i32 {
+  match move ConnectOptions.make(false, 0, usize.ONE) {
+    Result<ConnectOptions, ConnectOptionsError>.Success {value} => { return 60 }
+    Result<ConnectOptions, ConnectOptionsError>.Failure {error} => {
+      if error.reason != ConnectOptionsReason.PollInterval || error.value != 0 { return 61 }
+    }
+  }
+  match move ConnectOptions.make(false, 1, 1025) {
+    Result<ConnectOptions, ConnectOptionsError>.Success {value} => { return 62 }
+    Result<ConnectOptions, ConnectOptionsError>.Failure {error} => {
+      if error.reason != ConnectOptionsReason.MaxAttempts || error.value != 1025 { return 63 }
+    }
+  }
+  unsafe { silk_socket_stub_reset(0) }
+  let mut clock = FixtureClock {
+    nowValue: SystemClock.make(0, 0),
+    waits: usize.ZERO,
+  }
+  let attempted = run Effect.result(connectUnix(
+    b"relative.sock",
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move attempted {
+    Result<i32, NativeSocketError>.Success {value} => { return 64 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.InvalidEndpoint {reason, offset, limit} => {
+        if reason != InvalidEndpointReason.RelativePath || offset != usize.ZERO { return 65 }
+      }
+      _ => { return 66 }
+    }
+  }
+  if unsafe silk_socket_stub_sockets() != 0 || clock.waits != usize.ZERO { return 67 }
+  unsafe { silk_socket_stub_reset(0) }
+  let empty = run Effect.result(connectUnix(
+    b"",
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  if !invalidUnixMatches(move empty, InvalidEndpointReason.EmptyPath, usize.ZERO)
+    || unsafe silk_socket_stub_sockets() != 0 { return 68 }
+  let nul = run Effect.result(connectUnix(
+    b"/tmp/\x00socket",
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  if !invalidUnixMatches(move nul, InvalidEndpointReason.NulPath, 5)
+    || unsafe silk_socket_stub_sockets() != 0 { return 69 }
+  let abstract = run Effect.result(connectUnix(
+    b"\x00silk",
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  if !invalidUnixMatches(move abstract, InvalidEndpointReason.AbstractPath, usize.ZERO)
+    || unsafe silk_socket_stub_sockets() != 0 { return 70 }
+  let oversized = run Effect.result(connectUnix(
+    b"/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  if !invalidUnixMatches(move oversized, InvalidEndpointReason.PathTooLong, 108)
+    || unsafe silk_socket_stub_sockets() != 0 { return 71 }
+
+  unsafe { silk_socket_stub_reset(0) }
+  let emptyEndpoints: [Endpoint; 0] = []
+  let emptyAttempt = run Effect.result(connectResolved(
+    &emptyEndpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move emptyAttempt {
+    Result<i32, NativeSocketError>.Success {value} => { return 72 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.InvalidEndpoint {reason, offset, limit} => {
+        if reason != InvalidEndpointReason.EmptyEndpoints || unsafe silk_socket_stub_sockets() != 0 {
+          return 73
+        }
+      }
+      _ => { return 74 }
+    }
+  }
+  let endpoints = [endpoint(1), endpoint(2)]
+  let bounded = match move ConnectOptions.make(false, 1, usize.ONE) {
+    Result<ConnectOptions, ConnectOptionsError>.Failure {error} => { return 75 }
+    Result<ConnectOptions, ConnectOptionsError>.Success {value} => value
+  }
+  let tooMany = run Effect.result(connectResolved(
+    &endpoints,
+    bounded,
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move tooMany {
+    Result<i32, NativeSocketError>.Success {value} => { return 76 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.InvalidEndpoint {reason, offset, limit} => {
+        if reason != InvalidEndpointReason.TooManyEndpoints || offset != 2 || limit != usize.ONE {
+          return 77
+        }
+      }
+      _ => { return 78 }
+    }
+  }
+  if unsafe silk_socket_stub_sockets() != 0 { return 79 }
+  return 42
+}
+
+effect fn runTimed(mode: i32, now: Instant, deadline: Option<Instant>) -> i32 {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: move now, waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let attempted = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    move deadline,
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  return match move attempted {
+    Result<i32, NativeSocketError>.Success {value} => 50
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.Timeout => {
+        if clock.waits != 2 || unsafe silk_socket_stub_polls() != 2 { return 51 }
+        return 42
+      }
+      NativeSocketError.TimeRangeError => {
+        if clock.waits != usize.ZERO || unsafe silk_socket_stub_polls() != 1 { return 52 }
+        return 42
+      }
+      _ => 53
+    }
+  }
+}
+
+fn noNativeWork() -> bool {
+  return unsafe silk_socket_stub_sockets() == 0
+    && unsafe silk_socket_stub_connects() == 0
+    && unsafe silk_socket_stub_polls() == 0
+    && unsafe silk_socket_stub_fcntls() == 0
+    && unsafe silk_socket_stub_setsockopts() == 0
+    && unsafe silk_socket_stub_getsockopts() == 0
+}
+
+effect fn reachedDeadlineCases() -> i32 {
+  unsafe { silk_socket_stub_reset(0) }
+  let deadline = SystemClock.make(7, 123)
+  let mut clock = FixtureClock {nowValue: SystemClock.make(7, 123), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let resolved = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.some(SystemClock.make(7, 123)),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move resolved {
+    Result<i32, NativeSocketError>.Success {value} => { return 70 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.Timeout => {}
+      _ => { return 71 }
+    }
+  }
+  if !noNativeWork() || clock.waits != usize.ZERO { return 72 }
+  if SystemClock.seconds(&clock.nowValue) != 7 || SystemClock.nanoseconds(&clock.nowValue) != 123 {
+    return 73
+  }
+
+  unsafe { silk_socket_stub_reset(0) }
+  let unix = run Effect.result(connectUnix(
+    b"/tmp/silk-jul-146.sock",
+    ConnectOptions.defaults(),
+    Option<Instant>.some(move deadline),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move unix {
+    Result<i32, NativeSocketError>.Success {value} => { return 74 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.Timeout => {}
+      _ => { return 75 }
+    }
+  }
+  if !noNativeWork() || clock.waits != usize.ZERO { return 76 }
+  return 42
+}
+
+effect fn attemptPolicyCases() -> i32 {
+  unsafe { silk_socket_stub_reset(1) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let exhausted = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move exhausted {
+    Result<i32, NativeSocketError>.Success {value} => { return 77 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.AttemptsExhausted {attempted, last} => {
+        if attempted != usize.ONE { return 78 }
+        match move last {
+          AttemptFailure.ConnectionRefused => {}
+          _ => { return 79 }
+        }
+      }
+      _ => { return 79 }
+    }
+  }
+  if unsafe silk_socket_stub_sockets() != 1
+    || unsafe silk_socket_stub_connects() != 1
+    || unsafe silk_socket_stub_closes() != 1
+    || unsafe silk_socket_stub_polls() != 0 { return 80 }
+
+  unsafe { silk_socket_stub_reset(7) }
+  let terminalEndpoints = [endpoint(1), endpoint(2)]
+  let terminal = run Effect.result(connectResolved(
+    &terminalEndpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move terminal {
+    Result<i32, NativeSocketError>.Success {value} => { return 81 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.PermissionDenied => {}
+      _ => { return 82 }
+    }
+  }
+  if unsafe silk_socket_stub_sockets() != 1
+    || unsafe silk_socket_stub_connects() != 1
+    || unsafe silk_socket_stub_closes() != 1 { return 83 }
+  return 42
+}
+
+effect fn emptyTransfers(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  unsafe { silk_socket_stub_mark_callback() }
+  let mut output: [u8; 0] = []
+  let read = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  match move read {
+    ReadTransfer.Data {count} => { if count != usize.ZERO { return 1 } }
+    ReadTransfer.End => { return 2 }
+  }
+  let input: [u8; 0] = []
+  let written = run ByteDuplex.writeSome(&input, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  if written != usize.ZERO { return 3 }
+  if unsafe silk_socket_stub_recvs() != 0 || unsafe silk_socket_stub_sends() != 0 { return 4 }
+  return 42
+}
+
+effect fn readOne(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  unsafe { silk_socket_stub_mark_callback() }
+  let mut output: [u8; 4] = [0, 0, 0, 0]
+  let read = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  return match move read {
+    ReadTransfer.Data {count} => {
+      if count == 2 && output[0] == 104 && output[1] == 105 { return 42 }
+      return 1
+    }
+    ReadTransfer.End => 2
+  }
+}
+
+effect fn writeOne(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  unsafe { silk_socket_stub_mark_callback() }
+  let written = run ByteDuplex.writeSome(b"hello", Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  if written != 2 { return 1 }
+  return 42
+}
+
+effect fn readForError(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  unsafe { silk_socket_stub_mark_callback() }
+  let mut output: [u8; 4] = [0, 0, 0, 0]
+  let transfer = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  drop move transfer
+  return 1
+}
+
+effect fn writeForError(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  unsafe { silk_socket_stub_mark_callback() }
+  let count = run ByteDuplex.writeSome(b"hello", Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  drop count
+  return 1
+}
+
+effect fn runReadRetry(mode: i32, expectedWaits: usize, expectedRecvs: i32) -> i32
+! NativeSocketError | ByteIoError {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let value = run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    readOne,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if value != 42 || clock.waits != expectedWaits { return 1 }
+  if unsafe silk_socket_stub_recvs() != expectedRecvs { return 2 }
+  if unsafe silk_socket_stub_closes() != 1 { return 3 }
+  return 42
+}
+
+effect fn runWriteRetry(mode: i32, expectedWaits: usize, expectedSends: i32) -> i32
+! NativeSocketError | ByteIoError {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let value = run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    writeOne,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if value != 42 || clock.waits != expectedWaits { return 1 }
+  if unsafe silk_socket_stub_sends() != expectedSends { return 2 }
+  if unsafe silk_socket_stub_closes() != 1 { return 3 }
+  return 42
+}
+
+effect fn expectReadError(mode: i32, operation: ByteIoOperation, code: i32, invalid: bool) -> i32 {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let attempted = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    readForError,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move attempted {
+    Result<i32, NativeSocketError | ByteIoError>.Success {value} => { return 1 }
+    Result<i32, NativeSocketError | ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Provider {operation: observed, code: observedCode} => {
+        if invalid || observed != operation || observedCode != code { return 2 }
+      }
+      ByteIoError.InvalidTransferCount {operation: observed, count, limit} => {
+        if !invalid || observed != operation || count != 5 || limit != 4 { return 3 }
+      }
+      _ => { return 4 }
+    }
+  }
+  if unsafe silk_socket_stub_closes() != 1 { return 5 }
+  return 42
+}
+
+effect fn expectWriteCountError(mode: i32, expectedCount: usize) -> i32 {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let attempted = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    writeForError,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move attempted {
+    Result<i32, NativeSocketError | ByteIoError>.Success {value} => { return 1 }
+    Result<i32, NativeSocketError | ByteIoError>.Failure {error} => match move error {
+      ByteIoError.InvalidTransferCount {operation, count, limit} => {
+        if operation != ByteIoOperation.Write || count != expectedCount || limit != 5 { return 2 }
+      }
+      _ => { return 3 }
+    }
+  }
+  if unsafe silk_socket_stub_closes() != 1 { return 4 }
+  return 42
+}
+
+effect fn expectWriteProvider(mode: i32, expectedCode: i32) -> i32 {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let attempted = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    writeForError,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move attempted {
+    Result<i32, NativeSocketError | ByteIoError>.Success {value} => { return 1 }
+    Result<i32, NativeSocketError | ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Provider {operation, code} => {
+        if operation != ByteIoOperation.Write || code != expectedCode { return 2 }
+      }
+      _ => { return 3 }
+    }
+  }
+  if unsafe silk_socket_stub_closes() != 1 { return 4 }
+  return 42
+}
+
+effect fn ioCases() -> i32 ! NativeSocketError | ByteIoError {
+  let readEintr = run runReadRetry(30, usize.ONE, 2)
+  if readEintr != 42 { return 100 }
+  let readAgain = run runReadRetry(31, usize.ZERO, 2)
+  if readAgain != 42 || unsafe silk_socket_stub_polls() != 1 { return 101 }
+  let readReadyAgain = run runReadRetry(32, usize.ONE, 3)
+  if readReadyAgain != 42 || unsafe silk_socket_stub_polls() != 1 { return 102 }
+  let writeEintr = run runWriteRetry(33, usize.ONE, 2)
+  if writeEintr != 42 { return 103 }
+  let writeAgain = run runWriteRetry(34, usize.ZERO, 2)
+  if writeAgain != 42 || unsafe silk_socket_stub_polls() != 1 { return 104 }
+  let writeReadyAgain = run runWriteRetry(35, usize.ONE, 3)
+  if writeReadyAgain != 42 || unsafe silk_socket_stub_polls() != 1 { return 105 }
+  let hupPending = run runReadRetry(36, usize.ZERO, 2)
+  if hupPending != 42 || unsafe silk_socket_stub_polls() != 1 { return 106 }
+  let socketError = run expectReadError(37, ByteIoOperation.Read, 104, false)
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let darwinError = run expectReadError(37, ByteIoOperation.Read, 54, false)
+    if darwinError != 42 { return 107 }
+  } else {
+    if socketError != 42 { return 107 }
+  }
+  let invalidPoll = run expectReadError(38, ByteIoOperation.Read, 9, false)
+  if invalidPoll != 42 { return 108 }
+  let readCount = run expectReadError(39, ByteIoOperation.Read, 0, true)
+  if readCount != 42 { return 109 }
+  let zeroWrite = run expectWriteCountError(40, usize.ZERO)
+  if zeroWrite != 42 { return 110 }
+  let longWrite = run expectWriteCountError(41, 6)
+  if longWrite != 42 { return 111 }
+  let writeProvider = run expectWriteProvider(45, 32)
+  if writeProvider != 42 { return 112 }
+  return 42
+}
+
+effect fn lifecycleCases() -> i32 ! NativeSocketError | ByteIoError {
+  let endpoints = [endpoint(1)]
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+
+  unsafe { silk_socket_stub_reset(43) }
+  let setup = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    markedSuccess,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move setup {
+    Result<i32, NativeSocketError>.Success {value} => { return 120 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.NativeFailure {operation, errno} => {
+        if operation != NativeSocketOperation.Configure || errno != 5 { return 121 }
+      }
+      _ => { return 122 }
+    }
+  }
+  if unsafe silk_socket_stub_sockets() != 1
+    || unsafe silk_socket_stub_connects() != 0
+    || unsafe silk_socket_stub_callbacks() != 0
+    || unsafe silk_socket_stub_closes() != 1 { return 123 }
+
+  unsafe { silk_socket_stub_reset(0) }
+  let success = run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    markedSuccess,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if success != 42 || unsafe silk_socket_stub_callbacks() != 1 { return 124 }
+  if unsafe silk_socket_stub_callback_event() <= 0
+    || unsafe silk_socket_stub_close_event() <= unsafe silk_socket_stub_callback_event() { return 125 }
+
+  unsafe { silk_socket_stub_reset(42) }
+  let protected = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    markedFailure,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move protected {
+    Result<i32, NativeSocketError | ByteIoError>.Success {value} => { return 126 }
+    Result<i32, NativeSocketError | ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Provider {operation, code} => {
+        if operation != ByteIoOperation.Flush || code != 777 { return 127 }
+      }
+      _ => { return 128 }
+    }
+  }
+  if unsafe silk_socket_stub_close_attempts() != 1
+    || unsafe silk_socket_stub_close_event() <= unsafe silk_socket_stub_callback_event() { return 129 }
+
+  unsafe { silk_socket_stub_reset(42) }
+  let explicit = run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    explicitClose,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if explicit != 42 || unsafe silk_socket_stub_close_attempts() != 1 { return 130 }
+
+  unsafe { silk_socket_stub_reset(42) }
+  let byteClose = run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    explicitByteClose,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if byteClose != 42 || unsafe silk_socket_stub_close_attempts() != 1 { return 134 }
+
+  unsafe { silk_socket_stub_reset(44) }
+  let noDelay = match move ConnectOptions.make(true, 1, usize.ONE) {
+    Result<ConnectOptions, ConnectOptionsError>.Failure {error} => { return 131 }
+    Result<ConnectOptions, ConnectOptionsError>.Success {value} => value
+  }
+  let configured = run connectResolved(
+    &endpoints,
+    noDelay,
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if configured != 42 || unsafe silk_socket_stub_nodelay() != 1 { return 132 }
+
+  unsafe { silk_socket_stub_reset(0) }
+  let empty = run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    emptyTransfers,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if empty != 42 { return 133 }
+  return 42
+}
+
+effect fn timedRead(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  let mut output: [u8; 1] = [0]
+  let attempted = run Effect.result(
+    ByteDuplex.readSome(&mut output, Option<Instant>.some(SystemClock.make(0, 1)))
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  return match move attempted {
+    Result<ReadTransfer, ByteIoError>.Success {value} => 1
+    Result<ReadTransfer, ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Timeout {operation} => {
+        if operation == ByteIoOperation.Read { return 42 }
+        return 2
+      }
+      _ => 3
+    }
+  }
+}
+
+effect fn timedShutdown(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  let attempted = run Effect.result(
+    ByteDuplex.shutdownWrite(Option<Instant>.some(SystemClock.make(0, 1)))
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  return match move attempted {
+    Result<(), ByteIoError>.Success {value} => 1
+    Result<(), ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Timeout {operation} => {
+        if operation == ByteIoOperation.ShutdownWrite { return 42 }
+        return 2
+      }
+      _ => 3
+    }
+  }
+}
+
+effect fn runSequencedNoTransfer(mode: i32, expireAt: usize) -> i32 ! NativeSocketError {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = SequencedClock {calls: usize.ZERO, expireAt: expireAt, waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  return run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.some(SystemClock.make(0, 1)),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+effect fn runSequencedRead(mode: i32, expireAt: usize) -> i32
+! NativeSocketError | ByteIoError {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = SequencedClock {calls: usize.ZERO, expireAt: expireAt, waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  return run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.some(SystemClock.make(0, 1)),
+    timedRead,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+effect fn runSequencedShutdown(mode: i32, expireAt: usize) -> i32
+! NativeSocketError | ByteIoError {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = SequencedClock {calls: usize.ZERO, expireAt: expireAt, waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  return run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.some(SystemClock.make(0, 1)),
+    timedShutdown,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+
+effect fn deadlineBoundaryCases() -> i32 ! NativeSocketError | ByteIoError {
+  unsafe { silk_socket_stub_reset(0) }
+  let mut beforeConfigure = SequencedClock {calls: usize.ZERO, expireAt: 3, waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let first = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.some(SystemClock.make(0, 1)),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut beforeConfigure))
+  match move first {
+    Result<i32, NativeSocketError>.Success {value} => { return 140 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.Timeout => {}
+      _ => { return 141 }
+    }
+  }
+  if unsafe silk_socket_stub_sockets() != 1
+    || unsafe silk_socket_stub_fcntls() != 0
+    || unsafe silk_socket_stub_setsockopts() != 0
+    || unsafe silk_socket_stub_connects() != 0
+    || unsafe silk_socket_stub_closes() != 1 { return 142 }
+
+  let noDelay = match move ConnectOptions.make(true, 1, usize.ONE) {
+    Result<ConnectOptions, ConnectOptionsError>.Failure {error} => { return 152 }
+    Result<ConnectOptions, ConnectOptionsError>.Success {value} => value
+  }
+  unsafe { silk_socket_stub_reset(0) }
+  let mut betweenConfigure = SequencedClock {calls: usize.ZERO, expireAt: 4, waits: usize.ZERO}
+  let configured = run Effect.result(connectResolved(
+    &endpoints,
+    move noDelay,
+    Option<Instant>.some(SystemClock.make(0, 1)),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut betweenConfigure))
+  match move configured {
+    Result<i32, NativeSocketError>.Success {value} => { return 153 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.Timeout => {}
+      _ => { return 154 }
+    }
+  }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if unsafe silk_socket_stub_fcntls() != 1
+      || unsafe silk_socket_stub_setsockopts() != 0 { return 155 }
+  } else {
+    if unsafe silk_socket_stub_fcntls() != 0
+      || unsafe silk_socket_stub_setsockopts() != 1 { return 155 }
+  }
+  if unsafe silk_socket_stub_connects() != 0
+    || unsafe silk_socket_stub_closes() != 1 { return 156 }
+
+  let mut pollExpiry: usize = 5
+  static if Intrinsic.targetOperatingSystem() == "darwin" { pollExpiry = 10 }
+  let beforePoll = run Effect.result(runSequencedNoTransfer(2, pollExpiry))
+  match move beforePoll {
+    Result<i32, NativeSocketError>.Success {value} => { return 143 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.Timeout => {}
+      _ => { return 144 }
+    }
+  }
+  if unsafe silk_socket_stub_connects() != 1
+    || unsafe silk_socket_stub_polls() != 0
+    || unsafe silk_socket_stub_getsockopts() != 0 { return 145 }
+
+  let mut optionExpiry: usize = 6
+  static if Intrinsic.targetOperatingSystem() == "darwin" { optionExpiry = 11 }
+  let beforeOption = run Effect.result(runSequencedNoTransfer(2, optionExpiry))
+  match move beforeOption {
+    Result<i32, NativeSocketError>.Success {value} => { return 146 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.Timeout => {}
+      _ => { return 147 }
+    }
+  }
+  if unsafe silk_socket_stub_polls() != 1
+    || unsafe silk_socket_stub_getsockopts() != 0 { return 148 }
+
+  let mut readPollExpiry: usize = 6
+  static if Intrinsic.targetOperatingSystem() == "darwin" { readPollExpiry = 11 }
+  let readPoll = run runSequencedRead(31, readPollExpiry)
+  if readPoll != 42 || unsafe silk_socket_stub_recvs() != 1
+    || unsafe silk_socket_stub_polls() != 0 { return 149 }
+
+  let mut readOptionExpiry: usize = 7
+  static if Intrinsic.targetOperatingSystem() == "darwin" { readOptionExpiry = 12 }
+  let readOption = run runSequencedRead(37, readOptionExpiry)
+  if readOption != 42 || unsafe silk_socket_stub_polls() != 1
+    || unsafe silk_socket_stub_getsockopts() != 0 { return 150 }
+
+  let mut shutdownExpiry: usize = 5
+  static if Intrinsic.targetOperatingSystem() == "darwin" { shutdownExpiry = 10 }
+  let shutdown = run runSequencedShutdown(0, shutdownExpiry)
+  if shutdown != 42 || unsafe silk_socket_stub_shutdowns() != 0 { return 151 }
+  return 42
+}
+
+effect fn shutdownOnce(connection: &mut Connection) -> i32 ! ByteIoError
+? &mut MonotonicClock {
+  run ByteDuplex.shutdownWrite(Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  return 42
+}
+
+effect fn expectShutdown(mode: i32, expectedWaits: usize, expectedCalls: i32, expected: i32) -> i32 {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let attempted = run Effect.result(connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    shutdownOnce,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move attempted {
+    Result<i32, NativeSocketError | ByteIoError>.Success {value} => {
+      if expected != 0 || value != 42 { return 1 }
+    }
+    Result<i32, NativeSocketError | ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Closed {operation} => {
+        if expected != 1 || operation != ByteIoOperation.ShutdownWrite { return 2 }
+      }
+      ByteIoError.Provider {operation, code} => {
+        if expected != 2 || operation != ByteIoOperation.ShutdownWrite || code != 5 { return 3 }
+      }
+      _ => { return 4 }
+    }
+  }
+  if clock.waits != expectedWaits || unsafe silk_socket_stub_shutdowns() != expectedCalls
+    || unsafe silk_socket_stub_closes() != 1 { return 5 }
+  return 42
+}
+
+effect fn afterExplicitClose(connection: &mut Connection) -> i32
+! NativeSocketError | ByteIoError
+? &mut MonotonicClock {
+  run ByteDuplex.close() |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  let mut output: [u8; 1] = [0]
+  let read = run Effect.result(
+    ByteDuplex.readSome(&mut output, Option<Instant>.none())
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  match move read {
+    Result<ReadTransfer, ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Closed {operation} => { if operation != ByteIoOperation.Read { return 1 } }
+      _ => { return 2 }
+    }
+    _ => { return 3 }
+  }
+  let write = run Effect.result(
+    ByteDuplex.writeSome(b"hello", Option<Instant>.none())
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  match move write {
+    Result<usize, ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Closed {operation} => { if operation != ByteIoOperation.Write { return 4 } }
+      _ => { return 5 }
+    }
+    _ => { return 6 }
+  }
+  let flush = run Effect.result(
+    ByteDuplex.flush(Option<Instant>.none()) |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  match move flush {
+    Result<(), ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Closed {operation} => { if operation != ByteIoOperation.Flush { return 7 } }
+      _ => { return 8 }
+    }
+    _ => { return 9 }
+  }
+  let shutdown = run Effect.result(
+    ByteDuplex.shutdownWrite(Option<Instant>.none())
+      |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  )
+  match move shutdown {
+    Result<(), ByteIoError>.Failure {error} => match move error {
+      ByteIoError.Closed {operation} => { if operation != ByteIoOperation.Flush { return 10 } }
+      _ => { return 11 }
+    }
+    _ => { return 12 }
+  }
+  run ByteDuplex.close() |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  return 42
+}
+
+effect fn expectSetupFailure(
+  mode: i32,
+  options: ConnectOptions,
+  operation: NativeSocketOperation,
+  expectedFcntls: i32,
+  expectedOptions: i32,
+  expectedCloses: i32,
+) -> i32 {
+  unsafe { silk_socket_stub_reset(mode) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let attempted = run Effect.result(connectResolved(
+    &endpoints,
+    move options,
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move attempted {
+    Result<i32, NativeSocketError>.Success {value} => { return 1 }
+    Result<i32, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.NativeFailure {operation: observed, errno} => {
+        if observed != operation || errno != 5 { return 2 }
+      }
+      _ => { return 3 }
+    }
+  }
+  if unsafe silk_socket_stub_fcntls() != expectedFcntls
+    || unsafe silk_socket_stub_setsockopts() != expectedOptions
+    || unsafe silk_socket_stub_connects() != 0
+    || unsafe silk_socket_stub_callbacks() != 0
+    || unsafe silk_socket_stub_close_attempts() != expectedCloses { return 4 }
+  return 42
+}
+
+effect fn lifecycleEdgeCases() -> i32 ! NativeSocketError | ByteIoError {
+  let pollEintr = run runReadRetry(46, usize.ONE, 2)
+  if pollEintr != 42 { return 160 }
+  let pollFailure = run expectReadError(47, ByteIoOperation.Read, 5, false)
+  if pollFailure != 42 { return 161 }
+  let socketOptionFailure = run expectReadError(48, ByteIoOperation.Read, 5, false)
+  if socketOptionFailure != 42 { return 162 }
+  let writeHup = run expectWriteProvider(50, 32)
+  if writeHup != 42 { return 163 }
+  let interrupted = run expectShutdown(51, usize.ONE, 2, 0)
+  if interrupted != 42 { return 164 }
+  let notConnected = run expectShutdown(52, usize.ZERO, 1, 1)
+  if notConnected != 42 { return 165 }
+  let provider = run expectShutdown(53, usize.ZERO, 1, 2)
+  if provider != 42 { return 166 }
+
+  unsafe { silk_socket_stub_reset(0) }
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+  let endpoints = [endpoint(1)]
+  let closed = run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    afterExplicitClose,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if closed != 42 { return closed }
+  if unsafe silk_socket_stub_close_attempts() != 1 { return 179 }
+  if unsafe silk_socket_stub_recvs() != 0 { return 180 }
+  if unsafe silk_socket_stub_sends() != 0 { return 181 }
+  if unsafe silk_socket_stub_shutdowns() != 0 { return 182 }
+
+  unsafe { silk_socket_stub_reset(1) }
+  let orderedEndpoints = [endpoint(1), endpoint(2)]
+  let ordered = run connectResolved(
+    &orderedEndpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    noTransfer,
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if ordered != 42 || unsafe silk_socket_stub_first_close_event() <= 0
+    || unsafe silk_socket_stub_second_socket_event() <= unsafe silk_socket_stub_first_close_event() {
+    return 168
+  }
+
+  let socketFailure = run expectSetupFailure(
+    54,
+    ConnectOptions.defaults(),
+    NativeSocketOperation.Socket,
+    0,
+    0,
+    0,
+  )
+  if socketFailure != 42 { return 169 }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let fcntl1 = run expectSetupFailure(55, ConnectOptions.defaults(), NativeSocketOperation.Configure, 1, 0, 1)
+    if fcntl1 != 42 { return 171 }
+    let fcntl2 = run expectSetupFailure(56, ConnectOptions.defaults(), NativeSocketOperation.Configure, 2, 0, 1)
+    if fcntl2 != 42 { return 172 }
+    let fcntl3 = run expectSetupFailure(57, ConnectOptions.defaults(), NativeSocketOperation.Configure, 3, 0, 1)
+    if fcntl3 != 42 { return 173 }
+    let fcntl4 = run expectSetupFailure(58, ConnectOptions.defaults(), NativeSocketOperation.Configure, 4, 0, 1)
+    if fcntl4 != 42 { return 174 }
+  }
+  let mut platformFcntls = 0
+  static if Intrinsic.targetOperatingSystem() == "darwin" { platformFcntls = 4 }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    let noSigpipe = run expectSetupFailure(
+      60,
+      ConnectOptions.defaults(),
+      NativeSocketOperation.Configure,
+      4,
+      2,
+      1,
+    )
+    if noSigpipe != 42 { return 176 }
+  }
+  let noDelay = match move ConnectOptions.make(true, 1, usize.ONE) {
+    Result<ConnectOptions, ConnectOptionsError>.Failure {error} => { return 177 }
+    Result<ConnectOptions, ConnectOptionsError>.Success {value} => value
+  }
+  let mut optionCount = 2
+  static if Intrinsic.targetOperatingSystem() == "darwin" { optionCount = 3 }
+  let noDelayFailure = run expectSetupFailure(
+    61,
+    move noDelay,
+    NativeSocketOperation.Configure,
+    platformFcntls,
+    optionCount,
+    1,
+  )
+  if noDelayFailure != 42 { return 178 }
+  return 42
+}
+
+effect fn closeMovedNativeOwner(connection: Connection) -> i32 ! NativeSocketError {
+  let mut retained = move connection
+  if Connection.phase(&retained) != ConnectionPhase.Open { return 260 }
+  if unsafe silk_socket_stub_close_attempts() != 0 { return 261 }
+  run Connection.close(&mut retained)
+  if Connection.phase(&retained) != ConnectionPhase.Closed { return 262 }
+  let sockets = unsafe silk_socket_stub_sockets()
+  let connects = unsafe silk_socket_stub_connects()
+  let polls = unsafe silk_socket_stub_polls()
+  let setsockopts = unsafe silk_socket_stub_setsockopts()
+  run Connection.close(&mut retained)
+  if unsafe silk_socket_stub_close_attempts() != 1
+    || unsafe silk_socket_stub_sockets() != sockets
+    || unsafe silk_socket_stub_connects() != connects
+    || unsafe silk_socket_stub_polls() != polls
+    || unsafe silk_socket_stub_setsockopts() != setsockopts { return 263 }
+  return 42
+}
+
+effect fn ownedAcquisitionCases() -> i32 ! NativeSocketError {
+  let endpoints = [endpoint(1)]
+  let mut clock = FixtureClock {nowValue: SystemClock.make(0, 0), waits: usize.ZERO}
+
+  unsafe { silk_socket_stub_reset(0) }
+  let resolved = run connectResolvedOwned(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  if unsafe silk_socket_stub_closes() != 0
+    || unsafe silk_socket_stub_sockets() != 1
+    || unsafe silk_socket_stub_connects() != 1 { return 264 }
+  let resolvedClosed = run closeMovedNativeOwner(move resolved)
+  if resolvedClosed != 42 { return resolvedClosed }
+
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    unsafe { silk_socket_stub_reset(0) }
+    let unix = run connectUnixOwned(
+      b"/tmp/silk-jul-146.sock",
+      ConnectOptions.defaults(),
+      Option<Instant>.none(),
+    ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+    if unsafe silk_socket_stub_closes() != 0
+      || unsafe silk_socket_stub_sockets() != 1
+      || unsafe silk_socket_stub_connects() != 1 { return 265 }
+    let unixClosed = run closeMovedNativeOwner(move unix)
+    if unixClosed != 42 { return unixClosed }
+  }
+
+  unsafe { silk_socket_stub_reset(43) }
+  let rejected = run Effect.result(connectResolvedOwned(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock))
+  match move rejected {
+    Result<Connection, NativeSocketError>.Success {value} => { return 266 }
+    Result<Connection, NativeSocketError>.Failure {error} => match move error {
+      NativeSocketError.NativeFailure {operation, errno} => {
+        if operation != NativeSocketOperation.Configure || errno != 5 { return 267 }
+      }
+      _ => { return 268 }
+    }
+  }
+  if unsafe silk_socket_stub_sockets() != 1
+    || unsafe silk_socket_stub_connects() != 0
+    || unsafe silk_socket_stub_closes() != 1
+    || unsafe silk_socket_stub_close_attempts() != 1
+    || unsafe silk_socket_stub_polls() != 0
+    || unsafe silk_socket_stub_recvs() != 0
+    || unsafe silk_socket_stub_sends() != 0
+    || unsafe silk_socket_stub_shutdowns() != 0 { return 269 }
+  return 42
+}
+
+effect fn parkedOwnedAcquisition() -> i32 ! NativeSocketError {
+  let endpoints = [endpoint(1)]
+  let mut clock = AcquisitionClock {}
+  let connection = run connectResolvedOwned(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+  ) |> Effect.provideMut<MonotonicClock>(&mut clock)
+  unsafe { silk_socket_stub_mark_callback() }
+  drop connection
+  unsafe { silk_socket_stub_mark_completion() }
+  return 1
+}
+
+effect fn ownedAcquisitionFailed(error: NativeSocketError) -> i32 {
+  drop error
+  return -1
+}
+
+fn ownedAcquisitionReady(state: &()) -> () { return () }
+fn ownedAcquisitionComplete(state: &mut i32, value: i32) -> () {
+  state.* = value
+  return ()
+}
+fn ownedAcquisitionParked(state: &mut i32, execution: Intrinsic.Execution<i32>) -> () {
+  drop move execution
+  state.* = 42
+  return ()
+}
+
+effect fn ownedAcquisitionCancellation() -> i32 ! OutOfMemoryError {
+  unsafe { silk_socket_stub_reset(4) }
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let body = Effect.catchAll(parkedOwnedAcquisition(), ownedAcquisitionFailed)
+  let execution = run Execution.make(move body, (), ownedAcquisitionReady)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut result = 0
+  run Execution.drive(
+    move execution,
+    &mut result,
+    ownedAcquisitionComplete,
+    ownedAcquisitionParked,
+  )
+  if result != 42 { return 270 }
+  if unsafe silk_socket_stub_wait_registrations() != 1
+    || unsafe silk_socket_stub_guard_drops() != 1 { return 271 }
+  if unsafe silk_socket_stub_sockets() != 1
+    || unsafe silk_socket_stub_connects() != 1
+    || unsafe silk_socket_stub_polls() != 1
+    || unsafe silk_socket_stub_closes() != 1
+    || unsafe silk_socket_stub_close_attempts() != 1 { return 272 }
+  if unsafe silk_socket_stub_callback_event() != 0
+    || unsafe silk_socket_stub_completions() != 0 { return 273 }
+  if unsafe silk_socket_stub_wait_registration_event() <= 0
+    || unsafe silk_socket_stub_guard_drop_event()
+      <= unsafe silk_socket_stub_wait_registration_event()
+    || unsafe silk_socket_stub_first_close_event()
+      <= unsafe silk_socket_stub_guard_drop_event() { return 274 }
+  return 42
+}
+
+effect fn cancellationRead(connection: &mut Connection) -> i32
+! ByteIoError
+? &mut MonotonicClock {
+  unsafe { silk_socket_stub_mark_callback() }
+  let lifetime = CancellationLifetime {active: true}
+  let mut output: [u8; 2] = [0, 0]
+  let transfer = run ByteDuplex.readSome(&mut output, Option<Instant>.none())
+    |> Effect.provideMut<ByteDuplex>(&mut connection.*)
+  unsafe { silk_socket_stub_mark_completion() }
+  drop transfer
+  drop lifetime
+  return 1
+}
+
+effect fn suspendedConnection() -> i32
+! NativeSocketError | ByteIoError
+? &mut MonotonicClock {
+  let endpoints = [endpoint(1)]
+  return run connectResolved(
+    &endpoints,
+    ConnectOptions.defaults(),
+    Option<Instant>.none(),
+    cancellationRead,
+  )
+}
+
+effect fn cancellationRoot() -> i32
+! OutOfMemoryError | TaskIdExhaustedError
+? &mut Scheduler | &mut MonotonicClock {
+  let child = run Fiber<
+    i32,
+    NativeSocketError | ByteIoError,
+  >.forkChild(suspendedConnection())
+  drop child
+  run Fiber.yieldNow()
+  run Fiber.yieldNow()
+  if unsafe silk_socket_stub_sockets() != 1 { return 2 }
+  if unsafe silk_socket_stub_connects() != 1 { return 3 }
+  if unsafe silk_socket_stub_callbacks() != 1 { return 4 }
+  if unsafe silk_socket_stub_recvs() != 1 { return 5 }
+  if unsafe silk_socket_stub_polls() != 1 { return 6 }
+  unsafe { silk_socket_stub_mark_wait_registration() }
+  return 42
+}
+
+effect fn cancellationFailed(
+  error: OutOfMemoryError | TaskIdExhaustedError | StalledError,
+) -> i32 {
+  return match move error {
+    OutOfMemoryError {} => 21
+    TaskIdExhaustedError {} => 22
+    StalledError {} => 23
+  }
+}
+
+effect fn cancellationCase() -> i32 {
+  unsafe { silk_socket_stub_reset(62) }
+  let mut clock = FixtureClock {
+    nowValue: SystemClock.make(0, 0),
+    waits: usize.ZERO,
+  }
+  let mut scheduler = LocalScheduler.make()
+  let result = run Effect.catchAll(
+    LocalScheduler.execute(&mut scheduler, cancellationRoot())
+      |> Effect.provideMut<MonotonicClock>(&mut clock),
+    cancellationFailed,
+  )
+  if result != 42 { return result }
+  if clock.waits != usize.ZERO { return 7 }
+  if unsafe silk_socket_stub_wait_registrations() != 1 { return 8 }
+  if unsafe silk_socket_stub_guard_drops() != 1 { return 9 }
+  let closes = unsafe silk_socket_stub_closes()
+  if closes != 1 { return 30 + closes }
+  if unsafe silk_socket_stub_close_attempts() != 1 { return 11 }
+  if unsafe silk_socket_stub_wait_registration_event() <= 0 { return 12 }
+  if unsafe silk_socket_stub_wait_registration_event() <= unsafe silk_socket_stub_callback_event() {
+    return 13
+  }
+  if unsafe silk_socket_stub_guard_drop_event()
+    <= unsafe silk_socket_stub_wait_registration_event() { return 14 }
+  if unsafe silk_socket_stub_first_close_event() <= unsafe silk_socket_stub_guard_drop_event() {
+    return 15
+  }
+  if unsafe silk_socket_stub_callbacks() != 1 { return 16 }
+  if unsafe silk_socket_stub_getsockopts() != 0 { return 17 }
+  if unsafe silk_socket_stub_recvs() != 1 { return 18 }
+  if unsafe silk_socket_stub_sends() != 0 { return 19 }
+  if unsafe silk_socket_stub_shutdowns() != 0 { return 20 }
+  if unsafe silk_socket_stub_completions() != 0 { return 24 }
+  return 42
+}
+
+effect fn nativeCases() -> i32 ! NativeSocketError | ByteIoError | OutOfMemoryError {
+  if unsafe silk_socket_darwin_witness() != 42 { return 40 }
+  if unsafe silk_socket_gnu_witness() != 42 { return 41 }
+  let invalid = run invalidCases()
+  if invalid != 42 { return invalid }
+  let reachedDeadline = run reachedDeadlineCases()
+  if reachedDeadline != 42 { return reachedDeadline }
+  let attemptPolicy = run attemptPolicyCases()
+  if attemptPolicy != 42 { return attemptPolicy }
+  let lifecycle = run lifecycleCases()
+  if lifecycle != 42 { return lifecycle }
+  let io = run ioCases()
+  if io != 42 { return io }
+  let deadlines = run deadlineBoundaryCases()
+  if deadlines != 42 { return deadlines }
+  let edges = run lifecycleEdgeCases()
+  if edges != 42 { return edges }
+  let owned = run ownedAcquisitionCases()
+  if owned != 42 { return owned }
+  let ownedCancellation = run ownedAcquisitionCancellation()
+  if ownedCancellation != 42 { return ownedCancellation }
+  let cancellation = run cancellationCase()
+  if cancellation != 42 { return cancellation }
+  let immediate = run runResolved(0, false, usize.ZERO)
+  if immediate != 42 { return immediate }
+  let fallback = run runResolved(1, true, usize.ZERO)
+  if fallback != 42 { return fallback }
+  let pending = run runResolved(2, false, usize.ZERO)
+  if pending != 42 { return pending }
+  let interrupted = run runResolved(5, false, usize.ONE)
+  if interrupted != 42 { return interrupted }
+  let timed = run runTimed(
+    4,
+    SystemClock.make(0, 0),
+    Option<Instant>.some(SystemClock.make(0, 2000000)),
+  )
+  if timed != 42 { return timed }
+  let overflow = run runTimed(
+    4,
+    SystemClock.make(i64.MAX, 999500000),
+    Option<Instant>.none(),
+  )
+  if overflow != 42 { return overflow }
+  static if Intrinsic.targetOperatingSystem() == "linux" {
+    let backlog = run runUnixRetry()
+    if backlog != 42 { return backlog }
+  }
+  return 42
+}
+
+effect fn recoverNative(error: NativeSocketError | ByteIoError | OutOfMemoryError) -> i32 {
+  drop error
+  return 90
+}
+pub fn main() -> i32 { return run nativeCases() |> Effect.catchAll(recoverNative) }

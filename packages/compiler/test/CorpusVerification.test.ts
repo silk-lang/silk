@@ -8,6 +8,9 @@ import * as Path from 'effect/Path'
 import * as Schema from 'effect/Schema'
 import * as Verification from '../../../compiler/scripts/CorpusVerification.js'
 import type { CorpusProgram } from './support/corpus.js'
+import * as Corpus from '../../../corpus/corpus.mjs'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 
 // Each case's source names it, so the stub can attribute builds and runs of concurrent cases.
 const sourceOf = (name: string): string => `// ${name}\npub fn main() -> i32 { return 42 }`
@@ -214,3 +217,12 @@ it.effect('requires SILKC and rejects selection configuration before corpus exec
     }
   }).pipe(Effect.provide(NodeServices.layer)),
 )
+
+// Programs are added by hand, so each outcome file must already be in its one canonical form.
+it('keeps every corpus outcome file canonical', () => {
+  for (const kind of Corpus.kinds)
+    for (const name of Corpus.programNames(kind)) {
+      const text = readFileSync(join(Corpus.corpusRoot, kind, name, 'outcome.json'), 'utf8')
+      assert.strictEqual(Corpus.formatOutcome(JSON.parse(text)), text, `${kind}/${name}`)
+    }
+})

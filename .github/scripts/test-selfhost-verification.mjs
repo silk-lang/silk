@@ -34,7 +34,7 @@ try {
   mkdirSync(checkout)
   const archive = execFileSync(
     'git',
-    ['archive', 'HEAD', 'packages/compiler', 'examples', 'openspec'],
+    ['archive', 'HEAD', 'corpus', 'packages/compiler', 'examples', 'openspec'],
     { maxBuffer: 64 * 1024 * 1024 },
   )
   execFileSync('tar', ['-x', '-C', checkout], { input: archive })

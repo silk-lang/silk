@@ -3040,5 +3040,4 @@ export const tlsClientResourcePolicyNativeSource = composeFocusedNative(
   ]),
   ['scenarioReference', 'feedFragments', 'authenticateFragments'],
 )
-export const tlsClientNativeOnlySource = `pub fn main() -> i32 { return 42 }`
 export const tlsClientAcceptanceSource = tlsClientWasmSource
