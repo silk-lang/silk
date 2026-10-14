@@ -347,9 +347,11 @@ cover first:
   A view of a temporary used past its statement, such as `let left = make().left()` followed by
   `left.*`, is OWN0019 at the use (CALL-003), where the bootstrap reports it. Lowering keeps every
   temporary of the initializer of a binding whose type can hold a view (`Type.holdsView`) for the
-  binding's scope, so their storage and cleanup end there. Only a borrowed fixed array stays valid
-  that long, so `let view = identity(&[1, 2])` is valid; any other such temporary's loans expire
-  with its statement (an `Expire` event, which ends validity without ending storage).
+  binding's scope, so their storage and cleanup end there, and likewise for the subject of a
+  borrowing destructuring `let` and, since it may view at an instance, a binding typed by a type
+  parameter. Only a viewing binding's borrowed fixed array stays valid that long, so `let view =
+  identity(&[1, 2])` is valid; any other such temporary's loans expire with its statement (an
+  `Expire` event, which ends validity without ending storage).
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
