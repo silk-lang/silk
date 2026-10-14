@@ -34,9 +34,10 @@ function decode(output, sourceLength) {
     else if ((match = /^diagnostics (\d+)$/.exec(line))) diagnosticCount = Number(match[1])
     else if (
       diagnosticCount !== undefined &&
-      (match = /^#(\d+) (MissingToken|UnexpectedToken|NestingLimit) (\w+) (\d+)\.\.(\d+)$/.exec(
-        line,
-      ))
+      (match =
+        /^#(\d+) (MissingToken|UnexpectedToken|NestingLimit|ReservedTemplate|ReservedImportBinding) (\S+) (\d+)\.\.(\d+)$/.exec(
+          line,
+        ))
     ) {
       assert.equal(Number(match[1]), diagnostics.length)
       const start = Number(match[4])
