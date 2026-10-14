@@ -1,0 +1,764 @@
+//! Named project profiles and package-parameter bindings from a project manifest.
+//!
+//! `[profiles.<name>]` tables hold complete logical profiles (`target` is required) with optional
+//! profile-tier `bindings`; `[build].profile` names the default one and `[build].bindings` holds
+//! project-tier bindings that every build receives. This mirrors the TypeScript
+//! `ProjectProfile.catalog`, `ProjectProfile.decode`, `CompilationProfile.decode` and
+//! `ConfigurationValue.decode`: a manifest load validates the whole catalog, and a build decodes
+//! the selected profile again. Refusals carry the TypeScript `<code>: <subject>` pair.
+
+import semantic.InitialProfile {
+  Field as ProfileField,
+  InitialProfile,
+  Input as ProfileInput,
+  Problem as InitialProfileProblem,
+  ProblemKind,
+  Selection as ProfileSelection,
+}
+import semantic.ProfileBinding {
+  Field as BindingField,
+  Input as BindingInput,
+  Provenance,
+  Supplied,
+  Tier,
+}
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.box { Box }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.option { Option }
+import silk.result { Result }
+import silk.string { String }
+import silk.toml_value { Toml, TomlChild, Value as TomlValue }
+import silk.usize
+import silk.vector { Vector }
+
+/// The configuration error class of a refused profile or binding, as the TypeScript codes name it.
+pub enum Code {
+  /// A value is absent, malformed or outside its domain.
+  InvalidInput,
+  /// A value is in its domain but the selected target cannot use it.
+  UnsupportedCombination,
+  /// A binding's provenance may not enter a build.
+  ForbiddenProvenance,
+}
+
+/// A profile catalog, profile or binding that a build cannot use.
+pub struct InvalidProfile {
+  /// The error class.
+  pub code: Code
+  /// The refused input, such as `profile name` or `cpu.model`.
+  pub subject: Bytes
+}
+
+/// One selected profile: its logical input and the bindings it supplies.
+pub struct Profile {
+  /// The logical profile, not yet frozen.
+  pub input: ProfileInput
+  /// Project-tier bindings followed by the profile's own.
+  pub bindings: Vector<Supplied>
+}
+
+// The deepest binding value the TypeScript decoder admits.
+fn maximumDepth() -> usize {
+  return usize.add(0, 128)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn refuse(code: Code, subject: &[u8]) -> never ! InvalidProfile | OutOfMemoryError ? &mut Allocator {
+  fail InvalidProfile { code: code, subject: run Bytes.copy(subject) }
+}
+
+effect fn invalid(subject: &[u8]) -> never ! InvalidProfile | OutOfMemoryError ? &mut Allocator {
+  return run refuse(Code.InvalidInput, subject)
+}
+
+/// The TypeScript spelling of `code`.
+pub fn codeName(code: Code) -> &'static [u8] {
+  return match code {
+    Code.InvalidInput => b"InvalidInput"
+    Code.UnsupportedCombination => b"UnsupportedCombination"
+    Code.ForbiddenProvenance => b"ForbiddenProvenance"
+  }
+}
+
+fn isTable(value: &TomlValue) -> bool {
+  return match &value.* {
+    TomlValue.Table { .. } => true
+    _ => false
+  }
+}
+
+fn isArray(value: &TomlValue) -> bool {
+  return match &value.* {
+    TomlValue.Array { .. } => true
+    _ => false
+  }
+}
+
+// The number of members of a table; zero for another value kind.
+fn keyCount(table: &TomlValue) -> usize {
+  return match &table.* {
+    TomlValue.Table { entries, kind: _ } => {
+      let boxed = Box<Vector<TomlChild>>.get(&entries)
+      return Vector<TomlChild>.length(&boxed[0])
+    }
+    _ => usize.ZERO
+  }
+}
+
+// The member of a table at `index`, or `None` past its end or for another value kind.
+fn memberAt<'a>(table: &'a TomlValue, index: usize) -> Option<&'a TomlChild> {
+  return match &table.* {
+    TomlValue.Table { entries, kind: _ } => {
+      let boxed = Box<Vector<TomlChild>>.get(&entries)
+      let children = Vector<TomlChild>.asSlice(&boxed[0])
+      if index >= children.length {
+        return Option<&'a TomlChild>.none()
+      }
+      return Option<&'a TomlChild>.some(&children[index])
+    }
+    _ => Option<&'a TomlChild>.none()
+  }
+}
+
+// The key of a table member, or `None` for an array item.
+fn memberKey<'a>(child: &'a TomlChild) -> Option<&'a [u8]> {
+  return match &child.* {
+    TomlChild.Member { entry } => Option<&'a [u8]>.some(String.ownedUtf8Bytes(&entry.key))
+    TomlChild.Item { value: _ } => Option<&'a [u8]>.none()
+  }
+}
+
+// The value of a table member, or `None` for an array item.
+fn memberValue<'a>(child: &'a TomlChild) -> Option<&'a TomlValue> {
+  return match &child.* {
+    TomlChild.Member { entry } => Option<&'a TomlValue>.some(&entry.value)
+    TomlChild.Item { value: _ } => Option<&'a TomlValue>.none()
+  }
+}
+
+// Whether every key of `table` is one of `allowed`.
+fn onlyKeys(table: &TomlValue, allowed: &[&[u8]]) -> bool {
+  let mut at = usize.ZERO
+  while at < keyCount(table) {
+    let mut found = false
+    if let Option<&TomlChild>.Some { value: child } = move memberAt(table, at) {
+      if let Option<&[u8]>.Some { value: key } = move memberKey(child) {
+        let mut index = usize.ZERO
+        while index < allowed.length {
+          if same(key, allowed[index]) {
+            found = true
+          }
+          index = index + usize.ONE
+        }
+      }
+    }
+    if !found {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn text<'a>(value: Option<&'a TomlValue>) -> Option<&'a [u8]> {
+  return match move Toml.asString(move value) {
+    Option<string<'a>>.Some { value: written } => Option<&'a [u8]>.some(String.utf8Bytes(written))
+    Option<string<'a>>.None => Option<&'a [u8]>.none()
+  }
+}
+
+fn hasValue(value: &Option<&TomlValue>) -> bool {
+  return match &value.* {
+    Option<&TomlValue>.Some { .. } => true
+    Option<&TomlValue>.None => false
+  }
+}
+
+fn hasText(value: &Option<&[u8]>) -> bool {
+  return match &value.* {
+    Option<&[u8]>.Some { .. } => true
+    Option<&[u8]>.None => false
+  }
+}
+
+// An optional string field: absent is `None`, another value kind refuses `subject`.
+effect fn optionalText(table: &TomlValue, name: string, subject: &[u8]) -> Option<Bytes>
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let field = Toml.field(table, name)
+  if !hasValue(&field) {
+    return Option<Bytes>.none()
+  }
+  return match move text(move field) {
+    Option<&[u8]>.Some { value: written } => Option<Bytes>.some(run Bytes.copy(written))
+    Option<&[u8]>.None => run invalid(subject)
+  }
+}
+
+// An optional array of strings: absent is empty, anything else but strings refuses `subject`.
+effect fn textSet(source: Option<&TomlValue>, subject: &[u8]) -> Vector<Bytes>
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let mut values = Vector<Bytes>.make()
+  let listed = match move source {
+    Option<&TomlValue>.None => {
+      return move values
+    }
+    Option<&TomlValue>.Some { value: present } => present
+  }
+  if !isArray(listed) {
+    return run invalid(subject)
+  }
+  let mut at = usize.ZERO
+  while true {
+    let item = match move Toml.item(listed, at) {
+      Option<&TomlValue>.Some { value: element } => element
+      Option<&TomlValue>.None => {
+        break
+      }
+    }
+    match move text(Option<&TomlValue>.some(item)) {
+      Option<&[u8]>.Some { value: written } => run Vector<Bytes>.append(&mut values, run Bytes.copy(written))
+      Option<&[u8]>.None => run invalid(subject)
+    }
+    at = at + usize.ONE
+  }
+  return move values
+}
+
+// An entry or runtime request: absent is the default, else `{ kind = "default" | "none" }` or
+// `{ kind = "named", name = "..." }`. `freeze` validates the name's spelling.
+effect fn selection(source: Option<&TomlValue>, subject: &[u8]) -> ProfileSelection
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let table = match move source {
+    Option<&TomlValue>.None => {
+      return ProfileSelection.Default
+    }
+    Option<&TomlValue>.Some { value: present } => present
+  }
+  if !isTable(table) {
+    return run invalid(subject)
+  }
+  let kind = match move text(Toml.field(table, "kind")) {
+    Option<&[u8]>.Some { value: written } => written
+    Option<&[u8]>.None => run invalid(subject)
+  }
+  if same(kind, b"default") && keyCount(table) == usize.ONE {
+    return ProfileSelection.Default
+  }
+  if same(kind, b"none") && keyCount(table) == usize.ONE {
+    return ProfileSelection.None
+  }
+  if same(kind, b"named") && keyCount(table) == usize.add(0, 2) {
+    if let Option<&[u8]>.Some { value: name } = move text(Toml.field(table, "name")) {
+      return ProfileSelection.Named { name: run Bytes.copy(name) }
+    }
+  }
+  return run invalid(subject)
+}
+
+// The TypeScript subject of a rejected `freeze` field.
+fn fieldSubject(field: ProfileField) -> &'static [u8] {
+  return match field {
+    ProfileField.Target => b"target"
+    ProfileField.Cpu => b"cpu.model"
+    ProfileField.CpuFeatures => b"cpu.features"
+    ProfileField.Deployment => b"deployment"
+    ProfileField.Libc => b"libc"
+    ProfileField.Artifact => b"artifact"
+    ProfileField.Entry => b"entry"
+    ProfileField.Link => b"link"
+    ProfileField.CodeModel => b"codeModel"
+    ProfileField.Relocation => b"relocation"
+    ProfileField.Optimization => b"optimization"
+    ProfileField.Safety => b"safety"
+    ProfileField.Threading => b"threading"
+    ProfileField.Sanitizers => b"sanitizers"
+    ProfileField.Unwind => b"unwind"
+    ProfileField.Runtime => b"runtime"
+  }
+}
+
+// Reads one profile table's logical fields; `bindings` is read separately.
+effect fn logical(table: &TomlValue) -> ProfileInput
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let allowed: [&[u8]; 17] = [
+    b"target", b"cpu", b"deployment", b"libc", b"artifact", b"entry", b"link", b"codeModel",
+    b"relocation", b"optimization", b"debug", b"safety", b"threading", b"sanitizers", b"unwind",
+    b"runtime", b"bindings",
+  ]
+  if !onlyKeys(table, &allowed) {
+    return run invalid(b"profile fields")
+  }
+  let mut input = ProfileInput.make()
+  let target = match move text(Toml.field(table, "target")) {
+    Option<&[u8]>.Some { value } => run Bytes.copy(value)
+    Option<&[u8]>.None => run invalid(b"target")
+  }
+  input.target = Option<Bytes>.some(move target)
+  if let Option<&TomlValue>.Some { value: cpu } = move Toml.field(table, "cpu") {
+    let cpuFields: [&[u8]; 2] = [b"model", b"features"]
+    if !isTable(cpu) || !onlyKeys(cpu, &cpuFields) {
+      return run invalid(b"cpu")
+    }
+    if hasValue(&Toml.field(cpu, "model")) {
+      let model = match move text(Toml.field(cpu, "model")) {
+        Option<&[u8]>.Some { value } => run Bytes.copy(value)
+        Option<&[u8]>.None => run refuse(Code.UnsupportedCombination, b"cpu.model")
+      }
+      input.cpu = Option<Bytes>.some(move model)
+    }
+    input.cpuFeatures = run textSet(Toml.field(cpu, "features"), b"cpu.features")
+  }
+  input.deployment = run optionalText(table, "deployment", b"deployment")
+  input.libc = run optionalText(table, "libc", b"libc")
+  input.artifact = run optionalText(table, "artifact", b"artifact")
+  input.entry = run selection(Toml.field(table, "entry"), b"entry")
+  input.link = run optionalText(table, "link", b"link")
+  input.codeModel = run optionalText(table, "codeModel", b"codeModel")
+  input.relocation = run optionalText(table, "relocation", b"relocation")
+  input.optimization = run optionalText(table, "optimization", b"optimization")
+  if let Option<&TomlValue>.Some { value: debug } = move Toml.field(table, "debug") {
+    input.debug = match &debug.* {
+      TomlValue.Boolean { value } => Option<bool>.some(value)
+      _ => run invalid(b"debug")
+    }
+  }
+  input.safety = run optionalText(table, "safety", b"safety")
+  input.threading = run optionalText(table, "threading", b"threading")
+  input.sanitizers = run textSet(Toml.field(table, "sanitizers"), b"sanitizers")
+  input.unwind = run optionalText(table, "unwind", b"unwind")
+  input.runtime = run selection(Toml.field(table, "runtime"), b"runtime")
+  // `freeze` owns the target-dependent checks; a valid profile is decoded again when selected.
+  let frozen = run Effect.result(InitialProfile.freeze(&input))
+  match move frozen {
+    Result<InitialProfile, InitialProfileProblem | OutOfMemoryError>.Success { value } => {
+      drop value
+    }
+    Result<InitialProfile, InitialProfileProblem | OutOfMemoryError>.Failure { error } => match move error {
+      InitialProfileProblem problem => {
+        let code = match problem.kind {
+          ProblemKind.InvalidInput => Code.InvalidInput
+          ProblemKind.UnsupportedCombination => Code.UnsupportedCombination
+        }
+        return run refuse(code, fieldSubject(problem.field))
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return move input
+}
+
+fn exactKeys(table: &TomlValue, expected: &[&[u8]]) -> bool {
+  return keyCount(table) == expected.length && onlyKeys(table, expected)
+}
+
+// Whether `value` is an exact decimal integer of at most 21 bytes, as the TypeScript decoder admits.
+fn isDecimal(value: &[u8]) -> bool {
+  if value.length == usize.ZERO || value.length > usize.add(0, 21) {
+    return false
+  }
+  let mut start = usize.ZERO
+  if value[usize.ZERO] == 45 {
+    start = usize.ONE
+  }
+  if start == value.length {
+    return false
+  }
+  if value[start] == 48 && value.length > start + usize.ONE {
+    return false
+  }
+  let mut at = start
+  while at < value.length {
+    if value[at] < 48 || value[at] > 57 {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Decodes one portable binding value: a table whose `kind` selects its exact shape.
+effect fn bindingValue(source: &TomlValue, depth: usize) -> BindingInput
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let subject = b"configuration value"
+  if depth > maximumDepth() || !isTable(source) {
+    return run invalid(subject)
+  }
+  let kind = match move text(Toml.field(source, "kind")) {
+    Option<&[u8]>.Some { value: written } => written
+    Option<&[u8]>.None => run invalid(subject)
+  }
+  let withValue: [&[u8]; 2] = [b"kind", b"value"]
+  if same(kind, b"integer") {
+    let decimal = match move text(Toml.field(source, "value")) {
+      Option<&[u8]>.Some { value: written } => written
+      Option<&[u8]>.None => run invalid(subject)
+    }
+    if !exactKeys(source, &withValue) || !isDecimal(decimal) {
+      return run invalid(subject)
+    }
+    if same(decimal, b"-0") {
+      return BindingInput.Integer { decimal: run Bytes.copy(b"0") }
+    }
+    return BindingInput.Integer { decimal: run Bytes.copy(decimal) }
+  }
+  if same(kind, b"boolean") {
+    if exactKeys(source, &withValue) {
+      if let Option<&TomlValue>.Some { value: present } = move Toml.field(source, "value") {
+        if let TomlValue.Boolean { value: flag } = &present.* {
+          return BindingInput.Boolean { value: flag }
+        }
+      }
+    }
+    return run invalid(subject)
+  }
+  if same(kind, b"string") {
+    if exactKeys(source, &withValue) {
+      if let Option<&[u8]>.Some { value: written } = move text(Toml.field(source, "value")) {
+        return BindingInput.String { text: run Bytes.copy(written) }
+      }
+    }
+    return run invalid(subject)
+  }
+  if same(kind, b"enum") {
+    let enumKeys: [&[u8]; 3] = [b"kind", b"type", b"member"]
+    let nominal = text(Toml.field(source, "type"))
+    let member = text(Toml.field(source, "member"))
+    if exactKeys(source, &enumKeys) {
+      if let Option<&[u8]>.Some { value: typeName } = move nominal {
+        if let Option<&[u8]>.Some { value: memberName } = move member {
+          if typeName.length > usize.ZERO && memberName.length > usize.ZERO {
+            return BindingInput.Enum { nominal: run Bytes.copy(typeName), member: run Bytes.copy(memberName) }
+          }
+        }
+      }
+    }
+    return run invalid(subject)
+  }
+  if same(kind, b"none") {
+    if keyCount(source) == usize.ONE {
+      return BindingInput.None
+    }
+    return run invalid(subject)
+  }
+  if same(kind, b"some") {
+    if exactKeys(source, &withValue) {
+      if let Option<&TomlValue>.Some { value: inner } = move Toml.field(source, "value") {
+        let decoded = run bindingValue(inner, depth + usize.ONE)
+        return BindingInput.Some { value: run Box<BindingInput>.make(move decoded) }
+      }
+    }
+    return run invalid(subject)
+  }
+  if same(kind, b"array") {
+    let arrayKeys: [&[u8]; 2] = [b"kind", b"values"]
+    let listed = match move Toml.field(source, "values") {
+      Option<&TomlValue>.Some { value: present } => present
+      Option<&TomlValue>.None => run invalid(subject)
+    }
+    if !exactKeys(source, &arrayKeys) || !isArray(listed) {
+      return run invalid(subject)
+    }
+    let mut values = Vector<Box<BindingInput>>.make()
+    let mut at = usize.ZERO
+    while true {
+      let item = match move Toml.item(listed, at) {
+        Option<&TomlValue>.Some { value: element } => element
+        Option<&TomlValue>.None => {
+          break
+        }
+      }
+      let decoded = run bindingValue(item, depth + usize.ONE)
+      run Vector<Box<BindingInput>>.append(&mut values, run Box<BindingInput>.make(move decoded))
+      at = at + usize.ONE
+    }
+    return BindingInput.Array { values: move values }
+  }
+  if same(kind, b"record") {
+    let recordKeys: [&[u8]; 2] = [b"kind", b"fields"]
+    let table = match move Toml.field(source, "fields") {
+      Option<&TomlValue>.Some { value: present } => present
+      Option<&TomlValue>.None => run invalid(subject)
+    }
+    if !exactKeys(source, &recordKeys) || !isTable(table) {
+      return run invalid(subject)
+    }
+    let mut fields = Vector<BindingField>.make()
+    let mut at = usize.ZERO
+    while at < keyCount(table) {
+      let child = match move memberAt(table, at) {
+        Option<&TomlChild>.Some { value: present } => present
+        Option<&TomlChild>.None => run invalid(subject)
+      }
+      let name = match move memberKey(child) {
+        Option<&[u8]>.Some { value: key } => key
+        Option<&[u8]>.None => run invalid(subject)
+      }
+      let field = match move memberValue(child) {
+        Option<&TomlValue>.Some { value: present } => present
+        Option<&TomlValue>.None => run invalid(subject)
+      }
+      let decoded = run bindingValue(field, depth + usize.ONE)
+      run Vector<BindingField>.append(&mut fields, BindingField {
+        name: run Bytes.copy(name),
+        value: run Box<BindingInput>.make(move decoded),
+      })
+      at = at + usize.ONE
+    }
+    return BindingInput.Record { fields: move fields }
+  }
+  return run invalid(subject)
+}
+
+// Decodes one binding's origin into a public provenance.
+effect fn provenance(binding: &TomlValue) -> Provenance
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let origin = match move Toml.field(binding, "origin") {
+    Option<&TomlValue>.Some { value: present } => present
+    Option<&TomlValue>.None => run invalid(b"binding origin")
+  }
+  if !isTable(origin) {
+    return run invalid(b"binding origin")
+  }
+  let source = text(Toml.field(origin, "source"))
+  let kind = text(Toml.field(origin, "provenance"))
+  if !hasText(&source) {
+    return run invalid(b"binding origin")
+  }
+  let spelled = match move kind {
+    Option<&[u8]>.Some { value } => value
+    Option<&[u8]>.None => run invalid(b"binding origin")
+  }
+  let translator = Toml.field(origin, "translator")
+  let translated = text(Toml.field(origin, "translator"))
+  if hasValue(&translator) && !hasText(&translated) {
+    return run invalid(b"binding provenance")
+  }
+  if same(spelled, b"literal") {
+    return Provenance.Literal
+  }
+  if same(spelled, b"translated-public") {
+    return match move translated {
+      Option<&[u8]>.Some { value } => Provenance.TranslatedPublic { translator: run Bytes.copy(value) }
+      // A public translation without a translator identity is not public.
+      Option<&[u8]>.None => run refuse(Code.ForbiddenProvenance, b"binding")
+    }
+  }
+  if same(spelled, b"secret") || same(spelled, b"physical-supply") || same(spelled, b"runtime") {
+    return run refuse(Code.ForbiddenProvenance, b"binding")
+  }
+  return run invalid(b"binding provenance")
+}
+
+// Decodes an optional array of binding tables into supplied bindings of `tier`.
+effect fn bindings(source: Option<&TomlValue>, tier: Tier) -> Vector<Supplied>
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let mut supplied = Vector<Supplied>.make()
+  let listed = match move source {
+    Option<&TomlValue>.None => {
+      return move supplied
+    }
+    Option<&TomlValue>.Some { value: present } => present
+  }
+  if !isArray(listed) {
+    return run invalid(b"bindings")
+  }
+  let identityKeys: [&[u8]; 5] = [b"package", b"module", b"parameter", b"value", b"origin"]
+  let mut at = usize.ZERO
+  while true {
+    let item = match move Toml.item(listed, at) {
+      Option<&TomlValue>.Some { value: element } => element
+      Option<&TomlValue>.None => {
+        break
+      }
+    }
+    if !isTable(item) {
+      return run invalid(b"binding")
+    }
+    let origin = run provenance(item)
+    let package = text(Toml.field(item, "package"))
+    let module = text(Toml.field(item, "module"))
+    let parameter = text(Toml.field(item, "parameter"))
+    if !onlyKeys(item, &identityKeys) {
+      return run invalid(b"binding identity")
+    }
+    let packageName = match move package {
+      Option<&[u8]>.Some { value: written } => written
+      Option<&[u8]>.None => run invalid(b"binding identity")
+    }
+    let moduleName = match move module {
+      Option<&[u8]>.Some { value: written } => written
+      Option<&[u8]>.None => run invalid(b"binding identity")
+    }
+    let parameterName = match move parameter {
+      Option<&[u8]>.Some { value: written } => written
+      Option<&[u8]>.None => run invalid(b"binding identity")
+    }
+    let written = match move Toml.field(item, "value") {
+      Option<&TomlValue>.Some { value: present } => present
+      Option<&TomlValue>.None => run invalid(b"configuration value")
+    }
+    let decoded = run bindingValue(written, usize.ZERO)
+    // A manifest names a module logically, as `[build].composition` does; its native identity is
+    // the module's path relative to the package.
+    let mut modulePath = run Bytes.copy(moduleName)
+    run Bytes.append(&mut modulePath, b".silk")
+    run Vector<Supplied>.append(&mut supplied, Supplied {
+      package: run Bytes.copy(packageName),
+      module: move modulePath,
+      parameter: run Bytes.copy(parameterName),
+      value: move decoded,
+      provenance: move origin,
+      tier: tier,
+    })
+    at = at + usize.ONE
+  }
+  return move supplied
+}
+
+// Whether `name` is a profile name: an ASCII letter, then letters, digits, `_` or `-`.
+fn isProfileName(name: &[u8]) -> bool {
+  if name.length == usize.ZERO {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < name.length {
+    let char = name[at]
+    let letter = char >= 65 && char <= 90 || char >= 97 && char <= 122
+    let digit = char >= 48 && char <= 57
+    if !letter && (at == usize.ZERO || !digit && char != 95 && char != 45) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// The project-tier bindings of `[build].bindings`.
+pub effect fn projectBindings(document: &TomlValue) -> Vector<Supplied>
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  return run bindings(Toml.fieldAt(Toml.field(document, "build"), "bindings"), Tier.Project)
+}
+
+/// Validates the manifest's profile catalog and project bindings and answers the default profile
+/// name, `[build].profile`, when there is one.
+pub effect fn catalog(document: &TomlValue) -> Option<Bytes>
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<&TomlValue>.Some { value: table } = move Toml.field(document, "profiles") {
+    if !isTable(table) {
+      return run invalid(b"profiles")
+    }
+  }
+  let defaultField = Toml.fieldAt(Toml.field(document, "build"), "profile")
+  let defaultName = text(Toml.fieldAt(Toml.field(document, "build"), "profile"))
+  if hasValue(&defaultField) && !hasText(&defaultName) {
+    return run invalid(b"build.profile")
+  }
+  let mut found = false
+  if let Option<&TomlValue>.Some { value: table } = move Toml.field(document, "profiles") {
+    let mut at = usize.ZERO
+    while at < keyCount(table) {
+      let child = match move memberAt(table, at) {
+        Option<&TomlChild>.Some { value: present } => present
+        Option<&TomlChild>.None => run invalid(b"profile name")
+      }
+      let name = match move memberKey(child) {
+        Option<&[u8]>.Some { value: key } => key
+        Option<&[u8]>.None => run invalid(b"profile name")
+      }
+      if !isProfileName(name) {
+        return run invalid(b"profile name")
+      }
+      let profile = match move memberValue(child) {
+        Option<&TomlValue>.Some { value: present } => present
+        Option<&TomlValue>.None => run invalid(b"profile")
+      }
+      let decoded = run decode(profile)
+      drop decoded
+      if let Option<&[u8]>.Some { value: chosen } = &defaultName {
+        if same(chosen, name) {
+          found = true
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut selected = Option<Bytes>.none()
+  if let Option<&[u8]>.Some { value: chosen } = move defaultName {
+    if !found {
+      return run invalid(b"unknown build.profile")
+    }
+    selected = Option<Bytes>.some(run Bytes.copy(chosen))
+  }
+  let project = run projectBindings(document)
+  drop project
+  return move selected
+}
+
+// Decodes one profile table with its profile-tier bindings.
+effect fn decode(table: &TomlValue) -> Profile
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  if !isTable(table) {
+    return run invalid(b"profile")
+  }
+  let own = run bindings(Toml.field(table, "bindings"), Tier.Override)
+  let input = run logical(table)
+  return Profile { input: move input, bindings: move own }
+}
+
+/// The profile `[profiles.<name>]` declares, with the project bindings before its own, as the
+/// TypeScript `ProjectProfile.select` orders them; an unknown name refuses `unknown profile <name>`.
+pub effect fn select(document: &TomlValue, name: &[u8]) -> Profile
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let mut supplied = run projectBindings(document)
+  if let Option<&TomlValue>.Some { value: profiles } = move Toml.field(document, "profiles") {
+    let mut at = usize.ZERO
+    while at < keyCount(profiles) {
+      if let Option<&TomlChild>.Some { value: child } = move memberAt(profiles, at) {
+        if let Option<&[u8]>.Some { value: key } = move memberKey(child) {
+          if same(key, name) {
+            if let Option<&TomlValue>.Some { value: table } = move memberValue(child) {
+              let Profile { input, bindings: own } = move run decode(table)
+              let mut remaining = move own
+              while Vector<Supplied>.length(&remaining) > usize.ZERO {
+                run Vector<Supplied>.append(&mut supplied, Vector<Supplied>.remove(&mut remaining, usize.ZERO))
+              }
+              return Profile { input: move input, bindings: move supplied }
+            }
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut subject = run Bytes.copy(b"unknown profile ")
+  run Bytes.append(&mut subject, name)
+  fail InvalidProfile { code: Code.InvalidInput, subject: move subject }
+}
