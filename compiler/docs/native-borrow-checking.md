@@ -246,6 +246,20 @@ A region becomes unavailable at points after its owner's `StorageDead`, and afte
 that invalidates an overlapping place. A violation is OWN0019 at the use's origin. Point sets are
 bitsets over the body's location count.
 
+The R3 2b worklist uses these same Walker points and successor edges. A local term must map to
+one exact loan; its required set includes the walk's in-flight intervals and live holder points.
+Availability excludes paths before creation and after overlapping End, Expire, write, move or drop
+events, restarting at creation on a loop back edge. Own declared parameters and `'static` are
+available throughout this body. Required bitsets propagate from shorter to longer to a fixed point.
+
+This first point proof uses conservative sets: numeric interval interiors may require extra
+points, and retained edges stay active throughout the body. Inclusion still proves the original
+relation; failed inclusion remains pending until location-sensitive requirements resolve it.
+The existing exact End/access walk retains OWN0019 and conflict diagnostics. Missing or ambiguous
+loan mappings, approximate loans, meets, provisional static inference, outside-owner atoms,
+crossed referent loans and Contents are not promoted to Checked. The shared parameter-to-local
+reborrow floor is the first target; no callee body's stage or MIR participates in its proof.
+
 ### 4.4 Liveness and conflicts
 
 Loan liveness is a backward dataflow over the graph of §3, normal and failure edges alike: a loan is live at
