@@ -45,7 +45,8 @@
 //! definitive rejection. A referent loan which crosses a scope boundary still leaves its external
 //! validity relation to the region proof. Call results and projections retain precisely the
 //! regions their types can name; parameters chosen outside the body cannot retain a fresh body
-//! region. The proof trusts callee contracts and never reads a callee body or MIR.
+//! region, nor can a call result retain a body loan whose regions cannot outlive one it names. The
+//! proof trusts callee contracts and never reads a callee body or MIR.
 
 //! Immediate execution drives, notifications, current-execution queries, relinquishing and package
 //! construction, whose stored inputs typing proves detached, are calls to their catalog contracts.
@@ -77,6 +78,7 @@ import semantic.TypedBody {
   ReceiverPass,
   ReferentCapture,
   RunAccess,
+  SafetyObligation,
   SubjectAccess,
 }
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -338,6 +340,11 @@ struct Walker {
   crossed: bool
   // How lowering keeps the temporaries of the binding initializer or `let` subject being walked.
   retention: Retention
+  // Whether typing retained no capture contents, so body loan regions are related only by
+  // equality, the facts the body's types imply, and `premises`.
+  settled: bool
+  // The region relations typing admitted without proof, as assumed outlives facts.
+  premises: Vector<ImpliedGroup>
 }
 
 // How lowering keeps a binding's temporaries (BORROW-006). It keeps every temporary of a viewing
@@ -994,7 +1001,8 @@ effect fn operands(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walk
     current = flow.at
     index = index + usize.ONE
   }
-  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false)
+  let untyped = Vector<NodeId>.make()
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false, Vector<NodeId>.asSlice(&untyped))
 }
 
 // Consumes carried loans at a fresh point for `result`, which keeps carrying the loans it can
@@ -1005,13 +1013,22 @@ effect fn operands(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walk
 //   outlive them; the region slice proves that relation.
 // - When exactly one operand's loans name a result region, the result may hold them: a conflict
 //   rejects.
+// - A loan whose regions are all body regions, of a call whose signature types it, is not held when
+//   none of them can outlive a result region. Typing relates two body regions only by equality or
+//   a meet, which shares an atom, or by a region relation it leaves open, so a callee can reach a
+//   result region only through those relations and the outlives facts its parameter and result
+//   types imply: a reference's or slice's referent outlives its region, and a nominal's arguments
+//   may outlive one another. If they lead the loan's regions to a result region, or to a region
+//   from outside the body, whose premises the walk does not read, the loan stays carried,
+//   approximately. Retained capture contents relate regions in ways the walk does not describe, so
+//   a body with them keeps every such loan.
 // - Otherwise a loan is carried approximately, and a conflict with it leaves the body imprecise:
 //   every fresh borrow of one call shares the call's region, so several operands may name it, and a
 //   callable retains its capture loans whatever its type names.
 // A `stores` result keeps every operand, as the Effect an `effect fn` call constructs does, so it
 // keeps all their loans exactly whatever regions its type names.
 effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, result: NodeId, at: usize, carried: &Vector<Carry>,
-  stores: bool) -> Flow
+  stores: bool, typed: &[NodeId]) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let point = run newPoint(&mut walker.*, at)
   let mut onward = Vector<Carry>.make()
@@ -1027,6 +1044,8 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
       // The one operand whose loans may name a result region, or `usize.MAX`.
       let mut naming = usize.MAX
       let mut several = false
+      // Whether a loan has body regions that no result region shares.
+      let mut unnamed = false
       let mut index = usize.ZERO
       while index < loans.length {
         let all = Vector<Loan>.asSlice(&walker.loans)
@@ -1037,8 +1056,14 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
           } else if naming != loans[index].operand {
             several = true
           }
+        } else if bodyRegions(regionsOf, owner) {
+          unnamed = true
         }
         index = index + usize.ONE
+      }
+      let mut implied = noImplied()
+      if unnamed && known && !stores && typed.length > usize.ZERO {
+        implied = run callImplied(nodes, &walker.*, typed, result)
       }
       index = usize.ZERO
       while index < loans.length {
@@ -1054,6 +1079,8 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
             kept = false
           } else if !several && naming == loans[index].operand && regionsOf.length > usize.ZERO && sharesAtom(regionsOf, named) {
             exact = true
+          } else if implied.known && bodyRegions(regionsOf, owner) && !run mayOutlive(&implied, regionsOf, named, owner) {
+            kept = false
           }
         }
         if kept {
@@ -1172,6 +1199,192 @@ fn bodyRegions(regions: &[Shared<Lifetime>], owner: &DeclarationId) -> bool {
   return true
 }
 
+// The outlives facts a call's argument and result types imply by being well formed, which its
+// callee may assume: a reference's or slice's referent outlives its region, and the arguments of
+// a nominal may outlive one another by its declared bounds, so they are taken as one class. `known`
+// is false when a type has a form this summary does not describe.
+struct Implied {
+  groups: Vector<ImpliedGroup>
+  known: bool
+}
+
+// The atoms of one well-formedness fact: every member outlives every container atom, or, with no
+// container, the members of one nominal may outlive one another.
+struct ImpliedGroup {
+  container: Vector<Shared<Lifetime>>
+  members: Vector<Shared<Lifetime>>
+}
+
+fn noImplied() -> Implied {
+  return Implied {groups: Vector<ImpliedGroup>.make(), known: false}
+}
+
+// The facts a call implies: the body's open region relations and the well-formedness of the
+// types of `arguments` and `result`.
+effect fn callImplied(nodes: &[Node], walker: &Walker, arguments: &[NodeId], result: NodeId) -> Implied
+! OutOfMemoryError ? &mut Allocator {
+  let mut implied = Implied {groups: Vector<ImpliedGroup>.make(), known: walker.settled}
+  let premises = Vector<ImpliedGroup>.asSlice(&walker.premises)
+  let mut premise = usize.ZERO
+  while premise < premises.length {
+    let mut members = Vector<Shared<Lifetime>>.make()
+    run appendAllAtoms(&mut members, Vector<Shared<Lifetime>>.asSlice(&premises[premise].members))
+    let mut container = Vector<Shared<Lifetime>>.make()
+    run appendAllAtoms(&mut container, Vector<Shared<Lifetime>>.asSlice(&premises[premise].container))
+    run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move members})
+    premise = premise + usize.ONE
+  }
+  let mut atoms = Vector<Shared<Lifetime>>.make()
+  let mut index = usize.ZERO
+  while index <= arguments.length {
+    let mut typed = Option<Shared<Type>>.none()
+    if index < arguments.length { typed = expressionType(nodes, arguments[index]) } else { typed = expressionType(nodes, result) }
+    if let Option<Shared<Type>>.Some {value} = move typed {
+      run implies(&value, &mut implied, &mut atoms)
+    } else {
+      implied.known = false
+    }
+    index = index + usize.ONE
+  }
+  return move implied
+}
+
+effect fn appendAtoms(target: &mut Vector<Shared<Lifetime>>, region: &Shared<Lifetime>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = Lifetime.atomCount(region)
+  let mut at = usize.ZERO
+  while at < count {
+    run Vector<Shared<Lifetime>>.append(&mut target.*, Lifetime.atomAt(region, at))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn appendAllAtoms(target: &mut Vector<Shared<Lifetime>>, atoms: &[Shared<Lifetime>]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < atoms.length {
+    run Vector<Shared<Lifetime>>.append(&mut target.*, Shared<Lifetime>.clone(&atoms[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Records the facts `ty` implies and appends every atom it names to `atoms`.
+effect fn implies(ty: &Shared<Type>, implied: &mut Implied, atoms: &mut Vector<Shared<Lifetime>>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  match move run Type.copy(ty) {
+    Type.Primitive {..} => {}
+    Type.Unit => {}
+    // A type parameter bound outside the body names no body region (see `bodyRetainedRegions`).
+    Type.Parameter {..} => {}
+    Type.String {lifetime} => {
+      run appendAtoms(&mut atoms.*, &lifetime)
+    }
+    Type.Reference {referent, lifetime, ..} => {
+      run contained(&referent, &lifetime, &mut implied.*, &mut atoms.*)
+    }
+    Type.Slice {element, lifetime, ..} => {
+      run contained(&element, &lifetime, &mut implied.*, &mut atoms.*)
+    }
+    Type.Array {element, ..} => {
+      run implies(&element, &mut implied.*, &mut atoms.*)
+    }
+    Type.Nominal {arguments, ..} => {
+      let mut inner = Vector<Shared<Lifetime>>.make()
+      let listed = Vector<Argument>.asSlice(&arguments)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        match &listed[at] {
+          Argument.Type {value} => {
+            run implies(&value, &mut implied.*, &mut inner)
+          }
+          Argument.Lifetime {value} => {
+            run appendAtoms(&mut inner, &value)
+          }
+          Argument.Row {..} => {
+            implied.known = false
+          }
+        }
+        at = at + usize.ONE
+      }
+      run appendAllAtoms(&mut atoms.*, Vector<Shared<Lifetime>>.asSlice(&inner))
+      run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: Vector<Shared<Lifetime>>.make(), members: move inner})
+    }
+    _ => {
+      implied.known = false
+    }
+  }
+  return ()
+}
+
+// Records that every atom `inside` names outlives `region`.
+effect fn contained(inside: &Shared<Type>, region: &Shared<Lifetime>, implied: &mut Implied, atoms: &mut Vector<Shared<Lifetime>>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut inner = Vector<Shared<Lifetime>>.make()
+  run implies(inside, &mut implied.*, &mut inner)
+  let mut container = Vector<Shared<Lifetime>>.make()
+  run appendAtoms(&mut container, region)
+  run appendAllAtoms(&mut atoms.*, Vector<Shared<Lifetime>>.asSlice(&inner))
+  run appendAllAtoms(&mut atoms.*, Vector<Shared<Lifetime>>.asSlice(&container))
+  run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move inner})
+  return ()
+}
+
+fn containsAtom(atoms: &[Shared<Lifetime>], atom: &Shared<Lifetime>) -> bool {
+  let mut at = usize.ZERO
+  while at < atoms.length {
+    if Lifetime.equalsShared(&atoms[at], atom) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether a loan with body regions `from` may outlive a region of `named` through the facts
+// `implied` records: the atoms the facts reach from `from` include one of `named`, or one from
+// outside the body, whose premises are not read here.
+effect fn mayOutlive(implied: &Implied, from: &[Shared<Lifetime>], named: &[Shared<Lifetime>], owner: &DeclarationId) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut reached = Vector<Shared<Lifetime>>.make()
+  let mut at = usize.ZERO
+  while at < from.length {
+    run appendAtoms(&mut reached, &from[at])
+    at = at + usize.ONE
+  }
+  let groups = Vector<ImpliedGroup>.asSlice(&implied.groups)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut group = usize.ZERO
+    while group < groups.length {
+      let members = Vector<Shared<Lifetime>>.asSlice(&groups[group].members)
+      let mut entered = false
+      let mut member = usize.ZERO
+      while !entered && member < members.length {
+        entered = containsAtom(Vector<Shared<Lifetime>>.asSlice(&reached), &members[member])
+        member = member + usize.ONE
+      }
+      if entered {
+        let mut targets = Vector<Shared<Lifetime>>.asSlice(&groups[group].container)
+        if targets.length == usize.ZERO {
+          targets = members
+        }
+        let mut target = usize.ZERO
+        while target < targets.length {
+          if !containsAtom(Vector<Shared<Lifetime>>.asSlice(&reached), &targets[target]) {
+            run Vector<Shared<Lifetime>>.append(&mut reached, Shared<Lifetime>.clone(&targets[target]))
+            changed = true
+          }
+          target = target + usize.ONE
+        }
+      }
+      group = group + usize.ONE
+    }
+  }
+  let atoms = Vector<Shared<Lifetime>>.asSlice(&reached)
+  return !bodyRegions(atoms, owner) || sharesAtom(atoms, named)
+}
+
 // Whether any atom of `left` is an atom of `right`.
 fn sharesAtom(left: &[Shared<Lifetime>], right: &[Shared<Lifetime>]) -> bool {
   let mut first = usize.ZERO
@@ -1245,7 +1458,7 @@ effect fn copyIds(values: &[NodeId]) -> Vector<NodeId> ! OutOfMemoryError ? &mut
 // A call's arguments in order. A shared or mutable receiver pass borrows the receiver place for the
 // whole call; a taking receiver pass moves it.
 effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, arguments: &[NodeId], receiver: usize, exact: bool,
-  result: NodeId, at: usize) -> Flow
+  signature: bool, result: NodeId, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut carried = Vector<Carry>.make()
   let mut current = at
@@ -1275,7 +1488,11 @@ effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: 
     }
     index = index + usize.ONE
   }
-  return run finish(nodes, owner, &mut walker.*, result, current, &carried, exact)
+  let mut typed = Vector<NodeId>.make()
+  if signature {
+    typed = run copyIds(arguments)
+  }
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried, exact, Vector<NodeId>.asSlice(&typed))
 }
 
 // Constructs a callable or section from its captured operands, in order (CAPTURE-001). A borrowed capture's
@@ -1337,7 +1554,8 @@ effect fn invoke(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     current = flow.at
     index = index + usize.ONE
   }
-  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false)
+  let untyped = Vector<NodeId>.make()
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false, Vector<NodeId>.asSlice(&untyped))
 }
 
 // Constructs the Effect an `effect fn` value's invocation promises without calling it (EFF-001). The
@@ -1441,7 +1659,9 @@ union Shape {
   // `&&` or `||`: the right operand runs on one path, and its temporaries end with it.
   ShortCircuit {left: NodeId, right: NodeId},
   PassThrough {value: NodeId},
-  Call {arguments: Vector<NodeId>, receiver: usize, exact: bool},
+  // `signature` marks a call to a declaration or interface operation, whose written signature
+  // types its arguments and result.
+  Call {arguments: Vector<NodeId>, receiver: usize, exact: bool, signature: bool},
   Invoke {callee: NodeId, arguments: Vector<NodeId>, pipeline: bool, exclusive: bool},
   // `referents` name their operands by position.
   Construct {values: Vector<NodeId>, referents: Vector<ReferentCapture>},
@@ -1533,16 +1753,19 @@ effect fn shapeOf(nodes: &[Node], id: NodeId) -> Shape ! OutOfMemoryError ? &mut
             // The run's result is the call's success value, which stores none of its operands
             // beyond what its own type retains.
             if let Expression.DirectCall {arguments, receiverPass, ..} = &operand {
-              return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: false}
+              return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: false,
+                signature: true}
             }
             if let Expression.InterfaceCall {arguments, receiverPass, ..} = &operand {
-              return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: false}
+              return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: false,
+                signature: true}
             }
             // A drive retains its operands in an opaque Effect until activation. Only this
             // immediate run can consume all operand/capture loans at the S2 call point.
             if let Expression.StorageCall {operation, arguments, ..} = &operand {
               if operation == StorageOperation.ExecutionDrive {
-                return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false}
+                return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false,
+                  signature: false}
               }
             }
             return run expressionShape(&operand)
@@ -1623,16 +1846,16 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
     Expression.VariantConstruct {fields, ..} => Shape.Operands {values: run fieldValues(Vector<AggregateField>.asSlice(&fields))}
     // An `effect fn` call's Effect stores exactly its written arguments (EFFECT-OWN-001).
     Expression.DirectCall {arguments, receiverPass, constructs, ..} => Shape.Call {
-      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: constructs,
+      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: constructs, signature: true,
     }
     Expression.InterfaceCall {arguments, receiverPass, isEffect, ..} => Shape.Call {
-      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: isEffect,
+      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: isEffect, signature: true,
     }
     Expression.ForeignCall {arguments, ..} => Shape.Call {
-      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false,
+      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false,
     }
     Expression.IntrinsicCall {arguments, ..} => Shape.Call {
-      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false,
+      arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false,
     }
     Expression.Integer {..} => Shape.Leaf
     Expression.Float {..} => Shape.Leaf
@@ -1691,7 +1914,7 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
         return Shape.Outside {reason: BorrowStatus.StoredLoans}
       }
       if contractCall(operation) {
-        return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false}
+        return Shape.Call {arguments: run copyIds(Vector<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false}
       }
       return Shape.Outside {reason: BorrowStatus.Storage}
     }
@@ -1956,7 +2179,8 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         if Vector<Carry>.length(&flow.carried) > usize.ZERO || (path.through && holds(&walker.*, path.root)) {
           let retained = run nodeRetains(nodes, id, owner)
           if retained {
-            return run finish(nodes, owner, &mut walker.*, id, flow.at, &flow.carried, false)
+            let untyped = Vector<NodeId>.make()
+            return run finish(nodes, owner, &mut walker.*, id, flow.at, &flow.carried, false, Vector<NodeId>.asSlice(&untyped))
           }
         }
         let point = run newPoint(&mut walker.*, flow.at)
@@ -1988,13 +2212,14 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       run appendOperand(&mut carried, Vector<Carry>.asSlice(&first.carried), usize.ZERO)
       let second = run settled(nodes, locals, owner, &mut walker.*, right, first.at)
       run appendOperand(&mut carried, Vector<Carry>.asSlice(&second.carried), usize.ONE)
-      return run finish(nodes, owner, &mut walker.*, id, second.at, &carried, false)
+      let untyped = Vector<NodeId>.make()
+      return run finish(nodes, owner, &mut walker.*, id, second.at, &carried, false, Vector<NodeId>.asSlice(&untyped))
     }
     Shape.PassThrough {value} => {
       return run visit(nodes, locals, owner, &mut walker.*, value, at)
     }
-    Shape.Call {arguments, receiver, exact} => {
-      return run call(nodes, locals, owner, &mut walker.*, Vector<NodeId>.asSlice(&arguments), receiver, exact, id, at)
+    Shape.Call {arguments, receiver, exact, signature} => {
+      return run call(nodes, locals, owner, &mut walker.*, Vector<NodeId>.asSlice(&arguments), receiver, exact, signature, id, at)
     }
     Shape.Construct {values, referents} => {
       return run construct(nodes, locals, owner, &mut walker.*, Vector<NodeId>.asSlice(&values), Vector<ReferentCapture>.asSlice(&referents), at)
@@ -2117,7 +2342,8 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         point = written.at
         run consume(&mut walker.*, Vector<Carry>.asSlice(&flow.carried), point)
         if retained {
-          return run finish(nodes, owner, &mut walker.*, id, point, &read.carried, false)
+          let untyped = Vector<NodeId>.make()
+          return run finish(nodes, owner, &mut walker.*, id, point, &read.carried, false, Vector<NodeId>.asSlice(&untyped))
         }
         run consume(&mut walker.*, Vector<Carry>.asSlice(&read.carried), point)
         return flowAt(point)
@@ -2915,8 +3141,31 @@ fn reaches(entering: &[u64], width: usize, point: usize, bit: usize) -> bool {
 /// `owner` is the body's declaration, `locals` and `nodes` its typed locals and nodes, and `root`
 /// its root node. Conflicts and uses of moved places are reported in evaluation order; the first
 /// one is returned.
-pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], root: NodeId, pending: bool, cleanup: Vector<LoanCleanup>) -> Verdict
+pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], root: NodeId, pending: bool,
+  obligations: &[SafetyObligation], cleanup: Vector<LoanCleanup>) -> Verdict
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  // Each region relation typing left open is a premise of the calls it admitted: its offered
+  // region outlives its wanted one. Retained capture contents relate regions this walk does not
+  // describe.
+  let mut premises = Vector<ImpliedGroup>.make()
+  let mut settled = true
+  let mut obligation = usize.ZERO
+  while obligation < obligations.length {
+    match &obligations[obligation] {
+      SafetyObligation.RegionRelation {offered, wanted, ..} => {
+        let mut members = Vector<Shared<Lifetime>>.make()
+        run appendAtoms(&mut members, &offered)
+        let mut container = Vector<Shared<Lifetime>>.make()
+        run appendAtoms(&mut container, &wanted)
+        run Vector<ImpliedGroup>.append(&mut premises, ImpliedGroup {container: move container, members: move members})
+      }
+      SafetyObligation.Contents {..} => {
+        settled = false
+      }
+      _ => ()
+    }
+    obligation = obligation + usize.ONE
+  }
   let mut walker = Walker {
     points: Vector<Point>.make(),
     loans: Vector<Loan>.make(),
@@ -2936,6 +3185,8 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     guardConsumed: Option<Location>.none(),
     crossed: false,
     retention: Retention.None,
+    settled: settled,
+    premises: move premises,
   }
   run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make(), expiring: Vector<usize>.make(), statement: false})
   let mut parameter = usize.ZERO
