@@ -336,8 +336,10 @@ cover first:
 - `stored-loans`: a stored or delayed `executionDrive` construction retains captures its empty
   native environment does not describe, so it stays unchecked even when its result type names no
   environment region; lowering runs only an immediate drive, so no emitted body has one. Other
-  cases include a loan carried around a loop, a retaining write through a referent, a displaced value that retains a region, a move or
-  drop of a place with no local root, and cleanup with unknown retained contents.
+  cases include a loan carried around a loop, a retaining write through a referent, a retaining
+  value displaced out of a local holder, a move or drop of a place with no local root, and cleanup
+  with unknown retained contents. A retaining value displaced from behind a reference carries
+  what that reference reaches, as a read through it does.
 
   A borrow of a value with no place (a call result, a literal, a projection or dereference of
   one, or a temporary receiver) lends that value's hidden owner (BORROW-006). The walk evaluates
