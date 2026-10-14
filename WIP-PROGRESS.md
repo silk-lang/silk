@@ -172,18 +172,14 @@ process.exit(await runCorpus(process.argv[2], nativeCorpus, [], selected, undefi
 
 ## Status 2026-10-14 (later session)
 
-- #1680: ready, handed off (DDC 38604023044 green).
-- #1686 failure-identity: ready, handed off (DDC 38610051143 green). Region omission is the
-  coordinator's decision (intended native behavior).
-- observer-callback: draft #1694 (`selfhost-native-traps-3` @ 817706b, stacked on #1686) plus
-  main-first #1693 (`main-native-observer-capturing-callback`, corpus program
-  `diagnostic-observer-capturing-callback`). Adapter helpers (InstanceKey.Helper, role Observe).
-  Pending: full corpus result, TS bootstrap check, DDC, then ready + handoff.
-- Probe dirs: /tmp/fi/*, /tmp/oc/{lambda,section,corpus}.
+- #1680 merged (selfhost 3fb9603f). #1686 merged (1bb9a087). #1677 and #1693 merged on main.
+- Sync #1697 (`selfhost-sync-main-33f8cd26` @ 48e8f96): main 33f8cd26 + 43eacdf9 + 8b97fae0 into
+  selfhost 54303d8a; DDC 38630442504. Do NOT push to it unless it fails.
+- #1694 observer-callback stacked on #1697 (`selfhost-native-traps-3` @ 52fd2b4), ready; DDC
+  38634908698. Gap line for diagnostic-observer-capturing-callback added.
+- Process: stack the next PR on the previous one; never wait for merges.
 
 ## Exact next action
 
-1. Full corpus with the traps-3 compiler; bootstrap check on traps-3; DDC on traps-3.
-2. Mark #1694 ready, hand off with merge order: #1680, #1686, #1694 on selfhost; #1677 and #1693 on
-   main; then sync + gap file regen.
-3. Final report to coordinator.
+1. Watch DDC 38630442504 (#1697) and 38634908698 (#1694); fix any failure on the owning branch.
+2. Send the coordinator the final B9 report.
