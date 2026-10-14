@@ -290,7 +290,7 @@ The checker is part of the `Body` unit, as the v2 note's checking-unit rule requ
   the declaration (v2 §3.5), so an edit elsewhere in the file never changes a cached answer. The
   answer is part of the `Body` result, compared by v2's cutoff (§6.3 there); only the build verdict
   reads it.
-- **Who reads it.** `buildRuntime`, for the unit of every emitted instance, deduplicated by key.
+- **Who reads it.** `buildArtifact`, for the unit of every emitted instance, deduplicated by key.
   `MirFunction.safetyChecked` and `InstanceRecipe.safetyChecked` then come from the checking answer
   instead of `BodyStage.FullyChecked`. A rejection joins `BackendBuild.Rejected` exactly as typing
   rejections do.

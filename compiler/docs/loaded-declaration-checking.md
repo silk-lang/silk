@@ -1,7 +1,7 @@
 # Loaded declaration checking (MODULE-004)
 
 `main.silk` preloads the program through `ModuleSources.preloadProgram` before it
-creates the semantic store. Build and test compile through `Semantic.buildRuntime`.
+creates the semantic store. Build and test compile through `Semantic.buildArtifact`.
 Its declaration sweep checks every active, closed, nongeneric, provider-free
 declaration in the loaded root package independently of the executable instance
 walk. A standard-library module loaded as a dependency is checked when a use

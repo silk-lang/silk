@@ -145,9 +145,120 @@ const program = Effect.gen(function* () {
   assert.equal(project.status, 42, project.stderr)
   const [hostTarget] = yield* fs.readDirectory(join(directory, 'build/llvm'))
   assert.ok(hostTarget, 'run must place its executable below build/llvm/<target>')
-  assert.equal(yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')), true)
+  assert.equal(
+    yield* fs.exists(join(directory, 'build/llvm', hostTarget, 'debug/native-build')),
+    true,
+  )
+  // An object form needs no `main` and no runtime: the application's C exports are its roots.
+  const library = join(directory, 'library')
+  yield* fs.makeDirectory(join(library, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(library, 'src/Main.silk'),
+    'fn helper(value: i32) -> i32 { return value + unsafe offset() }\n' +
+      'unsafe extern "C" fn offset() -> i32\n' +
+      'pub fn unrelated() -> i32 { return 99 }\n' +
+      'export "C" fn answer(value: i32) -> i32 as "silk_answer" { return helper(value) }\n',
+  )
+  yield* fs.writeFileString(join(library, 'offset.c'), 'int offset(void) { return 1; }\n')
+  yield* fs.writeFileString(
+    join(library, 'consumer.c'),
+    'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
+  )
+  const manifest = (inputs: string) =>
+    `[package]\nname = "library"\nroot = "src/Main.silk"\n\n[build]\nnative-link-inputs = [${inputs}]\n`
+  const tools = dirname(clang)
+  const inspect = Effect.fnUntraced(function* (object: string) {
+    const header = yield* invoke(join(tools, 'llvm-readobj'), ['--file-header', object], library)
+    assert.equal(header.status, 0, header.stderr)
+    const symbols = yield* invoke(join(tools, 'llvm-nm'), ['--defined-only', object], library)
+    assert.equal(symbols.status, 0, symbols.stderr)
+    return { header: header.stdout, symbols: symbols.stdout.split('\n') }
+  })
+  const exported = (symbols: ReadonlyArray<string>, name: string) =>
+    symbols.some((line) => / T _?(\S+)$/.exec(line)?.[1] === name)
+  const compiledHelper = yield* invoke(
+    clang,
+    ['-c', '-fPIC', 'offset.c', '-o', 'offset.o'],
+    library,
+  )
+  assert.equal(compiledHelper.status, 0, compiledHelper.stderr)
+  const libraryArguments = (output: string, ...selectors: ReadonlyArray<string>) => [
+    'build',
+    'src/Main.silk',
+    '-o',
+    output,
+    '--emit',
+    'object',
+    '--stdlib',
+    standardLibrary,
+    ...selectors,
+  ]
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
+  const object = yield* invoke(silkc, libraryArguments('silk.o'), library, {
+    ...process.env,
+    SILKC_CLANG: clang,
+  })
+  assert.equal(object.status, 0, object.stderr)
+  assert.equal(yield* fs.exists(join(library, 'silk.o.silkc.ll')), false)
+  const relocatable = yield* inspect('silk.o')
+  assert.match(relocatable.header, /Type: Relocatable|MH_OBJECT/)
+  assert.ok(exported(relocatable.symbols, 'silk_answer'), relocatable.symbols.join('\n'))
+  assert.ok(!exported(relocatable.symbols, 'main'), 'an object form acquires no startup')
+  assert.ok(
+    !exported(relocatable.symbols, 'offset'),
+    'an undeclared foreign definition stays external',
+  )
+  // The C caller and the Silk export agree on the C ABI once the foreign definition is supplied.
+  const consumer = yield* invoke(
+    clang,
+    ['consumer.c', 'silk.o', 'offset.o', '-o', 'consumer'],
+    library,
+  )
+  assert.equal(consumer.status, 0, consumer.stderr)
+  assert.equal((yield* invoke(join(library, 'consumer'), [], library)).status, 0)
+  // Declared objects are merged into the object by a relocatable link.
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('{ object = "offset.o" }'))
+  const merged = yield* invoke(silkc, libraryArguments('merged.o'), library, {
+    ...process.env,
+    SILKC_CLANG: clang,
+  })
+  assert.equal(merged.status, 0, merged.stderr)
+  const mergedSymbols = yield* inspect('merged.o')
+  assert.ok(
+    exported(mergedSymbols.symbols, 'silk_answer') && exported(mergedSymbols.symbols, 'offset'),
+  )
+  const mergedConsumer = yield* invoke(
+    clang,
+    ['consumer.c', 'merged.o', '-o', 'merged-consumer'],
+    library,
+  )
+  assert.equal(mergedConsumer.status, 0, mergedConsumer.stderr)
+  assert.equal((yield* invoke(join(library, 'merged-consumer'), [], library)).status, 0)
+  // A library input cannot be merged into a relocatable object.
+  yield* fs.writeFileString(
+    join(library, 'silk.toml'),
+    manifest('{ library = "m", mode = "dynamic" }'),
+  )
+  const unmergeable = yield* invoke(silkc, libraryArguments('unmergeable.o'), library, {
+    ...process.env,
+    SILKC_CLANG: sentinel,
+  })
+  assert.notEqual(unmergeable.status, 0, 'a library input was merged into an object')
+  assert.equal(yield* fs.exists(join(library, 'unmergeable.o')), false)
+  assert.equal(yield* fs.exists(marker), false)
+  // An object for another target is compiled for that target without a linker.
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
+  const crossObject = yield* invoke(
+    silkc,
+    libraryArguments('cross.o', '--target', foreign),
+    library,
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(crossObject.status, 0, crossObject.stderr)
+  const crossHeader = (yield* inspect('cross.o')).header
+  assert.match(crossHeader, foreign.startsWith('x86_64') ? /x86-64/ : /Mach-O arm64/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation and project run passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run and object artifacts passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))

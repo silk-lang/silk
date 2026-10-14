@@ -204,22 +204,29 @@ such as a provision section's `once Effect<'env; ...>` representation bound. A f
 `'static` expectation of a shorter region, a declared region widened to another, and any owner,
 access, element, pointee or type-argument difference stay type errors.
 
-Build invocation: `silkc build <source> -o <output> --emit <executable|llvm-ir> --target <triple>
---stdlib <directory> --optimization <none|speed> --debug <true|false>`.
-The target defaults to the compiler's host target. Another supported target emits only LLVM IR:
-an executable build for a non-host target is an invalid build profile, so the macOS CI leg
-cross-emits the compiler's IR on Linux and links it on macOS.
+Build invocation: `silkc build <source> -o <output> --emit <executable|object|llvm-ir> --target
+<triple> --stdlib <directory> --optimization <none|speed> --debug <true|false>`.
+The target defaults to the compiler's host target. Another supported target emits only an object
+or LLVM IR: an executable build for a non-host target is an invalid build profile, so the macOS CI
+leg cross-emits the compiler's IR on Linux and links it on macOS.
 The output defaults to an executable. `--emit llvm-ir` writes the exact completed backend module
-bytes to the requested file, returns success without invoking Clang, and creates no intermediate
-executable or temporary IR file. Invalid or repeated output selectors fail before source loading.
+bytes of the executable to the requested file, returns success without invoking Clang, and creates
+no intermediate executable or temporary IR file. `--emit object` selects the `object` profile
+artifact and compiles a relocatable object for the target with the profile's relocation model
+(`-fPIC` by default). It acquires no catalog runtime or storage component: the application's
+`export "C"` functions are its roots, so a package without `main` builds, and a `[build].composition`
+may omit `defaults`. Declared object and archive inputs are merged into it by a relocatable link;
+any other declared input is refused. Invalid or repeated output selectors fail before source loading.
 With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
-<native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup together.
+<native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup, and an
+object linked with a separately compiled C caller together; the selfhost workflow runs it on N1.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
-root contains `silk/`; it is an explicit CLI input. A package without a `[build].composition`
-takes its runtime from the library's `compositions.json` for the target and libc, so such a build
-needs the library root even without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
+root contains `silk/`; it is an explicit CLI input. An executable package without a
+`[build].composition` takes its runtime from the library's `compositions.json` for the target and
+libc, so such a build needs the library root even without standard-library imports; no listed
+runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
 is the root for local module paths. Every module identity names the package by its logical
 identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
