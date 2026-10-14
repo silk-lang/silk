@@ -183,6 +183,9 @@ struct Loan {
   // Whether the loan borrows a place rooted in a body local, so its region is a body region even
   // when typing recorded none.
   local: bool
+  // This reborrow has the same authenticated universal lifetime as its parent reference.
+  // Crossing a body scope cannot extend that lifetime; any other external crossing stays open.
+  crossingProved: bool
   created: usize
 }
 
@@ -337,8 +340,8 @@ struct Walker {
   guarded: Vector<usize>
   // The first move or drop of a guarded binding root: a guard consumed a provisional binding.
   guardConsumed: Option<Location>
-  // Whether a referent loan crossed a scope boundary: its region relation is the region slice's
-  // to prove, so the body is never `Checked` on the walk alone.
+  // Whether a referent loan crossed a scope boundary without retaining its parent's exact
+  // authenticated universal lifetime. Such a crossing still needs a symbolic source-boundary proof.
   crossed: bool
   // How lowering keeps the temporaries of the binding initializer or `let` subject being walked.
   retention: Retention
@@ -420,12 +423,12 @@ effect fn appendCarried(target: &mut Vector<Carry>, source: &[Carry]) -> () ! Ou
   return ()
 }
 
-// A crossed referent loan leaves its external validity relation to the region proof.
+// Only a reborrow that retains its parent's exact universal lifetime has a closed boundary proof.
 fn cross(walker: &mut Walker, carried: &[Carry]) -> () {
   let loans = Vector<Loan>.asSlice(&walker.loans)
   let mut at = usize.ZERO
   while at < carried.length {
-    if !loans[carried[at].loan].local { walker.crossed = true }
+    if !loans[carried[at].loan].local && !loans[carried[at].loan].crossingProved { walker.crossed = true }
     at = at + usize.ONE
   }
   return ()
@@ -840,6 +843,7 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
   node: usize, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut path = run pathOf(nodes, place)
+  let mut source = borrowedPlaceLifetime(nodes, place)
   let mut current = at
   if path.root == usize.MAX {
     // A borrow of a value with no place lends its hidden owner (BORROW-006).
@@ -852,6 +856,7 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
   if node != usize.MAX && sliceValue(nodes, place) && sliceValue(nodes, NodeId {index: node}) {
     run Vector<usize>.append(&mut path.steps, referent())
     path.through = true
+    source = nodeLoanLifetime(nodes, place)
   }
   let mut evaluated = run indexes(nodes, locals, owner, &mut walker.*, &path, current)
   // A reference to a whole holder, or a reborrow through one, reaches what its loans borrow, so
@@ -863,7 +868,53 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&used.carried))
     evaluated = used.at
   }
-  return run takeLoan(nodes, owner, &mut walker.*, &path, exclusive, span, node, evaluated, move carried)
+  let crossingProved = path.through && sameUniversalLoanLifetime(nodes, owner, node, &source)
+  return run takeLoan(nodes, owner, &mut walker.*, &path, exclusive, span, node, crossingProved, evaluated, move carried)
+}
+
+fn loanLifetime(ty: &Type) -> Option<Shared<Lifetime>> {
+  return match &ty.* {
+    Type.Reference {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    Type.Slice {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    _ => Option<Shared<Lifetime>>.none()
+  }
+}
+
+fn nodeLoanLifetime(nodes: &[Node], node: NodeId) -> Option<Shared<Lifetime>> {
+  if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, node) {
+    return Shared<Type>.with<Option<Shared<Lifetime>>>(&value, loanLifetime)
+  }
+  return Option<Shared<Lifetime>>.none()
+}
+
+// The innermost descriptor that reaches the borrowed storage, not a lifetime mentioned by a
+// nested field's type. A reference to a descriptor slot is bounded by the slot's place instead.
+fn borrowedPlaceLifetime(nodes: &[Node], node: NodeId) -> Option<Shared<Lifetime>> {
+  return match &nodes[node.index].kind {
+    NodeKind.Expression {form: Expression.Dereference {value}, ..} => nodeLoanLifetime(nodes, value)
+    NodeKind.Expression {form: Expression.Field {value, ..}, ..} => borrowedPlaceLifetime(nodes, value)
+    NodeKind.Expression {form: Expression.Index {value, ..}, ..} => {
+      if sliceValue(nodes, value) { return nodeLoanLifetime(nodes, value) }
+      return borrowedPlaceLifetime(nodes, value)
+    }
+    NodeKind.Expression {form: Expression.PatternBinding {subject, access, ..}, ..} => {
+      if access == BindingAccess.Shared || access == BindingAccess.Exclusive { return borrowedPlaceLifetime(nodes, subject) }
+      return Option<Shared<Lifetime>>.none()
+    }
+    _ => Option<Shared<Lifetime>>.none()
+  }
+}
+
+fn sameUniversalLoanLifetime(nodes: &[Node], owner: &DeclarationId, node: usize,
+  source: &Option<Shared<Lifetime>>) -> bool {
+  if node == usize.MAX { return false }
+  if let Option<Shared<Lifetime>>.Some {value: parent} = &source.* {
+    if regionDomain(&parent, owner) != RegionDomain.Universal { return false }
+    if let Option<Shared<Lifetime>>.Some {value: borrowed} = move nodeLoanLifetime(nodes, NodeId {index: node}) {
+      return Lifetime.equalsShared(&parent, &borrowed)
+    }
+  }
+  return false
 }
 
 // Evaluates `base`, a value with no place, into its hidden owner and returns the point after it.
@@ -923,13 +974,15 @@ effect fn reborrowReferent(nodes: &[Node], owner: &DeclarationId, walker: &mut W
   run Vector<usize>.append(&mut path.steps, referent())
   path.through = true
   let span = nodes[operand.index].origin.location
-  return run takeLoan(nodes, owner, &mut walker.*, &path, exclusive, span, operand.index, at, Vector<Carry>.make())
+  let source = nodeLoanLifetime(nodes, operand)
+  let crossingProved = sameUniversalLoanLifetime(nodes, owner, operand.index, &source)
+  return run takeLoan(nodes, owner, &mut walker.*, &path, exclusive, span, operand.index, crossingProved, at, Vector<Carry>.make())
 }
 
 // Records a new loan of `path` at a fresh point after `at`; the borrowing value carries it after
 // `carried`. `node` is the expression whose type names the loan's regions, or `usize.MAX`.
 effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, path: &Path, exclusive: bool, span: Location, node: usize,
-  at: usize, carried: Vector<Carry>) -> Flow
+  crossingProved: bool, at: usize, carried: Vector<Carry>) -> Flow
 ! OutOfMemoryError ? &mut Allocator {
   let mut onward = move carried
   let mut regions = Vector<Shared<Lifetime>>.make()
@@ -953,6 +1006,7 @@ effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, p
       approximate: false,
       regions: move regions,
       local: !path.through,
+      crossingProved: crossingProved,
       created: usize.MAX,
     },
   )
@@ -3595,7 +3649,7 @@ effect fn wrappedRegionClaims() -> ()
   run Vector<Loan>.append(&mut walker.loans, Loan {
     place: Place {root: 0, steps: Vector<usize>.make()}, exclusive: false,
     origin: Location.make(0, 1), intervals: move intervals, approximate: false,
-    regions: move named, local: true, created: 1,
+    regions: move named, local: true, crossingProved: false, created: 1,
   })
   run Vector<Holding>.append(&mut walker.definitions, Holding {loan: 0, holder: 0, point: 4, source: usize.MAX, read: usize.MAX})
   // A definition created at the bottom of the loop reaches the next header read. There is no

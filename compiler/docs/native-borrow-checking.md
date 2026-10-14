@@ -260,6 +260,13 @@ requirement (the walk's in-flight intervals and live holder points) must lie wit
 availability; the term's required set is their union. Points propagated into the term from a
 shorter region must lie where every one of its loans is available, the intersection. A term no loan
 names stays pending.
+An external reborrow may cross a body scope when its reference or slice lifetime is exactly the
+authenticated universal lifetime of the descriptor reaching that storage. The parent is taken from
+the innermost dereference or slice backing store; a lifetime merely nested in a field type is not
+such evidence. This identity proof does not extend either lifetime or relate distinct universals.
+Crossings with local inference regions, unknown parents, or different parent lifetimes remain
+pending for the symbolic source-boundary proof. Loan conflicts and retained obligations are still
+checked independently.
 When call inference retags a fresh reference borrow with the call's shared region, its retained
 source-validity relations follow that same loan. This renaming is limited to the borrow's own
 fresh atom and relations recorded at that exact source origin. It neither renames an existing
