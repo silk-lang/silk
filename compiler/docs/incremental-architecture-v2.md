@@ -509,7 +509,7 @@ The audit's lesson is to account these separately (audit §1):
 | ---------------------------------------------------------------------------------- | -------- | -------------------------------------------------------------------------------------- |
 | Identity interning                                                                 | yes      | it replaces byte comparison and copying, a net gain (#1427, #1431)                     |
 | Unit table and memo answers                                                        | yes      | memoization is the scheduler; every unit runs at most once                             |
-| Instance walk and reachability                                                     | yes      | emission needs it (`buildRuntime`, `Semantic.silk:64948`)                              |
+| Instance walk and reachability                                                     | yes      | emission needs it (`buildArtifact`, `Semantic.silk:64948`)                              |
 | Diagnostics and reference context                                                  | yes      | output                                                                                 |
 | Fingerprints                                                                       | no       | nothing compares them                                                                  |
 | Edges, dependee maps, stamps                                                       | no       | nothing invalidates                                                                    |
