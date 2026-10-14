@@ -49,7 +49,8 @@ still carries ownership, lifetime, cleanup, and Effect safety obligations for M2
 claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
 scalar, reference, record and sequence forms through demanded MIR and LLVM text. The selector
 `silkc build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
-the default output links an executable. IR output does not invoke Clang. Successful builds emit a
+the form and stage otherwise come from the manifest's `[build].artifact` and `[build].stage`, as in
+the TypeScript CLI. IR output does not invoke Clang. Successful builds emit a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
@@ -1038,8 +1039,12 @@ Each entry records:
   `export "C" fn` declarations of the selected runtime and of the application module. Selfhost takes the single default of
   `[build].composition` in the nearest `silk.toml`; without a composition it takes the
   standard-library `compositions.json` runtime listed for the target and libc, as the bootstrap
-  does. A composition with no default, two defaults, an unlisted default, or no catalog runtime
-  for the target and libc stops the build. Selfhost does not yet read profile `runtime` requests
+  does. Two defaults or an unlisted default stop the build; a composition with no default or no
+  catalog runtime for the target and libc stops an executable build. An object form
+  (`[build].artifact = "object"`) acquires no catalog runtime or catalog storage component, so a
+  package without a `main` builds; a composition without a default selects no runtime for it, and
+  its application's C exports are its only roots, possibly none. A static library form takes the
+  same roots and archives its object with `llvm-ar`. The shared library form is not yet native. Selfhost does not yet read profile `runtime` requests
   (`none` or a named runtime), composition `retention` or `requirements`, and it does not make
   exports declared in other imported modules build roots. A Silk call to an exported
   definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
@@ -1050,8 +1055,10 @@ Each entry records:
   request or on retention roots needs the bootstrap.
 - **Diagnostics and limits:** an unselected runtime is `InvalidBuildComposition` before analysis.
 - **Evidence:** `SemanticLoweringCases` covers runtime C export roots, lane extensions, inactive
-  arms, absent runtime sources, manifest default selection, and catalog selection by target and
-  libc.
+  arms, absent runtime sources, manifest default selection, catalog selection by target and
+  libc, and runtime-less object roots and selection. `compiler/scripts/test-native-build.ts` links a
+  native object with a separately compiled C caller, merges a declared object input, refuses a
+  library input, and cross-compiles an object; it runs on N1 in the selfhost workflow.
 
 ### Selfhost checks observations partially
 
@@ -1060,10 +1067,11 @@ Each entry records:
   [compiler/docs/failure-observer-and-trace.md](compiler/docs/failure-observer-and-trace.md)
   (2026-10-05). Logical frames and `while handling` causes landed with that note's N7 (2026-10-09),
   event 6 for arithmetic traps on 2026-10-10, and event 6 for MIR `Trap` terminators on
-  2026-10-14, and identities for strings, arrays, slices, pointers and `'static` regions on
-  2026-10-14. The remaining rows retire with the suspension stage's executable-closure summary
-  (SEM0216, SEM0217), callback environments in the observer record, and identity rendering for the
-  remaining failure types. The region row below is intended native behavior and does not retire.
+  2026-10-14, identities for strings, arrays, slices, pointers and `'static` regions on
+  2026-10-14, and capturing and staged callbacks through observation adapters on 2026-10-14. The
+  remaining rows retire with the suspension stage's executable-closure summary (SEM0216, SEM0217)
+  and identity rendering for the remaining failure types. The region row below is intended native
+  behavior and does not retire.
 - **Rule:** [TERM-004](apps/docs/content/reference/program-termination-and-reporting.md#term-004--a-failure-report-has-one-stable-minimum)
   to TERM-008 and
   [FAIL-006](apps/docs/content/reference/typed-failures.md#fail-006--typed-failure-applies-ordinary-cleanup-and-preserves-diagnostic-context):
@@ -1082,9 +1090,9 @@ Each entry records:
     has no native counterpart.
   - SEM0216 and SEM0217 are not diagnosed; a context-free `observeUnhandled` returns `0` at run
     time, as the bootstrap's null observer does.
-  - A capturing callback reports `observer-callback`. An observed `fail` of an anonymous tuple or
-    record, a callable, an Effect or foreign function, or a nominal with a requirement-row argument
-    reports `failure-identity`.
+  - A callback whose callable consumes or exclusively lends its environment reports
+    `observer-callback`. An observed `fail` of an anonymous tuple or record, a callable, an Effect
+    or foreign function, or a nominal with a requirement-row argument reports `failure-identity`.
   - Identities spell `'static` as the bootstrap does (`string<'static>`, `&'static [u8]`,
     `memory/driver.Holder<'static>`). By design, selfhost omits any other region (`string`, `&T`,
     `memory/driver.Problem`). The bootstrap prints its internal inference region there
@@ -1098,7 +1106,8 @@ Each entry records:
   needs the bootstrap.
 - **Evidence:** `observedFailuresCarryOriginContext`, `observationsCarryContextThroughExpansions`,
   `nestedObservationsStartFresh`, `observedInstancesEmitTheContextAbi`,
-  `observedTrapsRecordTheirSites` and `storagePrimitivesFollowTheirContracts` in
+  `observedTrapsRecordTheirSites`, `observerCallbacksRunThroughAdapters` and
+  `storagePrimitivesFollowTheirContracts` in
   `compiler/src/semantic/SemanticCallableCases.silk`; the `native-termination-*` corpus programs.
 
 ### Selfhost admits `Intrinsic.NonParking` bounds without proof
