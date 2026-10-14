@@ -112,8 +112,10 @@ const fixtureBuild = Effect.fnUntraced(
 )
 
 const producer = (smokeBody = 'exit 42', ir = 'compiler IR') => `
-test "$1" = build && test "$3" = -o && test "$5" = --emit && test "$7" = --stdlib || exit 91
-test -f "$2" && test -f "$8/silk/i32.silk" || exit 92
+test "$1" = build && test "$3" = -o || exit 91
+if test "$5" = --emit; then test "$6" = llvm-ir && test "$7" = --stdlib && stdlib="$8" || exit 91
+else test "$5" = --stdlib && stdlib="$6" || exit 91; fi
+test -f "$2" && test -f "$stdlib/silk/i32.silk" || exit 92
 printf 'N0 %s\\n' "$*" >> "$0.invocations"
 if test "$6" = llvm-ir; then printf '${ir}' > "$4"; exit 0; fi
 cat > "$4" <<'N1'
@@ -298,8 +300,6 @@ sleep 60`,
         join(options.snapshot, 'compiler/src/main.silk'),
         '-o',
         result.output.path,
-        '--emit',
-        'executable',
         '--stdlib',
         join(options.snapshot, 'packages/compiler/stdlib'),
         '--optimization',

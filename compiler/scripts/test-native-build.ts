@@ -97,7 +97,7 @@ const program = Effect.gen(function* () {
   assert.equal(ran.status, 42, ran.stderr)
   const explicit = yield* invoke(
     silkc,
-    [...argumentsFor('explicit'), '--emit', 'executable'],
+    [...argumentsFor('explicit'), '--emit', 'final'],
     directory,
     { ...process.env, SILKC_CLANG: clang },
   )
@@ -121,7 +121,9 @@ const program = Effect.gen(function* () {
     ['--emit', 'invalid'],
     ['--emit'],
     ['--emit', 'llvm-ir', '--emit', 'llvm-ir'],
-    ['--emit', 'executable', '--emit', 'llvm-ir'],
+    ['--emit', 'final', '--emit', 'llvm-ir'],
+    // The artifact form is the manifest's `[build].artifact`; `--emit` names only a stage.
+    ['--emit', 'executable'],
     ['--target', foreign],
     ['--emit', 'llvm-ir', '--target', 'no-such-target'],
     ['--emit', 'llvm-ir', '--target', foreign, '--target', foreign],
@@ -164,8 +166,8 @@ const program = Effect.gen(function* () {
     join(library, 'consumer.c'),
     'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
   )
-  const manifest = (inputs: string) =>
-    `[package]\nname = "library"\nroot = "src/Main.silk"\n\n[build]\nnative-link-inputs = [${inputs}]\n`
+  const manifest = (inputs: string, artifact = 'object') =>
+    `[package]\nname = "library"\nroot = "src/Main.silk"\n\n[build]\nartifact = "${artifact}"\nnative-link-inputs = [${inputs}]\n`
   const tools = dirname(clang)
   const inspect = Effect.fnUntraced(function* (object: string) {
     const header = yield* invoke(join(tools, 'llvm-readobj'), ['--file-header', object], library)
@@ -187,8 +189,6 @@ const program = Effect.gen(function* () {
     'src/Main.silk',
     '-o',
     output,
-    '--emit',
-    'object',
     '--stdlib',
     standardLibrary,
     ...selectors,
@@ -246,19 +246,75 @@ const program = Effect.gen(function* () {
   assert.notEqual(unmergeable.status, 0, 'a library input was merged into an object')
   assert.equal(yield* fs.exists(join(library, 'unmergeable.o')), false)
   assert.equal(yield* fs.exists(marker), false)
-  // An object for another target is compiled for that target without a linker.
+  // An object for each supported native target is compiled for that target without a linker.
   yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
-  const crossObject = yield* invoke(
+  for (const [target, machine] of [
+    ['x86_64-unknown-linux-gnu', /Format: elf64-x86-64/],
+    ['aarch64-unknown-linux-gnu', /Format: elf64-littleaarch64/],
+    ['aarch64-apple-darwin', /Format: Mach-O arm64/],
+  ] as const) {
+    const crossObject = yield* invoke(
+      silkc,
+      libraryArguments(`${target}.o`, '--target', target),
+      library,
+      { ...process.env, SILKC_CLANG: clang },
+    )
+    assert.equal(crossObject.status, 0, crossObject.stderr)
+    const crossed = yield* inspect(`${target}.o`)
+    assert.match(crossed.header, machine)
+    assert.ok(exported(crossed.symbols, 'silk_answer'), crossed.symbols.join('\n'))
+    assert.ok(!exported(crossed.symbols, 'main'), `${target}: an object form acquires no startup`)
+  }
+  // A stage carries the manifest's form: the object form's IR has its export and no startup.
+  const formIr = yield* invoke(
     silkc,
-    libraryArguments('cross.o', '--target', foreign),
+    libraryArguments('form.ll', '--emit', 'llvm-ir'),
+    library,
+    { ...process.env, SILKC_CLANG: sentinel },
+  )
+  assert.equal(formIr.status, 0, formIr.stderr)
+  const formText = yield* fs.readFileString(join(library, 'form.ll'))
+  assert.match(formText, /^define [^\n]*@silk_answer\(/m)
+  assert.doesNotMatch(formText, /^define [^\n]*@main\(/m)
+  // Intermediate stages compile for their target and merge no declared inputs.
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('{ object = "offset.o" }'))
+  const assembly = yield* invoke(
+    silkc,
+    libraryArguments('form.s', '--emit', 'assembly', '--target', 'aarch64-unknown-linux-gnu'),
     library,
     { ...process.env, SILKC_CLANG: clang },
   )
-  assert.equal(crossObject.status, 0, crossObject.stderr)
-  const crossHeader = (yield* inspect('cross.o')).header
-  assert.match(crossHeader, foreign.startsWith('x86_64') ? /x86-64/ : /Mach-O arm64/)
+  assert.equal(assembly.status, 0, assembly.stderr)
+  assert.match(yield* fs.readFileString(join(library, 'form.s')), /silk_answer:/)
+  const bitcode = yield* invoke(
+    silkc,
+    libraryArguments('form.bc', '--emit', 'llvm-bitcode'),
+    library,
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(bitcode.status, 0, bitcode.stderr)
+  assert.equal(Buffer.from(yield* fs.readFile(join(library, 'form.bc'))).subarray(0, 2).toString(), 'BC')
+  const stagedObject = yield* invoke(
+    silkc,
+    libraryArguments('staged.o', '--emit', 'object'),
+    library,
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(stagedObject.status, 0, stagedObject.stderr)
+  assert.ok(!exported((yield* inspect('staged.o')).symbols, 'offset'), 'a stage merged an input')
+  // A form that is not native yet is refused before any tool runs.
+  for (const artifact of ['shared-library', 'static-library']) {
+    yield* fs.writeFileString(join(library, 'silk.toml'), manifest('', artifact))
+    const refused = yield* invoke(silkc, libraryArguments('refused'), library, {
+      ...process.env,
+      SILKC_CLANG: sentinel,
+    })
+    assert.equal(refused.status, 2, `${artifact}: ${refused.stderr}`)
+    assert.equal(yield* fs.exists(join(library, 'refused')), false)
+    assert.equal(yield* fs.exists(marker), false)
+  }
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run and object artifacts passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, object artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
