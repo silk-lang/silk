@@ -3791,6 +3791,77 @@ pub fn main() -> i32 {
 }`,
     expected: { _tag: 'Completes', result: 42 },
   },
+  // Floating-point and char members in closed structural unions: returns injecting each member,
+  // widening into a larger union, struct fields, contextual array elements, and exhaustive matches
+  // that read back exact payloads, including negative zero and a large f64.
+  {
+    name: 'structural-union-float-char-members',
+    source: `struct Holder { value: i32 | f64 }
+fn pick(flag: bool) -> i32 | f64 {
+  if flag { return 7 }
+  return 2.5
+}
+fn small(flag: bool) -> f32 | u8 {
+  let real: f32 = 1.25
+  let byte: u8 = 200
+  if flag { return real }
+  return byte
+}
+fn letter(flag: bool) -> char | i64 {
+  let big: i64 = -9000000000
+  if flag { return 'z' }
+  return big
+}
+fn widen(value: i32 | f64) -> i32 | f64 | char {
+  return value
+}
+fn score(value: i32 | f64) -> i32 {
+  return match value {
+    i32 whole => whole
+    f64 real => {
+      if real == 2.5 { return 100 }
+      if real == -0.0 { return 200 }
+      if real == 1.0e300 { return 300 }
+      return 999
+    }
+  }
+}
+fn scoreWide(value: i32 | f64 | char) -> i32 {
+  return match value {
+    i32 whole => whole
+    f64 real => { if real == 2.5 { return 10 } return 99 }
+    char c => { if c == 'q' { return 20 } return 98 }
+  }
+}
+fn scoreSmall(value: f32 | u8) -> i32 {
+  return match value {
+    f32 real => { if real == 1.25 { return 1 } return 90 }
+    u8 byte => { if byte == 200 { return 2 } return 91 }
+  }
+}
+fn scoreLetter(value: char | i64) -> i32 {
+  return match value {
+    char c => { if c == 'z' { return 4 } return 92 }
+    i64 big => { if big == -9000000000 { return 8 } return 93 }
+  }
+}
+pub fn main() -> i32 {
+  let mut failures = 0
+  if score(pick(true)) != 7 { failures = failures + 1 }
+  if score(pick(false)) != 100 { failures = failures + 2 }
+  if score(-0.0) + score(1.0e300) != 500 { failures = failures + 4 }
+  if scoreWide(widen(pick(false))) != 10 { failures = failures + 8 }
+  if scoreWide('q') != 20 { failures = failures + 16 }
+  if scoreSmall(small(true)) + scoreSmall(small(false)) != 3 { failures = failures + 32 }
+  if scoreLetter(letter(true)) + scoreLetter(letter(false)) != 12 { failures = failures + 64 }
+  let holder = Holder { value: 2.5 }
+  let items: [i32 | f64; 3] = [1, 2.5, 3]
+  if score(holder.value) + score(items[0]) + score(items[1]) + score(items[2]) != 204 { failures = failures + 128 }
+  if failures == 0 { return 42 }
+  return failures
+}`,
+    expected: { _tag: 'Completes', result: 42 },
+  },
   // A non-generic nominal union: payload and unit variants, construction, call results, and shared
   // and consuming matches with a guard and a universal arm.
   {
@@ -9814,6 +9885,31 @@ pub fn main() -> i32 {
   return 42
 }`,
     expected: { _tag: 'Completes', result: 42 },
+  },
+  // A generic caller runs a generic service operation whose environment is named: each run
+  // selects the provided Counting<i64> witness through the instantiated requirement.
+  {
+    name: 'generic-service-operation-named-environment',
+    source: `import silk.effect { Effect }
+service Store<T> { effect<'env> fn put<'env>(value: T) -> i32 ? &mut Store<T> }
+struct Counting<T> { count: i32 }
+impl<T> Store<T> for Counting<T> {
+  effect<'env> fn put<'env>(self: &mut Self, value: T) -> i32 {
+    drop value
+    self.count = self.count + 1
+    return self.count
+  }
+}
+effect<'env> fn putTwice<'env, T>(first: T, second: T) -> i32 ? &mut Store<T> {
+  let a = run Store<T>.put(move first)
+  let b = run Store<T>.put(move second)
+  return a + b
+}
+pub fn main() -> i32 {
+  let mut store = Counting<i64> { count: 0 }
+  return run putTwice<i64>(1, 2) |> Effect.provideMut<Store<i64>>(&mut store)
+}`,
+    expected: { _tag: 'Completes', result: 3 },
   },
   {
     name: 'finite-effect-join-selected-requirement',
