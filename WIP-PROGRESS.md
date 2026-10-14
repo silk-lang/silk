@@ -119,7 +119,21 @@ effect fn release() -> () { return run Effect.suspend(parks()) }
 pub fn main() -> i32 { return run Effect.ensuringNonParking(protected(), release()) }
 ```
 
-## PR2 design (chosen) and state
+## Status 2026-10-14 (later session)
+
+- PR1 is #1682 (WIP commit dropped, head 7317a0fe1). Case passed, TS check clean, DDC dispatched (run 38608507335).
+- PR2 implemented on this branch (uncommitted pieces committed as a WIP checkpoint): entry obligations from
+  `nonParkingSubjects` in lowerMir, `executableTargets` (CallableValue, CallableSchema -> declaration targets,
+  composites, joins, views, references), `carriesNonParking` forwarding for Finalize/UseRelease, `closeParking`,
+  `nonParkingViolations` (runtime-module sites last), immediate-run references use the call node's origin.
+  Probes match the bootstrap (r1 6:35, r2 5:31, native_start 135:16, service 8:45, suspendpark, mainnests and
+  calmfinal accepted) except direct intrinsic (native 6:10 at `run`, bootstrap 6:14) and forwarded bounds
+  (bootstrap dedups to invoke's parameter anchor 4:11). `unreached` calm target is rejected natively, accepted by
+  the bootstrap (Julia's open question). Case `nonParkingBoundsAreProvedAtBuild` passes; full
+  SemanticLoweringCases root passed before the main-body edit.
+- Next: other Cases roots, full corpus, TS check, compat entry, adversarial review, PR, DDC.
+
+## PR2 design (original) and state
 
 WIP on `selfhost-nonparking-proof` (does not compile yet; untested):
 - Mir.silk (done): `NonParkingRun {callees: Vector<InstanceKey>, origin}`; `MirFunction.nonParking: Vector<NonParkingRun>`;

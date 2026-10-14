@@ -2523,6 +2523,154 @@ fn spanOf(text: string, spelling: string, occurrence: usize) -> Span {
   return Span.make(start, start + String.utf8Bytes(spelling).length)
 }
 
+test effect fn nonParkingBoundsAreProvedAtBuild() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run nonParkingClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// #1665: an `Intrinsic.NonParking` value may nest a transfer but never park externally, also
+// transitively. A bounded instance owes the proof at the call that reaches it, a finalizer or
+// release whose bound no premise carries owes it at its intrinsic run, and a nonparking service
+// operation owes it for the selected witness at its call (SEM0139). Valid bounded values build.
+effect fn nonParkingClaims() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> ? &mut Allocator | &mut Types {
+  let id = run module("nonparking-proof.silk")
+  let declarations = """
+effect fn guarded<'env, A, E, ?R, ?S, F: once Effect<'env; () ! never ? S> + Intrinsic.NonParking>(
+  self: once Effect<'env; A ! E ? R>, finalizer: F) -> A ! E ? R | S {
+  return run Intrinsic.finalizeEffectNonParking<A, E, R, S>(move self, move finalizer)
+}
+effect fn unbounded<'env, A, E, ?R, ?S, F: once Effect<'env; () ! never ? S>>(self: once Effect<'env; A ! E ? R>, finalizer: F)
+  -> A ! E ? R | S {
+  return run Intrinsic.finalizeEffectNonParking<A, E, R, S>(move self, move finalizer)
+}
+fn invoke<F: fn() -> i32 + Intrinsic.NonParking>(body: F) -> i32 { return body() }
+fn forwards<F: fn() -> i32 + Intrinsic.NonParking>(body: F) -> i32 { return invoke(move body) }
+effect fn provideMut<'env, ?S, A, P, E, ?R>(self: once Effect<'env; A ! E ? R>, provider: &'env mut P) -> A ! E ? Without<R, S>
+where &'env mut P provides S from R {
+  let bound = Intrinsic.bindRequirementMut<S>(move self, provider)
+  return run bound
+}
+service Port { effect fn close() -> () ? &mut Port with Intrinsic.nonParking() }
+effect fn closing() -> () ? &mut Port { run Port.close() }
+effect fn work() -> i32 { return 1 }
+"""
+  let rejectedText = """
+effect fn pause() -> () { return run Intrinsic.relinquish() }
+effect fn release() -> () { return run pause() }
+fn parked() -> i32 {
+  run pause()
+  return 2
+}
+fn alsoParked() -> i32 {
+  run pause()
+  return 4
+}
+struct Restless {}
+effect fn shut(self: &mut Restless) -> () { return run pause() }
+impl Port for Restless { close: Restless.shut }
+fn closed() -> i32 {
+  let mut port = Restless {}
+  run closing() |> provideMut<Port>(&mut port)
+  return 3
+}
+pub fn main() -> i32 {
+  let guardedRun = run guarded(work(), release())
+  let invoked = invoke(parked)
+  let forwarded = forwards(alsoParked)
+  let unboundedRun = run unbounded(work(), release())
+  let serviced = closed()
+  return guardedRun
+}
+"""
+  let rejected = run nonParkingBuild(&id, declarations, rejectedText)
+  let base = String.utf8Bytes(declarations).length
+  run Testing.expect(reportCount(&rejected) == 6,
+    "a build reports each unproved NonParking site once and emits no artifact")
+  run Testing.expect(unprovedAt(&rejected, &id, base + offsetOf(rejectedText, "guarded(work(), release())", usize.ZERO)),
+    "a bounded finalizer that parks through a helper is rejected at the call that reaches the bounded instance")
+  run Testing.expect(unprovedAt(&rejected, &id, base + offsetOf(rejectedText, "invoke(parked)", usize.ZERO)),
+    "a bounded callable that parks is rejected at the call that reaches the bounded instance")
+  run Testing.expect(unprovedAt(&rejected, &id, base + offsetOf(rejectedText, "forwards(alsoParked)", usize.ZERO))
+    && unprovedAt(&rejected, &id, offsetOf(declarations, "invoke(move body)", usize.ZERO)),
+    "a forwarded bound is owed by each bounded instance's own incoming call")
+  run Testing.expect(unprovedAt(&rejected, &id, offsetOf(declarations, "run Intrinsic.finalizeEffectNonParking", usize.ONE)),
+    "a nonparking finalizer whose bound no premise carries is rejected at its intrinsic run")
+  run Testing.expect(unprovedAt(&rejected, &id, offsetOf(declarations, "Port.close()", usize.ZERO)),
+    "a nonparking service operation is rejected at its call when the selected witness parks")
+  let acceptedText = """
+effect fn tidy() -> () { return () }
+fn plain() -> i32 { return 2 }
+struct Calm {}
+effect fn shut(self: &mut Calm) -> () { return () }
+impl Port for Calm { close: Calm.shut }
+fn closed() -> i32 {
+  let mut port = Calm {}
+  run closing() |> provideMut<Port>(&mut port)
+  return 3
+}
+pub fn main() -> i32 {
+  let guardedRun = run guarded(work(), tidy())
+  let invoked = invoke(plain)
+  let forwarded = forwards(plain)
+  let unboundedRun = run unbounded(work(), tidy())
+  let serviced = closed()
+  return guardedRun
+}
+"""
+  let accepted = run nonParkingBuild(&id, declarations, acceptedText)
+  run Testing.expect(match &accepted { BackendBuild.Module {..} => true _ => false },
+    "bounded finalizers, callables, forwarded bounds and service witnesses that never park build")
+  // A nested transfer is not an external park. This entry runtime provides no execution storage,
+  // so the build stops at the suspension boundary after the NonParking proof succeeds.
+  let nestedText = """
+fn nests() -> i32 { return run Intrinsic.suspendEffect(effect { return 3 }) }
+pub fn main() -> i32 { return invoke(nests) }
+"""
+  let nested = run nonParkingBuild(&id, declarations, nestedText)
+  let mut transferred = false
+  if let BackendBuild.Rejected {first, further, ..} = &nested {
+    transferred = Vector<Shared<Rejection>>.length(&further) == usize.ZERO
+      && Shared<Rejection>.with<bool>(&first, fn(value: &Rejection) -> bool { return value.code == RejectionCode.InvalidConfiguration })
+  }
+  run Testing.expect(transferred, "a bounded callable that only nests a transfer satisfies NonParking")
+}
+
+// Builds one application module made of the shared declarations followed by `text`.
+effect fn nonParkingBuild(id: &ModuleId, declarations: string, text: string) -> BackendBuild
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut bytes = run Bytes.copy(String.utf8Bytes(declarations))
+  run Bytes.append(&mut bytes, String.utf8Bytes(text))
+  let source = Option<Bytes>.some(move bytes)
+  let empty = Revision.make()
+  let revision = run Revision.publish(&empty, id, &source)
+  let runtime = run withEntryRuntime(&revision)
+  let mut store = Semantic.traced(move runtime, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu), Option<FinalProfile>.none())
+  let mut request = Request.forApplication(ModuleId.copy(id))
+  return run buildApplication(&mut store, &mut request, staticClosureNodes)
+}
+
+fn unprovedAt(build: &BackendBuild, module: &ModuleId, start: usize) -> bool {
+  if let BackendBuild.Rejected {first, further, ..} = &build.* {
+    if unprovedIs(&first, module, start) { return true }
+    let rest = Vector<Shared<Rejection>>.asSlice(&further)
+    let mut index = usize.ZERO
+    while index < rest.length {
+      if unprovedIs(&rest[index], module, start) { return true }
+      index = index + usize.ONE
+    }
+  }
+  return false
+}
+
+fn unprovedIs(selected: &Shared<Rejection>, module: &ModuleId, start: usize) -> bool {
+  return Shared<Rejection>.with<bool>(selected, fn(value: &Rejection) -> bool {
+    return value.code == RejectionCode.UnsatisfiedExecutableProperty && ModuleId.equals(&value.module, module) && value.span.start == start
+  })
+}
+
 test effect fn localSharedAccessRejectsEveryReachedEscape() -> ()
 ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
   let mut allocator = Allocator.systemAllocatorProvider()
