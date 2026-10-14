@@ -222,9 +222,9 @@ supplied, and outside-owner atoms remain pending. An anonymous body's enclosing 
 their identity and are left for the environment proof. Open capture contents still prevent
 `Checked`. This is groundwork, with no promised gap-count reduction.
 
-An inferred binder initially holding `'static` is not a declared static requirement. Later
-covariant evidence takes the existing binder-shortening proof (LIFE-002), including its variance
-and bound checks, before a body can retain a relation. Explicitly written binders never shorten.
+An inferred binder initially holding `'static` is not a declared static requirement. Retained
+relations record that provisional origin explicitly and remain pending. Inference behavior is
+unchanged; a provisional static relation must not cause SEM0212 or become a declared premise.
 
 ### 4.2 Points
 
