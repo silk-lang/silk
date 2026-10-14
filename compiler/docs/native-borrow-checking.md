@@ -269,7 +269,7 @@ Unknown or local parents and distinct universal lifetimes remain pending for the
 source-boundary proof. A body-local reborrow still needs every retained goal proved; in particular,
 finite body points cannot prove a local atom outlives a universal. Loan conflicts and retained
 obligations are checked independently.
-When call inference retags a fresh reference borrow with the call's shared region, its retained
+When call or aggregate inference retags a fresh reference borrow with its shared region, its retained
 source-validity relations follow that same loan. This renaming is limited to the borrow's own
 fresh atom and relations recorded at that exact source origin. It neither renames an existing
 contextual region nor turns a retained goal into a declared premise.
