@@ -1160,9 +1160,10 @@ Each entry records:
     program forms. An `export "C"` function that C code calls by symbol from inside a NonParking
     scope is outside the proof. The existing ForeignCallback check rejects a suspending callback
     address.
-  - A callable whose result is a composite Effect run inline by its caller is not yet lowered
-    natively (an `Unsupported` gap). When it is, its targets must include the instances the
-    returned composite runs.
+  - A plain function that returns an Effect for its caller to run (as a bracket's release, or as a
+    bounded callable whose result is run) is not yet lowered natively and is refused as
+    unsupported. The proof also treats such a target as inexact, so it stays unproved until a
+    returned Effect's parts can be targeted.
   - `closeSuspendable` does not follow drop edges either; a Drop hook that suspends is outside
     the suspension selection.
 - **Evidence:** `nonParkingBoundsAreProvedAtBuild` in
