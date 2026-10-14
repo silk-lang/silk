@@ -17,7 +17,7 @@ import parser.Parser
 import parser.SyntaxTree
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
-import silk.child_process {ChildProcess, ProcessError}
+import silk.child_process {ChildProcess, ProcessError, ProcessRequest}
 import silk.effect {Effect}
 import silk.filesystem {FileError, FileSystem, Path}
 import silk.host_input {HostInput, HostInputError}
@@ -522,7 +522,8 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 ///
 /// An executable's final stage links the declared inputs and the C libraries for the host. Every
 /// other form or stage is compiled for its target with the profile's relocation model and needs no
-/// linker. An object's final stage merges declared objects and archives by a relocatable link and
+/// linker. An object's final stage merges declared objects and archives by a relocatable link; a
+/// static library's final stage archives its compiled object beside the declared objects. Each
 /// refuses any other declared input; an intermediate stage takes no declared inputs.
 effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
   target: &Target, linkInputs: &[NativeLinkInput]) -> i32
@@ -531,10 +532,15 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   let mut intermediate = run Bytes.copy(Path.rawBytes(output))
   run Bytes.append(&mut intermediate, b".silkc.ll")
   let irPath = run Path.fromBytes(Bytes.asSlice(&intermediate))
+  // A static library's single compiled member is written beside the archive, then removed.
+  let mut memberBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut memberBytes, b".silkc.o")
+  let member = run Path.fromBytes(Bytes.asSlice(&memberBytes))
   let mut process = run NativeToolchain.request()
   let final = stage == Stage.Final
   let linked = final && form == Form.Executable
   let merged = final && form == Form.Object && linkInputs.length > usize.ZERO
+  let archive = final && form == Form.StaticLibrary
   if !linked {
     // The IR names no triple, so a cross-target output states its target to Clang.
     let mut selected = run Bytes.copy(b"--target=")
@@ -570,8 +576,28 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   run ChildProcess.addArgument(&mut process, b"-x")
   run ChildProcess.addArgument(&mut process, b"none")
   run ChildProcess.addArgument(&mut process, b"-o")
-  run ChildProcess.addArgument(&mut process, Path.rawBytes(output))
-  if final {
+  let mut archiver = Option<ProcessRequest>.none()
+  if archive {
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&memberBytes))
+    // `rcsD`: replace members, create the archive, write its symbol index, and zero member times.
+    let mut request = run NativeToolchain.archiver()
+    run ChildProcess.addArgument(&mut request, b"rcsD")
+    run ChildProcess.addArgument(&mut request, Path.rawBytes(output))
+    run ChildProcess.addArgument(&mut request, Bytes.asSlice(&memberBytes))
+    let mut declared = usize.ZERO
+    while declared < linkInputs.length {
+      // An archive member is an object; a declared archive is not nested inside another.
+      match &linkInputs[declared] {
+        NativeLinkInput.Object {path} => { run ChildProcess.addArgument(&mut request, Path.rawBytes(&path)) }
+        _ => { fail InvalidNativeLinkInput {} }
+      }
+      declared = declared + usize.ONE
+    }
+    archiver = Option<ProcessRequest>.some(move request)
+  } else {
+    run ChildProcess.addArgument(&mut process, Path.rawBytes(output))
+  }
+  if final && !archive {
     // Declared inputs precede the C libraries so their own references to libc and libm resolve.
     let mut input = usize.ZERO
     while input < linkInputs.length {
@@ -588,27 +614,33 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   ! FileError | ProcessError | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
     run FileSystem.writeFile(&resource.*, Bytes.asSlice(ir))
-    let outcome = run ChildProcess.submit(&process)
-    return match move ChildProcess.exitCode(&outcome) {
-      Option<i32>.Some {value} => {
-        if value == 0 {
-          return 0
-        }
-        run writeError(ChildProcess.errorBytes(&outcome))
-        return 1
-      }
-      Option<i32>.None => {
-        run writeError(ChildProcess.errorBytes(&outcome))
-        return 1
-      }
+    let compiled = run submitted(&process)
+    if compiled != 0 { return compiled }
+    if let Option<ProcessRequest>.Some {value: archiving} = &archiver {
+      // A stale archive would keep members this build no longer produces.
+      run removeQuietly(output)
+      return run submitted(&archiving)
     }
+    return 0
   }
   let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem {
-    let removed = run Effect.result(FileSystem.removeFile(&resource.*))
-    drop removed
+    run removeQuietly(&resource.*)
+    if archive { run removeQuietly(&member) }
     return ()
   }
   return run Effect.useReleaseNonParking(move irPath, move use, move release)
+}
+
+// Runs one native tool: 0 when it exits successfully, else 1 after forwarding its diagnostics.
+effect fn submitted(process: &ProcessRequest) -> i32
+! ProcessError | OutOfMemoryError | WriterError
+? &mut ChildProcess | &mut Allocator {
+  let outcome = run ChildProcess.submit(process)
+  if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) {
+    if value == 0 { return 0 }
+  }
+  run writeError(ChildProcess.errorBytes(&outcome))
+  return 1
 }
 
 /// A finished compilation: its process status, or for a test build that linked, the identities
@@ -963,9 +995,8 @@ effect fn buildSource(sourcePath: &Path, output: &Path, stage: Option<Stage>, st
     Option<Stage>.Some {value} => value
     Option<Stage>.None => Projects.stage(&project)
   }
-  // A shared library needs hidden visibility for its non-exported definitions, and an archive needs
-  // the archiver; neither is native yet.
-  if form == Form.SharedLibrary || (form == Form.StaticLibrary && selected == Stage.Final) {
+  // A shared library needs hidden visibility for its non-exported definitions; it is not native yet.
+  if form == Form.SharedLibrary {
     run writeError(b"SILK_GAP artifact-form: the ")
     run writeError(Projects.formSpelling(form))
     run writeError(b" form is not native yet\n")
