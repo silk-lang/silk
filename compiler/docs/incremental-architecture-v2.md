@@ -1215,7 +1215,10 @@ was accepted:
    IR of every codegen unit.
 7. **Session order.** Watch mode before the LSP.
 8. **Disk caches.** None in v2. Object code per codegen unit is the first candidate, after a
-   measurement shows it pays.
+   measurement shows it pays. A later
+   [persisted declaration verdicts](persisted-declaration-verdicts.md) note proposes extending
+   this decision to reuse checked declaration facts across processes; that separate design has
+   not been approved for implementation.
 9. **Budgets.** One-shot within 1% of a recorder-free build; the first incremental build within 3%
    time and 5% peak RSS.
 
