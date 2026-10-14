@@ -7587,6 +7587,58 @@ pub fn main() -> i32 { return run Effect.catchAll(program(), noMemory) }`
  * cancelled there: the payload drops while the failure is live, and the failure's node is released
  * before the observer state drops.
  */
+// An observer callback that captures a Copy weight runs through its captured environment for every
+// event of each observation.
+const diagnosticCapturingCallback = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.shared { Shared }
+
+struct Log {
+  origins: i32
+  weighted: i32
+  events: i32
+}
+struct Missing {}
+fn weigh(log: &mut Log, event: u8, weight: i32) -> () {
+  log.events = log.events + 1
+  if event == 0 {
+    log.origins = log.origins + 1
+    log.weighted = log.weighted + weight
+  }
+  return ()
+}
+fn observing<'env, S: 'env, A, ?R, F: fn<'static>(&mut S, u8, usize, usize, string<'static>, string<'static>) -> usize + Intrinsic.NonParking>(state: S, observer: F, body: once Effect<'env; A ? R>) -> once Effect<'env; A ? R> {
+  return Intrinsic.observeDiagnostics<S, A, R, F>(move state, move observer, move body)
+}
+effect fn load() -> i32 ! Missing { fail Missing {} }
+effect fn recovered(error: Missing) -> i32 {
+  drop error
+  return 7
+}
+fn origins(log: &mut Log) -> i32 { return log.origins }
+fn weighted(log: &mut Log) -> i32 { return log.weighted }
+fn events(log: &mut Log) -> i32 { return log.events }
+// The callback captures a Copy weight; each observation calls it through its captured environment.
+effect fn exercise() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let log = run Shared<Log>.make(Log { origins: 0, weighted: 0, events: 0 }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let weight = 3
+  let weighed = fn(state: &mut Shared<Log>, event: u8, first: usize, second: usize, identity: string<'static>, origin: string<'static>) -> usize {
+    Shared.withMut(&state.*, weigh(event, weight))
+    if event == 0 { return 1 }
+    return 0
+  }
+  let first = run observing(Shared.clone(&log), weighed, Effect.catchAll(load(), recovered))
+  let second = run observing(Shared.clone(&log), weighed, Effect.catchAll(load(), recovered))
+  if first + second != 14 { return 1 }
+  if Shared.withMut(&log, origins) != 2 { return 2 }
+  if Shared.withMut(&log, weighted) != 6 { return 3 }
+  if Shared.withMut(&log, events) < 2 { return 4 }
+  return 42
+}
+effect fn exhausted(error: OutOfMemoryError) -> i32 { return 5 }
+pub fn main() -> i32 { return run Effect.catchAll(exercise(), exhausted) }`
+
 const diagnosticCancelledHandlerRelease = `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.execution { Execution, Wake }
@@ -11328,6 +11380,11 @@ pub effect fn main() -> () ! SomeError { return () }`,
     expected: { _tag: 'Completes', result: 42 },
   },
   {
+    name: 'diagnostic-observer-capturing-callback',
+    source: diagnosticCapturingCallback,
+    expected: { _tag: 'Completes', result: 42 },
+  },
+  {
     name: 'native-termination-logical-path',
     source: `pub struct NotFoundError {}
 
@@ -11415,6 +11472,20 @@ pub effect fn main() {
 }`,
     nativeStderr:
       'fatal trap: division by zero\n  at memory/driver.calculate (memory/driver:2:10)\n',
+    expected: { _tag: 'Trap' },
+  },
+  {
+    name: 'native-termination-fatal-bounds',
+    source: `fn pick(values: &[i32], at: usize) -> i32 {
+  return values[at]
+}
+
+pub effect fn main() {
+  let values = [1, 2, 3]
+  let z = pick(&values, 5)
+  return ()
+}`,
+    nativeStderr: 'fatal trap: index out of bounds\n  at memory/driver.pick (memory/driver:2:10)\n',
     expected: { _tag: 'Trap' },
   },
   {
