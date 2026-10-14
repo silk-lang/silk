@@ -214,6 +214,18 @@ Region variables live only in the side table. Each is one of:
 Declared outlives bounds and `where` premises become assumptions between universal regions. They
 are given, not proved, in the body itself (LIFE-002).
 
+The R3 2a premise check runs inside the body query. It checks retained relations made solely
+of `'static` and that named body's declared lifetime atoms against `BodyPremises`, including
+input well-formedness edges. Goals never become premises. A rigid relation absent from that
+closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained origin; local, invocation,
+supplied, and outside-owner atoms remain pending. An anonymous body's enclosing atoms retain
+their identity and are left for the environment proof. Open capture contents still prevent
+`Checked`. This is groundwork, with no promised gap-count reduction.
+
+An inferred binder initially holding `'static` is not a declared static requirement. Later
+covariant evidence takes the existing binder-shortening proof (LIFE-002), including its variance
+and bound checks, before a body can retain a relation. Explicitly written binders never shorten.
+
 ### 4.2 Points
 
 Points are the typed body's evaluation points (§3), plus one exit point per `Return` and `Fail`.

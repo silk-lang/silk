@@ -31650,19 +31650,14 @@ fn freshLifetimeOrdinal(region: &Shared<Lifetime>, fresh: &DeclarationId) -> usi
   })
 }
 
-// Whether a later operand's covariant region `source` meets `bound`, the region an earlier operand
-// fixed for the same inferred binder: a caller-local region or inferred 'static. An offered
-// 'static, or the caller's own lifetime against a caller-local loan, outlives it, which is proven.
-// A caller-local region, or any region where the
-// binder holds 'static (inferred 'static evidence never requires 'static), relates to `bound` as a
-// pair typing cannot prove yet. A bound declared region, and any other pair, is a mismatch.
+// A later operand may retain a relation to a caller-local inference region. Inferred 'static
+// evidence must instead take the existing `shortenedBinder` path: retaining source -> 'static
+// would turn an inference choice into a false declared requirement (LIFE-002).
 effect fn relatesToFixedRegion(bound: &Shared<Lifetime>, source: &Shared<Lifetime>, caller: &DeclarationId,
   relations: &mut Vector<RegionPair>) -> bool ! OutOfMemoryError ? &mut Allocator {
-  if Lifetime.equalsShared(bound, source) { return false }
-  let staticBound = Shared<Lifetime>.with<bool>(bound, staticLifetime)
-  if !staticBound && !callerLocalRegion(bound, caller) { return false }
+  if Lifetime.equalsShared(bound, source) || !callerLocalRegion(bound, caller) { return false }
   if Shared<Lifetime>.with<bool>(source, staticLifetime) || enclosingLifetimeOutlivesLoan(source, bound) { return true }
-  if !staticBound && !callerLocalRegion(source, caller) { return false }
+  if !callerLocalRegion(source, caller) { return false }
   run Vector<RegionPair>.append(&mut relations.*, RegionPair {offered: Shared<Lifetime>.clone(source),
     wanted: Shared<Lifetime>.clone(bound)})
   return true
@@ -36356,7 +36351,13 @@ effect fn finishLiteral(
   // The anonymous body is checked like any body: its outer locals are the captured places, and
   // its own loans and moves are proved before it is published (ANON-OWN-001).
   let mut unchecked = BodyBorrowStatus.Regions
-  let pending = openRegionObligation(Vector<BodySafetyObligation>.asSlice(&obligations))
+  let pending = match move run checkDeclaredRegions(&identity, bodyConstraints, Vector<BodySafetyObligation>.asSlice(&obligations)) {
+    Result<bool, BodyOrigin>.Success {value} => value
+    Result<bool, BodyOrigin>.Failure {error: origin} => {
+      return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module,
+        RejectionCode.UnsatisfiedLifetimeBound, BodyOrigin.span(origin, &run cursorAnchor(cursor))))
+    }
+  }
   if bodyHasLoans(Vector<BodyNode>.asSlice(&checkedNodes)) {
     let cleanupAnchor = run cursorAnchor(cursor)
     let observers = match move run borrowCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &identity,
@@ -42264,21 +42265,121 @@ effect fn appendByValueFields(fields: &[BodyAggregateField], operands: &mut Vect
   return ()
 }
 
-// Whether typing retained a region obligation the borrow stage does not discharge yet: a region
-// relation it admitted without proof, or the unresolved contents of a capture.
-fn openRegionObligation(obligations: &[BodySafetyObligation]) -> bool {
+// Only this named body's declared atoms and 'static have a complete premise-only proof here.
+// Invocation, outside-owner and local atoms remain for the point/environment proof; in particular
+// an enclosing parameter is never silently promoted to 'static in an anonymous body.
+fn ownDeclaredRegion(region: &Shared<Lifetime>, caller: &DeclarationId) -> bool {
+  return Lifetime.allAtoms(region, fn(value: &Lifetime) -> bool {
+    return match &value.* {
+      Lifetime.Static => true
+      Lifetime.Parameter {declaration, ..} => !anonymousOwner(&declaration) && DeclarationId.equals(&declaration, caller)
+      _ => false
+    }
+  })
+}
+
+// Returns whether obligations remain, or the origin of a rigid relation not implied by the body's
+// declared/header premises (SEM0212). Retained relations are goals, never assumptions. Derive the
+// input-contents edges lazily so ordinary local-only bodies allocate no premise-proof workspace.
+effect fn checkDeclaredRegions(caller: &DeclarationId, constraints: &[Constraint], obligations: &[BodySafetyObligation])
+  -> Result<bool, BodyOrigin> ! OutOfMemoryError ? &mut Allocator {
+  let mut pending = false
+  let mut premises = Vector<Constraint>.make()
+  let mut derived = false
   let mut at = usize.ZERO
   while at < obligations.length {
     match &obligations[at] {
-      BodySafetyObligation.RegionRelation {..} => { return true }
-      BodySafetyObligation.Contents {..} => { return true }
+      BodySafetyObligation.RegionRelation {origin, offered, wanted} => {
+        if ownDeclaredRegion(&offered, caller) && ownDeclaredRegion(&wanted, caller) {
+          if !derived { premises = run contentsOutlives(constraints) derived = true }
+          if !run knownOutlives(Vector<Constraint>.asSlice(&premises), &offered, &wanted) {
+            return Result<bool, BodyOrigin>.failResult(origin)
+          }
+        } else { pending = true }
+      }
+      BodySafetyObligation.Contents {..} => { pending = true }
       _ => ()
     }
+    at = at + usize.ONE
+  }
+  return Result<bool, BodyOrigin>.succeed(pending)
+}
+
+// Node obligation collection adds capture contents, but no new RegionRelation. Relations have
+// already been checked before the loan walk; open capture contents still prevent Checked.
+fn openCaptureContents(obligations: &[BodySafetyObligation]) -> bool {
+  let mut at = usize.ZERO
+  while at < obligations.length {
+    if let BodySafetyObligation.Contents {..} = &obligations[at] { return true }
     at = at + usize.ONE
   }
   return false
 }
 
+
+test effect fn declaredRegionPremisesKeepGoalsSeparate() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run declaredRegionPremiseClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn declaredRegionPremiseClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let module = run ModuleId.make(b"memory", b"example", b"region-premises.silk")
+  let mut owners = Vector<OwnerStep>.make()
+  run Vector<OwnerStep>.append(&mut owners, OwnerStep {kind: OwnerKind.Function,
+    name: Option<Bytes>.some(run Bytes.copy(b"caller")), occurrence: usize.ZERO})
+  let caller = run DeclarationId.fromParts(move module, move owners)
+  let a = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&caller), ordinal: 0})
+  let b = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&caller), ordinal: 1})
+  let c = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&caller), ordinal: 2})
+  let forever = run Shared<Lifetime>.make(Lifetime.Static)
+  let origin = BodyOrigin {node: 7, location: Location.make(11, 13)}
+  let mut premises = Vector<Constraint>.make()
+  run Vector<Constraint>.append(&mut premises, Constraint.Outlives {longer: Shared<Lifetime>.clone(&a), shorter: Shared<Lifetime>.clone(&b)})
+  run Vector<Constraint>.append(&mut premises, Constraint.Outlives {longer: Shared<Lifetime>.clone(&b), shorter: Shared<Lifetime>.clone(&c)})
+  let mut goals = Vector<BodySafetyObligation>.make()
+  run Vector<BodySafetyObligation>.append(&mut goals, BodySafetyObligation.RegionRelation {
+    origin: origin, offered: Shared<Lifetime>.clone(&a), wanted: Shared<Lifetime>.clone(&c)})
+  run Vector<BodySafetyObligation>.append(&mut goals, BodySafetyObligation.RegionRelation {
+    origin: origin, offered: Shared<Lifetime>.clone(&forever), wanted: Shared<Lifetime>.clone(&a)})
+  run Vector<BodySafetyObligation>.append(&mut goals, BodySafetyObligation.RegionRelation {
+    origin: origin, offered: Shared<Lifetime>.clone(&b), wanted: Shared<Lifetime>.clone(&b)})
+  let proved = run checkDeclaredRegions(&caller, Vector<Constraint>.asSlice(&premises), Vector<BodySafetyObligation>.asSlice(&goals))
+  run Testing.expect(match &proved { Result<bool, BodyOrigin>.Success {value} => !value _ => false },
+    "declared transitive, static and reflexive relations are discharged")
+  let local = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&caller), ordinal: 9})
+  run Vector<BodySafetyObligation>.append(&mut goals, BodySafetyObligation.RegionRelation {
+    origin: origin, offered: Shared<Lifetime>.clone(&a), wanted: move local})
+  let pending = run checkDeclaredRegions(&caller, Vector<Constraint>.asSlice(&premises), Vector<BodySafetyObligation>.asSlice(&goals))
+  run Testing.expect(match &pending { Result<bool, BodyOrigin>.Success {value} => value _ => false },
+    "even a parameter-to-local relation waits for the point proof")
+  let failure = BodyOrigin {node: 17, location: Location.make(21, 23)}
+  run Vector<BodySafetyObligation>.append(&mut goals, BodySafetyObligation.RegionRelation {
+    origin: failure, offered: Shared<Lifetime>.clone(&c), wanted: Shared<Lifetime>.clone(&a)})
+  let reversed = run checkDeclaredRegions(&caller, Vector<Constraint>.asSlice(&premises), Vector<BodySafetyObligation>.asSlice(&goals))
+  run Testing.expect(match &reversed {
+    Result<bool, BodyOrigin>.Failure {error} => error.node == failure.node && error.location.start == failure.location.start && error.location.end == failure.location.end
+    _ => false
+  }, "pending locals do not hide an invalid rigid relation, and the offending origin is retained")
+  let mut staticGoal = Vector<BodySafetyObligation>.make()
+  run Vector<BodySafetyObligation>.append(&mut staticGoal, BodySafetyObligation.RegionRelation {
+    origin: origin, offered: Shared<Lifetime>.clone(&a), wanted: Shared<Lifetime>.clone(&forever)})
+  let invalidStatic = run checkDeclaredRegions(&caller, Vector<Constraint>.asSlice(&premises), Vector<BodySafetyObligation>.asSlice(&staticGoal))
+  run Testing.expect(match &invalidStatic { Result<bool, BodyOrigin>.Failure {..} => true _ => false },
+    "a declared parameter does not outlive static without a premise")
+  run Vector<Constraint>.append(&mut premises, Constraint.Outlives {longer: Shared<Lifetime>.clone(&a), shorter: Shared<Lifetime>.clone(&forever)})
+  let validStatic = run checkDeclaredRegions(&caller, Vector<Constraint>.asSlice(&premises), Vector<BodySafetyObligation>.asSlice(&staticGoal))
+  run Testing.expect(match &validStatic { Result<bool, BodyOrigin>.Success {value} => !value _ => false },
+    "a written static premise admits the same relation")
+  let foreign = run Shared<Lifetime>.make(Lifetime.Supplied {ordinal: 0})
+  run Vector<BodySafetyObligation>.append(&mut staticGoal, BodySafetyObligation.RegionRelation {
+    origin: origin, offered: move foreign, wanted: move forever})
+  let unknown = run checkDeclaredRegions(&caller, Vector<Constraint>.asSlice(&premises), Vector<BodySafetyObligation>.asSlice(&staticGoal))
+  run Testing.expect(match &unknown { Result<bool, BodyOrigin>.Success {value} => value _ => false },
+    "supplied atoms stay pending rather than acquiring a static premise or a rejection")
+  return ()
+}
 
 // An affine place taken by value must say `move`: the first such operand in node order is
 // `ExplicitMoveRequired` at that operand (OWN-002, the bootstrap's `OWN0003`). An exclusive
@@ -60308,7 +60409,13 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
   if staticBody {
     unchecked = BodyBorrowStatus.Awaiting
   } else {
-    let pending = openRegionObligation(Vector<BodySafetyObligation>.asSlice(&relations))
+    let pending = match move run checkDeclaredRegions(&identity, Vector<Constraint>.asSlice(&constraints), Vector<BodySafetyObligation>.asSlice(&relations)) {
+      Result<bool, BodyOrigin>.Success {value} => value
+      Result<bool, BodyOrigin>.Failure {error: origin} => {
+        return rejectedBody(run reject(&resolver.*, &module, RejectionCode.UnsatisfiedLifetimeBound,
+          BodyOrigin.span(origin, &run cursorAnchor(&cursor))), move dependencies)
+      }
+    }
     if bodyHasLoans(Vector<BodyNode>.asSlice(&nodes)) {
       let cleanupAnchor = run cursorAnchor(&cursor)
       let observers = match move run borrowCleanup(&mut resolver.*, &mut owner.*, &mut dependencies, &identity,
@@ -60343,7 +60450,7 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
     )
     // A checked body has discharged every obligation typing retained; a capture's open contents
     // are not discharged yet.
-    if unchecked == BodyBorrowStatus.Checked && openRegionObligation(Vector<BodySafetyObligation>.asSlice(&obligations)) {
+    if unchecked == BodyBorrowStatus.Checked && openCaptureContents(Vector<BodySafetyObligation>.asSlice(&obligations)) {
       unchecked = BodyBorrowStatus.Regions
     }
     if unchecked != BodyBorrowStatus.Checked {
