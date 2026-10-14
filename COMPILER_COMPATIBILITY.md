@@ -49,8 +49,8 @@ still carries ownership, lifetime, cleanup, and Effect safety obligations for M2
 claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
 scalar, reference, record and sequence forms through demanded MIR and LLVM text. The selector
 `silkc build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
-the default output links an executable and `--emit object` compiles a relocatable object. IR output
-does not invoke Clang. Successful builds emit a
+the default output links an executable, `--emit object` compiles a relocatable object and
+`--emit static-library` archives one. IR output does not invoke Clang. Successful builds emit a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
@@ -1055,11 +1055,11 @@ Each entry records:
   `[build].composition` in the nearest `silk.toml`; without a composition it takes the
   standard-library `compositions.json` runtime listed for the target and libc, as the bootstrap
   does. Two defaults or an unlisted default stop the build; a composition with no default or no
-  catalog runtime for the target and libc stops an executable build. An object form
-  (`silkc build --emit object`) acquires no catalog runtime or catalog storage component, so a
-  package without a `main` builds; a composition without a default selects no runtime for it, and
-  its application's C exports are its only roots, possibly none. Static and shared library forms
-  are not yet native. Selfhost does not yet read profile `runtime` requests
+  catalog runtime for the target and libc stops an executable build. An object or static library
+  form (`silkc build --emit object|static-library`) acquires no catalog runtime or catalog storage
+  component, so a package without a `main` builds; a composition without a default selects no
+  runtime for it, and its application's C exports are its only roots, possibly none. The shared
+  library form is not yet native. Selfhost does not yet read profile `runtime` requests
   (`none` or a named runtime), composition `retention` or `requirements`, and it does not make
   exports declared in other imported modules build roots. A Silk call to an exported
   definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
@@ -1072,8 +1072,9 @@ Each entry records:
 - **Evidence:** `SemanticLoweringCases` covers runtime C export roots, lane extensions, inactive
   arms, absent runtime sources, manifest default selection, catalog selection by target and
   libc, and runtime-less object roots and selection. `compiler/scripts/test-native-build.ts` links a
-  native object with a separately compiled C caller, merges a declared object input, refuses a
-  library input, and cross-compiles an object; it runs on N1 in the selfhost workflow.
+  native object and static library with a separately compiled C caller, merges or archives a
+  declared object input, refuses inputs a form cannot carry, replaces a stale archive, and
+  cross-compiles both forms; it runs on N1 in the selfhost workflow.
 
 ### Selfhost reports only arithmetic observed traps and checks observations partially
 

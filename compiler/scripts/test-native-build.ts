@@ -182,19 +182,19 @@ const program = Effect.gen(function* () {
     library,
   )
   assert.equal(compiledHelper.status, 0, compiledHelper.stderr)
-  const libraryArguments = (output: string, ...selectors: ReadonlyArray<string>) => [
+  const formArguments = (form: string, output: string, ...selectors: ReadonlyArray<string>) => [
     'build',
     'src/Main.silk',
     '-o',
     output,
     '--emit',
-    'object',
+    form,
     '--stdlib',
     standardLibrary,
     ...selectors,
   ]
   yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
-  const object = yield* invoke(silkc, libraryArguments('silk.o'), library, {
+  const object = yield* invoke(silkc, formArguments('object', 'silk.o'), library, {
     ...process.env,
     SILKC_CLANG: clang,
   })
@@ -218,7 +218,7 @@ const program = Effect.gen(function* () {
   assert.equal((yield* invoke(join(library, 'consumer'), [], library)).status, 0)
   // Declared objects are merged into the object by a relocatable link.
   yield* fs.writeFileString(join(library, 'silk.toml'), manifest('{ object = "offset.o" }'))
-  const merged = yield* invoke(silkc, libraryArguments('merged.o'), library, {
+  const merged = yield* invoke(silkc, formArguments('object', 'merged.o'), library, {
     ...process.env,
     SILKC_CLANG: clang,
   })
@@ -239,7 +239,7 @@ const program = Effect.gen(function* () {
     join(library, 'silk.toml'),
     manifest('{ library = "m", mode = "dynamic" }'),
   )
-  const unmergeable = yield* invoke(silkc, libraryArguments('unmergeable.o'), library, {
+  const unmergeable = yield* invoke(silkc, formArguments('object', 'unmergeable.o'), library, {
     ...process.env,
     SILKC_CLANG: sentinel,
   })
@@ -250,15 +250,94 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
   const crossObject = yield* invoke(
     silkc,
-    libraryArguments('cross.o', '--target', foreign),
+    formArguments('object', 'cross.o', '--target', foreign),
     library,
     { ...process.env, SILKC_CLANG: clang },
   )
   assert.equal(crossObject.status, 0, crossObject.stderr)
   const crossHeader = (yield* inspect('cross.o')).header
   assert.match(crossHeader, foreign.startsWith('x86_64') ? /x86-64/ : /Mach-O arm64/)
+  // A static library archives the compiled object beside the declared objects, and only those.
+  const members = Effect.fnUntraced(function* (archive: string) {
+    const listed = yield* invoke(join(tools, 'llvm-ar'), ['t', archive], library)
+    assert.equal(listed.status, 0, listed.stderr)
+    return listed.stdout.split('\n').filter((line) => line.length > 0)
+  })
+  // The default archiver is the llvm-ar beside the configured Clang.
+  const { SILKC_AR: _configuredArchiver, ...inherited } = process.env
+  const archiveEnvironment = { ...inherited, SILKC_CLANG: clang }
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest('{ object = "offset.o" }'))
+  const bundled = yield* invoke(
+    silkc,
+    formArguments('static-library', 'libsilk.a'),
+    library,
+    archiveEnvironment,
+  )
+  assert.equal(bundled.status, 0, bundled.stderr)
+  assert.deepEqual(yield* members('libsilk.a'), ['libsilk.a.silkc.o', 'offset.o'])
+  const bundledConsumer = yield* invoke(
+    clang,
+    ['consumer.c', 'libsilk.a', '-o', 'archive-consumer'],
+    library,
+  )
+  assert.equal(bundledConsumer.status, 0, bundledConsumer.stderr)
+  assert.equal((yield* invoke(join(library, 'archive-consumer'), [], library)).status, 0)
+  // Rebuilding replaces the archive, so a member the build no longer declares disappears.
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
+  const rebuilt = yield* invoke(
+    silkc,
+    formArguments('static-library', 'libsilk.a'),
+    library,
+    archiveEnvironment,
+  )
+  assert.equal(rebuilt.status, 0, rebuilt.stderr)
+  assert.deepEqual(yield* members('libsilk.a'), ['libsilk.a.silkc.o'])
+  for (const intermediate of ['libsilk.a.silkc.o', 'libsilk.a.silkc.ll'])
+    assert.equal(yield* fs.exists(join(library, intermediate)), false, intermediate)
+  const archived = yield* inspect('libsilk.a')
+  assert.ok(exported(archived.symbols, 'silk_answer') && !exported(archived.symbols, 'main'))
+  const archiveConsumer = yield* invoke(
+    clang,
+    ['consumer.c', 'libsilk.a', 'offset.o', '-o', 'archive-consumer'],
+    library,
+  )
+  assert.equal(archiveConsumer.status, 0, archiveConsumer.stderr)
+  assert.equal((yield* invoke(join(library, 'archive-consumer'), [], library)).status, 0)
+  // An archive is not nested in another, and a missing archiver fails without an archive.
+  yield* fs.writeFileString(
+    join(library, 'silk.toml'),
+    manifest('{ static-archive = "libsilk.a" }'),
+  )
+  const nested = yield* invoke(silkc, formArguments('static-library', 'nested.a'), library, {
+    ...process.env,
+    SILKC_CLANG: sentinel,
+  })
+  assert.notEqual(nested.status, 0, 'an archive input was nested in a static library')
+  assert.equal(yield* fs.exists(join(library, 'nested.a')), false)
+  assert.equal(yield* fs.exists(marker), false)
+  yield* fs.writeFileString(join(library, 'silk.toml'), manifest(''))
+  const unarchived = yield* invoke(
+    silkc,
+    formArguments('static-library', 'unarchived.a'),
+    library,
+    { ...process.env, SILKC_CLANG: clang, SILKC_AR: sentinel },
+  )
+  assert.notEqual(unarchived.status, 0, 'a failed archiver reported success')
+  assert.equal(yield* fs.exists(join(library, 'unarchived.a')), false)
+  assert.equal(yield* fs.exists(join(library, 'unarchived.a.silkc.o')), false)
+  yield* fs.remove(marker)
+  // A static library for another target needs no linker either.
+  const crossArchive = yield* invoke(
+    silkc,
+    formArguments('static-library', 'libcross.a', '--target', foreign),
+    library,
+    archiveEnvironment,
+  )
+  assert.equal(crossArchive.status, 0, crossArchive.stderr)
+  const crossArchiveHeader = (yield* inspect('libcross.a')).header
+  assert.match(crossArchiveHeader, foreign.startsWith('x86_64') ? /x86-64/ : /Mach-O arm64/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run and object artifacts passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, object and static library artifacts passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))

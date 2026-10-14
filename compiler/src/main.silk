@@ -17,7 +17,7 @@ import parser.Parser
 import parser.SyntaxTree
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
-import silk.child_process {ChildProcess, ProcessError}
+import silk.child_process {ChildProcess, ProcessError, ProcessRequest}
 import silk.effect {Effect}
 import silk.filesystem {FileError, FileSystem, Path}
 import silk.host_input {HostInput, HostInputError}
@@ -102,6 +102,7 @@ effect fn invalidWorkingDirectoryEncoding() -> never ! ApplicationError {
 enum BuildOutput {
   Executable,
   Object,
+  StaticLibrary,
   LlvmIr,
 }
 
@@ -110,6 +111,7 @@ fn profileArtifact(kind: BuildOutput) -> &'static [u8] {
   return match kind {
     BuildOutput.Executable => b"executable"
     BuildOutput.Object => b"object"
+    BuildOutput.StaticLibrary => b"static-archive"
     BuildOutput.LlvmIr => b"executable"
   }
 }
@@ -256,9 +258,10 @@ effect fn runRequest(count: usize) -> RunCommand
   }
 }
 
-/// Reads `build <source> -o <output> [--emit executable|object|llvm-ir] [--target <triple>] [--stats]`,
-/// `test <root> -o <output> [--filter <text>] [--file <path>] --no-cache`, and dump modes. Only the
-/// host target links an executable; another target emits an object or LLVM IR.
+/// Reads `build <source> -o <output> [--emit executable|object|static-library|llvm-ir] [--target
+/// <triple>] [--stats]`, `test <root> -o <output> [--filter <text>] [--file <path>] --no-cache`, and
+/// dump modes. Only the host target links an executable; another target emits an object, a static
+/// library or LLVM IR.
 effect fn request() -> Request
 ! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError
 ? &mut HostInput | &mut Allocator {
@@ -327,6 +330,8 @@ effect fn request() -> Request
           kind = BuildOutput.LlvmIr
         } else if same(Bytes.asSlice(&value), b"object") {
           kind = BuildOutput.Object
+        } else if same(Bytes.asSlice(&value), b"static-library") {
+          kind = BuildOutput.StaticLibrary
         } else if !same(Bytes.asSlice(&value), b"executable") {
           return run invalidArgumentCount(count)
         }
@@ -539,9 +544,10 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 
 /// Compiles the completed LLVM text into `kind` at `output`.
 ///
-/// An executable links the declared inputs and the C libraries for the host. An object is compiled
-/// for its target with the profile's relocation model and needs no linker; declared objects and
-/// archives are merged into it by a relocatable link, and any other declared input is refused.
+/// An executable links the declared inputs and the C libraries for the host. An object or static
+/// library is compiled for its target with the profile's relocation model and needs no linker.
+/// Declared objects and archives are merged into an object by a relocatable link; a static library
+/// archives its compiled object beside the declared objects. Any other declared input is refused.
 effect fn compileIr(ir: &Bytes, output: &Path, kind: BuildOutput, optimization: &[u8], debug: bool, relocation: &[u8],
   target: &Target, linkInputs: &[NativeLinkInput]) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
@@ -549,18 +555,23 @@ effect fn compileIr(ir: &Bytes, output: &Path, kind: BuildOutput, optimization: 
   let mut intermediate = run Bytes.copy(Path.rawBytes(output))
   run Bytes.append(&mut intermediate, b".silkc.ll")
   let irPath = run Path.fromBytes(Bytes.asSlice(&intermediate))
-  let mut process = run NativeToolchain.request()
+  // A static library's single member is compiled beside the archive, then removed.
+  let mut memberBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut memberBytes, b".silkc.o")
+  let member = run Path.fromBytes(Bytes.asSlice(&memberBytes))
   let object = kind == BuildOutput.Object
-  if object {
+  let archive = kind == BuildOutput.StaticLibrary
+  let mut process = run NativeToolchain.request()
+  if object || archive {
     // The IR names no triple, so a cross-target object states its target to Clang.
     let mut selected = run Bytes.copy(b"--target=")
     run Bytes.append(&mut selected, Target.name(target))
     run ChildProcess.addArgument(&mut process, Bytes.asSlice(&selected))
-    if linkInputs.length == usize.ZERO {
-      run ChildProcess.addArgument(&mut process, b"-c")
-    } else {
+    if object && linkInputs.length > usize.ZERO {
       run ChildProcess.addArgument(&mut process, b"-r")
       run ChildProcess.addArgument(&mut process, b"-nostdlib")
+    } else {
+      run ChildProcess.addArgument(&mut process, b"-c")
     }
     if same(relocation, b"pic") {
       run ChildProcess.addArgument(&mut process, b"-fPIC")
@@ -583,15 +594,38 @@ effect fn compileIr(ir: &Bytes, output: &Path, kind: BuildOutput, optimization: 
   run ChildProcess.addArgument(&mut process, b"-x")
   run ChildProcess.addArgument(&mut process, b"none")
   run ChildProcess.addArgument(&mut process, b"-o")
-  run ChildProcess.addArgument(&mut process, Path.rawBytes(output))
-  // Declared inputs precede the C libraries so their own references to libc and libm resolve.
-  let mut input = usize.ZERO
-  while input < linkInputs.length {
-    if object && !NativeLinkInputs.relocatable(&linkInputs[input]) { fail InvalidNativeLinkInput {} }
-    run NativeLinkInputs.appendArguments(&linkInputs[input], target, &mut process)
-    input = input + usize.ONE
+  if archive {
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&memberBytes))
+  } else {
+    run ChildProcess.addArgument(&mut process, Path.rawBytes(output))
   }
-  if !object {
+  let mut archiver = Option<ProcessRequest>.none()
+  if archive {
+    // `rcsD`: replace members, create the archive, write its symbol index, and zero member times.
+    let mut request = run NativeToolchain.archiver()
+    run ChildProcess.addArgument(&mut request, b"rcsD")
+    run ChildProcess.addArgument(&mut request, Path.rawBytes(output))
+    run ChildProcess.addArgument(&mut request, Bytes.asSlice(&memberBytes))
+    let mut declared = usize.ZERO
+    while declared < linkInputs.length {
+      // An archive member is an object; a declared archive is not nested inside another.
+      match &linkInputs[declared] {
+        NativeLinkInput.Object {path} => { run ChildProcess.addArgument(&mut request, Path.rawBytes(&path)) }
+        _ => { fail InvalidNativeLinkInput {} }
+      }
+      declared = declared + usize.ONE
+    }
+    archiver = Option<ProcessRequest>.some(move request)
+  } else {
+    // Declared inputs precede the C libraries so their own references to libc and libm resolve.
+    let mut input = usize.ZERO
+    while input < linkInputs.length {
+      if object && !NativeLinkInputs.relocatable(&linkInputs[input]) { fail InvalidNativeLinkInput {} }
+      run NativeLinkInputs.appendArguments(&linkInputs[input], target, &mut process)
+      input = input + usize.ONE
+    }
+  }
+  if !object && !archive {
     run ChildProcess.addArgument(&mut process, b"-lc")
     run ChildProcess.addArgument(&mut process, b"-lm")
   }
@@ -599,27 +633,33 @@ effect fn compileIr(ir: &Bytes, output: &Path, kind: BuildOutput, optimization: 
   ! FileError | ProcessError | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
     run FileSystem.writeFile(&resource.*, Bytes.asSlice(ir))
-    let outcome = run ChildProcess.submit(&process)
-    return match move ChildProcess.exitCode(&outcome) {
-      Option<i32>.Some {value} => {
-        if value == 0 {
-          return 0
-        }
-        run writeError(ChildProcess.errorBytes(&outcome))
-        return 1
-      }
-      Option<i32>.None => {
-        run writeError(ChildProcess.errorBytes(&outcome))
-        return 1
-      }
+    let compiled = run submitted(&process)
+    if compiled != 0 { return compiled }
+    if let Option<ProcessRequest>.Some {value: archiving} = &archiver {
+      // A stale archive would keep members this build no longer produces.
+      run removeQuietly(output)
+      return run submitted(&archiving)
     }
+    return 0
   }
   let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem {
-    let removed = run Effect.result(FileSystem.removeFile(&resource.*))
-    drop removed
+    run removeQuietly(&resource.*)
+    if archive { run removeQuietly(&member) }
     return ()
   }
   return run Effect.useReleaseNonParking(move irPath, move use, move release)
+}
+
+// Runs one native tool: 0 when it exits successfully, else 1 after forwarding its diagnostics.
+effect fn submitted(process: &ProcessRequest) -> i32
+! ProcessError | OutOfMemoryError | WriterError
+? &mut ChildProcess | &mut Allocator {
+  let outcome = run ChildProcess.submit(process)
+  if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) {
+    if value == 0 { return 0 }
+  }
+  run writeError(ChildProcess.errorBytes(&outcome))
+  return 1
 }
 
 /// A finished compilation: its process status, or for a test build that linked, the identities
@@ -1162,7 +1202,7 @@ effect fn report(failure: ApplicationError | InitialProfileProblem | HostInputEr
   return match move failure {
     ApplicationError application => match move application {
       ApplicationError.InvalidArgumentCount {actual: _} => run writeError(
-        b"silkc: usage: silkc build <source> -o <output> [--emit executable|object|llvm-ir] [--target <triple>] [--stdlib <directory>] [--optimization none|speed] [--debug true|false] [--stats]\n       silkc test <root> -o <executable> [--stdlib <directory>] [--filter <text>] [--file <path>] [--optimization none|speed] [--debug true|false] --no-cache\n       silkc run [--stdlib <directory>] [arguments...] [-- arguments...]\n",
+        b"silkc: usage: silkc build <source> -o <output> [--emit executable|object|static-library|llvm-ir] [--target <triple>] [--stdlib <directory>] [--optimization none|speed] [--debug true|false] [--stats]\n       silkc test <root> -o <executable> [--stdlib <directory>] [--filter <text>] [--file <path>] [--optimization none|speed] [--debug true|false] --no-cache\n       silkc run [--stdlib <directory>] [arguments...] [-- arguments...]\n",
       )
       ApplicationError.InvalidWorkingDirectoryEncoding => run writeError(b"silkc: the working directory is not UTF-8\n")
       ApplicationError.InvalidBuildProfile => run writeError(b"silkc: invalid build profile\n")

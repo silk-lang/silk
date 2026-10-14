@@ -204,10 +204,10 @@ such as a provision section's `once Effect<'env; ...>` representation bound. A f
 `'static` expectation of a shorter region, a declared region widened to another, and any owner,
 access, element, pointee or type-argument difference stay type errors.
 
-Build invocation: `silkc build <source> -o <output> --emit <executable|object|llvm-ir> --target
-<triple> --stdlib <directory> --optimization <none|speed> --debug <true|false>`.
-The target defaults to the compiler's host target. Another supported target emits only an object
-or LLVM IR: an executable build for a non-host target is an invalid build profile, so the macOS CI
+Build invocation: `silkc build <source> -o <output> --emit <executable|object|static-library|llvm-ir>
+--target <triple> --stdlib <directory> --optimization <none|speed> --debug <true|false>`.
+The target defaults to the compiler's host target. Another supported target emits only an object,
+a static library or LLVM IR: an executable build for a non-host target is an invalid build profile, so the macOS CI
 leg cross-emits the compiler's IR on Linux and links it on macOS.
 The output defaults to an executable. `--emit llvm-ir` writes the exact completed backend module
 bytes of the executable to the requested file, returns success without invoking Clang, and creates
@@ -216,10 +216,14 @@ artifact and compiles a relocatable object for the target with the profile's rel
 (`-fPIC` by default). It acquires no catalog runtime or storage component: the application's
 `export "C"` functions are its roots, so a package without `main` builds, and a `[build].composition`
 may omit `defaults`. Declared object and archive inputs are merged into it by a relocatable link;
-any other declared input is refused. Invalid or repeated output selectors fail before source loading.
+any other declared input is refused. `--emit static-library` selects the `static-archive` profile
+artifact with the same roots and compilation, compiles the object to `<output>.silkc.o`, replaces
+`<output>` with a deterministic archive (`llvm-ar rcsD`) of that object followed by the declared
+object inputs, and removes the intermediate. Any other declared input is refused. The archiver is
+`SILKC_AR`, or else `llvm-ar` beside the configured Clang. Invalid or repeated output selectors fail before source loading.
 With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
 <native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup, and an
-object linked with a separately compiled C caller together; the selfhost workflow runs it on N1.
+object and a static library linked with a separately compiled C caller together; the selfhost workflow runs it on N1.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
