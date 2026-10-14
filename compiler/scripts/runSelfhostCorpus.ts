@@ -367,7 +367,7 @@ const writeProgram = async (
   ]
   writeFileSync(
     join(directory, 'silk.toml'),
-    `[package]\nname = "corpus"\nroot = "main.silk"\n${
+    `[package]\nname = "corpus"\nversion = "0.1.0"\nroot = "main.silk"\n${
       build.length === 0 ? '' : `\n[build]\n${build.join('\n')}\n`
     }`,
   )
