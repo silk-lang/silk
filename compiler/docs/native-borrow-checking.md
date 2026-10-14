@@ -297,7 +297,7 @@ until the provided Effect completes. There are no two-phase borrows, as in the b
   before any code is emitted. Each held access walks its callback's call graph; every `run` outside
   an Effect block and every execution readiness notification it reaches is reported at its own span
   and module, related to the call where the callback entered its access wrappers, once per pair.
-  Both code-producing entries, `silkc build` and `silkc test`, build through that pass. A body's
+  Both code-producing entries, `silk build` and `silk test`, build through that pass. A body's
   `Checked` verdict therefore covers loans and regions only.
 - Only reached accesses are judged. An access in a declaration no root reaches is judged once the
   native compiler checks every loaded declaration (MODULE-004), and that work must include this
