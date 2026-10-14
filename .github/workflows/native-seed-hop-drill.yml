@@ -1,7 +1,8 @@
 name: Native seed hop drill
 
-# GitHub schedules run on main. Execute the matching workflow on selfhost so its pin schema,
-# history reader, and verification tooling always come from the same compiler branch.
+# Main's copy of this workflow only dispatches this selfhost copy, which keeps the pin schema and
+# its tooling together. Each target replays the pin on selfhost, using its source commit's
+# predecessor. The first ARM64 seed is replayed through the x86-64 predecessor's cross-emitted IR.
 on:
   schedule:
     - cron: '41 6 * * 2'
@@ -9,19 +10,215 @@ on:
 
 permissions:
   contents: read
-  actions: write
 
 concurrency:
-  group: native-seed-hop-drill-dispatch
+  group: native-seed-hop-drill
   cancel-in-progress: false
 
 jobs:
-  dispatch:
-    name: Run the selfhost workflow
+  prepare:
+    name: Find the predecessor / ${{ matrix.target }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu, aarch64-apple-darwin]
+    env:
+      TARGET: ${{ matrix.target }}
     steps:
-      - name: Dispatch the matching workflow on selfhost
+      - uses: actions/checkout@v6
+        with:
+          ref: selfhost
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Read the authoritative current pin and its immutable predecessor facts
+        id: hop
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/hop"
+          cp compiler/native-seed.json "$RUNNER_TEMP/hop/current-pin.json"
+          node --input-type=module - "$RUNNER_TEMP/hop" <<'JS'
+          import { writeFileSync } from 'node:fs'
+          import * as Effect from 'effect/Effect'
+          import { createRequire } from 'node:module'
+          import { pathToFileURL } from 'node:url'
+          const require = createRequire(new URL('./packages/cli/package.json', import.meta.url))
+          const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
+          import { readPin } from './compiler/scripts/NativeSeed.mjs'
+          const pin = await Effect.runPromise(readPin('compiler/native-seed.json').pipe(Effect.provide(NodeServices.layer)))
+          const seed = pin.seeds[process.env.TARGET]
+          writeFileSync(`${process.argv[2]}/hop.json`, JSON.stringify(seed ? {active: true, target: process.env.TARGET, source: seed.sourceCommit, tag: seed.tag} : {active: false}))
+          JS
+          active=$(jq -r .active "$RUNNER_TEMP/hop/hop.json")
+          echo "active=$active" >> "$GITHUB_OUTPUT"
+          if [ "$active" != true ]; then
+            echo "### $TARGET: no reviewed pin yet; no hop to replay" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          source=$(jq -er .source "$RUNNER_TEMP/hop/hop.json")
+          git show "$source:compiler/native-seed.json" > "$RUNNER_TEMP/hop/historical-pin.json"
+          node --input-type=module - "$RUNNER_TEMP/hop" <<'JS'
+          import { readFileSync, writeFileSync } from 'node:fs'
+          import { historicalSeeds } from './.github/scripts/native-seed-history.mjs'
+          const root = process.argv[2]
+          const archived = historicalSeeds(JSON.parse(readFileSync(`${root}/historical-pin.json`, 'utf8')))
+          const previous = archived.find((seed) => seed.target === process.env.TARGET)
+            ?? (process.env.TARGET !== 'x86_64-unknown-linux-gnu' ? archived.find((seed) => seed.target === 'x86_64-unknown-linux-gnu') : undefined)
+          if (!previous) throw new Error('Source commit names no native predecessor')
+          // Project immutable historical release coordinates into the current verification format.
+          writeFileSync(`${root}/previous-pin.json`, JSON.stringify({schemaVersion: 2, seeds: {[previous.target]: previous}}))
+          const hop = JSON.parse(readFileSync(`${root}/hop.json`, 'utf8'))
+          writeFileSync(`${root}/hop.json`, JSON.stringify({...hop, previousTarget: previous.target, cross: previous.target !== process.env.TARGET}))
+          JS
+          cross=$(jq -r .cross "$RUNNER_TEMP/hop/hop.json")
+          echo "cross=$cross" >> "$GITHUB_OUTPUT"
+      - uses: ./.github/actions/setup-linux-llvm
+        if: steps.hop.outputs.cross == 'true'
+      - name: Replay the initial cross-emission from the historical x86-64 predecessor
+        if: steps.hop.outputs.cross == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run native-seed-hop-drill.yml --repo "$GITHUB_REPOSITORY" --ref selfhost
+          SILKC_CLANG: ${{ env.SILK_TEST_CLANG }}
+        run: |
+          set -euo pipefail
+          pin="$RUNNER_TEMP/hop/previous-pin.json"
+          tag=$(jq -er '.seeds["x86_64-unknown-linux-gnu"].tag' "$pin")
+          asset=$(jq -er '.seeds["x86_64-unknown-linux-gnu"].asset' "$pin")
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/previous-download"
+          node compiler/scripts/NativeSeed.mjs verify "$pin" x86_64-unknown-linux-gnu "$RUNNER_TEMP/previous-download/$asset" "$RUNNER_TEMP/previous"
+          source=$(jq -er .source "$RUNNER_TEMP/hop/hop.json")
+          node compiler/scripts/SourceSnapshot.mjs create "$RUNNER_TEMP/authored-inputs" "$source"
+          cd "$RUNNER_TEMP/authored-inputs/compiler"
+          "$RUNNER_TEMP/previous" build src/main.silk -o "$RUNNER_TEMP/bridge-N1" --stdlib ../packages/compiler/stdlib --optimization speed --debug false
+          "$RUNNER_TEMP/bridge-N1" build src/main.silk -o "$RUNNER_TEMP/hop/compiler.ll" --emit llvm-ir --target "$TARGET" \
+            --stdlib ../packages/compiler/stdlib --optimization speed --debug false
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-hop-inputs-${{ matrix.target }}
+          path: ${{ runner.temp }}/hop/
+          if-no-files-found: error
+          retention-days: 7
+
+  drill:
+    name: Replay native seed / ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: selfhost
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-hop-inputs-${{ matrix.target }}
+          path: ${{ runner.temp }}/hop
+      - name: Read the target hop
+        id: hop
+        run: echo "active=$(jq -r .active "$RUNNER_TEMP/hop/hop.json")" >> "$GITHUB_OUTPUT"
+      - uses: pnpm/action-setup@v6
+        if: steps.hop.outputs.active == 'true'
+      - uses: actions/setup-node@v6
+        if: steps.hop.outputs.active == 'true'
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+        if: steps.hop.outputs.active == 'true'
+      - uses: ./.github/actions/setup-native-llvm
+        if: steps.hop.outputs.active == 'true'
+      - name: Export the pinned seed's exact source
+        if: steps.hop.outputs.active == 'true'
+        run: node compiler/scripts/SourceSnapshot.mjs create "$RUNNER_TEMP/authored-inputs" "$(jq -er .source "$RUNNER_TEMP/hop/hop.json")"
+      - name: Verify the published seed and obtain replayed N1
+        if: steps.hop.outputs.active == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/drill"
+          mkdir -p "$out"
+          verify() {
+            local pin="$1" name="$2" tag asset
+            tag=$(jq -er --arg target "$TARGET" '.seeds[$target].tag' "$pin")
+            asset=$(jq -er --arg target "$TARGET" '.seeds[$target].asset' "$pin")
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/$name-download"
+            node compiler/scripts/NativeSeed.mjs verify "$pin" "$TARGET" "$RUNNER_TEMP/$name-download/$asset" "$out/$name"
+          }
+          verify "$RUNNER_TEMP/hop/current-pin.json" published
+          if [ "$(jq -r .cross "$RUNNER_TEMP/hop/hop.json")" = true ]; then
+            "$SILKC_CLANG" -O2 -x ir "$RUNNER_TEMP/hop/compiler.ll" -x none -o "$out/N1" -lc -lm
+          else
+            verify "$RUNNER_TEMP/hop/previous-pin.json" previous
+            (cd "$RUNNER_TEMP/authored-inputs/compiler" && "$out/previous" build src/main.silk -o "$out/N1" \
+              --stdlib ../packages/compiler/stdlib --optimization speed --debug false)
+          fi
+          chmod 0555 "$out/N1"
+      - name: Rebuild N2 and compare N1, N2, and the published compiler IR
+        if: steps.hop.outputs.active == 'true'
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/drill"
+          args=(--stdlib "$RUNNER_TEMP/authored-inputs/packages/compiler/stdlib" --optimization speed --debug false)
+          stage() {
+            local name="$1"
+            shift
+            /usr/bin/time "$@" > "$out/$name.log" 2>&1 || {
+              tail -n 60 "$out/$name.log"
+              echo "::error title=Hop drill stage $name failed::See the native-seed-hop-drill artifact."
+              exit 1
+            }
+          }
+          cd "$RUNNER_TEMP/authored-inputs/compiler"
+          stage n2 "$out/N1" build src/main.silk -o "$out/N2" "${args[@]}"
+          stage n1-ir "$out/N1" build src/main.silk -o "$out/n1.ll" --emit llvm-ir "${args[@]}"
+          stage n2-ir "$out/N2" build src/main.silk -o "$out/n2.ll" --emit llvm-ir "${args[@]}"
+          stage published-ir "$out/published" build src/main.silk -o "$out/published.ll" --emit llvm-ir "${args[@]}"
+          identical=true
+          cmp -s "$out/n1.ll" "$out/n2.ll" || identical=false
+          cmp -s "$out/n2.ll" "$out/published.ll" || identical=false
+          if [ "$(jq -r .cross "$RUNNER_TEMP/hop/hop.json")" = true ]; then
+            cmp -s "$RUNNER_TEMP/hop/compiler.ll" "$out/n1.ll" || identical=false
+          fi
+          jq -n --arg target "$TARGET" --arg tag "$(jq -er .tag "$RUNNER_TEMP/hop/hop.json")" \
+            --arg source "$(jq -er .source "$RUNNER_TEMP/hop/hop.json")" \
+            --arg previous "$(jq -er '.seeds[].tag' "$RUNNER_TEMP/hop/previous-pin.json")" \
+            --arg n1sha "$(shasum -a 256 "$out/n1.ll" | cut -d' ' -f1)" \
+            --arg n2sha "$(shasum -a 256 "$out/n2.ll" | cut -d' ' -f1)" \
+            --arg publishedsha "$(shasum -a 256 "$out/published.ll" | cut -d' ' -f1)" --argjson identical "$identical" \
+            '{target: $target, seed: $tag, source: $source, previous: $previous, identical: $identical,
+              irSha256: {replayedN1: $n1sha, replayedN2: $n2sha, published: $publishedsha}}' | tee "$out/receipt.json"
+          if [ "$identical" != true ]; then
+            diff "$out/published.ll" "$out/n2.ll" | head -n 200 | cut -c 1-300 > "$out/ir-diff.txt" || true
+            echo "::error title=Hop replay diverged::Replayed and published compiler IR differ."
+            exit 1
+          fi
+      - name: Preserve the drill receipt and logs
+        if: always() && steps.hop.outputs.active == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-seed-hop-drill-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/drill/*.json
+            ${{ runner.temp }}/drill/*.log
+            ${{ runner.temp }}/drill/*.txt
+          if-no-files-found: ignore
+          retention-days: 90
