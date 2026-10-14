@@ -257,6 +257,10 @@ requirement (the walk's in-flight intervals and live holder points) must lie wit
 availability; the term's required set is their union. Points propagated into the term from a
 shorter region must lie where every one of its loans is available, the intersection. A term no loan
 names stays pending.
+When call inference retags a fresh reference borrow with the call's shared region, its retained
+source-validity relations follow that same loan. This renaming is limited to the borrow's own
+fresh atom and relations recorded at that exact source origin. It neither renames an existing
+contextual region nor turns a retained goal into a declared premise.
 Availability excludes paths before creation and after overlapping End, Expire, write, move or drop
 events, restarting at creation on a loop back edge. Own declared parameters and `'static` are
 available throughout this body. Required bitsets propagate from shorter to longer to a fixed point.
