@@ -1082,9 +1082,10 @@ Each entry records:
   [compiler/docs/failure-observer-and-trace.md](compiler/docs/failure-observer-and-trace.md)
   (2026-10-05). Logical frames and `while handling` causes landed with that note's N7 (2026-10-09),
   event 6 for arithmetic traps on 2026-10-10, and event 6 for MIR `Trap` terminators on
+  2026-10-14, and identities for strings, arrays, slices, pointers and `'static` regions on
   2026-10-14. The remaining rows retire with the suspension stage's executable-closure summary
   (SEM0216, SEM0217), callback environments in the observer record, and identity rendering for the
-  remaining failure types.
+  remaining failure types. The region row below is intended native behavior and does not retire.
 - **Rule:** [TERM-004](apps/docs/content/reference/program-termination-and-reporting.md#term-004--a-failure-report-has-one-stable-minimum)
   to TERM-008 and
   [FAIL-006](apps/docs/content/reference/typed-failures.md#fail-006--typed-failure-applies-ordinary-cleanup-and-preserves-diagnostic-context):
@@ -1103,8 +1104,14 @@ Each entry records:
     has no native counterpart.
   - SEM0216 and SEM0217 are not diagnosed; a context-free `observeUnhandled` returns `0` at run
     time, as the bootstrap's null observer does.
-  - A capturing callback reports `observer-callback`; an observed `fail` of a type that is not
-    nominal, primitive or unit reports `failure-identity`.
+  - A capturing callback reports `observer-callback`. An observed `fail` of an anonymous tuple or
+    record, a callable, an Effect or foreign function, or a nominal with a requirement-row argument
+    reports `failure-identity`.
+  - Identities spell `'static` as the bootstrap does (`string<'static>`, `&'static [u8]`,
+    `memory/driver.Holder<'static>`). By design, selfhost omits any other region (`string`, `&T`,
+    `memory/driver.Problem`). The bootstrap prints its internal inference region there
+    (`memory/driver.Problem<'_local9>`), a name that means nothing to users. The bootstrap stays
+    as it is.
   - Selfhost infers omitted `observeDiagnostics` type arguments from the operands; the bootstrap
     requires all four (SEM0051). A fallible body or a misshapen callback is an argument type
     mismatch at that argument in both (bootstrap SEM0012).
