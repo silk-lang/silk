@@ -342,12 +342,14 @@ cover first:
   A borrow of a value with no place (a call result, a literal, a projection or dereference of
   one, or a temporary receiver) lends that value's hidden owner (BORROW-006). The walk evaluates
   the value into a root of its own, which holds the value's loans and observes its cleanup like a
-  local, and ends it with the innermost statement or match arm that evaluates it, the bootstrap's
-  statement scope. A view of a temporary used past its statement, such as `let left =
-  make().left()` followed by `left.*`, is OWN0019 at the use (CALL-003). A borrowed fixed-array
-  temporary in the initializer of a binding whose type can hold a view (`Type.holdsView`) is kept
-  for the binding's scope, the same rule lowering uses to keep a borrowing binding's temporaries,
-  so `let view = identity(&[1, 2])` is valid.
+  local, and ends it where lowering drops it: with the innermost statement or match arm that
+  evaluates it, or with the `if` or `while` condition, guard or `&&`/`||` right operand that does.
+  A view of a temporary used past its statement, such as `let left = make().left()` followed by
+  `left.*`, is OWN0019 at the use (CALL-003), where the bootstrap reports it. Lowering keeps every
+  temporary of the initializer of a binding whose type can hold a view (`Type.holdsView`) for the
+  binding's scope, so their storage and cleanup end there. Only a borrowed fixed array stays valid
+  that long, so `let view = identity(&[1, 2])` is valid; any other such temporary's loans expire
+  with its statement (an `Expire` event, which ends validity without ending storage).
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
