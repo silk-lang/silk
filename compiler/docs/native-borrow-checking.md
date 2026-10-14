@@ -250,8 +250,13 @@ A region becomes unavailable at points after its owner's `StorageDead`, and afte
 that invalidates an overlapping place. A violation is OWN0019 at the use's origin. Point sets are
 bitsets over the body's location count.
 
-The R3 2b worklist uses these same Walker points and successor edges. A local term must map to
-one exact loan; its required set includes the walk's in-flight intervals and live holder points.
+The R3 2b worklist uses these same Walker points and successor edges. A local term maps to the
+loans whose typed regions name it: usually one borrow, but every fresh borrow of one call shares the
+call's region, and a borrow of a value names the regions that value's type retains. Each loan's own
+requirement (the walk's in-flight intervals and live holder points) must lie within that loan's
+availability; the term's required set is their union. Points propagated into the term from a
+shorter region must lie where every one of its loans is available, the intersection. A term no loan
+names stays pending.
 Availability excludes paths before creation and after overlapping End, Expire, write, move or drop
 events, restarting at creation on a loop back edge. Own declared parameters and `'static` are
 available throughout this body. Required bitsets propagate from shorter to longer to a fixed point.
