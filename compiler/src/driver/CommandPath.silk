@@ -1,12 +1,31 @@
-//! Command-line path arguments resolved against the working directory.
+//! Command-line path arguments resolved against the working directory, and commands found on
+//! `PATH`.
+//!
+//! The portable filesystem does not follow symbolic links, and `PATH` entries and installed
+//! commands often are links, so this boundary resolves them with POSIX `realpath` directly.
 
 import silk.allocator { Allocator, OutOfMemoryError }
-import silk.filesystem { FileError, FileSystem, Path }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { DirectoryInfo, FileError, FileInfo, FileSystem, Path }
 import silk.host_input { HostInput }
+import silk.option { Option }
+import silk.pointer { Pointer }
 import silk.result { Result }
 import silk.slice { Slice }
 import silk.string { InvalidUtf8 }
 import silk.usize
+import silk.vector { Vector }
+
+unsafe extern "C" fn realpath(path: ?[*] const u8, resolved: ?[*] mut u8) -> ?[*] mut u8
+with Intrinsic.foreign(noCapture: ("path", "resolved"))
+
+// At least PATH_MAX on every supported host (4096 on Linux, 1024 on macOS), so `realpath` never
+// writes past the buffer.
+fn resolvedCapacity() -> usize {
+  return usize.add(0, 4096)
+}
+
 
 effect fn invalid() -> never ! FileError {
   fail FileSystem.error(FileSystem.pathOperation(), FileSystem.invalidPath())
@@ -34,4 +53,132 @@ pub effect fn resolve(working: &Path, argument: &[u8]) -> Path
     return run Path.resolve(&root, text)
   }
   return run Path.resolve(working, text)
+}
+
+/// Whether `value` contains the byte `wanted`.
+pub fn contains(value: &[u8], wanted: u8) -> bool {
+  let mut at = usize.ZERO
+  while at < value.length {
+    if value[at] == wanted {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// The paths a bare command `name` may name, in `PATH` order: each entry of the colon-separated
+/// `searchPath` joined with `name`, where an empty entry is the working directory (`.`).
+pub effect fn searchCandidates(searchPath: &[u8], name: &[u8]) -> Vector<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut candidates = Vector<Bytes>.make()
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= searchPath.length {
+    if at == searchPath.length || searchPath[at] == 58 {
+      let mut candidate = Bytes.make()
+      if at == start {
+        run Bytes.append(&mut candidate, b".")
+      } else {
+        run Bytes.append(&mut candidate, Slice.view<u8>(searchPath, start, at - start))
+      }
+      run Bytes.append(&mut candidate, b"/")
+      run Bytes.append(&mut candidate, name)
+      run Vector<Bytes>.append(&mut candidates, move candidate)
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move candidates
+}
+
+fn isNull(answer: ?[*] mut u8) -> bool {
+  unsafe {
+    return Pointer.isNullMany<u8>(Intrinsic.pointerRequalify<?[*] mut u8, ?[*] const u8>(answer))
+  }
+}
+
+/// The canonical path of `path` with every symbolic link resolved, or `None` when the host cannot
+/// resolve it.
+pub effect fn canonical(path: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  if contains(path, 0) {
+    return Option<Bytes>.none()
+  }
+  let mut request = run Bytes.copy(path)
+  let ending: [u8; 1] = [0]
+  run Bytes.append(&mut request, &ending)
+  let mut buffer = run Bytes.zeroed(resolvedCapacity())
+  let answer = unsafe realpath(
+    Pointer.fromSlice<u8>(Bytes.asSlice(&request)),
+    Pointer.fromMutSlice<u8>(Bytes.asMutSlice(&mut buffer)),
+  )
+  if isNull(answer) {
+    return Option<Bytes>.none()
+  }
+  let written = Bytes.asSlice(&buffer)
+  let mut length = usize.ZERO
+  while length < written.length && written[length] != 0 {
+    length = length + usize.ONE
+  }
+  return Option<Bytes>.some(run Bytes.copy(Slice.view<u8>(written, usize.ZERO, length)))
+}
+
+/// The path `text` spells, or `None` when no path can spell it.
+pub effect fn pathOf(text: &[u8]) -> Option<Path> ! OutOfMemoryError ? &mut Allocator {
+  let parsed = run Effect.result(Path.fromBytes(text))
+  return match move parsed {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => Option<Path>.some(move value)
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError invalid => {
+        drop invalid
+        return Option<Path>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+/// Whether `text` names an existing directory (`directory`) or regular file; any inspection
+/// failure answers `false`.
+pub effect fn exists(text: &[u8], directory: bool) -> bool ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let candidate = match move run pathOf(text) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => {
+      return false
+    }
+  }
+  let inspected = run Effect.result(FileSystem.stat(&candidate))
+  return match move inspected {
+    Result<FileInfo | DirectoryInfo, FileError>.Success { value } => match move value {
+      FileInfo file => !directory
+      DirectoryInfo found => directory
+    }
+    Result<FileInfo | DirectoryInfo, FileError>.Failure { error } => {
+      drop error
+      return false
+    }
+  }
+}
+
+/// The first `PATH` candidate for `name` that names a regular file, with its symbolic links
+/// resolved; `searchPath` is the colon-separated `PATH` value.
+pub effect fn search(searchPath: &[u8], name: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let candidates = run searchCandidates(searchPath, name)
+  let listed = Vector<Bytes>.asSlice(&candidates)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    // A PATH entry is often a symbolic link, which the portable filesystem does not follow.
+    if let Option<Bytes>.Some { value: resolved } = move run canonical(Bytes.asSlice(&listed[at])) {
+      if run exists(Bytes.asSlice(&resolved), false) {
+        return Option<Bytes>.some(move resolved)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Bytes>.none()
 }
