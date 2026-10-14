@@ -298,8 +298,11 @@ until the provided Effect completes. There are no two-phase borrows, as in the b
 - Only reached accesses are judged. An access in a declaration no root reaches is judged once the
   native compiler checks every loaded declaration (MODULE-004), and that work must include this
   pass.
-- OWN0020 (ownership across suspension) is out of scope until suspension lowering exists
-  (`mir-core-shape.md` §6), and is reported as a named gap if reached.
+- Ownership across suspension needs no rule of its own (SUSP-011, SUSP-013). A suspending `run`
+  is a call in the walk, so a loan or a partial move live across it reports the ordinary codes,
+  as the bootstrap does. The bootstrap's OWN0020 guards the invariants of its own suspension
+  planner; natively, a frame that cannot store a drop flag live at a suspension point is an
+  internal compiler error in `Coroutine.plan`, never a user diagnostic.
 
 ## 5. Place in the query graph
 
@@ -658,7 +661,9 @@ Julia decided the open questions in the joint review with #1433 (2026-10-11):
    checks run after typing in the same `Body` unit. One unit and one key own both, so one body edit
    reruns both and nothing else.
 5. **OWN0017 and OWN0020.** OWN0017 is dropped from the catalog; it has no bootstrap call site.
-   OWN0020 waits for suspension lowering and is a named gap until then.
+   OWN0020 waits for suspension lowering and is a named gap until then. Suspension lowering has
+   since landed, and OWN0020 has no native counterpart: ownership across suspension reports the
+   ordinary codes, and a frame that cannot represent a live owner aborts as a compiler bug (§4.5).
 6. **When the gap becomes an error.** CI fails on any increase of the unchecked count from the
    first slice; the gap becomes a hard error at zero on the self-build.
 7. **Diagnostic spelling.** During the transition the native CLI prints native names together with
