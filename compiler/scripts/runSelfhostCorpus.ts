@@ -4,7 +4,7 @@ import { availableParallelism, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
-import type { CorpusProgram, NativeRun } from '../../packages/compiler/test/support/corpus.js'
+import type * as Corpus from '../../corpus/corpus.mjs'
 
 export interface Gap {
   readonly code: string
@@ -272,11 +272,11 @@ export const defaultCCompiler = '/usr/bin/clang'
  */
 const nativeLinkInputs = async (
   directory: string,
-  program: CorpusProgram,
+  program: Corpus.Program,
   cCompiler: string,
 ): Promise<ReadonlyArray<string>> => {
   const objects: string[] = []
-  for (const [unit, contents] of Object.entries(program.nativeCSources ?? {})) {
+  for (const [unit, contents] of Object.entries(program.cSources)) {
     if (!safeName.test(unit)) throw new Error(`unsafe corpus C unit name: ${unit}`)
     writeFileSync(join(directory, `${unit}.c`), contents)
     const compiled = await runProcess(
@@ -289,7 +289,7 @@ const nativeLinkInputs = async (
       throw new Error(`C unit ${unit}: ${processFailure(compiled)}`)
     objects.push(`{ object = ${JSON.stringify(`${unit}.o`)} }`)
   }
-  const libraries = (program.nativeDynamicLibraries ?? []).map((library) => {
+  const libraries = (program.outcome.dynamicLibraries ?? []).map((library) => {
     if (!safeName.test(library)) throw new Error(`unsafe corpus library name: ${library}`)
     return `{ library = ${JSON.stringify(library)}, mode = "dynamic" }`
   })
@@ -324,8 +324,8 @@ const toml = (value: unknown): string => {
  * default runtime for the host, as `ArtifactComposition.defaults` selects it, with the program's
  * runtime components replacing the catalog's.
  */
-const componentComposition = (program: CorpusProgram, stdlib: string): string | undefined => {
-  if (program.nativeComponents === undefined) return undefined
+const componentComposition = (program: Corpus.Program, stdlib: string): string | undefined => {
+  if (program.outcome.components === undefined) return undefined
   const host = hostTargets[`${process.platform}-${process.arch}`]
   if (host === undefined)
     throw new Error(`no native corpus target for ${process.platform}-${process.arch}`)
@@ -341,7 +341,7 @@ const componentComposition = (program: CorpusProgram, stdlib: string): string | 
     defaults: [runtime.name],
     retention: [],
     requirements: [],
-    components: program.nativeComponents,
+    components: program.outcome.components,
   })
 }
 
@@ -352,13 +352,13 @@ const programModule = 'memory/driver.silk'
 
 const writeProgram = async (
   directory: string,
-  program: CorpusProgram,
+  program: Corpus.Program,
   cCompiler: string,
   stdlib: string,
 ): Promise<void> => {
   const source = join(directory, programModule)
   mkdirSync(dirname(source), { recursive: true })
-  writeFileSync(source, program.nativeSource ?? program.source)
+  writeFileSync(source, program.source)
   const linkInputs = await nativeLinkInputs(directory, program, cCompiler)
   const composition = componentComposition(program, stdlib)
   const build = [
@@ -371,7 +371,7 @@ const writeProgram = async (
       build.length === 0 ? '' : `\n[build]\n${build.join('\n')}\n`
     }`,
   )
-  for (const [module, contents] of Object.entries(program.nativeImports ?? {})) {
+  for (const [module, contents] of Object.entries(program.imports)) {
     if (module.startsWith('/') || module.split('/').includes('..'))
       throw new Error(`unsafe corpus import path: ${module}`)
     const path = join(directory, `${module}.silk`)
@@ -380,7 +380,7 @@ const writeProgram = async (
   }
 }
 
-const runExecutable = (executable: string, invocation: NativeRun): Promise<ProcessResult> =>
+const runExecutable = (executable: string, invocation: Corpus.Run): Promise<ProcessResult> =>
   invocation.closeStderr
     ? runProcess(
         'sh',
@@ -396,24 +396,22 @@ const runExecutable = (executable: string, invocation: NativeRun): Promise<Proce
     : runProcess(executable, invocation.arguments ?? [], runTimeoutMs)
 
 const compareRun = (
-  program: CorpusProgram,
-  invocation: NativeRun,
+  program: Corpus.Program,
+  invocation: Corpus.Run,
   run: ProcessResult,
 ): string | undefined => {
   if (run.error !== undefined) return run.error.message
-  if (program.nativeStdout !== undefined && run.stdout !== program.nativeStdout)
-    return `stdout: expected ${JSON.stringify(program.nativeStdout)}, got ${JSON.stringify(run.stdout)}`
-  if (
-    !invocation.closeStderr &&
-    program.nativeStderr !== undefined &&
-    run.stderr !== program.nativeStderr
-  )
-    return `stderr: expected ${JSON.stringify(program.nativeStderr)}, got ${JSON.stringify(run.stderr)}`
-  if (program.expected._tag === 'Trap') {
+  if (program.stdout !== undefined && run.stdout !== program.stdout)
+    return `stdout: expected ${JSON.stringify(program.stdout)}, got ${JSON.stringify(run.stdout)}`
+  if (!invocation.closeStderr && program.stderr !== undefined && run.stderr !== program.stderr)
+    return `stderr: expected ${JSON.stringify(program.stderr)}, got ${JSON.stringify(run.stderr)}`
+  const outcome = program.outcome.expected
+  if (outcome.kind === 'trap') {
     if (run.signal !== null || (run.status !== null && run.status !== 0)) return undefined
     return 'expected a trap or nonzero exit, got exit 0'
   }
-  const expected = program.expected.result & 0xff
+  if (outcome.kind !== 'completes') return 'a native program must complete or trap'
+  const expected = outcome.exitCode & 0xff
   if (run.signal !== null || run.status !== expected)
     return `exit: expected ${expected}, got ${run.status ?? 'none'}${run.signal === null ? '' : ` (signal ${run.signal})`}`
   return undefined
@@ -421,7 +419,7 @@ const compareRun = (
 
 export const runCase = async (
   silkc: string,
-  program: CorpusProgram,
+  program: Corpus.Program,
   stdlib = fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
   cCompiler = defaultCCompiler,
 ): Promise<CaseResult> => {
@@ -429,7 +427,7 @@ export const runCase = async (
   try {
     await writeProgram(directory, program, cCompiler, stdlib)
     const executable = join(directory, 'program')
-    const profiles = program.nativeProfiles ?? [
+    const profiles = program.outcome.profiles ?? [
       { name: 'optimized', optimization: 'speed', debug: false },
     ]
     // Every profile checks the same bodies, so the first build's gap stands for the program.
@@ -470,7 +468,7 @@ export const runCase = async (
       }
       borrowGap ??= parseBorrowGap(built.stderr)
 
-      for (const [ordinal, invocation] of (program.nativeRuns ?? [{}]).entries()) {
+      for (const [ordinal, invocation] of (program.outcome.runs ?? [{}]).entries()) {
         const mismatch = compareRun(
           program,
           invocation,
@@ -544,7 +542,7 @@ export const summarize = (
  */
 export const runCorpus = async (
   silkc: string,
-  corpus: ReadonlyArray<CorpusProgram>,
+  corpus: ReadonlyArray<Corpus.Program>,
   required: ReadonlyArray<string>,
   selected?: ReadonlyArray<string>,
   stdlib?: string,

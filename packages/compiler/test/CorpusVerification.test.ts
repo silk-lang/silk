@@ -7,7 +7,6 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Path from 'effect/Path'
 import * as Schema from 'effect/Schema'
 import * as Verification from '../../../compiler/scripts/CorpusVerification.js'
-import type { CorpusProgram } from './support/corpus.js'
 import * as Corpus from '../../../corpus/corpus.mjs'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -15,17 +14,23 @@ import { join } from 'node:path'
 // Each case's source names it, so the stub can attribute builds and runs of concurrent cases.
 const sourceOf = (name: string): string => `// ${name}\npub fn main() -> i32 { return 42 }`
 
-const literal: CorpusProgram = {
+const literal: Corpus.Program = {
   name: 'literal',
   source: sourceOf('literal'),
-  expected: { _tag: 'Completes', result: 42 },
-  nativeStdout: 'witness\n',
-  nativeStderr: 'stderr witness\n',
-  nativeProfiles: [
-    { name: 'debug', optimization: 'none', debug: true },
-    { name: 'optimized', optimization: 'speed', debug: false },
-  ],
-  nativeRuns: [{ arguments: ['one'] }, { arguments: ['two'] }],
+  reference: undefined,
+  imports: {},
+  cSources: {},
+  stdout: 'witness\n',
+  stderr: 'stderr witness\n',
+  outcome: {
+    schemaVersion: 1,
+    expected: { kind: 'completes', exitCode: 42 },
+    profiles: [
+      { name: 'debug', optimization: 'none', debug: true },
+      { name: 'optimized', optimization: 'speed', debug: false },
+    ],
+    runs: [{ arguments: ['one'] }, { arguments: ['two'] }],
+  },
 }
 
 const fixture = Effect.fnUntraced(function* () {
@@ -84,7 +89,12 @@ it.effect('verifies all live pins and declared profiles/runs without changing it
     // An unpinned failing case must not execute.
     yield* Verification.run(self, [
       literal,
-      { ...literal, name: 'unselected', source: sourceOf('unselected'), nativeComponents: [] },
+      {
+        ...literal,
+        name: 'unselected',
+        source: sourceOf('unselected'),
+        outcome: { ...literal.outcome, components: [] },
+      },
     ])
     assert.strictEqual(yield* fs.readFileString(self.compiler), self.compilerSource)
     assert.strictEqual(yield* fs.readFileString(self.source), 'consumer stdlib witness\n')
@@ -102,21 +112,26 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
     const fs = yield* FileSystem.FileSystem
     const self = yield* fixture()
     yield* fs.writeFileString(self.pins, '["literal"]')
-    const corpus: ReadonlyArray<CorpusProgram> = [
+    const corpus: ReadonlyArray<Corpus.Program> = [
       literal,
       {
         ...literal,
         name: 'observed-failure',
         source: sourceOf('observed-failure'),
-        nativeStdout: '',
-        nativeStderr: '',
+        stdout: '',
+        stderr: '',
       },
-      { ...literal, name: 'observed-gap', source: sourceOf('observed-gap'), nativeComponents: [] },
+      {
+        ...literal,
+        name: 'observed-gap',
+        source: sourceOf('observed-gap'),
+        outcome: { ...literal.outcome, components: [] },
+      },
       {
         ...literal,
         name: 'observed-trap',
         source: sourceOf('observed-trap'),
-        expected: { _tag: 'Trap' },
+        outcome: { ...literal.outcome, expected: { kind: 'trap' } },
       },
     ]
     const messages: Array<string> = []
@@ -144,7 +159,7 @@ it.effect('runs the complete readonly corpus and emits its ordered versioned aut
       manifest.programs.map((program) => program.name),
       corpus.map((program) => program.name),
     )
-    assert.deepEqual(manifest.programs.at(0)?.profiles, literal.nativeProfiles)
+    assert.deepEqual(manifest.programs.at(0)?.profiles, literal.outcome.profiles)
     assert.deepEqual(manifest.programs.at(0)?.runs, [
       { arguments: ['one'], closeStderr: false },
       { arguments: ['two'], closeStderr: false },
@@ -190,10 +205,13 @@ it.effect('fails pinned unsupported and mismatched outcomes', () =>
     const self = yield* fixture()
     yield* fs.writeFileString(self.pins, '["literal"]')
     for (const program of [
-      { ...literal, nativeComponents: [] },
-      { ...literal, nativeStdout: 'wrong' },
-      { ...literal, expected: { _tag: 'Completes', result: 41 } },
-    ] satisfies ReadonlyArray<CorpusProgram>) {
+      { ...literal, outcome: { ...literal.outcome, components: [] } },
+      { ...literal, stdout: 'wrong' },
+      {
+        ...literal,
+        outcome: { ...literal.outcome, expected: { kind: 'completes', exitCode: 41 } },
+      },
+    ] satisfies ReadonlyArray<Corpus.Program>) {
       assert.strictEqual((yield* Effect.result(Verification.run(self, [program])))._tag, 'Failure')
     }
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
