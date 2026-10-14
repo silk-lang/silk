@@ -1023,8 +1023,8 @@ Each entry records:
 - **Summary:** the design discussion considered several directions:
   - a target-neutral lowering boundary that turns non-suspending Effects into ordinary closures,
     provider operands, tagged outcomes, and cleanup (native step 5 design);
-  - keeping coroutine lowering for suspension (native step 5 design reserves it; reached
-    suspension reports the `suspension` gap until then);
+  - keeping coroutine lowering for suspension (native step 5 design reserves it; implemented in
+    629d0038e, where reached parking lowers through `Intrinsic.relinquish`);
   - letting source execution infrastructure choose frame storage;
   - reifying completed outcomes, and how panics and traps relate to Effect outcomes.
 
@@ -1059,8 +1059,8 @@ Each entry records:
   exports declared in other imported modules build roots. A Silk call to an exported
   definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
   its C ABI gap. Exported statics remain `ForeignStaticUnavailable`. Native C ABI lanes cover
-  x86_64-unknown-linux-gnu and aarch64-apple-darwin only, so on aarch64-unknown-linux-gnu every
-  selfhost build stops at the runtime's first C export with `c-abi-target`.
+  x86_64-unknown-linux-gnu, aarch64-apple-darwin and aarch64-unknown-linux-gnu (`CAbi.supported`);
+  other targets stop at the runtime's first C export with `c-abi-target`.
 - **Source migration:** none for defaulted builds. A build that relies on a profile `runtime`
   request or on retention roots needs the bootstrap.
 - **Diagnostics and limits:** an unselected runtime is `InvalidBuildComposition` before analysis.
@@ -1107,25 +1107,27 @@ Each entry records:
   `observedTrapsRecordTheirSites` in `compiler/src/semantic/SemanticCallableCases.silk`; the
   `native-termination-*` corpus programs.
 
-### Selfhost admits `Intrinsic.NonParking` bounds before the suspension stage
+### Selfhost admits `Intrinsic.NonParking` bounds without proof
 
-- **Status:** temporary divergence, Step 9e of
-  [#567](https://github.com/julia-script/silk/issues/567), 2026-10-05. It is retired by the
-  suspension stage or native provider lowering, whichever first lets a reached executable park.
+- **Status:** open divergence that accepts invalid programs, tracked by
+  [#1665](https://github.com/silk-lang/silk/issues/1665). Introduced as a temporary Step 9e
+  divergence of [#567](https://github.com/silk-lang/silk/issues/567) on 2026-10-05. Its fallback
+  ended when 629d0038e (2026-10-09) made reached parking lower through `Intrinsic.relinquish`.
 - **Rule:** an `Intrinsic.NonParking` bound holds only when the specialized transitive graph
   cannot reach external parking.
 - **Compilers:** the bootstrap proves the bound during executable analysis
   (`ExecutableOrigin.ts` NonParking obligations for `finalizeEffectNonParking` and
   `useReleaseNonParking`; `CallResolution.ts` for service operations) and rejects a finalizer or
-  release whose targets are not exact or not proven. Selfhost discharges the bound at the call
-  without that analysis. Any parking it would have rejected is still reached, and selfhost reports
-  it as `SuspensionUnavailable` (the `suspension` gap) at the `park` or `suspendEffect` site
-  (Effect note D6), not as an unsatisfied bound at the call.
-- **Source migration:** none; no program that compiles under selfhost parks.
-- **Diagnostics and limits:** the failure is a structured `suspension` gap at the parking site
-  instead of the bootstrap's unsatisfied-property diagnostic at the bounded call.
+  release whose targets are not exact or not proven with SEM0139. Selfhost discharges the bound at
+  the call without that analysis. Before 629d0038e, any parking it would have rejected was refused
+  as the `suspension` gap at the `park` site; that refusal no longer exists, so selfhost now accepts
+  a `NonParking`-bounded finalizer or callable that parks. #1665 has two reproductions.
+- **Source migration:** none. Programs that rely on the admission are invalid under the reference.
+- **Diagnostics and limits:** selfhost reports nothing where the bootstrap reports SEM0139 at the
+  bounded call. Retire this entry when selfhost proves the bound.
 - **Evidence:** `nonParkingFinalizersAreAdmitted` in
-  `compiler/src/semantic/SemanticCaptureCases.silk`.
+  `compiler/src/semantic/SemanticCaptureCases.silk` pins the admission of valid finalizers; the
+  bootstrap's rejection is in `packages/compiler/test/Suspendability.test.ts`.
 
 ### Nominal qualification requires an inherent member
 
