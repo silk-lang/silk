@@ -43,7 +43,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(directory, 'main.silk'), source)
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "native-build"\nroot = "main.silk"\n',
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nroot = "main.silk"\n',
   )
   const sentinel = join(directory, 'clang-sentinel')
   const marker = join(directory, 'clang-called')
