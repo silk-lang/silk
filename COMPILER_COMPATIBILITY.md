@@ -2174,3 +2174,18 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   branch's N1 CLI rejects the same arm with SEM0224 at bytes 116–130. The native payload-control
   probe retains SEM0046 at bytes 116–126. The source-written lowering actor checks all four
   grammar/subject routes at exact spans. Full exact-head native Cases remain the execution gate.
+
+### Anonymous callables spelled with `once fn` or `mut fn`
+
+- **Status:** recorded on 2026-10-14. Native follows the reference; the bootstrap is lenient.
+- **Rule:** [ANON-CALLABLE-001](apps/docs/content/reference/functions-callables-and-control-flow.md#anon-callable-001--an-anonymous-callable-has-one-exact-source-identity-and-explicit-contract):
+  source does not spell `mut fn` or `once fn` when constructing an anonymous callable. Its
+  invocation mode derives from its captures (ANON-OWN-001).
+- **Compilers:** native rejects `once fn() -> i32 { return 4 }` and `mut fn() -> i32 { … }` at the
+  modifier with PAR0001 and PAR0002. The bootstrap accepts both spellings and derives the mode from
+  the captures anyway.
+- **Source migration:** write `fn() -> i32 { … }`; a consuming capture still makes the value
+  `once`.
+- **Evidence:** the bootstrap's focused manifest check accepts both spellings, and the N1 CLI
+  rejects them at the modifier while accepting the unspelled form. The bootstrap is not changed;
+  retire this entry with it.
