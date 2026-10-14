@@ -182,10 +182,12 @@ origin }`, then the drop chain and `Fail`. The texts it stores live in the funct
 Layout gives every failure slot a fixed-size companion of five words: `[string<'static>; 2]`
 (identity, label), then the observer pool handle (N7). The `Failure` local's companion is the caller's
 `%context` out-address; every other failure slot that a statement, a `ContextOf` or an observing
-call edge names gets its own companion in the frame. Identity is the canonical type name
-(`module.Name<Arguments>`, primitives by spelling, `()`); other failure types report the
-`failure-identity` gap. Texts are rendered while building MIR, where module source and declaration
-names are available.
+call edge names gets its own companion in the frame. Identity is the bootstrap's type encoding
+(`module.Name<Arguments>`, primitives by spelling, `()`, `string<'static>`, `Array<T, N>`, `&'static
+mut [T]`, `?[*]const align(N) T`). A region other than `'static` has no source spelling after
+instance selection and is omitted. Anonymous aggregates, callables, Effects, foreign functions and
+requirement-row arguments report the `failure-identity` gap. Texts are rendered while building MIR,
+where module source and declaration names are available.
 
 ABI of a function in an observing program, after the written parameters and providers:
 
@@ -295,12 +297,12 @@ callable-value follow-up owns it.
 
 ## 4. Gap codes
 
-| Code                | Change    | Raised where                                                               | Exit condition                       |
-| ------------------- | --------- | -------------------------------------------------------------------------- | ------------------------------------ |
-| `intrinsic-member`  | narrower  | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled` | suspension stage                     |
-| `observer-callback` | **new**   | an `observeDiagnostics` callback that is not a direct function             | callback environments in the record  |
-| `failure-identity`  | **new**   | an observed `fail` of a type other than a nominal, primitive, string or unit type | identity rendering for the remainder |
-| `entry-signature`   | removed   | no generated entry; every build roots at its runtime's C exports           | default runtime selection            |
+| Code                | Change   | Raised where                                                                                                         | Exit condition                       |
+| ------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| `intrinsic-member`  | narrower | `execution*`, `wake`; no longer `observeDiagnostics` or `observeUnhandled`                                           | suspension stage                     |
+| `observer-callback` | **new**  | an `observeDiagnostics` callback that is not a direct function                                                       | callback environments in the record  |
+| `failure-identity`  | **new**  | an observed `fail` of an anonymous aggregate, callable, Effect or foreign function, or a nominal with a row argument | identity rendering for the remainder |
+| `entry-signature`   | removed  | no generated entry; every build roots at its runtime's C exports                                                     | default runtime selection            |
 
 ## 5. Bootstrap parity and COMPILER_COMPATIBILITY.md
 
