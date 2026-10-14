@@ -2065,7 +2065,6 @@ export const nativeListenerDarwinWitnessSource = `
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 #if defined(__APPLE__)
 _Static_assert(sizeof(socklen_t) == 4, "Darwin socklen_t width");
@@ -2116,7 +2115,6 @@ export const nativeListenerGnuWitnessSource = `
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <time.h>
 #include <unistd.h>
 #if defined(__linux__) && defined(__GLIBC__)
 _Static_assert(sizeof(socklen_t) == 4, "GNU socklen_t width");
