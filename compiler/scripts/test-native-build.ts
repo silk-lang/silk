@@ -274,8 +274,8 @@ const program = Effect.gen(function* () {
   )
   assert.equal(formIr.status, 0, formIr.stderr)
   const formText = yield* fs.readFileString(join(library, 'form.ll'))
-  assert.match(formText, /^define [^\n]*@silk_answer\(/m)
-  assert.doesNotMatch(formText, /^define [^\n]*@main\(/m)
+  assert.match(formText, /^define [^\n]*@"?silk_answer"?\(/m)
+  assert.doesNotMatch(formText, /^define [^\n]*@"?main"?\(/m)
   // Intermediate stages compile for their target and merge no declared inputs.
   yield* fs.writeFileString(join(library, 'silk.toml'), manifest('{ object = "offset.o" }'))
   const assembly = yield* invoke(
