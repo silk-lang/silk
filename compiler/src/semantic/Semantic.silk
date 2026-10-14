@@ -1249,7 +1249,7 @@ effect fn foreignDeclaration(resolver: &mut Resolver, instance: &InstanceKey) ->
     InstanceKey.DropGlue { .. } => {
       return false
     }
-    InstanceKey.ExecutionHelper { .. } => {
+    InstanceKey.Helper { .. } => {
       return false
     }
     _ => ()
@@ -23376,6 +23376,19 @@ fn mutablePlace(nodes: &[BodyNode], locals: &[BodyLocal], id: BodyNodeId) -> boo
   }
 }
 
+// Whether a place's projections bottom out in a local or pattern binding rather than in a
+// temporary result such as a call.
+fn bindingRootedPlace(nodes: &[BodyNode], id: BodyNodeId) -> bool {
+  return match & nodes[id.index].kind {
+    BodyNodeKind.Expression {form: BodyExpression.Local {..}, ..} => true
+    BodyNodeKind.Expression {form: BodyExpression.PatternBinding {..}, ..} => true
+    BodyNodeKind.Expression {form: BodyExpression.Field {value, ..}, ..} => bindingRootedPlace(nodes, value)
+    BodyNodeKind.Expression {form: BodyExpression.Index {value, ..}, ..} => bindingRootedPlace(nodes, value)
+    BodyNodeKind.Expression {form: BodyExpression.Dereference {value}, ..} => bindingRootedPlace(nodes, value)
+    _ => false
+  }
+}
+
 // Called after mutablePlace refused: owned immutable roots differ from shared views or rvalues.
 fn assignmentPlaceCode(nodes: &[BodyNode], id: BodyNodeId) -> RejectionCode {
   return match &nodes[id.index].kind {
@@ -23713,6 +23726,13 @@ fn pointerSizedIntegerType(typeValue: &Type) -> bool {
 
 fn neverType(typeValue: &Type) -> bool {
   return Type.isNever(typeValue)
+}
+
+fn unitOrNever(typeValue: &Type) -> bool {
+  return match & typeValue.* {
+    Type.Unit => true
+    _ => Type.isNever(typeValue)
+  }
 }
 
 fn scalarCode(typeValue: &Type) -> usize {
@@ -28745,6 +28765,36 @@ effect fn recordFieldCount(resolver: &mut Resolver, module: &ModuleId, ty: &Shar
   return Result<usize, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.NotType, span))
 }
 
+// Whether `module` may name every field of a struct declaration: all fields are public, or the
+// struct is declared in `module`.
+effect fn recordFieldsVisible(resolver: &mut Resolver, module: &ModuleId, ty: &Shared<Type>) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, ty)
+  if moduleOrdinal == usize.MAX { return true }
+  let declaredModule = resolvedModule(&resolver.*, moduleOrdinal)
+  if ModuleId.equals(module, &declaredModule) { return true }
+  let ordinal = run ordinalOfProvider(&mut resolver.*, &declaredModule, ty)
+  if let Option<usize>.Some {value: declaration} = move ordinal {
+    let written = run header(&mut resolver.*, &declaredModule, declaration)
+    if let Option<HeaderSyntax>.Some {value: syntax} = move written {
+      if let Node.StructHeader {fields, ..} = syntax.header {
+        let sourceAnswer = run source(&mut resolver.*, &declaredModule)
+        if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, &declaredModule) {
+          let hir = IndexedSource.authored(indexed)
+          let mut at = usize.ZERO
+          while at < fields.length {
+            if let Node.Field {isPublic, ..} = Module.node(hir, Module.child(hir, fields, at)) {
+              if !isPublic { return false }
+            }
+            at = at + usize.ONE
+          }
+        }
+      }
+    }
+  }
+  return true
+}
+
 // Deferred generic union representation is reported only after ordinary ownership and member validation.
 effect fn deferredUnionVariant(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
@@ -33236,12 +33286,15 @@ effect fn variantTag(
   return Result<usize, Shared<Rejection>>.succeed(tag)
 }
 
-// One variant's written field names (declaration order), whether braces were written, and the
-// payload field types from the variant's member shape.
+// One variant's written field names (declaration order), whether braces were written, the
+// payload field types from the variant's member shape, and each field's visibility outside the
+// union's declaring module.
 struct VariantShape {
   braces: bool
   names: Vector<Bytes>
   types: Vector<Shared<Type>>
+  publics: Vector<bool>
+  module: usize
 }
 
 fn shapeLength(answer: &Result<Answer, NoRejection>) -> usize {
@@ -33261,6 +33314,15 @@ fn shapeTypeAt(answer: &Result<Answer, NoRejection>, at: usize) -> Option<Shared
   return Option<Shared<Type>>.none()
 }
 
+// Whether `module` may name the variant field at `index`: a public field, or any field inside the
+// union's declaring module.
+fn variantFieldVisible(resolver: &Resolver, module: &ModuleId, shape: &VariantShape, index: usize) -> bool {
+  let publics = Vector<bool>.asSlice(&shape.publics)
+  if index < publics.length && publics[index] { return true }
+  let declaring = resolvedModule(resolver, shape.module)
+  return ModuleId.equals(module, &declaring)
+}
+
 effect fn variantShape(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, unionType: &Shared<Type>, nominal: &NominalUnion,
@@ -33275,6 +33337,7 @@ effect fn variantShape(
   }
   if tag >= variants.length { return Result<VariantShape, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.UnknownUnionVariant, span)) }
   let mut names = Vector<Bytes>.make()
+  let mut publics = Vector<bool>.make()
   let mut braces = false
   let sourceAnswer = run source(&mut resolver.*, &declaredModule)
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, &declaredModule) {
@@ -33283,9 +33346,10 @@ effect fn variantShape(
       braces = writtenBraces
       let mut at = usize.ZERO
       while at < fields.length {
-        if let Node.Field {name, ..} = Module.node(hir, Module.child(hir, fields, at)) {
+        if let Node.Field {name, isPublic, ..} = Module.node(hir, Module.child(hir, fields, at)) {
           if let Node.Name {text} = Module.node(hir, name) {
             run Vector<Bytes>.append(&mut names, run Bytes.copy(Module.text(hir, text)))
+            run Vector<bool>.append(&mut publics, isPublic)
           }
         }
         at = at + usize.ONE
@@ -33315,7 +33379,9 @@ effect fn variantShape(
     if let Option<Shared<Type>>.Some {value} = move selected { run Vector<Shared<Type>>.append(&mut types, move value) }
     at = at + usize.ONE
   }
-  return Result<VariantShape, Shared<Rejection>>.succeed(VariantShape {braces: braces, names: move names, types: move types})
+  return Result<VariantShape, Shared<Rejection>>.succeed(VariantShape {
+    braces: braces, names: move names, types: move types, publics: move publics, module: nominal.module,
+  })
 }
 
 // One selected nominal-union variant, optionally awaiting ordinary payload inference.
@@ -33485,7 +33551,7 @@ effect fn namedPathPair(source: &SourceIndex, cursor: &AuthoredCursor, annotatio
 // The fields a record or variant pattern can name.
 union FieldSource {
   Record {ty: Shared<Type>},
-  Variant {tag: usize, names: Vector<Bytes>, types: Vector<Shared<Type>>},
+  Variant {tag: usize, shape: VariantShape},
 }
 
 // A pattern's written member type, resolved once with every other reached body annotation. Any
@@ -33737,7 +33803,7 @@ effect fn checkNestedVariantPattern(
   run Vector<BodyPlaceStep>.append(&mut path, BodyPlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&ty), source: Shared<Type>.clone(subjectType)})
   run Vector<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&path), tag: variant.tag,
     tags: variant.nominal.count, source: Option<Shared<Type>>.none()})
-  let origin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
+  let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
   return run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
     annotations, elided, &mut nodes.*, subject, &origin, fields, &path, access, &mut tests.*, span)
 }
@@ -33788,15 +33854,19 @@ effect fn checkRecordPatternFields(
           }
           step = BodyPlaceStep.Field {index: field.index}
         }
-        FieldSource.Variant {tag, names, types} => {
-          let written = Vector<Bytes>.asSlice(&names)
-          let listed = Vector<Shared<Type>>.asSlice(&types)
+        FieldSource.Variant {tag, shape} => {
+          let written = Vector<Bytes>.asSlice(&shape.names)
+          let listed = Vector<Shared<Type>>.asSlice(&shape.types)
           let mut index = usize.ZERO
           while index < written.length {
             if same(Bytes.asSlice(&written[index]), Bytes.asSlice(&text)) { break }
             index = index + usize.ONE
           }
           if index == written.length { return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnknownStructField, fieldSpan)) }
+          // A pattern names a variant field only where a projection of it would be allowed.
+          if !variantFieldVisible(&resolver.*, module, &shape, index) {
+            return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.InaccessibleProjectedField, fieldSpan))
+          }
           field = CheckedRecordMember {index: index, count: written.length, ty: Shared<Type>.clone(&listed[index])}
           step = BodyPlaceStep.VariantField {tag: tag, field: index}
         }
@@ -33866,7 +33936,7 @@ effect fn checkRecordPatternFields(
               return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, subpatternSpan))
             }
             run Vector<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count, source: Option<Shared<Type>>.none()})
-            let nestedOrigin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
+            let nestedOrigin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
             let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
               annotations, elided, &mut nodes.*, subject, &nestedOrigin, nested, &fieldPath, access, &mut tests.*, subpatternSpan)
             if let Option<Shared<Rejection>>.Some {value} = move failed { return Option<Shared<Rejection>>.some(move value) }
@@ -33930,7 +34000,7 @@ effect fn checkRecordPatternFields(
             return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, subpatternSpan))
           }
           run Vector<BodyPatternTest>.append(&mut tests.*, BodyPatternTest {path: run copySteps(&fieldPath), tag: variant.tag, tags: fieldUnion.count, source: Option<Shared<Type>>.none()})
-          let nestedOrigin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
+          let nestedOrigin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
           let mut nestedFields = Range.empty()
           if nested.present { nestedFields = nested.range }
           let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
@@ -33952,7 +34022,7 @@ effect fn checkRecordPatternFields(
           Result<usize, Shared<Rejection>>.Failure {error} => { return Option<Shared<Rejection>>.some(move error) }
         }
       }
-      FieldSource.Variant {names, ..} => { total = Vector<Bytes>.length(&names) }
+      FieldSource.Variant {shape, ..} => { total = Vector<Bytes>.length(&shape.names) }
     }
     if Vector<usize>.length(&seen) != total {
       return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.MissingPatternField, span))
@@ -33975,6 +34045,15 @@ effect fn checkVariantConstruct<'scope>(
   let variant = match move chosen {
     Result<SelectedVariant, Shared<Rejection>>.Success {value} => move value
     Result<SelectedVariant, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+  }
+  // STRUCT-002: outside the declaring module, a variant with a private field has no source
+  // constructor; the literal is rejected without naming the hidden field.
+  let mut field = usize.ZERO
+  while field < Vector<Bytes>.length(&variant.shape.names) {
+    if !variantFieldVisible(&resolver.*, module, &variant.shape, field) {
+      return run bodyRejection(&resolver.*, module, RejectionCode.InaccessibleConstruction, span)
+    }
+    field = field + usize.ONE
   }
   let names = Vector<Bytes>.asSlice(&variant.shape.names)
   let types = Vector<Shared<Type>>.asSlice(&variant.shape.types)
@@ -34743,9 +34822,7 @@ effect fn checkRecordMatch<'scope>(
           return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan)
         }
         ordinal = variant.tag
-        let origin = FieldSource.Variant {
-          tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types,
-        }
+        let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
         let root = Vector<BodyPlaceStep>.make()
         let mut writtenFields = Range.empty()
         if fields.present { writtenFields = fields.range }
@@ -34770,7 +34847,7 @@ effect fn checkRecordMatch<'scope>(
           if !variant.shape.braces { return run bodyRejection(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, patternSpan) }
           if !memberUncovered(&rows, variant.tag) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
           ordinal = variant.tag
-          let origin = FieldSource.Variant {tag: variant.tag, names: move variant.shape.names, types: move variant.shape.types}
+          let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
           let root = Vector<BodyPlaceStep>.make()
           let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
             statementScope.annotations, &elided, &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests, patternSpan)
@@ -35409,6 +35486,12 @@ effect fn checkRecordFields<'scope>(
     Result<usize, Shared<Rejection>>.Failure {error} => {
       return Result<CheckedRecordFields, Shared<Rejection>>.failResult(move error)
     }
+  }
+  // STRUCT-002: outside the declaring module, a struct with a private field has no source
+  // constructor; the literal is rejected without naming the hidden field.
+  if !run recordFieldsVisible(&mut resolver.*, module, recordType) {
+    return Result<CheckedRecordFields, Shared<Rejection>>.failResult(
+      run reject(&resolver.*, module, RejectionCode.InaccessibleConstruction, span))
   }
   let mut inferred = Vector<Binding>.make()
   let mut operands = Vector<BodyAggregateField>.make()
@@ -49017,13 +49100,20 @@ effect fn checkPlaceAssignment(
       return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
     }
   }
+  // ASSIGN-001: the target names one writable place rooted in a binding; a temporary result,
+  // and any field, element or referent reached through one, is not a destination.
+  let targetSpan = run bodySpan(&resolver.source, cursor, target)
+  if !bindingRootedPlace(Vector<BodyNode>.asSlice(&nodes.*), destination) {
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(
+      run reject(&resolver.*, module, RejectionCode.InvalidAssignmentPlace, targetSpan))
+  }
   if !mutablePlace(
     Vector<BodyNode>.asSlice(&nodes.*),
     Vector<BodyLocal>.asSlice(&locals.*),
     destination,
   ) {
     let code = assignmentPlaceCode(Vector<BodyNode>.asSlice(&nodes.*), destination)
-    return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module, code, span))
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module, code, targetSpan))
   }
   let expected = bodyExpressionType(Vector<BodyNode>.asSlice(&nodes.*), &destination)
   // A local whose type retains a region takes the value's own type first, so the assignment can
@@ -49771,6 +49861,17 @@ effect fn checkWrittenExpression(
             let diverges = match & Vector<BodyNode>.asSlice(&nodes.*)[node.index].kind {
               BodyNodeKind.Expression {ty, ..} => Shared<Type>.with<bool>(&ty, neverType)
               _ => false
+            }
+            // STMT-001: only a `()` or `never` result may stand alone; any other value, an Effect
+            // construction included, is bound, returned, run or explicitly dropped.
+            let ignorable = match & Vector<BodyNode>.asSlice(&nodes.*)[node.index].kind {
+              BodyNodeKind.Expression {ty, ..} => Shared<Type>.with<bool>(&ty, unitOrNever)
+              _ => true
+            }
+            if !ignorable {
+              return Result<bool, Shared<Rejection>>.failResult(
+                run reject(&resolver.*, module, RejectionCode.ExplicitDiscard, run bodySpan(&resolver.source, cursor, expression)),
+              )
             }
             run Vector<BodyNodeId>.append(&mut statements.*, node)
             if diverges {
@@ -51957,7 +52058,7 @@ effect fn storeMir(resolver: &mut Resolver, function: MirFunction, dependencies:
   return memberSuccess(Value.Mir {index: index}, move dependencies)
 }
 
-// Package helpers follow their creator, where their own queries find them.
+// Helpers follow their creator, where their own queries find them.
 effect fn storeLowered(resolver: &mut Resolver, lowered: Lowered, dependencies: Vector<Dependency>) -> Answer
 ! OutOfMemoryError ? &mut Allocator {
   let Lowered {function, helpers} = move lowered
@@ -51969,9 +52070,9 @@ effect fn storeLowered(resolver: &mut Resolver, lowered: Lowered, dependencies: 
   return move answer
 }
 
-// A package helper's MIR is lowered with its creator's; this answer selects it after the creator's.
+// A helper's MIR is lowered with its creator's; this answer selects it after the creator's.
 effect fn resolveHelperMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, instance: &InstanceKey,
-  creator: &InstanceKey, node: usize, purpose: HelperRole, observing: bool) -> Answer
+  creator: &InstanceKey, node: usize, ordinal: usize, purpose: HelperRole, observing: bool) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut dependencies = Vector<Dependency>.make()
   let identity = InstanceKey.identity(creator)
@@ -52005,9 +52106,9 @@ effect fn resolveHelperMir(resolver: &mut Resolver, owner: &mut Query<Answer, No
   let mut helping = true
   while helping && at < stored.length {
     helping = false
-    if let InstanceKey.ExecutionHelper {node: site, purpose: selectedPurpose, ..} = &stored[at].key {
+    if let InstanceKey.Helper {node: site, ordinal: position, purpose: selectedPurpose, ..} = &stored[at].key {
       helping = true
-      if site == node && selectedPurpose == purpose && run InstanceKey.sameApplication(&stored[at].key, instance) {
+      if site == node && position == ordinal && selectedPurpose == purpose && run InstanceKey.sameApplication(&stored[at].key, instance) {
         return memberSuccess(Value.Mir {index: at}, move dependencies)
       }
     }
@@ -52120,13 +52221,13 @@ effect fn canonicalRejection(resolver: &mut Resolver, sourceOwner: &DeclarationI
 }
 
 // The query member that selects an instance's MIR producer: an ordinary or selected body, drop
-// glue, a C export shim, or an execution package helper.
+// glue, a C export shim, or a helper.
 fn instanceMember(instance: &InstanceKey) -> usize {
   return match &instance.* {
     InstanceKey.Function {..} => usize.ZERO
     InstanceKey.DropGlue {..} => usize.MAX - usize.ONE
     InstanceKey.Export {..} => exportMember()
-    InstanceKey.ExecutionHelper {..} => usize.MAX - 3
+    InstanceKey.Helper {..} => usize.MAX - 3
   }
 }
 
@@ -55454,13 +55555,25 @@ effect fn callableInvocationResult(resolver: &mut Resolver, owner: &mut Query<An
 }
 
 // Whether a section call stores no argument, so every operand is written.
-fn writtenLanesOnly(lanes: &[MirStoredLane]) -> bool {
-  let mut at = usize.ZERO
-  while at < lanes.length {
-    if let MirStoredLane.Field {..} = lanes[at] { return false }
-    at = at + usize.ONE
+// Whether a target's callable reaches its environment through a shared loan, or has none.
+fn sharedEnvironment(target: &MirCallTarget) -> bool {
+  if let Option<MirStoredArguments>.Some {value: stored} = &target.stored {
+    if stored.consumes { return false }
+    return match &stored.environment {
+      Option<MirStoredEnvironment>.None => true
+      Option<MirStoredEnvironment>.Some {value: input} => sharedLoan(&input.borrow)
+    }
   }
-  return true
+  // An anonymous body receives its whole environment first.
+  let operands = Vector<MirCallOperand>.asSlice(&target.operands)
+  return operands.length != usize.ZERO && sharedLoan(&operands[usize.ZERO].borrow)
+}
+
+fn sharedLoan(borrow: &Option<Access>) -> bool {
+  return match &borrow.* {
+    Option<Access>.Some {value} => value == Access.Shared
+    Option<Access>.None => false
+  }
 }
 
 fn callableInputParameter(input: &CallableFieldInput, at: usize) -> bool {
@@ -55943,6 +56056,10 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
           Result<Option<Shared<Type>>, PreparationFailure>.Success {value} => move value
           Result<Option<Shared<Type>>, PreparationFailure>.Failure {error} => { return Result<usize, PreparationFailure>.failResult(move error) }
         }
+        let callbackDrop = match move run ownedCleanup(&mut resolver.*, &mut owner.*, &mut dependencies.*, &stored[usize.ONE], origin, anchor) {
+          Result<Option<Shared<Type>>, PreparationFailure>.Success {value} => move value
+          Result<Option<Shared<Type>>, PreparationFailure>.Failure {error} => { return Result<usize, PreparationFailure>.failResult(move error) }
+        }
         let inner = match move run compositePlan(&mut resolver.*, &mut owner.*, &mut dependencies.*, body, node, caller,
           callerBindings, projections, identity, &stored[2], origin, own, &mut bound.*, module, &mut steps.*, anchor) {
           Result<usize, PreparationFailure>.Success {value} => value
@@ -55958,8 +56075,10 @@ effect fn compositePlan(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
         let carriedWhole = run carriesNonParking(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, callerBindings,
           projections, ty, BodyOrigin.span(origin, anchor))
         let owed = !carriedPart && !carriedWhole
+        let lent = run Types.intern(Type.Reference {referent: Shared<Type>.clone(&stored[usize.ONE]), access: Access.Shared,
+          lifetime: run Shared<Lifetime>.make(Lifetime.Static)})
         run Vector<MirRunPlan>.append(&mut steps.*, MirRunPlan.Observe {inner: inner, state: move address, stateDrop: move stateDrop,
-          callback: move callback.key, owed: owed})
+          callable: move lent, callbackDrop: move callbackDrop, callback: move callback, owed: owed})
         return Result<usize, PreparationFailure>.succeed(Vector<MirRunPlan>.length(&steps.*) - usize.ONE)
       }
       if operation == Composition.UseRelease {
@@ -56635,9 +56754,10 @@ struct InvokedTarget {
   mode: CallableMode
 }
 
-// The observer callback's direct call `callback(&mut state, event, first, second, identity,
-// origin) -> usize` (failure observer note N1). Only a direct function is supported: an
-// observed instance passes exactly the written operands.
+// The observer callback's call `callback(&mut state, event, first, second, identity, origin) ->
+// usize` (failure observer note N1). The observation's adapter invokes it repeatedly through a
+// shared loan of the stored callable, so a callable that consumes or exclusively lends its
+// environment, or that needs providers, is not supported.
 effect fn observerTarget(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, body: &Shared<TypedBody>, node: BodyNodeId, caller: &Application,
   callerBindings: &[Binding], projections: &[RuntimeProjection], identity: &Shared<DeclarationId>, callable: &Shared<Type>,
@@ -56666,14 +56786,14 @@ effect fn observerTarget(resolver: &mut Resolver, owner: &mut Query<Answer, NoRe
     Result<MirCallTarget, PreparationFailure>.Success {value} => move value
     Result<MirCallTarget, PreparationFailure>.Failure {error} => { return Result<MirCallTarget, PreparationFailure>.failResult(move error) }
   }
-  let direct = match &target.stored {
-    Option<MirStoredArguments>.Some {value: stored} => match &stored.environment {
-      Option<MirStoredEnvironment>.None => writtenLanesOnly(Vector<MirStoredLane>.asSlice(&stored.lanes))
-      _ => false
-    }
-    Option<MirStoredArguments>.None => false
+  let shared = sharedEnvironment(&target)
+  let served = Vector<MirProviderSource>.length(&target.providers) == usize.ZERO && match &target.dispatch {
+    Option<MirProviderSource>.None => true
+    _ => false
   }
-  if !direct || target.receiverDereferences != usize.ZERO { return Result<MirCallTarget, PreparationFailure>.failResult(PreparationFailure.Coverage {code: GapCode.ObserverCallback}) }
+  if !shared || !served || target.receiverDereferences != usize.ZERO {
+    return Result<MirCallTarget, PreparationFailure>.failResult(PreparationFailure.Coverage {code: GapCode.ObserverCallback})
+  }
   return Result<MirCallTarget, PreparationFailure>.succeed(move target)
 }
 
@@ -57203,9 +57323,9 @@ effect fn lowerMir(
     }
     suspending = Option<Vector<InstanceKey>>.some(move callees)
   }
-  if let InstanceKey.ExecutionHelper {creator, node, purpose} = &instance {
+  if let InstanceKey.Helper {creator, node, ordinal, purpose} = &instance {
     let creating = Shared<InstanceKey>.with<InstanceKey>(&creator, InstanceKey.copy)
-    return run resolveHelperMir(&mut resolver.*, &mut owner.*, &instance, &creating, node, purpose, observing)
+    return run resolveHelperMir(&mut resolver.*, &mut owner.*, &instance, &creating, node, ordinal, purpose, observing)
   }
   if let Option<Shared<Type>>.Some {value: glued} = move InstanceKey.glueType(&instance) {
     return run resolveGlueMir(&mut resolver.*, &mut owner.*, move instance, &glued, observing)
@@ -58321,6 +58441,15 @@ pub effect fn mirLayoutDemands(function: &MirFunction, anchor: &Option<Anchor>) 
     while statementAt < statements.length {
       run appendStatementLayoutDemands(function, &statements[statementAt], &mut copied, anchor)
       statementAt = statementAt + usize.ONE
+    }
+    // A call reads each argument in place, so a projected argument needs its referent layouts too.
+    if let MirTerminator.Call {arguments, origin, ..} = &blocks[blockAt].terminator {
+      let listed = Vector<MirOperand>.asSlice(&arguments)
+      let mut argumentAt = usize.ZERO
+      while argumentAt < listed.length {
+        run appendOperandLayoutDemands(function, &listed[argumentAt], anchoredSpan(anchor, origin), &mut copied)
+        argumentAt = argumentAt + usize.ONE
+      }
     }
     blockAt = blockAt + usize.ONE
   }
@@ -69544,11 +69673,13 @@ impl Semantic {
     let ancestors = Admission.make()
     return run closeChain(&mut self.*, &ancestors, &validated, move incoming, limit)
   }
-  /// Builds an artifact whose roots are the active C exports of the selected runtime source and of
-  /// the request's application module, which is what `import Intrinsic.application` binds inside
-  /// the runtime. Checks the loaded root-package declarations supplied by source ownership, then
-  /// emits only reached instances and joins their definitions in content-symbol order.
-  pub effect fn buildRuntime(self: &mut Self, request: &mut Request, runtime: &ModuleId,
+  /// Builds an artifact whose roots are the active C exports of the selected runtime source, when
+  /// one is selected, and of the request's application module, which is what `import
+  /// Intrinsic.application` binds inside the runtime. A library or object form selects no runtime,
+  /// so its application's exports are its only roots and it may have none (ARTIFACT-003). Checks
+  /// the loaded root-package declarations supplied by source ownership, then emits only reached
+  /// instances and joins their definitions in content-symbol order.
+  pub effect fn buildArtifact(self: &mut Self, request: &mut Request, runtime: Option<&ModuleId>,
     rootPackage: &[ModuleId], closureNodes: usize) -> BackendBuild
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
@@ -69566,24 +69697,28 @@ impl Semantic {
       return BackendBuild.Unsupported { gaps: move checked.gaps }
     }
     let origin = Span.make(usize.ZERO, usize.ZERO)
-    let listed = match move run exportCandidates(&mut self.resolver, runtime) {
-      Option<Vector<ExportCandidate>>.Some {value} => move value
-      Option<Vector<ExportCandidate>>.None => {
-        return refusedBuild(run reject(&self.resolver, runtime, RejectionCode.MissingModule, origin))
-      }
-    }
     let mut roots = Vector<BuildRoot>.make()
     let mut gaps = Vector<Shared<BackendGap>>.make()
-    let refused = run Semantic.rootExports(&mut self.*, &mut request.*, runtime, &listed, &mut roots, &mut gaps)
-    if let Option<Shared<Rejection>>.Some {value} = move refused {
-      return refusedBuild(move value)
-    }
-    if Vector<Shared<BackendGap>>.length(&gaps) > usize.ZERO {
-      return BackendBuild.Unsupported {gaps: move gaps}
-    }
-    // A runtime whose arms select no export for this target provides no artifact root.
-    if Vector<BuildRoot>.length(&roots) == usize.ZERO {
-      return refusedBuild(run reject(&self.resolver, runtime, RejectionCode.UnknownFunction, origin))
+    let mut rootModule = Option<ModuleId>.none()
+    if let Option<&ModuleId>.Some {value: selected} = move runtime {
+      let listed = match move run exportCandidates(&mut self.resolver, selected) {
+        Option<Vector<ExportCandidate>>.Some {value} => move value
+        Option<Vector<ExportCandidate>>.None => {
+          return refusedBuild(run reject(&self.resolver, selected, RejectionCode.MissingModule, origin))
+        }
+      }
+      let refused = run Semantic.rootExports(&mut self.*, &mut request.*, selected, &listed, &mut roots, &mut gaps)
+      if let Option<Shared<Rejection>>.Some {value} = move refused {
+        return refusedBuild(move value)
+      }
+      if Vector<Shared<BackendGap>>.length(&gaps) > usize.ZERO {
+        return BackendBuild.Unsupported {gaps: move gaps}
+      }
+      // A runtime whose arms select no export for this target provides no artifact root.
+      if Vector<BuildRoot>.length(&roots) == usize.ZERO {
+        return refusedBuild(run reject(&self.resolver, selected, RejectionCode.UnknownFunction, origin))
+      }
+      rootModule = Option<ModuleId>.some(ModuleId.copy(selected))
     }
     // The application's own C exports are roots beside the runtime's, so foreign code can call them.
     let mut application = Option<ModuleId>.none()
@@ -69601,8 +69736,17 @@ impl Semantic {
           return BackendBuild.Unsupported {gaps: move gaps}
         }
       }
+      if let Option<ModuleId>.None = &rootModule {
+        rootModule = Option<ModuleId>.some(move applicationModule)
+      }
     }
-    return run Semantic.buildFrom(&mut self.*, runtime, Vector<BuildRoot>.asSlice(&roots), origin, closureNodes, false,
+    let module = match move rootModule {
+      Option<ModuleId>.Some {value} => move value
+      Option<ModuleId>.None => {
+        return CompilerBug.panic(b"an artifact build names neither a runtime nor an application")
+      }
+    }
+    return run Semantic.buildFrom(&mut self.*, &module, Vector<BuildRoot>.asSlice(&roots), origin, closureNodes, false,
       &Option<FrameSelection>.none())
   }
   // Roots every active C export `module` declares. Signature gaps are collected beside the roots;
@@ -70620,8 +70764,8 @@ struct SuspensionSummary {
   park: Option<Span>
   nonParking: Vector<ParkObligation>
   // Instances this body runs without a direct call: the drop glue of each drop and each Silk
-  // function whose address it forms, such as an observer callback. Execution helpers are left out:
-  // driving runs a package's body, which may park without parking its driver.
+  // function whose address it forms, such as an observer adapter. An Execution's start helper is
+  // left out: driving runs a package's body, which may park without parking its driver.
   indirect: Vector<InstanceKey>
   // Whether this body notifies an Execution, which runs the reached readiness endpoints.
   notifies: bool
@@ -70659,7 +70803,7 @@ impl SuspensionSummary {
           if InstanceKey.fixedLinkage(&key) {
             run Vector<CallbackBoundary>.append(&mut callbacks, CallbackBoundary {key: InstanceKey.copy(&key), span: anchoredSpan(anchor, origin)})
           }
-          if !executionHelper(&key) { run Vector<InstanceKey>.append(&mut indirect, InstanceKey.copy(&key)) }
+          if !startHelper(&key) { run Vector<InstanceKey>.append(&mut indirect, InstanceKey.copy(&key)) }
           if let Option<Shared<Type>>.Some {..} = move InstanceKey.glueType(&key) {
             run Vector<InstanceKey>.append(&mut packages, InstanceKey.copy(&key))
           }
@@ -70846,12 +70990,13 @@ effect fn closeSuspendable(summaries: &[SuspensionSummary]) -> Vector<bool> ! Ou
   return move marked
 }
 
-fn executionHelper(key: &InstanceKey) -> bool {
-  return match &key.* { InstanceKey.ExecutionHelper {..} => true _ => false }
+// An Execution's start helper runs its body, which may park without parking whoever forms it.
+fn startHelper(key: &InstanceKey) -> bool {
+  return match &key.* { InstanceKey.Helper {purpose, ..} => purpose == HelperRole.Start _ => false }
 }
 
 fn readinessHelper(key: &InstanceKey) -> bool {
-  return match &key.* { InstanceKey.ExecutionHelper {purpose, ..} => purpose == HelperRole.Notify _ => false }
+  return match &key.* { InstanceKey.Helper {purpose, ..} => purpose == HelperRole.Notify _ => false }
 }
 
 // Each summary's indirect runs as summary positions: every reached instance its drops, formed
