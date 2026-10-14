@@ -170,8 +170,18 @@ const selected = nativeCorpus.filter((p) => new RegExp(process.argv[3]).test(p.n
 process.exit(await runCorpus(process.argv[2], nativeCorpus, [], selected, undefined, process.env.SILKC_CLANG, 12))
 ```
 
+## Status 2026-10-14 (later session)
+
+- #1680: TS bootstrap check clean (0 `error[`). DDC dispatched: run 38604023044 (T1 DDC job green).
+- failure-identity: implemented on `selfhost-native-traps-2` @ 147ebc3, draft PR #1686 (stacked on
+  #1680). Static regions spelled; non-static regions OMITTED, not gapped: the bootstrap prints
+  inference regions (`Problem<'_local9>`) that native cannot reproduce, and gapping regressed
+  corpus `borrowed-outcome-failure`. Question to Julia via coordinator: canonical spelling for
+  non-static regions. Bootstrap check + DDC for #1686 pending.
+- Probe dirs: /tmp/fi/<name> (holder, array, slice, pointer, aligned, region).
+
 ## Exact next action
 
-1. Run the TS bootstrap check above on `selfhost-native-traps-1`.
-2. If it is clean, dispatch the DDC for that branch, mark #1680 ready, and merge when it passes.
-3. Then start item 3 (failure-identity) on a new branch, `selfhost-native-traps-2`.
+1. When run 38604023044 is green: mark #1680 ready, hand off to coordinator.
+2. #1686: bootstrap check, DDC on `selfhost-native-traps-2`, ready, hand off.
+3. Start observer-callback.
