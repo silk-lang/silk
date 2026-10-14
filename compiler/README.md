@@ -231,6 +231,17 @@ Test invocation: `silkc test <root> -o <executable> --stdlib <directory> [--filt
 bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it with an uncached
 plan, admits its receipt and exits with its status; see [Native `silkc test`](docs/native-test.md).
 
+Run invocation: `silkc run [--stdlib <directory>] [arguments...] [-- arguments...]`. It finds the
+nearest `silk.toml` above the working directory, as the TypeScript CLI's `silk run` does, and
+builds `[package].root` for the host target in the debug profile (no optimization, debug
+information) at `<output-dir>/llvm/<target>/debug/<name>`, where `[build].output-dir` defaults to
+`build` and must stay inside the project. Options are read until `--`; other arguments before it
+and every argument after it go to the program in order. The compiler then replaces its own process
+with the program (`execv`), so the program inherits standard input, output and error, the
+environment and the working directory, and its exit status or terminating signal is the command's.
+A missing or invalid manifest, a non-executable `[build].artifact` or a non-final `[build].stage`
+exits 2; a refused build keeps `build`'s status.
+
 ### One native generation and its smoke receipt
 
 `NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored compiler/stdlib
