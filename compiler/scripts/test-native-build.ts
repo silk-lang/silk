@@ -115,12 +115,12 @@ const program = Effect.gen(function* () {
   const ambient = Object.fromEntries(
     Object.entries(process.env).filter(([name]) => name !== 'SILKC_CLANG'),
   )
-  const tools = join(directory, 'tools')
-  yield* fs.makeDirectory(tools)
-  yield* fs.symlink(sentinel, join(tools, 'clang'))
+  const pathTools = join(directory, 'tools')
+  yield* fs.makeDirectory(pathTools)
+  yield* fs.symlink(sentinel, join(pathTools, 'clang'))
   const onPath = yield* invoke(silkc, argumentsFor('on-path'), directory, {
     ...ambient,
-    PATH: `${tools}:${process.env.PATH ?? ''}`,
+    PATH: `${pathTools}:${process.env.PATH ?? ''}`,
   })
   assert.notEqual(onPath.status, 0, 'the sentinel clang fails the link')
   assert.equal(yield* fs.exists(marker), true, 'the clang on PATH must run')
