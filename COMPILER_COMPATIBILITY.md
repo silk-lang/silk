@@ -124,23 +124,21 @@ Each entry records:
   reborrow to satisfy a shared parameter or binding annotation.
 - **Source migration:** none.
 - **Diagnostics and limits:** selfhost is stricter than the bootstrap. Type arguments, requirement
-  rows, callable and Effect positions, services, interfaces, recursive declarations still being
-  summarized, and declarations whose member shape is unavailable are treated as invariant. Such
-  calls keep the original `TypeMismatch` at the call.
-  An unchanged requirement-row argument does not by itself make an unrelated nominal lifetime
-  invariant: the lifetime still follows the declaration's fields (LIFE-002). Requirement keys that
-  mention the binder, including either side of an unresolved row subtraction, remain invariant;
-  row arguments themselves must still match exactly.
-  A call lifetime fixed by earlier operands may also shorten to their meet with a later operand
+  row arguments, callable and Effect positions, recursive declarations still being summarized,
+  and declarations whose member shape is unavailable are treated as invariant. Such calls keep
+  the original `TypeMismatch` at the call. An unchanged requirement-row argument does not make
+  an unrelated nominal lifetime invariant: the declaration's fields decide its variance
+  (LIFE-002). Requirement keys mentioning that lifetime, including either side of an unresolved
+  row subtraction, remain invariant; row arguments themselves still match exactly. Qualified
+  interface and captured service operations use the same operand-region matcher as direct calls.
+  A call lifetime fixed by earlier operands may shorten to their meet with a later operand only
   when every parameter stores it covariantly. Ordinary outlives and contents bounds admit that
-  inference step when their longer side or subject does not mention the shortened binder; every
-  final applied bound is still proved. This includes captured service operations without relaxing
-  exclusive referents or requirement-key identity.
+  inference step only when their longer side or subject does not mention the shortened binder;
+  every final applied bound is still proved. Newly inferred inner lifetimes cannot replace an
+  explicitly supplied lifetime, and exclusive referents remain invariant.
 - **Evidence:** `sharedLoanParametersShortenOnlyMatchingAccess` in
-  `compiler/src/semantic/SemanticLoweringCases.silk`, and
-  `loadedDeclarationSweepKeepsRowsInvariantDuringLifetimeInference` and
-  `capturedServiceCallShortensOnlyCovariantLifetimes` in
-  `compiler/src/semantic/SemanticConformanceCases.silk`.
+  `compiler/src/semantic/SemanticLoweringCases.silk`, and the loaded-declaration sweep and
+  `standalone*` direct-demand Cases in `compiler/src/semantic/SemanticConformanceCases.silk`.
 - **Open questions:** when selfhost replaces exact call inference with subtyping, fold this rule into
   the matcher using a cached per-declaration variance summary.
 
@@ -2139,3 +2137,20 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   `compiler/` bind the slice to a local before indexing it, which both compilers accept. Declaration
   handle Cases use the same direct-view form.
 - The bootstrap is not extended for this. Retire this entry with the bootstrap.
+
+### Braced unit-variant patterns
+
+- **Status:** approved by Julia on 2026-10-13; SEM0224 allocated on main in #1648. Native
+  enforcement is implemented; bootstrap enforcement remains incomplete.
+- **Rule:** PATT-021 writes a unit nominal-union variant as a bare selector. A braced payload
+  pattern is invalid even when its field list is empty. Missing fields of a payload-bearing
+  variant remain SEM0046.
+- **Compilers:** native rejects plain, applied, nested-field and structural-union member forms
+  with SEM0224. The synchronized bootstrap accepts the plain braced-unit fixture.
+- **Source migration:** write `Shape.Empty` instead of `Shape.Empty {}`. The compiler's
+  `Node.UnitType` pattern and coverage/refutability fixtures use the bare form; their distinct
+  assertions remain.
+- **Evidence:** the bootstrap's focused manifest check accepts a `Shape.Empty {}` arm; the
+  branch's N1 CLI rejects the same arm with SEM0224 at bytes 116–130. The native payload-control
+  probe retains SEM0046 at bytes 116–126. The source-written lowering actor checks all four
+  grammar/subject routes at exact spans. Full exact-head native Cases remain the execution gate.
