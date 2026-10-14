@@ -1101,6 +1101,12 @@ Counted only in an incremental session:
 | codegen units recompiled and reused                        | backend                                                                                           |
 | instances visited by the walk, and walk time               | `buildFrom`                                                                                       |
 
+Fingerprint bytes hashed counts the logical input bytes appended to the whole and prototype
+declaration hash streams, including token and identity framing and any bytes appended to both
+streams. It accumulates when a source index is successfully published, once per changed index;
+failed staged revisions contribute nothing. A one-shot build computes no declaration fingerprints
+and has no fingerprint counter.
+
 `silkc build --stats` prints them on standard error after the build, in a fixed text form a script
 can parse. The cold-build gate (§9.1), the first-build budget (§9.2) and the update targets (§9.3)
 are each measured with it on the self-build, and every slice PR reports them beside time and RSS,

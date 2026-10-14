@@ -11,10 +11,11 @@
 import semantic.Anchor {Anchor}
 import semantic.ModuleId {ModuleId}
 import semantic.InternIndex {InternIndex}
-import semantic.ModuleIndex {ModuleIndex, NameObservation}
+import semantic.ModuleIndex {ImplInventoryChanges, ModuleIndex, NameObservation}
 import semantic.Query {Cycle, Query}
 import semantic.SourceRevision {Observation, Revision}
 import semantic.SourceUnit {SourceUnit}
+import semantic.SourceLocations {LineMap, SourceLocations}
 import hir.Hir {CauseCode, HirId, Module, Node, OwnerKind, Range}
 import semantic.DeclarationId {DeclarationId}
 import hir.Intern {StringTable, Symbol}
@@ -39,10 +40,101 @@ pub struct IndexedSource {
   identities: Vector<Option<Shared<DeclarationId>>>
 }
 
-/// One changed loaded module, retaining its previous declaration index for identity matching.
+/// One changed loaded module, with its previous index and current authenticated source answer.
 pub struct SourceChange {
   pub module: ModuleId
   pub previous: Option<ModuleIndex>
+  // The prior HIR, token locations and bytes live only until pending graph invalidation finishes.
+  previousUnit: Option<SourceUnit>
+  pub current: Shared<Result<SourceResult, NoRejection>>
+}
+
+/// One changed module's location evidence, prepared once for its observed declaration properties.
+pub struct LocationComparison<'a> {
+  previous: &'a SourceUnit
+  previousIndex: &'a ModuleIndex
+  current: &'a SourceUnit
+  currentIndex: &'a ModuleIndex
+  previousLines: LineMap
+  currentLines: LineMap
+}
+
+fn ambiguousLocation(index: &ModuleIndex, ordinal: usize) -> bool {
+  let declarations = ModuleIndex.listDeclarations(index)
+  let mut at = ordinal
+  while at < declarations.length {
+    if declarations[at].ambiguous { return true }
+    at = match &declarations[at].parent {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => usize.MAX
+    }
+  }
+  return false
+}
+
+impl LocationComparison {
+  fn matchesCurrent(self: &Self, oldLocations: &SourceLocations, oldSpan: Span, newSpan: Span) -> bool {
+    return Shared<SourceLocations>.with<bool>(&self.current.locations,
+      fn(newLocations: &SourceLocations) -> bool {
+        return SourceLocations.matchesRange(oldLocations, newLocations, oldSpan, newSpan,
+          &self.previousLines, &self.currentLines)
+      })
+  }
+
+  /// A missing or identity-unstable declaration always changes its location property.
+  pub fn changed(self: &Self, identity: &DeclarationId) -> bool {
+    let old = ModuleIndex.ordinalOf(self.previousIndex, identity)
+    let latest = ModuleIndex.ordinalOf(self.currentIndex, identity)
+    if let Option<usize>.Some {value: before} = move old {
+      if let Option<usize>.Some {value: after} = move latest {
+        if ambiguousLocation(self.previousIndex, before)
+          || ambiguousLocation(self.currentIndex, after)
+          || !ModuleIndex.matchesIdentity(self.previousIndex, before, self.currentIndex, after) {
+          return true
+        }
+        let oldDeclarations = ModuleIndex.listDeclarations(self.previousIndex)
+        let newDeclarations = ModuleIndex.listDeclarations(self.currentIndex)
+        let oldSpan = Module.span(&self.previous.authored, oldDeclarations[before].local)
+        let newSpan = Module.span(&self.current.authored, newDeclarations[after].local)
+        return !Shared<SourceLocations>.with<bool>(&self.previous.locations,
+          fn(oldLocations: &SourceLocations) -> bool {
+            return LocationComparison.matchesCurrent(self, oldLocations, oldSpan, newSpan)
+          })
+      }
+    }
+    return true
+  }
+}
+
+struct StagedChange {
+  module: ModuleId
+  key: Word
+  oldSlot: usize
+  source: Option<IndexedSource>
+  current: Shared<Result<SourceResult, NoRejection>>
+}
+
+struct PreparedSource {
+  source: Option<IndexedSource>
+  current: Shared<Result<SourceResult, NoRejection>>
+  present: bool
+}
+
+effect fn indexPresent(
+  id: &ModuleId,
+  number: usize,
+  observation: &Observation,
+  bytes: Bytes,
+  fingerprinted: bool,
+) -> IndexedSource ! OutOfMemoryError ? &mut Allocator {
+  let unit = run SourceUnit.parse(id, number, move bytes)
+  let index = run ModuleIndex.build(&unit, fingerprinted)
+  return IndexedSource {
+    observation: run Observation.copy(observation),
+    unit: move unit,
+    index: move index,
+    identities: Vector<Option<Shared<DeclarationId>>>.make(),
+  }
 }
 
 /// One parser diagnostic of a loaded source. A syntax error rejects the program whether or not any
@@ -163,14 +255,7 @@ effect fn demandSource(
       run record(&mut events.*, EventKind.SourceRead, id, number, present)
       let content = run Observation.copyContent(&observed)
       if let Option<Bytes>.Some {value} = move content {
-        let unit = run SourceUnit.parse(id, number, move value)
-        let index = run ModuleIndex.build(&unit, fingerprinted)
-        let source = IndexedSource {
-          observation: run Observation.copy(&observed),
-          unit: move unit,
-          index: move index,
-          identities: Vector<Option<Shared<DeclarationId>>>.make(),
-        }
+        let source = run indexPresent(id, number, &observed, move value, fingerprinted)
         let slot = Vector<SourceSlot>.length(&sources.*)
         run Vector<SourceSlot>.append(
           &mut sources.*,
@@ -291,6 +376,8 @@ pub struct SourceIndex {
   cursorToken: Option<Shared<CursorStamp>>
   query: Query<SourceResult, NoRejection>
   events: Vector<Event>
+  // Cumulative bytes appended to fingerprints of successfully published indexes.
+  hashedByteCount: usize
   // Whether this store can be revised; `revise` traps on a one-shot store.
   revisions: bool
 }
@@ -312,6 +399,42 @@ effect fn record(
     },
   )
   return ()
+}
+
+effect fn prepareChangedSource(
+  revision: &Revision,
+  id: &ModuleId,
+  number: usize,
+  slot: usize,
+  fingerprinted: bool,
+  events: &mut Vector<Event>,
+) -> PreparedSource ! OutOfMemoryError ? &mut Allocator {
+  run record(&mut events.*, EventKind.QueryStart, id, number, false)
+  let observed = run Revision.observe(revision, id)
+  let present = Observation.isPresent(&observed)
+  run record(&mut events.*, EventKind.SourceRead, id, number, present)
+  let content = run Observation.copyContent(&observed)
+  if let Option<Bytes>.Some {value: bytes} = move content {
+    let source = run indexPresent(id, number, &observed, move bytes, fingerprinted)
+    let current = run Shared<Result<SourceResult, NoRejection>>.make(
+      Result<SourceResult, NoRejection>.succeed(
+        SourceResult.Present {slot: slot, observation: move observed},
+      ),
+    )
+    run record(&mut events.*, EventKind.QueryFinish, id, number, false)
+    return PreparedSource {
+      source: Option<IndexedSource>.some(move source), current: move current, present: true,
+    }
+  }
+  let current = run Shared<Result<SourceResult, NoRejection>>.make(
+    Result<SourceResult, NoRejection>.succeed(
+      SourceResult.Absent {observation: move observed},
+    ),
+  )
+  run record(&mut events.*, EventKind.QueryFinish, id, number, false)
+  return PreparedSource {
+    source: Option<IndexedSource>.none(), current: move current, present: false,
+  }
 }
 
 effect fn keyFor(store: &mut SourceIndex, id: &ModuleId) -> Word ! OutOfMemoryError ? &mut Allocator {
@@ -498,6 +621,7 @@ fn openIndex(revision: Revision, revisions: bool) -> SourceIndex {
     cursorToken: Option<Shared<CursorStamp>>.none(),
     query: Query<SourceResult, NoRejection>.make(),
     events: Vector<Event>.make(),
+    hashedByteCount: usize.ZERO,
     revisions: revisions,
   }
 }
@@ -530,26 +654,30 @@ impl SourceIndex {
   pub fn revisable(self: &Self) -> bool {
     return self.revisions
   }
+  /// Cumulative logical bytes hashed by published source indexes in this revisable store.
+  /// A one-shot store returns zero because it never computes declaration fingerprints.
+  pub fn fingerprintBytesHashed(self: &Self) -> usize {
+    return self.hashedByteCount
+  }
   /// Selects another immutable revision, retaining source queries whose exact content agrees, and
   /// returns the loaded modules whose bytes or presence changed.
   ///
   /// # Details
   ///
   /// Unchanged present sources keep their parsed syntax, authored HIR, name index, and stable
-  /// source slots. Changed or removed sources release those values and invalidate their query;
-  /// a newly present path invalidates its absent answer. Content observations, rather than paths
-  /// or revision numbers, decide reuse. Every previously issued authored cursor is invalidated.
+  /// source slots. Changed sources are reindexed before returning, so callers can diff the old
+  /// and new declaration sets before any cached semantic answer is reused. Content observations,
+  /// rather than paths or revision numbers, decide reuse. Every authored cursor is invalidated.
   pub effect fn revise(self: &mut Self, revision: Revision) -> Vector<SourceChange> ! OutOfMemoryError ? &mut Allocator {
     if !self.revisions {
       oneShotRevised()
     }
-    let mut changed = Vector<SourceChange>.make()
-    if let Option<Shared<CursorStamp>>.Some {value} = &self.cursorToken {
-      Shared<CursorStamp>.withMut<()>(&value, fn(stamp: &mut CursorStamp) -> () {
-        stamp.generation = stamp.generation + usize.ONE
-        return ()
-      })
-    }
+    // Prepare every successor while the old revision, queries, source slots and cursors remain
+    // valid. A parser or allocator failure must let the caller retry this exact revision.
+    let mut changed = Vector<StagedChange>.make()
+    let mut events = Vector<Event>.make()
+    let mut nextSlot = Vector<SourceSlot>.length(&self.sources)
+    let number = Revision.revisionNumber(&revision)
     let mut at = usize.ZERO
     while at < Vector<ModuleId>.length(&self.keys) {
       let key = Hash.word(usize.toU64(at))
@@ -562,25 +690,109 @@ impl SourceIndex {
           },
         )
         if !valid {
-          let slot = Shared<Result<SourceResult, NoRejection>>.with<usize>(&value, answerSlot)
-          let mut previous = Option<ModuleIndex>.none()
-          if slot < Vector<SourceSlot>.length(&self.sources) {
-            let mut sources = Vector<SourceSlot>.asMutSlice(&mut self.sources)
-            let held = Intrinsic.replace(sources[slot].source, Option<IndexedSource>.none())
-            if let Option<IndexedSource>.Some {value: prior} = move held {
-              previous = Option<ModuleIndex>.some(move prior.index)
-            }
-          }
-          Query.forget(&mut self.query, key)
+          let oldSlot = Shared<Result<SourceResult, NoRejection>>.with<usize>(&value, answerSlot)
           let keys = Vector<ModuleId>.asSlice(&self.keys)
-          run Vector<SourceChange>.append(&mut changed, SourceChange {module: ModuleId.copy(&keys[at]), previous: move previous})
+          let id = &keys[at]
+          let prepared = run prepareChangedSource(
+            &revision, id, number, nextSlot, self.revisions, &mut events,
+          )
+          if prepared.present { nextSlot = nextSlot + usize.ONE }
+          run Vector<StagedChange>.append(&mut changed, StagedChange {
+            module: ModuleId.copy(id), key: key, oldSlot: oldSlot,
+            source: move prepared.source, current: move prepared.current,
+          })
         }
       }
       at = at + usize.ONE
     }
+    let count = Vector<StagedChange>.length(&changed)
+    let added = nextSlot - Vector<SourceSlot>.length(&self.sources)
+    run Vector<SourceSlot>.reserveExact(&mut self.sources, added)
+    let mut reindexed = Vector<SourceChange>.make()
+    run Vector<SourceChange>.reserveExact(&mut reindexed, count)
+    if let Option<Shared<CursorStamp>>.Some {value} = &self.cursorToken {
+      Shared<CursorStamp>.withMut<()>(&value, fn(stamp: &mut CursorStamp) -> () {
+        stamp.generation = stamp.generation + usize.ONE
+        return ()
+      })
+    }
+    // From here every destination has capacity, and query replacement is allocation-free.
     self.revision = move revision
-    self.events = Vector<Event>.make()
-    return move changed
+    self.events = move events
+    while Vector<StagedChange>.length(&changed) > usize.ZERO {
+      let change = Vector<StagedChange>.remove(&mut changed, usize.ZERO)
+      let mut previous = Option<ModuleIndex>.none()
+      let mut previousUnit = Option<SourceUnit>.none()
+      if change.oldSlot < Vector<SourceSlot>.length(&self.sources) {
+        let mut sources = Vector<SourceSlot>.asMutSlice(&mut self.sources)
+        let held = Intrinsic.replace(sources[change.oldSlot].source, Option<IndexedSource>.none())
+        if let Option<IndexedSource>.Some {value: prior} = move held {
+          previous = Option<ModuleIndex>.some(move prior.index)
+          previousUnit = Option<SourceUnit>.some(move prior.unit)
+        }
+      }
+      if let Option<IndexedSource>.Some {value} = move change.source {
+        self.hashedByteCount = self.hashedByteCount + ModuleIndex.fingerprintBytesHashed(&value.index)
+        run Vector<SourceSlot>.append(&mut self.sources, SourceSlot {source: Option<IndexedSource>.some(move value)})
+      }
+      Query.replaceCompleted(&mut self.query, change.key, Shared<Result<SourceResult, NoRejection>>.clone(&change.current))
+      run Vector<SourceChange>.append(&mut reindexed, SourceChange {
+        module: move change.module,
+        previous: move previous,
+        previousUnit: move previousUnit,
+        current: move change.current,
+      })
+    }
+    return move reindexed
+  }
+  /// Compares only written name/visibility membership for one published source change.
+  /// Source appearance or disappearance changes the observed namespace, even if empty.
+  pub fn namespaceChanged(self: &Self, change: &SourceChange) -> bool {
+    let current = SourceIndex.source(self, &change.current, &change.module)
+    if let Option<ModuleIndex>.Some {value: previous} = &change.previous {
+      if let Option<&IndexedSource>.Some {value} = move current {
+        return !ModuleIndex.matchesNamespace(&previous, &value.index)
+      }
+      return true
+    }
+    return match move current {
+      Option<&IndexedSource>.Some {..} => true
+      Option<&IndexedSource>.None => false
+    }
+  }
+  /// Prepares old/current line maps once for the observed `DeclLocation` keys of one change.
+  /// `None` means one source is absent; every old declaration location then changed.
+  pub effect fn locationComparison<'a>(self: &'a Self, change: &'a SourceChange) -> Option<LocationComparison<'a>>
+  ! OutOfMemoryError ? &mut Allocator {
+    if let Option<ModuleIndex>.Some {value: previousIndex} = &change.previous {
+      if let Option<SourceUnit>.Some {value: previous} = &change.previousUnit {
+        let found = SourceIndex.source(self, &change.current, &change.module)
+        if let Option<&IndexedSource>.Some {value: indexed} = move found {
+          let previousLines = run LineMap.make(SourceUnit.bytes(&previous))
+          let currentLines = run LineMap.make(SourceUnit.bytes(&indexed.unit))
+          return Option<LocationComparison<'a>>.some(LocationComparison {
+            previous: &previous, previousIndex: &previousIndex,
+            current: &indexed.unit, currentIndex: &indexed.index,
+            previousLines: move previousLines, currentLines: move currentLines,
+          })
+        }
+      }
+    }
+    return Option<LocationComparison<'a>>.none()
+  }
+  /// Compares the written implementation inventories of one pending source change. A missing
+  /// source capture changes both inventories. Semantic owners and static-arm selections are
+  /// deliberately outside this source-only comparison.
+  pub fn implInventoryChanges(self: &Self, change: &SourceChange) -> ImplInventoryChanges {
+    if let Option<ModuleIndex>.Some {value: previousIndex} = &change.previous {
+      if let Option<SourceUnit>.Some {value: previous} = &change.previousUnit {
+        let found = SourceIndex.source(self, &change.current, &change.module)
+        if let Option<&IndexedSource>.Some {value: indexed} = move found {
+          return ModuleIndex.implInventoryChanges(&previousIndex, &previous, &indexed.index, &indexed.unit)
+        }
+      }
+    }
+    return ImplInventoryChanges {conformance: true, inherent: true}
   }
   /// Reports whether this store's held revision has bytes for one module path.
   pub fn presents(self: &Self, id: &ModuleId) -> bool {
@@ -669,6 +881,13 @@ impl SourceIndex {
       self.revisions,
     )
     if !hit {
+      if self.revisions {
+        let bytesHashed = match move SourceIndex.source(&self.*, &answer, id) {
+          Option<&IndexedSource>.Some {value: indexed} => ModuleIndex.fingerprintBytesHashed(&indexed.index)
+          Option<&IndexedSource>.None => usize.ZERO
+        }
+        self.hashedByteCount = self.hashedByteCount + bytesHashed
+      }
       run record(&mut self.events, EventKind.QueryFinish, id, number, false)
     }
     return move answer

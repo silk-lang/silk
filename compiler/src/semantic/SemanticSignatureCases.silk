@@ -1,11 +1,14 @@
 //! Declaration demands, revisions, signature and effect contracts, and receiver calls.
 
 import semantic.Types {TypeTable, Types}
+import backend.Gap {Code as GapCode}
 import hir.Hir {Access, CallableMode, OwnerKind}
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
+import semantic.ContentHash {ContentHash}
 import semantic.Lifetime {Intersection, Lifetime}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.ModuleIndex {Fingerprints, ModuleIndex}
 import semantic.Query {Cycle}
 import semantic.Semantic {
   Answer,
@@ -13,6 +16,8 @@ import semantic.Semantic {
   Constraint,
   Contract,
   Dependency,
+  Event,
+  EventKind,
   Family,
   Member,
   Outcome,
@@ -25,6 +30,7 @@ import semantic.Semantic {
 import semantic.SourceIndex {NoRejection, RevisionMismatch, SourceIndex}
 import semantic.Rejection {GenericKind, Rejection, RejectionCode}
 import semantic.SourceRevision {Revision}
+import semantic.SourceUnit {SourceUnit}
 import semantic.StaticValue
 import semantic.Specialization {Application as SpecializationApplication, ScopeBinding}
 import semantic.Type {Argument, Binding, Outlives, Row, Type}
@@ -39,6 +45,7 @@ import semantic.TypedBody {
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
+import silk.layout {Layout}
 import silk.option {Option}
 import silk.result {Result}
 import silk.shared {Shared}
@@ -52,6 +59,7 @@ import semantic.SemanticCaseSupport {
   NestedFailureAllocator,
   agreesWithFresh,
   answersEqual,
+  backendGapAt,
   bodyAnswerIsTyped,
   bodyCallGenericCount,
   bodyCalls,
@@ -554,11 +562,11 @@ effect fn memberRevisionClaims() -> ()
     usize.ONE,
   )
   run Testing.expect(
-    warmType && coldType && Shared<Result<Answer, NoRejection>>.with<AnswerView>(&kept, inspect).success && starts(Semantic.eventLog(&semantic), Family.Body) == 4 && hits(
+    warmType && coldType && Shared<Result<Answer, NoRejection>>.with<AnswerView>(&kept, inspect).success && starts(Semantic.eventLog(&semantic), Family.Body) == 2 && hits(
       Semantic.eventLog(&semantic),
       Family.Body,
-    ) == usize.ZERO && starts(Semantic.eventLog(&freshType), Family.Body) == 1,
-    "a field type edit checks the caller and the unrelated body again; slice 5's cutoff keeps both, since identity, names, and the callee signature are equal",
+    ) == 2 && starts(Semantic.eventLog(&freshType), Family.Body) == 1,
+    "a field type edit keeps both unrelated body providers cached while warm and fresh member facts agree",
   )
   let renamedText = "type Element = bool\npub struct Point {\n height: &'undeclared i32\n depth: i32\n}\npub fn leaf() -> i32 { return 1 }\n"
   let renamedSource = run present(renamedText)
@@ -585,15 +593,23 @@ effect fn memberRevisionClaims() -> ()
     warmRenamed && coldRenamed && starts(
       Semantic.eventLog(&semantic),
       Family.Body,
-    ) == 5,
-    "renamed names, a newly present member, and a current field diagnostic reach their consumers, and at module granularity the unrelated body, which slice 5's cutoff keeps",
+    ) == 2,
+    "renamed names, a newly present member, and a current field diagnostic reach their consumers without restarting unrelated bodies",
   )
-  let faultText = "type Element = bool\npub struct Point {\n height: bool\n depth: i32\n}\npub fn leaf() -> i32 { return 1 }\n// This unique source allocation fails while the caller revalidates.\n"
+  let faultText = "type Element = bool\npub struct Point {\n height: bool\n depth: i32\n}\npub fn leaf() -> i32 { return 1 }\n"
   let faultSource = run present(faultText)
-  let faultRevision = run Revision.publish(&renamedRevision, &geometry, &faultSource)
+  let faultModule = run module("faultsource.silk")
+  let nestedText = "pub fn leaf() -> i32 { return 3 }\n// This new module is first loaded while the caller revalidates.\n"
+  let nestedSource = run present(nestedText)
+  let revisedConsumer = run present(
+    "import geometry as Geometry\nimport faultsource as Fault\nfn origin(at: Geometry.Point) -> () { return () }\nfn caller() -> i32 { return Fault.leaf() }\nfn unrelated() -> i32 { return 2 }\n",
+  )
+  let fixedGeometry = run Revision.publish(&renamedRevision, &geometry, &faultSource)
+  let addedModule = run Revision.publish(&fixedGeometry, &faultModule, &nestedSource)
+  let faultRevision = run Revision.publish(&addedModule, &consumer, &revisedConsumer)
   run Semantic.update(&mut semantic, run Revision.copy(&faultRevision))
   let mut fault = NestedFailureAllocator {
-    targetBytes: String.utf8Bytes(faultText).length,
+    targetBytes: String.utf8Bytes(nestedText).length,
     rejected: false,
   }
   let mut failedRequest = Request.make()
@@ -621,8 +637,8 @@ effect fn memberRevisionClaims() -> ()
       Result<Answer, NoRejection>,
     >.with<
       AnswerView,
-    >(&retried, inspect).success && Semantic.requestDiscovered(&mut semantic, &retriedRequest, &geometry) && starts(Semantic.eventLog(&semantic), Family.Body) == 7,
-    "a failure while the caller is checked again publishes nothing, and the retry checks the current caller",
+    >(&retried, inspect).success && Semantic.requestDiscovered(&mut semantic, &retriedRequest, &faultModule) && starts(Semantic.eventLog(&semantic), Family.Body) == 4,
+    "a newly imported source failure publishes nothing, and retry checks the current caller",
   )
   let mut freshFault = makeSemantic(move faultRevision)
   let mut freshFaultRequest = Request.make()
@@ -2122,6 +2138,493 @@ test effect fn reusesUnrelatedRevisionAndInvalidatesImportedHeader() -> ()
   let mut typeTable = TypeTable.make()
   return run revisionReuseClaims()
     |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn firstNameStartKey(events: &[Event]) -> usize {
+  let mut at = usize.ZERO
+  while at < events.length {
+    if events[at].kind == EventKind.Start && events[at].family == Family.Name {
+      return events[at].key
+    }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn startsForKey(events: &[Event], key: usize) -> usize {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < events.length {
+    if events[at].kind == EventKind.Start && events[at].key == key {
+      count = count + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+effect fn selectionIndex(id: &ModuleId, text: string) -> ModuleIndex
+! OutOfMemoryError ? &mut Allocator {
+  let source = run SourceUnit.parse(id, usize.ONE, run Bytes.copy(String.utf8Bytes(text)))
+  return run ModuleIndex.build(&source, true)
+}
+
+fn declarationNamed(index: &ModuleIndex, name: &[u8]) -> usize {
+  let declarations = ModuleIndex.listDeclarations(index)
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    if DeclarationId.named(&declarations[at].identity, name) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// Two identical selected aliases initially select one binding. Retargeting one member keeps its
+// import owner path, member ordinal, alias, and written Bar bucket but changes selection.
+effect fn identicalImportAliasRevisionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("entry.silk")
+  let a = run module("a.silk")
+  let firstText = "import a { Foo as Bar }\nimport a { Foo as Bar }\nfn use(value: Bar) -> i32 { return 0 }\n"
+  let changedText = "import a { Foo as Bar }\nimport a { Other as Bar }\nfn use(value: Bar) -> i32 { return 0 }\n"
+  let firstIndex = run selectionIndex(&entry, firstText)
+  let changedIndex = run selectionIndex(&entry, changedText)
+  run Testing.expect(ModuleIndex.matchesName(&firstIndex, &changedIndex, b"Bar")
+    && ModuleIndex.matchesIdentity(&firstIndex, usize.ZERO, &changedIndex, usize.ZERO)
+    && ModuleIndex.matchesIdentity(&firstIndex, usize.ONE, &changedIndex, usize.ONE),
+    "retargeting one selected member keeps both import handles and Bar's written bucket equal")
+  let item = run present("pub struct Foo {}\npub struct Other {}\n")
+  let withA = run Revision.publish(&Revision.make(), &a, &item)
+  let firstSource = run present(firstText)
+  let first = run Revision.publish(&withA, &entry, &firstSource)
+  let mut warm = makeSemantic(run Revision.copy(&first))
+  let mut initialRequest = Request.make()
+  let initial = run Semantic.demandSignature(&mut warm, &mut initialRequest, &entry, b"use")
+  run Testing.expect(succeeded(&initial), "identical imports select one namespace binding")
+
+  let changedSource = run present(changedText)
+  let changed = run Revision.publish(&first, &entry, &changedSource)
+  run Semantic.update(&mut warm, run Revision.copy(&changed))
+  let mut changedRequest = Request.make()
+  let collision = run Semantic.demandSignature(&mut warm, &mut changedRequest, &entry, b"use")
+  let mut freshChanged = makeSemantic(run Revision.copy(&changed))
+  let mut freshChangedRequest = Request.make()
+  let expected = run Semantic.demandSignature(&mut freshChanged, &mut freshChangedRequest, &entry, b"use")
+  run Testing.expect(rejectsSpan(&collision, RejectionCode.Collision, changedText, "Bar", 2)
+    && agreesWithFresh(&collision, &expected),
+    "retargeted alias rejects at the use with the same code and span as fresh selection")
+
+  let restored = run Revision.publish(&changed, &entry, &firstSource)
+  run Semantic.update(&mut warm, run Revision.copy(&restored))
+  let mut restoredRequest = Request.make()
+  let again = run Semantic.demandSignature(&mut warm, &mut restoredRequest, &entry, b"use")
+  let mut freshRestored = makeSemantic(move restored)
+  let mut freshRestoredRequest = Request.make()
+  let freshAgain = run Semantic.demandSignature(&mut freshRestored, &mut freshRestoredRequest, &entry, b"use")
+  run Testing.expect(succeeded(&again) && agreesWithFresh(&again, &freshAgain)
+    && run answersEqual(&again, &freshAgain, usize.ZERO),
+    "restoring the identical aliases restores the current selected type")
+  return ()
+}
+
+test effect fn selectionGuardRetargetedDuplicateImportAlias() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run identicalImportAliasRevisionClaims()
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// An unrelated selected import changes the same-key count of imports from one path. The old import
+// handle ends even though the written Bar candidate has not changed.
+effect fn samePathImportRevisionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("entry.silk")
+  let a = run module("a.silk")
+  let firstText = "import a { Foo as Bar }\nfn use(value: Bar) -> i32 { return 0 }\n"
+  let addedText = "import a { Foo as Bar }\nimport a { Other }\nfn use(value: Bar) -> i32 { return 0 }\n"
+  let firstIndex = run selectionIndex(&entry, firstText)
+  let addedIndex = run selectionIndex(&entry, addedText)
+  run Testing.expect(ModuleIndex.matchesName(&firstIndex, &addedIndex, b"Bar")
+    && !ModuleIndex.matchesIdentity(&firstIndex, usize.ZERO, &addedIndex, usize.ZERO),
+    "adding another same-path import keeps Bar's bucket but retires the first import identity")
+  let aSource = run present("pub struct Foo {}\npub struct Other {}\n")
+  let withA = run Revision.publish(&Revision.make(), &a, &aSource)
+  let firstSource = run present(firstText)
+  let first = run Revision.publish(&withA, &entry, &firstSource)
+  let mut warm = makeSemantic(run Revision.copy(&first))
+  let mut firstRequest = Request.make()
+  let original = run Semantic.demandSignature(&mut warm, &mut firstRequest, &entry, b"use")
+  run Testing.expect(succeeded(&original), "the first selected import names Bar")
+
+  let addedSource = run present(addedText)
+  let added = run Revision.publish(&first, &entry, &addedSource)
+  run Semantic.update(&mut warm, run Revision.copy(&added))
+  let mut revisedRequest = Request.make()
+  let revised = run Semantic.demandSignature(&mut warm, &mut revisedRequest, &entry, b"use")
+  let mut fresh = makeSemantic(move added)
+  let mut freshRequest = Request.make()
+  let expected = run Semantic.demandSignature(&mut fresh, &mut freshRequest, &entry, b"use")
+  run Testing.expect(succeeded(&revised) && agreesWithFresh(&revised, &expected)
+    && run answersEqual(&revised, &expected, usize.ZERO),
+    "the retired same-path import handle resolves Bar through the current source")
+  return ()
+}
+
+test effect fn selectionGuardUnrelatedImportRetiresOwner() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run samePathImportRevisionClaims()
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A later conditional changes the anonymous owner sibling count while the Foo bucket stays
+// written exactly as before. Editing Foo's governing condition then changes its availability.
+effect fn staticOwnerRevisionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("entry.silk")
+  let firstText = "static if true { pub struct Foo {} }\nfn use(value: Foo) -> i32 { return 0 }\n"
+  let addedText = "static if true { pub struct Foo {} }\nstatic if false { pub struct Other {} }\nfn use(value: Foo) -> i32 { return 0 }\n"
+  let changedText = "static if false { pub struct Foo {} }\nstatic if false { pub struct Other {} }\nfn use(value: Foo) -> i32 { return 0 }\n"
+  let firstIndex = run selectionIndex(&entry, firstText)
+  let addedIndex = run selectionIndex(&entry, addedText)
+  let changedIndex = run selectionIndex(&entry, changedText)
+  let firstFoo = declarationNamed(&firstIndex, b"Foo")
+  let addedFoo = declarationNamed(&addedIndex, b"Foo")
+  run Testing.expect(firstFoo != usize.MAX && addedFoo != usize.MAX
+    && ModuleIndex.matchesName(&firstIndex, &addedIndex, b"Foo")
+    && ModuleIndex.matchesIdentity(&firstIndex, firstFoo, &addedIndex, addedFoo)
+    && !ModuleIndex.matchesIdentity(&firstIndex, usize.ZERO, &addedIndex, usize.ZERO)
+    && ModuleIndex.matchesName(&addedIndex, &changedIndex, b"Foo"),
+    "Foo's written bucket survives a new conditional and a governing condition edit")
+  let firstSource = run present(firstText)
+  let first = run Revision.publish(&Revision.make(), &entry, &firstSource)
+  let mut warm = makeSemantic(run Revision.copy(&first))
+  let mut firstRequest = Request.make()
+  let original = run Semantic.demandSignature(&mut warm, &mut firstRequest, &entry, b"use")
+  run Testing.expect(succeeded(&original), "selected Foo is available before revision")
+
+  let addedSource = run present(addedText)
+  let added = run Revision.publish(&first, &entry, &addedSource)
+  run Semantic.update(&mut warm, run Revision.copy(&added))
+  let mut addedRequest = Request.make()
+  let retained = run Semantic.demandSignature(&mut warm, &mut addedRequest, &entry, b"use")
+  let mut freshAdded = makeSemantic(run Revision.copy(&added))
+  let mut freshAddedRequest = Request.make()
+  let freshRetained = run Semantic.demandSignature(&mut freshAdded, &mut freshAddedRequest, &entry, b"use")
+  run Testing.expect(succeeded(&retained) && agreesWithFresh(&retained, &freshRetained)
+    && run answersEqual(&retained, &freshRetained, usize.ZERO),
+    "ancestor sibling-count change still selects Foo from the current declaration")
+
+  let changedSource = run present(changedText)
+  let changed = run Revision.publish(&added, &entry, &changedSource)
+  run Semantic.update(&mut warm, run Revision.copy(&changed))
+  let mut changedRequest = Request.make()
+  let hidden = run Semantic.demandSignature(&mut warm, &mut changedRequest, &entry, b"use")
+  let mut freshChanged = makeSemantic(move changed)
+  let mut freshChangedRequest = Request.make()
+  let expected = run Semantic.demandSignature(&mut freshChanged, &mut freshChangedRequest, &entry, b"use")
+  run Testing.expect(rejectsSpan(&hidden, RejectionCode.UnknownType, changedText, "Foo", usize.ONE)
+    && agreesWithFresh(&hidden, &expected),
+    "changed governing condition removes Foo with the current exact diagnostic")
+  return ()
+}
+
+test effect fn selectionGuardStaticOwnerAndConditionEdits() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run staticOwnerRevisionClaims()
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A callable body is outside its prototype. The completed signature stays cached across an
+// authored body edit, while the answer remains identical to a fresh store at the new revision.
+effect fn syntaxReaderBodyCutoffClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("syntax-reader-body.silk")
+  let first = run present("fn chosen(value: i32) -> i32 { return 1 }\n")
+  let initial = run Revision.publish(&Revision.make(), &entry, &first)
+  let mut warm = makeSemantic(run Revision.copy(&initial))
+  let mut request = Request.make()
+  let original = run Semantic.demandSignature(&mut warm, &mut request, &entry, b"chosen")
+  run Testing.expect(succeeded(&original), "the initial callable signature is checked")
+  let before = starts(Semantic.eventLog(&warm), Family.Signature)
+
+  let changed = run present("fn chosen(value: i32) -> i32 { return 2 }\n")
+  let revised = run Revision.publish(&initial, &entry, &changed)
+  run Semantic.update(&mut warm, run Revision.copy(&revised))
+  let mut warmRequest = Request.make()
+  let held = run Semantic.demandSignature(&mut warm, &mut warmRequest, &entry, b"chosen")
+  let mut fresh = makeSemantic(move revised)
+  let mut freshRequest = Request.make()
+  let expected = run Semantic.demandSignature(&mut fresh, &mut freshRequest, &entry, b"chosen")
+  run Testing.expect(succeeded(&held) && agreesWithFresh(&held, &expected)
+    && starts(Semantic.eventLog(&warm), Family.Signature) == before,
+    "a body-only edit reuses the signature provider and agrees with fresh analysis")
+  return ()
+}
+
+test effect fn syntaxReaderBodyEditKeepsCleanSignature() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run syntaxReaderBodyCutoffClaims()
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn rawPrototypeMatches(first: &ModuleIndex, old: usize, second: &ModuleIndex, revised: usize) -> bool {
+  let before = ModuleIndex.listDeclarations(first)
+  let after = ModuleIndex.listDeclarations(second)
+  if old >= before.length || revised >= after.length { return false }
+  if let Option<Fingerprints>.Some {value: left} = &before[old].fingerprints {
+    if let Option<Fingerprints>.Some {value: right} = &after[revised].fingerprints {
+      return ContentHash.equals(left.prototype, right.prototype)
+    }
+  }
+  return false
+}
+
+// Moving an unconditional declaration into a new inactive arm leaves its written prototype
+// unchanged. The old selection has no governing Condition dependency, so its name input must
+// notice that the declaration acquired a conditional owner.
+effect fn staticArmMoveRevisionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("static-arm-move.silk")
+  let firstText = "fn target() -> i32 { return 1 }\nfn use() -> i32 { return target() }\n"
+  let movedText = "static if false { fn target() -> i32 { return 1 } }\nfn use() -> i32 { return target() }\n"
+  let firstIndex = run selectionIndex(&entry, firstText)
+  let movedIndex = run selectionIndex(&entry, movedText)
+  let oldTarget = declarationNamed(&firstIndex, b"target")
+  let movedTarget = declarationNamed(&movedIndex, b"target")
+  run Testing.expect(oldTarget != usize.MAX && movedTarget != usize.MAX
+    && !ModuleIndex.matchesIdentity(&firstIndex, oldTarget, &movedIndex, movedTarget),
+    "a newly conditional declaration gains a distinct owner identity")
+  run Testing.expect(rawPrototypeMatches(&firstIndex, oldTarget, &movedIndex, movedTarget),
+    "wrapping the declaration leaves its written prototype equal")
+  run Testing.expect(!ModuleIndex.matchesName(&firstIndex, &movedIndex, b"target")
+    && !ModuleIndex.matchesPrototype(&firstIndex, oldTarget, &movedIndex, movedTarget),
+    "new conditional ownership changes name and declaration inputs")
+  let firstSource = run present(firstText)
+  let first = run Revision.publish(&Revision.make(), &entry, &firstSource)
+  let mut warm = makeSemantic(run Revision.copy(&first))
+  let mut firstRequest = Request.make()
+  let selected = run Semantic.demandBody(&mut warm, &mut firstRequest, &entry, b"use")
+  run Testing.expect(succeeded(&selected), "the selected arm's target is callable")
+  let bodyStarts = starts(Semantic.eventLog(&warm), Family.Body)
+  let movedSource = run present(movedText)
+  let revised = run Revision.publish(&first, &entry, &movedSource)
+  run Semantic.update(&mut warm, run Revision.copy(&revised))
+  let mut revisedRequest = Request.make()
+  let hidden = run Semantic.demandBody(&mut warm, &mut revisedRequest, &entry, b"use")
+  let mut fresh = makeSemantic(move revised)
+  let mut freshRequest = Request.make()
+  let expected = run Semantic.demandBody(&mut fresh, &mut freshRequest, &entry, b"use")
+  run Testing.expect(rejectsSpan(&hidden, RejectionCode.UnknownFunction, movedText, "target", usize.ONE)
+    && agreesWithFresh(&hidden, &expected)
+    && starts(Semantic.eventLog(&warm), Family.Body) > bodyStarts,
+    "moving target into a new inactive arm invalidates the warm selected body at its current call")
+  return ()
+}
+
+test effect fn selectionGuardNewStaticArmChangesAvailability() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run staticArmMoveRevisionClaims()
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// An operation's own contract is unchanged, but public exposure comes from its interface header.
+effect fn syntaxReaderParentPrototypeClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("syntax-reader-parent.silk")
+  let firstText = "struct Private {}\ninterface Gate { fn accept(value: Private) -> i32 }\n"
+  let changedText = "struct Private {}\npub interface Gate { fn accept(value: Private) -> i32 }\n"
+  let first = run present(firstText)
+  let initial = run Revision.publish(&Revision.make(), &entry, &first)
+  let mut warm = makeSemantic(run Revision.copy(&initial))
+  let mut request = Request.make()
+  let original = run Semantic.demandOperation(&mut warm, &mut request, &entry, b"Gate", b"accept")
+  run Testing.expect(succeeded(&original), "private interface operation may name a private type")
+  let before = starts(Semantic.eventLog(&warm), Family.Signature)
+
+  let changed = run present(changedText)
+  let revised = run Revision.publish(&initial, &entry, &changed)
+  run Semantic.update(&mut warm, run Revision.copy(&revised))
+  let mut warmRequest = Request.make()
+  let exposed = run Semantic.demandOperation(&mut warm, &mut warmRequest, &entry, b"Gate", b"accept")
+  let mut fresh = makeSemantic(move revised)
+  let mut freshRequest = Request.make()
+  let expected = run Semantic.demandOperation(&mut fresh, &mut freshRequest, &entry, b"Gate", b"accept")
+  run Testing.expect(rejectsSpan(&exposed, RejectionCode.PrivateTypeExposure, changedText, "Private", usize.ONE)
+    && agreesWithFresh(&exposed, &expected)
+    && starts(Semantic.eventLog(&warm), Family.Signature) > before,
+    "the parent visibility edit recomputes the operation and its exact exposure rejection")
+  return ()
+}
+
+test effect fn syntaxReaderParentHeaderChangesOperationExposure() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run syntaxReaderParentPrototypeClaims()
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// A variadic foreign import's written contract stays fixed, while adding a body changes whether
+// the C boundary is admitted. This is a whole-declaration read of the foreign header classifier.
+effect fn syntaxReaderForeignBodyClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("syntax-reader-foreign.silk")
+  let firstText = "unsafe extern \"C\" fn receive(tag: i32, ...) -> i32\n"
+  let changedText = "unsafe extern \"C\" fn receive(tag: i32, ...) -> i32 { return tag }\n"
+  let first = run present(firstText)
+  let initial = run Revision.publish(&Revision.make(), &entry, &first)
+  let mut warm = makeSemantic(run Revision.copy(&initial))
+  let mut request = Request.make()
+  let original = run Semantic.demandMir(&mut warm, &mut request, &entry, b"receive")
+  run Testing.expect(backendGapAt(&original, GapCode.ForeignContract, firstText,
+    "unsafe extern \"C\" fn receive(tag: i32, ...) -> i32", usize.ZERO),
+    "a bodyless variadic foreign import reaches the normal foreign boundary")
+  let before = starts(Semantic.eventLog(&warm), Family.Mir)
+
+  let changed = run present(changedText)
+  let revised = run Revision.publish(&initial, &entry, &changed)
+  run Semantic.update(&mut warm, run Revision.copy(&revised))
+  let mut warmRequest = Request.make()
+  let revisedAnswer = run Semantic.demandMir(&mut warm, &mut warmRequest, &entry, b"receive")
+  let mut fresh = makeSemantic(move revised)
+  let mut freshRequest = Request.make()
+  let expected = run Semantic.demandMir(&mut fresh, &mut freshRequest, &entry, b"receive")
+  run Testing.expect(backendGapAt(&revisedAnswer, GapCode.CAbiVariadic, changedText,
+      "unsafe extern \"C\" fn receive(tag: i32, ...) -> i32 { return tag }", usize.ZERO)
+    && backendGapAt(&expected, GapCode.CAbiVariadic, changedText,
+      "unsafe extern \"C\" fn receive(tag: i32, ...) -> i32 { return tag }", usize.ZERO)
+    && starts(Semantic.eventLog(&warm), Family.Mir) > before,
+    "a variadic foreign body edit changes the warm and fresh gap at the exact declaration span")
+  return ()
+}
+
+test effect fn syntaxReaderForeignBodyPresenceInvalidatesBoundary() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut types = TypeTable.make()
+  return run syntaxReaderForeignBodyClaims()
+    |> Effect.provideMut<Types>(&mut types) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn nameBucketRevisionClaims(stop: usize) -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("entry.silk")
+  let original = run present("type Keeper = i32\n")
+  let held = run Revision.publish(&Revision.make(), &entry, &original)
+  let mut semantic = makeSemantic(run Revision.copy(&held))
+  let mut request = Request.make()
+  let absent = run Semantic.demandAlias(&mut semantic, &mut request, &entry, b"Missing")
+  run Testing.expect(!succeeded(&absent) && Semantic.requestDiscovered(&mut semantic, &request, &entry),
+    "present negative name lookup rejects and reports its discovery")
+  let bucketKey = firstNameStartKey(Semantic.eventLog(&semantic))
+  run Testing.expect(bucketKey != usize.MAX && startsForKey(Semantic.eventLog(&semantic), bucketKey) == usize.ONE,
+    "negative name bucket has one producer start")
+  if stop == usize.ONE { return () }
+
+  let unrelated = run present("type Keeper = i32\ntype Other = bool\n")
+  let unrelatedRevision = run Revision.publish(&held, &entry, &unrelated)
+  run Semantic.update(&mut semantic, run Revision.copy(&unrelatedRevision))
+  let mut unchangedRequest = Request.make()
+  let unchanged = run Semantic.demandAlias(&mut semantic, &mut unchangedRequest, &entry, b"Missing")
+  let mut freshUnrelated = makeSemantic(run Revision.copy(&unrelatedRevision))
+  let mut freshUnrelatedRequest = Request.make()
+  let coldUnchanged = run Semantic.demandAlias(&mut freshUnrelated, &mut freshUnrelatedRequest, &entry, b"Missing")
+  run Testing.expect(startsForKey(Semantic.eventLog(&semantic), bucketKey) == usize.ONE
+      && agreesWithFresh(&unchanged, &coldUnchanged),
+    "an unrelated new name keeps the negative bucket and its exact rejection")
+  if stop == 2 { return () }
+
+  let added = run present("type Keeper = i32\ntype Other = bool\ntype Missing = i32\n")
+  let addedRevision = run Revision.publish(&unrelatedRevision, &entry, &added)
+  run Semantic.update(&mut semantic, run Revision.copy(&addedRevision))
+  let mut addedRequest = Request.make()
+  let found = run Semantic.demandAlias(&mut semantic, &mut addedRequest, &entry, b"Missing")
+  let mut freshAdded = makeSemantic(run Revision.copy(&addedRevision))
+  let mut freshAddedRequest = Request.make()
+  let coldFound = run Semantic.demandAlias(&mut freshAdded, &mut freshAddedRequest, &entry, b"Missing")
+  run Testing.expect(startsForKey(Semantic.eventLog(&semantic), bucketKey) == 2,
+    "a new matching name reruns the bucket")
+  run Testing.expect(succeeded(&found), "a newly present alias succeeds")
+  run Testing.expect(agreesWithFresh(&found, &coldFound), "newly present alias agrees with fresh")
+  run Testing.expect(Semantic.answerRead(&mut semantic, &found, &entry)
+      && Semantic.sourcesRead(&mut semantic, &found) == usize.ONE,
+    "a named answer reports its module source read")
+  if stop == 3 { return () }
+
+  let conflicting = run present("type Keeper = i32\ntype Other = bool\ntype Missing = i32\ntype Missing = bool\n")
+  let conflictingRevision = run Revision.publish(&addedRevision, &entry, &conflicting)
+  run Semantic.update(&mut semantic, run Revision.copy(&conflictingRevision))
+  let mut conflictRequest = Request.make()
+  let collision = run Semantic.demandAlias(&mut semantic, &mut conflictRequest, &entry, b"Missing")
+  let mut freshConflict = makeSemantic(run Revision.copy(&conflictingRevision))
+  let mut freshConflictRequest = Request.make()
+  let coldCollision = run Semantic.demandAlias(&mut freshConflict, &mut freshConflictRequest, &entry, b"Missing")
+  run Testing.expect(startsForKey(Semantic.eventLog(&semantic), bucketKey) == 3
+      && !succeeded(&collision) && agreesWithFresh(&collision, &coldCollision),
+    "a second matching name reruns the complete bucket with the fresh collision")
+  if stop == 4 { return () }
+
+  let restored = run Revision.publish(&conflictingRevision, &entry, &original)
+  run Semantic.update(&mut semantic, run Revision.copy(&restored))
+  let mut removedRequest = Request.make()
+  let removed = run Semantic.demandAlias(&mut semantic, &mut removedRequest, &entry, b"Missing")
+  let mut freshRemoved = makeSemantic(move restored)
+  let mut freshRemovedRequest = Request.make()
+  let coldRemoved = run Semantic.demandAlias(&mut freshRemoved, &mut freshRemovedRequest, &entry, b"Missing")
+  run Testing.expect(startsForKey(Semantic.eventLog(&semantic), bucketKey) == 4
+      && !succeeded(&removed) && agreesWithFresh(&removed, &coldRemoved),
+    "removing a name restores the negative bucket and exact fresh rejection")
+  return ()
+}
+
+effect fn runNameBucketStage(stop: usize) -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run nameBucketRevisionClaims(stop)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn nameBucketNegativeRead() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  return run runNameBucketStage(1)
+}
+
+test effect fn nameBucketUnrelatedAddition() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  return run runNameBucketStage(2)
+}
+
+test effect fn nameBucketMatchingAddition() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  return run runNameBucketStage(3)
+}
+
+test effect fn nameBucketConflictingAddition() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  return run runNameBucketStage(4)
+}
+
+test effect fn nameBucketTracksNegativeAndChangedCandidates() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  return run runNameBucketStage(5)
 }
 
 effect fn negativeRevisionClaims() -> ()
@@ -4503,8 +5006,24 @@ effect fn stableDeclarationUnitClaims() -> ()
     agreesWithFresh(&next, &expected),
     "retargeted body and selected callee agree with fresh analysis"
   )
-  let deletedSource = run present("fn leaf() -> i32 { return 2 }\n")
+  let deletedText = "fn leaf() -> i32 { return 2 }\n// unique changed-source parse failure\n"
+  let deletedSource = run present(deletedText)
   let deleted = run Revision.publish(&initial, &entry, &deletedSource)
+  let mut fault = NestedFailureAllocator {
+    targetBytes: String.utf8Bytes(deletedText).length,
+    rejected: false,
+  }
+  let failedUpdate = run Effect.result(Semantic.update(&mut semantic, run Revision.copy(&deleted)))
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let parseFailed = match move failedUpdate {
+    Result<(), Cycle | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError {} => true
+      Cycle {} => false
+    }
+    Result<(), Cycle | OutOfMemoryError>.Success {value: ignored} => false
+  }
+  run Testing.expect(parseFailed && fault.rejected,
+    "failed eager changed-source parse is reported before semantic state advances")
   run Semantic.update(&mut semantic, move deleted)
 
   // The intermediate deletion is never demanded, but still ends the old handle's lifetime.
@@ -4528,6 +5047,13 @@ effect fn stableDeclarationUnitClaims() -> ()
       && Shared<Result<Answer, NoRejection>>.with<AnswerView>(&reintroducedMir, inspect).success,
     "the old backend unit cannot revive through its unchanged emitted name"
   )
+  let mut freshRestored = makeSemantic(run Revision.publish(&initial, &entry, &inserted))
+  let mut freshRestoredRequest = Request.make()
+  let freshBody = run Semantic.demandBody(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  let freshMir = run Semantic.demandMir(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  run Testing.expect(agreesWithFresh(&reintroduced, &freshBody)
+      && agreesWithFresh(&reintroducedMir, &freshMir),
+    "after failed update and retry, restored body and MIR agree with a fresh store")
   return ()
 }
 
@@ -4536,5 +5062,120 @@ test effect fn preservesDeclarationUnitThroughInsertionAndReordering() -> ()
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut typeTable = TypeTable.make()
   return run stableDeclarationUnitClaims() |> Effect.provideMut<Types>(&mut typeTable)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Fails the last allocation of an update. With a loaded body and MIR, this is the dependency
+// graph's first traversal-queue reservation, after the source and declaration refresh.
+struct UpdateAllocationProbe {
+  failAt: usize
+  allocations: usize
+  lastAlignment: usize
+  rejected: bool
+}
+
+impl UpdateAllocationProbe {
+  effect fn allocate(self: &mut Self, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+    if self.allocations == self.failAt {
+      self.rejected = true
+      fail OutOfMemoryError {}
+    }
+    self.allocations = self.allocations + usize.ONE
+    self.lastAlignment = layout.alignment
+    let mut system = Allocator.systemAllocatorProvider()
+    return run Allocator.allocate(move layout)
+      |> Effect.provideMut<Allocator>(&mut system)
+  }
+}
+
+impl Allocator for UpdateAllocationProbe {
+  allocate: UpdateAllocationProbe.allocate
+}
+
+effect fn loadedForUpdateRecovery(revision: Revision, entry: &ModuleId) -> Semantic
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch
+? &mut Allocator | &mut Types {
+  let mut semantic = makeSemantic(move revision)
+  let mut request = Request.make()
+  drop run Semantic.demandBody(&mut semantic, &mut request, entry, b"entry")
+  drop run Semantic.demandMir(&mut semantic, &mut request, entry, b"entry")
+  drop run Semantic.demandBody(&mut semantic, &mut request, entry, b"entry")
+  drop run Semantic.demandMir(&mut semantic, &mut request, entry, b"entry")
+  return move semantic
+}
+
+effect fn postCommitFailureClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static>
+? &mut Allocator | &mut Types {
+  let entry = run module("update-recovery.silk")
+  let original = run present("fn leaf() -> i32 { return 1 }\nfn entry() -> i32 { return leaf() }\n")
+  let initial = run Revision.publish(&Revision.make(), &entry, &original)
+  let deleted = run present("fn leaf() -> i32 { return 2 }\n")
+  let revised = run Revision.publish(&initial, &entry, &deleted)
+  let mut measured = run loadedForUpdateRecovery(run Revision.copy(&initial), &entry)
+  let mut count = UpdateAllocationProbe {
+    failAt: usize.MAX, allocations: usize.ZERO, lastAlignment: usize.ZERO, rejected: false,
+  }
+  let measuredRevision = run Revision.copy(&revised)
+  run Semantic.update(&mut measured, move measuredRevision)
+    |> Effect.provideMut<Allocator>(&mut count)
+  run Testing.expect(count.allocations > usize.ZERO && count.lastAlignment == Layout.of<u32>().alignment,
+    "the final update allocation is the graph's u32 traversal queue")
+
+  let mut warm = run loadedForUpdateRecovery(run Revision.copy(&initial), &entry)
+  let oldBodyUnit = lastDeclarationUnit(&warm, Family.Body)
+  let oldMirUnit = lastDeclarationUnit(&warm, Family.Mir)
+  let mut fault = UpdateAllocationProbe {
+    failAt: count.allocations - usize.ONE,
+    allocations: usize.ZERO,
+    lastAlignment: usize.ZERO,
+    rejected: false,
+  }
+  let attemptedRevision = run Revision.copy(&revised)
+  let attempt = run Effect.result(Semantic.update(&mut warm, move attemptedRevision))
+    |> Effect.provideMut<Allocator>(&mut fault)
+  let failed = match move attempt {
+    Result<(), Cycle | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError {} => true
+      Cycle {} => false
+    }
+    Result<(), Cycle | OutOfMemoryError>.Success {value: ignored} => false
+  }
+  let sourceEvents = Semantic.sourceEvents(&warm)
+  run Testing.expect(failed && fault.rejected && sourceEvents.length == 3
+      && sourceEvents[1].revision == Revision.revisionNumber(&revised),
+    "graph queue failure occurs after source revision commits")
+
+  // A demand immediately after failure must finish publication before it can reuse a cached body.
+  let mut failedRequest = Request.make()
+  let missing = run Semantic.demandBody(&mut warm, &mut failedRequest, &entry, b"entry")
+  let mut freshDeleted = makeSemantic(run Revision.copy(&revised))
+  let mut freshDeletedRequest = Request.make()
+  let freshMissing = run Semantic.demandBody(&mut freshDeleted, &mut freshDeletedRequest, &entry, b"entry")
+  run Testing.expect(agreesWithFresh(&missing, &freshMissing) && !succeeded(&missing),
+    "a demand after graph-stage failure settles pending invalidation before cache reuse")
+  run Semantic.update(&mut warm, run Revision.copy(&revised))
+
+  let restored = run Revision.publish(&revised, &entry, &original)
+  run Semantic.update(&mut warm, run Revision.copy(&restored))
+  let mut restoredRequest = Request.make()
+  let body = run Semantic.demandBody(&mut warm, &mut restoredRequest, &entry, b"entry")
+  let mir = run Semantic.demandMir(&mut warm, &mut restoredRequest, &entry, b"entry")
+  let mut freshRestored = makeSemantic(move restored)
+  let mut freshRestoredRequest = Request.make()
+  let freshBody = run Semantic.demandBody(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  let freshMir = run Semantic.demandMir(&mut freshRestored, &mut freshRestoredRequest, &entry, b"entry")
+  run Testing.expect(lastDeclarationUnit(&warm, Family.Body) != oldBodyUnit
+      && lastDeclarationUnit(&warm, Family.Mir) != oldMirUnit
+      && agreesWithFresh(&body, &freshBody) && agreesWithFresh(&mir, &freshMir),
+    "same-revision retry and reintroduction never revive lost body or MIR handles")
+  return ()
+}
+
+test effect fn graphStageFailureReplaysBeforeDemandAndSameRevisionRetry() -> ()
+! InvalidModulePath | OutOfMemoryError | Cycle | RevisionMismatch | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run postCommitFailureClaims() |> Effect.provideMut<Types>(&mut typeTable)
     |> Effect.provideMut<Allocator>(&mut allocator)
 }
