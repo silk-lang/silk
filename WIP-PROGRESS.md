@@ -172,14 +172,22 @@ process.exit(await runCorpus(process.argv[2], nativeCorpus, [], selected, undefi
 
 ## Status 2026-10-14 (later session)
 
-- #1680 merged (selfhost 3fb9603f). #1686 merged (1bb9a087). #1677 and #1693 merged on main.
-- Sync #1697 (`selfhost-sync-main-33f8cd26` @ 48e8f96): main 33f8cd26 + 43eacdf9 + 8b97fae0 into
-  selfhost 54303d8a; DDC 38630442504. Do NOT push to it unless it fails.
-- #1694 observer-callback stacked on #1697 (`selfhost-native-traps-3` @ 52fd2b4), ready; DDC
-  38634908698. Gap line for diagnostic-observer-capturing-callback added.
-- Process: stack the next PR on the previous one; never wait for merges.
+B9 done: #1680, #1686, #1694 (+ main #1677, #1693) merged; sync #1697 merged.
+
+## D2/D5 (current)
+
+- #1719 main `main-corpus-as-data`: corpus/native/<name>, corpus/invalid/<name>, corpus/corpus.mjs,
+  README; corpus.ts thin loader. Outcome dump identical (sha 10bfae09...).
+- #1720 main `main-corpus-harness-data` (stacked on #1719): harnesses read corpus/ directly.
+- #1721 main `main-selfhost-harness-checkout` (stacked on #1720): formatter reads intrinsic
+  inventory fixture (with phase); bundle script `[harness|inventory|all]`, harness has no TS input.
+- Worktree /home/user/silk-main.
 
 ## Exact next action
 
-1. Watch DDC 38630442504 (#1697) and 38634908698 (#1694); fix any failure on the owning branch.
-2. Send the coordinator the final B9 report.
+1. Watch CI on #1719/#1720/#1721; fix failures.
+2. After merge + sync: selfhost PR switching corpus and macOS jobs to
+   `pnpm install --frozen-lockfile && node .github/scripts/bundle-selfhost-verification.mjs harness`
+   and `node .scratch/selfhost-verification.mjs ...`; the sync must also pass
+   `corpus/native/trivial-features/main.silk` as corpus-source in selfhost's selfhost.yml.
+3. Then main PR: stop publishing silk-selfhost-verification; drop download-bootstrap verification.
