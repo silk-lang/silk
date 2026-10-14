@@ -324,6 +324,10 @@ pub struct Block {
 /// `callees`, the instances that run the obligated value, may reach an external park.
 pub struct NonParkingRun {
   pub callees: Vector<InstanceKey>
+  /// The types whose drop glue running or dropping the obligated value may execute in place: its
+  /// own value, a bracket's resource, a binding's provider, an observer's state. A reached glue of
+  /// one of them may not park either; an unreached one never runs.
+  pub glues: Vector<Shared<Type>>
   /// Declarations whose every reached instance runs an obligated value: a named function
   /// value whose deferred binders each use opens (a callable schema).
   pub declarations: Vector<Shared<DeclarationId>>
@@ -361,6 +365,10 @@ pub struct MirFunction {
   /// A nested transfer through `Effect.suspend` marks [`suspension`] only. Absent for an instance
   /// that runs no external park.
   pub parks: Option<Origin>
+  /// Whether this body releases an Execution package through its erased drop: completing a
+  /// drive, destroying a notified package, or dropping the handle. That drop runs the package
+  /// glue of whichever package the handle names.
+  pub releasesPackages: bool
   /// The `Intrinsic.NonParking` obligations this body owes at its own sites, in lowering order.
   /// The build proves each one against the closed external-park set (SEM0139).
   pub nonParking: Vector<NonParkingRun>
@@ -748,7 +756,10 @@ pub union RunPlan {
   /// Runs part 2 under the diagnostic observer whose state is part 0 and whose callback is the
   /// instance `callback`, with no selected failure, then drops the state (failure observer note N1).
   /// `state` is the state's address type.
-  Observe {pub inner: usize, pub state: Shared<Type>, pub stateDrop: Option<Shared<Type>>, pub callback: InstanceKey},
+  Observe {pub inner: usize, pub state: Shared<Type>, pub stateDrop: Option<Shared<Type>>, pub callback: InstanceKey,
+    /// Whether this run owes the callback's NonParking proof: any diagnostic the body reports
+    /// invokes it, and no `Intrinsic.NonParking` premise of the running instance carries it.
+    pub owed: bool},
   /// Runs part 0, the deferred child, at an explicit suspension boundary (SUSP-001). Its run is
   /// ordinary; the instance that reaches it becomes a suspension origin.
   Suspend {pub inner: usize},
@@ -6488,7 +6499,7 @@ effect fn packageHelper(creator: &Builder, key: InstanceKey, package: &Shared<Ty
     bindings: move bindings, projections: move projections, calls: Vector<CallTarget>.make(),
     function: MirFunction {key: move key, borrow: BodyBorrowStatus.Checked, result: Shared<Type>.clone(&unit), parameters: move parameters,
       locals: move locals, blocks: Vector<Block>.make(), references: Vector<Reference>.make(), externs: Vector<Shared<DeclarationId>>.make(),
-      observes: false, contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make()},
+      observes: false, contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make()},
     current: usize.ZERO, live: true, loops: Vector<LoopTargets>.make(), scrutinees: Vector<Scrutinee>.make(),
     owners: Vector<Owner>.make(), cleanup: Vector<CleanupNode>.make(), scopes: Vector<usize>.make(), temporaries: Vector<Pending>.make(),
     remainders: Vector<Remainder>.make(), needs: CleanupNeeds {locals: Vector<bool>.make(), nodes: Vector<bool>.make()},
@@ -6588,6 +6599,7 @@ effect fn packageAt(builder: &mut Builder, handle: &Place, execution: &Shared<Ty
 // Calls the erased package function the header records at `field` with the package's address.
 effect fn callErased(builder: &mut Builder, access: &PackageAccess, field: CoreField, origin: Origin) -> ()
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if field == CoreField.HeaderDrop { builder.function.releasesPackages = true }
   let bytes = run SealedCore.bytes()
   let function = run storageValue(&mut builder.*, &bytes, Rvalue.Use {value: Operand.Copy {
     place: run storagePlace(&place(access.header), true, &[SealedCore.ordinal(field)])}}, origin)
@@ -7723,7 +7735,8 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       let deferredPart = run projectedPart(environment, usize.ZERO)
       run executePlan(&mut builder.*, steps, inner, &deferredPart, output, sink, &mut bound.*, origin)
     }
-    RunPlan.Observe {inner, state, stateDrop, callback} => {
+    RunPlan.Observe {inner, state, stateDrop, callback, owed} => {
+      if owed { run oweNonParking(&mut builder.*, &callback, origin) }
       // The body runs under the record `[callback, &mut state]` with no selected failure (N1, N2).
       // Its presence makes the whole program observe diagnostics.
       builder.function.observes = true
@@ -7845,9 +7858,12 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
     }
     RunPlan.Finalize {inner, innerFailure, finalizer, finalizerSuccess, nonParking, finalizerDrop, owed} => {
       if owed {
+        // A cancelled finalizer is dropped unrun, also within the NonParking scope.
         let mut callees = Vector<InstanceKey>.make()
-        run planCallees(steps, finalizer, &mut callees)
-        run Vector<NonParkingRun>.append(&mut builder.*.function.nonParking, NonParkingRun {callees: move callees,
+        let mut glues = Vector<Shared<Type>>.make()
+        run planCallees(steps, finalizer, &mut callees, &mut glues)
+        run appendDrop(&mut glues, &finalizerDrop)
+        run Vector<NonParkingRun>.append(&mut builder.*.function.nonParking, NonParkingRun {callees: move callees, glues: move glues,
           declarations: Vector<Shared<DeclarationId>>.make(), exact: true, origin: Option<Origin>.some(origin)})
       }
       let protectedPart = run projectedPart(environment, usize.ZERO)
@@ -7879,7 +7895,15 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
     }
     RunPlan.UseRelease {lent, use, useSuccess, useFailure, release, releaseSuccess, releaseFailure, resourceDrop, owed} => {
       // Invoking the release runs the Effect it returns in the same call.
-      if owed { run oweNonParking(&mut builder.*, &release.key, origin) }
+      // The release drops the resource after it runs, within the same NonParking scope.
+      if owed {
+        let mut callees = Vector<InstanceKey>.make()
+        run Vector<InstanceKey>.append(&mut callees, InstanceKey.copy(&release.key))
+        let mut glues = Vector<Shared<Type>>.make()
+        run appendDrop(&mut glues, &resourceDrop)
+        run Vector<NonParkingRun>.append(&mut builder.*.function.nonParking, NonParkingRun {callees: move callees, glues: move glues,
+          declarations: Vector<Shared<DeclarationId>>.make(), exact: true, origin: Option<Origin>.some(origin)})
+      }
       let resource = run projectedPart(environment, usize.ZERO)
       let usePart = run projectedPart(environment, usize.ONE)
       let releasePart = run projectedPart(environment, 2)
@@ -7922,43 +7946,59 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
 effect fn oweNonParking(builder: &mut Builder, key: &InstanceKey, origin: Origin) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut callees = Vector<InstanceKey>.make()
   run Vector<InstanceKey>.append(&mut callees, InstanceKey.copy(key))
-  return run Vector<NonParkingRun>.append(&mut builder.*.function.nonParking, NonParkingRun {callees: move callees, declarations: Vector<Shared<DeclarationId>>.make(), exact: true,
-    origin: Option<Origin>.some(origin)})
+  return run Vector<NonParkingRun>.append(&mut builder.*.function.nonParking, NonParkingRun {callees: move callees,
+    glues: Vector<Shared<Type>>.make(), declarations: Vector<Shared<DeclarationId>>.make(), exact: true, origin: Option<Origin>.some(origin)})
 }
 
 // Appends the instances that running plan step `step` calls: each runner, handler, use, release
-// and observer callback beneath it.
-effect fn planCallees(steps: &[RunPlan], step: usize, callees: &mut Vector<InstanceKey>) -> () ! OutOfMemoryError ? &mut Allocator {
+// and observer callback beneath it; and the types whose drop glue the expansion runs in place:
+// a dropped handler, finalizer, resource, provider or observer state.
+effect fn planCallees(steps: &[RunPlan], step: usize, callees: &mut Vector<InstanceKey>, glues: &mut Vector<Shared<Type>>) -> ()
+! OutOfMemoryError ? &mut Allocator {
   match &steps[step] {
     RunPlan.Runner {target, ..} => { run Vector<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&target.key)) }
-    RunPlan.Catch {inner, handler, ..} => {
-      run planCallees(steps, inner, &mut callees.*)
+    RunPlan.Catch {inner, handler, handlerDrop, ..} => {
+      run planCallees(steps, inner, &mut callees.*, &mut glues.*)
       run Vector<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&handler.key))
+      run appendDrop(&mut glues.*, &handlerDrop)
     }
-    RunPlan.Finalize {inner, finalizer, ..} => {
-      run planCallees(steps, inner, &mut callees.*)
-      run planCallees(steps, finalizer, &mut callees.*)
+    RunPlan.Finalize {inner, finalizer, finalizerDrop, ..} => {
+      run planCallees(steps, inner, &mut callees.*, &mut glues.*)
+      run planCallees(steps, finalizer, &mut callees.*, &mut glues.*)
+      run appendDrop(&mut glues.*, &finalizerDrop)
     }
-    RunPlan.UseRelease {use, release, ..} => {
+    RunPlan.UseRelease {use, release, resourceDrop, ..} => {
       run Vector<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&use.key))
       run Vector<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&release.key))
+      run appendDrop(&mut glues.*, &resourceDrop)
     }
-    RunPlan.Bind {inner, ..} => { run planCallees(steps, inner, &mut callees.*) }
+    RunPlan.Bind {inner, providerDrop} => {
+      run planCallees(steps, inner, &mut callees.*, &mut glues.*)
+      if let Option<ProviderDrop>.Some {value: dropped} = &providerDrop {
+        run Vector<Shared<Type>>.append(&mut glues.*, Shared<Type>.clone(&dropped.provider))
+      }
+    }
     RunPlan.Join {arms, ..} => {
       let listed = Vector<JoinArm>.asSlice(&arms)
       let mut at = usize.ZERO
       while at < listed.length {
-        run planCallees(steps, listed[at].step, &mut callees.*)
+        run planCallees(steps, listed[at].step, &mut callees.*, &mut glues.*)
         at = at + usize.ONE
       }
     }
-    RunPlan.Observe {inner, callback, ..} => {
-      run planCallees(steps, inner, &mut callees.*)
+    RunPlan.Observe {inner, callback, stateDrop, ..} => {
+      run planCallees(steps, inner, &mut callees.*, &mut glues.*)
       run Vector<InstanceKey>.append(&mut callees.*, InstanceKey.copy(&callback))
+      run appendDrop(&mut glues.*, &stateDrop)
     }
-    RunPlan.Suspend {inner} => { run planCallees(steps, inner, &mut callees.*) }
-    RunPlan.Lent {inner} => { run planCallees(steps, inner, &mut callees.*) }
+    RunPlan.Suspend {inner} => { run planCallees(steps, inner, &mut callees.*, &mut glues.*) }
+    RunPlan.Lent {inner} => { run planCallees(steps, inner, &mut callees.*, &mut glues.*) }
   }
+  return ()
+}
+
+effect fn appendDrop(glues: &mut Vector<Shared<Type>>, dropped: &Option<Shared<Type>>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Option<Shared<Type>>.Some {value} = &dropped.* { run Vector<Shared<Type>>.append(&mut glues.*, Shared<Type>.clone(&value)) }
   return ()
 }
 
@@ -9185,7 +9225,7 @@ impl MirFunction {
       references: move references,
       externs: Vector<Shared<DeclarationId>>.make(),
       observes: false,
-      contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make(),
+      contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make(),
     }
   }
   /// Lowers a closed body while preserving its unfinished safety status, without reading a callee body.
@@ -9294,7 +9334,7 @@ impl MirFunction {
         references: Vector<Reference>.make(),
         externs: Vector<Shared<DeclarationId>>.make(),
         observes: false,
-        contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make(),
+        contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make(),
       },
       current: usize.ZERO,
       live: true,
