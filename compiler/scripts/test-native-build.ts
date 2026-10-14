@@ -167,6 +167,41 @@ const program = Effect.gen(function* () {
   )
   assert.equal(greeted.status, 0, greeted.stderr)
   assert.match(greeted.stdout, /Hello, world!/)
+  // An installed compiler finds `<prefix>/lib/silk/stdlib` beside `<prefix>/bin` without
+  // `--stdlib`, also through a symbolic link in another directory and as a bare name on PATH.
+  const prefix = join(directory, 'prefix')
+  yield* fs.makeDirectory(join(prefix, 'bin'), { recursive: true })
+  yield* fs.makeDirectory(join(prefix, 'lib/silk'), { recursive: true })
+  yield* fs.copyFile(silkc, join(prefix, 'bin/silkc'))
+  yield* fs.chmod(join(prefix, 'bin/silkc'), 0o755)
+  yield* fs.copy(standardLibrary, join(prefix, 'lib/silk/stdlib'))
+  const links = join(directory, 'links')
+  yield* fs.makeDirectory(links)
+  yield* fs.symlink(join(prefix, 'bin/silkc'), join(links, 'silk'))
+  const symlinked = yield* invoke(join(links, 'silk'), ['run'], join(directory, 'greeting'), {
+    ...process.env,
+    SILKC_CLANG: clang,
+  })
+  assert.equal(symlinked.status, 0, symlinked.stderr)
+  assert.match(symlinked.stdout, /Hello, world!/)
+  const searched = yield* invoke('silk', ['run'], join(directory, 'greeting'), {
+    ...process.env,
+    PATH: `${links}:${process.env.PATH ?? ''}`,
+    SILKC_CLANG: clang,
+  })
+  assert.equal(searched.status, 0, searched.stderr)
+  // Without an installation beside it, the compiler still needs `--stdlib`.
+  yield* fs.makeDirectory(join(directory, 'bare/bin'), { recursive: true })
+  yield* fs.copyFile(silkc, join(directory, 'bare/bin/silkc'))
+  yield* fs.chmod(join(directory, 'bare/bin/silkc'), 0o755)
+  const uninstalled = yield* invoke(
+    join(directory, 'bare/bin/silkc'),
+    ['run'],
+    join(directory, 'greeting'),
+    { ...process.env, SILKC_CLANG: sentinel },
+  )
+  assert.notEqual(uninstalled.status, 0, 'a compiler without an installation needs --stdlib')
+  assert.equal(yield* fs.exists(marker), false)
   const repeated = yield* invoke(silkc, ['init', 'greeting'], directory)
   assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
   // A project `build` names its manifest instead of discovering one, and `--release` selects the
@@ -278,7 +313,7 @@ const program = Effect.gen(function* () {
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input and bindings passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings and installed standard library passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
