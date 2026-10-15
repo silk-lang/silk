@@ -131,6 +131,33 @@ const program = Effect.gen(function* () {
   })
   assert.equal(clangless.status, 2, 'a missing clang is an operational failure')
   assert.equal(yield* fs.exists(join(directory, 'clangless')), false)
+  // `--clang` wins over SILK_CLANG: a path resolves against the working directory and a bare name
+  // is searched on PATH.
+  const flagged = yield* invoke(
+    silk,
+    [...argumentsFor('flagged'), '--clang', './clang-sentinel'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.notEqual(flagged.status, 0, 'the sentinel clang fails the link')
+  assert.equal(yield* fs.exists(marker), true, 'the --clang path must run')
+  yield* fs.remove(marker)
+  const named = yield* invoke(silk, [...argumentsFor('named'), '--clang', 'clang'], directory, {
+    ...process.env,
+    SILK_CLANG: clang,
+    PATH: `${pathTools}:${process.env.PATH ?? ''}`,
+  })
+  assert.notEqual(named.status, 0, 'the sentinel clang fails the link')
+  assert.equal(yield* fs.exists(marker), true, 'a bare --clang name must run from PATH')
+  yield* fs.remove(marker)
+  const unnamed = yield* invoke(
+    silk,
+    [...argumentsFor('unnamed'), '--clang', 'no-such-clang'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(unnamed.status, 2, 'a --clang name missing from PATH is an operational failure')
+  assert.equal(yield* fs.exists(join(directory, 'unnamed')), false)
   // Another target emits its IR without linking; only the host target links an executable.
   const foreign =
     process.platform === 'darwin' ? 'x86_64-unknown-linux-gnu' : 'aarch64-apple-darwin'
@@ -795,7 +822,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, runtime requests, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, runtime requests, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
