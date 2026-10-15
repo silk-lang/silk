@@ -1559,60 +1559,75 @@ export const analyze = (
   // A later write installs a new value into local storage. That value reaches a universal
   // contract only through an edge out of the storage raised where the write's installation can
   // reach, so a store before the write, or after a later rewrite, leaves it out.
-  const installedInto = new Map<
-    string,
-    Array<{
-      readonly ordinal: number
-      readonly longer: Lifetime.Lifetime
-      readonly reach?: BodyControlFlow.Reachable
-      readonly installed: string
-    }>
-  >()
   // A later write replacing the same binding's whole value retires what an earlier write installed.
-  const wholeInstalls = new Map<string, Array<number>>()
+  const ownerBarriers = new Map<string, Array<number>>()
   for (const { installed, owner, whole } of body.activatedConstraints) {
-    const installation = controlFlow.boundaries.get(AuthoredIdentity.anchorKey(installed))
-    if (!whole || owner === undefined || installation === undefined) continue
+    if (owner === undefined) continue
     const key = AuthoredIdentity.anchorKey(owner)
-    const before = wholeInstalls.get(key) ?? []
-    if (!before.includes(installation.before)) before.push(installation.before)
-    wholeInstalls.set(key, before)
-  }
-  for (const [ordinal, { bound, installed, owner }] of body.activatedConstraints.entries()) {
+    const barriers = ownerBarriers.get(key) ?? []
+    if (!ownerBarriers.has(key)) {
+      const declared = controlFlow.boundaries.get(key)
+      if (declared !== undefined) barriers.push(declared.before)
+      ownerBarriers.set(key, barriers)
+    }
     const installation = controlFlow.boundaries.get(AuthoredIdentity.anchorKey(installed))
-    const ownerBoundary =
-      owner === undefined
-        ? undefined
-        : controlFlow.boundaries.get(AuthoredIdentity.anchorKey(owner))
-    const reach =
-      installation === undefined
-        ? undefined
-        : BodyControlFlow.reachable(controlFlow, installation.after, [
-            installation.before,
-            ...(ownerBoundary === undefined ? [] : [ownerBoundary.before]),
-            ...(owner === undefined
-              ? []
-              : (wholeInstalls.get(AuthoredIdentity.anchorKey(owner)) ?? [])),
-          ])
+    if (whole && installation !== undefined && !barriers.includes(installation.before))
+      barriers.push(installation.before)
+  }
+  // Reach is resolved only for installations the walk meets, once each.
+  interface Installation {
+    readonly ordinal: number
+    readonly longer: Lifetime.Lifetime
+    readonly installed: string
+    readonly reach: () => BodyControlFlow.Reachable | undefined
+  }
+  const installedInto = new Map<string, Array<Installation>>()
+  for (const [ordinal, { bound, installed, owner }] of body.activatedConstraints.entries()) {
+    let resolved: { readonly reach: BodyControlFlow.Reachable | undefined } | undefined
+    const reach = (): BodyControlFlow.Reachable | undefined => {
+      if (resolved !== undefined) return resolved.reach
+      const installation = controlFlow.boundaries.get(AuthoredIdentity.anchorKey(installed))
+      resolved = {
+        reach:
+          installation === undefined
+            ? undefined
+            : BodyControlFlow.reachable(controlFlow, installation.after, [
+                installation.before,
+                ...(owner === undefined
+                  ? []
+                  : (ownerBarriers.get(AuthoredIdentity.anchorKey(owner)) ?? [])),
+              ]),
+      }
+      return resolved.reach
+    }
     const into = installedInto.get(Lifetime.key(bound.shorter)) ?? []
     into.push({
       ordinal,
       longer: bound.longer,
-      ...(reach === undefined ? {} : { reach }),
       installed: AuthoredIdentity.anchorKey(installed),
+      reach,
     })
     installedInto.set(Lifetime.key(bound.shorter), into)
   }
-  // Sites absent from the record, or raised outside any statement, count as reached everywhere.
+  // A site counts as reached when the installation reaches its start or, for an installation
+  // nested inside the site statement, its end. Sites absent from the record, or raised outside any
+  // statement, count as reached everywhere.
   const reachesSite = (
-    reach: BodyControlFlow.Reachable | undefined,
+    installation: Installation,
     sites: ReadonlySet<string | undefined> | undefined,
   ): boolean => {
-    if (reach === undefined || sites === undefined) return true
+    if (sites === undefined) return true
+    const reach = installation.reach()
+    if (reach === undefined) return true
     for (const site of sites) {
       if (site === undefined) return true
       const boundary = controlFlow.boundaries.get(site)
-      if (boundary === undefined || BodyControlFlow.includes(reach, boundary.before)) return true
+      if (
+        boundary === undefined ||
+        BodyControlFlow.includes(reach, boundary.before) ||
+        BodyControlFlow.includes(reach, boundary.after)
+      )
+        return true
     }
     return false
   }
@@ -1694,7 +1709,7 @@ export const analyze = (
       if (next === undefined) continue
       const { source, sites } = next
       for (const installation of installedInto.get(Lifetime.key(source)) ?? []) {
-        if (followed.has(installation.ordinal) || !reachesSite(installation.reach, sites)) continue
+        if (followed.has(installation.ordinal) || !reachesSite(installation, sites)) continue
         followed.add(installation.ordinal)
         pending.push({ source: installation.longer, sites: new Set([installation.installed]) })
       }
