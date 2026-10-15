@@ -191,3 +191,9 @@ B9 done: #1680, #1686, #1694 (+ main #1677, #1693) merged; sync #1697 merged.
    and `node .scratch/selfhost-verification.mjs ...`; the sync must also pass
    `corpus/native/trivial-features/main.silk` as corpus-source in selfhost's selfhost.yml.
 3. Then main PR: stop publishing silk-selfhost-verification; drop download-bootstrap verification.
+
+## 2026-10-15 D2/D5 complete
+
+- Main: #1719 corpus as data, #1720 harness reads corpus/, #1721 harness bundle without TS compiler, #1733 stop publishing silk-selfhost-verification. All merged.
+- Selfhost: #1723 sync, #1737 re-sync on main merge commit 0c0d8e1, #1732 corpus/macOS/ARM64 jobs build harness from checkout. All merged.
+- Lesson (in PAPERCUTS): sync main's merge commit, never a main PR head; T1 DDC needs a published silk-bootstrap at the merge base.
