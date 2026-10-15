@@ -509,6 +509,47 @@ pub fn inspect(point: Point) -> i32 {
     'OWN0011',
   )
 
+  // A borrowed match arm keeps its owner loaned through the arm's last binding use (MATCH-002); a
+  // guard-only use or a write after that use leaves the owner free.
+  const armSource = `pub struct Token { kind: i32 }
+pub union Slot { Held { value: Token }, Vacant }
+pub fn reset(input: Slot) -> i32 {
+  let mut slot = move input
+  return match &slot {
+    Slot.Held { value } => {
+      slot = Slot.Vacant
+      return value.kind
+    }
+    Slot.Vacant => 0
+  }
+}
+pub fn released(input: Slot) -> i32 {
+  let mut slot = move input
+  return match &slot {
+    Slot.Held { value } if value.kind > 0 => {
+      slot = Slot.Vacant
+      return 1
+    }
+    Slot.Held { value } => {
+      let kind = value.kind
+      slot = Slot.Vacant
+      return kind
+    }
+    Slot.Vacant => 0
+  }
+}`
+  const arm = analyze('borrowed-arm-loan', armSource)
+  const write = armSource.indexOf('slot = Slot.Vacant')
+  assert.deepEqual(arm.diagnostics, [])
+  assert.deepEqual(
+    ownership(arm).diagnostics.map((diagnostic) => [
+      diagnostic.code,
+      diagnostic.span.start,
+      diagnostic.span.end,
+    ]),
+    [['OWN0011', write, write + 'slot'.length]],
+  )
+
   const moved = analyze(
     'moved-pattern-selection',
     `pub struct Point { x: i32 }
