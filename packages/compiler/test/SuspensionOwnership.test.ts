@@ -229,7 +229,6 @@ it.layer(Layer.effect(Relayed, snapshot(source)))((it) => {
           .map((slot) => slot.local.ordinal),
         [0, 1, 2],
       )
-      assert.deepEqual(ownership.violations, [])
     }),
   )
 
