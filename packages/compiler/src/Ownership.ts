@@ -1548,6 +1548,10 @@ const checkExpressionOperation = (
           )
         )
           return false
+        // A mutable capture's loan begins at construction (CAPTURE-001), and the callable may
+        // replace any part of the captured root through it.
+        const captured = capture.access === 'Exclusive' ? placeOf(capture.value) : undefined
+        if (captured !== undefined) forgetRefinement(state, live, captured.root, [])
       }
       return true
     }
@@ -1711,6 +1715,10 @@ const checkExpressionOperation = (
           )
         else if (site !== undefined)
           checkUse(state, live, site, capture.span, capture.access === 'Take')
+        // A mutable capture's loan begins at construction (CAPTURE-001), and the body may replace
+        // any part of the captured root through it.
+        if (site !== undefined && capture.access === 'Exclusive')
+          forgetRefinement(state, live, site, [])
       }
       return true
     }
