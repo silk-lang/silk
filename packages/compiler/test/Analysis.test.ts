@@ -23,7 +23,7 @@ import * as SourceResolver from '../src/SourceResolver.js'
 import * as SemanticDisplay from '../src/SemanticDisplay.js'
 import * as SyntaxTree from '../src/SyntaxTree.js'
 import * as Type from '../src/Type.js'
-import { invalidMatchCorpus } from './support/corpus.js'
+import { invalidCorpus, reportedDiagnostics } from './support/corpus.js'
 import * as Projections from './support/projections.js'
 import { raise, unreachable } from './support/raise.js'
 
@@ -534,14 +534,17 @@ it.effect('keeps unsupported targets explicit and queryable without manufacturin
 
 it.effect('keeps invalid match corpus failures phase-owned and downstream facts queryable', () =>
   Effect.gen(function* () {
-    for (const program of invalidMatchCorpus) {
+    for (const program of invalidCorpus.filter((program) => program.name.startsWith('match-'))) {
       const self = yield* AnalysisFixture.retainingMain(
         `memory/${program.name}`,
         ascii(program.source),
         'wasm32-unknown-unknown',
       )
-      const codes = Analysis.diagnostics(self).map((diagnostic) => diagnostic.code)
-      for (const code of program.codes) assert.include(codes, code, program.name)
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
       assert.strictEqual(Analysis.mirOf(self)._tag, 'Unavailable', program.name)
       assert.isAtLeast(
         Projections.matchesOf(self, `memory/${program.name}`).length,
