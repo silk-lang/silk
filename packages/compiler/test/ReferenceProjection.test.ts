@@ -9,7 +9,7 @@ import * as MirVerification from '../src/MirVerification.js'
 import * as Residualization from '../src/Residualization.js'
 import * as Type from '../src/Type.js'
 import type * as StaticValue from '../src/StaticValue.js'
-import { referenceProjectionAcceptance } from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
@@ -65,7 +65,7 @@ it.effect('retains zero-lane reads and nested reborrows while restoring the pare
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'reference-projection/surviving-runtime-structure',
-      ascii(referenceProjectionAcceptance),
+      ascii(corpusProgram('reference-projection').source),
       'aarch64-apple-darwin',
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])

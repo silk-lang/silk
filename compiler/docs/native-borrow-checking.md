@@ -324,13 +324,16 @@ until the provided Effect completes. There are no two-phase borrows, as in the b
   before any code is emitted. Each held access walks its callback's call graph; every `run` outside
   an Effect block and every execution readiness notification it reaches is reported at its own span
   and module, related to the call where the callback entered its access wrappers, once per pair.
-  Both code-producing entries, `silkc build` and `silkc test`, build through that pass. A body's
+  Both code-producing entries, `silk build` and `silk test`, build through that pass. A body's
   `Checked` verdict therefore covers loans and regions only.
 - Only reached accesses are judged. An access in a declaration no root reaches is judged once the
   native compiler checks every loaded declaration (MODULE-004), and that work must include this
   pass.
-- OWN0020 (ownership across suspension) is out of scope until suspension lowering exists
-  (`mir-core-shape.md` §6), and is reported as a named gap if reached.
+- Ownership across suspension needs no rule of its own (SUSP-011, SUSP-013). A suspending `run`
+  is a call in the walk, so a loan or a partial move live across it reports the ordinary codes,
+  as the bootstrap does. The bootstrap's OWN0020 guards the invariants of its own suspension
+  planner; natively, a frame that cannot store a drop flag live at a suspension point is an
+  internal compiler error in `Coroutine.plan`, never a user diagnostic.
 
 ## 5. Place in the query graph
 
@@ -347,7 +350,7 @@ The checker is part of the `Body` unit, as the v2 note's checking-unit rule requ
   the declaration (v2 §3.5), so an edit elsewhere in the file never changes a cached answer. The
   answer is part of the `Body` result, compared by v2's cutoff (§6.3 there); only the build verdict
   reads it.
-- **Who reads it.** `buildRuntime`, for the unit of every emitted instance, deduplicated by key.
+- **Who reads it.** `buildArtifact`, for the unit of every emitted instance, deduplicated by key.
   `MirFunction.safetyChecked` and `InstanceRecipe.safetyChecked` then come from the checking answer
   instead of `BodyStage.FullyChecked`. A rejection joins `BackendBuild.Rejected` exactly as typing
   rejections do.
@@ -369,10 +372,12 @@ cover first:
 - `regions`: loans, explicit moves and by-value uses of affine values (OWN0003), forwarded
   exclusive views included, are proved, but the body is not region-closed (below), or retains a
   region relation or capture contents; later slices prove those.
-- `storage`: the body uses `slotAddress`, whose raw pointer result names no region of the slot
-  it reaches. `replace` is checked as a write to its place operand that yields the displaced value.
-  Immediate `executionDrive`, `executionNotify`, `executionCurrent` and `relinquish`, together
-  with the other supported storage operations, are calls to their catalog contracts.
+- Storage operations have no reason of their own. `replace` is checked as a write to its place
+  operand that yields the displaced value. Immediate `executionDrive`, `executionNotify`,
+  `executionCurrent`, `relinquish` and `slotAddress`, together with the other supported storage
+  operations, are calls to their catalog contracts. `slotAddress` consumes its slot, and its
+  `*mut T` result names no region, so the address holds no loan, as in the bootstrap: it keeps no
+  storage alive, and every access through it is `unsafe` and proves its own validity.
   `executionFromAllocation` is one too: it consumes its allocation, body, readiness state and
   endpoint, and typing proves the last three `Intrinsic.Detached` at the call (EXEC-004, SEM0139),
   so the package retains no loan of its constructor beyond what its `Intrinsic.Execution<A>`
@@ -431,6 +436,17 @@ hide until the regions slice proves it.
   a region cannot outlive what the caller chose, typing already rejects a body-local borrow given a
   caller's region or type, and safe code obtains a type parameter's value only as such a value.
 - When exactly one operand's loans name a result region, the result retains them exactly.
+- A loan whose regions are all body regions is not retained by a call to a declaration or interface
+  operation when none of its regions can outlive a result region. Typing relates two body regions
+  only by equality or a meet, which share an atom, or by a region relation it leaves open. So the
+  callee can reach a result region only through those relations, taken as premises (offered
+  outlives wanted), and the outlives facts its argument and result types imply: a reference's or
+  slice's referent outlives its region, and a nominal's arguments may outlive one another. If
+  those facts lead a loan region to a result region, or to a region from outside the body, the
+  loan stays carried, approximately. A body that retains capture contents keeps every such loan.
+  `stream.take()` returning `Option<&'data A>` therefore releases its `&'call mut` receiver loan,
+  while `unshelve(&shelf)` returning `&'a Token` from `&'a Shelf<'b>` keeps the shelf's `'b`
+  contents loan, since `'b` outlives `'a`.
 - Otherwise each loan is carried approximately: every fresh borrow of one call shares the call's
   region, so several operands may name it, and a callable retains its capture loans whatever its
   type names.
@@ -550,7 +566,7 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
   the earlier loan (BORROW-004), and the violating use for OWN0019, as in the bootstrap. Typed-node
   origins carry these spans already. Answers store them relative to the declaration (Q2).
 - **Parity is measured differentially**, on code, primary span and module, over the bootstrap's
-  expected-diagnostic programs: the ownership and lifetime cases in `test/support/corpus.ts`, plus
+  expected-diagnostic programs: the ownership and lifetime cases of the acceptance corpus, plus
   a new invalid-ownership set covering every code in §1.1. The selfhost runner has no
   expected-diagnostic mode today (`CorpusProgram.expected` is only `Completes` or `Trap`). Adding
   one changes guarded inputs (`runSelfhostCorpus.ts`, `corpus.ts`), so it lands on `main` first.
@@ -682,7 +698,9 @@ Julia decided the open questions in the joint review with #1433 (2026-10-11):
    checks run after typing in the same `Body` unit. One unit and one key own both, so one body edit
    reruns both and nothing else.
 5. **OWN0017 and OWN0020.** OWN0017 is dropped from the catalog; it has no bootstrap call site.
-   OWN0020 waits for suspension lowering and is a named gap until then.
+   OWN0020 waits for suspension lowering and is a named gap until then. Suspension lowering has
+   since landed, and OWN0020 has no native counterpart: ownership across suspension reports the
+   ordinary codes, and a frame that cannot represent a live owner aborts as a compiler bug (§4.5).
 6. **When the gap becomes an error.** CI fails on any increase of the unchecked count from the
    first slice; the gap becomes a hard error at zero on the self-build.
 7. **Diagnostic spelling.** During the transition the native CLI prints native names together with
