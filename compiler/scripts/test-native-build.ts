@@ -527,6 +527,29 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(overridden.status, 5, overridden.stderr)
+  // A `none` runtime request selects no hosted start: the application's own C `main` is the entry.
+  yield* fs.makeDirectory(join(directory, 'bare'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'bare/main.silk'),
+    'export "C" fn start() -> i32 as "main" {\n  return 6\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'bare/silk.toml'),
+    '[package]\nname = "bare"\nversion = "0.1.0"\nroot = "main.silk"\n',
+  )
+  const bare = yield* invoke(
+    silk,
+    [
+      'run',
+      '--profile-input',
+      JSON.stringify({ target: hostTarget, runtime: { kind: 'none' } }),
+      '--stdlib',
+      standardLibrary,
+    ],
+    join(directory, 'bare'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(bare.status, 6, bare.stderr)
   const cleanedByPath = yield* invoke(silk, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
@@ -772,7 +795,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, runtime requests, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))

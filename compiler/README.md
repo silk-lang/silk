@@ -264,7 +264,10 @@ library. `compiler/scripts/ReleaseArchive.ts` packages that installation per tar
 bytes. The selfhost workflow packages every target's N2 this way, runs a new `init` project from
 the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
 library's `compositions.json` for the target and libc, so such a build needs the library root even
-without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
+without standard-library imports; no listed runtime is a refusal. The profile's `runtime` request
+chooses among them: `{ kind = "named", name = "<name>" }` selects the composition or catalog runtime
+of that name and never a default, and `{ kind = "none" }` selects no runtime and no catalog
+component, so the application's own `export "C"` functions are the roots. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
 (resolved against the manifest's directory), else the root's containing directory, is the root for
 local module paths, and the root must be a module below it. Every module identity names the package by its logical
 identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
