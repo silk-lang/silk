@@ -574,10 +574,11 @@ it.effect('rejects a place replacement that a live loan of the place observes', 
   }),
 )
 
-it.effect('reports each independent statement failure of an invalid body in source order', () =>
+it.effect('reports each independent failure of an invalid body in source order', () =>
   Effect.gen(function* () {
-    for (const program of invalidCorpus.filter((program) =>
-      program.name.startsWith('statement-'),
+    for (const program of invalidCorpus.filter(
+      (program) =>
+        program.name.startsWith('statement-') || program.name.startsWith('short-circuit-'),
     )) {
       const self = yield* AnalysisFixture.retainingMain(
         `memory/${program.name}`,
