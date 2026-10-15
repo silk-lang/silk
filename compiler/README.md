@@ -324,6 +324,15 @@ profile's, else 11.0.0) and supply the ARM64 `libSystem` contract. Clang receive
 `-isysroot` with `-mmacosx-version-min`; an ambient `SDKROOT` never reaches Clang. A refused
 supply prints `<code>: <subject> (<origin>)` and its correction, and exits 2.
 
+A project's `[build].platform-supply` table selects the supply as the TypeScript CLI decodes it:
+`kind = "automatic"` or `"native"` keeps the selection above; `kind = "explicit"` names its
+`target`, SDK or sysroot `root`, `linker`, an optional `origin` and optional `support`
+installations (`root`, `target`, `origin`), with relative paths against the manifest's directory.
+An explicit supply must name the build's target and replaces `SDKROOT` and discovery: a macOS
+SDK is validated as above, and a GNU/Linux sysroot reaches Clang as `--sysroot`, its compiler
+support as `--gcc-install-dir` and the linker, which must be installed, as `--ld-path`. A
+`managed` supply is refused with `UnsupportedProvider`.
+
 `silk --help` (or `-h`) prints the command synopsis and `silk --version` (or `-v`) prints
 `silk v<version>`, both on standard output with status 0.
 

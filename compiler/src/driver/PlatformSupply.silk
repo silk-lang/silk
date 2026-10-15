@@ -1,5 +1,6 @@
-//! The macOS SDK one native compilation consumes, resolved as the platform-supplies reference
-//! requires: `SDKROOT` when it is set, else discovery through `xcrun` for the host target only.
+//! The platform supply one native link consumes, resolved as the platform-supplies reference
+//! requires: a project's explicit SDK or sysroot when it names one, else for macOS `SDKROOT` when
+//! it is set, else discovery through `xcrun` for the host target only.
 //!
 //! The resolved supply records what was consulted (`SDKROOT` or `DEVELOPER_DIR`, and the
 //! discovery query's result), so a later change to the ambient environment cannot change it. An
@@ -21,9 +22,29 @@ import silk.result { Result }
 import silk.sha2 { Sha256 }
 import silk.slice { Slice }
 import silk.string { String }
+import silk.toml_value { Toml, TomlChild, Value as TomlValue }
 import silk.u8
 import silk.usize
 import silk.vector { Vector }
+
+/// One GNU compiler-support installation an explicit supply names.
+pub struct Installation {
+  pub root: Path
+  pub target: Bytes
+  pub origin: Bytes
+}
+
+/// A requested supply: the project's `[build].platform-supply`, or automatic when it names none.
+pub union Request {
+  /// Discovery for a compatible host target, as when nothing is requested.
+  Automatic,
+  /// Host discovery, named explicitly.
+  Native,
+  /// A managed installation: recognized, but not supported.
+  Managed { pub name: Bytes },
+  /// An installed SDK or sysroot, its linker and its compiler-support installations.
+  Explicit { pub target: Bytes, pub root: Path, pub linker: Path, pub origin: Bytes, pub support: Vector<Installation> },
+}
 
 /// One selected supply input, with the SHA-256 of the bytes resolution read.
 pub struct SupplyFile {
@@ -38,15 +59,24 @@ pub struct SupplyFile {
   pub digest: [u8; 32]
 }
 
-/// One resolved macOS SDK.
+/// One resolved platform supply: a macOS SDK, or an explicit GNU/Linux sysroot.
 pub struct Supply {
-  /// The SDK root, passed to Clang as `-isysroot`.
+  /// The SDK root (`-isysroot`) of a macOS target, or the sysroot (`--sysroot`) of a GNU/Linux one.
   pub root: Path
+
+  /// Whether `root` is a macOS SDK.
+  pub darwin: bool
+
+  /// The compiler-support installation for the target (`--gcc-install-dir`), if one is declared.
+  pub support: Option<Path>
+
+  /// The explicit linker (`--ld-path`), if one is declared.
+  pub linker: Option<Path>
 
   /// The deployment version, passed to Clang as `-mmacosx-version-min`.
   pub deployment: Bytes
 
-  /// Where the SDK came from: `SDKROOT` or `SDK discovery`.
+  /// Where the supply came from: `SDKROOT`, `SDK discovery`, or the explicit request's origin.
   pub origin: Bytes
 
   /// The `DEVELOPER_DIR` value discovery forwarded to `xcrun`, if any.
@@ -66,8 +96,178 @@ pub struct SupplyError {
   pub code: &'static [u8]
   pub subject: Bytes
   pub origin: Bytes
-  pub correction: &'static [u8]
+  pub correction: Bytes
   pub detail: Bytes
+}
+
+// Whether `value` is a TOML table whose keys are all in `allowed`.
+fn exactTable(value: &TomlValue, allowed: &[&[u8]]) -> bool {
+  return match &value.* {
+    TomlValue.Table { entries, kind: _ } => {
+      let boxed = Box<Vector<TomlChild>>.get(&entries)
+      let children = Vector<TomlChild>.asSlice(&boxed[0])
+      let mut at = usize.ZERO
+      while at < children.length {
+        if let TomlChild.Member { entry } = &children[at] {
+          let key = String.ownedUtf8Bytes(&entry.key)
+          let mut known = false
+          let mut index = usize.ZERO
+          while index < allowed.length {
+            if same(key, allowed[index]) {
+              known = true
+            }
+            index = index + usize.ONE
+          }
+          if !known {
+            return false
+          }
+        }
+        at = at + usize.ONE
+      }
+      return true
+    }
+    _ => false
+  }
+}
+
+// The text of the string field `name` of `table`, if it is one.
+fn textField<'a>(table: &'a TomlValue, name: string) -> Option<&'a [u8]> {
+  return match move Toml.asString(Toml.field(table, name)) {
+    Option<string>.Some { value } => Option<&'a [u8]>.some(String.utf8Bytes(value))
+    Option<string>.None => Option<&'a [u8]>.none()
+  }
+}
+
+// Whether `target` is a canonical target a native supply can name.
+fn supplyTarget(target: &[u8]) -> bool {
+  return same(target, b"aarch64-apple-darwin") || same(target, b"x86_64-unknown-linux-gnu")
+    || same(target, b"aarch64-unknown-linux-gnu")
+}
+
+effect fn invalidRequest(origin: &[u8]) -> never ! SupplyError | OutOfMemoryError ? &mut Allocator {
+  return run failure(b"InvalidConfiguration", b"platform-supply", origin,
+    b"Use kind automatic/native, managed with name, or explicit with target/root/linker/origin and optional support installations.", b"")
+}
+
+// The path `text` names, relative paths resolving against `directory`.
+effect fn suppliedPath(directory: &Path, text: &[u8], origin: &[u8]) -> Path ! SupplyError | OutOfMemoryError ? &mut Allocator {
+  let resolved = run Effect.result(CommandPath.resolve(directory, text))
+  return match move resolved {
+    Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError invalid => {
+        drop invalid
+        return run invalidRequest(origin)
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+/// Decodes `[build].platform-supply` as the TypeScript `PlatformSupply.decode` does: `kind`
+/// `automatic` or `native` alone, `managed` with `name`, or `explicit` with `target`, `root`,
+/// `linker`, an optional `origin` (else `origin`) and optional `support` installations of `root`,
+/// `target` and `origin`. Paths resolve against the manifest's `directory`.
+pub effect fn decode(value: &TomlValue, directory: &Path, origin: &[u8]) -> Request
+  ! SupplyError | OutOfMemoryError
+  ? &mut Allocator {
+  let kindOnly: [&[u8]; 1] = [b"kind"]
+  let managedKeys: [&[u8]; 2] = [b"kind", b"name"]
+  let explicitKeys: [&[u8]; 6] = [b"kind", b"target", b"root", b"linker", b"origin", b"support"]
+  let installationKeys: [&[u8]; 3] = [b"root", b"target", b"origin"]
+  let kind = match move textField(value, "kind") {
+    Option<&[u8]>.Some { value: text } => text
+    Option<&[u8]>.None => run invalidRequest(origin)
+  }
+  if same(kind, b"automatic") && exactTable(value, &kindOnly) {
+    return Request.Automatic
+  }
+  if same(kind, b"native") && exactTable(value, &kindOnly) {
+    return Request.Native
+  }
+  if same(kind, b"managed") && exactTable(value, &managedKeys) {
+    if let Option<&[u8]>.Some { value: name } = move textField(value, "name") {
+      return Request.Managed { name: run Bytes.copy(name) }
+    }
+    return run invalidRequest(origin)
+  }
+  if !same(kind, b"explicit") || !exactTable(value, &explicitKeys) {
+    return run invalidRequest(origin)
+  }
+  let target = match move textField(value, "target") {
+    Option<&[u8]>.Some { value: text } => text
+    Option<&[u8]>.None => run invalidRequest(origin)
+  }
+  if !supplyTarget(target) {
+    return run invalidRequest(origin)
+  }
+  let rootText = match move textField(value, "root") {
+    Option<&[u8]>.Some { value: text } => text
+    Option<&[u8]>.None => run invalidRequest(origin)
+  }
+  let linkerText = match move textField(value, "linker") {
+    Option<&[u8]>.Some { value: text } => text
+    Option<&[u8]>.None => run invalidRequest(origin)
+  }
+  let mut named = run Bytes.copy(origin)
+  if let Option<&TomlValue>.Some { value: _ } = move Toml.field(value, "origin") {
+    named = match move textField(value, "origin") {
+      Option<&[u8]>.Some { value: text } => run Bytes.copy(text)
+      Option<&[u8]>.None => run invalidRequest(origin)
+    }
+  }
+  let mut support = Vector<Installation>.make()
+  if let Option<&TomlValue>.Some { value: listed } = move Toml.field(value, "support") {
+    let array = match &listed.* {
+      TomlValue.Array { .. } => true
+      _ => false
+    }
+    if !array {
+      return run invalidRequest(origin)
+    }
+    let mut at = usize.ZERO
+    while true {
+      let item = match move Toml.item(listed, at) {
+        Option<&TomlValue>.Some { value: entry } => entry
+        Option<&TomlValue>.None => {
+          break
+        }
+      }
+      if !exactTable(item, &installationKeys) {
+        return run invalidRequest(origin)
+      }
+      let supportRoot = match move textField(item, "root") {
+        Option<&[u8]>.Some { value: text } => text
+        Option<&[u8]>.None => run invalidRequest(origin)
+      }
+      let supportTarget = match move textField(item, "target") {
+        Option<&[u8]>.Some { value: text } => text
+        Option<&[u8]>.None => run invalidRequest(origin)
+      }
+      let supportOrigin = match move textField(item, "origin") {
+        Option<&[u8]>.Some { value: text } => text
+        Option<&[u8]>.None => run invalidRequest(origin)
+      }
+      if !supplyTarget(supportTarget) {
+        return run invalidRequest(origin)
+      }
+      run Vector<Installation>.append(&mut support, Installation {
+        root: run suppliedPath(directory, supportRoot, origin),
+        target: run Bytes.copy(supportTarget),
+        origin: run Bytes.copy(supportOrigin),
+      })
+      at = at + usize.ONE
+    }
+  }
+  return Request.Explicit {
+    target: run Bytes.copy(target),
+    root: run suppliedPath(directory, rootText, origin),
+    linker: run suppliedPath(directory, linkerText, origin),
+    origin: move named,
+    support: move support,
+  }
 }
 
 /// The deployment a build uses when its profile names none.
@@ -103,14 +303,14 @@ fn contains(text: &[u8], wanted: &[u8]) -> bool {
   return false
 }
 
-effect fn failure(code: &'static [u8], subject: &[u8], origin: &[u8], correction: &'static [u8], detail: &[u8]) -> never
+effect fn failure(code: &'static [u8], subject: &[u8], origin: &[u8], correction: &[u8], detail: &[u8]) -> never
   ! SupplyError | OutOfMemoryError
   ? &mut Allocator {
   fail SupplyError {
     code: code,
     subject: run Bytes.copy(subject),
     origin: run Bytes.copy(origin),
-    correction: correction,
+    correction: run Bytes.copy(correction),
     detail: run Bytes.copy(detail),
   }
 }
@@ -365,35 +565,14 @@ effect fn discover(developerDirectory: &Option<Bytes>, files: &mut Vector<Supply
   return run Bytes.copy(trimmed(ChildProcess.outputBytes(&outcome)))
 }
 
-/// Resolves the macOS SDK for a compilation for `target` on `host` with the profile's `libc` and
-/// `deployment` (empty for the default 11.0.0): `None` for a target that needs no SDK.
-///
-/// `SDKROOT`, when set, names the SDK and must be valid. Otherwise discovery runs `xcrun --sdk
-/// macosx --show-sdk-path`, forwarding `DEVELOPER_DIR`, and only for the host target. The SDK
-/// must state an ARM64 macOS target and a version in its `SDKSettings.json`, admit the deployment,
-/// and supply the ARM64 `libSystem` contract.
-pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &[u8]) -> Option<Supply>
-  ! SupplyError | FileError | HostInputError | OutOfMemoryError
-  ? &mut HostInput | &mut FileSystem | &mut ChildProcess | &mut Allocator {
-  if !same(Target.operatingSystem(target), b"darwin") || same(libc, b"none") {
-    return Option<Supply>.none()
-  }
-  let mut origin = run Bytes.copy(b"SDKROOT")
-  let mut developerDirectory = Option<Bytes>.none()
-  let mut files = Vector<SupplyFile>.make()
-  let mut root = Bytes.make()
-  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SDKROOT") {
-    root = move value
-  } else {
-    if Target.id(target) != Target.id(host) {
-      return run failure(b"HostMismatch", Target.name(target), b"host",
-        b"Provide an explicit supply for the requested target.", b"")
-    }
-    origin = run Bytes.copy(b"SDK discovery")
-    developerDirectory = run HostInput.variableNamed("DEVELOPER_DIR")
-    root = run discover(&developerDirectory, &mut files)
-  }
-  let text = Bytes.asSlice(&root)
+// Validates the macOS SDK at `root`, selected from `origin`: it must state an ARM64 macOS target
+// and a version in its `SDKSettings.json`, admit the deployment, and supply the ARM64 `libSystem`
+// contract.
+effect fn sdk(root: &[u8], origin: Bytes, developerDirectory: Option<Bytes>, deployment: &[u8], linker: Option<Path>, files: Vector<SupplyFile>) -> Supply
+  ! SupplyError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut files = move files
+  let text = root
   if text.length == usize.ZERO || text[usize.ZERO] != 47 || same(text, b"/") {
     return run failure(b"InvalidConfiguration", text, Bytes.asSlice(&origin),
       b"Select an absolute macOS SDK directory.", b"")
@@ -447,12 +626,109 @@ pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &
     return run failure(b"TargetMismatch", Path.rawBytes(&systemPath), b"SDK libSystem contract",
       b"Supply the ARM64 macOS libSystem contract.", b"")
   }
-  return Option<Supply>.some(Supply {
+  return Supply {
     root: move directory,
+    darwin: true,
+    support: Option<Path>.none(),
+    linker: move linker,
     deployment: move requested,
     origin: move origin,
     developerDirectory: move developerDirectory,
     version: move version,
     files: move files,
-  })
+  }
+}
+
+// Records the explicit linker, which must be an installed file.
+effect fn explicitLinker(linker: &Path, files: &mut Vector<SupplyFile>) -> Path
+  ! SupplyError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if !run CommandPath.exists(Path.rawBytes(linker), false) {
+    return run failure(b"MissingCapability", Path.rawBytes(linker), b"tool selection",
+      b"Set an absolute path to an installed executable tool.", b"")
+  }
+  let bytes = run recorded(&mut files.*, linker, b"linker", b"selected tool")
+  drop bytes
+  return run Path.fromBytes(Path.rawBytes(linker))
+}
+
+/// Resolves the platform supply a link for `target` on `host` consumes, with the profile's `libc`
+/// and `deployment` (empty for the default 11.0.0): `None` when the link needs none.
+///
+/// A managed request is refused. An explicit request must name `target`; it supplies the macOS
+/// SDK, or the GNU/Linux sysroot and its compiler-support installation, and its linker. Otherwise
+/// a macOS SDK is `SDKROOT` when set, which must be valid and never falls back, else what `xcrun
+/// --sdk macosx --show-sdk-path` reports with `DEVELOPER_DIR` forwarded, for the host target
+/// only; a GNU/Linux target keeps the selected compiler's own sysroot.
+pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &[u8], request: &Request) -> Option<Supply>
+  ! SupplyError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut ChildProcess | &mut Allocator {
+  let darwin = same(Target.operatingSystem(target), b"darwin")
+  match &request.* {
+    Request.Managed { name } => {
+      return run failure(b"UnsupportedProvider", Bytes.asSlice(&name), b"project", b"Select an installed supply.", b"")
+    }
+    Request.Explicit { target: named, root, linker, origin, support } => {
+      if !same(Bytes.asSlice(&named), Target.name(target)) {
+        let mut correction = run Bytes.copy(b"Provide an explicit supply for ")
+        run Bytes.append(&mut correction, Target.name(target))
+        run Bytes.append(&mut correction, b".")
+        return run failure(b"TargetMismatch", Bytes.asSlice(&named), Bytes.asSlice(&origin), Bytes.asSlice(&correction), b"")
+      }
+      let mut files = Vector<SupplyFile>.make()
+      let selectedLinker = run explicitLinker(&linker, &mut files)
+      if darwin {
+        return Option<Supply>.some(run sdk(Path.rawBytes(&root), run Bytes.copy(Bytes.asSlice(&origin)),
+          Option<Bytes>.none(), deployment, Option<Path>.some(move selectedLinker), move files))
+      }
+      let installations = Vector<Installation>.asSlice(&support)
+      let mut selectedSupport = Option<Path>.none()
+      let mut at = usize.ZERO
+      while at < installations.length {
+        if !same(Bytes.asSlice(&installations[at].target), Target.name(target)) {
+          let mut correction = run Bytes.copy(b"Declare support for ")
+          run Bytes.append(&mut correction, Target.name(target))
+          run Bytes.append(&mut correction, b".")
+          return run failure(b"TargetMismatch", Path.rawBytes(&installations[at].root),
+            Bytes.asSlice(&installations[at].origin), Bytes.asSlice(&correction), b"")
+        }
+        if let Option<Path>.None = &selectedSupport {
+          selectedSupport = Option<Path>.some(run Path.fromBytes(Path.rawBytes(&installations[at].root)))
+        }
+        at = at + usize.ONE
+      }
+      return Option<Supply>.some(Supply {
+        root: run Path.fromBytes(Path.rawBytes(&root)),
+        darwin: false,
+        support: move selectedSupport,
+        linker: Option<Path>.some(move selectedLinker),
+        deployment: Bytes.make(),
+        origin: run Bytes.copy(Bytes.asSlice(&origin)),
+        developerDirectory: Option<Bytes>.none(),
+        version: Bytes.make(),
+        files: move files,
+      })
+    }
+    Request.Automatic => {}
+    Request.Native => {}
+  }
+  if !darwin || same(libc, b"none") {
+    return Option<Supply>.none()
+  }
+  let mut origin = run Bytes.copy(b"SDKROOT")
+  let mut developerDirectory = Option<Bytes>.none()
+  let mut files = Vector<SupplyFile>.make()
+  let mut root = Bytes.make()
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SDKROOT") {
+    root = move value
+  } else {
+    if Target.id(target) != Target.id(host) {
+      return run failure(b"HostMismatch", Target.name(target), b"host",
+        b"Provide an explicit supply for the requested target.", b"")
+    }
+    origin = run Bytes.copy(b"SDK discovery")
+    developerDirectory = run HostInput.variableNamed("DEVELOPER_DIR")
+    root = run discover(&developerDirectory, &mut files)
+  }
+  return Option<Supply>.some(run sdk(Bytes.asSlice(&root), move origin, move developerDirectory, deployment, Option<Path>.none(), move files))
 }
