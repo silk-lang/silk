@@ -127,5 +127,17 @@ const sortKeys = (value) => {
   return value
 }
 
+const position = (text, offset) => {
+  const before = text.slice(0, offset)
+  const line = before.split('\n').length
+  return `${line}:${offset - before.lastIndexOf('\n')}`
+}
+
+/**
+ * The `line:column-line:column` form of the span from `start` to `end` in `text`, both 1-based and
+ * counting characters, as rejected programs record their expected diagnostics.
+ */
+export const formatSpan = (text, start, end) => `${position(text, start)}-${position(text, end)}`
+
 /** The canonical `outcome.json` text: sorted keys, two-space indentation, one trailing newline. */
 export const formatOutcome = (outcome) => `${JSON.stringify(sortKeys(outcome), null, 2)}\n`
