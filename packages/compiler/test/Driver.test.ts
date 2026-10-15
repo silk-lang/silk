@@ -30,7 +30,7 @@ import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as ToolchainIntegrity from '../src/ToolchainIntegrity.js'
 import * as TestExecution from '../src/TestExecution.js'
-import { independentExecutionFinalizedDestroy, invalidGenericCorpus } from './support/corpus.js'
+import { corpusProgram, invalidCorpus, reportedDiagnostics } from './support/corpus.js'
 import { ecdsaP256WasmSource } from './support/ecdsaP256Acceptance.js'
 import { p256WasmAcceptanceSource } from './support/p256Acceptance.js'
 import { chacha20Poly1305WasmSource } from './support/chacha20Poly1305Acceptance.js'
@@ -638,19 +638,22 @@ it.effect('names the failing native stage with command provenance', () =>
   }),
 )
 
-for (const program of invalidGenericCorpus) {
+for (const program of invalidCorpus.filter((program) => program.name.startsWith('generic-'))) {
   it.effect(`rejects ${program.name} before layout and MIR`, () =>
     Effect.gen(function* () {
       const outcome = yield* compileSource(program.name, program.source)
       assert.strictEqual(outcome._tag, 'Rejected', program.name)
       if (outcome._tag !== 'Rejected') return
-      const codes = outcome.diagnostics.map((diagnostic) => diagnostic.code)
-      for (const code of program.codes) assert.include(codes, code, program.name)
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, outcome.diagnostics),
+        program.diagnostics,
+        program.name,
+      )
       const phases = outcome.report.map((entry) => entry.phase)
       assert.notInclude(phases, 'target-layout', program.name)
       assert.notInclude(phases, 'mir-lowering', program.name)
       assert.notInclude(phases, 'backend', program.name)
-      if (!program.codes.includes('SEM0053')) {
+      if (!program.diagnostics.some((diagnostic) => diagnostic.code === 'SEM0053')) {
         assert.notInclude(phases, 'instance-discovery', program.name)
       }
     }),
@@ -1051,7 +1054,7 @@ it.effect(
     Effect.gen(function* () {
       const outcome = yield* compileSource(
         'execution-finalized-destroy.wasm',
-        independentExecutionFinalizedDestroy,
+        corpusProgram('independent-execution-finalized-destroy').source,
         {
           compilation: {
             root: 'memory/execution-finalized-destroy-wasm',

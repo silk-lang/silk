@@ -1,5 +1,6 @@
 //! Project source selection and the native formatter command's stable exit classes.
 
+import driver.CommandPath
 import format.FormatError {FormatError}
 import format.SourceSyntax
 import format.SyntaxFormatter
@@ -23,6 +24,8 @@ import silk.writer {Writer, WriterError}
 pub struct Command {
   pub paths: Vector<Bytes>
   pub check: bool
+  /// The manifest `--manifest-path` names, as written; absent to discover the nearest one.
+  pub manifest: Option<Bytes>
 }
 
 pub enum Reason { InvalidArgument, MissingProject, InvalidRoot, OutsideRoot, InvalidSelection, InvalidEncoding }
@@ -58,11 +61,13 @@ effect fn reject(reason: Reason, path: &[u8]) -> never
   fail CommandError {reason: reason, path: run Bytes.copy(path)}
 }
 
-/// Parses arguments following `format`; `--` permits filenames beginning with a dash.
+/// Parses arguments following `format`: paths, `--check` and `--manifest-path <path>`; `--`
+/// permits filenames beginning with a dash.
 pub effect fn make(arguments: Vector<Bytes>) -> Command
 ! CommandError | OutOfMemoryError ? &mut Allocator {
   let mut paths = move arguments
   let mut check = false
+  let mut manifest = Option<Bytes>.none()
   let mut literal = false
   let mut at: usize = 0
   while at < Vector<Bytes>.length(&paths) {
@@ -74,6 +79,16 @@ pub effect fn make(arguments: Vector<Bytes>) -> Command
     } else if !literal && same(argument, b"--check") {
       check = true
       drop Vector<Bytes>.remove(&mut paths, at)
+    } else if !literal && same(argument, b"--manifest-path") {
+      let unset = match &manifest {
+        Option<Bytes>.Some {..} => false
+        Option<Bytes>.None => true
+      }
+      if !unset || at + 1 >= values.length {
+        return run reject(Reason.InvalidArgument, argument)
+      }
+      drop Vector<Bytes>.remove(&mut paths, at)
+      manifest = Option<Bytes>.some(Vector<Bytes>.remove(&mut paths, at))
     } else {
       if !literal && begins(argument, b"-") {
         return run reject(Reason.InvalidArgument, argument)
@@ -81,7 +96,7 @@ pub effect fn make(arguments: Vector<Bytes>) -> Command
       at = at + 1
     }
   }
-  return Command {paths: move paths, check: check}
+  return Command {paths: move paths, check: check, manifest: move manifest}
 }
 
 effect fn resolve(base: &Path, bytes: &[u8]) -> Path
@@ -121,28 +136,57 @@ effect fn readOptional(path: &Path) -> Option<Bytes>
   }
 }
 
-effect fn sourceRoot(working: &Path) -> Path
+// The source root the manifest at `manifest`, whose text is `contents`, declares: its
+// `[package].source-root` against the manifest's directory, else the directory of its
+// `[package].root`.
+effect fn packageRoot(manifest: &Path, contents: &Bytes) -> Path
+! CommandError | FileError | TomlError | OutOfMemoryError ? &mut Allocator {
+  let directory = match move run Path.parent(manifest) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { return run reject(Reason.InvalidRoot, Path.rawBytes(manifest)) }
+  }
+  let document = run Toml.parse(Bytes.asSlice(contents))
+  let package = Toml.field(&document, "package")
+  let configured = Toml.asString(Toml.fieldAt(move package, "root"))
+  if let Option<string>.Some {value: text} = move configured {
+    if String.byteLength(text) == 0 || begins(String.utf8Bytes(text), b"/") {
+      return run reject(Reason.InvalidRoot, Path.rawBytes(manifest))
+    }
+    let entry = run Path.resolve(&directory, text)
+    if !within(&directory, &entry) || !silkFile(&entry) {
+      return run reject(Reason.InvalidRoot, Path.rawBytes(manifest))
+    }
+    let mut selected = run Path.parent(&entry)
+    if let Option<string>.Some {value: written} = move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "source-root")) {
+      if String.byteLength(written) == 0 {
+        return run reject(Reason.InvalidRoot, Path.rawBytes(manifest))
+      }
+      selected = Option<Path>.some(run CommandPath.resolve(&directory, String.utf8Bytes(written)))
+    }
+    if let Option<Path>.Some {value: root} = move selected {
+      if within(&root, &entry) { return move root }
+    }
+  }
+  return run reject(Reason.InvalidRoot, Path.rawBytes(manifest))
+}
+
+// The source root of the manifest `self` names, else of the nearest `silk.toml` at or above
+// `working`.
+effect fn sourceRoot(self: &Command, working: &Path) -> Path
 ! CommandError | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if let Option<Bytes>.Some {value: written} = &self.manifest {
+    let manifest = run resolve(working, Bytes.asSlice(&written))
+    return match move run readOptional(&manifest) {
+      Option<Bytes>.Some {value} => run packageRoot(&manifest, &value)
+      Option<Bytes>.None => run reject(Reason.MissingProject, Path.rawBytes(&manifest))
+    }
+  }
   let mut directory = run Path.fromBytes(Path.rawBytes(working))
   while true {
     let manifest = run Path.join(&directory, "silk.toml")
     let contents = run readOptional(&manifest)
     if let Option<Bytes>.Some {value} = move contents {
-      let document = run Toml.parse(Bytes.asSlice(&value))
-      let package = Toml.field(&document, "package")
-      let configured = Toml.asString(Toml.fieldAt(move package, "root"))
-      if let Option<string>.Some {value: text} = move configured {
-        if String.byteLength(text) == 0 || begins(String.utf8Bytes(text), b"/") {
-          return run reject(Reason.InvalidRoot, Path.rawBytes(&manifest))
-        }
-        let entry = run Path.resolve(&directory, text)
-        if !within(&directory, &entry) || !silkFile(&entry) {
-          return run reject(Reason.InvalidRoot, Path.rawBytes(&manifest))
-        }
-        let parent = run Path.parent(&entry)
-        if let Option<Path>.Some {value: root} = move parent { return move root }
-      }
-      return run reject(Reason.InvalidRoot, Path.rawBytes(&manifest))
+      return run packageRoot(&manifest, &value)
     }
     let parent = run Path.parent(&directory)
     if let Option<Path>.Some {value} = move parent {
@@ -212,10 +256,11 @@ effect fn walk(selected: &mut Vector<Path>, root: &Path, directory: &Path) -> ()
   }
 }
 
-/// Selects sorted, duplicate-free exact `.silk` files under the nearest package's source root.
+/// Selects sorted, duplicate-free exact `.silk` files under the package's source root: the
+/// manifest `--manifest-path` names, else the nearest one.
 pub effect fn select(self: &Command, working: &Path) -> Vector<Path>
 ! CommandError | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let root = run sourceRoot(working)
+  let root = run sourceRoot(self, working)
   let mut selected = Vector<Path>.make()
   let arguments = Vector<Bytes>.asSlice(&self.paths)
   if arguments.length == 0 {
@@ -327,7 +372,7 @@ effect fn fromHost() -> i32
 
 fn reasonName(reason: Reason) -> &'static [u8] {
   return match reason {
-    Reason.InvalidArgument => b"unknown option (usage: silkc format [paths] [--check])"
+    Reason.InvalidArgument => b"unknown option (usage: silk format [paths] [--check] [--manifest-path <path>])"
     Reason.MissingProject => b"no silk.toml found"
     Reason.InvalidRoot => b"invalid [package].root"
     Reason.OutsideRoot => b"selection is outside the package source root"
@@ -338,7 +383,7 @@ fn reasonName(reason: Reason) -> &'static [u8] {
 
 effect fn reportFailure(error: CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError) -> ()
 ! WriterError ? &mut Writer {
-  run Writer.writeAll(b"silkc format: ")
+  run Writer.writeAll(b"silk format: ")
   match move error {
     CommandError failure => {
       run Writer.writeAll(Bytes.asSlice(&failure.path))
