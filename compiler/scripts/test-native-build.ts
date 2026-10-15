@@ -263,7 +263,7 @@ const program = Effect.gen(function* () {
   )
   assert.equal(rejected.status, 1, rejected.stderr)
   assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`))
-  assert.match(rejected.stderr, /src\/main\.silk:6:16: error\[SEM0037\]/)
+  assert.match(rejected.stderr, /\/rejected\/src\/main\.silk:6:16: error\[SEM0037\]/)
   assert.match(rejected.stdout, new RegExp(`check ${hostTarget}: failed \\(exit 1\\)\n`))
   const json = yield* invoke(
     silk,
@@ -275,10 +275,23 @@ const program = Effect.gen(function* () {
     .split('\n')
     .filter((line) => line.startsWith('{'))
     .map(
-      (line) => JSON.parse(line) as { code: string; line: number; column: number; target: string },
+      (line) =>
+        JSON.parse(line) as {
+          code: string
+          path: string
+          line: number
+          column: number
+          target: string
+        },
     )
   assert.ok(
-    reported.some((entry) => entry.code === 'SEM0037' && entry.line === 6 && entry.column === 16),
+    reported.some(
+      (entry) =>
+        entry.code === 'SEM0037' &&
+        entry.path.endsWith('/rejected/src/main.silk') &&
+        entry.line === 6 &&
+        entry.column === 16,
+    ),
     json.stderr,
   )
   // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
