@@ -52,6 +52,7 @@ export interface Summary {
 
 const unsupportedPrefix = 'SILK_UNSUPPORTED_JSON='
 const borrowGapPrefix = 'SILK_GAP borrow-check: '
+const rootBorrowGapPrefix = 'SILK_GAP borrow-check root-package: '
 const buildErrorPrefix = 'SILK_BUILD_ERROR='
 // A native build of certificate-bounded-decoding takes 28.5-30 s on the hosted Linux runner, so a
 // 30 s build deadline timed it out at random; builds get 4x that, while program runs stay short.
@@ -168,15 +169,14 @@ const validGap = (gap: unknown): gap is Gap => {
 
 /**
  * Reads a successful build's borrow-check gap line,
- * `SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...; note)`. A line without a
- * per-reason breakdown keeps only its total.
+ * `SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...; note)`, which counts the
+ * emitted bodies, or with `prefix` another line of that form. A line without a per-reason
+ * breakdown keeps only its total.
  */
-export const parseBorrowGap = (stderr: string): BorrowGap | undefined => {
-  const line = stderr.split('\n').find((candidate) => candidate.startsWith(borrowGapPrefix))
+export const parseBorrowGap = (stderr: string, prefix = borrowGapPrefix): BorrowGap | undefined => {
+  const line = stderr.split('\n').find((candidate) => candidate.startsWith(prefix))
   if (line === undefined) return undefined
-  const match = /^(\d+) bodies not borrow-checked \(([^)]*)\)$/.exec(
-    line.slice(borrowGapPrefix.length),
-  )
+  const match = /^(\d+) bodies not borrow-checked \(([^)]*)\)$/.exec(line.slice(prefix.length))
   if (match === null) throw new Error(`malformed borrow-check gap line: ${line}`)
   const reasons: Record<string, number> = {}
   for (const part of (match[2] ?? '').split(';', 1)[0]?.split(', ') ?? []) {
@@ -398,8 +398,11 @@ const reportedDiagnostics = (
 
 /**
  * Checks a program the compiler must reject. Reporting exactly the expected diagnostics, codes and
- * spans in order, passes. Accepting the program fails. Rejecting it with any other list is a
- * diagnostic-parity gap: the program stays rejected, so the gap is reported, not failed.
+ * spans in order, passes. Accepting the program fails, unless the build declared bodies it did not
+ * borrow-check, among the emitted ones or anywhere in the root package: that acceptance claims
+ * nothing, so it is a `BORROW_CHECK_GAP`, which turns back into a failure once every body is
+ * checked. Rejecting it with any other list is a diagnostic-parity gap: the program stays
+ * rejected, so the gap is reported, not failed.
  */
 const checkRejected = async (
   silkc: string,
@@ -414,7 +417,20 @@ const checkRejected = async (
     buildTimeoutMs,
     directory,
   )
-  if (built.error === undefined && built.status === 0 && built.signal === null)
+  if (built.error === undefined && built.status === 0 && built.signal === null) {
+    const emitted = parseBorrowGap(built.stderr)
+    const root = parseBorrowGap(built.stderr, rootBorrowGapPrefix)
+    if ((emitted?.total ?? 0) > 0 || (root?.total ?? 0) > 0)
+      return {
+        name: program.name,
+        status: 'unsupported',
+        gaps: [
+          {
+            code: 'BORROW_CHECK_GAP',
+            reason: `accepted with bodies not borrow-checked: ${emitted?.total ?? 0} emitted, ${root?.total ?? 0} in the root package`,
+          },
+        ],
+      }
     return {
       name: program.name,
       status: 'fail',
@@ -422,6 +438,7 @@ const checkRejected = async (
       diagnostics: [],
       reason: 'the compiler accepted a program it must reject',
     }
+  }
   const diagnostics = built.error === undefined ? parseBuildDiagnostics(built.stderr) : undefined
   if (diagnostics === undefined) {
     const gaps = built.error === undefined ? parseUnsupported(built.stderr) : undefined
