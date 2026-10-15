@@ -226,7 +226,10 @@ export interface Measurement {
   readonly command: ReadonlyArray<string>
   readonly measurementCommand: ReadonlyArray<string>
   readonly cwd: string
-  readonly linkerEnvironment: { readonly SILKC_CLANG: string } | null
+  readonly linkerEnvironment:
+    | { readonly SILK_CLANG: string }
+    | { readonly SILKC_CLANG: string }
+    | null
   readonly exitCode: number | null
   readonly signal: string | null
   readonly stdout: string
@@ -321,7 +324,12 @@ export const run = Effect.fn('NativeProcess.run')(function* ({
       command,
       measurementCommand,
       cwd,
-      linkerEnvironment: env?.SILKC_CLANG === undefined ? null : { SILKC_CLANG: env.SILKC_CLANG },
+      linkerEnvironment:
+        env?.SILK_CLANG !== undefined
+          ? { SILK_CLANG: env.SILK_CLANG }
+          : env?.SILKC_CLANG !== undefined
+            ? { SILKC_CLANG: env.SILKC_CLANG }
+            : null,
       exitCode: result.status,
       signal,
       stdout: result.stdout.toString('utf8'),

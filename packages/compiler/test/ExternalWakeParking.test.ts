@@ -8,7 +8,7 @@ import type * as ExecutionTransition from '../src/ExecutionTransition.js'
 import * as Mir from '../src/Mir.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as Type from '../src/Type.js'
-import { independentExecutionMultiplePackages } from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 import { unreachable } from './support/raise.js'
 
 const replaceMirOperation = (
@@ -168,7 +168,7 @@ it.effect(
     Effect.gen(function* () {
       const snapshot = yield* AnalysisFixture.retainingMain(
         'independent-execution/forged-mir-authority',
-        new TextEncoder().encode(independentExecutionMultiplePackages),
+        new TextEncoder().encode(corpusProgram('independent-execution-multiple-packages').source),
         'wasm32-unknown-unknown',
       )
       assert.deepEqual(Analysis.diagnostics(snapshot), [])
