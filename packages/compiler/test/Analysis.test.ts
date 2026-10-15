@@ -593,6 +593,25 @@ it.effect('reports each independent statement failure of an invalid body in sour
   }),
 )
 
+it.effect('rejects each expression beyond the EXPR-006 nesting limit at its first token', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter((program) =>
+      program.name.startsWith('expression-nesting-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
 it.effect(
   'answers local, parameter, callable, field, and half-open semantic occurrence queries',
   () =>
