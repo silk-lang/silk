@@ -78,10 +78,12 @@ import semantic.TypedBody {
   UnionMember as BodyUnionMember,
 }
 import backend.Mir {
+  Cancel as MirCancel,
   SwitchCase as MirSwitchCase,
   FailureEdge as MirFailureEdge,
   Diagnostics as MirDiagnostics,
 }
+import backend.Coroutine {entryLive, liveFlag, unexitedPoint}
 import semantic.SourceRevision {Observation, Revision}
 import driver.ModuleSources as ModuleSourceFiles {
   InvalidBuildComposition,
@@ -1453,6 +1455,123 @@ export "C" fn destroy(state: usize) -> () { return () }
   run Testing.expect(lowered,
     "suspendable instances drive frames from the selected storage, keep borrowed locals in their frame, and cancel each point through its own exit")
   return ()
+}
+
+// Every suspension point of a frame has a cancel exit, and no drop flag is read before an edge
+// writes it: planning aborts otherwise. Real frames satisfy both; a frame stripped of its cancel
+// exits, or an entry that reads a flag, is reported at that point or flag.
+test effect fn suspensionFramesKeepTheirCancelExitsAndAssignedFlags() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let id = run module("suspension-frame-invariants.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let source = """
+struct Token { value: i32 }
+impl Intrinsic.Drop for Token { fn drop(self: &mut Token) -> () { return () } }
+struct Pair { left: Token right: Token }
+effect fn tidy() -> () { return () }
+effect fn parked(flag: bool) -> i32 {
+  let mut pair = Pair { left: Token { value: 1 }, right: Token { value: 2 } }
+  if flag { let left = move pair.left drop left }
+  run Intrinsic.relinquish()
+  pair.left = Token { value: 3 }
+  return pair.right.value
+}
+effect fn finalized(flag: bool) -> i32 { return run Intrinsic.finalizeEffectNonParking(parked(flag), tidy()) }
+pub fn main() -> i32 {
+  let value = run finalized(true)
+  return value
+}
+export "C" fn create() -> usize { return 0 }
+export "C" fn acquire(state: usize, size: usize, alignment: usize) -> usize { return state }
+export "C" fn release(state: usize, frame: usize) -> () { return () }
+export "C" fn destroy(state: usize) -> () { return () }
+"""
+  let mut store = run applicationSemantic(&id, source, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.forApplication(ModuleId.copy(&id))
+  let storage = run storageIn(&id) |> Effect.provideMut<Allocator>(&mut allocator)
+  Semantic.selectExecutionStorage(&mut store, move storage)
+  let built = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let emitted = match &built { BackendBuild.Module {..} => true _ => false }
+  let mut frames = usize.ZERO
+  let mut exited = true
+  let mut stripped = true
+  let mut assigned = true
+  let mut flagged = usize.ZERO
+  let mut index = usize.ZERO
+  let mut more = true
+  while more {
+    more = false
+    if let Option<&MirFunction>.Some {value: function} = move Semantic.mirAt(&store, index) {
+      more = true
+      let cancels = Vector<MirCancel>.asSlice(&function.cancels)
+      if cancels.length != usize.ZERO {
+        frames = frames + usize.ONE
+        let blocks = Vector<MirBlock>.asSlice(&function.blocks)
+        let suspending = run cancelPoints(blocks.length, cancels) |> Effect.provideMut<Allocator>(&mut allocator)
+        let marked = Vector<bool>.asSlice(&suspending)
+        let found = run unexitedPoint(blocks, cancels, marked) |> Effect.provideMut<Allocator>(&mut allocator)
+        if found != usize.MAX { exited = false }
+        let none = Vector<MirCancel>.make()
+        let unexited = run unexitedPoint(blocks, Vector<MirCancel>.asSlice(&none), marked) |> Effect.provideMut<Allocator>(&mut allocator)
+        if unexited != firstPoint(cancels) { stripped = false }
+        let mut entry = run entryLive(function) |> Effect.provideMut<Allocator>(&mut allocator)
+        let locals = Vector<MirLocal>.asSlice(&function.locals)
+        if liveFlag(locals, Vector<u64>.asSlice(&entry)) != usize.MAX { assigned = false }
+        let flag = firstFlag(locals)
+        if flag != usize.MAX {
+          let words = Vector<u64>.asMutSlice(&mut entry)
+          words[flag / 64] = u64.bitOr(words[flag / 64], u64.shiftLeft(1, usize.toU64(flag - flag / 64 * 64)))
+          if liveFlag(locals, Vector<u64>.asSlice(&entry)) == flag { flagged = flagged + usize.ONE }
+        }
+      }
+    }
+    index = index + usize.ONE
+  }
+  run Testing.expect(emitted && frames >= 2 && exited && stripped,
+    "every suspension point of a frame has a cancel exit, and one without is reported at the point")
+  run Testing.expect(assigned && flagged >= usize.ONE,
+    "no drop flag of a frame is live on entry, and an entry that reads one is reported at that flag")
+  return ()
+}
+
+// One mark per block: whether it is the point of one of `cancels`.
+effect fn cancelPoints(count: usize, cancels: &[MirCancel]) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut marks = Vector<bool>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run Vector<bool>.append(&mut marks, false)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < cancels.length {
+    let listed = Vector<bool>.asMutSlice(&mut marks)
+    listed[cancels[at].point] = true
+    at = at + usize.ONE
+  }
+  return move marks
+}
+
+fn firstPoint(cancels: &[MirCancel]) -> usize {
+  let mut first = usize.MAX
+  let mut at = usize.ZERO
+  while at < cancels.length {
+    if cancels[at].point < first { first = cancels[at].point }
+    at = at + usize.ONE
+  }
+  return first
+}
+
+fn firstFlag(locals: &[MirLocal]) -> usize {
+  let mut at = usize.ZERO
+  while at < locals.length {
+    if let MirLocalKind.DropFlag {..} = &locals[at].kind { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
 }
 
 test effect fn unitParametersHaveNoLlvmLane() -> ()
