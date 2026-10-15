@@ -19,7 +19,11 @@ place, a binding reached through fields and literal fixed-array elements (`OWN00
 a binding of it names the payload its match selected until the arm replaces, moves or exclusively
 borrows the subject or an owner of it, including through an unknown index: a later use of the
 binding is `ExtractionBoundary` (the bootstrap's `OWN0002`), and a loop in the arm that does so
-before its next iteration uses the binding repeats incompatibly (`OWN0005`).
+before its next iteration uses the binding repeats incompatibly (`OWN0005`). An assignment or
+`Intrinsic.replace` writes through a `match place` binding when its subject is mutably owned, a
+mutable local reached through fields, elements and `match place` bindings (`ImmutableAssignment`,
+the bootstrap's `SEM0035`, otherwise); `&mut` of the binding still needs a mutable binding
+(`ExclusiveBorrowRequiresMutable`, the bootstrap's `SEM0057`).
 Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
 `unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
