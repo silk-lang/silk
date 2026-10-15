@@ -263,7 +263,7 @@ export const parseBuildDiagnostics = (
 
 const safeName = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
 
-/** The C driver the self-hosted compiler links with when `SILKC_CLANG` names none. */
+/** The C driver the self-hosted compiler links with when `SILK_CLANG` names none. */
 export const defaultCCompiler = '/usr/bin/clang'
 
 /**
