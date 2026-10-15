@@ -30,6 +30,22 @@ owner's lifetimes, which the call infers; it is otherwise a complete type.
   arguments on the owner, and the migration codemod is deleted.
 - Retire this entry when both compilers reject the member-prefix spelling with a diagnostic.
 
+## Cancellation cleanup order
+
+EXEC-008 cleans the owners of a cancelled frame in structured-exit order: innermost exited region
+first, reverse acquisition within a region, so a consuming match arm's bindings drop before the
+subject's remainder.
+
+- **Bootstrap:** releases a cancelled frame's affine owners in local-ordinal order
+  (`Ownership.inReleaseOrder` over the suspension planner's slots). A consuming match of a subject
+  cancelled inside its arm drops the subject's remainder before the arm's binding. An ordinary
+  `return` from the same arm already drops the binding first.
+- **Native:** a cancel exit is the structured-exit cleanup of its point, so it matches EXEC-008.
+- **Source migration:** none. The consuming-match cancel case is pinned by a native Case and stays
+  out of the shared corpus until both compilers agree.
+- Retire this entry when the bootstrap cancels in structured-exit order and the case joins the
+  shared corpus.
+
 ## Generic type aliases
 
 TYPE-004 now admits `type Name<Parameters> = Target`, with type and lifetime parameters that each
