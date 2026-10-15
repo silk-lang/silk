@@ -638,7 +638,9 @@ it.effect('names the failing native stage with command provenance', () =>
   }),
 )
 
-for (const program of invalidCorpus.filter((program) => program.name.startsWith('generic-'))) {
+for (const program of invalidCorpus.filter(
+  (program) => program.name.startsWith('generic-') || program.name.startsWith('fixed-array-'),
+)) {
   it.effect(`rejects ${program.name} before layout and MIR`, () =>
     Effect.gen(function* () {
       const outcome = yield* compileSource(program.name, program.source)
