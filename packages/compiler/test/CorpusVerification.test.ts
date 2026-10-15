@@ -217,13 +217,13 @@ it.effect('fails pinned unsupported and mismatched outcomes', () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
-it.effect('requires SILKC and rejects selection configuration before corpus execution', () =>
+it.effect('requires SILK_COMPILER and rejects selection configuration before corpus execution', () =>
   Effect.gen(function* () {
     for (const config of [
       {},
-      { SILKC: '' },
-      { SILKC: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: 'literal' },
-      { SILKC: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: ' ' },
+      { SILK_COMPILER: '' },
+      { SILK_COMPILER: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: 'literal' },
+      { SILK_COMPILER: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: ' ' },
     ]) {
       for (const mode of ['corpus', 'corpus-full'] as const) {
         const result = yield* Verification.runConfigured(mode).pipe(
