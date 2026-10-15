@@ -5,7 +5,7 @@ import * as Analysis from '../src/Analysis.js'
 import * as Intrinsic from '../src/Intrinsic.js'
 import * as Type from '../src/Type.js'
 import * as Projections from './support/projections.js'
-import { effectHigherOrderValues } from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
@@ -129,7 +129,7 @@ it.effect('specializes passed, returned, stored, and captured closed Effect valu
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'effect-runtime/higher-order-structure',
-      ascii(effectHigherOrderValues),
+      ascii(corpusProgram('effect-higher-order-values').source),
       'aarch64-apple-darwin',
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])

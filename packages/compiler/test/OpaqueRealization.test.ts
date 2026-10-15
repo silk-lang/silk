@@ -11,7 +11,71 @@ import * as SourceResolver from '../src/SourceResolver.js'
 import * as Type from '../src/Type.js'
 import { raise } from './support/raise.js'
 import { readFileSync } from 'node:fs'
-import { executionDriveOpaqueCallbackSource } from './support/corpus.js'
+
+/**
+ * A valid program whose generated runner statically calls an `Execution.drive` instance with an
+ * opaque callback, which native lowering does not support yet. The TypeScript compiler reports
+ * SEM0219 at that body instead of emitting a trap stub; the program returns to the native corpus
+ * through the new compiler's lowering (#567 Step 9).
+ */
+const executionDriveOpaqueCallbackSource = `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.execution { Execution }
+import silk.i8
+import silk.layout { Layout }
+import silk.ownership { Drop }
+import silk.shared { Shared }
+struct Counter { value: i32 }
+fn increment(counter: &mut Counter) -> i32 {
+  counter.value = counter.value + 1
+  return counter.value
+}
+fn read(counter: &Counter) -> i32 { return counter.value }
+struct Guard { left: i8 right: i8 storage: Intrinsic.Allocation counter: Shared<Counter> }
+impl Drop for Guard {
+  fn drop(self: &mut Guard) -> () {
+    if i8.toI32(self.left) != 19 || i8.toI32(self.right) != 23 { let boom = 1 / 0 }
+    let changed = Shared<Counter>.withMut<i32>(&self.counter, increment)
+    return ()
+  }
+}
+union Choice { Small { marker: i8, guard: Guard }, Wide { value: i64 } }
+fn ready(state: &()) -> () { return () }
+fn complete(state: (), value: i32) -> () { return () }
+fn suspend(state: (), execution: Intrinsic.Execution<i32>, choice: Choice) -> () {
+  let unexpected = 1 / 0
+  drop execution
+  drop choice
+  return ()
+}
+fn suspendWith(choice: Choice) -> some<F: once fn((), Intrinsic.Execution<i32>) -> ()> F {
+  return suspend(move choice)
+}
+effect fn packaged(counter: &Shared<Counter>) -> i32 ! OutOfMemoryError ? &mut Allocator {
+  let storage = run Allocator.allocate(Layout.of<i32>())
+  let choice = Choice.Small {
+    marker: i8.toI8(7),
+    guard: Guard {
+      left: i8.toI8(19), right: i8.toI8(23), storage: move storage,
+      counter: Shared<Counter>.clone(counter),
+    },
+  }
+  let execution = run Execution.make(effect { return 42 }, (), ready)
+  let driven = run Execution.drive(move execution, (), complete, suspendWith(move choice))
+  let count = Shared<Counter>.with<i32>(counter, read)
+  if count != 1 { return 1 }
+  return 42
+}
+effect fn program() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let counter = run Shared<Counter>.make(Counter { value: 0 })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let result = run packaged(&counter) |> Effect.provideMut<Allocator>(&mut allocator)
+  drop counter
+  return result
+}
+effect fn recover(error: OutOfMemoryError) -> i32 { return 2 }
+pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }`
 
 const encoder = new TextEncoder()
 
