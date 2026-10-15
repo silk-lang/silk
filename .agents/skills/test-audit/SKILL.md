@@ -141,7 +141,7 @@ placeholders with real names; `--root` paths are relative to `compiler/`. Use
 budget authority. Honor session restrictions on local builds: use focused Linux
 CI when native compilation is prohibited, and report what was not run.
 
-For corpus work, use the runner command in `selfhost.yml` with `SILKC` naming the
+For corpus work, use the runner command in `selfhost.yml` with `SILK_COMPILER` naming the
 built selfhost executable; `SILK_SELFHOST_CORPUS_CASES` selects comma-separated
 existing case names. The runner's TypeScript tests protect runner classification,
 not compiler semantics. Parser comparison work uses the existing
