@@ -509,6 +509,79 @@ pub fn inspect(point: Point) -> i32 {
     'OWN0011',
   )
 
+  // A borrowed match arm keeps its owner loaned through the arm's last binding use (MATCH-002); a
+  // guard-only use, a write after that use, or an arm that binds nothing leaves the owner free, and
+  // a write whose value reads a binding completes after that read. An `if let` through a returned
+  // reference keeps the storage that reference borrows lent through its body (PATT-009).
+  // Under a whole-arm loan (MATCH-001 read literally) `released` and `unbound` are rejected too.
+  const armSource = `pub struct Token { kind: i32 }
+pub union Slot { Held { value: Token }, Vacant }
+pub fn reset(input: Slot) -> i32 {
+  let mut slot = move input
+  return match &slot {
+    Slot.Held { value } => {
+      slot = Slot.Vacant
+      return value.kind
+    }
+    Slot.Vacant => 0
+  }
+}
+pub fn released(input: Slot) -> i32 {
+  let mut slot = move input
+  return match &slot {
+    Slot.Held { value } if value.kind > 0 => {
+      slot = Slot.Vacant
+      return 1
+    }
+    Slot.Held { value } => {
+      let kind = value.kind
+      slot = Slot.Vacant
+      return kind
+    }
+    Slot.Vacant => 0
+  }
+}
+pub fn unbound(input: Slot) -> i32 {
+  let mut slot = move input
+  match &slot {
+    Slot.Held { .. } => { slot = Slot.Vacant }
+    Slot.Vacant => {}
+  }
+  return 0
+}
+pub fn refilled(input: Slot) -> i32 {
+  let mut slot = move input
+  match &slot {
+    Slot.Held { value } => { slot = Slot.Held { value: Token { kind: value.kind } } }
+    Slot.Vacant => {}
+  }
+  return 0
+}
+fn same<'a>(slot: &'a Slot) -> &'a Slot { return slot }
+pub fn returned(input: Slot) -> i32 {
+  let mut viewed = move input
+  if let Slot.Held { value } = &same(&viewed).* {
+    viewed = Slot.Vacant
+    return value.kind
+  }
+  return 0
+}`
+  const arm = analyze('borrowed-arm-loan', armSource)
+  const write = armSource.indexOf('slot = Slot.Vacant')
+  const viewedWrite = armSource.indexOf('viewed = Slot.Vacant')
+  assert.deepEqual(arm.diagnostics, [])
+  assert.deepEqual(
+    ownership(arm).diagnostics.map((diagnostic) => [
+      diagnostic.code,
+      diagnostic.span.start,
+      diagnostic.span.end,
+    ]),
+    [
+      ['OWN0011', write, write + 'slot'.length],
+      ['OWN0011', viewedWrite, viewedWrite + 'viewed'.length],
+    ],
+  )
+
   const moved = analyze(
     'moved-pattern-selection',
     `pub struct Point { x: i32 }
