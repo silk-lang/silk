@@ -316,6 +316,14 @@ Every successful compilation (`build`, a project `build`, `run` and `test`) prin
 CLI does: paths are relative to the project directory, or to the source's directory for a
 single-file build, and N is the number of symbols the emission plan names.
 
+A macOS executable links against one resolved SDK, as the platform-supplies reference
+requires (objects and intermediate stages need none): `SDKROOT` when it is set (it must name a valid SDK; an invalid one never falls back),
+else, for the host target only, the SDK `xcrun --sdk macosx --show-sdk-path` reports with
+`DEVELOPER_DIR` forwarded. The SDK must state an ARM64 macOS target, admit the deployment (the
+profile's, else 11.0.0) and supply the ARM64 `libSystem` contract. Clang receives it as
+`-isysroot` with `-mmacosx-version-min`; an ambient `SDKROOT` never reaches Clang. A refused
+supply prints `<code>: <subject> (<origin>)` and its correction, and exits 2.
+
 `silk --help` (or `-h`) prints the command synopsis and `silk --version` (or `-v`) prints
 `silk v<version>`, both on standard output with status 0.
 

@@ -1,0 +1,392 @@
+//! The macOS SDK one native compilation consumes, resolved as the platform-supplies reference
+//! requires: `SDKROOT` when it is set, else discovery through `xcrun` for the host target only.
+//!
+//! The resolved supply records what was consulted (`SDKROOT` or `DEVELOPER_DIR`, and the
+//! discovery query's result), so a later change to the ambient environment cannot change it. An
+//! invalid `SDKROOT` fails and never falls back to discovery. Other operating systems need no SDK.
+
+import driver.CommandPath
+import semantic.Target { Target }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.box { Box }
+import silk.bytes { Bytes }
+import silk.child_process { ChildProcess, ProcessError, ProcessOutcome }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.host_input { HostInput, HostInputError }
+import silk.json_scanner { JsonError }
+import silk.json_value { Json, JsonChild, Value as JsonValue }
+import silk.option { Option }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.string { String }
+import silk.u8
+import silk.usize
+import silk.vector { Vector }
+
+/// One resolved macOS SDK.
+pub struct Supply {
+  /// The SDK root, passed to Clang as `-isysroot`.
+  pub root: Path
+
+  /// The deployment version, passed to Clang as `-mmacosx-version-min`.
+  pub deployment: Bytes
+
+  /// Where the SDK came from: `SDKROOT` or `SDK discovery`.
+  pub origin: Bytes
+
+  /// The `DEVELOPER_DIR` value discovery forwarded to `xcrun`, if any.
+  pub developerDirectory: Option<Bytes>
+
+  /// The SDK version its `SDKSettings.json` states.
+  pub version: Bytes
+}
+
+/// A supply that cannot be resolved, worded as the TypeScript `PlatformSupply` failure:
+/// `<code>: <subject> (<origin>)`, then the correction and any tool output.
+pub struct SupplyError {
+  pub code: &'static [u8]
+  pub subject: Bytes
+  pub origin: Bytes
+  pub correction: &'static [u8]
+  pub detail: Bytes
+}
+
+/// The deployment a build uses when its profile names none.
+pub fn defaultDeployment() -> &'static [u8] {
+  return b"11.0.0"
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn contains(text: &[u8], wanted: &[u8]) -> bool {
+  if wanted.length > text.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at + wanted.length <= text.length {
+    if same(Slice.view<u8>(text, at, wanted.length), wanted) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn failure(code: &'static [u8], subject: &[u8], origin: &[u8], correction: &'static [u8], detail: &[u8]) -> never
+  ! SupplyError | OutOfMemoryError
+  ? &mut Allocator {
+  fail SupplyError {
+    code: code,
+    subject: run Bytes.copy(subject),
+    origin: run Bytes.copy(origin),
+    correction: correction,
+    detail: run Bytes.copy(detail),
+  }
+}
+
+// Whether `version` is one to three dot-separated decimal components.
+fn isVersion(version: &[u8]) -> bool {
+  if version.length == usize.ZERO {
+    return false
+  }
+  let mut dots = usize.ZERO
+  let mut digits = usize.ZERO
+  let mut at = usize.ZERO
+  while at < version.length {
+    let byte = version[at]
+    if byte == 46 {
+      if digits == usize.ZERO {
+        return false
+      }
+      dots = dots + usize.ONE
+      digits = usize.ZERO
+    } else if byte >= 48 && byte <= 57 {
+      digits = digits + usize.ONE
+    } else {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return digits > usize.ZERO && dots <= usize.add(0, 2)
+}
+
+// The numeric component of `version` at `index`, zero when absent.
+fn component(version: &[u8], index: usize) -> usize {
+  let mut current = usize.ZERO
+  let mut value = usize.ZERO
+  let mut at = usize.ZERO
+  while at < version.length {
+    let byte = version[at]
+    if byte == 46 {
+      if current == index {
+        return value
+      }
+      current = current + usize.ONE
+      value = usize.ZERO
+    } else if byte >= 48 && byte <= 57 && current == index {
+      value = value * usize.add(0, 10) + (u8.toUsize(byte) - usize.add(0, 48))
+    }
+    at = at + usize.ONE
+  }
+  if current == index {
+    return value
+  }
+  return usize.ZERO
+}
+
+/// Compares two dotted versions component by component, as the TypeScript `compareVersions`:
+/// -1, 0 or 1 as `left` sorts before, equal to or after `right`.
+pub fn compareVersions(left: &[u8], right: &[u8]) -> i32 {
+  let mut index = usize.ZERO
+  while index < usize.add(0, 3) {
+    let a = component(left, index)
+    let b = component(right, index)
+    if a < b {
+      return -1
+    }
+    if a > b {
+      return 1
+    }
+    index = index + usize.ONE
+  }
+  return 0
+}
+
+// The text of `text` without leading and trailing ASCII whitespace.
+fn trimmed(text: &[u8]) -> &[u8] {
+  let mut start = usize.ZERO
+  let mut end = text.length
+  while start < end && (text[start] == 32 || text[start] == 10 || text[start] == 13 || text[start] == 9) {
+    start = start + usize.ONE
+  }
+  while end > start && (text[end - usize.ONE] == 32 || text[end - usize.ONE] == 10 || text[end - usize.ONE] == 13 || text[end - usize.ONE] == 9) {
+    end = end - usize.ONE
+  }
+  return Slice.view<u8>(text, start, end - start)
+}
+
+// The `SupportedTargets.macosx` table of an SDK's settings.
+fn macosTable(settings: &JsonValue) -> Option<&JsonValue> {
+  return Json.fieldAt(Json.field(settings, "SupportedTargets"), "macosx")
+}
+
+// Whether the JSON array `value` holds the string `wanted`.
+fn holdsString(value: Option<&JsonValue>, wanted: &[u8]) -> bool {
+  let array = match move value {
+    Option<&JsonValue>.Some { value: found } => found
+    Option<&JsonValue>.None => {
+      return false
+    }
+  }
+  if let JsonValue.Array { values } = &array.* {
+    let boxed = Box<Vector<JsonChild>>.get(&values)
+    let children = Vector<JsonChild>.asSlice(&boxed[0])
+    let mut at = usize.ZERO
+    while at < children.length {
+      if let JsonChild.Item { value: element } = &children[at] {
+        if let JsonValue.String { text } = &element {
+          if same(String.utf8Bytes(String.view(&text)), wanted) {
+            return true
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return false
+}
+
+// Reads the file at `path`, failing as `InvalidConfiguration` when it cannot be read.
+effect fn required(path: &Path, origin: &[u8], correction: &'static [u8]) -> Bytes
+  ! SupplyError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let read = run Effect.result(FileSystem.readFile(path))
+  return match move read {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError unreadable => {
+        drop unreadable
+        return run failure(b"InvalidConfiguration", Path.rawBytes(path), origin, correction, b"")
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// The first `xcrun` on `searchPath` that is a regular file, else the first one a symbolic link
+// resolves to.
+effect fn located(searchPath: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let candidates = run CommandPath.searchCandidates(searchPath, b"xcrun")
+  let listed = Vector<Bytes>.asSlice(&candidates)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if run CommandPath.exists(Bytes.asSlice(&listed[at]), false) {
+      return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&listed[at])))
+    }
+    at = at + usize.ONE
+  }
+  return run CommandPath.search(searchPath, b"xcrun")
+}
+
+// Runs `xcrun --sdk macosx --show-sdk-path` with `PATH` and, when set, `DEVELOPER_DIR`, and
+// answers the SDK root it prints.
+effect fn discover(developerDirectory: &Option<Bytes>) -> Bytes
+  ! SupplyError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut ChildProcess | &mut Allocator {
+  let searchPath = run HostInput.variableNamed("PATH")
+  let xcrun = match &searchPath {
+    Option<Bytes>.Some { value } => run located(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<Bytes>.none()
+  }
+  let tool = match move xcrun {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => run failure(
+      b"InvalidConfiguration",
+      b"xcrun",
+      b"SDK discovery",
+      b"Install the Xcode command-line tools, or set SDKROOT to an SDK directory.",
+      b""
+    )
+  }
+  let program = run Path.fromBytes(Bytes.asSlice(&tool))
+  let mut process = run ChildProcess.request(&program)
+  run ChildProcess.addArgument(&mut process, b"--sdk")
+  run ChildProcess.addArgument(&mut process, b"macosx")
+  run ChildProcess.addArgument(&mut process, b"--show-sdk-path")
+  if let Option<Bytes>.Some { value } = &searchPath {
+    run ChildProcess.setVariable(&mut process, b"PATH", Bytes.asSlice(&value))
+  }
+  if let Option<Bytes>.Some { value } = &developerDirectory.* {
+    run ChildProcess.setVariable(&mut process, b"DEVELOPER_DIR", Bytes.asSlice(&value))
+  }
+  let ran = run Effect.result(ChildProcess.execute(&process))
+  let outcome = match move ran {
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success { value } => move value
+    Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure { error } => match move error {
+      ProcessError failed => {
+        drop failed
+        return run failure(b"InvalidConfiguration", Bytes.asSlice(&tool), b"SDK discovery",
+          b"Install the Xcode command-line tools, or set SDKROOT to an SDK directory.", b"")
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let succeeded = match move ChildProcess.exitCode(&outcome) {
+    Option<i32>.Some { value } => value == 0
+    Option<i32>.None => false
+  }
+  if !succeeded {
+    return run failure(b"InvalidConfiguration", b"xcrun --sdk macosx --show-sdk-path", b"SDK discovery",
+      b"Install the Xcode command-line tools, or set SDKROOT to an SDK directory.", ChildProcess.errorBytes(&outcome))
+  }
+  return run Bytes.copy(trimmed(ChildProcess.outputBytes(&outcome)))
+}
+
+/// Resolves the macOS SDK for a compilation for `target` on `host` with the profile's `libc` and
+/// `deployment` (empty for the default 11.0.0): `None` for a target that needs no SDK.
+///
+/// `SDKROOT`, when set, names the SDK and must be valid. Otherwise discovery runs `xcrun --sdk
+/// macosx --show-sdk-path`, forwarding `DEVELOPER_DIR`, and only for the host target. The SDK
+/// must state an ARM64 macOS target and a version in its `SDKSettings.json`, admit the deployment,
+/// and supply the ARM64 `libSystem` contract.
+pub effect fn resolve(target: &Target, host: &Target, libc: &[u8], deployment: &[u8]) -> Option<Supply>
+  ! SupplyError | FileError | HostInputError | OutOfMemoryError
+  ? &mut HostInput | &mut FileSystem | &mut ChildProcess | &mut Allocator {
+  if !same(Target.operatingSystem(target), b"darwin") || same(libc, b"none") {
+    return Option<Supply>.none()
+  }
+  let mut origin = run Bytes.copy(b"SDKROOT")
+  let mut developerDirectory = Option<Bytes>.none()
+  let mut root = Bytes.make()
+  if let Option<Bytes>.Some { value } = move run HostInput.variableNamed("SDKROOT") {
+    root = move value
+  } else {
+    if Target.id(target) != Target.id(host) {
+      return run failure(b"HostMismatch", Target.name(target), b"host",
+        b"Provide an explicit supply for the requested target.", b"")
+    }
+    origin = run Bytes.copy(b"SDK discovery")
+    developerDirectory = run HostInput.variableNamed("DEVELOPER_DIR")
+    root = run discover(&developerDirectory)
+  }
+  let text = Bytes.asSlice(&root)
+  if text.length == usize.ZERO || text[usize.ZERO] != 47 || same(text, b"/") {
+    return run failure(b"InvalidConfiguration", text, Bytes.asSlice(&origin),
+      b"Select an absolute macOS SDK directory.", b"")
+  }
+  let directory = run Path.fromBytes(text)
+  let metadataPath = run Path.join(&directory, "SDKSettings.json")
+  let metadata = run required(&metadataPath, Bytes.asSlice(&origin), b"Select an SDK with valid SDKSettings.json.")
+  let parsed = run Effect.result(Json.parse(Bytes.asSlice(&metadata)))
+  let settings = match move parsed {
+    Result<JsonValue, JsonError | OutOfMemoryError>.Success { value } => move value
+    Result<JsonValue, JsonError | OutOfMemoryError>.Failure { error } => match move error {
+      JsonError malformed => {
+        drop malformed
+        return run failure(b"InvalidConfiguration", Path.rawBytes(&metadataPath), Bytes.asSlice(&origin),
+          b"Select an SDK with valid SDKSettings.json.", b"")
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let version = match move Json.asString(Json.field(&settings, "Version")) {
+    Option<string>.Some { value } => run Bytes.copy(String.utf8Bytes(value))
+    Option<string>.None => Bytes.make()
+  }
+  if !holdsString(Json.fieldAt(macosTable(&settings), "Archs"), b"arm64") || !isVersion(Bytes.asSlice(&version)) {
+    return run failure(b"TargetMismatch", Path.rawBytes(&metadataPath), Bytes.asSlice(&origin),
+      b"Select an ARM64 macOS SDK.", b"")
+  }
+  let mut requested = run Bytes.copy(deployment)
+  if deployment.length == usize.ZERO {
+    requested = run Bytes.copy(defaultDeployment())
+  }
+  let mut maximum = run Bytes.copy(Bytes.asSlice(&version))
+  if let Option<string>.Some { value } = move Json.asString(Json.fieldAt(macosTable(&settings), "MaximumDeploymentTarget")) {
+    maximum = run Bytes.copy(String.utf8Bytes(value))
+  }
+  let mut belowMinimum = false
+  if let Option<string>.Some { value } = move Json.asString(Json.fieldAt(macosTable(&settings), "MinimumDeploymentTarget")) {
+    belowMinimum = compareVersions(Bytes.asSlice(&requested), String.utf8Bytes(value)) < 0
+  }
+  if compareVersions(Bytes.asSlice(&requested), defaultDeployment()) < 0 || belowMinimum
+    || compareVersions(Bytes.asSlice(&requested), Bytes.asSlice(&maximum)) > 0 {
+    return run failure(b"DeploymentMismatch", Bytes.asSlice(&requested), Path.rawBytes(&metadataPath),
+      b"Choose an SDK admitting the requested ARM64 deployment; the compiler will not raise it.", b"")
+  }
+  let systemPath = run Path.join(&directory, "usr/lib/libSystem.tbd")
+  let system = run required(&systemPath, b"SDK libSystem contract", b"Supply the ARM64 macOS libSystem contract.")
+  let contract = Bytes.asSlice(&system)
+  if !contains(contract, b"arm64-macos") || !contains(contract, b"/usr/lib/libSystem.B.dylib") {
+    return run failure(b"TargetMismatch", Path.rawBytes(&systemPath), b"SDK libSystem contract",
+      b"Supply the ARM64 macOS libSystem contract.", b"")
+  }
+  return Option<Supply>.some(Supply {
+    root: move directory,
+    deployment: move requested,
+    origin: move origin,
+    developerDirectory: move developerDirectory,
+    version: move version,
+  })
+}
