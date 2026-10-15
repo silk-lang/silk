@@ -532,16 +532,17 @@ Each entry records:
 - **Compilers:** both lower drops, replacement drops, drop flags and partial moves. On 2026-10-07,
   selfhost component cleanup was locally verified for conditional partial transfers, joins with
   opposite authored move orders, receiving-owner cleanup and component refill. It retains canonical
-  projected components and independent edge-written flags rather than consuming-site hole lists.
-  Both reject a read, borrow or write of a moved or maybe-moved array element, including through a
-  runtime index that may name it, as `OWN0001`; selfhost borrow checking names a literal in-bounds
-  index's static element (2026-10-15). Selfhost still reports the backend gap `cleanup` for a loop
-  iteration that leaves an owner in a different state than it found it, a guard that changes an
-  owner's state, a borrowing match result whose arm created temporaries, and drop glue for callable
-  and Effect environments and unions without a canonical member order. Since 2026-10-08 a type
-  parameter owns no cleanup when a declared premise proves it Copy, as `K: Copy` or a shared
-  callable representation does; an unbounded abstract owner of a generic named instance keeps the
-  `cleanup` gap.
+  projected components and independent edge-written flags rather than consuming-site hole lists. A
+  store at a literal in-bounds array index refills a moved element as its static component
+  (2026-10-14). Both reject a read, borrow or write of a moved or maybe-moved array element,
+  including through a runtime index that may name it, as `OWN0001`; selfhost borrow checking names a
+  literal in-bounds index's static element (2026-10-15). Selfhost still reports the backend gap
+  `cleanup` for a loop iteration that leaves an owner in a different state than it found it, a guard
+  that changes an owner's state, a borrowing match result whose arm created temporaries, and drop
+  glue for callable and Effect environments and unions without a canonical member order. Since
+  2026-10-08 a type parameter owns no cleanup when a declared premise proves it Copy, as `K: Copy`
+  or a shared callable representation does; an unbounded abstract owner of a generic named instance
+  keeps the `cleanup` gap.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticLoweringCases.silk`, and `cleanupFollowsLoopsAndConditionalPaths`
