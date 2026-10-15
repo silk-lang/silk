@@ -156,6 +156,8 @@ export interface LoanFact {
     | 'ReturnedView'
     /** A shared or exclusive callee whose environment the invocation's result retains. */
     | 'RetainedCallee'
+    /** A borrowed match's owner, loaned to one arm's bindings through their last use. */
+    | 'MatchBinding'
   readonly parent?: BindingSite
   readonly suspendsParent: boolean
   readonly startRegion: Tir.RegionId
@@ -1898,6 +1900,10 @@ const analyzeLoans = (
 ): LoanAnalysis => {
   let loanAccessChecks = 0
   const loans: Array<LoanFact> = []
+  // Borrowed match bindings are projections of the scrutinee valid only within their selected arm
+  // (MATCH-002). Their owner stays loaned until the arm's last binding use; no value carries the
+  // loan beyond the arm, so it spans that arm's text and never reaches cleanup planning.
+  const bindingLoans: Array<{ readonly loan: LoanFact; readonly from: number }> = []
   const invocations: Array<InvocationOwnership> = []
   const diagnostics: Array<Diagnostic.Diagnostic> = []
 
@@ -2859,6 +2865,7 @@ const analyzeLoans = (
     root: BindingSite,
     anchor: AuthoredHir.Anchor | undefined,
   ): boolean =>
+    (loan.origin !== 'MatchBinding' || sameSite(loan.root, root)) &&
     !grantsParentCapability(loan, root, anchor) &&
     referentsAt(root, anchor).some((source) =>
       loan.referents.some((referent) => referentsOverlap(referent, source)),
@@ -3051,11 +3058,18 @@ const analyzeLoans = (
   }
 
   const delayedLoansAt = (span: SourceSpan.SourceSpan, write = false): ReadonlyArray<LoanFact> => {
-    if (loans.length === 0) return []
+    const held = bindingLoans.flatMap(({ loan, from }) =>
+      loan.startSpan.sourceId === span.sourceId &&
+      from <= span.start &&
+      span.end <= loan.endSpan.end
+        ? [loan]
+        : [],
+    )
+    if (loans.length === 0) return held
     // Every loan in scope is probed at this one access: resolve its control-flow point once.
     const flow = fn.lifetimeFlow
     const at = flow === undefined ? undefined : LifetimeFlow.accessPoint(flow, span, write)
-    return loans.filter((loan) => {
+    const delayed = loans.filter((loan) => {
       const retainedExecutableCapture =
         loan.origin === 'CallableCapture' ||
         loan.origin === 'ReturnedCallableCapture' ||
@@ -3076,6 +3090,7 @@ const analyzeLoans = (
           : LifetimeFlow.liveAt(flow, loan.startSpan, at, loan.endSpan)
       return live ?? retainedThroughAuthoredUse
     })
+    return held.length === 0 ? delayed : [...delayed, ...held]
   }
 
   // Invocations a `run` executes in place: the Effect each constructs is consumed by that run, so
@@ -3099,6 +3114,7 @@ const analyzeLoans = (
         : rootsOf(place.root, place.path)
     return active.find(
       (loan) =>
+        (loan.origin !== 'MatchBinding' || sameSite(loan.root, direct.site)) &&
         !grantsParentCapability(loan, direct.site, expression.anchor) &&
         (loan.referents.some((referent) =>
           places.some((selected) => referentsOverlap(referent, selected)),
@@ -3159,6 +3175,106 @@ const analyzeLoans = (
       case 'Move':
       case 'Place':
         return naturalAccess(expression.scrutinee)
+    }
+  }
+
+  // An arm's authored extent from its first expression to the latest point a use of one of
+  // `bindings` can reach: a use inside a loop recurs through the loop's end.
+  const bindingExtent = (
+    bindings: ReadonlySet<string>,
+    guard: LoanView.Expression | undefined,
+    body: LoanView.ArmBody,
+  ): { readonly from: number; readonly last: number } | undefined => {
+    let from: number | undefined
+    let last: number | undefined
+    let uses = 0
+    const reach = (end: number): void => {
+      if (last === undefined || end > last) last = end
+    }
+    const expressionUses = (expression: LoanView.Expression): void => {
+      const start = context.spanOf(expression.anchor).start
+      if (from === undefined || start < from) from = start
+      if (expression._tag === 'Identifier') {
+        const direct = directSite(expression)
+        if (direct !== undefined && bindings.has(siteKey(direct.site))) {
+          uses += 1
+          reach(context.spanOf(expression.anchor).end)
+        }
+        return
+      }
+      if (expression._tag === 'Match') {
+        expressionUses(expression.scrutinee)
+        for (const arm of expression.arms) {
+          if (arm.guard !== undefined) expressionUses(arm.guard)
+          if (arm.body._tag === 'Expression') expressionUses(arm.body.expression)
+          else statementUses(arm.body.statements)
+        }
+        return
+      }
+      if (expression._tag === 'EffectBlock') {
+        statementUses(expression.statements)
+        return
+      }
+      for (const child of LoanView.children(expression)) expressionUses(child)
+    }
+    const statementUses = (statements: ReadonlyArray<LoanView.Statement>): void => {
+      for (const statement of statements) {
+        const before = uses
+        for (const expression of LoanView.statementExpressions(statement))
+          expressionUses(expression)
+        if (statement._tag === 'UnsafeStatement') statementUses(statement.statements)
+        else if (statement._tag === 'IfStatement' || statement._tag === 'IfLetStatement') {
+          statementUses(statement.taken)
+          statementUses(statement.otherwise)
+        } else if (statement._tag === 'WhileStatement') {
+          statementUses(statement.body)
+          if (uses !== before) reach(context.spanOf(statement.anchor).end)
+        }
+      }
+    }
+    if (guard !== undefined) expressionUses(guard)
+    if (body._tag === 'Expression') expressionUses(body.expression)
+    else statementUses(body.statements)
+    return from === undefined || last === undefined ? undefined : { from, last }
+  }
+
+  const holdBindings = (
+    expression: Extract<LoanView.Expression, { readonly _tag: 'Match' }>,
+    region: Tir.RegionId,
+  ): void => {
+    if (expression.access !== 'Shared' && expression.access !== 'Exclusive') return
+    const place = physicalPlace(expression.scrutinee)
+    if (place === undefined) return
+    const start = context.spanOf(expression.scrutinee.anchor)
+    for (const [ordinal, arm] of expression.arms.entries()) {
+      const sites = arm.bindings.map((binding): BindingSite => ({
+        _tag: 'Pattern',
+        binding: binding.id,
+      }))
+      const extent = bindingExtent(new Set(sites.map(siteKey)), arm.guard, arm.body)
+      if (extent === undefined) continue
+      bindingLoans.push({
+        from: extent.from,
+        loan: {
+          _tag: 'Loan',
+          id: { _tag: 'BorrowId', call: expression.ref, ordinal },
+          root: place.root,
+          referents: [
+            ...new Map(
+              sites
+                .flatMap((site) => rootsOf(site))
+                .map((referent) => [referentKey(referent), referent]),
+            ).values(),
+          ],
+          access: expression.access,
+          origin: 'MatchBinding',
+          suspendsParent: false,
+          startRegion: region,
+          endRegion: region,
+          startSpan: start,
+          endSpan: { ...start, start: extent.last, end: extent.last },
+        },
+      })
     }
   }
 
@@ -3276,6 +3392,7 @@ const analyzeLoans = (
         return
       case 'Match':
         inspect(expression.scrutinee, region, active, scrutineeAccess(expression))
+        holdBindings(expression, region)
         for (const arm of expression.arms) {
           if (arm.guard !== undefined) inspect(arm.guard, region, active, 'Read')
           if (arm.body._tag === 'Expression') inspect(arm.body.expression, region, active, access)
