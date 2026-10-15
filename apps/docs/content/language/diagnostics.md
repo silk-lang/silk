@@ -16,11 +16,10 @@ $ pnpm --filter @silklang/compiler documentation:generate
 | `LEX`  | Lexical   | 12    |
 | `PAR`  | Parser    | 5     |
 | `MOD`  | Module    | 2     |
-| `SEM`  | Semantic  | 207   |
+| `SEM`  | Semantic  | 206   |
 | `OWN`  | Ownership | 17    |
-| `LAY`  | Layout    | 1     |
 
-There are 244 codes in total.
+There are 242 codes in total.
 
 ## Lexical (`LEX`)
 
@@ -99,7 +98,6 @@ There are 244 codes in total.
 | `SEM0038` |                                                                                                              | `<transfer> is only valid inside a loop`                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `SEM0039` |                                                                                                              | `Structural union members must be detached ordinary values with finite storage, found <type>`                                                                                                                                                                                                                                                                                                                                                                              |
 | `SEM0040` |                                                                                                              | `<source> cannot widen to <target>; missing <join>`                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `SEM0041` |                                                                                                              | `Cannot match non-nominal type <actual>`                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `SEM0042` |                                                                                                              | `<member> is not a member of <scrutinee>`                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `SEM0043` |                                                                                                              | `Unreachable match arm <member>`                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `SEM0044` |                                                                                                              | `Match does not cover <join>`                                                                                                                                                                                                                                                                                                                                                                                                                                              |
@@ -289,12 +287,6 @@ There are 244 codes in total.
 | `OWN0016` | Stable code for an access-scoped local-shared borrow escaping or crossing suspension.                | `Local-shared access cannot suspend while its exclusive borrow is live`<br>`Local-shared access cannot invoke an external readiness callback while its exclusive borrow is live` |
 | `OWN0018` | Stable code for returning a callable or Effect that borrows storage owned by the returning function. | `<executable> cannot escape with a <toLowerCase> borrow of local <spelling>`                                                                                                     |
 | `OWN0019` | A borrowed value is used beyond the validity of its referent.                                        | `Lifetime <lifetime> does not remain valid at this use`                                                                                                                          |
-
-## Layout (`LAY`)
-
-| Code      | Meaning                                                                               | Reported as                                                           |
-| --------- | ------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
-| `LAY0001` | Stable code for an exact `usize` or `isize` literal outside the selected target word. | `<type> literal <spelling> exceeds the <bits>-bit range for <target>` |
 
 ## See also
 
