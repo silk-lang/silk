@@ -17,7 +17,6 @@ import * as Effect from 'effect/Effect'
 import * as Layer from 'effect/Layer'
 import * as Analysis from '../src/Analysis.js'
 import * as Instances from '../src/Instances.js'
-import * as Diagnostic from '../src/Diagnostic.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as SuspensionOwnership from '../src/SuspensionOwnership.js'
 import * as Projections from './support/projections.js'
@@ -331,23 +330,21 @@ pub fn main() -> i32 { let first = run partial() let second = run conditional(tr
       ...program,
       functions: program.functions.map((fn) => ({ ...fn, initializationFlags: [] })),
     }
-    const violations = SuspensionOwnership.plan(
-      missingFlags,
-      provisional.value,
-      self.index,
-      OpaqueRealization.catalogOf(self),
-    ).violations
-    assert.isNotEmpty(violations)
-    assert.deepEqual(
-      violations.map((violation) => {
-        const diagnostic = Diagnostic.invalidSuspensionOwnership(violation.detail, violation.span)
-        return {
-          code: diagnostic.code,
-          span: source.slice(diagnostic.span.start, diagnostic.span.end).trim(),
-        }
-      }),
-      [{ code: 'OWN0020', span: 'run delayed()' }],
+    // Lost flags are a planner defect at the suspended run, never a source diagnostic.
+    const defect = assert.throws(
+      () =>
+        SuspensionOwnership.plan(
+          missingFlags,
+          provisional.value,
+          self.index,
+          OpaqueRealization.catalogOf(self),
+        ),
+      RangeError,
+      / suspended partial ownership requires every conditional initialization flag to be assigned and retained$/,
     )
+    const at = Number(/:(\d+): suspended/.exec(String(defect))?.[1] ?? -1)
+    assert.isAbove(at, source.indexOf('effect fn conditional'))
+    assert.isTrue(source.slice(at).trimStart().startsWith('run delayed()'))
     const missingRead = source.replace(
       'return owner.right.value + result',
       'return owner.left.value + result',
