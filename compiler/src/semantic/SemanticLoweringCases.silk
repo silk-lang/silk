@@ -67,6 +67,7 @@ import semantic.SourceIndex {NoRejection, RevisionMismatch, SourceIndex}
 import semantic.ContentHash {ContentHash}
 import semantic.Rejection {MessageArgument, RelatedSite, Rejection, RejectionCode}
 import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
+import semantic.Retention {Root as RetentionRoot}
 import semantic.TypedBody {
   BorrowStatus,
   ConsumedPlace as BodyConsumedPlace,
@@ -1452,6 +1453,77 @@ export "C" fn destroy(state: usize) -> () { return () }
   }
   run Testing.expect(lowered,
     "suspendable instances drive frames from the selected storage, keep borrowed locals in their frame, and cancel each point through its own exit")
+  return ()
+}
+
+effect fn retaining(module: &ModuleId, declaration: &[u8]) -> Vector<RetentionRoot> ! OutOfMemoryError ? &mut Allocator {
+  let mut roots = Vector<RetentionRoot>.make()
+  run Vector<RetentionRoot>.append(&mut roots, RetentionRoot {module: ModuleId.copy(module), declaration: run Bytes.copy(declaration)})
+  return move roots
+}
+
+// The code and span start of a refused build's first rejection.
+fn refusedAt(built: &BackendBuild, start: usize) -> bool {
+  if let BackendBuild.Rejected {first, ..} = &built.* {
+    return Shared<Rejection>.with<bool>(&first, fn(found: &Rejection) -> bool {
+      return found.code == RejectionCode.InvalidConfiguration && found.span.start == start
+    })
+  }
+  return false
+}
+
+// A retention selector roots one monomorphic runtime function, even a private one, and marks it
+// used without exporting it; an unrelated public function still disappears. A selector naming no
+// single function, or a generic or provider-requiring one, is a configuration rejection
+// (ARTIFACT-003).
+test effect fn retentionRootsKeepPrivateFunctionsUsed() -> ()
+! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  let id = run module("retention-roots.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let source = """
+service Clock {}
+fn capability() -> i32 { return 7177 }
+pub fn unrelated() -> i32 { return 8188 }
+fn view<T>(value: &T) -> i32 { return 1 }
+effect fn timed() -> i32 ? &Clock { return 1 }
+pub fn main() -> i32 { return 0 }
+"""
+  let mut store = run applicationSemantic(&id, source, MachineTarget.forId(TargetId.X8664UnknownLinuxGnu))
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut request = Request.forApplication(ModuleId.copy(&id))
+  let plain = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut unretained = false
+  if let BackendBuild.Module {text, ..} = &plain {
+    unretained = !containsIr(Bytes.asSlice(&text), b"i32 7177") && !containsIr(Bytes.asSlice(&text), b"@llvm.used")
+  }
+  run Testing.expect(unretained, "an unexported private function is not emitted without a retention root")
+  Semantic.selectRetention(&mut store, run retaining(&id, b"capability") |> Effect.provideMut<Allocator>(&mut allocator))
+  let kept = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut retained = false
+  if let BackendBuild.Module {text, ..} = &kept {
+    let ir = Bytes.asSlice(&text)
+    retained = containsIr(ir, b"i32 7177") && containsIr(ir, b"@llvm.used = appending global [1 x ptr] [ptr @")
+      && containsIr(ir, b"], section \"llvm.metadata\"\n") && !containsIr(ir, b"i32 8188")
+  }
+  run Testing.expect(retained, "a retained private function is emitted and marked used, and an unrelated public one is not")
+  Semantic.selectRetention(&mut store, run retaining(&id, b"view") |> Effect.provideMut<Allocator>(&mut allocator))
+  let generic = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  Semantic.selectRetention(&mut store, run retaining(&id, b"timed") |> Effect.provideMut<Allocator>(&mut allocator))
+  let provided = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  Semantic.selectRetention(&mut store, run retaining(&id, b"absent") |> Effect.provideMut<Allocator>(&mut allocator))
+  let absent = run buildApplication(&mut store, &mut request, staticClosureNodes)
+    |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    refusedAt(&generic, offsetOf(source, "view<T>", usize.ZERO)) && refusedAt(&provided, offsetOf(source, "timed()", usize.ZERO))
+      && refusedAt(&absent, usize.ZERO),
+    "a generic, provider-requiring or absent retention root is a configuration rejection at its declaration or module"
+  )
   return ()
 }
 
@@ -11595,6 +11667,24 @@ effect fn compositionClaims() -> ()
   let unselected = run compositionRefused(&source, Option<Path>.none(), b"gnu")
   run Testing.expect(ambiguous && unlisted && unselected,
     "two default candidates are ambiguous, an unlisted default never falls back, and a composition must select a runtime")
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [\"start\"], retention = [{ module = \"support/start\", declaration = \"enter\" }] }\n")
+  let retaining = run ModuleSourceFiles.make(&source, Option<Path>.none(), b"x86_64-unknown-linux-gnu", b"gnu", true)
+  let selectors = run ModuleSourceFiles.retention(&retaining)
+  let decoded = Vector<RetentionRoot>.asSlice(&selectors)
+  let mut retainedPath = Bytes.make()
+  if decoded.length == usize.ONE { retainedPath = run ModuleId.copyPath(&decoded[0].module) }
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [\"start\"], retention = [{ module = \"support/start\", declaration = \"enter\", symbol = \"x\" }] }\n")
+  let extraKey = run compositionRefused(&source, Option<Path>.none(), b"gnu")
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [\"start\"], retention = [{ module = \"support/start\", declaration = \"1enter\" }] }\n")
+  let badName = run compositionRefused(&source, Option<Path>.none(), b"gnu")
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [\"start\"], retention = { module = \"support/start\", declaration = \"enter\" } }\n")
+  let scalarRetention = run compositionRefused(&source, Option<Path>.none(), b"gnu")
+  run Testing.expect(
+    decoded.length == usize.ONE && sameBytes(Bytes.asSlice(&retainedPath), b"support/start.silk") && sameBytes(Bytes.asSlice(&decoded[0].declaration), b"enter")
+      && extraKey && badName && scalarRetention,
+    "retention selectors name exactly a package module and an identifier declaration in an array"
+  )
+  run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], defaults = [], retention = [], requirements = [] }\n")
   // A library or object form needs no runtime: an empty or absent default selects none.
   let emptyDefaults = run ModuleSourceFiles.make(&source, Option<Path>.none(), b"x86_64-unknown-linux-gnu", b"gnu", false)
   run writePackageFile(&temp.path, "silk.toml", b"[package]\nname = \"composed\"\nroot = \"main.silk\"\n\n[build]\ncomposition = { runtimes = [{ name = \"start\", module = \"support/start\" }], retention = [], requirements = [] }\n")

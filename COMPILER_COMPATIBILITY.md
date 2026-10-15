@@ -2306,6 +2306,57 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   `compiler/src/semantic/SemanticLoweringCases.silk` asserts one diagnostic.
 - Retire this entry when static bodies recover without evaluating an incomplete prefix.
 
+### Native nesting stack budget beside EXPR-006
+
+- **Status:** Implemented on 2026-10-15 (native); approved by the coordinator as a native stack
+  guard until `bl-llvm-lifetime-markers` lands. The rule itself is EXPR-006 (Confirmed).
+- **Rule:** [EXPR-006](apps/docs/content/reference/expressions-and-operators.md) limits expressions
+  to 256 active child edges and reports `PAR0005` at the first significant token of the depth-257
+  child. Each operator of a left-nested infix or pipeline chain adds one edge. No other construct
+  has a language limit.
+- **Compilers:** both count EXPR-006's edges, including chain operators, and report `PAR0005` at
+  the same token. The bootstrap resets the count at statement-level expressions; native keeps
+  counting through a block nested inside an expression. Native frames do not share stack slots
+  yet (no `llvm.lifetime` markers), so its later phases spend 8–83 KB of stack per nesting level.
+  Native therefore also charges every active construct a measured cost against one budget of 4096
+  units (about 1 KB each, half of an 8 MB stack) and reports `PAR0005` before entering a construct
+  beyond it. Programs EXPR-006 accepts but native rejects:
+  - prefix chains longer than 134 (`-`, `!`, `~`, `&`, `move`, `unsafe`, `run`);
+  - infix or pipeline chains longer than 135 operators (EXPR-006 and the bootstrap allow 256);
+  - more than 59 nested blocks (44 nested `if`, 43 nested `match` arms);
+  - more than 255 nested types;
+  - mixes whose summed cost exceeds the budget, such as deep expressions inside nested blocks
+    inside expressions.
+- **Costs** (`ParseState.silk`; measured on 2026-10-15 at `selfhost` 7f8d816 plus the borrowed
+  parser state, `silk check`, Linux x86_64, 8 MB stack, budget lifted):
+
+  | Construct                           | Measured stack per level | Charge |
+  | ----------------------------------- | ------------------------ | ------ |
+  | Expression child edge (parentheses) | ~8 KB                    | 8      |
+  | Prefix operand                      | ~30 KB                   | 30     |
+  | Infix or pipeline chain operator    | ~29 KB                   | 30     |
+  | Block (`while`, arm, effect, fn)    | ~42 KB (`while`)         | 68     |
+  | `if` beyond its block (`else if`)   | ~21 KB                   | 22     |
+  | `match` beyond its arm block        | 83 KB per arm level      | 16     |
+  | Type                                | ~15 KB                   | 16     |
+  | Pattern                             | ~5 KB                    | 16     |
+
+  An arm level costs a grouped child, a `match` and a block: 8 + 16 + 68 = 92 units.
+- **Source migration:** none expected. The deepest nesting in the standard library, the compiler
+  sources, the corpus and the examples (850 files) is 14 nested braces, 15 nested delimiters, 7
+  nested parentheses and a 5-operator prefix run, about 1.2K of the 4096 units.
+- **Diagnostics and limits:** `PAR0005` for every native limit. Its message names no limit while
+  the native limits differ from EXPR-006's. Every native limit rises once
+  `bl-llvm-lifetime-markers` restores stack-slot sharing.
+- **Evidence:** corpus programs at each limit (`nesting-budget-*`) run on every native target in
+  CI and fail if the costs drift; match arms appear there only 16 deep, because the bootstrap's
+  acceptance test compiles every corpus program and its check time grows exponentially with
+  nested match depth. `invalid/expression-nesting-parens-257` matches the bootstrap's diagnostic.
+  `parser/ParserCases::nestingBudgetBoundaries` checks each limit and one past it.
+- **Open questions:** the bootstrap does not count prefix chains against EXPR-006 (a bootstrap
+  defect), and its `check` time grows exponentially with nested `match` depth (24 levels take
+  150 s); both are on the backlog.
+
 ### Ownership conflicts across recovered statements
 
 - **Status:** recorded on 2026-10-15 from bootstrap probes. Native diagnostic gap.
