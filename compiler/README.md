@@ -19,7 +19,11 @@ place, a binding reached through fields and literal fixed-array elements (`OWN00
 a binding of it names the payload its match selected until the arm replaces, moves or exclusively
 borrows the subject or an owner of it, including through an unknown index: a later use of the
 binding is `ExtractionBoundary` (the bootstrap's `OWN0002`), and a loop in the arm that does so
-before its next iteration uses the binding repeats incompatibly (`OWN0005`).
+before its next iteration uses the binding repeats incompatibly (`OWN0005`). An assignment or
+`Intrinsic.replace` writes through a `match place` binding when its subject is mutably owned, a
+mutable local reached through fields, elements and `match place` bindings (`ImmutableAssignment`,
+the bootstrap's `SEM0035`, otherwise); `&mut` of the binding still needs a mutable binding
+(`ExclusiveBorrowRequiresMutable`, the bootstrap's `SEM0057`).
 Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
 `unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
@@ -264,7 +268,10 @@ library. `compiler/scripts/ReleaseArchive.ts` packages that installation per tar
 bytes. The selfhost workflow packages every target's N2 this way, runs a new `init` project from
 the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
 library's `compositions.json` for the target and libc, so such a build needs the library root even
-without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
+without standard-library imports; no listed runtime is a refusal. The profile's `runtime` request
+chooses among them: `{ kind = "named", name = "<name>" }` selects the composition or catalog runtime
+of that name and never a default, and `{ kind = "none" }` selects no runtime and no catalog
+component, so the application's own `export "C"` functions are the roots. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
 (resolved against the manifest's directory), else the root's containing directory, is the root for
 local module paths, and the root must be a module below it. Every module identity names the package by its logical
 identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
