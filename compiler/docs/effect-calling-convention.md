@@ -243,7 +243,7 @@ Quoted verbatim from the Step 4 author; the same text appears in [mir-core-shape
 
 ## 3. Worked examples
 
-All four are native corpus programs (`packages/compiler/test/support/corpus.ts`). MIR is
+All four are native corpus programs (`corpus/native/`). MIR is
 abbreviated: `bbN` are blocks, `_r` is `Return`, `_f` is `Failure`, `_pN` is `Provider N`.
 
 ### `effect-selective-catch` (catch, catchAll, failure unions)

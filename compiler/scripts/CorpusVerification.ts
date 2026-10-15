@@ -6,7 +6,7 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Path from 'effect/Path'
 import type * as PlatformError from 'effect/PlatformError'
 import * as Schema from 'effect/Schema'
-import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
+import * as Corpus from '../../corpus/corpus.mjs'
 import { defaultCCompiler, runCorpus } from './runSelfhostCorpus.js'
 
 export interface CorpusVerification {
@@ -60,9 +60,9 @@ export class VerificationError extends Data.TaggedError('CorpusVerificationError
 
 /** Materialize authored fixtures before a caller performs any source formatting. */
 export const materialize = Effect.fn('CorpusVerification.materialize')(
-  function* (): Effect.fn.Return<ReadonlyArray<CorpusProgram>, VerificationError> {
-    const { nativeCorpus } = yield* Effect.tryPromise({
-      try: () => import('../../packages/compiler/test/support/corpus.js'),
+  function* (): Effect.fn.Return<ReadonlyArray<Corpus.Program>, VerificationError> {
+    const programs = yield* Effect.try({
+      try: () => Corpus.loadPrograms('native'),
       catch: (cause) =>
         new VerificationError({
           operation: 'materialize corpus',
@@ -70,14 +70,21 @@ export const materialize = Effect.fn('CorpusVerification.materialize')(
           reason: { _tag: 'WrappedFailure', cause },
         }),
     })
-    return nativeCorpus
+    const rejected = programs.filter((program) => program.outcome.expected.kind === 'rejected')
+    if (rejected.length > 0)
+      return yield* new VerificationError({
+        operation: 'materialize corpus',
+        message: `Native corpus programs must complete or trap: ${rejected.map((program) => program.name).join(', ')}`,
+        reason: { _tag: 'InvalidInput' },
+      })
+    return programs
   },
 )
 
 /** Resolve the consuming checkout's promises and reject omissions before any compiler runs. */
 export const readPins = Effect.fn('CorpusVerification.readPins')(function* (
   self: CorpusVerification,
-  corpus: ReadonlyArray<CorpusProgram>,
+  corpus: ReadonlyArray<Corpus.Program>,
 ): Effect.fn.Return<
   readonly [string, ...Array<string>],
   VerificationError | PlatformError.PlatformError,
@@ -120,7 +127,7 @@ export const readPins = Effect.fn('CorpusVerification.readPins')(function* (
 /** Execute materialized scenarios; formatter callers retain the regular runner's selection policy. */
 export const execute = Effect.fn('CorpusVerification.execute')(function* (
   self: CorpusVerification,
-  corpus: ReadonlyArray<CorpusProgram>,
+  corpus: ReadonlyArray<Corpus.Program>,
   required: ReadonlyArray<string>,
   selected?: ReadonlyArray<string>,
 ): Effect.fn.Return<
@@ -157,7 +164,7 @@ export const execute = Effect.fn('CorpusVerification.execute')(function* (
 /** Verify every live pin with the supplied compiler, without formatting or rebuilding it. */
 export const run = Effect.fn('CorpusVerification.run')(function* (
   self: CorpusVerification,
-  corpus: ReadonlyArray<CorpusProgram>,
+  corpus: ReadonlyArray<Corpus.Program>,
 ): Effect.fn.Return<
   void,
   VerificationError | PlatformError.PlatformError,
@@ -167,10 +174,18 @@ export const run = Effect.fn('CorpusVerification.run')(function* (
   yield* execute(self, corpus, pins, pins)
 })
 
+// The manifest keeps its tagged outcome; a native program only completes or traps.
+const manifestExpected = (
+  program: Corpus.Program,
+): { readonly _tag: 'Completes'; readonly result: number } | { readonly _tag: 'Trap' } =>
+  program.outcome.expected.kind === 'completes'
+    ? { _tag: 'Completes', result: program.outcome.expected.exitCode }
+    : { _tag: 'Trap' }
+
 /** Run every regular scenario read-only; unpinned gaps/failures remain ordered observations. */
 export const runFull = Effect.fn('CorpusVerification.runFull')(function* (
   self: CorpusVerification,
-  corpus: ReadonlyArray<CorpusProgram>,
+  corpus: ReadonlyArray<Corpus.Program>,
 ): Effect.fn.Return<
   void,
   VerificationError | PlatformError.PlatformError,
@@ -183,16 +198,16 @@ export const runFull = Effect.fn('CorpusVerification.runFull')(function* (
     required: pins,
     programs: corpus.map((program) => ({
       name: program.name,
-      profiles: program.nativeProfiles ?? [
+      profiles: program.outcome.profiles ?? [
         { name: 'optimized', optimization: 'speed', debug: false },
       ],
-      runs: (program.nativeRuns ?? [{}]).map((run) => ({
+      runs: (program.outcome.runs ?? [{}]).map((run) => ({
         arguments: run.arguments ?? [],
         closeStderr: run.closeStderr ?? false,
       })),
-      expected: program.expected,
-      ...(program.nativeStdout === undefined ? {} : { stdout: program.nativeStdout }),
-      ...(program.nativeStderr === undefined ? {} : { stderr: program.nativeStderr }),
+      expected: manifestExpected(program),
+      ...(program.stdout === undefined ? {} : { stdout: program.stdout }),
+      ...(program.stderr === undefined ? {} : { stderr: program.stderr }),
     })),
   }).pipe(
     Effect.mapError(
