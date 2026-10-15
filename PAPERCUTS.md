@@ -702,3 +702,6 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-14 · One native census launch failed with “exec-server transport disconnected” before process creation; a read-only retry restored the connection and existing builds remained alive · Retried the unstarted command and checked process/receipt state before continuing · silk R3.
 2026-10-15 · A symbolic-region prototype used an unsupported alternation of match patterns, producing cascading PAR0001/PAR0002 diagnostics · Split the alternatives into separate boolean match arms and diagnosed from the first error span · silk R3.
 2026-10-15 · TS bootstrap reported OWN0005 for R3 obligation-loop continue after borrowed match bindings, while native Cases passed · use one if/else path and one loop increment; revalidate the exact stack heads before dispatch · silk R3
+
+2026-10-15 · Concurrent R3 corpus drivers inherited the same CPU pair, wasting available parallelism; assign separate pairs to their Node processes and current descendants, and record scheduling changes outside budget samples · silk
+2026-10-15 · A transient managed-workspace handshake failure reported the environment failed while files and detached compiler jobs survived; after tools return, inspect saved receipts and process identities before restarting work · silk
