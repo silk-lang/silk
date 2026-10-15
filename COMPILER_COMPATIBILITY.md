@@ -2272,3 +2272,19 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** the `covered` fixture of the scalar-enum actor in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Statement recovery in static bodies
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe. Native diagnostic gap.
+- **Rule:** a rejected body reports each independent failure. A statement that binds nothing and
+  fails does not hide the failures of the statements after it.
+- **Compilers:** in a runtime body, native checks the statements after such a failure and reports
+  each one. In a `static fn` or another body evaluated at compile time, native stops at the first
+  failed statement. Its later statements evaluate the checked prefix, and a prefix missing the
+  failed statement would run a different program. For
+  `static fn s(flag: bool) -> i32 { if 46 { return 0 } while 47 { } return 0 }` the bootstrap
+  reports SEM0011 at `46` and at `47`, and native reports only the first.
+- **Source migration:** none. Both compilers reject the body.
+- **Evidence:** the `statementsStatic` fixture in
+  `compiler/src/semantic/SemanticLoweringCases.silk` asserts one diagnostic.
+- Retire this entry when static bodies recover without evaluating an incomplete prefix.
