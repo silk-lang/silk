@@ -1919,6 +1919,9 @@ const analyzeLoans = (
   // on them. Only an access rooted at one of these, or at a view derived from one, reaches the
   // scrutinee through the arm's own projections.
   const bindingHolders = new Map<LoanFact, ReadonlySet<string>>()
+  // While a written destination is inspected, the point its write completes: the end of the
+  // statement, after its value.
+  let completingWrite: SourceSpan.SourceSpan | undefined
   const invocations: Array<InvocationOwnership> = []
   const diagnostics: Array<Diagnostic.Diagnostic> = []
 
@@ -3096,10 +3099,13 @@ const analyzeLoans = (
   }
 
   const delayedLoansAt = (span: SourceSpan.SourceSpan, write = false): ReadonlyArray<LoanFact> => {
+    // A statement's write completes after its value is evaluated, so binding uses in that value
+    // end before it.
+    const completes = completingWrite?.sourceId === span.sourceId ? completingWrite : span
     const held = bindingLoans.flatMap(({ loan, from }) =>
       loan.startSpan.sourceId === span.sourceId &&
-      from <= span.start &&
-      span.end <= loan.endSpan.end
+      from <= completes.start &&
+      completes.end <= loan.endSpan.end
         ? [loan]
         : [],
     )
@@ -3291,13 +3297,66 @@ const analyzeLoans = (
     return from === undefined || to === undefined ? undefined : { from, last, to }
   }
 
+  // The storage a borrowed match's scrutinee names: its place and, for a scrutinee reached through
+  // a view or a reference a call returns, the storage that reference borrows.
+  const lentReferents = (scrutinee: LoanView.Expression): ReadonlyArray<LoanReferent> => {
+    const place = physicalPlace(scrutinee)
+    let viewed = scrutinee
+    while (
+      viewed._tag === 'ReferentProjection' ||
+      viewed._tag === 'FieldProjection' ||
+      viewed._tag === 'IndexProjection'
+    )
+      viewed = viewed.subject
+    const sources =
+      place === undefined ? sourceReferents(viewed) : [place, ...rootsOf(place.root, place.path)]
+    return [
+      ...new Map(
+        sources
+          .flatMap((source) => [source, ...rootsOf(source.root, source.path)])
+          .map((referent) => [referentKey(referent), referent]),
+      ).values(),
+    ]
+  }
+
+  // A borrowed `if let` or destructuring `let` of a place its source reaches only through a
+  // returned reference keeps that reference's storage lent through its selection (PATT-009); the
+  // borrow of the projected result names no place to lend.
+  const holdSelection = (
+    selection: Extract<LoanView.Statement, { readonly _tag: 'IfLetStatement' }>['selection'],
+    region: Tir.RegionId,
+  ): void => {
+    const source = selection.source
+    if (source._tag !== 'Borrow' || physicalPlace(source.subject) !== undefined) return
+    const lent = lentReferents(source.subject)
+    const first = lent.at(0)
+    if (first === undefined) return
+    const start = context.spanOf(source.anchor)
+    const loan: LoanFact = {
+      _tag: 'Loan',
+      id: { _tag: 'BorrowId', call: source.ref, ordinal: 0 },
+      root: first.root,
+      referents: lent,
+      access: source.access,
+      origin: 'MatchBinding',
+      suspendsParent: false,
+      startRegion: region,
+      endRegion: region,
+      startSpan: start,
+      endSpan: selection.loanEnd,
+    }
+    bindingHolders.set(loan, new Set())
+    bindingLoans.push({ from: start.end, loan })
+  }
+
   const holdBindings = (
     expression: Extract<LoanView.Expression, { readonly _tag: 'Match' }>,
     region: Tir.RegionId,
   ): void => {
     if (expression.access !== 'Shared' && expression.access !== 'Exclusive') return
-    const place = physicalPlace(expression.scrutinee)
-    if (place === undefined) return
+    const lent = lentReferents(expression.scrutinee)
+    const first = lent.at(0)
+    if (first === undefined) return
     const start = context.spanOf(expression.scrutinee.anchor)
     for (const [ordinal, arm] of expression.arms.entries()) {
       const sites = arm.bindings.map((binding): BindingSite => ({
@@ -3312,16 +3371,8 @@ const analyzeLoans = (
       const loan: LoanFact = {
         _tag: 'Loan',
         id: { _tag: 'BorrowId', call: expression.ref, ordinal },
-        root: place.root,
-        // A scrutinee reached through a viewing local also names the storage that view borrows.
-        referents: [
-          ...new Map(
-            [place, ...rootsOf(place.root, place.path)].map((referent) => [
-              referentKey(referent),
-              referent,
-            ]),
-          ).values(),
-        ],
+        root: first.root,
+        referents: lent,
         access: armLoan.kind === 'Match' ? expression.access : 'Shared',
         origin: 'MatchBinding',
         suspendsParent: false,
@@ -4082,6 +4133,7 @@ const analyzeLoans = (
               order: context.orderOf(statement.selection.anchor),
             },
           )
+          holdSelection(statement.selection, statement.region)
           break
         case 'IfStatement':
           inspect(statement.condition, statement.region, active)
@@ -4100,13 +4152,21 @@ const analyzeLoans = (
               order: context.orderOf(statement.selection.anchor),
             },
           )
+          holdSelection(statement.selection, statement.region)
           statements(statement.taken, active)
           statements(statement.otherwise, active)
           break
         case 'WriteStatement':
           // Replacing a descriptor writes its binding storage; an explicit referent
           // projection still checks the borrowed allocation (OWN-005, BORROW-008).
-          inspect(statement.destination, statement.region, active, 'Write', undefined, true)
+          {
+            const destination = context.spanOf(statement.destination.anchor)
+            const value = context.spanOf(statement.value.anchor)
+            const end = Math.max(destination.end, value.end)
+            completingWrite = { ...destination, start: end, end }
+            inspect(statement.destination, statement.region, active, 'Write', undefined, true)
+            completingWrite = undefined
+          }
           inspect(statement.value, statement.region, active, naturalAccess(statement.value))
           break
         case 'WhileStatement':
