@@ -138,12 +138,16 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
       fixture(function* ({ root, options }) {
         const alias = join(root, 'clang')
         symlinkSync('clang-22', alias)
-        const check = `test "$SILKC_CLANG" = '${options.clang}' || exit 81\ntest -z "$SILK_PRIVATE_SECRET" && test -z "$SILK_TEST_CLANG" || exit 82`
+        // The pinned seed reads SILKC_CLANG; every newer generation reads SILK_CLANG.
+        const check = (variable, other) =>
+          `test "$${variable}" = '${options.clang}' && test -z "$${other}" || exit 81\ntest -z "$SILK_PRIVATE_SECRET" && test -z "$SILK_TEST_CLANG" || exit 82`
+        const seedCheck = check('SILKC_CLANG', 'SILK_CLANG')
+        const outputCheck = check('SILK_CLANG', 'SILKC_CLANG')
         executable(
           options.producer,
-          `${check}\n${producer(check + '\nexit 42').replace(
+          `${seedCheck}\n${producer(outputCheck + '\nexit 42').replace(
             'test "$1" = build && test "$3" = -o || exit 93',
-            check + '\ntest "$1" = build && test "$3" = -o || exit 93',
+            outputCheck + '\ntest "$1" = build && test "$3" = -o || exit 93',
           )}`,
         )
         const result = yield* fixtureBuild({
@@ -151,6 +155,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
           clang: alias,
           environment: {
             ...process.env,
+            SILK_CLANG: '/conflicting/clang',
             SILKC_CLANG: '/conflicting/clang',
             SILK_TEST_CLANG: '/other/clang',
             SILK_PRIVATE_SECRET: 'unrecorded-private-value',
@@ -162,7 +167,12 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         assert.strictEqual(result.linker.version, 'fixture clang version 22')
         assert.strictEqual(result.linker.sha256, SourceSnapshot.hash(readFileSync(options.clang)))
         for (const stage of result.stages)
-          assert.deepStrictEqual(stage.linkerEnvironment, { SILKC_CLANG: options.clang })
+          assert.deepStrictEqual(
+            stage.linkerEnvironment,
+            stage.name === 'native-build'
+              ? { SILKC_CLANG: options.clang }
+              : { SILK_CLANG: options.clang },
+          )
         assert.strictEqual(JSON.stringify(result).includes('unrecorded-private-value'), false)
       }),
   )

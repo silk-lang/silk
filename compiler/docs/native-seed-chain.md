@@ -66,8 +66,10 @@ asset=$(jq -er --arg target "$target" '.seeds[$target].asset' compiler/native-se
 gh release download "$tag" --repo silk-lang/silk --pattern "$asset" --dir "$seed_dir/download"
 node compiler/scripts/NativeSeed.mjs verify compiler/native-seed.json "$target" \
   "$seed_dir/download/$asset" "$seed_dir/silk"
-export SILKC="$seed_dir/silk"
-export SILKC_CLANG="$(command -v clang)"
+export SILK_COMPILER="$seed_dir/silk"
+export SILK_CLANG="$(command -v clang)"
+# The pinned seed predates SILK_CLANG and reads SILKC_CLANG until the next re-pin.
+export SILKC_CLANG="$SILK_CLANG"
 # On macOS:
 # export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 ```
