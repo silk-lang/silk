@@ -33,11 +33,20 @@ The file is canonical JSON: keys sorted, two-space indentation, one trailing new
 | Key                | Required | Value                                                                                                                                                                                          |
 | ------------------ | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `schemaVersion`    | yes      | `1`.                                                                                                                                                                                           |
-| `expected`         | yes      | `{"kind": "completes", "exitCode": N}`, `{"kind": "trap"}`, or, under `invalid/` only, `{"kind": "rejected", "codes": ["SEM0051"]}`.                                                           |
+| `expected`         | yes      | `{"kind": "completes", "exitCode": N}`, `{"kind": "trap"}`, or, under `invalid/` only, `{"kind": "rejected", "diagnostics": [{"code": "SEM0051", "span": "2:31-2:54"}]}` (see below).          |
 | `runs`             | no       | Separate runs of the one executable: `[{"arguments": ["a"], "closeStderr": true}]`. Each run must produce the expected outcome and output. One run without arguments otherwise.                |
 | `profiles`         | no       | Native profiles the contract must hold under: `[{"debug": true, "name": "debug", "optimization": "none"}]`.                                                                                    |
 | `dynamicLibraries` | no       | System libraries to link, such as `["m"]`.                                                                                                                                                     |
 | `components`       | no       | Runtime components bound to program declarations: `[{"bindings": [{"declaration": "refuse", "module": "test/refusing_storage", "operation": "acquire"}], "capability": "execution-storage"}]`. |
+
+## Rejected programs
+
+A program under `invalid/` lists every diagnostic compilation must report, in the order the
+compiler reports them: its code and its span in `main.silk` as `line:column-line:column`, both
+1-based and counting characters. `formatSpan` in `corpus.mjs` writes this form. Messages are never
+compared. The bootstrap's tests and the native corpus harness both check the exact list: native
+programs that are still rejected with a different list are reported as `DIAGNOSTIC_PARITY` gaps,
+and an accepted program fails.
 
 ## Splices
 
@@ -56,5 +65,5 @@ of the expanded text.
 
 ## Adding a program
 
-Create `native/<name>/` with `main.silk` and `outcome.json`, plus any optional files. Names use
-letters, digits and hyphens. No index needs updating.
+Create `native/<name>/` or `invalid/<name>/` with `main.silk` and `outcome.json`, plus any
+optional files. Names use letters, digits and hyphens. No index needs updating.
