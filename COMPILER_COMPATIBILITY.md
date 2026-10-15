@@ -532,14 +532,17 @@ Each entry records:
 - **Compilers:** both lower drops, replacement drops, drop flags and partial moves. On 2026-10-07,
   selfhost component cleanup was locally verified for conditional partial transfers, joins with
   opposite authored move orders, receiving-owner cleanup and component refill. It retains canonical
-  projected components and independent edge-written flags rather than consuming-site hole lists.
-  Selfhost still reports the backend gap `cleanup` for a write at a runtime index beside a moved
-  element, a loop iteration that leaves an owner in a different state than it found it, a
-  guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
-  drop glue for callable and Effect environments and unions without a canonical member order.
-  Since 2026-10-08 a type parameter owns no cleanup when a declared premise proves it Copy, as
-  `K: Copy` or a shared callable representation does; an unbounded abstract owner of a generic
-  named instance keeps the `cleanup` gap.
+  projected components and independent edge-written flags rather than consuming-site hole lists. A
+  store at a literal in-bounds array index refills a moved element as its static component
+  (2026-10-14). Both reject a read, borrow or write of a moved or maybe-moved array element,
+  including through a runtime index that may name it, as `OWN0001`; selfhost borrow checking names a
+  literal in-bounds index's static element (2026-10-15). Selfhost still reports the backend gap
+  `cleanup` for a loop iteration that leaves an owner in a different state than it found it, a guard
+  that changes an owner's state, a borrowing match result whose arm created temporaries, and drop
+  glue for callable and Effect environments and unions without a canonical member order. Since
+  2026-10-08 a type parameter owns no cleanup when a declared premise proves it Copy, as `K: Copy`
+  or a shared callable representation does; an unbounded abstract owner of a generic named instance
+  keeps the `cleanup` gap.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticLoweringCases.silk`, and `cleanupFollowsLoopsAndConditionalPaths`
@@ -2206,6 +2209,21 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   branch's N1 CLI rejects the same arm with SEM0224 at bytes 116–130. The native payload-control
   probe retains SEM0046 at bytes 116–126. The source-written lowering actor checks all four
   grammar/subject routes at exact spans. Full exact-head native Cases remain the execution gate.
+
+### Anonymous callables spelled with `once fn` or `mut fn`
+
+- **Status:** recorded on 2026-10-14. Native follows the reference; the bootstrap is lenient.
+- **Rule:** [ANON-CALLABLE-001](apps/docs/content/reference/functions-callables-and-control-flow.md#anon-callable-001--an-anonymous-callable-has-one-exact-source-identity-and-explicit-contract):
+  source does not spell `mut fn` or `once fn` when constructing an anonymous callable. Its
+  invocation mode derives from its captures (ANON-OWN-001).
+- **Compilers:** native rejects `once fn() -> i32 { return 4 }` and `mut fn() -> i32 { … }` at the
+  modifier with PAR0001 and PAR0002. The bootstrap accepts both spellings and derives the mode from
+  the captures anyway.
+- **Source migration:** write `fn() -> i32 { … }`; a consuming capture still makes the value
+  `once`.
+- **Evidence:** the bootstrap's focused manifest check accepts both spellings, and the N1 CLI
+  rejects them at the modifier while accepting the unspelled form. The bootstrap is not changed;
+  retire this entry with it.
 
 ### Repeated integer match values in the bootstrap
 

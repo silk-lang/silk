@@ -373,3 +373,44 @@ void it('keeps uncoded refusal reasons separate from catalog diagnostics', () =>
     undefined,
   )
 })
+
+void it('checks a rejected program against its exact diagnostics', async () => {
+  const rejected: Corpus.Program = {
+    ...literal,
+    name: 'rejected',
+    source: 'fn f() -> i32 { return true }\npub fn main() -> i32 { return 0 }',
+    outcome: {
+      schemaVersion: 1,
+      expected: { kind: 'rejected', diagnostics: [{ code: 'SEM0001', span: '1:24-1:28' }] },
+    },
+  }
+  const reporting = (records: string) =>
+    `if [ "$1" != build ] || [ "$2" != memory/driver.silk ] || [ "$5" != --stdlib ]; then exit 3; fi
+printf '${records}' >&2
+exit 1`
+  const error = (code: string, start: number, end: number) =>
+    `SILK_BUILD_ERROR={"code":"${code}","span":{"start":${start},"end":${end}},"module":"memory/driver.silk"}\\n`
+  await withStub(reporting(error('SEM0001', 23, 27)), async (silkc) => {
+    assert.deepStrictEqual(await runCase(silkc, rejected), { name: 'rejected', status: 'pass' })
+  })
+  // A rejection with any other list stays rejected: a parity gap, not a failure.
+  await withStub(
+    reporting(`${error('SEM0001', 23, 27)}${error('SEM0002', 30, 32)}`),
+    async (silkc) => {
+      const result = await runCase(silkc, rejected)
+      assert.strictEqual(result.status, 'unsupported')
+      assert.deepStrictEqual(
+        result.status === 'unsupported' ? result.gaps.map((gap) => gap.code) : [],
+        ['DIAGNOSTIC_PARITY'],
+      )
+    },
+  )
+  await withStub(reporting(error('SEM0001', 22, 27)), async (silkc) => {
+    assert.strictEqual((await runCase(silkc, rejected)).status, 'unsupported')
+  })
+  await withStub(compiled, async (silkc) => {
+    const result = await runCase(silkc, rejected)
+    assert.strictEqual(result.status, 'fail')
+    assert.strictEqual(result.status === 'fail' ? result.code : '', 'ACCEPTED_INVALID')
+  })
+})
