@@ -17,7 +17,7 @@ export interface CorpusVerification {
 }
 
 /** Reads the compiler's own C driver setting, so corpus objects match its link. */
-export const cCompiler = Config.NonEmptyString('SILKC_CLANG').pipe(
+export const cCompiler = Config.NonEmptyString('SILK_CLANG').pipe(
   Config.withDefault(defaultCCompiler),
 )
 
@@ -232,7 +232,7 @@ export const runConfigured = Effect.fn('CorpusVerification.runConfigured')(funct
   FileSystem.FileSystem | Path.Path
 > {
   const path = yield* Path.Path
-  const compiler = yield* Config.NonEmptyString('SILKC')
+  const compiler = yield* Config.NonEmptyString('SILK_COMPILER')
   const selection = yield* Config.String('SILK_SELFHOST_CORPUS_CASES').pipe(Config.withDefault(''))
   if (selection !== '')
     return yield* new VerificationError({
