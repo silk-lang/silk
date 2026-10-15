@@ -12,6 +12,6 @@ p=dest/'compiler/src/semantic/TypedBody.silk';s=p.read_text();start=s.index('pub
 needle='  return 5\n}\n\n/// The position';assert needle in s;s=s.replace(needle,f'  return {5+len(ops)}\n}}\n\n/// The position')
 s=s.replace('    BorrowStatus.Imprecise => 4','    BorrowStatus.Imprecise => 4\n'+''.join(f'    BorrowStatus.Probe{op} => {i+5}\n' for i,(op,name) in enumerate(ops)).rstrip())
 s=s.replace('  return "imprecise"\n}', '  if position == 4 { return "imprecise" }\n'+''.join(f'  if position == {i+5} {{ return "{name}" }}\n' for i,(op,name) in enumerate(ops[:-1]))+f'  return "{ops[-1][1]}"\n}}');p.write_text(s)
-p=dest/'compiler/src/semantic/BorrowCheck.silk';s=p.read_text();needle='      return Shape.Outside {reason: BorrowStatus.Storage}';assert s.count(needle)==1
-s=s.replace(needle,'      let reason = match operation {\n'+''.join(f'        StorageOperation.{op} => BorrowStatus.Probe{op}\n' for op,name in ops)+'        _ => BorrowStatus.Storage\n      }\n      return Shape.Outside {reason: reason}');p.write_text(s)
+p=dest/'compiler/src/semantic/BorrowCheck.silk';s=p.read_text();needle='      return Shape.Outside {reason: BorrowStatus.StoredLoans}';assert s.count(needle)==1
+s=s.replace(needle,'      let reason = match operation {\n'+''.join(f'        StorageOperation.{op} => BorrowStatus.Probe{op}\n' for op,name in ops)+'        _ => BorrowStatus.StoredLoans\n      }\n      return Shape.Outside {reason: reason}');p.write_text(s)
 print('Census probe generated',dest)
