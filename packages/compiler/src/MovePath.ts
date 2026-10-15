@@ -242,6 +242,29 @@ export const restore = (
 ): Result.Result<State, TransitionFailure> =>
   Result.map(resolve(self, path, shapeOf, false), () => update(self, path, make()))
 
+const withoutRefinement = (self: State): State => ({
+  initialization: self.initialization,
+  children: self.children.map((child) => ({
+    selector: child.selector,
+    state: withoutRefinement(child.state),
+  })),
+  ...(self.discriminant === undefined ? {} : { discriminant: self.discriminant }),
+})
+
+const stateAt = (self: State, path: Path): State => {
+  let current = self
+  for (const selector of path) current = childOf(current, selector)
+  return current
+}
+
+/**
+ * Forgets every discriminant proof within a selected subtree whose value may have been replaced
+ * without being tracked here, such as through an exclusive borrow or an unknown index. A
+ * `match place` binding refined from that subtree then no longer names a place of it (MATCH-001).
+ */
+export const unrefine = (self: State, path: Path): State =>
+  update(self, path, withoutRefinement(stateAt(self, path)))
+
 /** Terminates an entire selected place, permitting exact cleanup of a partial remainder. */
 export const terminate = (
   self: State,
