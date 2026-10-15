@@ -81,6 +81,7 @@ const nativeEnvironment = (
   current: Readonly<Record<string, string | undefined>>,
   clang: string,
 ): Readonly<Record<string, string>> => {
+  // The pinned seed predates SILK_CLANG and reads SILKC_CLANG; this goes with the next re-pin.
   const env: Record<string, string> = { SILKC_CLANG: clang }
   for (const name of allowedEnvironment) {
     const value = current[name]
