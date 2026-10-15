@@ -1,12 +1,5 @@
 import { records } from './support/records.js'
-import {
-  borrowedCaptureSection,
-  constrainedCallableForwarding,
-  constrainedSectionGenericOwner,
-  genericItemPipelineInGenericOwner,
-  ownerTypedDirectSection,
-  relayedSection,
-} from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 import * as Layer from 'effect/Layer'
 import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
@@ -100,7 +93,7 @@ it.effect('lowers relay calls carrying a section environment named before its ap
     // callable type, and each relay call in `main` must select exactly that instance.
     const snapshot = yield* AnalysisFixture.retainingMain(
       'generics/relayed-section',
-      new TextEncoder().encode(relayedSection),
+      new TextEncoder().encode(corpusProgram('relayed-section').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const mir = Analysis.loweredMir(snapshot)
@@ -476,7 +469,7 @@ it.effect('admits and lowers a constrained callable relayed through bound calls'
     // application, so their hidden identity names the one environment the section constructs.
     const snapshot = yield* AnalysisFixture.retainingMain(
       'generics/constrained-relay',
-      new TextEncoder().encode(constrainedCallableForwarding),
+      new TextEncoder().encode(corpusProgram('constrained-callable-forwarding').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const mir = Analysis.loweredMir(snapshot)
@@ -623,11 +616,11 @@ pub fn main() -> i32 {
 
 it.effect('lowers a constrained section that is relayed but never applied', () =>
   Effect.gen(function* () {
-    const source = constrainedCallableForwarding.replace(
+    const source = corpusProgram('constrained-callable-forwarding').source.replace(
       'let bind = forwardAgain(Effect.provide<Counter>(&fixed))\n  return run bind(read())',
       'let bind = forwardAgain(Effect.provide<Counter>(&fixed))\n  drop bind\n  return 42',
     )
-    assert.notStrictEqual(source, constrainedCallableForwarding)
+    assert.notStrictEqual(source, corpusProgram('constrained-callable-forwarding').source)
     const snapshot = yield* AnalysisFixture.retainingMain(
       'generics/constrained-relay-unapplied',
       new TextEncoder().encode(source),
@@ -661,7 +654,7 @@ it.effect('applies a section environment holding borrows by value', () =>
     // application passes the stored descriptors to the target's parameters as stored.
     const snapshot = yield* AnalysisFixture.retainingMain(
       'generics/borrowed-capture-section',
-      new TextEncoder().encode(borrowedCaptureSection),
+      new TextEncoder().encode(corpusProgram('borrowed-capture-section').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const mir = Analysis.loweredMir(snapshot)
@@ -1129,7 +1122,7 @@ it.effect('applies a section built inside a generic owner at each owner instance
     // owner's own parameter, which each owner instance then makes concrete.
     const snapshot = yield* AnalysisFixture.retainingMain(
       'generics/constrained-section-generic-owner',
-      new TextEncoder().encode(constrainedSectionGenericOwner),
+      new TextEncoder().encode(corpusProgram('constrained-section-generic-owner').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const mir = Analysis.loweredMir(snapshot)
@@ -1162,7 +1155,7 @@ it.effect('applies a generic function item piped inside a generic owner', () =>
     // concrete and invokes its own `keep<…>`.
     const snapshot = yield* AnalysisFixture.retainingMain(
       'generics/generic-item-pipeline-owner',
-      new TextEncoder().encode(genericItemPipelineInGenericOwner),
+      new TextEncoder().encode(corpusProgram('generic-item-pipeline-in-generic-owner').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const mir = Analysis.loweredMir(snapshot)
@@ -1192,7 +1185,7 @@ it.effect('invokes an owner-typed section with its complete call at each owner t
     // for the owner instance, named by its own complete call.
     const snapshot = yield* AnalysisFixture.retainingMain(
       'generics/owner-typed-direct-section',
-      new TextEncoder().encode(ownerTypedDirectSection),
+      new TextEncoder().encode(corpusProgram('owner-typed-direct-section').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const mir = Analysis.loweredMir(snapshot)
