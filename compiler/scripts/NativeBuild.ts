@@ -48,7 +48,6 @@ export interface BuildReceipt {
   smoke: {
     name: 'trivial-features'
     corpusSource: string
-    corpusSha256: string
     sourceSha256: string
     expectedExitCode: 42
     expectedStdout: ''
@@ -143,19 +142,14 @@ const executableHash = Effect.fnUntraced(function* (path: string, immutable: boo
   return yield* fileHash(path)
 })
 
-/** Freeze the existing corpus fixture without importing the TypeScript bootstrap. */
+/** Freeze the corpus program `trivial-features` without importing the TypeScript bootstrap. */
 export const smokeProgram = Effect.fn('NativeBuild.smokeProgram')(function* (corpusSource: string) {
   const fs = yield* FileSystem.FileSystem
   const bytes = yield* fs.readFile(corpusSource)
-  const matches = [
-    ...Buffer.from(bytes)
-      .toString('utf8')
-      .matchAll(/^const trivialFeatures = `([^`]*)`\n/gm),
-  ]
-  const source = matches[0]?.[1]
-  if (matches.length !== 1 || source === undefined || /\\|\$\{/.test(source))
-    return yield* reject('expected one plain, unescaped trivialFeatures corpus template')
-  return { source, corpusSha256: SourceSnapshot.hash(bytes), sha256: SourceSnapshot.hash(source) }
+  const source = Buffer.from(bytes).toString('utf8')
+  if (source.includes('/*@splice '))
+    return yield* reject('expected the smoke program to be plain source without splices')
+  return { source, sha256: SourceSnapshot.hash(bytes) }
 })
 
 const hostTarget = Effect.fnUntraced(function* () {
@@ -182,7 +176,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   snapshot,
   outputDirectory,
   corpusSource = fileURLToPath(
-    new URL('../../packages/compiler/test/support/corpus.ts', import.meta.url),
+    new URL('../../corpus/native/trivial-features/main.silk', import.meta.url),
   ),
   optimization = 'speed',
   debug = false,
@@ -307,7 +301,6 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     const smoke = {
       name: 'trivial-features',
       corpusSource,
-      corpusSha256: program.corpusSha256,
       sourceSha256: program.sha256,
       expectedExitCode: 42,
       expectedStdout: '',
@@ -429,7 +422,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       yield* fs.writeFileString(smokeSource, program.source, { flag: 'wx' })
       yield* fs.writeFileString(
         join(smokeDirectory, 'silk.toml'),
-        '[package]\nname = "trivial-features"\nroot = "main.silk"\n',
+        '[package]\nname = "trivial-features"\nversion = "0.1.0"\nroot = "main.silk"\n',
         { flag: 'wx' },
       )
       const smokeBuilt = yield* invoke(
