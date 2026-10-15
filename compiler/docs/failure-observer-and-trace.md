@@ -9,7 +9,7 @@ at `6b1679f82` (`Intrinsic.ts`, `DiagnosticObservation.ts`, `ExecutableOrigin.ts
 `NativeCall.ts`, `Mir.ts`), `silk/native_diagnostics`, `silk/native_report`, `silk/native_start`,
 the reference pages [program termination and reporting](../../apps/docs/content/reference/program-termination-and-reporting.md)
 (TERM-001..012) and [typed failures](../../apps/docs/content/reference/typed-failures.md) (FAIL-006,
-FAIL-007), and the native corpus (`packages/compiler/test/support/corpus.ts`).
+FAIL-007), and the native corpus (`corpus/native/`).
 
 ## In plain words
 
