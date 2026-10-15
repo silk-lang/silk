@@ -10,7 +10,7 @@ recovers from an earlier published native seed.
 
 | Name | Built by                       | From                                                       |
 | ---- | ------------------------------ | ---------------------------------------------------------- |
-| seed | an earlier `selfhost` push run | the pin                                                    |
+| seed | an earlier `main` push run     | the pin                                                    |
 | N1   | the seed                       | this checkout's `compiler/` and `packages/compiler/stdlib` |
 | N2   | N1                             | the same inputs                                            |
 
@@ -38,7 +38,7 @@ requesting a seed.
       "asset": "silk-compiler-x86_64-unknown-linux-gnu",
       "sha256": "<64 hex>",
       "sourceCommit": "<40 hex>",
-      "runId": "<publishing selfhost push run>"
+      "runId": "<publishing main push run>"
     }
   }
 }
@@ -91,7 +91,7 @@ Why releases:
   artifact silently stops working when the branch is quiet for a week.
 - A release asset is durable, addressable by tag and name, readable with the default
   `contents: read` token, and needs no extra service, registry or secret.
-- Only one job needs write access: the publisher, on `selfhost` pushes, with job-scoped
+- Only one job needs write access: the publisher, on `main` pushes, with job-scoped
   `contents: write`. Pull requests never publish.
 - A committed binary would grow the repository on every advance. The pin stays a few lines.
 
@@ -104,8 +104,7 @@ Jobs in `.github/workflows/selfhost.yml`:
 
 1. **Native N1 from pinned seed** obtains and verifies the seed, exports the snapshot, builds N1
    with it (`NativeBuild.ts`), smoke-tests N1 with the corpus program
-   `trivial-features` (exit 42), and runs the native contract tests. On pull requests it also runs
-   the main-first bootstrap provenance check.
+   `trivial-features` (exit 42), and runs the native contract tests.
 2. **Native seed chain (N2 fixpoint)** builds N2 with N1, emits the compiler's LLVM IR with both N1
    and N2, requires the two IR files to be byte-identical, and smoke-tests N2
    (`NativeBuild.ts --fixpoint`). The N2 build and N1's IR emission run concurrently; on the runner
@@ -113,7 +112,10 @@ Jobs in `.github/workflows/selfhost.yml`:
    **Authored native seed (N0)**.
 3. **Selfhost native corpus** builds the formatter safety gate with N1 and verifies repository
    formatting with it, then runs the full corpus with N1 (the verification harness's
-   `--mode corpus-full`) and keeps the baseline-pass and accepted-failure checks.
+   `--mode corpus-full`). Any failed program fails the job. An invalid program the compiler accepts
+   is a failure unless the build reports bodies it did not borrow-check, emitted or anywhere in
+   the root package; then it is a `BORROW_CHECK_GAP`, which turns back into a failure once every
+   body is checked.
 4. **Native chain and corpus / aarch64-unknown-linux-gnu** runs on `ubuntu-24.04-arm`;
    **Native chain and corpus / aarch64-apple-darwin** runs on `macos-15`. Both run on pull requests,
    pushes, and dispatches. A pinned target verifies its own seed and builds N1 from the committed
@@ -131,32 +133,28 @@ fixpoint at N1/N2; only a seed miscompile or nondeterminism breaks it.
 
 ### Bootstrap DDC
 
-**Bootstrap builds the compiler (T1 DDC)** keeps the chain from depending only on itself. It finds
-the newest `main` commit this tree contains (`git merge-base HEAD origin/main`), downloads the
-verified `silk-bootstrap` artifact main's CI published for exactly that commit, and builds
-`compiler/silk.toml` with it. The result, T1, and N1 built by the pinned seed each emit the
-compiler's LLVM IR. The two files must be byte-identical: a compiler built by an independent
-compiler agrees with the chain on the meaning of the compiler source. The job records a receipt
-(synced main commit, bootstrap run, stage times and peak memory, IR hashes) as the
-`selfhost-bootstrap-ddc` artifact on every push run, so drift stays visible.
+**Bootstrap builds the compiler (T1 DDC)** keeps the chain from depending only on itself. It bundles
+the TypeScript bootstrap from the checkout (`pnpm bundle:cli`) and builds `compiler/silk.toml` with
+it. The result, T1, and N1 built by the pinned seed each emit the compiler's LLVM IR. The two files
+must be byte-identical: a compiler built by an independent compiler agrees with the chain on the
+meaning of the compiler source. The job records a receipt (checkout commit, bootstrap bundle
+digest, stage times and peak memory, IR hashes) as the `selfhost-bootstrap-ddc` artifact, so drift
+stays visible.
 
-It runs on every `selfhost` push and on pull requests that change `compiler/native-seed.json`; on
-other pull requests it exits at once. It is not a branch-protection requirement, since selfhost pull
-requests merge on local evidence, but **a seed bump merges only with this job green on its head**.
-Measured locally on 4 cores, the T1 build took 19 minutes at 10.6 GB peak; the receipt records the
-runner figures.
+It runs on every push and dispatch, and on pull requests that change `compiler/`, `packages/` or
+`pnpm-lock.yaml`; on other pull requests it exits at once and passes. It is part of the required
+**Focused Linux Silk** check, so a change the checkout's bootstrap cannot compile, or compiles
+differently, is red on its own pull request. Measured locally on 4 cores, the T1 build took 19
+minutes at 10.6 GB peak; the receipt records the runner figures.
 
-The bootstrap comes from the synced commit, never from `main` HEAD, which may already carry
-main-first changes selfhost has not merged. Main's artifact expires after 90 days, so selfhost must
-sync `main` at least that often. Without a verified artifact for the synced commit the job fails
-rather than falling back to another bootstrap; sync main into selfhost so one exists. A red job on a
-push means selfhost uses something the synced bootstrap cannot compile or compiles differently: land
-a main-first bootstrap fix, or respell the compiler source and record the divergence in
-`COMPILER_COMPATIBILITY.md`. Seed bumps wait until it is green again.
+The bootstrap and the compiler come from the same commit, so no bootstrap artifact is downloaded and
+none can expire. A red job means the compiler uses something the bootstrap cannot compile or
+compiles differently: repair the bootstrap in the same pull request, or respell the compiler source
+and record the divergence in `COMPILER_COMPATIBILITY.md`.
 
 ### Reusing a pull request run
 
-Every `selfhost` push runs in its own concurrency group, so no merge's run is replaced while it
+Every `main` push runs in its own concurrency group, so no merge's run is replaced while it
 waits. A pull request run records the full Git tree it tested (`refs/pull/N/merge`). The first job
 of a push or dispatch, **Reuse a green PR run of the same tree**, looks for a completed, fully green
 pull request run of the merge commit's second parent whose recorded tree equals `HEAD^{tree}` and
@@ -169,7 +167,7 @@ or unverifiable artifact, the full gate runs.
 
 ## Publication
 
-A successful `selfhost` push run (every job above green) runs **Publish native seed candidate**. It
+A successful `main` push run (every job above green) runs **Publish native seed candidate**. It
 creates the prerelease `native-seed-<commit>` targeting that commit with:
 
 - `silk-compiler-x86_64-unknown-linux-gnu`, `silk-compiler-aarch64-unknown-linux-gnu`, and
@@ -197,30 +195,22 @@ in its target entry in `native-seed.json` and `output.sha256` of N2 in
 
 ### Retention
 
-One prerelease per green push accumulates. **A release that any `selfhost` pin has ever named is
+One prerelease per green push accumulates. **A release that any `main` pin has ever named is
 never deleted**: [hop replay](#hop-replay) rebuilds each pinned seed from the one before it, so the
 chain back to the first seed needs every hop. The rule also keeps the 20 newest candidates **per
 target asset**. Since a release holds multiple targets, retention keeps the union of those target
 rules; a release eligible for any target is kept. `native-seed-retention.yml` (on `main`, weekly)
-applies it with `prune-native-seeds.mjs`, which reads the whole pin history of `selfhost` first; the
+applies it with `prune-native-seeds.mjs`, which reads the whole pin history of `main` first; the
 script has no deletion mode. It reports the decision and target-specific reasons and checks that
 every current pin names an existing asset. Candidates can be pruned by hand after review. Immutable
 single-seed Git records still supply historical release facts; they are never accepted as an active
 pin by `NativeSeed.mjs`.
 
-### Default-branch schedule routing
-
-GitHub runs schedules from `main`, while pins and compiler tooling live on `selfhost`. The
-companion schedule-routing change makes the two `main` workflows dispatch their matching
-`selfhost` workflows, preserving their weekly times. Land that routing change before the
-per-target schema change: otherwise main's older readers would still expect the former pin.
-Keep the branch roles when synchronizing workflows: `main` dispatches and `selfhost` executes.
-
 ## Advancing the pin
 
 Advance when the compiler needs a feature that the pinned seed cannot compile, and otherwise
 whenever convenient (a fresher seed builds faster code). Copy the candidate's `native-seed.json` to
-`compiler/native-seed.json` in a PR to `selfhost`, or copy just the target entries being advanced.
+`compiler/native-seed.json` in a PR to `main`, or copy just the target entries being advanced.
 Its CI proves the new seed builds this checkout, reaches the fixpoint and passes the corpus. The
 bump merges only once [the bootstrap DDC](#bootstrap-ddc) is green on its head.
 
@@ -235,13 +225,12 @@ For a change that makes the compiler's own source use a feature the seed does no
 
 1. Land the compiler support for the feature without using it in `compiler/` or in the stdlib.
    The current seed compiles that commit.
-2. After its `selfhost` push run publishes a candidate, land a PR that advances the pin to it.
+2. After its `main` push run publishes a candidate, land a PR that advances the pin to it.
 3. Land the change that uses the feature.
 
-The author of the feature runs these steps. Stdlib changes follow the same rule: they keep landing
-on `main` first and reach `selfhost` through a sync, and the pinned seed compiles them from the
-checkout. A sync that brings stdlib source the seed cannot compile waits until the compiler support
-has landed on `selfhost` and the pin has advanced. A toolchain change, such as an LLVM upgrade that
+The author of the feature runs these steps. Stdlib changes follow the same rule: the pinned seed
+compiles them from the checkout, so stdlib source the seed cannot compile waits until the compiler
+support has landed and the pin has advanced. A toolchain change, such as an LLVM upgrade that
 the seed's output must follow, lands the same way.
 
 ### Hop replay
@@ -269,7 +258,7 @@ from immutable Git records and verified with the current tooling; historical sou
 Git objects without replacing the tooling checkout. To recover a chain whose newest seed is lost or
 suspect, replay forward from the newest seed that still verifies and pin the result.
 
-The drill replays the pin of the ref it runs on. Schedules run it on `selfhost`; dispatching it on a
+The drill replays the pin of the ref it runs on. Schedules run it on `main`; dispatching it on a
 pin proposal branch replays the proposed hops before review, which is the evidence a pin PR carries.
 
 ### Earlier published seed
