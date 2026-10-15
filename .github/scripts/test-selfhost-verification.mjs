@@ -15,7 +15,6 @@ import {
 } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { pathToFileURL } from 'node:url'
 
 // Hash every consumer Silk source, including fixture imports and the live stdlib.
 const sourceDigests = (directory) =>
@@ -27,14 +26,22 @@ const sourceDigests = (directory) =>
   })
 
 const bundle = resolve('.scratch/selfhost-verification.mjs')
-const { runtimeIntrinsicNames } = await import(pathToFileURL(bundle).href)
+const inventoryBundle = resolve('.scratch/inventory-verification.mjs')
+// The canonical runtime members the harness checks the catalog against: every operation of the
+// checked intrinsic inventory that is not static-only.
+const runtimeIntrinsicNames = JSON.parse(
+  readFileSync('packages/compiler/test/fixtures/intrinsic-inventory.json', 'utf8'),
+)
+  .entries.filter((entry) => entry.phase !== 'StaticOnly')
+  .map((entry) => entry.operation.slice('Intrinsic.'.length))
+  .sort()
 const temporary = mkdtempSync(join(tmpdir(), 'silk-verification-smoke-'))
 try {
   const checkout = join(temporary, 'checkout')
   mkdirSync(checkout)
   const archive = execFileSync(
     'git',
-    ['archive', 'HEAD', 'packages/compiler', 'examples', 'openspec'],
+    ['archive', 'HEAD', 'corpus', 'packages/compiler', 'examples', 'openspec'],
     { maxBuffer: 64 * 1024 * 1024 },
   )
   execFileSync('tar', ['-x', '-C', checkout], { input: archive })
@@ -64,7 +71,7 @@ try {
       cwd: checkout,
       env: {
         ...process.env,
-        SILKC: '',
+        SILK_COMPILER: '',
         SILK_BOOTSTRAP: '',
         RUNNER_TEMP: temporary,
         NODE_PATH: '',
@@ -129,7 +136,7 @@ chmod +x program
   const expectedSources = sourceDigests(checkout)
   const corpusEnvironment = {
     ...process.env,
-    SILKC: compiler,
+    SILK_COMPILER: compiler,
     SILK_SELFHOST_CORPUS_CASES: '',
     NODE_PATH: '',
     NODE_OPTIONS: '',
@@ -258,7 +265,7 @@ chmod +x program
       .status,
     0,
   )
-  assert.notStrictEqual(invokeCorpus(['--mode', 'corpus-full'], { SILKC: '' }).status, 0)
+  assert.notStrictEqual(invokeCorpus(['--mode', 'corpus-full'], { SILK_COMPILER: '' }).status, 0)
   assert.strictEqual(readFileSync(calls, 'utf8'), callsBeforeRejections)
   assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
   assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
@@ -285,7 +292,7 @@ chmod +x program
   chmodSync(mainSource, 0o644)
   chmodSync(join(inventoryCheckout, 'compiler/silk.toml'), 0o644)
   const inventoryBootstrap = join(temporary, 'inventory-bootstrap.mjs')
-  copyFileSync(downloaded, inventoryBootstrap)
+  copyFileSync(inventoryBundle, inventoryBootstrap)
   const hash = (bytes) => createHash('sha256').update(bytes).digest('hex')
   const inventoryFiles = (directory, relative = '') =>
     readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -355,9 +362,20 @@ chmod +x program
       },
     }
   }
+  const invokeInventoryBundle = (environment, args = ['--mode', 'inventory']) =>
+    spawnSync(process.execPath, [inventoryBootstrap, ...args], {
+      cwd: checkout,
+      env: { ...corpusEnvironment, ...environment },
+      encoding: 'utf8',
+      timeout: 30_000,
+      maxBuffer: 64 * 1024 * 1024,
+    })
+  const inventoryUsage = invokeInventoryBundle({}, ['--mode', 'inventory', 'extra'])
+  assert.notStrictEqual(inventoryUsage.status, 0)
+  assert.match(inventoryUsage.stdout + inventoryUsage.stderr, /Usage:/)
   const invokeInventory = (request) => {
     writeFileSync(requestFile, JSON.stringify(request))
-    return invokeCorpus(['--mode', 'inventory'], { SILK_INVENTORY_REQUEST: requestFile })
+    return invokeInventoryBundle({ SILK_INVENTORY_REQUEST: requestFile })
   }
   const request = makeRequest()
   const inventorySourcesBefore = sourceDigests(inventoryCheckout)
@@ -498,16 +516,11 @@ chmod +x program
   assert.notStrictEqual(malformed.status, 0)
   assert.strictEqual(malformed.stdout, '')
   writeFileSync(requestFile, '{broken')
-  const malformedJson = invokeCorpus(['--mode', 'inventory'], {
-    SILK_INVENTORY_REQUEST: requestFile,
-  })
+  const malformedJson = invokeInventoryBundle({ SILK_INVENTORY_REQUEST: requestFile })
   assert.notStrictEqual(malformedJson.status, 0)
   assert.strictEqual(malformedJson.stdout, '')
-  assert.notStrictEqual(
-    invokeCorpus(['--mode', 'inventory'], { SILK_INVENTORY_REQUEST: '' }).status,
-    0,
-  )
-  assert.deepStrictEqual(readFileSync(inventoryBootstrap), readFileSync(downloaded))
+  assert.notStrictEqual(invokeInventoryBundle({ SILK_INVENTORY_REQUEST: '' }).status, 0)
+  assert.deepStrictEqual(readFileSync(inventoryBootstrap), readFileSync(inventoryBundle))
   assert.strictEqual(readFileSync(calls, 'utf8'), callsBeforeRejections)
   assert.strictEqual(existsSync(sentinel), false)
   process.stdout.write(

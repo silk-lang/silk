@@ -816,6 +816,117 @@ fn restore(mut input: Choice) -> Choice {
   )
 })
 
+it('keeps a match place refinement across borrows and index writes that cannot replace it', () => {
+  const facts = checkPartial(
+    'ownership/place-refinement-controls',
+    `
+struct Token { value: i32 }
+union Packet { Empty, Ready { left: Token, right: Token } }
+struct Holder {
+  held: Packet
+  count: i32
+}
+fn ready(value: i32) -> Packet { return Packet.Ready { left: Token { value: value }, right: Token { value: 0 } } }
+fn bump(count: &mut i32) -> () {
+  count.* = count.* + 1
+  return ()
+}
+fn reset(packet: &mut Packet) -> () {
+  packet.* = Packet.Empty
+  return ()
+}
+fn siblingBorrow() -> i32 {
+  let mut holder = Holder { held: ready(5), count: 0 }
+  let mut out = 0
+  match place holder.held {
+    Packet.Ready { left, .. } => {
+      bump(&mut holder.count)
+      out = left.value + holder.count
+    }
+    Packet.Empty => {}
+  }
+  return out
+}
+fn indexWriteAfterUse(at: usize) -> i32 {
+  let mut packets = [ready(7), ready(8)]
+  let mut out = 0
+  match place packets[0] {
+    Packet.Ready { left, .. } => {
+      out = left.value
+      packets[at] = Packet.Empty
+    }
+    Packet.Empty => {}
+  }
+  return out
+}
+fn writeBeforeMatch() -> i32 {
+  let mut packet = Packet.Empty
+  packet = ready(11)
+  let mut out = 0
+  match place packet {
+    Packet.Ready { left, .. } => { out = left.value }
+    Packet.Empty => {}
+  }
+  return out
+}
+fn borrowAfterUse() -> i32 {
+  let mut packet = ready(13)
+  let mut out = 0
+  match place packet {
+    Packet.Ready { left, .. } => {
+      out = left.value
+      reset(&mut packet)
+    }
+    Packet.Empty => {}
+  }
+  return out
+}
+`,
+  )
+  assert.deepEqual(facts.diagnostics, [])
+})
+
+it('keeps a match place refinement across an Effect that captures it after the last use or only reads it', () => {
+  const facts = checkPartial(
+    'ownership/place-refinement-effect-controls',
+    `
+struct Token { value: i32 }
+union Packet { Empty, Ready { left: Token, right: Token } }
+effect fn afterUse() -> i32 {
+  let mut packet = Packet.Ready { left: Token { value: 1 }, right: Token { value: 2 } }
+  let mut out = 0
+  match place packet {
+    Packet.Ready { left, .. } => {
+      out = left.value
+      run effect {
+        packet = Packet.Empty
+        return ()
+      }
+    }
+    Packet.Empty => {}
+  }
+  return out
+}
+effect fn sharedCapture() -> i32 {
+  let mut packet = Packet.Ready { left: Token { value: 1 }, right: Token { value: 2 } }
+  let mut out = 0
+  match place packet {
+    Packet.Ready { left, .. } => {
+      run effect {
+        let seen = match &packet { Packet.Ready { .. } => 1 Packet.Empty => 0 }
+        return ()
+      }
+      out = left.value
+    }
+    Packet.Empty => {}
+  }
+  return out
+}
+`,
+  )
+  assert.deepEqual(facts.diagnostics, [])
+})
+
 it('rejects whole use after a projected move and records explicit partial-place termination', () => {
   const facts = checkPartial(
     'ownership/partial-drop',
