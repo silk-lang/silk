@@ -3139,10 +3139,12 @@ const analyzeLoans = (
     const place = physicalPlace(expression)
     if (direct === undefined || place === undefined) return undefined
     loanAccessChecks += 1
+    // A binding of `match place`, `&` or `&mut` names the scrutinee's own place, so an access to it,
+    // a write included, meets loans of that place.
     const places =
-      destination || borrowedRootType(expression) === undefined
-        ? [place]
-        : rootsOf(place.root, place.path)
+      place.root._tag === 'Pattern' || (!destination && borrowedRootType(expression) !== undefined)
+        ? rootsOf(place.root, place.path)
+        : [place]
     return active.find(
       (loan) =>
         !grantsParentCapability(loan, direct.site, expression.anchor) &&
@@ -3278,6 +3280,11 @@ const analyzeLoans = (
       }
       case 'Move':
         inspect(expression.subject, region, active, 'Move', delayedEnd)
+        return
+      case 'PlaceReplace':
+        // `Intrinsic.replace` writes its place as an assignment does (OWN-005, BORROW-008).
+        inspect(expression.destination, region, active, 'Write', undefined, true)
+        inspect(expression.value, region, active, naturalAccess(expression.value))
         return
       case 'ReferentProjection':
         inspect(expression.subject, region, active, access, delayedEnd)

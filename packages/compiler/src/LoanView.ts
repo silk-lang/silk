@@ -1142,7 +1142,7 @@ export const ofTir = (
         return {
           ...base,
           _tag: 'PlaceReplace',
-          destination: { ...base, _tag: 'Integer' },
+          destination: expression(node.destination),
           value: expression(node.value),
         }
       case 'CompileError':
