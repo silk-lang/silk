@@ -1901,7 +1901,9 @@ fn use() -> i32 {
 ```
 
 The shared loan lasts through `view`'s last use at `view[0]`. Mutation of `values` is valid
-afterward. While a shared returned view remains live, its root cannot be mutated, moved, dropped, or
+afterward. Annotating a binding with a lifetime, including one of the enclosing function's lifetime
+parameters, constrains its type but does not extend its loan beyond its last use or the last use of
+a value retaining it. While a shared returned view remains live, its root cannot be mutated, moved, dropped, or
 borrowed exclusively. An exclusive returned view suspends every independent access to its root.
 
 A temporary passed to a returned-view function gains a hidden owner in the caller:

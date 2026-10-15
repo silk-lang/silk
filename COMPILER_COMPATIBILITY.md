@@ -1904,6 +1904,22 @@ repeated invocation and capture-only drop glue.
   This correction does not establish native self-build success.
 - **Source migration:** none.
 
+## Cancellation cleanup order
+
+EXEC-008 cleans the owners of a cancelled frame in structured-exit order: innermost exited region
+first, reverse acquisition within a region, so a consuming match arm's bindings drop before the
+subject's remainder.
+
+- **Bootstrap:** releases a cancelled frame's affine owners in local-ordinal order
+  (`Ownership.inReleaseOrder` over the suspension planner's slots). A consuming match of a subject
+  cancelled inside its arm drops the subject's remainder before the arm's binding. An ordinary
+  `return` from the same arm already drops the binding first.
+- **Native:** a cancel exit is the structured-exit cleanup of its point, so it matches EXEC-008.
+- **Source migration:** none. The consuming-match cancel case is pinned by a native Case and stays
+  out of the shared corpus until both compilers agree.
+- Retire this entry when the bootstrap cancels in structured-exit order and the case joins the
+  shared corpus.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
@@ -2402,3 +2418,17 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** the `statementsAfterBinding`, `bindingChain`, `bindingClosure`, `bindingArm` and
   `bindingPattern` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+## Loans of lifetime-annotated and universally bounded borrows
+
+VIEW-002 ends a loan at its last use or the last use of a value retaining it. Annotating a binding
+with a lifetime, including one of the function's lifetime parameters, does not extend the loan.
+
+- **Bootstrap:** keeps a borrow live to the end of the body when its region must outlive a lifetime
+  chosen outside it: an annotated `let view: &'a T = &place` binding, or an unannotated borrow a
+  call constrains to outlive such a lifetime. It therefore rejects a write to the borrowed place
+  after the view's last use, even when nothing stores the view. Stricter is safe.
+- **Native:** ends such a loan at its last use unless a call or callable can store it where the
+  caller can still read it, then keeps it live wherever its creation reaches.
+- **Source migration:** none.
+- Retire this entry when the bootstrap is deleted.
