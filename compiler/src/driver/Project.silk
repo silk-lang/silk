@@ -16,6 +16,7 @@ import silk.toml_scanner { TomlError }
 import silk.toml_value { Toml, TomlChild, Value as TomlValue }
 import silk.usize
 import silk.vector { Vector }
+import driver.CommandPath
 import driver.PlatformSupply as PlatformSupplies { Request as SupplyRequest, SupplyError }
 import driver.ProjectProfile as ProjectProfiles { Code as ProfileCode, InvalidProfile }
 import driver.TargetSelector
@@ -40,6 +41,7 @@ pub struct Project {
   directory: Path
   name: Bytes
   entry: Path
+  sourceRoot: Path
   outputDirectory: Path
   form: Form
   stage: Stage
@@ -316,6 +318,20 @@ pub fn isSemanticVersion(version: &[u8]) -> bool {
 }
 
 // The first key of the table `table` that is not one of `allowed`.
+// Whether `value` is present and anything but an empty array.
+fn listsAny(value: Option<&TomlValue>) -> bool {
+  return match move value {
+    Option<&TomlValue>.Some { value: present } => match move Toml.item(present, usize.ZERO) {
+      Option<&TomlValue>.Some { .. } => true
+      Option<&TomlValue>.None => match &present.* {
+        TomlValue.Array { .. } => false
+        _ => true
+      }
+    }
+    Option<&TomlValue>.None => false
+  }
+}
+
 fn unsupportedKey<'a>(table: &'a TomlValue, allowed: &[&[u8]]) -> Option<&'a [u8]> {
   return match &table.* {
     TomlValue.Table { entries, kind: _ } => {
@@ -409,10 +425,35 @@ pub effect fn decode(manifest: &Path, text: &[u8]) -> Project
     root,
     b"package.root must name a file inside the project"
   )
-  // `source-root` moves module resolution away from the root's directory, which native project
-  // commands do not implement yet; refusing it keeps them from building different sources.
-  if let Option<&TomlValue>.Some { value: _ } = move Toml.fieldAt(Toml.field(&document, "package"), "source-root") {
-    return run invalid(manifest, b"package.source-root is not supported by the native compiler yet")
+  // Modules resolve below `source-root`, else below the root's directory, and the root must be one.
+  let sourceRootDetail = b"package.source-root must be a non-empty string"
+  let mut sourceRoot = match move run Path.parent(&entry) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => run invalid(manifest, b"package.root must name a file inside the project")
+  }
+  if let Option<&TomlValue>.Some { value: written } = move Toml.fieldAt(Toml.field(&document, "package"), "source-root") {
+    let text = match move Toml.asString(Option<&TomlValue>.some(written)) {
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => run invalid(manifest, sourceRootDetail)
+    }
+    if text.length == usize.ZERO {
+      return run invalid(manifest, sourceRootDetail)
+    }
+    sourceRoot = match move run Effect.result(CommandPath.resolve(&directory, text)) {
+      Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+      Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+        FileError rejected => {
+          drop rejected
+          return run invalid(manifest, sourceRootDetail)
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+  if !within(Path.rawBytes(&sourceRoot), Path.rawBytes(&entry)) {
+    return run invalid(manifest, b"package.root must be a module below the source root")
   }
   // TypeScript also requires the version; the corpus and smoke harnesses on `main` still write
   // manifests without one, so a missing version is accepted until they declare it.
@@ -447,6 +488,14 @@ pub effect fn decode(manifest: &Path, text: &[u8]) -> Project
     // than ignored.
     if let Option<&TomlValue>.Some { value: _ } = move Toml.field(build, "native-bindings") {
       return run invalid(manifest, b"build.native-bindings is not supported by the native compiler yet")
+    }
+    // Native requirements and retention roots change what a build links and keeps; until native
+    // builds honor them, a composition naming any is refused rather than built without them.
+    if listsAny(Toml.fieldAt(Toml.field(build, "composition"), "requirements")) {
+      return run invalid(manifest, b"build.composition.requirements is not supported by the native compiler yet")
+    }
+    if listsAny(Toml.fieldAt(Toml.field(build, "composition"), "retention")) {
+      return run invalid(manifest, b"build.composition.retention is not supported by the native compiler yet")
     }
   }
   let outputDetail = b"build.output-dir must be a non-empty manifest-relative directory that does not escape the project"
@@ -537,6 +586,7 @@ pub effect fn decode(manifest: &Path, text: &[u8]) -> Project
     directory: move directory,
     name: run Bytes.copy(name),
     entry: move entry,
+    sourceRoot: move sourceRoot,
     outputDirectory: move outputDirectory,
     form: form,
     stage: stage,
@@ -634,6 +684,21 @@ pub fn name(self: &Project) -> &[u8] {
 /// Borrows the platform supply `[build].platform-supply` requests: automatic when it names none.
 pub fn supply(self: &Project) -> &SupplyRequest {
   return &self.supply
+}
+
+/// Borrows the directory modules resolve below: `[package].source-root`, else the entry's directory.
+pub fn sourceRoot(self: &Project) -> &Path {
+  return &self.sourceRoot
+}
+
+// Whether the normalized absolute `path` lies strictly below the directory `root`.
+fn within(root: &[u8], path: &[u8]) -> bool {
+  let mut prefix = root.length
+  if same(root, b"/") {
+    prefix = usize.ZERO
+  }
+  return path.length > prefix + usize.ONE && same(Slice.view<u8>(path, usize.ZERO, prefix), Slice.view<u8>(root, usize.ZERO, prefix))
+    && path[prefix] == 47
 }
 
 /// Borrows the resolved `[package].root` entry.
@@ -829,23 +894,19 @@ fn isModulePath(path: &[u8]) -> bool {
 pub effect fn selectSource(self: &Project, path: &Path) -> SourceSelection
   ! OutOfMemoryError
   ? &mut Allocator {
-  let sourceRoot = match move run Path.parent(&self.entry) {
-    Option<Path>.Some { value } => move value
-    Option<Path>.None => { return SourceSelection.NotModule }
-  }
-  let root = Path.rawBytes(&sourceRoot)
+  let root = Path.rawBytes(&self.sourceRoot)
   let selected = Path.rawBytes(path)
-  if selected.length <= root.length + usize.ONE || !same(Slice.view<u8>(selected, usize.ZERO, root.length), root)
-    || selected[root.length] != 47 {
-    return SourceSelection.Outside { sourceRoot: move sourceRoot }
+  if !within(root, selected) {
+    return SourceSelection.Outside { sourceRoot: run copyPath(&self.sourceRoot) }
   }
-  if !isModulePath(Slice.view<u8>(selected, root.length + usize.ONE, selected.length - root.length - usize.ONE)) {
+  let mut prefix = root.length + usize.ONE
+  if same(root, b"/") {
+    prefix = usize.ONE
+  }
+  if !isModulePath(Slice.view<u8>(selected, prefix, selected.length - prefix)) {
     return SourceSelection.NotModule
   }
-  let directory = Path.rawBytes(&self.directory).length
-  return SourceSelection.Module {
-    relative: run Bytes.copy(Slice.view<u8>(selected, directory + usize.ONE, selected.length - directory - usize.ONE)),
-  }
+  return SourceSelection.Module { relative: run CommandPath.relative(&self.directory, path) }
 }
 
 /// Removes the output directory and everything below it, or a file in its place; an absent output
