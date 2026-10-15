@@ -447,6 +447,31 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
+  // `[package].source-root` roots module resolution above the entry's own directory.
+  yield* fs.makeDirectory(join(directory, 'rooted/src/app'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'rooted/src/lib'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'rooted/src/lib/limit.silk'),
+    'pub fn limit() -> i32 {\n  return 9\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'rooted/src/app/main.silk'),
+    'import lib.limit { limit }\n\npub fn main() -> i32 {\n  return limit()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'rooted/silk.toml'),
+    '[package]\nname = "rooted"\nversion = "0.1.0"\nroot = "src/app/main.silk"\nsource-root = "src"\n',
+  )
+  const rooted = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'rooted'),
+    {
+      ...process.env,
+      SILK_CLANG: clang,
+    },
+  )
+  assert.equal(rooted.status, 9, rooted.stderr)
   // A full JSON profile replaces the target selection and adds its own bindings after them.
   const overridden = yield* invoke(
     silk,
@@ -717,7 +742,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
