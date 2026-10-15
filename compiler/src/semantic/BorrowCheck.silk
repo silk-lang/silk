@@ -251,6 +251,9 @@ struct Event {
   // For a replacement, whether its right-hand side moves out of the target: 0 no, 1 yes, 2 only
   // through an unknown index.
   consumesTarget: usize
+  // The place match whose binding this access goes through, or `usize.MAX` (see `Path`).
+  refiner: usize
+  refinedDepth: usize
 }
 
 struct Point {
@@ -311,6 +314,11 @@ struct Path {
   through: bool
   steps: Vector<Step>
   indexes: Vector<NodeId>
+  // The subject node of the innermost `match place` whose binding names this place, or
+  // `usize.MAX`, and how many leading steps name that subject. The binding denotes the payload
+  // the match selected only until the subject place is written or moved (MATCH-001).
+  refiner: usize
+  refinedDepth: usize
 }
 
 struct Holding {
@@ -375,7 +383,17 @@ struct Walker {
   crossed: bool
   // How lowering keeps the temporaries of the binding initializer or `let` subject being walked.
   retention: Retention
+  // Each `match place` and the point after its subject access, where it selects its arm.
+  refinements: Vector<Refinement>
 }
+
+// A `match place` at `subject` selects the variant its bindings refine at point `test`.
+struct Refinement {
+  subject: usize
+  test: usize
+}
+
+impl Copy for Refinement {}
 
 // How lowering keeps a binding's temporaries (BORROW-006). It keeps every temporary of a viewing
 // binding's initializer, and of a borrowing destructuring `let`'s subject, for the binding's scope;
@@ -542,7 +560,7 @@ fn sliceValue(nodes: &[Node], id: NodeId) -> bool {
 
 // Reads the written place of `id`, or a path with root `usize.MAX` when it names no place.
 effect fn pathOf(nodes: &[Node], id: NodeId) -> Path ! OutOfMemoryError ? &mut Allocator {
-  let mut path = Path {root: usize.MAX, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make()}
+  let mut path = Path {root: usize.MAX, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make(), refiner: usize.MAX, refinedDepth: usize.ZERO}
   run extendPath(nodes, id, usize.MAX, &mut path)
   return move path
 }
@@ -550,7 +568,7 @@ effect fn pathOf(nodes: &[Node], id: NodeId) -> Path ! OutOfMemoryError ? &mut A
 // Reads the place `id` names when the value of `base`, which names no place, is held by its hidden
 // owner (BORROW-006): `base`'s projections, indexes and dereferences extend that owner's root.
 effect fn temporaryPath(nodes: &[Node], id: NodeId, base: NodeId) -> Path ! OutOfMemoryError ? &mut Allocator {
-  let mut path = Path {root: usize.MAX, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make()}
+  let mut path = Path {root: usize.MAX, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make(), refiner: usize.MAX, refinedDepth: usize.ZERO}
   run extendPath(nodes, id, base.index, &mut path)
   return move path
 }
@@ -691,6 +709,12 @@ effect fn bindingPath(nodes: &[Node], subject: NodeId, steps: &[PlaceStep], acce
     if base.root != usize.MAX {
       path.root = base.root
       path.through = base.through
+      path.refiner = base.refiner
+      path.refinedDepth = base.refinedDepth
+      if access == BindingAccess.Place {
+        path.refiner = subject.index
+        path.refinedDepth = Vector<Step>.length(&base.steps)
+      }
       path.steps = move base.steps
     }
   }
@@ -747,6 +771,63 @@ fn determined(place: &Place) -> bool {
   return true
 }
 
+// Whether `written` names the first `depth` steps of `used`, or a prefix of them: replacing or
+// moving it replaces the subject a refined binding of `used` was selected from.
+fn coversRefined(written: &Place, used: &Place, depth: usize) -> bool {
+  if written.root != used.root { return false }
+  let first = Vector<Step>.asSlice(&written.steps)
+  let second = Vector<Step>.asSlice(&used.steps)
+  if first.length > depth || depth > second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at].kind == StepKind.AnyElement || !sameStep(first[at], second[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether control can pass from point `from` to point `to` without passing `test`, where the match
+// selects its variant again. Back edges count: a later iteration of a loop in the arm reaches it.
+effect fn reachesAvoiding(walker: &Walker, from: usize, to: usize, test: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let points = Vector<Point>.asSlice(&walker.points)
+  let mut seen = Vector<bool>.make()
+  let mut at = usize.ZERO
+  while at < points.length {
+    run Vector<bool>.append(&mut seen, false)
+    at = at + usize.ONE
+  }
+  let mut pending = Vector<usize>.make()
+  run Vector<usize>.append(&mut pending, from)
+  while Vector<usize>.length(&pending) > usize.ZERO {
+    let last = Vector<usize>.length(&pending) - usize.ONE
+    let point = Vector<usize>.remove(&mut pending, last)
+    let next = Vector<usize>.asSlice(&points[point].next)
+    let mut successor = usize.ZERO
+    while successor < next.length {
+      let target = next[successor]
+      if target == to { return true }
+      if target != test && !Vector<bool>.asSlice(&seen)[target] {
+        let mut marked = Vector<bool>.asMutSlice(&mut seen)
+        marked[target] = true
+        run Vector<usize>.append(&mut pending, target)
+      }
+      successor = successor + usize.ONE
+    }
+  }
+  return false
+}
+
+// The point where the `match place` at `subject` selects its variant, or `usize.MAX`.
+fn refinementTest(walker: &Walker, subject: usize) -> usize {
+  let refinements = Vector<Refinement>.asSlice(&walker.refinements)
+  let mut at = usize.ZERO
+  while at < refinements.length {
+    if refinements[at].subject == subject { return refinements[at].test }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
 fn conflictCode(kind: Kind, exclusive: bool) -> Option<RejectionCode> {
   if kind == Kind.ExclusiveBorrow || (kind == Kind.SharedBorrow && exclusive) {
     return Option<RejectionCode>.some(RejectionCode.LoanConflict)
@@ -784,6 +865,8 @@ effect fn access(walker: &mut Walker, path: &Path, kind: Kind, span: Location, a
       span: span,
       loan: loan,
       consumesTarget: usize.ZERO,
+      refiner: path.refiner,
+      refinedDepth: path.refinedDepth,
     },
   )
   return point
@@ -1860,7 +1943,9 @@ effect fn releaseScopes(walker: &mut Walker, keep: usize, span: Location, at: us
       root: root,
       through: false,
       steps: Vector<Step>.make(),
-      indexes: Vector<NodeId>.make()
+      indexes: Vector<NodeId>.make(),
+      refiner: usize.MAX,
+      refinedDepth: usize.ZERO,
     }
     if expires[index] {
       current = run access(&mut walker.*, &path, Kind.Expire, span, current, usize.MAX)
@@ -2332,7 +2417,7 @@ effect fn replace(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walke
   if Vector<Carry>.length(&flow.carried) > usize.ZERO {
     retained = run retains(&ty, owner)
   }
-  let path = Path {root: local, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make()}
+  let path = Path {root: local, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make(), refiner: usize.MAX, refinedDepth: usize.ZERO}
   let cleaned = run observeCleanup(&mut walker.*, local, span, flow.at)
   let point = run access(&mut walker.*, &path, Kind.Write, span, cleaned, usize.MAX)
   markConsumedTarget(&mut walker.*, since, point, span)
@@ -2381,6 +2466,9 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
   }
   walker.retention = retention
   let tested = run newPoint(&mut walker.*, flow.at)
+  if access == Scrutinee.Place && path.root != usize.MAX {
+    run Vector<Refinement>.append(&mut walker.refinements, Refinement {subject: subject.index, test: tested})
+  }
   if Vector<Carry>.length(&flow.carried) > usize.ZERO {
     // Bindings of a subject that carries a loan would hold it.
     let retained = run nodeRetains(nodes, subject, owner)
@@ -2924,6 +3012,35 @@ fn boundInside(walker: &Walker, repeat: &Loop, local: usize) -> bool {
   return false
 }
 
+// Whether a loop repeats with every `match place` refinement it uses intact: a write in the body
+// to the subject of a match outside the loop invalidates a binding the next iteration uses (the
+// bootstrap's `OWN0005` otherwise).
+effect fn refinementRepeats(walker: &Walker, events: &[Event], repeat: &Loop) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut use = usize.ZERO
+  while use < events.length {
+    let used = &events[use]
+    if used.refiner != usize.MAX && used.point >= repeat.header && used.point < repeat.end
+      && used.kind != Kind.End && used.kind != Kind.Expire {
+      let test = refinementTest(walker, used.refiner)
+      if test != usize.MAX && (test < repeat.header || test >= repeat.end) {
+        let mut source = usize.ZERO
+        while source < events.length {
+          let written = &events[source]
+          if written.point >= repeat.header && written.point < repeat.end
+            && (written.kind == Kind.Write || written.kind == Kind.Move || written.kind == Kind.Drop)
+            && coversRefined(&written.place, &used.place, used.refinedDepth)
+            && run reachesAvoiding(walker, written.point, used.point, test) {
+            return false
+          }
+          source = source + usize.ONE
+        }
+      }
+    }
+    use = use + usize.ONE
+  }
+  return true
+}
+
 // Whether a loop repeats with the same moved places of its outer locals as it enters with
 // (the bootstrap's `OWN0005` otherwise).
 fn compatibleHeader(walker: &Walker, events: &[Event], moves: &[usize], reach: &Reach, width: usize, repeat: &Loop) -> bool {
@@ -2982,6 +3099,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     guardConsumed: Option<Location>.none(),
     crossed: false,
     retention: Retention.None,
+    refinements: Vector<Refinement>.make(),
   }
   run Vector<Scope>.append(&mut walker.scopes, Scope {roots: Vector<usize>.make(), expiring: Vector<usize>.make(), statement: false})
   let mut parameter = usize.ZERO
@@ -3064,7 +3182,8 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
   while at <= events.length {
     // A loop header is checked in evaluation order, before the first access after it.
     while checkedLoops < loops.length && (at == events.length || loops[checkedLoops].header < events[at].point) {
-      if moveWidth > usize.ZERO && !compatibleHeader(&walker, events, moved, &reach, moveWidth, &loops[checkedLoops]) {
+      let repeats = run refinementRepeats(&walker, events, &loops[checkedLoops])
+      if (moveWidth > usize.ZERO && !compatibleHeader(&walker, events, moved, &reach, moveWidth, &loops[checkedLoops])) || !repeats {
         let span = loops[checkedLoops].span
         return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.IncompatibleLoopHeader, access: span, earlier: Option<Location>.none()}
       }
@@ -3111,6 +3230,22 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
         }
       }
       bit = bit + usize.ONE
+    }
+    // A `match place` binding names the payload its match selected. Once the subject place is
+    // replaced, the binding no longer denotes a place of it, as the bootstrap reports (OWN0002).
+    if event.refiner != usize.MAX && event.kind != Kind.End && event.kind != Kind.Expire {
+      let test = refinementTest(&walker, event.refiner)
+      let mut source = usize.ZERO
+      while test != usize.MAX && source < events.length {
+        let written = &events[source]
+        if (written.kind == Kind.Write || written.kind == Kind.Move || written.kind == Kind.Drop)
+          && coversRefined(&written.place, &event.place, event.refinedDepth)
+          && run reachesAvoiding(&walker, written.point, event.point, test) {
+          return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.ExtractionBoundary,
+            access: event.span, earlier: Option<Location>.some(written.span)}
+        }
+        source = source + usize.ONE
+      }
     }
     let mut index = usize.ZERO
     while index < loans.length {
