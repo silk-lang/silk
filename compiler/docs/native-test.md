@@ -27,6 +27,11 @@ silkc test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--fil
   `<executable>.plan` and `<executable>.receipt` and removed after the run.
 - `--filter` and `--file` are passed to the runner unchanged (TEST-006). `--file` takes the
   package-relative logical path the catalog reports, such as `src/semantic/TargetCases.silk`.
+- `silkc test [project options] [--root <path>] [--file <path>] [--filter <text>] --no-cache`,
+  without a root, is the project form of the TypeScript `silk test`: it loads the nearest (or the
+  `--manifest-path`) project, takes `--root` or else `[package].root` as the discovery root, and
+  writes the runner to `<output-dir>/test/llvm/<target>/<profile>/<name>`. Its `--file` is
+  resolved against the project directory and passed as the project-relative path.
 - `--no-cache` is required for now. Result reuse (TEST-008) needs execution identities that the
   native compiler does not publish yet; without the flag the command reports
   `SILK_GAP test-result-cache` and exits 2 before compiling. When execution identities land, the

@@ -319,6 +319,17 @@ existing manifest or entry, a `src` that is not a directory or an ancestor that 
 with status 2 before anything is written, and a failure part-way removes everything initialization
 created and restores the previous `.gitignore`.
 
+Project test invocation: `silkc test [project options] [--root <path>] [--file <path>]
+[--filter <text>] --no-cache`, that is `test` without a discovery root; the project options are
+`build`'s. It loads the project as `run` does and builds the test runner for the host, as the
+TypeScript `silk test` does: always a final executable, whatever `[build].artifact` and
+`[build].stage` select, at `<output-dir>/test/llvm/<target>/<profile>/<name>`. Discovery starts at
+`--root`, else at `[package].root`. `--root` and `--file` are resolved against the project
+directory and must name a canonical `.silk` module path below the directory of `[package].root`;
+the runner receives `--file` as the project-relative path its catalog reports. A foreign target,
+an invalid selection and a run without `--no-cache` (see below) exit 2 before building; otherwise
+the status is the test run's, as for a file-root `test`.
+
 Clean invocation: `silkc clean [--manifest-path <path>]`. It removes the project's `[build].output-dir` and
 everything below it, as the TypeScript `silk clean` does, and prints `Removed <directory>`. An
 absent output directory is already clean. Only builds write there, and the manifest decoder keeps
