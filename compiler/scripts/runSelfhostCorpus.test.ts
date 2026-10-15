@@ -413,4 +413,26 @@ exit 1`
     assert.strictEqual(result.status, 'fail')
     assert.strictEqual(result.status === 'fail' ? result.code : '', 'ACCEPTED_INVALID')
   })
+  // An acceptance with bodies left unchecked, reached or not, claims nothing: a declared gap. With
+  // every body checked it fails.
+  const accepting = (emitted: number, root: number) =>
+    `echo 'SILK_GAP borrow-check: ${emitted} bodies not borrow-checked (all checked; native borrow checking is roadmap step 14)' >&2
+echo 'SILK_GAP borrow-check root-package: ${root} bodies not borrow-checked (all checked; native borrow checking is roadmap step 14)' >&2
+${compiled}`
+  for (const [emitted, root, expected] of [
+    [0, 0, 'ACCEPTED_INVALID'],
+    [0, 5, 'BORROW_CHECK_GAP'],
+    [2, 0, 'BORROW_CHECK_GAP'],
+  ] as const)
+    await withStub(accepting(emitted, root), async (silkc) => {
+      const result = await runCase(silkc, rejected)
+      assert.deepStrictEqual(
+        result.status === 'fail'
+          ? result.code
+          : result.status === 'unsupported'
+            ? result.gaps.map((gap) => gap.code).join()
+            : result.status,
+        expected,
+      )
+    })
 })
