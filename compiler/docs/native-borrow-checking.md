@@ -278,6 +278,15 @@ still yields `Imprecise`, never a definite rejection or `Checked`: a shared infe
 not identify which operand a generic result retains. Other unknown retention, including missing
 region mappings and projected-assignment uncertainty, remains excluded from region proofs. A
 later operation cannot upgrade an already unknown mapping to a complete union.
+A known result borrow also keeps the ancestors recorded by actual reborrow provenance. The
+retention walk computes one closure over already-carried loans, starting at outer borrow atoms
+named by the result and following their actual parent atoms. An ancestor enters the complete
+possible-source union, never exact retention; previously unknown provenance stays unknown.
+Every source sharing a parent atom remains in the union. An inner retained lifetime is not a
+parent edge, so this rule cannot use an owned `Shelf` borrow to establish retention of its inner
+reference. Conflicts with possible ancestors remain imprecise, and every region proof still
+checks every carried source.
+
 Static storage validity does not remove alias restrictions. Loan retention includes explicit
 `'static` atoms for references, aggregates and retained environments. A holder of a static shared
 view still prevents mutation through its source until the holder's final use. Lifetime-only
