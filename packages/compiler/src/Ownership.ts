@@ -1901,8 +1901,9 @@ const analyzeLoans = (
   let loanAccessChecks = 0
   const loans: Array<LoanFact> = []
   // Borrowed match bindings are projections of the scrutinee valid only within their selected arm
-  // (MATCH-002). Their owner stays loaned until the arm's last binding use; no value carries the
-  // loan beyond the arm, so it spans that arm's text and never reaches cleanup planning.
+  // (MATCH-002). Their owner stays loaned until the arm's last binding use, so writing, moving, or
+  // exclusively borrowing it before then conflicts. No value carries the loan beyond the arm, so
+  // it spans that arm's text and never reaches cleanup planning.
   const bindingLoans: Array<{ readonly loan: LoanFact; readonly from: number }> = []
   const invocations: Array<InvocationOwnership> = []
   const diagnostics: Array<Diagnostic.Diagnostic> = []
@@ -3266,7 +3267,9 @@ const analyzeLoans = (
                 .map((referent) => [referentKey(referent), referent]),
             ).values(),
           ],
-          access: expression.access,
+          // The owner may still be read while an exclusive binding is idle; only an access that
+          // invalidates or exclusively reborrows the bound payload conflicts.
+          access: 'Shared',
           origin: 'MatchBinding',
           suspendsParent: false,
           startRegion: region,
