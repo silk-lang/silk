@@ -75,7 +75,7 @@ export interface BuildOptions {
   readonly timeoutMs?: number | undefined
 }
 // Forward standard process necessities only; compiler/tool overrides come from verified inputs.
-// Never serialize this environment: measurement exposes only the verified SILKC_CLANG binding.
+// Never serialize this environment: measurement exposes only the verified clang binding.
 const allowedEnvironment = [
   'PATH',
   'SDKROOT',
@@ -87,12 +87,15 @@ const allowedEnvironment = [
   'LC_ALL',
   'LC_CTYPE',
 ]
+// The variable that names the clang a compiler of `generation` links with. The pinned seed predates
+// SILK_CLANG and reads SILKC_CLANG; that binding goes with the next re-pin.
+const clangVariable = (generation: string) => (generation === 'seed' ? 'SILKC_CLANG' : 'SILK_CLANG')
 const nativeEnvironment = (
   current: Readonly<Record<string, string | undefined>>,
   clang: string,
+  generation: string,
 ): Readonly<Record<string, string>> => {
-  // The pinned seed predates SILK_CLANG and reads SILKC_CLANG; this goes with the next re-pin.
-  const env: Record<string, string> = { SILKC_CLANG: clang }
+  const env: Record<string, string> = { [clangVariable(generation)]: clang }
   for (const name of allowedEnvironment) {
     const value = current[name]
     if (value !== undefined) env[name] = value
@@ -192,7 +195,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   const fs = yield* FileSystem.FileSystem
   producer = resolve(producer)
   clang = resolve(clang)
-  environment = nativeEnvironment(environment, clang)
+  environment = nativeEnvironment(environment, clang, producerGeneration)
   snapshot = resolve(snapshot)
   outputDirectory = resolve(outputDirectory)
   corpusSource = resolve(corpusSource)
@@ -272,7 +275,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return yield* reject('verified clang target must be a regular executable')
       const sha256 = yield* fileHash(path)
       const result = yield* NativeProcess.execute(path, ['--version'], {
-        env: nativeEnvironment(environment, path),
+        env: nativeEnvironment(environment, path, producerGeneration),
         timeoutMs,
       }).pipe(
         Effect.mapError(
@@ -297,7 +300,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       ...tool,
       environmentPolicy: 'standard-host-with-verified-clang',
     }
-    const env = nativeEnvironment(environment, tool.path)
+    const environmentFor = (compiler: string) => nativeEnvironment(environment, tool.path, compiler)
     const program = yield* smokeProgram(corpusSource).pipe(staged('inputs'))
     const smoke = {
       name: 'trivial-features',
@@ -319,7 +322,8 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       )
         return yield* reject('verified clang changed during native build/smoke')
     })
-    const invoke = (name: string, command: ReadonlyArray<string>, cwd: string) =>
+    // `compiler` is the generation whose compiler the stage runs, which selects its clang variable.
+    const invoke = (name: string, command: ReadonlyArray<string>, cwd: string, compiler: string) =>
       Effect.gen(function* () {
         yield* checkInputs()
         const evidence = yield* NativeProcess.run({
@@ -327,7 +331,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
           cwd,
           resourceFile: join(outputDirectory, `${name}-rss.txt`),
           timeCommand,
-          env,
+          env: environmentFor(compiler),
           timeoutMs,
         })
         const result = evidence.measurement
@@ -380,13 +384,14 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       '--debug',
       String(debug),
     ]
-    const emitIr = (name: string, compiler: string) =>
+    const emitIr = (name: string, compiler: string, compilerGeneration: string) =>
       Effect.gen(function* () {
         const ir = join(outputDirectory, `${name}.ll`)
         const emitted = yield* invoke(
           name,
           [compiler, ...argumentsFor(compilerRoot, ir, 'llvm-ir')],
           join(snapshot, 'compiler'),
+          compilerGeneration,
         )
         if (!NativeProcess.succeeded(emitted)) return yield* reject(`${name} emission failed`)
         return yield* fileHash(ir)
@@ -396,6 +401,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         'native-build',
         [producer, ...argumentsFor(compilerRoot, receipt.output.path, 'executable')],
         join(snapshot, 'compiler'),
+        producerGeneration,
       )
       if (!NativeProcess.succeeded(built))
         return yield* reject(`${producerGeneration} native build failed`)
@@ -408,9 +414,12 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     }).pipe(staged('native-build'))
     const producerIr = `${producerGeneration}-ir`
     if (receipt.fixpoint) {
-      const [, producerIrSha256] = yield* Effect.all([build, emitIr(producerIr, producer)], {
-        concurrency: 2,
-      })
+      const [, producerIrSha256] = yield* Effect.all(
+        [build, emitIr(producerIr, producer, producerGeneration)],
+        {
+          concurrency: 2,
+        },
+      )
       receipt.fixpoint.producerIrSha256 = producerIrSha256
     } else yield* build
     const output = receipt.output.path
@@ -430,6 +439,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         'smoke-build',
         [output, ...argumentsFor(smokeSource, smokeBinary, 'executable')],
         smokeDirectory,
+        generation,
       )
       if (!NativeProcess.succeeded(smokeBuilt))
         return yield* reject(`${generation} smoke compilation failed`)
@@ -437,7 +447,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     }).pipe(staged('smoke-build'))
     receipt.smoke = { ...smoke, outputSha256: smokeOutput }
     yield* Effect.gen(function* () {
-      const ran = yield* invoke('smoke-run', [smokeBinary], smokeDirectory)
+      const ran = yield* invoke('smoke-run', [smokeBinary], smokeDirectory, generation)
       if (ran.error !== null || ran.signal !== null || ran.exitCode !== 42 || ran.stdout !== '')
         return yield* reject('trivial-features exit/stdout mismatch')
       if ((yield* executableHash(output, true)) !== outputSha256)
@@ -449,7 +459,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return yield* reject('smoke input/output changed during execution')
     }).pipe(staged('smoke-run'))
     if (receipt.fixpoint) {
-      const outputIrSha256 = yield* emitIr(`${generation}-ir`, output)
+      const outputIrSha256 = yield* emitIr(`${generation}-ir`, output, generation)
       receipt.fixpoint.outputIrSha256 = outputIrSha256
       if (outputIrSha256 !== receipt.fixpoint.producerIrSha256)
         return yield* reject(

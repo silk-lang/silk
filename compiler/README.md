@@ -237,7 +237,7 @@ storage component: the application's `export "C"` functions are its roots, so a 
 object and archive inputs by a relocatable link and refuses any other declared input. A
 `static-library` form acquires no catalog runtime either; its final stage compiles one object and
 archives it with `llvm-ar rcsD` beside the declared object inputs, refusing any other declared input.
-The archiver is `SILKC_AR`, or else the `llvm-ar` beside the configured Clang. The shared library
+The archiver is `SILK_LLVM_AR`, or else the `llvm-ar` beside the configured Clang. The shared library
 form stops with `SILK_GAP artifact-form` before any tool runs. Invalid or
 repeated output selectors fail before source loading.
 With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
@@ -506,16 +506,17 @@ the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first g
 ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
 verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-Without `SILKC_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
-does, and refuses with status 2 when there is none. With `SILKC` pointing at the verified ARM64
-executable and `SILKC_CLANG` pointing at LLVM 22 `clang`, development builds use the native
-compiler directly:
+Without `SILK_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
+does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
+executable and `SILK_CLANG` pointing at LLVM 22 `clang`, development builds use the native
+compiler directly. A pinned seed predates `SILK_CLANG` and reads `SILKC_CLANG` until the next
+re-pin:
 
 ```sh
 mkdir -p .scratch
-"$SILKC" build compiler/src/main.silk -o .scratch/silk-next \
+"$SILK_COMPILER" build compiler/src/main.silk -o .scratch/silk-next \
   --stdlib "$PWD/packages/compiler/stdlib" --optimization speed
-"$SILKC" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
+"$SILK_COMPILER" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
   --stdlib "$PWD/packages/compiler/stdlib" --no-cache --filter frozenTarget
 ```
 
