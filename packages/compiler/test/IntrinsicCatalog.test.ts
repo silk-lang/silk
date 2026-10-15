@@ -1351,6 +1351,7 @@ it('matches the checked intrinsic inventory and records every unsafe invariant',
   )
   const entries = Intrinsic.inventory().map((entry) => ({
     operation: entry.operation,
+    phase: entry.phase,
     signature: entry.signature,
     unsafe: entry.unsafe,
     admission: entry.admission,
