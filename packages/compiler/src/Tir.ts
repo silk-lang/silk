@@ -966,6 +966,8 @@ type ExpressionNode =
   | {
       /** Atomically reads one writable place and stores a replacement, yielding the old value. */
       readonly _tag: 'Replace'
+      /** The authored destination, kept as evidence for loan analysis and never evaluated. */
+      readonly destination: Expression
       readonly place: WritePlace
       readonly value: Expression
       readonly type: DeclarationFacts.SemanticType

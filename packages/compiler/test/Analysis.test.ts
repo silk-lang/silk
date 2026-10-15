@@ -555,6 +555,107 @@ it.effect('keeps invalid match corpus failures phase-owned and downstream facts 
   }),
 )
 
+it.effect('rejects a place replacement that a live loan of the place observes', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter((program) =>
+      program.name.startsWith('replace-during-loan-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
+it.effect(
+  'keeps a loan whose region outlives a universal region live for the rest of the body',
+  () =>
+    Effect.gen(function* () {
+      for (const program of invalidCorpus.filter((program) =>
+        program.name.startsWith('universal-loan-'),
+      )) {
+        const self = yield* AnalysisFixture.retainingMain(
+          `memory/${program.name}`,
+          ascii(program.source),
+          'wasm32-unknown-unknown',
+        )
+        assert.deepStrictEqual(
+          reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+          program.diagnostics,
+          program.name,
+        )
+      }
+    }),
+)
+
+it.effect('reports each independent failure of an invalid body in source order', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter(
+      (program) =>
+        program.name.startsWith('statement-') ||
+        program.name.startsWith('short-circuit-') ||
+        program.name.startsWith('loop-condition-') ||
+        program.name.startsWith('aggregate-escape-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
+it.effect('rejects each expression beyond the EXPR-006 nesting limit at its first token', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter((program) =>
+      program.name.startsWith('expression-nesting-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
+it.effect('relates a call result stored into a caller-owned field to its argument loans', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter((program) =>
+      program.name.startsWith('field-store-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
 it.effect(
   'answers local, parameter, callable, field, and half-open semantic occurrence queries',
   () =>
