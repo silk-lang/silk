@@ -311,6 +311,11 @@ environment and the working directory, and its exit status or terminating signal
 A non-executable `[build].artifact` or a non-final `[build].stage` exits 2; a refused build keeps
 `build`'s status.
 
+Every successful compilation (`build`, a project `build`, `run` and `test`) prints
+`Compiled <source> -> <artifact> (llvm, <target>, N symbols)` on standard output, as the TypeScript
+CLI does: paths are relative to the project directory, or to the source's directory for a
+single-file build, and N is the number of symbols the emission plan names.
+
 `silk --help` (or `-h`) prints the command synopsis and `silk --version` (or `-v`) prints
 `silk v<version>`, both on standard output with status 0.
 
