@@ -684,9 +684,19 @@ Each entry records:
     bootstrap reports SEM0212 at `&held`; native keeps TypeMismatch (SEM0012) on the call, because
     the argument's subtyping fallback runs on that mismatch. Slice arguments report SEM0212 at the
     operand in both.
+  - A receiver call whose method or inherent impl bounds its lifetimes (`pair.view(short)` under
+    `impl<'a, 'b: 'a> Pair<'a, 'b>` with `'s: 'static` unproven): the bootstrap's region proof
+    reports SEM0212 at the function header; native proves the bound at the call and reports it
+    over the call. A call written on the type (`Pair<'static, 's>.widen(short)`) is SEM0212 over
+    the call in both.
+  - A returned call whose bound requires a body-owned borrow to outlive the `'static` result
+    (`return Pair.widen(&gone)`): the bootstrap reports OWN0019 at the call, then SEM0212 at
+    `&gone`; native reports SEM0212 over the call, as for a free function's bound.
 - **Source migration:** none; both compilers reject.
 - **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
-  (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`).
+  (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`) and
+  `SemanticCallableCases::inherentImplBoundsAreProvedAtEachCall` (`receiverEscape`,
+  `liftedEscape`).
 
 ### Bootstrap misses implied outlives from reference-to-lifetime-parameterized types
 
