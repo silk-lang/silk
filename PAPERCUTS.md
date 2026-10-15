@@ -705,3 +705,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 2026-10-15 · Concurrent R3 corpus drivers inherited the same CPU pair, wasting available parallelism; assign separate pairs to their Node processes and current descendants, and record scheduling changes outside budget samples · silk
 2026-10-15 · A transient managed-workspace handshake failure reported the environment failed while files and detached compiler jobs survived; after tools return, inspect saved receipts and process identities before restarting work · silk
+2026-10-15 · gh pr create returned GraphQL HTTP 401 after a successful push while REST auth still worked · created the draft with gh api POST /repos/silk-lang/silk/pulls using a JSON body file · silk R3
