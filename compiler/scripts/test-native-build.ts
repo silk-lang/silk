@@ -131,6 +131,33 @@ const program = Effect.gen(function* () {
   })
   assert.equal(clangless.status, 2, 'a missing clang is an operational failure')
   assert.equal(yield* fs.exists(join(directory, 'clangless')), false)
+  // `--clang` wins over SILK_CLANG: a path resolves against the working directory and a bare name
+  // is searched on PATH.
+  const flagged = yield* invoke(
+    silk,
+    [...argumentsFor('flagged'), '--clang', './clang-sentinel'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.notEqual(flagged.status, 0, 'the sentinel clang fails the link')
+  assert.equal(yield* fs.exists(marker), true, 'the --clang path must run')
+  yield* fs.remove(marker)
+  const named = yield* invoke(silk, [...argumentsFor('named'), '--clang', 'clang'], directory, {
+    ...process.env,
+    SILK_CLANG: clang,
+    PATH: `${pathTools}:${process.env.PATH ?? ''}`,
+  })
+  assert.notEqual(named.status, 0, 'the sentinel clang fails the link')
+  assert.equal(yield* fs.exists(marker), true, 'a bare --clang name must run from PATH')
+  yield* fs.remove(marker)
+  const unnamed = yield* invoke(
+    silk,
+    [...argumentsFor('unnamed'), '--clang', 'no-such-clang'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(unnamed.status, 2, 'a --clang name missing from PATH is an operational failure')
+  assert.equal(yield* fs.exists(join(directory, 'unnamed')), false)
   // Another target emits its IR without linking; only the host target links an executable.
   const foreign =
     process.platform === 'darwin' ? 'x86_64-unknown-linux-gnu' : 'aarch64-apple-darwin'
@@ -472,6 +499,36 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(rooted.status, 9, rooted.stderr)
+  // A composition retention root keeps a private function from a module nothing imports.
+  yield* fs.makeDirectory(join(directory, 'retained/support'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'retained/main.silk'),
+    'pub fn answer() -> i32 {\n  return 3\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'retained/support/start.silk'),
+    'import Intrinsic.application\n\nexport "C" fn enter() -> i32 as "main" {\n  return application.answer()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'retained/support/keep.silk'),
+    'fn capability() -> i32 {\n  return 7177\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'retained/silk.toml'),
+    '[package]\nname = "retained"\nversion = "0.1.0"\nroot = "main.silk"\n\n[build]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"], retention = [{ module = "support/keep", declaration = "capability" }] }\n',
+  )
+  const retainedIr = yield* invoke(
+    silk,
+    ['build', 'main.silk', '-o', 'retained.ll', '--emit', 'llvm-ir', '--stdlib', standardLibrary],
+    join(directory, 'retained'),
+  )
+  assert.equal(retainedIr.status, 0, retainedIr.stderr)
+  const retainedText = yield* fs.readFileString(join(directory, 'retained/retained.ll'))
+  assert.match(retainedText, /i32 7177/)
+  assert.match(
+    retainedText,
+    /^@llvm\.used = appending global \[1 x ptr\] \[ptr @[^\]]+\], section "llvm\.metadata"$/m,
+  )
   // A full JSON profile replaces the target selection and adds its own bindings after them.
   const overridden = yield* invoke(
     silk,
@@ -497,6 +554,29 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(overridden.status, 5, overridden.stderr)
+  // A `none` runtime request selects no hosted start: the application's own C `main` is the entry.
+  yield* fs.makeDirectory(join(directory, 'bare'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'bare/main.silk'),
+    'export "C" fn start() -> i32 as "main" {\n  return 6\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'bare/silk.toml'),
+    '[package]\nname = "bare"\nversion = "0.1.0"\nroot = "main.silk"\n',
+  )
+  const bare = yield* invoke(
+    silk,
+    [
+      'run',
+      '--profile-input',
+      JSON.stringify({ target: hostTarget, runtime: { kind: 'none' } }),
+      '--stdlib',
+      standardLibrary,
+    ],
+    join(directory, 'bare'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(bare.status, 6, bare.stderr)
   const cleanedByPath = yield* invoke(silk, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
@@ -742,7 +822,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, runtime requests, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
