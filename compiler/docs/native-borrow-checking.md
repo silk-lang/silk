@@ -267,9 +267,10 @@ A universal target retains its exact identity and must follow declared/header pr
 input well-formedness bounds. Retained goals never supply those premises.
 A local parent is traced through every outer loan naming that inference atom until it reaches
 sufficient universal parents. Owned storage, unknown provenance, a cycle without such roots, and
-an atom used only as another loan's inner retained region stay pending. The symbolic proof caches
-its results by source and target within this one body; a proof for one universal cannot prove
-another. It does not use finite body points to infer a caller boundary.
+an atom used only as another loan's inner retained region stay pending. Cyclic reborrows are
+proved only when every reachable local component reaches a sufficient real parent; a grounded
+branch cannot justify an ungrounded sibling cycle. The symbolic proof caches completed results
+by source and target within this one body; a proof for one universal cannot prove another. It does not use finite body points to infer a caller boundary.
 Loan conflicts, approximate-flow guards, and all other retained goals are checked independently.
 When call or aggregate inference retags a fresh reference borrow with its shared region, its retained
 source-validity relations follow that same loan. This renaming is limited to the borrow's own
