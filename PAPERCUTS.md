@@ -763,3 +763,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-15 · R3 integration passed native Cases and T1 DDC but CI found 13 direct type constructors in two older unit Cases · migrate those fixtures to Types.intern with scoped TypeTable providers, and run TypesCapabilityCodemod --check on integrated heads · silk R3
 
 2026-10-15 · A fresh R3 worktree linked root node_modules but the checkout-owned verification harness could not resolve esbuild from packages/cli · Link the installed package-local cli, compiler and llvm node_modules as well before bundling the harness; preserve the failed receipt and rerun only the missing validation · Silk R3
+
+2026-10-15 · The R3 workflow failed a provider-prefix Case that inspected open obligations after R3 had fully proved both bodies · Demand the two bodies and assert Checked directly; private compile-time observations confirmed both statuses, and the original assertion passes on clean selfhost · Silk R3
