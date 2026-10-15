@@ -65,15 +65,15 @@ it.effect('rejects an exact usize magnitude outside the selected target before M
 
     assert.deepEqual(
       snapshot.diagnostics.map((diagnostic) => diagnostic.code),
-      ['LAY0001'],
+      ['SEM0002'],
     )
     const diagnostic = snapshot.diagnostics.at(0)
-    assert.strictEqual(diagnostic?.reason._tag, 'WordLiteralOutOfRange')
-    if (diagnostic?.reason._tag === 'WordLiteralOutOfRange') {
+    assert.strictEqual(diagnostic?.reason._tag, 'IntegerOutOfRange')
+    if (diagnostic?.reason._tag === 'IntegerOutOfRange') {
       assert.strictEqual(diagnostic.reason.type, 'usize')
       assert.strictEqual(diagnostic.reason.spelling, '4294967296')
-      assert.strictEqual(diagnostic.reason.bits, 32)
-      assert.strictEqual(diagnostic.reason.target, 'wasm32-unknown-unknown')
+      assert.strictEqual(diagnostic.reason.minimum, '0')
+      assert.strictEqual(diagnostic.reason.maximum, '4294967295')
     }
     assert.strictEqual(Analysis.mirOf(snapshot)._tag, 'Unavailable')
   }),
@@ -128,7 +128,7 @@ it.effect('rejects the exact native i64 magnitude for the WebAssembly target', (
     const wasm = yield* source(nativeExact, 'wasm32-unknown-unknown')
     assert.include(
       wasm.diagnostics.map((diagnostic) => diagnostic.code),
-      'LAY0001',
+      'SEM0002',
     )
     assert.strictEqual(Analysis.mirOf(wasm)._tag, 'Unavailable')
   }),
