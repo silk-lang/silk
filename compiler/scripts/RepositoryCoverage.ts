@@ -37,7 +37,6 @@ interface Receipt {
 
 const invalid = (message: string) => new CoverageError({ message })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-const esbuild: typeof import('../../packages/cli/node_modules/esbuild/lib/main.js') = require('esbuild')
 const hash = (source: string) => createHash('sha256').update(source.trim()).digest('hex')
 
 /** Remove comments and quoted literals before recognizing an exported entry declaration. */
@@ -134,45 +133,26 @@ export const exclusion = (path: string) => {
   if (path.startsWith('compiler/fixtures/'))
     return 'Lexer/parser input or the separately gated stdlib-root fixture.'
   if (path.startsWith('compiler/docs/')) return 'Compiler design probes; documentation evidence.'
+  if (path.startsWith('corpus/')) return 'Native corpus program or module; measured by the corpus.'
   return undefined
 }
 
-/** Materialize the actual corpus, without building or invoking the TypeScript compiler. */
-const corpusHashes = Effect.fnUntraced(function* (repository: string, temporary: string) {
-  const fs = yield* FileSystem.FileSystem
-  // The corpus and its fixture-reading support actors share this source directory.
-  const sourceUrl = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.String))(
-    pathToFileURL(join(repository, 'packages/compiler/test/support/corpus.ts')).href,
-  )
-  const bundled = yield* Effect.tryPromise({
-    try: () =>
-      esbuild.build({
-        absWorkingDir: repository,
-        entryPoints: ['packages/compiler/test/support/corpus.ts'],
-        bundle: true,
-        platform: 'node',
-        format: 'esm',
-        write: false,
-        define: { 'import.meta.url': sourceUrl },
-        banner: {
-          js: "import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);",
-        },
-      }),
-    catch: (cause) => new CoverageError({ message: 'Could not materialize the corpus', cause }),
-  })
-  // corpus.ts resolves its authored fixtures relative to import.meta.url, even when bundled.
-  const code = bundled.outputFiles.at(0)?.text
-  if (code === undefined) return yield* invalid('Corpus bundle has no output')
-  const entry = join(temporary, 'corpus.mjs')
-  yield* fs.writeFileString(entry, code)
+/** Read the native corpus from its data, without building or invoking the TypeScript compiler. */
+const corpusHashes = Effect.fnUntraced(function* (repository: string) {
   const corpus = yield* Effect.tryPromise({
-    try: () => import(pathToFileURL(entry).href),
-    catch: (cause) => new CoverageError({ message: 'Could not load the corpus inventory', cause }),
+    try: () => import(pathToFileURL(join(repository, 'corpus/corpus.mjs')).href),
+    catch: (cause) => new CoverageError({ message: 'Could not load the corpus', cause }),
+  })
+  const programs = yield* Effect.try({
+    try: () => corpus.loadPrograms('native'),
+    catch: (cause) => new CoverageError({ message: 'Could not read the native corpus', cause }),
   })
   const sources = yield* Schema.decodeUnknownEffect(
-    Schema.NonEmptyArray(Schema.Struct({ source: Schema.String })),
-  )(corpus.nativeCorpus)
-  return new Set(sources.map(({ source }) => hash(source)))
+    Schema.NonEmptyArray(
+      Schema.Struct({ source: Schema.String, reference: Schema.optional(Schema.String) }),
+    ),
+  )(programs)
+  return new Set(sources.map(({ source, reference }) => hash(reference ?? source)))
 })
 
 export const discover = Effect.fn('RepositoryCoverage.discover')(function* (
@@ -287,7 +267,7 @@ export const run = Effect.fn('RepositoryCoverage.run')(function* ({
   return yield* Effect.scoped(
     Effect.gen(function* () {
       const temporary = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-repository-coverage-' })
-      const corpus = yield* corpusHashes(repository, temporary)
+      const corpus = yield* corpusHashes(repository)
       const inventory = yield* discover(repository, corpus)
       const tree = join(temporary, 'repository')
       // Preserve sibling module paths. Each entry receives an isolated, synthetic package manifest.
