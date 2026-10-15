@@ -2788,13 +2788,7 @@ const addWordLiteral = (
     })
     return
   }
-  const diagnostic = Diagnostic.wordLiteralTargetOutOfRange(
-    type,
-    value.toString(),
-    target.id,
-    bits,
-    span,
-  )
+  const diagnostic = Diagnostic.integerOutOfRange(value.toString(), type, range, span)
   diagnostics.push(diagnostic)
   verdicts.push({
     _tag: 'UnavailableWordLiteral',

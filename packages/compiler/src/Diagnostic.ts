@@ -7,7 +7,7 @@ import type * as Target from './Target.js'
 import * as Token from './Token.js'
 
 /** The compiler phase that originated a diagnostic. */
-export type Phase = 'lexical' | 'parser' | 'module' | 'semantic' | 'ownership' | 'layout'
+export type Phase = 'lexical' | 'parser' | 'module' | 'semantic' | 'ownership'
 
 const phaseRank: Readonly<Record<Phase, number>> = {
   lexical: 0,
@@ -15,7 +15,6 @@ const phaseRank: Readonly<Record<Phase, number>> = {
   module: 2,
   semantic: 3,
   ownership: 4,
-  layout: 5,
 }
 
 /** Stable diagnostic code for a maximal unsupported byte region. */
@@ -136,7 +135,6 @@ export const assignmentTypeMismatchCode = 'SEM0037' as const
 export const transferOutsideLoopCode = 'SEM0038' as const
 export const invalidUnionMemberCode = 'SEM0039' as const
 export const incompatibleUnionConversionCode = 'SEM0040' as const
-export const matchScrutineeNotNominalCode = 'SEM0041' as const
 export const matchMemberNotInScrutineeCode = 'SEM0042' as const
 export const unreachableMatchArmCode = 'SEM0043' as const
 export const incompleteMatchCode = 'SEM0044' as const
@@ -479,9 +477,6 @@ export const localSharedAccessEscapeCode = 'OWN0016' as const
 /** Stable code for returning a callable or Effect that borrows storage owned by the returning function. */
 export const executableBorrowEscapeCode = 'OWN0018' as const
 
-/** Stable code for an exact `usize` or `isize` literal outside the selected target word. */
-export const wordLiteralOutOfRangeCode = 'LAY0001' as const
-
 /** Every stable diagnostic code any phase can produce. */
 export type Code =
   | typeof unknownLifetimeCode
@@ -556,7 +551,6 @@ export type Code =
   | typeof transferOutsideLoopCode
   | typeof invalidUnionMemberCode
   | typeof incompatibleUnionConversionCode
-  | typeof matchScrutineeNotNominalCode
   | typeof matchMemberNotInScrutineeCode
   | typeof unreachableMatchArmCode
   | typeof incompleteMatchCode
@@ -728,7 +722,6 @@ export type Code =
   | typeof storedEffectRunAccessCode
   | typeof localSharedAccessEscapeCode
   | typeof executableBorrowEscapeCode
-  | typeof wordLiteralOutOfRangeCode
 
 /** A semantic declaration identity carried structurally to avoid a module cycle. */
 export interface DeclarationEntity {
@@ -1047,15 +1040,6 @@ export type Reason<L = SourceSpan.SourceSpan> =
   | { readonly _tag: 'UnhandledEffectRequirements'; readonly requirements: ReadonlyArray<string> }
   | { readonly _tag: 'InvalidEffectProvision'; readonly detail: string }
   | {
-      readonly _tag: 'WordLiteralOutOfRange'
-      readonly type: 'usize' | 'isize'
-      readonly spelling: string
-      readonly target: string
-      readonly bits: 32 | 64
-      readonly minimum: string
-      readonly maximum: string
-    }
-  | {
       readonly _tag: 'DuplicateDeclarationName'
       readonly spelling: string
       readonly originalSpan: L
@@ -1269,7 +1253,6 @@ export type Reason<L = SourceSpan.SourceSpan> =
       readonly target: string
       readonly missing: ReadonlyArray<string>
     }
-  | { readonly _tag: 'MatchScrutineeNotNominal'; readonly actual: string }
   | {
       readonly _tag: 'MatchMemberNotInScrutinee'
       readonly member: string
@@ -3888,35 +3871,6 @@ export const unknownOwnedCallableReturn = <L>(span: L): Diagnostic<L> => ({
   span,
 })
 
-/** Creates the target-owned diagnostic for a `usize` literal outside its selected word. */
-export const wordLiteralTargetOutOfRange = <L>(
-  type: 'usize' | 'isize',
-  spelling: string,
-  target: string,
-  bits: 32 | 64,
-  span: L,
-): Diagnostic<L> => {
-  const minimum = type === 'usize' ? 0n : -(1n << BigInt(bits - 1))
-  const maximum = type === 'usize' ? (1n << BigInt(bits)) - 1n : (1n << BigInt(bits - 1)) - 1n
-  return {
-    _tag: 'Diagnostic',
-    phase: 'layout',
-    code: wordLiteralOutOfRangeCode,
-    severity: 'error',
-    message: `${type} literal ${spelling} exceeds the ${bits}-bit range for ${target}`,
-    reason: {
-      _tag: 'WordLiteralOutOfRange' as const,
-      type,
-      spelling,
-      target,
-      bits,
-      minimum: minimum.toString(),
-      maximum: maximum.toString(),
-    },
-    span,
-  }
-}
-
 /** Creates the diagnostic for a qualified call naming an unknown built-in actor. */
 export const unknownActor = <L>(spelling: string, span: L): Diagnostic<L> => ({
   _tag: 'Diagnostic',
@@ -4125,16 +4079,6 @@ export const incompatibleUnionConversion = <L>(
     target,
     missing: [...missing],
   },
-  span,
-})
-
-export const matchScrutineeNotNominal = <L>(actual: string, span: L): Diagnostic<L> => ({
-  _tag: 'Diagnostic',
-  phase: 'semantic',
-  code: matchScrutineeNotNominalCode,
-  severity: 'error',
-  message: `Cannot match non-nominal type ${actual}`,
-  reason: { _tag: 'MatchScrutineeNotNominal' as const, actual },
   span,
 })
 
