@@ -170,9 +170,11 @@ pub fn main() -> i32 {
   }),
 )
 
-it.effect('ends loans a match arm holds at the arm and keeps a joining branch loan held', () =>
-  Effect.gen(function* () {
-    const source = `struct Token { value: i32 }
+it.effect(
+  'ends loans an arm or iteration holds at its end and keeps a joining branch loan held',
+  () =>
+    Effect.gen(function* () {
+      const source = `struct Token { value: i32 }
 union Packet { Empty, Ready { left: Token, right: Token } }
 fn bump(token: &mut Token) -> () {
   token.value = token.value + 1
@@ -208,25 +210,38 @@ fn acrossReturn(flag: bool) -> i32 {
   bump(move view)
   return 0
 }
-pub fn main() -> i32 { return armBinding() + armOuter() + acrossReturn(false) }`
-    const self = yield* AnalysisFixture.retainingMain('qualified-borrow/arm-loans', ascii(source))
-    assert.deepEqual(Analysis.diagnostics(self), [])
-    const mir = Analysis.loweredMir(self)
-    // A loan a statement arm's own binding holds ends with that arm on its fall-through path.
-    assert.deepEqual(yield* MirVerification.verify(mir), [])
-    // A branch that returns never reaches the join, so the loan the other branch carries into it
-    // stays held through the later use and ends only at the function's exits.
-    const across = mir.functions.find(
-      (fn) => fn.id._tag === 'CanonicalDeclarationId' && fn.id.name === 'acrossReturn',
-    )
-    assert.isDefined(across)
-    const endings = (across?.regions ?? []).flatMap((region) =>
-      region._tag === 'OperationRegion' || region._tag === 'CleanupRegion'
-        ? (region._tag === 'OperationRegion' ? region.operations : region.releases)
-            .filter((operation) => operation._tag === 'EndLoan')
-            .map(() => region.outcome._tag)
-        : [],
-    )
-    assert.deepEqual(endings, ['Return', 'Return'])
-  }),
+fn firstMatching(entries: &[Token], wanted: i32) -> i32 {
+  let mut entry: usize = 0
+  while entry < entries.length {
+    let candidate = &entries[entry]
+    if candidate.value == wanted { return candidate.value }
+    entry = entry + 1
+  }
+  return 0
+}
+pub fn main() -> i32 {
+  let tokens = [Token { value: 1 }, Token { value: 2 }]
+  return armBinding() + armOuter() + acrossReturn(false) + firstMatching(&tokens, 2)
+}`
+      const self = yield* AnalysisFixture.retainingMain('qualified-borrow/arm-loans', ascii(source))
+      assert.deepEqual(Analysis.diagnostics(self), [])
+      const mir = Analysis.loweredMir(self)
+      // A loan a statement arm's or a loop body's own binding holds ends with that arm or iteration
+      // on its fall-through path.
+      assert.deepEqual(yield* MirVerification.verify(mir), [])
+      // A branch that returns never reaches the join, so the loan the other branch carries into it
+      // stays held through the later use and ends only at the function's exits.
+      const across = mir.functions.find(
+        (fn) => fn.id._tag === 'CanonicalDeclarationId' && fn.id.name === 'acrossReturn',
+      )
+      assert.isDefined(across)
+      const endings = (across?.regions ?? []).flatMap((region) =>
+        region._tag === 'OperationRegion' || region._tag === 'CleanupRegion'
+          ? (region._tag === 'OperationRegion' ? region.operations : region.releases)
+              .filter((operation) => operation._tag === 'EndLoan')
+              .map(() => region.outcome._tag)
+          : [],
+      )
+      assert.deepEqual(endings, ['Return', 'Return'])
+    }),
 )
