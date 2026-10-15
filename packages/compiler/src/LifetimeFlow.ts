@@ -2103,7 +2103,10 @@ export const validateCleanup = (
   ownership: Ownership.FunctionOwnership,
   context: SemanticContext.SemanticContext,
 ): {
+  /** The violations elaboration has not already reported. */
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
+  /** The first violation of the replay, reported here or by elaboration. */
+  readonly violation: Diagnostic.Diagnostic | undefined
   readonly work?: Lifetime.Work
 } => {
   // Fresh destructor points are outside the analyzed domain, so the solver treats every region as
@@ -2244,15 +2247,37 @@ export const validateCleanup = (
     }
     solution = { ...solved, violations }
   }
-  return {
-    diagnostics: diagnosticsOf(
-      solution,
+  const report = (reported: Lifetime.Solution) =>
+    diagnosticsOf(
+      reported,
       self.origins,
       (origin) => origin.span,
       spans,
       context.spanOf(ownership.declaration.anchor),
       SourceSpan.key,
-    ),
+    )
+  // The replay re-solves elaboration's regions, so it finds each violation elaboration already
+  // reported again at the same lifetime and point.
+  const elaborated = new Set(
+    self.solution._tag === 'Solved'
+      ? self.solution.violations.map(
+          (violation) => `${Lifetime.key(violation.lifetime)}:${violation.point}`,
+        )
+      : [],
+  )
+  const unreported: Lifetime.Solution =
+    solution._tag === 'Solved'
+      ? {
+          ...solution,
+          violations: solution.violations.filter(
+            (violation) =>
+              !elaborated.has(`${Lifetime.key(violation.lifetime)}:${violation.point}`),
+          ),
+        }
+      : solution
+  return {
+    diagnostics: report(unreported),
+    violation: report(solution).at(0),
     ...(solution._tag === 'Solved' ? { work: solution.work } : {}),
   }
 }

@@ -580,7 +580,8 @@ it.effect('reports each independent failure of an invalid body in source order',
       (program) =>
         program.name.startsWith('statement-') ||
         program.name.startsWith('short-circuit-') ||
-        program.name.startsWith('loop-condition-'),
+        program.name.startsWith('loop-condition-') ||
+        program.name.startsWith('aggregate-escape-'),
     )) {
       const self = yield* AnalysisFixture.retainingMain(
         `memory/${program.name}`,
