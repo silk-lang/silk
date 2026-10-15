@@ -1915,6 +1915,10 @@ const analyzeLoans = (
   // exclusively borrowing it before then conflicts. No value carries the loan beyond the arm, so
   // it spans that arm's text and never reaches cleanup planning.
   const bindingLoans: Array<{ readonly loan: LoanFact; readonly from: number }> = []
+  // The sites an arm loan's holders occupy: its bindings and those of the borrowing matches nested
+  // on them. Only an access rooted at one of these, or at a view derived from one, reaches the
+  // scrutinee through the arm's own projections.
+  const bindingHolders = new Map<LoanFact, ReadonlySet<string>>()
   const invocations: Array<InvocationOwnership> = []
   const diagnostics: Array<Diagnostic.Diagnostic> = []
 
@@ -2544,6 +2548,8 @@ const analyzeLoans = (
     return arguments_
   }
   const viewRoots = new Map<number, ReadonlyArray<LoanReferent>>()
+  // The sites a viewing binding's initializer borrows directly, before they resolve to storage.
+  const viewBases = new Map<number, ReadonlyArray<BindingSite>>()
   const viewAliases = new Map<number, ReadonlyArray<number>>()
   // A binding of `match place`, `&` or `&mut` names the selected payload in the scrutinee's own
   // place (MATCH-002), so its borrows and loans are rooted there.
@@ -2783,6 +2789,13 @@ const analyzeLoans = (
       continue
     const sources = sourceReferents(binding.initializer)
     if (sources.length > 0) viewRoots.set(binding.id.ordinal, sources)
+    const bases = [binding.initializer, ...returnedSources(binding.initializer)].flatMap(
+      (source) => {
+        const direct = physicalPlace(source)?.root
+        return direct === undefined ? [] : [direct]
+      },
+    )
+    if (bases.length > 0) viewBases.set(binding.id.ordinal, bases)
     const aliases = [binding.initializer, ...returnedSources(binding.initializer)].flatMap(
       (source) => {
         const direct = physicalPlace(source)?.root
@@ -2871,12 +2884,26 @@ const analyzeLoans = (
       )
     )
   }
+  // Whether `site` reaches a borrowed match arm's scrutinee through that arm's own bindings.
+  const heldThrough = (loan: LoanFact, site: BindingSite): boolean => {
+    const holders = bindingHolders.get(loan)
+    if (holders === undefined) return false
+    const visited = new Set<string>()
+    const through = (candidate: BindingSite): boolean => {
+      const key = siteKey(candidate)
+      if (holders.has(key)) return true
+      if (candidate._tag !== 'Let' || visited.has(key)) return false
+      visited.add(key)
+      return (viewBases.get(candidate.binding.ordinal) ?? []).some(through)
+    }
+    return through(site)
+  }
   const loanConflicts = (
     loan: LoanFact,
     root: BindingSite,
     anchor: AuthoredHir.Anchor | undefined,
   ): boolean =>
-    (loan.origin !== 'MatchBinding' || sameSite(loan.root, root)) &&
+    !heldThrough(loan, root) &&
     !grantsParentCapability(loan, root, anchor) &&
     referentsAt(root, anchor).some((source) =>
       loan.referents.some((referent) => referentsOverlap(referent, source)),
@@ -3125,7 +3152,7 @@ const analyzeLoans = (
         : rootsOf(place.root, place.path)
     return active.find(
       (loan) =>
-        (loan.origin !== 'MatchBinding' || sameSite(loan.root, direct.site)) &&
+        !heldThrough(loan, direct.site) &&
         !grantsParentCapability(loan, direct.site, expression.anchor) &&
         (loan.referents.some((referent) =>
           places.some((selected) => referentsOverlap(referent, selected)),
@@ -3190,9 +3217,10 @@ const analyzeLoans = (
   }
 
   // An arm's authored extent from its first expression to the latest point a use of one of
-  // `bindings` can reach: a use inside a loop recurs through the loop's end.
+  // `bindings` can reach: a use inside a loop recurs through the loop's end. A borrowing match on a
+  // binding adds its own bindings, which project the same storage.
   const bindingExtent = (
-    bindings: ReadonlySet<string>,
+    bindings: Set<string>,
     guard: LoanView.Expression | undefined,
     body: LoanView.ArmBody,
   ):
@@ -3219,6 +3247,16 @@ const analyzeLoans = (
       }
       if (expression._tag === 'Match') {
         expressionUses(expression.scrutinee)
+        const subject = directSite(expression.scrutinee)
+        if (
+          expression.access !== 'Move' &&
+          expression.access !== 'Copy' &&
+          subject !== undefined &&
+          bindings.has(siteKey(subject.site))
+        )
+          for (const arm of expression.arms)
+            for (const binding of arm.bindings)
+              bindings.add(siteKey({ _tag: 'Pattern', binding: binding.id }))
         for (const arm of expression.arms) {
           if (arm.guard !== undefined) expressionUses(arm.guard)
           if (arm.body._tag === 'Expression') expressionUses(arm.body.expression)
@@ -3266,26 +3304,34 @@ const analyzeLoans = (
         _tag: 'Pattern',
         binding: binding.id,
       }))
-      const extent = bindingExtent(new Set(sites.map(siteKey)), arm.guard, arm.body)
+      const holders = new Set(sites.map(siteKey))
+      const extent = bindingExtent(holders, arm.guard, arm.body)
       if (extent === undefined) continue
       const end = armLoan.extent === 'Arm' ? extent.to : extent.last
       if (end === undefined) continue
-      bindingLoans.push({
-        from: extent.from,
-        loan: {
-          _tag: 'Loan',
-          id: { _tag: 'BorrowId', call: expression.ref, ordinal },
-          root: place.root,
-          referents: [place],
-          access: armLoan.kind === 'Match' ? expression.access : 'Shared',
-          origin: 'MatchBinding',
-          suspendsParent: false,
-          startRegion: region,
-          endRegion: region,
-          startSpan: start,
-          endSpan: { ...start, start: end, end },
-        },
-      })
+      const loan: LoanFact = {
+        _tag: 'Loan',
+        id: { _tag: 'BorrowId', call: expression.ref, ordinal },
+        root: place.root,
+        // A scrutinee reached through a viewing local also names the storage that view borrows.
+        referents: [
+          ...new Map(
+            [place, ...rootsOf(place.root, place.path)].map((referent) => [
+              referentKey(referent),
+              referent,
+            ]),
+          ).values(),
+        ],
+        access: armLoan.kind === 'Match' ? expression.access : 'Shared',
+        origin: 'MatchBinding',
+        suspendsParent: false,
+        startRegion: region,
+        endRegion: region,
+        startSpan: start,
+        endSpan: { ...start, start: end, end },
+      }
+      bindingHolders.set(loan, holders)
+      bindingLoans.push({ from: extent.from, loan })
     }
   }
 
