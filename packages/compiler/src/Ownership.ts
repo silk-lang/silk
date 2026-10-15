@@ -5599,7 +5599,7 @@ const checkFunction = (
   }
   if (lifetimes === undefined || checked.ownership.verdict._tag !== 'Satisfied') return checked
   const cleanup = LifetimeFlow.validateCleanup(lifetimes, checked.ownership, context)
-  const firstCleanupViolation = cleanup.diagnostics.at(0)
+  const firstCleanupViolation = cleanup.violation
   return {
     ownership: {
       ...checked.ownership,
