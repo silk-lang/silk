@@ -257,8 +257,9 @@ library. `compiler/scripts/ReleaseArchive.ts` packages that installation per tar
 bytes. The selfhost workflow packages every target's N2 this way, runs a new `init` project from
 the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
 library's `compositions.json` for the target and libc, so such a build needs the library root even
-without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
-is the root for local module paths. Every module identity names the package by its logical
+without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
+(resolved against the manifest's directory), else the root's containing directory, is the root for
+local module paths, and the root must be a module below it. Every module identity names the package by its logical
 identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
 manifest above it has no package identity and is refused. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
@@ -351,7 +352,7 @@ Project test invocation: `silk test [project options] [--root <path>] [--file <p
 TypeScript `silk test` does: always a final executable, whatever `[build].artifact` and
 `[build].stage` select, at `<output-dir>/test/llvm/<target>/<profile>/<name>`. Discovery starts at
 `--root`, else at `[package].root`. `--root` and `--file` are resolved against the project
-directory and must name a canonical `.silk` module path below the directory of `[package].root`;
+directory and must name a canonical `.silk` module path below the source root;
 the runner receives `--file` as the project-relative path its catalog reports. A foreign target,
 an invalid selection and a run without `--no-cache` (see below) exit 2 before building; otherwise
 the status is the test run's, as for a file-root `test`.
@@ -404,8 +405,8 @@ self-build. Run the focused contracts with
 `pnpm exec vitest run --config compiler/scripts/vitest.config.mjs compiler/scripts/NativeBuild.test.mjs`.
 
 `silk format [paths] [--check]` formats source without semantic analysis or code generation.
-The nearest `silk.toml` above the working directory supplies `[package].root`; its containing
-directory is the source root. With no paths the command recursively selects that root. Explicit
+The nearest `silk.toml` above the working directory supplies the source root: its
+`[package].source-root`, else the directory containing `[package].root`. With no paths the command recursively selects that root. Explicit
 files and directories are resolved against the working directory, must stay inside the source
 root, and select only exact `.silk` extensions. Selection is sorted by normalized path bytes and
 deduplicated; symbolic links are rejected by the native filesystem provider. Use `--` before a
