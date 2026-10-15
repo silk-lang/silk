@@ -177,6 +177,40 @@ contract and do not promise post-trap cleanup.
 [native corpus](../../../../packages/compiler/test/support/corpus.ts)
 (`independent-execution-zero-sized-guard-cancel`, `effect-borrowed-recovery-park-resume-cancel`).
 
+### EXEC-008 — Cancellation cleans in structured-exit order
+
+**Status:** Confirmed
+
+Within one cancelled frame, the owners live at the suspension point are cleaned in the order an
+ordinary structured exit from that point would clean them: innermost exited region first, and
+within a region in reverse acquisition order. A consuming match arm's bindings are cleaned before
+the subject's remainder. Pending cleanup of a composed Effect, such as a finalizer, runs before
+the regions that enclose it. A failure held while a finalizer runs is cleaned after the pending
+cleanup started inside that finalizer.
+
+```silk,ignore
+effect fn parked(holder: Holder) -> i32 {
+  match move holder {
+    Holder { token, .. } => {
+      run Execution.park(register)
+      return token.value
+    }
+  }
+}
+```
+
+Cancelling `parked` while it is parked drops `token` and then the subject's remaining `other`
+field, exactly as returning from the arm would.
+
+**Boundary:** Order across frames is EXEC-005's innermost-frame-first release. Cancellation adds no
+cleanup that a structured exit from the same point would not run, and it runs no finalizer that a
+completing exit would skip.
+
+**Diagnostics:** None. Ordering is not a source rule.
+
+**Evidence:** [native corpus](../../../../packages/compiler/test/support/corpus.ts)
+(`suspension-held-failure-cancellation`).
+
 ### EXEC-006 — Scheduling policy remains ordinary source
 
 **Status:** Confirmed
