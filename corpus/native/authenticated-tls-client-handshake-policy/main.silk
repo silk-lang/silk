@@ -1,0 +1,552 @@
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.effect {Effect}
+import silk.bytes {Bytes}
+import silk.pointer {Pointer}
+
+unsafe extern "C" fn silk_tls_fixture_size(id: i32) -> usize
+unsafe extern "C" fn silk_tls_fixture_copy(
+  id: i32,
+  output: ?[*]mut u8,
+  capacity: usize,
+) -> usize with Intrinsic.foreign(noCapture: ("output",))
+effect fn loadFixture(id: i32) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = unsafe silk_tls_fixture_size(id)
+  let mut bytes = run Bytes.zeroed(length)
+  let copied = unsafe silk_tls_fixture_copy(id, Pointer.fromMutSlice(Bytes.asMutSlice(&mut bytes)), length)
+  if copied != length { return Bytes.make() }
+  return move bytes
+}
+
+import silk.https_identity {HttpsIdentity, IdentityError, OriginHost, ReferenceIdentity}
+import silk.layout {Layout}
+import silk.random {Random}
+import silk.result {Result}
+import silk.option {Option}
+import silk.slice {Slice}
+import silk.system_clock {SystemClock}
+import silk.tls_client {
+  AlpnConfig,
+  AlpnProtocol,
+  Authentication,
+  Client,
+  ClientConfig,
+  ClientLimits,
+  ClientOperation,
+  Demand,
+  NamedGroup,
+  Progress,
+  ProtocolReason,
+  TlsLimitKind,
+  TlsError,
+}
+import silk.trust_anchor {TrustAnchor}
+import silk.tls_record {CipherSuite}
+import silk.trust_snapshot {SnapshotLimits, TrustLoadLimits, TrustSnapshot, TrustSourceError}
+import silk.certificate_path {ValidationReason}
+import silk.u8
+import silk.usize
+import silk.vector {Vector}
+
+// Deterministic test double only. Production code must supply a CSPRNG implementation.
+struct ScriptedRandom { filled: usize }
+
+impl Random for ScriptedRandom {
+  effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+    let mut index = usize.ZERO
+    while index < output.length {
+      output[index] = usize.toU8((self.filled + index + usize.ONE) % 251 + usize.ONE)
+      index = index + usize.ONE
+    }
+    self.filled = self.filled + output.length
+    return ()
+  }
+}
+
+// TLS_CLIENT_NATIVE_EMPTY_TRUST_BEGIN
+fn emptyTrust() -> TrustSnapshot {
+  let made = TrustSnapshot.fromAnchors(
+    Vector<TrustAnchor>.make(),
+    SnapshotLimits {anchors: 0, encodedBytes: 0},
+  )
+  return match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+      let invalid = 1 / 0
+      return emptyTrust()
+    }
+  }
+}
+// TLS_CLIENT_NATIVE_EMPTY_TRUST_END
+
+// TLS_CLIENT_ROOT_TRUST_BEGIN
+effect fn rootTrust() -> TrustSnapshot ! OutOfMemoryError ? &mut Allocator {
+  let pemOwner = run loadFixture(0)
+  if Bytes.length(&pemOwner) != 1200 {
+    let invalid = 1 / 0
+    return run rootTrust()
+  }
+  let pem = Bytes.asSlice(&pemOwner)
+  let made = run TrustSnapshot.fromPem(pem, TrustLoadLimits.defaults())
+  return match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+      let invalid = 1 / 0
+      return run rootTrust()
+    }
+  }
+}
+// TLS_CLIENT_ROOT_TRUST_END
+
+fn reference<'a>(bytes: &'a [u8]) -> ReferenceIdentity<'a> {
+  let admitted = HttpsIdentity.reference(OriginHost<'a>.Dns {bytes: bytes})
+  return match move admitted {
+    Result<ReferenceIdentity<'a>, IdentityError>.Success {value} => value
+    Result<ReferenceIdentity<'a>, IdentityError>.Failure {error} => {
+      let invalid = 1 / 0
+      return reference(bytes)
+    }
+  }
+}
+
+// TLS_CLIENT_NATIVE_HELPERS_BEGIN
+fn hasDemand(result: Result<Progress, TlsError>, expected: Demand) -> bool {
+  return match move result {
+    Result<Progress, TlsError>.Success {value} => value.demand == expected
+    Result<Progress, TlsError>.Failure {error} => false
+  }
+}
+
+fn isFailureCode(result: Result<Progress, TlsError>, expected: i32) -> bool {
+  return match move result {
+    Result<Progress, TlsError>.Success {value} => false
+    Result<Progress, TlsError>.Failure {error} => feedFailureCode(move error) == expected
+  }
+}
+
+fn validAes128Authentication<'a>(value: &Authentication<'a>) -> bool {
+  let selected = value.selectedAlpn()
+  return match move selected {
+    Option.None => false
+    Option.Some {value: selectedBytes} => selectedBytes.length == 2
+      && selectedBytes[0] == 104
+      && selectedBytes[1] == 50
+      && value.suite() == CipherSuite.Aes128GcmSha256
+      && value.group() == NamedGroup.X25519
+  }
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut index = usize.ZERO
+  while index < left.length {
+    if left[index] != right[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+// TLS_CLIENT_NATIVE_HELPERS_END
+
+fn protocolFailureCode(reason: ProtocolReason) -> i32 {
+  return match reason {
+    ProtocolReason.Record => 40
+    ProtocolReason.UnexpectedMessage => 41
+    ProtocolReason.InvalidLength => 42
+    ProtocolReason.Extension => 43
+    ProtocolReason.ServerHello => 44
+    ProtocolReason.HelloRetryRequest => 45
+    ProtocolReason.CompatibilityCcs => 46
+    ProtocolReason.CertificateRequest => 47
+    ProtocolReason.Certificate => 48
+    ProtocolReason.PostHandshake => 49
+    ProtocolReason.InternalState => 50
+  }
+}
+
+fn feedFailureCode(error: TlsError) -> i32 {
+  return match move error {
+    TlsError.PeerAlert {code} => 30
+    TlsError.BadRecordMac => 31
+    TlsError.ProtocolViolation {reason} => protocolFailureCode(reason)
+    TlsError.CertificateDecode {error: decodeError} => 51
+    TlsError.CertificatePath {error: pathError} => 52
+    TlsError.CertificateIdentity {error: identityError} => 53
+    TlsError.CertificateVerify {error: verifyError} => 54
+    TlsError.Finished => 55
+    TlsError.UnsupportedProfile => 56
+    TlsError.LimitExceeded {kind, limit} => 57
+    TlsError.InvalidState {operation} => 58
+    TlsError.EmptyBuffer => 59
+    TlsError.HandshakeTruncated => 60
+    TlsError.Truncated => 61
+    TlsError.NoApplicationProtocol => 62
+  }
+}
+
+fn alpnProtocol<'a>(bytes: &'a [u8]) -> AlpnProtocol<'a> {
+  return AlpnProtocol<'a> {bytes: bytes}
+}
+
+
+
+union FeedOutcome {
+  Complete,
+  Stalled,
+  Failure { error: TlsError },
+}
+
+effect fn feedOutcome(
+  client: &mut Client,
+  input: &[u8],
+  progressSteps: usize,
+) -> FeedOutcome
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let mut offset = usize.ZERO
+  while offset < input.length {
+    let remaining = Slice.view<u8>(input, offset, input.length - offset)
+    let fed = run Client.feedInput(&mut client, remaining)
+    let accepted = match move fed {
+      Result<Progress, TlsError>.Success {value} => value.consumed
+      Result<Progress, TlsError>.Failure {error} => {
+        return FeedOutcome.Failure {error: move error}
+      }
+    }
+    if accepted == usize.ZERO { return FeedOutcome.Stalled }
+    offset = offset + accepted
+    let mut steps = usize.ZERO
+    while steps < progressSteps {
+      let advanced = run Client.progress(&mut client)
+      if let Result<Progress, TlsError>.Failure {error} = move advanced {
+        return FeedOutcome.Failure {error: move error}
+      }
+      steps = steps + usize.ONE
+    }
+  }
+  return FeedOutcome.Complete
+}
+
+effect fn feedAll(
+  client: &mut Client,
+  input: &[u8],
+) -> i32
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let outcome = run feedOutcome(&mut client.*, input, 8)
+  return match move outcome {
+    FeedOutcome.Complete => 0
+    FeedOutcome.Stalled => 21
+    FeedOutcome.Failure {error} => feedFailureCode(move error)
+  }
+}
+
+// TLS_CLIENT_NATIVE_LIMIT_HELPER_BEGIN
+// TLS_CLIENT_NATIVE_LIMIT_HELPER_END
+
+effect fn authenticate(
+  client: &mut Client,
+  flight: &[u8],
+) -> i32
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let fed = run feedAll(&mut client.*, flight)
+  if fed != 0 { return fed }
+  let mut outputSteps = usize.ZERO
+  while outputSteps < 3 {
+    let mut steps = usize.ZERO
+    while client.pendingOutput().length == 0 && steps < 8 {
+      let advanced = run Client.progress(&mut client)
+      if let Result<Progress, TlsError>.Failure {error} = move advanced {
+        return feedFailureCode(move error)
+      }
+      steps = steps + usize.ONE
+    }
+    let outputLength = Client.pendingOutput(&client.*).length
+    if outputLength == 0 { return 23 }
+    let acknowledged = Client.ackWritten(&mut client, outputLength)
+    match move acknowledged {
+      Result<Progress, TlsError>.Success {value} => {
+        if value.demand == Demand.Authenticated { return 0 }
+      }
+      Result<Progress, TlsError>.Failure {error} => { return feedFailureCode(move error) }
+    }
+    outputSteps = outputSteps + usize.ONE
+  }
+  return 24
+}
+
+
+
+// TLS_CLIENT_CASES_BEGIN
+effect fn scenarioTrust(
+  trusted: bool,
+  master: &TrustSnapshot,
+) -> TrustSnapshot
+! OutOfMemoryError
+? &mut Allocator {
+  if !trusted { return emptyTrust() }
+  let copied = run TrustSnapshot.copy(master, SnapshotLimits.defaults())
+  return match move copied {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+      let invalid = 1 / 0
+      return run scenarioTrust(trusted, master)
+    }
+  }
+}
+
+effect fn makeClient<'a>(
+  master: &TrustSnapshot,
+  trusted: bool,
+  selectedReference: ReferenceIdentity<'a>,
+  selectedAlpn: AlpnConfig<'a>,
+  limits: ClientLimits,
+  seconds: i64,
+) -> Result<Client, TlsError>
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let trust = run scenarioTrust(trusted, master)
+  let config = ClientConfig {
+    reference: selectedReference,
+    alpn: selectedAlpn,
+    limits: limits,
+  }
+  return run Client.make(&config, move trust, SystemClock.make(seconds, 123456789))
+}
+
+effect fn matchesHello(client: &Client, fixtureId: i32) -> bool
+! OutOfMemoryError
+? &mut Allocator {
+  let owner = run loadFixture(fixtureId)
+  let actual = client.pendingOutput()
+  let expected = Bytes.asSlice(&owner)
+  if actual.length != expected.length || actual.length < 5 { return false }
+  if actual[0] != 22 || actual[1] != 3 || actual[2] != 3 { return false }
+  if u8.toUsize(actual[3]) * 256 + u8.toUsize(actual[4]) + 5 != actual.length {
+    return false
+  }
+  let mut index: usize = 5
+  while index < actual.length {
+    if actual[index] != expected[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn scenarioReference<'a>(id: i32, normal: &'a [u8], wrong: &'a [u8]) -> ReferenceIdentity<'a> {
+  if id == 6 {
+    let admitted = HttpsIdentity.reference(OriginHost<'a>.Ipv4 {bytes: [127, 0, 0, 1]})
+    return match move admitted {
+      Result<ReferenceIdentity<'a>, IdentityError>.Success {value} => value
+      Result<ReferenceIdentity<'a>, IdentityError>.Failure {error} => reference(normal)
+    }
+  }
+  if id == 5 { return reference(wrong) }
+  return reference(normal)
+}
+
+fn policyHello(id: i32) -> i32 {
+  if id == 0 || id == 3 || id == 4 || (id >= 11 && id <= 15)
+    || id == 21 || id == 22 || id == 30 { return 3 }
+  if id == 1 || id == 2 || id == 19 || id == 20 || id == 27 || id == 28 {
+    return 6
+  }
+  if id == 5 { return 27 }
+  if id == 6 { return 29 }
+  return 1
+}
+
+fn policyFlight(id: i32) -> i32 {
+  if id == 0 { return 4 }
+  if id == 1 { return 9 }
+  if id == 3 || id == 4 { return 5 }
+  if id == 5 { return 28 }
+  if id == 6 { return 30 }
+  if id == 7 { return 10 }
+  if id == 8 { return 11 }
+  if id == 9 { return 12 }
+  if id == 10 { return 13 }
+  if id == 11 { return 14 }
+  if id == 12 { return 15 }
+  if id == 13 { return 16 }
+  if id == 14 { return 17 }
+  if id == 15 { return 18 }
+  if id == 16 { return 36 }
+  if id == 17 { return 37 }
+  if id == 18 { return 38 }
+  if id == 19 { return 39 }
+  if id == 20 { return 19 }
+  if id == 21 { return 41 }
+  if id == 22 { return 42 }
+  if id == 23 { return 54 }
+  if id == 24 { return 55 }
+  if id == 30 { return 57 }
+  return 2
+}
+
+fn policyFailure(id: i32) -> i32 {
+  if id == 4 || id == 22 { return 62 }
+  if id == 5 || id == 6 { return 53 }
+  if id == 7 { return 51 }
+  if id == 8 { return 54 }
+  if id == 9 { return 55 }
+  if id == 10 || id == 21 || id == 30 { return 43 }
+  if id >= 11 && id <= 15 { return 47 }
+  if id == 16 { return 44 }
+  if id == 17 || id == 18 { return 56 }
+  if id == 19 || id == 20 { return 45 }
+  if id == 23 || id == 24 { return 56 }
+  if id == 29 { return 52 }
+  return 0
+}
+
+fn validPolicyAuthentication<'a>(id: i32, value: &Authentication<'a>) -> bool {
+  if id == 0 { return validAes128Authentication(value) }
+  if id == 1 {
+    return value.suite() == CipherSuite.Aes256GcmSha384
+      && value.group() == NamedGroup.P256
+  }
+  if id == 3 {
+    return match move value.selectedAlpn() {
+      Option.None => true
+      Option.Some {value: selected} => false
+    }
+  }
+  return value.suite() == CipherSuite.ChaCha20Poly1305Sha256
+    && value.group() == NamedGroup.X25519
+}
+
+effect fn handshakePolicyCase<'a>(
+  id: i32,
+  master: &TrustSnapshot,
+  protocols: &'a [AlpnProtocol<'a>],
+) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let normal = b"ExAmPlE.com"
+  let wrong = b"wrong.example"
+  let mut selectedAlpn = AlpnConfig.defaults()
+  if id == 0 || id == 4 || (id >= 11 && id <= 15) || id == 21 || id == 22 || id == 30 {
+    selectedAlpn = AlpnConfig.Offered {protocols: protocols, required: true}
+  } else if id == 3 {
+    selectedAlpn = AlpnConfig.Offered {protocols: protocols, required: false}
+  }
+  let trusted = id != 29
+  let made = run makeClient(
+    master,
+    trusted,
+    scenarioReference(id, &normal, &wrong),
+    selectedAlpn,
+    ClientLimits.defaults(),
+    1789156800,
+  )
+  let mut client = match move made {
+    Result<Client, TlsError>.Success {value} => move value
+    Result<Client, TlsError>.Failure {error} => { return false }
+  }
+  if !(run matchesHello(&client, policyHello(id))) { return false }
+  let helloLength = client.pendingOutput().length
+  drop client.ackWritten(helloLength)
+
+  if id == 2 {
+    let retry = run loadFixture(51)
+    if (run feedAll(&mut client, Bytes.asSlice(&retry))) != 0 { return false }
+    return run matchesHello(&client, 52)
+  }
+
+  if id == 1 || id == 27 || id == 28 {
+    let retry = run loadFixture(8)
+    if (run feedAll(&mut client, Bytes.asSlice(&retry))) != 0 { return false }
+    if !(run matchesHello(&client, 7)) { return false }
+    let retryLength = client.pendingOutput().length
+    drop client.ackWritten(retryLength)
+    if id == 27 {
+      let changed = run loadFixture(40)
+      let code = run feedAll(&mut client, Bytes.asSlice(&changed))
+      return code == 44 && isFailureCode(run client.progress(), 44)
+    }
+    if id == 28 {
+      let second = run loadFixture(8)
+      let code = run feedAll(&mut client, Bytes.asSlice(&second))
+      return code == 45 && isFailureCode(run client.progress(), 45)
+    }
+  }
+
+  if id == 25 {
+    let ccs = run loadFixture(26)
+    if (run feedAll(&mut client, Bytes.asSlice(&ccs))) != 0 { return false }
+  }
+
+  let flight = run loadFixture(policyFlight(id))
+  if id == 0 {
+    if (run feedAll(&mut client, Bytes.asSlice(&flight))) != 0 { return false }
+    let expectedCertificate = run loadFixture(46)
+    let certificate = client.pendingOutput()
+    if !sameBytes(certificate, Bytes.asSlice(&expectedCertificate)) { return false }
+    let certificateLength = certificate.length
+    drop certificate
+    if !hasDemand(client.ackWritten(certificateLength), Demand.NeedOutput) { return false }
+    let expectedFinished = run loadFixture(47)
+    let finished = client.pendingOutput()
+    if !sameBytes(finished, Bytes.asSlice(&expectedFinished)) { return false }
+    let finishedLength = finished.length
+    drop finished
+    if !hasDemand(client.ackWritten(finishedLength), Demand.Authenticated) { return false }
+    let metadata = client.authentication()
+    return match move metadata {
+      Option.None => false
+      Option.Some {value} => validPolicyAuthentication(id, &value)
+    }
+  }
+  let expectedFailure = policyFailure(id)
+  if expectedFailure != 0 {
+    let code = run feedAll(&mut client, Bytes.asSlice(&flight))
+    return code == expectedFailure && isFailureCode(run client.progress(), expectedFailure)
+  }
+  if (run authenticate(&mut client, Bytes.asSlice(&flight))) != 0 { return false }
+  if id == 26 {
+    let mut plaintext: [u8; 40] = [
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+    if !hasDemand(client.readPlaintext(&mut plaintext), Demand.NeedInput) { return false }
+    let ccs = run loadFixture(26)
+    let code = run feedAll(&mut client, Bytes.asSlice(&ccs))
+    return code == 46 && isFailureCode(run client.progress(), 46)
+  }
+  let metadata = client.authentication()
+  return match move metadata {
+    Option.None => false
+    Option.Some {value} => validPolicyAuthentication(id, &value)
+  }
+}
+
+effect fn cases<'a>(protocols: &'a [AlpnProtocol<'a>]) -> i32
+! OutOfMemoryError
+? &mut Allocator {
+  let master = run rootTrust()
+  let mut random = ScriptedRandom {filled: 0}
+  let mut id = 0
+  while id <= 30 {
+    random.filled = usize.ZERO
+    let passed = run handshakePolicyCase(id, &master, protocols)
+      |> Effect.provideMut<Random>(&mut random)
+    let mut expectedEntropy: usize = 64
+    if id == 1 || id == 2 || id == 27 || id == 28 { expectedEntropy = 96 }
+    if !passed || random.filled != expectedEntropy { return id + 1 }
+    id = id + 1
+  }
+  return 42
+}
+// TLS_CLIENT_CASES_END
+
+effect fn recover(error: OutOfMemoryError) -> i32 { return 98 }
+
+// TLS_CLIENT_MAIN_BEGIN
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let h2 = b"h2"
+  let protocols = [alpnProtocol(&h2)]
+  return run Effect.catchAll(cases(&protocols), recover)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+// TLS_CLIENT_MAIN_END
