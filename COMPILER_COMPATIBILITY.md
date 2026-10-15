@@ -689,14 +689,15 @@ Each entry records:
     reports SEM0212 at the function header; native proves the bound at the call and reports it
     over the call. A call written on the type (`Pair<'static, 's>.widen(short)`) is SEM0212 over
     the call in both.
-  - A returned call whose bound requires a body-owned borrow to outlive the `'static` result
-    (`return Pair.widen(&gone)`): the bootstrap reports OWN0019 at the call, then SEM0212 at
-    `&gone`; native reports SEM0212 over the call, as for a free function's bound.
+  - A bare call on the type whose impl bound names a lifetime the member never mentions
+    (`Lent.keep(short)` under `impl<'a: 'm, 'm>`): both take that lifetime as 'static and reject
+    with SEM0212. The bootstrap reports at the function header, or at a local borrow operand
+    (`Leak.leak(&held)` at `&held`); native reports over the call.
 - **Source migration:** none; both compilers reject.
 - **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
   (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`) and
-  `SemanticCallableCases::inherentImplBoundsAreProvedAtEachCall` (`receiverEscape`,
-  `liftedEscape`).
+  `SemanticCallableCases::inherentImplBoundsAreProvedAtEachCall` (`receiverEscape`, `unmentioned`,
+  `chained`, `dangling`, `lifted`).
 
 ### Bootstrap misses implied outlives from reference-to-lifetime-parameterized types
 
