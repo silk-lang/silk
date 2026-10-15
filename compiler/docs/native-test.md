@@ -94,9 +94,9 @@ What must match the bootstrap for the same root:
   so `silk/test_runner` and `silk/testing` add nothing.
 - **Pass/fail and exit status.** Decided by the runner from each test's outcome.
 
-The bootstrap prints one extra line before the runner, `Compiled src/<root> -> build/... (llvm,
-<target>, N symbols)`. The native command prints `silk test: compiled <root> -> <executable>` in
-its place. No check reads it.
+Both compilers print one extra line before the runner, `Compiled <root> -> <executable> (llvm,
+<target>, N symbols)`, with paths relative to the project directory (the root's directory for a
+file-root `test`). The symbol counts differ between the compilers. No check reads it.
 
 ## Front end
 
