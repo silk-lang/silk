@@ -20,12 +20,12 @@ claims, and historical receipts below are explicitly distinguished from final-he
       EVIDENCE: merged layers throughselfhostfeb466e include Step6 cleanup; the feature integrates selfhostba5abe4f9 including #756/#757/#760 and main22de957e (#759). Final-head ancestry is rechecked before merge.
 
 - [ ] G2: the full corpus has zero failures and reports the final PASS, unsupported, and track counts
-      CHECK: SILKC="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
+      CHECK: SILK_COMPILER="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
       EXPECT: /Selfhost corpus: pass=[0-9]+ fail=0 unsupported=[0-9]+ track=[0-9]+/
       EVIDENCE: current main-synced sweep /private/tmp/step7e-corpus-main-sync.log measured70PASS/0FAIL/322Unsupported/track56 and preserved all69 earlier PASS. This precedes the cost-only exact-key/word optimizations and latest Step8 merge; exact final CI is still required.
 
 - [ ] G3: every corpus program newly passing because of Step 7 is pinned in both hard-coded acceptance lists after an exact native PASS
-      CHECK: SILKC="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" SILK_SELFHOST_CORPUS_CASES=retained-if-let-match-binding,scalar-enum-equality-from-borrowed-variant,while-entry-backedge,generic-record-instances,generic-union-instances,generic-lifetime-selected-cleanup pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
+      CHECK: SILK_COMPILER="$PWD/compiler/build/llvm/aarch64-apple-darwin/release-with-debug/silk-compiler" SILK_SELFHOST_CORPUS_CASES=retained-if-let-match-binding,scalar-enum-equality-from-borrowed-variant,while-entry-backedge,generic-record-instances,generic-union-instances,generic-lifetime-selected-cleanup pnpm --filter @silklang/compiler exec tsx ../../compiler/scripts/runSelfhostCorpus.ts
       EXPECT: Selfhost corpus: pass=6 fail=0 unsupported=0 track=6
       EVIDENCE: five earlier Step7 pins retained; newmain#759 exact source built and returned42 with both compilers, then passed at committed native sourcebd94dd78d before both pin lists were updated. Final integrated-head CI re-executes every pin.
 
