@@ -1830,6 +1830,46 @@ interface LoanLiveness {
   readonly required: BodyControlFlow.Reachable
   readonly observedHolderUse: boolean
   readonly retainedEnds: Map<number, BodyControlFlow.Reachable>
+  /** Whether the loan's region must outlive a universal region, which outlives the whole body. */
+  readonly universal: boolean
+}
+
+const universalOriginsCache = new WeakMap<LifetimeFlow, ReadonlySet<string>>()
+
+/**
+ * The regions that must outlive a universal region: `'static`, or a lifetime chosen before the body
+ * runs. Such a region outlives every point of the body, so a loan of it stays live wherever its
+ * creation reaches, whether or not a holder still uses it.
+ */
+const universalOrigins = (self: LifetimeFlow): ReadonlySet<string> => {
+  const cached = universalOriginsCache.get(self)
+  if (cached !== undefined) return cached
+  const longerThan = new Map<string, Array<string>>()
+  const universal = new Set<string>()
+  const pending: Array<string> = []
+  for (const bound of self.input.constraints) {
+    const shorter = Lifetime.key(bound.shorter)
+    const longer = Lifetime.key(bound.longer)
+    const listed = longerThan.get(shorter)
+    if (listed === undefined) longerThan.set(shorter, [longer])
+    else listed.push(longer)
+    // Outliving an intersection requires outliving only its shortest member, so the bound is
+    // universal only when every member is.
+    if (
+      Lifetime.atoms(bound.shorter).every(
+        (atom) => atom._tag === 'BoundLifetime' || atom._tag === 'StaticLifetime',
+      )
+    )
+      pending.push(longer)
+  }
+  while (pending.length > 0) {
+    const key = pending.pop()
+    if (key === undefined || universal.has(key)) continue
+    universal.add(key)
+    pending.push(...(longerThan.get(key) ?? []))
+  }
+  universalOriginsCache.set(self, universal)
+  return universal
 }
 
 // Ownership probes many accesses against the same loan. Reverse its fixed required uses once,
@@ -1881,11 +1921,13 @@ const resolveLoanLiveness = (
       if (use.start !== undefined && use.start >= start.end) observedHolderUse = true
       if (!use.retired && use.after !== undefined) targets.push(use.after)
     }
+  const universal = universalOrigins(self)
   const answer: LoanLiveness = {
     created,
     required: BodyControlFlow.predecessors(self.controlFlow, targets, created.before),
     observedHolderUse,
     retainedEnds: new Map(),
+    universal: origins.some((key) => universal.has(key)),
   }
   if (byOrigin === undefined) {
     byOrigin = new Map()
@@ -1924,7 +1966,7 @@ export const liveAt = (
   if (liveness === undefined) return undefined
   const { created } = liveness
   if (!BodyControlFlow.reaches(self.controlFlow, created.after, at, created.before)) return false
-  if (BodyControlFlow.includes(liveness.required, at)) return true
+  if (liveness.universal || BodyControlFlow.includes(liveness.required, at)) return true
   if (liveness.observedHolderUse) return false
   const retainedEnd = BodyControlFlow.at(self.controlFlow, end)
   if (retainedEnd === undefined) return false

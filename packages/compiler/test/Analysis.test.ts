@@ -574,6 +574,27 @@ it.effect('rejects a place replacement that a live loan of the place observes', 
   }),
 )
 
+it.effect(
+  'keeps a loan whose region outlives a universal region live for the rest of the body',
+  () =>
+    Effect.gen(function* () {
+      for (const program of invalidCorpus.filter((program) =>
+        program.name.startsWith('universal-loan-'),
+      )) {
+        const self = yield* AnalysisFixture.retainingMain(
+          `memory/${program.name}`,
+          ascii(program.source),
+          'wasm32-unknown-unknown',
+        )
+        assert.deepStrictEqual(
+          reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+          program.diagnostics,
+          program.name,
+        )
+      }
+    }),
+)
+
 it.effect('reports each independent failure of an invalid body in source order', () =>
   Effect.gen(function* () {
     for (const program of invalidCorpus.filter(

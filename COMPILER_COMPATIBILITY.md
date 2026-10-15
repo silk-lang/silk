@@ -118,3 +118,17 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Source migration:** `ModuleIndex.fingerprint` in `compiler/` binds the slice to a local before
   indexing it, which both compilers accept and compile identically. No other site is known.
 - The bootstrap is not extended for this. Retire this entry with the bootstrap.
+
+## Loans of lifetime-annotated and universally bounded borrows
+
+VIEW-002 ends a loan at its last use or the last use of a value retaining it. Annotating a binding
+with a lifetime, including one of the function's lifetime parameters, does not extend the loan.
+
+- **Bootstrap:** keeps a borrow live to the end of the body when its region must outlive a lifetime
+  chosen outside it: an annotated `let view: &'a T = &place` binding, or an unannotated borrow a
+  call constrains to outlive such a lifetime. It therefore rejects a write to the borrowed place
+  after the view's last use, even when nothing stores the view. Stricter is safe.
+- **Native:** ends such a loan at its last use unless a call or callable can store it where the
+  caller can still read it, then keeps it live wherever its creation reaches.
+- **Source migration:** none.
+- Retire this entry when the bootstrap is deleted.
