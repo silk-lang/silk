@@ -39,7 +39,7 @@ Selfhost builds its verification harness from its own checkout with
 The harness's default mode verifies the checkout's intrinsic catalog and formatting with the
 formatter safety gate named by `SILK_FORMAT_GATE`, writing its log to `RUNNER_TEMP`. Its `corpus`
 and `corpus-full` modes run the corpus against `compiler/scripts/selfhost-track.json` with the
-native compiler named by `SILKC`.
+native compiler named by `SILK_COMPILER`.
 
 The action runs on GitHub-hosted runners with Bash, `gh`, and `jq` available. Workflows in other
 repositories can pass a `token` with Actions read access to `julia-script/silk`; their own
