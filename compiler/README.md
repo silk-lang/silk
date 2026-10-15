@@ -116,11 +116,12 @@ in their canonical order. Joins normalize the incoming component partitions, inc
 authored move orders, and retain each child's independent liveness. Replacing a component drops
 its initialized old value before the store, then restores precisely that component; siblings keep
 their state. A move beneath a type with a Drop hook is rejected as `OWN0002`. Typing records the
-static element a literal in-bounds index of a fixed array names, so borrow checking rejects a read,
-borrow or write of a moved element as `OWN0001`, and so does an access whose runtime index may name
-it. A guard that changes an owner's state or consumes a binding of its arm (the bootstrap rejects
-such moves as OWN0008, which selfhost does not report yet), a loop iteration that leaves an owner
-changed and a borrowing match result whose arm created temporaries still report the `cleanup` gap.
+static element a literal in-bounds index of a fixed array names, so a store there refills a moved
+element like a field, and borrow checking rejects a read, borrow or write of a moved element as
+`OWN0001`, and so does an access whose runtime index may name it. A guard that changes an owner's
+state or consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost
+does not report yet), a loop iteration that leaves an owner changed and a borrowing match result
+whose arm created temporaries still report the `cleanup` gap.
 Anonymous-environment availability preserves unchanged loop headers even when a pre-loop branch
 may have moved a field. It compares active roots, may/must holes, indexed uncertainty and guard
 state after each repeating edge; the missing field remains unavailable. Conditions are checked
