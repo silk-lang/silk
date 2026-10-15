@@ -555,10 +555,49 @@ it.effect('keeps invalid match corpus failures phase-owned and downstream facts 
   }),
 )
 
-it.effect('reports each independent statement failure of an invalid body in source order', () =>
+it.effect('rejects a place replacement that a live loan of the place observes', () =>
   Effect.gen(function* () {
     for (const program of invalidCorpus.filter((program) =>
-      program.name.startsWith('statement-'),
+      program.name.startsWith('replace-during-loan-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
+it.effect('reports each independent failure of an invalid body in source order', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter(
+      (program) =>
+        program.name.startsWith('statement-') || program.name.startsWith('short-circuit-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
+it.effect('rejects each expression beyond the EXPR-006 nesting limit at its first token', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter((program) =>
+      program.name.startsWith('expression-nesting-'),
     )) {
       const self = yield* AnalysisFixture.retainingMain(
         `memory/${program.name}`,
