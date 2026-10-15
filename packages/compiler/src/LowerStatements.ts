@@ -315,8 +315,10 @@ export const lowerSequence = (
   terminal: Mir.Outcome,
   reserved?: Mir.RegionId,
   armExit?: Ownership.ExitPlan,
+  scope?: SourceSpan.SourceSpan,
 ): Mir.RegionId | undefined => {
   const id = reserved ?? fn.reserve()
+  const held = scope === undefined ? undefined : new Set(fn.loanLocals.keys())
   // Iterative: a sequence is as long as the author wrote it, so its length must not become
   // JavaScript stack depth. Only nested blocks recurse.
   let region = id
@@ -346,7 +348,26 @@ export const lowerSequence = (
     if (following === 'Terminated') return id
     region = following
   }
-  const [, releases] = fn.capture(() => emitReleases(fn, armExit))
+  const [, releases] = fn.capture(() => {
+    // A scoped sequence ends, on its falling-through path, the loans it began and its own
+    // bindings hold: the enclosing construct restores the entry state for its next path, which
+    // would drop them unended. A loan whose recorded end lies beyond the scope stays held.
+    if (scope !== undefined && held !== undefined) {
+      const order = loanOrder(fn.ownership?.loans ?? [])
+      const begun: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
+      for (const key of fn.loanLocals.keys())
+        if (!held.has(key)) begun.push(...(order.get(key) ?? []))
+      endLoans(
+        fn,
+        begun
+          .filter(({ loan }) => loan.endSpan.end <= scope.end)
+          .sort((left, right) => left.ordinal - right.ordinal)
+          .map(({ loan }) => loan.id),
+        scope,
+      )
+    }
+    emitReleases(fn, armExit)
+  })
   if (releases.length > 0) {
     fn.publish({
       _tag: 'CleanupRegion',
@@ -1225,6 +1246,7 @@ const lowerStatement = (
       repeat,
       bodyId,
       exits.loopFallthroughs.get(statement.loop.ordinal),
+      statement.span,
     )
     if (loweredBody === undefined) return undefined
     const bodyState = delayedEffectState(fn)
