@@ -886,6 +886,47 @@ fn borrowAfterUse() -> i32 {
   assert.deepEqual(facts.diagnostics, [])
 })
 
+it('keeps a match place refinement across an Effect that captures it after the last use or only reads it', () => {
+  const facts = checkPartial(
+    'ownership/place-refinement-effect-controls',
+    `
+struct Token { value: i32 }
+union Packet { Empty, Ready { left: Token, right: Token } }
+effect fn afterUse() -> i32 {
+  let mut packet = Packet.Ready { left: Token { value: 1 }, right: Token { value: 2 } }
+  let mut out = 0
+  match place packet {
+    Packet.Ready { left, .. } => {
+      out = left.value
+      run effect {
+        packet = Packet.Empty
+        return ()
+      }
+    }
+    Packet.Empty => {}
+  }
+  return out
+}
+effect fn sharedCapture() -> i32 {
+  let mut packet = Packet.Ready { left: Token { value: 1 }, right: Token { value: 2 } }
+  let mut out = 0
+  match place packet {
+    Packet.Ready { left, .. } => {
+      run effect {
+        let seen = match &packet { Packet.Ready { .. } => 1 Packet.Empty => 0 }
+        return ()
+      }
+      out = left.value
+    }
+    Packet.Empty => {}
+  }
+  return out
+}
+`,
+  )
+  assert.deepEqual(facts.diagnostics, [])
+})
+
 it('rejects whole use after a projected move and records explicit partial-place termination', () => {
   const facts = checkPartial(
     'ownership/partial-drop',
