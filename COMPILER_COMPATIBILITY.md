@@ -22,7 +22,7 @@ diagnosis, and it may be a real bug.
 | Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
-| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
+| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silk build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
 
@@ -48,7 +48,7 @@ coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `Cont
 still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This does not
 claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
 scalar, reference, record and sequence forms through demanded MIR and LLVM text. The selector
-`silkc build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
+`silk build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
 the form and stage otherwise come from the manifest's `[build].artifact` and `[build].stage`, as in
 the TypeScript CLI. IR output does not invoke Clang. Successful builds emit a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
@@ -1267,14 +1267,14 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   bootstrap's spelling; native fingerprints frame the native HIR encoding, so they differ from the
   bootstrap's (TEST-005 does not fix the bytes).
 - **Source migration:** none.
-- **Diagnostics and limits:** native `silkc test` requires `--no-cache`; test-result reuse
+- **Diagnostics and limits:** native `silk test` requires `--no-cache`; test-result reuse
   (TEST-008) needs execution identities the native compiler does not publish yet and reports
   `SILK_GAP test-result-cache` otherwise.
 - **Evidence:** `callableAndEffectSignatureContracts` in
   `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` and each
   TEST-001 span; `compiler/src/semantic/TestDiscoveryCases.silk` checks the catalog, its refusals
   and a body iterating it. The native Cases shards in `selfhost.yml` run the bundled runner built
-  by `silkc test`.
+  by `silk test`.
 - **Owner:** bootstrap span alignment with the reference: a `main` follow-up.
 
 ### References to fixed arrays

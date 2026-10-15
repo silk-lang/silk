@@ -1101,7 +1101,7 @@ Counted only in an incremental session:
 | codegen units recompiled and reused                        | backend                                                                                           |
 | instances visited by the walk, and walk time               | `buildFrom`                                                                                       |
 
-`silkc build --stats` prints them on standard error after the build, in a fixed text form a script
+`silk build --stats` prints them on standard error after the build, in a fixed text form a script
 can parse. The cold-build gate (§9.1), the first-build budget (§9.2) and the update targets (§9.3)
 are each measured with it on the self-build, and every slice PR reports them beside time and RSS,
 as #1359 and #1427 did.
@@ -1137,7 +1137,7 @@ its exact bytes, which the source store retains anyway; `SourceRevision.Observat
 as that record of a module's bytes or absence. Without cutoff a rerun result always counts as
 changed, so every transitive consumer of an outdated unit would rerun after pull verification:
 slice 3 marks them outdated at once (push marking), and units have three states, absent, up to date
-and outdated, with no revision stamps. `silkc build --stats` prints the §9.4 counters. It deletes the evidence machinery that
+and outdated, with no revision stamps. `silk build --stats` prints the §9.4 counters. It deletes the evidence machinery that
 slice 2 only stopped recording: `Answer.sources`, `Answer.footprint`, `Answer.identity`,
 `Answer.answerId`, `Answer.bodyEvidence`, `SourceFrame`, `mergeEvidence`, `appendObservation`,
 `validAnswer`, `BodyDependency`, `BodyCandidate`, `reuseBody`, `priorCandidate`, `BodyInput`'s text
@@ -1188,7 +1188,7 @@ the `Body` unit, keyed by `(DeclIndex, selection)` once slice 0 lands and by tod
 before that, and it reads only the body, callee headers and type summaries (P5a). Slice 3 then
 records its edges like any other `Body` read. The borrow-checking note (#1421) owns its own slices.
 
-**Slice 8, the session driver.** `silkc build --watch` first, then the LSP entry points.
+**Slice 8, the session driver.** `silk build --watch` first, then the LSP entry points.
 
 The `SourceIndexCases.silk` scenarios of #1359 carry over unchanged in meaning: an unchanged file
 keeps its parse and index, a changed file drops them, a newly present file replaces its absent
