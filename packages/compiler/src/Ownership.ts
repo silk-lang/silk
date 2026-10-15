@@ -681,6 +681,43 @@ const selectorPath = (
   return path
 }
 
+/** The longest selector prefix that names a statically known place. */
+const knownPrefix = (
+  selectors: ReadonlyArray<Tir.BorrowSelector | Tir.WriteSelector>,
+): MovePath.Path => {
+  const path: Array<MovePath.Selector> = []
+  for (const selector of selectors) {
+    if (selector._tag === 'Field') path.push(...fieldSelectors(selector.field))
+    else if (selector._tag === 'Index' && selector.bounds._tag === 'Proven')
+      path.push({ _tag: 'ConstantIndex', index: selector.bounds.index })
+    else break
+  }
+  return path
+}
+
+/**
+ * Forgets the variant refinements within a place whose value may change untracked: an exclusive
+ * borrow can replace it, and a write through an unknown index may reach any element of it. A
+ * `match place` binding refined there then no longer names a place of it (MATCH-001).
+ */
+const forgetRefinement = (
+  state: CheckState,
+  live: FlowState,
+  root: BindingSite,
+  path: MovePath.Path,
+): void => {
+  const key = siteKey(root)
+  const binding = state.bindings.get(key)
+  if (binding === undefined) return
+  if (binding.place !== undefined) {
+    forgetRefinement(state, live, binding.place.root, [...binding.place.path, ...path])
+    return
+  }
+  const before = live.get(key)
+  if (before === undefined) return
+  live.set(key, MovePath.unrefine(before, path))
+}
+
 const placeFailure = (
   state: CheckState,
   binding: MutableBinding,
@@ -1464,11 +1501,12 @@ const checkExpressionOperation = (
         )
           return false
       const rootType = state.bindings.get(siteKey(site))?.type
-      const path =
+      const throughReference =
         rootType !== undefined && (Type.isReference(rootType) || Type.isSlice(rootType))
-          ? []
-          : (selectorPath(expression.selectors) ?? [])
+      const path = throughReference ? [] : (selectorPath(expression.selectors) ?? [])
       checkPath(state, live, site, path, expression.span)
+      if (expression.access === 'Exclusive' && !throughReference)
+        forgetRefinement(state, live, site, knownPrefix(expression.selectors))
       return true
     }
     case 'SliceLength':
@@ -1510,6 +1548,10 @@ const checkExpressionOperation = (
           )
         )
           return false
+        // A mutable capture's loan begins at construction (CAPTURE-001), and the callable may
+        // replace any part of the captured root through it.
+        const captured = capture.access === 'Exclusive' ? placeOf(capture.value) : undefined
+        if (captured !== undefined) forgetRefinement(state, live, captured.root, [])
       }
       return true
     }
@@ -1673,6 +1715,10 @@ const checkExpressionOperation = (
           )
         else if (site !== undefined)
           checkUse(state, live, site, capture.span, capture.access === 'Take')
+        // A mutable capture's loan begins at construction (CAPTURE-001), and the body may replace
+        // any part of the captured root through it.
+        if (site !== undefined && capture.access === 'Exclusive')
+          forgetRefinement(state, live, site, [])
       }
       return true
     }
@@ -4589,6 +4635,7 @@ const checkFunction = (
           statement.place._tag === 'WritePlace'
             ? selectorPath(statement.place.selectors)
             : undefined
+        const authoredRoot = rootSite
         const canonical = canonicalPlace(state, { root: rootSite, path: path ?? [] })
         if (canonical !== undefined) {
           rootSite = canonical.root
@@ -4636,6 +4683,8 @@ const checkFunction = (
             span: statement.span,
             initialization: selected,
           })
+        if (statement.place._tag === 'WritePlace' && path === undefined)
+          forgetRefinement(state, live, authoredRoot, knownPrefix(statement.place.selectors))
         if (statement.place._tag === 'WritePlace' && path !== undefined) {
           const restored = MovePath.restore(current, path, shape)
           if (Result.isSuccess(restored)) {

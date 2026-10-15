@@ -14,7 +14,12 @@ initializer's temporaries until its scope exits. A `match &mut`, `match place` o
 subject must name an existing place (`InvalidMatchScrutineePlace`, the bootstrap's `OWN0009`), and
 a `match &mut` or `let P = &mut e` subject must be a mutable place (`ExclusiveMatchRequiresMutable`,
 the bootstrap's `OWN0007`). A guard cannot move or drop a binding of its consuming arm
-(`GuardConsumesPattern`, the bootstrap's `OWN0008`).
+(`GuardConsumesPattern`, the bootstrap's `OWN0008`). A `match place` subject is a complete binding
+place, a binding reached through fields and literal fixed-array elements (`OWN0009` otherwise), and
+a binding of it names the payload its match selected until the arm replaces, moves or exclusively
+borrows the subject or an owner of it, including through an unknown index: a later use of the
+binding is `ExtractionBoundary` (the bootstrap's `OWN0002`), and a loop in the arm that does so
+before its next iteration uses the binding repeats incompatibly (`OWN0005`).
 Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
 `unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
@@ -115,11 +120,13 @@ static partial move marks the authenticated component moved: cleanup visits the 
 in their canonical order. Joins normalize the incoming component partitions, including opposite
 authored move orders, and retain each child's independent liveness. Replacing a component drops
 its initialized old value before the store, then restores precisely that component; siblings keep
-their state. A move beneath a type with a Drop hook is rejected as `OWN0002`. A write at a runtime
-index beside a moved element, a guard that changes an owner's state or
-consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost does not
-report yet), a loop iteration that leaves an owner changed and a borrowing match result whose arm
-created temporaries still report the `cleanup` gap.
+their state. A move beneath a type with a Drop hook is rejected as `OWN0002`. Typing records the
+static element a literal in-bounds index of a fixed array names, so a store there refills a moved
+element like a field, and borrow checking rejects a read, borrow or write of a moved element as
+`OWN0001`, and so does an access whose runtime index may name it. A guard that changes an owner's
+state or consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost
+does not report yet), a loop iteration that leaves an owner changed and a borrowing match result
+whose arm created temporaries still report the `cleanup` gap.
 Anonymous-environment availability preserves unchanged loop headers even when a pre-loop branch
 may have moved a field. It compares active roots, may/must holes, indexed uncertainty and guard
 state after each repeating edge; the missing field remains unavailable. Conditions are checked
@@ -150,8 +157,16 @@ place (D4): the protected Effect fails into a temporary, a switch sends members 
 handler and injects the rest into the residual failure. `finalizeEffect`, its NonParking variant
 and `useReleaseNonParking` expand the same way: both exits of the protected run (or of `use`, lent
 the owned resource) run the `() ! never` finalizer (or `release`, which drops the resource), and a
-held failure is raised afterwards. Reached parking lowers through `Intrinsic.relinquish` (D6), but
-`Intrinsic.NonParking` bounds are still admitted without proof (#1665). An `effect {}` block or anonymous
+held failure is raised afterwards. Reached parking lowers through `Intrinsic.relinquish` (D6). The
+build proves every reached `Intrinsic.NonParking` obligation after closing the external parks
+(`Intrinsic.relinquish`, `Intrinsic.executionCurrent`) over direct calls, drops, formed function
+addresses, readiness notifications and package releases. A bounded instance's own premise is owed
+by the call that reaches it, a nonparking finalizer, release or observer callback whose bound no
+premise carries is owed at its run, and a `with Intrinsic.nonParking()` service operation is owed
+for its selected witness at the call. An obligation covers the drop glue its value's runner
+executes in place. A nested transfer through `Effect.suspend` is not a park. An obligated value
+with no exact executable target, or one that reaches a park, is SEM0139. An
+`effect {}` block or anonymous
 `effect fn` is an exact representation like an anonymous closure: its environment holds its
 captures, and running it (or an invoked anonymous `effect fn`) calls its own instance with the
 environment as parameter 0. A block derives its success, failure and requirement row from its
@@ -204,45 +219,125 @@ such as a provision section's `once Effect<'env; ...>` representation bound. A f
 `'static` expectation of a shorter region, a declared region widened to another, and any owner,
 access, element, pointee or type-argument difference stay type errors.
 
-Build invocation: `silkc build <source> -o <output> --emit <executable|llvm-ir> --target <triple>
---stdlib <directory> --optimization <none|speed> --debug <true|false>`.
-The target defaults to the compiler's host target. Another supported target emits only LLVM IR:
-an executable build for a non-host target is an invalid build profile, so the macOS CI leg
-cross-emits the compiler's IR on Linux and links it on macOS.
-The output defaults to an executable. `--emit llvm-ir` writes the exact completed backend module
-bytes to the requested file, returns success without invoking Clang, and creates no intermediate
-executable or temporary IR file. Invalid or repeated output selectors fail before source loading.
+Build invocation: `silk build <source> -o <output> [--emit <stage>] --target <triple> --stdlib
+<directory> --optimization <none|speed> --debug <true|false>`.
+As in the TypeScript CLI, the artifact form is the `[build].artifact` and the stage the
+`[build].stage` of the nearest `silk.toml` above the source; `--emit` replaces the stage with one of
+its spellings (`final`, `llvm-ir`, `llvm-bitcode`, `assembly`, `object`). The form sets the profile
+artifact, so every stage carries it: an object form's `llvm-ir` is that object's module. The target
+defaults to the compiler's host target. Only an executable's final stage links, and only for the
+host target; an executable build for a non-host target is an invalid build profile, so the macOS CI
+leg cross-emits the compiler's IR on Linux and links it on macOS. The `llvm-ir` stage writes the
+exact completed backend module bytes to the requested file, returns success without invoking Clang,
+and creates no intermediate executable or temporary IR file. Every other stage and form is compiled
+for its target with the profile's relocation model (`-fPIC` by default) and needs no linker; an
+intermediate stage merges no declared inputs. An `object` form acquires no catalog runtime or
+storage component: the application's `export "C"` functions are its roots, so a package without
+`main` builds, and a `[build].composition` may omit `defaults`. Its final stage merges declared
+object and archive inputs by a relocatable link and refuses any other declared input. A
+`static-library` form acquires no catalog runtime either; its final stage compiles one object and
+archives it with `llvm-ar rcsD` beside the declared object inputs, refusing any other declared input.
+The archiver is `SILK_LLVM_AR`, or else the `llvm-ar` beside the configured Clang. The shared library
+form stops with `SILK_GAP artifact-form` before any tool runs. Invalid or
+repeated output selectors fail before source loading.
 With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
-<native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup together.
+<native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup, objects
+and static libraries linked with a separately compiled C caller, both forms for every native target
+and the intermediate stages together; the selfhost workflow runs it on N1.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
-root contains `silk/`; it is an explicit CLI input. A package without a `[build].composition`
-takes its runtime from the library's `compositions.json` for the target and libc, so such a build
-needs the library root even without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
-is the root for local module paths. Every module identity names the package by its logical
+root contains `silk/`. `--stdlib` names it explicitly; without the flag, every command uses the
+library an installation keeps at `<prefix>/lib/silk/stdlib` beside `<prefix>/bin/silk`. The
+compiler finds its executable from argument zero (a path, or a bare name searched in `PATH`) and
+resolves symbolic links with `realpath`, so a link to it in another directory finds the same
+library. `compiler/scripts/ReleaseArchive.ts` packages that installation per target as
+`silk-<version>-<target>.tar.gz`: `bin/silk` and `lib/silk/stdlib` below one
+`silk-<version>-<target>/` directory, with zero owners and times so equal inputs give equal
+bytes. The selfhost workflow packages every target's N2 this way, runs a new `init` project from
+the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
+library's `compositions.json` for the target and libc, so such a build needs the library root even
+without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
+(resolved against the manifest's directory), else the root's containing directory, is the root for
+local module paths, and the root must be a module below it. Every module identity names the package by its logical
 identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
 manifest above it has no package identity and is refused. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
 
-Test invocation: `silkc test <root> -o <executable> --stdlib <directory> [--filter <text>]
+Test invocation: `silk test <root> -o <executable> --stdlib <directory> [--filter <text>]
 [--file <path>] [--optimization <none|speed>] [--debug <true|false>] --no-cache`. It builds the
 bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it with an uncached
-plan, admits its receipt and exits with its status; see [Native `silkc test`](docs/native-test.md).
+plan, admits its receipt and exits with its status; see [Native `silk test`](docs/native-test.md).
 
-Run invocation: `silkc run [--stdlib <directory>] [arguments...] [-- arguments...]`. It finds the
-nearest `silk.toml` above the working directory, as the TypeScript CLI's `silk run` does, and
-builds `[package].root` for the host target in the debug profile (no optimization, debug
-information) at `<output-dir>/llvm/<target>/debug/<name>`, where `[build].output-dir` defaults to
-`build` and must stay inside the project. Options are read until `--`; other arguments before it
+Project build invocation: `silk build [--manifest-path <path>] [--target <host|triple>]...
+[--release] [--optimization <debug|release|release-with-debug>] [--profile <name>]
+[--profile-input <json>] [--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
+`silk.toml` above the working directory, or exactly the manifest `--manifest-path` names, as the
+TypeScript CLI's `silk build` does, and builds `[package].root` once per selected target: the
+`--target` selectors in order, or else `[build].targets` (default `["host"]`), where `host` names
+the compiler's host and a repeated target builds once. The debug profile (no optimization, debug
+information) is the default; `--optimization release` (or `--release`) selects optimization without
+debug information and `--optimization release-with-debug` keeps it, as the TypeScript CLI does, and
+`--release` with another `--optimization` exits 2. Each
+artifact lands at `<output-dir>/llvm/<target>/<profile>/<name>`, where `[build].output-dir`
+defaults to `build` and must stay inside the project; an `llvm-ir` `[build].stage` writes
+`<name>.ll` there instead. Only the host target links an executable, and library artifacts and the
+other intermediate stages are not native yet; each such target fails with status 2. The command
+prints one `build llvm/<target>: ok <artifact>` or `failed (exit <status>)` line per target and a
+`Build summary`; its status is 2 when any target failed operationally, else 1 when any build was
+refused, else 0. A missing or invalid manifest or an unknown target exits 2 before building.
+
+Named profiles follow the TypeScript `ProjectProfile`: a `[profiles.<name>]` table is a complete
+logical profile (`target` is required; `cpu`, `optimization`, `debug` and the other profile fields
+are optional) with optional profile-tier `bindings`, and `[build].profile` names the default one.
+`--profile-input <json>` supplies a complete profile as a JSON object with the same fields and
+`bindings` (`Invalid --profile-input JSON` exits 2), and naming it together with `--profile` is
+refused as `ConflictingBindings: profile selection modes`. `--profile-input`, or `--profile
+<name>`, or else the default when no `--target` is given, builds exactly that profile once, in the profile directory its optimization and debug choices name; it conflicts with
+`--target`, `--release` and `--optimization` (status 2). `[build].bindings` holds project-tier package-parameter
+bindings (`package`, `module`, `parameter`, a `value` such as `{ kind = "integer", value = "3" }`
+and an `origin` with `source` and a public `provenance`) that every project build receives, before
+the selected profile's own. Loading a project validates the whole catalog; a refusal prints the
+TypeScript `<code>: <subject>`, such as `InvalidInput: profile name`, and exits 2.
+
+Run invocation: `silk run [--manifest-path <path>] [--target <host|triple>]... [--release]
+[--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>]
+[arguments...] [-- arguments...]`. It builds the
+project's executable as the project build does, for the named profile, else the first `--target`,
+else the host (it ignores `[build].targets`), and a target other than the host exits 2. Options are read until `--`; other arguments before it
 and every argument after it go to the program in order. The compiler then replaces its own process
 with the program (`execv`), so the program inherits standard input, output and error, the
 environment and the working directory, and its exit status or terminating signal is the command's.
-A missing or invalid manifest, a non-executable `[build].artifact` or a non-final `[build].stage`
-exits 2; a refused build keeps `build`'s status.
+A non-executable `[build].artifact` or a non-final `[build].stage` exits 2; a refused build keeps
+`build`'s status.
 
-Init invocation: `silkc init [path] [--name <name>]`. It creates a project as the TypeScript
+Every successful compilation (`build`, a project `build`, `run` and `test`) prints
+`Compiled <source> -> <artifact> (llvm, <target>, N symbols)` on standard output, as the TypeScript
+CLI does: paths are relative to the project directory, or to the source's directory for a
+single-file build, and N is the number of symbols the emission plan names.
+
+A macOS executable links against one resolved SDK, as the platform-supplies reference
+requires (objects and intermediate stages need none): `SDKROOT` when it is set (it must name a valid SDK; an invalid one never falls back),
+else, for the host target only, the SDK `xcrun --sdk macosx --show-sdk-path` reports with
+`DEVELOPER_DIR` forwarded. The SDK must state an ARM64 macOS target, admit the deployment (the
+profile's, else 11.0.0) and supply the ARM64 `libSystem` contract. Clang receives it as
+`-isysroot` with `-mmacosx-version-min`; an ambient `SDKROOT` never reaches Clang. A refused
+supply prints `<code>: <subject> (<origin>)` and its correction, and exits 2.
+
+A project's `[build].platform-supply` table selects the supply as the TypeScript CLI decodes it:
+`kind = "automatic"` or `"native"` keeps the selection above; `kind = "explicit"` names its
+`target`, SDK or sysroot `root`, `linker`, an optional `origin` and optional `support`
+installations (`root`, `target`, `origin`), with relative paths against the manifest's directory.
+An explicit supply must name the build's target and replaces `SDKROOT` and discovery: a macOS
+SDK is validated as above, and a GNU/Linux sysroot reaches Clang as `--sysroot`, its compiler
+support as `--gcc-install-dir` and the linker, which must be installed, as `--ld-path`. A
+`managed` supply is refused with `UnsupportedProvider`.
+
+`silk --help` (or `-h`) prints the command synopsis and `silk --version` (or `-v`) prints
+`silk v<version>`, both on standard output with status 0.
+
+Init invocation: `silk init [path] [--name <name>]`. It creates a project as the TypeScript
 initializer does: `silk.toml` (`[package]` name, version `0.1.0`, root `src/main.silk`), a
 `src/main.silk` that logs a greeting, and a `.gitignore` holding `/build/` (appended to an existing
 one that lacks the rule). The directory defaults to the working directory and is created with its
@@ -251,7 +346,18 @@ existing manifest or entry, a `src` that is not a directory or an ancestor that 
 with status 2 before anything is written, and a failure part-way removes everything initialization
 created and restores the previous `.gitignore`.
 
-Clean invocation: `silkc clean`. It removes the nearest project's `[build].output-dir` and
+Project test invocation: `silk test [project options] [--root <path>] [--file <path>]
+[--filter <text>] --no-cache`, that is `test` without a discovery root; the project options are
+`build`'s. It loads the project as `run` does and builds the test runner for the host, as the
+TypeScript `silk test` does: always a final executable, whatever `[build].artifact` and
+`[build].stage` select, at `<output-dir>/test/llvm/<target>/<profile>/<name>`. Discovery starts at
+`--root`, else at `[package].root`. `--root` and `--file` are resolved against the project
+directory and must name a canonical `.silk` module path below the source root;
+the runner receives `--file` as the project-relative path its catalog reports. A foreign target,
+an invalid selection and a run without `--no-cache` (see below) exit 2 before building; otherwise
+the status is the test run's, as for a file-root `test`.
+
+Clean invocation: `silk clean [--manifest-path <path>]`. It removes the project's `[build].output-dir` and
 everything below it, as the TypeScript `silk clean` does, and prints `Removed <directory>`. An
 absent output directory is already clean. Only builds write there, and the manifest decoder keeps
 the directory inside the project. A missing or invalid manifest, or a failed removal, exits 2.
@@ -298,9 +404,9 @@ injected-producer contracts establish the receipt boundary; they do not claim a 
 self-build. Run the focused contracts with
 `pnpm exec vitest run --config compiler/scripts/vitest.config.mjs compiler/scripts/NativeBuild.test.mjs`.
 
-`silkc format [paths] [--check]` formats source without semantic analysis or code generation.
-The nearest `silk.toml` above the working directory supplies `[package].root`; its containing
-directory is the source root. With no paths the command recursively selects that root. Explicit
+`silk format [paths] [--check]` formats source without semantic analysis or code generation.
+The nearest `silk.toml` above the working directory supplies the source root: its
+`[package].source-root`, else the directory containing `[package].root`. With no paths the command recursively selects that root. Explicit
 files and directories are resolved against the working directory, must stay inside the source
 root, and select only exact `.silk` extensions. Selection is sorted by normalized path bytes and
 deduplicated; symbolic links are rejected by the native filesystem provider. Use `--` before a
@@ -359,7 +465,7 @@ reads only the syntax index, so a name with a conditional candidate there is the
   suspension, closures and the opt-in MIR check.
 - [Effect calling convention](docs/effect-calling-convention.md): how native code receives Effect
   providers, returns typed failures, and expands the Effect composition intrinsics (roadmap step 5).
-- [Native `silkc test`](docs/native-test.md): test discovery, the runner exchange, and the CI
+- [Native `silk test`](docs/native-test.md): test discovery, the runner exchange, and the CI
   switch of the Cases shards.
 
 ## Development branches and bootstrap
@@ -411,39 +517,36 @@ pinning instructions.
 ### ARM64 Linux development
 
 Both compilers support `aarch64-unknown-linux-gnu`, including ARM64 Debian and Ubuntu VMs.
-The native compiler selects this host automatically. The release pinned in `native-seed.json`
-currently contains an **x86-64** executable; its architecture is a distribution constraint, not
-the list of targets the compiler supports. It cannot run directly on ARM64.
+The native compiler selects this host automatically. Install Node 24, the repository's pnpm
+version, GitHub CLI, `jq`, `build-essential`, and LLVM 22.1.8 for Linux ARM64. Put the complete
+LLVM `bin` directory on `PATH`.
 
-For the first ARM64 compiler, use the TypeScript bootstrap from this synchronized checkout (or
-the verified main bundle described above). Install Node 24, the repository's pnpm version,
-`build-essential`, and LLVM 22.1.8 for Linux ARM64. Put the complete LLVM `bin` directory on
-`PATH`, then run these commands from the repository root:
+Start with the ARM64 entry in `native-seed.json` once a reviewed pin exists, following
+[Install a verified native seed](docs/native-seed-chain.md#install-a-verified-native-seed) with
+`target=aarch64-unknown-linux-gnu`. The script verifies SHA-256 before creating the executable;
+no TypeScript compiler or CPU emulation is needed. The initial per-target schema change preserves
+the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first green push publishes
+ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
+verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-```sh
-pnpm install --frozen-lockfile
-pnpm --filter @silklang/cli... run build
-node --max-old-space-size=16384 packages/cli/dist/bin.js build \
-  --manifest-path compiler/silk.toml --release
-export SILKC_CLANG="$(command -v clang)"
-export SILKC="$PWD/compiler/build/llvm/aarch64-unknown-linux-gnu/release/silk-compiler"
-```
-
-The initial bootstrap can take several minutes. `SILKC_CLANG` selects the LLVM 22 compiler for
-native linking; the selfhost CLI otherwise uses `/usr/bin/clang`. Subsequent development builds
-can use the ARM64 executable directly, with no JavaScript compiler or CPU emulation:
+Without `SILK_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
+does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
+executable and `SILK_CLANG` pointing at LLVM 22 `clang`, development builds use the native
+compiler directly. A pinned seed predates `SILK_CLANG` and reads `SILKC_CLANG` until the next
+re-pin:
 
 ```sh
 mkdir -p .scratch
-"$SILKC" build compiler/src/main.silk -o .scratch/silkc-next \
+"$SILK_COMPILER" build compiler/src/main.silk -o .scratch/silk-next \
   --stdlib "$PWD/packages/compiler/stdlib" --optimization speed
-"$SILKC" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
+"$SILK_COMPILER" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
   --stdlib "$PWD/packages/compiler/stdlib" --no-cache --filter frozenTarget
 ```
 
 Use the existing source-written `*Cases.silk` roots and their filters for focused changes.
-This local bootstrap does not change the pinned release or claim the CI seed-chain fixpoint;
-the pin and its provenance remain governed by [the native seed chain](docs/native-seed-chain.md).
+ARM64 Linux CI on `ubuntu-24.04-arm` checks N1/N2 compiler IR identity and the native corpus;
+macOS arm64 has the same seed verification and native chain on `macos-15`. The pin and its
+provenance remain governed by [the native seed chain](docs/native-seed-chain.md).
 
 ## Anonymous declaration identities
 

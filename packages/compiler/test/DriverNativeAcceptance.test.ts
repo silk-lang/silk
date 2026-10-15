@@ -31,7 +31,8 @@ import type * as ModuleClosure from '../src/ModuleClosure.js'
 import * as Linker from '../src/Linker.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
-import { httpRedirectCorpusProgram, nativeCorpus, type NativeRun } from './support/corpus.js'
+import { nativeCorpus, type NativeRun } from './support/corpus.js'
+import { httpRedirectAcceptanceSource } from './support/httpRedirectAcceptance.js'
 import { checkedConversionPrograms } from './support/checkedConversions.js'
 import { base64AcceptanceSource } from './support/base64Acceptance.js'
 import { httpClientPortableAcceptanceSource } from './support/httpClientAcceptance.js'
@@ -309,8 +310,8 @@ const compileCSources = Effect.fnUntraced(function* (
 
 const portableWasmCorpus = [
   {
-    name: httpRedirectCorpusProgram.name,
-    source: httpRedirectCorpusProgram.source,
+    name: 'http-redirect',
+    source: httpRedirectAcceptanceSource,
     expected: 0,
   },
   {
