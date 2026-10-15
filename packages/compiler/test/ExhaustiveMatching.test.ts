@@ -510,7 +510,8 @@ pub fn inspect(point: Point) -> i32 {
   )
 
   // A borrowed match arm keeps its owner loaned through the arm's last binding use (MATCH-002); a
-  // guard-only use or a write after that use leaves the owner free.
+  // guard-only use, a write after that use, or an arm that binds nothing leaves the owner free.
+  // Under a whole-arm loan (MATCH-001 read literally) `released` and `unbound` are rejected too.
   const armSource = `pub struct Token { kind: i32 }
 pub union Slot { Held { value: Token }, Vacant }
 pub fn reset(input: Slot) -> i32 {
@@ -537,6 +538,14 @@ pub fn released(input: Slot) -> i32 {
     }
     Slot.Vacant => 0
   }
+}
+pub fn unbound(input: Slot) -> i32 {
+  let mut slot = move input
+  match &slot {
+    Slot.Held { .. } => { slot = Slot.Vacant }
+    Slot.Vacant => {}
+  }
+  return 0
 }`
   const arm = analyze('borrowed-arm-loan', armSource)
   const write = armSource.indexOf('slot = Slot.Vacant')
