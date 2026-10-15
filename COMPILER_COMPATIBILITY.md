@@ -22,7 +22,7 @@ diagnosis, and it may be a real bug.
 | Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
-| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
+| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silk build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
 
@@ -48,8 +48,9 @@ coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `Cont
 still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This does not
 claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
 scalar, reference, record and sequence forms through demanded MIR and LLVM text. The selector
-`silkc build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
-the default output links an executable. IR output does not invoke Clang. Successful builds emit a
+`silk build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
+the form and stage otherwise come from the manifest's `[build].artifact` and `[build].stage`, as in
+the TypeScript CLI. IR output does not invoke Clang. Successful builds emit a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
 projections now use neutral record/sequence layouts in backend roadmap step 4. Runtime slice
 descriptors and checked element places use the same internal aggregate slots; subrange primitives
@@ -531,14 +532,17 @@ Each entry records:
 - **Compilers:** both lower drops, replacement drops, drop flags and partial moves. On 2026-10-07,
   selfhost component cleanup was locally verified for conditional partial transfers, joins with
   opposite authored move orders, receiving-owner cleanup and component refill. It retains canonical
-  projected components and independent edge-written flags rather than consuming-site hole lists.
-  Selfhost still reports the backend gap `cleanup` for a write at a runtime index beside a moved
-  element, a loop iteration that leaves an owner in a different state than it found it, a
-  guard that changes an owner's state, a borrowing match result whose arm created temporaries, and
-  drop glue for callable and Effect environments and unions without a canonical member order.
-  Since 2026-10-08 a type parameter owns no cleanup when a declared premise proves it Copy, as
-  `K: Copy` or a shared callable representation does; an unbounded abstract owner of a generic
-  named instance keeps the `cleanup` gap.
+  projected components and independent edge-written flags rather than consuming-site hole lists. A
+  store at a literal in-bounds array index refills a moved element as its static component
+  (2026-10-14). Both reject a read, borrow or write of a moved or maybe-moved array element,
+  including through a runtime index that may name it, as `OWN0001`; selfhost borrow checking names a
+  literal in-bounds index's static element (2026-10-15). Selfhost still reports the backend gap
+  `cleanup` for a loop iteration that leaves an owner in a different state than it found it, a guard
+  that changes an owner's state, a borrowing match result whose arm created temporaries, and drop
+  glue for callable and Effect environments and unions without a canonical member order. Since
+  2026-10-08 a type parameter owns no cleanup when a declared premise proves it Copy, as `K: Copy`
+  or a shared callable representation does; an unbounded abstract owner of a generic named instance
+  keeps the `cleanup` gap.
 - **Source migration:** none.
 - **Evidence:** `cleanupStackDropsWhatEachExitLeaves` and `dropGlueCleansHookThenChildren` in
   `compiler/src/semantic/SemanticLoweringCases.silk`, and `cleanupFollowsLoopsAndConditionalPaths`
@@ -663,20 +667,43 @@ Each entry records:
   `genericCopyCyclesKeepCompleteImportedDiagnosticSite` and
   `genericCleanupPropertiesKeepFiniteOpaqueDescentAndRejectGrowth`; corrected execution pending.
 
-### Selfhost keeps generic aggregate borrow regions tied to actual places
+### Lifetime failures at call arguments and returns keep native codes or spans
 
-- **Status:** authored on 2026-10-04 during final Step 7 correction verification; native execution
-  and exact-head CI remain pending.
-- **Rule:** fixed lifetime arguments cannot be replaced by local inference or manufacture a
-  stronger loan than the borrowed storage. Reborrowing a parameter referent retains its source
-  region; a static result annotation cannot turn owned local storage into a static loan.
-- **Compilers:** bootstrap reports `SEM0212` at the invalid local borrow and `OWN0019` at its
-  enclosing return use. The native aggregate operand boundary retains `TypeMismatch` at that
-  borrow, consistent with its existing field type-mismatch family. Complete and partial written
-  prefixes remain fixed evidence.
-- **Source migration:** none.
-- **Evidence:** positive complete/partial prefixes and the local-to-static negative in
-  `genericNominalBorrowArgumentsPreserveActualRegions`; reduced-fixture native execution pending.
+- **Status:** recorded on 2026-10-14 with the lifetime-diagnostic parity follow-up to #1668. It is
+  retired when native reports these where the bootstrap's region proof does.
+- **Rule:** LIFE-002 and BORROW-008. A view cannot be admitted at a longer region than its
+  storage's validity: SEM0212 for an unproven relation, OWN0019 for storage the body owns.
+- **Compilers:** both reject every program below; the bootstrap reports from its whole-body
+  region proof, native from typing at the boundary.
+  - A returned view whose region is a body loan region: both report SEM0212 when any source is
+    external (`return pick(&source.*, &local)`) and OWN0019 when every source is owned. The
+    bootstrap places SEM0212 at the function header; native places it at the returned expression.
+    A returned reference whose region came from outside the body (`return value`) is SEM0129 at
+    the expression in both.
+  - A reference argument at a longer fixed region (`keep(&held)` for `&'static i32`): the
+    bootstrap reports SEM0212 at `&held`; native keeps TypeMismatch (SEM0012) on the call, because
+    the argument's subtyping fallback runs on that mismatch. Slice arguments report SEM0212 at the
+    operand in both.
+- **Source migration:** none; both compilers reject.
+- **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
+  (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`).
+
+### Bootstrap misses implied outlives from reference-to-lifetime-parameterized types
+
+- **Status:** recorded on 2026-10-14 while validating the native imprecise-retention slice (#1698).
+  It is retired when the bootstrap's loan pass, or a native region slice that makes such callers
+  `Checked`, proves the implied bound.
+- **Rule:** LIFE-002: `&'a T` implies `T: 'a`, so `&'a Shelf<'b>` implies `'b: 'a`. A callee may
+  return the `'b` contents of its argument as `&'a`, and the result then aliases them.
+- **Compilers:** the bootstrap accepts a write to the `'b` referent while such a result lives:
+  `let shelf = Shelf {inner: &held}`, `let view = unshelve(&shelf)` (or `shelf.shelved()`), then
+  `held = Token {value: 2}` and a read of `view`. Native keeps that caller `imprecise`: the call
+  result keeps the contents loan approximately because the implied fact links its region to the
+  result's, so the body is never `Checked`.
+- **Source migration:** none. The compiler and standard library have no such caller: their
+  self-build reports no `imprecise` body.
+- **Evidence:** `SemanticCaptureCases::returnedViewsKeepTheirSourceLoans` (`unshelveThenReplace`,
+  `shelvedThenReplace`).
 
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
@@ -1053,8 +1080,12 @@ Each entry records:
   `export "C" fn` declarations of the selected runtime and of the application module. Selfhost takes the single default of
   `[build].composition` in the nearest `silk.toml`; without a composition it takes the
   standard-library `compositions.json` runtime listed for the target and libc, as the bootstrap
-  does. A composition with no default, two defaults, an unlisted default, or no catalog runtime
-  for the target and libc stops the build. Selfhost does not yet read profile `runtime` requests
+  does. Two defaults or an unlisted default stop the build; a composition with no default or no
+  catalog runtime for the target and libc stops an executable build. An object form
+  (`[build].artifact = "object"`) acquires no catalog runtime or catalog storage component, so a
+  package without a `main` builds; a composition without a default selects no runtime for it, and
+  its application's C exports are its only roots, possibly none. A static library form takes the
+  same roots and archives its object with `llvm-ar`. The shared library form is not yet native. Selfhost does not yet read profile `runtime` requests
   (`none` or a named runtime), composition `retention` or `requirements`, and it does not make
   exports declared in other imported modules build roots. A Silk call to an exported
   definition remains the `foreign-export` gap. An export lane outside the immediate C subset keeps
@@ -1065,8 +1096,10 @@ Each entry records:
   request or on retention roots needs the bootstrap.
 - **Diagnostics and limits:** an unselected runtime is `InvalidBuildComposition` before analysis.
 - **Evidence:** `SemanticLoweringCases` covers runtime C export roots, lane extensions, inactive
-  arms, absent runtime sources, manifest default selection, and catalog selection by target and
-  libc.
+  arms, absent runtime sources, manifest default selection, catalog selection by target and
+  libc, and runtime-less object roots and selection. `compiler/scripts/test-native-build.ts` links a
+  native object with a separately compiled C caller, merges a declared object input, refuses a
+  library input, and cross-compiles an object; it runs on N1 in the selfhost workflow.
 
 ### Selfhost checks observations partially
 
@@ -1075,10 +1108,11 @@ Each entry records:
   [compiler/docs/failure-observer-and-trace.md](compiler/docs/failure-observer-and-trace.md)
   (2026-10-05). Logical frames and `while handling` causes landed with that note's N7 (2026-10-09),
   event 6 for arithmetic traps on 2026-10-10, and event 6 for MIR `Trap` terminators on
-  2026-10-14, and identities for strings, arrays, slices, pointers and `'static` regions on
-  2026-10-14. The remaining rows retire with the suspension stage's executable-closure summary
-  (SEM0216, SEM0217), callback environments in the observer record, and identity rendering for the
-  remaining failure types. The region row below is intended native behavior and does not retire.
+  2026-10-14, identities for strings, arrays, slices, pointers and `'static` regions on
+  2026-10-14, and capturing and staged callbacks through observation adapters on 2026-10-14. The
+  remaining rows retire with the suspension stage's executable-closure summary (SEM0216, SEM0217)
+  and identity rendering for the remaining failure types. The region row below is intended native
+  behavior and does not retire.
 - **Rule:** [TERM-004](apps/docs/content/reference/program-termination-and-reporting.md#term-004--a-failure-report-has-one-stable-minimum)
   to TERM-008 and
   [FAIL-006](apps/docs/content/reference/typed-failures.md#fail-006--typed-failure-applies-ordinary-cleanup-and-preserves-diagnostic-context):
@@ -1097,9 +1131,9 @@ Each entry records:
     has no native counterpart.
   - SEM0216 and SEM0217 are not diagnosed; a context-free `observeUnhandled` returns `0` at run
     time, as the bootstrap's null observer does.
-  - A capturing callback reports `observer-callback`. An observed `fail` of an anonymous tuple or
-    record, a callable, an Effect or foreign function, or a nominal with a requirement-row argument
-    reports `failure-identity`.
+  - A callback whose callable consumes or exclusively lends its environment reports
+    `observer-callback`. An observed `fail` of an anonymous tuple or record, a callable, an Effect
+    or foreign function, or a nominal with a requirement-row argument reports `failure-identity`.
   - Identities spell `'static` as the bootstrap does (`string<'static>`, `&'static [u8]`,
     `memory/driver.Holder<'static>`). By design, selfhost omits any other region (`string`, `&T`,
     `memory/driver.Problem`). The bootstrap prints its internal inference region there
@@ -1113,30 +1147,63 @@ Each entry records:
   needs the bootstrap.
 - **Evidence:** `observedFailuresCarryOriginContext`, `observationsCarryContextThroughExpansions`,
   `nestedObservationsStartFresh`, `observedInstancesEmitTheContextAbi`,
-  `observedTrapsRecordTheirSites` and `storagePrimitivesFollowTheirContracts` in
+  `observedTrapsRecordTheirSites`, `observerCallbacksRunThroughAdapters` and
+  `storagePrimitivesFollowTheirContracts` in
   `compiler/src/semantic/SemanticCallableCases.silk`; the `native-termination-*` corpus programs.
 
-### Selfhost admits `Intrinsic.NonParking` bounds without proof
+### Selfhost proves `Intrinsic.NonParking` more conservatively than the bootstrap
 
-- **Status:** open divergence that accepts invalid programs, tracked by
-  [#1665](https://github.com/silk-lang/silk/issues/1665). Introduced as a temporary Step 9e
-  divergence of [#567](https://github.com/silk-lang/silk/issues/567) on 2026-10-05. Its fallback
-  ended when 629d0038e (2026-10-09) made reached parking lower through `Intrinsic.relinquish`.
+- **Status:** open divergences, found with
+  [#1665](https://github.com/silk-lang/silk/issues/1665) on 2026-10-14. All of them reject programs
+  the bootstrap accepts; none accepts a program that parks.
 - **Rule:** an `Intrinsic.NonParking` bound holds only when the specialized transitive graph
-  cannot reach external parking.
-- **Compilers:** the bootstrap proves the bound during executable analysis
-  (`ExecutableOrigin.ts` NonParking obligations for `finalizeEffectNonParking` and
-  `useReleaseNonParking`; `CallResolution.ts` for service operations) and rejects a finalizer or
-  release whose targets are not exact or not proven with SEM0139. Selfhost discharges the bound at
-  the call without that analysis. Before 629d0038e, any parking it would have rejected was refused
-  as the `suspension` gap at the `park` site; that refusal no longer exists, so selfhost now accepts
-  a `NonParking`-bounded finalizer or callable that parks. #1665 has two reproductions.
-- **Source migration:** none. Programs that rely on the admission are invalid under the reference.
-- **Diagnostics and limits:** selfhost reports nothing where the bootstrap reports SEM0139 at the
-  bounded call. Retire this entry when selfhost proves the bound.
-- **Evidence:** `nonParkingFinalizersAreAdmitted` in
-  `compiler/src/semantic/SemanticCaptureCases.silk` pins the admission of valid finalizers; the
-  bootstrap's rejection is in `packages/compiler/test/Suspendability.test.ts`.
+  cannot reach external parking (`Intrinsic.relinquish`, `Intrinsic.executionCurrent`). A nested
+  transfer through `Effect.suspend` is not a park. A bounded value is proved even when the program
+  never invokes it.
+- **Compilers:** both compilers reject an unproved bound with SEM0139. They report it:
+  - at the call that reaches the bounded instance;
+  - at a nonparking finalizer or release whose bound no premise carries;
+  - at a `with Intrinsic.nonParking()` service call.
+
+  Selfhost's park closure also follows drops, formed function addresses, readiness notifications
+  and package releases. Its obligations cover the drop glue a composite's runner executes in
+  place: a bracket's resource, a binding's provider, an observer's state, a cancelled finalizer.
+  Selfhost diverges from the bootstrap in these ways:
+  - **Observation callbacks.** Selfhost obligates an `Intrinsic.observeDiagnostics` callback at the
+    observation's run unless a premise carries it, because every diagnostic the observed body
+    reports invokes it. The bootstrap does not check that callback.
+  - **Execution releases.** Releasing an Execution (dropping the handle, completing a drive, or
+    destroying a notified package) is treated as running the glue of every package the program
+    forms. A package whose captured state has a parking Drop hook therefore makes every
+    NonParking scope that releases any Execution unproved, including `native_start`'s drive
+    callbacks. No standard-library Drop hook runs an Effect.
+  - **Callable schemas.** Selfhost cannot open a callable schema (a named function value with
+    deferred binders, such as an elided reference lifetime). It proves the schema against every
+    reached instance of its declaration. A calm use is therefore unproved when another reached
+    instance of the same declaration parks, or when no instance is reached at all. The bootstrap
+    proves the function itself.
+- **Source migration:** none for ordinary programs. Do not give an Execution body state whose
+  Drop hook parks. Do not pass a never-invoked function with deferred binders to a
+  NonParking-bounded parameter.
+- **Diagnostics and limits:**
+  - Selfhost reports every unproved site, with the application module's sites first and the
+    runtime module's sites last. The bootstrap keeps one diagnostic per message, so for a bound
+    forwarded through a second bounded parameter it reports only the inner parameter's anchor.
+  - A direct `Intrinsic.finalizeEffectNonParking` or `useReleaseNonParking` run is reported at its
+    `run`.
+  - Selfhost assumes that a foreign call re-enters Silk only through a callback address the
+    program forms. An `export "C"` function that C code calls by symbol from inside a NonParking
+    scope is outside the proof. The existing ForeignCallback check rejects a suspending callback
+    address.
+  - A plain function that returns an Effect for its caller to run (as a bracket's release, or as a
+    bounded callable whose result is run) is not yet lowered natively and is refused as
+    unsupported. The proof also treats such a target as inexact, so it stays unproved until a
+    returned Effect's parts can be targeted.
+  - `closeSuspendable` does not follow drop edges either; a Drop hook that suspends is outside
+    the suspension selection.
+- **Evidence:** `nonParkingBoundsAreProvedAtBuild` in
+  `compiler/src/semantic/SemanticLoweringCases.silk`; the bootstrap's rejections are in
+  `packages/compiler/test/Suspendability.test.ts`.
 
 ### Nominal qualification requires an inherent member
 
@@ -1189,22 +1256,6 @@ continue parsing fields. Struct literal initializers still use commas. The boots
 its comma acceptance is an intentional recorded divergence until a separately authorized repair.
 The structured parser assertion lives in `hir/LoweringCases.structFieldCommaReportsAuthoredSyntax`.
 
-### Escaping local array loans report a type mismatch in selfhost
-
-- **Status:** divergence recorded by the coordinator on 2026-10-02 for PR #688 (B9-S8). It is
-  retired when region escape checking lands with roadmap step 14.
-- **Rule:** BORROW-006 lets a borrowed array literal own hidden storage. A view of that storage
-  or of a local array cannot outlive its function, and returning it reports `OWN0019`.
-- **Compilers:** the bootstrap reports `OWN0019` at the escape. Selfhost types the loan with a
-  caller-local region, so a `'static` result rejects it as `TypeMismatch` at the borrow span. This
-  applies to `return &local` and `return &[42]` alike. Selfhost has no validity-escape code before
-  step 14.
-- **Source migration:** none; both compilers reject the program.
-- **Diagnostics and limits:** for these direct returns, only the code differs. Other escape forms
-  are step 14 scope and are not claimed here.
-- **Evidence:** `sliceConversionsRetainRegionAccessAndDiagnostics` asserts `TypeMismatch` at
-  `&local` and `&[42]`. The bootstrap's `RuntimeSliceOwnership.test.ts` asserts `OWN0019`.
-
 ### Test declaration diagnostics and discovery
 
 - **Status:** recorded on 2026-10-08 with the Stage 1 census tail; native discovery and TEST-001
@@ -1223,14 +1274,14 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   bootstrap's spelling; native fingerprints frame the native HIR encoding, so they differ from the
   bootstrap's (TEST-005 does not fix the bytes).
 - **Source migration:** none.
-- **Diagnostics and limits:** native `silkc test` requires `--no-cache`; test-result reuse
+- **Diagnostics and limits:** native `silk test` requires `--no-cache`; test-result reuse
   (TEST-008) needs execution identities the native compiler does not publish yet and reports
   `SILK_GAP test-result-cache` otherwise.
 - **Evidence:** `callableAndEffectSignatureContracts` in
   `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` and each
   TEST-001 span; `compiler/src/semantic/TestDiscoveryCases.silk` checks the catalog, its refusals
   and a body iterating it. The native Cases shards in `selfhost.yml` run the bundled runner built
-  by `silkc test`.
+  by `silk test`.
 - **Owner:** bootstrap span alignment with the reference: a `main` follow-up.
 
 ### References to fixed arrays
@@ -2165,3 +2216,189 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   branch's N1 CLI rejects the same arm with SEM0224 at bytes 116–130. The native payload-control
   probe retains SEM0046 at bytes 116–126. The source-written lowering actor checks all four
   grammar/subject routes at exact spans. Full exact-head native Cases remain the execution gate.
+
+### Anonymous callables spelled with `once fn` or `mut fn`
+
+- **Status:** recorded on 2026-10-14. Native follows the reference; the bootstrap is lenient.
+- **Rule:** [ANON-CALLABLE-001](apps/docs/content/reference/functions-callables-and-control-flow.md#anon-callable-001--an-anonymous-callable-has-one-exact-source-identity-and-explicit-contract):
+  source does not spell `mut fn` or `once fn` when constructing an anonymous callable. Its
+  invocation mode derives from its captures (ANON-OWN-001).
+- **Compilers:** native rejects `once fn() -> i32 { return 4 }` and `mut fn() -> i32 { … }` at the
+  modifier with PAR0001 and PAR0002. The bootstrap accepts both spellings and derives the mode from
+  the captures anyway.
+- **Source migration:** write `fn() -> i32 { … }`; a consuming capture still makes the value
+  `once`.
+- **Evidence:** the bootstrap's focused manifest check accepts both spellings, and the N1 CLI
+  rejects them at the modifier while accepting the unspelled form. The bootstrap is not changed;
+  retire this entry with it.
+
+### Repeated integer match values in the bootstrap
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe; the coordinator ruled the native
+  behavior correct. Bootstrap divergence.
+- **Rule:** an arm made impossible by the coverage of the unguarded arms before it is unreachable
+  and reports SEM0043 (functions-callables-and-control-flow.md, match coverage). In
+  `match value { 11 => 1 11 => 2 _ => 3 }` the first `11` arm is reachable and only the second is
+  unreachable.
+- **Compilers:** native reports SEM0043 once, at the second arm `11 => 2`. The bootstrap reports
+  SEM0043 at both `11` arms.
+- **Source migration:** none. Programs that repeat an integer value are rejected by both compilers.
+- **Evidence:** the `repeated` fixture of the integer-match actor in
+  `compiler/src/semantic/SemanticCaptureCases.silk` asserts one diagnostic at the later arm.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Nested variant field patterns in the bootstrap parser
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe. Bootstrap gap.
+- **Rule:** a record field pattern can name a nested variant, as in
+  `Outer.Wrap { inner: Inner.Empty }` (patterns-and-destructuring.md, nested variant patterns).
+- **Compilers:** native accepts and checks nested variant field patterns. The bootstrap parser
+  rejects `inner: Inner.Empty` with PAR0002 at the `.` and then SEM0022 for the field.
+- **Source migration:** none. Code checked by the bootstrap writes no nested variant field
+  patterns.
+- **Evidence:** the nested-variant fixtures in `compiler/src/semantic/SemanticCaptureCases.silk`
+  (`routed`, `unreachable`).
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Wildcard after complete scalar enum coverage in the bootstrap
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe; the coordinator ruled the native
+  behavior correct. Bootstrap divergence.
+- **Rule:** an arm made impossible by earlier coverage is unreachable and reports SEM0043
+  (functions-callables-and-control-flow.md, match coverage). A `_` arm after unguarded arms for
+  every member of a scalar enum is such an arm.
+- **Compilers:** native reports SEM0043 at the whole `_` arm. The bootstrap accepts it.
+- **Source migration:** remove the `_` arm when the earlier arms cover every member.
+- **Evidence:** the `covered` fixture of the scalar-enum actor in
+  `compiler/src/semantic/SemanticLoweringCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### The `Compiled` line counts each backend's own symbols
+
+- **Status:** recorded on 2026-10-15 with the native `Compiled` line (C3, CLI parity).
+- **Rule:** after a successful compilation both CLIs print
+  `Compiled <source> -> <artifact> (llvm, <target>, N symbols)` on standard output, with paths
+  relative to the project directory, or to the source's directory for a single-file build.
+- **Compilers:** the line, its paths and its target are the same. N is the number of symbols the
+  compiler's own backend emits: the bootstrap counts its LLVM artifact's symbol table and native
+  counts its emission plan (`EmissionPlan.symbolCount`), so the same program reports different
+  counts (an `init` project: 257 in the bootstrap, 210 native).
+- **Source migration:** none.
+- **Diagnostics and limits:** N is informational; no check compares it across compilers, and no
+  test asserts a specific count.
+- **Evidence:** `compiler/scripts/test-native-build.ts` checks the line for a project release
+  build with any positive N; `CommandPathCases` checks the relative paths.
+- **Open questions:** none.
+
+### Statement recovery in static bodies
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe. Native diagnostic gap.
+- **Rule:** a rejected body reports each independent failure. A statement that binds nothing and
+  fails does not hide the failures of the statements after it.
+- **Compilers:** in a runtime body, native checks the statements after such a failure and reports
+  each one. In a `static fn` or another body evaluated at compile time, native stops at the first
+  failed statement. Its later statements evaluate the checked prefix, and a prefix missing the
+  failed statement would run a different program. For
+  `static fn s(flag: bool) -> i32 { if 46 { return 0 } while 47 { } return 0 }` the bootstrap
+  reports SEM0011 at `46` and at `47`, and native reports only the first.
+- **Source migration:** none. Both compilers reject the body.
+- **Evidence:** the `statementsStatic` fixture in
+  `compiler/src/semantic/SemanticLoweringCases.silk` asserts one diagnostic.
+- Retire this entry when static bodies recover without evaluating an incomplete prefix.
+
+### Native nesting stack budget beside EXPR-006
+
+- **Status:** Implemented on 2026-10-15 (native); approved by the coordinator as a native stack
+  guard until `bl-llvm-lifetime-markers` lands. The rule itself is EXPR-006 (Confirmed).
+- **Rule:** [EXPR-006](apps/docs/content/reference/expressions-and-operators.md) limits expressions
+  to 256 active child edges and reports `PAR0005` at the first significant token of the depth-257
+  child. Each operator of a left-nested infix or pipeline chain adds one edge. No other construct
+  has a language limit.
+- **Compilers:** both count EXPR-006's edges, including chain operators, and report `PAR0005` at
+  the same token. The bootstrap resets the count at statement-level expressions; native keeps
+  counting through a block nested inside an expression. Native frames do not share stack slots
+  yet (no `llvm.lifetime` markers), so its later phases spend 8–83 KB of stack per nesting level.
+  Native therefore also charges every active construct a measured cost against one budget of 4096
+  units (about 1 KB each, half of an 8 MB stack) and reports `PAR0005` before entering a construct
+  beyond it. Programs EXPR-006 accepts but native rejects:
+  - prefix chains longer than 134 (`-`, `!`, `~`, `&`, `move`, `unsafe`, `run`);
+  - infix or pipeline chains longer than 135 operators (EXPR-006 and the bootstrap allow 256);
+  - more than 59 nested blocks (44 nested `if`, 43 nested `match` arms);
+  - more than 255 nested types;
+  - mixes whose summed cost exceeds the budget, such as deep expressions inside nested blocks
+    inside expressions.
+- **Costs** (`ParseState.silk`; measured on 2026-10-15 at `selfhost` 7f8d816 plus the borrowed
+  parser state, `silk check`, Linux x86_64, 8 MB stack, budget lifted):
+
+  | Construct                           | Measured stack per level | Charge |
+  | ----------------------------------- | ------------------------ | ------ |
+  | Expression child edge (parentheses) | ~8 KB                    | 8      |
+  | Prefix operand                      | ~30 KB                   | 30     |
+  | Infix or pipeline chain operator    | ~29 KB                   | 30     |
+  | Block (`while`, arm, effect, fn)    | ~42 KB (`while`)         | 68     |
+  | `if` beyond its block (`else if`)   | ~21 KB                   | 22     |
+  | `match` beyond its arm block        | 83 KB per arm level      | 16     |
+  | Type                                | ~15 KB                   | 16     |
+  | Pattern                             | ~5 KB                    | 16     |
+
+  An arm level costs a grouped child, a `match` and a block: 8 + 16 + 68 = 92 units.
+- **Source migration:** none expected. The deepest nesting in the standard library, the compiler
+  sources, the corpus and the examples (850 files) is 14 nested braces, 15 nested delimiters, 7
+  nested parentheses and a 5-operator prefix run, about 1.2K of the 4096 units.
+- **Diagnostics and limits:** `PAR0005` for every native limit. Its message names no limit while
+  the native limits differ from EXPR-006's. Every native limit rises once
+  `bl-llvm-lifetime-markers` restores stack-slot sharing.
+- **Evidence:** corpus programs at each limit (`nesting-budget-*`) run on every native target in
+  CI and fail if the costs drift; match arms appear there only 16 deep, because the bootstrap's
+  acceptance test compiles every corpus program and its check time grows exponentially with
+  nested match depth. `invalid/expression-nesting-parens-257` matches the bootstrap's diagnostic.
+  `parser/ParserCases::nestingBudgetBoundaries` checks each limit and one past it.
+- **Open questions:** the bootstrap does not count prefix chains against EXPR-006 (a bootstrap
+  defect), and its `check` time grows exponentially with nested `match` depth (24 levels take
+  150 s); both are on the backlog.
+
+### Ownership conflicts across recovered statements
+
+- **Status:** recorded on 2026-10-15 from bootstrap probes. Native diagnostic gap.
+- **Rule:** a rejected body reports each independent failure, ownership conflicts included.
+- **Compilers:** a runtime body whose statements recovered past failures that bind nothing is
+  borrow-checked with each failed statement as a point no path continues past. When every token of
+  the failed statement is a literal, `true`, `false`, `if`, `else`, `while`, a brace or plain
+  punctuation, the statements after it resume from the body's entry; otherwise they stay
+  unreached, as after a `return`, since any name may be `never`-typed and any call, operator,
+  pipe, `run` or exit may end every path. Native reports a use after move, a
+  loan conflict, an access during a loan, an overlapping assignment or a consuming guard when both
+  ends lie on one side of every failed statement. The bootstrap also reports a conflict whose move
+  and use lie on either side of a failed statement, including one after a failed reassignment
+  (`let a = take(move t)`, `t = 3`, `let b = take(move t)`: SEM0037 and OWN0001), conflicts inside
+  the failed statement, and conflicts after a failed statement that names anything. Native
+  reports only the semantic failure there, never a conflict a failed statement might have
+  prevented. Region, lifetime and loop-entry conflicts of such a body, and a second conflict in
+  it, are not reported natively.
+- **Source migration:** none. Both compilers reject the body.
+- **Evidence:** the `ownedAcross`, `ownedReplaced`, `ownedLoop`, `ownedFailedReturn` and
+  `ownedFailedExits` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk` assert the
+  semantic failure alone; the `statement-recovery-ownership` invalid-corpus program pins the
+  conflicts both compilers report.
+- Retire this entry when native checks recovered bodies with the failed statements' effects.
+
+### Reads of a failed binding
+
+- **Status:** recorded on 2026-10-15 from bootstrap probes; Julia chose to suppress the dependents
+  of an unavailable binding. Bootstrap divergence.
+- **Rule:** a rejected body reports each independent failure once. A binding whose `let` failed is
+  unavailable, and a statement that fails only by reading it, directly or through another
+  unavailable binding, reports nothing of its own.
+- **Compilers:** native checks the statements after a failed `let` in a runtime body, binds none of
+  its names, and fails a statement that reads one silently; a binding that reads one is
+  unavailable in turn. The bootstrap types the failed binding from its initializer and reports the
+  cascades: for `let first: i32 = flag` (with `flag: bool`) it adds SEM0012 at `first + 1` and
+  SEM0135 at a later `second + 2`, SEM0129 at `return captured` in a callable literal, SEM0040 at
+  a match whose arm yields the binding, and SEM0129 at `return held` after
+  `let held: i32 = flag`. For `let Token { absentField, .. } = Token { value: 1 }` it reports
+  OWN0003, SEM0133 and SEM0022 at the binding and SEM0006 at `return absentField`; native reports
+  the binding's own failure only. A static body still stops at its first failed statement.
+- **Source migration:** none. Both compilers reject the body.
+- **Evidence:** the `statementsAfterBinding`, `bindingChain`, `bindingClosure`, `bindingArm` and
+  `bindingPattern` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.

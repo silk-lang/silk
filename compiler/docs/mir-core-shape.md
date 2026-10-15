@@ -245,8 +245,10 @@ Abandon { origin }
 - Providers, the `Return`/`Failure` out-slots and drop flags are ordinary locals, so the frame
   transform stores them like any live place.
 
-Until the stage lands, lowering reports gap `suspension` where it reaches `Intrinsic.suspendEffect`;
-a caller fails through its callee's gap.
+The stage landed with a different shape and the `suspension` gap is retired. A suspension point is
+a `Terminator.Call` to a suspendable callee, or a `Terminator.Relinquish`. Lowering records each
+point's cancel exit, which drops every owner live there (`Mir.recordCancel`), and `Coroutine.plan`
+builds the frame. A drop flag live at a point without frame storage is an internal compiler error.
 
 _Rejected:_ a `cancel` edge on every `Call` (cost on every Effect call, contrary to SUSP-018);
 deriving cancellation cleanup from the failure chain (absent for `never`-failure callees);
@@ -295,7 +297,7 @@ types we already know); a separate `InstanceKey.Closure` (duplicates `Declaratio
 
 ## 8. Checking (question 7)
 
-`MirCheck` is an opt-in module that `silkc` never links. Only the corpus runner calls it, in CI
+`MirCheck` is an opt-in module that `silk` never links. Only the corpus runner calls it, in CI
 (§12). It checks:
 
 1. **Structure:** block 0 is the entry; indices are in range; every block has one terminator;
@@ -391,7 +393,7 @@ bb2: Drop(held); Abandon
 `delayed` holds a `Nested` point because the stdlib `Effect.suspend` instance is `NestedTransfer`.
 That instance's body `run Intrinsic.suspendEffect(move deferred)` is the `Transfer` point.
 
-Until the suspension stage, this reports gap `suspension` at the `Effect.suspend` call.
+Natively, both points are calls to suspendable instances (§6).
 
 ## 10. Gap codes
 
@@ -425,7 +427,7 @@ Each field or variant lands with its first producer; nothing is reserved early.
 ## 12. Decisions (Julia, 2026-10-02)
 
 1. **`MirCheck` trigger.** It runs only from the corpus runner in CI and is never linked into
-   `silkc`.
+   `silk`.
 2. **Cancellation edge.** Each suspension point carries its own explicit `cancel` chain, written by
    lowering (§6); the frame transform does not derive it.
 3. **Silent `Drop` emission.** A stopgap that reports `cleanup` when emission meets `Drop` lands
