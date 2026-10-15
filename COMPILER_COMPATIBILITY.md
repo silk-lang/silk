@@ -2224,3 +2224,44 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** the bootstrap's focused manifest check accepts both spellings, and the N1 CLI
   rejects them at the modifier while accepting the unspelled form. The bootstrap is not changed;
   retire this entry with it.
+
+### Repeated integer match values in the bootstrap
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe; the coordinator ruled the native
+  behavior correct. Bootstrap divergence.
+- **Rule:** an arm made impossible by the coverage of the unguarded arms before it is unreachable
+  and reports SEM0043 (functions-callables-and-control-flow.md, match coverage). In
+  `match value { 11 => 1 11 => 2 _ => 3 }` the first `11` arm is reachable and only the second is
+  unreachable.
+- **Compilers:** native reports SEM0043 once, at the second arm `11 => 2`. The bootstrap reports
+  SEM0043 at both `11` arms.
+- **Source migration:** none. Programs that repeat an integer value are rejected by both compilers.
+- **Evidence:** the `repeated` fixture of the integer-match actor in
+  `compiler/src/semantic/SemanticCaptureCases.silk` asserts one diagnostic at the later arm.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Nested variant field patterns in the bootstrap parser
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe. Bootstrap gap.
+- **Rule:** a record field pattern can name a nested variant, as in
+  `Outer.Wrap { inner: Inner.Empty }` (patterns-and-destructuring.md, nested variant patterns).
+- **Compilers:** native accepts and checks nested variant field patterns. The bootstrap parser
+  rejects `inner: Inner.Empty` with PAR0002 at the `.` and then SEM0022 for the field.
+- **Source migration:** none. Code checked by the bootstrap writes no nested variant field
+  patterns.
+- **Evidence:** the nested-variant fixtures in `compiler/src/semantic/SemanticCaptureCases.silk`
+  (`routed`, `unreachable`).
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Wildcard after complete scalar enum coverage in the bootstrap
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe; the coordinator ruled the native
+  behavior correct. Bootstrap divergence.
+- **Rule:** an arm made impossible by earlier coverage is unreachable and reports SEM0043
+  (functions-callables-and-control-flow.md, match coverage). A `_` arm after unguarded arms for
+  every member of a scalar enum is such an arm.
+- **Compilers:** native reports SEM0043 at the whole `_` arm. The bootstrap accepts it.
+- **Source migration:** remove the `_` arm when the earlier arms cover every member.
+- **Evidence:** the `covered` fixture of the scalar-enum actor in
+  `compiler/src/semantic/SemanticLoweringCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
