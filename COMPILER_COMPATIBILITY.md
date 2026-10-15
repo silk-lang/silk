@@ -22,7 +22,7 @@ diagnosis, and it may be a real bug.
 | Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
 | ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
-| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silkc build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
+| Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silk build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
 
@@ -48,7 +48,7 @@ coverage ledger (workspace note `fc5536e2-4ce3-4989-8600-43c96f4104d5`). A `Cont
 still carries ownership, lifetime, cleanup, and Effect safety obligations for M2.5. This does not
 claim borrow checking or general executable support. The selfhost build CLI currently lowers closed
 scalar, reference, record and sequence forms through demanded MIR and LLVM text. The selector
-`silkc build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
+`silk build <source> -o <file.ll> --emit llvm-ir` writes the completed backend answer directly;
 the form and stage otherwise come from the manifest's `[build].artifact` and `[build].stage`, as in
 the TypeScript CLI. IR output does not invoke Clang. Successful builds emit a
 `SILK_GAP borrow-check` summary when reached bodies retain safety obligations. Field/index
@@ -1274,14 +1274,14 @@ The structured parser assertion lives in `hir/LoweringCases.structFieldCommaRepo
   bootstrap's spelling; native fingerprints frame the native HIR encoding, so they differ from the
   bootstrap's (TEST-005 does not fix the bytes).
 - **Source migration:** none.
-- **Diagnostics and limits:** native `silkc test` requires `--no-cache`; test-result reuse
+- **Diagnostics and limits:** native `silk test` requires `--no-cache`; test-result reuse
   (TEST-008) needs execution identities the native compiler does not publish yet and reports
   `SILK_GAP test-result-cache` otherwise.
 - **Evidence:** `callableAndEffectSignatureContracts` in
   `compiler/src/semantic/SemanticSignatureCases.silk` checks a valid `test effect fn` and each
   TEST-001 span; `compiler/src/semantic/TestDiscoveryCases.silk` checks the catalog, its refusals
   and a body iterating it. The native Cases shards in `selfhost.yml` run the bundled runner built
-  by `silkc test`.
+  by `silk test`.
 - **Owner:** bootstrap span alignment with the reference: a `main` follow-up.
 
 ### References to fixed arrays
@@ -2231,3 +2231,44 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** the bootstrap's focused manifest check accepts both spellings, and the N1 CLI
   rejects them at the modifier while accepting the unspelled form. The bootstrap is not changed;
   retire this entry with it.
+
+### Repeated integer match values in the bootstrap
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe; the coordinator ruled the native
+  behavior correct. Bootstrap divergence.
+- **Rule:** an arm made impossible by the coverage of the unguarded arms before it is unreachable
+  and reports SEM0043 (functions-callables-and-control-flow.md, match coverage). In
+  `match value { 11 => 1 11 => 2 _ => 3 }` the first `11` arm is reachable and only the second is
+  unreachable.
+- **Compilers:** native reports SEM0043 once, at the second arm `11 => 2`. The bootstrap reports
+  SEM0043 at both `11` arms.
+- **Source migration:** none. Programs that repeat an integer value are rejected by both compilers.
+- **Evidence:** the `repeated` fixture of the integer-match actor in
+  `compiler/src/semantic/SemanticCaptureCases.silk` asserts one diagnostic at the later arm.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Nested variant field patterns in the bootstrap parser
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe. Bootstrap gap.
+- **Rule:** a record field pattern can name a nested variant, as in
+  `Outer.Wrap { inner: Inner.Empty }` (patterns-and-destructuring.md, nested variant patterns).
+- **Compilers:** native accepts and checks nested variant field patterns. The bootstrap parser
+  rejects `inner: Inner.Empty` with PAR0002 at the `.` and then SEM0022 for the field.
+- **Source migration:** none. Code checked by the bootstrap writes no nested variant field
+  patterns.
+- **Evidence:** the nested-variant fixtures in `compiler/src/semantic/SemanticCaptureCases.silk`
+  (`routed`, `unreachable`).
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Wildcard after complete scalar enum coverage in the bootstrap
+
+- **Status:** recorded on 2026-10-15 from a bootstrap probe; the coordinator ruled the native
+  behavior correct. Bootstrap divergence.
+- **Rule:** an arm made impossible by earlier coverage is unreachable and reports SEM0043
+  (functions-callables-and-control-flow.md, match coverage). A `_` arm after unguarded arms for
+  every member of a scalar enum is such an arm.
+- **Compilers:** native reports SEM0043 at the whole `_` arm. The bootstrap accepts it.
+- **Source migration:** remove the `_` arm when the earlier arms cover every member.
+- **Evidence:** the `covered` fixture of the scalar-enum actor in
+  `compiler/src/semantic/SemanticLoweringCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.

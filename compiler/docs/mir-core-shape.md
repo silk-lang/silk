@@ -297,7 +297,7 @@ types we already know); a separate `InstanceKey.Closure` (duplicates `Declaratio
 
 ## 8. Checking (question 7)
 
-`MirCheck` is an opt-in module that `silkc` never links. Only the corpus runner calls it, in CI
+`MirCheck` is an opt-in module that `silk` never links. Only the corpus runner calls it, in CI
 (§12). It checks:
 
 1. **Structure:** block 0 is the entry; indices are in range; every block has one terminator;
@@ -427,7 +427,7 @@ Each field or variant lands with its first producer; nothing is reserved early.
 ## 12. Decisions (Julia, 2026-10-02)
 
 1. **`MirCheck` trigger.** It runs only from the corpus runner in CI and is never linked into
-   `silkc`.
+   `silk`.
 2. **Cancellation edge.** Each suspension point carries its own explicit `cancel` chain, written by
    lowering (§6); the frame transform does not derive it.
 3. **Silent `Drop` emission.** A stopgap that reports `cleanup` when emission meets `Drop` lands
