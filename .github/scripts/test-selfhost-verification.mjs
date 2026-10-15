@@ -71,7 +71,7 @@ try {
       cwd: checkout,
       env: {
         ...process.env,
-        SILKC: '',
+        SILK_COMPILER: '',
         SILK_BOOTSTRAP: '',
         RUNNER_TEMP: temporary,
         NODE_PATH: '',
@@ -136,7 +136,7 @@ chmod +x program
   const expectedSources = sourceDigests(checkout)
   const corpusEnvironment = {
     ...process.env,
-    SILKC: compiler,
+    SILK_COMPILER: compiler,
     SILK_SELFHOST_CORPUS_CASES: '',
     NODE_PATH: '',
     NODE_OPTIONS: '',
@@ -265,7 +265,7 @@ chmod +x program
       .status,
     0,
   )
-  assert.notStrictEqual(invokeCorpus(['--mode', 'corpus-full'], { SILKC: '' }).status, 0)
+  assert.notStrictEqual(invokeCorpus(['--mode', 'corpus-full'], { SILK_COMPILER: '' }).status, 0)
   assert.strictEqual(readFileSync(calls, 'utf8'), callsBeforeRejections)
   assert.deepStrictEqual(readFileSync(compiler), expectedCompiler)
   assert.deepStrictEqual(sourceDigests(checkout), expectedSources)
