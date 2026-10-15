@@ -53,12 +53,12 @@ Snapshot: 2026-10-14, selfhost `5db0627`.
 
 ## Environment and toolchain
 
-| Item                                                  | Status                                                                                            |
-| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Clang                                                 | done (#1709): `SILKC_CLANG`, else the first `clang` on `PATH`; the `--clang` flag is still needed |
-| `SDKROOT`, `DEVELOPER_DIR` and SDK discovery on macOS | needed: TS resolves the SDK through `platform-supply`/`xcrun`; native needs `SDKROOT` set         |
-| `SILK_NATIVE_CACHE_DIR`                               | not needed: the TS native artifact cache; native caching belongs to the incremental design        |
-| `SILKC_CLANG`                                         | native-only override; keep, or rename with the binary                                             |
+| Item                                                  | Status                                                                                                                                                                              |
+| ----------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Clang                                                 | done (#1709): `SILK_CLANG`, else the first `clang` on `PATH`; the `--clang` flag is still needed                                                                                    |
+| `SDKROOT`, `DEVELOPER_DIR` and SDK discovery on macOS | needed: TS resolves the SDK through `platform-supply`/`xcrun`; native needs `SDKROOT` set                                                                                           |
+| `SILK_NATIVE_CACHE_DIR`                               | not needed: the TS native artifact cache; native caching belongs to the incremental design                                                                                          |
+| `SILK_CLANG`, `SILK_LLVM_AR`, `SILK_COMPILER`         | done (#1742 and this PR): native-only overrides and the harness compiler, renamed from `SILKC_*` with the binary; CI passes `SILKC_CLANG` to the pinned seed alone until its re-pin |
 
 ## Exit codes and output
 
@@ -74,6 +74,6 @@ Snapshot: 2026-10-14, selfhost `5db0627`.
 
 | Item                                                         | Status                                                                                                                            |
 | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------- |
-| Binary name `silk` (TS npm bin)                              | done (#1734); `SILKC`, `SILKC_CLANG` and `SILKC_AR` keep their names until a main-first rename                                    |
+| Binary name `silk` (TS npm bin)                              | done (#1734)                                                                                                                      |
 | Standard library without `--stdlib`                          | done (#1704): `<prefix>/lib/silk/stdlib` beside `<prefix>/bin`; TS embeds its library                                             |
 | Release archive with `bin/` and `lib/silk/stdlib` per target | done (#1734): `ReleaseArchive.ts` and a `silk-release-<target>` workflow artifact per target; publishing a release is not decided |

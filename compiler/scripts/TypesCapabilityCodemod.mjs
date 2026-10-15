@@ -11,7 +11,7 @@
 //
 // The rewrite is idempotent. After merging selfhost into a branch, run it from the repository root
 // with a working native compiler:
-//   SILKC=<native silk> SILKC_CLANG=<clang> node compiler/scripts/TypesCapabilityCodemod.mjs
+//   SILK_COMPILER=<native silk> SILK_CLANG=<clang> node compiler/scripts/TypesCapabilityCodemod.mjs
 // `--check` only reports `Shared<Type>.make(` sites outside Types.silk and exits nonzero if any
 // remain; it needs no compiler, which is what CI runs.
 import { execFileSync } from 'node:child_process'
@@ -70,13 +70,13 @@ function ensureImport(text, name) {
 }
 
 // Step 2: the compiler names each unhandled site.
-const silk = process.env.SILKC
-if (silk === undefined) throw new Error('set SILKC to a native silk')
+const silk = process.env.SILK_COMPILER
+if (silk === undefined) throw new Error('set SILK_COMPILER to a native silk')
 // The entries CI builds and its test shards' roots, read from the workflow so the lists cannot
 // drift apart.
 const workflow = readFileSync(join(compiler, '../.github/workflows/selfhost.yml'), 'utf8')
 const entries = new Set(['src/main.silk'])
-for (const match of workflow.matchAll(/"\$SILKC" build "[^"]*\/compiler\/(src\/[\w/]+\.silk)"/g)) entries.add(match[1])
+for (const match of workflow.matchAll(/"\$SILK_COMPILER" build "[^"]*\/compiler\/(src\/[\w/]+\.silk)"/g)) entries.add(match[1])
 const testRoots = [...workflow.matchAll(/roots: >-\n((?:[ \t]+src\/\S.*\n)+)/g)].flatMap((match) => match[1].trim().split(/\s+/))
 const roots = [...[...entries].map((root) => ({ kind: 'build', root })), ...testRoots.map((root) => ({ kind: 'test', root }))]
 

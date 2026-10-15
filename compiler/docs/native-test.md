@@ -263,7 +263,7 @@ from the `native-n1` job's `selfhost-native-n1` artifact, the compiler the pinne
 the checkout, and runs:
 
 ```sh
-"$SILKC" test "$PWD/compiler/src/<root>" -o "$RUNNER_TEMP/<name>-tests" \
+"$SILK_COMPILER" test "$PWD/compiler/src/<root>" -o "$RUNNER_TEMP/<name>-tests" \
   --stdlib "$PWD/packages/compiler/stdlib" --optimization speed --no-cache | tee "$log"
 node .github/scripts/check-selfhost-test-times.mjs "$log"
 ```
