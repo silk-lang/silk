@@ -10,9 +10,10 @@ require this job; the existing same-tree green-run reuse also covers it.
 
 `compiler/scripts/RepositoryCoverage.ts` starts with `git ls-files -z -- '*.silk'`. Its rules are:
 
-- Materialize `nativeCorpus` from the consuming checkout with esbuild, without building or running
-  the TypeScript compiler. Exclude sources whose SHA-256 matches a corpus source after trimming
-  outer whitespace. This also discovers dynamically loaded corpus fixtures and example manifests.
+- Exclude `corpus/`, which the corpus jobs measure. Read the native corpus with `corpus/corpus.mjs`
+  from the consuming checkout, without building or running the TypeScript compiler, and exclude
+  sources whose SHA-256 matches a corpus program after trimming outer whitespace. This also covers
+  examples and fixtures that corpus programs splice whole.
 - Include every remaining `packages/compiler/conformance/**/*.silk`, including library fixtures
   without `main`. Their rejection is useful coverage evidence for missing artifact output modes.
 - Include other tracked sources with an exported top-level `pub fn main` or `pub effect fn main`.
