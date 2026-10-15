@@ -78,6 +78,7 @@ import * as SemanticDisplay from './SemanticDisplay.js'
 import * as SourceSpan from './SourceSpan.js'
 import * as Evaluation from './Evaluation.js'
 import * as StaticValue from './StaticValue.js'
+import * as RowAlgebra from './RowAlgebra.js'
 import * as Type from './Type.js'
 export const unsafeCallDiagnostic = (
   unsafe: boolean,
@@ -2266,13 +2267,16 @@ export const analyzeFunctionBody = (
         )
     }
     // Requirements belong to the residual signature, so they cannot retain a phase-only type.
+    // Read the completed row, where a `Without` expression still carries what it keeps.
     const requirements = declaration.requirementRow
     if (
       requirements.anchor !== undefined &&
-      requirements.entries.some(
-        (entry) =>
-          entry.capability._tag === 'Resolved' &&
-          DeclarationFacts.containsStaticPhaseOnly(context.resolution.index, entry.capability.type),
+      RowAlgebra.concreteMembers(Type.requirementRowPolicy(), requirements.row).some(
+        (requirement) =>
+          DeclarationFacts.containsStaticPhaseOnly(
+            context.resolution.index,
+            requirement.capability,
+          ),
       )
     )
       context.diagnostics.push(

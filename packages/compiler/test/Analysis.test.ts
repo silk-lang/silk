@@ -616,7 +616,7 @@ it.effect('rejects each expression beyond the EXPR-006 nesting limit at its firs
   }),
 )
 
-it.effect('rejects a static sequence anywhere in a runtime signature', () =>
+it.effect('rejects a static sequence in a runtime parameter or requirement row', () =>
   Effect.gen(function* () {
     for (const program of invalidCorpus.filter((program) =>
       program.name.startsWith('phase-only-'),
