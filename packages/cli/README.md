@@ -39,7 +39,7 @@ Main also publishes `silk-selfhost-verification` from the same checked run. The 
 Its default mode verifies the consuming checkout's intrinsic catalog and formatting with the
 formatter safety gate named by `SILK_FORMAT_GATE`, writing its log to `RUNNER_TEMP`. Its `corpus`
 and `corpus-full` modes run the corpus against `compiler/scripts/selfhost-track.json` with the
-native compiler named by `SILKC`. Selfhost needs no dependency install or verification packaging
+native compiler named by `SILK_COMPILER`. Selfhost needs no dependency install or verification packaging
 job.
 
 The action runs on GitHub-hosted runners with Bash, `gh`, and `jq` available. Workflows in other
