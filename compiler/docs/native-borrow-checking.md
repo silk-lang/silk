@@ -276,9 +276,12 @@ When call or aggregate inference retags a fresh reference borrow with its shared
 source-validity relations follow that same loan. This renaming is limited to the borrow's own
 fresh atom and relations recorded at that exact source origin. It neither renames an existing
 contextual region nor turns a retained goal into a declared premise.
-Availability excludes paths before creation and after overlapping End, Expire, write, move or drop
-events, restarting at creation on a loop back edge. Authenticated declared parameters and `'static` are
-available throughout this body. Required bitsets propagate from shorter to longer to a fixed point.
+For an external loan whose actual parent bound is proved, source storage is valid throughout the
+body independently of when the loan or its reference descriptor was created. Ending or replacing
+that descriptor does not end its referent. Availability retains actual referent End, Expire,
+write, move and drop exclusions, and the Walker still checks actual loan activity and conflicts.
+Owned storage and unproved sources keep the conservative creation/end bounds, restarting at
+creation on a loop back edge. Required bitsets propagate from shorter to longer to a fixed point.
 
 This first point proof uses conservative sets: numeric interval interiors may require extra
 points, and retained edges stay active throughout the body. Inclusion still proves the original
