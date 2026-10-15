@@ -260,15 +260,17 @@ requirement (the walk's in-flight intervals and live holder points) must lie wit
 availability; the term's required set is their union. Points propagated into the term from a
 shorter region must lie where every one of its loans is available, the intersection. A term no loan
 names stays pending.
-An external reborrow may cross a body scope when the descriptor reaching that storage has an
-authenticated universal lifetime and the reborrow has either that same lifetime or a body-local
-inference lifetime. The parent is taken from the innermost dereference or slice backing store; a
-lifetime merely nested in a field type is not such evidence. This source bound does not extend
-either lifetime or relate distinct universals.
-Unknown or local parents and distinct universal lifetimes remain pending for the symbolic
-source-boundary proof. A body-local reborrow still needs every retained goal proved; in particular,
-finite body points cannot prove a local atom outlives a universal. Loan conflicts and retained
-obligations are checked independently.
+An external reborrow may cross a body scope when its actual storage parent bounds the reborrow.
+The parent is taken from the innermost dereference or slice backing store; a lifetime merely
+nested in a field type is not such evidence. A universal parent covers finite body-local uses.
+A universal target retains its exact identity and must follow declared/header premises, including
+input well-formedness bounds. Retained goals never supply those premises.
+A local parent is traced through every outer loan naming that inference atom until it reaches
+sufficient universal parents. Owned storage, unknown provenance, a cycle without such roots, and
+an atom used only as another loan's inner retained region stay pending. The symbolic proof caches
+its results by source and target within this one body; a proof for one universal cannot prove
+another. It does not use finite body points to infer a caller boundary.
+Loan conflicts, approximate-flow guards, and all other retained goals are checked independently.
 When call or aggregate inference retags a fresh reference borrow with its shared region, its retained
 source-validity relations follow that same loan. This renaming is limited to the borrow's own
 fresh atom and relations recorded at that exact source origin. It neither renames an existing
