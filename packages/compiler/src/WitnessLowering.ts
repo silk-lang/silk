@@ -354,7 +354,7 @@ export const endWitnessReborrows = (
   span: SourceSpan.SourceSpan,
 ): void => {
   for (const reborrow of reborrows)
-    if (fn.loanLocals.delete(borrowKey(reborrow.borrow)))
+    if (fn.endsLoan(borrowKey(reborrow.borrow)) && fn.loanLocals.delete(borrowKey(reborrow.borrow)))
       fn.emit({
         _tag: 'EndLoan',
         borrow: reborrow.borrow,

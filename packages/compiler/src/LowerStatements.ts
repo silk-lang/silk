@@ -23,6 +23,7 @@ import {
   prepareInitialization,
   specializedCleanup,
   transitionAt,
+  temporaryLoansBegunSince,
   terminalLoopLoanEndings,
   withDelayedFailureLoanEndings,
   withoutLoanEndings,
@@ -51,7 +52,7 @@ import * as Tir from './Tir.js'
 import * as Layout from './Layout.js'
 import * as Instances from './Instances.js'
 import type { DelayedEffectState } from './Lower.js'
-import { borrowKey, i32, patternKey, spanKey } from './Lower.js'
+import { borrowKey, i32, patternKey, spanKey, spanWithin } from './Lower.js'
 import type {} from './LowerExpression.js'
 import {
   copiedValueType,
@@ -318,7 +319,7 @@ export const lowerSequence = (
   scope?: SourceSpan.SourceSpan,
 ): Mir.RegionId | undefined => {
   const id = reserved ?? fn.reserve()
-  const held = scope === undefined ? undefined : new Set(fn.loanLocals.keys())
+  const held = new Set(fn.loanLocals.keys())
   // Iterative: a sequence is as long as the author wrote it, so its length must not become
   // JavaScript stack depth. Only nested blocks recurse.
   let region = id
@@ -352,7 +353,7 @@ export const lowerSequence = (
     // A scoped sequence ends, on its falling-through path, the loans it began and its own
     // bindings hold: the enclosing construct restores the entry state for its next path, which
     // would drop them unended. A loan whose recorded end lies beyond the scope stays held.
-    if (scope !== undefined && held !== undefined) {
+    if (scope !== undefined) {
       const order = loanOrder(fn.ownership?.loans ?? [])
       const begun: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
       for (const key of fn.loanLocals.keys())
@@ -360,13 +361,32 @@ export const lowerSequence = (
       endLoans(
         fn,
         begun
-          .filter(({ loan }) => loan.endSpan.end <= scope.end)
+          .filter(({ loan }) => spanWithin(scope, loan.endSpan))
           .sort((left, right) => left.ordinal - right.ordinal)
           .map(({ loan }) => loan.id),
         scope,
       )
     }
     emitReleases(fn, armExit)
+    // The sequence owns the temporaries its statements borrowed and the view does not carry
+    // past it; they end after its other releases, so a binding that retains a view drops first.
+    const first = statements[0]
+    const last = statements.at(-1)
+    if (first !== undefined && last !== undefined) {
+      const extent = { sourceId: first.span.sourceId, start: first.span.start, end: last.span.end }
+      const order = loanOrder(fn.ownership?.loans ?? [])
+      fn.inScopeCleanup(() =>
+        endLoans(
+          fn,
+          temporaryLoansBegunSince(fn, held).filter((borrow) =>
+            (order.get(borrowKey(borrow)) ?? []).every(({ loan }) =>
+              spanWithin(extent, loan.endSpan),
+            ),
+          ),
+          last.span,
+        ),
+      )
+    }
   })
   if (releases.length > 0) {
     fn.publish({
@@ -931,7 +951,7 @@ const lowerStatement = (
         : undefined
     const ownershipLoanReleases = loansEndingAt(fn, statement.span).flatMap((loan) => {
       const slice = fn.loanLocals.get(borrowKey(loan.id))
-      if (slice === undefined) return []
+      if (slice === undefined || !fn.endsLoan(borrowKey(loan.id))) return []
       fn.loanLocals.delete(borrowKey(loan.id))
       return [
         {
@@ -946,7 +966,7 @@ const lowerStatement = (
       droppedBinding === undefined ? [] : (fn.effectLoanEnds.get(droppedBinding) ?? [])
     ).flatMap((borrow) => {
       const slice = fn.loanLocals.get(borrowKey(borrow))
-      if (slice === undefined) return []
+      if (slice === undefined || !fn.endsLoan(borrowKey(borrow))) return []
       fn.loanLocals.delete(borrowKey(borrow))
       return [
         {
@@ -1143,7 +1163,7 @@ const lowerStatement = (
       const order = loanOrder(fn.ownership?.loans ?? [])
       const ending: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
       for (const key of state.loanLocals.keys())
-        if (!joined.has(key)) ending.push(...(order.get(key) ?? []))
+        if (!joined.has(key) && fn.endsLoan(key)) ending.push(...(order.get(key) ?? []))
       return ending
         .sort((left, right) => left.ordinal - right.ordinal)
         .flatMap(({ loan }) => {
@@ -1205,11 +1225,19 @@ const lowerStatement = (
   if (statement._tag === 'While') {
     const loop: Mir.LoopId = { _tag: 'Loop', ordinal: statement.loop.ordinal }
     const entryState = delayedEffectState(fn)
-    const [condition, conditionOperations] = fn.capture(() =>
-      lowerExpression(fn, statement.condition),
-    )
+    const entered = new Set(entryState.loanLocals.keys())
+    // The condition runs on every iteration, so it is the scope of the temporaries it borrows.
+    const [condition, conditionOperations] = fn.capture(() => {
+      const value = lowerExpression(fn, statement.condition)
+      if (value !== undefined && value !== 'Transferred')
+        fn.inScopeCleanup(() =>
+          endLoans(fn, temporaryLoansBegunSince(fn, entered), statement.condition.span),
+        )
+      return value
+    })
     if (condition === 'Transferred') return transferred(conditionOperations)
     if (condition === undefined) return undefined
+    fn.loopEntryLoans.set(loop.ordinal, entered)
     const conditionId = fn.reserve()
     const bodyId = fn.reserve()
     const following = fn.reserve()
