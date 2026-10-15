@@ -1,0 +1,1706 @@
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.execution {Execution, Wake}
+import silk.https_identity {HttpsIdentity, IdentityError, OriginHost, ReferenceIdentity}
+import silk.memory_byte_duplex {
+  MemoryByteDuplex,
+  MemoryByteDuplexPhase,
+  MemoryReadEvent,
+  MemoryWriteAction,
+  MemoryWriteEvent,
+}
+import silk.monotonic_clock {MonotonicClock}
+import silk.option {Option}
+import silk.random {Random}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.system_clock {Instant, SystemClock}
+import silk.tls_client {AlpnConfig, Authentication, ClientConfig, ClientLimits, NamedGroup, TlsError}
+import silk.tls_connection {OwnedConnection, ConnectionError, ConnectionOptions, ConnectionPhase, authenticateOwned, withClient}
+import silk.tls_record {CipherSuite}
+import silk.trust_snapshot {TrustLoadLimits, TrustSnapshot, TrustSourceError}
+import silk.u64
+import silk.usize
+import silk.vector {Vector}
+
+struct ScriptedRandom {filled: usize}
+impl Random for ScriptedRandom {
+  effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+    let mut index = usize.ZERO
+    while index < output.length {
+      output[index] = usize.toU8((self.filled + index + usize.ONE) % 251 + usize.ONE)
+      index = index + usize.ONE
+    }
+    self.filled = self.filled + output.length
+    return ()
+  }
+}
+
+struct FixedWallClock {calls: usize}
+impl SystemClock for FixedWallClock {
+  effect fn now(self: &mut Self) -> Instant {
+    self.calls = self.calls + usize.ONE
+    return SystemClock.make(1789156800, 123456789)
+  }
+  effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }
+}
+
+struct VirtualClock {mark: Instant nowCalls: usize waitCalls: usize}
+impl MonotonicClock for VirtualClock {
+  effect fn now(self: &mut Self) -> Instant {
+    self.nowCalls = self.nowCalls + usize.ONE
+    return SystemClock.make(SystemClock.seconds(&self.mark), SystemClock.nanoseconds(&self.mark))
+  }
+  effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    self.waitCalls = self.waitCalls + usize.ONE
+    self.mark = move when
+    return ()
+  }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    self.waitCalls = self.waitCalls + usize.ONE
+    self.mark = MonotonicClock.deadlineAfter(&self.mark, howLong)
+    return ()
+  }
+}
+
+struct SequencedDeadlineClock {calls: usize expireAt: usize}
+impl MonotonicClock for SequencedDeadlineClock {
+  effect fn now(self: &mut Self) -> Instant {
+    self.calls = self.calls + usize.ONE
+    if self.calls >= self.expireAt { return SystemClock.make(131, 0) }
+    return SystemClock.make(100, 0)
+  }
+  effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () { drop when return () }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () { drop howLong return () }
+}
+
+service CallbackAudit { effect fn invoked() -> () ? &mut CallbackAudit }
+struct CallbackCounter {calls: usize}
+effect fn countCallback(self: &mut CallbackCounter) -> () { self.calls = self.calls + usize.ONE return () }
+impl CallbackAudit for CallbackCounter {invoked: CallbackCounter.countCallback}
+
+struct DeadlineAudit {
+  writes: usize
+  flushes: usize
+  closes: usize
+  deadlineCalls: usize
+  deadlineConsistent: bool
+  deadlineSeconds: i64
+  deadlineNanoseconds: i64
+}
+
+fn recordDeadline(
+  state: &mut DeadlineAudit,
+  deadline: &Option<Instant>,
+) -> () {
+  if let Option<Instant>.Some {value} = &deadline.* {
+    let seconds = SystemClock.seconds(&value)
+    let nanoseconds = SystemClock.nanoseconds(&value)
+    if state.deadlineCalls == usize.ZERO {
+      state.deadlineSeconds = seconds
+      state.deadlineNanoseconds = nanoseconds
+    } else if state.deadlineSeconds != seconds || state.deadlineNanoseconds != nanoseconds {
+      state.deadlineConsistent = false
+    }
+    state.deadlineCalls = state.deadlineCalls + usize.ONE
+  }
+  return ()
+}
+
+struct TimeoutDuplex {audit: Shared<DeadlineAudit>}
+impl TimeoutDuplex {
+  unsafe effect fn read(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    drop output
+    drop deadline
+    return ReadTransfer.End
+  }
+  unsafe effect fn write(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.audit, fn(state: &mut DeadlineAudit) -> () {
+      state.writes = state.writes + usize.ONE
+      recordDeadline(move state, &deadline)
+      return ()
+    })
+    return input.length
+  }
+  unsafe effect fn flush(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.audit, fn(state: &mut DeadlineAudit) -> () {
+      state.flushes = state.flushes + usize.ONE
+      recordDeadline(move state, &deadline)
+      return ()
+    })
+    fail ByteDuplex.timeout(ByteIoOperation.Flush)
+  }
+  unsafe effect fn shutdown(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    drop deadline
+    return ()
+  }
+  unsafe effect fn close(self: &mut Self) -> () ! ByteIoError {
+    Shared.withMut(&self.audit, fn(state: &mut DeadlineAudit) -> () {
+      state.closes = state.closes + usize.ONE
+      return ()
+    })
+    fail ByteDuplex.provider(ByteIoOperation.Close, 88)
+  }
+}
+impl ByteDuplex for TimeoutDuplex {
+  readSomeRaw: TimeoutDuplex.read
+  writeSomeRaw: TimeoutDuplex.write
+  flushRaw: TimeoutDuplex.flush
+  shutdownWriteRaw: TimeoutDuplex.shutdown
+  closeRaw: TimeoutDuplex.close
+}
+
+enum PostReadResult { Data, InvalidCount }
+
+struct PostReadState {
+  readReturned: bool
+  reads: usize
+  writes: usize
+  flushes: usize
+  closes: usize
+}
+
+fn postReadReturned(state: &PostReadState) -> bool { return state.readReturned }
+
+struct PostReadClock {state: Shared<PostReadState>}
+impl MonotonicClock for PostReadClock {
+  effect fn now(self: &mut Self) -> Instant {
+    if Shared.with(&self.state, postReadReturned) { return SystemClock.make(130, 0) }
+    return SystemClock.make(100, 0)
+  }
+  effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () { drop when return () }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () { drop howLong return () }
+}
+
+struct PostReadDuplex {
+  result: PostReadResult
+  state: Shared<PostReadState>
+}
+
+impl PostReadDuplex {
+  unsafe effect fn read(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    drop deadline
+    Shared.withMut(&self.state, fn(state: &mut PostReadState) -> () {
+      state.readReturned = true
+      state.reads = state.reads + usize.ONE
+      return ()
+    })
+    return match self.result {
+      PostReadResult.Data => {
+        output[usize.ZERO] = 255
+        return ReadTransfer.Data {count: usize.ONE}
+      }
+      PostReadResult.InvalidCount => ReadTransfer.Data {count: output.length + usize.ONE}
+    }
+  }
+  unsafe effect fn write(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    drop deadline
+    Shared.withMut(&self.state, fn(state: &mut PostReadState) -> () {
+      state.writes = state.writes + usize.ONE
+      return ()
+    })
+    return input.length
+  }
+  unsafe effect fn flush(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    drop deadline
+    Shared.withMut(&self.state, fn(state: &mut PostReadState) -> () {
+      state.flushes = state.flushes + usize.ONE
+      return ()
+    })
+    return ()
+  }
+  unsafe effect fn shutdown(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock { drop deadline return () }
+  unsafe effect fn close(self: &mut Self) -> () ! ByteIoError {
+    Shared.withMut(&self.state, fn(state: &mut PostReadState) -> () {
+      // Invalid-count validation can close before the owning scope releases the provider.
+      if state.closes == usize.ZERO { state.closes = usize.ONE }
+      return ()
+    })
+    return ()
+  }
+}
+
+impl ByteDuplex for PostReadDuplex {
+  readSomeRaw: PostReadDuplex.read
+  writeSomeRaw: PostReadDuplex.write
+  flushRaw: PostReadDuplex.flush
+  shutdownWriteRaw: PostReadDuplex.shutdown
+  closeRaw: PostReadDuplex.close
+}
+
+
+struct OwnedMemoryAudit {
+  closes: usize
+  underlyingCloseAttempts: usize
+  closed: bool
+  laterIo: usize
+  reads: usize
+  writes: usize
+  flushes: usize
+  helloPrefix: bool
+  applicationWrite: bool
+  shortWritePrefix: bool
+  shutdowns: usize
+  shutdownAfterFlush: bool
+  closeLast: bool
+  handshakeCalls: usize
+  handshakeReads: usize
+  handshakeWrites: usize
+  handshakeFlushes: usize
+  handshakeShutdowns: usize
+  handshakeDeadlineConsistent: bool
+  handshakeDeadlineSeconds: i64
+  handshakeDeadlineNanoseconds: i64
+}
+
+fn freshOwnedMemoryAudit() -> OwnedMemoryAudit {
+  return OwnedMemoryAudit {
+    closes: usize.ZERO,
+    underlyingCloseAttempts: usize.ZERO,
+    closed: false,
+    laterIo: usize.ZERO,
+    reads: usize.ZERO,
+    writes: usize.ZERO,
+    flushes: usize.ZERO,
+    helloPrefix: false,
+    applicationWrite: false,
+    shortWritePrefix: false,
+    shutdowns: usize.ZERO,
+    shutdownAfterFlush: false,
+    closeLast: false,
+    handshakeCalls: usize.ZERO,
+    handshakeReads: usize.ZERO,
+    handshakeWrites: usize.ZERO,
+    handshakeFlushes: usize.ZERO,
+    handshakeShutdowns: usize.ZERO,
+    handshakeDeadlineConsistent: true,
+    handshakeDeadlineSeconds: 0,
+    handshakeDeadlineNanoseconds: 0,
+  }
+}
+
+fn recordOwnedMemoryIo(
+  state: &mut OwnedMemoryAudit,
+  operation: ByteIoOperation,
+  deadline: &Option<Instant>,
+) -> () {
+  if state.closed { state.laterIo = state.laterIo + usize.ONE }
+  match operation {
+    ByteIoOperation.Read => { state.reads = state.reads + usize.ONE }
+    ByteIoOperation.Write => { state.writes = state.writes + usize.ONE }
+    ByteIoOperation.Flush => { state.flushes = state.flushes + usize.ONE }
+    ByteIoOperation.ShutdownWrite => {}
+    ByteIoOperation.Close => {}
+  }
+  if let Option<Instant>.Some {value} = &deadline.* {
+    let seconds = SystemClock.seconds(&value)
+    let nanoseconds = SystemClock.nanoseconds(&value)
+    if state.handshakeCalls == usize.ZERO {
+      state.handshakeDeadlineSeconds = seconds
+      state.handshakeDeadlineNanoseconds = nanoseconds
+    } else if state.handshakeDeadlineSeconds != seconds
+      || state.handshakeDeadlineNanoseconds != nanoseconds {
+      state.handshakeDeadlineConsistent = false
+    }
+    state.handshakeCalls = state.handshakeCalls + usize.ONE
+    match operation {
+      ByteIoOperation.Read => { state.handshakeReads = state.handshakeReads + usize.ONE }
+      ByteIoOperation.Write => { state.handshakeWrites = state.handshakeWrites + usize.ONE }
+      ByteIoOperation.Flush => { state.handshakeFlushes = state.handshakeFlushes + usize.ONE }
+      ByteIoOperation.ShutdownWrite => {
+        state.handshakeShutdowns = state.handshakeShutdowns + usize.ONE
+      }
+      ByteIoOperation.Close => {}
+    }
+  }
+  return ()
+}
+
+struct OwnedMemoryDuplex {
+  inner: MemoryByteDuplex
+  audit: Shared<OwnedMemoryAudit>
+}
+
+impl OwnedMemoryDuplex {
+  unsafe effect fn read(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.audit, fn(state: &mut OwnedMemoryAudit) -> () {
+      recordOwnedMemoryIo(move state, ByteIoOperation.Read, &deadline)
+      return ()
+    })
+    return run ByteDuplex.readSome(move output, move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn write(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.audit, fn(state: &mut OwnedMemoryAudit) -> () {
+      recordOwnedMemoryIo(move state, ByteIoOperation.Write, &deadline)
+      return ()
+    })
+    return run ByteDuplex.writeSome(input, move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn flush(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.audit, fn(state: &mut OwnedMemoryAudit) -> () {
+      recordOwnedMemoryIo(move state, ByteIoOperation.Flush, &deadline)
+      return ()
+    })
+    return run ByteDuplex.flush(move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn shutdown(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.audit, fn(state: &mut OwnedMemoryAudit) -> () {
+      recordOwnedMemoryIo(move state, ByteIoOperation.ShutdownWrite, &deadline)
+      return ()
+    })
+    return run ByteDuplex.shutdownWrite(move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn close(self: &mut Self) -> () ! ByteIoError {
+    let attempted = run Effect.result(
+      ByteDuplex.close()
+        |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+    )
+    let outbound = MemoryByteDuplex.outbound(&self.inner)
+    let hello = b"\x16\x03\x03\x00\x98\x01\x00\x00\x94\x03\x03\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x20\x21\x00\x00\x06\x13\x03\x13\x01\x13\x02\x01\x00\x00\x65\x00\x00\x00\x10\x00\x0e\x00\x00\x0b\x65\x78\x61\x6d\x70\x6c\x65\x2e\x63\x6f\x6d\x00\x2b\x00\x03\x02\x03\x04\x00\x0d\x00\x06\x00\x04\x04\x03\x08\x04\x00\x32\x00\x08\x00\x06\x04\x03\x08\x04\x04\x01\x00\x0a\x00\x06\x00\x04\x00\x1d\x00\x17\x00\x33\x00\x26\x00\x24\x00\x1d\x00\x20\x86\xc1\x5a\x11\x19\x20\x1d\x2a\x9a\x60\x23\xac\xee\xaf\x49\x66\x4a\x54\x18\x6a\xd2\xdb\x46\x58\x45\x33\x17\x07\xb6\xda\x2b\x0d"
+    let mut helloPrefix = outbound.length >= hello.length
+    let mut helloIndex = usize.ZERO
+    while helloPrefix && helloIndex < hello.length {
+      if outbound[helloIndex] != hello[helloIndex] { helloPrefix = false }
+      helloIndex = helloIndex + usize.ONE
+    }
+    let applicationWrite = contains(outbound, b"\x17\x03\x03\x00\x15\x29\x45\xd2\x6d\xfb\x8d\x58\xa8\xeb\xca\x7d\x5a\x8c\x66\x60\x63\xdc\xa4\xf8\x90\xb8")
+    let operations = MemoryByteDuplex.audit(&self.inner)
+    let shortWritePrefix = operations.length >= 2
+      && operations[0].operation == ByteIoOperation.Write
+      && operations[0].count == usize.ONE
+      && operations[1].operation == ByteIoOperation.Write
+      && operations[1].count == 2
+    let mut shutdowns = usize.ZERO
+    let mut shutdownAfterFlush = false
+    let mut operationIndex = usize.ONE
+    while operationIndex < operations.length {
+      if operations[operationIndex].operation == ByteIoOperation.ShutdownWrite {
+        shutdowns = shutdowns + usize.ONE
+        if operations[operationIndex - usize.ONE].operation == ByteIoOperation.Flush {
+          shutdownAfterFlush = true
+        }
+      }
+      operationIndex = operationIndex + usize.ONE
+    }
+    let closeLast = operations.length > usize.ZERO
+      && operations[operations.length - usize.ONE].operation == ByteIoOperation.Close
+    let closeAttempts = MemoryByteDuplex.closeAttempts(&self.inner)
+    let closed = MemoryByteDuplex.phase(&self.inner) == MemoryByteDuplexPhase.Closed
+    drop operations
+    Shared.withMut(&self.audit, fn(state: &mut OwnedMemoryAudit) -> () {
+      state.closes = state.closes + usize.ONE
+      state.underlyingCloseAttempts = closeAttempts
+      state.closed = closed
+      state.helloPrefix = helloPrefix
+      state.applicationWrite = applicationWrite
+      state.shortWritePrefix = shortWritePrefix
+      state.shutdowns = shutdowns
+      state.shutdownAfterFlush = shutdownAfterFlush
+      state.closeLast = closeLast
+      return ()
+    })
+    return match move attempted {
+      Result<(), ByteIoError>.Success {value} => move value
+      Result<(), ByteIoError>.Failure {error} => { fail move error }
+    }
+  }
+}
+
+impl ByteDuplex for OwnedMemoryDuplex {
+  readSomeRaw: OwnedMemoryDuplex.read
+  writeSomeRaw: OwnedMemoryDuplex.write
+  flushRaw: OwnedMemoryDuplex.flush
+  shutdownWriteRaw: OwnedMemoryDuplex.shutdown
+  closeRaw: OwnedMemoryDuplex.close
+}
+
+struct CancellationState {closes: usize callbacks: usize}
+fn recordCancellationClose(state: &mut CancellationState) -> () {
+  state.closes = state.closes + usize.ONE
+  return ()
+}
+fn recordCancellationCallback(state: &mut CancellationState) -> () {
+  state.callbacks = state.callbacks + usize.ONE
+  return ()
+}
+fn cancellationResult(state: &mut CancellationState) -> i32 {
+  if state.closes == usize.ONE && state.callbacks == usize.ZERO { return 42 }
+  return -3
+}
+
+struct SharedCallbackCounter {state: Shared<CancellationState>}
+effect fn countSharedCallback(self: &mut SharedCallbackCounter) -> () {
+  Shared.withMut(&self.state, recordCancellationCallback)
+  return ()
+}
+impl CallbackAudit for SharedCallbackCounter {invoked: SharedCallbackCounter.countSharedCallback}
+
+struct ParkingClock {}
+struct ParkGuard {wake: Wake}
+fn retainWake(wake: Wake) -> ParkGuard { return ParkGuard {wake: move wake} }
+impl MonotonicClock for ParkingClock {
+  effect fn now(self: &mut Self) -> Instant { return SystemClock.make(100, 0) }
+  effect fn getResolution(self: &mut Self) -> u64 { return u64.toU64(1) }
+  effect fn waitUntil(self: &mut Self, when: Instant) -> () {
+    drop when
+    run Execution.park(retainWake)
+    return ()
+  }
+  effect fn waitFor(self: &mut Self, howLong: u64) -> () {
+    drop howLong
+    run Execution.park(retainWake)
+    return ()
+  }
+}
+
+struct ParkingDuplex {state: Shared<CancellationState>}
+impl ParkingDuplex {
+  unsafe effect fn read(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    drop output
+    let wakeAt = match move deadline {
+      Option<Instant>.None => SystemClock.make(200, 0)
+      Option<Instant>.Some {value} => move value
+    }
+    run MonotonicClock.waitUntil(move wakeAt)
+    return ReadTransfer.End
+  }
+  unsafe effect fn write(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    drop deadline
+    return input.length
+  }
+  unsafe effect fn flush(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock { drop deadline return () }
+  unsafe effect fn shutdown(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock { drop deadline return () }
+  unsafe effect fn close(self: &mut Self) -> () ! ByteIoError {
+    Shared.withMut(&self.state, recordCancellationClose)
+    return ()
+  }
+}
+impl ByteDuplex for ParkingDuplex {
+  readSomeRaw: ParkingDuplex.read
+  writeSomeRaw: ParkingDuplex.write
+  flushRaw: ParkingDuplex.flush
+  shutdownWriteRaw: ParkingDuplex.shutdown
+  closeRaw: ParkingDuplex.close
+}
+
+struct DirectCancellationState {
+  armed: bool
+  closed: bool
+  offers: usize
+  completions: usize
+  closes: usize
+  laterIo: usize
+  sequence: usize
+  offerOrder: usize
+  closeOrder: usize
+  terminalOwner: bool
+}
+
+fn armDirectCancellation(state: &mut DirectCancellationState) -> () {
+  state.armed = true
+  return ()
+}
+
+fn recordDirectIo(state: &mut DirectCancellationState) -> () {
+  if state.closed { state.laterIo = state.laterIo + usize.ONE }
+  return ()
+}
+
+fn beginDirectWrite(state: &mut DirectCancellationState) -> bool {
+  if state.closed { state.laterIo = state.laterIo + usize.ONE }
+  if !state.armed || state.closed { return false }
+  state.offers = state.offers + usize.ONE
+  state.sequence = state.sequence + usize.ONE
+  if state.offerOrder == usize.ZERO { state.offerOrder = state.sequence }
+  return true
+}
+
+fn recordTerminalOwner(state: &mut DirectCancellationState) -> () {
+  state.terminalOwner = true
+  return ()
+}
+
+fn completeDirectWrite(state: &mut DirectCancellationState) -> () {
+  state.completions = state.completions + usize.ONE
+  return ()
+}
+
+fn closeDirectCancellation(state: &mut DirectCancellationState) -> () {
+  state.closes = state.closes + usize.ONE
+  state.sequence = state.sequence + usize.ONE
+  if state.closeOrder == usize.ZERO { state.closeOrder = state.sequence }
+  state.closed = true
+  return ()
+}
+
+fn directCancellationResult(state: &mut DirectCancellationState) -> i32 {
+  if state.offers != usize.ONE { return 71 }
+  if state.completions != usize.ZERO { return 72 }
+  if state.closes != usize.ONE { return 73 }
+  if state.laterIo != usize.ZERO { return 74 }
+  if state.offerOrder != usize.ONE || state.closeOrder != 2 { return 75 }
+  if !state.terminalOwner { return 76 }
+  return 42
+}
+
+struct DirectCancellationDuplex {
+  inner: MemoryByteDuplex
+  state: Shared<DirectCancellationState>
+}
+
+impl DirectCancellationDuplex {
+  unsafe effect fn read(
+    self: &mut Self,
+    output: &mut [u8],
+    deadline: Option<Instant>,
+  ) -> ReadTransfer ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.state, recordDirectIo)
+    return run ByteDuplex.readSome(move output, move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn write(
+    self: &mut Self,
+    input: &[u8],
+    deadline: Option<Instant>,
+  ) -> usize ! ByteIoError ? &mut MonotonicClock {
+    if Shared.withMut(&self.state, beginDirectWrite) {
+      run MonotonicClock.waitUntil(SystemClock.make(200, 0))
+      Shared.withMut(&self.state, completeDirectWrite)
+    }
+    return run ByteDuplex.writeSome(input, move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn flush(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.state, recordDirectIo)
+    return run ByteDuplex.flush(move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn shutdown(
+    self: &mut Self,
+    deadline: Option<Instant>,
+  ) -> () ! ByteIoError ? &mut MonotonicClock {
+    Shared.withMut(&self.state, recordDirectIo)
+    return run ByteDuplex.shutdownWrite(move deadline)
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+
+  unsafe effect fn close(self: &mut Self) -> () ! ByteIoError {
+    Shared.withMut(&self.state, closeDirectCancellation)
+    return run ByteDuplex.close()
+      |> Effect.provideMut<ByteDuplex>(&mut self.inner)
+  }
+}
+
+impl ByteDuplex for DirectCancellationDuplex {
+  readSomeRaw: DirectCancellationDuplex.read
+  writeSomeRaw: DirectCancellationDuplex.write
+  flushRaw: DirectCancellationDuplex.flush
+  shutdownWriteRaw: DirectCancellationDuplex.shutdown
+  closeRaw: DirectCancellationDuplex.close
+}
+
+struct CallbackFailure {code: i32}
+
+
+fn reference<'a>(bytes: &'a [u8]) -> ReferenceIdentity<'a> {
+  let made = HttpsIdentity.reference(OriginHost<'a>.Dns {bytes: bytes})
+  return match move made {
+    Result<ReferenceIdentity<'a>, IdentityError>.Success {value} => value
+    Result<ReferenceIdentity<'a>, IdentityError>.Failure {error} => {
+      let invalid = 1 / 0
+      return reference(bytes)
+    }
+  }
+}
+
+effect fn rootTrust() -> TrustSnapshot
+! TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  let made = run TrustSnapshot.fromPem(b"\x2d\x2d\x2d\x2d\x2d\x42\x45\x47\x49\x4e\x20\x43\x45\x52\x54\x49\x46\x49\x43\x41\x54\x45\x2d\x2d\x2d\x2d\x2d\x0a\x4d\x49\x49\x44\x53\x54\x43\x43\x41\x6a\x47\x67\x41\x77\x49\x42\x41\x67\x49\x4a\x41\x4c\x6f\x64\x4b\x48\x7a\x68\x5a\x30\x32\x77\x4d\x41\x30\x47\x43\x53\x71\x47\x53\x49\x62\x33\x44\x51\x45\x42\x43\x77\x55\x41\x4d\x44\x41\x78\x4c\x6a\x41\x73\x42\x67\x4e\x56\x0a\x42\x41\x4d\x4d\x4a\x56\x4e\x70\x62\x47\x73\x67\x56\x45\x78\x54\x49\x45\x4e\x73\x61\x57\x56\x75\x64\x43\x42\x55\x5a\x58\x4e\x30\x49\x46\x4a\x76\x62\x33\x51\x67\x4c\x53\x42\x55\x52\x56\x4e\x55\x49\x45\x39\x4f\x54\x46\x6b\x77\x48\x68\x63\x4e\x4d\x6a\x59\x77\x0a\x4f\x54\x45\x78\x4d\x54\x55\x31\x4e\x6a\x45\x33\x57\x68\x63\x4e\x4d\x7a\x59\x77\x4f\x54\x41\x34\x4d\x54\x55\x31\x4e\x6a\x45\x33\x57\x6a\x41\x77\x4d\x53\x34\x77\x4c\x41\x59\x44\x56\x51\x51\x44\x44\x43\x56\x54\x61\x57\x78\x72\x49\x46\x52\x4d\x55\x79\x42\x44\x0a\x62\x47\x6c\x6c\x62\x6e\x51\x67\x56\x47\x56\x7a\x64\x43\x42\x53\x62\x32\x39\x30\x49\x43\x30\x67\x56\x45\x56\x54\x56\x43\x42\x50\x54\x6b\x78\x5a\x4d\x49\x49\x42\x49\x6a\x41\x4e\x42\x67\x6b\x71\x68\x6b\x69\x47\x39\x77\x30\x42\x41\x51\x45\x46\x41\x41\x4f\x43\x0a\x41\x51\x38\x41\x4d\x49\x49\x42\x43\x67\x4b\x43\x41\x51\x45\x41\x77\x50\x38\x75\x4c\x31\x74\x33\x72\x65\x79\x6f\x63\x50\x57\x67\x41\x6d\x61\x34\x49\x54\x42\x33\x35\x6e\x64\x46\x78\x59\x49\x2b\x51\x35\x62\x34\x48\x4f\x64\x74\x33\x4b\x4a\x51\x38\x4e\x5a\x53\x0a\x49\x4a\x48\x37\x2f\x76\x48\x4d\x2f\x45\x6e\x31\x78\x31\x2b\x7a\x47\x47\x66\x2f\x31\x4c\x4f\x59\x7a\x75\x64\x44\x52\x7a\x48\x78\x41\x69\x69\x78\x52\x35\x57\x71\x42\x37\x31\x31\x41\x6f\x77\x45\x46\x4e\x75\x36\x6b\x31\x4a\x4d\x7a\x4a\x62\x48\x64\x58\x38\x6f\x0a\x73\x63\x30\x50\x70\x31\x2b\x50\x57\x54\x46\x56\x71\x38\x6e\x71\x4d\x37\x73\x30\x55\x52\x64\x73\x36\x48\x59\x37\x50\x73\x6c\x6c\x62\x70\x7a\x64\x4e\x76\x37\x64\x6a\x4c\x38\x4b\x43\x2b\x36\x6f\x62\x46\x33\x53\x36\x4a\x47\x43\x74\x7a\x77\x37\x33\x5a\x54\x59\x0a\x54\x65\x2b\x64\x57\x53\x71\x6b\x35\x4a\x77\x6c\x66\x67\x4c\x6c\x62\x6b\x56\x79\x69\x65\x54\x50\x49\x6b\x69\x6c\x67\x51\x79\x36\x44\x72\x68\x48\x36\x4a\x43\x49\x4c\x53\x42\x33\x57\x78\x77\x51\x48\x35\x64\x42\x50\x50\x6f\x4b\x5a\x56\x69\x66\x48\x36\x4f\x4f\x0a\x6c\x73\x6a\x42\x33\x37\x78\x39\x74\x64\x42\x61\x73\x4d\x37\x6a\x75\x35\x64\x56\x2f\x4b\x2f\x41\x34\x2f\x31\x76\x30\x57\x75\x4c\x6f\x74\x36\x49\x7a\x4c\x70\x77\x42\x67\x47\x43\x71\x69\x71\x6d\x52\x47\x59\x35\x31\x45\x6b\x68\x44\x6a\x70\x61\x50\x54\x6b\x65\x0a\x73\x45\x64\x36\x6e\x56\x55\x55\x68\x35\x74\x65\x36\x65\x46\x75\x67\x6d\x51\x4c\x39\x46\x37\x67\x6f\x32\x48\x6b\x43\x2f\x6f\x51\x54\x33\x75\x34\x30\x77\x49\x44\x41\x51\x41\x42\x6f\x32\x59\x77\x5a\x44\x41\x53\x42\x67\x4e\x56\x48\x52\x4d\x42\x41\x66\x38\x45\x0a\x43\x44\x41\x47\x41\x51\x48\x2f\x41\x67\x45\x42\x4d\x41\x34\x47\x41\x31\x55\x64\x44\x77\x45\x42\x2f\x77\x51\x45\x41\x77\x49\x42\x42\x6a\x41\x64\x42\x67\x4e\x56\x48\x51\x34\x45\x46\x67\x51\x55\x63\x77\x54\x56\x49\x43\x31\x55\x4e\x74\x76\x73\x78\x31\x65\x6f\x0a\x62\x53\x48\x4e\x69\x65\x39\x50\x52\x64\x34\x77\x48\x77\x59\x44\x56\x52\x30\x6a\x42\x42\x67\x77\x46\x6f\x41\x55\x63\x77\x54\x56\x49\x43\x31\x55\x4e\x74\x76\x73\x78\x31\x65\x6f\x62\x53\x48\x4e\x69\x65\x39\x50\x52\x64\x34\x77\x44\x51\x59\x4a\x4b\x6f\x5a\x49\x0a\x68\x76\x63\x4e\x41\x51\x45\x4c\x42\x51\x41\x44\x67\x67\x45\x42\x41\x45\x4f\x4e\x43\x37\x65\x75\x4b\x77\x59\x30\x46\x71\x67\x4b\x79\x75\x53\x41\x4f\x72\x2f\x53\x68\x4f\x66\x62\x67\x79\x5a\x78\x61\x36\x6d\x50\x57\x70\x6c\x76\x78\x42\x32\x4a\x2b\x39\x2f\x49\x0a\x4e\x59\x6c\x65\x74\x49\x66\x47\x47\x65\x6f\x63\x46\x75\x58\x54\x76\x32\x68\x78\x4d\x52\x76\x34\x2f\x43\x76\x43\x38\x48\x6d\x2b\x58\x34\x61\x49\x52\x50\x45\x4b\x67\x6f\x56\x39\x51\x47\x74\x5a\x51\x70\x32\x76\x56\x58\x39\x56\x49\x45\x34\x64\x63\x33\x2f\x55\x0a\x69\x74\x38\x41\x35\x74\x6b\x52\x34\x48\x43\x5a\x31\x5a\x33\x79\x42\x72\x67\x55\x31\x52\x52\x32\x4f\x2b\x4b\x35\x62\x6b\x70\x33\x53\x2f\x54\x50\x2f\x4d\x59\x6f\x63\x36\x54\x72\x79\x57\x63\x35\x5a\x43\x54\x51\x46\x2b\x53\x6f\x6f\x32\x71\x2f\x53\x35\x68\x71\x0a\x53\x78\x6e\x33\x73\x32\x6c\x2f\x39\x57\x6e\x48\x4d\x75\x4d\x79\x36\x79\x70\x4c\x59\x31\x33\x59\x43\x39\x41\x31\x4f\x50\x50\x4e\x64\x55\x54\x42\x4f\x4d\x46\x4a\x73\x31\x2f\x6c\x79\x6b\x53\x69\x41\x33\x4c\x69\x53\x69\x6f\x51\x62\x4e\x67\x47\x58\x4b\x35\x66\x0a\x50\x72\x73\x52\x4d\x64\x6b\x47\x34\x67\x37\x55\x6e\x69\x56\x6f\x43\x31\x33\x6e\x43\x6f\x4c\x77\x5a\x59\x2f\x62\x76\x6e\x31\x70\x2f\x54\x78\x79\x6c\x36\x69\x4c\x7a\x71\x4c\x35\x33\x48\x6b\x33\x2f\x2b\x36\x64\x39\x77\x6a\x45\x76\x6f\x49\x32\x36\x46\x6d\x4c\x0a\x33\x4d\x75\x51\x5a\x46\x47\x61\x2f\x2f\x5a\x31\x4b\x5a\x44\x39\x4e\x48\x4c\x34\x64\x6f\x4f\x5a\x37\x62\x77\x6b\x35\x66\x61\x59\x46\x6f\x30\x6e\x4d\x35\x30\x3d\x0a\x2d\x2d\x2d\x2d\x2d\x45\x4e\x44\x20\x43\x45\x52\x54\x49\x46\x49\x43\x41\x54\x45\x2d\x2d\x2d\x2d\x2d\x0a", TrustLoadLimits.defaults())
+  return match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => { fail move error }
+  }
+}
+
+effect fn preparedTrust(snapshot: &TrustSnapshot) -> TrustSnapshot
+! TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  let limits = TrustLoadLimits.defaults()
+  let copied = run TrustSnapshot.copy(&snapshot, limits.snapshot)
+  return match move copied {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => { fail move error }
+  }
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+  if needle.length > haystack.length { return false }
+  let mut start = usize.ZERO
+  while start <= haystack.length - needle.length {
+    let mut equal = true
+    let mut index = usize.ZERO
+    while index < needle.length {
+      if haystack[start + index] != needle[index] { equal = false }
+      index = index + usize.ONE
+    }
+    if equal { return true }
+    start = start + usize.ONE
+  }
+  return false
+}
+
+effect fn rawMemoryTransport(
+  closeFailure: Option<i32>,
+  peerClose: bool,
+) -> MemoryByteDuplex
+! OutOfMemoryError
+? &mut Allocator {
+  let first = run Bytes.copy(b"\x16\x03\x03\x00\x5a\x02\x00\x00\x56\x03\x03\xd2\x06\x2c\x50\x8f\x69\x3e\x4c\xc8\x9a\x60\x12\x50\x98\x81\x34\xd4\xa6\x37\x54\x9d\x66\x94\xdf\x5c\x2d\xb4\x44\xfa\xaa\xc7\x30\x00\x13\x03\x00\x00\x2e\x00\x33\x00\x24\x00\x1d\x00\x20\x79\x6b\xc4\x85\xa2\xc6\x6f")
+  let second = run Bytes.copy(b"\x84\xe9\x7a\xda\x22\x78\xc4\x0a\xe5\x22\xd4\xec\xc9\xb5\x84\x7f\x39\xc5\x1c\x10\xce\x60\xc5\xd3\x13\x00\x2b\x00\x02\x03\x04\x14\x03\x03\x00\x01\x01\x17\x03\x03\x07\xe9\x5e\xed\x26\x1e\x86\x19\xe7\xf4\x02\xe4\xa9\xa3\x84\xf3\xf5\x94\x87\xf9\xb0\x27\xb7\xc3\x78\xc8\xbb\x0b\x9a\xbb\xfd\x13\x5e\xe5\x38\xd5\xf9\x08\xa1\x3c\xaf\xbb\xa9\x17\x3d\x4f\x3e\x3d\xa1\xbd\x8a\xe9\x50\xfb\x80\xe4\x59\xc9\x84\xdb\xbf\x10\x97\xe9\xda\xb1\x53\xa2\xa8\x30\x0c\x44\x7f\x00\xf8\x2d\x77\x15\xe2\xe6\x79\x96\xfb\xca\xb5\xb4\x13\x9a\x43\x58\xf3\x56\x14\xaa\xb8\xbb\xf2\xd2\x7a\xfd\xdb\x3f\xf2\x47\xff\xbf\xcc\x30\x62\x23\xa7\xff\x13\x6f\x22\x25\x46\x97\x4a\x32\x41\x6b\x02\x09\x9c\x26\xd0\x75\x80\x08\x08\x55\xe9\xe3\x3a\xfd\xc4\x36\xc6\x31\xbe\x83\x92\xa2\xe3\xe2\x0e\xab\x5b\xc8\x64\x58\x80\x6a\x42\xb6\xa7\x77\xf1\x59\xb9\xdd\x74\xd1\xde\xe5\x98\x8c\x22\x72\xa5\xca\xab\x5d\x03\xdf\x24\x0e\x6f\x80\xb6\x40\x0c\x56\x10\xb8\x59\x00\x29\x79\xda\x71\x34\xff\x2b\x1c\x71\x12\x4a\xb3\x4c\x6d\xd1\x3d\xe8\x03\xc0\x75\x9c\x47\x2e\xd6\xe5\xd5\x01\x06\x17\x85\x4d\x88\x89\x1e\xee\x15\x5b\x20\xa0\x2d\x45\xad\x62\x94\x5c\x01\x19\x19\x59\x43\x6a\x0d\x81\x50\xf0\x8b\x3e\xa0\x7b\x4c\xb7\xcf\xde\x65\xca\xc7\xb7\x71\x80\x6d\xcd\x61\x68\xc8\x96\x7e\xf4\x7b\xdc\x34\x26\x1c\xb6\x02\xc3\xd1\xd2\x9b\x37\x8a\xcb\x0e\x0e\x32\xda\x29\xa8\xea\x3d\x5b\xf2\x87\x4c\x3f\x9c\x9d\x26\xa3\x0e\x3a\x3f\x46\xb7\x2b\x32\x9a\x0c\xe3\x47\x25\xaf\x2b\x41\x0f\xdd\x94\x93\xb6\xf0\xd2\xc9\xd0\x49\x75\xd2\x7c\x41\x5c\x2d\x2e\xde\xcf\x76\xac\x7a\xad\x7f\xba\xfb\x22\x22\x2e\xb1\xdf\x1f\x81\x9f\x0b\x9b\x2d\xba\xbf\x55\x46\x82\xf0\x64\x92\x57\xa1\x8d\xf1\x56\xc3\x5e\xba\x83\xd6\x7a\x73\x8d\x8d\x9d\xde\x99\x95\x1c\xf5\x3a\x5a\xc3\x9f\x13\x43\xf1\x84\xed\x95\x9f\x50\xc4\x46\x8a\x81\x49\x9f\xe8\xff\x01\x1c\x50\x92\xe6\x84\x81\x60\x66\x0c\x52\xb1\x94\x12\xb8\x97\xd7\xab\x05\x4f\x57\xbc\xe7\xa3\x90\xcd\x4d\x07\x37\xb5\x61\xd3\xb8\xeb\xfa\xe9\xc8\x2a\x2a\x63\x12\x28\x31\xae\x6a\x79\xb3\x6d\x1e\x82\x9f\xb9\x51\x4f\x95\x75\x05\x10\x08\xf9\x4e\x5c\x66\x3d\xf2\xec\x16\xe6\x86\x4d\xe3\xa8\x90\xc1\x02\x76")
+  let third = run Bytes.copy(b"\x22\x94\x47\xba\x0d\x39\x9d\x44\x11\x2f\xe0\x3b\x01\x9f\xde\x18\xb3\xef\x2b\x49\x5e\x6c\x93\x0b\x37\xb8\x8a\xba\xa0\x46\x0b\x2f\x6d\x4a\x2e\x3c\xff\x3a\xaf\xb8\xb3\x71\xb9\x3a\x8b\x0b\x38\xd6\x07\x89\x02\x9e\x9e\x94\xfa\x49\x5a\x0b\xc3\x56\xc4\x27\x87\xf5\xa2\x77\x65\x57\xc7\x3e\xfd\x8a\x13\x45\x87\x51\xad\x37\x9f\x0b\x79\x19\x23\x21\xd0\xf2\x03\x74\xcb\x75\x9f\xbe\x5f\xea\xb6\x5e\xb5\xa1\xb6\xfe\x69\xe3\xfe\x43\x33\xdc\xe0\x0b\x02\x46\x57\x3d\x05\x71\xa2\xb9\x0c\xa6\x30\x03\x31\x6f\x31\x8e\xac\xf3\xd5\xcc\x33\x77\x8b\x60\x8e\x31\xe2\xb1\x61\x26\x2c\x80\x59\x0b\x18\x32\xd6\xd9\x37\x4a\xe5\x7d\x07\x65\xe1\x0e\x61\x40\xec\xc8\x92\x72\x2c\xc9\x0d\xaf\x47\x8a\x40\x29\x05\x6e\xa5\x23\x61\xaa\x05\x38\xba\x65\xcd\x3e\xc6\x43\x68\xa0\x4a\xa4\x24\x9a\x4e\x8e\x22\xa1\x65\xc9\xcb\x7b\xc8\x82\xf5\x36\xae\xcc\xe8\x2d\x2b\x31\x5c\xe0\xa5\x67\x19\x2b\x67\xdc\xd2\x3f\x60\x4c\xae\x3d\x99\x57\x5d\x46\xef\x77\xc1\xee\xea\xb1\x52\x7d\x31\xcf\xe6\x85\x7f\xdb\xec\xf4\xb7\x3f\xec\xf3\x97\x73\xf2\x3a\x80\x94\xb8\x50\x6d\xec\x87\xbb\xf9\xc0\x84\xf2\x2a\x7c\x98\x19\x10\x35\x2e\x86\xbc\x51\x13\xb1\x74\x5a\x6e\xb0\xd8\xcb\xf0\x46\xe9\x0d\x96\xc4\x62\xc7\x33\x81\xa4\xcc\xfb\x63\x70\xc4\x4b\x3c\xd3\x8b\xda\xc2\x4b\x5c\xd4\xa0\x81\x96\xa0\xf9\x5d\xf3\x9b\x30\x6e\x2d\x18\xc0\xba\xbe\xeb\x1a\x0b\xcb\x57\x7f\xee\x96\xbf\xc5\x7f\x5c\x20\xe1\x84\x8b\x85\x65\xb3\xc2\x98\x2c\x57\xa7\x2f\xf2\xdd\x5e\xdc\xf8\x42\x4d\x00\xcd\x78\xf3\xf3\x6d\xe3\xa2\x21\x0b\x9a\x32\x4f\xb6\x06\x1d\x1f\xe6\x0a\x8c\x4e\x4e\xc4\x89\xac\x31\x7e\x55\x03\xa4\x40\x34\xbf\x9a\x09\xda\xa2\x3a\x11\x42\xb9\x2d\x9a\xa8\xf7\x68\x67\xc8\xc8\xaa\x23\xce\xb9\x66\x26\x97\x49\x02\xc7\x4f\x05\x99\x8b\x61\x2a\x0b\x3a\x5e\x5d\x64\x31\x69\xf8\x99\x0a\x82\xad\x3b\x29\x39\x16\x1f\x4e\x17\x3e\xef\xbe\xd5\x45\xe2\x21\x81\xfc\x74\xb7\x86\x50\x7f\x73\xd4\x58\x13\x12\x81\x4a\x14\xb7\x80\x6e\x40\xce\x3f\x76\x96\xde\xc1\x3e\x7f\xf8\xf7\x90\x30\x8c\x73\xf1\x0b\x44\xe4\xff\x1a\x44\xfd\x2a\xd7\x1e\x95\x15\xaa\x11\x8a\x50\x4a\xb2\xb4\x83\x17\x45\xee\x27\x00\x9f\x6a\x86\xab\xbd\x06\x15\x99\xae\x02\x6c\xe6\xae\x69\x92\xdf\x37\xdd\xa5\x9f\x40\x5b\xcd\x38\xd4\xe2\xe5\x07\xfb\xfd\x12\xdd\xaa\x0d\x9a\x29\xf2\xff\xe8\x78\xe1\x3a\x8e\x4d\x84\x6c\x79\xe1\xac\x2a\x36\xcb\x9f\x7b\xee\xe5\x72\xbf\x9b\xa1\xd8\xb6\x53\xcb\x03\x8a\x23\x9d\xb4\xad\x7f\xfe\x57\x26\xe5\x38\xf0\xd9\x5c\x90\xff\x29\xd1\x7d\xc2\xe8\x4a\x40\x00\x0a\xa8\x98\xa1\xbd\x9c\x63\xfd\x2d\x18\x11\xa8\x99\xaf\x24\x62\x39\x99\x32\x4a\xa8\xc6\x10\xa0\xec\x5c\x56\x36\x17\x6a\x5f\xe2\x55\x03\xf1\x6a\x46\xac\xbd\x1f\xe7\x02\xc6\xbf\xa6\xe1\x04\x1e\x80\x79\x64\x2e\x57\x63\xea\x05\x1a\x96\xc8\xfb\x34\x2d\xa1\x1f\xa7\x77\xa7\xe5\x71\xfa\x82\xd0\x13\xa9\x4e\x11\xba\x8a\x08\x23\x38\xe6\x3f\x31\xcd\x36\x75\xfa\x8a\x8d\x05\x5f\xe7\x49\xd3\x0c\x2e\xaf\xf1\xa1\x56\xa7\x16\xaf\xd1\x42\xad\x6e\x9f\x92\x1c\x5d\x96\xf8\x26\x7b\x99\xfc\xd8\xf0\xb3\x60\x7f\x21\xb7\xba\x5f\x8d\x6e\x42\x93\xc8\x0b\xd6\x80\x5e\xde\x42\xe3\x69\x80\xa4\x48\x7c\xa6\x70\xc9\x76\x04\x5b\x72\x4a\x2e\xe6\x45\xb0\x9d\x5b\x1a\x2e\xa0\xa8\xf9\xf6\x1c\xa3\x9a\x11\x3c\xda\xe6\xcb\x41\x9b\x18\xc7\xe9\x31\x66\x60\x5e\x82\x4b\x6c\x67\xb0\xf0\x50\x15\xec\x24\x05\xc4\xea\x4c\x26\xf2\xcd\x38\x34\xbc\xa8\x38\x0f\xf8\x9e\x2f\x31\x7d\xbd\x67\x31\xb5\x64\xcb\x10\xad\xf5\x4e\x3c\xd7\x02\x00\x72\x3d\x52\x07\xb7\x19\x3b\x35\xd1\xe0\xb5\x76\x7e\x0b\x6e\x46\x10\x58\x64\xe6\x6f\xda\xe4\xbc\x7b\xfa\x5e\xfa\x3f\x37\x48\xca\x73\xbf\xbc\x55\xb0\x86\xb3\xa6\x66\x60\x9e\xcf\x48\x8e\x04\x36\x9e\xe6\xd2\xe8\x56\x73\x8f\x86\x4d\xae\xd7\x91\x72\x4c\x74\x74\x74\x68\xd0\x7e\xca\xd2\xb4\x33\x1e\xaf\x14\xc0\xb2\x24\x04\x0b\x66\x6f\x27\x57\x02\x65\x44\x2b\x32\x0d\xd7\xf5\x82\x96\x08\x96\x21\x52\x2d\xe5\xe7\x56\x60\x4a\x19\xe8\x31\xba\x03\xaa\x73\x54\x8e\x10\xba\xa2\xd4\xa0\x15\x44\x45\xd6\xa5\x38\x34\xd4\x4b\x2d\xe7\xe9\x16\x24\x3c\xd4\x4c\xba\xcb\xe6\x76\xb3\x74\xea\x5f\x3e\x3c\x38\x1c\x6b\xf3\xc3\xbf\xf2\xa3\x0a\x2b\x5e\xf8\x2c\x8c\x48\x77\x7f\xfa\xcd\xca\x1b\xdf\xe9\x9c\x6f\xd8\x86\xd9\x73\x7e\x24\xe0\xa7\x80\x94\x1a\x46\xcd\x6a\x28\xdf\x3f\xb8\x0a\x3e\xa6\x81\x0c\xb6\xcb\x49\x8f\x14\xc8\x27\xae\x27\xf0\xa0\x48\xf3\x2f\x5f\x97\x09\x50\x96\x64\x19\xa3\xde\x9f\x7e\x7d\x72\x76\xca\xec\xe4\x16\x01\xeb\xf7\xe1\x95\x17\xb9\xf2\x49\xb1\x3d\xf7\xea\xf4\xe9\xf3\x83\xec\x85\xe9\xf6\x07\x3a\x20\xe4\x70\xfd\x5c\x64\xfd\xba\x71\xc2\xbb\xe0\xf0\x57\x1f\x20\x7d\x88\x41\x77\x7c\x6e\xc6\x6e\x52\x84\x57\x9a\x46\x4b\x5a\x44\x6b\x69\xeb\x74\xee\x32\x60\xfb\xb4\x3a\x08\xbc\xb9\x95\xd1\x7b\xe0\x23\x7c\xf3\xb1\x3c\x13\x74\x05\x53\x19\x59\xbd\xe6\x83\x63\x6f\xc5\x68\x2f\xc5\xf4\x8a\xeb\xc3\xd0\x87\xc7\xf4\x32\x02\x24\x0c\x20\xee\x1b\xfe\x22\xd1\x04\xe4\x5a\x17\x00\xe8\xb0\xb9\x3b\xae\x6b\x1b\x7b\xb5\x14\xad\x8e\x1d\x29\xbf\xfd\x24\x72\x52\x7b\xd5\xa1\x14\xa1\x94\xb4\x13\xc5\xca\x19\x5a\xa2\xbd\xaf\x54\x92\xc9\x26\xe1\x6b\x6b\x54\x86\x28\x49\x6a\x0d\x84\xd1\xbf\x1e\x09\xe4\x67\x15\xa3\xdc\x90\xce\x3f\x6d\x0a\x16\x2f\x0e\x8d\xfc\x65\xc7\xd4\x8a\xe1\xcc\x23\x39\x73\xc8\xb0\x27\x1c\x8f\x38\x34\x65\x07\x37\xfe\x0f\x4b\x3c\xed\x0a\x30\x82\x05\x9c\x67\x65\xf9\x10\xf1\x87\x75\x91\x6d\x7e\x12\x51\x61\xe7\x91\xb0\x54\x06\x8d\x31\xdf\x3e\x10\x05\xf7\xaf\x3a\xdc\xe3\xd7\x1e\x4a\xf2\x2e\x2a\xbc\x7f\xee\xfa\x17\xd4\xf2\xf1\x69\x81\x42\x21\x5c\x79\x83\x41\x18\x37\xd7\xd3\xe9\x81\x87\x85\xc0\xd1\x94\x24\xdf\xd7\x8a\x80\xb3\x28\x80\xf8\xc9\xd4\x4a\xfa\x3b\x57\xc5\xd1\x5b\xec\xe1\xdd\xe1\xcf\x9f\x3c\xfb\x4b\xc5\x18\x7b\x1f\x75\xc2\xf9\x18\xad\x1b\xf9\xc3\xed\xda\x87\x50\x4b\xe3\x6e\xa1\xea\x36\x16\x94\x4b\x55\xf6\xfc\x5b\x3c\xb0\x62\xdf\xfb\x57\x25\xe5\x88\x4e\x45\x1e\x5e\x82\x68\x2f\xb1\x76\xb8\xa1\x22\x1c\xbf\xfb\xd0\xca\x19\xfc\xbf\x05\x5a\x9a\xaa\x0d\xac\x8c\x0a\x5b\x7c\x95\x1a\x6e\x7c\x82\xe1\x03\x87\x97\x03\x26\x33\xa7\x23\xcb\x75\xb2\xb7\xe1\x4c\x22\x89\xe0\x13\xbe\x87\x28\x86\x91\x05\xd4\x12\x95\xe2\x48\xd2\x44\x26\xd1\xa6\x8c\x6b\xa7\x67\xd1\xaf\xba\x9c\x73\x5a\x76\xa7\x7e\x22\x55\x32\x64\xbc\xa7\xe7\x0f\x38\x0a\x58\x22\xb0\x71\x9e\x27\x58\xdc\xec\xf7\x94\x3d\x6d\xdd\x22\x60\xc9\x8f\xc0\xa0\x97\xe8\x4e\xf1\x6f\x37\xb0\x0e\x1a\x68\xc9\x97\x1c\x62\xdd\x06\xe0\xe3\x2a\x1d\xd9\x57\xc1\x60\xb4\xb4\xb7\x0b\x42\x68\x0b\x1d\x40\x41\x75\x4f\x49\xe5\xe4\x1f\xce\xc4\x58\x0b\x00\x4b\x0e\x9f\x9f\x87\x46\x00\x3b\xe2\x42\x61\x04\x50\xe4\x5e\xfc\xb1\x39\x2a\x0a\x68\x4d\x17\x03\x03\x00\x32\x9f\x1c\x16\x84\x74\x56\x9c\x90\x58\x6a\xba\x81\x91\xc7\xd4\x3f\x43\xcc\x34\x41\x3b\xc2\xad\xba\xdf\x12\x65\xde\xc8\x2e\x80\xc3\x1c\xd2\xc4\xe7\xe3\x3b\xbc\x2d\xcf\x65\x87\xe8\x17\x8c\xeb\xe1\xb6\x34")
+  let mut reads = Vector<MemoryReadEvent>.make()
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
+    readyAt: SystemClock.make(100, 0),
+    bytes: move first,
+  })
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
+    readyAt: SystemClock.make(100, 0),
+    bytes: move second,
+  })
+  run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
+    readyAt: SystemClock.make(100, 0),
+    bytes: move third,
+  })
+  if peerClose {
+    run Vector<MemoryReadEvent>.append(&mut reads, MemoryReadEvent.Data {
+      readyAt: SystemClock.make(100, 0),
+      bytes: run Bytes.copy(b"\x17\x03\x03\x00\x13\xf2\x7b\x8e\x7e\x92\x5e\x5d\x2f\xd6\xb7\xb3\xc0\x53\x0b\xc8\x61\xab\x56\x0b"),
+    })
+  }
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  let mut index = usize.ZERO
+  while index < 16 {
+    let mut count: usize = 65535
+    if index == usize.ZERO { count = usize.ONE }
+    if index == usize.ONE { count = 2 }
+    run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
+      readyAt: SystemClock.make(100, 0),
+      action: MemoryWriteAction.Accept {count: count},
+    })
+    index = index + usize.ONE
+  }
+  return run MemoryByteDuplex.make(move reads, move writes, 4096, 64, move closeFailure)
+}
+
+effect fn ownedMemoryTransport(
+  closeFailure: Option<i32>,
+  peerClose: bool,
+  audit: Shared<OwnedMemoryAudit>,
+) -> OwnedMemoryDuplex
+! OutOfMemoryError
+? &mut Allocator {
+  let inner = run rawMemoryTransport(move closeFailure, peerClose)
+  return OwnedMemoryDuplex {inner: move inner, audit: move audit}
+}
+
+effect fn directCancellationTransport(
+  state: Shared<DirectCancellationState>,
+) -> DirectCancellationDuplex
+! OutOfMemoryError
+? &mut Allocator {
+  let inner = run rawMemoryTransport(Option<i32>.none(), false)
+  return DirectCancellationDuplex {inner: move inner, state: move state}
+}
+
+effect fn emptyTransport() -> MemoryByteDuplex
+! OutOfMemoryError
+? &mut Allocator {
+  let reads = Vector<MemoryReadEvent>.make()
+  let mut writes = Vector<MemoryWriteEvent>.make()
+  let mut index = usize.ZERO
+  while index < 4 {
+    run Vector<MemoryWriteEvent>.append(&mut writes, MemoryWriteEvent {
+      readyAt: SystemClock.make(100, 0),
+      action: MemoryWriteAction.Accept {count: 65535},
+    })
+    index = index + usize.ONE
+  }
+  return run MemoryByteDuplex.make(
+    move reads,
+    move writes,
+    1024,
+    16,
+    Option<i32>.none(),
+  )
+}
+
+effect fn ownedEmptyTransport(
+  audit: Shared<OwnedMemoryAudit>,
+) -> OwnedMemoryDuplex
+! OutOfMemoryError
+? &mut Allocator {
+  let inner = run emptyTransport()
+  return OwnedMemoryDuplex {inner: move inner, audit: move audit}
+}
+
+
+fn observedTerminalClose(state: &OwnedMemoryAudit) -> bool {
+  return state.closes == usize.ONE
+    && state.underlyingCloseAttempts == usize.ONE
+    && state.closed
+    && state.closeLast
+    && state.laterIo == usize.ZERO
+}
+
+fn observedSuccessfulScope(state: &OwnedMemoryAudit) -> i32 {
+  if !(observedTerminalClose(state)) { return 1101 }
+  if !(state.helloPrefix) { return 1102 }
+  if !(state.applicationWrite) { return 1103 }
+  if !(state.shortWritePrefix) { return 1104 }
+  if !(state.shutdowns == usize.ONE) { return 1105 }
+  if !(state.shutdownAfterFlush) { return 1106 }
+  if !(state.reads >= 3) { return 1107 }
+  if !(state.writes >= 2) { return 1108 }
+  if !(state.flushes >= usize.ONE) { return 1109 }
+  if !(state.handshakeReads == 3) { return 1110 }
+  if !(state.handshakeWrites >= 3) { return 1111 }
+  if !(state.handshakeFlushes >= usize.ONE) { return 1112 }
+  if !(state.handshakeShutdowns == usize.ZERO) { return 1113 }
+  if !(state.reads > state.handshakeReads) { return 1114 }
+  if !(state.writes > state.handshakeWrites) { return 1115 }
+  if !(state.flushes > state.handshakeFlushes) { return 1116 }
+  if !(state.handshakeCalls == state.handshakeReads
+      + state.handshakeWrites
+      + state.handshakeFlushes) { return 1117 }
+  if !(state.handshakeDeadlineConsistent) { return 1118 }
+  if !(state.handshakeDeadlineSeconds == 130) { return 1119 }
+  if !(state.handshakeDeadlineNanoseconds == 0) { return 1120 }
+  return 0
+}
+
+effect fn preparationFailureLeavesProvider() -> bool
+! OutOfMemoryError
+? &mut Allocator {
+  let provider = run emptyTransport()
+  let attempted = run TrustSnapshot.fromPem(b"", TrustLoadLimits.defaults())
+  match move attempted {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => {
+      drop value
+      return false
+    }
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+      drop error
+    }
+  }
+  return MemoryByteDuplex.closeAttempts(&provider) == usize.ZERO
+}
+
+
+fn validAuthentication<'a>(value: &Authentication<'a>) -> bool {
+  return value.suite() == CipherSuite.ChaCha20Poly1305Sha256
+    && value.group() == NamedGroup.X25519
+    && value.anchorIndex() == usize.ZERO
+    && value.sanIndex() == usize.ZERO
+}
+
+effect fn useAuthenticated(
+  connection: &mut OwnedConnection<OwnedMemoryDuplex>,
+) -> i32
+! ConnectionError | OutOfMemoryError
+? &mut MonotonicClock | &mut Allocator | &mut Random
+{
+  let authentication = OwnedConnection.authentication(&connection.*)
+  match move authentication {
+    Option.None => { return 1 }
+    Option.Some {value} => { if !validAuthentication(&value) { return 2 } }
+  }
+  let mut plaintext: [u8; 40] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ]
+  let read = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
+  let count = match move read {
+    ReadTransfer.Data {count: transferred} => transferred
+    ReadTransfer.End => { return 3 }
+  }
+  let expected = b"coalesced authenticated plaintext"
+  if count != expected.length { return 4 }
+  let mut index = usize.ZERO
+  while index < count {
+    if plaintext[index] != expected[index] { return 5 }
+    index = index + usize.ONE
+  }
+  let written = run OwnedConnection.writeSome(&mut connection.*, &b"ping", Option<Instant>.none())
+  if written != 4 { return 6 }
+  run OwnedConnection.flush(&mut connection.*, Option<Instant>.none())
+  run OwnedConnection.shutdownWrite(&mut connection.*, Option<Instant>.none())
+  let ended = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
+  match move ended {
+    ReadTransfer.Data {count: unexpectedCount} => { drop unexpectedCount return 7 }
+    ReadTransfer.End => {}
+  }
+  if OwnedConnection.phase(&connection.*) != ConnectionPhase.WriteShutdown { return 8 }
+  run OwnedConnection.shutdownWrite(&mut connection.*, Option<Instant>.none())
+  return 42
+}
+
+effect fn expectTruncation(
+  connection: &mut OwnedConnection<OwnedMemoryDuplex>,
+) -> i32
+! ConnectionError | OutOfMemoryError
+? &mut MonotonicClock | &mut Allocator | &mut Random
+{
+  let mut plaintext: [u8; 40] = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ]
+  let first = run OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
+  match move first {
+    ReadTransfer.Data {count} => { if count != b"coalesced authenticated plaintext".length { return 1 } }
+    ReadTransfer.End => { return 2 }
+  }
+  let truncated = run Effect.result(
+    OwnedConnection.readSome(&mut connection.*, &mut plaintext, Option<Instant>.none())
+  )
+  match move truncated {
+    Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Success {value} => { return 3 }
+    Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError.Tls {error: tlsError} => match move tlsError {
+        TlsError.Truncated => {}
+        _ => { return 4 }
+      }
+      _ => { return 5 }
+    }
+  }
+  if OwnedConnection.phase(&connection.*) != ConnectionPhase.Closed { return 6 }
+  let mut empty: [u8; 0] = []
+  let later = run Effect.result(
+    OwnedConnection.readSome(&mut connection.*, &mut empty, Option<Instant>.none())
+  )
+  match move later {
+    Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Success {value} => { return 7 }
+    Result<ReadTransfer, ConnectionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError.Io {error: ByteIoError.Closed {operation}} => {}
+      _ => { return 8 }
+    }
+  }
+  return 42
+}
+
+effect fn failAuthenticated(
+  connection: &mut OwnedConnection<OwnedMemoryDuplex>,
+) -> i32
+! CallbackFailure {
+  match move OwnedConnection.authentication(&connection.*) {
+    Option.None => { return 1 }
+    Option.Some {value} => { drop value }
+  }
+  fail CallbackFailure {code: 77}
+}
+
+effect fn shouldNotRunMemory(
+  connection: &mut OwnedConnection<OwnedMemoryDuplex>,
+) -> i32 ? &mut CallbackAudit {
+  drop connection
+  run CallbackAudit.invoked()
+  return 1
+}
+
+effect fn shouldNotRunParking(
+  connection: &mut OwnedConnection<ParkingDuplex>,
+) -> i32 ? &mut CallbackAudit {
+  drop connection
+  run CallbackAudit.invoked()
+  return 1
+}
+
+effect fn shouldNotRunTimeout(
+  connection: &mut OwnedConnection<TimeoutDuplex>,
+) -> i32 ? &mut CallbackAudit {
+  drop connection
+  run CallbackAudit.invoked()
+  return 1
+}
+
+effect fn timeoutDeadlineCase(
+  config: &ClientConfig,
+  trust: &TrustSnapshot,
+  random: &mut ScriptedRandom,
+  external: Option<Instant>,
+  expectedSeconds: i64,
+  expectTransport: bool,
+) -> bool
+! TrustSourceError | OutOfMemoryError
+? &mut SystemClock | &mut MonotonicClock | &mut Allocator {
+  let audit = run Shared<DeadlineAudit>.make(DeadlineAudit {
+    writes: usize.ZERO,
+    flushes: usize.ZERO,
+    closes: usize.ZERO,
+    deadlineCalls: usize.ZERO,
+    deadlineConsistent: true,
+    deadlineSeconds: 0,
+    deadlineNanoseconds: 0,
+  })
+  let timeout = TimeoutDuplex {audit: Shared.clone(&audit)}
+  let timeoutTrust = run preparedTrust(trust)
+  let mut callbacks = CallbackCounter {calls: usize.ZERO}
+  let timed = run Effect.result(withClient<i32, never>(
+    move timeout,
+    config,
+    move timeoutTrust,
+    ConnectionOptions {
+      handshakeTimeoutNanoseconds: u64.toU64(30000000000),
+      externalDeadline: move external,
+    },
+    shouldNotRunTimeout,
+  )
+    |> Effect.provideMut<CallbackAudit>(&mut callbacks)
+    |> Effect.provideMut<Random>(&mut random.*))
+  let rejected = match move timed {
+    Result<i32, ConnectionError | OutOfMemoryError>.Success {value} => {
+      drop value
+      return false
+    }
+    Result<i32, ConnectionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError.HandshakeTimeout => true
+      _ => false
+    }
+  }
+  if !rejected || callbacks.calls != usize.ZERO { return false }
+  return Shared.with(&audit, fn(state: &DeadlineAudit) -> bool {
+    if state.closes != usize.ONE { return false }
+    if !expectTransport {
+      return state.writes == usize.ZERO && state.flushes == usize.ZERO
+    }
+    return state.writes > usize.ZERO
+      && state.flushes == usize.ONE
+      && state.deadlineCalls == state.writes + state.flushes
+      && state.deadlineConsistent
+      && state.deadlineSeconds == expectedSeconds
+      && state.deadlineNanoseconds == 0
+  })
+}
+
+effect fn postReadBoundaryCase(
+  config: &ClientConfig,
+  trust: &TrustSnapshot,
+  random: &mut ScriptedRandom,
+  result: PostReadResult,
+) -> bool
+! TrustSourceError | OutOfMemoryError
+? &mut SystemClock | &mut Allocator {
+  let state = run Shared<PostReadState>.make(PostReadState {
+    readReturned: false,
+    reads: usize.ZERO,
+    writes: usize.ZERO,
+    flushes: usize.ZERO,
+    closes: usize.ZERO,
+  })
+  let transport = PostReadDuplex {result: result, state: Shared.clone(&state)}
+  let snapshot = run preparedTrust(trust)
+  let mut clock = PostReadClock {state: Shared.clone(&state)}
+  let attempted = run Effect.result(
+    authenticateOwned<PostReadDuplex>(
+      move transport,
+      config,
+      move snapshot,
+      ConnectionOptions.defaults(),
+    )
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Random>(&mut random.*)
+  )
+  let expected = match move attempted {
+    Result<OwnedConnection<PostReadDuplex>, ConnectionError | OutOfMemoryError>.Success {value} => {
+      drop value
+      return false
+    }
+    Result<OwnedConnection<PostReadDuplex>, ConnectionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError.HandshakeTimeout => result == PostReadResult.Data
+      ConnectionError.Io {error: ByteIoError.InvalidTransferCount {operation, count, limit}} =>
+        result == PostReadResult.InvalidCount
+          && operation == ByteIoOperation.Read
+          && count == 16385
+          && limit == 16384
+      _ => false
+    }
+  }
+  if !expected { return false }
+  return Shared.with(&state, fn(observed: &PostReadState) -> bool {
+    return observed.readReturned
+      && observed.reads == usize.ONE
+      && observed.writes > usize.ZERO
+      && observed.flushes > usize.ZERO
+      && observed.closes == usize.ONE
+  })
+}
+
+effect fn canceledConnection(state: Shared<CancellationState>) -> i32
+! ConnectionError | TrustSourceError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let snapshot = run rootTrust()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut wall = FixedWallClock {calls: usize.ZERO}
+  let mut monotonic = ParkingClock {}
+  let mut random = ScriptedRandom {filled: usize.ZERO}
+  let mut callbacks = SharedCallbackCounter {state: Shared.clone(&state)}
+  let transport = ParkingDuplex {state: move state}
+  let host = b"ExAmPlE.com"
+  let config = ClientConfig {
+    reference: reference(&host),
+    alpn: AlpnConfig.defaults(),
+    limits: ClientLimits.defaults(),
+  }
+  return run withClient<i32, never>(
+    move transport,
+    &config,
+    move snapshot,
+    ConnectionOptions.defaults(),
+    shouldNotRunParking,
+  )
+    |> Effect.provideMut<CallbackAudit>(&mut callbacks)
+    |> Effect.provideMut<SystemClock>(&mut wall)
+    |> Effect.provideMut<MonotonicClock>(&mut monotonic)
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+fn cancellationReady(state: &()) -> () { return () }
+fn cancellationComplete(state: &mut (), value: i32) -> () { drop value return () }
+fn cancellationParked(state: &mut (), execution: Intrinsic.Execution<i32>) -> () {
+  drop move execution
+  return ()
+}
+effect<'env> fn cancellationFailed<E: 'env, 'env>(error: E) -> i32 { drop error return -4 }
+
+effect fn pendingDirectWrite(
+  owner: &mut OwnedConnection<DirectCancellationDuplex>,
+) -> i32 ! ConnectionError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = ParkingClock {}
+  let mut random = ScriptedRandom {filled: usize.ZERO}
+  let written = run OwnedConnection.writeSome(&mut owner.*, &b"ambiguous", Option<Instant>.none())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  return usize.toI32(written)
+}
+
+fn isClosedFailure<A>(
+  result: Result<A, ConnectionError | OutOfMemoryError>,
+  expected: ByteIoOperation,
+) -> bool {
+  return match move result {
+    Result<A, ConnectionError | OutOfMemoryError>.Success {value} => {
+      drop value
+      return false
+    }
+    Result<A, ConnectionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError.Io {error: ByteIoError.Closed {operation}} => operation == expected
+      _ => false
+    }
+  }
+}
+
+effect fn rejectsLaterDirectIo<P>(
+  owner: &mut OwnedConnection<P>,
+) -> bool
+where &mut P provides &ByteDuplex from &mut ByteDuplex,
+  &mut P provides &ByteDuplex from &mut ByteDuplex
+    | &mut MonotonicClock
+    | &mut Allocator
+    | &mut Random {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = VirtualClock {
+    mark: SystemClock.make(100, 0),
+    nowCalls: usize.ZERO,
+    waitCalls: usize.ZERO,
+  }
+  let mut random = ScriptedRandom {filled: usize.ZERO}
+  let mut empty: [u8; 0] = []
+  let mut output: [u8; 1] = [0]
+  let emptyRead = run Effect.result(
+    OwnedConnection.readSome(&mut owner.*, &mut empty, Option<Instant>.none())
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  if !isClosedFailure<ReadTransfer>(move emptyRead, ByteIoOperation.Read) { return false }
+  let read = run Effect.result(
+    OwnedConnection.readSome(&mut owner.*, &mut output, Option<Instant>.none())
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  if !isClosedFailure<ReadTransfer>(move read, ByteIoOperation.Read) { return false }
+  let emptyWrite = run Effect.result(
+    OwnedConnection.writeSome(&mut owner.*, &b"", Option<Instant>.none())
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  if !isClosedFailure<usize>(move emptyWrite, ByteIoOperation.Write) { return false }
+  let write = run Effect.result(
+    OwnedConnection.writeSome(&mut owner.*, &b"x", Option<Instant>.none())
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  if !isClosedFailure<usize>(move write, ByteIoOperation.Write) { return false }
+  let flushed = run Effect.result(
+    OwnedConnection.flush(&mut owner.*, Option<Instant>.none())
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  if !isClosedFailure<()>(move flushed, ByteIoOperation.Flush) { return false }
+  let shutdown = run Effect.result(
+    OwnedConnection.shutdownWrite(&mut owner.*, Option<Instant>.none())
+      |> Effect.provideMut<MonotonicClock>(&mut clock)
+      |> Effect.provideMut<Random>(&mut random)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  return isClosedFailure<()>(move shutdown, ByteIoOperation.ShutdownWrite)
+}
+
+struct DirectOwnedLease {
+  owner: OwnedConnection<DirectCancellationDuplex>
+  state: Shared<DirectCancellationState>
+}
+
+effect fn useDirectOwner(lease: &mut DirectOwnedLease) -> i32
+! ConnectionError | OutOfMemoryError {
+  return run pendingDirectWrite(&mut lease.owner)
+}
+
+effect fn releaseDirectOwner(lease: &mut DirectOwnedLease) -> () {
+  if OwnedConnection.phase(&lease.owner) == ConnectionPhase.Closed
+    && run rejectsLaterDirectIo<DirectCancellationDuplex>(&mut lease.owner) {
+    Shared.withMut(&lease.state, recordTerminalOwner)
+  }
+  return ()
+}
+
+effect fn parkedDirectOwner(
+  owner: OwnedConnection<DirectCancellationDuplex>,
+  state: Shared<DirectCancellationState>,
+) -> i32 ! ConnectionError | OutOfMemoryError {
+  let lease = DirectOwnedLease {owner: move owner, state: move state}
+  return run Effect.useReleaseNonParking(move lease, useDirectOwner, releaseDirectOwner)
+}
+
+effect fn cancelDirectOwned(
+  config: &ClientConfig,
+  trust: &TrustSnapshot,
+  random: &mut ScriptedRandom,
+) -> i32
+! ConnectionError | TrustSourceError | OutOfMemoryError
+? &mut SystemClock | &mut MonotonicClock | &mut Allocator {
+  let state = run Shared<DirectCancellationState>.make(DirectCancellationState {
+    armed: false,
+    closed: false,
+    offers: usize.ZERO,
+    completions: usize.ZERO,
+    closes: usize.ZERO,
+    laterIo: usize.ZERO,
+    sequence: usize.ZERO,
+    offerOrder: usize.ZERO,
+    closeOrder: usize.ZERO,
+    terminalOwner: false,
+  })
+  let transport = run directCancellationTransport(Shared.clone(&state))
+  let snapshot = run preparedTrust(trust)
+  let mut owner = run authenticateOwned<DirectCancellationDuplex>(
+    move transport,
+    config,
+    move snapshot,
+    ConnectionOptions.defaults(),
+  ) |> Effect.provideMut<Random>(&mut random.*)
+  Shared.withMut(&state, armDirectCancellation)
+  let body = Effect.catchAll(
+    parkedDirectOwner(move owner, Shared.clone(&state)),
+    cancellationFailed,
+  )
+  let execution = run Execution.make(move body, (), cancellationReady)
+  let mut branch = ()
+  run Execution.drive(move execution, &mut branch, cancellationComplete, cancellationParked)
+  return Shared.withMut(&state, directCancellationResult)
+}
+
+effect fn postFinishedDeadline(
+  config: &ClientConfig,
+  trust: &TrustSnapshot,
+  random: &mut ScriptedRandom,
+) -> bool
+! ConnectionError | TrustSourceError | OutOfMemoryError
+? &mut SystemClock | &mut Allocator {
+  let countingState = run Shared<DirectCancellationState>.make(DirectCancellationState {
+    armed: false,
+    closed: false,
+    offers: usize.ZERO,
+    completions: usize.ZERO,
+    closes: usize.ZERO,
+    laterIo: usize.ZERO,
+    sequence: usize.ZERO,
+    offerOrder: usize.ZERO,
+    closeOrder: usize.ZERO,
+    terminalOwner: false,
+  })
+  let countingTransport = run directCancellationTransport(Shared.clone(&countingState))
+  let countingTrust = run preparedTrust(trust)
+  let mut countingClock = SequencedDeadlineClock {
+    calls: usize.ZERO,
+    expireAt: usize.MAX,
+  }
+  let mut owner = run authenticateOwned<DirectCancellationDuplex>(
+    move countingTransport,
+    config,
+    move countingTrust,
+    ConnectionOptions.defaults(),
+  )
+    |> Effect.provideMut<MonotonicClock>(&mut countingClock)
+    |> Effect.provideMut<Random>(&mut random.*)
+  let finalCheck = countingClock.calls
+  let closed = run Effect.result(OwnedConnection.close(&mut owner))
+  match move closed {
+    Result<(), ConnectionError>.Success {value} => { drop value }
+    Result<(), ConnectionError>.Failure {error} => { drop error return false }
+  }
+  if !(run rejectsLaterDirectIo<DirectCancellationDuplex>(&mut owner)) { return false }
+  let rejectedBeforeProvider = Shared.with(
+    &countingState,
+    fn(state: &DirectCancellationState) -> bool {
+      return state.closes == usize.ONE && state.laterIo == usize.ZERO
+    },
+  )
+  if !rejectedBeforeProvider { return false }
+  if finalCheck <= usize.ONE { return false }
+
+  random.filled = usize.ZERO
+  let expiringState = run Shared<DirectCancellationState>.make(DirectCancellationState {
+    armed: false,
+    closed: false,
+    offers: usize.ZERO,
+    completions: usize.ZERO,
+    closes: usize.ZERO,
+    laterIo: usize.ZERO,
+    sequence: usize.ZERO,
+    offerOrder: usize.ZERO,
+    closeOrder: usize.ZERO,
+    terminalOwner: false,
+  })
+  let expiringTransport = run directCancellationTransport(Shared.clone(&expiringState))
+  let expiringTrust = run preparedTrust(trust)
+  let mut expiringClock = SequencedDeadlineClock {
+    calls: usize.ZERO,
+    expireAt: finalCheck,
+  }
+  let attempted = run Effect.result(
+    authenticateOwned<DirectCancellationDuplex>(
+      move expiringTransport,
+      config,
+      move expiringTrust,
+      ConnectionOptions.defaults(),
+    )
+      |> Effect.provideMut<MonotonicClock>(&mut expiringClock)
+      |> Effect.provideMut<Random>(&mut random.*)
+  )
+  let timedOut = match move attempted {
+    Result<OwnedConnection<DirectCancellationDuplex>, ConnectionError | OutOfMemoryError>.Success {value} => {
+      drop value
+      return false
+    }
+    Result<OwnedConnection<DirectCancellationDuplex>, ConnectionError | OutOfMemoryError>.Failure {error} => match move error {
+      ConnectionError.HandshakeTimeout => true
+      _ => false
+    }
+  }
+  if !timedOut || expiringClock.calls != finalCheck { return false }
+  return Shared.with(&expiringState, fn(state: &DirectCancellationState) -> bool {
+    return state.closes == usize.ONE
+      && state.offers == usize.ZERO
+      && state.completions == usize.ZERO
+      && state.laterIo == usize.ZERO
+  })
+}
+
+effect fn directCloseFailure(
+  config: &ClientConfig,
+  trust: &TrustSnapshot,
+  random: &mut ScriptedRandom,
+) -> bool
+! ConnectionError | TrustSourceError | OutOfMemoryError
+? &mut SystemClock | &mut MonotonicClock | &mut Allocator {
+  let audit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
+  let transport = run ownedMemoryTransport(
+    Option<i32>.some(91),
+    false,
+    Shared.clone(&audit),
+  )
+  let snapshot = run preparedTrust(trust)
+  let mut owner = run authenticateOwned<OwnedMemoryDuplex>(
+    move transport,
+    config,
+    move snapshot,
+    ConnectionOptions.defaults(),
+  ) |> Effect.provideMut<Random>(&mut random.*)
+  let first = run Effect.result(OwnedConnection.close(&mut owner))
+  match move first {
+    Result<(), ConnectionError>.Success {value} => { drop value return false }
+    Result<(), ConnectionError>.Failure {error} => match move error {
+      ConnectionError.Io {error: ByteIoError.Provider {operation, code}} => {
+        if operation != ByteIoOperation.Close || code != 91 { return false }
+      }
+      _ => { return false }
+    }
+  }
+  if OwnedConnection.phase(&owner) != ConnectionPhase.Closed { return false }
+  let repeated = run Effect.result(OwnedConnection.close(&mut owner))
+  match move repeated {
+    Result<(), ConnectionError>.Success {value} => { drop value }
+    Result<(), ConnectionError>.Failure {error} => { drop error return false }
+  }
+  if !(run rejectsLaterDirectIo<OwnedMemoryDuplex>(&mut owner)) { return false }
+  return Shared.with(&audit, observedTerminalClose)
+}
+
+effect fn cancelSuspendedConnection() -> i32 ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let state = run Shared<CancellationState>.make(CancellationState {
+    closes: usize.ZERO,
+    callbacks: usize.ZERO,
+  }) |> Effect.provideMut<Allocator>(&mut allocator)
+  let body = Effect.catchAll(
+    canceledConnection(Shared.clone(&state)),
+    cancellationFailed,
+  )
+  let execution = run Execution.make(
+    move body,
+    (),
+    cancellationReady,
+  ) |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut branch = ()
+  run Execution.drive(move execution, &mut branch, cancellationComplete, cancellationParked)
+  return Shared.withMut(&state, cancellationResult)
+}
+
+
+effect fn runCases(
+  config: &ClientConfig,
+  trust: &TrustSnapshot,
+  random: &mut ScriptedRandom,
+) -> i32
+! ConnectionError | TrustSourceError | OutOfMemoryError
+? &mut SystemClock
+  | &mut MonotonicClock
+  | &mut Allocator {
+  let successAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
+  let success = run ownedMemoryTransport(
+    Option<i32>.none(),
+    true,
+    Shared.clone(&successAudit),
+  )
+  let successTrust = run preparedTrust(trust)
+  let attempted = run Effect.result(withClient<i32, ConnectionError | OutOfMemoryError>(
+    move success,
+    config,
+    move successTrust,
+    ConnectionOptions.defaults(),
+    useAuthenticated,
+  ) |> Effect.provideMut<Random>(&mut random.*))
+  let completed = match move attempted {
+    Result<i32, ConnectionError | OutOfMemoryError>.Success {value} => value
+    Result<i32, ConnectionError | OutOfMemoryError>.Failure {error} => { return run failed(move error) }
+  }
+  if completed != 42 { return 1000 + completed }
+  let auditResult = Shared.with(&successAudit, observedSuccessfulScope)
+  if auditResult != 0 { return auditResult }
+
+  if !(run preparationFailureLeavesProvider()) { return 19 }
+  random.filled = usize.ZERO
+  let failingAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
+  let failing = run ownedMemoryTransport(
+    Option<i32>.some(91),
+    false,
+    Shared.clone(&failingAudit),
+  )
+  let failingTrust = run preparedTrust(trust)
+  let failed = run Effect.result(withClient<i32, CallbackFailure>(
+    move failing,
+    config,
+    move failingTrust,
+    ConnectionOptions.defaults(),
+    failAuthenticated,
+  ) |> Effect.provideMut<Random>(&mut random.*))
+  match move failed {
+    Result<i32, CallbackFailure | ConnectionError | OutOfMemoryError>.Success {value} => {
+      return 20
+    }
+    Result<i32, CallbackFailure | ConnectionError | OutOfMemoryError>.Failure {error} => {
+      match move error {
+        CallbackFailure {code} => { if code != 77 { return 21 } }
+        _ => { return 22 }
+      }
+    }
+  }
+  if !Shared.with(&failingAudit, observedTerminalClose) { return 23 }
+  random.filled = usize.ZERO
+  let truncatedAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
+  let truncated = run ownedMemoryTransport(
+    Option<i32>.none(),
+    false,
+    Shared.clone(&truncatedAudit),
+  )
+  let truncatedTrust = run preparedTrust(trust)
+  let truncation = run withClient<i32, ConnectionError | OutOfMemoryError>(
+    move truncated,
+    config,
+    move truncatedTrust,
+    ConnectionOptions.defaults(),
+    expectTruncation,
+  ) |> Effect.provideMut<Random>(&mut random.*)
+  if truncation != 42 { return 25 }
+  if !Shared.with(&truncatedAudit, observedTerminalClose) { return 26 }
+  random.filled = usize.ZERO
+  let endedAudit = run Shared<OwnedMemoryAudit>.make(freshOwnedMemoryAudit())
+  let ended = run ownedEmptyTransport(Shared.clone(&endedAudit))
+  let endedTrust = run preparedTrust(trust)
+  let mut endedCallbacks = CallbackCounter {calls: usize.ZERO}
+  let handshakeEnd = run Effect.result(withClient<i32, never>(
+    move ended,
+    config,
+    move endedTrust,
+    ConnectionOptions.defaults(),
+    shouldNotRunMemory,
+  )
+    |> Effect.provideMut<CallbackAudit>(&mut endedCallbacks)
+    |> Effect.provideMut<Random>(&mut random.*))
+  match move handshakeEnd {
+    Result<i32, ConnectionError | OutOfMemoryError>.Success {value} => {
+      return 27
+    }
+    Result<i32, ConnectionError | OutOfMemoryError>.Failure {error} => {
+      match move error {
+        ConnectionError.Tls {error: tlsError} => match move tlsError {
+          TlsError.HandshakeTruncated => {}
+          _ => { return 28 }
+        }
+        _ => { return 29 }
+      }
+    }
+  }
+  if endedCallbacks.calls != usize.ZERO { return 30 }
+  if !Shared.with(&endedAudit, observedTerminalClose) { return 31 }
+  random.filled = usize.ZERO
+  if !(run timeoutDeadlineCase(
+    config,
+    trust,
+    &mut random.*,
+    Option<Instant>.none(),
+    130,
+    true,
+  )) { return 32 }
+  random.filled = usize.ZERO
+  if !(run timeoutDeadlineCase(
+    config,
+    trust,
+    &mut random.*,
+    Option<Instant>.some(SystemClock.make(105, 0)),
+    105,
+    true,
+  )) { return 33 }
+  random.filled = usize.ZERO
+  if !(run timeoutDeadlineCase(
+    config,
+    trust,
+    &mut random.*,
+    Option<Instant>.some(SystemClock.make(140, 0)),
+    130,
+    true,
+  )) { return 34 }
+  random.filled = usize.ZERO
+  if !(run timeoutDeadlineCase(
+    config,
+    trust,
+    &mut random.*,
+    Option<Instant>.some(SystemClock.make(99, 0)),
+    99,
+    false,
+  )) { return 35 }
+  random.filled = usize.ZERO
+  if !(run postReadBoundaryCase(
+    config,
+    trust,
+    &mut random.*,
+    PostReadResult.Data,
+  )) { return 36 }
+  random.filled = usize.ZERO
+  if !(run postReadBoundaryCase(
+    config,
+    trust,
+    &mut random.*,
+    PostReadResult.InvalidCount,
+  )) { return 3600 }
+  let canceled = run cancelSuspendedConnection()
+  if canceled != 42 { return 37 }
+  random.filled = usize.ZERO
+  let directCanceled = run cancelDirectOwned(config, trust, &mut random.*)
+  if directCanceled != 42 { return 3800 + directCanceled }
+  random.filled = usize.ZERO
+  if !(run postFinishedDeadline(config, trust, &mut random.*)) { return 39 }
+  random.filled = usize.ZERO
+  if !(run directCloseFailure(config, trust, &mut random.*)) { return 40 }
+  return 42
+}
+
+effect fn failed(error: ConnectionError | TrustSourceError | OutOfMemoryError) -> i32 {
+  match move error {
+    ConnectionError.HandshakeTimeout => { return -100 }
+    ConnectionError.Io {error: io} => match move io {
+      ByteIoError.Timeout {operation} => { return -201 }
+      ByteIoError.InvalidTransferCount {operation, count, limit} => { return -202 }
+      ByteIoError.Closed {operation} => match operation {
+        ByteIoOperation.Read => { return -2031 }
+        ByteIoOperation.Write => { return -2032 }
+        ByteIoOperation.Flush => { return -2033 }
+        ByteIoOperation.ShutdownWrite => { return -2034 }
+        ByteIoOperation.Close => { return -2035 }
+      }
+      ByteIoError.Provider {operation, code} => { return -300 - code }
+    }
+    ConnectionError.Tls {error: tlsError} => match move tlsError {
+      TlsError.PeerAlert {code} => { return -101 }
+      TlsError.BadRecordMac => { return -102 }
+      TlsError.ProtocolViolation {reason} => { return -103 }
+      TlsError.CertificateDecode {error: detail} => { return -104 }
+      TlsError.CertificatePath {error: detail} => { return -105 }
+      TlsError.CertificateIdentity {error: detail} => { return -106 }
+      TlsError.CertificateVerify {error: detail} => { return -107 }
+      TlsError.Finished => { return -108 }
+      TlsError.UnsupportedProfile => { return -109 }
+      TlsError.LimitExceeded {kind, limit} => { return -110 }
+      TlsError.InvalidState {operation} => { return -111 }
+      TlsError.EmptyBuffer => { return -112 }
+      TlsError.HandshakeTruncated => { return -113 }
+      TlsError.Truncated => { return -114 }
+      TlsError.NoApplicationProtocol => { return -115 }
+    }
+    OutOfMemoryError {} => { return -901 }
+    _ => { return -902 }
+  }
+}
+
+effect fn program() -> i32 ! TrustSourceError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let snapshot = run rootTrust()
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut wall = FixedWallClock {calls: usize.ZERO}
+  let mut monotonic = VirtualClock {
+    mark: SystemClock.make(100, 0),
+    nowCalls: usize.ZERO,
+    waitCalls: usize.ZERO,
+  }
+  let mut random = ScriptedRandom {filled: usize.ZERO}
+  let host = b"ExAmPlE.com"
+  let config = ClientConfig {
+    reference: reference(&host),
+    alpn: AlpnConfig.defaults(),
+    limits: ClientLimits.defaults(),
+  }
+  let result = run Effect.catchAll(
+    runCases(&config, &snapshot, &mut random)
+      |> Effect.provideMut<SystemClock>(&mut wall)
+      |> Effect.provideMut<MonotonicClock>(&mut monotonic)
+      |> Effect.provideMut<Allocator>(&mut allocator),
+    failed,
+  )
+  if result != 42 { return result }
+  if wall.calls != 14 { return -2 }
+  return 42
+}
+
+effect fn startupFailed(error: TrustSourceError | OutOfMemoryError) -> i32 {
+  match move error {
+    OutOfMemoryError {} => { return -903 }
+    _ => { return -904 }
+  }
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), startupFailed)
+}
