@@ -24,11 +24,20 @@ export interface Component {
   }>
 }
 
+/**
+ * One diagnostic a rejected program must report: its code and its span in `main.silk` as
+ * `line:column-line:column`.
+ */
+export interface ExpectedDiagnostic {
+  readonly code: string
+  readonly span: string
+}
+
 /** What running or checking a program must produce. */
 export type Expected =
   | { readonly kind: 'completes'; readonly exitCode: number }
   | { readonly kind: 'trap' }
-  | { readonly kind: 'rejected'; readonly codes: ReadonlyArray<string> }
+  | { readonly kind: 'rejected'; readonly diagnostics: ReadonlyArray<ExpectedDiagnostic> }
 
 /** The contents of one `outcome.json`. */
 export interface Outcome {
@@ -59,4 +68,5 @@ export declare const expandSplices: (text: string, origin?: string) => string
 export declare const programNames: (kind: Kind) => ReadonlyArray<string>
 export declare const loadProgram: (kind: Kind, name: string) => Program
 export declare const loadPrograms: (kind: Kind) => ReadonlyArray<Program>
+export declare const formatSpan: (text: string, start: number, end: number) => string
 export declare const formatOutcome: (outcome: Outcome) => string
