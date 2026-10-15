@@ -664,6 +664,27 @@ Each entry records:
   `genericCopyCyclesKeepCompleteImportedDiagnosticSite` and
   `genericCleanupPropertiesKeepFiniteOpaqueDescentAndRejectGrowth`; corrected execution pending.
 
+### Lifetime failures at call arguments and returns keep native codes or spans
+
+- **Status:** recorded on 2026-10-14 with the lifetime-diagnostic parity follow-up to #1668. It is
+  retired when native reports these where the bootstrap's region proof does.
+- **Rule:** LIFE-002 and BORROW-008. A view cannot be admitted at a longer region than its
+  storage's validity: SEM0212 for an unproven relation, OWN0019 for storage the body owns.
+- **Compilers:** both reject every program below; the bootstrap reports from its whole-body
+  region proof, native from typing at the boundary.
+  - A returned view whose region is a body loan region: both report SEM0212 when any source is
+    external (`return pick(&source.*, &local)`) and OWN0019 when every source is owned. The
+    bootstrap places SEM0212 at the function header; native places it at the returned expression.
+    A returned reference whose region came from outside the body (`return value`) is SEM0129 at
+    the expression in both.
+  - A reference argument at a longer fixed region (`keep(&held)` for `&'static i32`): the
+    bootstrap reports SEM0212 at `&held`; native keeps TypeMismatch (SEM0012) on the call, because
+    the argument's subtyping fallback runs on that mismatch. Slice arguments report SEM0212 at the
+    operand in both.
+- **Source migration:** none; both compilers reject.
+- **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
+  (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`).
+
 ### Bootstrap misses implied outlives from reference-to-lifetime-parameterized types
 
 - **Status:** recorded on 2026-10-14 while validating the native imprecise-retention slice (#1698).
