@@ -760,3 +760,6 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-15 · Integrating the lifetime-parity changes moved fixed-section and unrelated-parent rejection assertions from type mismatch to SEM0212 (the section reports its operand) · Confirmed exact compile-time rejection spans with private diagnostics and updated Cases without weakening rejection · silk R3 integration
 
 2026-10-15 · An unpublished initialized-storage expiry guard used an unsupported bare block initializer, so not-Checked could pass on a parser rejection · Use an if-scoped borrowed assignment and require a semantic lifetime outcome before accepting the guard · silk R3
+2026-10-15 · Minimal native/bootstrap verdict probes used private main functions, and an error[...] reader missed native SILK_BUILD_ERROR JSON diagnostics · Export fixture entry points, record structured native codes and spans, and preserve failed setup receipts separately before rerunning · Silk R3 verdict probes
+
+2026-10-15 · R3 integration passed native Cases and T1 DDC but CI found 13 direct type constructors in two older unit Cases · migrate those fixtures to Types.intern with scoped TypeTable providers, and run TypesCapabilityCodemod --check on integrated heads · silk R3
