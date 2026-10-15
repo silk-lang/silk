@@ -422,9 +422,12 @@ root, and select only exact `.silk` extensions. Selection is sorted by normalize
 deduplicated; symbolic links are rejected by the native filesystem provider. Use `--` before a
 filename beginning with a dash.
 
-Write mode replaces changed files; `--check` reports changes without writing. Damaged source is
-reported with its first offending byte offset and remains untouched. Other readable selected
-files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
+Write mode replaces changed files; `--check` reports changes without writing. Each selected file
+reports one line, as the TypeScript CLI words it: `<path>: unchanged` and `<path>: formatted` on
+standard output, and `<path>: needs formatting`, `<path>: cannot format damaged source (<codes>)`
+with the distinct lexical and syntax diagnostic codes, or `<path>: Cannot read source file
+<path>` and the other failure messages on standard error. Damaged source remains untouched.
+Other readable selected files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
 drift, and `2` for project, selection, filesystem, allocation, or diagnostic-output failures.
 The portable filesystem uses complete create-or-truncate writes; an interrupted or failed write
 can leave a partial file, so formatter writes currently have the same limitation.
