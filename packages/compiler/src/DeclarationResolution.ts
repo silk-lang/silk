@@ -526,11 +526,23 @@ export const resolveDeclaredType = (
           role,
         }
       }) ?? []
+    // A subtracting row is resolved whole, so `Without` keeps exactly what it does not remove.
+    const requirementExpression =
+      fact.requirementRow?.expression === undefined
+        ? undefined
+        : resolveRowExpressionDecision(
+            spanOf,
+            module,
+            fact.requirementRow.expression,
+            resolvers,
+            modules,
+          )
     const diagnostics = [
       ...target.diagnostics,
       ...arguments_.flatMap((argument) => argument.diagnostics),
       ...requirements.flatMap((requirement) => requirement.capability.diagnostics),
       ...requirements.flatMap((requirement) => requirement.role.diagnostics),
+      ...(requirementExpression?.diagnostics ?? []),
     ]
     if (target.fact._tag === 'Resolved' && Type.isNominal(target.fact.type)) {
       const declaration = targetDeclaration
@@ -573,9 +585,13 @@ export const resolveDeclaredType = (
         fact.requirementRow === undefined
           ? []
           : [
-              requirementsAvailable
-                ? Type.requirementRowArgument(requirementTypes, fact.requirementRow.parameters)
-                : undefined,
+              requirementExpression !== undefined
+                ? Type.requirementRowArgumentFromRow(
+                    semanticRequirementRow(spanOf, requirementExpression.fact),
+                  )
+                : requirementsAvailable
+                  ? Type.requirementRowArgument(requirementTypes, fact.requirementRow.parameters)
+                  : undefined,
             ]
       const written = [...valueArguments, ...rowArguments]
       let lifetimeOrdinal = 0

@@ -424,6 +424,8 @@ export type DeclaredTypeFact =
           readonly anchor: AuthoredHir.Anchor
         }>
         readonly parameters: ReadonlyArray<Type.Parameter>
+        /** The complete row expression, retained when the row subtracts (`Without<R, K>`). */
+        readonly expression?: RowExpressionDecision
         readonly anchor: AuthoredHir.Anchor
       }
       readonly spelling: string

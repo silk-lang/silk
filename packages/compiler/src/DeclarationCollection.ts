@@ -1236,6 +1236,9 @@ export const analyzeDeclaredType = (
                   anchor: requirement.anchor,
                 })),
                 parameters: rows.requirementParameters,
+                ...(rows.requirementExpression === undefined
+                  ? {}
+                  : { expression: rows.requirementExpression }),
                 anchor: rows.requirementAnchor,
               },
             }),
