@@ -219,7 +219,7 @@ such as a provision section's `once Effect<'env; ...>` representation bound. A f
 `'static` expectation of a shorter region, a declared region widened to another, and any owner,
 access, element, pointee or type-argument difference stay type errors.
 
-Build invocation: `silkc build <source> -o <output> [--emit <stage>] --target <triple> --stdlib
+Build invocation: `silk build <source> -o <output> [--emit <stage>] --target <triple> --stdlib
 <directory> --optimization <none|speed> --debug <true|false>`.
 As in the TypeScript CLI, the artifact form is the `[build].artifact` and the stage the
 `[build].stage` of the nearest `silk.toml` above the source; `--emit` replaces the stage with one of
@@ -237,7 +237,7 @@ storage component: the application's `export "C"` functions are its roots, so a 
 object and archive inputs by a relocatable link and refuses any other declared input. A
 `static-library` form acquires no catalog runtime either; its final stage compiles one object and
 archives it with `llvm-ar rcsD` beside the declared object inputs, refusing any other declared input.
-The archiver is `SILKC_AR`, or else the `llvm-ar` beside the configured Clang. The shared library
+The archiver is `SILK_LLVM_AR`, or else the `llvm-ar` beside the configured Clang. The shared library
 form stops with `SILK_GAP artifact-form` before any tool runs. Invalid or
 repeated output selectors fail before source loading.
 With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
@@ -248,10 +248,14 @@ Optimization defaults to `speed` and debug to `false`. These explicit logical ch
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
 root contains `silk/`. `--stdlib` names it explicitly; without the flag, every command uses the
-library an installation keeps at `<prefix>/lib/silk/stdlib` beside `<prefix>/bin/silkc`. The
+library an installation keeps at `<prefix>/lib/silk/stdlib` beside `<prefix>/bin/silk`. The
 compiler finds its executable from argument zero (a path, or a bare name searched in `PATH`) and
 resolves symbolic links with `realpath`, so a link to it in another directory finds the same
-library. An executable package without a `[build].composition` takes its runtime from the
+library. `compiler/scripts/ReleaseArchive.ts` packages that installation per target as
+`silk-<version>-<target>.tar.gz`: `bin/silk` and `lib/silk/stdlib` below one
+`silk-<version>-<target>/` directory, with zero owners and times so equal inputs give equal
+bytes. The selfhost workflow packages every target's N2 this way, runs a new `init` project from
+the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
 library's `compositions.json` for the target and libc, so such a build needs the library root even
 without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
 is the root for local module paths. Every module identity names the package by its logical
@@ -260,12 +264,12 @@ directory, so one package built from two directories emits identical bytes. An e
 manifest above it has no package identity and is refused. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
 
-Test invocation: `silkc test <root> -o <executable> --stdlib <directory> [--filter <text>]
+Test invocation: `silk test <root> -o <executable> --stdlib <directory> [--filter <text>]
 [--file <path>] [--optimization <none|speed>] [--debug <true|false>] --no-cache`. It builds the
 bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it with an uncached
-plan, admits its receipt and exits with its status; see [Native `silkc test`](docs/native-test.md).
+plan, admits its receipt and exits with its status; see [Native `silk test`](docs/native-test.md).
 
-Project build invocation: `silkc build [--manifest-path <path>] [--target <host|triple>]...
+Project build invocation: `silk build [--manifest-path <path>] [--target <host|triple>]...
 [--release] [--optimization <debug|release|release-with-debug>] [--profile <name>]
 [--profile-input <json>] [--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
 `silk.toml` above the working directory, or exactly the manifest `--manifest-path` names, as the
@@ -296,7 +300,7 @@ and an `origin` with `source` and a public `provenance`) that every project buil
 the selected profile's own. Loading a project validates the whole catalog; a refusal prints the
 TypeScript `<code>: <subject>`, such as `InvalidInput: profile name`, and exits 2.
 
-Run invocation: `silkc run [--manifest-path <path>] [--target <host|triple>]... [--release]
+Run invocation: `silk run [--manifest-path <path>] [--target <host|triple>]... [--release]
 [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>]
 [arguments...] [-- arguments...]`. It builds the
 project's executable as the project build does, for the named profile, else the first `--target`,
@@ -307,10 +311,10 @@ environment and the working directory, and its exit status or terminating signal
 A non-executable `[build].artifact` or a non-final `[build].stage` exits 2; a refused build keeps
 `build`'s status.
 
-`silkc --help` (or `-h`) prints the command synopsis and `silkc --version` (or `-v`) prints
-`silkc v<version>`, both on standard output with status 0.
+`silk --help` (or `-h`) prints the command synopsis and `silk --version` (or `-v`) prints
+`silk v<version>`, both on standard output with status 0.
 
-Init invocation: `silkc init [path] [--name <name>]`. It creates a project as the TypeScript
+Init invocation: `silk init [path] [--name <name>]`. It creates a project as the TypeScript
 initializer does: `silk.toml` (`[package]` name, version `0.1.0`, root `src/main.silk`), a
 `src/main.silk` that logs a greeting, and a `.gitignore` holding `/build/` (appended to an existing
 one that lacks the rule). The directory defaults to the working directory and is created with its
@@ -319,7 +323,18 @@ existing manifest or entry, a `src` that is not a directory or an ancestor that 
 with status 2 before anything is written, and a failure part-way removes everything initialization
 created and restores the previous `.gitignore`.
 
-Clean invocation: `silkc clean [--manifest-path <path>]`. It removes the project's `[build].output-dir` and
+Project test invocation: `silk test [project options] [--root <path>] [--file <path>]
+[--filter <text>] --no-cache`, that is `test` without a discovery root; the project options are
+`build`'s. It loads the project as `run` does and builds the test runner for the host, as the
+TypeScript `silk test` does: always a final executable, whatever `[build].artifact` and
+`[build].stage` select, at `<output-dir>/test/llvm/<target>/<profile>/<name>`. Discovery starts at
+`--root`, else at `[package].root`. `--root` and `--file` are resolved against the project
+directory and must name a canonical `.silk` module path below the directory of `[package].root`;
+the runner receives `--file` as the project-relative path its catalog reports. A foreign target,
+an invalid selection and a run without `--no-cache` (see below) exit 2 before building; otherwise
+the status is the test run's, as for a file-root `test`.
+
+Clean invocation: `silk clean [--manifest-path <path>]`. It removes the project's `[build].output-dir` and
 everything below it, as the TypeScript `silk clean` does, and prints `Removed <directory>`. An
 absent output directory is already clean. Only builds write there, and the manifest decoder keeps
 the directory inside the project. A missing or invalid manifest, or a failed removal, exits 2.
@@ -366,7 +381,7 @@ injected-producer contracts establish the receipt boundary; they do not claim a 
 self-build. Run the focused contracts with
 `pnpm exec vitest run --config compiler/scripts/vitest.config.mjs compiler/scripts/NativeBuild.test.mjs`.
 
-`silkc format [paths] [--check]` formats source without semantic analysis or code generation.
+`silk format [paths] [--check]` formats source without semantic analysis or code generation.
 The nearest `silk.toml` above the working directory supplies `[package].root`; its containing
 directory is the source root. With no paths the command recursively selects that root. Explicit
 files and directories are resolved against the working directory, must stay inside the source
@@ -427,7 +442,7 @@ reads only the syntax index, so a name with a conditional candidate there is the
   suspension, closures and the opt-in MIR check.
 - [Effect calling convention](docs/effect-calling-convention.md): how native code receives Effect
   providers, returns typed failures, and expands the Effect composition intrinsics (roadmap step 5).
-- [Native `silkc test`](docs/native-test.md): test discovery, the runner exchange, and the CI
+- [Native `silk test`](docs/native-test.md): test discovery, the runner exchange, and the CI
   switch of the Cases shards.
 
 ## Development branches and bootstrap
@@ -491,16 +506,17 @@ the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first g
 ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
 verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-Without `SILKC_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
-does, and refuses with status 2 when there is none. With `SILKC` pointing at the verified ARM64
-executable and `SILKC_CLANG` pointing at LLVM 22 `clang`, development builds use the native
-compiler directly:
+Without `SILK_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
+does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
+executable and `SILK_CLANG` pointing at LLVM 22 `clang`, development builds use the native
+compiler directly. A pinned seed predates `SILK_CLANG` and reads `SILKC_CLANG` until the next
+re-pin:
 
 ```sh
 mkdir -p .scratch
-"$SILKC" build compiler/src/main.silk -o .scratch/silkc-next \
+"$SILK_COMPILER" build compiler/src/main.silk -o .scratch/silk-next \
   --stdlib "$PWD/packages/compiler/stdlib" --optimization speed
-"$SILKC" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
+"$SILK_COMPILER" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
   --stdlib "$PWD/packages/compiler/stdlib" --no-cache --filter frozenTarget
 ```
 
