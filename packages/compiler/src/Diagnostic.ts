@@ -108,50 +108,91 @@ export const conditionNotBoolCode = 'SEM0011' as const
 
 /** Stable code for a call argument whose type mismatches its parameter. */
 export const argumentTypeMismatchCode = 'SEM0012' as const
+/** Stable code for an import or qualified reference naming a member its module does not declare. */
 export const unknownImportedMemberCode = 'SEM0014' as const
+/** Stable code for an import or qualified reference naming a private member of another module. */
 export const inaccessibleImportedMemberCode = 'SEM0015' as const
+/** Stable code for two bindings in one scope claiming the same spelling. */
 export const bindingConflictCode = 'SEM0016' as const
+/** Stable code for a struct declaration that names one field twice. */
 export const duplicateFieldNameCode = 'SEM0017' as const
+/** Stable code for a type position whose name resolves to something other than a type. */
 export const expectedTypeCode = 'SEM0018' as const
+/** Stable code for a public declaration whose signature mentions a private type. */
 export const privateTypeExposureCode = 'SEM0019' as const
+/** Stable code for aggregates that contain themselves inline and so have no finite layout. */
 export const inlineRecursiveAggregateCode = 'SEM0020' as const
+/** Stable code for constructing a struct at a site where its raw constructor is not available. */
 export const inaccessibleStructConstructionCode = 'SEM0021' as const
+/** Stable code for a struct literal naming a field its type does not declare. */
 export const unknownStructFieldCode = 'SEM0022' as const
+/** Stable code for a struct literal that initializes one field twice. */
 export const duplicateStructInitializerCode = 'SEM0023' as const
+/** Stable code for a struct literal that omits a declared field. */
 export const missingStructInitializerCode = 'SEM0024' as const
+/** Stable code for a struct literal field whose value mismatches the field type. */
 export const structFieldTypeMismatchCode = 'SEM0025' as const
+/** Stable code for a field projection on a value that is not a struct. */
 export const projectionOnNonStructCode = 'SEM0026' as const
+/** Stable code for a field projection naming a field its struct does not declare. */
 export const unknownProjectedFieldCode = 'SEM0027' as const
+/** Stable code for a field projection naming a private field of another module's struct. */
 export const inaccessibleProjectedFieldCode = 'SEM0028' as const
+/** Stable code for an empty array literal with no expected `Array` type to fix its element. */
 export const emptyArrayNeedsContextCode = 'SEM0029' as const
+/** Stable code for an array literal element whose type mismatches the element type. */
 export const arrayElementTypeMismatchCode = 'SEM0030' as const
+/** Stable code for an array literal whose element count differs from its expected length. */
 export const arrayLengthMismatchCode = 'SEM0031' as const
+/** Stable code for indexing a value whose type does not support indexing. */
 export const indexOnNonArrayCode = 'SEM0032' as const
+/** Stable code for an index expression whose type is not `usize`. */
 export const indexNotUsizeCode = 'SEM0033' as const
+/** Stable code for a statically known index outside an array's known length. */
 export const indexOutOfBoundsCode = 'SEM0034' as const
+/** Stable code for assigning through a binding that is not declared mutable. */
 export const immutableAssignmentCode = 'SEM0035' as const
+/** Stable code for an assignment whose left side is not a writable place. */
 export const invalidAssignmentPlaceCode = 'SEM0036' as const
+/** Stable code for an assigned value whose type mismatches its place. */
 export const assignmentTypeMismatchCode = 'SEM0037' as const
+/** Stable code for `break` or `continue` outside any loop. */
 export const transferOutsideLoopCode = 'SEM0038' as const
+/** Stable code for a structural union member that is not a detached ordinary value with finite storage. */
 export const invalidUnionMemberCode = 'SEM0039' as const
+/** Stable code for a union conversion whose source has members its target lacks. */
 export const incompatibleUnionConversionCode = 'SEM0040' as const
+/** Stable code for a match arm naming a member its scrutinee type does not have. */
 export const matchMemberNotInScrutineeCode = 'SEM0042' as const
+/** Stable code for a match arm that earlier arms already cover. */
 export const unreachableMatchArmCode = 'SEM0043' as const
+/** Stable code for a match that leaves some scrutinee members uncovered. */
 export const incompleteMatchCode = 'SEM0044' as const
+/** Stable code for a match guard whose type is not `bool`. */
 export const matchGuardNotBoolCode = 'SEM0045' as const
+/** Stable code for a struct pattern that omits a field without a trailing `..`. */
 export const missingPatternFieldCode = 'SEM0046' as const
+/** Stable code for a struct pattern that names one field twice. */
 export const duplicatePatternFieldCode = 'SEM0047' as const
+/** Stable code for a pattern binding whose spelling collides with an existing declaration. */
 export const patternBindingConflictCode = 'SEM0048' as const
+/** Stable code for match arms whose result types have no common type. */
 export const incompatibleMatchResultsCode = 'SEM0049' as const
+/** Stable code for a generic parameter list that declares one spelling twice. */
 export const duplicateTypeParameterCode = 'SEM0050' as const
+/** Stable code for an application with the wrong number of type arguments. */
 export const typeArgumentArityCode = 'SEM0051' as const
+/** Stable code for a generic call whose type arguments its values do not determine. */
 export const typeArgumentInferenceCode = 'SEM0052' as const
+/** Stable code for recursion that re-specializes its callee with different type arguments. */
 export const polymorphicRecursionCode = 'SEM0053' as const
 /** Stable code for an operand that cannot form a borrowed view. */
 export const invalidBorrowOperandCode = 'SEM0056' as const
+/** Stable code for an exclusive borrow of a binding that is not declared mutable. */
 export const exclusiveBorrowRequiresMutableCode = 'SEM0057' as const
 /** Stable code for an exclusive reborrow of a shared reference or slice. */
 export const invalidReborrowCode = 'SEM0058' as const
+/** Stable code for passing an array where a slice is expected without an explicit borrow. */
 export const implicitSliceDecayCode = 'SEM0059' as const
 /** Stable code for a negative decimal literal contextualized as unsigned `usize`. */
 export const usizeNegativeCode = 'SEM0060' as const
@@ -159,21 +200,35 @@ export const usizeNegativeCode = 'SEM0060' as const
 export const invalidFailureTypeCode = 'SEM0061' as const
 /** Stable code for a failure channel attached to an ordinary function. */
 export const failureChannelOnOrdinaryCode = 'SEM0062' as const
+/** Stable code for `fail` outside an effect function. */
 export const failOutsideEffectCode = 'SEM0063' as const
+/** Stable code for an effect function failing with a type its signature does not declare. */
 export const undeclaredFailureCode = 'SEM0064' as const
+/** Stable code for `run` applied to a value that is not an effect. */
 export const runNonEffectCode = 'SEM0065' as const
+/** Stable code for a `run` whose failures the enclosing signature does not declare. */
 export const unhandledEffectFailuresCode = 'SEM0066' as const
+/** Stable code for an `Effect.catch` handler that does not fit the failures it handles. */
 export const invalidEffectHandlerCode = 'SEM0067' as const
+/** Stable code for a mutable binding inside an effect recipe. */
 export const mutableEffectRecipeCode = 'SEM0068' as const
 /** Stable code for a non-concrete or non-nominal capability in a requirement row. */
 export const invalidRequirementTypeCode = 'SEM0070' as const
+/** Stable code for a `run` whose requirements the enclosing signature does not provide. */
 export const unhandledEffectRequirementsCode = 'SEM0071' as const
+/** Stable code for an `Effect.provide` provider that does not fit the requirement it replaces. */
 export const invalidEffectProvisionCode = 'SEM0074' as const
+/** Stable code for a call whose callee is not callable. */
 export const nonCallableApplicationCode = 'SEM0075' as const
+/** Stable code for a callable value whose signature cannot satisfy the expected callable type. */
 export const incompatibleCallableSignatureCode = 'SEM0076' as const
+/** Stable code for invoking a stored callable through a place without the access its contract requires. */
 export const invalidCallableInvocationAccessCode = 'SEM0077' as const
+/** Stable code for calling a unary callable with no arguments instead of naming it. */
 export const redundantUnaryEmptyCallCode = 'SEM0078' as const
+/** Stable code for merging callable values from different construction sites without explicit erasure. */
 export const callableIdentityErasureCode = 'SEM0080' as const
+/** Stable code for returning an owned callable whose concrete environment is unknown. */
 export const unknownOwnedCallableReturnCode = 'SEM0081' as const
 /** Stable code for an Effect join whose alternatives cannot be represented as a finite composite. */
 export const nonFiniteEffectJoinCode = 'SEM0132' as const
@@ -432,7 +487,9 @@ export const unknownLifetimeCode = 'SEM0209' as const
 export const ambiguousLifetimeElisionCode = 'SEM0210' as const
 /** A lifetime binder or outlives bound has an unsupported declaration shape. */
 export const invalidLifetimeBinderCode = 'SEM0211' as const
+/** Stable code for a lifetime that must outlive another but is not known to. */
 export const unsatisfiedLifetimeBoundCode = 'SEM0212' as const
+/** Stable code for a type that must remain valid for a lifetime but is not known to. */
 export const unsatisfiedTypeOutlivesCode = 'SEM0213' as const
 /** A `test` qualifier marks a function outside the finite executable test contract. */
 export const invalidTestDeclarationCode = 'SEM0218' as const
@@ -453,16 +510,27 @@ export const expiredLifetimeCode = 'OWN0019' as const
 
 /** Stable code for a use of a binding after its consuming move. */
 export const useAfterMoveCode = 'OWN0001' as const
+/** Stable code for a partial move out of a place whose boundary keeps the owner whole. */
 export const partialMoveCode = 'OWN0002' as const
+/** Stable code for a non-Copy value consumed without the explicit `move` its position requires. */
 export const explicitMoveRequiredCode = 'OWN0003' as const
+/** Stable code for an assignment whose right side consumes the owner it is about to replace. */
 export const overlappingAssignmentCode = 'OWN0004' as const
+/** Stable code for a loop whose body leaves owner liveness different from what its next iteration expects. */
 export const incompatibleLoopHeaderCode = 'OWN0005' as const
+/** Stable code for a borrowed pattern binding that outlives its match arm. */
 export const matchBorrowEscapeCode = 'OWN0006' as const
+/** Stable code for an exclusive match over a binding that is not declared mutable. */
 export const exclusiveMatchRequiresMutableCode = 'OWN0007' as const
+/** Stable code for a match guard that consumes a binding its pattern introduced. */
 export const guardConsumesPatternCode = 'OWN0008' as const
+/** Stable code for a borrowing match whose scrutinee is not a complete binding place. */
 export const invalidMatchScrutineePlaceCode = 'OWN0009' as const
+/** Stable code for a borrowed-view loan that conflicts with an active loan of the same storage. */
 export const conflictingViewLoanCode = 'OWN0010' as const
+/** Stable code for an owner access that conflicts with an active borrowed-view loan. */
 export const ownerAccessDuringLoanCode = 'OWN0011' as const
+/** Stable code for moving a non-Copy value out through a borrowed-view place. */
 export const borrowedMoveCode = 'OWN0012' as const
 
 /** Stable code for invoking a stored callable through too weak an aggregate receiver access. */
