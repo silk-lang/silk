@@ -278,6 +278,13 @@ still yields `Imprecise`, never a definite rejection or `Checked`: a shared infe
 not identify which operand a generic result retains. Other unknown retention, including missing
 region mappings and projected-assignment uncertainty, remains excluded from region proofs. A
 later operation cannot upgrade an already unknown mapping to a complete union.
+Static storage validity does not remove alias restrictions. Loan retention includes explicit
+`'static` atoms for references, aggregates and retained environments. A holder of a static shared
+view still prevents mutation through its source until the holder's final use. Lifetime-only
+capture checks can omit static atoms, but the borrow walker's retained-region query cannot.
+An unrelated static result cannot retain body-owned storage; filtering those body loans must
+preserve a source loan whose own retained region is static.
+
 When call or aggregate inference retags a fresh reference borrow with its shared region, its retained
 source-validity relations follow that same loan. This renaming is limited to the borrow's own
 fresh atom and relations recorded at that exact source origin. It neither renames an existing
@@ -432,7 +439,7 @@ callees' contracts: the program-level guarantee needs every body checked, which 
 count tracks, and a callee that still leaves with `regions` is where a contract violation could
 hide until the regions slice proves it.
 
-- When every result region is a lifetime parameter of the checked declaration, or the result is
+- When every result region is static or an enclosing/own declared lifetime parameter, or the result is
   one of its type parameters, a loan of a body local, or with a body region, is not retained: such
   a region cannot outlive what the caller chose, typing already rejects a body-local borrow given a
   caller's region or type, and safe code obtains a type parameter's value only as such a value.
