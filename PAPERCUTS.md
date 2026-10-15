@@ -722,3 +722,8 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-15 · A new Contents unit fixture used reserved `effect` as a local identifier and reported PAR0002; renamed the local to `computation` and reran under a fresh evidence label · silk/selfhost
 2026-10-15 · Combining two negated `run` calls directly with `&&` in a new assertion parsed into SEM0135; bound the effect results to booleans before combining them · silk/selfhost
 2026-10-15 · A proposed source positive requiring an implied callable environment bound at an explicit helper call already rejects SEM0212 on the parent; kept the stored-environment positive at the direct premise-proof tier and recorded the source-call limitation separately · silk/selfhost
+
+2026-10-15 · A private R3 diagnostic build failed UnknownName after copying a helper using Intersection without its import · Added the missing import to the private probe and its preparation script; production source was unaffected · silk
+2026-10-15 · The R3 required-loan prototype used a comma between struct declaration fields and failed PAR0002 · Use newline-separated Silk field declarations; constructor commas remain valid · silk
+2026-10-15 · gh REST updates began returning HTTP 401 after the session credential expired · Updated PR metadata through the connected GitHub tool; local validation continues · silk
+2026-10-15 · A cost supervisor began calibration just before a separate native suite was launched after a failed scheduling assertion · Stopped the owned cost process group, invalidated the entire calibration attempt, preserved its files, and restarted only after an explicit suite-completion gate using fresh sample labels · silk R3
