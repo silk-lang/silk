@@ -5,6 +5,7 @@ import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -158,7 +159,7 @@ pub effect fn main() -> () ! FileError | OutOfMemoryError {
 )
 
 it.effect(
-  'runs OS and explicit trust providers against real confined files',
+  'runs OS and explicit trust providers, including rename, against real confined files',
   () =>
     Effect.gen(function* () {
       const source = `import silk.allocator { OutOfMemoryError }
@@ -171,7 +172,7 @@ import silk.usize
 import silk.os_filesystem { OsFileSystem }
 import silk.native_filesystem { NativeFileSystem }
 import silk.bytes { Bytes }
-import silk.filesystem { FileError, FileSystem, Path }
+import silk.filesystem { DirectoryInfo, FileError, FileInfo, FileSystem, Path }
 import silk.result { Result }
 import silk.native_file_trust_source { NativeFileTrustSource }
 import silk.trust_snapshot { TrustFileOperation, TrustLoadLimits, TrustSnapshot, TrustSourceError }
@@ -205,6 +206,34 @@ effect fn program() -> i32 ! FileError | OutOfMemoryError {
   let listedPath = Path.rawBytes(&listedEntries[0].path)
   if listedPath.length != 10 || listedPath[8] != u8.toU8(${process.platform === 'darwin' ? 195 : 255}) { return 6 }
   run FileSystem.removeFile(&rawPath) |> Effect.provideMut(&mut fs)
+  let staged = run Path.make("/staged.txt") |> Effect.provideMut(&mut allocator)
+  let published = run Path.make("/published.txt") |> Effect.provideMut(&mut allocator)
+  let replaced = [u8.toU8(111), u8.toU8(108), u8.toU8(100)]
+  run FileSystem.writeFile(&published, &replaced) |> Effect.provideMut(&mut fs)
+  run FileSystem.writeFile(&staged, &input) |> Effect.provideMut(&mut fs)
+  run FileSystem.rename(&staged, &published) |> Effect.provideMut(&mut fs)
+  let moved = run FileSystem.readFile(&published) |> Effect.provideMut(&mut fs) |> Effect.provideMut(&mut allocator)
+  if Bytes.asSlice(&moved).length != usize.add(0, 5) { return 11 }
+  let gone = run Effect.result(FileSystem.stat(&staged) |> Effect.provideMut(&mut fs))
+  let vanished = match move gone {
+    Result<FileInfo | DirectoryInfo, FileError>.Success { value } => false
+    Result<FileInfo | DirectoryInfo, FileError>.Failure { error } => error.reason.code == FileSystem.notFound().code
+  }
+  if vanished == false { return 12 }
+  let directoryMove = run Effect.result(FileSystem.rename(&parent, &staged) |> Effect.provideMut(&mut fs))
+  let wrongKind = match move directoryMove {
+    Result<(), FileError>.Success { value } => false
+    Result<(), FileError>.Failure { error } => error.reason.code == FileSystem.wrongType().code
+  }
+  if wrongKind == false { return 13 }
+  let escaping = run Path.make("/escape/moved.txt") |> Effect.provideMut(&mut allocator)
+  let linkMove = run Effect.result(FileSystem.rename(&published, &escaping) |> Effect.provideMut(&mut fs))
+  let contained = match move linkMove {
+    Result<(), FileError>.Success { value } => false
+    Result<(), FileError>.Failure { error } => true
+  }
+  if contained == false { return 14 }
+  run FileSystem.removeFile(&published) |> Effect.provideMut(&mut fs)
   let mut kind = 0
   let mut length: usize = 0
   let escaped = run Effect.result(NativeFileSystem.inspect(b"${nativeRoot}", b"/../outside", &mut kind, &mut length, 2))
@@ -295,6 +324,7 @@ export "C" fn enter() -> i32 as "main" { return main() }`
         Json.stringify({ signal: second.signal, stderr: second.stderr, stdout: second.stdout }),
       )
       assert.strictEqual(readFileSync(outsideMarker, 'utf8'), 'untouched')
+      assert.strictEqual(existsSync(join(outsideRoot, 'moved.txt')), false)
     }),
   // This compiles both ordinary filesystem actors once before exercising real confined files.
   120_000,
