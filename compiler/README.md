@@ -115,11 +115,13 @@ static partial move marks the authenticated component moved: cleanup visits the 
 in their canonical order. Joins normalize the incoming component partitions, including opposite
 authored move orders, and retain each child's independent liveness. Replacing a component drops
 its initialized old value before the store, then restores precisely that component; siblings keep
-their state. A move beneath a type with a Drop hook is rejected as `OWN0002`. A write at a runtime
-index beside a moved element, a guard that changes an owner's state or
-consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost does not
-report yet), a loop iteration that leaves an owner changed and a borrowing match result whose arm
-created temporaries still report the `cleanup` gap.
+their state. A move beneath a type with a Drop hook is rejected as `OWN0002`. Typing records the
+static element a literal in-bounds index of a fixed array names, so a store there refills a moved
+element like a field, and borrow checking rejects a read, borrow or write of a moved element as
+`OWN0001`, and so does an access whose runtime index may name it. A guard that changes an owner's
+state or consumes a binding of its arm (the bootstrap rejects such moves as OWN0008, which selfhost
+does not report yet), a loop iteration that leaves an owner changed and a borrowing match result
+whose arm created temporaries still report the `cleanup` gap.
 Anonymous-environment availability preserves unchanged loop headers even when a pre-loop branch
 may have moved a field. It compares active roots, may/must holes, indexed uncertainty and guard
 state after each repeating edge; the missing field remains unavailable. Conditions are checked
@@ -150,8 +152,16 @@ place (D4): the protected Effect fails into a temporary, a switch sends members 
 handler and injects the rest into the residual failure. `finalizeEffect`, its NonParking variant
 and `useReleaseNonParking` expand the same way: both exits of the protected run (or of `use`, lent
 the owned resource) run the `() ! never` finalizer (or `release`, which drops the resource), and a
-held failure is raised afterwards. Reached parking lowers through `Intrinsic.relinquish` (D6), but
-`Intrinsic.NonParking` bounds are still admitted without proof (#1665). An `effect {}` block or anonymous
+held failure is raised afterwards. Reached parking lowers through `Intrinsic.relinquish` (D6). The
+build proves every reached `Intrinsic.NonParking` obligation after closing the external parks
+(`Intrinsic.relinquish`, `Intrinsic.executionCurrent`) over direct calls, drops, formed function
+addresses, readiness notifications and package releases. A bounded instance's own premise is owed
+by the call that reaches it, a nonparking finalizer, release or observer callback whose bound no
+premise carries is owed at its run, and a `with Intrinsic.nonParking()` service operation is owed
+for its selected witness at the call. An obligation covers the drop glue its value's runner
+executes in place. A nested transfer through `Effect.suspend` is not a park. An obligated value
+with no exact executable target, or one that reaches a park, is SEM0139. An
+`effect {}` block or anonymous
 `effect fn` is an exact representation like an anonymous closure: its environment holds its
 captures, and running it (or an invoked anonymous `effect fn`) calls its own instance with the
 environment as parameter 0. A block derives its success, failure and requirement row from its
