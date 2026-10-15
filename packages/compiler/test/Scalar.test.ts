@@ -3,6 +3,8 @@ import { assert, it } from '@effect/vitest'
 import * as Intrinsic from '../src/Intrinsic.js'
 import * as Scalar from '../src/Scalar.js'
 import * as Type from '../src/Type.js'
+import { corpusProgram } from './support/corpus.js'
+import { floatOperationMatrix, integerOperationMatrix } from './support/scalarOperationMatrix.js'
 
 it('owns the current scalar vocabulary in stable presentation order', () => {
   assert.deepEqual(
@@ -134,4 +136,11 @@ it('resolves fixed and target-width scalar facts without phase-specific cases', 
         assert.strictEqual(resolved.rule.operation, operation.code)
     }
   }
+})
+
+// The corpus stores both operation matrices as data; regenerating them from the scalar vocabulary
+// must reproduce the checked-in programs byte for byte.
+it('keeps the corpus operation matrices generated from the scalar vocabulary', () => {
+  assert.strictEqual(corpusProgram('integer-operation-matrix').source, integerOperationMatrix)
+  assert.strictEqual(corpusProgram('float-operation-matrix').source, floatOperationMatrix)
 })

@@ -243,7 +243,7 @@ Quoted verbatim from the Step 4 author; the same text appears in [mir-core-shape
 
 ## 3. Worked examples
 
-All four are native corpus programs (`packages/compiler/test/support/corpus.ts`). MIR is
+All four are native corpus programs (`corpus/native/`). MIR is
 abbreviated: `bbN` are blocks, `_r` is `Return`, `_f` is `Failure`, `_pN` is `Provider N`.
 
 ### `effect-selective-catch` (catch, catchAll, failure unions)
@@ -340,7 +340,7 @@ pub effect fn main() ! NotFoundError { let v = run middle(); return () }
 | `effect-instance`          | **deleted**             | was: instance with a non-empty row, or an `effect fn` interface witness                                                                                              | Step 9 provider PR                                                      |
 | `entry-signature`          | **deleted**             | was: `Entry { main }` with any signature except `fn main() -> i32`                                                                                                   | default runtime selection                                               |
 | `intrinsic-member`         | narrower                | catalog members the selfhost does not lower; no longer `execution*`, `observeUnhandled` or `observeDiagnostics` ([the observer note](failure-observer-and-trace.md)) | suspension stage                                                        |
-| `observer-callback`        | **new** (observer note) | an `observeDiagnostics` callback that is not a direct function                                                                                                       | callback environments in the observer record                            |
+| `observer-callback`        | **new** (observer note) | an `observeDiagnostics` callback whose callable consumes or exclusively lends its environment                                                                        | none; an adapter shares the callback                                    |
 | `failure-identity`         | **new** (observer note) | an observed `fail` of an anonymous aggregate, callable, Effect or foreign function, or a nominal with a row argument                                                 | identity rendering for the remaining types                              |
 | `typed-form`               | narrower                | `run`, `fail` and `effect {}` stop producing it as Step 9 PRs land                                                                                                   | per PR                                                                  |
 | `interface-effect-witness` | narrower                | an `effect fn` interface call that no `run` executes in place                                                                                                        | lowering stored interface Effect constructions; owner: Step 9 follow-up |
