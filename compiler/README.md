@@ -14,7 +14,10 @@ initializer's temporaries until its scope exits. A `match &mut`, `match place` o
 subject must name an existing place (`InvalidMatchScrutineePlace`, the bootstrap's `OWN0009`), and
 a `match &mut` or `let P = &mut e` subject must be a mutable place (`ExclusiveMatchRequiresMutable`,
 the bootstrap's `OWN0007`). A guard cannot move or drop a binding of its consuming arm
-(`GuardConsumesPattern`, the bootstrap's `OWN0008`).
+(`GuardConsumesPattern`, the bootstrap's `OWN0008`). A `match place` binding names the payload its
+match selected until the arm replaces or moves the subject or an owner of it: a later use of the
+binding is `ExtractionBoundary` (the bootstrap's `OWN0002`), and a loop in the arm that does so
+before its next iteration uses the binding repeats incompatibly (`OWN0005`).
 Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
 `unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
