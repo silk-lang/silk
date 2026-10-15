@@ -1,4 +1,4 @@
-# Native `silkc test`
+# Native `silk test`
 
 The compiler's own Cases tests run on the TypeScript bootstrap today. Every Cases shard in
 `.github/workflows/selfhost.yml` runs `node "$SILK_BOOTSTRAP" test --manifest-path
@@ -13,7 +13,7 @@ The language contract is the reference chapter [Tests and the source runner](../
 ## Command
 
 ```sh
-silkc test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--file <path>] \
+silk test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--file <path>] \
   [--optimization none|speed] [--debug true|false] --no-cache
 ```
 
@@ -27,7 +27,7 @@ silkc test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--fil
   `<executable>.plan` and `<executable>.receipt` and removed after the run.
 - `--filter` and `--file` are passed to the runner unchanged (TEST-006). `--file` takes the
   package-relative logical path the catalog reports, such as `src/semantic/TargetCases.silk`.
-- `silkc test [project options] [--root <path>] [--file <path>] [--filter <text>] --no-cache`,
+- `silk test [project options] [--root <path>] [--file <path>] [--filter <text>] --no-cache`,
   without a root, is the project form of the TypeScript `silk test`: it loads the nearest (or the
   `--manifest-path`) project, takes `--root` or else `[package].root` as the discovery root, and
   writes the runner to `<output-dir>/test/llvm/<target>/<profile>/<name>`. Its `--file` is
@@ -95,7 +95,7 @@ What must match the bootstrap for the same root:
 - **Pass/fail and exit status.** Decided by the runner from each test's outcome.
 
 The bootstrap prints one extra line before the runner, `Compiled src/<root> -> build/... (llvm,
-<target>, N symbols)`. The native command prints `silkc test: compiled <root> -> <executable>` in
+<target>, N symbols)`. The native command prints `silk test: compiled <root> -> <executable>` in
 its place. No check reads it.
 
 ## Front end

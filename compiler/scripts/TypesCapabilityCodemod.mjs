@@ -11,7 +11,7 @@
 //
 // The rewrite is idempotent. After merging selfhost into a branch, run it from the repository root
 // with a working native compiler:
-//   SILKC=<native silkc> SILKC_CLANG=<clang> node compiler/scripts/TypesCapabilityCodemod.mjs
+//   SILKC=<native silk> SILKC_CLANG=<clang> node compiler/scripts/TypesCapabilityCodemod.mjs
 // `--check` only reports `Shared<Type>.make(` sites outside Types.silk and exits nonzero if any
 // remain; it needs no compiler, which is what CI runs.
 import { execFileSync } from 'node:child_process'
@@ -70,8 +70,8 @@ function ensureImport(text, name) {
 }
 
 // Step 2: the compiler names each unhandled site.
-const silkc = process.env.SILKC
-if (silkc === undefined) throw new Error('set SILKC to a native silkc')
+const silk = process.env.SILKC
+if (silk === undefined) throw new Error('set SILKC to a native silk')
 // The entries CI builds and its test shards' roots, read from the workflow so the lists cannot
 // drift apart.
 const workflow = readFileSync(join(compiler, '../.github/workflows/selfhost.yml'), 'utf8')
@@ -92,7 +92,7 @@ const diagnostics = (target) => {
       : ['test', join(compiler, target.root), '-o', output, '--stdlib', stdlib, '--no-cache']
   let text
   try {
-    text = execFileSync(silkc, args, { cwd: join(compiler, '..'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28 })
+    text = execFileSync(silk, args, { cwd: join(compiler, '..'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28 })
   } catch (failure) {
     text = `${failure.stdout ?? ''}${failure.stderr ?? ''}`
   }
