@@ -1,11 +1,14 @@
-//! The host side of one uncached `silk test` run: the plan the bundled runner validates before any
-//! test body runs, and admission of the receipt it writes back.
+//! The host side of one `silk test` run: the plan the bundled runner validates before any test
+//! body runs, and admission of the receipt it writes back.
 //!
 //! # Details
 //!
 //! The formats are the bootstrap's exchange (`packages/cli/src/TestExchange.ts`) and the runner's
-//! `silk/test_exchange`: little-endian integers, `SLKTPLN1` and `SLKTRCP1` magic, version 1, and
-//! mode 2 for an uncached run. An uncached plan and receipt are exactly 256 bytes, zero padded.
+//! `silk/test_exchange`: little-endian integers, `SLKTPLN1` and `SLKTRCP1` magic and version 1.
+//! A per-test run (mode 1) directs each discovered test to execute or to report a cached pass,
+//! and its receipt lists every selected test's disposition. An uncached run (mode 2) exchanges
+//! exactly 256 bytes each way, zero padded. A run is per-test only when both complete directions
+//! fit `min(4096 + 256 * discovered, 16 MiB)` bytes (TEST-008).
 
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.bytes { Bytes }
@@ -17,21 +20,59 @@ import silk.test_exchange as TestExchange
 import silk.u32
 import silk.u64
 import silk.u8
+import silk.vector { Vector }
 import silk.usize
 
 const VERSION: u32 = 1
+
+const PER_TEST: u32 = 1
 
 const UNCACHED: u32 = 2
 
 const COMPACT_BYTES: usize = 256
 
-/// The counts an admitted uncached receipt reports.
+const HARD_MAXIMUM_BYTES: usize = 16777216
+
+const PER_TEST_PLAN_HEADER: usize = 56
+
+const PER_TEST_RECEIPT_HEADER: usize = 88
+
+const RECEIPT_TRAILER: usize = 52
+
+/// The counts an admitted receipt reports.
 pub struct Counts {
   pub discovered: u64
   pub selected: u64
+  pub cached: u64
   pub executed: u64
   pub passed: u64
   pub failed: u64
+}
+
+/// What a per-test plan directs the runner to do with one discovered test.
+pub enum Action { Execute, Cached }
+
+/// One discovered test in catalog order: its declaration identity, its execution identity when it
+/// is eligible for result reuse, and the planned action. Only an eligible test may be `Cached`.
+pub struct PlanEntry {
+  pub declaration: Bytes
+  pub execution: Option<Bytes>
+  pub action: Action
+}
+
+/// How the runner disposed of one selected test.
+pub enum Disposition { Cached, Passed, Failed }
+
+/// One selected test's disposition, as an admitted per-test receipt lists it.
+pub struct ReceiptEntry {
+  pub ordinal: u64
+  pub disposition: Disposition
+}
+
+/// An admitted per-test receipt: its selected entries in increasing ordinal order and its counts.
+pub struct PerTestReceipt {
+  pub entries: Vector<ReceiptEntry>
+  pub counts: Counts
 }
 
 /// The catalog digest the runner recomputes from its own descriptors: SHA-256 over each identity
@@ -123,18 +164,18 @@ pub fn admitReceipt(plan: &[u8], receipt: &[u8], status: i32) -> Option<Counts> 
   let counts = Counts {
     discovered: readLittle(receipt, 80, 8),
     selected: readLittle(receipt, 88, 8),
+    cached: readLittle(receipt, 96, 8),
     executed: readLittle(receipt, 104, 8),
     passed: readLittle(receipt, 112, 8),
     failed: readLittle(receipt, 120, 8),
   }
-  let cached = readLittle(receipt, 96, 8)
   let reported = readLittle(receipt, 128, 4)
   let mut expected: u64 = 0
   if counts.failed > 0 {
     expected = 1
   }
   if counts.discovered != readLittle(plan, 80, 8) || counts.selected > counts.discovered
-    || cached != 0
+    || counts.cached != 0
     || counts.executed != counts.selected
     || counts.passed > counts.selected
     || counts.failed != counts.selected - counts.passed
@@ -151,4 +192,152 @@ pub fn admitReceipt(plan: &[u8], receipt: &[u8], status: i32) -> Option<Counts> 
     index = index + usize.ONE
   }
   return Option<Counts>.some(move counts)
+}
+
+// The bytes one entry occupies in a plan or receipt: ordinal, both length-prefixed identities and
+// the action or disposition byte.
+fn entryBytes(entry: &PlanEntry) -> usize {
+  let mut execution = usize.ZERO
+  if let Option<Bytes>.Some {value} = &entry.execution { execution = Bytes.length(&value) }
+  return 8 + 8 + Bytes.length(&entry.declaration) + 8 + execution + 1
+}
+
+// The per-test bound: `min(4096 + 256 * discovered, 16 MiB)`.
+fn perTestBound(discovered: usize) -> usize {
+  if discovered >= (HARD_MAXIMUM_BYTES - 4096) / 256 { return HARD_MAXIMUM_BYTES }
+  return 4096 + 256 * discovered
+}
+
+/// Whether the complete per-test plan and its largest receipt for `entries` both fit the per-test
+/// bound. Otherwise the run is uncached and looks up no results.
+pub fn selectsPerTest(entries: &[PlanEntry]) -> bool {
+  let bound = perTestBound(entries.length)
+  let mut sized = usize.ZERO
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let one = entryBytes(&entries[at])
+    if one > bound || sized > bound - one { return false }
+    sized = sized + one
+    at = at + usize.ONE
+  }
+  return sized <= bound - PER_TEST_RECEIPT_HEADER - RECEIPT_TRAILER
+}
+
+effect fn appendText(output: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run appendLittle(&mut output.*, usize.toU64(text.length), 8)
+  return run Bytes.append(&mut output.*, text)
+}
+
+/// The per-test plan: magic, version, mode 1, the invocation nonce and the discovered count, then
+/// each entry's ordinal, declaration identity, execution identity (empty when ineligible) and
+/// action byte (0 execute, 1 cached). The caller selects per-test mode first.
+pub effect fn perTestPlan(nonce: &[u8], entries: &[PlanEntry]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut plan = run Bytes.copy(b"SLKTPLN1")
+  run appendLittle(&mut plan, u32.toU64(VERSION), 4)
+  run appendLittle(&mut plan, u32.toU64(PER_TEST), 4)
+  run Bytes.append(&mut plan, nonce)
+  run appendLittle(&mut plan, usize.toU64(entries.length), 8)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    run appendLittle(&mut plan, usize.toU64(at), 8)
+    run appendText(&mut plan, Bytes.asSlice(&entries[at].declaration))
+    match &entries[at].execution {
+      Option<Bytes>.Some {value} => { run appendText(&mut plan, Bytes.asSlice(&value)) }
+      Option<Bytes>.None => { run appendText(&mut plan, b"") }
+    }
+    let mut action: u64 = 0
+    if entries[at].action == Action.Cached { action = 1 }
+    run appendLittle(&mut plan, action, 1)
+    at = at + usize.ONE
+  }
+  return move plan
+}
+
+// Whether the receipt holds `text`, length-prefixed, at `offset`; answers the offset after it, or
+// `usize.MAX` when it does not.
+fn readText(receipt: &[u8], offset: usize, text: &[u8]) -> usize {
+  if offset > receipt.length || receipt.length - offset < 8 { return usize.MAX }
+  let length = readLittle(receipt, offset, 8)
+  if length != usize.toU64(text.length) { return usize.MAX }
+  let start = offset + 8
+  if receipt.length - start < text.length { return usize.MAX }
+  if !sameRange(Slice.view<u8>(receipt, start, text.length), text) { return usize.MAX }
+  return start + text.length
+}
+
+/// Admits a per-test receipt for `plan`, the encoding of `entries`, written by a runner that
+/// exited with `status`, the way the bootstrap's `TestExchange.admitReceipt` does: its size within
+/// the per-test bound; the plan's nonce and SHA-256; selected entries in strictly increasing
+/// ordinal order whose identities equal the plan's and whose disposition is cached exactly when
+/// the plan directed it; counts recomputed from those entries; and a status that agrees with the
+/// failures and the process. Absence means the receipt is not admitted.
+pub effect fn admitPerTestReceipt(plan: &[u8], entries: &[PlanEntry], receipt: &[u8], status: i32) -> Option<PerTestReceipt>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if receipt.length > perTestBound(entries.length) || receipt.length < PER_TEST_RECEIPT_HEADER + RECEIPT_TRAILER {
+    return Option<PerTestReceipt>.none()
+  }
+  let digest = Sha256.hash(plan)
+  if
+    !sameRange(Slice.view<u8>(receipt, usize.ZERO, 8), b"SLKTRCP1")
+      || readLittle(receipt, 8, 4) != u32.toU64(VERSION)
+      || readLittle(receipt, 12, 4) != u32.toU64(PER_TEST)
+      || !sameRange(Slice.view<u8>(receipt, 16, 32), Slice.view<u8>(plan, 16, 32))
+      || !sameRange(Slice.view<u8>(receipt, 48, 32), &digest) {
+    return Option<PerTestReceipt>.none()
+  }
+  let selected = readLittle(receipt, 80, 8)
+  if selected > usize.toU64(entries.length) { return Option<PerTestReceipt>.none() }
+  let mut listed = Vector<ReceiptEntry>.make()
+  let mut cached: u64 = 0
+  let mut failed: u64 = 0
+  let mut offset = PER_TEST_RECEIPT_HEADER
+  let mut next: u64 = 0
+  let mut index: u64 = 0
+  while index < selected {
+    if receipt.length - offset < 8 { return Option<PerTestReceipt>.none() }
+    let ordinal = readLittle(receipt, offset, 8)
+    if ordinal < next || ordinal >= usize.toU64(entries.length) { return Option<PerTestReceipt>.none() }
+    let planned = &entries[u64.toUsize(ordinal)]
+    offset = readText(receipt, offset + 8, Bytes.asSlice(&planned.declaration))
+    if offset == usize.MAX { return Option<PerTestReceipt>.none() }
+    match &planned.execution {
+      Option<Bytes>.Some {value} => { offset = readText(receipt, offset, Bytes.asSlice(&value)) }
+      Option<Bytes>.None => { offset = readText(receipt, offset, b"") }
+    }
+    if offset == usize.MAX || offset >= receipt.length { return Option<PerTestReceipt>.none() }
+    let code = receipt[offset]
+    offset = offset + usize.ONE
+    let mut disposition = Disposition.Passed
+    if code == 0 { disposition = Disposition.Cached }
+    else if code == 2 { disposition = Disposition.Failed }
+    else if code != 1 { return Option<PerTestReceipt>.none() }
+    if (planned.action == Action.Cached) != (disposition == Disposition.Cached) { return Option<PerTestReceipt>.none() }
+    if disposition == Disposition.Cached { cached = cached + 1 }
+    if disposition == Disposition.Failed { failed = failed + 1 }
+    run Vector<ReceiptEntry>.append(&mut listed, ReceiptEntry {ordinal: ordinal, disposition: disposition})
+    next = ordinal + 1
+    index = index + 1
+  }
+  if receipt.length - offset != RECEIPT_TRAILER { return Option<PerTestReceipt>.none() }
+  let counts = Counts {
+    discovered: readLittle(receipt, offset, 8),
+    selected: readLittle(receipt, offset + 8, 8),
+    cached: readLittle(receipt, offset + 16, 8),
+    executed: readLittle(receipt, offset + 24, 8),
+    passed: readLittle(receipt, offset + 32, 8),
+    failed: readLittle(receipt, offset + 40, 8),
+  }
+  let reported = readLittle(receipt, offset + 48, 4)
+  let mut expected: u64 = 0
+  if failed > 0 { expected = 1 }
+  if counts.discovered != usize.toU64(entries.length) || counts.selected != selected
+    || counts.cached != cached || counts.executed != selected - cached
+    || counts.failed != failed || counts.passed != selected - failed
+    || reported != expected || status < 0 || u32.toU64(i32.toU32(status)) != reported {
+    return Option<PerTestReceipt>.none()
+  }
+  return Option<PerTestReceipt>.some(PerTestReceipt {entries: move listed, counts: move counts})
 }
