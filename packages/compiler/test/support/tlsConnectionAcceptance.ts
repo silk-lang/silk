@@ -1750,8 +1750,5 @@ pub fn main() -> i32 {
   return run Effect.catchAll(program(), startupFailed)
 }`
 
-/** Full target-neutral behavior and structured-cancellation matrix for the native corpus. */
-export const tlsConnectionAcceptanceSource = connectionSource(true)
-
 /** One authenticated exchange, application I/O, and terminal release through LLVM-to-Wasm. */
 export const tlsConnectionWasmSource = connectionSource(false)
