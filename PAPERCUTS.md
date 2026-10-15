@@ -710,3 +710,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 
 2026-10-15 · The floating selfhost verification artifact now requires SILK_COMPILER while the R3 stack workflow still exports SILKC; macOS corpus fails during configuration after a green M1 IR fixpoint · Recorded exact artifact run and setup failure for the coordinator; kept local verification pinned and did not redispatch · silk R3
 2026-10-15 · Native test CLI printed usage when --filter preceded -o despite listing --filter as supported · Keep the required positional prefix `test <root> -o <runner>` before optional flags; the usage exit is not baseline Case evidence · silk R3
+2026-10-15 · exec-server transport disconnected before a shell could start during R3 timing · retried the connection, verified the files were not created, and preserved the running detached measurement records · silk
