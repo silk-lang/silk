@@ -543,8 +543,10 @@ the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first g
 ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
 verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-Without `SILK_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
-does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
+A single-file `build` takes `--clang <path>` as the TypeScript `build-exe` does; it wins over
+`SILK_CLANG`. A value with a `/` is a path against the working directory and a bare name is
+searched on `PATH`. Without either, the native compiler runs the first `clang` on `PATH`, as the
+TypeScript CLI does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
 executable and `SILK_CLANG` pointing at LLVM 22 `clang`, development builds use the native
 compiler directly. A pinned seed predates `SILK_CLANG` and reads `SILKC_CLANG` until the next
 re-pin:
