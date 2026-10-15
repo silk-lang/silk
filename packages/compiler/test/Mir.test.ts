@@ -1,5 +1,5 @@
 import * as AnalysisFixture from './support/AnalysisFixture.js'
-import { nativeCorpus, narrowEffectRecord, outputStorageSource } from './support/corpus.js'
+import { corpusProgram, nativeCorpus } from './support/corpus.js'
 import { readFileSync } from 'node:fs'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
@@ -1203,7 +1203,7 @@ it.effect('forms an output slot address without reading or initializing its valu
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'mir/output-storage',
-      ascii(outputStorageSource),
+      ascii(corpusProgram('owned-output-storage').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const program = Analysis.loweredMir(snapshot)
@@ -1278,7 +1278,7 @@ it.effect('reads narrow success fields from their stored Effect outcome payload'
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'mir/narrow-effect-record',
-      ascii(narrowEffectRecord),
+      ascii(corpusProgram('narrow-record-effect-success-lanes').source),
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])
     const artifact = yield* Analysis.codegen(snapshot, { mode: 'debug' })

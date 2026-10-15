@@ -98,6 +98,7 @@ it.effect(
           'fn main() -> i32 { return 0 }',
         'openspec/changes/archive/old/evidence/captured-resource.silk':
           'pub fn main() -> i32 { return 0 }',
+        'corpus/native/new/main.silk': 'pub fn main() -> i32 { return 0 }',
         'packages/compiler/stdlib/new.silk':
           '//! ```silk\n//! pub fn main() -> i32 { return 42 }\n//! ```',
       }
@@ -122,7 +123,7 @@ it.effect(
           'packages/compiler/stdlib/new.silk#doc-1',
         ],
       )
-      assert.strictEqual(inventory.excluded.length, 5)
+      assert.strictEqual(inventory.excluded.length, 6)
       assert.isTrue(inventory.excluded.every(({ reason }) => reason.length > 0))
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
@@ -184,9 +185,10 @@ it.effect(
       const fs = yield* FileSystem.FileSystem
       const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-coverage-receipt-' })
       const files = {
-        'packages/compiler/test/support/corpus.ts':
-          'import { readFileSync } from "node:fs"; export const nativeCorpus = [{ source: readFileSync(new URL("fixture.silk", import.meta.url), "utf8") }]',
-        'packages/compiler/test/support/fixture.silk': 'pub fn main() -> i32 { return 7 }',
+        'corpus/corpus.mjs':
+          'import { readFileSync } from "node:fs"; export const loadPrograms = () => [{ source: readFileSync(new URL("native/fixture/main.silk", import.meta.url), "utf8"), reference: undefined }]',
+        'corpus/native/fixture/main.silk': 'pub fn main() -> i32 { return 7 }',
+        'examples/measured/main.silk': 'pub fn main() -> i32 { return 7 }',
         'examples/new/main.silk': 'pub fn main() -> i32 { return 42 }',
         'packages/compiler/conformance/new/library.silk': 'pub fn answer() -> i32 { return 42 }',
         'compiler/scripts/repository-coverage-track.json': '["examples/new/main.silk"]',

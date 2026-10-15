@@ -2,7 +2,7 @@ const positiveCase = `  let runtime0 = run runtimeCase(b"\\nHost: example.test\\
   if runtime0 != 0 { return runtime0 }`
 
 /** Consolidated WebSocket handshake validation and scoped portable duplex acceptance. */
-export const websocketUpgradeAcceptanceSource = `import silk.allocator {Allocator, OutOfMemoryError}
+const websocketUpgradeAcceptanceSource = `import silk.allocator {Allocator, OutOfMemoryError}
 import silk.buffered_input {BufferError}
 import silk.buffered_duplex {BufferedDuplex}
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
