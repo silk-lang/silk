@@ -2294,17 +2294,21 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Status:** recorded on 2026-10-15 from bootstrap probes. Native diagnostic gap.
 - **Rule:** a rejected body reports each independent failure, ownership conflicts included.
 - **Compilers:** a runtime body whose statements recovered past failures that bind nothing is
-  borrow-checked with each failed statement as a point no path continues past. The statements after
-  one resume from the body's entry. Native reports a use after move, a loan conflict, an access
-  during a loan, an overlapping assignment or a consuming guard when both ends lie on one side of
-  every failed statement. The bootstrap also reports a conflict whose move and use lie on either
-  side of a failed statement, including one after a failed reassignment
-  (`let a = take(move t)`, `t = 3`, `let b = take(move t)`: SEM0037 and OWN0001), and conflicts
-  inside the failed statement. Native reports only the semantic failure there, never a conflict a
-  failed statement might have prevented. Region, lifetime and loop-entry conflicts of such a body,
-  and a second conflict in it, are not reported natively.
+  borrow-checked with each failed statement as a point no path continues past. When the failed
+  statement names no `return`, `fail`, `break`, `continue` or `run` and calls nothing, the
+  statements after it resume from the body's entry; otherwise they stay unreached, as after a
+  `return`, since the statement may have ended every path. Native reports a use after move, a
+  loan conflict, an access during a loan, an overlapping assignment or a consuming guard when both
+  ends lie on one side of every failed statement. The bootstrap also reports a conflict whose move
+  and use lie on either side of a failed statement, including one after a failed reassignment
+  (`let a = take(move t)`, `t = 3`, `let b = take(move t)`: SEM0037 and OWN0001), conflicts inside
+  the failed statement, and conflicts after a failed statement that calls something. Native
+  reports only the semantic failure there, never a conflict a failed statement might have
+  prevented. Region, lifetime and loop-entry conflicts of such a body, and a second conflict in
+  it, are not reported natively.
 - **Source migration:** none. Both compilers reject the body.
-- **Evidence:** the `ownedAcross`, `ownedReplaced` and `ownedLoop` fixtures in
-  `compiler/src/semantic/SemanticLoweringCases.silk` assert the semantic failure alone; the
-  `statement-recovery-ownership` invalid-corpus program pins the conflicts both compilers report.
+- **Evidence:** the `ownedAcross`, `ownedReplaced`, `ownedLoop`, `ownedFailedReturn` and
+  `ownedFailedExits` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk` assert the
+  semantic failure alone; the `statement-recovery-ownership` invalid-corpus program pins the
+  conflicts both compilers report.
 - Retire this entry when native checks recovered bodies with the failed statements' effects.
