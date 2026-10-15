@@ -616,6 +616,25 @@ it.effect('rejects each expression beyond the EXPR-006 nesting limit at its firs
   }),
 )
 
+it.effect('rejects a static sequence anywhere in a runtime signature', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter((program) =>
+      program.name.startsWith('phase-only-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
 it.effect(
   'answers local, parameter, callable, field, and half-open semantic occurrence queries',
   () =>

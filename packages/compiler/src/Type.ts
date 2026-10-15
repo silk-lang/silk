@@ -1020,9 +1020,15 @@ export const isStaticPhaseOnly = (self: Type): boolean =>
 export const containsStaticPhaseOnly = (self: Type): boolean => {
   if (typeof self === 'string' || isString(self) || isParameter(self)) return false
   if (isStaticPhaseOnly(self)) return true
+  // A requirement-row argument carries its capabilities into the nominal's residual signature.
   if (isNominal(self))
     return self.arguments.some(
-      (argument) => isTypeArgument(argument) && containsStaticPhaseOnly(argument),
+      (argument) =>
+        (isTypeArgument(argument) && containsStaticPhaseOnly(argument)) ||
+        (isRequirementRowArgument(argument) &&
+          requirementMembers(argument).some((requirement) =>
+            containsStaticPhaseOnly(requirement.capability),
+          )),
     )
   if (isFixedArray(self) || isSlice(self)) return containsStaticPhaseOnly(self.element)
   if (isReference(self)) return containsStaticPhaseOnly(self.target)

@@ -2265,6 +2265,24 @@ export const analyzeFunctionBody = (
           ),
         )
     }
+    // Requirements belong to the residual signature, so they cannot retain a phase-only type.
+    const requirements = declaration.requirementRow
+    if (
+      requirements.anchor !== undefined &&
+      requirements.entries.some(
+        (entry) =>
+          entry.capability._tag === 'Resolved' &&
+          DeclarationFacts.containsStaticPhaseOnly(context.resolution.index, entry.capability.type),
+      )
+    )
+      context.diagnostics.push(
+        Diagnostic.staticPhaseViolation(
+          'runtime requirement with a phase-only type',
+          target,
+          [],
+          Location.at(requirements.anchor),
+        ),
+      )
   }
   const statements = analyzeStatements(
     context,
