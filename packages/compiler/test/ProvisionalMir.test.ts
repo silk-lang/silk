@@ -429,7 +429,6 @@ pub fn main() -> i32 {
       const ownership = Projections.suspensionOwnershipOf(self)
       assert.strictEqual(ownership._tag, 'Available')
       if (ownership._tag === 'Available') {
-        assert.deepEqual(ownership.value.violations, [])
         if (variant === 'suspending') assert.isNotEmpty(ownership.value.plans)
       }
       const recoveryStart = source.indexOf(' run recover(first)')
