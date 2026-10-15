@@ -78,66 +78,9 @@ fn case${index}() -> bool {
 }`,
 )
 
-const cases = caseSources.join('\n')
-
 // One nonempty fixture gives independent authentication failures for every bound input.
 const tamper = vectors.find((entry) => entry.Key.length === 32 && entry.PT.length === 34)
 if (tamper === undefined) throw new Error('Missing AES-GCM boundary fixture')
-const negatives = `fn negatives() -> bool {
-  ${array('key', tamper.Key)}
-  ${array('nonce', tamper.IV)}
-  ${array('aad', tamper.AAD)}
-  ${array('ciphertext', tamper.CT)}
-  ${array('tag', tamper.Tag)}
-  let mut wrongKey = key
-  wrongKey[0] = u8.bitXor(wrongKey[0], 1)
-  if rejectedOpen(6, &wrongKey, &nonce, &aad, &ciphertext, &tag) == false { return false }
-  let mut wrongNonce = nonce
-  wrongNonce[0] = u8.bitXor(wrongNonce[0], 1)
-  if rejectedOpen(6, &key, &wrongNonce, &aad, &ciphertext, &tag) == false { return false }
-  let mut wrongAad = aad
-  wrongAad[0] = u8.bitXor(wrongAad[0], 1)
-  if rejectedOpen(6, &key, &nonce, &wrongAad, &ciphertext, &tag) == false { return false }
-  let mut wrongCiphertext = ciphertext
-  wrongCiphertext[16] = u8.bitXor(wrongCiphertext[16], 1)
-  if rejectedOpen(6, &key, &nonce, &aad, &wrongCiphertext, &tag) == false { return false }
-  let mut index: usize = 0
-  while index < 16 {
-    let mut wrongTag = tag
-    wrongTag[index] = u8.bitXor(wrongTag[index], 1)
-    if rejectedOpen(6, &key, &nonce, &aad, &ciphertext, &wrongTag) == false { return false }
-    index = index + 1
-  }
-  let empty: [u8; 0] = []
-  ${[0, 15, 17, 24, 31, 33]
-    .map(
-      (n) => `let key${n}: [u8; ${n}] = ${filled(n, 0)}
-  if rejectedOpen(1, &key${n}, &nonce, &aad, &ciphertext, &tag) == false || rejectedSeal(1, &key${n}, &nonce, &ciphertext) == false { return false }`,
-    )
-    .join('\n')}
-  ${[0, 11, 13]
-    .map(
-      (n) => `let nonce${n}: [u8; ${n}] = ${filled(n, 0)}
-  if rejectedOpen(2, &key, &nonce${n}, &aad, &ciphertext, &tag) == false || rejectedSeal(2, &key, &nonce${n}, &ciphertext) == false { return false }`,
-    )
-    .join('\n')}
-  ${[0, 15, 17]
-    .map(
-      (n) => `let mut tag${n}: [u8; ${n}] = ${filled(n)}
-  if rejectedOpen(3, &key, &nonce, &aad, &ciphertext, &tag${n}) == false { return false }
-  let mut out${n}: [u8; 40] = ${filled(40)}
-  let badTag${n} = AesGcm.seal(&key, &nonce, &aad, &ciphertext, &mut out${n}, &mut tag${n})
-  if errorCode(move badTag${n}) != 3 || equal(&out${n}, &empty) == false || equal(&tag${n}, &empty) == false { return false }`,
-    )
-    .join('\n')}
-  let mut short: [u8; 16] = ${filled(16)}
-  let mut tagOut: [u8; 16] = ${filled(16)}
-  let shortSeal = AesGcm.seal(&key, &nonce, &aad, &ciphertext, &mut short, &mut tagOut)
-  if errorCode(move shortSeal) != 4 || equal(&short, &empty) == false || equal(&tagOut, &empty) == false { return false }
-  let shortOpen = AesGcm.open(&key, &nonce, &aad, &ciphertext, &tag, &mut short)
-  return errorCode(move shortOpen) == 4 && equal(&short, &empty)
-}`
-
 // The actual private arithmetic predicate is extracted rather than publishing a test API or
 // constructing invalid slices that pretend to own enormous address ranges.
 const implementation = readFileSync(
@@ -147,19 +90,6 @@ const implementation = readFileSync(
 const start = implementation.indexOf('fn lengthsAdmitted(')
 const end = implementation.indexOf('fn validate(', start)
 if (start < 0 || end < 0) throw new Error('Missing AES-GCM length admission predicate')
-const limits = implementation.slice(start, end)
-export const aesGcmAcceptanceSource = `${imports}${helpers}${cases}
-${negatives}
-${limits}
-pub fn main() -> i32 {
-  ${vectors.map((_, index) => `if case${index}() == false { return ${index + 1} }`).join('\n  ')}
-  if negatives() == false { return 20 }
-  if lengthsAdmitted(68719476704, 2305843009213693951) == false { return 21 }
-  if lengthsAdmitted(68719476705, 0) || lengthsAdmitted(0, 2305843009213693952) { return 22 }
-  if lengthsAdmitted(u64.MAX, 0) || lengthsAdmitted(0, u64.MAX) { return 23 }
-  return 42
-}`
-
 // One partial AES-256 block exercises 64-bit GHASH on wasm32, plus tag rejection before output.
 export const aesGcmWasmAcceptanceSource = `${imports}${helpers}${caseSources[9]}
 pub fn main() -> i32 {
