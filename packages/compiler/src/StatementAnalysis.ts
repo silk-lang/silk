@@ -36,6 +36,7 @@ import type {
 import {
   assignmentRoot,
   assignmentRootAccess,
+  borrowedPlaceWritable,
   compatible,
   constructionExpressionAnchor,
   constructionExpressionType,
@@ -1376,12 +1377,7 @@ export const analyzeStatements = (
         root !== undefined &&
         rootAccess !== 'ImmutableOwned' &&
         rootAccess !== 'SharedBorrowed' &&
-        !(
-          rootAccess === 'ExclusiveBorrowed' &&
-          destination.fact._tag !== 'IndexProjection' &&
-          destination.fact._tag !== 'ReferentProjection' &&
-          destination.fact._tag !== 'FieldProjection'
-        )
+        !(rootAccess === 'ExclusiveBorrowed' && !borrowedPlaceWritable(root, destination.fact))
       if (destination.fact._tag === 'ForeignStatic') {
         context.diagnostics.push(
           Diagnostic.immutableAssignment(
@@ -1406,10 +1402,7 @@ export const analyzeStatements = (
         )
       } else if (
         rootAccess === 'SharedBorrowed' ||
-        (rootAccess === 'ExclusiveBorrowed' &&
-          destination.fact._tag !== 'IndexProjection' &&
-          destination.fact._tag !== 'ReferentProjection' &&
-          destination.fact._tag !== 'FieldProjection')
+        (rootAccess === 'ExclusiveBorrowed' && !borrowedPlaceWritable(root, destination.fact))
       ) {
         context.diagnostics.push(
           Diagnostic.invalidAssignmentPlace(Location.at(destinationNode.anchor)),

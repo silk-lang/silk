@@ -77,6 +77,7 @@ import {
   argumentFact,
   assignmentRoot,
   assignmentRootAccess,
+  borrowedPlaceWritable,
   availableBoolExpressionType,
   availableExpressionType,
   callCallee,
@@ -4992,9 +4993,7 @@ export function analyzePlaceReplace(
   } else if (
     assignmentRootAccess(root, destination.fact) === 'SharedBorrowed' ||
     (assignmentRootAccess(root, destination.fact) === 'ExclusiveBorrowed' &&
-      destination.fact._tag !== 'IndexProjection' &&
-      destination.fact._tag !== 'ReferentProjection' &&
-      destination.fact._tag !== 'FieldProjection')
+      !borrowedPlaceWritable(root, destination.fact))
   ) {
     diagnostics.push(Diagnostic.invalidAssignmentPlace(Location.at(destinationNode.anchor)))
   }

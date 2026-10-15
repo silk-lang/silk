@@ -1377,10 +1377,13 @@ export const assignmentRootAccess = (
   root: AssignmentRootFact,
   place: ExpressionDecision,
 ): AssignmentRootAccess => {
-  if (root._tag === 'PatternBinding')
+  if (root._tag === 'PatternBinding') {
+    // A `match &mut` binding lends the selected payload: it is written as borrowed storage.
+    if (root.access === 'Exclusive') return 'ExclusiveBorrowed'
     return root.access === 'Place' && root.placeMutability === 'Mutable'
       ? 'MutableOwned'
       : 'ImmutableOwned'
+  }
   let type: Type.Type | undefined
   if (root._tag === 'ParameterDeclaration') {
     if (root.declaredType._tag === 'Resolved') {
@@ -1410,12 +1413,28 @@ export const assignmentRootAccess = (
   return mutability === 'Mutable' ? 'MutableOwned' : 'ImmutableOwned'
 }
 
+/**
+ * Whether borrowed storage admits a write of `place`: a projection through the borrow, or a
+ * `match &mut` binding, which names the selected payload itself rather than a reference to it.
+ */
+export const borrowedPlaceWritable = (
+  root: AssignmentRootFact,
+  place: ExpressionDecision,
+): boolean =>
+  root._tag === 'PatternBinding' ||
+  place._tag === 'IndexProjection' ||
+  place._tag === 'ReferentProjection' ||
+  place._tag === 'FieldProjection'
+
 /** Resolves the mutable root a writable-place expression is anchored to, if any. */
 export const assignmentRoot = (fact: ExpressionDecision): AssignmentRootFact | undefined => {
   if (fact._tag === 'Identifier') {
     if (fact.reference._tag === 'ResolvedBinding') return fact.reference.binding
     if (fact.reference._tag === 'Resolved') return fact.reference.parameter
-    if (fact.reference._tag === 'ResolvedPattern' && fact.reference.binding.access === 'Place')
+    if (
+      fact.reference._tag === 'ResolvedPattern' &&
+      (fact.reference.binding.access === 'Place' || fact.reference.binding.access === 'Exclusive')
+    )
       return fact.reference.binding
     return undefined
   }
