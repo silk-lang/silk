@@ -159,6 +159,7 @@ import semantic.Intrinsic {
 import semantic.ScalarOperation {ScalarOperation}
 import semantic.Lifetime {CanonicalizationFailure, Intersection, Lifetime, Member as LifetimeMember}
 import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
+import semantic.Retention {Root as RetentionRoot}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.SealedOperators
 import semantic.ParameterSchema {ParameterSchema}
@@ -2029,6 +2030,8 @@ struct Resolver {
   nextAssembly: usize
   /// The composition's execution-storage component, which suspendable frames use (SUSP-005).
   executionStorage: Option<ExecutionStorage>
+  /// The composition's explicit retention roots (ARTIFACT-003), in manifest order.
+  retention: Vector<RetentionRoot>
   /// The discovery root of a test build and its package-relative module directory (TEST-003).
   discovery: Option<Discovery>
   profiles: Vector<FinalProfile>
@@ -59649,6 +59652,22 @@ effect fn normalizedNoCapture(hir: &Module, properties: Range, parameters: Range
   return move selected
 }
 
+// Whether declaration `ordinal` of `module` is a function with C linkage, imported or exported.
+effect fn linked(resolver: &mut Resolver, module: &ModuleId, ordinal: usize) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let observed = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &observed, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    let hir = IndexedSource.authored(value)
+    if ordinal < declarations.length {
+      if let Node.FunctionHeader {linkage, ..} = Module.node(hir, declarations[ordinal].header) {
+        return linkage.present
+      }
+    }
+  }
+  return false
+}
+
 struct ForeignHeader {
   behavior: ForeignContract
   noCapture: Vector<usize>
@@ -67960,6 +67979,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       parameterAssembly: Option<ParameterAssembly>.none(),
       nextAssembly: usize.ZERO,
       executionStorage: Option<ExecutionStorage>.none(),
+      retention: Vector<RetentionRoot>.make(),
       discovery: Option<Discovery>.none(),
       profiles: Vector<FinalProfile>.make(),
       profileSlot: profileSlot,
@@ -68047,6 +68067,11 @@ impl Semantic {
   /// Selects the execution-storage component a build binds when a reached instance suspends.
   pub fn selectExecutionStorage(self: &mut Self, storage: ExecutionStorage) -> () {
     self.resolver.executionStorage = Option<ExecutionStorage>.some(move storage)
+  }
+  /// Selects the composition's explicit retention roots, which an artifact build keeps beside its
+  /// exports (ARTIFACT-003).
+  pub fn selectRetention(self: &mut Self, roots: Vector<RetentionRoot>) -> () {
+    self.resolver.retention = move roots
   }
   /// Selects the discovery root of a test build: its tests and their package-relative paths
   /// below `directory`, such as `src`, answer `Intrinsic.tests()` (TEST-003). Without a selection
@@ -70817,6 +70842,13 @@ impl Semantic {
         rootModule = Option<ModuleId>.some(move applicationModule)
       }
     }
+    let refusedRetention = run Semantic.rootRetained(&mut self.*, &mut request.*, &mut roots, &mut gaps)
+    if let Option<Shared<Rejection>>.Some {value} = move refusedRetention {
+      return refusedBuild(move value)
+    }
+    if Vector<Shared<BackendGap>>.length(&gaps) > usize.ZERO {
+      return BackendBuild.Unsupported {gaps: move gaps}
+    }
     let module = match move rootModule {
       Option<ModuleId>.Some {value} => move value
       Option<ModuleId>.None => {
@@ -70884,7 +70916,91 @@ impl Semantic {
         continue
       }
       let symbol = run Shared<Bytes>.make(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
-      run Vector<BuildRoot>.append(&mut roots.*, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span})
+      run Vector<BuildRoot>.append(&mut roots.*, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span, retained: false})
+    }
+    return Option<Shared<Rejection>>.none()
+  }
+  // Roots every selected retention declaration as its monomorphic runtime instance (ARTIFACT-003).
+  // A selector that names no single function declaration, or a static, generic, foreign or
+  // provider-requiring one, refuses the build as an invalid configuration at the declaration, or
+  // at its module when no single one is named. Signature gaps are collected beside the roots.
+  effect fn rootRetained(self: &mut Self, request: &mut Request, roots: &mut Vector<BuildRoot>,
+    gaps: &mut Vector<Shared<BackendGap>>) -> Option<Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    // The selectors are copied out first: resolving each one mutates the resolver.
+    let mut selectors = Vector<RetentionRoot>.make()
+    let stored = Vector<RetentionRoot>.asSlice(&self.resolver.retention)
+    let mut copiedAt = usize.ZERO
+    while copiedAt < stored.length {
+      run Vector<RetentionRoot>.append(&mut selectors, run RetentionRoot.copy(&stored[copiedAt]))
+      copiedAt = copiedAt + usize.ONE
+    }
+    let listed = Vector<RetentionRoot>.asSlice(&selectors)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let selector = &listed[at]
+      at = at + usize.ONE
+      let module = &selector.module
+      let name = Bytes.asSlice(&selector.declaration)
+      let origin = Span.make(usize.ZERO, usize.ZERO)
+      let mut rootConditions = Vector<Dependency>.make()
+      let selection = run select(&mut self.resolver, &mut self.query, &mut rootConditions, module, name, false)
+      let selected = match move selection {
+        Result<Selection, Shared<Rejection>>.Success {value} => value
+        Result<Selection, Shared<Rejection>>.Failure {error} => { return Option<Shared<Rejection>>.some(move error) }
+      }
+      if selected.count != usize.ONE || selected.kind != CandidateKind.Declaration {
+        let mut span = origin
+        if selected.count == usize.ONE { span = selected.span }
+        return Option<Shared<Rejection>>.some(run reject(&self.resolver, module, RejectionCode.InvalidConfiguration, span))
+      }
+      let declared = run declarationAt(&mut self.resolver, module, selected.declaration)
+      let identity = match move declared {
+        Option<DeclarationId>.Some {value} => move value
+        Option<DeclarationId>.None => {
+          return Option<Shared<Rejection>>.some(run reject(&self.resolver, module, RejectionCode.InvalidConfiguration, selected.span))
+        }
+      }
+      if DeclarationId.kind(&identity) != OwnerKind.Function || run linked(&mut self.resolver, module, selected.declaration) {
+        return Option<Shared<Rejection>>.some(run reject(&self.resolver, module, RejectionCode.InvalidConfiguration, selected.span))
+      }
+      let function = run Shared<DeclarationId>.make(move identity)
+      let moduleOrdinal = run internModule(&mut self.resolver, module)
+      let signatureKey = Key {family: Family.Signature, module: moduleOrdinal, name: usize.ZERO, declaration: selected.declaration, member: usize.ZERO, external: false}
+      let interned = run internDeclaration(&mut self.resolver, signatureKey)
+      let signature = run demandRaw(&mut self.resolver, &mut self.query, interned, selected.span)
+      run recordRoot(&mut request.*, Family.Signature, module, name, &signature)
+      let reported = run reportedDiagnostics(&mut self.query, &signature)
+      let failures = Vector<Shared<Rejection>>.asSlice(&reported)
+      if failures.length > usize.ZERO {
+        let value = Shared<Rejection>.clone(&failures[usize.ZERO])
+        let code = Shared<Rejection>.with<RejectionCode>(&value, fn(rejection: &Rejection) -> RejectionCode {
+          return rejection.code
+        })
+        let mut coverageGap = BackendGap.forRejection(code)
+        if code == RejectionCode.Unsupported { coverageGap = Option<GapCode>.some(GapCode.SignatureForm) }
+        if let Option<GapCode>.Some {value: gapCode} = move coverageGap {
+          run Vector<Shared<BackendGap>>.append(&mut gaps.*, run Shared<BackendGap>.make(BackendGap.fromRejection(gapCode, &function, &value)))
+          continue
+        }
+        return Option<Shared<Rejection>>.some(move value)
+      }
+      let requirements = run signatureRequirements(&signature)
+      let provided = Shared<Row>.with<bool>(&requirements, fn(row: &Row) -> bool {
+        return Vector<Requirement>.length(&row.entries) > usize.ZERO || Vector<RowParameter>.length(&row.parameters) > usize.ZERO
+          || Vector<RowSubtraction>.length(&row.subtractions) > usize.ZERO
+      })
+      let monomorphic = Shared<Result<Answer, NoRejection>>.with<bool>(&signature, fn(answer: &Result<Answer, NoRejection>) -> bool {
+        return match move signatureFacts(answer) {
+          Option<SignatureFacts>.Some {value} => !value.isStatic && value.binders == usize.ZERO && value.staticSlots == usize.ZERO
+          Option<SignatureFacts>.None => false
+        }
+      })
+      if provided || !monomorphic {
+        return Option<Shared<Rejection>>.some(run reject(&self.resolver, module, RejectionCode.InvalidConfiguration, selected.span))
+      }
+      run Vector<BuildRoot>.append(&mut roots.*, BuildRoot {key: run InstanceKey.named(&function), span: selected.span, retained: true})
     }
     return Option<Shared<Rejection>>.none()
   }
@@ -71317,7 +71433,7 @@ impl Semantic {
         let mut extended = Vector<BuildRoot>.make()
         at = usize.ZERO
         while at < roots.length {
-          run Vector<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&roots[at].key), span: roots[at].span})
+          run Vector<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&roots[at].key), span: roots[at].span, retained: roots[at].retained})
           at = at + usize.ONE
         }
         let exports = run storageExports(&mut self.resolver, &mut self.query, &storage)
@@ -71328,7 +71444,7 @@ impl Semantic {
         at = usize.ZERO
         while at < selected.length {
           run FrameSelection.bind(&mut selection, run Bytes.copy(Bytes.asSlice(&selected[at].symbol)))
-          run Vector<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&selected[at].key), span: boundary})
+          run Vector<BuildRoot>.append(&mut extended, BuildRoot {key: InstanceKey.copy(&selected[at].key), span: boundary, retained: false})
           at = at + usize.ONE
         }
         let chosen = Option<FrameSelection>.some(move selection)
@@ -71339,6 +71455,7 @@ impl Semantic {
     return run assembleEmission(
       &self.resolver,
       Vector<CollectedText>.asSlice(&emitted),
+      roots,
       module,
       entrySpan,
     )
@@ -71700,10 +71817,11 @@ effect fn appendResolvedDefinitions(
 effect fn assembleEmission(
   resolver: &Resolver,
   reached: &[CollectedText],
+  roots: &[BuildRoot],
   module: &ModuleId,
   span: Span,
 ) -> BackendBuild ! OutOfMemoryError ? &mut Allocator {
-  let assembled = run Effect.result(assembleEmissionChecked(resolver, reached, module, span))
+  let assembled = run Effect.result(assembleEmissionChecked(resolver, reached, roots, module, span))
   return match move assembled {
     Result<BackendBuild, BackendGap | OutOfMemoryError>.Success {value} => move value
     Result<BackendBuild, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
@@ -71721,6 +71839,7 @@ effect fn assembleEmission(
 effect fn assembleEmissionChecked(
   resolver: &Resolver,
   reached: &[CollectedText],
+  roots: &[BuildRoot],
   module: &ModuleId,
   span: Span,
 ) -> BackendBuild ! BackendGap | OutOfMemoryError ? &mut Allocator {
@@ -71757,7 +71876,60 @@ effect fn assembleEmissionChecked(
     Vector<usize>.asSlice(&order),
     &mut text,
   )
+  run appendRetained(&plan, roots, &mut text)
   return BackendBuild.Module {text: move text, unchecked: move unchecked, plan: move plan}
+}
+
+// Marks every retained root's definition used (ARTIFACT-003), so neither the optimizer nor the
+// linker's dead-code elimination drops it: one `@llvm.used` array, in content-symbol order.
+effect fn appendRetained(plan: &EmissionPlan, roots: &[BuildRoot], text: &mut Bytes) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let identities = Vector<EmissionIdentity>.asSlice(&plan.identities)
+  let mut retained = Vector<usize>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if roots[at].retained {
+      let identity = match move run EmissionPlan.lookup(plan, &roots[at].key) {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { return CompilerBug.panic(b"a retained root has no emitted definition") }
+      }
+      run Vector<usize>.append(&mut retained, identity)
+    }
+    at = at + usize.ONE
+  }
+  let selected = Vector<usize>.asSlice(&retained)
+  if selected.length == usize.ZERO { return () }
+  // Few roots are retained: each pass emits the least symbol after the previous one.
+  let mut ordered = Vector<usize>.make()
+  let mut previous = usize.MAX
+  while true {
+    let mut least = usize.MAX
+    at = usize.ZERO
+    while at < selected.length {
+      let candidate = Bytes.asSlice(&identities[selected[at]].symbol)
+      let after = previous == usize.MAX || bytesBefore(Bytes.asSlice(&identities[previous].symbol), candidate)
+      if after && (least == usize.MAX || bytesBefore(candidate, Bytes.asSlice(&identities[least].symbol))) {
+        least = selected[at]
+      }
+      at = at + usize.ONE
+    }
+    if least == usize.MAX { break }
+    run Vector<usize>.append(&mut ordered, least)
+    previous = least
+  }
+  let listed = Vector<usize>.asSlice(&ordered)
+  run Bytes.append(&mut text.*, b"@llvm.used = appending global [")
+  run appendDecimal(&mut text.*, listed.length)
+  run Bytes.append(&mut text.*, b" x ptr] [")
+  at = usize.ZERO
+  while at < listed.length {
+    if at > usize.ZERO { run Bytes.append(&mut text.*, b", ") }
+    run Bytes.append(&mut text.*, b"ptr @")
+    run Bytes.append(&mut text.*, Bytes.asSlice(&identities[listed[at]].symbol))
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut text.*, b"], section \"llvm.metadata\"\n")
+  return ()
 }
 
 effect fn applicationVisited(visited: &[InstanceKey], lookup: &InternIndex, instance: &InstanceKey) -> bool
@@ -71812,10 +71984,13 @@ union BackendVisit {
   Leave,
 }
 
-// One artifact root: the generated C entry or one selected runtime C export, at its source span.
+// One artifact root: a selected runtime or application C export, a selected execution-storage
+// export or a retained declaration, at its source span.
 struct BuildRoot {
   key: InstanceKey
   span: Span
+  /// Whether a composition retention selector chose this root, which `@llvm.used` then marks.
+  retained: bool
 }
 
 struct CallbackBoundary {

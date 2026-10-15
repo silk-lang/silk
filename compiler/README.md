@@ -240,6 +240,13 @@ archives it with `llvm-ar rcsD` beside the declared object inputs, refusing any 
 The archiver is `SILK_LLVM_AR`, or else the `llvm-ar` beside the configured Clang. The shared library
 form stops with `SILK_GAP artifact-form` before any tool runs. Invalid or
 repeated output selectors fail before source loading.
+
+A `[build].composition` `retention` list (`[{ module = "support", declaration = "keep" }]`) roots
+each named function beside the exports and marks it in `@llvm.used`, without exporting it or
+changing its visibility (ARTIFACT-003). A selector must name exactly a package module and an
+identifier; one that names no single function, or a static, generic, foreign or
+provider-requiring one, refuses the build with `SEM0214` at the declaration. A non-empty
+`composition.requirements` is refused until native builds resolve native requirements.
 With a prebuilt native compiler and Clang, `node compiler/scripts/test-native-build.ts
 <native-compiler> <clang>` checks this CLI route, exact IR bytes, default linking and cleanup, objects
 and static libraries linked with a separately compiled C caller, both forms for every native target
