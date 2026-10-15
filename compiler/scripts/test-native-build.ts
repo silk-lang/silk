@@ -447,6 +447,61 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
+  // `[package].source-root` roots module resolution above the entry's own directory.
+  yield* fs.makeDirectory(join(directory, 'rooted/src/app'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'rooted/src/lib'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'rooted/src/lib/limit.silk'),
+    'pub fn limit() -> i32 {\n  return 9\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'rooted/src/app/main.silk'),
+    'import lib.limit { limit }\n\npub fn main() -> i32 {\n  return limit()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'rooted/silk.toml'),
+    '[package]\nname = "rooted"\nversion = "0.1.0"\nroot = "src/app/main.silk"\nsource-root = "src"\n',
+  )
+  const rooted = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'rooted'),
+    {
+      ...process.env,
+      SILK_CLANG: clang,
+    },
+  )
+  assert.equal(rooted.status, 9, rooted.stderr)
+  // A composition retention root keeps a private function from a module nothing imports.
+  yield* fs.makeDirectory(join(directory, 'retained/support'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'retained/main.silk'),
+    'pub fn answer() -> i32 {\n  return 3\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'retained/support/start.silk'),
+    'import Intrinsic.application\n\nexport "C" fn enter() -> i32 as "main" {\n  return application.answer()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'retained/support/keep.silk'),
+    'fn capability() -> i32 {\n  return 7177\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'retained/silk.toml'),
+    '[package]\nname = "retained"\nversion = "0.1.0"\nroot = "main.silk"\n\n[build]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"], retention = [{ module = "support/keep", declaration = "capability" }] }\n',
+  )
+  const retainedIr = yield* invoke(
+    silk,
+    ['build', 'main.silk', '-o', 'retained.ll', '--emit', 'llvm-ir', '--stdlib', standardLibrary],
+    join(directory, 'retained'),
+  )
+  assert.equal(retainedIr.status, 0, retainedIr.stderr)
+  const retainedText = yield* fs.readFileString(join(directory, 'retained/retained.ll'))
+  assert.match(retainedText, /i32 7177/)
+  assert.match(
+    retainedText,
+    /^@llvm\.used = appending global \[1 x ptr\] \[ptr @[^\]]+\], section "llvm\.metadata"$/m,
+  )
   // A full JSON profile replaces the target selection and adds its own bindings after them.
   const overridden = yield* invoke(
     silk,
@@ -717,7 +772,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
