@@ -281,6 +281,70 @@ const program = Effect.gen(function* () {
     reported.some((entry) => entry.code === 'SEM0037' && entry.line === 6 && entry.column === 16),
     json.stderr,
   )
+  // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
+  // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
+  // the status 1, and a selection outside the source root is refused before anything is built.
+  yield* fs.makeDirectory(join(directory, 'tested/src/util'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'tested/silk.toml'),
+    '[package]\nname = "tested"\nversion = "0.1.0"\nroot = "src/main.silk"\n[build]\nartifact = "static-library"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'tested/src/main.silk'),
+    'import util.check\n\npub fn answer() -> i32 {\n  return check.half(84)\n}\n\ntest fn rootPasses() -> () {\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'tested/src/util/check.silk'),
+    'import silk.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n',
+  )
+  const selectedTests = yield* invoke(
+    silkc,
+    [
+      'test',
+      '--no-cache',
+      '--stdlib',
+      standardLibrary,
+      '--file',
+      'src/util/check.silk',
+      '--filter',
+      'EVEN',
+    ],
+    join(directory, 'tested'),
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(selectedTests.status, 0, selectedTests.stderr)
+  assert.match(selectedTests.stdout, /util\/check::halvesEvenly\n/)
+  assert.match(
+    selectedTests.stdout,
+    /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 3 discovered\)/,
+  )
+  assert.equal(
+    yield* fs.exists(join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested')),
+    true,
+  )
+  const failedTests = yield* invoke(
+    silkc,
+    ['test', '--no-cache', '--stdlib', standardLibrary],
+    join(directory, 'tested'),
+    { ...process.env, SILKC_CLANG: clang },
+  )
+  assert.equal(failedTests.status, 1, failedTests.stderr)
+  assert.match(failedTests.stdout, /2 passed, 1 failed/)
+  for (const selection of [['--root', 'main.silk'], ['--file', 'src/util/check.txt'], []]) {
+    const refusedTests = yield* invoke(
+      silkc,
+      [
+        'test',
+        '--stdlib',
+        standardLibrary,
+        ...(selection.length === 0 ? [] : ['--no-cache', ...selection]),
+      ],
+      join(directory, 'tested'),
+      { ...process.env, SILKC_CLANG: sentinel },
+    )
+    assert.equal(refusedTests.status, 2, `test accepted ${selection.join(' ') || 'a cached run'}`)
+  }
+  assert.equal(yield* fs.exists(marker), false)
   const repeated = yield* invoke(silkc, ['init', 'greeting'], directory)
   assert.equal(repeated.status, 2, 'init must refuse an existing manifest')
   // A project `build` names its manifest instead of discovering one, and `--release` selects the
@@ -633,7 +697,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library, clang on PATH, version, help, check, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
