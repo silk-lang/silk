@@ -763,3 +763,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-15 · Minimal native/bootstrap verdict probes used private main functions, and an error[...] reader missed native SILK_BUILD_ERROR JSON diagnostics · Export fixture entry points, record structured native codes and spans, and preserve failed setup receipts separately before rerunning · Silk R3 verdict probes
 
 2026-10-15 · R3 integration passed native Cases and T1 DDC but CI found 13 direct type constructors in two older unit Cases · migrate those fixtures to Types.intern with scoped TypeTable providers, and run TypesCapabilityCodemod --check on integrated heads · silk R3
+
+2026-10-15 · A fresh R3 worktree linked root node_modules but the checkout-owned verification harness could not resolve esbuild from packages/cli · Link the installed package-local cli, compiler and llvm node_modules as well before bundling the harness; preserve the failed receipt and rerun only the missing validation · Silk R3
