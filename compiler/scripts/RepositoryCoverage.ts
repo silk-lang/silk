@@ -375,7 +375,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     Effect.gen(function* () {
       if (!compiler || !output || (mode !== undefined && mode !== '--baseline'))
         return yield* invalid(
-          'Usage: node RepositoryCoverage.ts <silkc> <output-directory> [--baseline]',
+          'Usage: node RepositoryCoverage.ts <silk> <output-directory> [--baseline]',
         )
       return yield* run({
         repository: resolve('.'),
