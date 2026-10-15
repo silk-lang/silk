@@ -119,6 +119,26 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   indexing it, which both compilers accept and compile identically. No other site is known.
 - The bootstrap is not extended for this. Retire this entry with the bootstrap.
 
+## Bootstrap cleans borrowed temporaries at the end of their scope
+
+BORROW-006 keeps a borrowed temporary's hidden owner live for every view derived from the borrow,
+then cleans it under the ordinary ownership rules; `read(&[1, 2])` cleans the array after the call.
+
+- **Bootstrap:** cleans a borrowed temporary when the scope that owns it ends: its block, branch,
+  statement arm, loop condition or iteration, a value arm whose result holds no view, or an exit
+  leaving that scope. It runs after that scope's other cleanup, so a binding or Effect that
+  retains the view is dropped first. Its recorded loan end is not used, because that end can fall
+  before a retaining value's last use: a view stored in a struct ends at the construction, and an
+  Effect that captures one ends at a `run` on another path. A view that outlives its temporary's
+  scope, such as an arm result or a branch assignment, is rejected with OWN0019; lowering never
+  ends such a loan at a join, so MIR verification would reject one that reached it.
+- **Native:** not changed here. Poison-on-drop probes of the reviewed shapes saw live storage in
+  every destructor.
+- **Source migration:** none. Only destructor timing changes: a temporary with a destructor now
+  runs it at its scope's end, after that scope's other owners.
+- Retire this entry with the bootstrap, or when its loan facts record the last use of every
+  retaining value.
+
 ## Loans of lifetime-annotated and universally bounded borrows
 
 VIEW-002 ends a loan at its last use or the last use of a value retaining it. Annotating a binding

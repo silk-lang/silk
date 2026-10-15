@@ -21,6 +21,7 @@ import {
   propagationLoanEnds,
   propagationReleases,
   specializedCleanup,
+  temporaryLoansBegunSince,
   transitionAt,
 } from './CleanupEmission.js'
 import * as CAbi from './CAbi.js'
@@ -72,6 +73,7 @@ import {
   character,
   patternKey,
   spanKey,
+  spanWithin,
   specializedWitnessEffectTargets,
   usize,
 } from './Lower.js'
@@ -330,6 +332,23 @@ export const lowerCallOperand = (
 }
 
 /** Captures a selected eager computation, preserving ordinary return and loop exits. */
+/** Whether a value of this local's type may hold a view of borrowed storage. */
+const mayRetainView = (fn: FunctionLowering, local: Mir.LocalId): boolean => {
+  const type = fn.localTypes.at(local.ordinal)
+  if (type === undefined) return true
+  const semantic = Mir.semanticType(type)
+  return (
+    Type.containsBorrow(semantic) ||
+    Type.freeLifetimes(semantic).length > 0 ||
+    Type.containsExecutableRepresentation(semantic)
+  )
+}
+
+/**
+ * Lowers one conditionally executed body. It owns the temporaries it borrows when its result
+ * cannot carry their views out, and ends them after its other operations; a result that may
+ * retain a view keeps them held, and no join ends them.
+ */
 export const lowerExecution = (
   fn: FunctionLowering,
   span: SourceSpan.SourceSpan,
@@ -337,7 +356,13 @@ export const lowerExecution = (
 ): Mir.Execution | undefined =>
   fn.captureExecution(() => {
     const entry = fn.reserve()
-    const [lowered, operations] = fn.capture(body)
+    const entered = new Set(fn.loanLocals.keys())
+    const [lowered, operations] = fn.capture(() => {
+      const value = body()
+      if (value !== undefined && value !== 'Transferred' && !mayRetainView(fn, value.result))
+        fn.inScopeCleanup(() => endLoans(fn, temporaryLoansBegunSince(fn, entered), span))
+      return value
+    })
     if (lowered === undefined) return undefined
     fn.publish({
       _tag: 'OperationRegion',
@@ -1753,6 +1778,7 @@ function lowerCallableApplyExpression(
     const borrow = fn.recipeBorrow(authored)
     const loan = fn.loanLocals.get(borrowKey(borrow))
     if (loan === undefined) return undefined
+    if (!fn.endsLoan(borrowKey(borrow))) continue
     fn.emit({
       _tag: 'EndLoan',
       borrow,
@@ -1771,6 +1797,7 @@ function lowerCallableApplyExpression(
     }
     const held = fn.loanLocals.get(borrowKey(borrow))
     if (held === undefined) return undefined
+    if (!fn.endsLoan(borrowKey(borrow))) continue
     fn.emit({
       _tag: 'EndLoan',
       borrow,
@@ -2655,8 +2682,9 @@ function lowerMatchExpression(
   const branchState = delayedEffectState(fn)
   // A loan an arm begins and its own statements hold ends with the arm, in loan order, as a
   // conditional branch's loans do: the next arm restores the branch state, which would drop it
-  // from tracking unended. A loan whose recorded end lies beyond the arm, such as one the arm's
-  // result carries, stays held.
+  // from tracking unended. Only a loan recorded to end within the arm ends here; the recorded end
+  // of a borrow the arm's result carries out is the borrow itself, which is harmless for a plain
+  // owner because its EndLoan emits nothing.
   const endArmLoans = (armSpan: SourceSpan.SourceSpan): void => {
     const order = loanOrder(fn.ownership?.loans ?? [])
     const begun: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
@@ -2665,7 +2693,7 @@ function lowerMatchExpression(
     endLoans(
       fn,
       begun
-        .filter(({ loan }) => loan.endSpan.end <= armSpan.end)
+        .filter(({ loan }) => spanWithin(armSpan, loan.endSpan))
         .sort((left, right) => left.ordinal - right.ordinal)
         .map(({ loan }) => loan.id),
       armSpan,
@@ -2907,7 +2935,8 @@ function lowerMatchExpression(
     if (state === undefined) continue
     const ending: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
     for (const key of branchState.loanLocals.keys())
-      if (!joined.has(key) && state.loanLocals.has(key)) ending.push(...(order.get(key) ?? []))
+      if (!joined.has(key) && state.loanLocals.has(key) && fn.endsLoan(key))
+        ending.push(...(order.get(key) ?? []))
     const endings = ending
       .sort((left, right) => left.ordinal - right.ordinal)
       .flatMap(({ loan }) => {
@@ -3365,6 +3394,7 @@ function lowerCallExpression(
     const borrow = fn.recipeBorrow(authored)
     const slice = fn.loanLocals.get(borrowKey(borrow))
     if (slice === undefined) return undefined
+    if (!fn.endsLoan(borrowKey(borrow))) continue
     fn.emit({
       _tag: 'EndLoan',
       borrow,
@@ -3417,7 +3447,7 @@ function lowerInterfaceOperationCallExpression(
     for (const authored of expression.loanEnds) {
       const borrow = fn.recipeBorrow(authored)
       const loan = fn.loanLocals.get(borrowKey(borrow))
-      if (loan === undefined) continue
+      if (loan === undefined || !fn.endsLoan(borrowKey(borrow))) continue
       fn.emit({
         _tag: 'EndLoan' as const,
         borrow,

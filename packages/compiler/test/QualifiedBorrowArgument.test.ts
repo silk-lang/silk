@@ -2,7 +2,9 @@ import * as AnalysisFixture from './support/AnalysisFixture.js'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as Analysis from '../src/Analysis.js'
+import * as Mir from '../src/Mir.js'
 import * as MirVerification from '../src/MirVerification.js'
+import { unreachable } from './support/raise.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
@@ -272,4 +274,287 @@ pub fn main() -> i32 {
       )
       assert.deepEqual(endings, ['Return', 'Return'])
     }),
+)
+
+it.effect('drops a borrowed temporary only after every value that may retain its view', () =>
+  Effect.gen(function* () {
+    const source = `import silk.ownership { Drop }
+struct Token { value: i32 }
+impl Drop for Token { fn drop(self: &mut Token) -> () { self.value = 0 return () } }
+fn make(value: i32) -> Token { return Token { value: value } }
+fn identity<'a>(view: &'a [Token]) -> &'a [Token] { return view }
+fn read(view: &[Token]) -> i32 { return view[0].value }
+struct Holder<'a> { view: &'a [Token] }
+impl<'a> Drop for Holder<'a> { fn drop(self: &mut Holder<'a>) -> () { let seen = read(self.view) return () } }
+union Packet { Empty, Ready { value: i32 } }
+effect fn useHolder<'a>(holder: Holder<'a>) -> i32 { return read(holder.view) }
+effect fn useView(view: &[Token]) -> i32 { return read(view) }
+effect fn pause() -> i32 { return 1 }
+fn identityMut(view: &mut [Token]) -> &mut [Token] { return move view }
+fn bump(view: &mut [Token]) -> () { view[0].value = view[0].value + 1  return () }
+struct Problem {}
+fn shortCircuit(flag: bool) -> bool { return flag || read(&[make(1)]) == 1 }
+fn first<'r, 'a>(holders: &'r [Holder<'a>]) -> &'r Holder<'a> { return &holders[0] }
+fn reborrowedHolder() -> i32 {
+  let values = [make(1)]
+  let kept = first(&[Holder { view: &values }])
+  return read(kept.view)
+}
+fn exclusiveAcrossReturn(flag: bool) -> i32 {
+  let view = identityMut(&mut [make(5)])
+  if flag { return 1 }
+  bump(move view)
+  return 0
+}
+fn heldAcrossBranches(flag: bool) -> i32 {
+  let view = identity(&[make(5)])
+  let mut total = 0
+  if flag { return 1 } else { total = 2 }
+  return read(view) + total
+}
+fn holderInArm(p: Packet) -> i32 {
+  match move p {
+    Packet.Ready { value } => {
+      let view = identity(&[make(value)])
+      let holder = Holder { view: view }
+      let seen = read(holder.view)
+    }
+    Packet.Empty => {}
+  }
+  return 0
+}
+fn returnInArm(p: Packet, flag: bool) -> i32 {
+  let mut total = 0
+  match move p {
+    Packet.Ready { value } => {
+      let view = identity(&[make(value)])
+      if flag { return 1 }
+      total = read(view)
+    }
+    Packet.Empty => {}
+  }
+  return total
+}
+effect fn acrossSuspension(flag: bool) -> i32 {
+  let view = identity(&[make(5)])
+  if flag { return 1 }
+  let paused = run pause()
+  return read(view) + paused
+}
+effect fn acrossFailure(flag: bool) -> i32 ! Problem {
+  let view = identity(&[make(5)])
+  if flag { fail Problem {} }
+  return read(view)
+}
+effect fn recover(error: Problem) -> i32 { return 0 }
+fn holderAcrossReturn(flag: bool) -> i32 {
+  let holder = Holder { view: &[make(1)] }
+  if flag { return 1 }
+  return read(holder.view)
+}
+effect fn heldThroughMatch(p: Packet) -> i32 {
+  let holder = Holder { view: identity(&[make(5)]) }
+  let paused = match move p { Packet.Ready { value } => run pause()  Packet.Empty => 0 }
+  return read(holder.view) + paused
+}
+fn readInOneArm(p: Packet) -> i32 {
+  let view = identity(&[make(5)])
+  let mut x = 0
+  match move p { Packet.Ready { value } => { x = read(view) }  Packet.Empty => { x = 2 } }
+  let other = [make(2)]
+  return read(&other) + x
+}
+effect fn runInOtherArm(p: Packet) -> i32 {
+  let view = identity(&[make(5)])
+  let held = useView(view)
+  let mut x = 0
+  match move p { Packet.Empty => { let holder = Holder { view: view } }  Packet.Ready { value } => { x = run held } }
+  return x
+}
+fn acrossReturn(flag: bool) -> i32 {
+  let view = identity(&[make(5)])
+  if flag { return 1 }
+  return read(view)
+}
+fn usedInBranch(flag: bool) -> i32 {
+  let view = identity(&[make(5)])
+  if flag { return read(view) }
+  let other = [make(2)]
+  return read(&other)
+}
+fn heldInArm(p: Packet) -> i32 {
+  let view = identity(&[make(5)])
+  match move p {
+    Packet.Ready { value } => { let holder = Holder { view: view } }
+    Packet.Empty => {}
+  }
+  return 0
+}
+effect fn runInBranch(flag: bool) -> i32 {
+  let held = useHolder(Holder { view: identity(&[make(5)]) })
+  let mut result = 0
+  if flag { result = run held }
+  return result
+}
+effect fn runInArm(p: Packet) -> i32 {
+  let held = useHolder(Holder { view: identity(&[make(5)]) })
+  let mut result = 0
+  match move p { Packet.Ready { value } => { result = run held }  Packet.Empty => {} }
+  return result
+}
+fn iterations(count: i32) -> i32 {
+  let mut total = 0
+  let mut at = 0
+  while at < count {
+    let view = identity(&[make(at)])
+    if at == 3 { break }
+    if at == 1 { at = at + 1  continue }
+    total = total + read(view)
+    at = at + 1
+  }
+  return total
+}
+fn condition(count: i32) -> i32 {
+  let mut at = 0
+  while read(&[make(at)]) < count { at = at + 1 }
+  return at
+}
+fn branchLocal(flag: bool) -> i32 {
+  let mut total = 0
+  if flag {
+    let view = identity(&[make(4)])
+    total = read(view)
+  } else {
+    total = read(&[make(2)])
+  }
+  return total
+}
+fn armLocal(p: Packet) -> i32 {
+  return match move p {
+    Packet.Ready { value } => read(&[make(value)])
+    Packet.Empty => 0
+  }
+}
+pub fn main() -> i32 {
+  let branch = run runInBranch(false)
+  let arm = run runInArm(Packet.Empty)
+  let suspended = run acrossSuspension(false)
+  let failed = run Intrinsic.catchFailure<Problem>(acrossFailure(false), recover)
+  let matched = run heldThroughMatch(Packet.Ready { value: 1 })
+  let other = run runInOtherArm(Packet.Empty)
+  let reviewed = exclusiveAcrossReturn(false) + heldAcrossBranches(false) +
+    holderInArm(Packet.Ready { value: 1 }) + returnInArm(Packet.Ready { value: 1 }, false) +
+    holderAcrossReturn(false) + readInOneArm(Packet.Ready { value: 1 }) + suspended + failed +
+    matched + other + reborrowedHolder()
+  if shortCircuit(false) { return 1 }
+  return acrossReturn(false) + usedInBranch(false) + heldInArm(Packet.Empty) + branch + arm +
+    iterations(5) + condition(3) + branchLocal(true) + armLocal(Packet.Empty) + reviewed
+}`
+    const self = yield* AnalysisFixture.retainingMain('qualified-borrow/temporaries', ascii(source))
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    const mir = Analysis.loweredMir(self)
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    const named = (name: string): Mir.MirFunction =>
+      mir.functions.find((fn) => fn.id._tag === 'CanonicalDeclarationId' && fn.id.name === name) ??
+      unreachable(`expected ${name}`)
+    // Each drop of a borrowed temporary, which carries the span of its `&` operand, is the last
+    // release of its sequence, after every binding or effect that may retain the view; one that
+    // reaches the end of the function drops at return.
+    const temporaryDrops = (fn: Mir.MirFunction) => {
+      const sequences = fn.regions.flatMap((region) =>
+        region._tag === 'OperationRegion' || region._tag === 'CleanupRegion'
+          ? [{ region, operations: Mir.operationsOf(region) }]
+          : [],
+      )
+      const nested = fn.regions
+        .flatMap(Mir.operationsOf)
+        .flatMap((operation) =>
+          operation._tag === 'Match'
+            ? operation.arms.flatMap((arm) =>
+                arm.selected.execution.regions.flatMap((region) =>
+                  region._tag === 'OperationRegion' || region._tag === 'CleanupRegion'
+                    ? [{ region, operations: Mir.operationsOf(region) }]
+                    : [],
+                ),
+              )
+            : [],
+        )
+      const all = [...sequences, ...nested]
+      const roots = new Set(
+        all.flatMap(({ operations }) =>
+          operations.flatMap((operation) =>
+            operation._tag === 'BeginLoan' ? [operation.root.ordinal] : [],
+          ),
+        ),
+      )
+      return all.flatMap(({ region, operations }) =>
+        operations.flatMap((operation, position) =>
+          operation._tag === 'Drop' &&
+          operation.cleanup._tag !== 'NoCleanup' &&
+          roots.has(operation.local.ordinal) &&
+          source[operation.provenance.span.start - 1] === '&'
+            ? [
+                {
+                  outcome: region.outcome._tag,
+                  last: operations
+                    .slice(position + 1)
+                    .every((later) => later._tag !== 'Drop' && later._tag !== 'EndLoan'),
+                },
+              ]
+            : [],
+        ),
+      )
+    }
+    for (const name of [
+      'acrossReturn',
+      'usedInBranch',
+      'heldInArm',
+      'runInBranch$effect$-1',
+      'runInArm$effect$-1',
+    ]) {
+      const drops = temporaryDrops(named(name))
+      assert.isAbove(drops.length, 0, name)
+      for (const drop of drops) assert.deepEqual(drop, { outcome: 'Return', last: true }, name)
+    }
+    for (const name of ['iterations', 'condition', 'branchLocal', 'armLocal']) {
+      const drops = temporaryDrops(named(name))
+      assert.isAbove(drops.length, 0, name)
+      for (const drop of drops) assert.isTrue(drop.last, name)
+    }
+    // Releasing a temporary before a read that still uses a view of it is a use after drop: the
+    // array under `acrossReturn`'s view, and the holders under `kept`, typed `&'r Holder<'a>` with
+    // the temporary's own carried lifetime, which still counts as its view through `'r`.
+    const releasedEarly = (name: string) =>
+      Effect.gen(function* () {
+        const fn = named(name)
+        const release =
+          fn.regions
+            .flatMap(Mir.operationsOf)
+            .find((operation) => operation._tag === 'Drop' && operation.hiddenOwner === true) ??
+          unreachable(`expected a hidden owner drop in ${name}`)
+        const premature: Mir.MirFunction = {
+          ...fn,
+          regions: fn.regions.map((region) =>
+            region._tag === 'OperationRegion' &&
+            region.operations.some(
+              (operation) =>
+                operation._tag === 'Call' &&
+                operation.target._tag === 'CanonicalDeclarationId' &&
+                operation.target.name === 'read',
+            )
+              ? { ...region, operations: [release, ...region.operations] }
+              : region,
+          ),
+        }
+        const violations = yield* MirVerification.verify({
+          ...mir,
+          functions: mir.functions.map((candidate) => (candidate === fn ? premature : candidate)),
+        })
+        return violations.flatMap((violation) =>
+          violation.rule === 'UseAfterDrop' ? [violation.detail.split(' ')[0]] : [],
+        )
+      })
+    assert.deepEqual(yield* releasedEarly('acrossReturn'), ['Move'])
+    assert.deepEqual(yield* releasedEarly('reborrowedHolder'), ['ReadPlace'])
+  }),
 )
