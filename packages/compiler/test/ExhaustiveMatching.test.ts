@@ -792,6 +792,10 @@ pub fn referenced(spelled: &Maybe) -> &[u8] {
   return b"i32"
 }`
   const escapedView = analyze('borrowed-owner-if-let-view', escapedViewSource)
+  // `selected` is inferred from a static literal, so the call result written into it must outlive
+  // that storage. The write reports what `let view = whole(&value) selected = view` reports.
+  const escapedInitializer = escapedViewSource.indexOf('b"i32"')
+  const escapedBorrow = escapedViewSource.indexOf('&value) }')
   const escapedUse = escapedViewSource.indexOf('selected.length')
   assert.deepEqual(
     [
@@ -801,7 +805,11 @@ pub fn referenced(spelled: &Maybe) -> &[u8] {
         ),
       ),
     ],
-    [JSON.stringify(['OWN0019', escapedUse, escapedUse + 'selected'.length])],
+    [
+      JSON.stringify(['OWN0019', escapedInitializer, escapedInitializer + 'b"i32"'.length]),
+      JSON.stringify(['SEM0212', escapedBorrow, escapedBorrow + '&value'.length]),
+      JSON.stringify(['OWN0019', escapedUse, escapedUse + 'selected'.length]),
+    ],
   )
 })
 
