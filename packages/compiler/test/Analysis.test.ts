@@ -555,6 +555,25 @@ it.effect('keeps invalid match corpus failures phase-owned and downstream facts 
   }),
 )
 
+it.effect('reports each independent statement failure of an invalid body in source order', () =>
+  Effect.gen(function* () {
+    for (const program of invalidCorpus.filter((program) =>
+      program.name.startsWith('statement-'),
+    )) {
+      const self = yield* AnalysisFixture.retainingMain(
+        `memory/${program.name}`,
+        ascii(program.source),
+        'wasm32-unknown-unknown',
+      )
+      assert.deepStrictEqual(
+        reportedDiagnostics(program.source, Analysis.diagnostics(self)),
+        program.diagnostics,
+        program.name,
+      )
+    }
+  }),
+)
+
 it.effect(
   'answers local, parameter, callable, field, and half-open semantic occurrence queries',
   () =>
