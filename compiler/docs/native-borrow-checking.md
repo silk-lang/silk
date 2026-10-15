@@ -523,7 +523,7 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
   the earlier loan (BORROW-004), and the violating use for OWN0019, as in the bootstrap. Typed-node
   origins carry these spans already. Answers store them relative to the declaration (Q2).
 - **Parity is measured differentially**, on code, primary span and module, over the bootstrap's
-  expected-diagnostic programs: the ownership and lifetime cases in `test/support/corpus.ts`, plus
+  expected-diagnostic programs: the ownership and lifetime cases of the acceptance corpus, plus
   a new invalid-ownership set covering every code in §1.1. The selfhost runner has no
   expected-diagnostic mode today (`CorpusProgram.expected` is only `Completes` or `Trap`). Adding
   one changes guarded inputs (`runSelfhostCorpus.ts`, `corpus.ts`), so it lands on `main` first.

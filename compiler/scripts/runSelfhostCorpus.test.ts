@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as assert from 'node:assert/strict'
 import { it } from 'node:test'
-import type { CorpusProgram } from '../../packages/compiler/test/support/corpus.js'
+import type * as Corpus from '../../corpus/corpus.mjs'
 import {
   parseBorrowGap,
   parseBuildDiagnostics,
@@ -13,11 +13,23 @@ import {
   summarize,
 } from './runSelfhostCorpus.js'
 
-const literal: CorpusProgram = {
+const literal: Corpus.Program = {
   name: 'literal',
   source: 'pub fn main() -> i32 { return 42 }',
-  expected: { _tag: 'Completes', result: 42 },
+  reference: undefined,
+  imports: {},
+  cSources: {},
+  stdout: undefined,
+  stderr: undefined,
+  outcome: { schemaVersion: 1, expected: { kind: 'completes', exitCode: 42 } },
 }
+
+const withOutcome = (
+  fields: Omit<Corpus.Outcome, 'schemaVersion' | 'expected'>,
+): Corpus.Program => ({
+  ...literal,
+  outcome: { ...literal.outcome, ...fields },
+})
 
 const withStub = async (body: string, run: (path: string) => Promise<void>): Promise<void> => {
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-stub-'))
@@ -31,7 +43,7 @@ const withStub = async (body: string, run: (path: string) => Promise<void>): Pro
   }
 }
 
-const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/i32.silk" ] || [ ! -f silk.toml ]; then exit 4; fi
+const compiled = `if [ "$5" != --stdlib ] || [ ! -f "$6/silk/i32.silk" ] || ! grep -qxF 'version = "0.1.0"' silk.toml; then exit 4; fi
 case "$6" in */) exit 5;; esac
 if [ "$1" != build ] || [ "$2" != memory/driver.silk ] || [ ! -f memory/driver.silk ] || [ "$3" != -o ] || [ "$4" != program ]; then exit 3; fi
 while [ "$1" != "-o" ]; do shift; done
@@ -42,13 +54,12 @@ chmod +x "$output"`
 void it('runs a pinned native corpus program through the build command', async () => {
   await withStub(compiled, async (silkc) => {
     assert.deepStrictEqual(await runCase(silkc, literal), { name: 'literal', status: 'pass' })
-    const profiled = {
-      ...literal,
-      nativeProfiles: [
+    const profiled = withOutcome({
+      profiles: [
         { name: 'debug', optimization: 'none', debug: true },
         { name: 'optimized', optimization: 'speed', debug: false },
       ],
-    } as const
+    })
     await withStub(
       `if [ "$7" != --optimization ] || [ "$9" != --debug ]; then exit 6; fi
 printf '%s:%s\\n' "$8" "\${10}" >> "$0.profiles"
@@ -68,10 +79,9 @@ ${compiled}`,
 })
 
 void it('declares compiled corpus C units and libraries as manifest link inputs', async () => {
-  const linked = {
-    ...literal,
-    nativeCSources: { fixture: 'int silk_fixture(void) { return 42; }\n' },
-    nativeDynamicLibraries: ['custom'],
+  const linked: Corpus.Program = {
+    ...withOutcome({ dynamicLibraries: ['custom'] }),
+    cSources: { fixture: 'int silk_fixture(void) { return 42; }\n' },
   }
   await withStub(
     `[ -s fixture.o ] || exit 7
@@ -87,15 +97,16 @@ ${compiled}`,
 })
 
 void it('supplies corpus runtime components as the host default composition', async () => {
-  const composed: CorpusProgram = {
-    ...literal,
-    nativeImports: { 'test/refusing': 'pub fn refuse() -> i32 { return 0 }' },
-    nativeComponents: [
-      {
-        capability: 'execution-storage',
-        bindings: [{ operation: 'acquire', module: 'test/refusing', declaration: 'refuse' }],
-      },
-    ],
+  const composed: Corpus.Program = {
+    ...withOutcome({
+      components: [
+        {
+          capability: 'execution-storage',
+          bindings: [{ operation: 'acquire', module: 'test/refusing', declaration: 'refuse' }],
+        },
+      ],
+    }),
+    imports: { 'test/refusing': 'pub fn refuse() -> i32 { return 0 }' },
   }
   await withStub(
     `[ -f test/refusing.silk ] || exit 7
@@ -268,17 +279,14 @@ exit 42
 SCRIPT
 chmod +x "$output"`
   await withStub(argumentAndStderrStub, async (silkc) => {
-    const program: CorpusProgram = {
-      ...literal,
-      nativeRuns: [{ closeStderr: true, arguments: ['one', 'two'] }],
-    }
+    const program = withOutcome({ runs: [{ closeStderr: true, arguments: ['one', 'two'] }] })
     assert.strictEqual((await runCase(silkc, program)).status, 'pass')
     assert.strictEqual(
-      (await runCase(silkc, { ...program, nativeRuns: [{ arguments: ['one', 'two'] }] })).status,
+      (await runCase(silkc, withOutcome({ runs: [{ arguments: ['one', 'two'] }] }))).status,
       'fail',
     )
     assert.strictEqual(
-      (await runCase(silkc, { ...program, nativeRuns: [{ closeStderr: true }] })).status,
+      (await runCase(silkc, withOutcome({ runs: [{ closeStderr: true }] }))).status,
       'fail',
     )
   })
