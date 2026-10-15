@@ -419,7 +419,8 @@ export const children = (self: Expression): ReadonlyArray<Expression> => {
   }
 }
 
-const statementExpressions = (statement: Statement): ReadonlyArray<Expression> => {
+/** The expressions one statement evaluates directly, excluding nested statement lists. */
+export const statementExpressions = (statement: Statement): ReadonlyArray<Expression> => {
   switch (statement._tag) {
     case 'BindStatement':
       return [statement.binding.initializer]
