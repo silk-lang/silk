@@ -2095,6 +2095,9 @@ struct BodyFrame {
   occurrences: Vector<StaticIteration>
   staticApplication: Option<Application>
   staticPrefixes: Vector<Vector<StaticPrefixWork>>
+  /// Diagnostics a recovering construct reported before checking went on. Every one belongs to a
+  /// body that fails: the construct that recorded it still fails its own check.
+  recovered: Vector<Shared<Rejection>>
 }
 
 // What one deriving `effect {}` body returns, fails with and runs.
@@ -21754,17 +21757,68 @@ effect fn enterBodyFrame(resolver: &mut Resolver, signature: &Shared<Result<Answ
   let requirements = run signatureRequirements(signature)
   let isEffect = Shared<Result<Answer, NoRejection>>.with<bool>(signature, signatureIsEffect)
   return run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: isEffect, failure: move failure,
-    requirements: move requirements, derived: Option<DerivedChannels>.none(), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make()})
+    requirements: move requirements, derived: Option<DerivedChannels>.none(), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make()})
 }
 
-// Closes the innermost body frame, returning the region relations its typing retained.
-fn leaveBodyFrame(resolver: &mut Resolver) -> Vector<BodySafetyObligation> {
+// Closes the innermost body frame of a block nested in a body, returning the region relations its
+// typing retained. The diagnostics it recovered belong to the enclosing body.
+effect fn leaveBodyFrame(resolver: &mut Resolver) -> Vector<BodySafetyObligation> ! OutOfMemoryError ? &mut Allocator {
   let popped = Vector<BodyFrame>.pop(&mut resolver.*.bodies)
   if let Option<BodyFrame>.Some {value} = move popped {
-    let BodyFrame {obligations, ..} = move value
+    let BodyFrame {obligations, recovered, ..} = move value
+    run forwardRecovered(&mut resolver.*, move recovered)
     return move obligations
   }
   return Vector<BodySafetyObligation>.make()
+}
+
+// The facts a body's own frame retained when its checking ends.
+struct ClosedBody {
+  obligations: Vector<BodySafetyObligation>
+  recovered: Vector<Shared<Rejection>>
+}
+
+// Closes the frame of a body that is its own declaration or static root.
+fn leaveRootBodyFrame(resolver: &mut Resolver) -> ClosedBody {
+  let popped = Vector<BodyFrame>.pop(&mut resolver.*.bodies)
+  if let Option<BodyFrame>.Some {value} = move popped {
+    let BodyFrame {obligations, recovered, ..} = move value
+    return ClosedBody {obligations: move obligations, recovered: move recovered}
+  }
+  return ClosedBody {obligations: Vector<BodySafetyObligation>.make(), recovered: Vector<Shared<Rejection>>.make()}
+}
+
+// Records a diagnostic a construct reported before it went on checking. The construct still fails,
+// so the diagnostic reaches the body's rejection. Outside every body frame there is no body to
+// report it, and the construct's own failure is the body's only diagnostic.
+effect fn recordRecovered(resolver: &mut Resolver, diagnostic: Shared<Rejection>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let popped = Vector<BodyFrame>.pop(&mut resolver.*.bodies)
+  if let Option<BodyFrame>.Some {value} = move popped {
+    let mut frame = move value
+    run Vector<Shared<Rejection>>.append(&mut frame.recovered, move diagnostic)
+    run Vector<BodyFrame>.append(&mut resolver.*.bodies, move frame)
+  }
+  return ()
+}
+
+// Hands the diagnostics a nested block recovered to the body that encloses it.
+effect fn forwardRecovered(resolver: &mut Resolver, recovered: Vector<Shared<Rejection>>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<Shared<Rejection>>.asSlice(&recovered)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run recordRecovered(&mut resolver.*, Shared<Rejection>.clone(&listed[at]))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The rejection of a body whose check failed: what it recovered, in order, then the failure that
+// ended it.
+effect fn failedBodyDiagnostics(recovered: Vector<Shared<Rejection>>, failure: Shared<Rejection>) -> Vector<Shared<Rejection>>
+! OutOfMemoryError ? &mut Allocator {
+  let mut diagnostics = move recovered
+  run Vector<Shared<Rejection>>.append(&mut diagnostics, move failure)
+  return move diagnostics
 }
 
 fn signatureParameterCount(answer: &Result<Answer, NoRejection>) -> usize {
@@ -33845,6 +33899,286 @@ effect fn rejectPatternMember(resolver: &Resolver, module: &ModuleId, member: &P
   return run reject(resolver, module, code, span)
 }
 
+// What one arm's pattern selects: its checked pattern, the member it covers (`usize.MAX` for a
+// universal arm), and the integer value an integer pattern selects.
+struct ArmPattern {
+  pattern: BodyPattern
+  ordinal: usize
+  integerCase: Option<Bytes>
+}
+
+effect fn armPatternRejection(resolver: &Resolver, module: &ModuleId, code: RejectionCode, span: Span)
+-> Result<ArmPattern, Shared<Rejection>> ! OutOfMemoryError ? &mut Allocator {
+  return Result<ArmPattern, Shared<Rejection>>.failResult(run reject(resolver, module, code, span))
+}
+
+// Checks one arm's pattern against the subject and the arms before it, appending the nodes that
+// declare its bindings and the tests that select it. The arm's guard and result are checked only
+// when its pattern is.
+effect fn checkArmPattern(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId, constraints: &[Constraint],
+  annotations: &[ResolvedAnnotation], elided: &DeclarationId, nodes: &mut Vector<BodyNode>,
+  subjectNode: BodyNodeId, subjectType: &Shared<Type>, access: MatchAccess, members: &[Shared<Type>],
+  rows: &Vector<CoverageRow>, integerCases: &[Bytes], integerSubject: bool, isNominal: bool, isUnion: bool,
+  open: bool, universal: bool, fallback: bool, writtenPattern: Node, pattern: HirId, patternSpan: Span,
+  armTests: &mut Vector<BodyPatternTest>,
+) -> Result<ArmPattern, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !fallback && (universal || (!open && Vector<CoverageRow>.length(rows) == usize.ZERO)) {
+    return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan)
+  }
+  let mut checkedPattern = BodyPattern.Universal
+  let mut ordinal = usize.MAX
+  let mut integerCase = Option<Bytes>.none()
+  match writtenPattern {
+    // An integer literal selects one value of an integer scrutinee at the scrutinee's type.
+    Node.IntegerPattern {value} => {
+      // A bool scrutinee has no integer values, so the arm can never select one (SEM0043).
+      if !integerSubject { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+      if let Node.IntegerLiteral {sign, magnitude, ..} = run bodyNode(&resolver.source, cursor, value) {
+        let digits = run bodyText(&resolver.source, cursor, magnitude)
+        let fits = Shared<Type>.with<bool>(subjectType, fn(resolved: &Type) -> bool {
+          return match &resolved.* {
+            Type.Primitive {name} => fitsInteger(&resolver.target, Bytes.asSlice(&name), sign, Bytes.asSlice(&digits))
+            _ => false
+          }
+        })
+        if !fits {
+          let code = Shared<Type>.with<RejectionCode>(subjectType, fn(resolved: &Type) -> RejectionCode {
+            return integerTypeRangeCode(resolved, sign)
+          })
+          return run armPatternRejection(&resolver.*, module, code, patternSpan)
+        }
+        let negative = sign == Sign.Negative && !zeroDigits(Bytes.asSlice(&digits))
+        let mut key = Bytes.make()
+        if negative { run Bytes.append(&mut key, b"-") }
+        run Bytes.append(&mut key, Bytes.asSlice(&digits))
+        let seen = integerCases
+        let mut scan = usize.ZERO
+        while scan < seen.length {
+          if same(Bytes.asSlice(&seen[scan]), Bytes.asSlice(&key)) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+          scan = scan + usize.ONE
+        }
+        let magnitude = match move decimalU64(Bytes.asSlice(&digits)) {
+          Option<u64>.Some {value: parsed} => parsed
+          Option<u64>.None => { return run armPatternRejection(&resolver.*, module, RejectionCode.IntegerOutOfRange, patternSpan) }
+        }
+        integerCase = Option<Bytes>.some(move key)
+        checkedPattern = BodyPattern.Integer {magnitude: magnitude, negative: negative}
+      } else {
+        return run armPatternRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan)
+      }
+    }
+    Node.UniversalPattern {name} => {
+      if name.present { return run armPatternRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
+    }
+    // `T name` selects one exact record member and binds the complete selected value; `T _`
+    // selects it without a usable name. Neither is a wildcard (PATT-015).
+    Node.BindingPattern {annotation, name, shadowsLocal} => {
+      if shadowsLocal {
+        return run armPatternRejection(&resolver.*, module, RejectionCode.PatternBindingConflict,
+          run bodySpan(&resolver.source, cursor, name))
+      }
+      if !annotation.present || isNominal || open { return run armPatternRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
+      let written = run patternMemberType(&mut resolver.*, module, annotations, annotation.id, patternSpan)
+      let writtenType = match move written {
+        Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result<ArmPattern, Shared<Rejection>>.failResult(move error) }
+      }
+      let chosen = run patternMember(&writtenType, members, elided)
+      let mut tag = usize.ZERO
+      let mut patternType = Shared<Type>.clone(&writtenType)
+      match &chosen {
+        PatternMember.Selected {tag: found, ty: selectedType} => {
+          tag = found
+          patternType = Shared<Type>.clone(&selectedType)
+        }
+        _ => { return Result<ArmPattern, Shared<Rejection>>.failResult(run rejectPatternMember(&resolver.*, module, &chosen, patternSpan)) }
+      }
+      if !memberUncovered(rows, tag) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+      ordinal = tag
+      let mut member = Option<BodyUnionMember>.none()
+      let mut path = Vector<BodyPlaceStep>.make()
+      if isUnion {
+        member = Option<BodyUnionMember>.some(BodyUnionMember {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
+        run Vector<BodyPlaceStep>.append(&mut path, BodyPlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
+      }
+      run Vector<BodyNode>.append(&mut nodes.*, BodyNode {
+        origin: run originAt(cursor, pattern, patternSpan),
+        kind: BodyNodeKind.Expression {ty: Shared<Type>.clone(&patternType),
+          form: BodyExpression.PatternBinding {subject: subjectNode, path: move path, access: bindingAccess(access)}},
+      })
+      checkedPattern = BodyPattern.Record {member: move member}
+    }
+    Node.VariantPattern {selector, fields} => {
+      if !isNominal { return run armPatternRejection(&resolver.*, module, RejectionCode.MatchMemberNotInScrutinee, patternSpan) }
+      let checkedSelection = run appliedPatternVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
+        caller, constraints, elided, subjectType, selector, pattern, patternSpan)
+      let variant = match move checkedSelection {
+        Result<SelectedVariant, Shared<Rejection>>.Success {value} => move value
+        Result<SelectedVariant, Shared<Rejection>>.Failure {error} => {
+          return Result<ArmPattern, Shared<Rejection>>.failResult(move error)
+        }
+      }
+      if variant.shape.braces && !fields.present {
+        return run armPatternRejection(&resolver.*, module, RejectionCode.MissingPatternField, patternSpan)
+      }
+      if fields.present && !variant.shape.braces {
+        return run armPatternRejection(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, patternSpan)
+      }
+      if !memberUncovered(rows, variant.tag) {
+        return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan)
+      }
+      ordinal = variant.tag
+      let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
+      let root = Vector<BodyPlaceStep>.make()
+      let mut writtenFields = Range.empty()
+      if fields.present { writtenFields = fields.range }
+      let failed = run checkRecordPatternFields(
+        &mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
+        annotations, elided, &mut nodes.*, subjectNode, &origin, writtenFields,
+        &root, bindingAccess(access), &mut armTests.*, patternSpan,
+      )
+      if let Option<Shared<Rejection>>.Some {value} = move failed {
+        return Result<ArmPattern, Shared<Rejection>>.failResult(move value)
+      }
+      checkedPattern = BodyPattern.Variant {tag: ordinal}
+    }
+    Node.NominalPattern {annotation, fields} => {
+      if isNominal {
+        let selected = run patternVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
+          subjectType, annotation, patternSpan)
+        let variant = match move selected {
+          Result<SelectedVariant, Shared<Rejection>>.Success {value} => move value
+          Result<SelectedVariant, Shared<Rejection>>.Failure {error} => { return Result<ArmPattern, Shared<Rejection>>.failResult(move error) }
+        }
+        if !variant.shape.braces { return run armPatternRejection(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, patternSpan) }
+        if !memberUncovered(rows, variant.tag) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+        ordinal = variant.tag
+        let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
+        let root = Vector<BodyPlaceStep>.make()
+        let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
+          annotations, elided, &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests.*, patternSpan)
+        if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<ArmPattern, Shared<Rejection>>.failResult(move value) }
+        checkedPattern = BodyPattern.Variant {tag: ordinal}
+      } else {
+        // `Member.Variant { .. }` names a variant of a nominal union member of a structural union.
+        let mut nested = Option<NestedVariant>.none()
+        if isUnion {
+          let writtenPair = run namedPathPair(&resolver.source, cursor, annotation)
+          if let Option<QualifiedBodyName>.Some {value: pair} = &writtenPair {
+            nested = run nestedVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
+              members, &pair, patternSpan)
+          }
+        }
+        if let Option<NestedVariant>.Some {value: selected} = move nested {
+          if !selected.variant.shape.braces { return run armPatternRejection(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, patternSpan) }
+          if !memberUncovered(rows, selected.tag) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+          ordinal = selected.tag
+          let member = BodyUnionMember {tag: selected.tag, ty: Shared<Type>.clone(&selected.ty), source: Shared<Type>.clone(subjectType)}
+          let failed = run checkNestedVariantPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
+            constraints, annotations, elided, &mut nodes.*, subjectNode, subjectType, move selected, fields,
+            bindingAccess(access), &mut armTests.*, patternSpan)
+          if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<ArmPattern, Shared<Rejection>>.failResult(move value) }
+          checkedPattern = BodyPattern.Record {member: Option<BodyUnionMember>.some(move member)}
+        } else {
+          let written = run patternMemberType(&mut resolver.*, module, annotations, annotation, patternSpan)
+          let writtenType = match move written {
+            Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
+            Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+              return Result<ArmPattern, Shared<Rejection>>.failResult(move error)
+            }
+          }
+          let chosen = run patternMember(&writtenType, members, elided)
+          let mut tag = usize.ZERO
+          let mut patternType = Shared<Type>.clone(&writtenType)
+          match &chosen {
+            PatternMember.Selected {tag: found, ty: selectedType} => {
+              tag = found
+              patternType = Shared<Type>.clone(&selectedType)
+            }
+            _ => { return Result<ArmPattern, Shared<Rejection>>.failResult(run rejectPatternMember(&resolver.*, module, &chosen, patternSpan)) }
+          }
+          // `{ }` destructures a record; a scalar member has no fields to name.
+          if !run declaredRecord(&mut resolver.*, &patternType) {
+            return run armPatternRejection(&resolver.*, module, RejectionCode.NotType, patternSpan)
+          }
+          if !memberUncovered(rows, tag) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+          ordinal = tag
+          let mut member = Option<BodyUnionMember>.none()
+          let mut root = Vector<BodyPlaceStep>.make()
+          if isUnion {
+            member = Option<BodyUnionMember>.some(BodyUnionMember {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
+            run Vector<BodyPlaceStep>.append(&mut root, BodyPlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
+          }
+          let origin = FieldSource.Record {ty: Shared<Type>.clone(&patternType)}
+          let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
+            annotations, elided, &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests.*, patternSpan)
+          if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<ArmPattern, Shared<Rejection>>.failResult(move value) }
+          checkedPattern = BodyPattern.Record {member: move member}
+        }
+      }
+    }
+    Node.EnumPattern {path} => {
+      let writtenPair = run bodyPathPair(&resolver.source, cursor, path)
+      if !isNominal {
+        // `Member.Variant` names a unit variant of a nominal union member of a structural union.
+        let mut nested = Option<NestedVariant>.none()
+        if isUnion {
+          if let Option<QualifiedBodyName>.Some {value: pair} = &writtenPair {
+            nested = run nestedVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
+              members, &pair, patternSpan)
+          }
+        }
+        let selected = match move nested {
+          Option<NestedVariant>.Some {value} => move value
+          Option<NestedVariant>.None => { return run armPatternRejection(&resolver.*, module, RejectionCode.MatchMemberNotInScrutinee, patternSpan) }
+        }
+        if selected.variant.shape.braces { return run armPatternRejection(&resolver.*, module, RejectionCode.MissingPatternField, patternSpan) }
+        if !memberUncovered(rows, selected.tag) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+        ordinal = selected.tag
+        let member = BodyUnionMember {tag: selected.tag, ty: Shared<Type>.clone(&selected.ty), source: Shared<Type>.clone(subjectType)}
+        let failed = run checkNestedVariantPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
+          constraints, annotations, elided, &mut nodes.*, subjectNode, subjectType, move selected, Range.empty(),
+          bindingAccess(access), &mut armTests.*, patternSpan)
+        if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<ArmPattern, Shared<Rejection>>.failResult(move value) }
+        checkedPattern = BodyPattern.Record {member: Option<BodyUnionMember>.some(move member)}
+      } else {
+        let pair = match move writtenPair {
+          Option<QualifiedBodyName>.Some {value} => move value
+          Option<QualifiedBodyName>.None => { return run armPatternRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
+        }
+        let context = Option<Shared<Type>>.some(Shared<Type>.clone(subjectType))
+        let selected = run selectVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
+          Bytes.asSlice(&pair.namespace), Bytes.asSlice(&pair.member), &context, patternSpan)
+        let checkedSelection = run checkedVariant(&resolver.*, module, move selected, subjectType, patternSpan)
+        let variant = match move checkedSelection {
+          Result<SelectedVariant, Shared<Rejection>>.Success {value} => move value
+          Result<SelectedVariant, Shared<Rejection>>.Failure {error} => { return Result<ArmPattern, Shared<Rejection>>.failResult(move error) }
+        }
+        if variant.shape.braces { return run armPatternRejection(&resolver.*, module, RejectionCode.MissingPatternField, patternSpan) }
+        if !memberUncovered(rows, variant.tag) { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+        ordinal = variant.tag
+        checkedPattern = BodyPattern.Variant {tag: ordinal}
+      }
+    }
+    _ => { return run armPatternRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
+  }
+  // A nested arm whose every value an earlier unguarded arm already selected is unreachable (SEM0043).
+  if ordinal != usize.MAX && Vector<BodyPatternTest>.length(&armTests.*) != usize.ZERO {
+    let uncovered = Vector<CoverageRow>.asSlice(rows)
+    let mut reachable = false
+    let mut scan = usize.ZERO
+    while scan < uncovered.length && !reachable {
+      reachable = uncovered[scan].member == ordinal && run rowIntersects(&uncovered[scan], &armTests.*)
+      scan = scan + usize.ONE
+    }
+    if !reachable { return run armPatternRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
+  }
+  return Result<ArmPattern, Shared<Rejection>>.succeed(ArmPattern {pattern: move checkedPattern, ordinal: ordinal, integerCase: move integerCase})
+}
+
 // A selected variant must belong to the matched subject's own union.
 effect fn checkedVariant(
   resolver: &Resolver, module: &ModuleId, selected: Option<Result<SelectedVariant, Shared<Rejection>>>,
@@ -34871,6 +35205,7 @@ effect fn checkRecordMatch<'scope>(
     return fixedIntegerType(value) || pointerSizedIntegerType(value)
   })
   let mut checkedArms = Vector<BodyMatchArm>.make()
+  let mut failedArms = Vector<Shared<Rejection>>.make()
   let armCount = matchArmCount(arms)
   let mut at = usize.ZERO
   while at < armCount {
@@ -34908,261 +35243,25 @@ effect fn checkRecordMatch<'scope>(
     let patternSpan = run bodySpan(&resolver.source, cursor, pattern)
     let mut writtenPattern = Node.UniversalPattern {name: HirRef.absent()}
     if !fallback { writtenPattern = run bodyNode(&resolver.source, cursor, pattern) }
-    if !fallback && (universal || (!open && Vector<CoverageRow>.length(&rows) == usize.ZERO)) {
-      return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan)
-    }
-    let mut checkedPattern = BodyPattern.Universal
-    let mut ordinal = usize.MAX
-    let mut integerCase = Option<Bytes>.none()
     let mut armTests = Vector<BodyPatternTest>.make()
     // Pattern checking appends exactly the nodes that declare this arm's bindings.
     let bindingsFrom = Vector<BodyNode>.length(&nodes.*)
-    match writtenPattern {
-      // An integer literal selects one value of an integer scrutinee at the scrutinee's type.
-      Node.IntegerPattern {value} => {
-        // A bool scrutinee has no integer values, so the arm can never select one (SEM0043).
-        if !integerSubject { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-        if let Node.IntegerLiteral {sign, magnitude, ..} = run bodyNode(&resolver.source, cursor, value) {
-          let digits = run bodyText(&resolver.source, cursor, magnitude)
-          let fits = Shared<Type>.with<bool>(subjectType, fn(resolved: &Type) -> bool {
-            return match &resolved.* {
-              Type.Primitive {name} => fitsInteger(&resolver.target, Bytes.asSlice(&name), sign, Bytes.asSlice(&digits))
-              _ => false
-            }
-          })
-          if !fits {
-            let code = Shared<Type>.with<RejectionCode>(subjectType, fn(resolved: &Type) -> RejectionCode {
-              return integerTypeRangeCode(resolved, sign)
-            })
-            return run bodyRejection(&resolver.*, module, code, patternSpan)
-          }
-          let negative = sign == Sign.Negative && !zeroDigits(Bytes.asSlice(&digits))
-          let mut key = Bytes.make()
-          if negative { run Bytes.append(&mut key, b"-") }
-          run Bytes.append(&mut key, Bytes.asSlice(&digits))
-          let seen = Vector<Bytes>.asSlice(&integerCases)
-          let mut scan = usize.ZERO
-          while scan < seen.length {
-            if same(Bytes.asSlice(&seen[scan]), Bytes.asSlice(&key)) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-            scan = scan + usize.ONE
-          }
-          let magnitude = match move decimalU64(Bytes.asSlice(&digits)) {
-            Option<u64>.Some {value: parsed} => parsed
-            Option<u64>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.IntegerOutOfRange, patternSpan) }
-          }
-          integerCase = Option<Bytes>.some(move key)
-          checkedPattern = BodyPattern.Integer {magnitude: magnitude, negative: negative}
-        } else {
-          return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan)
-        }
+    let checkedArm = run checkArmPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
+      constraints, statementScope.annotations, &elided, &mut nodes.*, subjectNode, subjectType, access,
+      Vector<Shared<Type>>.asSlice(&members), &rows, Vector<Bytes>.asSlice(&integerCases), integerSubject, isNominal,
+      isUnion, open, universal, fallback, writtenPattern, pattern, patternSpan, &mut armTests)
+    // An arm whose pattern fails covers nothing and joins no result; the arms after it are still
+    // checked, and the match fails once they are (MATCH-001).
+    let selection = match move checkedArm {
+      Result<ArmPattern, Shared<Rejection>>.Success {value} => move value
+      Result<ArmPattern, Shared<Rejection>>.Failure {error} => {
+        run Vector<Shared<Rejection>>.append(&mut failedArms, move error)
+        at = at + usize.ONE
+        continue
       }
-      Node.UniversalPattern {name} => {
-        if name.present { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
-      }
-      // `T name` selects one exact record member and binds the complete selected value; `T _`
-      // selects it without a usable name. Neither is a wildcard (PATT-015).
-      Node.BindingPattern {annotation, name, shadowsLocal} => {
-        if shadowsLocal {
-          return run bodyRejection(&resolver.*, module, RejectionCode.PatternBindingConflict,
-            run bodySpan(&resolver.source, cursor, name))
-        }
-        if !annotation.present || isNominal || open { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
-        let written = run patternMemberType(&mut resolver.*, module, statementScope.annotations, annotation.id, patternSpan)
-        let writtenType = match move written {
-          Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
-          Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
-        }
-        let chosen = run patternMember(&writtenType, Vector<Shared<Type>>.asSlice(&members), &elided)
-        let mut tag = usize.ZERO
-        let mut patternType = Shared<Type>.clone(&writtenType)
-        match &chosen {
-          PatternMember.Selected {tag: found, ty: selectedType} => {
-            tag = found
-            patternType = Shared<Type>.clone(&selectedType)
-          }
-          _ => { return Result<BodyNodeId, Shared<Rejection>>.failResult(run rejectPatternMember(&resolver.*, module, &chosen, patternSpan)) }
-        }
-        if !memberUncovered(&rows, tag) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-        ordinal = tag
-        let mut member = Option<BodyUnionMember>.none()
-        let mut path = Vector<BodyPlaceStep>.make()
-        if isUnion {
-          member = Option<BodyUnionMember>.some(BodyUnionMember {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
-          run Vector<BodyPlaceStep>.append(&mut path, BodyPlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
-        }
-        run Vector<BodyNode>.append(&mut nodes.*, BodyNode {
-          origin: run originAt(cursor, pattern, patternSpan),
-          kind: BodyNodeKind.Expression {ty: Shared<Type>.clone(&patternType),
-            form: BodyExpression.PatternBinding {subject: subjectNode, path: move path, access: bindingAccess(access)}},
-        })
-        checkedPattern = BodyPattern.Record {member: move member}
-      }
-      Node.VariantPattern {selector, fields} => {
-        if !isNominal { return run bodyRejection(&resolver.*, module, RejectionCode.MatchMemberNotInScrutinee, patternSpan) }
-        let checkedSelection = run appliedPatternVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-          caller, constraints, &elided, subjectType, selector, pattern, patternSpan)
-        let variant = match move checkedSelection {
-          Result<SelectedVariant, Shared<Rejection>>.Success {value} => move value
-          Result<SelectedVariant, Shared<Rejection>>.Failure {error} => {
-            return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
-          }
-        }
-        if variant.shape.braces && !fields.present {
-          return run bodyRejection(&resolver.*, module, RejectionCode.MissingPatternField, patternSpan)
-        }
-        if fields.present && !variant.shape.braces {
-          return run bodyRejection(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, patternSpan)
-        }
-        if !memberUncovered(&rows, variant.tag) {
-          return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan)
-        }
-        ordinal = variant.tag
-        let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
-        let root = Vector<BodyPlaceStep>.make()
-        let mut writtenFields = Range.empty()
-        if fields.present { writtenFields = fields.range }
-        let failed = run checkRecordPatternFields(
-          &mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
-          statementScope.annotations, &elided, &mut nodes.*, subjectNode, &origin, writtenFields,
-          &root, bindingAccess(access), &mut armTests, patternSpan,
-        )
-        if let Option<Shared<Rejection>>.Some {value} = move failed {
-          return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
-        }
-        checkedPattern = BodyPattern.Variant {tag: ordinal}
-      }
-      Node.NominalPattern {annotation, fields} => {
-        if isNominal {
-          let selected = run patternVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-            subjectType, annotation, patternSpan)
-          let variant = match move selected {
-            Result<SelectedVariant, Shared<Rejection>>.Success {value} => move value
-            Result<SelectedVariant, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
-          }
-          if !variant.shape.braces { return run bodyRejection(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, patternSpan) }
-          if !memberUncovered(&rows, variant.tag) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-          ordinal = variant.tag
-          let origin = FieldSource.Variant {tag: variant.tag, shape: move variant.shape}
-          let root = Vector<BodyPlaceStep>.make()
-          let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
-            statementScope.annotations, &elided, &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests, patternSpan)
-          if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<BodyNodeId, Shared<Rejection>>.failResult(move value) }
-          checkedPattern = BodyPattern.Variant {tag: ordinal}
-        } else {
-          // `Member.Variant { .. }` names a variant of a nominal union member of a structural union.
-          let mut nested = Option<NestedVariant>.none()
-          if isUnion {
-            let writtenPair = run namedPathPair(&resolver.source, cursor, annotation)
-            if let Option<QualifiedBodyName>.Some {value: pair} = &writtenPair {
-              nested = run nestedVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
-                Vector<Shared<Type>>.asSlice(&members), &pair, patternSpan)
-            }
-          }
-          if let Option<NestedVariant>.Some {value: selected} = move nested {
-            if !selected.variant.shape.braces { return run bodyRejection(&resolver.*, module, RejectionCode.UnitVariantPayloadPattern, patternSpan) }
-            if !memberUncovered(&rows, selected.tag) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-            ordinal = selected.tag
-            let member = BodyUnionMember {tag: selected.tag, ty: Shared<Type>.clone(&selected.ty), source: Shared<Type>.clone(subjectType)}
-            let failed = run checkNestedVariantPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
-              constraints, statementScope.annotations, &elided, &mut nodes.*, subjectNode, subjectType, move selected, fields,
-              bindingAccess(access), &mut armTests, patternSpan)
-            if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<BodyNodeId, Shared<Rejection>>.failResult(move value) }
-            checkedPattern = BodyPattern.Record {member: Option<BodyUnionMember>.some(move member)}
-          } else {
-            let written = run patternMemberType(&mut resolver.*, module, statementScope.annotations, annotation, patternSpan)
-            let writtenType = match move written {
-              Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
-              Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
-                return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
-              }
-            }
-            let chosen = run patternMember(&writtenType, Vector<Shared<Type>>.asSlice(&members), &elided)
-            let mut tag = usize.ZERO
-            let mut patternType = Shared<Type>.clone(&writtenType)
-            match &chosen {
-              PatternMember.Selected {tag: found, ty: selectedType} => {
-                tag = found
-                patternType = Shared<Type>.clone(&selectedType)
-              }
-              _ => { return Result<BodyNodeId, Shared<Rejection>>.failResult(run rejectPatternMember(&resolver.*, module, &chosen, patternSpan)) }
-            }
-            // `{ }` destructures a record; a scalar member has no fields to name.
-            if !run declaredRecord(&mut resolver.*, &patternType) {
-              return run bodyRejection(&resolver.*, module, RejectionCode.NotType, patternSpan)
-            }
-            if !memberUncovered(&rows, tag) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-            ordinal = tag
-            let mut member = Option<BodyUnionMember>.none()
-            let mut root = Vector<BodyPlaceStep>.make()
-            if isUnion {
-              member = Option<BodyUnionMember>.some(BodyUnionMember {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
-              run Vector<BodyPlaceStep>.append(&mut root, BodyPlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&patternType), source: Shared<Type>.clone(subjectType)})
-            }
-            let origin = FieldSource.Record {ty: Shared<Type>.clone(&patternType)}
-            let failed = run checkRecordPatternFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints,
-              statementScope.annotations, &elided, &mut nodes.*, subjectNode, &origin, fields, &root, bindingAccess(access), &mut armTests, patternSpan)
-            if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<BodyNodeId, Shared<Rejection>>.failResult(move value) }
-            checkedPattern = BodyPattern.Record {member: move member}
-          }
-        }
-      }
-      Node.EnumPattern {path} => {
-        let writtenPair = run bodyPathPair(&resolver.source, cursor, path)
-        if !isNominal {
-          // `Member.Variant` names a unit variant of a nominal union member of a structural union.
-          let mut nested = Option<NestedVariant>.none()
-          if isUnion {
-            if let Option<QualifiedBodyName>.Some {value: pair} = &writtenPair {
-              nested = run nestedVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
-                Vector<Shared<Type>>.asSlice(&members), &pair, patternSpan)
-            }
-          }
-          let selected = match move nested {
-            Option<NestedVariant>.Some {value} => move value
-            Option<NestedVariant>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.MatchMemberNotInScrutinee, patternSpan) }
-          }
-          if selected.variant.shape.braces { return run bodyRejection(&resolver.*, module, RejectionCode.MissingPatternField, patternSpan) }
-          if !memberUncovered(&rows, selected.tag) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-          ordinal = selected.tag
-          let member = BodyUnionMember {tag: selected.tag, ty: Shared<Type>.clone(&selected.ty), source: Shared<Type>.clone(subjectType)}
-          let failed = run checkNestedVariantPattern(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
-            constraints, statementScope.annotations, &elided, &mut nodes.*, subjectNode, subjectType, move selected, Range.empty(),
-            bindingAccess(access), &mut armTests, patternSpan)
-          if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<BodyNodeId, Shared<Rejection>>.failResult(move value) }
-          checkedPattern = BodyPattern.Record {member: Option<BodyUnionMember>.some(move member)}
-        } else {
-          let pair = match move writtenPair {
-            Option<QualifiedBodyName>.Some {value} => move value
-            Option<QualifiedBodyName>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
-          }
-          let context = Option<Shared<Type>>.some(Shared<Type>.clone(subjectType))
-          let selected = run selectVariant(&mut resolver.*, &mut owner.*, &mut dependencies.*, module,
-            Bytes.asSlice(&pair.namespace), Bytes.asSlice(&pair.member), &context, patternSpan)
-          let checkedSelection = run checkedVariant(&resolver.*, module, move selected, subjectType, patternSpan)
-          let variant = match move checkedSelection {
-            Result<SelectedVariant, Shared<Rejection>>.Success {value} => move value
-            Result<SelectedVariant, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
-          }
-          if variant.shape.braces { return run bodyRejection(&resolver.*, module, RejectionCode.MissingPatternField, patternSpan) }
-          if !memberUncovered(&rows, variant.tag) { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-          ordinal = variant.tag
-          checkedPattern = BodyPattern.Variant {tag: ordinal}
-        }
-      }
-      _ => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, patternSpan) }
     }
+    let ArmPattern {pattern: checkedPattern, ordinal, integerCase} = move selection
     let armBindings = run declaredBindings(Vector<BodyNode>.asSlice(&nodes.*), bindingsFrom, subjectNode)
-    // A nested arm whose every value an earlier unguarded arm already selected is unreachable (SEM0043).
-    if ordinal != usize.MAX && Vector<BodyPatternTest>.length(&armTests) != usize.ZERO {
-      let uncovered = Vector<CoverageRow>.asSlice(&rows)
-      let mut reachable = false
-      let mut scan = usize.ZERO
-      while scan < uncovered.length && !reachable {
-        reachable = uncovered[scan].member == ordinal && run rowIntersects(&uncovered[scan], &armTests)
-        scan = scan + usize.ONE
-      }
-      if !reachable { return run bodyRejection(&resolver.*, module, RejectionCode.UnreachableMatchArm, patternSpan) }
-    }
     let mut checkedGuard = Option<BodyNodeId>.none()
     if guard.present {
       let tested = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*,
@@ -35237,6 +35336,18 @@ effect fn checkRecordMatch<'scope>(
       bindings: move armBindings,
     })
     at = at + usize.ONE
+  }
+  // A match with a failed arm fails with each arm's diagnostic in order. Its coverage is unknown,
+  // so it reports no missing member.
+  let failedCount = Vector<Shared<Rejection>>.length(&failedArms)
+  if failedCount != usize.ZERO {
+    let failed = Vector<Shared<Rejection>>.asSlice(&failedArms)
+    let mut reported = usize.ZERO
+    while reported + usize.ONE < failedCount {
+      run recordRecovered(&mut resolver.*, Shared<Rejection>.clone(&failed[reported]))
+      reported = reported + usize.ONE
+    }
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(Shared<Rejection>.clone(&failed[reported]))
   }
   // An unconditional `let` must prove its pattern matches every value (PATT-006, SEM0133).
   if let MatchArms.Binding {pattern} = arms {
@@ -36360,7 +36471,7 @@ effect fn checkAnonymous<'scope>(
   let checked = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
     &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
     &mut checkedNodes, &mut signatures, &mut required, block, &resultType, bodyConstraints, true, false, usize.ZERO, false)
-  let relations = leaveBodyFrame(&mut resolver.*)
+  let relations = run leaveBodyFrame(&mut resolver.*)
   let control = match move checked {
     Result<CheckedControl, Shared<Rejection>>.Success {value} => move value
     Result<CheckedControl, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
@@ -36419,11 +36530,11 @@ effect fn checkEffectBlock<'scope>(
   if let Option<EffectChannels>.Some {value: declared} = move expectedChannels {
     run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: true, failure: Shared<Type>.clone(&declared.failure),
       requirements: Shared<Row>.clone(&declared.requirements), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make()})
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make()})
     let declaredCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
       &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
       &mut checkedNodes, &mut signatures, &mut required, block, &declared.success, constraints, true, false, usize.ZERO, false)
-    let declaredRelations = leaveBodyFrame(&mut resolver.*)
+    let declaredRelations = run leaveBodyFrame(&mut resolver.*)
     let checked = match move declaredCheck {
       Result<CheckedControl, Shared<Rejection>>.Success {value} => move value
       Result<CheckedControl, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
@@ -36443,21 +36554,22 @@ effect fn checkEffectBlock<'scope>(
     failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
     requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.some(DerivedChannels {
       returns: Vector<Shared<Type>>.make(), failed: Vector<Shared<Type>>.make(), failures: Vector<Shared<Type>>.make(),
-      requirements: Row.empty()}), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make()})
+      requirements: Row.empty()}), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make()})
   let derivedCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
     &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
     &mut checkedNodes, &mut signatures, &mut required, block, &unit, constraints, true, false, usize.ZERO, false)
   let frame = Vector<BodyFrame>.pop(&mut resolver.*.bodies)
-  let mut control = match move derivedCheck {
-    Result<CheckedControl, Shared<Rejection>>.Success {value} => move value
-    Result<CheckedControl, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
-  }
   let popped = match move frame {
     Option<BodyFrame>.Some {value} => move value
     Option<BodyFrame>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
   }
   // A body checked again against its joined channels retains only that check's relations.
-  let BodyFrame {derived: derivedFacts, obligations: derivedRelations, ..} = move popped
+  let BodyFrame {derived: derivedFacts, obligations: derivedRelations, recovered: derivedRecovered, ..} = move popped
+  run forwardRecovered(&mut resolver.*, move derivedRecovered)
+  let mut control = match move derivedCheck {
+    Result<CheckedControl, Shared<Rejection>>.Success {value} => move value
+    Result<CheckedControl, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+  }
   let mut relations = move derivedRelations
   let derived = match move derivedFacts {
     Option<DerivedChannels>.Some {value} => move value
@@ -36490,11 +36602,11 @@ effect fn checkEffectBlock<'scope>(
     required = Vector<DeclarationId>.make()
     run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: true, failure: Shared<Type>.clone(&failure),
       requirements: Shared<Row>.clone(&requirements), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make()})
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make()})
     let declaredCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
       &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
       &mut checkedNodes, &mut signatures, &mut required, block, &success, constraints, true, false, usize.ZERO, false)
-    relations = leaveBodyFrame(&mut resolver.*)
+    relations = run leaveBodyFrame(&mut resolver.*)
     control = match move declaredCheck {
       Result<CheckedControl, Shared<Rejection>>.Success {value} => move value
       Result<CheckedControl, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
@@ -37467,12 +37579,12 @@ effect fn currentBodyChannels(resolver: &Resolver) -> BodyFrame ! OutOfMemoryErr
   if bodies.length == usize.ZERO {
     return BodyFrame {isEffect: false, failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
       requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make()}
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make()}
   }
   let current = &bodies[bodies.length - usize.ONE]
   return BodyFrame {isEffect: current.isEffect, failure: Shared<Type>.clone(&current.failure),
     requirements: Shared<Row>.clone(&current.requirements), derived: Option<DerivedChannels>.none(),
-    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make()}
+    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make()}
 }
 
 // Whether the innermost body derives its channels from its `return`, `fail` and `run` sites.
@@ -44808,6 +44920,11 @@ effect fn rejectedBody(diagnostic: Shared<Rejection>, dependencies: Vector<Depen
     outcome: run rejectedOutcome(move diagnostic),
     dependencies: move dependencies,
   }
+}
+
+// A rejected body that reports several diagnostics of its own, in the order checking found them.
+fn rejectedBodyDiagnostics(diagnostics: Vector<Shared<Rejection>>, dependencies: Vector<Dependency>) -> Answer {
+  return Answer {outcome: Outcome.Rejected {diagnostics: move diagnostics}, dependencies: move dependencies}
 }
 
 fn sameBinderName(hir: &Module, left: HirId, right: HirId) -> bool {
@@ -52177,7 +52294,7 @@ effect fn checkedStaticRoot(
   run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: false,
     failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
     requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.none(),
-    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make()})
+    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make()})
   let checked = run checkExpression(
     &mut resolver.*,
     &mut owner.*,
@@ -52198,14 +52315,16 @@ effect fn checkedStaticRoot(
     true,
     false,
   )
-  let relations = leaveBodyFrame(&mut resolver.*)
+  let closed = leaveRootBodyFrame(&mut resolver.*)
+  let ClosedBody {obligations: relations, recovered} = move closed
   drop statementScope
   let rootNode = match move checked {
     Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
     Result<BodyNodeId, Shared<Rejection>>.Failure {error} => {
-      return run rejectedBody(move error, Vector<Dependency>.make())
+      return rejectedBodyDiagnostics(run failedBodyDiagnostics(move recovered, move error), Vector<Dependency>.make())
     }
   }
+  if Vector<Shared<Rejection>>.length(&recovered) != usize.ZERO { return CompilerBug.panic(b"a checked static root recovered a diagnostic") }
   let violation = run staticPhaseViolation(&mut resolver.*, Vector<BodyNode>.asSlice(&nodes), &run cursorAnchor(&cursor))
   if let Option<Span>.Some {value: violatingSpan} = move violation {
     return run rejectedBody(
@@ -60895,13 +61014,15 @@ effect fn checkPreparedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
     false,
   )
   run takeOccurrenceFacts(&mut resolver.*, &mut staticIterations)
-  let relations = leaveBodyFrame(&mut resolver.*)
+  let closed = leaveRootBodyFrame(&mut resolver.*)
+  let ClosedBody {obligations: relations, recovered} = move closed
   let control = match move checked {
     Result<CheckedControl, Shared<Rejection>>.Success {value} => move value
     Result<CheckedControl, Shared<Rejection>>.Failure {error} => {
-      return run rejectedBody(move error, move dependencies)
+      return rejectedBodyDiagnostics(run failedBodyDiagnostics(move recovered, move error), move dependencies)
     }
   }
+  if Vector<Shared<Rejection>>.length(&recovered) != usize.ZERO { return CompilerBug.panic(b"a checked body recovered a diagnostic") }
   // A static body runs at compile time over static values; like the borrow check, the move
   // requirement covers runtime bodies.
   if !staticBody {
