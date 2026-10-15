@@ -1853,8 +1853,10 @@ const universalOrigins = (self: LifetimeFlow): ReadonlySet<string> => {
     const listed = longerThan.get(shorter)
     if (listed === undefined) longerThan.set(shorter, [longer])
     else listed.push(longer)
+    // Outliving an intersection requires outliving only its shortest member, so the bound is
+    // universal only when every member is.
     if (
-      Lifetime.atoms(bound.shorter).some(
+      Lifetime.atoms(bound.shorter).every(
         (atom) => atom._tag === 'BoundLifetime' || atom._tag === 'StaticLifetime',
       )
     )
