@@ -217,23 +217,28 @@ it.effect('fails pinned unsupported and mismatched outcomes', () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
-it.effect('requires SILK_COMPILER and rejects selection configuration before corpus execution', () =>
-  Effect.gen(function* () {
-    for (const config of [
-      {},
-      { SILK_COMPILER: '' },
-      { SILK_COMPILER: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: 'literal' },
-      { SILK_COMPILER: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: ' ' },
-    ]) {
-      for (const mode of ['corpus', 'corpus-full'] as const) {
-        const result = yield* Verification.runConfigured(mode).pipe(
-          Effect.provideService(ConfigProvider.ConfigProvider, ConfigProvider.fromUnknown(config)),
-          Effect.result,
-        )
-        assert.strictEqual(result._tag, 'Failure')
+it.effect(
+  'requires SILK_COMPILER and rejects selection configuration before corpus execution',
+  () =>
+    Effect.gen(function* () {
+      for (const config of [
+        {},
+        { SILK_COMPILER: '' },
+        { SILK_COMPILER: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: 'literal' },
+        { SILK_COMPILER: 'never-invoke', SILK_SELFHOST_CORPUS_CASES: ' ' },
+      ]) {
+        for (const mode of ['corpus', 'corpus-full'] as const) {
+          const result = yield* Verification.runConfigured(mode).pipe(
+            Effect.provideService(
+              ConfigProvider.ConfigProvider,
+              ConfigProvider.fromUnknown(config),
+            ),
+            Effect.result,
+          )
+          assert.strictEqual(result._tag, 'Failure')
+        }
       }
-    }
-  }).pipe(Effect.provide(NodeServices.layer)),
+    }).pipe(Effect.provide(NodeServices.layer)),
 )
 
 // Programs are added by hand, so each outcome file must already be in its one canonical form.
