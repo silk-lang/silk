@@ -10,7 +10,7 @@ import * as Scalar from '../src/Scalar.js'
 import * as SourceFile from '../src/SourceFile.js'
 import * as SourceResolver from '../src/SourceResolver.js'
 import * as StaticValue from '../src/StaticValue.js'
-import { templateFormattingAcceptance } from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 
 const encoder = new TextEncoder()
 const ascii = (value: string): Uint8Array => encoder.encode(value)
@@ -178,7 +178,7 @@ it.effect('residualizes borrowed aggregate formatting without allocator machiner
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
       'number-text/templates-structure',
-      ascii(templateFormattingAcceptance),
+      ascii(corpusProgram('template-formatting').source),
       'wasm32-unknown-unknown',
     )
     assert.deepEqual(Analysis.diagnostics(snapshot), [])

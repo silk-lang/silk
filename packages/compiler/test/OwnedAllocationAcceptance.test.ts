@@ -10,7 +10,7 @@ import * as CleanupPlan from '../src/CleanupPlan.js'
 import * as MirVerification from '../src/MirVerification.js'
 import * as Mir from '../src/Mir.js'
 import { ordinaryStorageSource } from './support/ordinaryStorageSource.js'
-import { independentExecutionFinalizedDestroy } from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 
 it.effect(
   'refuses invalid allocation requests before malloc and retains the nullable cleanup path',
@@ -58,7 +58,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const module = 'allocation/finalized-export'
-      const source = independentExecutionFinalizedDestroy.replace(
+      const source = corpusProgram('independent-execution-finalized-destroy').source.replace(
         'pub fn main()',
         'export "C" fn lifecycle()',
       )
