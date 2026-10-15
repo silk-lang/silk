@@ -2265,3 +2265,20 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** the `covered` fixture of the scalar-enum actor in
   `compiler/src/semantic/SemanticLoweringCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### The `Compiled` line counts each backend's own symbols
+
+- **Status:** recorded on 2026-10-15 with the native `Compiled` line (C3, CLI parity).
+- **Rule:** after a successful compilation both CLIs print
+  `Compiled <source> -> <artifact> (llvm, <target>, N symbols)` on standard output, with paths
+  relative to the project directory, or to the source's directory for a single-file build.
+- **Compilers:** the line, its paths and its target are the same. N is the number of symbols the
+  compiler's own backend emits: the bootstrap counts its LLVM artifact's symbol table and native
+  counts its emission plan (`EmissionPlan.symbolCount`), so the same program reports different
+  counts (an `init` project: 257 in the bootstrap, 210 native).
+- **Source migration:** none.
+- **Diagnostics and limits:** N is informational; no check compares it across compilers, and no
+  test asserts a specific count.
+- **Evidence:** `compiler/scripts/test-native-build.ts` checks the line for a project release
+  build with any positive N; `CommandPathCases` checks the relative paths.
+- **Open questions:** none.
