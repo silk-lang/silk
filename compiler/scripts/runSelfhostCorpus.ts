@@ -4,7 +4,7 @@ import { availableParallelism, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { fileURLToPath } from 'node:url'
-import type * as Corpus from '../../corpus/corpus.mjs'
+import * as Corpus from '../../corpus/corpus.mjs'
 
 export interface Gap {
   readonly code: string
@@ -263,7 +263,7 @@ export const parseBuildDiagnostics = (
 
 const safeName = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/
 
-/** The C driver the self-hosted compiler links with when `SILKC_CLANG` names none. */
+/** The C driver the self-hosted compiler links with when `SILK_CLANG` names none. */
 export const defaultCCompiler = '/usr/bin/clang'
 
 /**
@@ -380,6 +380,75 @@ const writeProgram = async (
   }
 }
 
+/** A program module's diagnostics in the form `outcome.json` records them; byte offsets become characters. */
+const reportedDiagnostics = (
+  source: string,
+  diagnostics: ReadonlyArray<BuildDiagnostic>,
+): ReadonlyArray<Corpus.ExpectedDiagnostic> => {
+  const bytes = Buffer.from(source)
+  const characters = (offset: number): number => bytes.subarray(0, offset).toString().length
+  return diagnostics.map(({ code, module, span }) => ({
+    code,
+    span:
+      module === programModule
+        ? Corpus.formatSpan(source, characters(span.start), characters(span.end))
+        : `${module}:${span.start}-${span.end}`,
+  }))
+}
+
+/**
+ * Checks a program the compiler must reject. Reporting exactly the expected diagnostics, codes and
+ * spans in order, passes. Accepting the program fails. Rejecting it with any other list is a
+ * diagnostic-parity gap: the program stays rejected, so the gap is reported, not failed.
+ */
+const checkRejected = async (
+  silkc: string,
+  program: Corpus.Program,
+  expected: ReadonlyArray<Corpus.ExpectedDiagnostic>,
+  directory: string,
+  stdlib: string,
+): Promise<CaseResult> => {
+  const built = await runProcess(
+    silkc,
+    ['build', programModule, '-o', 'program', '--stdlib', stdlib],
+    buildTimeoutMs,
+    directory,
+  )
+  if (built.error === undefined && built.status === 0 && built.signal === null)
+    return {
+      name: program.name,
+      status: 'fail',
+      code: 'ACCEPTED_INVALID',
+      diagnostics: [],
+      reason: 'the compiler accepted a program it must reject',
+    }
+  const diagnostics = built.error === undefined ? parseBuildDiagnostics(built.stderr) : undefined
+  if (diagnostics === undefined) {
+    const gaps = built.error === undefined ? parseUnsupported(built.stderr) : undefined
+    if (gaps !== undefined) return { name: program.name, status: 'unsupported', gaps }
+    return {
+      name: program.name,
+      status: 'fail',
+      code: 'BUILD_PROCESS_FAILURE',
+      diagnostics: [],
+      reason: `build: ${processFailure(built)}`,
+    }
+  }
+  const reported = reportedDiagnostics(program.source, diagnostics)
+  if (JSON.stringify(reported) === JSON.stringify(expected))
+    return { name: program.name, status: 'pass' }
+  return {
+    name: program.name,
+    status: 'unsupported',
+    gaps: [
+      {
+        code: 'DIAGNOSTIC_PARITY',
+        reason: `expected ${JSON.stringify(expected)}, reported ${JSON.stringify(reported)}`,
+      },
+    ],
+  }
+}
+
 const runExecutable = (executable: string, invocation: Corpus.Run): Promise<ProcessResult> =>
   invocation.closeStderr
     ? runProcess(
@@ -426,6 +495,9 @@ export const runCase = async (
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-corpus-'))
   try {
     await writeProgram(directory, program, cCompiler, stdlib)
+    const expected = program.outcome.expected
+    if (expected.kind === 'rejected')
+      return await checkRejected(silkc, program, expected.diagnostics, directory, stdlib)
     const executable = join(directory, 'program')
     const profiles = program.outcome.profiles ?? [
       { name: 'optimized', optimization: 'speed', debug: false },
