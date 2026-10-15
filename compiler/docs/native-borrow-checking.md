@@ -494,14 +494,19 @@ A body the walk clears is `Checked` when it is region-closed and typing left not
 region-closed when every region its locals and values name is `'static`, a loan region of the
 body itself, or a universal region chosen before the body runs: a lifetime parameter of its own
 declaration or of a named declaration enclosing it (an impl's parameters in a method, an enclosing
-function's in an anonymous body), or an anonymous body's invocation binder. Inside an anonymous
+function's in an anonymous body), or an anonymous body's invocation binder. The anonymous body's
+own declaration-owned parameter atoms are rigid within that body, including elided input lifetimes.
+Exact owner identity authenticates them; separate atoms still require a declared/header premise
+to relate them. An outer body cannot authenticate a child callable's parameters as its own, and
+the region proof does not authenticate ownerless invocation atoms by ordinal. Inside an anonymous
 body, a loan region of the enclosing named body is a capture dependency: the enclosing body bounds its
 formation and retention with its own points, and the nested body proves only its own uses. A
 callable value's type also names its contract's binders (invocation binders, and a nested literal's
 own parameters); each invocation instantiates them afresh, so they name no region of a value the
-body holds. An enclosing literal's own binders and locals, supplied atoms and meets are not closed. No loan of the body has a universal region, and
-typing defers every relation that would make a body loan outlive one as a pending region
-obligation, so a body with nothing pending relies on none. A call result keeps an operand's region only by naming it, and conformance holds an
+body holds. An enclosing literal's own binders and locals, supplied atoms and meets are not closed.
+Owned body storage cannot outlive the body. Typing retains goals that would make an inferred region
+outlive a universal; only the separate symbolic source proof can discharge them. Atom closure
+alone proves no such relation. A call result keeps an operand's region only by naming it, and conformance holds an
 interface witness to exactly the regions its operation names, so a result typed by an open
 parameter keeps no loan of the body. Such a body's
 loans and their scopes are its whole region proof, because no loan of a cleared body outlives its
