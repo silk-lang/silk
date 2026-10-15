@@ -33,12 +33,25 @@ export interface CorpusProgram {
     | { readonly _tag: 'Trap' }
 }
 
-/** One program of `corpus/invalid/` and the diagnostic codes compilation must report. */
+/** One program of `corpus/invalid/` and the diagnostics compilation must report, in order. */
 export interface InvalidCorpusProgram {
   readonly name: string
   readonly source: string
-  readonly codes: ReadonlyArray<string>
+  readonly diagnostics: ReadonlyArray<Corpus.ExpectedDiagnostic>
 }
+
+/** The reported diagnostics of `source` in the form `outcome.json` records them. */
+export const reportedDiagnostics = (
+  source: string,
+  diagnostics: ReadonlyArray<{
+    readonly code: string
+    readonly span: { readonly start: number; readonly end: number }
+  }>,
+): ReadonlyArray<Corpus.ExpectedDiagnostic> =>
+  diagnostics.map(({ code, span }) => ({
+    code,
+    span: Corpus.formatSpan(source, span.start, span.end),
+  }))
 
 const nativeProgram = (program: Corpus.Program): CorpusProgram => {
   const { expected, runs, profiles, dynamicLibraries, components } = program.outcome
@@ -78,5 +91,5 @@ export const invalidCorpus: ReadonlyArray<InvalidCorpusProgram> = Corpus.loadPro
   const { expected } = program.outcome
   if (expected.kind !== 'rejected')
     throw new Error(`invalid/${program.name} does not expect a rejection`)
-  return { name: program.name, source: program.source, codes: expected.codes }
+  return { name: program.name, source: program.source, diagnostics: expected.diagnostics }
 })
