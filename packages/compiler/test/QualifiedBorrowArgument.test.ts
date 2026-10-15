@@ -176,6 +176,8 @@ it.effect(
     Effect.gen(function* () {
       const source = `struct Token { value: i32 }
 union Packet { Empty, Ready { left: Token, right: Token } }
+struct Holder { value: i32 }
+union Choice { Skip, Take }
 fn bump(token: &mut Token) -> () {
   token.value = token.value + 1
   return ()
@@ -219,15 +221,41 @@ fn firstMatching(entries: &[Token], wanted: i32) -> i32 {
   }
   return 0
 }
+fn copyInto(entry: &mut Holder, output: &mut Token) -> () {
+  output.value = entry.value
+  return ()
+}
+fn visit<F: once fn(&mut Holder) -> ()>(holder: &mut Holder, use: F) -> bool {
+  if holder.value == 0 { return false }
+  use(&mut holder.*)
+  return true
+}
+effect fn finish(holder: &mut Holder, value: i32) -> i32 {
+  holder.value = value
+  return value
+}
+effect fn endedInOneArm(holder: &mut Holder, choice: Choice) -> i32 {
+  let mut handles = Token { value: 0 }
+  let found = visit(&mut holder.*, copyInto(&mut handles))
+  if !found { drop handles return 0 }
+  let Token { value } = move handles
+  return match move choice {
+    Choice.Skip => value
+    Choice.Take => run finish(move holder, value)
+  }
+}
 pub fn main() -> i32 {
   let tokens = [Token { value: 1 }, Token { value: 2 }]
-  return armBinding() + armOuter() + acrossReturn(false) + firstMatching(&tokens, 2)
+  let mut holder = Holder { value: 1 }
+  let ended = run endedInOneArm(&mut holder, Choice.Take)
+  return armBinding() + armOuter() + acrossReturn(false) + firstMatching(&tokens, 2) + ended
 }`
       const self = yield* AnalysisFixture.retainingMain('qualified-borrow/arm-loans', ascii(source))
       assert.deepEqual(Analysis.diagnostics(self), [])
       const mir = Analysis.loweredMir(self)
       // A loan a statement arm's or a loop body's own binding holds ends with that arm or iteration
-      // on its fall-through path.
+      // on its fall-through path, and a loan from before a match that one arm ends is ended by the
+      // other joining arms rather than again after the join.
       assert.deepEqual(yield* MirVerification.verify(mir), [])
       // A branch that returns never reaches the join, so the loan the other branch carries into it
       // stays held through the later use and ends only at the function's exits.

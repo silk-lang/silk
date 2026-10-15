@@ -10,6 +10,7 @@ import {
   emitReleases,
   emitInitializationTransition,
   initializeBinding,
+  loanEndOperations,
   matchCleanupKey,
   ownerFields,
   lowerBorrowPlace,
@@ -2891,22 +2892,54 @@ function lowerMatchExpression(
       )
       .map((arm) => arm.id),
   }))
-  for (const key of branchState.loanLocals.keys()) {
-    const endedOnEveryPath = decisions.every((decision) => {
-      const candidates = decision.candidates.flatMap((candidate) => {
-        const arm = arms.find((entry) => entry.id.ordinal === candidate.ordinal)
-        const armState = armStates.get(candidate.ordinal)
-        return arm === undefined ? [] : [{ arm, armState }]
+  // As at a conditional's join, the match holds after it the loans from before it that every arm
+  // reaching the join still holds; transferring arms never reach it, and their exits already
+  // released their loans. Each joining arm ends, at its completion, the other earlier loans it
+  // still holds, in loan order, so a loan one arm ended is never ended again after the join.
+  const joined = new Set(
+    [...branchState.loanLocals.keys()].filter((key) =>
+      [...armStates.values()].every((state) => state.loanLocals.has(key)),
+    ),
+  )
+  const order = loanOrder(fn.ownership?.loans ?? [])
+  for (const [position, arm] of arms.entries()) {
+    const state = armStates.get(arm.id.ordinal)
+    if (state === undefined) continue
+    const ending: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
+    for (const key of branchState.loanLocals.keys())
+      if (!joined.has(key) && state.loanLocals.has(key)) ending.push(...(order.get(key) ?? []))
+    const endings = ending
+      .sort((left, right) => left.ordinal - right.ordinal)
+      .flatMap(({ loan }) => {
+        const held = state.loanLocals.get(borrowKey(loan.id))
+        return held === undefined
+          ? []
+          : loanEndOperations(fn, {
+              _tag: 'EndLoan' as const,
+              borrow: loan.id,
+              slice: held,
+              provenance: generated(arm.provenance.span),
+            })
       })
-      return (
-        candidates.length === decision.candidates.length &&
-        candidates.some(({ arm }) => arm.guard === undefined) &&
-        // Transferring arms never reach the join; their exit already releases its loans.
-        candidates.every(({ armState }) => armState === undefined || !armState.loanLocals.has(key))
-      )
-    })
-    if (endedOnEveryPath) fn.loanLocals.delete(key)
+    if (endings.length === 0) continue
+    arms[position] = {
+      ...arm,
+      selected: {
+        ...arm.selected,
+        execution: {
+          ...arm.selected.execution,
+          regions: arm.selected.execution.regions.map((region) => {
+            if (region._tag === 'OperationRegion' && region.outcome._tag === 'Complete')
+              return { ...region, operations: [...region.operations, ...endings] }
+            if (region._tag === 'CleanupRegion' && region.outcome._tag === 'Complete')
+              return { ...region, releases: [...endings, ...region.releases] }
+            return region
+          }),
+        },
+      },
+    }
   }
+  for (const key of branchState.loanLocals.keys()) if (!joined.has(key)) fn.loanLocals.delete(key)
   const mirDecisions = decisions.map((decision) => ({
     member: decision.member,
     candidates: decision.candidates,
