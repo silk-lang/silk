@@ -31,7 +31,7 @@ import * as Preparation from '../src/Preparation.js'
 import * as Type from '../src/Type.js'
 import * as SuspensionMode from '../src/SuspensionMode.js'
 import { unreachable } from './support/raise.js'
-import { dereferencedCallAcceptance, reflectedBorrowWrapperAcceptance } from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 
 const ascii = (value: string): Uint8Array =>
   Uint8Array.from(value, (character) => character.charCodeAt(0))
@@ -51,7 +51,7 @@ pub fn main() -> i32 { return identity(identity(42)) }`
 
 it.effect('discovers an ordinary call beneath a referent place', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(dereferencedCallAcceptance)
+    const result = yield* snapshot(corpusProgram('dereferenced-call-target').source)
     assert.deepEqual(Analysis.diagnostics(result), [])
     assert.isTrue(
       result.instances.instances.some((instance) => instance.key.declaration.name === 'view'),
@@ -61,7 +61,7 @@ it.effect('discovers an ordinary call beneath a referent place', () =>
 
 it.effect('discovers each reflection wrapper call beneath a referent place', () =>
   Effect.gen(function* () {
-    const result = yield* snapshot(reflectedBorrowWrapperAcceptance)
+    const result = yield* snapshot(corpusProgram('reflected-borrow-wrapper').source)
     assert.deepEqual(Analysis.diagnostics(result), [])
     const wrappers = result.instances.instances.filter(
       (instance) => instance.key.declaration.name === 'Reflect.borrowField',

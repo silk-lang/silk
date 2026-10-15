@@ -4,15 +4,22 @@
 //! TypeScript CLI's `Project.load` does, and place their artifacts below `[build].output-dir`.
 
 import silk.allocator { Allocator, OutOfMemoryError }
+import silk.box { Box }
 import silk.bytes { Bytes }
 import silk.effect { Effect }
 import silk.filesystem { DirectoryInfo, FileError, FileInfo, FileSystem, Path }
 import silk.option { Option }
 import silk.result { Result }
+import silk.slice { Slice }
 import silk.string { String }
 import silk.toml_scanner { TomlError }
-import silk.toml_value { Toml, Value as TomlValue }
+import silk.toml_value { Toml, TomlChild, Value as TomlValue }
 import silk.usize
+import silk.vector { Vector }
+import driver.CommandPath
+import driver.PlatformSupply as PlatformSupplies { Request as SupplyRequest, SupplyError }
+import driver.ProjectProfile as ProjectProfiles { Code as ProfileCode, InvalidProfile }
+import driver.TargetSelector
 
 /// A project that cannot be located or whose manifest a project command cannot use.
 pub union ProjectError {
@@ -24,6 +31,8 @@ pub union ProjectError {
   Unreadable { pub manifest: Path },
   /// The manifest is not TOML or one of its fields is invalid; `detail` names the field.
   InvalidManifest { pub manifest: Path, pub detail: Bytes },
+  /// A profile, the profile catalog or a binding is invalid; `subject` names the input.
+  InvalidProfile { pub manifest: Path, pub code: ProfileCode, pub subject: Bytes },
 }
 
 /// A loaded project manifest with every path resolved against its directory.
@@ -32,9 +41,42 @@ pub struct Project {
   directory: Path
   name: Bytes
   entry: Path
+  sourceRoot: Path
   outputDirectory: Path
-  artifact: Bytes
-  stage: Bytes
+  form: Form
+  stage: Stage
+  targets: Vector<Bytes>
+  text: Bytes
+  defaultProfile: Option<Bytes>
+  supply: SupplyRequest
+}
+
+/// Where a source file selected for a test run lies against the project's source root, the
+/// directory of `[package].root`.
+pub union SourceSelection {
+  /// A source module: its path relative to the project directory, with `/` separators.
+  Module { pub relative: Bytes },
+  /// The file is not below the source root.
+  Outside { pub sourceRoot: Path },
+  /// The file's path below the source root is not a canonical module path ending in `.silk`.
+  NotModule,
+}
+
+/// The final artifact form `[build].artifact` selects (ARTIFACT-001).
+pub enum Form {
+  Executable,
+  SharedLibrary,
+  StaticLibrary,
+  Object,
+}
+
+/// How far `[build].stage` carries the form: its final artifact or one intermediate representation.
+pub enum Stage {
+  Final,
+  LlvmIr,
+  LlvmBitcode,
+  Assembly,
+  Object,
 }
 
 fn same(left: &[u8], right: &[u8]) -> bool {
@@ -181,6 +223,144 @@ effect fn buildText<
   }
 }
 
+// The digits-only identifier `value` has no leading zero.
+fn isNumericIdentifier(value: &[u8]) -> bool {
+  if value.length == usize.ZERO {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < value.length {
+    if value[at] < 48 || value[at] > 57 {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return value.length == usize.ONE || value[usize.ZERO] != 48
+}
+
+fn isIdentifierByte(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122 || byte == 45
+}
+
+// Whether the dot-separated identifiers of `value` are valid; `prerelease` identifiers that are
+// all digits must also have no leading zero.
+fn validIdentifiers(value: &[u8], prerelease: bool) -> bool {
+  let mut start = usize.ZERO
+  let mut at = usize.ZERO
+  while at <= value.length {
+    if at == value.length || value[at] == 46 {
+      if at == start {
+        return false
+      }
+      let mut digits = true
+      let mut index = start
+      while index < at {
+        if !isIdentifierByte(value[index]) {
+          return false
+        }
+        if value[index] < 48 || value[index] > 57 {
+          digits = false
+        }
+        index = index + usize.ONE
+      }
+      if prerelease && digits && at - start > usize.ONE && value[start] == 48 {
+        return false
+      }
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Whether `version` is a semantic version (`MAJOR.MINOR.PATCH`, an optional `-` pre-release and an
+/// optional `+` build), as the TypeScript `Project.isSemanticVersion` accepts.
+pub fn isSemanticVersion(version: &[u8]) -> bool {
+  let mut end = version.length
+  let mut at = usize.ZERO
+  while at < version.length {
+    if version[at] == 43 {
+      end = at
+      break
+    }
+    at = at + usize.ONE
+  }
+  if end < version.length && !validIdentifiers(Slice.view<u8>(version, end + usize.ONE, version.length - end - usize.ONE), false) {
+    return false
+  }
+  let mut coreEnd = end
+  at = usize.ZERO
+  while at < end {
+    if version[at] == 45 {
+      coreEnd = at
+      break
+    }
+    at = at + usize.ONE
+  }
+  if coreEnd < end && !validIdentifiers(Slice.view<u8>(version, coreEnd + usize.ONE, end - coreEnd - usize.ONE), true) {
+    return false
+  }
+  let core = Slice.view<u8>(version, usize.ZERO, coreEnd)
+  let mut parts = usize.ZERO
+  let mut start = usize.ZERO
+  at = usize.ZERO
+  while at <= core.length {
+    if at == core.length || core[at] == 46 {
+      if !isNumericIdentifier(Slice.view<u8>(core, start, at - start)) {
+        return false
+      }
+      parts = parts + usize.ONE
+      start = at + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return parts == usize.add(0, 3)
+}
+
+// The first key of the table `table` that is not one of `allowed`.
+// Whether `value` is present and anything but an empty array.
+fn listsAny(value: Option<&TomlValue>) -> bool {
+  return match move value {
+    Option<&TomlValue>.Some { value: present } => match move Toml.item(present, usize.ZERO) {
+      Option<&TomlValue>.Some { .. } => true
+      Option<&TomlValue>.None => match &present.* {
+        TomlValue.Array { .. } => false
+        _ => true
+      }
+    }
+    Option<&TomlValue>.None => false
+  }
+}
+
+fn unsupportedKey<'a>(table: &'a TomlValue, allowed: &[&[u8]]) -> Option<&'a [u8]> {
+  return match &table.* {
+    TomlValue.Table { entries, kind: _ } => {
+      let boxed = Box<Vector<TomlChild>>.get(&entries)
+      let children = Vector<TomlChild>.asSlice(&boxed[0])
+      let mut at = usize.ZERO
+      while at < children.length {
+        if let TomlChild.Member { entry } = &children[at] {
+          let key = String.ownedUtf8Bytes(&entry.key)
+          let mut known = false
+          let mut index = usize.ZERO
+          while index < allowed.length {
+            if same(key, allowed[index]) {
+              known = true
+            }
+            index = index + usize.ONE
+          }
+          if !known {
+            return Option<&'a [u8]>.some(key)
+          }
+        }
+        at = at + usize.ONE
+      }
+      return Option<&'a [u8]>.none()
+    }
+    _ => Option<&'a [u8]>.none()
+  }
+}
+
 /// Decodes the manifest at `manifest` from its exact bytes. `[package].name` must be a portable
 /// package name and `[package].root` names the entry. `[build].output-dir` defaults to `build` and
 /// must stay inside the project; `[build].artifact` and `[build].stage` take their manifest
@@ -204,6 +384,17 @@ pub effect fn decode(manifest: &Path, text: &[u8]) -> Project
         fail move exhausted
       }
     }
+  }
+  let packageTable = Toml.field(&document, "package")
+  let packaged = match move packageTable {
+    Option<&TomlValue>.Some { value } => match &value.* {
+      TomlValue.Table { .. } => true
+      _ => false
+    }
+    Option<&TomlValue>.None => false
+  }
+  if !packaged {
+    return run invalid(manifest, b"missing [package] table")
   }
   let name = match move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "name")) {
     Option<string>.Some { value } => String.utf8Bytes(value)
@@ -234,6 +425,76 @@ pub effect fn decode(manifest: &Path, text: &[u8]) -> Project
     root,
     b"package.root must name a file inside the project"
   )
+  // Modules resolve below `source-root`, else below the root's directory, and the root must be one.
+  let sourceRootDetail = b"package.source-root must be a non-empty string"
+  let mut sourceRoot = match move run Path.parent(&entry) {
+    Option<Path>.Some { value } => move value
+    Option<Path>.None => run invalid(manifest, b"package.root must name a file inside the project")
+  }
+  if let Option<&TomlValue>.Some { value: written } = move Toml.fieldAt(Toml.field(&document, "package"), "source-root") {
+    let text = match move Toml.asString(Option<&TomlValue>.some(written)) {
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => run invalid(manifest, sourceRootDetail)
+    }
+    if text.length == usize.ZERO {
+      return run invalid(manifest, sourceRootDetail)
+    }
+    sourceRoot = match move run Effect.result(CommandPath.resolve(&directory, text)) {
+      Result<Path, FileError | OutOfMemoryError>.Success { value } => move value
+      Result<Path, FileError | OutOfMemoryError>.Failure { error } => match move error {
+        FileError rejected => {
+          drop rejected
+          return run invalid(manifest, sourceRootDetail)
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+  if !within(Path.rawBytes(&sourceRoot), Path.rawBytes(&entry)) {
+    return run invalid(manifest, b"package.root must be a module below the source root")
+  }
+  // TypeScript also requires the version; the corpus and smoke harnesses on `main` still write
+  // manifests without one, so a missing version is accepted until they declare it.
+  if let Option<&TomlValue>.Some { value: written } = move Toml.fieldAt(Toml.field(&document, "package"), "version") {
+    let versioned = match move Toml.asString(Option<&TomlValue>.some(written)) {
+      Option<string>.Some { value } => isSemanticVersion(String.utf8Bytes(value))
+      Option<string>.None => false
+    }
+    if !versioned {
+      return run invalid(manifest, b"package.version must be a valid semantic version")
+    }
+  }
+  if let Option<&TomlValue>.Some { value: build } = move Toml.field(&document, "build") {
+    let table = match &build.* {
+      TomlValue.Table { .. } => true
+      _ => false
+    }
+    if !table {
+      return run invalid(manifest, b"[build] must be a table")
+    }
+    let buildKeys: [&[u8]; 10] = [
+      b"targets", b"output-dir", b"artifact", b"native-link-inputs", b"platform-supply",
+      b"native-bindings", b"stage", b"composition", b"profile", b"bindings",
+    ]
+    if let Option<&[u8]>.Some { value: key } = move unsupportedKey(build, &buildKeys) {
+      let mut detail = run Bytes.copy(b"build.")
+      run Bytes.append(&mut detail, key)
+      run Bytes.append(&mut detail, b" is not a supported field")
+      return run invalid(manifest, Bytes.asSlice(&detail))
+    }
+    // This field changes what a build links; until native builds honor it, it is refused rather
+    // than ignored.
+    if let Option<&TomlValue>.Some { value: _ } = move Toml.field(build, "native-bindings") {
+      return run invalid(manifest, b"build.native-bindings is not supported by the native compiler yet")
+    }
+    // Native requirements change what a build links; until native builds resolve them, a
+    // composition naming any is refused rather than built without them.
+    if listsAny(Toml.fieldAt(Toml.field(build, "composition"), "requirements")) {
+      return run invalid(manifest, b"build.composition.requirements is not supported by the native compiler yet")
+    }
+  }
   let outputDetail = b"build.output-dir must be a non-empty manifest-relative directory that does not escape the project"
   let output = run buildText(manifest, &document, "output-dir", "build", outputDetail)
   if
@@ -242,30 +503,113 @@ pub effect fn decode(manifest: &Path, text: &[u8]) -> Project
   }
   let outputDirectory = run resolved(manifest, &directory, output, outputDetail)
   let artifactDetail = b"build.artifact must be executable, shared-library, static-library, or object"
-  let kind = String.utf8Bytes(
+  let form = match move formNamed(String.utf8Bytes(
     run buildText(manifest, &document, "artifact", "executable", artifactDetail)
-  )
-  if
-    !same(kind, b"executable") && !same(kind, b"shared-library") && !same(kind, b"static-library")
-      && !same(kind, b"object") {
-    return run invalid(manifest, artifactDetail)
+  )) {
+    Option<Form>.Some { value } => value
+    Option<Form>.None => run invalid(manifest, artifactDetail)
   }
   let stageDetail = b"build.stage is not an admitted emission stage"
-  let emitted = String.utf8Bytes(run buildText(manifest, &document, "stage", "final", stageDetail))
-  if
-    !same(emitted, b"final") && !same(emitted, b"llvm-ir") && !same(emitted, b"llvm-bitcode")
-      && !same(emitted, b"assembly")
-      && !same(emitted, b"object") {
-    return run invalid(manifest, stageDetail)
+  let stage = match move stageNamed(String.utf8Bytes(
+    run buildText(manifest, &document, "stage", "final", stageDetail)
+  )) {
+    Option<Stage>.Some { value } => value
+    Option<Stage>.None => run invalid(manifest, stageDetail)
+  }
+  let targetsDetail = b"build.targets must be a non-empty array of host or canonical target ids"
+  let mut targets = Vector<Bytes>.make()
+  match move Toml.fieldAt(Toml.field(&document, "build"), "targets") {
+    Option<&TomlValue>.None => {
+      run Vector<Bytes>.append(&mut targets, run Bytes.copy(b"host"))
+    }
+    Option<&TomlValue>.Some { value: listed } => {
+      let array = match &listed.* {
+        TomlValue.Array { .. } => true
+        _ => false
+      }
+      if !array {
+        return run invalid(manifest, targetsDetail)
+      }
+      let mut at = usize.ZERO
+      while true {
+        let item = match move Toml.item(listed, at) {
+          Option<&TomlValue>.Some { value } => value
+          Option<&TomlValue>.None => {
+            break
+          }
+        }
+        let selector = match move Toml.asString(Option<&TomlValue>.some(item)) {
+          Option<string>.Some { value } => String.utf8Bytes(value)
+          Option<string>.None => run invalid(manifest, targetsDetail)
+        }
+        if !TargetSelector.isSelector(selector) {
+          return run invalid(manifest, targetsDetail)
+        }
+        run Vector<Bytes>.append(&mut targets, run Bytes.copy(selector))
+        at = at + usize.ONE
+      }
+      if at == usize.ZERO {
+        return run invalid(manifest, targetsDetail)
+      }
+    }
+  }
+  let defaultProfile = run profileCatalog(manifest, &document)
+  let mut supply = SupplyRequest.Automatic
+  if let Option<&TomlValue>.Some { value: requested } = move Toml.fieldAt(Toml.field(&document, "build"), "platform-supply") {
+    let mut origin = run Bytes.copy(Path.rawBytes(manifest))
+    run Bytes.append(&mut origin, b":build.platform-supply")
+    let decoded = run Effect.result(PlatformSupplies.decode(requested, &directory, Bytes.asSlice(&origin)))
+    supply = match move decoded {
+      Result<SupplyRequest, SupplyError | OutOfMemoryError>.Success { value } => move value
+      Result<SupplyRequest, SupplyError | OutOfMemoryError>.Failure { error } => match move error {
+        SupplyError refused => {
+          // The TypeScript manifest error repeats the supply failure's message.
+          let mut detail = run Bytes.copy(refused.code)
+          run Bytes.append(&mut detail, b": ")
+          run Bytes.append(&mut detail, Bytes.asSlice(&refused.subject))
+          run Bytes.append(&mut detail, b" (")
+          run Bytes.append(&mut detail, Bytes.asSlice(&refused.origin))
+          run Bytes.append(&mut detail, b")")
+          return run invalid(manifest, Bytes.asSlice(&detail))
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
   }
   return Project {
     manifest: run copyPath(manifest),
     directory: move directory,
     name: run Bytes.copy(name),
     entry: move entry,
+    sourceRoot: move sourceRoot,
     outputDirectory: move outputDirectory,
-    artifact: run Bytes.copy(kind),
-    stage: run Bytes.copy(emitted),
+    form: form,
+    stage: stage,
+    targets: move targets,
+    text: run Bytes.copy(text),
+    defaultProfile: move defaultProfile,
+    supply: move supply,
+  }
+}
+
+// Validates the profile catalog and bindings and answers `[build].profile`.
+effect fn profileCatalog(manifest: &Path, document: &TomlValue) -> Option<Bytes>
+  ! ProjectError | OutOfMemoryError
+  ? &mut Allocator {
+  let validated = run Effect.result(ProjectProfiles.catalog(document))
+  return match move validated {
+    Result<Option<Bytes>, InvalidProfile | OutOfMemoryError>.Success { value } => move value
+    Result<Option<Bytes>, InvalidProfile | OutOfMemoryError>.Failure { error } => match move error {
+      InvalidProfile refused => {
+        let InvalidProfile { code, subject } = move refused
+        fail ProjectError.InvalidProfile { manifest: run copyPath(manifest), code: code, subject: move subject }
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
   }
 }
 
@@ -334,6 +678,26 @@ pub fn name(self: &Project) -> &[u8] {
   return Bytes.asSlice(&self.name)
 }
 
+/// Borrows the platform supply `[build].platform-supply` requests: automatic when it names none.
+pub fn supply(self: &Project) -> &SupplyRequest {
+  return &self.supply
+}
+
+/// Borrows the directory modules resolve below: `[package].source-root`, else the entry's directory.
+pub fn sourceRoot(self: &Project) -> &Path {
+  return &self.sourceRoot
+}
+
+// Whether the normalized absolute `path` lies strictly below the directory `root`.
+fn within(root: &[u8], path: &[u8]) -> bool {
+  let mut prefix = root.length
+  if same(root, b"/") {
+    prefix = usize.ZERO
+  }
+  return path.length > prefix + usize.ONE && same(Slice.view<u8>(path, usize.ZERO, prefix), Slice.view<u8>(root, usize.ZERO, prefix))
+    && path[prefix] == 47
+}
+
 /// Borrows the resolved `[package].root` entry.
 pub fn entry(self: &Project) -> &Path {
   return &self.entry
@@ -344,15 +708,78 @@ pub fn outputDirectory(self: &Project) -> &Path {
   return &self.outputDirectory
 }
 
-/// Borrows the manifest spelling of `[build].artifact`.
-pub fn artifact(self: &Project) -> &[u8] {
-  return Bytes.asSlice(&self.artifact)
+/// The artifact form `[build].artifact` selects.
+pub fn form(self: &Project) -> Form {
+  return self.form
+}
+
+/// The emission stage `[build].stage` selects.
+pub fn stage(self: &Project) -> Stage {
+  return self.stage
+}
+
+/// The manifest document again; `load` already validated it.
+pub effect fn document(self: &Project) -> TomlValue
+  ! TomlError | OutOfMemoryError
+  ? &mut Allocator {
+  return run Toml.parse(Bytes.asSlice(&self.text))
+}
+
+/// Borrows `[build].profile`, the profile a build uses when it selects no target or profile.
+pub fn defaultProfile(self: &Project) -> Option<&[u8]> {
+  return match &self.defaultProfile {
+    Option<Bytes>.Some { value } => Option<&[u8]>.some(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<&[u8]>.none()
+  }
+}
+
+/// Borrows the `[build].targets` selectors, `host` when the manifest names none.
+pub fn targets(self: &Project) -> &[Bytes] {
+  return Vector<Bytes>.asSlice(&self.targets)
 }
 
 /// Whether the project's final artifact is an executable that `run` can start.
 pub fn runnable(self: &Project) -> bool {
-  return same(Bytes.asSlice(&self.artifact), b"executable")
-    && same(Bytes.asSlice(&self.stage), b"final")
+  return self.form == Form.Executable && self.stage == Stage.Final
+}
+
+/// The form a `[build].artifact` spelling names.
+pub fn formNamed(spelling: &[u8]) -> Option<Form> {
+  if same(spelling, b"executable") { return Option<Form>.some(Form.Executable) }
+  if same(spelling, b"shared-library") { return Option<Form>.some(Form.SharedLibrary) }
+  if same(spelling, b"static-library") { return Option<Form>.some(Form.StaticLibrary) }
+  if same(spelling, b"object") { return Option<Form>.some(Form.Object) }
+  return Option<Form>.none()
+}
+
+/// The manifest spelling of `form`.
+pub fn formSpelling(form: Form) -> &'static [u8] {
+  return match form {
+    Form.Executable => b"executable"
+    Form.SharedLibrary => b"shared-library"
+    Form.StaticLibrary => b"static-library"
+    Form.Object => b"object"
+  }
+}
+
+/// The logical profile artifact of `form` (PROFILE-001), as the TypeScript CLI maps it.
+pub fn profileArtifact(form: Form) -> &'static [u8] {
+  return match form {
+    Form.Executable => b"executable"
+    Form.SharedLibrary => b"loadable-module"
+    Form.StaticLibrary => b"static-archive"
+    Form.Object => b"object"
+  }
+}
+
+/// The stage a `[build].stage` spelling names.
+pub fn stageNamed(spelling: &[u8]) -> Option<Stage> {
+  if same(spelling, b"final") { return Option<Stage>.some(Stage.Final) }
+  if same(spelling, b"llvm-ir") { return Option<Stage>.some(Stage.LlvmIr) }
+  if same(spelling, b"llvm-bitcode") { return Option<Stage>.some(Stage.LlvmBitcode) }
+  if same(spelling, b"assembly") { return Option<Stage>.some(Stage.Assembly) }
+  if same(spelling, b"object") { return Option<Stage>.some(Stage.Object) }
+  return Option<Stage>.none()
 }
 
 /// Names the build directory of one logical optimization profile, as the TypeScript CLI does:
@@ -368,14 +795,115 @@ pub fn profileName(optimization: &[u8], debug: bool) -> &'static [u8] {
   return b"release"
 }
 
-/// The executable's path for `target` and `profile`: `<output-dir>/llvm/<target>/<profile>/<name>`.
-pub effect fn executable(self: &Project, target: &[u8], profile: &[u8]) -> Path
+/// The artifact's path for `target` and `profile`: `<output-dir>/llvm/<target>/<profile>/<file>`,
+/// where the file is named as the TypeScript CLI names it. A final stage names the form's file
+/// (`<name>`, `lib<name>.so`, `lib<name>.dylib` on macOS, `lib<name>.a` or `<name>.o`), and an
+/// intermediate stage names `<name>.ll`, `.bc`, `.s` or `.o`.
+pub effect fn artifact(self: &Project, target: &[u8], profile: &[u8]) -> Path
   ! FileError | OutOfMemoryError
   ? &mut Allocator {
   let llvm = run Path.join(&self.outputDirectory, "llvm")
   let targeted = run Path.joinBytes(&llvm, target)
   let profiled = run Path.joinBytes(&targeted, profile)
+  let name = Bytes.asSlice(&self.name)
+  let mut file = Bytes.make()
+  let mut suffix: &[u8] = b""
+  match self.stage {
+    Stage.Final => match self.form {
+      Form.Executable => {}
+      Form.SharedLibrary => {
+        run Bytes.append(&mut file, b"lib")
+        suffix = b".so"
+        if same(target, b"aarch64-apple-darwin") {
+          suffix = b".dylib"
+        }
+      }
+      Form.StaticLibrary => {
+        run Bytes.append(&mut file, b"lib")
+        suffix = b".a"
+      }
+      Form.Object => {
+        suffix = b".o"
+      }
+    }
+    Stage.LlvmIr => {
+      suffix = b".ll"
+    }
+    Stage.LlvmBitcode => {
+      suffix = b".bc"
+    }
+    Stage.Assembly => {
+      suffix = b".s"
+    }
+    Stage.Object => {
+      suffix = b".o"
+    }
+  }
+  run Bytes.append(&mut file, name)
+  run Bytes.append(&mut file, suffix)
+  return run Path.joinBytes(&profiled, Bytes.asSlice(&file))
+}
+
+/// The test runner's path for `target` and `profile`:
+/// `<output-dir>/test/llvm/<target>/<profile>/<name>`, beside no build artifact.
+pub effect fn testExecutable(self: &Project, target: &[u8], profile: &[u8]) -> Path
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let tests = run Path.join(&self.outputDirectory, "test")
+  let llvm = run Path.join(&tests, "llvm")
+  let targeted = run Path.joinBytes(&llvm, target)
+  let profiled = run Path.joinBytes(&targeted, profile)
   return run Path.joinBytes(&profiled, Bytes.asSlice(&self.name))
+}
+
+// Whether `path` is a canonical module path with the `.silk` extension: `/`-separated segments of
+// ASCII letters, digits, `_` and `-`, as the TypeScript `SourceEntry.identify` requires.
+fn isModulePath(path: &[u8]) -> bool {
+  let extension = b".silk"
+  if path.length <= extension.length {
+    return false
+  }
+  let stem = path.length - extension.length
+  if !same(Slice.view<u8>(path, stem, extension.length), extension) {
+    return false
+  }
+  let mut segment = usize.ZERO
+  let mut at = usize.ZERO
+  while at < stem {
+    let byte = path[at]
+    if byte == 47 {
+      if segment == usize.ZERO {
+        return false
+      }
+      segment = usize.ZERO
+    } else if (byte >= 48 && byte <= 57) || (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95 || byte == 45 {
+      segment = segment + usize.ONE
+    } else {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return segment > usize.ZERO
+}
+
+/// Selects the source file at the absolute, normalized `path` for a test run, as the TypeScript
+/// `SourceEntry.select` does against the project's source root.
+pub effect fn selectSource(self: &Project, path: &Path) -> SourceSelection
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = Path.rawBytes(&self.sourceRoot)
+  let selected = Path.rawBytes(path)
+  if !within(root, selected) {
+    return SourceSelection.Outside { sourceRoot: run copyPath(&self.sourceRoot) }
+  }
+  let mut prefix = root.length + usize.ONE
+  if same(root, b"/") {
+    prefix = usize.ONE
+  }
+  if !isModulePath(Slice.view<u8>(selected, prefix, selected.length - prefix)) {
+    return SourceSelection.NotModule
+  }
+  return SourceSelection.Module { relative: run CommandPath.relative(&self.directory, path) }
 }
 
 /// Removes the output directory and everything below it, or a file in its place; an absent output
