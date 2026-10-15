@@ -1547,11 +1547,74 @@ export const analyze = (
     ]),
   )
   const universalDiagnostics = new Map<string, Diagnostic.Located>()
-  const incoming = new Map<string, Array<Lifetime.Lifetime>>()
-  for (const bound of constraints.values()) {
+  const incoming = new Map<
+    string,
+    Array<{ readonly longer: Lifetime.Lifetime; readonly constraint: string }>
+  >()
+  for (const [constraint, bound] of constraints) {
     const predecessors = incoming.get(Lifetime.key(bound.shorter)) ?? []
-    predecessors.push(bound.longer)
+    predecessors.push({ longer: bound.longer, constraint })
     incoming.set(Lifetime.key(bound.shorter), predecessors)
+  }
+  // A later write installs a new value into local storage. That value reaches a universal
+  // contract only through an edge out of the storage raised where the write's installation can
+  // reach, so a store before the write, or after a later rewrite, leaves it out.
+  const installedInto = new Map<
+    string,
+    Array<{
+      readonly ordinal: number
+      readonly longer: Lifetime.Lifetime
+      readonly reach?: BodyControlFlow.Reachable
+      readonly installed: string
+    }>
+  >()
+  // A later write replacing the same binding's whole value retires what an earlier write installed.
+  const wholeInstalls = new Map<string, Array<number>>()
+  for (const { installed, owner, whole } of body.activatedConstraints) {
+    const installation = controlFlow.boundaries.get(AuthoredIdentity.anchorKey(installed))
+    if (!whole || owner === undefined || installation === undefined) continue
+    const key = AuthoredIdentity.anchorKey(owner)
+    const before = wholeInstalls.get(key) ?? []
+    if (!before.includes(installation.before)) before.push(installation.before)
+    wholeInstalls.set(key, before)
+  }
+  for (const [ordinal, { bound, installed, owner }] of body.activatedConstraints.entries()) {
+    const installation = controlFlow.boundaries.get(AuthoredIdentity.anchorKey(installed))
+    const ownerBoundary =
+      owner === undefined
+        ? undefined
+        : controlFlow.boundaries.get(AuthoredIdentity.anchorKey(owner))
+    const reach =
+      installation === undefined
+        ? undefined
+        : BodyControlFlow.reachable(controlFlow, installation.after, [
+            installation.before,
+            ...(ownerBoundary === undefined ? [] : [ownerBoundary.before]),
+            ...(owner === undefined
+              ? []
+              : (wholeInstalls.get(AuthoredIdentity.anchorKey(owner)) ?? [])),
+          ])
+    const into = installedInto.get(Lifetime.key(bound.shorter)) ?? []
+    into.push({
+      ordinal,
+      longer: bound.longer,
+      ...(reach === undefined ? {} : { reach }),
+      installed: AuthoredIdentity.anchorKey(installed),
+    })
+    installedInto.set(Lifetime.key(bound.shorter), into)
+  }
+  // Sites absent from the record, or raised outside any statement, count as reached everywhere.
+  const reachesSite = (
+    reach: BodyControlFlow.Reachable | undefined,
+    sites: ReadonlySet<string | undefined> | undefined,
+  ): boolean => {
+    if (reach === undefined || sites === undefined) return true
+    for (const site of sites) {
+      if (site === undefined) return true
+      const boundary = controlFlow.boundaries.get(site)
+      if (boundary === undefined || BodyControlFlow.includes(reach, boundary.before)) return true
+    }
+    return false
   }
   const outgoing = new Map<string, Array<Lifetime.Lifetime>>()
   for (const bound of constraints.values()) {
@@ -1617,11 +1680,25 @@ export const analyze = (
       )
     )
       continue
-    const pending = [...(incoming.get(Lifetime.key(target.lifetime)) ?? [])]
+    const pending: Array<{
+      readonly source: Lifetime.Lifetime
+      readonly sites: ReadonlySet<string | undefined> | undefined
+    }> = (incoming.get(Lifetime.key(target.lifetime)) ?? []).map(({ longer, constraint }) => ({
+      source: longer,
+      sites: body.constraintSites.get(constraint),
+    }))
     const visited = new Set<string>()
+    const followed = new Set<number>()
     while (pending.length > 0) {
-      const source = pending.pop()
-      if (source === undefined || visited.has(Lifetime.key(source))) continue
+      const next = pending.pop()
+      if (next === undefined) continue
+      const { source, sites } = next
+      for (const installation of installedInto.get(Lifetime.key(source)) ?? []) {
+        if (followed.has(installation.ordinal) || !reachesSite(installation.reach, sites)) continue
+        followed.add(installation.ordinal)
+        pending.push({ source: installation.longer, sites: new Set([installation.installed]) })
+      }
+      if (visited.has(Lifetime.key(source))) continue
       visited.add(Lifetime.key(source))
       const origin = origins.get(Lifetime.key(source))
       // A universal contract extends beyond this body's finite use points. Inference regions and
@@ -1644,7 +1721,8 @@ export const analyze = (
           diagnostic,
         )
       }
-      pending.push(...(incoming.get(Lifetime.key(source)) ?? []))
+      for (const { longer, constraint } of incoming.get(Lifetime.key(source)) ?? [])
+        pending.push({ source: longer, sites: body.constraintSites.get(constraint) })
     }
   }
   // Selfhost profiling attributed 3.8 s to resolving every point's boundary, and keying its barrier

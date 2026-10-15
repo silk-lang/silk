@@ -631,6 +631,32 @@ it.effect('relates a call result stored into a caller-owned field to its argumen
         program.name,
       )
     }
+    // A store the installation cannot reach, or one after a later whole replacement, keeps only
+    // the loans that store can observe.
+    const controls = `struct Token { value: i32 }
+struct View<'a> { left: &'a Token }
+fn same<'a>(value: &'a Token) -> &'a Token { return value }
+fn read(value: &Token) -> i32 { return value.value }
+fn storedFirst<'s>(out: &mut View<'s>, token: &'s Token) -> i32 {
+  let local = Token { value: 3 }
+  let mut held = same(token)
+  out.left = held
+  held = same(&local)
+  return read(held)
+}
+fn replacedAgain<'s>(out: &mut View<'s>, token: &'s Token) -> () {
+  let local = Token { value: 3 }
+  let mut held = same(token)
+  held = same(&local)
+  held = same(token)
+  out.left = held
+}
+pub fn main() -> i32 { return 0 }`
+    const accepted = yield* AnalysisFixture.retainingMain(
+      'memory/field-store-controls',
+      ascii(controls),
+    )
+    assert.deepStrictEqual(Analysis.diagnostics(accepted), [])
   }),
 )
 

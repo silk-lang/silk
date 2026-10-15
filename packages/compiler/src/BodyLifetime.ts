@@ -19,11 +19,21 @@ export interface BodyLifetime {
   /** Every registered position by its point key, so a solver can walk the whole domain. */
   readonly anchors: ReadonlyMap<string, AuthoredHir.Anchor>
   readonly constraints: Map<string, Lifetime.Outlives>
+  /**
+   * The authored statements that raised each retained constraint, by its normalized key. A
+   * constraint raised outside any statement records `undefined`, which a reader treats as raised
+   * everywhere.
+   */
+  readonly constraintSites: Map<string, Set<string | undefined>>
+  /** The statement being elaborated; constraints committed meanwhile record it as their site. */
+  readonly site: { current?: AuthoredHir.Anchor }
   readonly formations: Map<string, Formation>
   readonly activatedConstraints: Array<{
     readonly bound: Lifetime.Outlives
     readonly installed: AuthoredHir.Anchor
     readonly owner?: AuthoredHir.Anchor
+    /** The write replaces the owner's whole value rather than one projected place. */
+    readonly whole: boolean
   }>
   readonly parameterBounds: ReadonlyMap<string, ReadonlyArray<Lifetime.Lifetime>>
   /** Hidden marked-body input antecedents, separate from universal declaration premises. */
@@ -53,6 +63,8 @@ export const make = (
     points,
     anchors: registered,
     constraints: new Map(),
+    constraintSites: new Map(),
+    site: {},
     formations: new Map(),
     activatedConstraints: [],
     parameterBounds,
@@ -196,6 +208,22 @@ export const constrain = (
   const bound = { longer, shorter }
   const normalized = Lifetime.assumptions([bound])
   self.constraints.set(normalized.key, bound)
+  const sites = self.constraintSites.get(normalized.key) ?? new Set()
+  sites.add(
+    self.site.current === undefined ? undefined : AuthoredIdentity.anchorKey(self.site.current),
+  )
+  self.constraintSites.set(normalized.key, sites)
+}
+
+/** Makes `anchor` the site of later constraints and returns the site it replaces. */
+export const enterSite = (
+  self: BodyLifetime,
+  anchor: AuthoredHir.Anchor | undefined,
+): AuthoredHir.Anchor | undefined => {
+  const previous = self.site.current
+  if (anchor === undefined) delete self.site.current
+  else self.site.current = anchor
+  return previous
 }
 
 /**
@@ -208,6 +236,7 @@ export const activatedCompatibility = (
   base: TypeCompatibility.Context,
   installed: AuthoredHir.Anchor,
   storage: ReadonlyArray<Lifetime.Lifetime>,
+  whole: boolean,
   owner?: AuthoredHir.Anchor,
 ): TypeCompatibility.Context => {
   const replaced = new Set(storage.map(Lifetime.key))
@@ -220,6 +249,7 @@ export const activatedCompatibility = (
     self.activatedConstraints.push({
       bound: { longer, shorter },
       installed,
+      whole,
       ...(owner === undefined ? {} : { owner }),
     })
   }

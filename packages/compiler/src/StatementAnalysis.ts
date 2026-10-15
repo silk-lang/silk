@@ -714,7 +714,11 @@ export const analyzeStatements = (
     return statement
   }
 
+  // Each statement is the site of the lifetime constraints its elaboration commits.
+  const bodyLifetimes = context.resolution.bodyLifetimes
+  const enclosingSite = bodyLifetimes?.site.current
   for (const element of blockNode.statements) {
+    if (bodyLifetimes !== undefined) BodyLifetime.enterSite(bodyLifetimes, element.anchor)
     if (element._tag === 'UnsafeStatement') {
       const region = nextRegion()
       const statements = analyzeStatements(context, element.body, scope, loopStack)
@@ -1351,6 +1355,7 @@ export const analyzeStatements = (
               context.resolution.lifetimeCompatibility,
               element.anchor,
               destination.type === undefined ? [] : Type.storageLifetimes(destination.type),
+              destination.fact._tag === 'Identifier',
               root?.anchor,
             )
       const writeResolution: ResolutionContext = {
@@ -1738,6 +1743,7 @@ export const analyzeStatements = (
     }
   }
 
+  if (bodyLifetimes !== undefined) BodyLifetime.enterSite(bodyLifetimes, enclosingSite)
   return facts
 }
 
