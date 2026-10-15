@@ -380,6 +380,13 @@ const program = Effect.gen(function* () {
   )
   assert.equal(released.status, 0, released.stderr)
   assert.match(released.stdout, /Build summary: 1 succeeded, 0 failed/)
+  // Each compilation names its source and artifact relative to the project, as `silk build` does.
+  assert.match(
+    released.stdout,
+    new RegExp(
+      `^Compiled src/main\\.silk -> build/llvm/${hostTarget}/release/greeting \\(llvm, ${hostTarget}, [1-9][0-9]* symbols\\)\n`,
+    ),
+  )
   assert.equal(
     yield* fs.exists(join(directory, 'greeting/build/llvm', hostTarget, 'release/greeting')),
     true,
