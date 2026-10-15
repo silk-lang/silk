@@ -14,8 +14,8 @@ claims, and historical receipts below are explicitly distinguished from final-he
       EXPECT: LINT OK
       EVIDENCE: pending revalidation after combined review
 
-- [ ] G1: the stack contains current selfhost, the main-first corpus sync and the Step 6 cleanup foundation
-      CHECK: git merge-base --is-ancestor origin/selfhost HEAD && git merge-base --is-ancestor 22de957e59470573c2bdea932392278219df139d HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
+- [ ] G1: the stack contains current main, the main-first corpus sync and the Step 6 cleanup foundation
+      CHECK: git merge-base --is-ancestor origin/main HEAD && git merge-base --is-ancestor 22de957e59470573c2bdea932392278219df139d HEAD && rg -q 'DropGlue' compiler/src/backend/InstanceKey.silk && rg -q 'cleanupStack|CleanupStack|cleanup stack' compiler/src && echo 'prerequisite verification passed'
       EXPECT: prerequisite verification passed
       EVIDENCE: merged layers throughselfhostfeb466e include Step6 cleanup; the feature integrates selfhostba5abe4f9 including #756/#757/#760 and main22de957e (#759). Final-head ancestry is rechecked before merge.
 

@@ -3,18 +3,16 @@
 //   check-borrow-gap.mjs corpus <corpus log>
 //     Compares each corpus program's SELFHOST_BORROW_GAP receipt with its baseline line. Any
 //     difference, a rise or a fall, fails until `update` records it, and so does a program that ran
-//     without a line. A line whose program did not run is only a notice: selfhost CI runs main's
-//     published corpus, so a selfhost change declares a new program's line before main's bundle
-//     carries the program.
+//     without a line. A line whose program did not run is only a notice, since a run filtered to
+//     some programs measures only those.
 //   check-borrow-gap.mjs update [--prune] <corpus log>
 //     Rewrites the baseline from a corpus log, with one line for every program that ran. A line whose
-//     program did not run is kept and listed as "not run", so regenerating from CI's log never loses
-//     a line declared ahead of main's bundle; `--prune` drops those lines instead, for programs the
-//     corpus no longer has. It refuses to write from a run with a failed program or with no program
-//     at all, since such a run measures nothing. It is the only writer of the file. CI's corpus job
-//     builds its corpus from main's verification harness, which can differ from a local run on this
-//     branch's corpus.ts; the baseline must match CI, so regenerate from the job's
-//     `selfhost-corpus-timings` artifact (or its log) whenever the two disagree.
+//     program did not run is kept and listed as "not run", so regenerating from a filtered run never
+//     loses a line; `--prune` drops those lines instead, for programs the corpus no longer has. It
+//     refuses to write from a run with a failed program or with no program at all, since such a run
+//     measures nothing. It is the only writer of the file. The baseline must match CI, so regenerate
+//     from the corpus job's `selfhost-corpus-timings` artifact (or its log) whenever a local run
+//     disagrees.
 //   check-borrow-gap.mjs diff <old baseline> <new baseline>
 //     Prints the per-program transition table between two baselines, for a PR body.
 //   check-borrow-gap.mjs self-build <receipt directory>
