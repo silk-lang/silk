@@ -912,7 +912,8 @@ export const analyze = (
         return
       }
       if (expression._tag === 'Replace') {
-        const source = expressionRoot(expression, context, builder)
+        const destination = expressionRoot(expression.destination, context, builder)
+        const source = destination === undefined ? undefined : canonicalRoot(destination)
         if (source !== undefined)
           invalidations.push({ root: rootSite(source, builder), path: source.path, expression })
       }

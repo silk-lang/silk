@@ -450,8 +450,6 @@ export const nonAliasResolutionCycleCode = 'SEM0223' as const
 export const unitVariantPayloadPatternCode = 'SEM0224' as const
 /** A borrowed value is used beyond the validity of its referent. */
 export const expiredLifetimeCode = 'OWN0019' as const
-/** An owner cannot be preserved by the suspension frame at this run boundary. */
-export const invalidSuspensionOwnershipCode = 'OWN0020' as const
 
 /** Stable code for a use of a binding after its consuming move. */
 export const useAfterMoveCode = 'OWN0001' as const
@@ -492,7 +490,6 @@ export type Code =
   | typeof nonAliasResolutionCycleCode
   | typeof unitVariantPayloadPatternCode
   | typeof expiredLifetimeCode
-  | typeof invalidSuspensionOwnershipCode
   | typeof unsupportedBytesCode
   | typeof unknownLiteralModifierCode
   | typeof unterminatedStaticLiteralCode
@@ -757,7 +754,6 @@ export type Reason<L = SourceSpan.SourceSpan> =
       readonly detail: string
     }
   | { readonly _tag: 'ExpiredLifetime'; readonly lifetime: string }
-  | { readonly _tag: 'InvalidSuspensionOwnership'; readonly detail: string }
   | { readonly _tag: 'UnsupportedBytes' }
   | { readonly _tag: 'UnknownLiteralModifier'; readonly modifier: string }
   | {
@@ -5536,17 +5532,6 @@ export const expiredLifetime = <L>(lifetime: string, span: L, origin?: L): Diagn
     : {
         relatedSpans: [{ label: 'borrowed storage originates here', span: origin }],
       }),
-})
-
-/** Publishes an ownership planner rejection at the source suspension boundary. */
-export const invalidSuspensionOwnership = <L>(detail: string, span: L): Diagnostic<L> => ({
-  _tag: 'Diagnostic',
-  phase: 'ownership',
-  code: invalidSuspensionOwnershipCode,
-  severity: 'error',
-  message: `Cannot preserve ownership across suspension: ${detail}`,
-  reason: { _tag: 'InvalidSuspensionOwnership' as const, detail },
-  span,
 })
 
 /** Preserves typed configuration origins and dependency failures without interpolating values. */
