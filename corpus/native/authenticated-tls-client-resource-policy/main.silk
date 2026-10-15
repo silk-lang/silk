@@ -1,0 +1,600 @@
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.effect {Effect}
+import silk.bytes {Bytes}
+import silk.pointer {Pointer}
+
+unsafe extern "C" fn silk_tls_fixture_size(id: i32) -> usize
+unsafe extern "C" fn silk_tls_fixture_copy(
+  id: i32,
+  output: ?[*]mut u8,
+  capacity: usize,
+) -> usize with Intrinsic.foreign(noCapture: ("output",))
+effect fn loadFixture(id: i32) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = unsafe silk_tls_fixture_size(id)
+  let mut bytes = run Bytes.zeroed(length)
+  let copied = unsafe silk_tls_fixture_copy(id, Pointer.fromMutSlice(Bytes.asMutSlice(&mut bytes)), length)
+  if copied != length { return Bytes.make() }
+  return move bytes
+}
+
+import silk.https_identity {HttpsIdentity, IdentityError, OriginHost, ReferenceIdentity}
+import silk.layout {Layout}
+import silk.random {Random}
+import silk.result {Result}
+import silk.option {Option}
+import silk.slice {Slice}
+import silk.system_clock {SystemClock}
+import silk.tls_client {
+  AlpnConfig,
+  AlpnProtocol,
+  Authentication,
+  Client,
+  ClientConfig,
+  ClientLimits,
+  ClientOperation,
+  Demand,
+  NamedGroup,
+  Progress,
+  ProtocolReason,
+  TlsLimitKind,
+  TlsError,
+}
+import silk.trust_anchor {TrustAnchor}
+import silk.tls_record {CipherSuite}
+import silk.trust_snapshot {SnapshotLimits, TrustLoadLimits, TrustSnapshot, TrustSourceError}
+import silk.certificate_path {ValidationReason}
+import silk.u8
+import silk.usize
+import silk.vector {Vector}
+
+// Deterministic test double only. Production code must supply a CSPRNG implementation.
+struct ScriptedRandom { filled: usize }
+
+impl Random for ScriptedRandom {
+  effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> () {
+    let mut index = usize.ZERO
+    while index < output.length {
+      output[index] = usize.toU8((self.filled + index + usize.ONE) % 251 + usize.ONE)
+      index = index + usize.ONE
+    }
+    self.filled = self.filled + output.length
+    return ()
+  }
+}
+
+// TLS_CLIENT_NATIVE_EMPTY_TRUST_BEGIN
+fn emptyTrust() -> TrustSnapshot {
+  let made = TrustSnapshot.fromAnchors(
+    Vector<TrustAnchor>.make(),
+    SnapshotLimits {anchors: 0, encodedBytes: 0},
+  )
+  return match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+      let invalid = 1 / 0
+      return emptyTrust()
+    }
+  }
+}
+// TLS_CLIENT_NATIVE_EMPTY_TRUST_END
+
+// TLS_CLIENT_ROOT_TRUST_BEGIN
+effect fn rootTrust() -> TrustSnapshot ! OutOfMemoryError ? &mut Allocator {
+  let pemOwner = run loadFixture(0)
+  if Bytes.length(&pemOwner) != 1200 {
+    let invalid = 1 / 0
+    return run rootTrust()
+  }
+  let pem = Bytes.asSlice(&pemOwner)
+  let made = run TrustSnapshot.fromPem(pem, TrustLoadLimits.defaults())
+  return match move made {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+      let invalid = 1 / 0
+      return run rootTrust()
+    }
+  }
+}
+// TLS_CLIENT_ROOT_TRUST_END
+
+fn reference<'a>(bytes: &'a [u8]) -> ReferenceIdentity<'a> {
+  let admitted = HttpsIdentity.reference(OriginHost<'a>.Dns {bytes: bytes})
+  return match move admitted {
+    Result<ReferenceIdentity<'a>, IdentityError>.Success {value} => value
+    Result<ReferenceIdentity<'a>, IdentityError>.Failure {error} => {
+      let invalid = 1 / 0
+      return reference(bytes)
+    }
+  }
+}
+
+// TLS_CLIENT_NATIVE_HELPERS_BEGIN
+fn isInvalidTime(result: Result<Client, TlsError>) -> bool {
+  return match move result {
+    Result<Client, TlsError>.Success {value} => false
+    Result<Client, TlsError>.Failure {error} => match move error {
+      TlsError.CertificatePath {error: pathError} => pathError.reason == ValidationReason.InvalidTime
+      _ => false
+    }
+  }
+}
+
+fn invalidLimit(result: Result<Client, TlsError>, expectedKind: TlsLimitKind, expected: usize) -> bool {
+  return match move result {
+    Result<Client, TlsError>.Success {value} => false
+    Result<Client, TlsError>.Failure {error} => match move error {
+      TlsError.LimitExceeded {kind, limit} => kind == expectedKind && limit == expected
+      _ => false
+    }
+  }
+}
+
+fn exactLimitFailure(
+  result: Result<Progress, TlsError>,
+  expectedKind: TlsLimitKind,
+  expectedLimit: usize,
+) -> bool {
+  return match move result {
+    Result<Progress, TlsError>.Success {value} => false
+    Result<Progress, TlsError>.Failure {error} => {
+      return exactLimitError(move error, expectedKind, expectedLimit)
+    }
+  }
+}
+
+fn exactLimitError(
+  error: TlsError,
+  expectedKind: TlsLimitKind,
+  expectedLimit: usize,
+) -> bool {
+  return match move error {
+    TlsError.LimitExceeded {kind, limit} => kind == expectedKind && limit == expectedLimit
+    _ => false
+  }
+}
+
+// TLS_CLIENT_NATIVE_HELPERS_END
+
+union FeedOutcome {
+  Complete,
+  Stalled,
+  Failure { error: TlsError },
+}
+
+effect fn feedOutcome(
+  client: &mut Client,
+  input: &[u8],
+  progressSteps: usize,
+) -> FeedOutcome
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let mut offset = usize.ZERO
+  while offset < input.length {
+    let remaining = Slice.view<u8>(input, offset, input.length - offset)
+    let fed = run Client.feedInput(&mut client, remaining)
+    let accepted = match move fed {
+      Result<Progress, TlsError>.Success {value} => value.consumed
+      Result<Progress, TlsError>.Failure {error} => {
+        return FeedOutcome.Failure {error: move error}
+      }
+    }
+    if accepted == usize.ZERO { return FeedOutcome.Stalled }
+    offset = offset + accepted
+    let mut steps = usize.ZERO
+    while steps < progressSteps {
+      let advanced = run Client.progress(&mut client)
+      if let Result<Progress, TlsError>.Failure {error} = move advanced {
+        return FeedOutcome.Failure {error: move error}
+      }
+      steps = steps + usize.ONE
+    }
+  }
+  return FeedOutcome.Complete
+}
+
+// TLS_CLIENT_NATIVE_LIMIT_HELPER_BEGIN
+effect fn feedExpectedLimit(
+  client: &mut Client,
+  input: &[u8],
+  expectedKind: TlsLimitKind,
+  expectedLimit: usize,
+) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let outcome = run feedOutcome(&mut client.*, input, usize.ONE)
+  return match move outcome {
+    FeedOutcome.Failure {error} => {
+      if !exactLimitError(move error, expectedKind, expectedLimit) { return false }
+      return exactLimitFailure(run Client.progress(&mut client.*), expectedKind, expectedLimit)
+    }
+    FeedOutcome.Complete => false
+    FeedOutcome.Stalled => false
+  }
+}
+// TLS_CLIENT_NATIVE_LIMIT_HELPER_END
+
+// TLS_CLIENT_CASES_BEGIN
+effect fn scenarioTrust(
+  trusted: bool,
+  master: &TrustSnapshot,
+) -> TrustSnapshot
+! OutOfMemoryError
+? &mut Allocator {
+  if !trusted { return emptyTrust() }
+  let copied = run TrustSnapshot.copy(master, SnapshotLimits.defaults())
+  return match move copied {
+    Result<TrustSnapshot, TrustSourceError>.Success {value} => move value
+    Result<TrustSnapshot, TrustSourceError>.Failure {error} => {
+      let invalid = 1 / 0
+      return run scenarioTrust(trusted, master)
+    }
+  }
+}
+
+effect fn makeClient<'a>(
+  master: &TrustSnapshot,
+  trusted: bool,
+  selectedReference: ReferenceIdentity<'a>,
+  selectedAlpn: AlpnConfig<'a>,
+  limits: ClientLimits,
+  seconds: i64,
+) -> Result<Client, TlsError>
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let trust = run scenarioTrust(trusted, master)
+  let config = ClientConfig {
+    reference: selectedReference,
+    alpn: selectedAlpn,
+    limits: limits,
+  }
+  return run Client.make(&config, move trust, SystemClock.make(seconds, 123456789))
+}
+
+effect fn matchesHello(client: &Client, fixtureId: i32) -> bool
+! OutOfMemoryError
+? &mut Allocator {
+  let owner = run loadFixture(fixtureId)
+  let actual = client.pendingOutput()
+  let expected = Bytes.asSlice(&owner)
+  if actual.length != expected.length || actual.length < 5 { return false }
+  if actual[0] != 22 || actual[1] != 3 || actual[2] != 3 { return false }
+  if u8.toUsize(actual[3]) * 256 + u8.toUsize(actual[4]) + 5 != actual.length {
+    return false
+  }
+  let mut index: usize = 5
+  while index < actual.length {
+    if actual[index] != expected[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+fn validPlaintext(bytes: &[u8], written: usize) -> bool {
+  let expected = b"coalesced authenticated plaintext"
+  if written != expected.length { return false }
+  let mut index = usize.ZERO
+  while index < written {
+    if bytes[index] != expected[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+struct CountingAllocator {calls: usize}
+
+effect fn allocate(self: &mut CountingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
+  self.calls = self.calls + usize.ONE
+  let mut system = Allocator.systemAllocatorProvider()
+  return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut system)
+}
+
+impl Allocator for CountingAllocator {allocate: CountingAllocator.allocate}
+
+effect fn limitsCase<'a>(
+  id: i32,
+  master: &TrustSnapshot,
+  acceptedBoundary: &'a [AlpnProtocol<'a>],
+  rejectedBoundary: &'a [AlpnProtocol<'a>],
+) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let host = b"ExAmPlE.com"
+  let mut limits = ClientLimits.defaults()
+  if id == 1 { limits.handshakeBodyBytes = usize.ONE }
+  if id == 3 { limits.certificateDecode.nodes = usize.ZERO }
+  if id == 4 { limits.sanDecode.identities = 257 }
+  if id == 5 { limits.identity.maxSanBytes = usize.ZERO }
+  if id == 6 { limits.path.signatureVerifications = usize.ZERO }
+  if id == 7 { limits.path.profile.nodes = usize.ZERO }
+  if id == 8 { limits.cookieBytes = 65535 }
+  if id == 9 { limits.handshakeBodyBytes = usize.MAX }
+  if id == 10 { limits.handshakeMessages = usize.ONE }
+  if id == 11 { limits.peerCertificates = usize.ONE }
+  if id == 12 { limits.certificateBytes = 844 }
+  if id == 13 { limits.certificateTotalBytes = 1679 }
+  if id == 14 { limits.extensionBytes = 45 }
+  if id == 15 { limits.cookieBytes = 1 }
+  if id == 16 { limits.emptyRecords = usize.ONE }
+  if id == 17 { limits.handshakeBytes = 2097 }
+  if id == 20 { limits.tickets = usize.ONE }
+  if id == 21 { limits.ticketBytes = 18 }
+  if id == 22 { limits.postHandshakeControls = usize.ONE }
+  if id == 23 {
+    limits.handshakeBodyBytes = 1693
+    limits.cookieBytes = 1506
+  }
+  if id == 19 {
+    limits.handshakeBodyBytes = 1694
+    limits.cookieBytes = 1507
+    limits.handshakeBytes = 2098
+    limits.handshakeMessages = 5
+    limits.peerCertificates = 2
+    limits.certificateBytes = 845
+    limits.certificateTotalBytes = 1680
+    limits.extensionBytes = 46
+  }
+  let mut selectedAlpn = AlpnConfig.defaults()
+  if id == 2 {
+    selectedAlpn = AlpnConfig.Offered {protocols: rejectedBoundary, required: false}
+  } else if id == 18 {
+    selectedAlpn = AlpnConfig.Offered {protocols: acceptedBoundary, required: false}
+  }
+  let mut seconds: i64 = 1789156800
+  if id == 0 { seconds = 253402300800 }
+  let constructorFailure = id <= 9
+  let made = run makeClient(
+    master,
+    !constructorFailure,
+    reference(&host),
+    selectedAlpn,
+    limits,
+    seconds,
+  )
+  if id == 0 { return isInvalidTime(move made) }
+  if id == 1 {
+    return invalidLimit(move made, TlsLimitKind.HandshakeBodyBytes, usize.ONE)
+  }
+  if id == 2 { return invalidLimit(move made, TlsLimitKind.Alpn, 1024) }
+  if id == 3 {
+    return invalidLimit(move made, TlsLimitKind.CertificateDecode, usize.ZERO)
+  }
+  if id == 4 {
+    return invalidLimit(move made, TlsLimitKind.CertificateSanDecode, 257)
+  }
+  if id == 5 {
+    return invalidLimit(move made, TlsLimitKind.CertificateIdentity, usize.ZERO)
+  }
+  if id == 6 {
+    return invalidLimit(move made, TlsLimitKind.CertificatePath, usize.ZERO)
+  }
+  if id == 7 {
+    return invalidLimit(move made, TlsLimitKind.CertificateProfile, usize.ZERO)
+  }
+  if id == 8 { return invalidLimit(move made, TlsLimitKind.CookieBytes, 65535) }
+  if id == 9 { return invalidLimit(move made, TlsLimitKind.HandshakeBodyBytes, usize.MAX) }
+  let mut client = match move made {
+    Result<Client, TlsError>.Success {value} => move value
+    Result<Client, TlsError>.Failure {error} => { return false }
+  }
+  if id == 18 { return true }
+  if !(run matchesHello(&client, 1)) { return false }
+  let helloLength = client.pendingOutput().length
+  drop client.ackWritten(helloLength)
+  if id == 19 {
+    let exactFlight = run loadFixture(2)
+    return run authenticateWithinLimits(&mut client, Bytes.asSlice(&exactFlight))
+  }
+  if id >= 20 && id <= 22 {
+    let exactFlight = run loadFixture(2)
+    if !(run authenticateWithinLimits(&mut client, Bytes.asSlice(&exactFlight))) { return false }
+    let mut plaintext: [u8; 40] = [
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ]
+    let read = client.readPlaintext(&mut plaintext)
+    let written = match move read {
+      Result<Progress, TlsError>.Success {value} => value.written
+      Result<Progress, TlsError>.Failure {error} => usize.ZERO
+    }
+    if !validPlaintext(&plaintext, written) { return false }
+    let first = run loadFixture(34)
+    if !(run feedComplete(&mut client, Bytes.asSlice(&first), usize.ONE)) { return false }
+    let second = run loadFixture(35)
+    let mut kind = TlsLimitKind.TicketBytes
+    let mut limit: usize = 18
+    if id == 20 {
+      kind = TlsLimitKind.Tickets
+      limit = usize.ONE
+    } else if id == 22 {
+      kind = TlsLimitKind.PostHandshakeControls
+      limit = usize.ONE
+    }
+    return run feedExpectedLimit(&mut client, Bytes.asSlice(&second), kind, limit)
+  }
+  if id == 15 {
+    let retry = run loadFixture(51)
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&retry),
+      TlsLimitKind.CookieBytes,
+      1,
+    )
+  }
+  if id == 16 {
+    let ccs = run loadFixture(26)
+    if !(run feedComplete(&mut client, Bytes.asSlice(&ccs), 8)) { return false }
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&ccs),
+      TlsLimitKind.EmptyRecords,
+      usize.ONE,
+    )
+  }
+  let flight = run loadFixture(2)
+  if id == 10 {
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&flight),
+      TlsLimitKind.HandshakeMessages,
+      usize.ONE,
+    )
+  }
+  if id == 23 {
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&flight),
+      TlsLimitKind.HandshakeBodyBytes,
+      1693,
+    )
+  }
+  if id == 11 {
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&flight),
+      TlsLimitKind.PeerCertificates,
+      usize.ONE,
+    )
+  }
+  if id == 12 {
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&flight),
+      TlsLimitKind.CertificateBytes,
+      844,
+    )
+  }
+  if id == 13 {
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&flight),
+      TlsLimitKind.CertificateTotalBytes,
+      1679,
+    )
+  }
+  if id == 14 {
+    return run feedExpectedLimit(
+      &mut client,
+      Bytes.asSlice(&flight),
+      TlsLimitKind.ExtensionBytes,
+      45,
+    )
+  }
+  return run feedExpectedLimit(
+    &mut client,
+    Bytes.asSlice(&flight),
+    TlsLimitKind.HandshakeBytes,
+    2097,
+  )
+}
+
+effect fn feedComplete(client: &mut Client, input: &[u8], steps: usize) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  let outcome = run feedOutcome(&mut client.*, input, steps)
+  return match move outcome {
+    FeedOutcome.Complete => true
+    FeedOutcome.Stalled => false
+    FeedOutcome.Failure {error} => false
+  }
+}
+
+effect fn authenticateWithinLimits(client: &mut Client, flight: &[u8]) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  if !(run feedComplete(&mut client.*, flight, 8)) { return false }
+  let mut steps = usize.ZERO
+  while steps < 3 {
+    let length = client.pendingOutput().length
+    if length == 0 { return false }
+    let acknowledged = Client.ackWritten(&mut client.*, length)
+    if let Result<Progress, TlsError>.Success {value} = move acknowledged {
+      if value.demand == Demand.Authenticated { return true }
+    }
+    steps = steps + usize.ONE
+  }
+  return false
+}
+
+effect fn runLimitCase<'a>(
+  id: i32,
+  master: &TrustSnapshot,
+  accepted: &'a [AlpnProtocol<'a>],
+  rejected: &'a [AlpnProtocol<'a>],
+  audit: &mut CountingAllocator,
+) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Random {
+  if id <= 9 {
+    return run limitsCase(id, master, accepted, rejected)
+      |> Effect.provideMut<Allocator>(&mut audit)
+  }
+  return run limitsCase(id, master, accepted, rejected)
+}
+
+effect fn cases() -> i32
+! OutOfMemoryError
+? &mut Allocator {
+  let boundaryOwner = run loadFixture(56)
+  let boundaries = alpnBoundaries(Bytes.asSlice(&boundaryOwner))
+  let master = run rootTrust()
+  let mut random = ScriptedRandom {filled: 0}
+  let mut allocationAudit = CountingAllocator {calls: usize.ZERO}
+  let mut id = 0
+  while id <= 23 {
+    random.filled = usize.ZERO
+    allocationAudit.calls = usize.ZERO
+    let passed = run runLimitCase(
+      id,
+      &master,
+      &boundaries.accepted,
+      &boundaries.rejected,
+      &mut allocationAudit,
+    ) |> Effect.provideMut<Random>(&mut random)
+    if id <= 9 && !(allocationAudit.calls == usize.ZERO) { return id + 101 }
+    let mut expectedEntropy: usize = 64
+    if id <= 9 { expectedEntropy = usize.ZERO }
+    if !passed || random.filled != expectedEntropy { return id + 1 }
+    id = id + 1
+  }
+  return 42
+}
+// TLS_CLIENT_CASES_END
+
+effect fn recover(error: OutOfMemoryError) -> i32 { return 98 }
+
+// TLS_CLIENT_MAIN_BEGIN
+struct AlpnBoundaries<'a> {
+  accepted: [AlpnProtocol<'a>; 4]
+  rejected: [AlpnProtocol<'a>; 5]
+}
+
+fn alpnBoundaries<'a>(bytes: &'a [u8]) -> AlpnBoundaries<'a> {
+  let one: &'a [u8] = Slice.view<u8>(bytes, 0, 255)
+  let two: &'a [u8] = Slice.view<u8>(bytes, 255, 255)
+  let three: &'a [u8] = Slice.view<u8>(bytes, 510, 255)
+  let four: &'a [u8] = Slice.view<u8>(bytes, 765, 255)
+  let five: &'a [u8] = Slice.view<u8>(bytes, 1020, 255)
+  let rejectedFour: &'a [u8] = Slice.view<u8>(four, 0, 251)
+  let rejectedFive: &'a [u8] = Slice.view<u8>(five, 0, 4)
+  let accepted: [AlpnProtocol<'a>; 4] = [
+    AlpnProtocol<'a> {bytes: one},
+    AlpnProtocol<'a> {bytes: two},
+    AlpnProtocol<'a> {bytes: three},
+    AlpnProtocol<'a> {bytes: four},
+  ]
+  let rejected: [AlpnProtocol<'a>; 5] = [
+    AlpnProtocol<'a> {bytes: one},
+    AlpnProtocol<'a> {bytes: two},
+    AlpnProtocol<'a> {bytes: three},
+    AlpnProtocol<'a> {bytes: rejectedFour},
+    AlpnProtocol<'a> {bytes: rejectedFive},
+  ]
+  return AlpnBoundaries<'a> {accepted: accepted, rejected: rejected}
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(cases(), recover)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+// TLS_CLIENT_MAIN_END
