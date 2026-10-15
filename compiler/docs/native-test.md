@@ -1,4 +1,4 @@
-# Native `silkc test`
+# Native `silk test`
 
 The compiler's own Cases tests run on the TypeScript bootstrap today. Every Cases shard in
 `.github/workflows/selfhost.yml` runs `node "$SILK_BOOTSTRAP" test --manifest-path
@@ -13,7 +13,7 @@ The language contract is the reference chapter [Tests and the source runner](../
 ## Command
 
 ```sh
-silkc test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--file <path>] \
+silk test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--file <path>] \
   [--optimization none|speed] [--debug true|false] --no-cache
 ```
 
@@ -27,6 +27,11 @@ silkc test <root.silk> -o <executable> [--stdlib <dir>] [--filter <text>] [--fil
   `<executable>.plan` and `<executable>.receipt` and removed after the run.
 - `--filter` and `--file` are passed to the runner unchanged (TEST-006). `--file` takes the
   package-relative logical path the catalog reports, such as `src/semantic/TargetCases.silk`.
+- `silk test [project options] [--root <path>] [--file <path>] [--filter <text>] --no-cache`,
+  without a root, is the project form of the TypeScript `silk test`: it loads the nearest (or the
+  `--manifest-path`) project, takes `--root` or else `[package].root` as the discovery root, and
+  writes the runner to `<output-dir>/test/llvm/<target>/<profile>/<name>`. Its `--file` is
+  resolved against the project directory and passed as the project-relative path.
 - `--no-cache` is required for now. Result reuse (TEST-008) needs execution identities that the
   native compiler does not publish yet; without the flag the command reports
   `SILK_GAP test-result-cache` and exits 2 before compiling. When execution identities land, the
@@ -89,9 +94,9 @@ What must match the bootstrap for the same root:
   so `silk/test_runner` and `silk/testing` add nothing.
 - **Pass/fail and exit status.** Decided by the runner from each test's outcome.
 
-The bootstrap prints one extra line before the runner, `Compiled src/<root> -> build/... (llvm,
-<target>, N symbols)`. The native command prints `silkc test: compiled <root> -> <executable>` in
-its place. No check reads it.
+Both compilers print one extra line before the runner, `Compiled <root> -> <executable> (llvm,
+<target>, N symbols)`, with paths relative to the project directory (the root's directory for a
+file-root `test`). The symbol counts differ between the compilers. No check reads it.
 
 ## Front end
 
@@ -258,7 +263,7 @@ from the `native-n1` job's `selfhost-native-n1` artifact, the compiler the pinne
 the checkout, and runs:
 
 ```sh
-"$SILKC" test "$PWD/compiler/src/<root>" -o "$RUNNER_TEMP/<name>-tests" \
+"$SILK_COMPILER" test "$PWD/compiler/src/<root>" -o "$RUNNER_TEMP/<name>-tests" \
   --stdlib "$PWD/packages/compiler/stdlib" --optimization speed --no-cache | tee "$log"
 node .github/scripts/check-selfhost-test-times.mjs "$log"
 ```
