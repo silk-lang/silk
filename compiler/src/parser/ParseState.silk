@@ -1,21 +1,18 @@
-//! Ownership-threaded state and primitive operations for the flat parser.
+//! Parser state and primitive operations for the flat parser.
 //!
 //! # When to use
 //!
 //! Use [`State`] in a grammar module that consumes tokens and builds nodes. Start one unfinished
-//! node with [`begin`]. Add token elements with [`consume`] or [`expect`]. Complete the node with
-//! [`finish`].
+//! node with an empty element list. Add token elements with [`consume`] or [`expect`]. Complete the
+//! node with [`finish`] or [`complete`], which answers its [`NodeId`].
 //!
 //! # Details
 //!
-//! Each grammar operation consumes its state and returns the new state. This ownership protocol
-//! avoids a long-lived mutable reference across nested grammar calls.
+//! Each grammar operation borrows the one parse state exclusively, so a nesting level holds only
+//! its own locals on the stack, never a copy of the state.
 //!
 //! The token cursor addresses the original token array. Lookups skip trivia, but the state keeps
 //! all tokens. Completed nodes stay in one array. A completed node never changes its index.
-//!
-//! [`ElementsResult`] represents a node that is not complete. [`NodeResult`] represents a node that
-//! is complete and already present in the node array.
 //!
 //! # Gotchas
 //!
@@ -36,13 +33,52 @@ import silk.string {String}
 import silk.usize
 import silk.vector {Vector}
 
-/// Maximum number of active recursive grammar operations.
-///
-/// The parser reports `NestingLimit` before it enters an operation beyond this budget.
-/// Sibling operations reuse the budget. This is not a limit on the number of nodes in a file.
-pub const NESTING_LIMIT: usize = 32
+/// Maximum number of active parent-to-child expression edges (EXPR-006).
+pub const EXPRESSION_LIMIT: usize = 256
 
-/// All mutable data for one parse, passed by ownership between grammar operations.
+/// The native stack budget for active nested constructs, in units of about one kilobyte.
+///
+/// # Details
+///
+/// The parser charges each active construct its measured stack cost in the whole compiler, not
+/// only in parsing, and reports `NestingLimit` before it enters one beyond this budget. The budget
+/// is half of an 8 MB main stack, so every mix of constructs keeps a 2x margin. It is a native
+/// guard beside EXPR-006: alone, 256 expression edges, 134 prefix operands, 135 chained operators,
+/// 59 blocks, 44 nested `if` statements, 43 nested `match` arms or 255 nested types fit; deeper
+/// mixes the reference accepts are rejected.
+/// Native frames do not yet share stack slots, so these costs fall once they do.
+pub const STACK_BUDGET: usize = 4096
+
+/// The cost of one expression child edge.
+pub const EXPRESSION_COST: usize = 8
+
+/// The cost of one prefix operand: `-`, `!`, `~`, `&`, `move`, `unsafe` or `run`.
+pub const PREFIX_COST: usize = 30
+
+/// The cost of one operator in a left-nested infix or pipeline chain.
+pub const CHAIN_COST: usize = 30
+
+/// The cost of one nested block, including function, `if`, loop, arm and effect bodies.
+pub const BLOCK_COST: usize = 68
+
+/// The cost of one `if` beyond its block, paid by each link of an `else if` chain.
+pub const CONDITIONAL_COST: usize = 22
+
+/// The cost of one `match` expression beyond its arms' blocks.
+pub const MATCH_COST: usize = 16
+
+/// The cost of one nested type.
+pub const TYPE_COST: usize = 16
+
+/// The cost of one nested pattern.
+pub const PATTERN_COST: usize = 16
+
+/// Whether entering a construct of `cost` stays within the stack budget.
+pub fn affordable(state: &State, cost: usize) -> bool {
+  return usize.add(state.stackCost, cost) <= STACK_BUDGET
+}
+
+/// All mutable data for one parse, borrowed exclusively by each grammar operation.
 ///
 /// # Details
 ///
@@ -60,34 +96,11 @@ pub struct State {
   pub diagnostics: Vector<Diagnostic>
   /// The raw token position from which the next significant-token search starts.
   pub index: usize
-  /// Active recursive grammar depth; siblings restore their parent's depth on return.
-  pub depth: usize
-}
-
-/// Parser state paired with the source-ordered elements of one unfinished node.
-///
-/// # Details
-///
-/// Grammar operations consume this value so the state and element list cannot diverge. A nested
-/// grammar returns a [`NodeResult`], and its node identity can then become one of these elements.
-pub struct ElementsResult {
-  /// Parser state after all operations represented by this result.
-  pub state: State
-  /// Direct child nodes, significant tokens, and missing tokens collected for the node.
-  pub elements: Vector<Element>
-}
-
-/// Parser state paired with the stable identity of one completed node.
-///
-/// # Details
-///
-/// The node is already present in `state.nodes`. Its identity can be appended to the direct
-/// elements of a parent node.
-pub struct NodeResult {
-  /// Parser state after the completed node was appended.
-  pub state: State
-  /// The index of the completed node in `state.nodes`.
-  pub node: NodeId
+  /// The summed stack cost of the active nested constructs; siblings restore their parent's.
+  pub stackCost: usize
+  /// Active expression child edges (EXPR-006). A block nested inside an expression keeps counting
+  /// from its enclosing expression, so expressions inside it share one bound with their ancestors.
+  pub expressionDepth: usize
 }
 
 fn isTrivia(tokenKind: TokenKind) -> bool {
@@ -137,18 +150,9 @@ pub fn make(source: Bytes, tokens: Vector<Token>) -> State {
     nodes: Vector<Node>.make(),
     diagnostics: Vector<Diagnostic>.make(),
     index: usize.ZERO,
-    depth: 0,
+    stackCost: 0,
+    expressionDepth: 0,
   }
-}
-
-/// Starts an empty direct-element list without changing parser state.
-///
-/// # When to use
-///
-/// Use at the start of each grammar rule that creates one node. Pass the result through token and
-/// recovery operations, then pass it to [`finish`].
-pub fn begin(state: State) -> ElementsResult {
-  return ElementsResult {state: move state, elements: Vector<Element>.make()}
 }
 
 /// Reports whether a significant token exists at or after the raw cursor.
@@ -214,14 +218,10 @@ pub fn insertionSpan(state: &State) -> Span {
 ///
 /// A source token must exist at or after the cursor. If physical input can end, call [`hasCurrent`]
 /// before this operation or use [`expect`].
-pub effect fn consume(initial: ElementsResult) -> ElementsResult ! OutOfMemoryError ? &mut Allocator {
-  let ElementsResult {state: initialState, elements: initialElements} = move initial
-  let mut state = move initialState
-  let mut elements = move initialElements
-  let index = significantIndex(&state)
+pub effect fn consume(state: &mut State, elements: &mut Vector<Element>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let index = significantIndex(&state.*)
   state.index = usize.add(index, usize.ONE)
-  run Vector<Element>.append(&mut elements, Element.Token {id: TokenId {index: index}})
-  return ElementsResult {state: move state, elements: move elements}
+  return run Vector<Element>.append(&mut elements.*, Element.Token {id: TokenId {index: index}})
 }
 
 /// Appends one missing-token element and its matching diagnostic without consuming input.
@@ -230,22 +230,18 @@ pub effect fn consume(initial: ElementsResult) -> ElementsResult ! OutOfMemoryEr
 ///
 /// The element and diagnostic use the same expected token kind and zero-width insertion span. The
 /// parser cursor does not move, so the current source token remains available for recovery.
-pub effect fn missing(initial: ElementsResult, expected: TokenKind) -> ElementsResult
+pub effect fn missing(state: &mut State, elements: &mut Vector<Element>, expected: TokenKind) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  let ElementsResult {state: initialState, elements: initialElements} = move initial
-  let mut state = move initialState
-  let mut elements = move initialElements
-  let missingSpan = insertionSpan(&state)
+  let missingSpan = insertionSpan(&state.*)
   run Vector<Diagnostic>.append(
     &mut state.diagnostics,
     Diagnostic.MissingToken {expected: expected, span: missingSpan},
   )
-  run Vector<Element>.append(
-    &mut elements,
+  return run Vector<Element>.append(
+    &mut elements.*,
     Element.MissingToken {expected: expected, span: missingSpan},
   )
-  return ElementsResult {state: move state, elements: move elements}
 }
 
 /// Consumes the expected token, or inserts a missing-token element at the current position.
@@ -259,13 +255,13 @@ pub effect fn missing(initial: ElementsResult, expected: TokenKind) -> ElementsR
 ///
 /// A mismatched source token stays current. The calling grammar must consume it or select another
 /// recovery action before a loop repeats.
-pub effect fn expect(initial: ElementsResult, expected: TokenKind) -> ElementsResult
+pub effect fn expect(state: &mut State, elements: &mut Vector<Element>, expected: TokenKind) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  if hasCurrent(&initial.state) && currentKind(&initial.state) == expected {
-    return run consume(move initial)
+  if hasCurrent(&state.*) && currentKind(&state.*) == expected {
+    return run consume(&mut state.*, &mut elements.*)
   }
-  return run missing(move initial, expected)
+  return run missing(&mut state.*, &mut elements.*, expected)
 }
 
 /// Consumes one significant token and records it as unexpected syntax.
@@ -284,21 +280,17 @@ pub effect fn expect(initial: ElementsResult, expected: TokenKind) -> ElementsRe
 ///
 /// A source token must exist at or after the cursor. Call [`hasCurrent`] first when physical input
 /// can end.
-pub effect fn unexpected(initial: ElementsResult) -> ElementsResult
+pub effect fn unexpected(state: &mut State, elements: &mut Vector<Element>) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  let ElementsResult {state: initialState, elements: initialElements} = move initial
-  let mut state = move initialState
-  let mut elements = move initialElements
-  let index = significantIndex(&state)
+  let index = significantIndex(&state.*)
   let token = Vector<Token>.get(&state.tokens, index)
   run Vector<Diagnostic>.append(
     &mut state.diagnostics,
     Diagnostic.UnexpectedToken {actual: kind(token), span: span(token)},
   )
   state.index = usize.add(index, usize.ONE)
-  run Vector<Element>.append(&mut elements, Element.Token {id: TokenId {index: index}})
-  return ElementsResult {state: move state, elements: move elements}
+  return run Vector<Element>.append(&mut elements.*, Element.Token {id: TokenId {index: index}})
 }
 
 /// Appends one completed node and returns its stable array identity.
@@ -315,17 +307,15 @@ pub effect fn unexpected(initial: ElementsResult) -> ElementsResult
 ///
 /// Elements must occur in source order. Each child node and token identity must belong to the
 /// returned state. This operation does not validate those conditions.
-pub effect fn finish(initial: ElementsResult, nodeKind: NodeKind, emptySpan: Span) -> NodeResult
+pub effect fn finish(state: &mut State, elements: Vector<Element>, nodeKind: NodeKind, emptySpan: Span) -> NodeId
 ! OutOfMemoryError
 ? &mut Allocator {
-  let ElementsResult {state: initialState, elements} = move initial
-  let mut state = move initialState
   let length = Vector<Element>.length(&elements)
   let mut nodeSpan = emptySpan
   if usize.ZERO < length {
-    let first = elementSpan(&state, Vector<Element>.get(&elements, usize.ZERO))
+    let first = elementSpan(&state.*, Vector<Element>.get(&elements, usize.ZERO))
     let last = elementSpan(
-      &state,
+      &state.*,
       Vector<Element>.get(&elements, usize.subtract(length, usize.ONE)),
     )
     nodeSpan = Span.make(first.start, last.end)
@@ -335,7 +325,7 @@ pub effect fn finish(initial: ElementsResult, nodeKind: NodeKind, emptySpan: Spa
     &mut state.nodes,
     Node {kind: nodeKind, span: nodeSpan, elements: move elements},
   )
-  return NodeResult {state: move state, node: node}
+  return node
 }
 
 /// Appends the source-file root for a completed top-level element list.
@@ -349,13 +339,11 @@ pub effect fn finish(initial: ElementsResult, nodeKind: NodeKind, emptySpan: Spa
 ///
 /// Call this operation after the top-level grammar has represented end-of-file in `elements`.
 /// This operation does not add or validate an end-of-file element.
-pub effect fn finishSourceFile(initial: ElementsResult) -> NodeResult
+pub effect fn finishSourceFile(state: &mut State, elements: Vector<Element>) -> NodeId
 ! OutOfMemoryError
 ? &mut Allocator {
-  let ElementsResult {state: initialState, elements} = move initial
-  let mut state = move initialState
   let node = NodeId {index: Vector<Node>.length(&state.nodes)}
-  let sourceEnd = insertionSpan(&state).end
+  let sourceEnd = insertionSpan(&state.*).end
   run Vector<Node>.append(
     &mut state.nodes,
     Node {
@@ -364,28 +352,28 @@ pub effect fn finishSourceFile(initial: ElementsResult) -> NodeResult
       elements: move elements,
     },
   )
-  return NodeResult {state: move state, node: node}
+  return node
 }
 
 /// Converts completed parser state and a source-file node identity into the final syntax tree.
 ///
 /// # Details
 ///
-/// The result takes ownership of the token, node, and diagnostic arrays. It uses `result.node` as
-/// the root identity. The parser cursor is no longer part of the result.
+/// The result takes ownership of the token, node, and diagnostic arrays. It uses `root` as the
+/// root identity. The parser cursor is no longer part of the result.
 ///
 /// # Gotchas
 ///
-/// The operation does not verify that `result.node` identifies a source-file node. Call
+/// The operation does not verify that `root` identifies a source-file node. Call
 /// [`finishSourceFile`] before this operation.
-pub fn intoSyntaxTree(result: NodeResult) -> SyntaxTree {
-  let NodeResult {state, node} = move result
-  let State {source, tokens, nodes, diagnostics, index: ignoredIndex, depth: ignoredDepth} = move state
+pub fn intoSyntaxTree(state: State, root: NodeId) -> SyntaxTree {
+  let State {source, tokens, nodes, diagnostics, index: ignoredIndex, stackCost: ignoredStackCost,
+    expressionDepth: ignoredExpressionDepth} = move state
   return SyntaxTree {
     source: move source,
     tokens: move tokens,
     nodes: move nodes,
-    root: node,
+    root: root,
     diagnostics: move diagnostics,
   }
 }
@@ -485,91 +473,84 @@ pub fn lineBreakBefore(state: &State) -> bool {
   return false
 }
 
-/// Attaches an already completed child to a saved parent element list.
-///
-/// The child's state becomes the parent's state. No node or token payload is copied.
-pub effect fn attach(elements: Vector<Element>, result: NodeResult) -> ElementsResult
-! OutOfMemoryError
-? &mut Allocator {
-  let NodeResult {state, node} = move result
-  let mut children = move elements
-  run Vector<Element>.append(&mut children, Element.Node {id: node})
-  return ElementsResult {state: move state, elements: move children}
+/// Attaches an already completed child to a parent element list. No node payload is copied.
+pub effect fn attach(elements: &mut Vector<Element>, node: NodeId) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run Vector<Element>.append(&mut elements.*, Element.Node {id: node})
 }
 
 /// Starts a parent whose first element is an existing completed node.
-pub effect fn wrap(result: NodeResult) -> ElementsResult ! OutOfMemoryError ? &mut Allocator {
-  return run attach(Vector<Element>.make(), move result)
+pub effect fn wrap(node: NodeId) -> Vector<Element> ! OutOfMemoryError ? &mut Allocator {
+  let mut elements = Vector<Element>.make()
+  run Vector<Element>.append(&mut elements, Element.Node {id: node})
+  return move elements
 }
 
 /// Consumes an optional token, leaving the unfinished node unchanged when it is absent.
-pub effect fn optional(initial: ElementsResult, expected: TokenKind) -> ElementsResult
+pub effect fn optional(state: &mut State, elements: &mut Vector<Element>, expected: TokenKind) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  if currentKind(&initial.state) == expected {
-    return run consume(move initial)
+  if currentKind(&state.*) == expected {
+    return run consume(&mut state.*, &mut elements.*)
   }
-  return move initial
+  return ()
 }
 
 /// Completes a node, using the current insertion point only when its element list is empty.
-pub effect fn complete(initial: ElementsResult, kind: NodeKind) -> NodeResult
+pub effect fn complete(state: &mut State, elements: Vector<Element>, kind: NodeKind) -> NodeId
 ! OutOfMemoryError
 ? &mut Allocator {
-  let empty = insertionSpan(&initial.state)
-  return run finish(move initial, kind, empty)
+  let empty = insertionSpan(&state.*)
+  return run finish(&mut state.*, move elements, kind, empty)
 }
 
 /// Reads the kind of a completed node without moving its element storage.
-pub fn nodeKind(result: &NodeResult) -> NodeKind {
-  return Vector<Node>.asSlice(&result.state.nodes)[result.node.index].kind
+pub fn nodeKind(state: &State, node: NodeId) -> NodeKind {
+  return Vector<Node>.asSlice(&state.nodes)[node.index].kind
 }
 
 /// Appends a fragment's direct elements to a saved parent without introducing a wrapper node.
-pub effect fn extend(elements: Vector<Element>, fragment: ElementsResult) -> ElementsResult
+pub effect fn extend(elements: &mut Vector<Element>, children: Vector<Element>) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  let ElementsResult {state, elements: children} = move fragment
-  let mut parent = move elements
   let mut index: usize = 0
   while index < Vector<Element>.length(&children) {
-    run Vector<Element>.append(&mut parent, Vector<Element>.get(&children, index))
+    run Vector<Element>.append(&mut elements.*, Vector<Element>.get(&children, index))
     index = usize.add(index, 1)
   }
-  return ElementsResult {state: move state, elements: move parent}
+  return ()
 }
 
 /// Expects a contextual word without accepting an unrelated identifier in that grammar slot.
-pub effect fn contextual(initial: ElementsResult, expected: string) -> ElementsResult
+pub effect fn contextual(state: &mut State, elements: &mut Vector<Element>, expected: string) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  if word(&initial.state, expected) {
-    return run consume(move initial)
+  if word(&state.*, expected) {
+    return run consume(&mut state.*, &mut elements.*)
   }
-  return run missing(move initial, TokenKind.Identifier)
+  return run missing(&mut state.*, &mut elements.*, TokenKind.Identifier)
 }
 
 /// Skips an over-deep branch iteratively, leaving unmatched enclosing delimiters untouched.
 ///
 /// The error node owns every skipped significant token. This recovery path never recursively
 /// invokes grammar rules, even when the input contains thousands of nested delimiters.
-pub effect fn nestingError(initial: State) -> NodeResult ! OutOfMemoryError ? &mut Allocator {
-  let mut p = begin(move initial)
-  let location = insertionSpan(&p.state)
+pub effect fn nestingError(state: &mut State) -> NodeId ! OutOfMemoryError ? &mut Allocator {
+  let mut elements = Vector<Element>.make()
+  let location = insertionSpan(&state.*)
   run Vector<Diagnostic>.append(
-    &mut p.state.diagnostics,
-    Diagnostic.NestingLimit {limit: NESTING_LIMIT, span: location},
+    &mut state.diagnostics,
+    Diagnostic.NestingLimit {limit: STACK_BUDGET, span: location},
   )
   let mut closing = Vector<TokenKind>.make()
-  while currentKind(&p.state) != TokenKind.EndOfFile {
-    let kind = currentKind(&p.state)
+  while currentKind(&state.*) != TokenKind.EndOfFile {
+    let kind = currentKind(&state.*)
     let length = Vector<TokenKind>.length(&closing)
     // A named function cannot belong to an expression or type, even if damaged source left
     // delimiters open. Anonymous fn(...) and effect {...} remain part of the skipped branch.
-    if (kind == TokenKind.FnKeyword && peek(&p.state, 1) == TokenKind.Identifier) || (kind == TokenKind.EffectKeyword && peek(
-      &p.state,
+    if (kind == TokenKind.FnKeyword && peek(&state.*, 1) == TokenKind.Identifier) || (kind == TokenKind.EffectKeyword && peek(
+      &state.*,
       1,
-    ) == TokenKind.FnKeyword && peek(&p.state, 2) == TokenKind.Identifier) || kind == TokenKind.PubKeyword {
+    ) == TokenKind.FnKeyword && peek(&state.*, 2) == TokenKind.Identifier) || kind == TokenKind.PubKeyword {
       break
     }
     if length == 0 && (kind == TokenKind.RightParenthesis || kind == TokenKind.RightBracket || kind == TokenKind.RightBrace || kind == TokenKind.Comma || kind == TokenKind.FatArrow || kind == TokenKind.LetKeyword || kind == TokenKind.ReturnKeyword || kind == TokenKind.PubKeyword) {
@@ -587,8 +568,87 @@ pub effect fn nestingError(initial: State) -> NodeResult ! OutOfMemoryError ? &m
       }
       Vector<TokenKind>.truncate(&mut closing, usize.subtract(length, 1))
     }
-    let next = run consume(move p)
-    p = move next
+    run consume(&mut state.*, &mut elements)
   }
-  return run complete(move p, NodeKind.Error)
+  return run complete(&mut state.*, move elements, NodeKind.Error)
+}
+
+/// Skips one expression child beyond its nesting budget, as EXPR-006 recovers it.
+///
+/// The diagnostic names the child's first significant token. The scan never recurses: it keeps
+/// one stack of open delimiters and stops at the first owner boundary of the enclosing expression
+/// (a separator, closing delimiter, statement or declaration keyword, or a `{` that cannot open a
+/// record here), leaving that boundary to the ordinary parser.
+pub effect fn expressionNestingError(state: &mut State, limit: usize, allowRecord: bool) -> NodeId
+! OutOfMemoryError
+? &mut Allocator {
+  let mut elements = Vector<Element>.make()
+  let first = significantIndex(&state.*)
+  let firstSpan = &state.tokens
+    |> Vector<Token>.get(first)
+    |> span
+  let mut closing = Vector<TokenKind>.make()
+  let mut significantConsumed = false
+  while currentKind(&state.*) != TokenKind.EndOfFile {
+    let kind = currentKind(&state.*)
+    let length = Vector<TokenKind>.length(&closing)
+    if length == 0 && significantConsumed && (overBudgetBoundary(kind) || (kind == TokenKind.LeftBrace && !allowRecord)) {
+      break
+    }
+    if kind == TokenKind.RightParenthesis || kind == TokenKind.RightBracket || kind == TokenKind.RightBrace {
+      if length == 0 || Vector<TokenKind>.get(&closing, usize.subtract(length, 1)) != kind {
+        break
+      }
+      Vector<TokenKind>.truncate(&mut closing, usize.subtract(length, 1))
+    } else if kind == TokenKind.LeftParenthesis {
+      run Vector<TokenKind>.append(&mut closing, TokenKind.RightParenthesis)
+    } else if kind == TokenKind.LeftBracket {
+      run Vector<TokenKind>.append(&mut closing, TokenKind.RightBracket)
+    } else if kind == TokenKind.LeftBrace {
+      run Vector<TokenKind>.append(&mut closing, TokenKind.RightBrace)
+    }
+    significantConsumed = true
+    run consume(&mut state.*, &mut elements)
+  }
+  run Vector<Diagnostic>.append(&mut state.diagnostics, Diagnostic.NestingLimit {limit: limit, span: firstSpan})
+  return run complete(&mut state.*, move elements, NodeKind.Error)
+}
+
+// Where an over-budget expression's scan stops when no delimiter it opened is still open.
+fn overBudgetBoundary(kind: TokenKind) -> bool {
+  return match kind {
+    TokenKind.Comma => true
+    TokenKind.Semicolon => true
+    TokenKind.RightParenthesis => true
+    TokenKind.RightBracket => true
+    TokenKind.RightBrace => true
+    TokenKind.FatArrow => true
+    TokenKind.LetKeyword => true
+    TokenKind.ConstKeyword => true
+    TokenKind.IfKeyword => true
+    TokenKind.WhileKeyword => true
+    TokenKind.BreakKeyword => true
+    TokenKind.ContinueKeyword => true
+    TokenKind.ReturnKeyword => true
+    TokenKind.FailKeyword => true
+    TokenKind.DropKeyword => true
+    TokenKind.ElseKeyword => true
+    TokenKind.PubKeyword => true
+    TokenKind.StructKeyword => true
+    TokenKind.TupleKeyword => true
+    TokenKind.EnumKeyword => true
+    TokenKind.UnionKeyword => true
+    TokenKind.TypeKeyword => true
+    TokenKind.ExternKeyword => true
+    TokenKind.ExportKeyword => true
+    TokenKind.FnKeyword => true
+    TokenKind.EffectKeyword => true
+    TokenKind.ImportKeyword => true
+    TokenKind.ImplKeyword => true
+    TokenKind.ServiceKeyword => true
+    TokenKind.InterfaceKeyword => true
+    TokenKind.RoleKeyword => true
+    TokenKind.EndOfFile => true
+    _ => false
+  }
 }
