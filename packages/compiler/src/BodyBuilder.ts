@@ -1452,6 +1452,7 @@ const residualExpression = (
     }
     return {
       _tag: 'Replace',
+      destination: tirExpression(fact.destination, options),
       place,
       value: tirExpectedExpression(
         fact.value,
