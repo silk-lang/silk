@@ -267,6 +267,9 @@ from immutable Git records and verified with the current tooling; historical sou
 Git objects without replacing the tooling checkout. To recover a chain whose newest seed is lost or
 suspect, replay forward from the newest seed that still verifies and pin the result.
 
+The drill replays the pin of the ref it runs on. Schedules run it on `selfhost`; dispatching it on a
+pin proposal branch replays the proposed hops before review, which is the evidence a pin PR carries.
+
 ### Earlier published seed
 
 For a broken chain: the pinned seed miscompiles, the fixpoint fails for a reason a different seed

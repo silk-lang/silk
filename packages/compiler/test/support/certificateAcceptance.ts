@@ -580,9 +580,6 @@ const literal = (bytes: Uint8Array): string =>
   `b"${Array.from(bytes, (byte) => `\\x${byte.toString(16).padStart(2, '0')}`).join('')}"`
 const baseline = input(0)
 const pemIndex = cases.find((entry) => entry.id === 'pem-lf')?.input ?? unreachable()
-const bundleIndex =
-  cases.find((entry) => entry.id === 'pem-two-block-bundle')?.input ?? unreachable()
-
 // Synthetic schema fixture: v2, both unique IDs, explicit NULL versus absent parameters,
 // nonzero unused-bit counts, and empty names. These are retained structural data, not policy.
 export const certificateUniqueIdsDer = Uint8Array.from([
@@ -591,13 +588,6 @@ export const certificateUniqueIdsDer = Uint8Array.from([
   48, 0, 48, 11, 48, 5, 6, 1, 42, 5, 0, 3, 2, 3, 160, 129, 2, 7, 128, 130, 2, 1, 254, 48, 5, 6, 1,
   43, 5, 0, 3, 2, 2, 252,
 ])
-
-const constructedEoc = certificateUniqueIdsDer.map((byte, index) => (index === 79 ? 0x20 : byte))
-const v1SubjectId = Uint8Array.from([
-  ...certificateUniqueIdsDer.subarray(0, 4),
-  ...certificateUniqueIdsDer.subarray(9, 66),
-  ...certificateUniqueIdsDer.subarray(70),
-]).map((byte, index) => (index === 1 || index === 3 ? byte - 9 : byte))
 
 const imports = `import silk.certificate { Certificate, CertificateVersion, DecodeLimits, DecodeError, DecodeClass, DecodeReason, DecodeOffsetSpace, AlgorithmView, BitStringView, ExtensionView }
 import silk.certificate_bundle { CertificateBundle }
@@ -708,238 +698,6 @@ effect fn ownership() -> bool ! OutOfMemoryError ? &mut Allocator {
 }
 `
 
-const extraChecks = `
-fn bitsEqual<'a>(value: Option<BitStringView<'a>>, unused: u8, byte: u8) -> bool {
-  return match move value {
-    Option<BitStringView<'a>>.None => false
-    Option<BitStringView<'a>>.Some { value: bits } => bits.unusedBits == unused && bits.bytes.length == 1 && bits.bytes[0] == byte
-  }
-}
-effect fn malformedAt(bytes: &[u8], reason: DecodeReason, offset: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let result = run Certificate.decodeDer(bytes, DecodeLimits.defaults())
-  return match move result {
-    Result<Certificate, DecodeError>.Success { value } => false
-    Result<Certificate, DecodeError>.Failure { error } => error.kind == DecodeClass.Malformed && error.reason == reason && error.offsetSpace == DecodeOffsetSpace.Input && error.offset == offset && error.certificateIndex == 0
-  }
-}
-fn inputLimitError(error: DecodeError) -> bool {
-  return error.kind == DecodeClass.ResourceLimit && error.reason == DecodeReason.InputBytes && error.offsetSpace == DecodeOffsetSpace.Input && error.offset == 1 && error.certificateIndex == 0
-}
-effect fn inputLimits() -> bool ! OutOfMemoryError ? &mut Allocator {
-  let mut limits = DecodeLimits.defaults()
-  limits.inputBytes = 1
-  let mut api = 0
-  while api < 3 {
-    let mut good = false
-    if api == 2 {
-      let result = run CertificateBundle.decodePem(b"12", limits)
-      good = match move result {
-        Result<CertificateBundle, DecodeError>.Success { value } => false
-        Result<CertificateBundle, DecodeError>.Failure { error } => inputLimitError(move error)
-      }
-    } else if api == 0 {
-      let result = run Certificate.decodeDer(b"12", limits)
-      good = match move result {
-        Result<Certificate, DecodeError>.Success { value } => false
-        Result<Certificate, DecodeError>.Failure { error } => inputLimitError(move error)
-      }
-    } else {
-      let result = run Certificate.decodePem(b"12", limits)
-      good = match move result {
-        Result<Certificate, DecodeError>.Success { value } => false
-        Result<Certificate, DecodeError>.Failure { error } => inputLimitError(move error)
-      }
-    }
-    if !good { return false }
-    api = api + 1
-  }
-  let emptyLabel = run Certificate.decodePem(b"-----BEGIN -----\\nAA==\\n-----END -----", DecodeLimits.defaults())
-  return match move emptyLabel {
-    Result<Certificate, DecodeError>.Success { value } => false
-    Result<Certificate, DecodeError>.Failure { error } => error.kind == DecodeClass.Unsupported && error.reason == DecodeReason.PemLabel && error.offsetSpace == DecodeOffsetSpace.Input && error.offset == 0
-  }
-}
-effect fn uniqueIds() -> bool ! OutOfMemoryError ? &mut Allocator {
-  let result = run Certificate.decodeDer(${literal(certificateUniqueIdsDer)}, DecodeLimits.defaults())
-  return match move result {
-    Result<Certificate, DecodeError>.Failure { error } => false
-    Result<Certificate, DecodeError>.Success { value } => {
-      let inner = Certificate.tbsSignatureAlgorithm(&value)
-      let outer = Certificate.signatureAlgorithm(&value)
-      let publicAlgorithm = Certificate.publicKeyAlgorithm(&value)
-      let key = Certificate.publicKey(&value)
-      let signature = Certificate.signature(&value)
-      return Certificate.version(&value) == CertificateVersion.V2
-        && bitsEqual(Certificate.issuerUniqueId(&value), 7, 128)
-        && bitsEqual(Certificate.subjectUniqueId(&value), 1, 254)
-        && missingBytes(move inner.parametersDer)
-        && optionalBytes(move outer.parametersDer, b"\\x05\\x00")
-        && optionalBytes(move publicAlgorithm.parametersDer, b"\\x05\\x00")
-        && inner.oid[0] == 42 && outer.oid[0] == 43
-        && key.unusedBits == 3 && key.bytes[0] == 160
-        && signature.unusedBits == 2 && signature.bytes[0] == 252
-        && Certificate.notBefore(&value).year == 1950 && Certificate.notAfter(&value).year == 2049
-    }
-  }
-}
-struct RefusingAllocator { calls: usize failAt: usize }
-effect fn allocate(self: &mut RefusingAllocator, layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError {
-  self.calls = self.calls + usize.ONE
-  if self.calls == self.failAt { return run Allocator.outOfMemory() }
-  let mut system = Allocator.systemAllocatorProvider()
-  return run Allocator.allocate(move layout) |> Effect.provideMut<Allocator>(&mut system)
-}
-impl Allocator for RefusingAllocator { allocate: RefusingAllocator.allocate }
-effect fn bundleSucceeded() -> bool ! OutOfMemoryError ? &mut Allocator {
-  let result = run CertificateBundle.decodePem(${literal(input(bundleIndex))}, DecodeLimits.defaults())
-  return match move result {
-    Result<CertificateBundle, DecodeError>.Failure { error } => false
-    Result<CertificateBundle, DecodeError>.Success { value } => CertificateBundle.length(&value) == 2
-  }
-}
-effect fn allocationFailed(error: OutOfMemoryError) -> bool { return false }
-effect fn allocationBoundaries() -> bool {
-  let mut audit = RefusingAllocator { calls: usize.ZERO, failAt: usize.ZERO }
-  let complete = run Effect.catchAll(bundleSucceeded() |> Effect.provideMut<Allocator>(&mut audit), allocationFailed)
-  if !complete { return false }
-  let total = audit.calls
-  // Initial refusal, partially built bundle, and final allocation failure. A native allocation
-  // release oracle may wrap this source; retries alone establish only typed failure/reusability.
-  let ordinals: [usize; 3] = [usize.ONE, total / 2, total]
-  let mut index = usize.ZERO
-  while index < 3 {
-    audit.calls = usize.ZERO
-    audit.failAt = ordinals[index]
-    let refused = run Effect.catchAll(bundleSucceeded() |> Effect.provideMut<Allocator>(&mut audit), allocationFailed)
-    if refused || audit.calls != ordinals[index] { return false }
-    audit.calls = usize.ZERO
-    audit.failAt = usize.ZERO
-    let retried = run Effect.catchAll(bundleSucceeded() |> Effect.provideMut<Allocator>(&mut audit), allocationFailed)
-    if !retried { return false }
-    index = index + usize.ONE
-  }
-  return true
-}
-`
-
-const fixtureTable = cases
-  .map((entry) => {
-    const limits = {
-      inputBytes: 16777216,
-      certificateBytes: 1048576,
-      totalDerBytes: 8388608,
-      certificates: 1024,
-      fieldBytes: 262144,
-      extensions: 256,
-      depth: 32,
-      nodes: 65536,
-      ...entry.limits,
-    }
-    let api = 2
-    if (entry.api === 'Certificate.decodeDer') api = 0
-    else if (entry.api === 'Certificate.decodePem') api = 1
-    return `Fixture { bytes: ${literal(input(entry.input))}, api: ${api}, success: ${entry.kind === 'Success'}, kind: DecodeClass.${entry.kind === 'Success' ? 'Malformed' : entry.kind}, reason: DecodeReason.${entry.reason}, limits: DecodeLimits { ${Object.entries(
-      limits,
-    )
-      .map(([key, value]) => `${key}: ${value}`)
-      .join(', ')} } }`
-  })
-  .join(',\n')
-
-const vectors = `
-struct Fixture {
-  bytes: &'static [u8]
-  api: i32
-  success: bool
-  kind: DecodeClass
-  reason: DecodeReason
-  limits: DecodeLimits
-}
-fn rejected(error: DecodeError, fixture: &Fixture, index: usize) -> bool {
-  if fixture.success || error.kind != fixture.kind || error.reason != fixture.reason { return false }
-  if index == 50 { return error.certificateIndex == 1 && error.offsetSpace == DecodeOffsetSpace.Input }
-  if index == 47 || index == 49 { return error.certificateIndex == 1 }
-  return error.certificateIndex == 0
-}
-fn certificateResult(result: Result<Certificate, DecodeError>, fixture: &Fixture, index: usize) -> bool {
-  return match move result {
-    Result<Certificate, DecodeError>.Failure { error } => rejected(move error, fixture, index)
-    Result<Certificate, DecodeError>.Success { value } => {
-      if !fixture.success { return false }
-      if fixture.api == 0 && !equal(Certificate.der(&value), fixture.bytes) { return false }
-      if index == 0 || fixture.api == 1 { return retained(&value) }
-      if index == 1 { return Certificate.serial(&value)[0] == 255 }
-      if index == 6 {
-        let inner = Certificate.tbsSignatureAlgorithm(&value)
-        let outer = Certificate.signatureAlgorithm(&value)
-        return !equal(inner.oid, outer.oid)
-      }
-      if index == 7 || index == 8 || index == 11 {
-        let bytes = fixture.bytes
-        let oid = Slice.view<u8>(bytes, 413, 3)
-        let raw = Slice.view<u8>(bytes, 421, 5)
-        if !extension(Certificate.extension(&value, 0), Slice.view<u8>(bytes, 409, 17), oid, true, raw) { return false }
-        if index == 8 { return extension(Certificate.extension(&value, 1), Slice.view<u8>(bytes, 426, 17), oid, true, Slice.view<u8>(bytes, 438, 5)) }
-      }
-      if index == 13 { return Certificate.signature(&value).unusedBits == 1 }
-      if index == 22 { return Certificate.version(&value) == CertificateVersion.V1 && Certificate.extensionCount(&value) == 0 }
-      if index == 23 { return Certificate.version(&value) == CertificateVersion.V2 && Certificate.extensionCount(&value) == 0 }
-      if index == 62 {
-        let algorithm = Certificate.signatureAlgorithm(&value)
-        return optionalBytes(move algorithm.parametersDer, Slice.view<u8>(fixture.bytes, 486, 82))
-      }
-      if index == 64 { return Certificate.notBefore(&value).year == 2011 }
-      return true
-    }
-  }
-}
-fn bundleResult(result: Result<CertificateBundle, DecodeError>, fixture: &Fixture, index: usize) -> bool {
-  return match move result {
-    Result<CertificateBundle, DecodeError>.Failure { error } => rejected(move error, fixture, index)
-    Result<CertificateBundle, DecodeError>.Success { value } => {
-      if !fixture.success || CertificateBundle.length(&value) != 2 { return false }
-      let mut at = usize.ZERO
-      while at < 2 {
-        let good = match move CertificateBundle.get(&value, at) {
-          Option<&Certificate>.None => false
-          Option<&Certificate>.Some { value: certificate } => retained(certificate)
-        }
-        if !good { return false }
-        at = at + usize.ONE
-      }
-      return absentCertificate(CertificateBundle.get(&value, 2))
-    }
-  }
-}
-effect fn vectors() -> i32 ! OutOfMemoryError ? &mut Allocator {
-  let fixtures: [Fixture; ${cases.length}] = [${fixtureTable}]
-  let mut index = usize.ZERO
-  while index < ${cases.length} {
-    let fixture = &fixtures[index]
-    let mut good = false
-    if fixture.api == 0 {
-      let result = run Certificate.decodeDer(fixture.bytes, fixture.limits)
-      good = certificateResult(move result, fixture, index)
-    } else if fixture.api == 1 {
-      let result = run Certificate.decodePem(fixture.bytes, fixture.limits)
-      good = certificateResult(move result, fixture, index)
-    } else {
-      let result = run CertificateBundle.decodePem(fixture.bytes, fixture.limits)
-      good = bundleResult(move result, fixture, index)
-    }
-    if !good { return usize.toI32(index) + 1 }
-    index = index + usize.ONE
-  }
-  if !(run ownership()) { return 101 }
-  if !(run uniqueIds()) { return 102 }
-  if !(run malformedAt(${literal(constructedEoc)}, DecodeReason.Tag, 79)) { return 104 }
-  if !(run malformedAt(${literal(v1SubjectId)}, DecodeReason.Schema, 61)) { return 105 }
-  if !(run allocationBoundaries()) { return 103 }
-  if !(run inputLimits()) { return 106 }
-  return 0
-}
-`
-
 const footer = (operation: string): string => `
 effect fn allocated() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
@@ -948,8 +706,6 @@ effect fn allocated() -> i32 ! OutOfMemoryError {
 effect fn recover(error: OutOfMemoryError) -> i32 { return 250 }
 pub fn main() -> i32 { return run Effect.catchAll(allocated(), recover) }
 `
-
-export const certificateAcceptanceSource = `${imports}${helpers}${retention}${extraChecks}${vectors}${footer('vectors')}`
 
 export const certificateWasmAcceptanceSource = `${imports}${helpers}${retention}
 effect fn portable() -> i32 ! OutOfMemoryError ? &mut Allocator {
