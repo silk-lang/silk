@@ -33,11 +33,50 @@ import silk.string {String}
 import silk.usize
 import silk.vector {Vector}
 
-/// Maximum number of active recursive grammar operations.
+/// Maximum number of active parent-to-child expression edges (EXPR-006).
+pub const EXPRESSION_LIMIT: usize = 256
+
+/// The native stack budget for active nested constructs, in units of about one kilobyte.
 ///
-/// The parser reports `NestingLimit` before it enters an operation beyond this budget.
-/// Sibling operations reuse the budget. This is not a limit on the number of nodes in a file.
-pub const NESTING_LIMIT: usize = 32
+/// # Details
+///
+/// The parser charges each active construct its measured stack cost in the whole compiler, not
+/// only in parsing, and reports `NestingLimit` before it enters one beyond this budget. The budget
+/// is half of an 8 MB main stack, so every mix of constructs keeps a 2x margin. It is a native
+/// guard beside EXPR-006: alone, 256 expression edges, 134 prefix operands, 135 chained operators,
+/// 59 blocks, 44 nested `if` statements, 43 nested `match` arms or 255 nested types fit; deeper
+/// mixes the reference accepts are rejected.
+/// Native frames do not yet share stack slots, so these costs fall once they do.
+pub const STACK_BUDGET: usize = 4096
+
+/// The cost of one expression child edge.
+pub const EXPRESSION_COST: usize = 8
+
+/// The cost of one prefix operand: `-`, `!`, `~`, `&`, `move`, `unsafe` or `run`.
+pub const PREFIX_COST: usize = 30
+
+/// The cost of one operator in a left-nested infix or pipeline chain.
+pub const CHAIN_COST: usize = 30
+
+/// The cost of one nested block, including function, `if`, loop, arm and effect bodies.
+pub const BLOCK_COST: usize = 68
+
+/// The cost of one `if` beyond its block, paid by each link of an `else if` chain.
+pub const CONDITIONAL_COST: usize = 22
+
+/// The cost of one `match` expression beyond its arms' blocks.
+pub const MATCH_COST: usize = 16
+
+/// The cost of one nested type.
+pub const TYPE_COST: usize = 16
+
+/// The cost of one nested pattern.
+pub const PATTERN_COST: usize = 16
+
+/// Whether entering a construct of `cost` stays within the stack budget.
+pub fn affordable(state: &State, cost: usize) -> bool {
+  return usize.add(state.stackCost, cost) <= STACK_BUDGET
+}
 
 /// All mutable data for one parse, borrowed exclusively by each grammar operation.
 ///
@@ -57,8 +96,11 @@ pub struct State {
   pub diagnostics: Vector<Diagnostic>
   /// The raw token position from which the next significant-token search starts.
   pub index: usize
-  /// Active recursive grammar depth; siblings restore their parent's depth on return.
-  pub depth: usize
+  /// The summed stack cost of the active nested constructs; siblings restore their parent's.
+  pub stackCost: usize
+  /// Active expression child edges (EXPR-006). A block nested inside an expression keeps counting
+  /// from its enclosing expression, so expressions inside it share one bound with their ancestors.
+  pub expressionDepth: usize
 }
 
 fn isTrivia(tokenKind: TokenKind) -> bool {
@@ -108,7 +150,8 @@ pub fn make(source: Bytes, tokens: Vector<Token>) -> State {
     nodes: Vector<Node>.make(),
     diagnostics: Vector<Diagnostic>.make(),
     index: usize.ZERO,
-    depth: 0,
+    stackCost: 0,
+    expressionDepth: 0,
   }
 }
 
@@ -324,7 +367,8 @@ pub effect fn finishSourceFile(state: &mut State, elements: Vector<Element>) -> 
 /// The operation does not verify that `root` identifies a source-file node. Call
 /// [`finishSourceFile`] before this operation.
 pub fn intoSyntaxTree(state: State, root: NodeId) -> SyntaxTree {
-  let State {source, tokens, nodes, diagnostics, index: ignoredIndex, depth: ignoredDepth} = move state
+  let State {source, tokens, nodes, diagnostics, index: ignoredIndex, stackCost: ignoredStackCost,
+    expressionDepth: ignoredExpressionDepth} = move state
   return SyntaxTree {
     source: move source,
     tokens: move tokens,
@@ -495,7 +539,7 @@ pub effect fn nestingError(state: &mut State) -> NodeId ! OutOfMemoryError ? &mu
   let location = insertionSpan(&state.*)
   run Vector<Diagnostic>.append(
     &mut state.diagnostics,
-    Diagnostic.NestingLimit {limit: NESTING_LIMIT, span: location},
+    Diagnostic.NestingLimit {limit: STACK_BUDGET, span: location},
   )
   let mut closing = Vector<TokenKind>.make()
   while currentKind(&state.*) != TokenKind.EndOfFile {
@@ -527,4 +571,84 @@ pub effect fn nestingError(state: &mut State) -> NodeId ! OutOfMemoryError ? &mu
     run consume(&mut state.*, &mut elements)
   }
   return run complete(&mut state.*, move elements, NodeKind.Error)
+}
+
+/// Skips one expression child beyond its nesting budget, as EXPR-006 recovers it.
+///
+/// The diagnostic names the child's first significant token. The scan never recurses: it keeps
+/// one stack of open delimiters and stops at the first owner boundary of the enclosing expression
+/// (a separator, closing delimiter, statement or declaration keyword, or a `{` that cannot open a
+/// record here), leaving that boundary to the ordinary parser.
+pub effect fn expressionNestingError(state: &mut State, limit: usize, allowRecord: bool) -> NodeId
+! OutOfMemoryError
+? &mut Allocator {
+  let mut elements = Vector<Element>.make()
+  let first = significantIndex(&state.*)
+  let firstSpan = &state.tokens
+    |> Vector<Token>.get(first)
+    |> span
+  let mut closing = Vector<TokenKind>.make()
+  let mut significantConsumed = false
+  while currentKind(&state.*) != TokenKind.EndOfFile {
+    let kind = currentKind(&state.*)
+    let length = Vector<TokenKind>.length(&closing)
+    if length == 0 && significantConsumed && (overBudgetBoundary(kind) || (kind == TokenKind.LeftBrace && !allowRecord)) {
+      break
+    }
+    if kind == TokenKind.RightParenthesis || kind == TokenKind.RightBracket || kind == TokenKind.RightBrace {
+      if length == 0 || Vector<TokenKind>.get(&closing, usize.subtract(length, 1)) != kind {
+        break
+      }
+      Vector<TokenKind>.truncate(&mut closing, usize.subtract(length, 1))
+    } else if kind == TokenKind.LeftParenthesis {
+      run Vector<TokenKind>.append(&mut closing, TokenKind.RightParenthesis)
+    } else if kind == TokenKind.LeftBracket {
+      run Vector<TokenKind>.append(&mut closing, TokenKind.RightBracket)
+    } else if kind == TokenKind.LeftBrace {
+      run Vector<TokenKind>.append(&mut closing, TokenKind.RightBrace)
+    }
+    significantConsumed = true
+    run consume(&mut state.*, &mut elements)
+  }
+  run Vector<Diagnostic>.append(&mut state.diagnostics, Diagnostic.NestingLimit {limit: limit, span: firstSpan})
+  return run complete(&mut state.*, move elements, NodeKind.Error)
+}
+
+// Where an over-budget expression's scan stops when no delimiter it opened is still open.
+fn overBudgetBoundary(kind: TokenKind) -> bool {
+  return match kind {
+    TokenKind.Comma => true
+    TokenKind.Semicolon => true
+    TokenKind.RightParenthesis => true
+    TokenKind.RightBracket => true
+    TokenKind.RightBrace => true
+    TokenKind.FatArrow => true
+    TokenKind.LetKeyword => true
+    TokenKind.ConstKeyword => true
+    TokenKind.IfKeyword => true
+    TokenKind.WhileKeyword => true
+    TokenKind.BreakKeyword => true
+    TokenKind.ContinueKeyword => true
+    TokenKind.ReturnKeyword => true
+    TokenKind.FailKeyword => true
+    TokenKind.DropKeyword => true
+    TokenKind.ElseKeyword => true
+    TokenKind.PubKeyword => true
+    TokenKind.StructKeyword => true
+    TokenKind.TupleKeyword => true
+    TokenKind.EnumKeyword => true
+    TokenKind.UnionKeyword => true
+    TokenKind.TypeKeyword => true
+    TokenKind.ExternKeyword => true
+    TokenKind.ExportKeyword => true
+    TokenKind.FnKeyword => true
+    TokenKind.EffectKeyword => true
+    TokenKind.ImportKeyword => true
+    TokenKind.ImplKeyword => true
+    TokenKind.ServiceKeyword => true
+    TokenKind.InterfaceKeyword => true
+    TokenKind.RoleKeyword => true
+    TokenKind.EndOfFile => true
+    _ => false
+  }
 }
