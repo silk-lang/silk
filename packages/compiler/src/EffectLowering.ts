@@ -1653,6 +1653,17 @@ export const lowerPlacePath = (
       ],
     }
   }
+  if (expression._tag === 'PatternBindingReference') {
+    // A `match place` binding names part of its subject, so a projection of it extends the
+    // subject's place instead of reading the whole binding.
+    const place = patternBinding(fn, expression.binding)?.place
+    if (place !== undefined) {
+      const root = ownershipLocal(fn, place.root)
+      if (root === undefined) return undefined
+      const selectors = lowerOwnershipPath(fn, root, place.path, expression.span)
+      return selectors === undefined ? undefined : { root, selectors }
+    }
+  }
   const root = lowerExpression(fn, expression, availableRequirements)
   if (root === 'Transferred') return root
   return root === undefined ? undefined : { root: root.result, selectors: [] }

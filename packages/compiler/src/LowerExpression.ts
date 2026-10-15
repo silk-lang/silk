@@ -424,20 +424,18 @@ export function lowerExpressionInner(
       return { result: bound }
     }
     case 'PatternBindingReference': {
-      const binding = patternBinding(fn, expression.binding)
-      if (binding?.place !== undefined) {
-        const root = ownershipLocal(fn, binding.place.root)
+      if (patternBinding(fn, expression.binding)?.place !== undefined) {
+        const place = lowerPlacePath(fn, expression, availableRequirements)
         const type = fn.type(expression.type)
-        if (root === undefined || type === undefined) return undefined
-        const selectors = lowerOwnershipPath(fn, root, binding.place.path, expression.span)
-        if (selectors === undefined) return undefined
-        if (selectors.length === 0) return { result: root }
+        if (place === 'Transferred') return place
+        if (place === undefined || type === undefined) return undefined
+        if (place.selectors.length === 0) return { result: place.root }
         const destination = fn.alloc(type)
         fn.emit({
           _tag: 'ReadPlace',
           destination,
-          root,
-          selectors,
+          root: place.root,
+          selectors: place.selectors,
           type,
           provenance: authored(expression.span),
         })
