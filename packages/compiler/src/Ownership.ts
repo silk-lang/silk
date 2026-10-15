@@ -1891,6 +1891,16 @@ interface LoanEndpoint {
   readonly cleanupOnly?: boolean
 }
 
+// The extent and kind of a borrowed match arm's loan of its scrutinee (MATCH-001), pending the
+// language decision. `Arm` holds the loan through the whole selected arm, guard included, whether
+// or not the arm binds; `LastUse` ends it at the arm's last binding use and holds none for an arm
+// that binds nothing. `Match` takes the match's own access, so `&mut` lends exclusively; `Shared`
+// lets the owner be read beside an idle exclusive binding.
+const armLoan: { readonly extent: 'Arm' | 'LastUse'; readonly kind: 'Match' | 'Shared' } = {
+  extent: 'LastUse',
+  kind: 'Shared',
+}
+
 const analyzeLoans = (
   fn: LoanView.Body,
   index: DeclarationIndex.Index,
@@ -3185,16 +3195,20 @@ const analyzeLoans = (
     bindings: ReadonlySet<string>,
     guard: LoanView.Expression | undefined,
     body: LoanView.ArmBody,
-  ): { readonly from: number; readonly last: number } | undefined => {
+  ):
+    | { readonly from: number; readonly last: number | undefined; readonly to: number }
+    | undefined => {
     let from: number | undefined
+    let to: number | undefined
     let last: number | undefined
     let uses = 0
     const reach = (end: number): void => {
       if (last === undefined || end > last) last = end
     }
     const expressionUses = (expression: LoanView.Expression): void => {
-      const start = context.spanOf(expression.anchor).start
-      if (from === undefined || start < from) from = start
+      const span = context.spanOf(expression.anchor)
+      if (from === undefined || span.start < from) from = span.start
+      if (to === undefined || span.end > to) to = span.end
       if (expression._tag === 'Identifier') {
         const direct = directSite(expression)
         if (direct !== undefined && bindings.has(siteKey(direct.site))) {
@@ -3236,7 +3250,7 @@ const analyzeLoans = (
     if (guard !== undefined) expressionUses(guard)
     if (body._tag === 'Expression') expressionUses(body.expression)
     else statementUses(body.statements)
-    return from === undefined || last === undefined ? undefined : { from, last }
+    return from === undefined || to === undefined ? undefined : { from, last, to }
   }
 
   const holdBindings = (
@@ -3254,28 +3268,31 @@ const analyzeLoans = (
       }))
       const extent = bindingExtent(new Set(sites.map(siteKey)), arm.guard, arm.body)
       if (extent === undefined) continue
+      const end = armLoan.extent === 'Arm' ? extent.to : extent.last
+      if (end === undefined) continue
       bindingLoans.push({
         from: extent.from,
         loan: {
           _tag: 'Loan',
           id: { _tag: 'BorrowId', call: expression.ref, ordinal },
           root: place.root,
-          referents: [
-            ...new Map(
-              sites
-                .flatMap((site) => rootsOf(site))
-                .map((referent) => [referentKey(referent), referent]),
-            ).values(),
-          ],
-          // The owner may still be read while an exclusive binding is idle; only an access that
-          // invalidates or exclusively reborrows the bound payload conflicts.
-          access: 'Shared',
+          referents:
+            armLoan.extent === 'Arm'
+              ? [place]
+              : [
+                  ...new Map(
+                    sites
+                      .flatMap((site) => rootsOf(site))
+                      .map((referent) => [referentKey(referent), referent]),
+                  ).values(),
+                ],
+          access: armLoan.kind === 'Match' ? expression.access : 'Shared',
           origin: 'MatchBinding',
           suspendsParent: false,
           startRegion: region,
           endRegion: region,
           startSpan: start,
-          endSpan: { ...start, start: extent.last, end: extent.last },
+          endSpan: { ...start, start: end, end },
         },
       })
     }
