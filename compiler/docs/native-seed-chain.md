@@ -65,9 +65,11 @@ tag=$(jq -er --arg target "$target" '.seeds[$target].tag' compiler/native-seed.j
 asset=$(jq -er --arg target "$target" '.seeds[$target].asset' compiler/native-seed.json)
 gh release download "$tag" --repo silk-lang/silk --pattern "$asset" --dir "$seed_dir/download"
 node compiler/scripts/NativeSeed.mjs verify compiler/native-seed.json "$target" \
-  "$seed_dir/download/$asset" "$seed_dir/silkc"
-export SILKC="$seed_dir/silkc"
-export SILKC_CLANG="$(command -v clang)"
+  "$seed_dir/download/$asset" "$seed_dir/silk"
+export SILK_COMPILER="$seed_dir/silk"
+export SILK_CLANG="$(command -v clang)"
+# The pinned seed predates SILK_CLANG and reads SILKC_CLANG until the next re-pin.
+export SILKC_CLANG="$SILK_CLANG"
 # On macOS:
 # export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
 ```
@@ -120,7 +122,7 @@ Jobs in `.github/workflows/selfhost.yml`:
    N1/N2 IR (and cross-emitted IR for the initial hop), runs the native corpus with N1, and uses
    N2 to compile and execute the `trivial-features` smoke program. The required aggregate check
    includes both targets.
-5. **Native selfhost cases** shards build each source test root's runner with N1 (`silkc test`)
+5. **Native selfhost cases** shards build each source test root's runner with N1 (`silk test`)
    and run it under the per-test time guard.
 
 N1 and N2 are compiled from the same source by different compilers, so identical IR shows that the
