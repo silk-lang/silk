@@ -17,7 +17,7 @@ import * as Driver from './support/TestDriver.js'
 import * as Json from './support/Json.js'
 import * as Process from './support/Process.js'
 import * as TestToolchain from './support/TestToolchain.js'
-import { synchronousStartupFailure, synchronousStartupSuccess } from './support/corpus.js'
+import { corpusProgram } from './support/corpus.js'
 
 const ascii = (text: string): Uint8Array => new TextEncoder().encode(text)
 const runtime = 'silk/native_start_sync'
@@ -173,8 +173,8 @@ it.effect(
         const path = yield* Path.Path
         const directory = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-source-startup-' })
         for (const [name, source, status] of [
-          ['success', synchronousStartupSuccess, 17],
-          ['failure', synchronousStartupFailure, 1],
+          ['success', corpusProgram('source-startup-host-input-i32-success').source, 17],
+          ['failure', corpusProgram('source-startup-host-input-i32-failure').source, 1],
           [
             'shared',
             'import silk.host_input { HostInput, HostInputError }\npub effect fn main() -> i32 ! HostInputError ? &HostInput { return 23 }',
