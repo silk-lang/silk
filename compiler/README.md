@@ -152,8 +152,16 @@ place (D4): the protected Effect fails into a temporary, a switch sends members 
 handler and injects the rest into the residual failure. `finalizeEffect`, its NonParking variant
 and `useReleaseNonParking` expand the same way: both exits of the protected run (or of `use`, lent
 the owned resource) run the `() ! never` finalizer (or `release`, which drops the resource), and a
-held failure is raised afterwards. Reached parking lowers through `Intrinsic.relinquish` (D6), but
-`Intrinsic.NonParking` bounds are still admitted without proof (#1665). An `effect {}` block or anonymous
+held failure is raised afterwards. Reached parking lowers through `Intrinsic.relinquish` (D6). The
+build proves every reached `Intrinsic.NonParking` obligation after closing the external parks
+(`Intrinsic.relinquish`, `Intrinsic.executionCurrent`) over direct calls, drops, formed function
+addresses, readiness notifications and package releases. A bounded instance's own premise is owed
+by the call that reaches it, a nonparking finalizer, release or observer callback whose bound no
+premise carries is owed at its run, and a `with Intrinsic.nonParking()` service operation is owed
+for its selected witness at the call. An obligation covers the drop glue its value's runner
+executes in place. A nested transfer through `Effect.suspend` is not a park. An obligated value
+with no exact executable target, or one that reaches a park, is SEM0139. An
+`effect {}` block or anonymous
 `effect fn` is an exact representation like an anonymous closure: its environment holds its
 captures, and running it (or an invoked anonymous `effect fn`) calls its own instance with the
 environment as parameter 0. A block derives its success, failure and requirement row from its
@@ -234,10 +242,13 @@ and the intermediate stages together; the selfhost workflow runs it on N1.
 Optimization defaults to `speed` and debug to `false`. These explicit logical choices are validated
 and published as the content-keyed profile input before source loading; the native corpus runner
 builds and runs every declared profile variant. Clang receives `-O0` or `-O2` and optional `-g`. A `--debug true` build also writes `<output>.symbols`, one line per emitted instance in emission order: its content-derived symbol, its family (`function`, `export`, `drop` or `helper`) and its source declaration as `package:path::Owner.name`, tab-separated. The map never changes the IR, so a profile can name `silk_<hash>` frames. The standard-library
-root contains `silk/`; it is an explicit CLI input. An executable package without a
-`[build].composition` takes its runtime from the library's `compositions.json` for the target and
-libc, so such a build needs the library root even without standard-library imports; no listed
-runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
+root contains `silk/`. `--stdlib` names it explicitly; without the flag, every command uses the
+library an installation keeps at `<prefix>/lib/silk/stdlib` beside `<prefix>/bin/silkc`. The
+compiler finds its executable from argument zero (a path, or a bare name searched in `PATH`) and
+resolves symbolic links with `realpath`, so a link to it in another directory finds the same
+library. An executable package without a `[build].composition` takes its runtime from the
+library's `compositions.json` for the target and libc, so such a build needs the library root even
+without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`, whose containing directory
 is the root for local module paths. Every module identity names the package by its logical
 identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
@@ -249,16 +260,50 @@ Test invocation: `silkc test <root> -o <executable> --stdlib <directory> [--filt
 bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it with an uncached
 plan, admits its receipt and exits with its status; see [Native `silkc test`](docs/native-test.md).
 
-Run invocation: `silkc run [--stdlib <directory>] [arguments...] [-- arguments...]`. It finds the
-nearest `silk.toml` above the working directory, as the TypeScript CLI's `silk run` does, and
-builds `[package].root` for the host target in the debug profile (no optimization, debug
-information) at `<output-dir>/llvm/<target>/debug/<name>`, where `[build].output-dir` defaults to
-`build` and must stay inside the project. Options are read until `--`; other arguments before it
+Project build invocation: `silkc build [--manifest-path <path>] [--target <host|triple>]...
+[--release] [--optimization <debug|release|release-with-debug>] [--profile <name>]
+[--profile-input <json>] [--stdlib <directory>]`, that is `build` without a source file. It loads the nearest
+`silk.toml` above the working directory, or exactly the manifest `--manifest-path` names, as the
+TypeScript CLI's `silk build` does, and builds `[package].root` once per selected target: the
+`--target` selectors in order, or else `[build].targets` (default `["host"]`), where `host` names
+the compiler's host and a repeated target builds once. The debug profile (no optimization, debug
+information) is the default; `--optimization release` (or `--release`) selects optimization without
+debug information and `--optimization release-with-debug` keeps it, as the TypeScript CLI does, and
+`--release` with another `--optimization` exits 2. Each
+artifact lands at `<output-dir>/llvm/<target>/<profile>/<name>`, where `[build].output-dir`
+defaults to `build` and must stay inside the project; an `llvm-ir` `[build].stage` writes
+`<name>.ll` there instead. Only the host target links an executable, and library artifacts and the
+other intermediate stages are not native yet; each such target fails with status 2. The command
+prints one `build llvm/<target>: ok <artifact>` or `failed (exit <status>)` line per target and a
+`Build summary`; its status is 2 when any target failed operationally, else 1 when any build was
+refused, else 0. A missing or invalid manifest or an unknown target exits 2 before building.
+
+Named profiles follow the TypeScript `ProjectProfile`: a `[profiles.<name>]` table is a complete
+logical profile (`target` is required; `cpu`, `optimization`, `debug` and the other profile fields
+are optional) with optional profile-tier `bindings`, and `[build].profile` names the default one.
+`--profile-input <json>` supplies a complete profile as a JSON object with the same fields and
+`bindings` (`Invalid --profile-input JSON` exits 2), and naming it together with `--profile` is
+refused as `ConflictingBindings: profile selection modes`. `--profile-input`, or `--profile
+<name>`, or else the default when no `--target` is given, builds exactly that profile once, in the profile directory its optimization and debug choices name; it conflicts with
+`--target`, `--release` and `--optimization` (status 2). `[build].bindings` holds project-tier package-parameter
+bindings (`package`, `module`, `parameter`, a `value` such as `{ kind = "integer", value = "3" }`
+and an `origin` with `source` and a public `provenance`) that every project build receives, before
+the selected profile's own. Loading a project validates the whole catalog; a refusal prints the
+TypeScript `<code>: <subject>`, such as `InvalidInput: profile name`, and exits 2.
+
+Run invocation: `silkc run [--manifest-path <path>] [--target <host|triple>]... [--release]
+[--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>]
+[arguments...] [-- arguments...]`. It builds the
+project's executable as the project build does, for the named profile, else the first `--target`,
+else the host (it ignores `[build].targets`), and a target other than the host exits 2. Options are read until `--`; other arguments before it
 and every argument after it go to the program in order. The compiler then replaces its own process
 with the program (`execv`), so the program inherits standard input, output and error, the
 environment and the working directory, and its exit status or terminating signal is the command's.
-A missing or invalid manifest, a non-executable `[build].artifact` or a non-final `[build].stage`
-exits 2; a refused build keeps `build`'s status.
+A non-executable `[build].artifact` or a non-final `[build].stage` exits 2; a refused build keeps
+`build`'s status.
+
+`silkc --help` (or `-h`) prints the command synopsis and `silkc --version` (or `-v`) prints
+`silkc v<version>`, both on standard output with status 0.
 
 Init invocation: `silkc init [path] [--name <name>]`. It creates a project as the TypeScript
 initializer does: `silk.toml` (`[package]` name, version `0.1.0`, root `src/main.silk`), a
@@ -269,7 +314,7 @@ existing manifest or entry, a `src` that is not a directory or an ancestor that 
 with status 2 before anything is written, and a failure part-way removes everything initialization
 created and restores the previous `.gitignore`.
 
-Clean invocation: `silkc clean`. It removes the nearest project's `[build].output-dir` and
+Clean invocation: `silkc clean [--manifest-path <path>]`. It removes the project's `[build].output-dir` and
 everything below it, as the TypeScript `silk clean` does, and prints `Removed <directory>`. An
 absent output directory is already clean. Only builds write there, and the manifest decoder keeps
 the directory inside the project. A missing or invalid manifest, or a failed removal, exits 2.
@@ -441,8 +486,10 @@ the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first g
 ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
 verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-With `SILKC` pointing at the verified ARM64 executable and `SILKC_CLANG` pointing at LLVM 22
-`clang`, development builds use the native compiler directly:
+Without `SILKC_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
+does, and refuses with status 2 when there is none. With `SILKC` pointing at the verified ARM64
+executable and `SILKC_CLANG` pointing at LLVM 22 `clang`, development builds use the native
+compiler directly:
 
 ```sh
 mkdir -p .scratch

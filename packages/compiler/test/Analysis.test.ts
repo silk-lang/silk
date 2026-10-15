@@ -23,7 +23,7 @@ import * as SourceResolver from '../src/SourceResolver.js'
 import * as SemanticDisplay from '../src/SemanticDisplay.js'
 import * as SyntaxTree from '../src/SyntaxTree.js'
 import * as Type from '../src/Type.js'
-import { invalidMatchCorpus } from './support/corpus.js'
+import { invalidCorpus } from './support/corpus.js'
 import * as Projections from './support/projections.js'
 import { raise, unreachable } from './support/raise.js'
 
@@ -534,7 +534,7 @@ it.effect('keeps unsupported targets explicit and queryable without manufacturin
 
 it.effect('keeps invalid match corpus failures phase-owned and downstream facts queryable', () =>
   Effect.gen(function* () {
-    for (const program of invalidMatchCorpus) {
+    for (const program of invalidCorpus.filter((program) => program.name.startsWith('match-'))) {
       const self = yield* AnalysisFixture.retainingMain(
         `memory/${program.name}`,
         ascii(program.source),

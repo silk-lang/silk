@@ -214,6 +214,10 @@ Region variables live only in the side table. Each is one of:
 Declared outlives bounds and `where` premises become assumptions between universal regions. They
 are given, not proved, in the body itself (LIFE-002).
 
+Region closure (§6) accepts the universal regions of enclosing declarations as atoms; it never
+relates them to each other. A relation that names an enclosing declaration's parameter, an
+invocation binder or an enclosing body's local stays pending.
+
 The R3 2a premise check runs inside the body query. It checks retained relations made solely
 of `'static` and that named body's declared lifetime atoms against `BodyPremises`, including
 input well-formedness edges. Goals never become premises. A rigid relation absent from that
@@ -461,10 +465,16 @@ through the run (EFFECT-OWN-002, CALLABLE-003).
 
 A body the walk clears is `Checked` when it is region-closed and typing left nothing pending. It is
 region-closed when every region its locals and values name is `'static`, a loan region of the
-body itself, or a universal region of the body's own declaration: one of its lifetime parameters.
-No loan of the body has a lifetime parameter's region, and typing defers every relation that would
-make a body loan outlive one as a pending region obligation, so a body with nothing pending relies
-on none. A call result keeps an operand's region only by naming it, and conformance holds an
+body itself, or a universal region chosen before the body runs: a lifetime parameter of its own
+declaration or of a named declaration enclosing it (an impl's parameters in a method, an enclosing
+function's in an anonymous body), or an anonymous body's invocation binder. Inside an anonymous
+body, a loan region of the enclosing named body is a capture dependency: the enclosing body bounds its
+formation and retention with its own points, and the nested body proves only its own uses. A
+callable value's type also names its contract's binders (invocation binders, and a nested literal's
+own parameters); each invocation instantiates them afresh, so they name no region of a value the
+body holds. An enclosing literal's own binders and locals, supplied atoms and meets are not closed. No loan of the body has a universal region, and
+typing defers every relation that would make a body loan outlive one as a pending region
+obligation, so a body with nothing pending relies on none. A call result keeps an operand's region only by naming it, and conformance holds an
 interface witness to exactly the regions its operation names, so a result typed by an open
 parameter keeps no loan of the body. Such a body's
 loans and their scopes are its whole region proof, because no loan of a cleared body outlives its
@@ -513,7 +523,7 @@ the gap becomes a hard build error, and `borrow-check` leaves the gap catalog.
   the earlier loan (BORROW-004), and the violating use for OWN0019, as in the bootstrap. Typed-node
   origins carry these spans already. Answers store them relative to the declaration (Q2).
 - **Parity is measured differentially**, on code, primary span and module, over the bootstrap's
-  expected-diagnostic programs: the ownership and lifetime cases in `test/support/corpus.ts`, plus
+  expected-diagnostic programs: the ownership and lifetime cases of the acceptance corpus, plus
   a new invalid-ownership set covering every code in §1.1. The selfhost runner has no
   expected-diagnostic mode today (`CorpusProgram.expected` is only `Completes` or `Trap`). Adding
   one changes guarded inputs (`runSelfhostCorpus.ts`, `corpus.ts`), so it lands on `main` first.

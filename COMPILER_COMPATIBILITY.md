@@ -1128,27 +1128,59 @@ Each entry records:
   `storagePrimitivesFollowTheirContracts` in
   `compiler/src/semantic/SemanticCallableCases.silk`; the `native-termination-*` corpus programs.
 
-### Selfhost admits `Intrinsic.NonParking` bounds without proof
+### Selfhost proves `Intrinsic.NonParking` more conservatively than the bootstrap
 
-- **Status:** open divergence that accepts invalid programs, tracked by
-  [#1665](https://github.com/silk-lang/silk/issues/1665). Introduced as a temporary Step 9e
-  divergence of [#567](https://github.com/silk-lang/silk/issues/567) on 2026-10-05. Its fallback
-  ended when 629d0038e (2026-10-09) made reached parking lower through `Intrinsic.relinquish`.
+- **Status:** open divergences, found with
+  [#1665](https://github.com/silk-lang/silk/issues/1665) on 2026-10-14. All of them reject programs
+  the bootstrap accepts; none accepts a program that parks.
 - **Rule:** an `Intrinsic.NonParking` bound holds only when the specialized transitive graph
-  cannot reach external parking.
-- **Compilers:** the bootstrap proves the bound during executable analysis
-  (`ExecutableOrigin.ts` NonParking obligations for `finalizeEffectNonParking` and
-  `useReleaseNonParking`; `CallResolution.ts` for service operations) and rejects a finalizer or
-  release whose targets are not exact or not proven with SEM0139. Selfhost discharges the bound at
-  the call without that analysis. Before 629d0038e, any parking it would have rejected was refused
-  as the `suspension` gap at the `park` site; that refusal no longer exists, so selfhost now accepts
-  a `NonParking`-bounded finalizer or callable that parks. #1665 has two reproductions.
-- **Source migration:** none. Programs that rely on the admission are invalid under the reference.
-- **Diagnostics and limits:** selfhost reports nothing where the bootstrap reports SEM0139 at the
-  bounded call. Retire this entry when selfhost proves the bound.
-- **Evidence:** `nonParkingFinalizersAreAdmitted` in
-  `compiler/src/semantic/SemanticCaptureCases.silk` pins the admission of valid finalizers; the
-  bootstrap's rejection is in `packages/compiler/test/Suspendability.test.ts`.
+  cannot reach external parking (`Intrinsic.relinquish`, `Intrinsic.executionCurrent`). A nested
+  transfer through `Effect.suspend` is not a park. A bounded value is proved even when the program
+  never invokes it.
+- **Compilers:** both compilers reject an unproved bound with SEM0139. They report it:
+  - at the call that reaches the bounded instance;
+  - at a nonparking finalizer or release whose bound no premise carries;
+  - at a `with Intrinsic.nonParking()` service call.
+
+  Selfhost's park closure also follows drops, formed function addresses, readiness notifications
+  and package releases. Its obligations cover the drop glue a composite's runner executes in
+  place: a bracket's resource, a binding's provider, an observer's state, a cancelled finalizer.
+  Selfhost diverges from the bootstrap in these ways:
+  - **Observation callbacks.** Selfhost obligates an `Intrinsic.observeDiagnostics` callback at the
+    observation's run unless a premise carries it, because every diagnostic the observed body
+    reports invokes it. The bootstrap does not check that callback.
+  - **Execution releases.** Releasing an Execution (dropping the handle, completing a drive, or
+    destroying a notified package) is treated as running the glue of every package the program
+    forms. A package whose captured state has a parking Drop hook therefore makes every
+    NonParking scope that releases any Execution unproved, including `native_start`'s drive
+    callbacks. No standard-library Drop hook runs an Effect.
+  - **Callable schemas.** Selfhost cannot open a callable schema (a named function value with
+    deferred binders, such as an elided reference lifetime). It proves the schema against every
+    reached instance of its declaration. A calm use is therefore unproved when another reached
+    instance of the same declaration parks, or when no instance is reached at all. The bootstrap
+    proves the function itself.
+- **Source migration:** none for ordinary programs. Do not give an Execution body state whose
+  Drop hook parks. Do not pass a never-invoked function with deferred binders to a
+  NonParking-bounded parameter.
+- **Diagnostics and limits:**
+  - Selfhost reports every unproved site, with the application module's sites first and the
+    runtime module's sites last. The bootstrap keeps one diagnostic per message, so for a bound
+    forwarded through a second bounded parameter it reports only the inner parameter's anchor.
+  - A direct `Intrinsic.finalizeEffectNonParking` or `useReleaseNonParking` run is reported at its
+    `run`.
+  - Selfhost assumes that a foreign call re-enters Silk only through a callback address the
+    program forms. An `export "C"` function that C code calls by symbol from inside a NonParking
+    scope is outside the proof. The existing ForeignCallback check rejects a suspending callback
+    address.
+  - A plain function that returns an Effect for its caller to run (as a bracket's release, or as a
+    bounded callable whose result is run) is not yet lowered natively and is refused as
+    unsupported. The proof also treats such a target as inexact, so it stays unproved until a
+    returned Effect's parts can be targeted.
+  - `closeSuspendable` does not follow drop edges either; a Drop hook that suspends is outside
+    the suspension selection.
+- **Evidence:** `nonParkingBoundsAreProvedAtBuild` in
+  `compiler/src/semantic/SemanticLoweringCases.silk`; the bootstrap's rejections are in
+  `packages/compiler/test/Suspendability.test.ts`.
 
 ### Nominal qualification requires an inherent member
 
