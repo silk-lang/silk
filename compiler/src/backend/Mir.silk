@@ -718,6 +718,8 @@ pub union RunPlan {
     /// The steps that run parts 0 and 1, in the same plan.
     pub inner: usize,
     pub innerFailure: Shared<Type>,
+    /// The failure's type when it owns cleanup; a frame cancelled while it waits drops it.
+    pub innerFailureDrop: Option<Shared<Type>>,
     pub finalizer: usize,
     pub finalizerSuccess: Shared<Type>,
     /// Whether the finalizer is `NonParking`. Cancelling a parked protected part runs a nonparking
@@ -737,6 +739,8 @@ pub union RunPlan {
     pub use: CallTarget,
     pub useSuccess: Shared<Type>,
     pub useFailure: Shared<Type>,
+    /// The failure's type when it owns cleanup; a frame cancelled while it waits drops it.
+    pub useFailureDrop: Option<Shared<Type>>,
     pub release: CallTarget,
     pub releaseSuccess: Shared<Type>,
     pub releaseFailure: Shared<Type>,
@@ -920,12 +924,20 @@ struct Builder {
   cancelEveryCall: bool
   // The failure slots whose context holds a live pool node while the calls lowered now run: the
   // handler of a caught failure, and the finalizer or release that holds one. A cancel exit
-  // from those calls releases each, innermost first (N7).
-  held: Vector<usize>
+  // from those calls releases each, innermost first (N7), and drops a value it still owns.
+  held: Vector<HeldFailure>
   // The composed Effects whose pending cleanup a cancel exit inside them runs, innermost last.
   cancelScopes: Vector<CancelScope>
   // Set while a cancel landing is lowered: its calls run to completion, so they record no exit.
   landing: bool
+}
+
+// A failure slot held across the calls lowered now. `cleanup` is its type when the slot still owns
+// a value that needs cleanup: a finalizer or release runs before the failure is delivered, while
+// a handler has already received it.
+struct HeldFailure {
+  slot: usize
+  cleanup: Option<Shared<Type>>
 }
 
 // A composed Effect whose cleanup is still pending while its protected part runs: a finalizer, a
@@ -3357,12 +3369,17 @@ effect fn recordCancel(builder: &mut Builder, origin: Origin) -> ()
   let point = builder.current
   let entry = run block(&mut builder.*, origin)
   resume(&mut builder.*, entry)
-  // A failure held across this point is never delivered: its node is released first (N7).
-  let mut at = Vector<usize>.length(&builder.held)
+  // A failure held across this point is never delivered: its node is released first (N7), and
+  // a value it still owns is dropped like any other owner the frame abandons (SUSP-013).
+  let mut at = Vector<HeldFailure>.length(&builder.held)
   while at > usize.ZERO {
     at = at - usize.ONE
-    let slot = Vector<usize>.asSlice(&builder.held)[at]
+    let slot = Vector<HeldFailure>.asSlice(&builder.held)[at].slot
+    let listed = Vector<HeldFailure>.asSlice(&builder.held)
+    let dropped = copyOptionalType(&listed[at].cleanup)
     run release(&mut builder.*, slot, origin)
+    let value = place(slot)
+    run dropUnused(&mut builder.*, &value, &dropped, origin)
   }
   // Each enclosing composed Effect's pending cleanup runs, innermost first, before the point's
   // own drops: finalizers before frame cleanup, as in an exit that completes.
@@ -6530,7 +6547,7 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Shared<Typ
     witnessIntrinsics: Vector<WitnessIntrinsic>.make(), helpers: Vector<MirFunction>.make(),
     exits: Vector<ExitStep>.make(), left: Vector<LeftExit>.make(), suspending: Option<Vector<InstanceKey>>.none(),
     cancelEveryCall: cancellable,
-    held: Vector<usize>.make(),
+    held: Vector<HeldFailure>.make(),
     cancelScopes: Vector<CancelScope>.make(),
     landing: false,
   }
@@ -7717,9 +7734,11 @@ effect fn planCall(builder: &mut Builder, target: &CallTarget, environment: &Pla
   }
   let callee = Callee.Instance {key: InstanceKey.copy(&target.key)}
   let diagnostics = run calleeDiagnostics(&builder.*, &callee, origin)
-  if releasing != usize.MAX { run Vector<usize>.append(&mut builder.*.held, releasing) }
+  if releasing != usize.MAX {
+    run Vector<HeldFailure>.append(&mut builder.*.held, HeldFailure {slot: releasing, cleanup: Option<Shared<Type>>.none()})
+  }
   run noteCancel(&mut builder.*, &callee, origin)
-  if releasing != usize.MAX { drop Vector<usize>.pop(&mut builder.*.held) }
+  if releasing != usize.MAX { drop Vector<HeldFailure>.pop(&mut builder.*.held) }
   terminate(&mut builder.*, Terminator.Call {callee: move callee,
     arguments: move values, providers: move providers, diagnostics: move diagnostics, destination: place(destination),
     normal: continuation, failure: move edge, origin: origin})
@@ -7968,7 +7987,7 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       }
       resume(&mut builder.*, joined)
     }
-    RunPlan.Finalize {inner, innerFailure, finalizer, finalizerSuccess, nonParking, finalizerDrop, owed} => {
+    RunPlan.Finalize {inner, innerFailure, innerFailureDrop, finalizer, finalizerSuccess, nonParking, finalizerDrop, owed} => {
       if owed {
         // A cancelled finalizer is dropped unrun, also within the NonParking scope.
         let mut callees = Vector<InstanceKey>.make()
@@ -7999,13 +8018,14 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, &mut bound.*, origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
       resume(&mut builder.*, failing)
-      run Vector<usize>.append(&mut builder.*.held, caught)
+      run Vector<HeldFailure>.append(&mut builder.*.held, HeldFailure {slot: caught, cleanup: copyOptionalType(&innerFailureDrop)})
       run finalizeOnce(&mut builder.*, steps, finalizer, &finalizerPart, &finalizerSuccess, &mut bound.*, origin)
-      drop Vector<usize>.pop(&mut builder.*.held)
+      drop Vector<HeldFailure>.pop(&mut builder.*.held)
       run deliverFailure(&mut builder.*, caught, &innerFailure, sink, origin)
       resume(&mut builder.*, joined)
     }
-    RunPlan.UseRelease {lent, use, useSuccess, useFailure, release, releaseSuccess, releaseFailure, resourceDrop, owed, resourceOwed} => {
+    RunPlan.UseRelease {lent, use, useSuccess, useFailure, useFailureDrop, release, releaseSuccess, releaseFailure, resourceDrop, owed,
+      resourceOwed} => {
       // Invoking the release runs the Effect it returns in the same call. The run then drops the
       // resource, within the same NonParking scope.
       if owed || resourceOwed {
@@ -8043,10 +8063,10 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
         Vector<BoundPlace>.asSlice(&bound.*), origin)
       terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
       resume(&mut builder.*, failing)
-      run Vector<usize>.append(&mut builder.*.held, caught)
+      run Vector<HeldFailure>.append(&mut builder.*.held, HeldFailure {slot: caught, cleanup: copyOptionalType(&useFailureDrop)})
       run releaseOnce(&mut builder.*, &release, &releasePart, &resource, &lent, &releaseSuccess, &releaseFailure, &resourceDrop,
         Vector<BoundPlace>.asSlice(&bound.*), origin)
-      drop Vector<usize>.pop(&mut builder.*.held)
+      drop Vector<HeldFailure>.pop(&mut builder.*.held)
       run deliverFailure(&mut builder.*, caught, &useFailure, sink, origin)
       resume(&mut builder.*, joined)
     }
@@ -9489,7 +9509,7 @@ impl MirFunction {
       anchor: Anchor.copy(anchor),
       suspending: move suspending,
       cancelEveryCall: false,
-      held: Vector<usize>.make(),
+      held: Vector<HeldFailure>.make(),
       cancelScopes: Vector<CancelScope>.make(),
       landing: false,
     }
