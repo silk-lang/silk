@@ -81,7 +81,7 @@ const loanOrders = new WeakMap<
   >
 >()
 
-const loanOrder = (loans: ReadonlyArray<Ownership.LoanFact>) => {
+export const loanOrder = (loans: ReadonlyArray<Ownership.LoanFact>) => {
   const cached = loanOrders.get(loans)
   if (cached !== undefined) return cached
   const order = new Map<
@@ -1091,17 +1091,38 @@ const lowerStatement = (
     const otherwiseState = delayedEffectState(fn)
     const otherwiseRegions = fn.regionsPublishedSince(beforeOtherwise)
     restoreDelayedEffectState(fn, branchState)
-    // Only loans held by one branch end, in the function's loan order. Visiting the held set
-    // keeps each conditional proportional to its live loans rather than to every loan issued
-    // anywhere in the function.
+    // A branch that never reaches the join transfers, and its exit already releases its loans.
+    const reaches = (regions: ReadonlyArray<number>): boolean =>
+      regions.some((ordinal) => {
+        const region = fn.regions.at(ordinal)
+        return (
+          region !== undefined &&
+          (region._tag === 'OperationRegion' || region._tag === 'CleanupRegion') &&
+          region.outcome._tag === 'Forward' &&
+          region.outcome.target.ordinal === following.ordinal
+        )
+      })
+    const joining = [
+      ...(reaches(takenRegions) ? [takenState] : []),
+      ...(reaches(otherwiseRegions) ? [otherwiseState] : []),
+    ]
+    // The join holds the loans every joining branch still holds from before the conditional.
+    const joined = new Set(
+      [...branchState.loanLocals.keys()].filter((key) =>
+        joining.every((state) => state.loanLocals.has(key)),
+      ),
+    )
+    // A joining branch ends every other loan it holds, in the function's loan order. Visiting the
+    // held set keeps each conditional proportional to its live loans rather than to every loan
+    // issued anywhere in the function.
     const branchEndings = (
       state: DelayedEffectState,
-      other: DelayedEffectState,
     ): ReadonlyArray<Extract<Mir.Operation, { readonly _tag: 'EndLoan' }>> => {
+      if (!joining.includes(state)) return []
       const order = loanOrder(fn.ownership?.loans ?? [])
       const ending: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
       for (const key of state.loanLocals.keys())
-        if (!other.loanLocals.has(key)) ending.push(...(order.get(key) ?? []))
+        if (!joined.has(key)) ending.push(...(order.get(key) ?? []))
       return ending
         .sort((left, right) => left.ordinal - right.ordinal)
         .flatMap(({ loan }) => {
@@ -1118,16 +1139,13 @@ const lowerStatement = (
               ]
         })
     }
-    const takenEndings = branchEndings(takenState, otherwiseState).flatMap((ending) =>
+    const takenEndings = branchEndings(takenState).flatMap((ending) =>
       loanEndOperations(fn, ending),
     )
-    const otherwiseEndings = branchEndings(otherwiseState, takenState).flatMap((ending) =>
+    const otherwiseEndings = branchEndings(otherwiseState).flatMap((ending) =>
       loanEndOperations(fn, ending),
     )
-    for (const key of branchState.loanLocals.keys()) {
-      if (!takenState.loanLocals.has(key) || !otherwiseState.loanLocals.has(key))
-        fn.loanLocals.delete(key)
-    }
+    for (const key of branchState.loanLocals.keys()) if (!joined.has(key)) fn.loanLocals.delete(key)
     for (const [regions, releases] of [
       [takenRegions, takenEndings],
       [otherwiseRegions, otherwiseEndings],

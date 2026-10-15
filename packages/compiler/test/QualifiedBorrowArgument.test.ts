@@ -169,3 +169,64 @@ pub fn main() -> i32 {
     )
   }),
 )
+
+it.effect('ends loans a match arm holds at the arm and keeps a joining branch loan held', () =>
+  Effect.gen(function* () {
+    const source = `struct Token { value: i32 }
+union Packet { Empty, Ready { left: Token, right: Token } }
+fn bump(token: &mut Token) -> () {
+  token.value = token.value + 1
+  return ()
+}
+fn armBinding() -> i32 {
+  let mut packet = Packet.Ready { left: Token { value: 1 }, right: Token { value: 2 } }
+  match &mut packet {
+    Packet.Ready { left, .. } => {
+      let view = &mut left
+      bump(move view)
+    }
+    Packet.Empty => {}
+  }
+  return 0
+}
+fn armOuter() -> i32 {
+  let mut token = Token { value: 1 }
+  let packet = Packet.Empty
+  match &packet {
+    Packet.Ready { .. } => {}
+    Packet.Empty => {
+      let view = &mut token
+      bump(move view)
+    }
+  }
+  return token.value
+}
+fn acrossReturn(flag: bool) -> i32 {
+  let mut token = Token { value: 1 }
+  let view = &mut token
+  if flag { return 1 }
+  bump(move view)
+  return 0
+}
+pub fn main() -> i32 { return armBinding() + armOuter() + acrossReturn(false) }`
+    const self = yield* AnalysisFixture.retainingMain('qualified-borrow/arm-loans', ascii(source))
+    assert.deepEqual(Analysis.diagnostics(self), [])
+    const mir = Analysis.loweredMir(self)
+    // A loan a statement arm's own binding holds ends with that arm on its fall-through path.
+    assert.deepEqual(yield* MirVerification.verify(mir), [])
+    // A branch that returns never reaches the join, so the loan the other branch carries into it
+    // stays held through the later use and ends only at the function's exits.
+    const across = mir.functions.find(
+      (fn) => fn.id._tag === 'CanonicalDeclarationId' && fn.id.name === 'acrossReturn',
+    )
+    assert.isDefined(across)
+    const endings = (across?.regions ?? []).flatMap((region) =>
+      region._tag === 'OperationRegion' || region._tag === 'CleanupRegion'
+        ? (region._tag === 'OperationRegion' ? region.operations : region.releases)
+            .filter((operation) => operation._tag === 'EndLoan')
+            .map(() => region.outcome._tag)
+        : [],
+    )
+    assert.deepEqual(endings, ['Return', 'Return'])
+  }),
+)

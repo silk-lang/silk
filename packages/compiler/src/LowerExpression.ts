@@ -74,7 +74,7 @@ import {
   specializedWitnessEffectTargets,
   usize,
 } from './Lower.js'
-import { lowerSequence } from './LowerStatements.js'
+import { loanOrder, lowerSequence } from './LowerStatements.js'
 import { lowerBuiltinExpression } from './LowerBuiltin.js'
 import * as Match from './Match.js'
 import * as Mir from './Mir.js'
@@ -2652,6 +2652,24 @@ function lowerMatchExpression(
   const arms: Array<Mir.MatchArm> = []
   const armStates = new Map<number, DelayedEffectState>()
   const branchState = delayedEffectState(fn)
+  // A loan an arm begins and its own statements hold ends with the arm, in loan order, as a
+  // conditional branch's loans do: the next arm restores the branch state, which would drop it
+  // from tracking unended. A loan whose recorded end lies beyond the arm, such as one the arm's
+  // result carries, stays held.
+  const endArmLoans = (armSpan: SourceSpan.SourceSpan): void => {
+    const order = loanOrder(fn.ownership?.loans ?? [])
+    const begun: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
+    for (const key of fn.loanLocals.keys())
+      if (!branchState.loanLocals.has(key)) begun.push(...(order.get(key) ?? []))
+    endLoans(
+      fn,
+      begun
+        .filter(({ loan }) => loan.endSpan.end <= armSpan.end)
+        .sort((left, right) => left.ordinal - right.ordinal)
+        .map(({ loan }) => loan.id),
+      armSpan,
+    )
+  }
   let pendingMembers = [...members]
   for (const [armOrdinal, arm] of expression.arms.entries()) {
     const transition = specializedCoverage.transitions.at(armOrdinal)
@@ -2768,6 +2786,7 @@ function lowerMatchExpression(
             ? packEffectComposite(fn, lowered, resultType, body.span)
             : lowered
         if (result === undefined) return result
+        endArmLoans(arm.span)
         emitReleases(fn, armExit)
         return result
       })
@@ -2804,14 +2823,15 @@ function lowerMatchExpression(
             outcome: { _tag: 'Forward', target: bodyEntry, provenance: generated(arm.span) },
           })
         if (finish === undefined) return { entry }
-        const [unit, operations] = fn.capture(() =>
-          lowerUnitLiteralExpression(fn, {
+        const [unit, operations] = fn.capture(() => {
+          endArmLoans(arm.span)
+          return lowerUnitLiteralExpression(fn, {
             _tag: 'UnitLiteral',
             type: Type.unit,
             span: body.span,
             origin: body.origin,
-          }),
-        )
+          })
+        })
         if (unit === undefined || unit === 'Transferred') return undefined
         fn.publish({
           _tag: 'OperationRegion',
