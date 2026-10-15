@@ -259,7 +259,14 @@ call's region, and a borrow of a value names the regions that value's type retai
 requirement (the walk's in-flight intervals and live holder points) must lie within that loan's
 availability; the term's required set is their union. Points propagated into the term from a
 shorter region must lie where every one of its loans is available, the intersection. A term no loan
-names stays pending.
+names stays pending when the relation needs its point set.
+
+An authenticated universal outlives every finite region owned by this body. That direction is
+proved directly without constructing point sets for the target's loans: their numeric intervals
+can conservatively include sibling failure cleanup. This does not bypass the Walker's loan
+conflicts or storage-end checks. A reverse local-to-universal goal still needs symbolic source
+provenance; unknown domains, provisional-static inference and capture contents remain pending.
+
 An external reborrow may cross a body scope when its actual storage parent bounds the reborrow.
 The parent is taken from the innermost dereference or slice backing store; a lifetime merely
 nested in a field type is not such evidence. A universal parent covers finite body-local uses.
