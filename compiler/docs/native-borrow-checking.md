@@ -271,7 +271,13 @@ an atom used only as another loan's inner retained region stay pending. Cyclic r
 proved only when every reachable local component reaches a sufficient real parent; a grounded
 branch cannot justify an ungrounded sibling cycle. The symbolic proof caches completed results
 by source and target within this one body; a proof for one universal cannot prove another. It does not use finite body points to infer a caller boundary.
-Loan conflicts, approximate-flow guards, and all other retained goals are checked independently.
+Loan conflicts and all other retained goals are checked independently. When several call operands
+name the known result region, the retained loans form a complete union of possible sources. A
+region proof must succeed for every source in that union. A conflict with one possible source
+still yields `Imprecise`, never a definite rejection or `Checked`: a shared inference atom does
+not identify which operand a generic result retains. Other unknown retention, including missing
+region mappings and projected-assignment uncertainty, remains excluded from region proofs. A
+later operation cannot upgrade an already unknown mapping to a complete union.
 When call or aggregate inference retags a fresh reference borrow with its shared region, its retained
 source-validity relations follow that same loan. This renaming is limited to the borrow's own
 fresh atom and relations recorded at that exact source origin. It neither renames an existing
