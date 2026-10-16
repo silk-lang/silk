@@ -19,7 +19,11 @@ place, a binding reached through fields and literal fixed-array elements (`OWN00
 a binding of it names the payload its match selected until the arm replaces, moves or exclusively
 borrows the subject or an owner of it, including through an unknown index: a later use of the
 binding is `ExtractionBoundary` (the bootstrap's `OWN0002`), and a loop in the arm that does so
-before its next iteration uses the binding repeats incompatibly (`OWN0005`).
+before its next iteration uses the binding repeats incompatibly (`OWN0005`). An assignment or
+`Intrinsic.replace` writes through a `match place` binding when its subject is mutably owned, a
+mutable local reached through fields, elements and `match place` bindings (`ImmutableAssignment`,
+the bootstrap's `SEM0035`, otherwise); `&mut` of the binding still needs a mutable binding
+(`ExclusiveBorrowRequiresMutable`, the bootstrap's `SEM0057`).
 Raw-pointer dereference requires an explicit lexical `unsafe` boundary, including inside an
 `unsafe fn`.
 Record construction and field places retain written operand order and declaration-order byte offsets.
@@ -264,10 +268,13 @@ library. `compiler/scripts/ReleaseArchive.ts` packages that installation per tar
 bytes. The selfhost workflow packages every target's N2 this way, runs a new `init` project from
 the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
 library's `compositions.json` for the target and libc, so such a build needs the library root even
-without standard-library imports; no listed runtime is a refusal. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
+without standard-library imports; no listed runtime is a refusal. The profile's `runtime` request
+chooses among them: `{ kind = "named", name = "<name>" }` selects the composition or catalog runtime
+of that name and never a default, and `{ kind = "none" }` selects no runtime and no catalog
+component, so the application's own `export "C"` functions are the roots. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
 (resolved against the manifest's directory), else the root's containing directory, is the root for
 local module paths, and the root must be a module below it. Every module identity names the package by its logical
-identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
+identity, `name@version` from the required `[package].name` and `[package].version`, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
 manifest above it has no package identity and is refused. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
@@ -419,9 +426,12 @@ root, and select only exact `.silk` extensions. Selection is sorted by normalize
 deduplicated; symbolic links are rejected by the native filesystem provider. Use `--` before a
 filename beginning with a dash.
 
-Write mode replaces changed files; `--check` reports changes without writing. Damaged source is
-reported with its first offending byte offset and remains untouched. Other readable selected
-files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
+Write mode replaces changed files; `--check` reports changes without writing. Each selected file
+reports one line, as the TypeScript CLI words it: `<path>: unchanged` and `<path>: formatted` on
+standard output, and `<path>: needs formatting`, `<path>: cannot format damaged source (<codes>)`
+with the distinct lexical and syntax diagnostic codes, or `<path>: Cannot read source file
+<path>` and the other failure messages on standard error. Damaged source remains untouched.
+Other readable selected files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
 drift, and `2` for project, selection, filesystem, allocation, or diagnostic-output failures.
 The portable filesystem uses complete create-or-truncate writes; an interrupted or failed write
 can leave a partial file, so formatter writes currently have the same limitation.
@@ -536,8 +546,10 @@ the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first g
 ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
 verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
 
-Without `SILK_CLANG`, the native compiler runs the first `clang` on `PATH`, as the TypeScript CLI
-does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
+A single-file `build` takes `--clang <path>` as the TypeScript `build-exe` does; it wins over
+`SILK_CLANG`. A value with a `/` is a path against the working directory and a bare name is
+searched on `PATH`. Without either, the native compiler runs the first `clang` on `PATH`, as the
+TypeScript CLI does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
 executable and `SILK_CLANG` pointing at LLVM 22 `clang`, development builds use the native
 compiler directly. A pinned seed predates `SILK_CLANG` and reads `SILKC_CLANG` until the next
 re-pin:
