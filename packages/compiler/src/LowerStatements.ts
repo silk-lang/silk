@@ -26,6 +26,7 @@ import {
   temporaryLoansBegunSince,
   terminalLoopLoanEndings,
   withDelayedFailureLoanEndings,
+  withNestedTerminalLoanEndings,
   withoutLoanEndings,
 } from './CleanupEmission.js'
 import type { LoweredExpression } from './EffectLowering.js'
@@ -82,6 +83,22 @@ const loanOrders = new WeakMap<
   >
 >()
 
+/**
+ * The exit plan of a `return` or `fail`. Ownership plans no exit for one whose value diverges, such
+ * as `return run reject()` of a `never` effect. That return is unreachable and releases no owner, but
+ * it still terminates a path, so it ends every loan held there.
+ */
+const returnExit = (exits: ExitIndex, span: SourceSpan.SourceSpan): Ownership.ExitPlan =>
+  exits.returns.get(spanKey(span)) ?? {
+    _tag: 'Exit',
+    kind: 'Return',
+    span,
+    loanEnds: [],
+    releases: [],
+    temporaries: [],
+    matches: [],
+  }
+
 export const loanOrder = (loans: ReadonlyArray<Ownership.LoanFact>) => {
   const cached = loanOrders.get(loans)
   if (cached !== undefined) return cached
@@ -137,14 +154,19 @@ export const lowerPatternSelection = (
   }
   const members = selection.members.map(specializeMember)
   const member = selection.member === undefined ? undefined : specializeMember(selection.member)
-  const literal = (value: boolean): LoweredExpression | undefined =>
-    lowerExpression(fn, {
-      _tag: 'BooleanLiteral' as const,
-      value,
-      type: 'bool' as const,
-      span: selection.span,
-      origin: selection.origin,
+  // The branch bit is generated, so unlike a source literal spanning the whole selection it ends
+  // none of the loans recorded to end within that span, such as a view the body still reads.
+  const literal = (value: boolean): LoweredExpression => {
+    const destination = fn.alloc(resultType)
+    fn.emit({
+      _tag: 'Literal',
+      destination,
+      type: resultType,
+      value: value ? 1 : 0,
+      provenance: generated(selection.span),
     })
+    return { result: destination }
+  }
   const bindingIds = selection.bindings.map((binding) => binding.id)
 
   if (result === 'Unit' && !selection.irrefutable) return undefined
@@ -1333,9 +1355,13 @@ const lowerStatement = (
       for (const region of fn.regions) {
         if (region === undefined || !loopFamily.has(region.ownerLoop?.ordinal ?? -1)) continue
         if (region._tag === 'OperationRegion') {
-          const operations = withDelayedFailureLoanEndings(
+          const operations = withNestedTerminalLoanEndings(
             fn,
-            withoutLoanEndings(region.operations, delayedLoanKeys, delayedOwners),
+            withDelayedFailureLoanEndings(
+              fn,
+              withoutLoanEndings(region.operations, delayedLoanKeys, delayedOwners),
+              delayedLoans,
+            ),
             delayedLoans,
           )
           const terminalEndings =
@@ -1497,9 +1523,7 @@ const lowerStatement = (
       value: failedValue,
       provenance: authored(statement.span),
     }
-    const [, releases] = fn.capture(() =>
-      emitReleases(fn, exits.returns.get(spanKey(statement.span))),
-    )
+    const [, releases] = fn.capture(() => emitReleases(fn, returnExit(exits, statement.span)))
     if (releases.length === 0) {
       fn.publish({
         _tag: 'OperationRegion',
@@ -1554,9 +1578,7 @@ const lowerStatement = (
   })
   if (returnedValue === 'Transferred') return transferred(operations)
   if (returnedValue === undefined) return undefined
-  const [, releases] = fn.capture(() =>
-    emitReleases(fn, exits.returns.get(spanKey(statement.span))),
-  )
+  const [, releases] = fn.capture(() => emitReleases(fn, returnExit(exits, statement.span)))
   const returnedType = fn.localTypes.at(returnedValue.ordinal)
   // A Copy read produces its return value before scope cleanup ends the source local's storage.
   const copyBeforeCleanup =
