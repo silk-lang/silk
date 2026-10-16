@@ -2430,3 +2430,31 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** the `statementsAfterBinding`, `bindingChain`, `bindingClosure`, `bindingArm` and
   `bindingPattern` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Struct literals infer the meet of their field lifetimes
+
+- **Status:** Approved on 2026-10-16 by Julia; implemented natively on the
+  `selfhost-regions-meet-locals` branch. Bootstrap divergence.
+- **Rule:** a struct literal whose fields offer different regions for an inferred lifetime binder
+  infers their meet, the shortest region, in any field order, as Rust does. A lifetime parameter of
+  the enclosing declaration outlives every region local to its body, so a literal mixing parameter
+  views with borrows of locals holds the local region. The literal still cannot outlive that local.
+- **Compilers:** native infers the meet. For `struct Trio<'a> {e: &'a i32, f: &'a i32, g: &'a i32}`
+  in `fn f(p: &i32)` with locals `one` and `two`, `Trio { e: p, f: &one, g: &two }` is accepted and
+  Checked, as are the orders with a local first. The bootstrap fixes the binder from the first
+  field, so with `p` first it rejects with SEM0212 at the first later borrow of a local.
+- **Source migration:** none. Write the fields in any order.
+- **Diagnostics and limits:** the inferred region stays the meet of every field region, so a
+  literal holding a local borrow is still rejected when it is returned (SEM0129 at the literal),
+  stored through `&mut` into a caller region (SEM0037 at the literal), read through a binding after
+  the local ends (OWN0019 at the read), or met by an expectation that fixes a caller region, such as
+  `let s: Trio<'p> = ...` (SEM0037) or `hold<Trio<'p>>(...)` (SEM0012) at the literal. The bootstrap
+  reports OWN0019 at the local borrow for several of these. A binder written on the literal, such
+  as `Trio<'p> { ... }`, or a region elided inside a written type argument, such as `Pair<&i32>`,
+  never shortens.
+  Known parity difference: for `S { x: p, y: &l }` with a parameter first and a direct borrow of a
+  local, before this change native reported OWN0019 where the bootstrap reports SEM0212; both
+  reject. Native now accepts it when the literal stays local.
+- **Evidence:** `binderMeetsKeepBodyLocalRegions` and `binderMeetsNeverWidenFixedRegions` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
