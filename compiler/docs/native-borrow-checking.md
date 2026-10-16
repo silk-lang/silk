@@ -416,7 +416,29 @@ The checker is part of the `Body` unit, as the v2 note's checking-unit rule requ
 ## 6. Counting unchecked bodies until it lands
 
 `SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...)` counts emitted definitions
-whose body is not `Checked`, with one count per reason. A body is `Checked` exactly when its stage
+whose body is not `Checked`, with one count per reason. `SILK_GAP borrow-check root-package: ...`
+counts the same way over the concrete root-package bodies the declaration sweep checks, reached or
+not: an unreached function is never emitted, so only this line shows it unchecked. An open generic
+or a deferred static template is not counted, since the sweep does not check it in the form a build
+reaches, and each reached instance is checked in its own right. A build, not a test runner,
+follows the line with one `SILK_GAP borrow-check body: <module> <start>-<end> <reason> <codes>`
+line per counted body, by the byte offsets of its body block. `<codes>` (`-` for none) are the
+catalog codes of the checks that decide a body's status and that this body left open, as its
+producer records them in `TypedBody.undecided`: loan liveness (`BorrowCheck.livenessCodes`, derived
+from the conflict and expiry reports) when the body has loans whose check did not finish, and the
+declared-region-relation code when `checkDeclaredRegions` left a relation pending. Typing and moves
+are checked whatever the status, so their codes are never listed. Typing also reports `SEM0212`
+and `OWN0019` at some sites; a program carried for such a code is the one ambiguity left, and the
+`carried` ratchet below keeps it visible.
+
+The corpus harness treats an accepted invalid program as a `BORROW_CHECK_GAP` only when every
+expected diagnostic lies inside the block of one of those bodies with one of the codes listed for
+it. Any other code, a diagnostic in a header, or one in a checked body is a failure, whatever else
+is unchecked. `compiler/borrow-check-gap.txt` records each carried program
+as a `carried <program>` line, so a new carry fails until `check-borrow-gap.mjs update` records
+it: a checker that stops checking a body cannot quietly turn a rejected program into a gap.
+
+A body is `Checked` exactly when its stage
 is `FullyChecked`. Every other body carries the `BorrowStatus` that names what a later slice must
 cover first:
 
@@ -448,6 +470,7 @@ cover first:
   calling body's `Checked` status, `Semantic.buildFrom` checks every reached access callback and
   its callees for suspension and readiness-notification escapes before emitting code (OWN0016,
   SHARED-003).
+
 - `stored-loans`: a stored or delayed `executionDrive` construction retains captures its empty
   native environment does not describe, so it stays unchecked even when its result type names no
   environment region; lowering runs only an immediate drive, so no emitted body has one. Other
@@ -467,8 +490,9 @@ cover first:
   binding's scope, so their storage and cleanup end there, and likewise for the subject of a
   borrowing destructuring `let` and, since it may view at an instance, a binding typed by a type
   parameter. Only a viewing binding's borrowed fixed array stays valid that long, so `let view =
-  identity(&[1, 2])` is valid; any other such temporary's loans expire with its statement (an
+identity(&[1, 2])` is valid; any other such temporary's loans expire with its statement (an
   `Expire` event, which ends validity without ending storage).
+
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
@@ -516,8 +540,8 @@ corpus program, `<program> <reason>=<count> ...` (a bare name when nothing is un
   program. `update` writes a line for every program that ran and keeps, listing them as "not run",
   the lines of programs that did not; `update --prune` drops those instead, for programs the corpus
   no longer has. A PR that changes checking or the corpus reruns `node
-  .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only writer, and `diff <old>
-  <new>` prints the per-program transition table for its description. The corpus job builds its
+.github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only writer, and `diff <old>
+<new>` prints the per-program transition table for its description. The corpus job builds its
   programs from main's verification harness, which can differ from a local run on this branch's
   `corpus.ts`; the file must match CI, so when they disagree, run `update` on the job's
   `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file with

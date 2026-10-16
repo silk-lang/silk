@@ -2705,7 +2705,6 @@ const planStaticData = Effect.fn('Layout.planStaticData')(function* (
 interface WordLiteralState {
   readonly seen: Set<string>
   readonly bits: 32 | 64
-  readonly target: Target.Target
   readonly verdicts: Array<WordLiteralVerdict>
   readonly diagnostics: Array<Diagnostic.Diagnostic>
 }
@@ -2742,7 +2741,7 @@ const planLiteralVerdicts = Effect.fn('Layout.planLiteralVerdicts')(function* (
   const diagnostics: Array<Diagnostic.Diagnostic> = []
   const seen = new Set<string>()
 
-  const state: WordLiteralState = { seen, bits, target, verdicts, diagnostics }
+  const state: WordLiteralState = { seen, bits, verdicts, diagnostics }
   for (const constant of constants)
     addWordLiteral(state, constant.type, constant.value, constant.span)
   for (const instance of discovery.instances) {
@@ -2772,7 +2771,7 @@ const addWordLiteral = (
   value: bigint,
   span: SourceSpan.SourceSpan,
 ): void => {
-  const { seen, bits, target, verdicts, diagnostics } = state
+  const { seen, bits, verdicts, diagnostics } = state
 
   const key = `${span.sourceId}:${span.start}:${span.end}:${type}:${value}`
   if (seen.has(key)) return
@@ -2788,13 +2787,7 @@ const addWordLiteral = (
     })
     return
   }
-  const diagnostic = Diagnostic.wordLiteralTargetOutOfRange(
-    type,
-    value.toString(),
-    target.id,
-    bits,
-    span,
-  )
+  const diagnostic = Diagnostic.integerOutOfRange(value.toString(), type, range, span)
   diagnostics.push(diagnostic)
   verdicts.push({
     _tag: 'UnavailableWordLiteral',
