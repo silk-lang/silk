@@ -2453,13 +2453,17 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   Checked, as are the orders with a local first. The bootstrap fixes the binder from the first
   field, so with `p` first it rejects with SEM0212 at the first later borrow of a local.
 - **Source migration:** none. Write the fields in any order.
-- **Diagnostics and limits:** a literal holding a local borrow is still rejected when it is
-  returned (OWN0019 at the literal), read through a binding after the local ends (OWN0019 at the
-  read), or stored through `&mut` into a caller region (SEM0212 at the local borrow), in any field
-  order. A binder written on the literal, such as `Trio<'p> { ... }`, is never shortened.
+- **Diagnostics and limits:** the inferred region stays the meet of every field region, so a
+  literal holding a local borrow is still rejected when it is returned (SEM0129 at the literal),
+  stored through `&mut` into a caller region (SEM0037 at the literal), read through a binding after
+  the local ends (OWN0019 at the read), or met by an expectation that fixes a caller region, such as
+  `let s: Trio<'p> = ...` (SEM0037) or `hold<Trio<'p>>(...)` (SEM0012) at the literal. The bootstrap
+  reports OWN0019 at the local borrow for several of these. A binder written on the literal, such
+  as `Trio<'p> { ... }`, or a region elided inside a written type argument, such as `Pair<&i32>`,
+  never shortens.
   Known parity difference: for `S { x: p, y: &l }` with a parameter first and a direct borrow of a
   local, before this change native reported OWN0019 where the bootstrap reports SEM0212; both
   reject. Native now accepts it when the literal stays local.
-- **Evidence:** `binderMeetsKeepBodyLocalRegions` in
+- **Evidence:** `binderMeetsKeepBodyLocalRegions` and `binderMeetsNeverWidenFixedRegions` in
   `compiler/src/semantic/SemanticCaptureCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
