@@ -10,6 +10,7 @@ import {
   emitReleases,
   emitInitializationTransition,
   initializeBinding,
+  loanEndOperations,
   matchCleanupKey,
   ownerFields,
   lowerBorrowPlace,
@@ -20,6 +21,7 @@ import {
   propagationLoanEnds,
   propagationReleases,
   specializedCleanup,
+  temporaryLoansBegunSince,
   transitionAt,
 } from './CleanupEmission.js'
 import * as CAbi from './CAbi.js'
@@ -71,10 +73,11 @@ import {
   character,
   patternKey,
   spanKey,
+  spanWithin,
   specializedWitnessEffectTargets,
   usize,
 } from './Lower.js'
-import { lowerSequence } from './LowerStatements.js'
+import { loanOrder, lowerSequence } from './LowerStatements.js'
 import { lowerBuiltinExpression } from './LowerBuiltin.js'
 import * as Match from './Match.js'
 import * as Mir from './Mir.js'
@@ -329,6 +332,23 @@ export const lowerCallOperand = (
 }
 
 /** Captures a selected eager computation, preserving ordinary return and loop exits. */
+/** Whether a value of this local's type may hold a view of borrowed storage. */
+const mayRetainView = (fn: FunctionLowering, local: Mir.LocalId): boolean => {
+  const type = fn.localTypes.at(local.ordinal)
+  if (type === undefined) return true
+  const semantic = Mir.semanticType(type)
+  return (
+    Type.containsBorrow(semantic) ||
+    Type.freeLifetimes(semantic).length > 0 ||
+    Type.containsExecutableRepresentation(semantic)
+  )
+}
+
+/**
+ * Lowers one conditionally executed body. It owns the temporaries it borrows when its result
+ * cannot carry their views out, and ends them after its other operations; a result that may
+ * retain a view keeps them held, and no join ends them.
+ */
 export const lowerExecution = (
   fn: FunctionLowering,
   span: SourceSpan.SourceSpan,
@@ -336,7 +356,13 @@ export const lowerExecution = (
 ): Mir.Execution | undefined =>
   fn.captureExecution(() => {
     const entry = fn.reserve()
-    const [lowered, operations] = fn.capture(body)
+    const entered = new Set(fn.loanLocals.keys())
+    const [lowered, operations] = fn.capture(() => {
+      const value = body()
+      if (value !== undefined && value !== 'Transferred' && !mayRetainView(fn, value.result))
+        fn.inScopeCleanup(() => endLoans(fn, temporaryLoansBegunSince(fn, entered), span))
+      return value
+    })
     if (lowered === undefined) return undefined
     fn.publish({
       _tag: 'OperationRegion',
@@ -1752,6 +1778,7 @@ function lowerCallableApplyExpression(
     const borrow = fn.recipeBorrow(authored)
     const loan = fn.loanLocals.get(borrowKey(borrow))
     if (loan === undefined) return undefined
+    if (!fn.endsLoan(borrowKey(borrow))) continue
     fn.emit({
       _tag: 'EndLoan',
       borrow,
@@ -1770,6 +1797,7 @@ function lowerCallableApplyExpression(
     }
     const held = fn.loanLocals.get(borrowKey(borrow))
     if (held === undefined) return undefined
+    if (!fn.endsLoan(borrowKey(borrow))) continue
     fn.emit({
       _tag: 'EndLoan',
       borrow,
@@ -2652,6 +2680,25 @@ function lowerMatchExpression(
   const arms: Array<Mir.MatchArm> = []
   const armStates = new Map<number, DelayedEffectState>()
   const branchState = delayedEffectState(fn)
+  // A loan an arm begins and its own statements hold ends with the arm, in loan order, as a
+  // conditional branch's loans do: the next arm restores the branch state, which would drop it
+  // from tracking unended. Only a loan recorded to end within the arm ends here; the recorded end
+  // of a borrow the arm's result carries out is the borrow itself, which is harmless for a plain
+  // owner because its EndLoan emits nothing.
+  const endArmLoans = (armSpan: SourceSpan.SourceSpan): void => {
+    const order = loanOrder(fn.ownership?.loans ?? [])
+    const begun: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
+    for (const key of fn.loanLocals.keys())
+      if (!branchState.loanLocals.has(key)) begun.push(...(order.get(key) ?? []))
+    endLoans(
+      fn,
+      begun
+        .filter(({ loan }) => spanWithin(armSpan, loan.endSpan))
+        .sort((left, right) => left.ordinal - right.ordinal)
+        .map(({ loan }) => loan.id),
+      armSpan,
+    )
+  }
   let pendingMembers = [...members]
   for (const [armOrdinal, arm] of expression.arms.entries()) {
     const transition = specializedCoverage.transitions.at(armOrdinal)
@@ -2768,6 +2815,7 @@ function lowerMatchExpression(
             ? packEffectComposite(fn, lowered, resultType, body.span)
             : lowered
         if (result === undefined) return result
+        endArmLoans(arm.span)
         emitReleases(fn, armExit)
         return result
       })
@@ -2804,14 +2852,15 @@ function lowerMatchExpression(
             outcome: { _tag: 'Forward', target: bodyEntry, provenance: generated(arm.span) },
           })
         if (finish === undefined) return { entry }
-        const [unit, operations] = fn.capture(() =>
-          lowerUnitLiteralExpression(fn, {
+        const [unit, operations] = fn.capture(() => {
+          endArmLoans(arm.span)
+          return lowerUnitLiteralExpression(fn, {
             _tag: 'UnitLiteral',
             type: Type.unit,
             span: body.span,
             origin: body.origin,
-          }),
-        )
+          })
+        })
         if (unit === undefined || unit === 'Transferred') return undefined
         fn.publish({
           _tag: 'OperationRegion',
@@ -2871,22 +2920,55 @@ function lowerMatchExpression(
       )
       .map((arm) => arm.id),
   }))
-  for (const key of branchState.loanLocals.keys()) {
-    const endedOnEveryPath = decisions.every((decision) => {
-      const candidates = decision.candidates.flatMap((candidate) => {
-        const arm = arms.find((entry) => entry.id.ordinal === candidate.ordinal)
-        const armState = armStates.get(candidate.ordinal)
-        return arm === undefined ? [] : [{ arm, armState }]
+  // As at a conditional's join, the match holds after it the loans from before it that every arm
+  // reaching the join still holds; transferring arms never reach it, and their exits already
+  // released their loans. Each joining arm ends, at its completion, the other earlier loans it
+  // still holds, in loan order, so a loan one arm ended is never ended again after the join.
+  const joined = new Set(
+    [...branchState.loanLocals.keys()].filter((key) =>
+      [...armStates.values()].every((state) => state.loanLocals.has(key)),
+    ),
+  )
+  const order = loanOrder(fn.ownership?.loans ?? [])
+  for (const [position, arm] of arms.entries()) {
+    const state = armStates.get(arm.id.ordinal)
+    if (state === undefined) continue
+    const ending: Array<{ readonly ordinal: number; readonly loan: Ownership.LoanFact }> = []
+    for (const key of branchState.loanLocals.keys())
+      if (!joined.has(key) && state.loanLocals.has(key) && fn.endsLoan(key))
+        ending.push(...(order.get(key) ?? []))
+    const endings = ending
+      .sort((left, right) => left.ordinal - right.ordinal)
+      .flatMap(({ loan }) => {
+        const held = state.loanLocals.get(borrowKey(loan.id))
+        return held === undefined
+          ? []
+          : loanEndOperations(fn, {
+              _tag: 'EndLoan' as const,
+              borrow: loan.id,
+              slice: held,
+              provenance: generated(arm.provenance.span),
+            })
       })
-      return (
-        candidates.length === decision.candidates.length &&
-        candidates.some(({ arm }) => arm.guard === undefined) &&
-        // Transferring arms never reach the join; their exit already releases its loans.
-        candidates.every(({ armState }) => armState === undefined || !armState.loanLocals.has(key))
-      )
-    })
-    if (endedOnEveryPath) fn.loanLocals.delete(key)
+    if (endings.length === 0) continue
+    arms[position] = {
+      ...arm,
+      selected: {
+        ...arm.selected,
+        execution: {
+          ...arm.selected.execution,
+          regions: arm.selected.execution.regions.map((region) => {
+            if (region._tag === 'OperationRegion' && region.outcome._tag === 'Complete')
+              return { ...region, operations: [...region.operations, ...endings] }
+            if (region._tag === 'CleanupRegion' && region.outcome._tag === 'Complete')
+              return { ...region, releases: [...endings, ...region.releases] }
+            return region
+          }),
+        },
+      },
+    }
   }
+  for (const key of branchState.loanLocals.keys()) if (!joined.has(key)) fn.loanLocals.delete(key)
   const mirDecisions = decisions.map((decision) => ({
     member: decision.member,
     candidates: decision.candidates,
@@ -3312,6 +3394,7 @@ function lowerCallExpression(
     const borrow = fn.recipeBorrow(authored)
     const slice = fn.loanLocals.get(borrowKey(borrow))
     if (slice === undefined) return undefined
+    if (!fn.endsLoan(borrowKey(borrow))) continue
     fn.emit({
       _tag: 'EndLoan',
       borrow,
@@ -3364,7 +3447,7 @@ function lowerInterfaceOperationCallExpression(
     for (const authored of expression.loanEnds) {
       const borrow = fn.recipeBorrow(authored)
       const loan = fn.loanLocals.get(borrowKey(borrow))
-      if (loan === undefined) continue
+      if (loan === undefined || !fn.endsLoan(borrowKey(borrow))) continue
       fn.emit({
         _tag: 'EndLoan' as const,
         borrow,
