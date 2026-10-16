@@ -222,6 +222,9 @@ binder, an unrelated declaration's parameter, or an enclosing body's local stays
 The R3 premise check runs inside the body query. It checks retained relations made solely
 of `'static` and authenticated declared lifetime atoms against `BodyPremises`, including
 inherited impl/function constraints and input well-formedness edges. Goals never become premises.
+An input's well-formedness includes its struct, tuple or union declaration's region bounds, so
+building such a value proves those bounds at the aggregate, as a call proves its applied bounds;
+one that does not hold is SEM0212 there.
 A rigid relation absent from that closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained
 origin. An inherent implementation's head bounds are premises no member call proves yet, so a body
 under one is never `Checked`, and only the remaining premises reach the loan proof. The point proof
@@ -280,8 +283,9 @@ A universal target retains its exact identity and must follow declared/header pr
 input well-formedness bounds. Retained goals never supply those premises.
 A local parent is traced through every outer loan naming that inference atom until it reaches
 sufficient universal parents. Values also enter a local region without a loan, such as a passed
-reference meeting a fresh borrow in one call region. Typing retains each such source as a relation
-even when an enclosing lifetime trivially covers the local region, and every source of a relation
+reference meeting a fresh borrow in one call region, or a callee or struct bound `'b: 'a` or
+`T: 'a` instantiated with a fresh loan's region for `'a`. Typing retains each such source as a
+relation even when an enclosing lifetime trivially covers the local region, and every source of a relation
 whose wanted side is the local atom must reach the target too, recursively. Owned storage, unknown provenance, a cycle without such roots, and
 an atom used only as another loan's inner retained region stay pending. Cyclic reborrows are
 proved only when every reachable local component reaches a sufficient real parent; a grounded
