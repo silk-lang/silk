@@ -703,6 +703,7 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `shelvedThenReplace`) and `implicitReceiverBorrowsRetainStoredSources` (write and move rejections,
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
+
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
 - **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
