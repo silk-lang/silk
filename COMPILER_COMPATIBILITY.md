@@ -155,15 +155,22 @@ Each entry records:
   binder that the shorter side of an outlives bound names, such as `'a` under `'b: 'a` in
   `fn widen<'a, 'b: 'a>(value: &'b Token) -> &'a Token`, then shortens to the region the bound's
   longer side lends, as the bootstrap infers, for a function's own bound and an inherent impl's
-  alike. A written binder, one the expected result fixes, and one an operand fixes never move.
-  A lifetime binder
+  alike. A written binder, one the expected result fixes, one an operand fixes, and one under more
+  than one outlives or contents bound never move, and a call shortens only in a runtime
+  declaration's own body, not in a callable literal, an Effect block or a static body. The
+  shortened binding holds only when the borrow check proves that whole body; otherwise each
+  shortened call reports SEM0212 at the call, as it did unshortened. A lifetime binder
   nothing mentions, such as `fn advanceFinalStage<'head>(...)`, binds `'static` too, which the
   bootstrap also accepts; only type and row binders stay `UninferredParameter`. Sections and
   function values keep their existing result-only binder gaps.
 - **Source migration:** none.
 - **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
   selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
-  bootstrap infers the shorter region.
+  bootstrap infers the shorter region. Where the bootstrap reports a shortened result escaping
+  through another call, a field or a binding as OWN0019 at the use and SEM0212 at the borrowed
+  argument, selfhost reports SEM0212 at the call, or OWN0019 where its borrow check sees the escape
+  first. A call under several bounds on one binder, or one in a body the borrow check leaves
+  unproved, keeps SEM0212 where the bootstrap accepts.
 - **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
   `compiler/src/semantic/SemanticCaptureCases.silk`,
   `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in
