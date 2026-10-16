@@ -166,16 +166,19 @@ Each entry records:
 - **Source migration:** none.
 - **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
   selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
-  bootstrap infers the shorter region. Where the bootstrap reports a shortened result escaping
+  bootstrap infers the shorter region. Where the bootstrap reports a shortened result returned
   through another call, a field or a binding as OWN0019 at the use and SEM0212 at the borrowed
-  argument, selfhost reports SEM0212 at the call, or OWN0019 where its borrow check sees the escape
-  first. A call under several bounds on one binder, or one in a body the borrow check leaves
-  unproved, keeps SEM0212 where the bootstrap accepts.
+  argument, selfhost reports one of them: OWN0019 where its borrow check follows the loan to the
+  return, and otherwise SEM0212 at the borrow, since a returned value is stored in the caller's
+  result slot and a region goal admitted into a lifetime parameter the result names refutes a
+  borrow of a local or a temporary there. A call under several bounds on one
+  binder, or one in a body the borrow check leaves unproved, keeps SEM0212 at the call where the
+  bootstrap accepts.
 - **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
   `compiler/src/semantic/SemanticCaptureCases.silk`,
   `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in
   `compiler/src/semantic/SemanticConformanceCases.silk`, and `resultOnlyBindersShortenToTheirBound`
-  in `compiler/src/semantic/SemanticCallableCases.silk`.
+  and `returnedLoansOutliveTheBody` in `compiler/src/semantic/SemanticCallableCases.silk`.
 
 ### Caller-local region relations and 'static binder shortening in selfhost
 
