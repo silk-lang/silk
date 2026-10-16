@@ -624,7 +624,7 @@ const program = Effect.gen(function* () {
     'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
   )
   const libraryManifest = (inputs: string, artifact = 'object') =>
-    `[package]\nname = "library"\nroot = "src/Main.silk"\n\n[build]\nartifact = "${artifact}"\nnative-link-inputs = [${inputs}]\n`
+    `[package]\nname = "library"\nversion = "0.1.0"\nroot = "src/Main.silk"\n\n[build]\nartifact = "${artifact}"\nnative-link-inputs = [${inputs}]\n`
   const tools = dirname(clang)
   const inspect = Effect.fnUntraced(function* (object: string) {
     const header = yield* invoke(join(tools, 'llvm-readobj'), ['--file-header', object], library)
