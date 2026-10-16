@@ -18,7 +18,8 @@
 //     from the corpus job's `selfhost-corpus-timings` artifact (or its log) whenever a local run
 //     disagrees.
 //   check-borrow-gap.mjs diff <old baseline> <new baseline>
-//     Prints the per-program transition table between two baselines, for a PR body.
+//     Prints the per-program transition table between two baselines, for a PR body, then every
+//     program newly carried or no longer carried as BORROW_CHECK_GAP.
 //   check-borrow-gap.mjs self-build <receipt directory>
 //     Prints every SILK_GAP borrow-check line the self-build stages wrote, as a receipt.
 //   check-borrow-gap.mjs self-test
@@ -189,6 +190,18 @@ const updatedLines = (current, actual, prune) => {
   return { lines, absent }
 }
 
+// The lines `diff` prints for carries: one per program newly carried or no longer carried.
+const carryChanges = (before, after) => [
+  ...[...after]
+    .filter((name) => !before.has(name))
+    .sort(byText)
+    .map((name) => `Newly carried as BORROW_CHECK_GAP: ${name}`),
+  ...[...before]
+    .filter((name) => !after.has(name))
+    .sort(byText)
+    .map((name) => `No longer carried: ${name}`),
+]
+
 // The carried programs `update` writes: the run's carries, plus recorded carries of programs that
 // did not run, unless pruned.
 const updatedCarries = (current, carried, ran, prune) => {
@@ -240,8 +253,10 @@ if (mode === 'corpus') {
     ].join('\n'),
   )
 } else if (mode === 'diff') {
-  const before = parseBaseline(readFileSync(first, 'utf8'), first).programs
-  const after = parseBaseline(readFileSync(second, 'utf8'), second).programs
+  const beforeBaseline = parseBaseline(readFileSync(first, 'utf8'), first)
+  const afterBaseline = parseBaseline(readFileSync(second, 'utf8'), second)
+  const before = beforeBaseline.programs
+  const after = afterBaseline.programs
   const reasons = [
     ...new Set([...Object.keys(totals(before)), ...Object.keys(totals(after))]),
   ].sort(byText)
@@ -262,6 +277,7 @@ if (mode === 'corpus') {
   print(
     `| total | ${reasons.map((reason) => `${oldTotals[reason] ?? 0} → ${newTotals[reason] ?? 0}`).join(' | ')} |`,
   )
+  for (const line of carryChanges(beforeBaseline.carried, afterBaseline.carried)) print(line)
 } else if (mode === 'self-build') {
   const { retired } = parseBaseline(
     readFileSync(baselineUrl, 'utf8'),
@@ -357,6 +373,11 @@ if (mode === 'corpus') {
     'alpha,beta'
   )
     throw new Error('update keeps a carry whose program did not run')
+  if (
+    carryChanges(new Set(['alpha', 'beta']), new Set(['beta', 'gamma'])).join('|') !==
+    'Newly carried as BORROW_CHECK_GAP: gamma|No longer carried: alpha'
+  )
+    throw new Error('diff lists carries added and removed')
   failures.length = 0
   notices.length = 0
   print('borrow-gap guard self-test passed')
