@@ -215,16 +215,25 @@ Declared outlives bounds and `where` premises become assumptions between univers
 are given, not proved, in the body itself (LIFE-002).
 
 Region closure (§6) accepts the universal regions of enclosing declarations as atoms; it never
-relates them to each other. A relation that names an enclosing declaration's parameter, an
-invocation binder or an enclosing body's local stays pending.
+relates them to each other. The premise proof authenticates a named parameter by its exact
+owner chain: the declaration must be this body or a named declaration enclosing it. An invocation
+binder, an unrelated declaration's parameter, or an enclosing body's local stays pending.
 
-The R3 2a premise check runs inside the body query. It checks retained relations made solely
-of `'static` and that named body's declared lifetime atoms against `BodyPremises`, including
-input well-formedness edges. Goals never become premises. A rigid relation absent from that
-closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained origin; local, invocation,
-supplied, and outside-owner atoms remain pending. An anonymous body's enclosing atoms retain
-their identity and are left for the environment proof. Open capture contents still prevent
-`Checked`. This is groundwork, with no promised gap-count reduction.
+The R3 premise check runs inside the body query. It checks retained relations made solely
+of `'static` and authenticated declared lifetime atoms against `BodyPremises`, including
+inherited impl/function constraints and input well-formedness edges. Goals never become premises.
+An input's well-formedness includes its struct, tuple or union declaration's region bounds, so
+building such a value proves those bounds at the aggregate, as a call proves its applied bounds;
+one that does not hold is SEM0212 there.
+A rigid relation absent from that closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained
+origin. An inherent implementation's head bounds are premises no member call proves yet, so a body
+under one is never `Checked`, and only the remaining premises reach the loan proof. The point proof
+treats those same authenticated parameters as universal, relying on the prior premise check for
+universal-to-universal relations whose whole offered side is declared; each universal constituent
+of a meet that also holds a local atom is proved there against the target. Anonymous bodies keep their enclosing
+function's lifetime identities and premises; storing the callable in a local does not change them.
+Local, invocation, supplied, and unrelated-owner atoms remain pending. Open capture contents still
+prevent `Checked`.
 
 An inferred binder initially holding `'static` is not a declared static requirement. Retained
 relations record that provisional origin explicitly and remain pending. Inference behavior is
@@ -250,19 +259,90 @@ A region becomes unavailable at points after its owner's `StorageDead`, and afte
 that invalidates an overlapping place. A violation is OWN0019 at the use's origin. Point sets are
 bitsets over the body's location count.
 
-The R3 2b worklist uses these same Walker points and successor edges. A local term must map to
-one exact loan; its required set includes the walk's in-flight intervals and live holder points.
-Availability excludes paths before creation and after overlapping End, Expire, write, move or drop
-events, restarting at creation on a loop back edge. Own declared parameters and `'static` are
-available throughout this body. Required bitsets propagate from shorter to longer to a fixed point.
+The R3 2b worklist uses these same Walker points and successor edges. A local term maps to the
+loans whose typed regions name it: usually one borrow, but every fresh borrow of one call shares the
+call's region, and a borrow of a value names the regions that value's type retains. Each loan's own
+requirement (the walk's in-flight intervals and live holder points) must lie within that loan's
+availability; the term's required set is their union. Points propagated into the term from a
+shorter region must lie where every one of its loans is available, the intersection. A term no loan
+names stays pending when the relation needs its point set.
+
+An authenticated universal outlives every finite region owned by this body. That direction is
+proved directly without constructing point sets for the target's loans: their numeric intervals
+can conservatively include sibling failure cleanup. This does not bypass the Walker's loan
+conflicts or storage-end checks. A reverse local-to-universal goal still needs symbolic source
+provenance; unknown domains, provisional-static inference and capture contents remain pending.
+
+An external reborrow may cross a body scope when its actual storage parent bounds the reborrow.
+The parent is the meet of the dereferenced descriptors on the borrowed path, from the innermost
+dereference or slice backing store outward: a reborrow through several references is valid only
+while each of them is. A shared descriptor is Copy, so the chain ends at the first shared one, and a
+shared reborrow through shared references keeps the innermost lifetime. A lifetime merely
+nested in a field type is not such evidence. A universal parent covers finite body-local uses.
+A universal target retains its exact identity and must follow declared/header premises, including
+input well-formedness bounds. Retained goals never supply those premises.
+A local parent is traced through every outer loan naming that inference atom until it reaches
+sufficient universal parents. Values also enter a local region without a loan, such as a passed
+reference meeting a fresh borrow in one call region, or a callee or struct bound `'b: 'a` or
+`T: 'a` instantiated with a fresh loan's region for `'a`. Typing retains each such source as a
+relation even when an enclosing lifetime trivially covers the local region, including the caller
+premise `T: 'r` that covers it. A contents bound on a type parameter with no such premise names no
+source region, so typing keeps it as an open contents obligation and the symbolic proof never
+relates that loan's region to a universal target. Every source of a relation
+whose wanted side is the local atom must reach the target too, recursively. Owned storage, unknown provenance, a cycle without such roots, and
+an atom used only as another loan's inner retained region stay pending. Cyclic reborrows are
+proved only when every reachable local component reaches a sufficient real parent; a grounded
+branch cannot justify an ungrounded sibling cycle. The symbolic proof caches completed results
+by source and target within this one body; a proof for one universal cannot prove another. It does not use finite body points to infer a caller boundary.
+A call result that names only caller regions drops the body-region loans its operands carry,
+since a body region cannot outlive a caller region. When a relation still makes such a dropped
+loan's region outlive a universal region, the walk no longer sees where the loan goes, so the
+loan is treated as an escaping loan. The same holds for every loan its region proof can ground
+on: the loans naming a region the proof walks from the dropped loan's regions, through their
+parents and retention relations, such as the loan of a local view the dropped loan reborrows. An
+access that would conflict with any of them after the dropped loan's creation contests every
+region of that walk, and a universal relation whose proof reaches a contested region stays pending.
+Loan conflicts and all other retained goals are checked independently. When several call operands
+name the known result region, the retained loans form a complete union of possible sources. A
+region proof must succeed for every source in that union. A conflict with one possible source
+still yields `Imprecise`, never a definite rejection or `Checked`: a shared inference atom does
+not identify which operand a generic result retains. Other unknown retention, including missing
+region mappings and projected-assignment uncertainty, remains excluded from region proofs. A
+later operation cannot upgrade an already unknown mapping to a complete union.
+A known result borrow also keeps the ancestors recorded by actual reborrow provenance. The
+retention walk computes one closure over already-carried loans, starting at outer borrow atoms
+named by the result and following their actual parent atoms. An ancestor enters the complete
+possible-source union, never exact retention; previously unknown provenance stays unknown.
+Every source sharing a parent atom remains in the union. An inner retained lifetime is not a
+parent edge, so this rule cannot use an owned `Shelf` borrow to establish retention of its inner
+reference. Conflicts with possible ancestors remain imprecise, and every region proof still
+checks every carried source.
+
+Static storage validity does not remove alias restrictions. Loan retention includes explicit
+`'static` atoms for references, aggregates and retained environments. A holder of a static shared
+view still prevents mutation through its source until the holder's final use. Lifetime-only
+capture checks can omit static atoms, but the borrow walker's retained-region query cannot.
+An unrelated static result cannot retain body-owned storage; filtering those body loans must
+preserve a source loan whose own retained region is static.
+
+When call or aggregate inference retags a fresh reference borrow with its shared region, its retained
+source-validity relations follow that same loan. This renaming is limited to the borrow's own
+fresh atom and relations recorded at that exact source origin. It neither renames an existing
+contextual region nor turns a retained goal into a declared premise.
+For an external loan whose actual parent bound is proved, source storage is valid throughout the
+body independently of when the loan or its reference descriptor was created. Ending or replacing
+that descriptor does not end its referent. Availability retains actual referent End, Expire,
+write, move and drop exclusions, and the Walker still checks actual loan activity and conflicts.
+Owned storage and unproved sources keep the conservative creation/end bounds, restarting at
+creation on a loop back edge. Required bitsets propagate from shorter to longer to a fixed point.
 
 This first point proof uses conservative sets: numeric interval interiors may require extra
 points, and retained edges stay active throughout the body. Inclusion still proves the original
 relation; failed inclusion remains pending until location-sensitive requirements resolve it.
-The existing exact End/access walk retains OWN0019 and conflict diagnostics. Missing or ambiguous
+The existing exact End/access walk retains OWN0019 and conflict diagnostics. Missing or unprovable
 loan mappings, approximate loans, meets, provisional static inference, outside-owner atoms,
-crossed referent loans and Contents are not promoted to Checked. The shared parameter-to-local
-reborrow floor is the first target; no callee body's stage or MIR participates in its proof.
+unproved crossed referent loans and Contents are not promoted to Checked. No callee body's stage
+or MIR participates in this proof.
 
 ### 4.4 Liveness and conflicts
 
@@ -428,7 +508,7 @@ callees' contracts: the program-level guarantee needs every body checked, which 
 count tracks, and a callee that still leaves with `regions` is where a contract violation could
 hide until the regions slice proves it.
 
-- When every result region is a lifetime parameter of the checked declaration, or the result is
+- When every result region is static or an enclosing/own declared lifetime parameter, or the result is
   one of its type parameters, a loan of a body local, or with a body region, is not retained: such
   a region cannot outlive what the caller chose, typing already rejects a body-local borrow given a
   caller's region or type, and safe code obtains a type parameter's value only as such a value.
@@ -507,14 +587,19 @@ A body the walk clears is `Checked` when it is region-closed and typing left not
 region-closed when every region its locals and values name is `'static`, a loan region of the
 body itself, or a universal region chosen before the body runs: a lifetime parameter of its own
 declaration or of a named declaration enclosing it (an impl's parameters in a method, an enclosing
-function's in an anonymous body), or an anonymous body's invocation binder. Inside an anonymous
+function's in an anonymous body), or an anonymous body's invocation binder. The anonymous body's
+own declaration-owned parameter atoms are rigid within that body, including elided input lifetimes.
+Exact owner identity authenticates them; separate atoms still require a declared/header premise
+to relate them. An outer body cannot authenticate a child callable's parameters as its own, and
+the region proof does not authenticate ownerless invocation atoms by ordinal. Inside an anonymous
 body, a loan region of the enclosing named body is a capture dependency: the enclosing body bounds its
 formation and retention with its own points, and the nested body proves only its own uses. A
 callable value's type also names its contract's binders (invocation binders, and a nested literal's
 own parameters); each invocation instantiates them afresh, so they name no region of a value the
-body holds. An enclosing literal's own binders and locals, supplied atoms and meets are not closed. No loan of the body has a universal region, and
-typing defers every relation that would make a body loan outlive one as a pending region
-obligation, so a body with nothing pending relies on none. A call result keeps an operand's region only by naming it, and conformance holds an
+body holds. An enclosing literal's own binders and locals, supplied atoms and meets are not closed.
+Owned body storage cannot outlive the body. Typing retains goals that would make an inferred region
+outlive a universal; only the separate symbolic source proof can discharge them. Atom closure
+alone proves no such relation. A call result keeps an operand's region only by naming it, and conformance holds an
 interface witness to exactly the regions its operation names, so a result typed by an open
 parameter keeps no loan of the body. Such a body's
 loans and their scopes are its whole region proof, because no loan of a cleared body outlives its
@@ -527,9 +612,9 @@ root's scope:
 - Every value that would carry a loan of a body local across a scope boundary leaves the walk with
   `stored-loans`: a block, branch or arm result, a subject that carries a loan, a return, an
   assignment and a `let mut` holder. A referent loan (storage behind a reference, which the body
-  does not own) may cross a join, a `let mut` holder, a replacement or a return; such a body is
-  marked crossed and is never `Checked`, because its region relations are the region slices' to
-  prove.
+  does not own) may cross a join, a `let mut` holder, a replacement or a return. The source-bound
+  proof in §4.3 admits that crossing only when an authenticated universal parent bounds the
+  reborrow; otherwise the body remains `regions`. Every retained relation still needs its own proof.
 - A borrow whose place has no local root, such as `&make()`, `&Pair {..}.first`, a borrowed array
   literal or a temporary receiver, borrows a hidden owner the walk roots at the borrowed value. It
   is released with its statement or arm, or with the binding's scope for an array kept by a
