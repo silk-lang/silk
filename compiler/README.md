@@ -205,9 +205,9 @@ references and drops the value and allocation with the last handle. Raw-buffer a
 stay owned by library code. `layoutOf`, `sharedLayout` and `systemAllocationAcquire` exchange the
 standard library's `silk/layout` `Layout` record, as the bootstrap's contracts name it.
 Borrow checking remains step 14: successful builds print a `SILK_GAP borrow-check` summary of the
-emitted bodies and a `SILK_GAP borrow-check root-package` summary of every root-package body, each
-with a per-reason breakdown, then one `SILK_GAP borrow-check body` line naming each unchecked
-root-package body. The TypeScript bootstrap compiler still builds it, as
+emitted bodies and a `SILK_GAP borrow-check root-package` summary of the concrete root-package
+bodies, each with a per-reason breakdown, then one `SILK_GAP borrow-check body` line naming each
+unchecked concrete root-package body by its block. The TypeScript bootstrap compiler still builds it, as
 the bootstrap DDC job in `selfhost.yml` checks (see `docs/native-seed-chain.md#bootstrap-ddc`).
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
