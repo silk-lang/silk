@@ -1143,14 +1143,34 @@ const lowerStatement = (
           region.outcome.target.ordinal === following.ordinal
         )
       })
+    // A `break` or `continue` ends only the loans its exit plan names, and the loop's own join
+    // reconciles the rest, so for a plain loan such a branch counts as reaching the join.
+    // A temporary's loans end at that exit (`emitReleases`), so only reaching branches count.
+    const loopTransfers = (regions: ReadonlyArray<number>): boolean =>
+      regions.some((ordinal) => {
+        const region = fn.regions.at(ordinal)
+        return (
+          region !== undefined &&
+          (region._tag === 'OperationRegion' || region._tag === 'CleanupRegion') &&
+          (region.outcome._tag === 'Exit' || region.outcome._tag === 'Repeat') &&
+          region.outcome.loop.ordinal === ownerLoop?.ordinal
+        )
+      })
     const joining = [
       ...(reaches(takenRegions) ? [takenState] : []),
       ...(reaches(otherwiseRegions) ? [otherwiseState] : []),
     ]
+    const looping = [
+      ...(!reaches(takenRegions) && loopTransfers(takenRegions) ? [takenState] : []),
+      ...(!reaches(otherwiseRegions) && loopTransfers(otherwiseRegions) ? [otherwiseState] : []),
+    ]
     // The join holds the loans every joining branch still holds from before the conditional.
     const joined = new Set(
-      [...branchState.loanLocals.keys()].filter((key) =>
-        joining.every((state) => state.loanLocals.has(key)),
+      [...branchState.loanLocals.keys()].filter(
+        (key) =>
+          joining.every((state) => state.loanLocals.has(key)) &&
+          (fn.temporaryBorrowOwners.has(key) ||
+            looping.every((state) => state.loanLocals.has(key))),
       ),
     )
     // A joining branch ends every other loan it holds, in the function's loan order. Visiting the

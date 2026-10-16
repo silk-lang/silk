@@ -223,6 +223,22 @@ fn firstMatching(entries: &[Token], wanted: i32) -> i32 {
   }
   return 0
 }
+fn tokens(values: &[Token]) -> &[Token] { return values }
+struct Shelf {
+  items: [Token; 2]
+}
+fn foundOrBreak(shelf: &Shelf, wanted: i32) -> i32 {
+  let found = tokens(&shelf.items)
+  let mut entry: usize = 0
+  while entry < found.length {
+    if found[entry].value == wanted {
+      if let Token { value } = &found[entry] { return value }
+      break
+    }
+    entry = entry + 1
+  }
+  return 0
+}
 fn copyInto(entry: &mut Holder, output: &mut Token) -> () {
   output.value = entry.value
   return ()
@@ -248,9 +264,11 @@ effect fn endedInOneArm(holder: &mut Holder, choice: Choice) -> i32 {
 }
 pub fn main() -> i32 {
   let tokens = [Token { value: 1 }, Token { value: 2 }]
+  let shelf = Shelf { items: [Token { value: 3 }, Token { value: 4 }] }
   let mut holder = Holder { value: 1 }
   let ended = run endedInOneArm(&mut holder, Choice.Take)
-  return armBinding() + armOuter() + acrossReturn(false) + firstMatching(&tokens, 2) + ended
+  return armBinding() + armOuter() + acrossReturn(false) + firstMatching(&tokens, 2) + ended +
+    foundOrBreak(&shelf, 3)
 }`
       const self = yield* AnalysisFixture.retainingMain('qualified-borrow/arm-loans', ascii(source))
       assert.deepEqual(Analysis.diagnostics(self), [])
