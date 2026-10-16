@@ -285,7 +285,10 @@ A local parent is traced through every outer loan naming that inference atom unt
 sufficient universal parents. Values also enter a local region without a loan, such as a passed
 reference meeting a fresh borrow in one call region, or a callee or struct bound `'b: 'a` or
 `T: 'a` instantiated with a fresh loan's region for `'a`. Typing retains each such source as a
-relation even when an enclosing lifetime trivially covers the local region, and every source of a relation
+relation even when an enclosing lifetime trivially covers the local region, including the caller
+premise `T: 'r` that covers it. A contents bound on a type parameter with no such premise names no
+source region, so typing keeps it as an open contents obligation and the symbolic proof never
+relates that loan's region to a universal target. Every source of a relation
 whose wanted side is the local atom must reach the target too, recursively. Owned storage, unknown provenance, a cycle without such roots, and
 an atom used only as another loan's inner retained region stay pending. Cyclic reborrows are
 proved only when every reachable local component reaches a sufficient real parent; a grounded
