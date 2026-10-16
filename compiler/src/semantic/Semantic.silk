@@ -53258,23 +53258,28 @@ effect fn checkedStaticRoot(
 }
 
 // A lowering defect is never a program verdict: stop before the MIR can be cached or emitted.
-// A part read after its whole owner's drop is excused only when the part runs no cleanup, the
-// same verdict lowering used to drop the rest whole.
-effect fn verifyLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, function: &MirFunction) -> ()
+// A part read after its whole owner's drop is excused only when the part runs no cleanup and
+// refers to no other storage, the same verdict lowering used to drop the rest whole. Every fact
+// the check reads joins `dependencies`, so a revision that changes one re-verifies the body.
+effect fn verifyLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  function: &MirFunction) -> ()
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let found = run MirVerification.useAfterDrop(function)
+  let flows = run callFlows(&mut resolver.*, &mut owner.*, &mut dependencies.*, function)
+  let found = run MirVerification.useAfterDrop(function, Vector<Option<Vector<bool>>>.asSlice(&flows))
   let listed = Vector<UseAfterDrop>.asSlice(&found)
   let mut at = usize.ZERO
   while at < listed.length {
     let mut excused = false
+    let mut undecided = false
     if let Option<Shared<Type>>.Some {value: part} = &listed[at].read {
-      let mut scratch = Vector<Dependency>.make()
-      let mut visiting = Vector<Shared<Type>>.make()
-      let premises = Vector<Constraint>.make()
-      excused = match move run cleanupFree(&mut resolver.*, &mut owner.*, &mut scratch, &part, Vector<Constraint>.asSlice(&premises),
-        &mut visiting, Span.make(usize.ZERO, usize.ZERO)) {
-        Result<bool, Shared<Rejection>>.Success {value} => value
-        Result<bool, Shared<Rejection>>.Failure {..} => false
+      if !MirVerification.carriesView(&part) {
+        let mut visiting = Vector<Shared<Type>>.make()
+        let premises = Vector<Constraint>.make()
+        match move run cleanupFree(&mut resolver.*, &mut owner.*, &mut dependencies.*, &part, Vector<Constraint>.asSlice(&premises),
+          &mut visiting, Span.make(usize.ZERO, usize.ZERO)) {
+          Result<bool, Shared<Rejection>>.Success {value} => { excused = value }
+          Result<bool, Shared<Rejection>>.Failure {..} => { undecided = true }
+        }
       }
     }
     if !excused {
@@ -53287,6 +53292,7 @@ effect fn verifyLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
       run appendDecimal(&mut reason, listed[at].block)
       run Bytes.append(&mut reason, b", statement ")
       run appendDecimal(&mut reason, listed[at].statement)
+      if undecided { run Bytes.append(&mut reason, b"; whether the read part runs cleanup is undecided") }
       run Bytes.append(&mut reason, b"):")
       let listing = run MirVerification.describe(function)
       run Bytes.append(&mut reason, Bytes.asSlice(&listing))
@@ -53296,24 +53302,319 @@ effect fn verifyLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
   }
 }
 
+// Per block, which arguments of the call ending it may pass a view into its result, read from
+// the callee's declared signature; `None` where the signature does not tell, so every argument
+// may. Only a body that drops a temporary has views to carry, so only it reads signatures.
+effect fn callFlows(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  function: &MirFunction) -> Vector<Option<Vector<bool>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut flows = Vector<Option<Vector<bool>>>.make()
+  if !MirVerification.dropsTemporary(function) { return move flows }
+  let blocks = Vector<MirBlock>.asSlice(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let mut flow = Option<Vector<bool>>.none()
+    if let MirTerminator.Call {callee: MirCallee.Instance {key: InstanceKey.Function {application, ..}}, arguments, ..} = &blocks[at].terminator {
+      let named = Shared<Application>.with<Option<DeclarationId>>(&application, fn(value: &Application) -> Option<DeclarationId> {
+        return match &value.target {
+          SpecializationTarget.Named {declaration} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+          _ => Option<DeclarationId>.none()
+        }
+      })
+      if let Option<DeclarationId>.Some {value: declaration} = move named {
+        let module = ModuleId.copy(DeclarationId.moduleId(&declaration))
+        let moduleOrdinal = run internModule(&mut resolver.*, &module)
+        let identity = run Shared<DeclarationId>.make(move declaration)
+        if let Option<usize>.Some {value: ordinal} = move run ordinalOfIdentity(&mut resolver.*, &module, &identity) {
+          let request = Key {family: Family.Signature, module: moduleOrdinal, name: usize.ZERO, declaration: ordinal, member: usize.ZERO, external: false}
+          let interned = run internDeclaration(&mut resolver.*, request)
+          let header = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, interned, Span.make(usize.ZERO, usize.ZERO))
+          let next = run signatureFlows(&header, Vector<MirOperand>.length(&arguments))
+          flow = move next
+        }
+      }
+    }
+    run Vector<Option<Vector<bool>>>.append(&mut flows, move flow)
+    at = at + usize.ONE
+  }
+  return move flows
+}
+
+// One region or type parameter a declared type mentions.
+union FlowNode {
+  Region {region: Shared<Lifetime>},
+  Parameter {declaration: DeclarationId, ordinal: usize},
+}
+
+// The regions and type parameters of a signature, partitioned so that two nodes share a class
+// when the signature lets one's contents flow into the other's: they occur in one parameter or
+// result type (whose well-formedness implies bounds between them) or in one declared bound.
+struct FlowClasses {
+  nodes: Vector<FlowNode>
+  classes: Vector<usize>
+}
+
+// Which arguments may pass a view into the result: those whose declared type shares a class
+// with the result's. `None` when the signature is not an ordinary function with a fully
+// understood shape: an Effect stores every argument, and a callable, opaque, pointer or row
+// can carry anything.
+effect fn signatureFlows(header: &Shared<Result<Answer, NoRejection>>, count: usize) -> Option<Vector<bool>>
+! OutOfMemoryError ? &mut Allocator {
+  let constructs = Shared<Result<Answer, NoRejection>>.with<bool>(header, signatureIsEffect)
+  let variadic = Shared<Result<Answer, NoRejection>>.with<bool>(header, signatureIsVariadic)
+  let statics = Shared<Result<Answer, NoRejection>>.with<usize>(header, signatureStaticCount)
+  if constructs || variadic || statics != usize.ZERO { return Option<Vector<bool>>.none() }
+  let parameters = run signatureParameterTypes(header)
+  let declared = Vector<Shared<Type>>.asSlice(&parameters)
+  if declared.length != count { return Option<Vector<bool>>.none() }
+  let result = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(header, signatureResult) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return Option<Vector<bool>>.none() }
+  }
+  let mut partition = FlowClasses {nodes: Vector<FlowNode>.make(), classes: Vector<usize>.make()}
+  let mut members = Vector<Vector<usize>>.make()
+  let mut at = usize.ZERO
+  while at < declared.length {
+    let mut mentioned = Vector<usize>.make()
+    if !run flowMentions(&mut partition, &mut mentioned, &declared[at]) { return Option<Vector<bool>>.none() }
+    run linkAll(&mut partition, &mentioned)
+    run Vector<Vector<usize>>.append(&mut members, move mentioned)
+    at = at + usize.ONE
+  }
+  let mut produced = Vector<usize>.make()
+  if !run flowMentions(&mut partition, &mut produced, &result) { return Option<Vector<bool>>.none() }
+  run linkAll(&mut partition, &produced)
+  let bounds = Shared<Result<Answer, NoRejection>>.with<usize>(header, signatureConstraintCount)
+  at = usize.ZERO
+  while at < bounds {
+    let bound = Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(header, fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> {
+      return signatureConstraint(answer, at)
+    })
+    if let Option<Constraint>.Some {value: constraint} = move bound {
+      let mut mentioned = Vector<usize>.make()
+      if !run boundMentions(&mut partition, &mut mentioned, &constraint) { return Option<Vector<bool>>.none() }
+      run linkAll(&mut partition, &mentioned)
+    }
+    at = at + usize.ONE
+  }
+  let mut carried = Vector<bool>.make()
+  let inputs = Vector<Vector<usize>>.asSlice(&members)
+  let outputs = Vector<usize>.asSlice(&produced)
+  at = usize.ZERO
+  while at < inputs.length {
+    let mentioned = Vector<usize>.asSlice(&inputs[at])
+    let classes = Vector<usize>.asSlice(&partition.classes)
+    let mut flows = false
+    let mut input = usize.ZERO
+    while !flows && input < mentioned.length {
+      let mut output = usize.ZERO
+      while !flows && output < outputs.length {
+        flows = classes[mentioned[input]] == classes[outputs[output]]
+        output = output + usize.ONE
+      }
+      input = input + usize.ONE
+    }
+    run Vector<bool>.append(&mut carried, flows)
+    at = at + usize.ONE
+  }
+  return Option<Vector<bool>>.some(move carried)
+}
+
+// Merges the classes of every node in `mentioned`.
+effect fn linkAll(partition: &mut FlowClasses, mentioned: &Vector<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<usize>.asSlice(&mentioned.*)
+  if listed.length == usize.ZERO { return () }
+  let target = Vector<usize>.asSlice(&partition.classes)[listed[usize.ZERO]]
+  let mut at = usize.ONE
+  while at < listed.length {
+    let merged = Vector<usize>.asSlice(&partition.classes)[listed[at]]
+    if merged != target {
+      let mut node = usize.ZERO
+      while node < Vector<usize>.length(&partition.classes) {
+        if Vector<usize>.asSlice(&partition.classes)[node] == merged { Vector<usize>.set(&mut partition.classes, node, target) }
+        node = node + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+}
+
+// The node index of `node`, added in a class of its own when new.
+effect fn flowNode(partition: &mut FlowClasses, node: FlowNode) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<FlowNode>.asSlice(&partition.nodes)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let same = match &listed[at] {
+      FlowNode.Region {region} => match &node { FlowNode.Region {region: other} => Lifetime.equalsShared(&region, &other) _ => false }
+      FlowNode.Parameter {declaration, ordinal} => match &node {
+        FlowNode.Parameter {declaration: other, ordinal: position} => ordinal == position && DeclarationId.equals(&declaration, &other)
+        _ => false
+      }
+    }
+    if same { return at }
+    at = at + usize.ONE
+  }
+  let added = listed.length
+  run Vector<FlowNode>.append(&mut partition.nodes, move node)
+  run Vector<usize>.append(&mut partition.classes, added)
+  return added
+}
+
+effect fn regionMentions(partition: &mut FlowClasses, mentioned: &mut Vector<usize>, region: &Shared<Lifetime>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let count = Lifetime.atomCount(region)
+  let mut at = usize.ZERO
+  while at < count {
+    let node = run flowNode(&mut partition.*, FlowNode.Region {region: Lifetime.atomAt(region, at)})
+    run Vector<usize>.append(&mut mentioned.*, node)
+    at = at + usize.ONE
+  }
+}
+
+// The declared shapes whose regions and type parameters are all the views a value can hold.
+fn flowShape(value: &Type) -> usize {
+  return match &value.* {
+    Type.Primitive {..} => usize.ZERO
+    Type.Unit => usize.ZERO
+    Type.Parameter {..} => usize.ONE
+    Type.String {..} => 2
+    Type.Reference {..} => 3
+    Type.Slice {..} => 3
+    Type.Array {..} => 4
+    Type.Nominal {..} => 5
+    Type.Union {..} => 6
+    _ => usize.MAX
+  }
+}
+
+fn flowRegion(value: &Type) -> Option<Shared<Lifetime>> {
+  return match &value.* {
+    Type.String {lifetime} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    Type.Reference {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    Type.Slice {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    _ => Option<Shared<Lifetime>>.none()
+  }
+}
+
+fn flowParameter(value: &Type) -> Option<FlowNode> {
+  return match &value.* {
+    Type.Parameter {declaration, ordinal} => Option<FlowNode>.some(FlowNode.Parameter {declaration: DeclarationId.copy(&declaration), ordinal: ordinal})
+    _ => Option<FlowNode>.none()
+  }
+}
+
+fn flowChildCount(value: &Type) -> usize {
+  return match &value.* {
+    Type.Reference {..} => usize.ONE
+    Type.Slice {..} => usize.ONE
+    Type.Array {..} => usize.ONE
+    Type.Nominal {arguments, ..} => Vector<Argument>.length(&arguments)
+    Type.Union {members} => Vector<Shared<Type>>.length(&members)
+    _ => usize.ZERO
+  }
+}
+
+// One child of a flow shape: a type, a lifetime argument, or `None` for a row argument, whose
+// contents the walk does not follow.
+union FlowChild {
+  Ty {value: Shared<Type>},
+  Region {value: Shared<Lifetime>},
+  Unknown,
+}
+
+fn flowChildAt(value: &Type, at: usize) -> FlowChild {
+  return match &value.* {
+    Type.Reference {referent, ..} => FlowChild.Ty {value: Shared<Type>.clone(&referent)}
+    Type.Slice {element, ..} => FlowChild.Ty {value: Shared<Type>.clone(&element)}
+    Type.Array {element, ..} => FlowChild.Ty {value: Shared<Type>.clone(&element)}
+    Type.Nominal {arguments, ..} => match &Vector<Argument>.asSlice(&arguments)[at] {
+      Argument.Type {value: argument} => FlowChild.Ty {value: Shared<Type>.clone(&argument)}
+      Argument.Lifetime {value: region} => FlowChild.Region {value: Shared<Lifetime>.clone(&region)}
+      Argument.Row {..} => FlowChild.Unknown
+    }
+    Type.Union {members} => FlowChild.Ty {value: Shared<Type>.clone(&Vector<Shared<Type>>.asSlice(&members)[at])}
+    _ => FlowChild.Unknown
+  }
+}
+
+// Appends the nodes `value` mentions; false when its shape can hold views the walk cannot name.
+effect fn flowMentions(partition: &mut FlowClasses, mentioned: &mut Vector<usize>, value: &Shared<Type>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let shape = Shared<Type>.with<usize>(value, flowShape)
+  if shape == usize.MAX { return false }
+  if let Option<FlowNode>.Some {value: parameter} = move Shared<Type>.with<Option<FlowNode>>(value, flowParameter) {
+    let node = run flowNode(&mut partition.*, move parameter)
+    run Vector<usize>.append(&mut mentioned.*, node)
+  }
+  if let Option<Shared<Lifetime>>.Some {value: region} = move Shared<Type>.with<Option<Shared<Lifetime>>>(value, flowRegion) {
+    run regionMentions(&mut partition.*, &mut mentioned.*, &region)
+  }
+  let count = Shared<Type>.with<usize>(value, flowChildCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let child = Shared<Type>.with<FlowChild>(value, fn(node: &Type) -> FlowChild { return flowChildAt(node, at) })
+    match move child {
+      FlowChild.Ty {value: nested} => { if !run flowMentions(&mut partition.*, &mut mentioned.*, &nested) { return false } }
+      FlowChild.Region {value: region} => run regionMentions(&mut partition.*, &mut mentioned.*, &region)
+      FlowChild.Unknown => { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Appends the nodes a declared bound relates; false for a bound over callables or rows.
+effect fn boundMentions(partition: &mut FlowClasses, mentioned: &mut Vector<usize>, constraint: &Constraint) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  match &constraint.* {
+    Constraint.Conforms {provider, contract} => {
+      if !run flowMentions(&mut partition.*, &mut mentioned.*, &provider) { return false }
+      return run flowMentions(&mut partition.*, &mut mentioned.*, &contract)
+    }
+    Constraint.Contents {subject, region} => {
+      run regionMentions(&mut partition.*, &mut mentioned.*, &region)
+      return run flowMentions(&mut partition.*, &mut mentioned.*, &subject)
+    }
+    Constraint.Outlives {longer, shorter} => {
+      run regionMentions(&mut partition.*, &mut mentioned.*, &longer)
+      run regionMentions(&mut partition.*, &mut mentioned.*, &shorter)
+      return true
+    }
+    Constraint.Copyable {..} => { return true }
+    Constraint.Property {..} => { return true }
+    Constraint.FailureSubset {selected, source} => {
+      if !run flowMentions(&mut partition.*, &mut mentioned.*, &selected) { return false }
+      return run flowMentions(&mut partition.*, &mut mentioned.*, &source)
+    }
+    _ => { return false }
+  }
+}
+
 effect fn storeMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, function: MirFunction, dependencies: Vector<Dependency>) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  run verifyLowered(&mut resolver.*, &mut owner.*, &function)
+  let mut read = move dependencies
+  run verifyLowered(&mut resolver.*, &mut owner.*, &mut read, &function)
   let index = Vector<MirFunction>.length(&resolver.mirValues)
   run Vector<MirFunction>.append(&mut resolver.*.mirValues, move function)
-  return memberSuccess(Value.Mir {index: index}, move dependencies)
+  return memberSuccess(Value.Mir {index: index}, move read)
 }
 
 // Helpers follow their creator, where their own queries find them.
 effect fn storeLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, lowered: Lowered, dependencies: Vector<Dependency>) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let Lowered {function, helpers} = move lowered
-  let answer = run storeMir(&mut resolver.*, &mut owner.*, move function, move dependencies)
+  let mut read = move dependencies
+  let listed = Vector<MirFunction>.asSlice(&helpers)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run verifyLowered(&mut resolver.*, &mut owner.*, &mut read, &listed[at])
+    at = at + usize.ONE
+  }
+  let answer = run storeMir(&mut resolver.*, &mut owner.*, move function, move read)
   let mut pending = move helpers
   while Vector<MirFunction>.length(&pending) > usize.ZERO {
     let helper = Vector<MirFunction>.remove(&mut pending, usize.ZERO)
-    run verifyLowered(&mut resolver.*, &mut owner.*, &helper)
     run Vector<MirFunction>.append(&mut resolver.*.mirValues, move helper)
   }
   return move answer
@@ -71001,6 +71302,15 @@ impl Semantic {
     let answer = run demandNamed(&mut self.resolver, &mut self.query, module, name, Family.Mir)
     run recordRoot(&mut request.*, Family.Mir, module, name, &answer)
     return move answer
+  }
+  /// The uses after drop in `function` that the lowering verifier checks for, with the call flows
+  /// it reads from callee signatures in this request.
+  pub effect fn useAfterDrop(self: &mut Self, request: &mut Request, function: &MirFunction) -> Vector<UseAfterDrop>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    run selectRequest(&mut self.resolver, &request.*)
+    let mut read = Vector<Dependency>.make()
+    let flows = run callFlows(&mut self.resolver, &mut self.query, &mut read, function)
+    return run MirVerification.useAfterDrop(function, Vector<Option<Vector<bool>>>.asSlice(&flows))
   }
   /// Demands backend-neutral target layout facts for one runtime type.
   pub effect fn demandLayout(self: &mut Self, request: &mut Request, module: &ModuleId, ty: &Shared<Type>) -> Shared<Result<Answer, NoRejection>>
