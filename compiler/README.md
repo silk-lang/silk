@@ -274,7 +274,7 @@ of that name and never a default, and `{ kind = "none" }` selects no runtime and
 component, so the application's own `export "C"` functions are the roots. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
 (resolved against the manifest's directory), else the root's containing directory, is the root for
 local module paths, and the root must be a module below it. Every module identity names the package by its logical
-identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
+identity, `name@version` from the required `[package].name` and `[package].version`, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
 manifest above it has no package identity and is refused. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
