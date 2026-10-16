@@ -150,43 +150,31 @@ Each entry records:
 TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
 - **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
   call: a complete ordinary call takes the region its expected result names, and otherwise binds
-  `'static`, since the outcome retains no operand region through that binder. A lifetime binder
+  `'static`, since the outcome retains no operand region through that binder. A direct call's
+  binder that the shorter side of an outlives bound names, such as `'a` under `'b: 'a` in
+  `fn widen<'a, 'b: 'a>(value: &'b Token) -> &'a Token`, then shortens to the region the bound's
+  longer side lends, as the bootstrap infers, for a function's own bound and an inherent impl's
+  alike. A written binder, one the expected result fixes, one an operand fixes, and one under more
+  than one outlives or contents bound never move, and a call shortens only in a runtime
+  declaration's own body, not in a callable literal, an Effect block or a static body. The
+  shortened binding holds only when the borrow check proves that whole body; otherwise each
+  shortened call reports SEM0212 at the call, as it did unshortened. A lifetime binder
   nothing mentions, such as `fn advanceFinalStage<'head>(...)`, binds `'static` too, which the
   bootstrap also accepts; only type and row binders stay `UninferredParameter`. Sections and
   function values keep their existing result-only binder gaps.
 - **Source migration:** none.
 - **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
   selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
-  bootstrap infers the shorter region.
+  bootstrap infers the shorter region. Where the bootstrap reports a shortened result escaping
+  through another call, a field or a binding as OWN0019 at the use and SEM0212 at the borrowed
+  argument, selfhost reports SEM0212 at the call, or OWN0019 where its borrow check sees the escape
+  first. A call under several bounds on one binder, or one in a body the borrow check leaves
+  unproved, keeps SEM0212 where the bootstrap accepts.
 - **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
-  `compiler/src/semantic/SemanticCaptureCases.silk` and
+  `compiler/src/semantic/SemanticCaptureCases.silk`,
   `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in
-  `compiler/src/semantic/SemanticConformanceCases.silk`.
-
-### Selfhost rejects an outlives bound on a result-only call lifetime
-
-- **Status:** known divergence; recorded on 2026-10-16 on PR #1823.
-- **Rule:** a result-only lifetime binder is chosen by the call's use (LIFE-003), so the bootstrap
-  infers the shorter region that satisfies the binder's outlives bounds.
-- **Compilers:** selfhost binds a result-only binder that neither an operand nor the expected result
-  fixes to `'static` (see "Result-only call lifetimes in selfhost"), then proves the call's bounds
-  against it. A bound whose shorter side is that binder, such as `'b: 'a` in
-  `fn widen<'a, 'b: 'a>(value: &'b Token) -> &'a Token`, then fails at the call: native reports
-  SEM0212 where the bootstrap accepts.
-  - Already on selfhost before PR #1823, for a function's own bound: `widen(&t).value`,
-    `let r = widen(&t)` then `r.value`, `widen(short).value` in a `'s` function, and `widen`
-    relaying through `inspect<'x>(value: &'x Token) -> &'x Token`.
-  - New with PR #1823, which proves an inherent impl's `where` bounds at each member call: the same
-    shape through `impl<'a, 'b: 'a> Pair<'a, 'b> { fn widen(value: &'b Token) -> &'a Token }`, as in
-    `Pair.widen(&t).value`.
-- **Source migration:** none needed; the rejection is conservative, since it rejects a program
-  the bootstrap accepts and admits nothing unsound. Writing the lifetime explicitly, as in
-  `Pair<'s, 's>.widen(short)`, is accepted. With lifetimes written out, native also accepts
-  `Lent<'s, 's>.keep(short)` and `Pair<'s, 's>.same(short)`, which the bootstrap rejects; both
-  are safe, because the written application satisfies every bound.
-- **Diagnostics and limits:** shortening a result-only binder to the region its bound's longer side
-  lends removes this divergence; it follows separately.
-- **Evidence:** the probes `f1`, `f2`, `f4`, `x3f` and `x3b` in PR #1823's description.
+  `compiler/src/semantic/SemanticConformanceCases.silk`, and `resultOnlyBindersShortenToTheirBound`
+  in `compiler/src/semantic/SemanticCallableCases.silk`.
 
 ### Caller-local region relations and 'static binder shortening in selfhost
 
@@ -717,6 +705,9 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
     with SEM0212. The same substitution turns a `T: 'a` bound over such a lifetime into
     `T: 'static`. The bootstrap reports at the function header, or at a local borrow operand
     (`Leak.leak(&held)` at `&held`); native reports over the call.
+  - With every lifetime written out, as in `Lent<'s, 's>.keep(short)` and
+    `Pair<'s, 's>.same(short)`, native accepts what the bootstrap rejects. Both are safe: the
+    written application satisfies every bound.
 - **Source migration:** none; both compilers reject.
 - **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
   (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`) and
@@ -2455,6 +2446,34 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Source migration:** none. Both compilers reject the body.
 - **Evidence:** the `statementsAfterBinding`, `bindingChain`, `bindingClosure`, `bindingArm` and
   `bindingPattern` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Struct literals infer the meet of their field lifetimes
+
+- **Status:** Approved on 2026-10-16 by Julia; implemented natively on the
+  `selfhost-regions-meet-locals` branch. Bootstrap divergence.
+- **Rule:** a struct literal whose fields offer different regions for an inferred lifetime binder
+  infers their meet, the shortest region, in any field order, as Rust does. A lifetime parameter of
+  the enclosing declaration outlives every region local to its body, so a literal mixing parameter
+  views with borrows of locals holds the local region. The literal still cannot outlive that local.
+- **Compilers:** native infers the meet. For `struct Trio<'a> {e: &'a i32, f: &'a i32, g: &'a i32}`
+  in `fn f(p: &i32)` with locals `one` and `two`, `Trio { e: p, f: &one, g: &two }` is accepted and
+  Checked, as are the orders with a local first. The bootstrap fixes the binder from the first
+  field, so with `p` first it rejects with SEM0212 at the first later borrow of a local.
+- **Source migration:** none. Write the fields in any order.
+- **Diagnostics and limits:** the inferred region stays the meet of every field region, so a
+  literal holding a local borrow is still rejected when it is returned (SEM0129 at the literal),
+  stored through `&mut` into a caller region (SEM0037 at the literal), read through a binding after
+  the local ends (OWN0019 at the read), or met by an expectation that fixes a caller region, such as
+  `let s: Trio<'p> = ...` (SEM0037) or `hold<Trio<'p>>(...)` (SEM0012) at the literal. The bootstrap
+  reports OWN0019 at the local borrow for several of these. A binder written on the literal, such
+  as `Trio<'p> { ... }`, or a region elided inside a written type argument, such as `Pair<&i32>`,
+  never shortens.
+  Known parity difference: for `S { x: p, y: &l }` with a parameter first and a direct borrow of a
+  local, before this change native reported OWN0019 where the bootstrap reports SEM0212; both
+  reject. Native now accepts it when the literal stays local.
+- **Evidence:** `binderMeetsKeepBodyLocalRegions` and `binderMeetsNeverWidenFixedRegions` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
 
 ## Bootstrap cleans borrowed temporaries at the end of their scope
