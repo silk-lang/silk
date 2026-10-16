@@ -322,6 +322,12 @@ export const emit = (
       break
     }
     case 'Return': {
+      // A `never` value never arrives: the call that produced it diverged, so nothing completes.
+      const returned = context.storage.fn.localTypes.at(terminator.value.ordinal)
+      if (returned !== undefined && SilkType.isNever(Mir.semanticType(returned))) {
+        Emitter.unreachable(context.body)
+        break
+      }
       const instruction = NativeReturn.completeLocal(
         context.suspension,
         context.storage,
