@@ -239,6 +239,60 @@ fn foundOrBreak(shelf: &Shelf, wanted: i32) -> i32 {
   }
   return 0
 }
+struct Missing {}
+effect fn missing() -> never ! Missing { fail Missing {} }
+effect fn absent(error: Missing) -> i32 { drop error return 0 }
+effect fn lastMatching(shelf: &Shelf, wanted: i32) -> i32 ! Missing {
+  let found = tokens(&shelf.items)
+  let mut entry: usize = 0
+  while entry < found.length {
+    if found[entry].value == wanted { return found[entry].value }
+    entry = entry + 1
+  }
+  return run missing()
+}
+fn returnInArm(shelf: &Shelf) -> i32 {
+  let found = tokens(&shelf.items)
+  let mut entry: usize = 0
+  while entry < found.length {
+    let value = found[entry].value
+    let choice = Choice.Take
+    match move choice {
+      Choice.Take => {
+        if value == 4 { return value }
+      }
+      Choice.Skip => {}
+    }
+    entry = entry + 1
+  }
+  return 0
+}
+union Parcel { Empty, Ready { choice: Choice } }
+fn returnInNestedArm(shelf: &Shelf) -> i32 {
+  let found = tokens(&shelf.items)
+  let mut entry: usize = 0
+  while entry < found.length {
+    let value = found[entry].value
+    let packet = Parcel.Ready { choice: Choice.Skip }
+    match move packet {
+      Parcel.Empty => {}
+      Parcel.Ready { choice } => match move choice {
+        Choice.Take => { return value }
+        Choice.Skip => { return 0 }
+      }
+    }
+    entry = entry + 1
+  }
+  return 0
+}
+fn readInIfLet(shelf: &Shelf, wanted: Parcel) -> i32 {
+  let found = tokens(&shelf.items)
+  if found.length == 0 { return 0 }
+  if let Parcel.Ready { choice } = move wanted {
+    return found[1].value
+  }
+  return 1
+}
 fn copyInto(entry: &mut Holder, output: &mut Token) -> () {
   output.value = entry.value
   return ()
@@ -267,15 +321,19 @@ pub fn main() -> i32 {
   let shelf = Shelf { items: [Token { value: 3 }, Token { value: 4 }] }
   let mut holder = Holder { value: 1 }
   let ended = run endedInOneArm(&mut holder, Choice.Take)
+  let last = run Intrinsic.catchFailure<Missing>(lastMatching(&shelf, 4), absent)
   return armBinding() + armOuter() + acrossReturn(false) + firstMatching(&tokens, 2) + ended +
-    foundOrBreak(&shelf, 3)
+    foundOrBreak(&shelf, 3) + last + returnInArm(&shelf) +
+    returnInNestedArm(&shelf) + readInIfLet(&shelf, Parcel.Empty)
 }`
       const self = yield* AnalysisFixture.retainingMain('qualified-borrow/arm-loans', ascii(source))
       assert.deepEqual(Analysis.diagnostics(self), [])
       const mir = Analysis.loweredMir(self)
       // A loan a statement arm's or a loop body's own binding holds ends with that arm or iteration
       // on its fall-through path, and a loan from before a match that one arm ends is ended by the
-      // other joining arms rather than again after the join.
+      // other joining arms rather than again after the join. A loan a loop ends at its exit also
+      // ends at a return in one of its arms, and a return whose value diverges still ends the loans
+      // it holds. An \`if let\` selection ends no loan its body still reads.
       assert.deepEqual(yield* MirVerification.verify(mir), [])
       // A branch that returns never reaches the join, so the loan the other branch carries into it
       // stays held through the later use and ends only at the function's exits.
@@ -365,6 +423,12 @@ effect fn acrossFailure(flag: bool) -> i32 ! Problem {
   return read(view)
 }
 effect fn recover(error: Problem) -> i32 { return 0 }
+effect fn rejected() -> never ! Problem { fail Problem {} }
+effect fn divergingReturn(flag: bool) -> i32 ! Problem {
+  let view = identity(&[make(5)])
+  if flag { return run rejected() }
+  return read(view)
+}
 fn holderAcrossReturn(flag: bool) -> i32 {
   let holder = Holder { view: &[make(1)] }
   if flag { return 1 }
@@ -458,12 +522,13 @@ pub fn main() -> i32 {
   let arm = run runInArm(Packet.Empty)
   let suspended = run acrossSuspension(false)
   let failed = run Intrinsic.catchFailure<Problem>(acrossFailure(false), recover)
+  let diverged = run Intrinsic.catchFailure<Problem>(divergingReturn(false), recover)
   let matched = run heldThroughMatch(Packet.Ready { value: 1 })
   let other = run runInOtherArm(Packet.Empty)
   let reviewed = exclusiveAcrossReturn(false) + heldAcrossBranches(false) +
     holderInArm(Packet.Ready { value: 1 }) + returnInArm(Packet.Ready { value: 1 }, false) +
     holderAcrossReturn(false) + readInOneArm(Packet.Ready { value: 1 }) + suspended + failed +
-    matched + other + reborrowedHolder()
+    matched + other + reborrowedHolder() + diverged
   if shortCircuit(false) { return 1 }
   return acrossReturn(false) + usedInBranch(false) + heldInArm(Packet.Empty) + branch + arm +
     iterations(5) + condition(3) + branchLocal(true) + armLocal(Packet.Empty) + reviewed

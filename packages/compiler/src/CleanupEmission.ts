@@ -1110,6 +1110,73 @@ export const terminalLoopLoanEndings = (
     return outcome._tag === 'Trap' ? [ending] : loanEndOperations(fn, ending)
   })
 
+/** The operation with each nested execution (scope body, branch, operand, guard or arm) transformed. */
+const mapNestedExecutions = (
+  operation: Mir.Operation,
+  transform: (execution: Mir.Execution) => Mir.Execution,
+): Mir.Operation => {
+  if (operation._tag === 'DiagnosticScope') return { ...operation, body: transform(operation.body) }
+  if (operation._tag === 'Conditional')
+    return {
+      ...operation,
+      taken: transform(operation.taken),
+      otherwise: transform(operation.otherwise),
+    }
+  if (operation._tag === 'ShortCircuit') return { ...operation, right: transform(operation.right) }
+  if (operation._tag === 'Match')
+    return {
+      ...operation,
+      arms: operation.arms.map((arm) => ({
+        ...arm,
+        ...(arm.guard === undefined
+          ? {}
+          : { guard: { ...arm.guard, execution: transform(arm.guard.execution) } }),
+        selected: { ...arm.selected, execution: transform(arm.selected.execution) },
+      })),
+    }
+  return operation
+}
+
+/**
+ * Ends loop-entry loans at the returns and traps nested in a loop region's operations, such as a
+ * `return` inside a match arm. `withoutLoanEndings` removed their endings there too.
+ */
+export const withNestedTerminalLoanEndings = (
+  fn: FunctionLowering,
+  operations: ReadonlyArray<Mir.Operation>,
+  loans: ReadonlyArray<DelayedLoopLoan>,
+): ReadonlyArray<Mir.Operation> =>
+  operations.map((operation) =>
+    mapNestedExecutions(operation, (execution) => ({
+      ...execution,
+      regions: execution.regions.map((region): Mir.Region => {
+        if (region._tag !== 'OperationRegion' && region._tag !== 'CleanupRegion') return region
+        const last = region._tag === 'OperationRegion' ? region.operations.at(-1) : undefined
+        // A trap after an expression whose every path transferred is unreachable, and those paths
+        // end the loans at their own exits.
+        const transferred =
+          region.outcome._tag === 'Trap' &&
+          (last?._tag === 'Match' ||
+            last?._tag === 'Conditional' ||
+            last?._tag === 'DiagnosticScope' ||
+            last?._tag === 'PropagateEffectFailure')
+        const terminalEndings =
+          !transferred && (region.outcome._tag === 'Return' || region.outcome._tag === 'Trap')
+            ? terminalLoopLoanEndings(fn, loans, region.outcome)
+            : []
+        if (region._tag === 'OperationRegion')
+          return {
+            ...region,
+            operations: [
+              ...withNestedTerminalLoanEndings(fn, region.operations, loans),
+              ...terminalEndings,
+            ],
+          }
+        return { ...region, releases: orderedCleanup(fn, [...terminalEndings, ...region.releases]) }
+      }),
+    })),
+  )
+
 /** Adds loop-entry loans to failure exits after their authored success endings move past the loop. */
 export const withDelayedFailureLoanEndings = (
   fn: FunctionLowering,
