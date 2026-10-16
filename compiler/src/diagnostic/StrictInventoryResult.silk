@@ -1,0 +1,546 @@
+//! Versioned, read-only facts for one exact V01 declaration query.
+//! Eligibility and the actual query discriminator are independent. Neither a signature nor
+//! a typed body certifies an executable closure or a completed native borrow-checking stage.
+
+import semantic.Types {Types}
+import diagnostic.JsonText
+import backend.Gap {Gap, Source as GapSource}
+import hir.Hir
+import lexer.Span {Span}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleId {ModuleId, InvalidModulePath}
+import semantic.ModuleIndex {NamedFunction}
+import semantic.Query {Cycle}
+import semantic.Rejection as Rejections {Rejection, RejectionCode}
+import semantic.Semantic {Semantic, Request, Answer, Outcome, Value, Constraint}
+import semantic.Type {Type, RowParameter}
+import semantic.Lifetime {Lifetime}
+import semantic.SourceIndex {NoRejection, RevisionMismatch}
+import semantic.SourceRevision {Observation}
+import semantic.TypedBody {TypedBody, Stage}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.string {String}
+import silk.usize
+import silk.u8
+import silk.u64
+import silk.vector {Vector}
+
+pub enum Phase { Signature, Body }
+pub enum Eligibility { Eligible, Inactive, NoBody, MissingSource, ConditionRejected }
+
+/// Scalar signature/header facts only: declared channels are not inferred body guarantees.
+pub struct Header {
+  pub parameters: usize
+  pub typeParameters: usize
+  pub lifetimeParameters: usize
+  pub rowParameters: usize
+  pub constraints: usize
+  pub isEffect: bool
+  pub isUnsafe: bool
+  pub isStatic: bool
+}
+
+pub union Fact {
+  Signature {pub header: Header},
+  Body {pub fullyChecked: bool},
+  Rejected {pub diagnostic: Shared<Rejection>},
+  /// An uncoded query or compiler coverage refusal, never a language rejection.
+  Refused {pub diagnostic: Shared<Rejection>},
+  Unsupported {pub gap: Shared<Gap>},
+  WrongValue,
+  QueryError {pub code: &'static [u8]},
+  /// The phase does not exist for this source: inactive declarations are unchecked and a
+  /// bodiless declaration has no Body. It is neither evidence nor a refusal.
+  NotDemanded,
+}
+
+pub fn phaseName(phase: Phase) -> &'static [u8] {
+  return match phase { Phase.Signature => b"signature" Phase.Body => b"body" }
+}
+
+pub fn eligibilityName(eligibility: Eligibility) -> &'static [u8] {
+  return match eligibility {
+    Eligibility.Eligible => b"eligible"
+    Eligibility.Inactive => b"inactive"
+    Eligibility.NoBody => b"no-body"
+    Eligibility.MissingSource => b"missing-source"
+    Eligibility.ConditionRejected => b"condition-rejected"
+  }
+}
+
+/// Availability decides first: an inactive declaration is unchecked whatever its syntax.
+pub fn eligibilityOf(function: &NamedFunction, state: &Result<bool, Shared<Rejection>>) -> Eligibility {
+  return match &state.* {
+    Result<bool, Shared<Rejection>>.Failure {..} => Eligibility.ConditionRejected
+    Result<bool, Shared<Rejection>>.Success {value} => {
+      if !value { return Eligibility.Inactive }
+      if !function.hasBody { return Eligibility.NoBody }
+      return Eligibility.Eligible
+    }
+  }
+}
+
+/// Inactive static arms contribute no name, type, or ownership checks, and bodiless declarations
+/// have only a Signature. Neither unchecked phase is demanded, so neither can be a refusal.
+pub fn demanded(eligibility: Eligibility, phase: Phase) -> bool {
+  return match eligibility {
+    Eligibility.Inactive => false
+    Eligibility.NoBody => phase == Phase.Signature
+    _ => true
+  }
+}
+
+pub fn factName(fact: &Fact) -> &'static [u8] {
+  return match &fact.* {
+    Fact.Signature {..} => b"signature"
+    Fact.Body {..} => b"body"
+    Fact.Rejected {..} => b"rejected"
+    Fact.Refused {..} => b"unsupported"
+    Fact.Unsupported {..} => b"unsupported"
+    Fact.WrongValue => b"wrong-value"
+    Fact.QueryError {..} => b"query-error"
+    Fact.NotDemanded => b"not-demanded"
+  }
+}
+
+// A rejected or unavailable key's fact names its leading diagnostic or forwarded cause.
+fn rejectedFact(cause: Option<Shared<Rejection>>) -> Fact {
+  let diagnostic = match move cause {
+    Option<Shared<Rejection>>.Some {value} => move value
+    Option<Shared<Rejection>>.None => { return Fact.WrongValue }
+  }
+  let code = Shared<Rejection>.with<RejectionCode>(&diagnostic, fn(value: &Rejection) -> RejectionCode { return value.code })
+  if Rejections.stableCode(code).length == usize.ZERO {
+    return Fact.Refused {diagnostic: move diagnostic}
+  }
+  return Fact.Rejected {diagnostic: move diagnostic}
+}
+
+/// Outcome.Success is not a phase fact until its Value matches the requested phase.
+pub fn classify(phase: Phase, outcome: &Outcome) -> Fact {
+  return match &outcome.* {
+    Outcome.Rejected {..} => rejectedFact(Outcome.cause(&outcome.*))
+    Outcome.Unavailable {..} => rejectedFact(Outcome.cause(&outcome.*))
+    Outcome.Success {value: Value.Unsupported {gap}} => Fact.Unsupported {gap: Shared<Gap>.clone(&gap)}
+    Outcome.Success {value: Value.Signature {signature}} => {
+      if phase != Phase.Signature { return Fact.WrongValue }
+      return Fact.Signature {header: Header {
+        parameters: Vector<Shared<Type>>.length(&signature.parameters),
+        typeParameters: Vector<Shared<Type>>.length(&signature.typeParameters),
+        lifetimeParameters: Vector<Shared<Lifetime>>.length(&signature.lifetimeParameters),
+        rowParameters: Vector<RowParameter>.length(&signature.rowParameters),
+        constraints: Vector<Constraint>.length(&signature.constraints),
+        isEffect: signature.isEffect, isUnsafe: signature.isUnsafe, isStatic: signature.isStatic,
+      }}
+    }
+    Outcome.Success {value: Value.Body {body, ..}} => {
+      if phase != Phase.Body { return Fact.WrongValue }
+      return Fact.Body {fullyChecked: Shared<TypedBody>.with<bool>(&body, fn(typed: &TypedBody) -> bool {
+        let stage = TypedBody.checkingStage(typed)
+        return match &stage.* { Stage.FullyChecked => true _ => false }
+      })}
+    }
+    _ => Fact.WrongValue
+  }
+}
+
+pub fn classifyAnswer(phase: Phase, answer: &Result<Answer, NoRejection>) -> Fact {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success {value} => classify(phase, &value.outcome)
+    Result<Answer, NoRejection>.Failure {..} => Fact.QueryError {code: b"query-result-failure"}
+  }
+}
+
+effect fn appendBoolean(output: &mut Bytes, value: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  if value { return run Bytes.append(&mut output.*, b"true") }
+  return run Bytes.append(&mut output.*, b"false")
+}
+
+effect fn appendSpan(output: &mut Bytes, span: Span) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"start\":")
+  run JsonText.appendDecimal(&mut output.*, span.start)
+  run Bytes.append(&mut output.*, b",\"end\":")
+  run JsonText.appendDecimal(&mut output.*, span.end)
+  return run Bytes.append(&mut output.*, b"}")
+}
+
+pub effect fn appendModule(output: &mut Bytes, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
+  let origin = run ModuleId.copyOrigin(module)
+  let package = run ModuleId.copyPackage(module)
+  let path = run ModuleId.copyPath(module)
+  run Bytes.append(&mut output.*, b"{\"origin\":")
+  run JsonText.appendString(&mut output.*, Bytes.asSlice(&origin))
+  run Bytes.append(&mut output.*, b",\"package\":")
+  run JsonText.appendString(&mut output.*, Bytes.asSlice(&package))
+  run Bytes.append(&mut output.*, b",\"path\":")
+  run JsonText.appendString(&mut output.*, Bytes.asSlice(&path))
+  return run Bytes.append(&mut output.*, b"}")
+}
+
+effect fn appendIdentity(output: &mut Bytes, declaration: &DeclarationId) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"module\":")
+  run appendModule(&mut output.*, DeclarationId.moduleId(declaration))
+  run Bytes.append(&mut output.*, b",\"owners\":[")
+  let owners = DeclarationId.ownerCount(declaration)
+  let mut at = usize.ZERO
+  while at < owners {
+    if at != usize.ZERO { run Bytes.append(&mut output.*, b",") }
+    run Bytes.append(&mut output.*, b"{\"kind\":")
+    run JsonText.appendString(&mut output.*, String.utf8Bytes(Hir.ownerKindName(DeclarationId.ownerKind(declaration, at))))
+    run Bytes.append(&mut output.*, b",\"name\":")
+    if DeclarationId.ownerNamed(declaration, at) {
+      let ownerName = run DeclarationId.copyOwnerName(declaration, at)
+      run JsonText.appendString(&mut output.*, Bytes.asSlice(&ownerName))
+    } else {
+      run Bytes.append(&mut output.*, b"null")
+    }
+    run Bytes.append(&mut output.*, b",\"occurrence\":")
+    run JsonText.appendDecimal(&mut output.*, DeclarationId.ownerOccurrence(declaration, at))
+    run Bytes.append(&mut output.*, b"}")
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut output.*, b"]}")
+}
+
+// A diagnostic's original module can be imported. Never replace it with the current inventory
+// subject or a gap's reached owner.
+effect fn appendDiagnosticModule(output: &mut Bytes, diagnostic: &Shared<Rejection>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let module = Shared<Rejection>.with<ModuleId>(diagnostic, fn(value: &Rejection) -> ModuleId {
+    return ModuleId.copy(&value.module)
+  })
+  return run appendModule(&mut output.*, &module)
+}
+
+effect fn appendRejection(output: &mut Bytes, diagnostic: &Shared<Rejection>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let code = Shared<Rejection>.with<RejectionCode>(diagnostic, fn(value: &Rejection) -> RejectionCode { return value.code })
+  let span = Shared<Rejection>.with<Span>(diagnostic, fn(value: &Rejection) -> Span { return value.span })
+  let catalogCode = Rejections.stableCode(code)
+  if catalogCode.length == usize.ZERO {
+    run Bytes.append(&mut output.*, b",\"reason\":")
+    run JsonText.appendString(&mut output.*, Rejection.name(code))
+  } else {
+    run Bytes.append(&mut output.*, b",\"code\":")
+    run JsonText.appendString(&mut output.*, catalogCode)
+  }
+  run Bytes.append(&mut output.*, b",\"module\":")
+  run appendDiagnosticModule(&mut output.*, diagnostic)
+  run Bytes.append(&mut output.*, b",\"span\":")
+  return run appendSpan(&mut output.*, span)
+}
+
+pub effect fn appendFact(output: &mut Bytes, fact: &Fact) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"kind\":")
+  run JsonText.appendString(&mut output.*, factName(fact))
+  match &fact.* {
+    Fact.Signature {header} => {
+      run Bytes.append(&mut output.*, b",\"parameters\":")
+      run JsonText.appendDecimal(&mut output.*, header.parameters)
+      run Bytes.append(&mut output.*, b",\"type_parameters\":")
+      run JsonText.appendDecimal(&mut output.*, header.typeParameters)
+      run Bytes.append(&mut output.*, b",\"lifetime_parameters\":")
+      run JsonText.appendDecimal(&mut output.*, header.lifetimeParameters)
+      run Bytes.append(&mut output.*, b",\"row_parameters\":")
+      run JsonText.appendDecimal(&mut output.*, header.rowParameters)
+      run Bytes.append(&mut output.*, b",\"constraints\":")
+      run JsonText.appendDecimal(&mut output.*, header.constraints)
+      run Bytes.append(&mut output.*, b",\"effect\":")
+      run appendBoolean(&mut output.*, header.isEffect)
+      run Bytes.append(&mut output.*, b",\"unsafe\":")
+      run appendBoolean(&mut output.*, header.isUnsafe)
+      run Bytes.append(&mut output.*, b",\"static\":")
+      run appendBoolean(&mut output.*, header.isStatic)
+    }
+    Fact.Body {fullyChecked} => {
+      run Bytes.append(&mut output.*, b",\"checking_stage\":")
+      if fullyChecked { run JsonText.appendString(&mut output.*, b"fully-checked") }
+      else { run JsonText.appendString(&mut output.*, b"contract-typed") }
+      run Bytes.append(&mut output.*, b",\"borrow_status\":\"not-checked\"")
+    }
+    Fact.Rejected {diagnostic} => { run appendRejection(&mut output.*, &diagnostic) }
+    Fact.Refused {diagnostic} => { run appendRejection(&mut output.*, &diagnostic) }
+    Fact.Unsupported {gap} => {
+      let copied = Shared<Gap>.with<Gap>(&gap, fn(value: &Gap) -> Gap { return Gap.copy(value) })
+      run Bytes.append(&mut output.*, b",\"coverage_reason\":")
+      run JsonText.appendString(&mut output.*, Gap.name(copied.code))
+      match &copied.source {
+        GapSource.Declaration {declaration, span} => {
+          let original = DeclarationId.copyShared(&declaration)
+          run Bytes.append(&mut output.*, b",\"module\":")
+          run appendModule(&mut output.*, DeclarationId.moduleId(&original))
+          run Bytes.append(&mut output.*, b",\"span\":")
+          run appendSpan(&mut output.*, span)
+        }
+        GapSource.Generated {declaration} => {
+          let original = DeclarationId.copyShared(&declaration)
+          run Bytes.append(&mut output.*, b",\"module\":")
+          run appendModule(&mut output.*, DeclarationId.moduleId(&original))
+          run Bytes.append(&mut output.*, b",\"span\":")
+          run appendSpan(&mut output.*, Gap.span(&copied))
+        }
+        GapSource.Relative {declaration, ..} => {
+          // A published fact must be placed before serialization; Gap.span checks that invariant.
+          let span = Gap.span(&copied)
+          let original = DeclarationId.copyShared(&declaration)
+          run Bytes.append(&mut output.*, b",\"module\":")
+          run appendModule(&mut output.*, DeclarationId.moduleId(&original))
+          run Bytes.append(&mut output.*, b",\"span\":")
+          run appendSpan(&mut output.*, span)
+        }
+        GapSource.Diagnostic {diagnostic} => {
+          run Bytes.append(&mut output.*, b",\"module\":")
+          run appendDiagnosticModule(&mut output.*, &diagnostic)
+          let span = Shared<Rejection>.with<Span>(&diagnostic, fn(value: &Rejection) -> Span { return value.span })
+          run Bytes.append(&mut output.*, b",\"span\":")
+          run appendSpan(&mut output.*, span)
+          let originalCode = Shared<Rejection>.with<RejectionCode>(&diagnostic, fn(value: &Rejection) -> RejectionCode { return value.code })
+          let catalogCode = Rejections.stableCode(originalCode)
+          if catalogCode.length == usize.ZERO {
+            run Bytes.append(&mut output.*, b",\"reason\":")
+            run JsonText.appendString(&mut output.*, Rejection.name(originalCode))
+          } else {
+            run Bytes.append(&mut output.*, b",\"diagnostic_code\":")
+            run JsonText.appendString(&mut output.*, catalogCode)
+          }
+        }
+      }
+    }
+    Fact.QueryError {code} => {
+      run Bytes.append(&mut output.*, b",\"code\":")
+      run JsonText.appendString(&mut output.*, code)
+    }
+    Fact.WrongValue => {}
+    Fact.NotDemanded => {}
+  }
+  return run Bytes.append(&mut output.*, b"}")
+}
+
+/// Appends one immutable source-observed function/phase record. Absence is explicit and has no
+/// digest. The caller supplies the V01 observation that owns these authored byte spans.
+pub effect fn appendRecord(output: &mut Bytes, function: &NamedFunction, observation: &Observation,
+  digest: &Option<[u8; 32]>, phase: Phase, eligibility: Eligibility, fact: &Fact) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  return run appendObservedRecord(&mut output.*, function, observation, digest, phase, eligibility, fact, Option<usize>.none())
+}
+
+/// The sweep retains rows until publication has settled, then stamps the final held revision.
+pub effect fn appendObservedRecord(output: &mut Bytes, function: &NamedFunction, observation: &Observation,
+  digest: &Option<[u8; 32]>, phase: Phase, eligibility: Eligibility, fact: &Fact, revision: Option<usize>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"schema\":\"silk.strict-inventory\",\"version\":1,\"record\":\"function\",\"declaration\":")
+  run appendIdentity(&mut output.*, &function.declaration.identity)
+  run Bytes.append(&mut output.*, b",\"span\":")
+  run appendSpan(&mut output.*, function.span)
+  run Bytes.append(&mut output.*, b",\"header_span\":")
+  run appendSpan(&mut output.*, function.headerSpan)
+  run Bytes.append(&mut output.*, b",\"name_span\":")
+  run appendSpan(&mut output.*, function.nameSpan)
+  run Bytes.append(&mut output.*, b",\"source_observation\":{\"module\":")
+  run appendModule(&mut output.*, Observation.moduleId(observation))
+  run Bytes.append(&mut output.*, b",\"present\":")
+  run appendBoolean(&mut output.*, Observation.isPresent(observation))
+  run Bytes.append(&mut output.*, b",\"sha256\":")
+  match &digest.* {
+    Option<[u8; 32]>.Some {value} => {
+      let digits = b"0123456789abcdef"
+      run Bytes.append(&mut output.*, b"\"")
+      let mut at = usize.ZERO
+      while at < 32 {
+        let byte = u8.toU64(value[at])
+        run Bytes.append(&mut output.*, &[digits[u64.toUsize(u64.divide(byte, 16))], digits[u64.toUsize(u64.remainder(byte, 16))]])
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut output.*, b"\"")
+    }
+    Option<[u8; 32]>.None => { run Bytes.append(&mut output.*, b"null") }
+  }
+  if let Option<usize>.Some {value} = move revision {
+    run Bytes.append(&mut output.*, b",\"revision\":")
+    run JsonText.appendDecimal(&mut output.*, value)
+  }
+  run Bytes.append(&mut output.*, b"},\"phase\":")
+  run JsonText.appendString(&mut output.*, phaseName(phase))
+  run Bytes.append(&mut output.*, b",\"eligibility\":")
+  run JsonText.appendString(&mut output.*, eligibilityName(eligibility))
+  run Bytes.append(&mut output.*, b",\"has_body\":")
+  run appendBoolean(&mut output.*, function.hasBody)
+  run Bytes.append(&mut output.*, b",\"fact\":")
+  run appendFact(&mut output.*, fact)
+  return run Bytes.append(&mut output.*, b"}\n")
+}
+
+/// A completeness footer describes only the caller's named scope, never stage success.
+pub effect fn appendFooter(output: &mut Bytes, records: usize, expectedRecords: usize, finished: bool) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"schema\":\"silk.strict-inventory\",\"version\":1,\"record\":\"footer\",\"records\":")
+  run JsonText.appendDecimal(&mut output.*, records)
+  run Bytes.append(&mut output.*, b",\"expected_records\":")
+  run JsonText.appendDecimal(&mut output.*, expectedRecords)
+  run Bytes.append(&mut output.*, b",\"coverage_complete\":")
+  run appendBoolean(&mut output.*, finished && records == expectedRecords)
+  return run Bytes.append(&mut output.*, b"}\n")
+}
+
+/// One exact source path in the sweep, including modules that cannot publish a census.
+pub effect fn appendModuleRecord(output: &mut Bytes, module: &ModuleId, sourceFile: &[u8], physicalFile: &[u8],
+  sourceRole: &[u8], observation: &Observation, digest: &Option<[u8; 32]>, revision: usize,
+  functions: usize, anonymous: usize, damaged: usize, status: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"schema\":\"silk.strict-inventory\",\"version\":1,\"record\":\"module\",\"module\":")
+  run appendModule(&mut output.*, module)
+  run Bytes.append(&mut output.*, b",\"source_file\":")
+  run JsonText.appendString(&mut output.*, sourceFile)
+  run Bytes.append(&mut output.*, b",\"physical_source_file\":")
+  run JsonText.appendString(&mut output.*, physicalFile)
+  run Bytes.append(&mut output.*, b",\"role\":")
+  run JsonText.appendString(&mut output.*, sourceRole)
+  run Bytes.append(&mut output.*, b",\"present\":")
+  run appendBoolean(&mut output.*, Observation.isPresent(observation))
+  run Bytes.append(&mut output.*, b",\"sha256\":")
+  run appendDigest(&mut output.*, digest)
+  run Bytes.append(&mut output.*, b",\"revision\":")
+  run JsonText.appendDecimal(&mut output.*, revision)
+  run Bytes.append(&mut output.*, b",\"functions\":")
+  run JsonText.appendDecimal(&mut output.*, functions)
+  run Bytes.append(&mut output.*, b",\"excluded_anonymous\":")
+  run JsonText.appendDecimal(&mut output.*, anonymous)
+  run Bytes.append(&mut output.*, b",\"excluded_damaged\":")
+  run JsonText.appendDecimal(&mut output.*, damaged)
+  run Bytes.append(&mut output.*, b",\"status\":")
+  run JsonText.appendString(&mut output.*, status)
+  return run Bytes.append(&mut output.*, b"}\n")
+}
+
+/// Canonical digest domain: one sorted snapshot-relative mapping/presence/raw SHA record.
+/// Absolute provider roots, source publication order and semantic outcomes are excluded.
+pub effect fn appendInputObservation(output: &mut Bytes, sourceFile: &[u8], sourceRole: &[u8], present: bool,
+  digest: &Option<[u8; 32]>) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"source_file\":")
+  run JsonText.appendString(&mut output.*, sourceFile)
+  run Bytes.append(&mut output.*, b",\"role\":")
+  run JsonText.appendString(&mut output.*, sourceRole)
+  run Bytes.append(&mut output.*, b",\"present\":")
+  run appendBoolean(&mut output.*, present)
+  run Bytes.append(&mut output.*, b",\"sha256\":")
+  run appendDigest(&mut output.*, digest)
+  return run Bytes.append(&mut output.*, b"}\n")
+}
+
+/// Failed authored imports preserve their declaration and actual original diagnostic fact.
+pub effect fn appendImportRecord(output: &mut Bytes, declaration: &DeclarationId, fact: &Fact) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"schema\":\"silk.strict-inventory\",\"version\":1,\"record\":\"import\",\"declaration\":")
+  run appendIdentity(&mut output.*, declaration)
+  run Bytes.append(&mut output.*, b",\"fact\":")
+  run appendFact(&mut output.*, fact)
+  return run Bytes.append(&mut output.*, b"}\n")
+}
+
+pub effect fn appendDigest(output: &mut Bytes, digest: &Option<[u8; 32]>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  match &digest.* {
+    Option<[u8; 32]>.Some {value} => {
+      let digits = b"0123456789abcdef"
+      run Bytes.append(&mut output.*, b"\"")
+      let mut at = usize.ZERO
+      while at < 32 {
+        let byte = u8.toU64(value[at])
+        run Bytes.append(&mut output.*, &[digits[u64.toUsize(u64.divide(byte, 16))], digits[u64.toUsize(u64.remainder(byte, 16))]])
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut output.*, b"\"")
+    }
+    Option<[u8; 32]>.None => { run Bytes.append(&mut output.*, b"null") }
+  }
+  return ()
+}
+
+/// Pins name the independently bootstrap-built diagnostic producer, never the N0 stage artifact.
+pub struct SweepPins {
+  pub producerFile: Bytes
+  pub producerDigest: [u8; 32]
+  /// Parsed and validated by the entry before any raw JSON reaches this shared encoder.
+  pub seedReceipt: Bytes
+  pub seedDigest: [u8; 32]
+  pub optimization: Bytes
+  pub debug: bool
+}
+
+/// Complete coverage and strict acceptance are independent. Failed transport never seals counts.
+pub effect fn appendSweepFooter(output: &mut Bytes, modules: usize, functions: usize, records: usize,
+  revision: usize, inputDigest: [u8; 32], complete: bool, strictSuccess: bool, pins: &SweepPins) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"{\"schema\":\"silk.strict-inventory\",\"version\":1,\"record\":\"footer\",\"coverage_complete\":")
+  run appendBoolean(&mut output.*, complete)
+  run Bytes.append(&mut output.*, b",\"strict_success\":")
+  run appendBoolean(&mut output.*, complete && strictSuccess)
+  run Bytes.append(&mut output.*, b",\"modules\":")
+  if complete { run JsonText.appendDecimal(&mut output.*, modules) } else { run Bytes.append(&mut output.*, b"null") }
+  run Bytes.append(&mut output.*, b",\"functions\":")
+  if complete { run JsonText.appendDecimal(&mut output.*, functions) } else { run Bytes.append(&mut output.*, b"null") }
+  run Bytes.append(&mut output.*, b",\"records\":")
+  run JsonText.appendDecimal(&mut output.*, records)
+  run Bytes.append(&mut output.*, b",\"expected_records\":")
+  if complete { run JsonText.appendDecimal(&mut output.*, functions + functions) } else { run Bytes.append(&mut output.*, b"null") }
+  run Bytes.append(&mut output.*, b",\"revision\":")
+  run JsonText.appendDecimal(&mut output.*, revision)
+  run Bytes.append(&mut output.*, b",\"input_observation_sha256\":")
+  run appendDigest(&mut output.*, &Option<[u8; 32]>.some(inputDigest))
+  run Bytes.append(&mut output.*, b",\"target\":\"x86_64-unknown-linux-gnu\",\"profile\":{\"optimization\":")
+  run JsonText.appendString(&mut output.*, Bytes.asSlice(&pins.optimization))
+  run Bytes.append(&mut output.*, b",\"debug\":")
+  run appendBoolean(&mut output.*, pins.debug)
+  run Bytes.append(&mut output.*, b"},\"request_policy\":\"one-pass-preloaded\",\"recovery\":false,\"producer\":{\"kind\":\"bootstrap-built-diagnostic\",\"file\":")
+  run JsonText.appendString(&mut output.*, Bytes.asSlice(&pins.producerFile))
+  run Bytes.append(&mut output.*, b",\"sha256\":")
+  run appendDigest(&mut output.*, &Option<[u8; 32]>.some(pins.producerDigest))
+  run Bytes.append(&mut output.*, b"},\"seed_receipt_sha256\":")
+  run appendDigest(&mut output.*, &Option<[u8; 32]>.some(pins.seedDigest))
+  run Bytes.append(&mut output.*, b",\"consumed_seed_receipt_raw\":")
+  run JsonText.appendString(&mut output.*, Bytes.asSlice(&pins.seedReceipt))
+  return run Bytes.append(&mut output.*, b"}\n")
+}
+
+/// Demands one exact declaration, using a V01 subject and observation from the held revision.
+/// No import traversal, recovery, selected body, MIR, or build artifact is requested here.
+pub effect fn queryOne(semantic: &mut Semantic, request: &mut Request, function: &NamedFunction,
+  observation: &Observation, digest: &Option<[u8; 32]>, availability: &Result<bool, Shared<Rejection>>, phase: Phase) -> Bytes
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut eligibility = eligibilityOf(function, availability)
+  let mut fact = Fact.QueryError {code: b"revision-mismatch"}
+  if !Observation.isPresent(observation) {
+    eligibility = Eligibility.MissingSource
+    fact = Fact.QueryError {code: b"missing-source"}
+  } else if !demanded(eligibility, phase) {
+    fact = Fact.NotDemanded
+  } else if ModuleId.equals(Observation.moduleId(observation), DeclarationId.moduleId(&function.declaration.identity)) {
+    let result = run Effect.result(demand(&mut semantic.*, &mut request.*, &function.declaration.identity, phase))
+    fact = match move result {
+      Result<Shared<Result<Answer, NoRejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} =>
+        Shared<Result<Answer, NoRejection>>.with<Fact>(&value, fn(answer: &Result<Answer, NoRejection>) -> Fact {
+          return classifyAnswer(phase, answer)
+        })
+      Result<Shared<Result<Answer, NoRejection>>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match &error {
+        Cycle {} => Fact.QueryError {code: b"cycle"}
+        InvalidModulePath {} => Fact.QueryError {code: b"invalid-module-path"}
+        RevisionMismatch {} => Fact.QueryError {code: b"revision-mismatch"}
+        OutOfMemoryError {} => Fact.QueryError {code: b"out-of-memory"}
+      }
+    }
+  }
+  let mut output = Bytes.make()
+  run appendRecord(&mut output, function, observation, digest, phase, eligibility, &fact)
+  return move output
+}
+
+effect fn demand(semantic: &mut Semantic, request: &mut Request, declaration: &DeclarationId, phase: Phase)
+-> Shared<Result<Answer, NoRejection>> ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if phase == Phase.Signature { return run Semantic.demandSignatureOf(&mut semantic.*, &mut request.*, declaration) }
+  return run Semantic.demandBodyOf(&mut semantic.*, &mut request.*, declaration)
+}

@@ -14,6 +14,10 @@ compatibility contract.
   path remains or its cleanup is deferred to a future task.
 - Prefer a breaking change over a compromised design. Existing usage inside this repository is a
   migration target to update, not a reason to preserve the old shape.
+- Bookkeeping that only serves a later revision, such as dependency edges or validation evidence,
+  may be gated on whether the build can be revised: one code path whose recorder returns early in a
+  one-shot build. This is a recording policy, not a dual path. It must not change what the
+  compiler computes, and both modes need a test. Alternate semantic paths stay forbidden.
 
 These conventions apply to the entire repository. The current `effect-patterns` skill is the
 authoritative source for Effect architecture. When this file and that skill differ, follow the
@@ -28,6 +32,13 @@ this file first when tooling fails mysteriously.
 - Append each entry at the end of the file on one physical line; use editor soft wrapping.
 - Entry order has no significance. Do not reorder or reformat existing entries.
 - Git uses `merge=union` for this append-only log, preserving concurrent additions from both branches.
+
+## Compiler compatibility
+
+Before treating a standard-library or compiler build failure as a compiler defect, read
+[COMPILER_COMPATIBILITY.md](COMPILER_COMPATIBILITY.md). It records approved language changes, how
+the TypeScript bootstrap and the self-hosted frontend currently differ, and which changes are still
+unimplemented. Add or retire entries there when an intentional divergence starts or ends.
 
 ## Agent skills
 
@@ -51,10 +62,16 @@ definition and reference live in `apps/docs/content/reference/`.
   handoff ceremony.
 - Before the final push, finish every repository mutation, including generated artifacts and any
   implementation-task checkboxes in an explicitly requested OpenSpec change, then audit, commit,
-  and push the intended head. Required
-  pull-request CI on that exact head is the authoritative full-repository completion guard; wait
-  for it to pass before handoff. If it fails, fix the cause, run affected focused checks, push the
-  new head, and wait for that head's CI.
+  and push the intended head.
+- `main` is the only integration branch. A pull request merges when its required checks pass on
+  its exact head: `CI result` (the TypeScript lanes) and `Focused Linux Silk` (the native lanes,
+  including the bootstrap DDC). Merge `main` into the branch before its final run, so the merge
+  commit reuses that run's verdict. If a check fails, fix the cause, run the affected focused
+  checks, and push the new head. A session may receive a request to fix a failure in work it
+  already shipped; fix it in a new PR the same way.
+- Never edit `compiler/borrow-check-gap.txt` by hand: after a corpus run, write it with
+  `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, and put the table that
+  `check-borrow-gap.mjs diff <old> <new>` prints in the PR description.
 - CI, review, PR updates, and handoff are workflow gates, not implementation tasks. Do not add
   OpenSpec task-list items whose sole action is running or recording checks, obtaining approval,
   waiting for CI, or reporting the handoff. A passing gate never requires a follow-up repository
@@ -238,6 +255,12 @@ genuinely needs isolation may scope a distinct layer within that test.
 
 The compiler suite is the critical path of `pnpm check`; every test pays for the compiler
 pipelines it runs. Prove each claim at the cheapest tier that can falsify it.
+
+- Until the self-hosted compiler is functional, every selfhost test should finish within 1 s on
+  Linux CI; aim for under 500 ms. The focused selfhost workflow warns above 1 s and fails at 3 s
+  from the test runner's per-test timings, so noise near the target does not fail CI. Reduce
+  fixture and demand cost before splitting a slow test; split only independent claims, and retain
+  every distinct assertion.
 
 - Prove parser, resolution, typing, ownership, Effect, target-selection, and diagnostic claims with
   structured analysis assertions. Prove compile-time execution only through `Evaluation`.

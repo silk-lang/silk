@@ -1,0 +1,1013 @@
+//! Demand-driven filesystem publication into immutable per-module compiler inputs.
+
+import driver.CommandPath
+import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput}
+import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.InitialProfile {Selection as RuntimeRequest}
+import semantic.ModuleIndex {ModuleIndex}
+import semantic.Retention {Root as RetentionRoot}
+import semantic.SealedOperators
+import semantic.SourceUnit {SourceUnit}
+import semantic.SourceIndex {Event, EventKind}
+import semantic.SourceRevision {Observation, Revision}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.box {Box}
+import silk.filesystem {FileError, FileSystem, Path}
+import silk.json_scanner {JsonError}
+import silk.json_value {Json, JsonChild, Value as JsonValue}
+import silk.option {Option}
+import silk.result {Result}
+import silk.slice {Slice}
+import silk.string {String}
+import silk.toml_scanner {TomlError}
+import silk.toml_value {Toml, TomlChild, Value as TomlValue}
+import silk.usize
+import silk.vector {Vector}
+
+/// A manifest without a package name or root, a non-text package version, or an entry outside that
+/// root's module directory.
+pub struct InvalidSourceRoot {}
+
+/// No `silk.toml` in the entry's directory or any of its parent directories, so the build has no
+/// logical package identity.
+pub struct MissingManifest {
+  /// The entry's directory, where the upward search for a manifest started.
+  pub directory: Path
+}
+
+/// A build that selects no single runtime module where it needs one: a `[build].composition` whose
+/// default runtime candidates name more than one runtime or an unlisted one, an executable whose
+/// composition names no default, or, without a composition, an executable whose standard-library
+/// catalog lists no runtime for the target and libc (ARTIFACT-001).
+pub struct InvalidBuildComposition {}
+
+/// The owned filesystem roots and separately published module contents for one build.
+pub struct ModuleSources {
+  root: Path
+  /// The logical package identity, `name` or `name@version` from the manifest. Every module
+  /// identity carries it instead of a host path, so a checkout's location never reaches a build.
+  package: Bytes
+  /// The module directory relative to its manifest's directory, as `path.relative` spells it, such
+  /// as `src` or `../shared`; empty when it is the manifest's directory.
+  directory: Bytes
+  standardLibrary: Option<Path>
+  entry: ModuleId
+  /// The selected runtime source module, whose C exports root the build (ARTIFACT-002). A library
+  /// or object form acquires no catalog runtime, so its application's C exports are its roots.
+  runtime: Option<ModuleId>
+  /// The composition's execution-storage component, absent when none is selected validly.
+  storage: Option<ExecutionStorage>
+  /// The composition's explicit retention roots, in manifest order (ARTIFACT-003).
+  retention: Vector<RetentionRoot>
+  /// The manifest's `[build].native-link-inputs`, resolved against its directory.
+  linkInputs: Vector<NativeLinkInput>
+  revision: Revision
+  attempted: Vector<ModuleId>
+}
+
+/// The existing filesystem provider selected for one canonical source request.
+pub enum ProviderRole { Compiler, StandardLibrary }
+
+pub struct SourceLocation {
+  pub provider: ProviderRole
+  /// No path exists when a standard-library request has no configured library root.
+  pub path: Option<Path>
+}
+
+fn startsWith(bytes: &[u8], prefix: &[u8]) -> bool {
+  if bytes.length < prefix.length { return false }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if bytes[at] != prefix[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn readOptional(path: &Path) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let attempted = run Effect.result(FileSystem.readFile(path))
+  return match move attempted {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => Option<Bytes>.some(move value)
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        if failure.reason.code == FileSystem.notFound().code {
+          return Option<Bytes>.none()
+        }
+        fail move failure
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The package module directory, the logical path of its selected default runtime source, its
+// composition's components table and its declared native link inputs.
+struct PackageRoot {
+  directory: Path
+  package: Bytes
+  relative: Bytes
+  runtime: RuntimeChoice
+  components: Components
+  retention: Vector<RetentionRoot>
+  linkInputs: Vector<NativeLinkInput>
+}
+
+// Where a package's components come from: its own `[build].composition`, or the standard
+// library catalog when it declares no composition.
+union Components {
+  Declared {storage: Option<ExecutionStorage>},
+  Catalog,
+}
+
+// The bindings read so far for the one `execution-storage` component.
+struct StorageParts {
+  components: usize
+  invalid: bool
+  create: Option<StorageBinding>
+  acquire: Option<StorageBinding>
+  release: Option<StorageBinding>
+  destroy: Option<StorageBinding>
+}
+
+fn emptyParts() -> StorageParts {
+  return StorageParts {
+    components: usize.ZERO,
+    invalid: false,
+    create: Option<StorageBinding>.none(),
+    acquire: Option<StorageBinding>.none(),
+    release: Option<StorageBinding>.none(),
+    destroy: Option<StorageBinding>.none(),
+  }
+}
+
+fn present(binding: &Option<StorageBinding>) -> bool {
+  return match &binding.* {
+    Option<StorageBinding>.Some {..} => true
+    Option<StorageBinding>.None => false
+  }
+}
+
+// Records one binding; an unknown, repeated or unresolvable operation invalidates the component.
+effect fn bind(parts: &mut StorageParts, package: &[u8], operation: &[u8], module: &[u8], declaration: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut logical = run Bytes.copy(module)
+  run Bytes.append(&mut logical, b".silk")
+  let resolved = run Effect.result(ModuleId.make(b"file", package, Bytes.asSlice(&logical)))
+  let identity = match move resolved {
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success {value} => move value
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidModulePath {} => {
+        parts.invalid = true
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let binding = Option<StorageBinding>.some(StorageBinding {module: move identity, declaration: run Bytes.copy(declaration)})
+  if sameText(operation, b"create") && !present(&parts.create) { parts.create = move binding }
+  else if sameText(operation, b"acquire") && !present(&parts.acquire) { parts.acquire = move binding }
+  else if sameText(operation, b"release") && !present(&parts.release) { parts.release = move binding }
+  else if sameText(operation, b"destroy") && !present(&parts.destroy) { parts.destroy = move binding }
+  else { parts.invalid = true }
+  return ()
+}
+
+// Exactly one execution-storage component with all four operations selects storage.
+fn finishStorage(parts: StorageParts) -> Option<ExecutionStorage> {
+  let StorageParts {components, invalid, create, acquire, release, destroy} = move parts
+  if components != usize.ONE || invalid { return Option<ExecutionStorage>.none() }
+  if let Option<StorageBinding>.Some {value: created} = move create {
+    if let Option<StorageBinding>.Some {value: acquired} = move acquire {
+      if let Option<StorageBinding>.Some {value: released} = move release {
+        if let Option<StorageBinding>.Some {value: destroyed} = move destroy {
+          return Option<ExecutionStorage>.some(
+            ExecutionStorage {create: move created, acquire: move acquired, release: move released, destroy: move destroyed},
+          )
+        }
+      }
+    }
+  }
+  return Option<ExecutionStorage>.none()
+}
+
+// Whether every key of the table `value` is one of `allowed`.
+fn onlyKeys(value: &TomlValue, allowed: &[&[u8]]) -> bool {
+  return match &value.* {
+    TomlValue.Table {entries, kind: _} => {
+      let boxed = Box<Vector<TomlChild>>.get(&entries)
+      let children = Vector<TomlChild>.asSlice(&boxed[0])
+      let mut at = usize.ZERO
+      while at < children.length {
+        if let TomlChild.Member {entry} = &children[at] {
+          let key = String.ownedUtf8Bytes(&entry.key)
+          let mut known = false
+          let mut index = usize.ZERO
+          while index < allowed.length {
+            if sameText(key, allowed[index]) { known = true }
+            index = index + usize.ONE
+          }
+          if !known { return false }
+        }
+        at = at + usize.ONE
+      }
+      return true
+    }
+    _ => false
+  }
+}
+
+// Whether `text` is an identifier: an ASCII letter or `_`, then letters, digits or `_`.
+fn identifier(text: &[u8]) -> bool {
+  if text.length == usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+    let digit = byte >= 48 && byte <= 57
+    if !letter && !(digit && at > usize.ZERO) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Reads `retention` from a manifest composition: selectors of exactly a canonical `module` and an
+// identifier `declaration`, as the TypeScript `ArtifactComposition.decode` admits.
+effect fn manifestRetention(composition: &TomlValue, package: &[u8]) -> Vector<RetentionRoot>
+! InvalidBuildComposition | OutOfMemoryError ? &mut Allocator {
+  let mut roots = Vector<RetentionRoot>.make()
+  let listed = match move Toml.field(composition, "retention") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return move roots }
+  }
+  let array = match &listed.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !array { fail InvalidBuildComposition {} }
+  let keys: [&[u8]; 2] = [b"module", b"declaration"]
+  let mut at = usize.ZERO
+  while true {
+    let selector = match move Toml.item(listed, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    at = at + usize.ONE
+    if !onlyKeys(selector, &keys) { fail InvalidBuildComposition {} }
+    let module = match move Toml.asString(Toml.field(selector, "module")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { fail InvalidBuildComposition {} }
+    }
+    let declaration = match move Toml.asString(Toml.field(selector, "declaration")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { fail InvalidBuildComposition {} }
+    }
+    if !identifier(declaration) { fail InvalidBuildComposition {} }
+    let mut logical = run Bytes.copy(module)
+    run Bytes.append(&mut logical, b".silk")
+    let resolved = run Effect.result(ModuleId.make(b"file", package, Bytes.asSlice(&logical)))
+    let identity = match move resolved {
+      Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success {value} => move value
+      Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+        InvalidModulePath {} => { fail InvalidBuildComposition {} }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    run Vector<RetentionRoot>.append(&mut roots, RetentionRoot {module: move identity, declaration: run Bytes.copy(declaration)})
+  }
+  return move roots
+}
+
+// Reads `components` from a manifest composition.
+effect fn manifestStorage(composition: &TomlValue, package: &[u8]) -> Option<ExecutionStorage>
+! OutOfMemoryError ? &mut Allocator {
+  let mut parts = emptyParts()
+  let listed = match move Toml.field(composition, "components") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return Option<ExecutionStorage>.none() }
+  }
+  let mut at = usize.ZERO
+  while true {
+    let component = match move Toml.item(listed, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    at = at + usize.ONE
+    let capability = match move Toml.asString(Toml.field(component, "capability")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { return Option<ExecutionStorage>.none() }
+    }
+    if !sameText(capability, b"execution-storage") { continue }
+    parts.components = parts.components + usize.ONE
+    let bindings = match move Toml.field(component, "bindings") {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { return Option<ExecutionStorage>.none() }
+    }
+    let mut bindingAt = usize.ZERO
+    while true {
+      let entry = match move Toml.item(bindings, bindingAt) {
+        Option<&TomlValue>.Some {value} => value
+        Option<&TomlValue>.None => { break }
+      }
+      bindingAt = bindingAt + usize.ONE
+      let operation = Toml.asString(Toml.field(entry, "operation"))
+      let module = Toml.asString(Toml.field(entry, "module"))
+      let declaration = Toml.asString(Toml.field(entry, "declaration"))
+      if let Option<string>.Some {value: operationText} = move operation {
+        if let Option<string>.Some {value: moduleText} = move module {
+          if let Option<string>.Some {value: declarationText} = move declaration {
+            run bind(&mut parts, package, String.utf8Bytes(operationText), String.utf8Bytes(moduleText),
+              String.utf8Bytes(declarationText))
+            continue
+          }
+        }
+      }
+      return Option<ExecutionStorage>.none()
+    }
+  }
+  return finishStorage(move parts)
+}
+
+fn jsonItem<'a>(value: &'a JsonValue, index: usize) -> Option<&'a JsonValue> {
+  return match &value.* {
+    JsonValue.Array {values} => {
+      let boxed = Box<Vector<JsonChild>>.get(&values)
+      let items = Vector<JsonChild>.asSlice(&boxed[0])
+      if index >= items.length { return Option<&'a JsonValue>.none() }
+      return match &items[index] {
+        JsonChild.Item {value: item} => Option<&'a JsonValue>.some(&item)
+        _ => Option<&'a JsonValue>.none()
+      }
+    }
+    _ => Option<&'a JsonValue>.none()
+  }
+}
+
+// Parses the standard library's composition catalog, absent when the library has none or it is
+// malformed.
+effect fn catalog(directory: &Path) -> Option<JsonValue>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run Path.join(directory, "compositions.json")
+  let read = run readOptional(&path)
+  let contents = match move read {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<JsonValue>.none() }
+  }
+  let parsed = run Effect.result(Json.parse(Bytes.asSlice(&contents)))
+  return match move parsed {
+    Result<JsonValue, JsonError | OutOfMemoryError>.Success {value} => Option<JsonValue>.some(move value)
+    Result<JsonValue, JsonError | OutOfMemoryError>.Failure {error} => match move error {
+      JsonError malformed => {
+        drop malformed
+        return Option<JsonValue>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The logical source path of the catalog runtime listed for `target` and `libc`, if any.
+effect fn catalogRuntime(document: &JsonValue, target: &[u8], libc: &[u8], named: Option<&[u8]>) -> Option<Bytes>
+! OutOfMemoryError ? &mut Allocator {
+  let listed = match move Json.field(document, "runtimes") {
+    Option<&JsonValue>.Some {value} => value
+    Option<&JsonValue>.None => { return Option<Bytes>.none() }
+  }
+  let mut at = usize.ZERO
+  while true {
+    let runtime = match move jsonItem(listed, at) {
+      Option<&JsonValue>.Some {value} => value
+      Option<&JsonValue>.None => { break }
+    }
+    at = at + usize.ONE
+    let matchesLibc = match move Json.asString(Json.field(runtime, "libc")) {
+      Option<string>.Some {value} => sameText(String.utf8Bytes(value), libc)
+      Option<string>.None => false
+    }
+    if !matchesLibc { continue }
+    if let Option<&[u8]>.Some {value: wanted} = &named {
+      let matchesName = match move Json.asString(Json.field(runtime, "name")) {
+        Option<string>.Some {value} => sameText(String.utf8Bytes(value), wanted)
+        Option<string>.None => false
+      }
+      if !matchesName { continue }
+    }
+    let targets = match move Json.field(runtime, "targets") {
+      Option<&JsonValue>.Some {value} => value
+      Option<&JsonValue>.None => { continue }
+    }
+    let mut targetAt = usize.ZERO
+    while true {
+      let named = match move jsonItem(targets, targetAt) {
+        Option<&JsonValue>.Some {value} => value
+        Option<&JsonValue>.None => { break }
+      }
+      targetAt = targetAt + usize.ONE
+      let selected = match move Json.asString(Option<&JsonValue>.some(named)) {
+        Option<string>.Some {value} => sameText(String.utf8Bytes(value), target)
+        Option<string>.None => false
+      }
+      if !selected { continue }
+      let module = match move Json.asString(Json.field(runtime, "module")) {
+        Option<string>.Some {value} => value
+        Option<string>.None => { return Option<Bytes>.none() }
+      }
+      let mut logical = run Bytes.copy(String.utf8Bytes(module))
+      run Bytes.append(&mut logical, b".silk")
+      return Option<Bytes>.some(move logical)
+    }
+  }
+  return Option<Bytes>.none()
+}
+
+// Reads `components` from the standard library's composition catalog.
+effect fn catalogStorage(document: &JsonValue, package: &[u8]) -> Option<ExecutionStorage>
+! OutOfMemoryError ? &mut Allocator {
+  let listed = match move Json.field(document, "components") {
+    Option<&JsonValue>.Some {value} => value
+    Option<&JsonValue>.None => { return Option<ExecutionStorage>.none() }
+  }
+  let mut parts = emptyParts()
+  let mut at = usize.ZERO
+  while true {
+    let component = match move jsonItem(listed, at) {
+      Option<&JsonValue>.Some {value} => value
+      Option<&JsonValue>.None => { break }
+    }
+    at = at + usize.ONE
+    let capability = match move Json.asString(Json.field(component, "capability")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { return Option<ExecutionStorage>.none() }
+    }
+    if !sameText(capability, b"execution-storage") { continue }
+    parts.components = parts.components + usize.ONE
+    let bindings = match move Json.field(component, "bindings") {
+      Option<&JsonValue>.Some {value} => value
+      Option<&JsonValue>.None => { return Option<ExecutionStorage>.none() }
+    }
+    let mut bindingAt = usize.ZERO
+    while true {
+      let entry = match move jsonItem(bindings, bindingAt) {
+        Option<&JsonValue>.Some {value} => value
+        Option<&JsonValue>.None => { break }
+      }
+      bindingAt = bindingAt + usize.ONE
+      let operation = Json.asString(Json.field(entry, "operation"))
+      let module = Json.asString(Json.field(entry, "module"))
+      let declaration = Json.asString(Json.field(entry, "declaration"))
+      if let Option<string>.Some {value: operationText} = move operation {
+        if let Option<string>.Some {value: moduleText} = move module {
+          if let Option<string>.Some {value: declarationText} = move declaration {
+            run bind(&mut parts, package, String.utf8Bytes(operationText), String.utf8Bytes(moduleText),
+              String.utf8Bytes(declarationText))
+            continue
+          }
+        }
+      }
+      return Option<ExecutionStorage>.none()
+    }
+  }
+  return finishStorage(move parts)
+}
+
+fn sameText(left: &[u8], right: &[u8]) -> bool {
+  return left.length == right.length && startsWith(left, right)
+}
+
+// How a package selects its runtime: its `[build].composition` default, which may be absent for a
+// library or object form, or the standard-library catalog when it declares no composition.
+union RuntimeChoice {
+  Declared {module: Option<Bytes>},
+  Catalog,
+}
+
+// Resolves `[build].composition` for the profile's runtime `request`, `Catalog` when the manifest
+// declares none. A `none` request selects no runtime. A named request selects the listed runtime
+// of that name. The default request selects the composition's single default candidate, which only
+// an executable requires; any other shape is invalid and never falls back to a hosted runtime.
+effect fn defaultRuntime(document: &TomlValue, executable: bool, request: &RuntimeRequest) -> RuntimeChoice
+! InvalidBuildComposition | OutOfMemoryError ? &mut Allocator {
+  let build = Toml.field(document, "build")
+  let composition = match move Toml.fieldAt(move build, "composition") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return RuntimeChoice.Catalog }
+  }
+  match &request.* {
+    RuntimeRequest.None => { return RuntimeChoice.Declared {module: Option<Bytes>.none()} }
+    RuntimeRequest.Named {name} => {
+      return RuntimeChoice.Declared {module: Option<Bytes>.some(run listedRuntime(composition, Bytes.asSlice(&name)))}
+    }
+    RuntimeRequest.Default => {}
+  }
+  let defaults = match move Toml.field(composition, "defaults") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => {
+      if executable { fail InvalidBuildComposition {} }
+      return RuntimeChoice.Declared {module: Option<Bytes>.none()}
+    }
+  }
+  let listed = match &defaults.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !listed { fail InvalidBuildComposition {} }
+  // An executable needs a runtime; an explicit composition never falls back to the catalog.
+  if let Option<&TomlValue>.None = move Toml.item(defaults, usize.ZERO) {
+    if executable { fail InvalidBuildComposition {} }
+    return RuntimeChoice.Declared {module: Option<Bytes>.none()}
+  }
+  // Two default candidates are ambiguous even when both would compile for the target.
+  if let Option<&TomlValue>.Some {..} = move Toml.item(defaults, usize.ONE) { fail InvalidBuildComposition {} }
+  let selected = match move Toml.asString(Toml.item(defaults, usize.ZERO)) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => { fail InvalidBuildComposition {} }
+  }
+  return RuntimeChoice.Declared {module: Option<Bytes>.some(run listedRuntime(composition, selected))}
+}
+
+// The logical module path of the runtime the composition lists as `selected`. A name the
+// composition does not list never falls back to a hosted runtime.
+effect fn listedRuntime(composition: &TomlValue, selected: &[u8]) -> Bytes
+! InvalidBuildComposition | OutOfMemoryError ? &mut Allocator {
+  let runtimes = match move Toml.field(composition, "runtimes") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { fail InvalidBuildComposition {} }
+  }
+  let mut at = usize.ZERO
+  while true {
+    let descriptor = match move Toml.item(runtimes, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { break }
+    }
+    at = at + usize.ONE
+    let named = match move Toml.asString(Toml.field(descriptor, "name")) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => { fail InvalidBuildComposition {} }
+    }
+    if sameText(named, selected) {
+      let module = match move Toml.asString(Toml.field(descriptor, "module")) {
+        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.None => { fail InvalidBuildComposition {} }
+      }
+      let mut logical = run Bytes.copy(module)
+      run Bytes.append(&mut logical, b".silk")
+      return move logical
+    }
+  }
+  fail InvalidBuildComposition {}
+}
+
+// The manifest's logical package identity: `[package].name`, `@` and the required
+// `[package].version` (PROFILE-002). Physical checkout paths are not identities.
+effect fn packageIdentity(document: &TomlValue) -> Bytes
+! InvalidSourceRoot | OutOfMemoryError ? &mut Allocator {
+  let name = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "name")) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => { fail InvalidSourceRoot {} }
+  }
+  if name.length == usize.ZERO { fail InvalidSourceRoot {} }
+  let version = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "version")) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => { fail InvalidSourceRoot {} }
+  }
+  if version.length == usize.ZERO { fail InvalidSourceRoot {} }
+  let mut identity = run Bytes.copy(name)
+  run Bytes.append(&mut identity, b"@")
+  run Bytes.append(&mut identity, version)
+  return move identity
+}
+
+// Reads the package that the manifest `contents` in `directory` declares.
+effect fn packageRoot(directory: &Path, contents: &Bytes, executable: bool, request: &RuntimeRequest) -> PackageRoot
+! FileError | TomlError | InvalidSourceRoot | InvalidBuildComposition | InvalidNativeLinkInput | OutOfMemoryError
+? &mut FileSystem | &mut Allocator {
+  let document = run Toml.parse(Bytes.asSlice(contents))
+  let identity = run packageIdentity(&document)
+  let package = Toml.field(&document, "package")
+  let root = Toml.asString(Toml.fieldAt(move package, "root"))
+  if let Option<string>.Some {value: rootText} = move root {
+    let entry = run Path.join(directory, rootText)
+    // Modules resolve below `source-root` when the package names one, else the root's directory.
+    let mut moduleDirectory = run Path.parent(&entry)
+    if let Option<string>.Some {value: written} = move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "source-root")) {
+      moduleDirectory = Option<Path>.some(run CommandPath.resolve(directory, String.utf8Bytes(written)))
+    }
+    if let Option<Path>.Some {value: selected} = move moduleDirectory {
+      let runtime = run defaultRuntime(&document, executable, request)
+      let mut components = Components.Catalog
+      let mut retention = Vector<RetentionRoot>.make()
+      let build = Toml.field(&document, "build")
+      if let Option<&TomlValue>.Some {value: composition} = move Toml.fieldAt(move build, "composition") {
+        components = Components.Declared {storage: run manifestStorage(composition, Bytes.asSlice(&identity))}
+        retention = run manifestRetention(composition, Bytes.asSlice(&identity))
+      }
+      let linkInputs = run NativeLinkInputs.read(&document, directory)
+      let relative = run CommandPath.relative(directory, &selected)
+      return PackageRoot {directory: move selected, package: move identity, relative: move relative, runtime: move runtime,
+        components: move components, retention: move retention, linkInputs: move linkInputs}
+    }
+  }
+  fail InvalidSourceRoot {}
+}
+
+effect fn sourceRoot(source: &Path, executable: bool, request: &RuntimeRequest) -> PackageRoot
+! FileError | TomlError | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | OutOfMemoryError
+? &mut FileSystem | &mut Allocator {
+  let parent = run Path.parent(source)
+  let mut directory = match move parent {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { fail InvalidSourceRoot {} }
+  }
+  let start = run Path.fromBytes(Path.rawBytes(&directory))
+  while true {
+    let manifest = run Path.join(&directory, "silk.toml")
+    let contents = run readOptional(&manifest)
+    if let Option<Bytes>.Some {value} = move contents {
+      return run packageRoot(&directory, &value, executable, request)
+    }
+    let parent = run Path.parent(&directory)
+    if let Option<Path>.Some {value} = move parent {
+      directory = move value
+    } else {
+      break
+    }
+  }
+  // Without a manifest a build has no logical package identity, and a host path is never one.
+  fail MissingManifest {directory: move start}
+}
+
+effect fn logicalEntry(root: &Path, source: &Path) -> Bytes
+! InvalidSourceRoot | OutOfMemoryError ? &mut Allocator {
+  let mut prefix = run Bytes.copy(Path.rawBytes(root))
+  if !Path.isRoot(root) { run Bytes.append(&mut prefix, b"/") }
+  let bytes = Path.rawBytes(source)
+  let directory = Bytes.asSlice(&prefix)
+  if !startsWith(bytes, directory) || bytes.length <= directory.length {
+    fail InvalidSourceRoot {}
+  }
+  let mut logical = Bytes.make()
+  let mut at = directory.length
+  while at < bytes.length {
+    run Bytes.append(&mut logical, &[bytes[at]])
+    at = at + usize.ONE
+  }
+  return move logical
+}
+
+/// Reads the entry and nearest package manifest, including its native link inputs, and selects the
+/// runtime the profile's `runtime` request names: by default the manifest composition's default,
+/// or else, for an `executable` artifact, the standard-library catalog runtime for `target` and
+/// `libc`; a named request selects the composition or catalog runtime of that name; `none` selects
+/// no runtime and no catalog component (ARTIFACT-001). A library or object form acquires no catalog
+/// runtime or storage component (ARTIFACT-002). No imported or runtime module is read here.
+pub effect fn make(source: &Path, standardLibrary: Option<Path>, target: &[u8], libc: &[u8], executable: bool, runtime: RuntimeRequest) -> ModuleSources
+! FileError | TomlError | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | InvalidModulePath | OutOfMemoryError
+? &mut FileSystem | &mut Allocator {
+  let located = run sourceRoot(source, executable, &runtime)
+  return run assemble(source, move located, move standardLibrary, target, libc, executable, &runtime)
+}
+
+/// Like [`make`], but the package is the one `manifest` declares rather than the nearest manifest
+/// above the entry, as a project command's `--manifest-path` selects.
+pub effect fn makeInPackage(source: &Path, manifest: &Path, standardLibrary: Option<Path>, target: &[u8], libc: &[u8], executable: bool, runtime: RuntimeRequest) -> ModuleSources
+! FileError | TomlError | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | InvalidModulePath | OutOfMemoryError
+? &mut FileSystem | &mut Allocator {
+  let directory = match move run Path.parent(manifest) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { fail InvalidSourceRoot {} }
+  }
+  let contents = run FileSystem.readFile(manifest)
+  let located = run packageRoot(&directory, &contents, executable, &runtime)
+  return run assemble(source, move located, move standardLibrary, target, libc, executable, &runtime)
+}
+
+effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<Path>, target: &[u8], libc: &[u8], executable: bool, request: &RuntimeRequest) -> ModuleSources
+! FileError | InvalidSourceRoot | InvalidBuildComposition | InvalidModulePath | OutOfMemoryError
+? &mut FileSystem | &mut Allocator {
+  let PackageRoot {directory: root, package, relative, runtime: declaredRuntime, components, retention, linkInputs} = move located
+  let mut catalogDocument = Option<JsonValue>.none()
+  if let Option<Path>.Some {value: directory} = &standardLibrary {
+    catalogDocument = run catalog(&directory)
+  }
+  // The catalog lists one runtime for an executable's target and libc, by its name; a `none`
+  // request selects no runtime and so acquires none of the catalog's components either.
+  let mut catalogName = Option<&[u8]>.none()
+  let mut catalogued = executable
+  match &request.* {
+    RuntimeRequest.None => { catalogued = false }
+    RuntimeRequest.Named {name} => {
+      if !executable { fail InvalidBuildComposition {} }
+      catalogName = Option<&[u8]>.some(Bytes.asSlice(&name))
+    }
+    RuntimeRequest.Default => {}
+  }
+  let mut storage = Option<ExecutionStorage>.none()
+  match move components {
+    Components.Declared {storage: declared} => { storage = move declared }
+    Components.Catalog => {
+      if let Option<JsonValue>.Some {value: document} = &catalogDocument {
+        if catalogued { storage = run catalogStorage(&document, Bytes.asSlice(&package)) }
+      }
+    }
+  }
+  let mut selectedRuntime = Option<Bytes>.none()
+  match move declaredRuntime {
+    RuntimeChoice.Declared {module} => { selectedRuntime = move module }
+    RuntimeChoice.Catalog => {
+      if catalogued {
+        match &catalogDocument {
+          Option<JsonValue>.Some {value: document} => {
+            match move run catalogRuntime(&document, target, libc, move catalogName) {
+              Option<Bytes>.Some {value} => { selectedRuntime = Option<Bytes>.some(move value) }
+              Option<Bytes>.None => { fail InvalidBuildComposition {} }
+            }
+          }
+          Option<JsonValue>.None => { fail InvalidBuildComposition {} }
+        }
+      }
+    }
+  }
+  let logical = run logicalEntry(&root, source)
+  if SealedOperators.isPath(Bytes.asSlice(&logical)) { fail InvalidSourceRoot {} }
+  let entry = run ModuleId.make(b"file", Bytes.asSlice(&package), Bytes.asSlice(&logical))
+  let mut runtime = Option<ModuleId>.none()
+  if let Option<Bytes>.Some {value: selected} = &selectedRuntime {
+    if SealedOperators.isPath(Bytes.asSlice(&selected)) { fail InvalidBuildComposition {} }
+    runtime = Option<ModuleId>.some(run ModuleId.make(b"file", Bytes.asSlice(&package), Bytes.asSlice(&selected)))
+  }
+  let content = Option<Bytes>.some(run FileSystem.readFile(source))
+  let revision = run Revision.publish(&Revision.make(), &entry, &content)
+  let mut attempted = Vector<ModuleId>.make()
+  run Vector<ModuleId>.append(&mut attempted, ModuleId.copy(&entry))
+  return ModuleSources {
+    root: move root,
+    package: move package,
+    directory: move relative,
+    standardLibrary: move standardLibrary,
+    entry: move entry,
+    runtime: move runtime,
+    storage: move storage,
+    retention: move retention,
+    linkInputs: move linkInputs,
+    revision: move revision,
+    attempted: move attempted,
+  }
+}
+
+/// Borrows the module directory's path relative to the package manifest, such as `src`.
+pub fn moduleDirectory(self: &ModuleSources) -> &[u8] { return Bytes.asSlice(&self.directory) }
+
+/// The canonical identity of `logical`, a path such as `silk/test_runner.silk`, in this package.
+pub effect fn module(self: &ModuleSources, logical: &[u8]) -> ModuleId ! InvalidModulePath | OutOfMemoryError ? &mut Allocator {
+  return run ModuleId.make(b"file", Bytes.asSlice(&self.package), logical)
+}
+
+/// Borrows the canonical entry identity inside its package's module directory.
+pub fn entry(self: &ModuleSources) -> &ModuleId { return &self.entry }
+
+/// Borrows the selected runtime source module, absent for a library or object form without one.
+pub fn runtime(self: &ModuleSources) -> Option<&ModuleId> {
+  return match &self.runtime {
+    Option<ModuleId>.Some {value} => Option<&ModuleId>.some(&value)
+    Option<ModuleId>.None => Option<&ModuleId>.none()
+  }
+}
+
+/// Borrows the package's native link inputs in declaration order.
+pub fn nativeLinkInputs(self: &ModuleSources) -> &[NativeLinkInput] {
+  return Vector<NativeLinkInput>.asSlice(&self.linkInputs)
+}
+
+/// Borrows the composition's execution-storage selection, absent when none is selected validly.
+/// The composition's explicit retention roots, in manifest order (ARTIFACT-003).
+pub effect fn retention(self: &ModuleSources) -> Vector<RetentionRoot> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<RetentionRoot>.make()
+  let listed = Vector<RetentionRoot>.asSlice(&self.retention)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Vector<RetentionRoot>.append(&mut copied, run RetentionRoot.copy(&listed[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+pub fn executionStorage(self: &ModuleSources) -> Option<&ExecutionStorage> {
+  return match &self.storage {
+    Option<ExecutionStorage>.Some {value} => Option<&ExecutionStorage>.some(&value)
+    Option<ExecutionStorage>.None => Option<&ExecutionStorage>.none()
+  }
+}
+
+/// Retains an immutable snapshot whose observations authenticate exact per-file contents.
+pub effect fn revision(self: &ModuleSources) -> Revision ! OutOfMemoryError ? &mut Allocator {
+  return run Revision.copy(&self.revision)
+}
+
+fn attempted(self: &ModuleSources, module: &ModuleId) -> bool {
+  let modules = Vector<ModuleId>.asSlice(&self.attempted)
+  let mut at = usize.ZERO
+  while at < modules.length {
+    if ModuleId.equals(&modules[at], module) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Reports the actual provider route. The already-published entry always came from the compiler
+/// file even if its logical path starts with silk/. Other requests retain the existing route.
+pub fn compilerProvider(self: &ModuleSources, module: &ModuleId) -> bool {
+  return ModuleId.equals(&self.entry, module) || !ModuleId.withPath<bool>(module, fn(path: &[u8]) -> bool {
+    return startsWith(path, b"silk/") || SealedOperators.isPath(path)
+  })
+}
+
+// A library source belongs to the root package only when the selected package's module directory
+// is that same library directory. Imported library modules otherwise inherit the entry's logical
+// ModuleId package, so comparing ModuleId packages alone cannot establish source ownership.
+fn rootPackageModule(self: &ModuleSources, module: &ModuleId) -> bool {
+  if !ModuleId.sameOrigin(&self.entry, module) || !ModuleId.samePackage(&self.entry, module) { return false }
+  if compilerProvider(self, module) { return true }
+  return match &self.standardLibrary {
+    Option<Path>.Some {value} => sameText(Path.rawBytes(&self.root), Path.rawBytes(&value))
+    Option<Path>.None => false
+  }
+}
+
+/// Copies the present, preloaded modules whose source provider is the selected root package.
+/// Missing imports and present dependencies stay outside the root declaration sweep.
+pub effect fn loadedRootModules(self: &ModuleSources) -> Vector<ModuleId> ! OutOfMemoryError ? &mut Allocator {
+  let mut selected = Vector<ModuleId>.make()
+  let published = Vector<ModuleId>.asSlice(&self.attempted)
+  let mut at = usize.ZERO
+  while at < published.length {
+    if Revision.presents(&self.revision, &published[at]) && rootPackageModule(self, &published[at]) {
+      run Vector<ModuleId>.append(&mut selected, ModuleId.copy(&published[at]))
+    }
+    at = at + usize.ONE
+  }
+  return move selected
+}
+
+/// Copies the exact filesystem mapping used for publication, without reading source bytes.
+pub effect fn sourceLocation(self: &ModuleSources, module: &ModuleId) -> SourceLocation
+! FileError | OutOfMemoryError ? &mut Allocator {
+  let copied = run ModuleId.copyPath(module)
+  let logical = Bytes.asSlice(&copied)
+  if !compilerProvider(self, module) {
+    if let Option<Path>.Some {value} = &self.standardLibrary {
+      return SourceLocation {provider: ProviderRole.StandardLibrary, path: Option<Path>.some(run Path.joinBytes(&value, logical))}
+    }
+    return SourceLocation {provider: ProviderRole.StandardLibrary, path: Option<Path>.none()}
+  }
+  return SourceLocation {provider: ProviderRole.Compiler, path: Option<Path>.some(run Path.joinBytes(&self.root, logical))}
+}
+
+effect fn readModule(self: &ModuleSources, module: &ModuleId) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run sourceLocation(self, module)
+  return match &location.path {
+    Option<Path>.Some {value} => run readOptional(&value)
+    Option<Path>.None => Option<Bytes>.none()
+  }
+}
+
+// Publishes `module` once, as present bytes or explicit absence, and returns its bytes.
+effect fn publish(self: &mut ModuleSources, module: &ModuleId, sealedContent: &Option<Bytes>) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if attempted(&self.*, module) {
+    let observed = run Revision.observe(&self.revision, module)
+    return run Observation.copyContent(&observed)
+  }
+  let mut content = Option<Bytes>.none()
+  if ModuleId.withPath<bool>(module, SealedOperators.isPath) {
+    if let Option<Bytes>.Some {value} = &sealedContent.* {
+      content = Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&value)))
+    }
+  } else { content = run readModule(&self.*, module) }
+  let next = run Revision.publish(&self.revision, module, &content)
+  self.revision = move next
+  run Vector<ModuleId>.append(&mut self.attempted, ModuleId.copy(module))
+  return move content
+}
+
+/// Publishes every module reachable from `roots` through written imports, so one semantic build
+/// sees the whole program.
+///
+/// # Details
+///
+/// Each module is read once, as present bytes or explicit absence, and a present module's imports
+/// are read as syntax only. An import path that is not a canonical module path names no module and
+/// is left to semantic analysis to reject.
+pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
+! FileError | InvalidModulePath | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  // Read and lex the compiler-owned declaration catalog once. Publish those same bytes only
+  // when a reachable module names a declared member; project sources cannot supply this catalog.
+  let sealedModule = run ModuleId.sibling(&self.entry, SealedOperators.path())
+  let sealedContent = run readModule(&self.*, &sealedModule)
+  let sealedNames = match &sealedContent {
+    Option<Bytes>.Some {value} => run SealedOperators.members(Bytes.asSlice(&value))
+    Option<Bytes>.None => Vector<Bytes>.make()
+  }
+  let mut pending = Vector<ModuleId>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    run Vector<ModuleId>.append(&mut pending, ModuleId.copy(&roots[at]))
+    at = at + usize.ONE
+  }
+  let mut scanned = Vector<ModuleId>.make()
+  while Vector<ModuleId>.length(&pending) > usize.ZERO {
+    let module = Vector<ModuleId>.remove(&mut pending, usize.ZERO)
+    if listed(Vector<ModuleId>.asSlice(&scanned), &module) { continue }
+    run Vector<ModuleId>.append(&mut scanned, ModuleId.copy(&module))
+    let content = run publish(&mut self.*, &module, &sealedContent)
+    if let Option<Bytes>.Some {value: bytes} = move content {
+      let unit = run SourceUnit.parse(&module, Revision.revisionNumber(&self.revision), move bytes)
+      if SealedOperators.referenced(&unit.syntax, Vector<Bytes>.asSlice(&sealedNames)) {
+        // The path is fixed and compiler-owned; sourceLocation never consults the project tree.
+        run Vector<ModuleId>.append(&mut pending, run ModuleId.sibling(&module, SealedOperators.path()))
+      }
+      let index = run ModuleIndex.build(&unit, false)
+      let paths = run ModuleIndex.importPaths(&index, &unit)
+      let written = Vector<Bytes>.asSlice(&paths)
+      let mut pathAt = usize.ZERO
+      while pathAt < written.length {
+        if SealedOperators.isPath(Bytes.asSlice(&written[pathAt])) {
+          pathAt = pathAt + usize.ONE
+          continue
+        }
+        let target = run Effect.result(ModuleId.sibling(&module, Bytes.asSlice(&written[pathAt])))
+        match move target {
+          Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success {value} => {
+            run Vector<ModuleId>.append(&mut pending, move value)
+          }
+          Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+            InvalidModulePath {} => {}
+            OutOfMemoryError exhausted => { fail move exhausted }
+          }
+        }
+        pathAt = pathAt + usize.ONE
+      }
+    }
+  }
+  return ()
+}
+
+/// Publishes the whole program a build of `application` can read: the entry, the application,
+/// the runtime when one is selected, the modules the language reads without an import, and
+/// everything they import.
+pub effect fn preloadProgram(self: &mut ModuleSources, application: &ModuleId) -> ()
+! FileError | InvalidModulePath | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut roots = Vector<ModuleId>.make()
+  run Vector<ModuleId>.append(&mut roots, ModuleId.copy(&self.entry))
+  run Vector<ModuleId>.append(&mut roots, ModuleId.copy(application))
+  if let Option<ModuleId>.Some {value: runtime} = &self.runtime {
+    run Vector<ModuleId>.append(&mut roots, ModuleId.copy(&runtime))
+  }
+  // Layout contracts read the standard library's layout module without an import.
+  run Vector<ModuleId>.append(&mut roots, run ModuleId.sibling(&self.entry, b"silk/layout.silk"))
+  // The declared library interfaces remain implicit until the approved alias migration (OP-009).
+  // Sealed interfaces are published only when preload sees a reference (INTR-007).
+  run Vector<ModuleId>.append(&mut roots, run ModuleId.sibling(&self.entry, b"silk/ops.silk"))
+  run Vector<ModuleId>.append(&mut roots, run ModuleId.sibling(&self.entry, b"silk/equal.silk"))
+  run Vector<ModuleId>.append(&mut roots, run ModuleId.sibling(&self.entry, b"silk/order.silk"))
+  if let Option<ExecutionStorage>.Some {value: storage} = &self.storage {
+    run Vector<ModuleId>.append(&mut roots, ModuleId.copy(&storage.create.module))
+    run Vector<ModuleId>.append(&mut roots, ModuleId.copy(&storage.acquire.module))
+    run Vector<ModuleId>.append(&mut roots, ModuleId.copy(&storage.release.module))
+    run Vector<ModuleId>.append(&mut roots, ModuleId.copy(&storage.destroy.module))
+  }
+  let retained = Vector<RetentionRoot>.asSlice(&self.retention)
+  let mut at = usize.ZERO
+  while at < retained.length {
+    run Vector<ModuleId>.append(&mut roots, ModuleId.copy(&retained[at].module))
+    at = at + usize.ONE
+  }
+  return run preload(&mut self.*, Vector<ModuleId>.asSlice(&roots))
+}
+
+fn listed(modules: &[ModuleId], module: &ModuleId) -> bool {
+  let mut at = usize.ZERO
+  while at < modules.length {
+    if ModuleId.equals(&modules[at], module) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+/// Reports whether a semantic store read a module this build never published. Preloading
+/// publishes every module the store can demand, so this is a driver defect.
+pub fn missedSource(self: &ModuleSources, events: &[Event]) -> bool {
+  let mut at = usize.ZERO
+  while at < events.length {
+    let event = &events[at]
+    if event.kind == EventKind.SourceRead && !event.present && !attempted(self, &event.module) {
+      // Operator discovery observes this implicit source's absence when no module names it.
+      if !ModuleId.withPath<bool>(&event.module, SealedOperators.isPath) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}

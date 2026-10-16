@@ -49,12 +49,13 @@ when its declarations do not become runtime-reachable. Selected imports retain o
 
 ## MODULE-STATIC-003 — Configuration precedes selection
 
-The compiler normalizes immutable initial target/artifact inputs, discovers unconditional package
-schemas, applies explicit bindings, evaluates defaults and validation, then publishes the complete
-immutable compilation profile. Module selection consumes that profile. A module declaring a package schema must be reachable through unconditional imports; first discovering a schema through a selected import is a configuration dependency error. Package parameters cannot
-be declared conditionally. A default requiring conditional availability is a configuration
-dependency failure; the compiler never mutates a published profile or selects an arm provisionally
-to break the dependency.
+The compiler normalizes immutable initial target/artifact inputs, loads the explicitly registered
+package schema modules, applies explicit bindings, evaluates defaults and validation, then publishes
+the complete immutable compilation profile. Module selection consumes that profile. Registration
+determines which schema headers are discovered; imports and selected imports do not register
+schemas. Package parameters cannot be declared conditionally. A default requiring conditional
+availability is a configuration dependency failure; the compiler never mutates a published profile
+or selects an arm provisionally to break the dependency.
 
 ## MODULE-STATIC-004 — Selective publication preserves declaration identity
 

@@ -5,12 +5,18 @@
 //! headers and import binding syntax without opening imported modules or checking types or bodies.
 //!
 //! # Details
-//! All authored declarations keep identities, including damaged declarations. A name lookup
+//! All authored declarations keep identities, including damaged declarations and anonymous callable
+//! or Effect literals in abstract bodies. Literal identities count both static arms before selection.
+//! A name lookup
 //! returns the complete set of written candidates, including an empty set for an absent name.
+//! Declarations in module-level `static if` arms belong to the module namespace; each records the
+//! arm that admits it, and semantic selection decides which arms exist.
 
-import hir.Hir {HirId, HirRef, Module, Node, OwnerKind, Range}
-import hir.Fingerprint
+import hir.Hir {HirId, HirRef, Module, Node, OwnerKey, OwnerKind, Range}
+import hir.Intern {SymbolRef}
+import semantic.ContentHash {ContentHash, Stream as ContentStream}
 import semantic.DeclarationId {DeclarationId}
+import semantic.InternIndex {InternIndex}
 import semantic.ModuleId {ModuleId}
 import semantic.SourceUnit {SourceUnit}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -21,6 +27,9 @@ import silk.shared {Shared}
 import silk.usize
 import silk.vector {Vector}
 import lexer.Span {Span}
+import lexer.Token {Token, TokenKind, kind as tokenKind, span as tokenSpan}
+import silk.u8
+import silk.u64
 
 /// How a written name entered the module namespace.
 pub enum CandidateKind {
@@ -32,16 +41,84 @@ pub enum CandidateKind {
   ImportMember,
 }
 
+/// One module-level `static if` arm: the conditional's selected branch must equal `holds`.
+pub struct Arm {
+  /// The ordinal of the conditional declaration in this index.
+  pub conditional: usize
+  /// Whether this arm is selected when the condition holds.
+  pub holds: bool
+}
+
+impl Copy for Arm {}
+
+fn copyArm(arm: &Option<Arm>) -> Option<Arm> {
+  return match & arm.* {
+    Option<Arm>.Some {value} => Option<Arm>.some(value)
+    Option<Arm>.None => Option<Arm>.none()
+  }
+}
+
 /// One authored declaration with its canonical and local identities.
 pub struct IndexedDeclaration {
   /// The module and complete owner chain, independent of HIR indexes.
   pub identity: DeclarationId
   /// The node location in this index's source unit only.
   pub local: HirId
-  /// The header location in this index's source unit only.
+  /// The written contract location, or the literal itself for an implicit Effect-block header.
   pub header: HirId
   /// Whether same-key siblings make occurrence matching across revisions ambiguous.
   pub ambiguous: bool
+  /// The ordinal of the directly enclosing declaration in this index; absent at module level.
+  /// Static conditional arms are transparent: their declarations belong to the enclosing scope.
+  pub parent: Option<usize>
+  /// The innermost module-level `static if` arm that admits this declaration; absent when
+  /// unconditional. The arm's conditional carries its own enclosing arm.
+  pub arm: Option<Arm>
+  /// The declaration's fingerprints, computed only for an index that a revision may replace;
+  /// absent for an anonymous literal, which belongs to its enclosing declaration.
+  pub fingerprints: Option<Fingerprints>
+}
+
+/// The content of one declaration that a revision compares (incremental v2 §3.1).
+///
+/// # Details
+///
+/// Each covers the declaration's significant tokens: trivia and positions are excluded, but
+/// whether a line feed precedes a token is kept, since the parser reads line breaks. A directly
+/// nested declaration with its own identity, such as an `impl` member or a static arm,
+/// contributes its identity instead of its tokens, so editing it leaves its parent equal.
+pub struct Fingerprints {
+  /// The whole declaration.
+  pub whole: ContentHash
+  /// What a reader of the declaration's header consumes: the tokens before a function's body,
+  /// and the whole declaration for every other form.
+  pub prototype: ContentHash
+}
+
+impl Copy for Fingerprints {}
+
+/// One named function or operation copied from authenticated authored syntax.
+pub struct NamedFunction {
+  /// The full canonical address, parent and static arm; local IDs are source-local only.
+  pub declaration: IndexedDeclaration
+  pub ordinal: usize
+  pub span: Span
+  pub headerSpan: Span
+  /// The actual FunctionHeader/OperationHeader name child, never a spelling-derived offset.
+  pub nameSpan: Span
+  /// Source-local child identity for the authenticated SourceIndex span check.
+  pub name: HirId
+  pub hasBody: bool
+  pub isStatic: bool
+}
+
+/// A syntax census, including explicit exclusions; this does not type any body.
+pub struct FunctionInventory {
+  pub functions: Vector<NamedFunction>
+  /// Import declarations that contribute actual indexed bindings, once per declaration.
+  pub imports: Vector<IndexedDeclaration>
+  pub excludedAnonymous: usize
+  pub excludedDamaged: usize
 }
 
 /// One syntax-derived binding of a written name to an authored declaration.
@@ -90,6 +167,14 @@ pub struct ModuleIndex {
   candidates: Vector<Candidate>
   collisions: Vector<Collision>
   buckets: Vector<Bucket>
+  // Declarations by identity, same-key sibling class, enclosing declaration and local node;
+  // candidates and buckets by name.
+  identities: InternIndex
+  siblings: InternIndex
+  enclosures: InternIndex
+  locals: InternIndex
+  candidateNames: InternIndex
+  bucketNames: InternIndex
 }
 
 /// A complete observed candidate set, including an empty set for absence.
@@ -179,29 +264,78 @@ fn headerName(header: Node) -> HirRef {
   }
 }
 
+fn copyIndex(ordinal: &Option<usize>) -> Option<usize> {
+  return match & ordinal.* {
+    Option<usize>.Some {value} => Option<usize>.some(value)
+    Option<usize>.None => Option<usize>.none()
+  }
+}
+
 effect fn copyName(module: &Module, id: HirId) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
   return match Module.node(module, id) {
-    Node.Name {text} => Option.some<Bytes>(run Bytes.copy(Module.text(module, text)))
-    _ => Option.none<Bytes>()
+    Node.Name {text} => Option<Bytes>.some(run Bytes.copy(Module.text(module, text)))
+    _ => Option<Bytes>.none()
   }
+}
+
+fn nameHash(name: &[u8]) -> u64 {
+  return InternIndex.hashBytes(0, name)
+}
+
+// The first candidate at or after `position` along its name chain that is spelled `name`.
+fn namedFrom(index: &ModuleIndex, position: usize, name: &[u8]) -> usize {
+  let listed = Vector<Candidate>.asSlice(&index.candidates)
+  let mut at = position
+  while at != usize.MAX && !sameBytes(Bytes.asSlice(&listed[at].name), name) {
+    at = InternIndex.after(&index.candidateNames, at)
+  }
+  return at
 }
 
 effect fn appendCandidate(index: &mut ModuleIndex, module: &Module, candidate: Candidate) -> ()
 ! OutOfMemoryError
 ? &mut Allocator {
-  let prior = Vector.asSlice<Candidate>(&index.candidates)
-  let mut position = usize.ZERO
+  let hashed = nameHash(Bytes.asSlice(&candidate.name))
+  let prior = Vector<Candidate>.asSlice(&index.candidates)
+  let mut position = InternIndex.first(&index.candidateNames, hashed)
   let second = prior.length
-  while position < prior.length {
+  while position != usize.MAX {
     if sameBytes(Bytes.asSlice(&prior[position].name), Bytes.asSlice(&candidate.name)) {
-      run Vector.append<Collision>(
+      run Vector<Collision>.append(
         &mut index.collisions,
         Collision {first: position, second: second, span: Module.span(module, candidate.local)},
       )
     }
-    position = position + usize.ONE
+    position = InternIndex.after(&index.candidateNames, position)
   }
-  run Vector.append<Candidate>(&mut index.candidates, move candidate)
+  run Vector<Candidate>.append(&mut index.candidates, move candidate)
+  run InternIndex.record(&mut index.candidateNames, hashed)
+  return ()
+}
+
+// The enclosure key of a declaration: its parent ordinal, or `usize.MAX` at module level. The
+// keys are exact, so one enclosure chain lists exactly the declarations it encloses.
+fn enclosureOf(declaration: &IndexedDeclaration) -> u64 {
+  return match & declaration.parent {
+    Option<usize>.Some {value} => usize.toU64(value)
+    Option<usize>.None => usize.toU64(usize.MAX)
+  }
+}
+
+// Appends one declaration and records it under its identity, same-key sibling class, enclosing
+// declaration and local node.
+effect fn appendDeclaration(index: &mut ModuleIndex, declaration: IndexedDeclaration) -> ()
+! OutOfMemoryError
+? &mut Allocator {
+  let identity = DeclarationId.hash(&declaration.identity)
+  let sibling = DeclarationId.siblingHash(&declaration.identity)
+  let enclosure = enclosureOf(&declaration)
+  let local = usize.toU64(declaration.local.index)
+  run Vector<IndexedDeclaration>.append(&mut index.declarations, move declaration)
+  run InternIndex.record(&mut index.identities, identity)
+  run InternIndex.record(&mut index.siblings, sibling)
+  run InternIndex.record(&mut index.enclosures, enclosure)
+  run InternIndex.record(&mut index.locals, local)
   return ()
 }
 
@@ -274,6 +408,8 @@ effect fn visit(
   unit: &SourceUnit,
   id: HirId,
   parent: Option<DeclarationId>,
+  enclosing: Option<usize>,
+  arm: Option<Arm>,
   topLevel: bool,
 ) -> () ! OutOfMemoryError ? &mut Allocator {
   let module = &unit.authored
@@ -282,29 +418,38 @@ effect fn visit(
       Option<DeclarationId>.Some {value} => run DeclarationId.child(&value, module, owner)
       Option<DeclarationId>.None => run DeclarationId.root(&unit.id, module, owner)
     }
-    let existing = Vector.asSlice<IndexedDeclaration>(&index.declarations)
-    let mut previous = Vector.make<usize>()
-    let mut offset = usize.ZERO
-    while offset < existing.length {
+    let existing = Vector<IndexedDeclaration>.asSlice(&index.declarations)
+    let mut previous = Vector<usize>.make()
+    let mut offset = InternIndex.first(&index.siblings, DeclarationId.siblingHash(&identity))
+    while offset != usize.MAX {
       if DeclarationId.sameSiblingKey(&existing[offset].identity, &identity) {
-        run Vector.append<usize>(&mut previous, offset)
+        run Vector<usize>.append(&mut previous, offset)
       }
-      offset = offset + usize.ONE
+      offset = InternIndex.after(&index.siblings, offset)
     }
     let current = existing.length
-    run Vector.append<IndexedDeclaration>(
-      &mut index.declarations,
+    // A conditional or one of its arms is transparent: members keep the enclosing scope.
+    let transparent = owner.kind == OwnerKind.Conditional
+    let mut inner = Option<usize>.some(current)
+    if transparent {
+      inner = copyIndex(&enclosing)
+    }
+    run appendDeclaration(
+      &mut index.*,
       IndexedDeclaration {
-        identity: run DeclarationId.copy(&identity),
+        identity: DeclarationId.copy(&identity),
         local: id,
         header: header,
-        ambiguous: Vector.length<usize>(&previous) > usize.ZERO,
+        ambiguous: Vector<usize>.length(&previous) > usize.ZERO,
+        parent: move enclosing,
+        arm: copyArm(&arm),
+        fingerprints: Option<Fingerprints>.none(),
       },
     )
-    let marked = Vector.asSlice<usize>(&previous)
+    let marked = Vector<usize>.asSlice(&previous)
     offset = usize.ZERO
     while offset < marked.length {
-      let entries = Vector.asMutSlice<IndexedDeclaration>(&mut index.declarations)
+      let entries = Vector<IndexedDeclaration>.asMutSlice(&mut index.declarations)
       entries[marked[offset]].ambiguous = true
       offset = offset + usize.ONE
     }
@@ -334,6 +479,8 @@ effect fn visit(
         }
       }
     }
+    let mut literals = LiteralScope.make()
+    run visitBody(&mut index.*, unit, body, &identity, current, &mut literals)
     if let Node.MembersBody {members} = Module.node(module, body) {
       let mut child = usize.ZERO
       while child < members.length {
@@ -341,8 +488,10 @@ effect fn visit(
           &mut index.*,
           unit,
           Module.child(module, members, child),
-          Option.some<DeclarationId>(run DeclarationId.copy(&identity)),
-          false,
+          Option<DeclarationId>.some(DeclarationId.copy(&identity)),
+          copyIndex(&inner),
+          copyArm(&arm),
+          topLevel && transparent,
         )
         child = child + usize.ONE
       }
@@ -352,16 +501,20 @@ effect fn visit(
         &mut index.*,
         unit,
         thenBranch,
-        Option.some<DeclarationId>(run DeclarationId.copy(&identity)),
-        false,
+        Option<DeclarationId>.some(DeclarationId.copy(&identity)),
+        copyIndex(&inner),
+        Option<Arm>.some(Arm {conditional: current, holds: true}),
+        topLevel,
       )
       if elseBranch.present {
         run visit(
           &mut index.*,
           unit,
           elseBranch.id,
-          Option.some<DeclarationId>(run DeclarationId.copy(&identity)),
-          false,
+          Option<DeclarationId>.some(DeclarationId.copy(&identity)),
+          copyIndex(&inner),
+          Option<Arm>.some(Arm {conditional: current, holds: false}),
+          topLevel,
         )
       }
     }
@@ -369,8 +522,229 @@ effect fn visit(
   return ()
 }
 
+// Counts are per abstract owner, never per selected branch or arena position.
+struct LiteralScope {
+  anonymous: usize
+  effects: usize
+}
+
+impl LiteralScope {
+  fn make() -> LiteralScope {
+    return LiteralScope {anonymous: usize.ZERO, effects: usize.ZERO}
+  }
+}
+
+effect fn visitBodyRange(
+  index: &mut ModuleIndex, unit: &SourceUnit, range: Range,
+  parent: &DeclarationId, enclosing: usize, scope: &mut LiteralScope,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < range.length {
+    run visitBody(&mut index.*, unit, Module.child(&unit.authored, range, at), parent, enclosing, &mut scope.*)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn visitBodyRef(
+  index: &mut ModuleIndex, unit: &SourceUnit, child: HirRef,
+  parent: &DeclarationId, enclosing: usize, scope: &mut LiteralScope,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  if child.present {
+    run visitBody(&mut index.*, unit, child.id, parent, enclosing, &mut scope.*)
+  }
+  return ()
+}
+
+effect fn visitLiteral(
+  index: &mut ModuleIndex, unit: &SourceUnit, local: HirId, header: HirId, body: HirId,
+  kind: OwnerKind, parent: &DeclarationId, enclosing: usize, scope: &mut LiteralScope,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut occurrence = scope.anonymous
+  if kind == OwnerKind.EffectBlock {
+    occurrence = scope.effects
+    scope.effects = scope.effects + usize.ONE
+  } else {
+    scope.anonymous = scope.anonymous + usize.ONE
+  }
+  let identity = run DeclarationId.child(parent, &unit.authored, OwnerKey {
+    kind: kind, name: SymbolRef.absent(), occurrence: occurrence,
+  })
+  let current = Vector<IndexedDeclaration>.length(&index.declarations)
+  let existing = Vector<IndexedDeclaration>.asSlice(&index.declarations)
+  let arm = copyArm(&existing[enclosing].arm)
+  run appendDeclaration(&mut index.*, IndexedDeclaration {
+    identity: DeclarationId.copy(&identity), local: local, header: header,
+    ambiguous: false, parent: Option<usize>.some(enclosing), arm: move arm,
+    fingerprints: Option<Fingerprints>.none(),
+  })
+  let mut nested = LiteralScope.make()
+  run visitBody(&mut index.*, unit, body, &identity, current, &mut nested)
+  return ()
+}
+
+// Walk executable HIR in written preorder. Bindings refer back to nodes but are not children.
+// Both static arms are visited without selecting or typing either one.
+effect fn visitBody(
+  index: &mut ModuleIndex, unit: &SourceUnit, id: HirId,
+  parent: &DeclarationId, enclosing: usize, scope: &mut LiteralScope,
+) -> () ! OutOfMemoryError ? &mut Allocator {
+  match Module.node(&unit.authored, id) {
+    Node.CallableExpression {contract, body} => {
+      let mut kind = OwnerKind.Anonymous
+      if let Node.CallableContract {isEffect, ..} = Module.node(&unit.authored, contract) {
+        if isEffect { kind = OwnerKind.EffectBlock }
+      }
+      run visitLiteral(&mut index.*, unit, id, contract, body, kind, parent, enclosing, &mut scope.*)
+    }
+    Node.EffectExpression {body} => {
+      run visitLiteral(&mut index.*, unit, id, id, body, OwnerKind.EffectBlock, parent, enclosing, &mut scope.*)
+    }
+    Node.CallableBody {block} => {
+      run visitBodyRef(&mut index.*, unit, block, parent, enclosing, &mut scope.*)
+    }
+    Node.InitializerBody {value} => {
+      run visitBodyRef(&mut index.*, unit, value, parent, enclosing, &mut scope.*)
+    }
+    Node.PackageParameterBody {default, validation} => {
+      run visitBodyRef(&mut index.*, unit, default, parent, enclosing, &mut scope.*)
+      run visitBodyRef(&mut index.*, unit, validation, parent, enclosing, &mut scope.*)
+    }
+    Node.MoveExpression {operand, ..} => {
+      run visitBody(&mut index.*, unit, operand, parent, enclosing, &mut scope.*)
+    }
+    Node.BorrowExpression {operand, ..} => {
+      run visitBody(&mut index.*, unit, operand, parent, enclosing, &mut scope.*)
+    }
+    Node.RunExpression {operand, ..} => {
+      run visitBody(&mut index.*, unit, operand, parent, enclosing, &mut scope.*)
+    }
+    Node.UnsafeExpression {operand, ..} => {
+      run visitBody(&mut index.*, unit, operand, parent, enclosing, &mut scope.*)
+    }
+    Node.CompileErrorExpression {message, ..} => {
+      run visitBody(&mut index.*, unit, message, parent, enclosing, &mut scope.*)
+    }
+    Node.ReferentExpression {subject, ..} => {
+      run visitBody(&mut index.*, unit, subject, parent, enclosing, &mut scope.*)
+    }
+    Node.ExpressionStatement {expression, ..} => {
+      run visitBody(&mut index.*, unit, expression, parent, enclosing, &mut scope.*)
+    }
+    Node.BindingStatement {initializer, ..} => {
+      run visitBody(&mut index.*, unit, initializer, parent, enclosing, &mut scope.*)
+    }
+    Node.PatternBindingStatement {initializer, ..} => {
+      run visitBody(&mut index.*, unit, initializer, parent, enclosing, &mut scope.*)
+    }
+    Node.FailStatement {value, ..} => {
+      run visitBody(&mut index.*, unit, value, parent, enclosing, &mut scope.*)
+    }
+    Node.DropStatement {value, ..} => {
+      run visitBody(&mut index.*, unit, value, parent, enclosing, &mut scope.*)
+    }
+    Node.UnsafeStatement {body, ..} => {
+      run visitBody(&mut index.*, unit, body, parent, enclosing, &mut scope.*)
+    }
+    Node.FieldInitializer {value, ..} => {
+      run visitBody(&mut index.*, unit, value, parent, enclosing, &mut scope.*)
+    }
+    Node.PrefixExpression {operand, ..} => {
+      run visitBody(&mut index.*, unit, operand, parent, enclosing, &mut scope.*)
+    }
+    Node.AssignmentStatement {target, value, ..} => {
+      run visitBody(&mut index.*, unit, target, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, value, parent, enclosing, &mut scope.*)
+    }
+    Node.InfixExpression {left, right, ..} => {
+      run visitBody(&mut index.*, unit, left, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, right, parent, enclosing, &mut scope.*)
+    }
+    Node.PipelineExpression {input, target, ..} => {
+      run visitBody(&mut index.*, unit, input, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, target, parent, enclosing, &mut scope.*)
+    }
+    Node.IndexExpression {subject, index: offset, ..} => {
+      run visitBody(&mut index.*, unit, subject, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, offset, parent, enclosing, &mut scope.*)
+    }
+    Node.WhileStatement {condition, body, ..} => {
+      run visitBody(&mut index.*, unit, condition, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, body, parent, enclosing, &mut scope.*)
+    }
+    Node.StaticForStatement {iterable, body, ..} => {
+      run visitBody(&mut index.*, unit, iterable, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, body, parent, enclosing, &mut scope.*)
+    }
+    Node.Block {statements, ..} => {
+      run visitBodyRange(&mut index.*, unit, statements, parent, enclosing, &mut scope.*)
+    }
+    Node.TupleExpression {elements, ..} => {
+      run visitBodyRange(&mut index.*, unit, elements, parent, enclosing, &mut scope.*)
+    }
+    Node.ArrayExpression {elements, ..} => {
+      run visitBodyRange(&mut index.*, unit, elements, parent, enclosing, &mut scope.*)
+    }
+    Node.StructExpression {fields, ..} => {
+      run visitBodyRange(&mut index.*, unit, fields, parent, enclosing, &mut scope.*)
+    }
+    Node.RecordExpression {fields, ..} => {
+      run visitBodyRange(&mut index.*, unit, fields, parent, enclosing, &mut scope.*)
+    }
+    Node.InvalidExpression {retained, ..} => {
+      run visitBodyRange(&mut index.*, unit, retained, parent, enclosing, &mut scope.*)
+    }
+    Node.InvalidStatement {retained, ..} => {
+      run visitBodyRange(&mut index.*, unit, retained, parent, enclosing, &mut scope.*)
+    }
+    Node.ConditionalStatement {condition, thenBranch, elseBranch, ..} => {
+      run visitBody(&mut index.*, unit, condition, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, thenBranch, parent, enclosing, &mut scope.*)
+      run visitBodyRef(&mut index.*, unit, elseBranch, parent, enclosing, &mut scope.*)
+    }
+    Node.StaticConditionalStatement {condition, thenBranch, elseBranch, ..} => {
+      run visitBody(&mut index.*, unit, condition, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, thenBranch, parent, enclosing, &mut scope.*)
+      run visitBodyRef(&mut index.*, unit, elseBranch, parent, enclosing, &mut scope.*)
+    }
+    Node.PatternConditionalStatement {subject, thenBranch, elseBranch, ..} => {
+      run visitBody(&mut index.*, unit, subject, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, thenBranch, parent, enclosing, &mut scope.*)
+      run visitBodyRef(&mut index.*, unit, elseBranch, parent, enclosing, &mut scope.*)
+    }
+    Node.ReturnStatement {value} => {
+      run visitBodyRef(&mut index.*, unit, value, parent, enclosing, &mut scope.*)
+    }
+    Node.MatchExpression {subject, arms, ..} => {
+      run visitBody(&mut index.*, unit, subject, parent, enclosing, &mut scope.*)
+      run visitBodyRange(&mut index.*, unit, arms, parent, enclosing, &mut scope.*)
+    }
+    Node.MatchArm {guard, result, ..} => {
+      run visitBodyRef(&mut index.*, unit, guard, parent, enclosing, &mut scope.*)
+      run visitBody(&mut index.*, unit, result, parent, enclosing, &mut scope.*)
+    }
+    Node.CallExpression {callee, arguments, ..} => {
+      run visitBody(&mut index.*, unit, callee, parent, enclosing, &mut scope.*)
+      run visitBodyRange(&mut index.*, unit, arguments, parent, enclosing, &mut scope.*)
+    }
+    Node.MemberExpression {fields, ..} => {
+      if fields.present {
+        run visitBodyRange(&mut index.*, unit, fields.range, parent, enclosing, &mut scope.*)
+      }
+    }
+    Node.FieldExpression {subject, ..} => {
+      run visitBody(&mut index.*, unit, subject, parent, enclosing, &mut scope.*)
+    }
+    Node.OrdinalExpression {subject, ..} => {
+      run visitBody(&mut index.*, unit, subject, parent, enclosing, &mut scope.*)
+    }
+    _ => ()
+  }
+  return ()
+}
+
 fn ambiguousChain(index: &ModuleIndex, identity: &DeclarationId) -> bool {
-  let declarations = Vector.asSlice<IndexedDeclaration>(&index.declarations)
+  let declarations = Vector<IndexedDeclaration>.asSlice(&index.declarations)
   let mut ordinal = usize.ZERO
   while ordinal < declarations.length {
     if declarations[ordinal].ambiguous && DeclarationId.isPrefixOf(
@@ -385,38 +759,181 @@ fn ambiguousChain(index: &ModuleIndex, identity: &DeclarationId) -> bool {
 }
 
 effect fn cacheBuckets(index: &mut ModuleIndex) -> () ! OutOfMemoryError ? &mut Allocator {
-  let count = Vector.length<Candidate>(&index.candidates)
+  let count = Vector<Candidate>.length(&index.candidates)
   let mut ordinal = usize.ZERO
   while ordinal < count {
-    let candidates = Vector.asSlice<Candidate>(&index.candidates)
+    let candidates = Vector<Candidate>.asSlice(&index.candidates)
     let name = run Bytes.copy(Bytes.asSlice(&candidates[ordinal].name))
     let known = ModuleIndex.cachedName(&index.*, Bytes.asSlice(&name))
     if let Option<Shared<NameObservation>>.Some {value} = move known {
       drop value
     } else {
       let observed = run ModuleIndex.observeName(&index.*, Bytes.asSlice(&name))
-      run Vector.append<Bucket>(
+      let hashed = nameHash(Bytes.asSlice(&name))
+      run Vector<Bucket>.append(
         &mut index.buckets,
-        Bucket {name: move name, observation: run Shared.make<NameObservation>(move observed)},
+        Bucket {name: move name, observation: run Shared<NameObservation>.make(move observed)},
       )
+      run InternIndex.record(&mut index.bucketNames, hashed)
     }
     ordinal = ordinal + usize.ONE
   }
   return ()
 }
 
+impl IndexedDeclaration {
+  /// Copies one declaration so a caller can continue after the index loan ends.
+  pub effect fn copy(self: &Self) -> IndexedDeclaration ! OutOfMemoryError ? &mut Allocator {
+    return IndexedDeclaration {
+      identity: DeclarationId.copy(&self.identity),
+      local: self.local,
+      header: self.header,
+      ambiguous: self.ambiguous,
+      parent: copyIndex(&self.parent),
+      arm: copyArm(&self.arm),
+      fingerprints: copyFingerprints(&self.fingerprints),
+    }
+  }
+}
+
 impl ModuleIndex {
+  /// Copies function addresses and import declarations from this index's exact source owner.
+  /// A different module or source revision refuses instead of interpreting foreign HIR IDs.
+  pub effect fn copyFunctionInventory(self: &Self, unit: &SourceUnit) -> Option<FunctionInventory>
+  ! OutOfMemoryError ? &mut Allocator {
+    if !ModuleId.equals(&self.module, &unit.id) || self.revision != unit.revision {
+      return Option<FunctionInventory>.none()
+    }
+    let mut inventory = FunctionInventory {
+      functions: Vector<NamedFunction>.make(), imports: Vector<IndexedDeclaration>.make(),
+      excludedAnonymous: usize.ZERO, excludedDamaged: usize.ZERO,
+    }
+    let declarations = Vector<IndexedDeclaration>.asSlice(&self.declarations)
+    let candidates = Vector<Candidate>.asSlice(&self.candidates)
+    let hir = &unit.authored
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let declared = &declarations[at]
+      let kind = DeclarationId.kind(&declared.identity)
+      if kind == OwnerKind.Anonymous || kind == OwnerKind.EffectBlock {
+        inventory.excludedAnonymous = inventory.excludedAnonymous + usize.ONE
+      } else if kind == OwnerKind.Damaged {
+        inventory.excludedDamaged = inventory.excludedDamaged + usize.ONE
+      } else if kind == OwnerKind.Import {
+        let mut binding = usize.ZERO
+        let mut indexed = false
+        while binding < candidates.length {
+          if candidates[binding].declaration == at && candidates[binding].kind != CandidateKind.Declaration {
+            indexed = true
+          }
+          binding = binding + usize.ONE
+        }
+        if indexed { run Vector<IndexedDeclaration>.append(&mut inventory.imports, run IndexedDeclaration.copy(declared)) }
+      } else if kind == OwnerKind.Function {
+        let mut name = HirRef.absent()
+        let mut contract = HirRef.absent()
+        match Module.node(hir, declared.header) {
+          Node.FunctionHeader {name: child, contract: written, ..} => { name = HirRef.of(child) contract = HirRef.of(written) }
+          Node.OperationHeader {name: child, contract: written, ..} => { name = HirRef.of(child) contract = HirRef.of(written) }
+          _ => ()
+        }
+        let mut valid = false
+        if name.present {
+          if let Node.Name {text} = Module.node(hir, name.id) {
+            valid = Module.text(hir, text).length > usize.ZERO
+          }
+        }
+        if valid {
+          if let Node.Declaration {body, ..} = Module.node(hir, declared.local) {
+            let hasBody = match Module.node(hir, body) { Node.CallableBody {block} => block.present _ => false }
+            let mut isStatic = false
+            if contract.present {
+              if let Node.CallableContract {isStatic: written, ..} = Module.node(hir, contract.id) { isStatic = written }
+            }
+            run Vector<NamedFunction>.append(&mut inventory.functions, NamedFunction {
+              declaration: run IndexedDeclaration.copy(declared), ordinal: at,
+              span: Module.span(hir, declared.local), headerSpan: Module.span(hir, declared.header),
+              nameSpan: Module.span(hir, name.id), name: name.id, hasBody: hasBody, isStatic: isStatic,
+            })
+          } else { inventory.excludedDamaged = inventory.excludedDamaged + usize.ONE }
+        } else { inventory.excludedDamaged = inventory.excludedDamaged + usize.ONE }
+      }
+      at = at + usize.ONE
+    }
+    return Option<FunctionInventory>.some(move inventory)
+  }
+  /// Reports the source revision this index was built from.
+  pub fn sourceRevision(self: &Self) -> usize {
+    return self.revision
+  }
   /// Borrows all authored declarations in source order, including damaged and nested entries.
   pub fn listDeclarations(self: &Self) -> &[IndexedDeclaration] {
-    return Vector.asSlice<IndexedDeclaration>(&self.declarations)
+    return Vector<IndexedDeclaration>.asSlice(&self.declarations)
+  }
+  /// Returns the logical path of every written import in source order, such as
+  /// `silk/vector.silk`, so a build can read its modules before semantic analysis.
+  ///
+  /// # Details
+  ///
+  /// Imports in every module-level `static if` arm are listed. `Intrinsic` imports and damaged
+  /// paths name no source module and are left out.
+  pub effect fn importPaths(self: &Self, unit: &SourceUnit) -> Vector<Bytes> ! OutOfMemoryError ? &mut Allocator {
+    let hir = &unit.authored
+    let declarations = Vector<IndexedDeclaration>.asSlice(&self.declarations)
+    let mut paths = Vector<Bytes>.make()
+    let mut ordinal = usize.ZERO
+    while ordinal < declarations.length {
+      if let Node.ImportHeader {path, ..} = Module.node(hir, declarations[ordinal].header) {
+        if let Node.Path {segments} = Module.node(hir, path) {
+          let mut joined = Bytes.make()
+          let mut valid = segments.length > usize.ZERO
+          let mut at = usize.ZERO
+          while valid && at < segments.length {
+            if let Node.Name {text} = Module.node(hir, Module.child(hir, segments, at)) {
+              let name = Module.text(hir, text)
+              if at == usize.ZERO && sameBytes(name, b"Intrinsic") {
+                valid = false
+              }
+              if at > usize.ZERO {
+                run Bytes.append(&mut joined, b"/")
+              }
+              run Bytes.append(&mut joined, name)
+            } else {
+              valid = false
+            }
+            at = at + usize.ONE
+          }
+          if valid {
+            run Bytes.append(&mut joined, b".silk")
+            run Vector<Bytes>.append(&mut paths, move joined)
+          }
+        }
+      }
+      ordinal = ordinal + usize.ONE
+    }
+    return move paths
   }
   /// Borrows top-level declaration and import bindings in source order.
   pub fn listCandidates(self: &Self) -> &[Candidate] {
-    return Vector.asSlice<Candidate>(&self.candidates)
+    return Vector<Candidate>.asSlice(&self.candidates)
+  }
+  /// Returns the first candidate in source order spelled `name`, or `usize.MAX` when none is.
+  ///
+  /// # Details
+  ///
+  /// With [`nextCandidateNamed`] this visits exactly the candidates a source-order scan comparing
+  /// names would, in the same order, through the name index.
+  pub fn firstCandidateNamed(self: &Self, name: &[u8]) -> usize {
+    return namedFrom(self, InternIndex.first(&self.candidateNames, nameHash(name)), name)
+  }
+  /// Returns the next candidate in source order spelled like candidate `after`, or `usize.MAX`.
+  pub fn nextCandidateNamed(self: &Self, after: usize) -> usize {
+    let listed = Vector<Candidate>.asSlice(&self.candidates)
+    return namedFrom(self, InternIndex.after(&self.candidateNames, after), Bytes.asSlice(&listed[after].name))
   }
   /// Borrows every same-name syntax collision found during indexing.
   pub fn listCollisions(self: &Self) -> &[Collision] {
-    return Vector.asSlice<Collision>(&self.collisions)
+    return Vector<Collision>.asSlice(&self.collisions)
   }
   /// Indexes all declarations and import bindings in a requested unit without semantic queries.
   ///
@@ -424,14 +941,22 @@ impl ModuleIndex {
   ///
   /// The index retains damaged declarations and complete same-name candidate sets. Import paths
   /// are read as syntax only; this operation never asks a source provider for their targets.
-  pub effect fn build(unit: &SourceUnit) -> ModuleIndex ! OutOfMemoryError ? &mut Allocator {
+  /// With `fingerprinted`, every named declaration also gets its [`Fingerprints`]; only a store
+  /// that a revision may replace compares them (AGENTS.md one-shot rule).
+  pub effect fn build(unit: &SourceUnit, fingerprinted: bool) -> ModuleIndex ! OutOfMemoryError ? &mut Allocator {
     let mut index = ModuleIndex {
-      module: run ModuleId.copy(&unit.id),
+      module: ModuleId.copy(&unit.id),
       revision: unit.revision,
-      declarations: Vector.make<IndexedDeclaration>(),
-      candidates: Vector.make<Candidate>(),
-      collisions: Vector.make<Collision>(),
-      buckets: Vector.make<Bucket>(),
+      declarations: Vector<IndexedDeclaration>.make(),
+      candidates: Vector<Candidate>.make(),
+      collisions: Vector<Collision>.make(),
+      buckets: Vector<Bucket>.make(),
+      identities: InternIndex.make(),
+      siblings: InternIndex.make(),
+      enclosures: InternIndex.make(),
+      locals: InternIndex.make(),
+      candidateNames: InternIndex.make(),
+      bucketNames: InternIndex.make(),
     }
     let module = &unit.authored
     let mut ordinal = usize.ZERO
@@ -440,12 +965,17 @@ impl ModuleIndex {
         &mut index,
         unit,
         Module.child(module, module.declarations, ordinal),
-        Option.none<DeclarationId>(),
+        Option<DeclarationId>.none(),
+        Option<usize>.none(),
+        Option<Arm>.none(),
         true,
       )
       ordinal = ordinal + usize.ONE
     }
     run cacheBuckets(&mut index)
+    if fingerprinted {
+      run fingerprint(&mut index, unit)
+    }
     return move index
   }
   /// Clones the complete preindexed bucket for a written name without allocation.
@@ -455,71 +985,124 @@ impl ModuleIndex {
   /// `None` means the requested spelling has no candidates. This can be called while borrowing a
   /// completed source answer through `Shared.with`; no Effect may escape that borrow.
   pub fn cachedName(self: &Self, name: &[u8]) -> Option<Shared<NameObservation>> {
-    let buckets = Vector.asSlice<Bucket>(&self.buckets)
-    let mut ordinal = usize.ZERO
-    while ordinal < buckets.length {
+    let buckets = Vector<Bucket>.asSlice(&self.buckets)
+    let mut ordinal = InternIndex.first(&self.bucketNames, nameHash(name))
+    while ordinal != usize.MAX {
       if sameBytes(Bytes.asSlice(&buckets[ordinal].name), name) {
-        return Option.some<Shared<NameObservation>>(
-          Shared.clone<NameObservation>(&buckets[ordinal].observation),
+        return Option<Shared<NameObservation>>.some(
+          Shared<NameObservation>.clone(&buckets[ordinal].observation),
         )
       }
-      ordinal = ordinal + usize.ONE
+      ordinal = InternIndex.after(&self.bucketNames, ordinal)
     }
-    return Option.none<Shared<NameObservation>>()
+    return Option<Shared<NameObservation>>.none()
+  }
+  /// Returns the first declaration directly enclosed by the declaration at `parent`, in source
+  /// order, or `usize.MAX` when it encloses none. `parent` `usize.MAX` selects module-level
+  /// declarations. Continue with [`nextEnclosed`].
+  pub fn firstEnclosed(self: &Self, parent: usize) -> usize {
+    return InternIndex.first(&self.enclosures, usize.toU64(parent))
+  }
+  /// Returns the declaration after `ordinal` in source order with the same enclosing declaration,
+  /// or `usize.MAX` after the last.
+  pub fn nextEnclosed(self: &Self, ordinal: usize) -> usize {
+    return InternIndex.after(&self.enclosures, ordinal)
+  }
+  /// Returns the ordinal of the first declaration whose local node has this index.
+  pub fn ordinalAtLocal(self: &Self, local: HirId) -> Option<usize> {
+    let ordinal = InternIndex.first(&self.locals, usize.toU64(local.index))
+    if ordinal == usize.MAX {
+      return Option<usize>.none()
+    }
+    return Option<usize>.some(ordinal)
+  }
+  /// Returns the ordinal of the first authored declaration with exactly this identity.
+  pub fn ordinalOf(self: &Self, identity: &DeclarationId) -> Option<usize> {
+    let declarations = Vector<IndexedDeclaration>.asSlice(&self.declarations)
+    let mut ordinal = InternIndex.first(&self.identities, DeclarationId.hash(identity))
+    while ordinal != usize.MAX {
+      if DeclarationId.equals(&declarations[ordinal].identity, identity) {
+        return Option<usize>.some(ordinal)
+      }
+      ordinal = InternIndex.after(&self.identities, ordinal)
+    }
+    return Option<usize>.none()
   }
   /// Records every candidate for one spelling in this index's module, including an empty bucket.
   pub effect fn observeName(self: &Self, name: &[u8]) -> NameObservation
   ! OutOfMemoryError
   ? &mut Allocator {
-    let mut members = Vector.make<ObservedCandidate>()
-    let candidates = Vector.asSlice<Candidate>(&self.candidates)
-    let declarations = Vector.asSlice<IndexedDeclaration>(&self.declarations)
-    let mut ordinal = usize.ZERO
-    while ordinal < candidates.length {
-      if sameBytes(Bytes.asSlice(&candidates[ordinal].name), name) {
-        let candidate = &candidates[ordinal]
-        run Vector.append<ObservedCandidate>(
-          &mut members,
-          ObservedCandidate {
-            declaration: run DeclarationId.copy(&declarations[candidate.declaration].identity),
-            kind: candidate.kind,
-            ordinal: candidate.ordinal,
-            isPublic: candidate.isPublic,
-          },
-        )
-      }
-      ordinal = ordinal + usize.ONE
+    let mut members = Vector<ObservedCandidate>.make()
+    let candidates = Vector<Candidate>.asSlice(&self.candidates)
+    let declarations = Vector<IndexedDeclaration>.asSlice(&self.declarations)
+    let mut ordinal = ModuleIndex.firstCandidateNamed(self, name)
+    while ordinal != usize.MAX {
+      let candidate = &candidates[ordinal]
+      run Vector<ObservedCandidate>.append(
+        &mut members,
+        ObservedCandidate {
+          declaration: DeclarationId.copy(&declarations[candidate.declaration].identity),
+          kind: candidate.kind,
+          ordinal: candidate.ordinal,
+          isPublic: candidate.isPublic,
+        },
+      )
+      ordinal = ModuleIndex.nextCandidateNamed(self, ordinal)
     }
     return NameObservation {
-      module: run ModuleId.copy(&self.module),
+      module: ModuleId.copy(&self.module),
       name: run Bytes.copy(name),
       members: move members,
     }
   }
-  /// Checks a cross-revision match only when both owner chains are unambiguous and authored content agrees.
+  /// Whether the declaration identity survives a revision, independently of its body content.
+  /// Same-key occurrence identities survive only while every owner's sibling count agrees.
+  pub fn matchesIdentity(self: &Self, left: usize, right: &ModuleIndex, other: usize) -> bool {
+    let before = Vector<IndexedDeclaration>.asSlice(&self.declarations)
+    let after = Vector<IndexedDeclaration>.asSlice(&right.declarations)
+    if left >= before.length || other >= after.length
+      || !DeclarationId.equals(&before[left].identity, &after[other].identity) {
+      return false
+    }
+    let mut owner = left
+    while owner < before.length {
+      let identity = &before[owner].identity
+      let mut oldCount = usize.ZERO
+      let mut newCount = usize.ZERO
+      let mut at = usize.ZERO
+      while at < before.length {
+        if DeclarationId.sameSiblingKey(identity, &before[at].identity) {
+          oldCount = oldCount + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      at = usize.ZERO
+      while at < after.length {
+        if DeclarationId.sameSiblingKey(identity, &after[at].identity) {
+          newCount = newCount + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      if oldCount != newCount {
+        return false
+      }
+      owner = match &before[owner].parent {
+        Option<usize>.Some { value } => value
+        Option<usize>.None => usize.MAX
+      }
+    }
+    return true
+  }
+  /// Whether declaration `left` here and `other` in `right` are one declaration with equal content:
+  /// the same unambiguous identity and equal whole fingerprints.
   ///
   /// # Details
   ///
-  /// This computes fingerprints only for the requested declaration pair. Index construction never
-  /// fingerprints every body.
-  ///
-  /// Invalid declaration ordinals return `false`.
-  pub effect fn matchesDeclaration(
-    self: &Self,
-    leftUnit: &SourceUnit,
-    left: usize,
-    right: &ModuleIndex,
-    rightUnit: &SourceUnit,
-    other: usize,
-  ) -> bool ! OutOfMemoryError ? &mut Allocator {
-    if !ModuleId.equals(&self.module, &leftUnit.id) || self.revision != leftUnit.revision || !ModuleId.equals(
-      &right.module,
-      &rightUnit.id,
-    ) || right.revision != rightUnit.revision {
-      return false
-    }
-    let leftItems = Vector.asSlice<IndexedDeclaration>(&self.declarations)
-    let rightItems = Vector.asSlice<IndexedDeclaration>(&right.declarations)
+  /// Only indexes built with fingerprints can match. Invalid ordinals and anonymous literals,
+  /// which carry no fingerprints, never match.
+  pub fn matchesDeclaration(self: &Self, left: usize, right: &ModuleIndex, other: usize) -> bool {
+    let leftItems = Vector<IndexedDeclaration>.asSlice(&self.declarations)
+    let rightItems = Vector<IndexedDeclaration>.asSlice(&right.declarations)
     if left >= leftItems.length || other >= rightItems.length {
       return false
     }
@@ -531,14 +1114,13 @@ impl ModuleIndex {
     ) {
       return false
     }
-    let firstHeader = run Fingerprint.header(&leftUnit.authored, first.local)
-    let secondHeader = run Fingerprint.header(&rightUnit.authored, second.local)
-    if !sameBytes(Vector.asSlice<u8>(&firstHeader), Vector.asSlice<u8>(&secondHeader)) {
-      return false
+    return match &first.fingerprints {
+      Option<Fingerprints>.Some {value: mine} => match &second.fingerprints {
+        Option<Fingerprints>.Some {value: theirs} => ContentHash.equals(mine.whole, theirs.whole)
+        Option<Fingerprints>.None => false
+      }
+      Option<Fingerprints>.None => false
     }
-    let firstBody = run Fingerprint.body(&leftUnit.authored, first.local)
-    let secondBody = run Fingerprint.body(&rightUnit.authored, second.local)
-    return sameBytes(Vector.asSlice<u8>(&firstBody), Vector.asSlice<u8>(&secondBody))
   }
 }
 
@@ -548,9 +1130,9 @@ impl NameObservation {
   ! OutOfMemoryError
   ? &mut Allocator {
     return NameObservation {
-      module: run ModuleId.copy(id),
+      module: ModuleId.copy(id),
       name: run Bytes.copy(name),
-      members: Vector.make<ObservedCandidate>(),
+      members: Vector<ObservedCandidate>.make(),
     }
   }
   /// Borrows the canonical module identity whose namespace was observed.
@@ -563,7 +1145,7 @@ impl NameObservation {
   }
   /// Borrows the complete candidate set, including an empty set for absence.
   pub fn listMembers(self: &Self) -> &[ObservedCandidate] {
-    return Vector.asSlice<ObservedCandidate>(&self.members)
+    return Vector<ObservedCandidate>.asSlice(&self.members)
   }
   /// Reports whether another complete bucket has the same candidates, including empty membership.
   ///
@@ -578,8 +1160,8 @@ impl NameObservation {
     ) {
       return false
     }
-    let left = Vector.asSlice<ObservedCandidate>(&self.members)
-    let right = Vector.asSlice<ObservedCandidate>(&other.members)
+    let left = Vector<ObservedCandidate>.asSlice(&self.members)
+    let right = Vector<ObservedCandidate>.asSlice(&other.members)
     if left.length != right.length {
       return false
     }
@@ -595,4 +1177,191 @@ impl NameObservation {
     }
     return true
   }
+}
+
+fn copyFingerprints(fingerprints: &Option<Fingerprints>) -> Option<Fingerprints> {
+  return match &fingerprints.* {
+    Option<Fingerprints>.Some {value} => Option<Fingerprints>.some(value)
+    Option<Fingerprints>.None => Option<Fingerprints>.none()
+  }
+}
+
+// Whether `kind` is an anonymous literal, which is analyzed inside its enclosing declaration.
+fn literalOwner(kind: OwnerKind) -> bool {
+  return kind == OwnerKind.Anonymous || kind == OwnerKind.EffectBlock
+}
+
+fn triviaToken(kind: TokenKind) -> bool {
+  return match kind {
+    TokenKind.Whitespace => true
+    TokenKind.LineComment => true
+    TokenKind.DocComment => true
+    TokenKind.ModuleDocComment => true
+    _ => false
+  }
+}
+
+fn holdsLineFeed(source: &[u8], span: Span) -> bool {
+  let mut at = span.start
+  while at < span.end && at < source.length {
+    if source[at] == 10 {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The index of the first token that starts at or after `start`; tokens are in source order.
+fn firstTokenAt(tokens: &[Token], start: usize) -> usize {
+  let mut low = usize.ZERO
+  let mut high = tokens.length
+  while low < high {
+    let middle = low + (high - low) / 2
+    if tokenSpan(tokens[middle]).start < start { low = middle + usize.ONE } else { high = middle }
+  }
+  return low
+}
+
+// Where a declaration's prototype ends: at a function's body block, or with the declaration.
+fn prototypeEnd(module: &Module, local: HirId, own: Span) -> usize {
+  if let Node.Declaration {body, ..} = Module.node(module, local) {
+    if let Node.CallableBody {block} = Module.node(module, body) {
+      if block.present {
+        return Module.span(module, block.id).start
+      }
+    }
+  }
+  return own.end
+}
+
+// Frames a length so that adjacent byte strings stay distinct.
+fn appendLength(stream: &mut ContentStream, length: usize) -> () {
+  let mut remaining = usize.toU64(length)
+  let mut at = usize.ZERO
+  while at < 4 {
+    ContentHash.appendByte(&mut stream.*, u64.toU8(u64.bitAnd(remaining, 255)))
+    remaining = u64.shiftRight(remaining, 8)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// One significant token: whether a line feed precedes it, then its exact text.
+fn appendToken(stream: &mut ContentStream, source: &[u8], span: Span, lineFeed: bool) -> () {
+  let mut marker: u8 = 0
+  if lineFeed {
+    marker = 1
+  }
+  ContentHash.appendByte(&mut stream.*, marker)
+  appendLength(&mut stream.*, span.end - span.start)
+  let mut at = span.start
+  while at < span.end {
+    ContentHash.appendByte(&mut stream.*, source[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// A nested declaration in place of its tokens: its canonical identity content.
+fn appendIdentity(stream: &mut ContentStream, identity: &DeclarationId) -> () {
+  ContentHash.appendByte(&mut stream.*, 2)
+  let length = DeclarationId.withContent<usize>(identity, fn(content: &[u8]) -> usize { return content.length })
+  appendLength(&mut stream.*, length)
+  DeclarationId.withContent<()>(identity, fn(content: &[u8]) -> () {
+    ContentHash.append(&mut stream.*, content)
+    return ()
+  })
+  return ()
+}
+
+// The spans and ordinals of the declarations directly nested in `ordinal` that have their own
+// identity. The index lists a declaration before everything nested in it, in source order.
+effect fn nestedOf(index: &ModuleIndex, module: &Module, ordinal: usize, own: Span) -> Vector<usize>
+! OutOfMemoryError ? &mut Allocator {
+  let declarations = Vector<IndexedDeclaration>.asSlice(&index.declarations)
+  let mut nested = Vector<usize>.make()
+  let mut covered = own.start
+  let mut at = ordinal + usize.ONE
+  while at < declarations.length {
+    let span = Module.span(module, declarations[at].local)
+    if span.start >= own.end {
+      break
+    }
+    if !literalOwner(DeclarationId.kind(&declarations[at].identity)) && span.start >= covered {
+      run Vector<usize>.append(&mut nested, at)
+      covered = span.end
+    }
+    at = at + usize.ONE
+  }
+  return move nested
+}
+
+effect fn fingerprintOf(index: &ModuleIndex, unit: &SourceUnit, ordinal: usize) -> Fingerprints
+! OutOfMemoryError ? &mut Allocator {
+  let module = &unit.authored
+  let declarations = Vector<IndexedDeclaration>.asSlice(&index.declarations)
+  let own = Module.span(module, declarations[ordinal].local)
+  let protoEnd = prototypeEnd(module, declarations[ordinal].local, own)
+  let nestedList = run nestedOf(index, module, ordinal, own)
+  let nested = Vector<usize>.asSlice(&nestedList)
+  let tokens = Vector<Token>.asSlice(&unit.syntax.tokens)
+  let source = Bytes.asSlice(&unit.syntax.source)
+  let mut whole = ContentHash.stream()
+  let mut prototype = ContentHash.stream()
+  let mut lineFeed = false
+  let mut next = usize.ZERO
+  // The nested declaration whose identity was last appended, so each stands in once.
+  let mut emitted = usize.MAX
+  let mut at = firstTokenAt(tokens, own.start)
+  while at < tokens.length {
+    let span = tokenSpan(tokens[at])
+    if span.start >= own.end {
+      break
+    }
+    at = at + usize.ONE
+    if triviaToken(tokenKind(tokens[at - usize.ONE])) {
+      lineFeed = lineFeed || holdsLineFeed(source, span)
+      continue
+    }
+    while next < nested.length && Module.span(module, declarations[nested[next]].local).end <= span.start {
+      next = next + usize.ONE
+    }
+    if next < nested.length {
+      let inner = Module.span(module, declarations[nested[next]].local)
+      if span.start >= inner.start {
+        if emitted != next {
+          appendIdentity(&mut whole, &declarations[nested[next]].identity)
+          if span.start < protoEnd {
+            appendIdentity(&mut prototype, &declarations[nested[next]].identity)
+          }
+          emitted = next
+        }
+        lineFeed = false
+        continue
+      }
+    }
+    appendToken(&mut whole, source, span, lineFeed)
+    if span.start < protoEnd {
+      appendToken(&mut prototype, source, span, lineFeed)
+    }
+    lineFeed = false
+  }
+  return Fingerprints {whole: ContentHash.finish(move whole), prototype: ContentHash.finish(move prototype)}
+}
+
+effect fn fingerprint(index: &mut ModuleIndex, unit: &SourceUnit) -> () ! OutOfMemoryError ? &mut Allocator {
+  let count = Vector<IndexedDeclaration>.length(&index.declarations)
+  let mut ordinal = usize.ZERO
+  while ordinal < count {
+    let declarations = Vector<IndexedDeclaration>.asSlice(&index.declarations)
+    let kind = DeclarationId.kind(&declarations[ordinal].identity)
+    if !literalOwner(kind) {
+      let computed = run fingerprintOf(&index.*, unit, ordinal)
+      let entries = Vector<IndexedDeclaration>.asMutSlice(&mut index.declarations)
+      entries[ordinal].fingerprints = Option<Fingerprints>.some(computed)
+    }
+    ordinal = ordinal + usize.ONE
+  }
+  return ()
 }

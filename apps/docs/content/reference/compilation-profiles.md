@@ -8,7 +8,7 @@ implementation checklist is `openspec/changes/add-structured-compilation-profile
 ## PROFILE-001 — Initial facts and complete profiles
 
 Initial inputs describe a canonical target and logical artifact/build choices. They contain no
-resolved package parameters. The compiler freezes those inputs before discovering schemas. A
+resolved package parameters. The compiler freezes those inputs before resolving registered schemas. A
 complete profile additionally contains every resolved package parameter and its origin. Only a
 complete, validated profile can enter ordinary specialization or backend work. Failed bootstrap
 returns diagnostics and publishes no partial profile.
@@ -55,7 +55,14 @@ The grammar of a package parameter is:
 parameter = ["pub"] "param" identifier ":" type ["=" expression] ["where" expression]
 ```
 
-A parameter is an unconditional module declaration with an explicit concrete type. It is an
+A parameter is an unconditional module declaration with an explicit concrete type. An application
+request explicitly registers the modules whose package parameters participate in its profile.
+Registration uses canonical module identities; importing a module, including through an alias,
+does not register its schemas. A registered module contributes every package parameter it declares,
+even if no source expression reads it. An unregistered parameter cannot be demanded by a default,
+validation expression, or ordinary static helper.
+
+The parameter is an
 immutable static value in ordinary Silk expressions. It cannot be declared inside a function,
 conditional declaration, implementation or type. A public parameter can omit its default, in
 which case an external binding is required. A private parameter requires a default and rejects
@@ -118,7 +125,7 @@ Static Silk cannot inspect environment variables, discover supplies or invoke tr
 ## PROFILE-004 — Bootstrap order and cycles
 
 1. Freeze and validate initial machine and logical artifact/build facts.
-2. Discover unconditional schema headers and unconditional imports; parse all loaded files.
+2. Load explicitly registered modules and their unconditional schema headers; parse those files.
 3. Resolve concrete schema types, including forward type references.
 4. Validate external bindings and precedence, retaining source and request origins.
 5. Resolve each final value on demand through the existing static evaluator. References see other

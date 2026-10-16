@@ -40,8 +40,12 @@ The installed module is registered in the stdlib manifest and generated source c
 HIR source corpora discover stdlib `.silk` files recursively; formatter verification discovers
 tracked `.silk` files. They include this source without a second fixed file inventory.
 
-This source work lands on `main`, passes exact-head CI, and reaches `selfhost` through a main sync.
-It does not remove the native compiler's generated entry. Ordinary plain-i32 source adaptation is
-the separate follow-up [#931](https://github.com/julia-script/silk/issues/931); source selection and
-native adapter removal must wait for both source contracts to be integrated and validated. Native
-suspension and full observer support retain their separate implementation obligations.
+This source work landed on `main` and reached `selfhost` through a main sync. The compiler package
+selects this runtime as its default in `compiler/silk.toml`, so the bootstrap links N0 through it:
+an unhandled failure from the compiler's `main` exits with status 1 and no diagnostic report. The
+native compiler reads the same `[build].composition` selection and roots the build at the
+runtime's C exports, with `Intrinsic.application` bound to the application module. A package
+without a composition takes the standard-library catalog runtime for its target and libc,
+`silk/native_start` on hosted targets; the native compiler has no generated entry. Ordinary plain-i32
+source adaptation is the separate follow-up [#931](https://github.com/julia-script/silk/issues/931).
+Native suspension and full observer support retain their separate implementation obligations.

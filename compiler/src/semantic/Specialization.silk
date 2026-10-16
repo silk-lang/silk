@@ -1,0 +1,1807 @@
+//! Closed semantic applications and finite admission of requested runtime specializations.
+//!
+//! # When to use
+//! A caller first checks a source body against its abstract contract and selects concrete
+//! conformance evidence. Intern the resulting closed application here; then enter each demanded
+//! call path before following it. This module does not discover executable roots or emit code.
+
+import semantic.Types {Types}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {CanonicalizationFailure, Lifetime, Numbering}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.RuntimeEncoding
+import semantic.RuntimeEncoding {Coordinates}
+import semantic.CallableSchema
+import semantic.CallableSchema {CallableSchema as SectionSchema}
+import semantic.CallableWitness
+import semantic.CallableWitness {CallableWitness as WitnessRecipe}
+import silk.bytes {Bytes}
+import silk.hash {Hash}
+import semantic.Query {Cycle}
+import semantic.Semantic {Answer, Outcome, Request, Semantic, Value}
+import semantic.SourceIndex {NoRejection, RevisionMismatch}
+import semantic.StaticValue
+import semantic.StaticValue {Value as StaticData}
+import semantic.Type {Argument, Binding, Row, Type}
+import hir.Hir {Access, OwnerKind}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.pointer {Pointer}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// A concrete function body or a selected interface operation and its exact witness.
+pub union Target {
+  Named {pub declaration: DeclarationId},
+  Operation {
+    pub contract: Shared<Type>,
+    pub provider: Shared<Type>,
+    pub operation: DeclarationId,
+    pub implementation: DeclarationId,
+  },
+}
+
+/// One application after call inference and conformance selection have completed.
+/// Lifetime arguments are retained here for semantic validity and erased only in runtime equality.
+/// A selected instance's application numbers its caller regions canonically ([`Numbering`]).
+pub struct Application {
+  pub target: Target
+  pub arguments: Vector<Argument>
+  /// Original declaration ordinals paired with the own arguments; never compacted or renumbered.
+  pub argumentOrdinals: Vector<usize>
+  /// Supplied enclosing environments in lexical owner order, excluding derived `Self`.
+  /// Each supplied argument is complete. A contract-independent inherent owner slot may be
+  /// absent; it must not be replaced with an arbitrary type or an open argument. Body uses of
+  /// an absent slot remain open and cannot acquire a runtime layout.
+  pub scopes: Vector<ScopeBinding>
+  /// Complete static argument values at the target's original static parameter indices, in
+  /// authored order. A static parameter has no runtime lane, so its value is part of identity.
+  pub statics: Vector<StaticSlot>
+}
+
+/// One static argument value paired with its original parameter index in the target.
+pub struct StaticSlot {
+  pub ordinal: usize
+  pub value: Shared<StaticData>
+}
+
+fn numberingDeclaration(value: &DeclarationId, numbering: &mut Numbering) -> bool {
+  if !Numbering.units(&mut numbering.*, DeclarationId.ownerCount(value)) { return false }
+  return Numbering.bytes(&mut numbering.*, RuntimeEncoding.declarationPayload(value))
+}
+
+effect fn copyStatics(slots: &[StaticSlot]) -> Vector<StaticSlot> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<StaticSlot>.make()
+  let mut at = usize.ZERO
+  while at < slots.length {
+    run Vector<StaticSlot>.append(&mut copied, StaticSlot {ordinal: slots[at].ordinal, value: StaticValue.copy(&slots[at].value)})
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+/// Arguments for one actual enclosing declaration, preserving original binder ownership.
+pub struct ScopeBinding {
+  pub owner: Shared<DeclarationId>
+  pub arguments: Vector<Argument>
+  pub argumentOrdinals: Vector<usize>
+}
+
+/// Positions in this pool's semantic and lifetime-erased runtime identity tables.
+pub struct Identity {
+  pub semantic: usize
+  pub runtime: usize
+}
+
+impl Copy for Identity {}
+
+/// Interns requested applications without discovering any other program roots.
+pub struct Pool {
+  semantic: Vector<Application>
+  runtime: Vector<Application>
+}
+
+/// The active request path. One caller owns the path while visiting its requested callees.
+pub struct Admission {
+  active: Vector<Step>
+}
+
+struct Step {
+  application: Application
+  edge: Edge
+  family: Shared<FamilyProfile>
+}
+
+// A family contains only finite original slots and sets of original executable declarations.
+// Exact types, capture structure and regions remain in the application's identity and guard.
+// In one checked source revision the original body declarations and lexical binder slots are
+// finite; neither specialization-generated identities nor recursive capture paths enter here.
+// Completeness concerns this retained producer/continuation projection, not an enumeration of
+// opaque return bodies or their eventual runtime runners.
+struct FamilyProfile {
+  slots: Vector<FamilySlot>
+  completeness: FamilyCompleteness
+}
+
+struct FamilySlot {
+  owner: Shared<DeclarationId>
+  ordinal: usize
+  kind: FamilyArgumentKind
+  targets: Vector<Shared<DeclarationId>>
+}
+
+enum FamilyArgumentKind { Type, Lifetime, Row }
+enum FamilyCompleteness { Complete, Incomplete }
+
+struct FamilyTargets {
+  targets: Vector<Shared<DeclarationId>>
+  completeness: FamilyCompleteness
+}
+
+union FamilyProducer {
+  Application {value: Shared<Application>},
+  Schema {value: Shared<SectionSchema>},
+  Operation {value: Shared<DeclarationId>},
+  None,
+}
+
+/// A concrete struct field selected and resolved under its owning nominal application.
+pub struct FieldDescent {
+  owner: Shared<Type>
+  field: Shared<Type>
+}
+
+/// Operand transport already validated by the witness header comparison.
+/// This evidence belongs to the call edge, never canonical target identity.
+pub union OperandPass {
+  Value,
+  Borrow {pub access: Access, pub lifetimeOrdinal: usize},
+}
+
+impl Copy for OperandPass {}
+
+/// How a requested application was reached from its parent on the active path.
+pub union Edge {
+  Direct,
+  Witness,
+  FieldWitness {pub field: FieldDescent},
+  /// A Drop hook selected by the cleanup of `owner`, the value a function dropped.
+  Cleanup {pub owner: Shared<Type>},
+}
+
+/// A finite request, a repeated runtime identity, or the exact path that grows recursively.
+pub union Decision {
+  Entered,
+  Reused {pub ancestor: usize},
+  Open,
+  Rejected {pub path: Vector<Application>},
+  /// The nearest active application of the same target differs only in static values. Non-static
+  /// growth was already ruled out; admission needs a finite closure certificate for this edge.
+  ChangingStatic {pub ancestor: usize},
+}
+
+effect fn copyArgument(value: &Argument) -> Argument ! OutOfMemoryError ? &mut Allocator {
+  return match & value.* {
+    Argument.Type {value: ty} => Argument.Type {value: Shared<Type>.clone(&ty)}
+    Argument.Lifetime {value: lifetime} => Argument.Lifetime {
+      value: Shared<Lifetime>.clone(&lifetime),
+    }
+    Argument.Row {value: row} => Argument.Row {value: Shared<Row>.clone(&row)}
+  }
+}
+
+effect fn copyOrdinals(values: &[usize]) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Vector<usize>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run Vector<usize>.append(&mut output, values[at])
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+effect fn copyArguments(values: &[Argument]) -> Vector<Argument> ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Vector<Argument>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run Vector<Argument>.append(&mut output, run copyArgument(&values[at]))
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+impl ScopeBinding {
+  pub effect fn copy(self: &Self) -> ScopeBinding ! OutOfMemoryError ? &mut Allocator {
+    return ScopeBinding {owner: Shared<DeclarationId>.clone(&self.owner),
+      arguments: run copyArguments(Vector<Argument>.asSlice(&self.arguments)),
+      argumentOrdinals: run copyOrdinals(Vector<usize>.asSlice(&self.argumentOrdinals))}
+  }
+}
+
+fn sameOwner(left: &Shared<DeclarationId>, right: &Shared<DeclarationId>) -> bool {
+  let first = Shared<DeclarationId>.with<usize>(left, fn(id: &DeclarationId) -> usize {
+    return Pointer.address<DeclarationId>(Pointer.fromRef<DeclarationId>(id))
+  })
+  let second = Shared<DeclarationId>.with<usize>(right, fn(id: &DeclarationId) -> usize {
+    return Pointer.address<DeclarationId>(Pointer.fromRef<DeclarationId>(id))
+  })
+  if first == second { return true }
+  return Shared<DeclarationId>.with<bool>(left, fn(id: &DeclarationId) -> bool { return sameOwnerRight(id, right) })
+}
+
+fn sameOwnerRight(left: &DeclarationId, right: &Shared<DeclarationId>) -> bool {
+  return Shared<DeclarationId>.with<bool>(right, fn(other: &DeclarationId) -> bool { return DeclarationId.equals(left, other) })
+}
+
+fn sameOrdinals(left: &[usize], right: &[usize]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn ordered(ordinals: &[usize], count: usize) -> bool {
+  if ordinals.length != count { return false }
+  let mut at = usize.ONE
+  while at < ordinals.length {
+    if ordinals[at - usize.ONE] >= ordinals[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn copyApplication(value: &Application) -> Application ! OutOfMemoryError ? &mut Allocator {
+  let target = match & value.target {
+    Target.Named {declaration} => Target.Named {declaration: DeclarationId.copy(&declaration)}
+    Target.Operation {contract, provider, operation, implementation} => Target.Operation {
+      contract: Shared<Type>.clone(&contract),
+      provider: Shared<Type>.clone(&provider),
+      operation: DeclarationId.copy(&operation),
+      implementation: DeclarationId.copy(&implementation),
+    }
+  }
+  let mut arguments = Vector<Argument>.make()
+  let listed = Vector<Argument>.asSlice(&value.arguments)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Vector<Argument>.append(&mut arguments, run copyArgument(&listed[at]))
+    at = at + usize.ONE
+  }
+  let mut scopes = Vector<ScopeBinding>.make()
+  let enclosing = Vector<ScopeBinding>.asSlice(&value.scopes)
+  at = usize.ZERO
+  while at < enclosing.length {
+    run Vector<ScopeBinding>.append(&mut scopes, run ScopeBinding.copy(&enclosing[at]))
+    at = at + usize.ONE
+  }
+  return Application {target: move target, arguments: move arguments,
+    argumentOrdinals: run copyOrdinals(Vector<usize>.asSlice(&value.argumentOrdinals)), scopes: move scopes,
+    statics: run copyStatics(Vector<StaticSlot>.asSlice(&value.statics))}
+}
+
+fn closedArgument(value: &Argument) -> bool {
+  return match & value.* {
+    Argument.Type {value: ty} => !Type.hasOpenRuntimeParameters(&ty)
+    Argument.Lifetime {..} => true
+    Argument.Row {value: row} => !Row.hasOpenRuntimeParameters(&row)
+  }
+}
+
+fn closed(value: &Application) -> bool {
+  if let Target.Operation {contract, provider, ..} = &value.target {
+    if Type.hasOpenRuntimeParameters(&contract) || Type.hasOpenRuntimeParameters(&provider) {
+      return false
+    }
+  }
+  let arguments = Vector<Argument>.asSlice(&value.arguments)
+  if !ordered(Vector<usize>.asSlice(&value.argumentOrdinals), arguments.length) { return false }
+  let statics = Vector<StaticSlot>.asSlice(&value.statics)
+  let mut staticAt = usize.ONE
+  while staticAt < statics.length {
+    if statics[staticAt - usize.ONE].ordinal >= statics[staticAt].ordinal { return false }
+    staticAt = staticAt + usize.ONE
+  }
+  let scopes = Vector<ScopeBinding>.asSlice(&value.scopes)
+  let mut scopeAt = usize.ZERO
+  while scopeAt < scopes.length {
+    let owner = &scopes[scopeAt].owner
+    if Shared<DeclarationId>.with<bool>(owner, fn(id: &DeclarationId) -> bool {
+      return DeclarationId.equals(id, body(value))
+    }) { return false }
+    let mut before = usize.ZERO
+    while before < scopeAt {
+      if sameOwner(owner, &scopes[before].owner) { return false }
+      before = before + usize.ONE
+    }
+    let given = Vector<Argument>.asSlice(&scopes[scopeAt].arguments)
+    if given.length == usize.ZERO || !ordered(Vector<usize>.asSlice(&scopes[scopeAt].argumentOrdinals), given.length) { return false }
+    let mut index = usize.ZERO
+    while index < given.length {
+      if !closedArgument(&given[index]) { return false }
+      index = index + usize.ONE
+    }
+    scopeAt = scopeAt + usize.ONE
+  }
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    if !closedArgument(&arguments[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn body(value: &Application) -> &DeclarationId {
+  return match & value.target {
+    Target.Named {declaration} => &declaration
+    Target.Operation {implementation, ..} => &implementation
+  }
+}
+
+effect fn sameType(left: &Shared<Type>, right: &Shared<Type>, runtime: bool) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if runtime {
+    return run Type.runtimeEqualsShared(left, right)
+  }
+  return run Type.equalsShared(left, right)
+}
+
+effect fn sameArgument(left: &Argument, right: &Argument, runtime: bool) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  return match & left.* {
+    Argument.Type {value} => match & right.* {
+      Argument.Type {value: compared} => run sameType(&value, &compared, runtime)
+      _ => false
+    }
+    Argument.Lifetime {value} => match & right.* {
+      Argument.Lifetime {value: compared} => runtime || Lifetime.equalsShared(&value, &compared)
+      _ => false
+    }
+    Argument.Row {value} => match & right.* {
+      Argument.Row {value: compared} => {
+        if runtime {
+          return run Row.runtimeEqualsShared(&value, &compared)
+        }
+        return run Row.equalsShared(&value, &compared)
+      }
+      _ => false
+    }
+  }
+}
+
+effect fn sameTarget(left: &Target, right: &Target, runtime: bool) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  return match & left.* {
+    Target.Named {declaration} => match & right.* {
+      Target.Named {declaration: compared} => DeclarationId.equals(&declaration, &compared)
+      _ => false
+    }
+    Target.Operation {contract, provider, operation, implementation} => match & right.* {
+      Target.Operation {
+        contract: otherContract,
+        provider: otherProvider,
+        operation: otherOperation,
+        implementation: otherImplementation,
+      } => {
+        if !DeclarationId.equals(&operation, &otherOperation) || !DeclarationId.equals(
+          &implementation,
+          &otherImplementation,
+        ) {
+          return false
+        }
+        if !run sameType(&contract, &otherContract, runtime) {
+          return false
+        }
+        return run sameType(&provider, &otherProvider, runtime)
+      }
+      _ => false
+    }
+  }
+}
+
+fn applicationArgumentCount(value: &Application) -> usize {
+  let mut count = Vector<Argument>.length(&value.arguments)
+  let scopes = Vector<ScopeBinding>.asSlice(&value.scopes)
+  let mut at = usize.ZERO
+  while at < scopes.length { count = count + Vector<Argument>.length(&scopes[at].arguments) at = at + usize.ONE }
+  return count
+}
+
+fn applicationArgumentAt(value: &Application, at: usize) -> Option<Argument> {
+  let own = Vector<Argument>.asSlice(&value.arguments)
+  if at < own.length { return Option<Argument>.some(Argument.copy(&own[at])) }
+  let mut position = at - own.length
+  let scopes = Vector<ScopeBinding>.asSlice(&value.scopes)
+  let mut scopeAt = usize.ZERO
+  while scopeAt < scopes.length {
+    let supplied = Vector<Argument>.asSlice(&scopes[scopeAt].arguments)
+    if position < supplied.length { return Option<Argument>.some(Argument.copy(&supplied[position])) }
+    position = position - supplied.length
+    scopeAt = scopeAt + usize.ONE
+  }
+  return Option<Argument>.none()
+}
+
+fn argumentKind(value: &Argument) -> usize {
+  return match &value.* {
+    Argument.Type {..} => usize.ZERO
+    Argument.Lifetime {..} => usize.ONE
+    Argument.Row {..} => 2
+  }
+}
+
+fn argumentHash(value: &Argument) -> u64 {
+  return match &value.* {
+    Argument.Type {value: ty} => Type.hash(&ty)
+    _ => usize.toU64(argumentKind(value))
+  }
+}
+
+fn sameArgumentKinds(left: &[Argument], right: &[Argument]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if argumentKind(&left[at]) != argumentKind(&right[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameApplicationShape(left: &Application, right: &Application) -> bool {
+  let target = match &left.target {
+    Target.Named {declaration} => match &right.target {
+      Target.Named {declaration: other} => DeclarationId.equals(&declaration, &other) _ => false }
+    Target.Operation {operation, implementation, ..} => match &right.target {
+      Target.Operation {operation: other, implementation: selected, ..} =>
+        DeclarationId.equals(&operation, &other) && DeclarationId.equals(&implementation, &selected) _ => false }
+  }
+  if !target || !sameOrdinals(Vector<usize>.asSlice(&left.argumentOrdinals), Vector<usize>.asSlice(&right.argumentOrdinals))
+    || !sameArgumentKinds(Vector<Argument>.asSlice(&left.arguments), Vector<Argument>.asSlice(&right.arguments)) { return false }
+  let scopes = Vector<ScopeBinding>.asSlice(&left.scopes)
+  let other = Vector<ScopeBinding>.asSlice(&right.scopes)
+  if scopes.length != other.length { return false }
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    if !sameOwner(&scopes[at].owner, &other[at].owner)
+      || !sameOrdinals(Vector<usize>.asSlice(&scopes[at].argumentOrdinals), Vector<usize>.asSlice(&other[at].argumentOrdinals))
+      || !sameArgumentKinds(Vector<Argument>.asSlice(&scopes[at].arguments), Vector<Argument>.asSlice(&other[at].arguments)) { return false }
+    at = at + usize.ONE
+  }
+  let statics = Vector<StaticSlot>.asSlice(&left.statics)
+  let values = Vector<StaticSlot>.asSlice(&right.statics)
+  if statics.length != values.length { return false }
+  at = usize.ZERO
+  while at < statics.length {
+    if statics[at].ordinal != values[at].ordinal { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn sameApplicationStatics(left: &Application, right: &Application) -> bool
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let first = Vector<StaticSlot>.asSlice(&left.statics)
+  let second = Vector<StaticSlot>.asSlice(&right.statics)
+  if first.length != second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at].ordinal != second[at].ordinal || !run StaticValue.equals(&first[at].value, &second[at].value) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn sameApplication(left: &Application, right: &Application, runtime: bool) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if runtime {
+    let first = run Application.runtime(left)
+    let second = run Application.runtime(right)
+    return RuntimeEncoding.equals(Bytes.asSlice(&first), Bytes.asSlice(&second))
+  }
+  if !run sameTarget(&left.target, &right.target, runtime) {
+    return false
+  }
+  if !sameOrdinals(Vector<usize>.asSlice(&left.argumentOrdinals), Vector<usize>.asSlice(&right.argumentOrdinals)) { return false }
+  if !run sameApplicationStatics(left, right) { return false }
+  let scopes = Vector<ScopeBinding>.asSlice(&left.scopes)
+  let compared = Vector<ScopeBinding>.asSlice(&right.scopes)
+  if scopes.length != compared.length { return false }
+  let mut scopeAt = usize.ZERO
+  while scopeAt < scopes.length {
+    if !sameOwner(&scopes[scopeAt].owner, &compared[scopeAt].owner) || !sameOrdinals(
+      Vector<usize>.asSlice(&scopes[scopeAt].argumentOrdinals), Vector<usize>.asSlice(&compared[scopeAt].argumentOrdinals)) { return false }
+    let given = Vector<Argument>.asSlice(&scopes[scopeAt].arguments)
+    let other = Vector<Argument>.asSlice(&compared[scopeAt].arguments)
+    if given.length != other.length { return false }
+    let mut index = usize.ZERO
+    while index < given.length {
+      if !run sameArgument(&given[index], &other[index], runtime) { return false }
+      index = index + usize.ONE
+    }
+    scopeAt = scopeAt + usize.ONE
+  }
+  let first = Vector<Argument>.asSlice(&left.arguments)
+  let second = Vector<Argument>.asSlice(&right.arguments)
+  if first.length != second.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if !run sameArgument(&first[at], &second[at], runtime) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether two applications of one target are runtime-equal apart from their static values.
+effect fn sameExceptStatics(left: &Application, right: &Application) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let mut first = run copyApplication(left)
+  let mut second = run copyApplication(right)
+  first.statics = Vector<StaticSlot>.make()
+  second.statics = Vector<StaticSlot>.make()
+  return run sameApplication(&first, &second, true)
+}
+
+fn opaqueEffect(value: &Type) -> bool {
+  return match & value.* {
+    Type.OpaqueRepresentation {contract, ..} => Shared<Type>.with<bool>(
+      &contract,
+      fn(typeContract: &Type) -> bool {
+        return match & typeContract.* {
+          Type.Effect {..} => true
+          _ => false
+        }
+      },
+    )
+    _ => false
+  }
+}
+
+fn selectedField(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
+  return match & answer.* {
+    Result<Answer, NoRejection>.Success {value} => match & value.outcome {
+      Outcome.Success {value: Value.MemberShape {types}} => {
+        let selected = Vector<Shared<Type>>.asSlice(&types)
+        if selected.length == usize.ONE {
+          return Option<Shared<Type>>.some(Shared<Type>.clone(&selected[0]))
+        }
+        return Option<Shared<Type>>.none()
+      }
+      _ => Option<Shared<Type>>.none()
+    }
+    Result<Answer, NoRejection>.Failure {error: _} => Option<Shared<Type>>.none()
+  }
+}
+
+fn witnesses(edge: &Edge) -> bool {
+  return match & edge.* {
+    Edge.Direct => false
+    Edge.Witness => true
+    Edge.FieldWitness {..} => true
+    Edge.Cleanup {..} => false
+  }
+}
+
+effect fn provesField(edge: &Edge, outer: &Shared<Type>, inner: &Shared<Type>) -> bool
+! OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if let Edge.FieldWitness {field} = &edge.* {
+    if !run Type.runtimeEqualsShared(outer, &field.owner) {
+      return false
+    }
+    if run Type.runtimeEqualsShared(outer, inner) {
+      return false
+    }
+    if run Type.runtimeEqualsShared(inner, &field.field) {
+      return true
+    }
+    return run Type.strictRuntimeSubterm(inner, &field.field)
+  }
+  return false
+}
+
+effect fn fieldOnPath(
+  active: &[Step],
+  ancestor: usize,
+  edge: &Edge,
+  outer: &Shared<Type>,
+  inner: &Shared<Type>,
+) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if run provesField(edge, outer, inner) {
+    return true
+  }
+  let mut at = ancestor + usize.ONE
+  while at < active.length {
+    if run provesField(&active[at].edge, outer, inner) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// A concrete witness may move through a bounded helper to a strictly smaller structural type.
+// Other type arguments must stay fixed or descend; hidden Effect families may change when some
+// concrete argument strictly descends. Rows and exact named representations never grant descent.
+effect fn witnessDescent(
+  ancestor: &Application,
+  requested: &Application,
+  active: &[Step],
+  ancestorAt: usize,
+  edge: &Edge,
+) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let ancestorBindings = run Application.bindings(ancestor)
+  let requestedBindings = run Application.bindings(requested)
+  let first = Vector<Binding>.asSlice(&ancestorBindings)
+  let second = Vector<Binding>.asSlice(&requestedBindings)
+  if first.length != second.length {
+    return false
+  }
+  let mut strict = false
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at].ordinal != second[at].ordinal || !sameOwner(&first[at].declaration, &second[at].declaration) { return false }
+    if run sameArgument(&first[at].value, &second[at].value, true) {
+      at = at + usize.ONE
+      continue
+    }
+    if let Argument.Type {value: outer} = &first[at].value {
+      if let Argument.Type {value: inner} = &second[at].value {
+        if run Type.strictRuntimeSubterm(&inner, &outer) {
+          strict = true
+          at = at + usize.ONE
+          continue
+        }
+        if run fieldOnPath(active, ancestorAt, edge, &outer, &inner) {
+          strict = true
+          at = at + usize.ONE
+          continue
+        }
+        if Shared<Type>.with<bool>(&outer, opaqueEffect) && Shared<Type>.with<bool>(
+          &inner,
+          opaqueEffect,
+        ) {
+          at = at + usize.ONE
+          continue
+        }
+      }
+    }
+    return false
+  }
+  return strict
+}
+
+// Every runtime type argument, paired by declaration ordinal, is concrete and no larger than the
+// ancestor's; every other argument is unchanged. Rows never grant descent.
+effect fn nonGrowing(ancestor: &Application, requested: &Application) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let ancestorBindings = run Application.bindings(ancestor)
+  let requestedBindings = run Application.bindings(requested)
+  let first = Vector<Binding>.asSlice(&ancestorBindings)
+  let second = Vector<Binding>.asSlice(&requestedBindings)
+  if first.length != second.length || first.length == usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at].ordinal != second[at].ordinal || !sameOwner(&first[at].declaration, &second[at].declaration) { return false }
+    if !run sameArgument(&first[at].value, &second[at].value, true) {
+      if let Argument.Type {value: outer} = &first[at].value {
+        if let Argument.Type {value: inner} = &second[at].value {
+          if Type.hasOpenRuntimeParameters(&outer) || Type.hasOpenRuntimeParameters(&inner) { return false }
+          if Type.runtimeSize(&inner) > Type.runtimeSize(&outer) { return false }
+        } else { return false }
+      } else { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether the exact runtime application is already active on the path.
+effect fn activeAnywhere(active: &[Step], application: &Application) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut at = usize.ZERO
+  while at < active.length {
+    if run sameApplication(&active[at].application, application, true) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+struct OperationInputs {
+  contract: Shared<Type>
+  provider: Shared<Type>
+}
+
+struct ScopeInputs {
+  owner: Shared<DeclarationId>
+  count: usize
+}
+
+fn failedNumberingApplication(numbering: &Numbering) -> Result<Application, CanonicalizationFailure> {
+  let reason = match move Numbering.failure(numbering) {
+    Option<CanonicalizationFailure>.Some {value} => value
+    _ => CanonicalizationFailure.UncollectedAtom
+  }
+  return Result<Application, CanonicalizationFailure>.failResult(reason)
+}
+
+impl Application {
+  /// Copies the original body declaration; the copy shares the declaration's record.
+  pub fn copyBodyDeclaration(source: &Shared<Application>) -> DeclarationId {
+    let copied = copyApplicationDeclaration(source, false)
+    return match move copied {
+      Option<DeclarationId>.Some {value} => move value
+      _ => absurd<DeclarationId>()
+    }
+  }
+  /// Copies the complete application using scalar/shared reads under short borrows.
+  pub effect fn copyShared(source: &Shared<Application>) -> Application ! OutOfMemoryError ? &mut Allocator {
+    let copiedDeclaration = copyApplicationDeclaration(source, false)
+    let copiedBody = match move copiedDeclaration {
+      Option<DeclarationId>.Some {value} => move value
+      _ => { return absurd<Application>() }
+    }
+    let selectedOperation = copyApplicationDeclaration(source, true)
+    let mut target = Target.Named {declaration: move copiedBody}
+    if let Option<DeclarationId>.Some {value: operation} = move selectedOperation {
+      let inputs = Shared<Application>.with<Option<OperationInputs>>(source, fn(value: &Application) -> Option<OperationInputs> {
+        return match &value.target {
+          Target.Operation {contract, provider, ..} => Option<OperationInputs>.some(OperationInputs {contract: Shared<Type>.clone(&contract), provider: Shared<Type>.clone(&provider)})
+          _ => Option<OperationInputs>.none()
+        }
+      })
+      let bodyOwner = match move target { Target.Named {declaration} => move declaration _ => { return absurd<Application>() } }
+      let found = match move inputs { Option<OperationInputs>.Some {value} => move value _ => { return absurd<Application>() } }
+      target = Target.Operation {contract: move found.contract, provider: move found.provider, operation: move operation, implementation: move bodyOwner}
+    }
+    let count = Shared<Application>.with<usize>(source, fn(value: &Application) -> usize { return Vector<Argument>.length(&value.arguments) })
+    let mut arguments = Vector<Argument>.make()
+    let mut ordinals = Vector<usize>.make()
+    let mut at = usize.ZERO
+    while at < count {
+      let value = Shared<Application>.with<Argument>(source, fn(value: &Application) -> Argument { let given = Vector<Argument>.asSlice(&value.arguments)
+        return Argument.copy(&given[at]) })
+      let ordinal = Shared<Application>.with<usize>(source, fn(value: &Application) -> usize { return Vector<usize>.asSlice(&value.argumentOrdinals)[at] })
+      run Vector<Argument>.append(&mut arguments, move value)
+      run Vector<usize>.append(&mut ordinals, ordinal)
+      at = at + usize.ONE
+    }
+    let scopeCount = Shared<Application>.with<usize>(source, fn(value: &Application) -> usize { return Vector<ScopeBinding>.length(&value.scopes) })
+    let mut scopes = Vector<ScopeBinding>.make()
+    at = usize.ZERO
+    while at < scopeCount {
+      let info = Shared<Application>.with<ScopeInputs>(source, fn(value: &Application) -> ScopeInputs {
+        let listed = Vector<ScopeBinding>.asSlice(&value.scopes)
+        let scope = &listed[at]
+        return ScopeInputs {owner: Shared<DeclarationId>.clone(&scope.owner), count: Vector<Argument>.length(&scope.arguments)}
+      })
+      let mut values = Vector<Argument>.make()
+      let mut slots = Vector<usize>.make()
+      let mut index = usize.ZERO
+      while index < info.count {
+        let value = Shared<Application>.with<Argument>(source, fn(value: &Application) -> Argument {
+          let listed = Vector<ScopeBinding>.asSlice(&value.scopes)
+          let scope = &listed[at]
+          let given = Vector<Argument>.asSlice(&scope.arguments)
+          return Argument.copy(&given[index])
+        })
+        let ordinal = Shared<Application>.with<usize>(source, fn(value: &Application) -> usize {
+          let listed = Vector<ScopeBinding>.asSlice(&value.scopes)
+          let scope = &listed[at]
+          return Vector<usize>.asSlice(&scope.argumentOrdinals)[index]
+        })
+        run Vector<Argument>.append(&mut values, move value)
+        run Vector<usize>.append(&mut slots, ordinal)
+        index = index + usize.ONE
+      }
+      run Vector<ScopeBinding>.append(&mut scopes, ScopeBinding {owner: move info.owner, arguments: move values, argumentOrdinals: move slots})
+      at = at + usize.ONE
+    }
+    let staticCount = Shared<Application>.with<usize>(source, fn(value: &Application) -> usize { return Vector<StaticSlot>.length(&value.statics) })
+    let mut statics = Vector<StaticSlot>.make()
+    at = usize.ZERO
+    while at < staticCount {
+      let slot = Shared<Application>.with<StaticSlot>(source, fn(value: &Application) -> StaticSlot {
+        let listed = Vector<StaticSlot>.asSlice(&value.statics)
+        return StaticSlot {ordinal: listed[at].ordinal, value: StaticValue.copy(&listed[at].value)}
+      })
+      run Vector<StaticSlot>.append(&mut statics, move slot)
+      at = at + usize.ONE
+    }
+    return Application {target: move target, arguments: move arguments, argumentOrdinals: move ordinals, scopes: move scopes, statics: move statics}
+  }
+  /// Counts free own and enclosing arguments in semantic traversal order, including phantom inputs.
+  pub fn argumentCount(self: &Self) -> usize { return applicationArgumentCount(self) }
+  /// Reads one free own or enclosing argument without borrowing the application.
+  pub fn argumentAt(self: &Self, at: usize) -> Option<Argument> { return applicationArgumentAt(self, at) }
+  /// Compares declaration, slot and argument-kind structure before binder-aware evidence comparison.
+  pub fn sameShape(left: &Self, right: &Self) -> bool { return sameApplicationShape(left, right) }
+  /// Compares selected static payloads after application/type borrows have been released.
+  pub effect fn staticEquals(left: &Self, right: &Self) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    return run sameApplicationStatics(left, right)
+  }
+  /// Number of semantic type positions: argument slots followed by operation contract/provider.
+  pub fn typeCount(self: &Self) -> usize {
+    let count = applicationArgumentCount(self)
+    return match &self.target { Target.Operation {..} => count + 2 _ => count }
+  }
+  /// Type evidence at one semantic position; lifetime and row argument positions have no type.
+  pub fn typeAt(self: &Self, at: usize) -> Option<Shared<Type>> {
+    let count = applicationArgumentCount(self)
+    if at < count {
+      let selected = applicationArgumentAt(self, at)
+      if let Option<Argument>.Some {value: Argument.Type {value}} = move selected {
+        return Option<Shared<Type>>.some(move value)
+      }
+      return Option<Shared<Type>>.none()
+    }
+    if let Target.Operation {contract, provider, ..} = &self.target {
+      if at == count { return Option<Shared<Type>>.some(Shared<Type>.clone(&contract)) }
+      if at == count + usize.ONE { return Option<Shared<Type>>.some(Shared<Type>.clone(&provider)) }
+    }
+    return Option<Shared<Type>>.none()
+  }
+  /// Copies one selected application without changing its semantic arguments.
+  pub effect fn copy(self: &Self) -> Application ! OutOfMemoryError ? &mut Allocator {
+    return run copyApplication(self)
+  }
+  /// One exact canonical projection shared by backend equality, interning, symbols and admission.
+  /// All validity lifetimes are erased; union and requirement-row members have canonical order.
+  pub effect fn runtime(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut coordinates = RuntimeEncoding.coordinates()
+    return run Application.encoding(self, false, &mut coordinates)
+  }
+  pub effect fn encoding(self: &Self, exact: bool, coordinates: &mut Coordinates) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    if coordinates.exceeded { return Bytes.make() }
+    let mut output = Bytes.make()
+    let owner = Application.bodyDeclaration(self)
+    match & self.target {
+      Target.Named {declaration} => {
+        run RuntimeEncoding.recordWord(&mut output, 0, &mut coordinates.*)
+        run RuntimeEncoding.recordDeclaration(&mut output, &declaration, &mut coordinates.*)
+      }
+      Target.Operation {contract, provider, operation, implementation} => {
+        run RuntimeEncoding.recordWord(&mut output, 1, &mut coordinates.*)
+        run RuntimeEncoding.recordDeclaration(&mut output, &operation, &mut coordinates.*)
+        run RuntimeEncoding.recordDeclaration(&mut output, &implementation, &mut coordinates.*)
+        let contractBytes = run Type.encoding(&contract, owner, exact, &mut coordinates.*)
+        let providerBytes = run Type.encoding(&provider, owner, exact, &mut coordinates.*)
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&contractBytes), &mut coordinates.*)
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&providerBytes), &mut coordinates.*)
+      }
+    }
+    let listed = Vector<Argument>.asSlice(&self.arguments)
+    let ordinals = Vector<usize>.asSlice(&self.argumentOrdinals)
+    run RuntimeEncoding.recordWord(&mut output, usize.toU64(listed.length), &mut coordinates.*)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run RuntimeEncoding.recordWord(&mut output, usize.toU64(ordinals[at]), &mut coordinates.*)
+      let encoding = run Argument.encoding(&listed[at], owner, exact, &mut coordinates.*)
+      run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&encoding), &mut coordinates.*)
+      at = at + usize.ONE
+    }
+    let scopes = Vector<ScopeBinding>.asSlice(&self.scopes)
+    run RuntimeEncoding.recordWord(&mut output, usize.toU64(scopes.length), &mut coordinates.*)
+    at = usize.ZERO
+    while at < scopes.length {
+      let affordable = Shared<DeclarationId>.with<bool>(&scopes[at].owner,
+        fn(identity: &DeclarationId) -> bool { return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(identity)) })
+      if !affordable { return Bytes.make() }
+      let scopeOwner = DeclarationId.copyShared(&scopes[at].owner)
+      run RuntimeEncoding.recordDeclaration(&mut output, &scopeOwner, &mut coordinates.*)
+      let values = Vector<Argument>.asSlice(&scopes[at].arguments)
+      let slots = Vector<usize>.asSlice(&scopes[at].argumentOrdinals)
+      run RuntimeEncoding.recordWord(&mut output, usize.toU64(values.length), &mut coordinates.*)
+      let mut index = usize.ZERO
+      while index < values.length {
+        run RuntimeEncoding.recordWord(&mut output, usize.toU64(slots[index]), &mut coordinates.*)
+        let encoding = run Argument.encoding(&values[index], &scopeOwner, exact, &mut coordinates.*)
+        run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&encoding), &mut coordinates.*)
+        index = index + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    // Static values have no runtime lane, so every one is part of the runtime instance identity.
+    let statics = Vector<StaticSlot>.asSlice(&self.statics)
+    run RuntimeEncoding.recordWord(&mut output, usize.toU64(statics.length), &mut coordinates.*)
+    at = usize.ZERO
+    while at < statics.length {
+      run RuntimeEncoding.recordWord(&mut output, usize.toU64(statics[at].ordinal), &mut coordinates.*)
+      let encoding = run StaticValue.encoding(&statics[at].value, owner, exact, &mut coordinates.*)
+      run RuntimeEncoding.recordField(&mut output, Bytes.asSlice(&encoding), &mut coordinates.*)
+      at = at + usize.ONE
+    }
+    return move output
+  }
+  /// Replaces arguments written in a caller's abstract binders with that caller's instance inputs.
+  pub effect fn substitute(self: &Self, caller: &Application) -> Application
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let bindings = run Application.bindings(caller)
+    return run Application.applyBindings(self, Vector<Binding>.asSlice(&bindings))
+  }
+  /// Applies recorded owner-qualified evidence simultaneously to own and enclosing inputs.
+  pub effect fn applyBindings(self: &Self, given: &[Binding]) -> Application
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let target = match &self.target {
+      Target.Operation {contract, provider, operation, implementation} => Target.Operation {
+        contract: run Type.applyBindings(&contract, given, true),
+        provider: run Type.applyBindings(&provider, given, true),
+        operation: DeclarationId.copy(&operation), implementation: DeclarationId.copy(&implementation),
+      }
+      Target.Named {declaration} => Target.Named {declaration: DeclarationId.copy(&declaration)}
+    }
+    let mut arguments = Vector<Argument>.make()
+    let own = Vector<Argument>.asSlice(&self.arguments)
+    let mut at = usize.ZERO
+    while at < own.length {
+      run Vector<Argument>.append(&mut arguments, run Argument.applyBindings(&own[at], given, true))
+      at = at + usize.ONE
+    }
+    let mut scopes = Vector<ScopeBinding>.make()
+    let enclosing = Vector<ScopeBinding>.asSlice(&self.scopes)
+    at = usize.ZERO
+    while at < enclosing.length {
+      let mut values = Vector<Argument>.make()
+      let previous = Vector<Argument>.asSlice(&enclosing[at].arguments)
+      let mut index = usize.ZERO
+      while index < previous.length {
+        run Vector<Argument>.append(&mut values, run Argument.applyBindings(&previous[index], given, true))
+        index = index + usize.ONE
+      }
+      run Vector<ScopeBinding>.append(&mut scopes, ScopeBinding {owner: Shared<DeclarationId>.clone(&enclosing[at].owner), arguments: move values,
+        argumentOrdinals: run copyOrdinals(Vector<usize>.asSlice(&enclosing[at].argumentOrdinals))})
+      at = at + usize.ONE
+    }
+    return Application {target: move target, arguments: move arguments,
+      argumentOrdinals: run copyOrdinals(Vector<usize>.asSlice(&self.argumentOrdinals)), scopes: move scopes,
+      statics: run copyStatics(Vector<StaticSlot>.asSlice(&self.statics))}
+  }
+  /// Charges copied declaration payloads before exact-record encoders snapshot an application.
+  pub fn copiedPayloadFits(self: &Self, coordinates: &mut Coordinates) -> bool {
+    if !RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(body(self))) { return false }
+    if let Target.Operation {operation, ..} = &self.target {
+      return RuntimeEncoding.recordPayload(&mut coordinates.*, RuntimeEncoding.declarationPayload(&operation))
+    }
+    return true
+  }
+  /// Charges local metadata before copying it; graph children have their own node/edge costs.
+  pub fn numberingCost(self: &Self, numbering: &mut Numbering) -> bool {
+    if !Numbering.units(&mut numbering.*, Vector<Argument>.length(&self.arguments)) { return false }
+    if !Numbering.units(&mut numbering.*, Vector<usize>.length(&self.argumentOrdinals)) { return false }
+    if !Numbering.units(&mut numbering.*, Vector<ScopeBinding>.length(&self.scopes)) { return false }
+    if !Numbering.units(&mut numbering.*, Vector<StaticSlot>.length(&self.statics)) { return false }
+    if !numberingDeclaration(body(self), &mut numbering.*) { return false }
+    if let Target.Operation {operation, ..} = &self.target {
+      if !numberingDeclaration(&operation, &mut numbering.*) { return false }
+    }
+    let scopes = Vector<ScopeBinding>.asSlice(&self.scopes)
+    let mut at = usize.ZERO
+    while at < scopes.length {
+      if !Numbering.units(&mut numbering.*, Vector<Argument>.length(&scopes[at].arguments)) { return false }
+      if !Numbering.units(&mut numbering.*, Vector<usize>.length(&scopes[at].argumentOrdinals)) { return false }
+      let affordable = Shared<DeclarationId>.with<bool>(&scopes[at].owner,
+        fn(identity: &DeclarationId) -> bool { return numberingDeclaration(identity, &mut numbering.*) })
+      if !affordable { return false }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  /// Renames every actual input through the complete frozen domain: operation evidence, own
+  /// arguments, enclosing scopes in lexical order, then static aggregate type evidence.
+  pub effect fn numberRegions(self: &Self, numbering: &mut Numbering) -> Result<Application, CanonicalizationFailure>
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    if !Numbering.units(&mut numbering.*, 2) || !Application.numberingCost(self, &mut numbering.*) {
+      return failedNumberingApplication(&numbering.*)
+    }
+    let owner = body(self)
+    let mut target = Target.Named {declaration: DeclarationId.copy(owner)}
+    if let Target.Operation {contract, provider, operation, implementation} = &self.target {
+      let numberedContract = run Type.numberRegions(&contract, owner, &mut numbering.*)
+      let numberedProvider = run Type.numberRegions(&provider, owner, &mut numbering.*)
+      target = Target.Operation {contract: move numberedContract, provider: move numberedProvider,
+        operation: DeclarationId.copy(&operation), implementation: DeclarationId.copy(&implementation)}
+    }
+    let mut arguments = Vector<Argument>.make()
+    let own = Vector<Argument>.asSlice(&self.arguments)
+    let mut at = usize.ZERO
+    while at < own.length {
+      run Vector<Argument>.append(&mut arguments, run Argument.numberRegions(&own[at], owner, &mut numbering.*))
+      let numberingFailure1 = Numbering.failure(&numbering.*)
+      if let Option<CanonicalizationFailure>.Some {value: reason} = move numberingFailure1 {
+        return Result<Application, CanonicalizationFailure>.failResult(reason)
+      }
+      at = at + usize.ONE
+    }
+    let mut scopes = Vector<ScopeBinding>.make()
+    let enclosing = Vector<ScopeBinding>.asSlice(&self.scopes)
+    at = usize.ZERO
+    while at < enclosing.length {
+      if !Numbering.units(&mut numbering.*, 2) {
+      return failedNumberingApplication(&numbering.*)
+    }
+      let mut values = Vector<Argument>.make()
+      let previous = Vector<Argument>.asSlice(&enclosing[at].arguments)
+      let mut index = usize.ZERO
+      while index < previous.length {
+        run Vector<Argument>.append(&mut values, run Argument.numberRegions(&previous[index], owner, &mut numbering.*))
+        let numberingFailure2 = Numbering.failure(&numbering.*)
+        if let Option<CanonicalizationFailure>.Some {value: reason} = move numberingFailure2 {
+          return Result<Application, CanonicalizationFailure>.failResult(reason)
+        }
+        index = index + usize.ONE
+      }
+      run Vector<ScopeBinding>.append(&mut scopes, ScopeBinding {owner: Shared<DeclarationId>.clone(&enclosing[at].owner), arguments: move values,
+        argumentOrdinals: run copyOrdinals(Vector<usize>.asSlice(&enclosing[at].argumentOrdinals))})
+      let numberingFailure3 = Numbering.failure(&numbering.*)
+      if let Option<CanonicalizationFailure>.Some {value: reason} = move numberingFailure3 {
+        return Result<Application, CanonicalizationFailure>.failResult(reason)
+      }
+      at = at + usize.ONE
+    }
+    let numberingFailure4 = Numbering.failure(&numbering.*)
+    if let Option<CanonicalizationFailure>.Some {value: reason} = move numberingFailure4 {
+      return Result<Application, CanonicalizationFailure>.failResult(reason)
+    }
+    let mut statics = Vector<StaticSlot>.make()
+    let previousStatics = Vector<StaticSlot>.asSlice(&self.statics)
+    at = usize.ZERO
+    while at < previousStatics.length {
+      let numbered = run StaticValue.numberRegions(&previousStatics[at].value, owner, &mut numbering.*)
+      let numberingFailure5 = Numbering.failure(&numbering.*)
+      if let Option<CanonicalizationFailure>.Some {value: reason} = move numberingFailure5 {
+        return Result<Application, CanonicalizationFailure>.failResult(reason)
+      }
+      run Vector<StaticSlot>.append(&mut statics, StaticSlot {ordinal: previousStatics[at].ordinal, value: move numbered})
+      at = at + usize.ONE
+    }
+    return Result<Application, CanonicalizationFailure>.succeed(Application {target: move target, arguments: move arguments,
+      argumentOrdinals: run copyOrdinals(Vector<usize>.asSlice(&self.argumentOrdinals)), scopes: move scopes,
+      statics: move statics})
+  }
+  /// The exact simultaneous binding environment for signature, body and layout substitution.
+  pub effect fn bindings(self: &Self) -> Vector<Binding> ! OutOfMemoryError ? &mut Allocator {
+    let mut output = Vector<Binding>.make()
+    let owner = run Shared<DeclarationId>.make(DeclarationId.copy(body(self)))
+    let values = Vector<Argument>.asSlice(&self.arguments)
+    let ordinals = Vector<usize>.asSlice(&self.argumentOrdinals)
+    let mut at = usize.ZERO
+    while at < values.length {
+      run Vector<Binding>.append(&mut output, Binding {declaration: Shared<DeclarationId>.clone(&owner),
+        ordinal: ordinals[at], value: Argument.copy(&values[at])})
+      at = at + usize.ONE
+    }
+    let scopes = Vector<ScopeBinding>.asSlice(&self.scopes)
+    at = usize.ZERO
+    while at < scopes.length {
+      let given = Vector<Argument>.asSlice(&scopes[at].arguments)
+      let slots = Vector<usize>.asSlice(&scopes[at].argumentOrdinals)
+      let mut index = usize.ZERO
+      while index < given.length {
+        run Vector<Binding>.append(&mut output, Binding {declaration: Shared<DeclarationId>.clone(&scopes[at].owner),
+          ordinal: slots[index], value: Argument.copy(&given[index])})
+        index = index + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    return move output
+  }
+  /// Original dense ordinals for declarations whose own binder list has no restated owner slots.
+  pub effect fn denseOrdinals(count: usize) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+    let mut output = Vector<usize>.make()
+    let mut at = usize.ZERO
+    while at < count {
+      run Vector<usize>.append(&mut output, at)
+      at = at + usize.ONE
+    }
+    return move output
+  }
+  /// Compares full source validity and selected operation evidence.
+  pub effect fn equals(left: &Self, right: &Self) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    return run sameApplication(left, right, false)
+  }
+  /// Returns a hash that two applications share whenever [`equals`] reports them equal.
+  ///
+  /// # Details
+  ///
+  /// The hash reads the target declarations, argument ordinals and kinds, the scope and static
+  /// counts, and [`Type.hash`] of each own type argument.
+  pub fn hash(self: &Self) -> u64 {
+    let mut hashed = match &self.target {
+      Target.Named {declaration} => Hash.combine(Hash.mix(&Hash.seed(0), 1), DeclarationId.hash(&declaration))
+      Target.Operation {operation, implementation, ..} => Hash.combine(
+        Hash.combine(Hash.mix(&Hash.seed(0), 2), DeclarationId.hash(&operation)),
+        DeclarationId.hash(&implementation),
+      )
+    }
+    let ordinals = Vector<usize>.asSlice(&self.argumentOrdinals)
+    let mut at = usize.ZERO
+    while at < ordinals.length {
+      hashed = Hash.combine(hashed, usize.toU64(ordinals[at]))
+      at = at + usize.ONE
+    }
+    hashed = Hash.combine(hashed, usize.toU64(Vector<ScopeBinding>.length(&self.scopes)))
+    hashed = Hash.combine(hashed, usize.toU64(Vector<StaticSlot>.length(&self.statics)))
+    let arguments = Vector<Argument>.asSlice(&self.arguments)
+    hashed = Hash.combine(hashed, usize.toU64(arguments.length))
+    at = usize.ZERO
+    while at < arguments.length {
+      hashed = Hash.combine(hashed, argumentHash(&arguments[at]))
+      at = at + usize.ONE
+    }
+    return hashed
+  }
+  /// Compares code identities after lifetime erasure only.
+  pub effect fn runtimeEquals(left: &Self, right: &Self) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    return run sameApplication(left, right, true)
+  }
+  /// Whether two applications share their target, binding layout and static values, and every
+  /// non-type binding is runtime-equal: only their type arguments may differ.
+  pub effect fn sameNonTypeArguments(older: &Self, newer: &Self) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    if !DeclarationId.equals(body(older), body(newer)) { return false }
+    if let Target.Operation {..} = &newer.target {
+      if !run sameTarget(&older.target, &newer.target, true) { return false }
+    }
+    if !run sameApplicationStatics(older, newer) { return false }
+    let olderBindings = run Application.bindings(older)
+    let newerBindings = run Application.bindings(newer)
+    let first = Vector<Binding>.asSlice(&olderBindings)
+    let second = Vector<Binding>.asSlice(&newerBindings)
+    if first.length != second.length { return false }
+    let mut at = usize.ZERO
+    while at < first.length {
+      if first[at].ordinal != second[at].ordinal || !sameOwner(&first[at].declaration, &second[at].declaration) { return false }
+      if !typeArgument(&first[at].value) || !typeArgument(&second[at].value) {
+        if !run sameArgument(&first[at].value, &second[at].value, true) { return false }
+      }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  /// Whether all type, row, and selected-operation evidence is concrete for runtime use.
+  /// Lifetime validity remains the responsibility of source typing and conformance proof.
+  pub fn isRuntimeClosed(self: &Self) -> bool {
+    return closed(self)
+  }
+  /// The concrete body requested by this application.
+  pub fn bodyDeclaration(self: &Self) -> &DeclarationId {
+    return body(self)
+  }
+}
+
+impl Pool {
+  pub fn make() -> Pool {
+    return Pool {semantic: Vector<Application>.make(), runtime: Vector<Application>.make()}
+  }
+  /// Returns no identity when source selection has left a type or row abstract.
+  pub effect fn intern(self: &mut Self, application: &Application) -> Option<Identity>
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    if !closed(application) {
+      return Option<Identity>.none()
+    }
+    let semantic = Vector<Application>.asSlice(&self.semantic)
+    let mut semanticAt = usize.ZERO
+    while semanticAt < semantic.length {
+      if run sameApplication(&semantic[semanticAt], application, false) {
+        break
+      }
+      semanticAt = semanticAt + usize.ONE
+    }
+    if semanticAt == semantic.length {
+      run Vector<Application>.append(&mut self.semantic, run copyApplication(application))
+    }
+    let runtime = Vector<Application>.asSlice(&self.runtime)
+    let mut runtimeAt = usize.ZERO
+    while runtimeAt < runtime.length {
+      if run sameApplication(&runtime[runtimeAt], application, true) {
+        break
+      }
+      runtimeAt = runtimeAt + usize.ONE
+    }
+    if runtimeAt == runtime.length {
+      run Vector<Application>.append(&mut self.runtime, run copyApplication(application))
+    }
+    return Option<Identity>.some(Identity {semantic: semanticAt, runtime: runtimeAt})
+  }
+  pub fn semanticCount(self: &Self) -> usize {
+    return Vector<Application>.length(&self.semantic)
+  }
+  pub fn runtimeCount(self: &Self) -> usize {
+    return Vector<Application>.length(&self.runtime)
+  }
+}
+
+impl FieldDescent {
+  /// Resolves one actual struct field under its concrete owner application. No unrelated nominal
+  /// type can provide a field edge, and a failed member demand supplies no evidence.
+  pub effect fn fromMember(
+    semantic: &mut Semantic,
+    request: &mut Request,
+    declaration: &DeclarationId,
+    owner: &Shared<Type>,
+    member: usize,
+  ) -> Option<FieldDescent>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    if DeclarationId.kind(declaration) != OwnerKind.Struct || !Shared<Type>.with<bool>(
+      owner,
+      fn(value: &Type) -> bool {
+        return match & value.* {
+          Type.Nominal {declaration: selected, ..} => DeclarationId.equals(&selected, declaration)
+          _ => false
+        }
+      },
+    ) {
+      return Option<FieldDescent>.none()
+    }
+    let spelled = run DeclarationId.copySpelling(declaration)
+    let answer = run Semantic.demandMemberShape(
+      &mut semantic.*,
+      &mut request.*,
+      DeclarationId.moduleId(declaration),
+      Bytes.asSlice(&spelled),
+      member,
+      owner,
+    )
+    let field = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(
+      &answer,
+      selectedField,
+    )
+    if let Option<Shared<Type>>.Some {value: selected} = move field {
+      if run Type.runtimeEqualsShared(owner, &selected) {
+        return Option<FieldDescent>.none()
+      }
+      return Option<FieldDescent>.some(
+        FieldDescent {owner: Shared<Type>.clone(owner), field: move selected},
+      )
+    }
+    return Option<FieldDescent>.none()
+  }
+}
+
+impl Admission {
+  pub fn make() -> Admission {
+    return Admission {active: Vector<Step>.make()}
+  }
+  /// A copy of the active path, so a closure transaction checks growth from the same ancestors.
+  pub effect fn copy(self: &Self) -> Admission ! OutOfMemoryError ? &mut Allocator {
+    let mut active = Vector<Step>.make()
+    let listed = Vector<Step>.asSlice(&self.active)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector<Step>.append(&mut active, Step {application: run copyApplication(&listed[at].application), edge: Edge.copy(&listed[at].edge),
+        family: Shared<FamilyProfile>.clone(&listed[at].family)})
+      at = at + usize.ONE
+    }
+    return Admission {active: move active}
+  }
+  /// The active applications from the outermost ancestor to the innermost.
+  pub effect fn path(self: &Self) -> Vector<Application> ! OutOfMemoryError ? &mut Allocator {
+    let mut path = Vector<Application>.make()
+    let listed = Vector<Step>.asSlice(&self.active)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector<Application>.append(&mut path, run copyApplication(&listed[at].application))
+      at = at + usize.ONE
+    }
+    return move path
+  }
+  /// The edges that reached the active applications, in [`Admission.path`] order.
+  pub effect fn edges(self: &Self) -> Vector<Edge> ! OutOfMemoryError ? &mut Allocator {
+    let mut edges = Vector<Edge>.make()
+    let listed = Vector<Step>.asSlice(&self.active)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector<Edge>.append(&mut edges, Edge.copy(&listed[at].edge))
+      at = at + usize.ONE
+    }
+    return move edges
+  }
+  /// Follows an edge already covered by finite evidence: a changing-static closure certificate or
+  /// a cleanup measure.
+  pub effect fn enterChain(self: &mut Self, application: &Application, edge: Edge) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut projected = FamilyProfile {slots: Vector<FamilySlot>.make(), completeness: FamilyCompleteness.Incomplete}
+    if closed(application) { projected = run familyProfile(application) }
+    let family = run Shared<FamilyProfile>.make(move projected)
+    run Vector<Step>.append(&mut self.active, Step {application: run copyApplication(application), edge: move edge, family: move family})
+    return ()
+  }
+  /// Checks the active path before following this application's body. Field descent requires an
+  /// actual resolved member edge; direct calls alone cannot change recursive arguments.
+  pub effect fn enter(self: &mut Self, application: &Application, edge: Edge) -> Decision
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    if !closed(application) {
+      return Decision.Open
+    }
+    let family = run Shared<FamilyProfile>.make(run familyProfile(application))
+    let active = Vector<Step>.asSlice(&self.active)
+    // The nearest matching frame decides first. Returning to an older, larger application after
+    // a witness descent is growth along the intervening cycle, even if that older key is cached.
+    let mut at = active.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      if sameFamily(&active[at].application, application, &active[at].family, &family) {
+        if run sameApplication(&active[at].application, application, true) {
+          return Decision.Reused {ancestor: at}
+        }
+        if run sameExceptStatics(&active[at].application, application) {
+          return Decision.ChangingStatic {ancestor: at}
+        }
+        // Re-entry whose arguments all equal or sit strictly inside the ancestor's descends a
+        // finite structure (bootstrap `structurallyDescending`).
+        if run descends(&active[at].application, application) { break }
+        // Running a received opaque Effect or callable value enters the producer application its
+        // type already names. That application sits strictly inside the ancestor's arguments, so
+        // nested compositions of one target shrink and never grow a new chain (GEN-006).
+        if run producedWithin(&active[at].application, application) { break }
+        let mut witness = witnesses(&edge)
+        let mut pathAt = at + usize.ONE
+        while pathAt < active.length {
+          witness = witness || witnesses(&active[pathAt].edge)
+          pathAt = pathAt + usize.ONE
+        }
+        // A witness may also delegate to a concrete application whose type arguments do not
+        // grow (GEN-006). Concrete shapes no larger than the ancestor's are finitely many, and
+        // refusing an exact repeat anywhere on the path keeps the path itself finite.
+        if witness {
+          let bounded = run nonGrowing(&active[at].application, application)
+          let repeated = run activeAnywhere(active, application)
+          if bounded && !repeated { break }
+        }
+        if !witness || !run witnessDescent(&active[at].application, application, active, at, &edge) {
+          let mut path = Vector<Application>.make()
+          pathAt = at
+          while pathAt < active.length {
+            run Vector<Application>.append(
+              &mut path,
+              run copyApplication(&active[pathAt].application),
+            )
+            pathAt = pathAt + usize.ONE
+          }
+          run Vector<Application>.append(&mut path, run copyApplication(application))
+          return Decision.Rejected {path: move path}
+        }
+      }
+      // An argument-free application's body selects the same descendants on every path, so
+      // older frames cannot feed growth below it: a recursion through it returns to it as reuse.
+      if argumentFree(&active[at].application) { break }
+    }
+    run Vector<Step>.append(
+      &mut self.active,
+      Step {application: run copyApplication(application), edge: move edge, family: move family},
+    )
+    return Decision.Entered
+  }
+  /// Finishes one entered application after its requested children have been checked.
+  pub fn leave(self: &mut Self) -> () {
+    let count = Vector<Step>.length(&self.active)
+    if count > usize.ZERO {
+      Vector<Step>.truncate(&mut self.active, count - usize.ONE)
+    }
+  }
+}
+
+// Every runtime type argument, paired by declaration ordinal, equals the ancestor's or is a strict
+// runtime subterm of it, and at least one is strict.
+effect fn descends(older: &Application, newer: &Application) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let next = Vector<Argument>.asSlice(&newer.arguments)
+  let nextOrdinals = Vector<usize>.asSlice(&newer.argumentOrdinals)
+  let previous = Vector<Argument>.asSlice(&older.arguments)
+  let previousOrdinals = Vector<usize>.asSlice(&older.argumentOrdinals)
+  if typeArgumentCount(next) != typeArgumentCount(previous) { return false }
+  let mut strict = false
+  let mut at = usize.ZERO
+  while at < next.length && at < nextOrdinals.length {
+    if let Argument.Type {value: current} = &next[at] {
+      let mut paired = false
+      let mut other = usize.ZERO
+      while other < previous.length && other < previousOrdinals.length {
+        if previousOrdinals[other] == nextOrdinals[at] {
+          if let Argument.Type {value: prior} = &previous[other] {
+            paired = true
+            if !run Type.runtimeEqualsShared(&prior, &current) {
+              if !run Type.strictRuntimeSubterm(&current, &prior) { return false }
+              strict = true
+            }
+          }
+        }
+        other = other + usize.ONE
+      }
+      if !paired { return false }
+    }
+    at = at + usize.ONE
+  }
+  return strict
+}
+
+// Whether `newer` is the producer application of an opaque or callable value type reached through
+// the storage and evidence children of `older`'s own type arguments.
+effect fn producedWithin(older: &Application, newer: &Application) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut pending = Vector<Shared<Type>>.make()
+  let selected = run Application.bindings(older)
+  let listed = Vector<Binding>.asSlice(&selected)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Argument.Type {value} = &listed[at].value { run Vector<Shared<Type>>.append(&mut pending, Shared<Type>.clone(&value)) }
+    at = at + usize.ONE
+  }
+  while Vector<Shared<Type>>.length(&pending) > usize.ZERO {
+    let current = match move Vector<Shared<Type>>.pop(&mut pending) {
+      Option<Shared<Type>>.Some {value: node} => move node
+      Option<Shared<Type>>.None => { return false }
+    }
+    let producer = Shared<Type>.with<FamilyProducer>(&current, familyProducer)
+    if let FamilyProducer.Application {value: produced} = move producer {
+      let copied = run Application.copyShared(&produced)
+      if run sameApplication(&copied, newer, true) { return true }
+    }
+    let count = Shared<Type>.with<usize>(&current, familyChildCount)
+    at = usize.ZERO
+    while at < count {
+      let child = Shared<Type>.with<Option<Shared<Type>>>(&current, fn(node: &Type) -> Option<Shared<Type>> { return familyChildAt(node, at) })
+      if let Option<Shared<Type>>.Some {value: nested} = move child { run Vector<Shared<Type>>.append(&mut pending, move nested) }
+      at = at + usize.ONE
+    }
+  }
+  return false
+}
+
+// Only original executable declarations select a family. Capture depth, multiplicity, concrete
+// types and fresh regions cannot generate infinitely many families by wrapping the same target.
+fn sameFamily(left: &Application, right: &Application, previous: &Shared<FamilyProfile>, next: &Shared<FamilyProfile>) -> bool {
+  if !DeclarationId.equals(body(left), body(right)) { return false }
+  let first = Shared<FamilyProfile>.with<usize>(previous, familyAddress)
+  let second = Shared<FamilyProfile>.with<usize>(next, familyAddress)
+  if first == second { return true }
+  return Shared<FamilyProfile>.with<bool>(previous, fn(older: &FamilyProfile) -> bool {
+    return sameFamilyRight(older, next)
+  })
+}
+
+fn sameFamilyRight(older: &FamilyProfile, next: &Shared<FamilyProfile>) -> bool {
+  return Shared<FamilyProfile>.with<bool>(next, fn(newer: &FamilyProfile) -> bool {
+    return sameFamilyProfile(older, newer)
+  })
+}
+
+fn familyAddress(value: &FamilyProfile) -> usize {
+  return Pointer.address<FamilyProfile>(Pointer.fromRef<FamilyProfile>(value))
+}
+
+fn sameFamilyProfile(left: &FamilyProfile, right: &FamilyProfile) -> bool {
+  // Incomplete representation evidence never establishes a different family. Keep the ordinary
+  // nearest-ancestor runtime/descent check, including its existing explicit growth refusal.
+  if left.completeness == FamilyCompleteness.Incomplete || right.completeness == FamilyCompleteness.Incomplete { return true }
+  let previous = Vector<FamilySlot>.asSlice(&left.slots)
+  let next = Vector<FamilySlot>.asSlice(&right.slots)
+  if previous.length != next.length { return false }
+  let mut at = usize.ZERO
+  while at < previous.length {
+    let mut found = false
+    let mut other = usize.ZERO
+    while other < next.length {
+      if previous[at].ordinal == next[other].ordinal && previous[at].kind == next[other].kind
+        && sameOwner(&previous[at].owner, &next[other].owner) {
+        if !sameFamilyTargets(Vector<Shared<DeclarationId>>.asSlice(&previous[at].targets),
+          Vector<Shared<DeclarationId>>.asSlice(&next[other].targets)) { return false }
+        found = true
+      }
+      other = other + usize.ONE
+    }
+    if !found { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameFamilyTargets(left: &[Shared<DeclarationId>], right: &[Shared<DeclarationId>]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    let mut found = false
+    let mut other = usize.ZERO
+    while !found && other < right.length {
+      found = sameOwner(&left[at], &right[other])
+      other = other + usize.ONE
+    }
+    if !found { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn familyProfile(application: &Application) -> FamilyProfile ! OutOfMemoryError ? &mut Allocator {
+  let mut slots = Vector<FamilySlot>.make()
+  if !ordered(Vector<usize>.asSlice(&application.argumentOrdinals), Vector<Argument>.length(&application.arguments)) {
+    return FamilyProfile {slots: move slots, completeness: FamilyCompleteness.Incomplete}
+  }
+  let scopes = Vector<ScopeBinding>.asSlice(&application.scopes)
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    if !ordered(Vector<usize>.asSlice(&scopes[at].argumentOrdinals), Vector<Argument>.length(&scopes[at].arguments)) {
+      return FamilyProfile {slots: move slots, completeness: FamilyCompleteness.Incomplete}
+    }
+    at = at + usize.ONE
+  }
+  let selected = run Application.bindings(application)
+  let listed = Vector<Binding>.asSlice(&selected)
+  let mut completeness = FamilyCompleteness.Complete
+  at = usize.ZERO
+  while at < listed.length {
+    let mut targets = FamilyTargets {targets: Vector<Shared<DeclarationId>>.make(), completeness: FamilyCompleteness.Complete}
+    if let Argument.Type {value} = &listed[at].value { targets = run familyTargets(&value) }
+    if targets.completeness == FamilyCompleteness.Incomplete { completeness = FamilyCompleteness.Incomplete }
+    run Vector<FamilySlot>.append(&mut slots, FamilySlot {owner: Shared<DeclarationId>.clone(&listed[at].declaration),
+      ordinal: listed[at].ordinal, kind: familyArgumentKind(&listed[at].value), targets: move targets.targets})
+    at = at + usize.ONE
+  }
+  return FamilyProfile {slots: move slots, completeness: completeness}
+}
+
+fn familyArgumentKind(value: &Argument) -> FamilyArgumentKind {
+  return match &value.* {
+    Argument.Type {..} => FamilyArgumentKind.Type
+    Argument.Lifetime {..} => FamilyArgumentKind.Lifetime
+    Argument.Row {..} => FamilyArgumentKind.Row
+  }
+}
+
+effect fn familyTargets(value: &Shared<Type>) -> FamilyTargets ! OutOfMemoryError ? &mut Allocator {
+  let mut output = FamilyTargets {targets: Vector<Shared<DeclarationId>>.make(), completeness: FamilyCompleteness.Complete}
+  let mut pending = Vector<Shared<Type>>.make()
+  let mut visited = Vector<usize>.make()
+  run Vector<Shared<Type>>.append(&mut pending, Shared<Type>.clone(value))
+  while Vector<Shared<Type>>.length(&pending) > usize.ZERO {
+    let current = match move Vector<Shared<Type>>.pop(&mut pending) {
+      Option<Shared<Type>>.Some {value: node} => move node
+      Option<Shared<Type>>.None => { return move output }
+    }
+    let address = Shared<Type>.with<usize>(&current, familyTypeAddress)
+    let seen = Vector<usize>.asSlice(&visited)
+    let mut known = false
+    let mut at = usize.ZERO
+    while !known && at < seen.length {
+      known = seen[at] == address
+      at = at + usize.ONE
+    }
+    if !known {
+      run Vector<usize>.append(&mut visited, address)
+      if Shared<Type>.with<FamilyCompleteness>(&current, familyTypeCompleteness) == FamilyCompleteness.Incomplete {
+        output.completeness = FamilyCompleteness.Incomplete
+      }
+      let producer = Shared<Type>.with<FamilyProducer>(&current, familyProducer)
+      match move producer {
+        FamilyProducer.Application {value: application} => {
+          let target = copyApplicationDeclaration(&application, false)
+          if let Option<DeclarationId>.Some {value: declaration} = move target {
+            run appendFamilyTarget(&mut output.targets, run Shared<DeclarationId>.make(move declaration))
+          } else { output.completeness = FamilyCompleteness.Incomplete }
+        }
+        FamilyProducer.Schema {value: schema} => {
+          let target = Shared<SectionSchema>.with<Shared<DeclarationId>>(&schema, fn(value: &SectionSchema) -> Shared<DeclarationId> {
+            return Shared<DeclarationId>.clone(&value.target)
+          })
+          run appendFamilyTarget(&mut output.targets, move target)
+        }
+        FamilyProducer.Operation {value: operation} => { run appendFamilyTarget(&mut output.targets, move operation) }
+        FamilyProducer.None => {}
+      }
+      let count = Shared<Type>.with<usize>(&current, familyChildCount)
+      at = usize.ZERO
+      while at < count {
+        let child = Shared<Type>.with<Option<Shared<Type>>>(&current, fn(node: &Type) -> Option<Shared<Type>> { return familyChildAt(node, at) })
+        if let Option<Shared<Type>>.Some {value: nested} = move child { run Vector<Shared<Type>>.append(&mut pending, move nested) }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return move output
+}
+
+effect fn appendFamilyTarget(targets: &mut Vector<Shared<DeclarationId>>, target: Shared<DeclarationId>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<Shared<DeclarationId>>.asSlice(&targets.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if sameOwner(&listed[at], &target) { return () }
+    at = at + usize.ONE
+  }
+  run Vector<Shared<DeclarationId>>.append(&mut targets.*, move target)
+  return ()
+}
+
+fn familyTypeAddress(value: &Type) -> usize { return Pointer.address<Type>(Pointer.fromRef<Type>(value)) }
+
+fn familyTypeCompleteness(value: &Type) -> FamilyCompleteness {
+  return match &value.* {
+    Type.Parameter {..} => FamilyCompleteness.Incomplete
+    Type.CallableOrigin {..} => FamilyCompleteness.Incomplete
+    Type.CallableResult {..} => FamilyCompleteness.Incomplete
+    Type.CallableStage {..} => FamilyCompleteness.Incomplete
+    _ => FamilyCompleteness.Complete
+  }
+}
+
+fn familyProducer(value: &Type) -> FamilyProducer {
+  return match &value.* {
+    Type.CallableValue {application, ..} => FamilyProducer.Application {value: Shared<Application>.clone(&application)}
+    Type.OpaqueRepresentation {application, ..} => FamilyProducer.Application {value: Shared<Application>.clone(&application)}
+    Type.CallableSchema {schema, ..} => FamilyProducer.Schema {value: Shared<SectionSchema>.clone(&schema)}
+    // An interface operation's Effect or callable result is identified by its operation, as the
+    // bootstrap keys a recursion family by each callable identity argument's target.
+    Type.CallableWitnessResult {witness} => FamilyProducer.Operation {value: Shared<WitnessRecipe>.with<Shared<DeclarationId>>(&witness,
+      fn(recipe: &WitnessRecipe) -> Shared<DeclarationId> { return Shared<DeclarationId>.clone(&recipe.operation) })}
+    _ => FamilyProducer.None
+  }
+}
+
+// These are actual free storage/evidence children, including opaque producers' retained selections.
+// Public contracts, opaque return bodies and deferred schema blueprints do not discover targets.
+// Clone handles before traversing any child.
+fn familyChildCount(value: &Type) -> usize {
+  return match &value.* {
+    Type.Nominal {arguments, ..} => Vector<Argument>.length(&arguments)
+    Type.Reference {..} => usize.ONE
+    Type.Slice {..} => usize.ONE
+    Type.Pointer {..} => usize.ONE
+    Type.Array {..} => usize.ONE
+    Type.Anonymous {members, ..} => Vector<Shared<Type>>.length(&members)
+    Type.Union {members} => Vector<Shared<Type>>.length(&members)
+    Type.CallableValue {application, captures, ..} => Shared<Application>.with<usize>(&application, Application.argumentCount) + Vector<Shared<Type>>.length(&captures)
+    Type.OpaqueRepresentation {application, ..} => Shared<Application>.with<usize>(&application, Application.argumentCount)
+    Type.CallableSchema {schema, captures, ..} => Shared<SectionSchema>.with<usize>(&schema, CallableSchema.argumentCount) + Vector<Shared<Type>>.length(&captures)
+    Type.CallableView {..} => usize.ONE
+    Type.EffectComposite {parts, ..} => Vector<Shared<Type>>.length(&parts)
+    Type.EffectJoin {alternatives, ..} => Vector<Shared<Type>>.length(&alternatives)
+    // Its provider, operands and selected type assignments; not its public contract or result.
+    Type.CallableWitnessResult {witness} => Shared<WitnessRecipe>.with<usize>(&witness, fn(recipe: &WitnessRecipe) -> usize {
+      return usize.ONE + CallableWitness.argumentCount(recipe) + CallableWitness.bindingCount(recipe)
+    })
+    _ => usize.ZERO
+  }
+}
+
+fn familyChildAt(value: &Type, at: usize) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Nominal {arguments, ..} => {
+      let listed = Vector<Argument>.asSlice(&arguments)
+      return match &listed[at] { Argument.Type {value: nested} => Option<Shared<Type>>.some(Shared<Type>.clone(&nested)) _ => Option<Shared<Type>>.none() }
+    }
+    Type.Reference {referent, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&referent))
+    Type.Slice {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+    Type.Pointer {pointee, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&pointee))
+    Type.Array {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+    Type.Anonymous {members, ..} => {
+      let listed = Vector<Shared<Type>>.asSlice(&members)
+      return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at]))
+    }
+    Type.Union {members} => {
+      let listed = Vector<Shared<Type>>.asSlice(&members)
+      return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at]))
+    }
+    Type.CallableValue {application, captures, ..} => {
+      let count = Shared<Application>.with<usize>(&application, Application.argumentCount)
+      if at < count { return familyApplicationChild(&application, at) }
+      let listed = Vector<Shared<Type>>.asSlice(&captures)
+      return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at - count]))
+    }
+    Type.OpaqueRepresentation {application, ..} => familyApplicationChild(&application, at)
+    Type.CallableSchema {schema, captures, ..} => {
+      let count = Shared<SectionSchema>.with<usize>(&schema, CallableSchema.argumentCount)
+      if at < count {
+        let selected = Shared<SectionSchema>.with<Argument>(&schema, fn(current: &SectionSchema) -> Argument { return CallableSchema.argumentAt(current, at) })
+        return match move selected { Argument.Type {value: nested} => Option<Shared<Type>>.some(move nested) _ => Option<Shared<Type>>.none() }
+      }
+      let listed = Vector<Shared<Type>>.asSlice(&captures)
+      return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at - count]))
+    }
+    Type.CallableView {representation, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&representation))
+    Type.EffectComposite {parts, ..} => {
+      let listed = Vector<Shared<Type>>.asSlice(&parts)
+      return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at]))
+    }
+    Type.EffectJoin {alternatives, ..} => {
+      let listed = Vector<Shared<Type>>.asSlice(&alternatives)
+      return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at]))
+    }
+    Type.CallableWitnessResult {witness} => Shared<WitnessRecipe>.with<Option<Shared<Type>>>(&witness,
+      fn(recipe: &WitnessRecipe) -> Option<Shared<Type>> {
+        if at == usize.ZERO { return Option<Shared<Type>>.some(Shared<Type>.clone(&recipe.provider)) }
+        let operands = CallableWitness.argumentCount(recipe)
+        if at - usize.ONE < operands { return Option<Shared<Type>>.some(CallableWitness.argumentAt(recipe, at - usize.ONE)) }
+        let selected = CallableWitness.bindingAt(recipe, at - usize.ONE - operands)
+        return match move selected.value { Argument.Type {value: nested} => Option<Shared<Type>>.some(move nested) _ => Option<Shared<Type>>.none() }
+      })
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+fn familyApplicationChild(application: &Shared<Application>, at: usize) -> Option<Shared<Type>> {
+  let selected = Shared<Application>.with<Option<Argument>>(application, fn(current: &Application) -> Option<Argument> {
+    return Application.argumentAt(current, at)
+  })
+  return match move selected {
+    Option<Argument>.Some {value: Argument.Type {value: nested}} => Option<Shared<Type>>.some(move nested)
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+fn argumentFree(application: &Application) -> bool {
+  return Vector<Argument>.length(&application.arguments) == usize.ZERO
+    && Vector<ScopeBinding>.length(&application.scopes) == usize.ZERO
+    && Vector<StaticSlot>.length(&application.statics) == usize.ZERO
+}
+
+fn typeArgument(value: &Argument) -> bool {
+  return match &value.* { Argument.Type {..} => true _ => false }
+}
+
+fn typeArgumentCount(arguments: &[Argument]) -> usize {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    if let Argument.Type {..} = &arguments[at] { count = count + usize.ONE }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+impl Edge {
+  /// Copies the path evidence without reading a body or resolving new conformance evidence.
+  pub fn copy(self: &Self) -> Edge {
+    return match & self.* {
+      Edge.Direct => Edge.Direct
+      Edge.Witness => Edge.Witness
+      Edge.FieldWitness {field} => Edge.FieldWitness {
+        field: FieldDescent {
+          owner: Shared<Type>.clone(&field.owner),
+          field: Shared<Type>.clone(&field.field),
+        },
+      }
+      Edge.Cleanup {owner} => Edge.Cleanup {owner: Shared<Type>.clone(&owner)}
+    }
+  }
+}
+
+// The declaration an application copy reads: its body, or its selected operation.
+fn selectedDeclaration<'a>(value: &'a Application, operation: bool) -> Option<&'a DeclarationId> {
+  if !operation { return Option<&DeclarationId>.some(body(value)) }
+  return match &value.target {
+    Target.Operation {operation: selected, ..} => Option<&DeclarationId>.some(&selected)
+    Target.Named {..} => Option<&DeclarationId>.none()
+  }
+}
+
+fn applicationDeclaration(value: &Application, operation: bool) -> Option<DeclarationId> {
+  return match move selectedDeclaration(value, operation) {
+    Option<&DeclarationId>.Some {value: selected} => Option<DeclarationId>.some(DeclarationId.copy(selected))
+    Option<&DeclarationId>.None => Option<DeclarationId>.none()
+  }
+}
+
+fn copyApplicationDeclaration(source: &Shared<Application>, operation: bool) -> Option<DeclarationId> {
+  return Shared<Application>.with<Option<DeclarationId>>(source, fn(value: &Application) -> Option<DeclarationId> {
+    return applicationDeclaration(value, operation)
+  })
+}
+
+fn absurd<T>() -> T {
+  let boom = 1 / 0
+  return absurd<T>()
+}

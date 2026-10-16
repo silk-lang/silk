@@ -1,0 +1,268 @@
+//! Target-neutral classification of immediate scalar and pointer C calls.
+
+import semantic.Types {Types}
+import backend.Layout {Abi, Metrics}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Target {Id, Target}
+import semantic.Type {Type}
+import semantic.ForeignContract {ForeignContract}
+import semantic.RuntimeEncoding
+import backend.Gap {Source as GapSource}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// The caller or callee must extend this lane to the target's argument register width.
+pub enum Extension {
+  None,
+  Signed,
+  Unsigned,
+}
+
+// Ordinary C data pointers are opaque ABI lanes. A callback pointer additionally carries its
+// exact source-level function/behavior contract; identical ptr text must not erase that contract.
+effect fn callbackIdentity(output: &mut Bytes, ty: &Shared<Type>, owner: &DeclarationId) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let callback = Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* { Type.ForeignFunction {..} => true _ => false }
+  })
+  if callback {
+    run RuntimeEncoding.word(&mut output.*, 1)
+    let encoded = run Type.runtimeEncoding(ty, owner)
+    run RuntimeEncoding.field(&mut output.*, Bytes.asSlice(&encoded))
+  } else { run RuntimeEncoding.word(&mut output.*, 0) }
+  return ()
+}
+
+/// Closed semantic contract identity without source declaration names or authored spans.
+pub effect fn identity(signature: &Signature) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run RuntimeEncoding.word(&mut output, ForeignContract.code(signature.behavior))
+  let mut global: u64 = 0
+  let mut variadic: u64 = 0
+  if signature.global { global = 1 }
+  if signature.variadic { variadic = 1 }
+  run RuntimeEncoding.word(&mut output, global)
+  run RuntimeEncoding.word(&mut output, variadic)
+  let owner = DeclarationId.copyShared(&signature.declaration)
+  run callbackIdentity(&mut output, &signature.result.ty, &owner)
+  let parameters = Vector<Lane>.asSlice(&signature.parameters)
+  run RuntimeEncoding.word(&mut output, usize.toU64(parameters.length))
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    run callbackIdentity(&mut output, &parameters[at].ty, &owner)
+    at = at + usize.ONE
+  }
+  let noCapture = Vector<usize>.asSlice(&signature.noCapture)
+  run RuntimeEncoding.word(&mut output, usize.toU64(noCapture.length))
+  at = usize.ZERO
+  while at < noCapture.length {
+    run RuntimeEncoding.word(&mut output, usize.toU64(noCapture[at]))
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+/// One already-demanded type layout and its C boundary extension rule.
+pub struct Lane {
+  pub ty: Shared<Type>
+  pub layout: Metrics
+  pub extension: Extension
+}
+
+/// The complete machine signature of one foreign declaration, independent of LLVM spelling.
+pub struct Signature {
+  pub behavior: ForeignContract
+  pub noCapture: Vector<usize>
+  pub declaration: Shared<DeclarationId>
+  pub symbol: Bytes
+  pub source: GapSource
+  /// A function's result lane, or the value lane a C object's address holds.
+  pub result: Lane
+  pub parameters: Vector<Lane>
+  /// Whether an imported function accepts integer tails after these fixed parameters.
+  pub variadic: bool
+  /// Whether the symbol names a C object (`static`) rather than a function.
+  pub global: bool
+}
+
+/// A checked call-local integer tail before and after C default argument promotion.
+pub struct VariadicArgument {
+  pub sourceType: Shared<Type>
+  pub promotedType: Shared<Type>
+}
+
+/// The integer-only unnamed-argument subset. Fixed C parameters use `admit` instead.
+pub fn admitsVariadic(ty: &Type) -> bool {
+  if let Type.Primitive {name} = &ty.* {
+    let text = Bytes.asSlice(&name)
+    return named(text, b"i8") || named(text, b"u8") || named(text, b"i16") || named(text, b"u16")
+      || named(text, b"i32") || named(text, b"u32") || named(text, b"i64") || named(text, b"u64")
+      || named(text, b"isize") || named(text, b"usize")
+  }
+  return false
+}
+
+fn narrowVariadic(ty: &Type) -> bool {
+  if let Type.Primitive {name} = &ty.* {
+    let text = Bytes.asSlice(&name)
+    return named(text, b"i8") || named(text, b"u8") || named(text, b"i16") || named(text, b"u16")
+  }
+  return false
+}
+
+/// Promotes each admitted narrow integer to signed C int; wider tails keep their source type.
+pub effect fn promoteVariadic(ty: &Shared<Type>) -> Option<VariadicArgument>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !Shared<Type>.with<bool>(ty, admitsVariadic) { return Option<VariadicArgument>.none() }
+  let mut promoted = Shared<Type>.clone(ty)
+  if Shared<Type>.with<bool>(ty, narrowVariadic) {
+    promoted = run Types.intern(Type.Primitive {name: run Bytes.copy(b"i32")})
+  }
+  return Option<VariadicArgument>.some(VariadicArgument {
+    sourceType: Shared<Type>.clone(ty), promotedType: move promoted,
+  })
+}
+
+fn variadicCount(arguments: &Vector<VariadicArgument>) -> usize {
+  return Vector<VariadicArgument>.length(arguments)
+}
+
+/// Copies immutable evidence while releasing its shared vector borrow before allocating.
+pub effect fn copySharedVariadic(arguments: &Shared<Vector<VariadicArgument>>) -> Vector<VariadicArgument>
+! OutOfMemoryError ? &mut Allocator {
+  let count = Shared<Vector<VariadicArgument>>.with<usize>(arguments, variadicCount)
+  let mut copied = Vector<VariadicArgument>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    let entry = Shared<Vector<VariadicArgument>>.with<VariadicArgument>(arguments,
+      fn(listed: &Vector<VariadicArgument>) -> VariadicArgument {
+        let values = Vector<VariadicArgument>.asSlice(listed)
+        return VariadicArgument {
+          sourceType: Shared<Type>.clone(&values[at].sourceType),
+          promotedType: Shared<Type>.clone(&values[at].promotedType),
+        }
+      })
+    run Vector<VariadicArgument>.append(&mut copied, move entry)
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+/// Independently authenticates retained promotion evidence against the actual operand type.
+pub effect fn validVariadic(argument: &VariadicArgument, actual: &Shared<Type>) -> bool
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !(run Type.equalsShared(&argument.sourceType, actual)) { return false }
+  let expected = run promoteVariadic(actual)
+  if let Option<VariadicArgument>.Some {value: prescribed} = move expected {
+    return run Type.equalsShared(&argument.promotedType, &prescribed.promotedType)
+  }
+  return false
+}
+
+/// Native C calls are covered on these hosts.
+pub fn supported(target: &Target) -> bool {
+  return match Target.id(target) {
+    Id.X8664UnknownLinuxGnu => true
+    Id.Aarch64AppleDarwin => true
+    Id.Aarch64UnknownLinuxGnu => true
+    _ => false
+  }
+}
+
+/// Whether a narrow integer lane is extended to 32 bits at the boundary. The SysV x86-64 and Apple
+/// arm64 ABIs require it; AAPCS64 leaves the upper bits unspecified, so Linux arm64 lanes stay bare.
+pub fn extendsNarrowIntegers(target: &Target) -> bool {
+  return match Target.id(target) {
+    Id.Aarch64UnknownLinuxGnu => false
+    _ => true
+  }
+}
+
+fn named(actual: &[u8], expected: &[u8]) -> bool {
+  if actual.length != expected.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < actual.length {
+    if actual[at] != expected[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Checks the closed immediate C-call subset before asking for its representation.
+/// Unit is admitted as a result; parameter validation excludes it separately.
+pub fn admit(ty: &Type) -> bool {
+  return match & ty.* {
+    Type.Unit => true
+    Type.ForeignFunction {signature, ..} => Shared<Type>.with<bool>(&signature, fn(contract: &Type) -> bool {
+      if let Type.Callable {invocationBinders, parameters, result, ..} = &contract.* {
+        if invocationBinders != usize.ZERO || !Shared<Type>.with<bool>(&result, callbackScalar) { return false }
+        let listed = Vector<Shared<Type>>.asSlice(&parameters)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          if !Shared<Type>.with<bool>(&listed[at], admitsCallbackParameter) { return false }
+          at = at + usize.ONE
+        }
+        return true
+      }
+      return false
+    })
+    Type.Pointer {..} => true
+    Type.Primitive {name} => {
+      let spelling = Bytes.asSlice(&name)
+      return named(spelling, b"i8") || named(spelling, b"u8") || named(spelling, b"i16") || named(
+        spelling,
+        b"u16",
+      ) || named(spelling, b"i32") || named(spelling, b"u32") || named(spelling, b"i64") || named(
+        spelling,
+        b"u64",
+      ) || named(spelling, b"isize") || named(spelling, b"usize") || named(spelling, b"f32") || named(
+        spelling,
+        b"f64",
+      )
+    }
+    _ => false
+  }
+}
+
+// Callback signatures currently admit closed scalar and raw-data-pointer lanes only.
+fn callbackScalar(ty: &Type) -> bool {
+  return match &ty.* { Type.ForeignFunction {..} => false _ => admit(ty) }
+}
+fn admitsCallbackParameter(ty: &Type) -> bool {
+  return match &ty.* { Type.Unit => false _ => callbackScalar(ty) }
+}
+
+/// Computes the C ABI rule from a queried Layout, without inspecting a function body.
+pub fn classify(ty: &Shared<Type>, layout: Metrics, target: &Target) -> Option<Lane> {
+  if layout.abi == Abi.Indirect || !supported(target) || !Shared<Type>.with<bool>(ty, admit) {
+    return Option<Lane>.none()
+  }
+  let mut extension = Extension.None
+  if layout.abi == Abi.Integer {
+    let signed = Shared<Type>.with<bool>(
+      ty,
+      fn(value: &Type) -> bool {
+        if let Type.Primitive {name} = &value.* {
+          let text = Bytes.asSlice(&name)
+          return text.length > usize.ZERO && text[usize.ZERO] == 105
+        }
+        return false
+      },
+    )
+    if layout.size < 4 && extendsNarrowIntegers(target) {
+      extension = Extension.Unsigned
+      if signed {
+        extension = Extension.Signed
+      }
+    }
+  }
+  return Option<Lane>.some(Lane {ty: Shared<Type>.clone(ty), layout: layout, extension: extension})
+}
