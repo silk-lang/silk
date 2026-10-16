@@ -62,7 +62,7 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.Lifetime {Lifetime}
 import semantic.Rejection {RejectionCode}
 import semantic.StorageOperation {StorageOperation}
-import semantic.Type {Argument, Binding, Type}
+import semantic.Type {Argument, Binding, KeptRegions, Type}
 import semantic.TypedBody {
   AggregateField,
   BorrowStatus,
@@ -234,6 +234,10 @@ struct Loan {
   parent: Option<Shared<Lifetime>>
   crossed: bool
   created: usize
+  // Whether the loan's value reached a call or callable that can keep it in a universal region, one
+  // chosen before the body runs; it must then outlive the body wherever its creation reaches (R3
+  // amendment 4).
+  escapes: bool
   // The match subject node whose borrowed arm bindings hold this loan, or `usize.MAX`: accesses
   // through those bindings reach the subject place without conflicting with it (MATCH-002).
   binder: usize
@@ -1603,6 +1607,7 @@ effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, p
       parent: move parent,
       crossed: false,
       created: usize.MAX,
+      escapes: false,
       binder: usize.MAX,
     },
   )
@@ -1665,7 +1670,8 @@ effect fn operands(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walk
     index = index + usize.ONE
   }
   let untyped = Vector<NodeId>.make()
-  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false, Forwarding.Operands, Vector<Step>.asSlice(&placed), Vector<NodeId>.asSlice(&untyped))
+  let noSinks = Vector<OperandSink>.make()
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false, Forwarding.Operands, Vector<Step>.asSlice(&placed), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
 }
 
 // Which local loans a result that names only caller regions keeps exactly (see `finish`).
@@ -1848,10 +1854,18 @@ fn outerSharedRegion(value: &Type) -> Option<Shared<Lifetime>> {
 // A `stores` result keeps every operand, as the Effect an `effect fn` call constructs does, so it
 // keeps all their loans exactly whatever regions its type names.
 effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, result: NodeId, at: usize, carried: &Vector<Carry>,
-  stores: bool, forwarding: Forwarding, placed: &[Step], typed: &[NodeId]) -> Flow
+  stores: bool, forwarding: Forwarding, placed: &[Step], typed: &[NodeId], sinks: &[OperandSink]) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let point = run newPoint(&mut walker.*, at)
   let mut onward = Vector<Carry>.make()
+  // A loan a call can keep in a universal region must outlive the body; one that reaches a call this
+  // walk cannot describe leaves the body unchecked.
+  let passed = Vector<Carry>.asSlice(carried)
+  let mut passing = usize.ZERO
+  while passing < passed.length {
+    if passed[passing].operand < sinks.length { keepLoan(&mut walker.*, owner, passed[passing].loan, &sinks[passed[passing].operand]) }
+    passing = passing + usize.ONE
+  }
   if Vector<Carry>.length(carried) > usize.ZERO {
     run consume(&mut walker.*, Vector<Carry>.asSlice(carried), point)
     let retained = run nodeRetains(nodes, result, owner)
@@ -2373,8 +2387,9 @@ effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: 
   if signature {
     typed = run copyIds(arguments)
   }
+  let sinks = run operandSinks(nodes, result, arguments, owner)
   let unplaced = Vector<Step>.make()
-  return run finish(nodes, owner, &mut walker.*, result, current, &carried, exact, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&typed))
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried, exact, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&typed), Vector<OperandSink>.asSlice(&sinks))
 }
 
 // Constructs a callable or section from its captured operands, in order (CAPTURE-001). A borrowed capture's
@@ -2384,7 +2399,7 @@ effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: 
 // needs through it. A section copies or takes its base callable's environment, so it carries the
 // loans that callee holds.
 effect fn construct(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, values: &[NodeId],
-  referents: &[ReferentCapture], at: usize) -> Flow
+  referents: &[ReferentCapture], staged: bool, result: NodeId, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut carried = Vector<Carry>.make()
   let mut current = at
@@ -2405,9 +2420,54 @@ effect fn construct(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
     index = index + usize.ONE
   }
   // The loans travel with the callable whatever regions its type names: holding them longer is
-  // conservative, and the region slice proves the environment's own regions.
+  // conservative, and the region slice proves the environment's own regions. A loan the callable can
+  // store, through a capture or an argument that names a universal region where it can store, must
+  // outlive the body (R3 amendment 4).
+  // A capture or contract parameter naming a type parameter can store through an instantiation or
+  // conformance this walk cannot see, so a loan it captures leaves the body unchecked. A staged
+  // callable's callee stores only through the contract its stage exposes.
+  let mut stored = Vector<Shared<Lifetime>>.make()
+  let mut opaque = false
+  if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, result) {
+    run Type.callableStoredRegions(&value, &mut stored)
+    opaque = run Type.contractNamesTypeParameter(&value)
+  }
+  index = usize.ZERO
+  while index < values.length {
+    run storedRegionsOf(nodes, values[index], &mut stored)
+    if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, values[index]) {
+      if !(staged && index == usize.ZERO) && run Type.namesTypeParameter(&value) { opaque = true }
+    }
+    index = index + usize.ONE
+  }
+  if opaque && Vector<Carry>.length(&carried) > usize.ZERO {
+    leave(&mut walker.*, BorrowStatus.StoredLoans)
+  } else if universalRegions(&stored, owner) {
+    // Whether the callable's body stores a capture is not visible here: a loan typed at a universal
+    // region escapes, and any other leaves the body unchecked.
+    let captured = Vector<Carry>.asSlice(&carried)
+    let mut unchecked = false
+    let mut held = usize.ZERO
+    while held < captured.length {
+      let mut all = Vector<Loan>.asMutSlice(&mut walker.loans)
+      if universalRegions(&all[captured[held].loan].regions, owner) {
+        all[captured[held].loan].escapes = true
+      } else {
+        unchecked = true
+      }
+      held = held + usize.ONE
+    }
+    if unchecked { leave(&mut walker.*, BorrowStatus.StoredLoans) }
+  }
   let point = run newPoint(&mut walker.*, current)
   return Flow {at: point, carried: move carried}
+}
+
+// Appends the regions a captured value can store into, when typing recorded its type. A captured
+// callable stores only through what its contract's parameters reach.
+effect fn storedRegionsOf(nodes: &[Node], node: NodeId, stored: &mut Vector<Shared<Lifetime>>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, node) { run Type.callableStoredRegions(&value, &mut stored.*) }
+  return ()
 }
 
 // An invocation of a callable value (CALLABLE-002). A pipeline's input is evaluated before the
@@ -2437,8 +2497,9 @@ effect fn invoke(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     index = index + usize.ONE
   }
   let untyped = Vector<NodeId>.make()
+  let sinks = run operandSinks(nodes, result, arguments, owner)
   let unplaced = Vector<Step>.make()
-  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped))
+  return run finish(nodes, owner, &mut walker.*, result, current, &carried, false, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&sinks))
 }
 
 // Constructs the Effect an `effect fn` value's invocation promises without calling it (EFF-001). The
@@ -2447,13 +2508,16 @@ effect fn invoke(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
 // own loans. Its operands enter the environment by CAPTURE-002. Every loan travels with the Effect
 // value, so it stays live until the Effect's last run or drop (EFFECT-OWN-001, EFFECT-OWN-002).
 effect fn defer(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, callee: NodeId, arguments: &[NodeId],
-  pipeline: bool, mode: CallableMode, at: usize) -> Flow
+  pipeline: bool, mode: CallableMode, result: NodeId, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut carried = Vector<Carry>.make()
   let mut current = at
   let mut first = usize.ZERO
+  let sinks = run operandSinks(nodes, result, arguments, owner)
+  let kept = Vector<OperandSink>.asSlice(&sinks)
   if pipeline && arguments.length > usize.ZERO {
     let input = run visit(nodes, locals, owner, &mut walker.*, arguments[0], current)
+    keepLoans(&mut walker.*, owner, Vector<Carry>.asSlice(&input.carried), &kept[0])
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&input.carried))
     current = input.at
     first = usize.ONE
@@ -2464,6 +2528,7 @@ effect fn defer(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
   let mut index = first
   while index < arguments.length {
     let flow = run visit(nodes, locals, owner, &mut walker.*, arguments[index], current)
+    keepLoans(&mut walker.*, owner, Vector<Carry>.asSlice(&flow.carried), &kept[index])
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&flow.carried))
     current = flow.at
     index = index + usize.ONE
@@ -2549,7 +2614,7 @@ union Shape {
   Call {arguments: Vector<NodeId>, receiver: usize, exact: bool, signature: bool},
   Invoke {callee: NodeId, arguments: Vector<NodeId>, pipeline: bool, exclusive: bool},
   // `referents` name their operands by position.
-  Construct {values: Vector<NodeId>, referents: Vector<ReferentCapture>},
+  Construct {values: Vector<NodeId>, referents: Vector<ReferentCapture>, staged: bool},
   Defer {callee: NodeId, arguments: Vector<NodeId>, pipeline: bool, mode: CallableMode},
   Binding {local: usize, initializer: NodeId, mutable: bool},
   Assignment {local: usize, value: NodeId},
@@ -2629,7 +2694,8 @@ effect fn shapeOf(nodes: &[Node], id: NodeId) -> Shape ! OutOfMemoryError ? &mut
       // A named function's section is an aggregate of its captured operands (CALLABLE-001).
       if let Expression.Aggregate {fields} = &form {
         if Shared<Type>.with<bool>(&ty, callableValue) {
-          return Shape.Construct {values: run fieldValues(Vector<AggregateField>.asSlice(&fields)), referents: Vector<ReferentCapture>.make()}
+          return Shape.Construct {values: run fieldValues(Vector<AggregateField>.asSlice(&fields)), referents: Vector<ReferentCapture>.make(),
+            staged: false}
         }
       }
       // An immediate run is exactly the one call it executes (EFF-003): the Effect that call
@@ -2765,7 +2831,7 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
     Expression.ForeignAddress {..} => Shape.Leaf
     Expression.Callable {fields, referents, ..} => Shape.Construct {
       values: run fieldValues(Vector<AggregateField>.asSlice(&fields)),
-      referents: run referentOperands(Vector<AggregateField>.asSlice(&fields), Vector<ReferentCapture>.asSlice(&referents)),
+      referents: run referentOperands(Vector<AggregateField>.asSlice(&fields), Vector<ReferentCapture>.asSlice(&referents)), staged: false,
     }
     Expression.StagedCallable {callee, arguments, ..} => {
       let mut values = run single(callee)
@@ -2775,7 +2841,7 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
         run Vector<NodeId>.append(&mut values, supplied[at])
         at = at + usize.ONE
       }
-      return Shape.Construct {values: move values, referents: Vector<ReferentCapture>.make()}
+      return Shape.Construct {values: move values, referents: Vector<ReferentCapture>.make(), staged: true}
     }
     Expression.CallableCall {callee, mode, arguments, pipeline, constructs, ..} => {
       // Invoking an `effect fn` value without running it constructs an Effect that stores its
@@ -3112,7 +3178,8 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
             let read = run attributeRead(&mut walker.*, &path, Vector<Carry>.asSlice(&flow.carried))
             let unplaced = Vector<Step>.make()
             let untyped = Vector<NodeId>.make()
-            return run finish(nodes, owner, &mut walker.*, id, flow.at, &read, false, Forwarding.Matched, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped))
+            let noSinks = Vector<OperandSink>.make()
+            return run finish(nodes, owner, &mut walker.*, id, flow.at, &read, false, Forwarding.Matched, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
           }
         }
         let point = run newPoint(&mut walker.*, flow.at)
@@ -3156,8 +3223,9 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         run edge(&mut walker.*, first.at, reached)
       }
       let untyped = Vector<NodeId>.make()
+      let noSinks = Vector<OperandSink>.make()
       let unplaced = Vector<Step>.make()
-      return run finish(nodes, owner, &mut walker.*, id, reached, &carried, false, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped))
+      return run finish(nodes, owner, &mut walker.*, id, reached, &carried, false, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
     }
     Shape.PassThrough {value} => {
       return run visit(nodes, locals, owner, &mut walker.*, value, at)
@@ -3165,14 +3233,14 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
     Shape.Call {arguments, receiver, exact, signature} => {
       return run call(nodes, locals, owner, &mut walker.*, Vector<NodeId>.asSlice(&arguments), receiver, exact, signature, id, at)
     }
-    Shape.Construct {values, referents} => {
-      return run construct(nodes, locals, owner, &mut walker.*, Vector<NodeId>.asSlice(&values), Vector<ReferentCapture>.asSlice(&referents), at)
+    Shape.Construct {values, referents, staged} => {
+      return run construct(nodes, locals, owner, &mut walker.*, Vector<NodeId>.asSlice(&values), Vector<ReferentCapture>.asSlice(&referents), staged, id, at)
     }
     Shape.Invoke {callee, arguments, pipeline, exclusive} => {
       return run invoke(nodes, locals, owner, &mut walker.*, callee, Vector<NodeId>.asSlice(&arguments), pipeline, exclusive, id, at)
     }
     Shape.Defer {callee, arguments, pipeline, mode} => {
-      return run defer(nodes, locals, owner, &mut walker.*, callee, Vector<NodeId>.asSlice(&arguments), pipeline, mode, at)
+      return run defer(nodes, locals, owner, &mut walker.*, callee, Vector<NodeId>.asSlice(&arguments), pipeline, mode, id, at)
     }
     Shape.Binding {local, initializer, mutable} => {
       let declared = localType(locals, local)
@@ -3302,8 +3370,9 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         run consume(&mut walker.*, Vector<Carry>.asSlice(&flow.carried), point)
         if retained {
           let untyped = Vector<NodeId>.make()
+          let noSinks = Vector<OperandSink>.make()
           let unplaced = Vector<Step>.make()
-          return run finish(nodes, owner, &mut walker.*, id, point, &read.carried, false, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped))
+          return run finish(nodes, owner, &mut walker.*, id, point, &read.carried, false, Forwarding.None, Vector<Step>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
         }
         run consume(&mut walker.*, Vector<Carry>.asSlice(&read.carried), point)
         return flowAt(point)
@@ -4452,8 +4521,11 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     while index < loans.length {
       if (event.kind == Kind.End || event.kind == Kind.Expire) && loans[index].local && covers(&event.place, &loans[index].place) {
         let carried = run flightEnds(&walker, &loans[index], event.point, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
-        let held = width > usize.ZERO && heldLive(&walker, index, Vector<usize>.asSlice(&bits), Vector<u64>.asSlice(&liveOut), width,
+        let mut held = width > usize.ZERO && heldLive(&walker, index, Vector<usize>.asSlice(&bits), Vector<u64>.asSlice(&liveOut), width,
           Vector<u64>.asSlice(&definitions.entering), definitionWidth, event.point)
+        if !held && loans[index].escapes {
+          held = run reachesAvoiding(&walker, &mut replacementReaches, loans[index].created, event.point, usize.MAX)
+        }
         if carried || held {
           if loans[index].precision != LoanPrecision.Exact { unknown = true } else {
             // A temporary's view carried past its owner is reported where it is first used after
@@ -4487,6 +4559,11 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
             let mut live = run inFlight(&walker, &loans[index], event.point, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
             if !live && width > usize.ZERO {
               live = heldLive(&walker, index, Vector<usize>.asSlice(&bits), Vector<u64>.asSlice(&liveOut), width, Vector<u64>.asSlice(&definitions.entering), definitionWidth, event.point)
+            }
+            // A universal loan a call can keep past the body outlives it, so it is live wherever its
+            // creation reaches, whether or not a holder still uses it here.
+            if !live && loans[index].escapes {
+              live = run reachesAvoiding(&walker, &mut replacementReaches, loans[index].created, event.point, usize.MAX)
             }
             if live {
               // An approximate loan's conflict is not a proof either way: the body answers
@@ -5563,6 +5640,201 @@ fn namedEnclosing(declaration: &DeclarationId, owner: &DeclarationId) -> bool {
   return kind != OwnerKind.Anonymous && kind != OwnerKind.EffectBlock && DeclarationId.isPrefixOf(declaration, owner)
 }
 
+// Marks a loan one operand carries into a call that can keep it in a universal region as escaping;
+// one that reaches a call this walk cannot describe leaves the body unchecked.
+fn keepLoan(walker: &mut Walker, owner: &DeclarationId, loan: usize, sink: &OperandSink) -> () {
+  let recorded = Vector<Loan>.asSlice(&walker.loans)
+  let origin = recorded[loan].origin
+  // An operand whose type names only `'static` holds no loan of the body unless typing gave that
+  // loan a `'static` region; one the walk carries into it otherwise is not part of its value.
+  let regions = Vector<Shared<Lifetime>>.asSlice(&recorded[loan].regions)
+  if !sink.holds && (regions.length == usize.ZERO || !staticRegions(&recorded[loan].regions)) { return () }
+  let mut kept = sink.whole
+  let mut approximate = sink.wholeApproximate
+  let mut own = origin.start == sink.span.start && origin.end == sink.span.end
+  if let Option<Shared<Lifetime>>.Some {value: region} = &sink.view {
+    let typed = Vector<Shared<Lifetime>>.asSlice(&recorded[loan].regions)
+    let mut at = usize.ZERO
+    while !own && at < typed.length {
+      own = Lifetime.equalsShared(&typed[at], &region)
+      at = at + usize.ONE
+    }
+  }
+  if own {
+    kept = sink.outer
+    approximate = sink.outerApproximate
+  }
+  // A loan the operand carries, rather than its own borrow, lies where typing placed it: one typed
+  // only at regions within the body cannot be at a universal position unless typing related
+  // regions natively unsolved, so it leaves the body unchecked rather than escaping.
+  if !own && kept == CallSink.Universal && typedLocally(&recorded[loan].regions, owner) { kept = CallSink.Unknown }
+  // An approximate channel's universal region may be longer than any binding needs: only a loan
+  // typing gave a universal region is held to it, and any other leaves the body unchecked.
+  if kept != CallSink.Universal && approximate == CallSink.Universal {
+    if universalRegions(&recorded[loan].regions, owner) {
+      kept = CallSink.Universal
+    } else {
+      kept = CallSink.Unknown
+    }
+  } else if kept == CallSink.Local && approximate == CallSink.Unknown {
+    kept = CallSink.Unknown
+  }
+  if kept == CallSink.Universal {
+    let mut all = Vector<Loan>.asMutSlice(&mut walker.loans)
+    all[loan].escapes = true
+  } else if kept == CallSink.Unknown {
+    leave(&mut walker.*, BorrowStatus.StoredLoans)
+  }
+  return ()
+}
+
+fn keepLoans(walker: &mut Walker, owner: &DeclarationId, carries: &[Carry], sink: &OperandSink) -> () {
+  let mut at = usize.ZERO
+  while at < carries.length {
+    keepLoan(&mut walker.*, owner, carries[at].loan, sink)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether a region atom is chosen before the body runs and outlives it: `'static`, or a lifetime
+// parameter of the body or of a named declaration enclosing it.
+fn universalAtom(region: &Lifetime, owner: &DeclarationId) -> bool {
+  return match &region.* {
+    Lifetime.Static => true
+    Lifetime.Parameter {declaration, ..} => DeclarationId.equals(&declaration, owner) || namedEnclosing(&declaration, owner)
+    _ => false
+  }
+}
+
+// Whether any of `regions` outlives the body: an intersection does only when every member does.
+fn universalRegions(regions: &Vector<Shared<Lifetime>>, owner: &DeclarationId) -> bool {
+  let named = Vector<Shared<Lifetime>>.asSlice(regions)
+  let mut at = usize.ZERO
+  while at < named.length {
+    if Lifetime.allAtoms(&named[at], fn(atom: &Lifetime) -> bool { return universalAtom(atom, owner) }) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether typing gave a loan regions, none of which outlives the body.
+fn typedLocally(regions: &Vector<Shared<Lifetime>>, owner: &DeclarationId) -> bool {
+  return Vector<Shared<Lifetime>>.length(regions) != usize.ZERO && !universalRegions(regions, owner)
+}
+
+// Whether every one of `regions` is `'static`.
+fn staticRegions(regions: &Vector<Shared<Lifetime>>) -> bool {
+  let named = Vector<Shared<Lifetime>>.asSlice(regions)
+  let mut at = usize.ZERO
+  while at < named.length {
+    if !Lifetime.allAtoms(&named[at], fn(atom: &Lifetime) -> bool { return match &atom.* { Lifetime.Static => true _ => false } }) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Where a call can keep an operand once it returns: in storage that outlives the caller's body, only
+// within it, or somewhere this walk has no record to tell.
+enum CallSink { Local, Universal, Unknown }
+
+// What a call can keep of one operand (R3 amendment 4). `whole` answers for loans the operand
+// carries in; `outer` answers for the loan the operand's own borrow creates, which the callee holds
+// only as the reference it receives.
+struct OperandSink {
+  outer: CallSink
+  whole: CallSink
+  // Where a channel the analysis only approximates can also keep the operand (KeptRegions).
+  outerApproximate: CallSink
+  wholeApproximate: CallSink
+  span: Location
+  // Whether the operand's type can hold a loan of the body: it names a region other than `'static`
+  // or a type parameter, or typing recorded none.
+  holds: bool
+  // The operand's own region when it is a view: a carried loan typed at it is the view's own borrow,
+  // made earlier as when a call returns a view of its argument, so it is judged as `outer`.
+  view: Option<Shared<Lifetime>>
+}
+
+// An approximate channel's sink: unknown where the call could not describe the operand at all.
+fn approximateSink(regions: &Vector<Shared<Lifetime>>, undescribed: bool, owner: &DeclarationId) -> CallSink {
+  if undescribed { return CallSink.Unknown }
+  return regionSink(regions, owner)
+}
+
+fn regionSink(regions: &Vector<Shared<Lifetime>>, owner: &DeclarationId) -> CallSink {
+  if universalRegions(regions, owner) { return CallSink.Universal }
+  return CallSink.Local
+}
+
+// What a call recorded it can keep of its operands, or none for a call this walk cannot see into.
+// An immediate run walks as the call it executes.
+fn callKept(nodes: &[Node], call: NodeId) -> Option<Shared<Vector<KeptRegions>>> {
+  return match &nodes[call.index].kind {
+    NodeKind.Expression {form: Expression.Run {value, access}, ..} => {
+      if access == RunAccess.Immediate { return callKept(nodes, value) }
+      return Option<Shared<Vector<KeptRegions>>>.none()
+    }
+    NodeKind.Expression {form: Expression.DirectCall {kept, ..}, ..} => Option<Shared<Vector<KeptRegions>>>.some(Shared<Vector<KeptRegions>>.clone(&kept))
+    NodeKind.Expression {form: Expression.InterfaceCall {kept, ..}, ..} => Option<Shared<Vector<KeptRegions>>>.some(Shared<Vector<KeptRegions>>.clone(&kept))
+    NodeKind.Expression {form: Expression.CallableCall {kept, ..}, ..} => Option<Shared<Vector<KeptRegions>>>.some(Shared<Vector<KeptRegions>>.clone(&kept))
+    _ => Option<Shared<Vector<KeptRegions>>>.none()
+  }
+}
+
+effect fn operandSinks(nodes: &[Node], call: NodeId, arguments: &[NodeId], owner: &DeclarationId) -> Vector<OperandSink>
+! OutOfMemoryError ? &mut Allocator {
+  let mut sinks = Vector<OperandSink>.make()
+  let recorded = callKept(nodes, call)
+  // A call with no record, an intrinsic or foreign one, can keep an operand only in storage
+  // another operand reaches, so it is undescribed only when some operand names a universal region
+  // where it can store; a callable operand stores only where its contract's parameters reach. Its signature is fixed, and a loan of the body never has the body's type
+  // parameter as its type.
+  let mut reaches = false
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let mut stored = Vector<Shared<Lifetime>>.make()
+    if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, arguments[at]) {
+      run Type.callableStoredRegions(&value, &mut stored)
+    }
+    if universalRegions(&stored, owner) { reaches = true }
+    at = at + usize.ONE
+  }
+  let mut unrecorded = CallSink.Local
+  if reaches { unrecorded = CallSink.Unknown }
+  at = usize.ZERO
+  while at < arguments.length {
+    let span = nodes[arguments[at].index].origin.location
+    let mut holds = true
+    let mut view = Option<Shared<Lifetime>>.none()
+    if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, arguments[at]) {
+      view = Type.viewRegion(&value)
+      let mut named = Vector<Shared<Lifetime>>.make()
+      run Type.regionAtoms(&value, &mut named)
+      let generic = run Type.namesTypeParameter(&value)
+      holds = generic || !staticRegions(&named)
+    }
+    let mut sink = OperandSink {outer: unrecorded, whole: unrecorded, outerApproximate: unrecorded, wholeApproximate: unrecorded,
+      span: span, holds: holds, view: Option<Shared<Lifetime>>.none()}
+    if let Option<Shared<Vector<KeptRegions>>>.Some {value: kept} = &recorded {
+      let listed = Shared<Vector<KeptRegions>>.with<usize>(&kept, fn(values: &Vector<KeptRegions>) -> usize { return Vector<KeptRegions>.length(values) })
+      if at < listed {
+        sink = Shared<Vector<KeptRegions>>.with<OperandSink>(&kept, fn(values: &Vector<KeptRegions>) -> OperandSink {
+          let entries = Vector<KeptRegions>.asSlice(values)
+          return OperandSink {outer: regionSink(&entries[at].outer, owner), whole: regionSink(&entries[at].whole, owner),
+            outerApproximate: approximateSink(&entries[at].outerApproximate, entries[at].undescribed, owner),
+            wholeApproximate: approximateSink(&entries[at].wholeApproximate, entries[at].undescribed, owner),
+            span: span, holds: holds, view: Option<Shared<Lifetime>>.none()}
+        })
+      }
+    }
+    sink.view = move view
+    run Vector<OperandSink>.append(&mut sinks, move sink)
+    at = at + usize.ONE
+  }
+  return move sinks
+}
+
 effect fn typeRegionClosed(ty: &Shared<Type>, owner: &DeclarationId) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut atoms = Vector<Shared<Lifetime>>.make()
   run Type.bodyRegionAtoms(ty, &mut atoms)
@@ -5670,7 +5942,7 @@ effect fn wrappedRegionClaims() -> ()
     place: Place {root: 0, steps: Vector<Step>.make()}, exclusive: false,
     origin: Location.make(0, 1), intervals: move intervals, precision: LoanPrecision.Exact,
     regions: move named, local: true, borrowed: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&region)),
-    parent: Option<Shared<Lifetime>>.none(), crossed: false, created: 1, binder: usize.MAX,
+    parent: Option<Shared<Lifetime>>.none(), crossed: false, created: 1, escapes: false, binder: usize.MAX,
   })
   run Vector<Holding>.append(&mut walker.definitions, Holding {loan: 0, holder: 0, point: 4, source: usize.MAX, read: usize.MAX, field: usize.MAX})
   // A definition created at the bottom of the loop reaches the next header read. There is no
@@ -5716,7 +5988,7 @@ effect fn symbolicTestLoan(region: &Shared<Lifetime>, parent: &Shared<Lifetime>,
   return Loan {place: Place {root: 0, steps: Vector<Step>.make()}, exclusive: false,
     origin: Location.make(0, 1), intervals: Vector<Interval>.make(), precision: LoanPrecision.Exact,
     regions: move regions, local: local, borrowed: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(region)),
-    parent: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(parent)), crossed: true, created: 1, binder: usize.MAX}
+    parent: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(parent)), crossed: true, created: 1, escapes: false, binder: usize.MAX}
 }
 
 effect fn symbolicRootClaims() -> ()
