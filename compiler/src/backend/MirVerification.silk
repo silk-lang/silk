@@ -48,6 +48,10 @@ pub struct UseAfterDrop {
   /// part's type. Drop glue never touches a part whose type runs no cleanup, so lowering may read
   /// such a part after dropping the rest; the caller excuses exactly those parts.
   pub read: Option<Shared<Type>>
+  /// When the use is a drop that only touches views its value holds directly, the value's type.
+  /// Only a destructor of that type can read such a view, so the caller reports the use exactly
+  /// when the type has its own `Drop`.
+  pub observer: Option<Shared<Type>>
 }
 
 // Storage a drop ended, and the local whose drop ended it. A runtime index in `place` names the
@@ -1067,6 +1071,49 @@ fn touches(read: &Place, place: &Place) -> bool {
   return true
 }
 
+// The runtime index locals of `place` that are ended.
+effect fn indexUse(facts: &Facts, place: &Place) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  let steps = Vector<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local} = &steps[at] {
+      let index = Place {local: local, projections: Vector<Projection>.make()}
+      if let Option<usize>.Some {value} = move killedBy(facts, &index) { return Option<usize>.some(value) }
+    }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+// Ended storage of `place` itself that a drop of `place` touches: its own drop, never a view it
+// holds.
+fn ownedTouch(facts: &Facts, place: &Place) -> Option<usize> {
+  let killed = Vector<Killed>.asSlice(&facts.killed)
+  let mut at = killedFrom(killed, place.local)
+  while at < killed.length && killed[at].place.local == place.local {
+    if killed[at].place.local == killed[at].dropped && touches(place, &killed[at].place) { return Option<usize>.some(killed[at].dropped) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+// A view of ended storage that a whole local's drop touches where only the local's own
+// destructor can read it: the local itself or one of its direct fields. A view deeper inside is
+// read only by a nested destructor this does not tell, so it is no report.
+fn heldTouch(facts: &Facts, place: &Place) -> Option<usize> {
+  if Vector<Projection>.length(&place.projections) != usize.ZERO { return Option<usize>.none() }
+  let killed = Vector<Killed>.asSlice(&facts.killed)
+  let mut at = killedFrom(killed, place.local)
+  while at < killed.length && killed[at].place.local == place.local {
+    let held = killed[at].place.local != killed[at].dropped
+    let depth = Vector<Projection>.length(&killed[at].place.projections)
+    let direct = depth == usize.ZERO || (depth == usize.ONE && ownedDepth(&killed[at].place) == depth)
+    if held && direct { return Option<usize>.some(killed[at].dropped) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
 fn killedBy(facts: &Facts, place: &Place) -> Option<usize> {
   let killed = Vector<Killed>.asSlice(&facts.killed)
   let mut at = killedFrom(killed, place.local)
@@ -1168,7 +1215,9 @@ effect fn destinationUse(facts: &Facts, destination: &Place) -> Option<usize> ! 
 
 fn violation(dropped: Option<usize>, block: usize, statement: usize, origin: Origin) -> Option<UseAfterDrop> {
   return match move dropped {
-    Option<usize>.Some {value} => Option<UseAfterDrop>.some(UseAfterDrop {block: block, statement: statement, dropped: value, origin: origin, read: Option<Shared<Type>>.none()})
+    Option<usize>.Some {value} => Option<UseAfterDrop>.some(UseAfterDrop {
+      block: block, statement: statement, dropped: value, origin: origin, read: Option<Shared<Type>>.none(), observer: Option<Shared<Type>>.none(),
+    })
     Option<usize>.None => Option<UseAfterDrop>.none()
   }
 }
@@ -1211,10 +1260,20 @@ effect fn statementUse(function: &MirFunction, facts: &Facts, statement: &Statem
       }
       return Option<UseAfterDrop>.none()
     }
-    // Dropping ended storage again runs its destructor twice.
+    // Dropping ended storage again runs its destructor twice. Dropping a value that holds a view
+    // of ended storage reads the view only through the value's own destructor.
     Statement.Drop {destination, diagnostics, origin, ..} => {
-      let read = run placeUse(facts, &destination)
-      return violation(eitherUse(move read, run diagnosticsUse(facts, &diagnostics)), block, index, origin)
+      let read = run indexUse(facts, &destination)
+      let found = violation(eitherUse(eitherUse(move read, ownedTouch(facts, &destination)), run diagnosticsUse(facts, &diagnostics)), block, index, origin)
+      if let Option<UseAfterDrop>.Some {..} = &found { return move found }
+      if let Option<usize>.Some {value: holder} = move heldTouch(facts, &destination) {
+        let mut observed = violation(Option<usize>.some(holder), block, index, origin)
+        if let Option<UseAfterDrop>.Some {value: report} = &mut observed {
+          report.observer = Option<Shared<Type>>.some(Shared<Type>.clone(&Vector<Local>.asSlice(&function.locals)[destination.local].ty))
+        }
+        return move observed
+      }
+      return Option<UseAfterDrop>.none()
     }
     Statement.FailureContext {destination, source, origin} => {
       let mut used = run placeUse(facts, &destination)
@@ -1406,9 +1465,14 @@ effect fn applyStatement<'a>(function: &MirFunction, shape: &Shape<'a>, facts: &
         if mayOverlap(&views[at].base, &destination) { run Vector<Place>.append(&mut holders, run Mir.copyPlace(&views[at].holder)) }
         at = at + usize.ONE
       }
+      // A raw address may outlive its storage; only reading through it is a use.
       while Vector<Place>.length(&holders) != usize.ZERO {
         if let Option<Place>.Some {value: holder} = move Vector<Place>.pop(&mut holders) {
-          run insertKilled(&mut facts.killed, Killed {place: move holder, dropped: dropped})
+          let mut ended = move holder
+          if Vector<Projection>.length(&ended.projections) == usize.ZERO && Shared<Type>.with<bool>(&Vector<Local>.asSlice(&function.locals)[ended.local].ty, isAddress) {
+            run Vector<Projection>.append(&mut ended.projections, Projection.Deref)
+          }
+          run insertKilled(&mut facts.killed, Killed {place: move ended, dropped: dropped})
         }
       }
     }
@@ -1433,6 +1497,10 @@ effect fn deriveValue<'a>(facts: &Facts, shape: &Shape<'a>, fresh: &mut Vector<V
   }
 }
 
+fn isAddress(value: &Type) -> bool {
+  return match &value.* { Type.Pointer {..} => true _ => false }
+}
+
 /// Whether a value of `ty` can refer to other storage: a view anywhere in it, or a raw address.
 pub fn carriesView(ty: &Shared<Type>) -> bool {
   return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
@@ -1441,13 +1509,13 @@ pub fn carriesView(ty: &Shared<Type>) -> bool {
   })
 }
 
-// Which arguments of the call ending `block` may pass a view into its result; every argument
-// when the caller knows nothing about the callee.
+// Whether an argument of the call ending `block` certainly passes a view into its result; none
+// does when the caller knows nothing about the callee.
 fn carriedAt<'a>(shape: &Shape<'a>, block: usize, argument: usize) -> bool {
-  if block >= shape.flows.length { return true }
+  if block >= shape.flows.length { return false }
   return match &shape.flows[block] {
-    Option<Vector<bool>>.Some {value} => argument >= Vector<bool>.length(&value) || Vector<bool>.asSlice(&value)[argument]
-    Option<Vector<bool>>.None => true
+    Option<Vector<bool>>.Some {value} => argument < Vector<bool>.length(&value) && Vector<bool>.asSlice(&value)[argument]
+    Option<Vector<bool>>.None => false
   }
 }
 
