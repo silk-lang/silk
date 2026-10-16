@@ -491,10 +491,12 @@ reads only the syntax index, so a name with a conditional candidate there is the
 
 `main` is the only integration branch, for the source-written compiler, the TypeScript bootstrap
 and the standard library they share. Start native compiler work on a `selfhost-*` branch from the
-current `main` and target its pull request at `main`; an upper PR of a native stack targets the
-`selfhost-*` branch below it. A pull request merges when `CI result` and `Focused Linux Silk` pass on
-its head. Merge `main` into the branch before its final run, with a merge that retains both
-parents, so the merge commit reuses that run's verdict.
+current `main` and target its pull request at `main`. An upper PR of a native stack targets the
+`selfhost-*` branch below it and runs no CI; the pull request that lands the stack's top into `main`
+checks the stack. A pull request enters the merge queue once `CI result` and `Focused Linux Silk`
+pass on its head. The queue reruns both checks, with the complete main lanes, on the pull request
+combined with `main` and the pull requests ahead of it, and merges it only when that run is green;
+the `main` push reuses that run. Merge `main` into a branch only to resolve a conflict.
 
 The TypeScript compiler and CLI are frozen. A repair the native compiler needs from them, or a
 standard-library change, lands in the same pull request as the native change that needs it; the
@@ -1349,9 +1351,9 @@ query and source-index cases. The semantic cases are split by topic into six roo
 their own roots to keep each native compilation within the CI time and heap limits. The HIR root
 runs the lowering, fingerprint, and parser cases without pulling the semantic engine into their
 binary. `--no-cache` executes assertions even if a previous run stored passing results. The focused
-Linux workflow runs these commands for pull requests targeting `main` and pushes to `main`, beside
-the broad TypeScript CI. Native work branches are named `selfhost-*`; pushing one does not start a
-second CI run before its pull request.
+Linux workflow runs these commands for pull requests targeting `main`, in the merge queue, and on
+`main` pushes the queue did not check, beside the broad TypeScript CI. Native work branches are
+named `selfhost-*`; pushing one does not start a second CI run before its pull request.
 The heaps match the cases matrix in `.github/workflows/selfhost.yml`: a semantic root peaks near
 11.3 GB, so run one at a time on a 15 GB machine.
 

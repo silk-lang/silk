@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - main
+  # Only pull requests into main run CI. A stack's upper PRs target another branch; the stack is
+  # checked once, by the pull request that lands its top into main.
   pull_request:
-    # A native stack's upper PRs target a compiler feature branch; selfhost.yml checks them.
-    branches-ignore:
-      - 'selfhost-*'
+    branches:
+      - main
+  merge_group:
   schedule:
     - cron: '17 4 * * 1-5'
   workflow_dispatch:
@@ -24,16 +26,53 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
-# A newer pull_request run of the same PR cancels the older one; push, schedule and
+# A newer pull_request run of the same PR cancels the older one; push, merge_group, schedule and
 # workflow_dispatch runs each keep a unique group, so they are never cancelled by it.
 concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The merge queue runs the main lanes below on the exact commit it then fast-forwards main to. A
+  # main push of that commit reuses the green merge-group run instead of running them again: it
+  # publishes that run's bootstrap and runs only validate. Any other run checks every lane its event
+  # selects.
+  reuse:
+    name: Reuse the merge queue run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      reused: ${{ steps.find.outputs.reused }}
+      run-id: ${{ steps.find.outputs.run-id }}
+    steps:
+      - name: Find the green merge-group run of this commit
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          id=
+          if [ "$EVENT" = push ]; then
+            id=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?event=merge_group&head_sha=$GITHUB_SHA&status=success&per_page=1" \
+              --jq '.workflow_runs[0].id // empty') || id=
+          fi
+          if [ -z "$id" ]; then
+            echo "reused=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "reused=true"
+            echo "run-id=$id"
+          } >> "$GITHUB_OUTPUT"
+          printf '### Reused the merge queue run\nRun [%s](%s) checked this commit `%s`; this push publishes its bootstrap.\n' \
+            "$id" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$id" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
   bundled-cli:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -97,18 +136,30 @@ jobs:
       - run: node packages/cli/scripts/test-bundle.mjs node --native
 
   publish-bootstrap:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    # Distribution is checked by the isolated Node/Bun bundle smoke, including native builds.
-    # Other repository checks still report failures without suppressing this CI input.
-    needs: [bundled-cli, bundled-cli-arm64]
+    # Distribution is checked by the isolated Node/Bun bundle smoke, including native builds, in
+    # this run or in the merge-group run it reuses. Other repository checks still report failures
+    # without suppressing this CI input.
+    if: >-
+      !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      && (needs.reuse.outputs.reused == 'true'
+      || (needs.bundled-cli.result == 'success' && needs.bundled-cli-arm64.result == 'success'))
+    needs: [reuse, bundled-cli, bundled-cli-arm64]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/download-artifact@v4
+        if: needs.reuse.outputs.reused != 'true'
         with:
           name: bootstrap-cli-${{ github.sha }}
           path: bootstrap
-      # Publish the compiler from this exact run after isolated checks succeed.
+      - uses: actions/download-artifact@v4
+        if: needs.reuse.outputs.reused == 'true'
+        with:
+          name: bootstrap-cli-${{ github.sha }}
+          path: bootstrap
+          run-id: ${{ needs.reuse.outputs.run-id }}
+          github-token: ${{ github.token }}
+      # Publish the compiler checked for this exact commit after its isolated checks succeed.
       - uses: actions/upload-artifact@v4
         with:
           name: silk-bootstrap
@@ -119,6 +170,9 @@ jobs:
 
   # Spike (openspec/changes/spike-ci-test-sharding): the compiler vitest payload runs in the
   # compiler-tests matrix below; validate keeps everything else `pnpm check` ran.
+  # Validate also runs on a main push that reuses the merge queue run. Caches saved by a merge-group
+  # run belong to the queue's temporary branch, so this run keeps main's pnpm store and Turbo cache
+  # current for pull requests and the queue.
   validate:
     if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
@@ -160,7 +214,8 @@ jobs:
           pnpm --filter @silklang/compiler exec tsc --ignoreConfig --noEmit --strict --exactOptionalPropertyTypes --skipLibCheck --allowImportingTsExtensions --allowJs --module nodenext --target es2022 --typeRoots node_modules/@types --types node ../../compiler/scripts/NativeBuild.ts ../../compiler/scripts/NativeProcess.ts
 
   package-tests:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     name: Package tests / ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -200,7 +255,8 @@ jobs:
           NODE_OPTIONS: ${{ matrix.name == 'lsp' && '--max-old-space-size=6144' || '' }}
 
   compiler-documentation:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     # Each independent check gets the existing bound; generation must not consume doctest time.
     timeout-minutes: 45
@@ -234,10 +290,11 @@ jobs:
   # case so the LLVM-to-Wasm leg under the shared host-resolved toolchain stays covered. The bounded
   # TLS witnesses use separate processes so their realized compiler graphs do not accumulate in one
   # V8 heap.
-  # Main keeps the complete corpus, split by SILK_NATIVE_SHARD because every case lives in one
-  # Vitest file.
+  # The merge queue and main keep the complete corpus, split by SILK_NATIVE_SHARD because every case
+  # lives in one Vitest file.
   native-acceptance:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     name: Native acceptance / ${{ matrix.name }}
     runs-on: ubuntu-24.04
     # Cold source-runtime corpus shards exceed 30 minutes, including toolchain/build setup.
@@ -285,7 +342,8 @@ jobs:
           SILK_NATIVE_FIXED_TESTS: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
 
   compiler-tests:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -337,7 +395,8 @@ jobs:
           if-no-files-found: warn
 
   tls-wasm:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     name: TLS Wasm / ${{ matrix.name }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -371,7 +430,8 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=6144
 
   macos-native-os:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: macos-15
     timeout-minutes: 20
     steps:
@@ -422,7 +482,8 @@ jobs:
           --maxWorkers=1
 
   webcontainer-browser:
-    if: github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -480,7 +541,8 @@ jobs:
           VITEST_MAX_WORKERS: 1
 
   platform-supplies:
-    if: github.event_name != 'workflow_dispatch' || !inputs.full_verification
+    needs: reuse
+    if: needs.reuse.outputs.reused != 'true' && (github.event_name != 'workflow_dispatch' || !inputs.full_verification)
     name: Platform supply / ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
@@ -623,13 +685,15 @@ jobs:
           if-no-files-found: error
 
   # The single required check for this workflow: every job above passed or did not apply to this
-  # event, and at least one ran. A failed or cancelled job fails it, and so does a run where every
-  # job was skipped, so it never reports green for a head nothing checked.
+  # event, and at least one besides the reuse lookup ran. A failed or cancelled job fails it, and so
+  # does a run where every other job was skipped, so it never reports green for a head nothing
+  # checked.
   result:
     name: CI result
     if: always()
     needs:
       [
+        reuse,
         bundled-cli,
         bundled-cli-arm64,
         publish-bootstrap,
@@ -653,4 +717,4 @@ jobs:
           set -euo pipefail
           jq -r 'to_entries[] | "\(.key)=\(.value.result)"' <<<"$RESULTS"
           jq -e 'all(.[]; .result == "success" or .result == "skipped")' <<<"$RESULTS" > /dev/null
-          jq -e 'any(.[]; .result == "success")' <<<"$RESULTS" > /dev/null
+          jq -e 'del(.reuse) | any(.[]; .result == "success")' <<<"$RESULTS" > /dev/null
