@@ -30,7 +30,7 @@ const fixture = Effect.fnUntraced(function* () {
       yield* fs.writeFileString(join(repository, path), text)
     },
   )
-  yield* put('compiler/silk.toml', '[package]\nname = "silk-compiler"\nroot = "src/main.silk"\n')
+  yield* put('compiler/silk.toml', '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
   yield* put('compiler/src/main.silk', main)
   yield* put('compiler/src/nested/Dependency.silk', 'pub fn value() -> i32 { return 1 }\n')
   yield* put('packages/compiler/stdlib/silk/i32.silk', 'pub let ZERO = 0\n')
