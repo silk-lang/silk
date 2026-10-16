@@ -436,6 +436,12 @@ exit 1`
     [borrowing('SEM0001', '1:35-1:42'), body('memory/driver.silk', 25, 43), 'ACCEPTED_INVALID'],
     [borrowing('OWN0003', '1:35-1:42'), body('memory/driver.silk', 25, 43), 'ACCEPTED_INVALID'],
     [borrowing('SEM0212', '1:35-1:42'), body('memory/driver.silk', 25, 43), 'BORROW_CHECK_GAP'],
+    // A body whose checks left nothing open lists no codes, so it carries nothing.
+    [
+      inBlock,
+      'SILK_GAP borrow-check body: memory/driver.silk 25-43 regions -\\n',
+      'ACCEPTED_INVALID',
+    ],
     [borrowing('OWN0011', '1:6-1:11'), body('memory/driver.silk', 25, 43), 'ACCEPTED_INVALID'],
   ] as const)
     await withStub(`printf '${bodies}' >&2\n${compiled}`, async (silkc) => {

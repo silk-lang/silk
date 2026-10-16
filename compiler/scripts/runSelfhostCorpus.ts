@@ -196,13 +196,16 @@ export interface UncheckedBody {
   readonly codes: ReadonlyArray<string>
 }
 
-/** Reads every `SILK_GAP borrow-check body: <module> <start>-<end> <reason> <codes>` line of a build. */
+/**
+ * Reads every `SILK_GAP borrow-check body: <module> <start>-<end> <reason> <codes>` line of a
+ * build; `-` lists no codes.
+ */
 export const parseUncheckedBodies = (stderr: string): ReadonlyArray<UncheckedBody> =>
   stderr
     .split('\n')
     .filter((line) => line.startsWith(uncheckedBodyPrefix))
     .map((line) => {
-      const match = /^(\S+) (\d+)-(\d+) ([a-z-]+) ([A-Z0-9]+(?:,[A-Z0-9]+)*)$/.exec(
+      const match = /^(\S+) (\d+)-(\d+) ([a-z-]+) (-|[A-Z0-9]+(?:,[A-Z0-9]+)*)$/.exec(
         line.slice(uncheckedBodyPrefix.length),
       )
       if (match === null) throw new Error(`malformed unchecked body line: ${line}`)
@@ -210,7 +213,7 @@ export const parseUncheckedBodies = (stderr: string): ReadonlyArray<UncheckedBod
         module: match[1] ?? '',
         span: { start: Number(match[2]), end: Number(match[3]) },
         reason: match[4] ?? '',
-        codes: (match[5] ?? '').split(','),
+        codes: match[5] === '-' ? [] : (match[5] ?? '').split(','),
       }
     })
 
