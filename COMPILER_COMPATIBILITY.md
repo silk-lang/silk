@@ -272,6 +272,7 @@ return found[0].value
 
 The compiler sources built by the bootstrap (T1) have never verified clean with `--verify-ir`. At
 selfhost 6d5dd194 after #1833, verification reports:
+
 - InvalidLoan: 52 (388 before #1833);
 - InvalidMatchOwnership: 31;
 - InvalidLocalSharedOperation: 5;
