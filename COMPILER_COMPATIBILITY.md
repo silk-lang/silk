@@ -2453,10 +2453,10 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   Checked, as are the orders with a local first. The bootstrap fixes the binder from the first
   field, so with `p` first it rejects with SEM0212 at the first later borrow of a local.
 - **Source migration:** none. Write the fields in any order.
-- **Diagnostics and limits:** a literal holding a local borrow that is returned is rejected
-  (OWN0019 at the literal), and one read through a binding after the local ends is rejected
-  (OWN0019 at the read). One stored through `&mut` into a caller region stays unchecked natively
-  (`stored-loans`) until native rejects a local loan stored into caller-owned storage.
+- **Diagnostics and limits:** a literal holding a local borrow is still rejected when it is
+  returned (OWN0019 at the literal), read through a binding after the local ends (OWN0019 at the
+  read), or stored through `&mut` into a caller region (SEM0212 at the local borrow), in any field
+  order. A binder written on the literal, such as `Trio<'p> { ... }`, is never shortened.
   Known parity difference: for `S { x: p, y: &l }` with a parameter first and a direct borrow of a
   local, before this change native reported OWN0019 where the bootstrap reports SEM0212; both
   reject. Native now accepts it when the literal stays local.
