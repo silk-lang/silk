@@ -577,6 +577,34 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(bare.status, 6, bare.stderr)
+  // `format` reports unchanged and formatted files on standard output, and drift and damage on
+  // standard error, as the TypeScript CLI does.
+  const formatting = join(directory, 'formatting')
+  yield* fs.makeDirectory(join(formatting, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(formatting, 'silk.toml'),
+    '[package]\nname = "formatting"\nversion = "0.1.0"\nroot = "src/a.silk"\n',
+  )
+  yield* fs.writeFileString(join(formatting, 'src/a.silk'), 'pub fn a() -> i32 {\n  return 1\n}\n')
+  yield* fs.writeFileString(join(formatting, 'src/b.silk'), 'pub fn b()->i32{return 2}\n')
+  yield* fs.writeFileString(join(formatting, 'src/c.silk'), 'pub fn c( {\n')
+  const formatChecked = yield* invoke(silk, ['format', '--check'], formatting)
+  assert.equal(formatChecked.status, 1, formatChecked.stderr)
+  assert.equal(formatChecked.stdout, `${join(formatting, 'src/a.silk')}: unchanged\n`)
+  assert.match(
+    formatChecked.stderr,
+    new RegExp(`^${join(formatting, 'src/b.silk')}: needs formatting$`, 'm'),
+  )
+  assert.match(
+    formatChecked.stderr,
+    new RegExp(
+      `^${join(formatting, 'src/c.silk')}: cannot format damaged source \\(PAR\\d{4}(, [A-Z]{3}\\d{4})*\\)$`,
+      'm',
+    ),
+  )
+  const rewritten = yield* invoke(silk, ['format'], formatting)
+  assert.equal(rewritten.status, 1, rewritten.stderr)
+  assert.match(rewritten.stdout, new RegExp(`^${join(formatting, 'src/b.silk')}: formatted$`, 'm'))
   const cleanedByPath = yield* invoke(silk, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
@@ -596,7 +624,7 @@ const program = Effect.gen(function* () {
     'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
   )
   const libraryManifest = (inputs: string, artifact = 'object') =>
-    `[package]\nname = "library"\nroot = "src/Main.silk"\n\n[build]\nartifact = "${artifact}"\nnative-link-inputs = [${inputs}]\n`
+    `[package]\nname = "library"\nversion = "0.1.0"\nroot = "src/Main.silk"\n\n[build]\nartifact = "${artifact}"\nnative-link-inputs = [${inputs}]\n`
   const tools = dirname(clang)
   const inspect = Effect.fnUntraced(function* (object: string) {
     const header = yield* invoke(join(tools, 'llvm-readobj'), ['--file-header', object], library)
@@ -822,7 +850,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, runtime requests, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
