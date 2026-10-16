@@ -294,6 +294,11 @@ an atom used only as another loan's inner retained region stay pending. Cyclic r
 proved only when every reachable local component reaches a sufficient real parent; a grounded
 branch cannot justify an ungrounded sibling cycle. The symbolic proof caches completed results
 by source and target within this one body; a proof for one universal cannot prove another. It does not use finite body points to infer a caller boundary.
+A call result that names only caller regions drops the body-region loans its operands carry,
+since a body region cannot outlive a caller region. When a relation still makes such a dropped
+loan's region outlive a universal region, the walk no longer sees where the loan goes, so the
+loan is treated as an escaping loan: an access that would conflict with it anywhere its creation
+reaches keeps the relation pending.
 Loan conflicts and all other retained goals are checked independently. When several call operands
 name the known result region, the retained loans form a complete union of possible sources. A
 region proof must succeed for every source in that union. A conflict with one possible source
