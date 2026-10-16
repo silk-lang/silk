@@ -37,7 +37,7 @@ const fixture = Effect.fnUntraced(
         )
         const snapshot = join(root, 'snapshot')
         const inputs = [
-          ['compiler/silk.toml', '[package]\nname = "compiler"\nroot = "src/main.silk"\n'],
+          ['compiler/silk.toml', '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n'],
           ['compiler/src/main.silk', 'pub fn main() -> i32 { return 0 }'],
           [
             'packages/compiler/stdlib/silk/i32.silk',
