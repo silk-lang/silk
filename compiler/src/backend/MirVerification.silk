@@ -1,0 +1,1083 @@
+//! Mechanical checks of lowered MIR that hold however lowering placed its work.
+//!
+//! # When to use
+//! Run each check on every lowered body, glue and helper before the answer is published. A
+//! violation is a lowering defect, never a source error: the caller aborts the build rather than
+//! emit code from it. Borrow checking does not see compiler-placed drops, so these checks are the
+//! only line between a misplaced drop and a silent use after free.
+
+import backend.Mir {
+  AggregateField,
+  Block,
+  Callee,
+  Diagnostics,
+  FailureEdge,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Rvalue,
+  Statement,
+  Terminator,
+}
+import backend.Mir
+import diagnostic.JsonText
+import semantic.Type {Type}
+import semantic.TypedBody {Origin}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// A use of storage that a destructor-running drop ended on some path to it.
+pub struct UseAfterDrop {
+  /// The block of the use.
+  pub block: usize
+  /// The statement of the use within `block`; the statement count names its terminator.
+  pub statement: usize
+  /// The local whose drop ended the used storage.
+  pub dropped: usize
+  pub origin: Origin
+  /// When the use copies or moves a strict part of a whole dropped place into a whole local, the
+  /// part's type. Drop glue never touches a part whose type runs no cleanup, so lowering may read
+  /// such a part after dropping the rest; the caller excuses exactly those parts.
+  pub read: Option<Shared<Type>>
+}
+
+// Storage a drop ended, and the local whose drop ended it. A runtime index in `place` names the
+// element its index local held at the drop; once that local is written, `place` may name another
+// element, so no later write can be shown to replace the ended one (`pinned`).
+struct Killed {
+  place: Place
+  dropped: usize
+  pinned: bool
+}
+
+// A place holding a view of `base`: a reference, slice or address derived from it.
+struct View {
+  holder: Place
+  base: Place
+}
+
+// A drop flag whose value is the same constant on every path reaching a point.
+struct KnownFlag {
+  local: usize
+  value: bool
+}
+
+impl Copy for KnownFlag {}
+
+// What may hold on entry to a block, over every path reaching it, and the drop flags whose value
+// every such path agrees on. A branch on a known flag never reaches its other side, so a drop that
+// flag skips is not a drop on that path.
+struct Facts {
+  killed: Vector<Killed>
+  views: Vector<View>
+  flags: Vector<KnownFlag>
+}
+
+/// Every use of storage after a destructor-running drop of it, on any path, once per site.
+///
+/// # Details
+///
+/// A `Drop` of a place ends it and every place overlapping it until a write replaces the place
+/// whole. Every later read, borrow, address, drop or write through it is a violation. A drop
+/// the compiler placed for a temporary also ends every view derived from the temporary, carried
+/// through copies, reborrows, slices, aggregates and call results that can hold a view. A drop
+/// of a binding or parameter ends only its own storage: borrow checking already owns the views of
+/// a written binding.
+pub effect fn useAfterDrop(function: &MirFunction) -> Vector<UseAfterDrop> ! OutOfMemoryError ? &mut Allocator {
+  let mut found = Vector<UseAfterDrop>.make()
+  let blocks = Vector<Block>.asSlice(&function.blocks)
+  if blocks.length == usize.ZERO { return move found }
+  let mut entries = Vector<Option<Facts>>.make()
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    run Vector<Option<Facts>>.append(&mut entries, Option<Facts>.none())
+    at = at + usize.ONE
+  }
+  Vector<Option<Facts>>.set(&mut entries, usize.ZERO, Option<Facts>.some(emptyFacts()))
+  // Only a temporary this function drops can end a view, so only its borrows start one.
+  let endable = run endableTemporaries(function)
+  let ending = Vector<bool>.asSlice(&endable)
+  if ending.length == usize.ZERO { return move found }
+  let mut pending = Vector<usize>.make()
+  let mut queued = Vector<bool>.make()
+  at = usize.ZERO
+  while at < blocks.length {
+    run Vector<bool>.append(&mut queued, false)
+    at = at + usize.ONE
+  }
+  run Vector<usize>.append(&mut pending, usize.ZERO)
+  Vector<bool>.set(&mut queued, usize.ZERO, true)
+  while Vector<usize>.length(&pending) != usize.ZERO {
+    let block = match move Vector<usize>.pop(&mut pending) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => usize.ZERO
+    }
+    Vector<bool>.set(&mut queued, block, false)
+    let mut facts = match &Vector<Option<Facts>>.asSlice(&entries)[block] {
+      Option<Facts>.Some {value} => run copyFacts(&value)
+      Option<Facts>.None => emptyFacts()
+    }
+    let statements = Vector<Statement>.asSlice(&blocks[block].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      if let Option<UseAfterDrop>.Some {value} = move run statementUse(function, &facts, &statements[index], block, index) {
+        run record(&mut found, move value)
+      }
+      run applyStatement(function, ending, &mut facts, &statements[index])
+      index = index + usize.ONE
+    }
+    let terminator = &blocks[block].terminator
+    if let Option<UseAfterDrop>.Some {value} = move run terminatorUse(function, &facts, terminator, block, statements.length) {
+      run record(&mut found, move value)
+    }
+    let targets = run MirFunction.successors(function, block)
+    let listed = Vector<usize>.asSlice(&targets)
+    let mut next = usize.ZERO
+    while next < listed.length {
+      if !feasible(&facts, terminator, listed[next]) {
+        next = next + usize.ONE
+        continue
+      }
+      let mut leaving = run copyFacts(&facts)
+      run applyEdge(function, &mut leaving, terminator, listed[next])
+      let grew = run mergeInto(&mut entries, listed[next], move leaving)
+      let waiting = Vector<bool>.asSlice(&queued)[listed[next]]
+      if grew && !waiting {
+        run Vector<usize>.append(&mut pending, listed[next])
+        Vector<bool>.set(&mut queued, listed[next], true)
+      }
+      next = next + usize.ONE
+    }
+  }
+  return move found
+}
+
+effect fn record(found: &mut Vector<UseAfterDrop>, candidate: UseAfterDrop) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<UseAfterDrop>.asSlice(&found.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].block == candidate.block && listed[at].statement == candidate.statement { return () }
+    at = at + usize.ONE
+  }
+  run Vector<UseAfterDrop>.append(&mut found.*, move candidate)
+}
+
+fn emptyFacts() -> Facts {
+  return Facts {killed: Vector<Killed>.make(), views: Vector<View>.make(), flags: Vector<KnownFlag>.make()}
+}
+
+// Per local, whether it is a temporary this function drops. Empty when the function drops nothing,
+// since then no storage can be used after a drop.
+effect fn endableTemporaries(function: &MirFunction) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
+  let locals = Vector<Local>.asSlice(&function.locals)
+  let mut endable = Vector<bool>.make()
+  let mut at = usize.ZERO
+  while at < locals.length {
+    run Vector<bool>.append(&mut endable, false)
+    at = at + usize.ONE
+  }
+  let mut drops = false
+  let blocks = Vector<Block>.asSlice(&function.blocks)
+  at = usize.ZERO
+  while at < blocks.length {
+    let statements = Vector<Statement>.asSlice(&blocks[at].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      if let Statement.Drop {destination, ..} = &statements[index] {
+        drops = true
+        let temporary = match &locals[destination.local].kind { LocalKind.Temp => true _ => false }
+        if temporary { Vector<bool>.set(&mut endable, destination.local, true) }
+      }
+      index = index + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if !drops { return Vector<bool>.make() }
+  return move endable
+}
+
+effect fn copyFacts(facts: &Facts) -> Facts ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = emptyFacts()
+  let killed = Vector<Killed>.asSlice(&facts.killed)
+  let mut at = usize.ZERO
+  while at < killed.length {
+    run Vector<Killed>.append(&mut copied.killed, Killed {place: run Mir.copyPlace(&killed[at].place), dropped: killed[at].dropped, pinned: killed[at].pinned})
+    at = at + usize.ONE
+  }
+  let views = Vector<View>.asSlice(&facts.views)
+  at = usize.ZERO
+  while at < views.length {
+    run Vector<View>.append(&mut copied.views, View {holder: run Mir.copyPlace(&views[at].holder), base: run Mir.copyPlace(&views[at].base)})
+    at = at + usize.ONE
+  }
+  let flags = Vector<KnownFlag>.asSlice(&facts.flags)
+  at = usize.ZERO
+  while at < flags.length {
+    run Vector<KnownFlag>.append(&mut copied.flags, flags[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// Unions `incoming` into the entry facts of `block`; whether anything was added.
+effect fn mergeInto(entries: &mut Vector<Option<Facts>>, block: usize, incoming: Facts) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let slots = Vector<Option<Facts>>.asMutSlice(&mut entries.*)
+  let visited = match &slots[block] { Option<Facts>.Some {..} => true Option<Facts>.None => false }
+  if !visited {
+    slots[block] = Option<Facts>.some(move incoming)
+    return true
+  }
+  let mut changed = false
+  if let Option<Facts>.Some {value: existing} = &mut slots[block] {
+    // A flag stays known only where every path agrees on it.
+    let mut agreed = Vector<KnownFlag>.make()
+    let previous = Vector<KnownFlag>.asSlice(&existing.flags)
+    let mut known = usize.ZERO
+    while known < previous.length {
+      if flagAgrees(&incoming, previous[known]) {
+        run Vector<KnownFlag>.append(&mut agreed, previous[known])
+      } else {
+        changed = true
+      }
+      known = known + usize.ONE
+    }
+    existing.flags = move agreed
+    let killed = Vector<Killed>.asSlice(&incoming.killed)
+    let mut at = usize.ZERO
+    while at < killed.length {
+      if !hasKilled(&existing, &killed[at]) {
+        run Vector<Killed>.append(&mut existing.killed, Killed {place: run Mir.copyPlace(&killed[at].place), dropped: killed[at].dropped, pinned: killed[at].pinned})
+        changed = true
+      }
+      at = at + usize.ONE
+    }
+    let views = Vector<View>.asSlice(&incoming.views)
+    at = usize.ZERO
+    while at < views.length {
+      if !hasView(&existing, &views[at].holder, &views[at].base) {
+        run Vector<View>.append(&mut existing.views, View {holder: run Mir.copyPlace(&views[at].holder), base: run Mir.copyPlace(&views[at].base)})
+        changed = true
+      }
+      at = at + usize.ONE
+    }
+  }
+  return changed
+}
+
+effect fn copyViews(views: &Vector<View>) -> Vector<View> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<View>.make()
+  let listed = Vector<View>.asSlice(&views.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run Vector<View>.append(&mut copied, View {holder: run Mir.copyPlace(&listed[at].holder), base: run Mir.copyPlace(&listed[at].base)})
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+fn flagAgrees(facts: &Facts, flag: KnownFlag) -> bool {
+  if let Option<bool>.Some {value} = move flagValue(facts, flag.local) { return value == flag.value }
+  return false
+}
+
+fn constantBoolean(value: &Rvalue) -> Option<bool> {
+  if let Rvalue.Use {value: used} = &value.* {
+    if let Operand.Boolean {value: known} = &used { return Option<bool>.some(known) }
+  }
+  return Option<bool>.none()
+}
+
+fn flagValue(facts: &Facts, local: usize) -> Option<bool> {
+  let flags = Vector<KnownFlag>.asSlice(&facts.flags)
+  let mut at = usize.ZERO
+  while at < flags.length {
+    if flags[at].local == local { return Option<bool>.some(flags[at].value) }
+    at = at + usize.ONE
+  }
+  return Option<bool>.none()
+}
+
+effect fn setFlag(facts: &mut Facts, local: usize, value: Option<bool>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut kept = Vector<KnownFlag>.make()
+  let flags = Vector<KnownFlag>.asSlice(&facts.flags)
+  let mut at = usize.ZERO
+  while at < flags.length {
+    if flags[at].local != local { run Vector<KnownFlag>.append(&mut kept, flags[at]) }
+    at = at + usize.ONE
+  }
+  if let Option<bool>.Some {value: known} = move value { run Vector<KnownFlag>.append(&mut kept, KnownFlag {local: local, value: known}) }
+  facts.flags = move kept
+}
+
+// Whether `target` is reachable from the end of `terminator` under the known flags.
+fn feasible(facts: &Facts, terminator: &Terminator, target: usize) -> bool {
+  if let Terminator.Branch {condition: Operand.Copy {place}, thenBlock, elseBlock, ..} = &terminator.* {
+    if thenBlock == elseBlock || Vector<Projection>.length(&place.projections) != usize.ZERO { return true }
+    if let Option<bool>.Some {value} = move flagValue(facts, place.local) {
+      if value { return target == thenBlock }
+      return target == elseBlock
+    }
+  }
+  return true
+}
+
+fn hasKilled(facts: &Facts, candidate: &Killed) -> bool {
+  let killed = Vector<Killed>.asSlice(&facts.killed)
+  let mut at = usize.ZERO
+  while at < killed.length {
+    if killed[at].dropped == candidate.dropped && killed[at].pinned == candidate.pinned && samePlace(&killed[at].place, &candidate.place) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn hasView(facts: &Facts, holder: &Place, base: &Place) -> bool {
+  let views = Vector<View>.asSlice(&facts.views)
+  let mut at = usize.ZERO
+  while at < views.length {
+    if samePlace(&views[at].holder, holder) && samePlace(&views[at].base, base) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Exact structural equality, used only to keep the fact sets finite.
+fn samePlace(left: &Place, right: &Place) -> bool {
+  if left.local != right.local { return false }
+  let first = Vector<Projection>.asSlice(&left.projections)
+  let second = Vector<Projection>.asSlice(&right.projections)
+  if first.length != second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if !sameStep(&first[at], &second[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn sameStep(left: &Projection, right: &Projection) -> bool {
+  return match &left.* {
+    Projection.Field {index} => match &right.* { Projection.Field {index: other} => index == other _ => false }
+    Projection.Payload {index, ..} => match &right.* { Projection.Payload {index: other, ..} => index == other _ => false }
+    Projection.VariantField {variant, field} => match &right.* {
+      Projection.VariantField {variant: otherVariant, field: otherField} => variant == otherVariant && field == otherField
+      _ => false
+    }
+    Projection.Index {local} => match &right.* { Projection.Index {local: other} => local == other _ => false }
+    Projection.ConstIndex {index} => match &right.* { Projection.ConstIndex {index: other} => index == other _ => false }
+    Projection.Deref => match &right.* { Projection.Deref => true _ => false }
+  }
+}
+
+// Whether two steps from the same storage may select overlapping bytes. Union payloads and
+// distinct nominal variants share storage; runtime indices may select any element.
+fn stepsMayOverlap(left: &Projection, right: &Projection) -> bool {
+  return match &left.* {
+    Projection.Field {index} => match &right.* { Projection.Field {index: other} => index == other _ => true }
+    Projection.Payload {..} => true
+    Projection.VariantField {variant, field} => match &right.* {
+      Projection.VariantField {variant: otherVariant, field: otherField} => variant != otherVariant || field == otherField
+      _ => true
+    }
+    Projection.Index {..} => true
+    Projection.ConstIndex {index} => match &right.* {
+      Projection.ConstIndex {index: other} => index == other
+      _ => true
+    }
+    Projection.Deref => true
+  }
+}
+
+// Whether `first` and `second` may share storage: same local, and one path a prefix of the other
+// step by step.
+fn mayOverlap(first: &Place, second: &Place) -> bool {
+  if first.local != second.local { return false }
+  let left = Vector<Projection>.asSlice(&first.projections)
+  let right = Vector<Projection>.asSlice(&second.projections)
+  let mut at = usize.ZERO
+  while at < left.length && at < right.length {
+    if !stepsMayOverlap(&left[at], &right[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether a write to `writer` replaces all of `written`: `writer` is an exact prefix of it with no
+// runtime index or dereference, so the write cannot land elsewhere.
+fn covers(writer: &Place, written: &Place) -> bool {
+  if writer.local != written.local { return false }
+  let left = Vector<Projection>.asSlice(&writer.projections)
+  let right = Vector<Projection>.asSlice(&written.projections)
+  if left.length > right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    let fixed = match &left[at] { Projection.Deref => false _ => true }
+    if !fixed || !sameStep(&left[at], &right[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether writing `destination` changes an index local that `place` selects an element by.
+fn indexes(place: &Place, destination: &Place) -> bool {
+  if Vector<Projection>.length(&destination.projections) != usize.ZERO { return false }
+  let steps = Vector<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local} = &steps[at] {
+      if local == destination.local { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The length of the prefix of `place` stored in its own local: up to its first dereference.
+fn ownedDepth(place: &Place) -> usize {
+  let steps = Vector<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    let deref = match &steps[at] { Projection.Deref => true _ => false }
+    if deref { return at }
+    at = at + usize.ONE
+  }
+  return steps.length
+}
+
+effect fn prefixOf(place: &Place, depth: usize) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut prefix = Place {local: place.local, projections: Vector<Projection>.make()}
+  let steps = Vector<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < depth {
+    run Vector<Projection>.append(&mut prefix.projections, run Mir.copyProjection(&steps[at]))
+    at = at + usize.ONE
+  }
+  return move prefix
+}
+
+// The killed storage that reading `place` touches: its owned prefix, and each runtime index local.
+effect fn placeUse(facts: &Facts, place: &Place) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  let steps = Vector<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local} = &steps[at] {
+      let index = Place {local: local, projections: Vector<Projection>.make()}
+      if let Option<usize>.Some {value} = move killedBy(facts, &index) { return Option<usize>.some(value) }
+    }
+    at = at + usize.ONE
+  }
+  let owned = run prefixOf(place, ownedDepth(place))
+  return killedBy(facts, &owned)
+}
+
+fn killedBy(facts: &Facts, place: &Place) -> Option<usize> {
+  let killed = Vector<Killed>.asSlice(&facts.killed)
+  let mut at = usize.ZERO
+  while at < killed.length {
+    if mayOverlap(place, &killed[at].place) { return Option<usize>.some(killed[at].dropped) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+effect fn operandUse(facts: &Facts, operand: &Operand) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  return match &operand.* {
+    Operand.Copy {place} => run placeUse(facts, &place)
+    Operand.Move {place} => run placeUse(facts, &place)
+    _ => Option<usize>.none()
+  }
+}
+
+effect fn operandsUse(facts: &Facts, operands: &Vector<Operand>) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<Operand>.asSlice(&operands.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Option<usize>.Some {value} = move run operandUse(facts, &listed[at]) { return Option<usize>.some(value) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+effect fn fieldsUse(facts: &Facts, fields: &Vector<AggregateField>) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<AggregateField>.asSlice(&fields.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Option<usize>.Some {value} = move run operandUse(facts, &listed[at].value) { return Option<usize>.some(value) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+effect fn diagnosticsUse(facts: &Facts, diagnostics: &Option<Diagnostics>) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  if let Option<Diagnostics>.Some {value} = &diagnostics.* {
+    if let Option<usize>.Some {value: dropped} = move run operandUse(facts, &value.observer) { return Option<usize>.some(dropped) }
+    return run operandUse(facts, &value.cause)
+  }
+  return Option<usize>.none()
+}
+
+fn eitherUse(first: Option<usize>, second: Option<usize>) -> Option<usize> {
+  if let Option<usize>.Some {value} = move first { return Option<usize>.some(value) }
+  return move second
+}
+
+effect fn rvalueUse(facts: &Facts, value: &Rvalue) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  return match &value.* {
+    Rvalue.Aggregate {fields} => run fieldsUse(facts, &fields)
+    Rvalue.Slice {data, count} => eitherUse(run operandUse(facts, &data), run operandUse(facts, &count))
+    Rvalue.SliceLength {place} => run placeUse(facts, &place)
+    Rvalue.SliceData {place} => run placeUse(facts, &place)
+    Rvalue.PointerOffset {pointer, index, ..} => eitherUse(run operandUse(facts, &pointer), run operandUse(facts, &index))
+    Rvalue.Use {value: used} => run operandUse(facts, &used)
+    Rvalue.Ref {place, ..} => run placeUse(facts, &place)
+    Rvalue.AddressOf {place, ..} => run placeUse(facts, &place)
+    Rvalue.Unary {value: used, ..} => run operandUse(facts, &used)
+    Rvalue.Binary {left, right, ..} => eitherUse(run operandUse(facts, &left), run operandUse(facts, &right))
+    Rvalue.ScalarBinary {left, right, ..} => eitherUse(run operandUse(facts, &left), run operandUse(facts, &right))
+    Rvalue.ScalarUnary {value: used, ..} => run operandUse(facts, &used)
+    Rvalue.Convert {value: used, ..} => run operandUse(facts, &used)
+    Rvalue.Fits {value: used, ..} => run operandUse(facts, &used)
+    Rvalue.AddressIntegerConversion {operand, ..} => run operandUse(facts, &operand)
+    Rvalue.Bitcast {value: used, ..} => run operandUse(facts, &used)
+    Rvalue.Discriminant {place} => run placeUse(facts, &place)
+    Rvalue.Inject {value: used, ..} => run operandUse(facts, &used)
+    Rvalue.Variant {fields, ..} => run fieldsUse(facts, &fields)
+    Rvalue.FunctionAddress {..} => Option<usize>.none()
+    Rvalue.ContextOf {place} => run placeUse(facts, &place)
+    Rvalue.ContextHandle {address} => run operandUse(facts, &address)
+    Rvalue.ForeignStatic {..} => Option<usize>.none()
+    Rvalue.RunningPackage => Option<usize>.none()
+    Rvalue.Assembly {inputs, ..} => run operandsUse(facts, &inputs)
+  }
+}
+
+// A write reads only what locates its destination: runtime index locals, and the pointer of a
+// write through a dereference.
+effect fn destinationUse(facts: &Facts, destination: &Place) -> Option<usize> ! OutOfMemoryError ? &mut Allocator {
+  let steps = Vector<Projection>.asSlice(&destination.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Projection.Index {local} = &steps[at] {
+      let index = Place {local: local, projections: Vector<Projection>.make()}
+      if let Option<usize>.Some {value} = move killedBy(facts, &index) { return Option<usize>.some(value) }
+    }
+    at = at + usize.ONE
+  }
+  let depth = ownedDepth(destination)
+  if depth == steps.length { return Option<usize>.none() }
+  let pointer = run prefixOf(destination, depth)
+  return killedBy(facts, &pointer)
+}
+
+fn violation(dropped: Option<usize>, block: usize, statement: usize, origin: Origin) -> Option<UseAfterDrop> {
+  return match move dropped {
+    Option<usize>.Some {value} => Option<UseAfterDrop>.some(UseAfterDrop {block: block, statement: statement, dropped: value, origin: origin, read: Option<Shared<Type>>.none()})
+    Option<usize>.None => Option<UseAfterDrop>.none()
+  }
+}
+
+// Whether every ended place `read` touches is a whole place its own drop ended and `read` is a
+// strict, fixed part of it: then reading it is sound exactly when its type runs no cleanup.
+fn partRead(facts: &Facts, read: &Place) -> bool {
+  let killed = Vector<Killed>.asSlice(&facts.killed)
+  let mut touched = false
+  let mut at = usize.ZERO
+  while at < killed.length {
+    if mayOverlap(read, &killed[at].place) {
+      let whole = killed[at].place.local == killed[at].dropped
+      let strict = Vector<Projection>.length(&killed[at].place.projections) < Vector<Projection>.length(&read.projections)
+      if !whole || !strict || !covers(&killed[at].place, read) { return false }
+      touched = true
+    }
+    at = at + usize.ONE
+  }
+  return touched
+}
+
+effect fn statementUse(function: &MirFunction, facts: &Facts, statement: &Statement, block: usize, index: usize) -> Option<UseAfterDrop>
+! OutOfMemoryError ? &mut Allocator {
+  match &statement.* {
+    Statement.Assign {destination, value, origin} => {
+      let read = run rvalueUse(facts, &value)
+      let found = violation(eitherUse(move read, run destinationUse(facts, &destination)), block, index, origin)
+      if let Option<UseAfterDrop>.Some {value: misuse} = move found {
+        let mut reported = move misuse
+        if let Rvalue.Use {value: used} = &value {
+          let part = match &used { Operand.Copy {place} => Option<Place>.some(run Mir.copyPlace(&place)) Operand.Move {place} => Option<Place>.some(run Mir.copyPlace(&place)) _ => Option<Place>.none() }
+          if let Option<Place>.Some {value: source} = move part {
+            if Vector<Projection>.length(&destination.projections) == usize.ZERO && ownedDepth(&source) == Vector<Projection>.length(&source.projections) && partRead(facts, &source) {
+              reported.read = Option<Shared<Type>>.some(Shared<Type>.clone(&Vector<Local>.asSlice(&function.locals)[destination.local].ty))
+            }
+          }
+        }
+        return Option<UseAfterDrop>.some(move reported)
+      }
+      return Option<UseAfterDrop>.none()
+    }
+    // Dropping ended storage again runs its destructor twice.
+    Statement.Drop {destination, diagnostics, origin, ..} => {
+      let read = run placeUse(facts, &destination)
+      return violation(eitherUse(move read, run diagnosticsUse(facts, &diagnostics)), block, index, origin)
+    }
+    Statement.FailureContext {destination, source, origin} => {
+      let mut used = run placeUse(facts, &destination)
+      if let Option<Place>.Some {value: from} = &source {
+        let next = eitherUse(move used, run placeUse(facts, &from))
+        used = move next
+      }
+      return violation(move used, block, index, origin)
+    }
+    Statement.SetContextHandle {address, value, origin} => {
+      let read = run operandUse(facts, &address)
+      return violation(eitherUse(move read, run operandUse(facts, &value)), block, index, origin)
+    }
+  }
+}
+
+fn failureLocal(function: &MirFunction) -> Option<usize> {
+  let locals = Vector<Local>.asSlice(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let failure = match &locals[at].kind { LocalKind.Failure => true _ => false }
+    if failure { return Option<usize>.some(at) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+effect fn terminatorUse(function: &MirFunction, facts: &Facts, terminator: &Terminator, block: usize, index: usize) -> Option<UseAfterDrop>
+! OutOfMemoryError ? &mut Allocator {
+  match &terminator.* {
+    Terminator.Branch {condition, origin, ..} => { return violation(run operandUse(facts, &condition), block, index, origin) }
+    Terminator.Switch {value, origin, ..} => { return violation(run operandUse(facts, &value), block, index, origin) }
+    Terminator.Return {origin} => {
+      let result = Place {local: usize.ZERO, projections: Vector<Projection>.make()}
+      return violation(killedBy(facts, &result), block, index, origin)
+    }
+    Terminator.Fail {origin} => {
+      if let Option<usize>.Some {value: failed} = move failureLocal(function) {
+        let slot = Place {local: failed, projections: Vector<Projection>.make()}
+        return violation(killedBy(facts, &slot), block, index, origin)
+      }
+      return Option<UseAfterDrop>.none()
+    }
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, failure, origin, ..} => {
+      return violation(run callUse(facts, &callee, &arguments, &providers, &diagnostics, &destination, &failure), block, index, origin)
+    }
+    _ => { return Option<UseAfterDrop>.none() }
+  }
+}
+
+// What a call reads: an indirect callee's address, its arguments, providers and diagnostics, and
+// what locates its destinations.
+effect fn callUse(facts: &Facts, callee: &Callee, arguments: &Vector<Operand>, providers: &Vector<Operand>,
+  diagnostics: &Option<Diagnostics>, destination: &Place, failure: &Option<FailureEdge>) -> Option<usize>
+! OutOfMemoryError ? &mut Allocator {
+  if let Callee.Indirect {address} = &callee.* {
+    if let Option<usize>.Some {value} = move run operandUse(facts, &address) { return Option<usize>.some(value) }
+  }
+  if let Callee.NativeIndirect {address, ..} = &callee.* {
+    if let Option<usize>.Some {value} = move run operandUse(facts, &address) { return Option<usize>.some(value) }
+  }
+  if let Option<usize>.Some {value} = move run operandsUse(facts, arguments) { return Option<usize>.some(value) }
+  if let Option<usize>.Some {value} = move run operandsUse(facts, providers) { return Option<usize>.some(value) }
+  if let Option<usize>.Some {value} = move run diagnosticsUse(facts, diagnostics) { return Option<usize>.some(value) }
+  if let Option<usize>.Some {value} = move run destinationUse(facts, destination) { return Option<usize>.some(value) }
+  if let Option<FailureEdge>.Some {value: edge} = &failure.* { return run destinationUse(facts, &edge.destination) }
+  return Option<usize>.none()
+}
+
+// A whole replacement of `destination` revives what it covers and forgets the views it held.
+effect fn written(facts: &mut Facts, destination: &Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if ownedDepth(destination) != Vector<Projection>.length(&destination.projections) { return () }
+  let mut killed = Vector<Killed>.make()
+  let previous = Vector<Killed>.asSlice(&facts.killed)
+  let mut at = usize.ZERO
+  while at < previous.length {
+    if previous[at].pinned || !covers(destination, &previous[at].place) {
+      run Vector<Killed>.append(&mut killed, Killed {place: run Mir.copyPlace(&previous[at].place), dropped: previous[at].dropped, pinned: previous[at].pinned || indexes(&previous[at].place, destination)})
+    }
+    at = at + usize.ONE
+  }
+  facts.killed = move killed
+  let mut views = Vector<View>.make()
+  let held = Vector<View>.asSlice(&facts.views)
+  at = usize.ZERO
+  while at < held.length {
+    if !covers(destination, &held[at].holder) {
+      run Vector<View>.append(&mut views, View {holder: run Mir.copyPlace(&held[at].holder), base: run Mir.copyPlace(&held[at].base)})
+    }
+    at = at + usize.ONE
+  }
+  facts.views = move views
+}
+
+// Records `holder` as a view of `base`, or of whatever `base` itself views when `base` is reached
+// through a dereference.
+effect fn derive(facts: &mut Facts, ending: &[bool], holder: &Place, base: &Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  let depth = ownedDepth(base)
+  if depth == Vector<Projection>.length(&base.projections) {
+    if !ending[base.local] { return () }
+    if !hasView(&facts.*, holder, base) {
+      run Vector<View>.append(&mut facts.views, View {holder: run Mir.copyPlace(holder), base: run Mir.copyPlace(base)})
+    }
+    return ()
+  }
+  let pointer = run prefixOf(base, depth)
+  run carry(&mut facts.*, holder, &pointer)
+}
+
+// Records `holder` as a view of every base that a place overlapping `source` views.
+effect fn carry(facts: &mut Facts, holder: &Place, source: &Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut bases = Vector<Place>.make()
+  let views = Vector<View>.asSlice(&facts.views)
+  let mut at = usize.ZERO
+  while at < views.length {
+    if mayOverlap(&views[at].holder, source) { run Vector<Place>.append(&mut bases, run Mir.copyPlace(&views[at].base)) }
+    at = at + usize.ONE
+  }
+  let listed = Vector<Place>.asSlice(&bases)
+  at = usize.ZERO
+  while at < listed.length {
+    if !hasView(&facts.*, holder, &listed[at]) {
+      run Vector<View>.append(&mut facts.views, View {holder: run Mir.copyPlace(holder), base: run Mir.copyPlace(&listed[at])})
+    }
+    at = at + usize.ONE
+  }
+}
+
+effect fn carryOperand(facts: &mut Facts, holder: &Place, operand: &Operand) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &operand.* {
+    Operand.Copy {place} => run carry(&mut facts.*, holder, &place)
+    Operand.Move {place} => run carry(&mut facts.*, holder, &place)
+    _ => ()
+  }
+}
+
+effect fn carryFields(facts: &mut Facts, holder: &Place, fields: &Vector<AggregateField>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<AggregateField>.asSlice(&fields.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run carryOperand(&mut facts.*, holder, &listed[at].value)
+    at = at + usize.ONE
+  }
+}
+
+effect fn applyStatement(function: &MirFunction, ending: &[bool], facts: &mut Facts, statement: &Statement) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &statement.* {
+    Statement.Assign {destination, value, ..} => {
+      if Vector<Projection>.length(&destination.projections) == usize.ZERO {
+        let flag = match &Vector<Local>.asSlice(&function.locals)[destination.local].kind { LocalKind.DropFlag {..} => true _ => false }
+        if flag {
+          let constant = constantBoolean(&value)
+          run setFlag(&mut facts.*, destination.local, move constant)
+        }
+      }
+      // The value is read before the write lands, so derive from the facts before it. Only a
+      // destination that can hold a view or address holds one: a scalar read through a view is
+      // the value, not the view.
+      let mut derived = Facts {killed: Vector<Killed>.make(), views: run copyViews(&facts.views), flags: Vector<KnownFlag>.make()}
+      if carriesView(&Vector<Local>.asSlice(&function.locals)[destination.local].ty) {
+        run deriveValue(&mut derived, ending, &destination, &value)
+      }
+      run written(&mut facts.*, &destination)
+      if ownedDepth(&destination) == Vector<Projection>.length(&destination.projections) {
+        let fresh = Vector<View>.asSlice(&derived.views)
+        let mut at = usize.ZERO
+        while at < fresh.length {
+          if samePlace(&fresh[at].holder, &destination) && !hasView(&facts.*, &fresh[at].holder, &fresh[at].base) {
+            run Vector<View>.append(&mut facts.views, View {holder: run Mir.copyPlace(&fresh[at].holder), base: run Mir.copyPlace(&fresh[at].base)})
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
+    Statement.Drop {destination, ..} => {
+      if ownedDepth(&destination) != Vector<Projection>.length(&destination.projections) { return () }
+      let dropped = destination.local
+      if !hasKilled(&facts.*, &Killed {place: run Mir.copyPlace(&destination), dropped: dropped, pinned: false}) {
+        run Vector<Killed>.append(&mut facts.killed, Killed {place: run Mir.copyPlace(&destination), dropped: dropped, pinned: false})
+      }
+      // Only a compiler-placed temporary's drop ends the views derived from it.
+      let temporary = match &Vector<Local>.asSlice(&function.locals)[dropped].kind { LocalKind.Temp => true _ => false }
+      if !temporary { return () }
+      let mut holders = Vector<Place>.make()
+      let views = Vector<View>.asSlice(&facts.views)
+      let mut at = usize.ZERO
+      while at < views.length {
+        if mayOverlap(&views[at].base, &destination) { run Vector<Place>.append(&mut holders, run Mir.copyPlace(&views[at].holder)) }
+        at = at + usize.ONE
+      }
+      let listed = Vector<Place>.asSlice(&holders)
+      at = usize.ZERO
+      while at < listed.length {
+        let ended = Killed {place: run Mir.copyPlace(&listed[at]), dropped: dropped, pinned: false}
+        if !hasKilled(&facts.*, &ended) { run Vector<Killed>.append(&mut facts.killed, move ended) }
+        at = at + usize.ONE
+      }
+    }
+    _ => ()
+  }
+}
+
+effect fn deriveValue(facts: &mut Facts, ending: &[bool], destination: &Place, value: &Rvalue) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Rvalue.Ref {place, ..} => run derive(&mut facts.*, ending, destination, &place)
+    Rvalue.AddressOf {place, ..} => run derive(&mut facts.*, ending, destination, &place)
+    Rvalue.SliceData {place} => run carry(&mut facts.*, destination, &place)
+    Rvalue.Slice {data, ..} => run carryOperand(&mut facts.*, destination, &data)
+    Rvalue.Use {value: used} => run carryOperand(&mut facts.*, destination, &used)
+    Rvalue.Bitcast {value: used, ..} => run carryOperand(&mut facts.*, destination, &used)
+    Rvalue.AddressIntegerConversion {operand, ..} => run carryOperand(&mut facts.*, destination, &operand)
+    Rvalue.PointerOffset {pointer, ..} => run carryOperand(&mut facts.*, destination, &pointer)
+    Rvalue.Inject {value: used, ..} => run carryOperand(&mut facts.*, destination, &used)
+    Rvalue.Aggregate {fields} => run carryFields(&mut facts.*, destination, &fields)
+    Rvalue.Variant {fields, ..} => run carryFields(&mut facts.*, destination, &fields)
+    _ => ()
+  }
+}
+
+// Whether a value of `ty` can refer to other storage: a view anywhere in it, or a raw address.
+fn carriesView(ty: &Shared<Type>) -> bool {
+  return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    if Type.holdsView(value) { return true }
+    return match &value.* { Type.Pointer {..} => true _ => false }
+  })
+}
+
+// A call writes its destination only on its normal edge and its failure slot only on its
+// failure edge. A result that can hold a view may hold one of any argument.
+effect fn applyEdge(function: &MirFunction, facts: &mut Facts, terminator: &Terminator, target: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Terminator.Call {arguments, destination, normal, failure, ..} = &terminator.* {
+    if target == normal {
+      let holds = carriesView(&Vector<Local>.asSlice(&function.locals)[destination.local].ty)
+      let mut derived = emptyFacts()
+      if holds && Vector<Projection>.length(&destination.projections) == usize.ZERO {
+        derived.views = run copyViews(&facts.views)
+        let listed = Vector<Operand>.asSlice(&arguments)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          run carryOperand(&mut derived, &destination, &listed[at])
+          at = at + usize.ONE
+        }
+      }
+      run written(&mut facts.*, &destination)
+      let fresh = Vector<View>.asSlice(&derived.views)
+      let mut at = usize.ZERO
+      while at < fresh.length {
+        if samePlace(&fresh[at].holder, &destination) && !hasView(&facts.*, &fresh[at].holder, &fresh[at].base) {
+          run Vector<View>.append(&mut facts.views, View {holder: run Mir.copyPlace(&fresh[at].holder), base: run Mir.copyPlace(&fresh[at].base)})
+        }
+        at = at + usize.ONE
+      }
+      return ()
+    }
+    if let Option<FailureEdge>.Some {value: edge} = &failure {
+      if target == edge.target { run written(&mut facts.*, &edge.destination) }
+    }
+  }
+}
+
+/// A compact listing of `function` for an internal-error report: each local's kind, then each
+/// block's statements and terminator with the places they touch.
+pub effect fn describe(function: &MirFunction) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = Bytes.make()
+  let locals = Vector<Local>.asSlice(&function.locals)
+  let mut at = usize.ZERO
+  while at < locals.length {
+    run Bytes.append(&mut text, b"\n  _")
+    run JsonText.appendDecimal(&mut text, at)
+    run Bytes.append(&mut text, match &locals[at].kind {
+      LocalKind.Return => b": return"
+      LocalKind.Parameter {..} => b": parameter"
+      LocalKind.User {..} => b": user"
+      LocalKind.Temp => b": temp"
+      LocalKind.Failure => b": failure"
+      LocalKind.Provider {..} => b": provider"
+      LocalKind.Observer => b": observer"
+      LocalKind.Cause => b": cause"
+      LocalKind.DropFlag {..} => b": drop flag of "
+    })
+    if let LocalKind.DropFlag {local, path} = &locals[at].kind {
+      let guarded = Place {local: local, projections: run copyPath(&path)}
+      run describePlace(&mut text, &guarded)
+    }
+    at = at + usize.ONE
+  }
+  let blocks = Vector<Block>.asSlice(&function.blocks)
+  at = usize.ZERO
+  while at < blocks.length {
+    run Bytes.append(&mut text, b"\n bb")
+    run JsonText.appendDecimal(&mut text, at)
+    let statements = Vector<Statement>.asSlice(&blocks[at].statements)
+    let mut index = usize.ZERO
+    while index < statements.length {
+      run Bytes.append(&mut text, b"\n  ")
+      match &statements[index] {
+        Statement.Assign {destination, value, ..} => {
+          run describePlace(&mut text, &destination)
+          run Bytes.append(&mut text, b" = ")
+          run describeRvalue(&mut text, &value)
+        }
+        Statement.Drop {destination, ..} => {
+          run Bytes.append(&mut text, b"drop ")
+          run describePlace(&mut text, &destination)
+        }
+        Statement.FailureContext {destination, ..} => {
+          run Bytes.append(&mut text, b"context ")
+          run describePlace(&mut text, &destination)
+        }
+        Statement.SetContextHandle {..} => run Bytes.append(&mut text, b"set context handle")
+      }
+      index = index + usize.ONE
+    }
+    run Bytes.append(&mut text, b"\n  -> ")
+    run describeTerminator(&mut text, &blocks[at].terminator)
+    let targets = run MirFunction.successors(function, at)
+    let listed = Vector<usize>.asSlice(&targets)
+    index = usize.ZERO
+    while index < listed.length {
+      run Bytes.append(&mut text, b" bb")
+      run JsonText.appendDecimal(&mut text, listed[index])
+      index = index + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move text
+}
+
+effect fn copyPath(path: &Vector<Projection>) -> Vector<Projection> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<Projection>.make()
+  let steps = Vector<Projection>.asSlice(&path.*)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    run Vector<Projection>.append(&mut copied, run Mir.copyProjection(&steps[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn describePlace(text: &mut Bytes, place: &Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut text.*, b"_")
+  run JsonText.appendDecimal(&mut text.*, place.local)
+  let steps = Vector<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    match &steps[at] {
+      Projection.Field {index} => {
+        run Bytes.append(&mut text.*, b".")
+        run JsonText.appendDecimal(&mut text.*, index)
+      }
+      Projection.Payload {index, ..} => {
+        run Bytes.append(&mut text.*, b".payload")
+        run JsonText.appendDecimal(&mut text.*, index)
+      }
+      Projection.VariantField {variant, field} => {
+        run Bytes.append(&mut text.*, b".v")
+        run JsonText.appendDecimal(&mut text.*, variant)
+        run Bytes.append(&mut text.*, b"f")
+        run JsonText.appendDecimal(&mut text.*, field)
+      }
+      Projection.Index {local} => {
+        run Bytes.append(&mut text.*, b"[_")
+        run JsonText.appendDecimal(&mut text.*, local)
+        run Bytes.append(&mut text.*, b"]")
+      }
+      Projection.ConstIndex {index} => {
+        run Bytes.append(&mut text.*, b"[")
+        run JsonText.appendDecimal(&mut text.*, index)
+        run Bytes.append(&mut text.*, b"]")
+      }
+      Projection.Deref => run Bytes.append(&mut text.*, b".*")
+    }
+    at = at + usize.ONE
+  }
+}
+
+effect fn describeOperand(text: &mut Bytes, operand: &Operand) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &operand.* {
+    Operand.Copy {place} => {
+      run Bytes.append(&mut text.*, b"copy ")
+      run describePlace(&mut text.*, &place)
+    }
+    Operand.Move {place} => {
+      run Bytes.append(&mut text.*, b"move ")
+      run describePlace(&mut text.*, &place)
+    }
+    Operand.Boolean {value} => {
+      if value { run Bytes.append(&mut text.*, b"true") } else { run Bytes.append(&mut text.*, b"false") }
+    }
+    _ => run Bytes.append(&mut text.*, b"const")
+  }
+}
+
+effect fn describeRvalue(text: &mut Bytes, value: &Rvalue) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Rvalue.Use {value: used} => run describeOperand(&mut text.*, &used)
+    Rvalue.Ref {place, ..} => {
+      run Bytes.append(&mut text.*, b"&")
+      run describePlace(&mut text.*, &place)
+    }
+    Rvalue.AddressOf {place, ..} => {
+      run Bytes.append(&mut text.*, b"addr ")
+      run describePlace(&mut text.*, &place)
+    }
+    Rvalue.SliceData {place} => {
+      run Bytes.append(&mut text.*, b"data ")
+      run describePlace(&mut text.*, &place)
+    }
+    Rvalue.Slice {data, ..} => {
+      run Bytes.append(&mut text.*, b"slice ")
+      run describeOperand(&mut text.*, &data)
+    }
+    Rvalue.Aggregate {fields} => {
+      run Bytes.append(&mut text.*, b"aggregate(")
+      let listed = Vector<AggregateField>.asSlice(&fields)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO { run Bytes.append(&mut text.*, b", ") }
+        run describeOperand(&mut text.*, &listed[at].value)
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut text.*, b")")
+    }
+    _ => run Bytes.append(&mut text.*, b"rvalue")
+  }
+}
+
+effect fn describeTerminator(text: &mut Bytes, terminator: &Terminator) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &terminator.* {
+    Terminator.Call {arguments, destination, ..} => {
+      run Bytes.append(&mut text.*, b"call(")
+      let listed = Vector<Operand>.asSlice(&arguments)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO { run Bytes.append(&mut text.*, b", ") }
+        run describeOperand(&mut text.*, &listed[at])
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut text.*, b") -> ")
+      run describePlace(&mut text.*, &destination)
+    }
+    Terminator.Branch {condition, ..} => {
+      run Bytes.append(&mut text.*, b"branch ")
+      run describeOperand(&mut text.*, &condition)
+    }
+    Terminator.Switch {value, ..} => {
+      run Bytes.append(&mut text.*, b"switch ")
+      run describeOperand(&mut text.*, &value)
+    }
+    Terminator.Goto {..} => run Bytes.append(&mut text.*, b"goto")
+    Terminator.Return {..} => run Bytes.append(&mut text.*, b"return")
+    Terminator.Fail {..} => run Bytes.append(&mut text.*, b"fail")
+    _ => run Bytes.append(&mut text.*, b"exit")
+  }
+}
