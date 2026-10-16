@@ -1,9 +1,15 @@
 //! Project source selection and the native formatter command's stable exit classes.
 
 import driver.CommandPath
-import format.FormatError {FormatError}
+import driver.Project as Projects
+import diagnostic.Catalog as Catalog {Code}
+import format.FormatError {FormatError, Reason as FormatReason}
 import format.SourceSyntax
 import format.SyntaxFormatter
+import lexer.LexicalDiagnostic {LexicalDiagnostic}
+import lexer.Token {Token}
+import parser.Diagnostic {Diagnostic}
+import parser.SyntaxTree {SyntaxTree}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
@@ -28,7 +34,7 @@ pub struct Command {
   pub manifest: Option<Bytes>
 }
 
-pub enum Reason { InvalidArgument, MissingProject, InvalidRoot, OutsideRoot, InvalidSelection, InvalidEncoding }
+pub enum Reason { InvalidArgument, MissingProject, InvalidRoot, InvalidVersion, OutsideRoot, InvalidSelection, InvalidEncoding }
 
 /// A request or project-selection failure before any source is rewritten.
 pub struct CommandError {
@@ -146,6 +152,12 @@ effect fn packageRoot(manifest: &Path, contents: &Bytes) -> Path
     Option<Path>.None => { return run reject(Reason.InvalidRoot, Path.rawBytes(manifest)) }
   }
   let document = run Toml.parse(Bytes.asSlice(contents))
+  // The manifest is the project's, which requires a semantic version as every command does.
+  let versioned = match move Toml.asString(Toml.fieldAt(Toml.field(&document, "package"), "version")) {
+    Option<string>.Some {value} => Projects.isSemanticVersion(String.utf8Bytes(value))
+    Option<string>.None => false
+  }
+  if !versioned { return run reject(Reason.InvalidVersion, Path.rawBytes(manifest)) }
   let package = Toml.field(&document, "package")
   let configured = Toml.asString(Toml.fieldAt(move package, "root"))
   if let Option<string>.Some {value: text} = move configured {
@@ -284,10 +296,89 @@ pub effect fn select(self: &Command, working: &Path) -> Vector<Path>
   return move selected
 }
 
-effect fn report(path: &Path, message: &[u8]) -> () ! WriterError ? &mut Writer {
-  run Writer.writeAll(Path.rawBytes(path))
-  run Writer.writeAll(b": ")
-  run Writer.writeAll(message)
+/// What formatting or checking one selected file did, as the TypeScript `FormatWorkflow` reports it.
+pub union Outcome {
+  /// The file is already canonical.
+  Unchanged,
+  /// The file was rewritten with its canonical bytes.
+  Formatted,
+  /// `--check` found the file not canonical and left it untouched.
+  NeedsFormatting,
+  /// The file has lexical or syntax damage; `codes` lists their distinct stable codes, joined by
+  /// `, `, in source then discovery order.
+  Damaged {pub codes: Bytes},
+  /// The file could not be read, formatted safely, or written.
+  Failed {pub message: Bytes},
+}
+
+/// One selected file and its outcome.
+pub struct FileOutcome {
+  pub path: Path
+  pub outcome: Outcome
+}
+
+/// A finished run: its exit status and every selected file's outcome, in selection order.
+pub struct Run {
+  pub status: i32
+  pub outcomes: Vector<FileOutcome>
+}
+
+/// The exit status of `outcomes`: 2 when any failed, else 1 when any is damaged or needs
+/// formatting, else 0.
+pub fn status(outcomes: &[FileOutcome]) -> i32 {
+  let mut worst = 0
+  let mut at = usize.ZERO
+  while at < outcomes.length {
+    let rank = match &outcomes[at].outcome {
+      Outcome.Failed {..} => 2
+      Outcome.Damaged {..} => 1
+      Outcome.NeedsFormatting => 1
+      _ => 0
+    }
+    if rank > worst { worst = rank }
+    at = at + usize.ONE
+  }
+  return worst
+}
+
+/// Whether the outcome's line belongs on standard output: unchanged and formatted files do, and
+/// drift, damage and failures go to standard error, as the TypeScript CLI writes them.
+pub fn toStandardOutput(self: &FileOutcome) -> bool {
+  return match &self.outcome {
+    Outcome.Unchanged => true
+    Outcome.Formatted => true
+    _ => false
+  }
+}
+
+/// The outcome's report line, `<path>: <outcome>` and a newline.
+pub effect fn line(self: &FileOutcome) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(Path.rawBytes(&self.path))
+  run Bytes.append(&mut text, b": ")
+  match &self.outcome {
+    Outcome.Unchanged => { run Bytes.append(&mut text, b"unchanged") }
+    Outcome.Formatted => { run Bytes.append(&mut text, b"formatted") }
+    Outcome.NeedsFormatting => { run Bytes.append(&mut text, b"needs formatting") }
+    Outcome.Damaged {codes} => {
+      run Bytes.append(&mut text, b"cannot format damaged source")
+      if Bytes.asSlice(&codes).length > usize.ZERO {
+        run Bytes.append(&mut text, b" (")
+        run Bytes.append(&mut text, Bytes.asSlice(&codes))
+        run Bytes.append(&mut text, b")")
+      }
+    }
+    Outcome.Failed {message} => { run Bytes.append(&mut text, Bytes.asSlice(&message)) }
+  }
+  run Bytes.append(&mut text, b"\n")
+  return move text
+}
+
+// The message `<prefix> <path>` a failed outcome reports.
+effect fn failed(prefix: &[u8], path: &Path) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  let mut message = run Bytes.copy(prefix)
+  run Bytes.append(&mut message, b" ")
+  run Bytes.append(&mut message, Path.rawBytes(path))
+  return Outcome.Failed {message: move message}
 }
 
 effect fn fileFailure(error: &FileError) -> () ! WriterError ? &mut Writer {
@@ -303,63 +394,105 @@ effect fn fileFailure(error: &FileError) -> () ! WriterError ? &mut Writer {
   run Writer.writeAll(b")")
 }
 
-effect fn formatFile(path: &Path, check: bool) -> i32
-! FileError | FormatError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut Allocator | &mut Writer {
-  let source = run FileSystem.readFile(path)
-  let tree = run SourceSyntax.parse(move source)
-  let formatted = run SyntaxFormatter.formatTree(&tree)
-  if same(Bytes.asSlice(&tree.source), Bytes.asSlice(&formatted)) { return 0 }
-  if check {
-    run report(path, b"would format\n")
-    return 1
+// Appends the spelling of `code` to the `, `-joined `codes` unless it is already listed.
+effect fn note(codes: &mut Bytes, seen: &mut Vector<Code>, code: Code) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = Vector<Code>.asSlice(&seen.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at] == code { return () }
+    at = at + usize.ONE
   }
-  run FileSystem.writeFile(path, Bytes.asSlice(&formatted))
-  run report(path, b"formatted\n")
-  return 0
+  run Vector<Code>.append(&mut seen.*, code)
+  if Bytes.asSlice(&codes.*).length > usize.ZERO { run Bytes.append(&mut codes.*, b", ") }
+  run Bytes.append(&mut codes.*, String.utf8Bytes(Catalog.spelling(code)))
+  return ()
 }
 
-effect fn process(path: &Path, check: bool) -> i32
-! WriterError ? &mut FileSystem | &mut Allocator | &mut Writer {
-  let attempted = run Effect.result(formatFile(path, check))
-  return match move attempted {
-    Result<i32, FileError | FormatError | OutOfMemoryError | WriterError>.Success {value} => value
-    Result<i32, FileError | FormatError | OutOfMemoryError | WriterError>.Failure {error} => match move error {
-      FormatError damaged => {
-        run report(path, b"damaged syntax at byte ")
-        run Format.display<usize>(&damaged.span.start)
-        run Writer.writeAll(b"\n")
-        return 1
+// The distinct codes of the tree's lexical failures, in source order, then of its syntax
+// diagnostics, in discovery order.
+effect fn damageCodes(tree: &SyntaxTree) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut codes = Bytes.make()
+  let mut seen = Vector<Code>.make()
+  let tokens = Vector<Token>.asSlice(&tree.tokens)
+  let mut at = usize.ZERO
+  while at < tokens.length {
+    match tokens[at] {
+      Token.Invalid {span: _, diagnostic} => { run note(&mut codes, &mut seen, LexicalDiagnostic.code(diagnostic)) }
+      Token.InvalidStaticLiteral {span: _, diagnostic} => { run note(&mut codes, &mut seen, LexicalDiagnostic.code(diagnostic)) }
+      Token.InvalidDurationLiteral {span: _, diagnostic} => { run note(&mut codes, &mut seen, LexicalDiagnostic.code(diagnostic)) }
+      _ => {}
+    }
+    at = at + usize.ONE
+  }
+  let diagnostics = Vector<Diagnostic>.asSlice(&tree.diagnostics)
+  at = usize.ZERO
+  while at < diagnostics.length {
+    run note(&mut codes, &mut seen, Diagnostic.code(diagnostics[at]))
+    at = at + usize.ONE
+  }
+  return move codes
+}
+
+// Formats or checks one file. A read or write failure, or formatting that would change the
+// syntax, is a failed outcome; lexical or syntax damage leaves the file untouched.
+effect fn process(path: &Path, check: bool) -> Outcome
+! OutOfMemoryError | WriterError ? &mut FileSystem | &mut Allocator {
+  let read = run Effect.result(FileSystem.readFile(path))
+  let source = match move read {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError unreadable => {
+        drop unreadable
+        return run failed(b"Cannot read source file", path)
       }
-      FileError failure => { run report(path, b"")
-        run fileFailure(&failure)
-        run Writer.writeAll(b"\n")
-        return 2 }
-      OutOfMemoryError exhausted => { run report(path, b"allocation failure\n")
-        return 2 }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let tree = run SourceSyntax.parse(move source)
+  let attempted = run Effect.result(SyntaxFormatter.formatTree(&tree))
+  let formatted = match move attempted {
+    Result<Bytes, FormatError | OutOfMemoryError | WriterError>.Success {value} => move value
+    Result<Bytes, FormatError | OutOfMemoryError | WriterError>.Failure {error} => match move error {
+      FormatError refused => {
+        if refused.reason == FormatReason.SafetyViolation {
+          return run failed(b"Cannot format without changing the syntax of source file", path)
+        }
+        return Outcome.Damaged {codes: run damageCodes(&tree)}
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
       WriterError failure => { fail move failure }
     }
   }
+  if same(Bytes.asSlice(&tree.source), Bytes.asSlice(&formatted)) { return Outcome.Unchanged }
+  if check { return Outcome.NeedsFormatting }
+  let written = run Effect.result(FileSystem.writeFile(path, Bytes.asSlice(&formatted)))
+  if let Result<(), FileError>.Failure {error} = move written {
+    drop error
+    return run failed(b"Cannot commit formatted source file", path)
+  }
+  return Outcome.Formatted
 }
 
-/// Formats every selected file, continuing after file failures; infrastructure failures take priority.
-pub effect fn execute(self: &Command, working: &Path) -> i32
+/// Formats every selected file, continuing after file failures; infrastructure failures stop the
+/// run. Outcomes follow the sorted selection.
+pub effect fn execute(self: &Command, working: &Path) -> Vector<FileOutcome>
 ! CommandError | FileError | TomlError | OutOfMemoryError | WriterError
-? &mut FileSystem | &mut Allocator | &mut Writer {
+? &mut FileSystem | &mut Allocator {
   let selected = run select(self, working)
   let paths = Vector<Path>.asSlice(&selected)
-  let mut status = 0
+  let mut outcomes = Vector<FileOutcome>.make()
   let mut at: usize = 0
   while at < paths.length {
     let outcome = run process(&paths[at], self.check)
-    if outcome > status { status = outcome }
+    run Vector<FileOutcome>.append(&mut outcomes, FileOutcome {path: run Path.fromBytes(Path.rawBytes(&paths[at])), outcome: move outcome})
     at = at + 1
   }
-  return status
+  return move outcomes
 }
 
-effect fn fromHost() -> i32
+effect fn fromHost() -> Vector<FileOutcome>
 ! CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError
-? &mut HostInput | &mut FileSystem | &mut Allocator | &mut Writer {
+? &mut HostInput | &mut FileSystem | &mut Allocator {
   let mut arguments = run HostInput.arguments()
   if Vector<Bytes>.length(&arguments) < 2 { return run reject(Reason.InvalidArgument, b"format") }
   drop Vector<Bytes>.remove(&mut arguments, 0)
@@ -375,6 +508,7 @@ fn reasonName(reason: Reason) -> &'static [u8] {
     Reason.InvalidArgument => b"unknown option (usage: silk format [paths] [--check] [--manifest-path <path>])"
     Reason.MissingProject => b"no silk.toml found"
     Reason.InvalidRoot => b"invalid [package].root"
+    Reason.InvalidVersion => b"package.version must be a valid semantic version"
     Reason.OutsideRoot => b"selection is outside the package source root"
     Reason.InvalidSelection => b"expected a directory or exact .silk file"
     Reason.InvalidEncoding => b"path is not valid UTF-8"
@@ -401,19 +535,21 @@ effect fn reportFailure(error: CommandError | FileError | TomlError | HostInputE
   run Writer.writeAll(b"\n")
 }
 
-/// Runs `format` through supplied host, filesystem and diagnostic writer providers.
-pub effect fn runHost() -> i32
+/// Runs `format` through the supplied host and filesystem providers. An infrastructure failure is
+/// reported on the diagnostic writer and answers status 2 with no outcomes; otherwise the caller
+/// writes each outcome's line to standard output or standard error.
+pub effect fn runHost() -> Run
 ? &mut HostInput | &mut FileSystem | &mut Allocator | &mut Writer {
   let attempted = run Effect.result(fromHost())
   return match move attempted {
-    Result<i32, CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Success {value} => value
-    Result<i32, CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} => {
+    Result<Vector<FileOutcome>, CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Success {value} => {
+      let finished = status(Vector<FileOutcome>.asSlice(&value))
+      return Run {status: finished, outcomes: move value}
+    }
+    Result<Vector<FileOutcome>, CommandError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Failure {error} => {
       let reported = run Effect.result(reportFailure(move error))
-      match move reported {
-        Result<(), WriterError>.Success {value: _} => {}
-        Result<(), WriterError>.Failure {error: _} => { return 2 }
-      }
-      return 2
+      drop reported
+      return Run {status: 2, outcomes: Vector<FileOutcome>.make()}
     }
   }
 }
