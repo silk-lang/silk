@@ -152,3 +152,133 @@ with a lifetime, including one of the function's lifetime parameters, does not e
   caller can still read it, then keeps it live wherever its creation reaches.
 - **Source migration:** none.
 - Retire this entry when the bootstrap is deleted.
+
+## Frozen-bootstrap defects
+
+The bootstrap receives only fixes that keep CI green, so the defects below stay in it. One, the
+`lowerMir` early free, was removed by #1833 but remains in compilers an earlier bootstrap built.
+Native rejects each program, lowers it correctly, or does not have the defect. Retire each entry
+with the bootstrap.
+
+### Bootstrap frees a borrowed temporary before a binding that retains its view
+
+BORROW-006 keeps a borrowed temporary alive for every view derived from it.
+
+```silk
+let base = [make(1)]
+let mut h = Holder { view: &base }
+let view = identity(&[make(5)])
+h = Holder { view: view }
+return 0
+```
+
+- **Bootstrap:** accepts it. At the return, cleanup orders the temporary's hidden-owner Drop by
+  acquisition ordinal, so the temporary is freed before `h`, and `h`'s destructor reads freed
+  storage. The same happens at an extra early return, `run` propagation, `fail`, a return in a
+  match arm, and `return read(&[make(2)])`. With `--verify-ir`, MIR verification reports
+  UseAfterDrop.
+- **Native:** rejects every variant with OWN0019, as the bootstrap does once the temporary is
+  named.
+
+### Bootstrap leaks a temporary borrowed in a value arm whose result may hold a view
+
+A value arm ends the temporaries it borrows only when its result cannot hold a view. When the
+result type may hold one but the value does not retain the temporary, the temporary is never
+ended:
+
+```silk
+fn pick<'a, 'b>(left: &'a [Token], right: &'b [Token]) -> &'a [Token] { return left }
+let chosen = match move p {
+  Packet.Ready { value } => pick(&base, &[make(value)])
+  Packet.Empty => pick(&base, &base)
+}
+```
+
+- **Bootstrap:** with `--verify-ir`, MIR verification reports InvalidLoan. Without it the
+  temporary leaks and its destructor never runs. An Effect-valued arm such as
+  `pure(read(&[make(value)]))` and `return match …` behave the same.
+- **Native:** not affected.
+
+### Bootstrap before #1833 freed a temporary before running an Effect built from its view
+
+In `Semantic.lowerMir` in `compiler/`, near the `callableResultType` run:
+
+```silk
+result = match move run callableResultType(&mut resolver.*, &mut owner.*, &mut dependencies,
+    &callerApplication, Vector<Constraint>.asSlice(&Vector<Constraint>.make()), Span.make(usize.ZERO, usize.ZERO)) {
+  Success {value} => move value
+  Failure {error} => { return run mirRejection(&identity, move error, move dependencies) }
+}
+```
+
+- **Bootstrap before #1833:** its MIR builds the Effect (`make-effect`, capturing the slice),
+  then ends the loan and drops the temporary Vector, and only then runs the Effect
+  (`run-effect-value`).
+  MirNormalization does not fuse the pair into one `run-static-effect` because the
+  `&mut resolver.*` and `&mut owner.*` captures are exclusive. The fused form always drops the
+  temporary after the run. The Vector is empty and no element is read, so the practical risk is
+  low. With `--verify-ir`, MIR verification reports UseAfterDrop in `lowerMir`. Nine reduced
+  probes did not reproduce it. It appears only in the whole-compiler build, probably through
+  cross-module instantiation or the real `Shared.with` and service context.
+- **Bootstrap since #1833:** a borrowed temporary ends only in its scope's cleanup, after the run,
+  and the compiler build reports no UseAfterDrop. Compilers that an earlier bootstrap built,
+  including the current native seed, still carry the early free.
+- **Native:** lowers the site as one direct call and drops the Vector after it on every exit.
+
+### Bootstrap accepts programs that read storage after its owner is dropped
+
+- **Bootstrap:** accepts thirteen use-after-drop programs that reviews of #1851 and #1855 found.
+  In two of them, a `keep` call retains the previous iteration's owner in a loop, and a later
+  iteration reads it.
+- **Native:** rejects them or leaves their bodies unchecked.
+
+### Bootstrap accepts a view stored past a write
+
+```silk
+let view: &'b Token = &src.t
+keep<'b>(&mut out.*, view)
+src.t = Token { value: 1 }
+```
+
+- **Bootstrap:** accepts it, including the Effect form `run keepLater<'b>(view)`, run at once or
+  deferred.
+- **Native:** rejects the direct store with OWN0011 at the write, and the Effect forms the same
+  way.
+
+### Bootstrap MIR verification treats an unreachable match fallthrough as terminating
+
+When a member's last match candidates all carry nested pattern tests, exhaustiveness proves
+that falling past them is impossible:
+
+```silk
+let found = tokens(&shelf.items)
+match move selection {
+  Result<Option<i32>, i32>.Success {value: Option<i32>.Some {..}} => { return 2 }
+  Result<Option<i32>, i32>.Failure {error} => { return error }
+  Result<Option<i32>, i32>.Success {value: Option<i32>.None} => ()
+}
+return found[0].value
+```
+
+- **Bootstrap:** the structured path analysis in MirVerification still treats that fallthrough
+  as a terminating path. No region exists there to end a loan, so a loan held across the match
+  fails InvalidLoan. A borrowed temporary held to the end of its scope hits the same path. It has
+  no codegen effect.
+- **Native:** the clean fix belongs in the native MIR verifier: lowering records the Match's
+  exhaustive coverage, and the verifier stops treating candidate exhaustion as terminal when that
+  coverage is recorded.
+
+### Bootstrap's compiler build does not pass `--verify-ir`
+
+The compiler sources built by the bootstrap (T1) have never verified clean with `--verify-ir`. At
+selfhost 6d5dd194 after #1833, verification reports:
+
+- InvalidLoan: 52 (388 before #1833);
+- InvalidMatchOwnership: 31;
+- InvalidLocalSharedOperation: 5;
+- InvalidSliceOperation: 5;
+- UseAfterDrop: none (1 before #1833, the `lowerMir` defect above).
+
+Of the 52 InvalidLoan, one is the unreachable match fallthrough above. Another known source is a
+plain loan carried out of a loop by `break`, which the loop's restored entry state never ends.
+Neither has a codegen effect.
