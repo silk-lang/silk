@@ -339,8 +339,10 @@ The checker is part of the `Body` unit, as the v2 note's checking-unit rule requ
 whose body is not `Checked`, with one count per reason. `SILK_GAP borrow-check root-package: ...`
 counts the same way over every root-package body the declaration sweep checks, reached or not, with
 a deferred static template counted as `awaiting`: an unreached function is never emitted, so only
-this line shows it unchecked. The corpus harness treats an accepted invalid program with either
-count above zero as a `BORROW_CHECK_GAP`, and one with both at zero as a failure. A body is `Checked` exactly when its stage
+this line shows it unchecked. One `SILK_GAP borrow-check body: <module> <start>-<end> <reason>` line
+follows for each of those bodies, by the byte offsets of its whole declaration. The corpus harness
+treats an accepted invalid program as a `BORROW_CHECK_GAP` only when every expected diagnostic lies
+in one of those bodies; a diagnostic in a checked body is a failure, whatever else is unchecked. A body is `Checked` exactly when its stage
 is `FullyChecked`. Every other body carries the `BorrowStatus` that names what a later slice must
 cover first:
 

@@ -52,7 +52,7 @@ export interface Summary {
 
 const unsupportedPrefix = 'SILK_UNSUPPORTED_JSON='
 const borrowGapPrefix = 'SILK_GAP borrow-check: '
-const rootBorrowGapPrefix = 'SILK_GAP borrow-check root-package: '
+const uncheckedBodyPrefix = 'SILK_GAP borrow-check body: '
 const buildErrorPrefix = 'SILK_BUILD_ERROR='
 // A native build of certificate-bounded-decoding takes 28.5-30 s on the hosted Linux runner, so a
 // 30 s build deadline timed it out at random; builds get 4x that, while program runs stay short.
@@ -169,14 +169,15 @@ const validGap = (gap: unknown): gap is Gap => {
 
 /**
  * Reads a successful build's borrow-check gap line,
- * `SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...; note)`, which counts the
- * emitted bodies, or with `prefix` another line of that form. A line without a per-reason
- * breakdown keeps only its total.
+ * `SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...; note)`. A line without a
+ * per-reason breakdown keeps only its total.
  */
-export const parseBorrowGap = (stderr: string, prefix = borrowGapPrefix): BorrowGap | undefined => {
-  const line = stderr.split('\n').find((candidate) => candidate.startsWith(prefix))
+export const parseBorrowGap = (stderr: string): BorrowGap | undefined => {
+  const line = stderr.split('\n').find((candidate) => candidate.startsWith(borrowGapPrefix))
   if (line === undefined) return undefined
-  const match = /^(\d+) bodies not borrow-checked \(([^)]*)\)$/.exec(line.slice(prefix.length))
+  const match = /^(\d+) bodies not borrow-checked \(([^)]*)\)$/.exec(
+    line.slice(borrowGapPrefix.length),
+  )
   if (match === null) throw new Error(`malformed borrow-check gap line: ${line}`)
   const reasons: Record<string, number> = {}
   for (const part of (match[2] ?? '').split(';', 1)[0]?.split(', ') ?? []) {
@@ -184,6 +185,82 @@ export const parseBorrowGap = (stderr: string, prefix = borrowGapPrefix): Borrow
     if (reason !== null) reasons[reason[1] ?? ''] = Number(reason[2])
   }
   return { total: Number(match[1]), reasons }
+}
+
+/** A root-package body the build left without borrow checking, by byte offsets of its declaration. */
+export interface UncheckedBody {
+  readonly module: string
+  readonly span: { readonly start: number; readonly end: number }
+  readonly reason: string
+}
+
+/** Reads every `SILK_GAP borrow-check body: <module> <start>-<end> <reason>` line of a build. */
+export const parseUncheckedBodies = (stderr: string): ReadonlyArray<UncheckedBody> =>
+  stderr
+    .split('\n')
+    .filter((line) => line.startsWith(uncheckedBodyPrefix))
+    .map((line) => {
+      const match = /^(\S+) (\d+)-(\d+) ([a-z-]+)$/.exec(line.slice(uncheckedBodyPrefix.length))
+      if (match === null) throw new Error(`malformed unchecked body line: ${line}`)
+      return {
+        module: match[1] ?? '',
+        span: { start: Number(match[2]), end: Number(match[3]) },
+        reason: match[4] ?? '',
+      }
+    })
+
+// A recorded span as a module and two comparable positions: `line:column-line:column` in the
+// program module, or `<module>:<start>-<end>` byte offsets in another module.
+const spanRange = (
+  span: string,
+): { readonly module: string; readonly start: number[]; readonly end: number[] } => {
+  const program = /^(\d+):(\d+)-(\d+):(\d+)$/.exec(span)
+  if (program !== null) {
+    const [line, column, endLine, endColumn] = program.slice(1).map(Number)
+    return {
+      module: programModule,
+      start: [line ?? 0, column ?? 0],
+      end: [endLine ?? 0, endColumn ?? 0],
+    }
+  }
+  const other = /^(.*):(\d+)-(\d+)$/.exec(span)
+  if (other === null) throw new Error(`malformed diagnostic span: ${span}`)
+  return { module: other[1] ?? '', start: [Number(other[2])], end: [Number(other[3])] }
+}
+
+const notAfter = (left: number[], right: number[]): boolean => {
+  for (const [index, value] of left.entries()) {
+    const other = right[index] ?? 0
+    if (value !== other) return value < other
+  }
+  return true
+}
+
+/**
+ * Whether every expected diagnostic lies inside a body the build reported not borrow-checked.
+ * Only then is accepting the program a declared gap; a diagnostic in a checked body is a hole.
+ */
+export const coveredByUncheckedBodies = (
+  source: string,
+  expected: ReadonlyArray<Corpus.ExpectedDiagnostic>,
+  bodies: ReadonlyArray<UncheckedBody>,
+): boolean => {
+  const ranges = reportedDiagnostics(
+    source,
+    bodies.map(({ module, span }) => ({ code: '', module, span })),
+  ).map(({ span }) => spanRange(span))
+  return (
+    expected.length > 0 &&
+    expected.every(({ span }) => {
+      const diagnostic = spanRange(span)
+      return ranges.some(
+        (body) =>
+          body.module === diagnostic.module &&
+          notAfter(body.start, diagnostic.start) &&
+          notAfter(diagnostic.end, body.end),
+      )
+    })
+  )
 }
 
 /** Reads every structured support refusal; internal reason IDs are not language codes. */
@@ -398,11 +475,12 @@ const reportedDiagnostics = (
 
 /**
  * Checks a program the compiler must reject. Reporting exactly the expected diagnostics, codes and
- * spans in order, passes. Accepting the program fails, unless the build declared bodies it did not
- * borrow-check, among the emitted ones or anywhere in the root package: that acceptance claims
- * nothing, so it is a `BORROW_CHECK_GAP`, which turns back into a failure once every body is
- * checked. Rejecting it with any other list is a diagnostic-parity gap: the program stays
- * rejected, so the gap is reported, not failed.
+ * spans in order, passes. Accepting the program fails, unless every expected diagnostic lies in a
+ * root-package body the build reported it did not borrow-check: that acceptance claims nothing, so
+ * it is a `BORROW_CHECK_GAP`, which turns back into a failure once those bodies are checked. A
+ * diagnostic in a checked body keeps the failure, whatever else is unchecked. Rejecting it with
+ * any other list is a diagnostic-parity gap: the program stays rejected, so the gap is reported,
+ * not failed.
  */
 const checkRejected = async (
   silkc: string,
@@ -418,16 +496,17 @@ const checkRejected = async (
     directory,
   )
   if (built.error === undefined && built.status === 0 && built.signal === null) {
-    const emitted = parseBorrowGap(built.stderr)
-    const root = parseBorrowGap(built.stderr, rootBorrowGapPrefix)
-    if ((emitted?.total ?? 0) > 0 || (root?.total ?? 0) > 0)
+    const bodies = parseUncheckedBodies(built.stderr)
+    if (coveredByUncheckedBodies(program.source, expected, bodies))
       return {
         name: program.name,
         status: 'unsupported',
         gaps: [
           {
             code: 'BORROW_CHECK_GAP',
-            reason: `accepted with bodies not borrow-checked: ${emitted?.total ?? 0} emitted, ${root?.total ?? 0} in the root package`,
+            reason: `accepted with every expected diagnostic in a body not borrow-checked: ${bodies
+              .map(({ module, span, reason }) => `${module}:${span.start}-${span.end} ${reason}`)
+              .join(', ')}`,
           },
         ],
       }
