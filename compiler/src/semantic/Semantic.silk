@@ -181,7 +181,7 @@ import semantic.ModuleIndex {
   NameObservation,
 }
 import semantic.Operator
-import semantic.BorrowCheck {Outcome as LoanOutcome, check as checkLoans, livenessCodes, regionClosed, storageNodes, LoanCleanup, RegionBound}
+import semantic.BorrowCheck {Outcome as LoanOutcome, Report as LoanReport, check as checkLoans, livenessCodes, regionClosed, storageNodes, LoanCleanup, RegionBound}
 import semantic.ReturnFlow
 import semantic.OpaqueRealization
 import semantic.CallableOrigin
@@ -447,7 +447,8 @@ pub struct Signature {
   pub lifetimeParameters: Vector<Shared<Lifetime>>
   /// The declaration-owned `?R` requirement-row parameters in written order.
   pub rowParameters: Vector<RowParameter>
-  /// The member's declared bounds followed by its inherent owner's substituted domain premises.
+  /// The member's declared bounds followed by its inherent owner's substituted domain premises
+  /// and its inherent impl's substituted `where` bounds.
   pub constraints: Vector<Constraint>
   /// The parameter types in written order.
   pub parameters: Vector<Shared<Type>>
@@ -804,7 +805,8 @@ pub union Value {
 
 /// Whole-program assembly of demanded instance text, with reached unsupported forms preserved.
 pub union BackendBuild {
-  /// `unchecked` counts the emitted definitions not borrow-checked, per `uncheckedReason`.
+  /// `unchecked` counts the emitted definitions and the unemitted checked root bodies not
+  /// borrow-checked, per `uncheckedReason`.
   Module {pub text: Bytes, pub unchecked: Vector<usize>, pub plan: EmissionPlan},
   Unsupported {pub gaps: Vector<Shared<BackendGap>>},
   /// Source refusals, in the order the walk reached them, with every gap reached beside them.
@@ -1176,6 +1178,14 @@ struct HeaderSyntax {
 pub struct DeclarationCheckResult {
   pub rejections: Vector<Shared<Rejection>>
   pub gaps: Vector<Shared<BackendGap>>
+  /// The concrete root-package bodies borrow checking left unchecked, in check order.
+  pub unchecked: Vector<UncheckedDeclaration>
+}
+
+/// A concrete declaration whose checked body borrow checking left unchecked.
+pub struct UncheckedDeclaration {
+  pub identity: DeclarationId
+  pub borrow: BodyBorrowStatus
 }
 
 pub struct DeferredStaticTemplate {
@@ -1268,6 +1278,17 @@ fn declarationOpen(hir: &Module, declarations: &[IndexedDeclaration], ordinal: u
     }
   }
   return false
+}
+
+// The borrow status of a checked body answer, or `Checked` when the answer holds no body.
+fn bodyAnswerBorrowStatus(answer: &Result<Answer, NoRejection>) -> BodyBorrowStatus {
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success { value } => match &value.outcome {
+      Outcome.Success { value: Value.Body { body } } => Shared<TypedBody>.with<BodyBorrowStatus>(&body, TypedBody.borrowStatus)
+      _ => BodyBorrowStatus.Checked
+    }
+    _ => BodyBorrowStatus.Checked
+  }
 }
 
 fn bodyAnswerPresent(answer: &Result<Answer, NoRejection>) -> bool {
@@ -20840,7 +20861,10 @@ effect fn appendOwnerParameters(
     }
     declaredAt = declaredAt + usize.ONE
   }
-  // An inherited premise over a binder the member never mentions constrains nothing it uses.
+  // An inherited premise over a type or row binder the member never mentions constrains nothing
+  // it uses. An owner lifetime the member never mentions is 'static, as in the bootstrap, so a
+  // premise naming one stays and each call proves it with 'static in that lifetime's place.
+  let sharedImplementation = run Shared<DeclarationId>.make(DeclarationId.copy(&implementation))
   let mut premiseAt = inheritedEnd
   while premiseAt > inheritedStart {
     premiseAt = premiseAt - usize.ONE
@@ -20849,9 +20873,22 @@ effect fn appendOwnerParameters(
     let mut premiseRows = Vector<usize>.make()
     let premises = Vector<Constraint>.asSlice(&constraints.*)
     run collectConstraint(&premises[premiseAt], &implementation, &mut premiseTypes, &mut premiseRegions, &mut premiseRows)
-    if !ordinalsWithin(&premiseTypes, &types) || !ordinalsWithin(&premiseRegions, &regions) || !ordinalsWithin(&premiseRows, &rows) {
+    if !ordinalsWithin(&premiseTypes, &types) || !ordinalsWithin(&premiseRows, &rows) {
       let unused = Vector<Constraint>.remove(&mut constraints.*, premiseAt)
       drop unused
+    } else if !ordinalsWithin(&premiseRegions, &regions) {
+      let mut unmentioned = Vector<Binding>.make()
+      let named = Vector<usize>.asSlice(&premiseRegions)
+      let mut namedAt = usize.ZERO
+      while namedAt < named.length {
+        if !containsOrdinal(&regions, named[namedAt]) {
+          run Vector<Binding>.append(&mut unmentioned, Binding {declaration: Shared<DeclarationId>.clone(&sharedImplementation),
+            ordinal: named[namedAt], value: Argument.Lifetime {value: run Shared<Lifetime>.make(Lifetime.Static)}})
+        }
+        namedAt = namedAt + usize.ONE
+      }
+      let substituted = run applyConstraintBindings(&premises[premiseAt], Vector<Binding>.asSlice(&unmentioned))
+      Vector<Constraint>.set(&mut constraints.*, premiseAt, move substituted)
     }
   }
   let sharedOwner = run Shared<DeclarationId>.make(DeclarationId.copy(&implementation))
@@ -21007,7 +21044,10 @@ effect fn inherentMemberPremises(
   let count = Shared<ImplementationHead>.with<usize>(&head, fn(value: &ImplementationHead) -> usize {
     return Vector<Constraint>.length(&value.ownerPremises)
   })
-  if count == usize.ZERO {
+  let authored = Shared<ImplementationHead>.with<usize>(&head, fn(value: &ImplementationHead) -> usize {
+    return Vector<Constraint>.length(&value.binders.constraints)
+  })
+  if count == usize.ZERO && authored == usize.ZERO {
     return Result<Vector<Constraint>, Shared<Rejection>>.succeed(move premises)
   }
   let mut actualSelf = Option<Shared<Type>>.none()
@@ -21064,6 +21104,17 @@ effect fn inherentMemberPremises(
   while at < count {
     let written = Shared<ImplementationHead>.with<Constraint>(&head, fn(value: &ImplementationHead) -> Constraint {
       let constraints = Vector<Constraint>.asSlice(&value.ownerPremises)
+      return copyConstraint(&constraints[at])
+    })
+    run Vector<Constraint>.append(&mut premises, run applyConstraintBindings(&written, Vector<Binding>.asSlice(&bindings)))
+    at = at + usize.ONE
+  }
+  // The impl's own `where` bounds are premises of every member body, so each call proves them
+  // under its application, as it proves the member's own bounds.
+  at = usize.ZERO
+  while at < authored {
+    let written = Shared<ImplementationHead>.with<Constraint>(&head, fn(value: &ImplementationHead) -> Constraint {
+      let constraints = Vector<Constraint>.asSlice(&value.binders.constraints)
       return copyConstraint(&constraints[at])
     })
     run Vector<Constraint>.append(&mut premises, run applyConstraintBindings(&written, Vector<Binding>.asSlice(&bindings)))
@@ -63529,6 +63580,22 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
       unchecked = verdict.status
       undecided = BodyUndecided {regions: declared.pending, loans: verdict.status != BodyBorrowStatus.Checked}
       if verdict.outcome == LoanOutcome.Conflict {
+        let listed = Vector<LoanReport>.asSlice(&verdict.reports)
+        if listed.length > usize.ONE {
+          // Every conflict the body reports, ordered by span as the bootstrap lists them.
+          let mut diagnostics = Vector<Shared<Rejection>>.make()
+          let mut at = usize.ZERO
+          while at < listed.length {
+            let mut related = Option<RelatedSite>.none()
+            if listed[at].related {
+              related = Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&module), span: Anchor.span(&run cursorAnchor(&cursor), listed[at].earlier)})
+            }
+            run Vector<Shared<Rejection>>.append(&mut diagnostics, run rejectWithRelated(&resolver.*, &module, listed[at].code,
+              Anchor.span(&run cursorAnchor(&cursor), listed[at].access), move related))
+            at = at + usize.ONE
+          }
+          return rejectedBodyDiagnostics(move diagnostics, move dependencies)
+        }
         let mut related = Option<RelatedSite>.none()
         if let Option<Location>.Some {value: earlier} = &verdict.earlier {
           let earlier = Anchor.span(&run cursorAnchor(&cursor), earlier)
@@ -70060,6 +70127,7 @@ impl Semantic {
     let mut rejections = Vector<Shared<Rejection>>.make()
     let mut gaps = Vector<Shared<BackendGap>>.make()
     let mut concrete = Vector<DeclarationId>.make()
+    let mut unchecked = Vector<UncheckedDeclaration>.make()
     let mut moduleAt = usize.ZERO
     while moduleAt < Vector<usize>.length(&modules) {
       let moduleOrdinal = Vector<usize>.get(&modules, moduleAt)
@@ -70251,6 +70319,13 @@ impl Semantic {
                 run Vector<
                   DeclarationId
                 >.append(&mut concrete, DeclarationId.copy(&declaration.identity))
+                let borrow = Shared<Result<Answer, NoRejection>>.with<BodyBorrowStatus>(&body, bodyAnswerBorrowStatus)
+                if borrow != BodyBorrowStatus.Checked {
+                  run Vector<UncheckedDeclaration>.append(
+                    &mut unchecked,
+                    UncheckedDeclaration { identity: DeclarationId.copy(&declaration.identity), borrow: borrow }
+                  )
+                }
               }
             }
           }
@@ -70442,7 +70517,7 @@ impl Semantic {
       run appendDeclarationGap(&mut gaps, Shared<BackendGap>.clone(&missing[at]))
       at = at + usize.ONE
     }
-    return DeclarationCheckResult { rejections: move rejections, gaps: move gaps }
+    return DeclarationCheckResult { rejections: move rejections, gaps: move gaps, unchecked: move unchecked }
   }
 
   // A nongeneric runtime declaration needs no invented arguments or providers to select its
@@ -70525,7 +70600,8 @@ impl Semantic {
     let mut summaries = Vector<SuspensionSummary>.make()
     let mut result = DeclarationCheckResult {
       rejections: Vector<Shared<Rejection>>.make(),
-      gaps: Vector<Shared<BackendGap>>.make()
+      gaps: Vector<Shared<BackendGap>>.make(),
+      unchecked: Vector<UncheckedDeclaration>.make()
     }
     let mut visited = Vector<InstanceKey>.make()
     let mut lookup = InternIndex.make()
@@ -72489,8 +72565,9 @@ impl Semantic {
         return CompilerBug.panic(b"an artifact build names neither a runtime nor an application")
       }
     }
-    return run Semantic.buildFrom(&mut self.*, &module, Vector<BuildRoot>.asSlice(&roots), origin, closureNodes, false,
+    let built = run Semantic.buildFrom(&mut self.*, &module, Vector<BuildRoot>.asSlice(&roots), origin, closureNodes, false,
       &Option<FrameSelection>.none())
+    return run withUnemittedBodies(move built, Vector<UncheckedDeclaration>.asSlice(&checked.unchecked))
   }
   // Roots every active C export `module` declares. Signature gaps are collected beside the roots;
   // any other refusal is returned.
@@ -73446,6 +73523,26 @@ effect fn appendResolvedDefinitions(
     at = at + usize.ONE
   }
   return move unchecked
+}
+
+// Counts and records the checked root bodies the build left unchecked but never emitted, so the gap
+// receipt covers every checked body, not only the emitted ones.
+effect fn withUnemittedBodies(built: BackendBuild, unchecked: &[UncheckedDeclaration]) -> BackendBuild
+! OutOfMemoryError ? &mut Allocator {
+  let mut result = move built
+  if let BackendBuild.Module {unchecked: counts, plan, ..} = &mut result {
+    let mut at = usize.ZERO
+    while at < unchecked.length {
+      if !EmissionPlan.emitsDeclaration(&plan, &unchecked[at].identity) {
+        let reason = uncheckedReason(unchecked[at].borrow)
+        let counted = Vector<usize>.get(&counts, reason)
+        Vector<usize>.set(&mut counts, reason, counted + usize.ONE)
+        run EmissionPlan.recordUnemitted(&mut plan, DeclarationId.copy(&unchecked[at].identity), unchecked[at].borrow)
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move result
 }
 
 effect fn assembleEmission(

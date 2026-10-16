@@ -163,6 +163,31 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in
   `compiler/src/semantic/SemanticConformanceCases.silk`.
 
+### Selfhost rejects an outlives bound on a result-only call lifetime
+
+- **Status:** known divergence; recorded on 2026-10-16 on PR #1823.
+- **Rule:** a result-only lifetime binder is chosen by the call's use (LIFE-003), so the bootstrap
+  infers the shorter region that satisfies the binder's outlives bounds.
+- **Compilers:** selfhost binds a result-only binder that neither an operand nor the expected result
+  fixes to `'static` (see "Result-only call lifetimes in selfhost"), then proves the call's bounds
+  against it. A bound whose shorter side is that binder, such as `'b: 'a` in
+  `fn widen<'a, 'b: 'a>(value: &'b Token) -> &'a Token`, then fails at the call: native reports
+  SEM0212 where the bootstrap accepts.
+  - Already on selfhost before PR #1823, for a function's own bound: `widen(&t).value`,
+    `let r = widen(&t)` then `r.value`, `widen(short).value` in a `'s` function, and `widen`
+    relaying through `inspect<'x>(value: &'x Token) -> &'x Token`.
+  - New with PR #1823, which proves an inherent impl's `where` bounds at each member call: the same
+    shape through `impl<'a, 'b: 'a> Pair<'a, 'b> { fn widen(value: &'b Token) -> &'a Token }`, as in
+    `Pair.widen(&t).value`.
+- **Source migration:** none needed; the rejection is conservative, since it rejects a program
+  the bootstrap accepts and admits nothing unsound. Writing the lifetime explicitly, as in
+  `Pair<'s, 's>.widen(short)`, is accepted. With lifetimes written out, native also accepts
+  `Lent<'s, 's>.keep(short)` and `Pair<'s, 's>.same(short)`, which the bootstrap rejects; both
+  are safe, because the written application satisfies every bound.
+- **Diagnostics and limits:** shortening a result-only binder to the region its bound's longer side
+  lends removes this divergence; it follows separately.
+- **Evidence:** the probes `f1`, `f2`, `f4`, `x3f` and `x3b` in PR #1823's description.
+
 ### Caller-local region relations and 'static binder shortening in selfhost
 
 - **Status:** implemented on 2026-10-07 on PR #1091.
@@ -682,9 +707,21 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
     bootstrap reports SEM0212 at `&held`; native keeps TypeMismatch (SEM0012) on the call, because
     the argument's subtyping fallback runs on that mismatch. Slice arguments report SEM0212 at the
     operand in both.
+  - A receiver call whose method or inherent impl bounds its lifetimes (`pair.view(short)` under
+    `impl<'a, 'b: 'a> Pair<'a, 'b>` with `'s: 'static` unproven): the bootstrap's region proof
+    reports SEM0212 at the function header; native proves the bound at the call and reports it
+    over the call. A call written on the type (`Pair<'static, 's>.widen(short)`) is SEM0212 over
+    the call in both.
+  - A bare call on the type whose impl bound names a lifetime the member never mentions
+    (`Lent.keep(short)` under `impl<'a: 'm, 'm>`): both take that lifetime as 'static and reject
+    with SEM0212. The same substitution turns a `T: 'a` bound over such a lifetime into
+    `T: 'static`. The bootstrap reports at the function header, or at a local borrow operand
+    (`Leak.leak(&held)` at `&held`); native reports over the call.
 - **Source migration:** none; both compilers reject.
 - **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
-  (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`).
+  (`wrongReferenceLifetime`, `parameterViews`, `mixedViews`, `ownedViews`) and
+  `SemanticCallableCases::inherentImplBoundsAreProvedAtEachCall` (`receiverEscape`, `unmentioned`,
+  `chained`, `dangling`, `lifted`).
 
 ### Bootstrap misses implied outlives from reference-to-lifetime-parameterized types
 
