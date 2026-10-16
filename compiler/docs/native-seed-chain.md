@@ -8,11 +8,11 @@ recovers from an earlier published native seed.
 
 ## Generations
 
-| Name | Built by                       | From                                                       |
-| ---- | ------------------------------ | ---------------------------------------------------------- |
-| seed | an earlier `main` push run     | the pin                                                    |
-| N1   | the seed                       | this checkout's `compiler/` and `packages/compiler/stdlib` |
-| N2   | N1                             | the same inputs                                            |
+| Name | Built by                   | From                                                       |
+| ---- | -------------------------- | ---------------------------------------------------------- |
+| seed | an earlier `main` push run | the pin                                                    |
+| N1   | the seed                   | this checkout's `compiler/` and `packages/compiler/stdlib` |
+| N2   | N1                         | the same inputs                                            |
 
 Every generation compiles the exact committed inputs exported by `SourceSnapshot.mjs` from Git
 objects, never the working tree. Each compiler build passes `--stdlib` pointing at the snapshot's

@@ -67,7 +67,9 @@ for (const path of sources(root)) {
   for (const edit of edits) text = text.slice(0, edit.from) + edit.text + text.slice(edit.to)
   rewritten += edits.length
   for (const match of text.matchAll(removed)) {
-    remaining.push(`${name}:${text.slice(0, match.index).split('\n').length}: DeclarationId.${match[1]}`)
+    remaining.push(
+      `${name}:${text.slice(0, match.index).split('\n').length}: DeclarationId.${match[1]}`,
+    )
   }
   if (!check && text !== source) writeFileSync(path, text)
 }
@@ -75,10 +77,14 @@ for (const path of sources(root)) {
 for (const line of remaining) console.error(line)
 if (check) {
   if (rewritten > 0 || remaining.length > 0) {
-    console.error(`${rewritten} pure DeclarationId copies to rewrite, ${remaining.length} removed accessors to convert`)
+    console.error(
+      `${rewritten} pure DeclarationId copies to rewrite, ${remaining.length} removed accessors to convert`,
+    )
     process.exit(1)
   }
 } else {
-  console.log(`rewrote ${rewritten} sites; ${remaining.length} removed accessors need a by-hand conversion`)
+  console.log(
+    `rewrote ${rewritten} sites; ${remaining.length} removed accessors need a by-hand conversion`,
+  )
   if (remaining.length > 0) process.exit(1)
 }

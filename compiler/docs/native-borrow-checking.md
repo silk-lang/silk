@@ -390,6 +390,7 @@ cover first:
   calling body's `Checked` status, `Semantic.buildFrom` checks every reached access callback and
   its callees for suspension and readiness-notification escapes before emitting code (OWN0016,
   SHARED-003).
+
 - `stored-loans`: a stored or delayed `executionDrive` construction retains captures its empty
   native environment does not describe, so it stays unchecked even when its result type names no
   environment region; lowering runs only an immediate drive, so no emitted body has one. Other
@@ -409,8 +410,9 @@ cover first:
   binding's scope, so their storage and cleanup end there, and likewise for the subject of a
   borrowing destructuring `let` and, since it may view at an instance, a binding typed by a type
   parameter. Only a viewing binding's borrowed fixed array stays valid that long, so `let view =
-  identity(&[1, 2])` is valid; any other such temporary's loans expire with its statement (an
+identity(&[1, 2])` is valid; any other such temporary's loans expire with its statement (an
   `Expire` event, which ends validity without ending storage).
+
 - `imprecise`: a conflict or a moved-place use is decided only by an unknown index, a partial
   replacement, a loan a retaining result carries approximately, or a move of a reference whose
   referent is reborrowed. It is an unchecked status: such a body is never `FullyChecked`, counts
@@ -458,8 +460,8 @@ corpus program, `<program> <reason>=<count> ...` (a bare name when nothing is un
   program. `update` writes a line for every program that ran and keeps, listing them as "not run",
   the lines of programs that did not; `update --prune` drops those instead, for programs the corpus
   no longer has. A PR that changes checking or the corpus reruns `node
-  .github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only writer, and `diff <old>
-  <new>` prints the per-program transition table for its description. The corpus job builds its
+.github/scripts/check-borrow-gap.mjs update <corpus log>`, the file's only writer, and `diff <old>
+<new>` prints the per-program transition table for its description. The corpus job builds its
   programs from main's verification harness, which can differ from a local run on this branch's
   `corpus.ts`; the file must match CI, so when they disagree, run `update` on the job's
   `selfhost-corpus-timings` artifact or its log. Lines are independent and git merges the file with
