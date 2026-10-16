@@ -180,9 +180,11 @@ Each entry records:
   - New with PR #1823, which proves an inherent impl's `where` bounds at each member call: the same
     shape through `impl<'a, 'b: 'a> Pair<'a, 'b> { fn widen(value: &'b Token) -> &'a Token }`, as in
     `Pair.widen(&t).value`.
-- **Source migration:** none needed; the rejection is conservative. Native rejects a program the
-  bootstrap accepts and never accepts one it rejects. Writing the lifetime explicitly, as in
-  `Pair<'s, 's>.widen(short)`, is accepted.
+- **Source migration:** none needed; the rejection is conservative, since it rejects a program
+  the bootstrap accepts and admits nothing unsound. Writing the lifetime explicitly, as in
+  `Pair<'s, 's>.widen(short)`, is accepted. With lifetimes written out, native also accepts
+  `Lent<'s, 's>.keep(short)` and `Pair<'s, 's>.same(short)`, which the bootstrap rejects; both
+  are safe, because the written application satisfies every bound.
 - **Diagnostics and limits:** shortening a result-only binder to the region its bound's longer side
   lends removes this divergence; it follows separately.
 - **Evidence:** the probes `f1`, `f2`, `f4`, `x3f` and `x3b` in PR #1823's description.
@@ -714,7 +716,8 @@ Each entry records:
     the call in both.
   - A bare call on the type whose impl bound names a lifetime the member never mentions
     (`Lent.keep(short)` under `impl<'a: 'm, 'm>`): both take that lifetime as 'static and reject
-    with SEM0212. The bootstrap reports at the function header, or at a local borrow operand
+    with SEM0212. The same substitution turns a `T: 'a` bound over such a lifetime into
+    `T: 'static`. The bootstrap reports at the function header, or at a local borrow operand
     (`Leak.leak(&held)` at `&held`); native reports over the call.
 - **Source migration:** none; both compilers reject.
 - **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
