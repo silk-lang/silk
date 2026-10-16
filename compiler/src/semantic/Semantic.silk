@@ -2139,6 +2139,10 @@ struct BodyFrame {
   /// The statements of this body that failed and were recovered past. A binder inside one has no
   /// local, and a read of it fails as `UnavailableBinding` instead of reporting a cascade.
   failedStatements: Vector<FailedStatement>
+  /// The calls of this root body whose result-only binder shortened to its outlives bound
+  /// (`outlivesShortenedBinders`). Their binding is admitted only when the borrow check proves the
+  /// whole body; otherwise each call keeps its unshortened bound refusal (SEM0212).
+  shortened: Vector<Span>
   /// Whether this frame begins a body of its own: a declaration's body or a static root. A frame
   /// nested in it (a callable literal, an Effect block) reads its failed statements; a frame of
   /// another body pushed above it never does.
@@ -21985,7 +21989,7 @@ effect fn enterBodyFrame(resolver: &mut Resolver, signature: &Shared<Result<Answ
   let requirements = run signatureRequirements(signature)
   let isEffect = Shared<Result<Answer, NoRejection>>.with<bool>(signature, signatureIsEffect)
   return run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: isEffect, failure: move failure,
-    requirements: move requirements, derived: Option<DerivedChannels>.none(), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), root: root})
+    requirements: move requirements, derived: Option<DerivedChannels>.none(), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: root})
 }
 
 // Closes the innermost body frame of a block nested in a body, returning the region relations its
@@ -22004,16 +22008,37 @@ effect fn leaveBodyFrame(resolver: &mut Resolver) -> Vector<BodySafetyObligation
 struct ClosedBody {
   obligations: Vector<BodySafetyObligation>
   recovered: Vector<Shared<Rejection>>
+  shortened: Vector<Span>
 }
 
 // Closes the frame of a body that is its own declaration or static root.
 fn leaveRootBodyFrame(resolver: &mut Resolver) -> ClosedBody {
   let popped = Vector<BodyFrame>.pop(&mut resolver.*.bodies)
   if let Option<BodyFrame>.Some {value} = move popped {
-    let BodyFrame {obligations, recovered, ..} = move value
-    return ClosedBody {obligations: move obligations, recovered: move recovered}
+    let BodyFrame {obligations, recovered, shortened, ..} = move value
+    return ClosedBody {obligations: move obligations, recovered: move recovered, shortened: move shortened}
   }
-  return ClosedBody {obligations: Vector<BodySafetyObligation>.make(), recovered: Vector<Shared<Rejection>>.make()}
+  return ClosedBody {obligations: Vector<BodySafetyObligation>.make(), recovered: Vector<Shared<Rejection>>.make(),
+    shortened: Vector<Span>.make()}
+}
+
+// Whether the innermost body frame is a declaration's or static root's own body rather than a
+// callable literal or Effect block nested in it.
+fn rootBodyFrame(resolver: &Resolver) -> bool {
+  let bodies = Vector<BodyFrame>.asSlice(&resolver.bodies)
+  if bodies.length == usize.ZERO { return false }
+  return bodies[bodies.length - usize.ONE].root
+}
+
+// Records a call whose result-only binder shortened on the innermost root body frame.
+effect fn recordShortened(resolver: &mut Resolver, span: Span) -> () ! OutOfMemoryError ? &mut Allocator {
+  let popped = Vector<BodyFrame>.pop(&mut resolver.*.bodies)
+  if let Option<BodyFrame>.Some {value} = move popped {
+    let mut frame = move value
+    run Vector<Span>.append(&mut frame.shortened, span)
+    run Vector<BodyFrame>.append(&mut resolver.*.bodies, move frame)
+  }
+  return ()
 }
 
 // Records a diagnostic a construct reported before it went on checking. The construct still fails,
@@ -22817,11 +22842,12 @@ fn capturedRegion(nodes: &[BodyNode], arguments: &[BodyNodeId]) -> Option<Shared
 // A lifetime binder that only the call's outcome mentions, such as an impl lifetime only the
 // result names, is chosen by the call's use rather than by an operand (LIFE-003). An ordinary
 // call's expected result fixes it; otherwise the outcome retains no operand region through it, so
-// it is 'static. A lifetime binder that nothing mentions relates no region, so it is 'static too;
-// only type and row binders can stay uninferred.
+// it is 'static, and `defaulted` lists it for a bound to shorten (`outlivesShortenedBinders`). A
+// lifetime binder that nothing mentions relates no region, so it is 'static too; only type and row
+// binders can stay uninferred.
 effect fn bindUseLifetimes(inference: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId,
   callOwner: &Shared<DeclarationId>, binderCount: usize, expected: &Option<Shared<Type>>, effectTarget: bool,
-  inferred: &mut Vector<Binding>) -> ()
+  inferred: &mut Vector<Binding>, defaulted: &mut Vector<usize>) -> ()
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut types = Vector<usize>.make()
   let mut mentioned = Vector<usize>.make()
@@ -22867,11 +22893,16 @@ effect fn bindUseLifetimes(inference: &Shared<Result<Answer, NoRejection>>, fres
     }
     if open {
       let mut region = run Shared<Lifetime>.make(Lifetime.Static)
+      let mut chosen = false
       if let Option<Argument>.Some {value: Argument.Lifetime {value: selected}} = move bindingArgumentAt(Vector<Binding>.asSlice(&evidence), at) {
         let mut owned = Vector<usize>.make()
         run Type.collectOwnedLifetime(&selected, fresh, &mut owned)
-        if Vector<usize>.length(&owned) == usize.ZERO { region = Shared<Lifetime>.clone(&selected) }
+        if Vector<usize>.length(&owned) == usize.ZERO {
+          region = Shared<Lifetime>.clone(&selected)
+          chosen = true
+        }
       }
+      if !chosen { run Vector<usize>.append(&mut defaulted.*, at) }
       run Vector<Binding>.append(&mut inferred.*, Binding {declaration: Shared<DeclarationId>.clone(callOwner), ordinal: at,
         value: Argument.Lifetime {value: move region}})
     }
@@ -32912,17 +32943,40 @@ effect fn boundShortenedBinders(
   }
 }
 
+// How many bounds of a call signature require something to outlive its fresh lifetime binder
+// `ordinal`: each `'longer: 'binder` and each `T: 'binder`.
+fn outlivesBoundCount(answer: &Result<Answer, NoRejection>, fresh: &DeclarationId, ordinal: usize) -> usize {
+  let mut count = usize.ZERO
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
+      let listed = Vector<Constraint>.asSlice(&signature.constraints)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        let bounded = match &listed[at] {
+          Constraint.Outlives {shorter, ..} => freshLifetimeOrdinal(&shorter, fresh) == ordinal
+          Constraint.Contents {region, ..} => freshLifetimeOrdinal(&region, fresh) == ordinal
+          _ => false
+        }
+        if bounded { count = count + usize.ONE }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return count
+}
+
 // An inferred lifetime binder that a `'longer: 'binder` bound names shortens to the meet of its held
 // region and 'longer when the premises do not already prove the bound, exactly as a `T: 'binder`
 // bound shortens it (`boundShortenedBinders`): the bootstrap's region inference chooses the
 // shortest region (LIFE-002). A section of `effect<'held> fn f<'data: 'held, 'held>` whose captures
 // are owned holds no region, so 'held starts 'static and shortens to the 'data its remaining operand
-// lends. A written binder never moves and every parameter must store the binder covariantly; the
+// lends; a call's result-only binder under `'b: 'a` shortens to the region its argument lends 'b.
+// A written binder, listed in `explicit`, never moves and every parameter must store the binder covariantly; the
 // bound proof then runs on the shortened binding. Reports whether any binder shortened.
 effect fn outlivesShortenedBinders(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
   signature: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId, inferred: &mut Vector<Binding>,
-  premises: &[Constraint], span: Span,
+  explicit: &[usize], premises: &[Constraint], span: Span,
 ) -> bool
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut shortenedAny = false
@@ -32939,7 +32993,7 @@ effect fn outlivesShortenedBinders(
       if let Constraint.Outlives {shorter, ..} = &value {
         let ordinal = freshLifetimeOrdinal(&shorter, fresh)
         let mut current = Option<Shared<Lifetime>>.none()
-        if ordinal != usize.MAX {
+        if ordinal != usize.MAX && !fixedOrdinal(explicit, ordinal) {
           if let Option<Argument>.Some {value: Argument.Lifetime {value: held}} = move bindingArgumentAt(Vector<Binding>.asSlice(&inferred.*), ordinal) {
             current = Option<Shared<Lifetime>>.some(move held)
           }
@@ -37503,7 +37557,7 @@ effect fn checkEffectBlock<'scope>(
   if let Option<EffectChannels>.Some {value: declared} = move expectedChannels {
     run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: true, failure: Shared<Type>.clone(&declared.failure),
       requirements: Shared<Row>.clone(&declared.requirements), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), root: false})
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false})
     let declaredCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
       &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
       &mut checkedNodes, &mut signatures, &mut required, block, &declared.success, constraints, true, false, usize.ZERO, false)
@@ -37527,7 +37581,7 @@ effect fn checkEffectBlock<'scope>(
     failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
     requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.some(DerivedChannels {
       returns: Vector<Shared<Type>>.make(), failed: Vector<Shared<Type>>.make(), failures: Vector<Shared<Type>>.make(),
-      requirements: Row.empty()}), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), root: false})
+      requirements: Row.empty()}), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false})
   let derivedCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
     &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
     &mut checkedNodes, &mut signatures, &mut required, block, &unit, constraints, true, false, usize.ZERO, false)
@@ -37575,7 +37629,7 @@ effect fn checkEffectBlock<'scope>(
     required = Vector<DeclarationId>.make()
     run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: true, failure: Shared<Type>.clone(&failure),
       requirements: Shared<Row>.clone(&requirements), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), root: false})
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false})
     let declaredCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
       &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
       &mut checkedNodes, &mut signatures, &mut required, block, &success, constraints, true, false, usize.ZERO, false)
@@ -38567,12 +38621,12 @@ effect fn currentBodyChannels(resolver: &Resolver) -> BodyFrame ! OutOfMemoryErr
   if bodies.length == usize.ZERO {
     return BodyFrame {isEffect: false, failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
       requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), root: false}
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false}
   }
   let current = &bodies[bodies.length - usize.ONE]
   return BodyFrame {isEffect: current.isEffect, failure: Shared<Type>.clone(&current.failure),
     requirements: Shared<Row>.clone(&current.requirements), derived: Option<DerivedChannels>.none(),
-    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), root: false}
+    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false}
 }
 
 // Whether the innermost body derives its channels from its `return`, `fail` and `run` sites.
@@ -45262,8 +45316,11 @@ Option<Shared<StaticData>>,
     }
     environmentAt = environmentAt + usize.ONE
   }
+  // Only a binder that nothing but the call's use fixed, and that use left 'static, may shorten.
+  let mut defaultedOrdinals = Vector<usize>.make()
   if parameterOffset == usize.ZERO && !valueConstruction && !bound {
-    run bindUseLifetimes(&inference, &freshOwner, &callOwner, originalBinderCount, expected, effectTarget, &mut inferred)
+    run bindUseLifetimes(&inference, &freshOwner, &callOwner, originalBinderCount, expected, effectTarget, &mut inferred,
+      &mut defaultedOrdinals)
   }
   if target.prefixLifetimes != usize.ZERO {
     run bindCallPrefixResult(&inference, &freshOwner, originalBinderCount, binderCount, expected, effectTarget, &mut inferred)
@@ -45298,6 +45355,24 @@ Option<Shared<StaticData>>,
   }
   run boundShortenedBinders(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &inference, &freshOwner,
     &mut inferred, explicitOrdinals, constraints, caller, expression, span, &run cursorAnchor(cursor))
+  // A binder shortens only in a runtime declaration's own body, whose borrow check then decides it
+  // (`BodyFrame.shortened`), and only when one bound names it (`outlivesBoundCount`): the meet of
+  // several bounds' regions is held to no single loan.
+  let shortening = !staticBody && rootBodyFrame(&resolver.*)
+  let mut pinnedOrdinals = Vector<usize>.make()
+  let mut pinnedAt = usize.ZERO
+  while pinnedAt < originalBinderCount {
+    if !shortening || !containsOrdinal(&defaultedOrdinals, pinnedAt) || fixedOrdinal(explicitOrdinals, pinnedAt)
+      || Shared<Result<Answer, NoRejection>>.with<usize>(&inference,
+        fn(answer: &Result<Answer, NoRejection>) -> usize { return outlivesBoundCount(answer, &freshOwner, pinnedAt) }) > usize.ONE {
+      run Vector<usize>.append(&mut pinnedOrdinals, pinnedAt)
+    }
+    pinnedAt = pinnedAt + usize.ONE
+  }
+  if run outlivesShortenedBinders(&mut resolver.*, &mut owner.*, &mut dependencies.*, &inference, &freshOwner,
+    &mut inferred, Vector<usize>.asSlice(&pinnedOrdinals), constraints, span) {
+    run recordShortened(&mut resolver.*, span)
+  }
   let mut unresolvedAt = usize.ZERO
   while unresolvedAt < originalBinderCount {
     let evidence = bindingArgumentAt(Vector<Binding>.asSlice(&inferred), unresolvedAt)
@@ -54109,7 +54184,7 @@ effect fn checkedStaticRoot(
   run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: false,
     failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
     requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.none(),
-    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), root: true})
+    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: true})
   let checked = run checkExpression(
     &mut resolver.*,
     &mut owner.*,
@@ -54131,7 +54206,7 @@ effect fn checkedStaticRoot(
     false,
   )
   let closed = leaveRootBodyFrame(&mut resolver.*)
-  let ClosedBody {obligations: relations, recovered} = move closed
+  let ClosedBody {obligations: relations, recovered, shortened} = move closed
   drop statementScope
   let rootNode = match move checked {
     Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
@@ -54140,6 +54215,7 @@ effect fn checkedStaticRoot(
     }
   }
   if Vector<Shared<Rejection>>.length(&recovered) != usize.ZERO { return CompilerBug.panic(b"a checked static root recovered a diagnostic") }
+  if Vector<Span>.length(&shortened) != usize.ZERO { return CompilerBug.panic(b"a static root shortened a call binder") }
   let violation = run staticPhaseViolation(&mut resolver.*, Vector<BodyNode>.asSlice(&nodes), &run cursorAnchor(&cursor))
   if let Option<Span>.Some {value: violatingSpan} = move violation {
     return run rejectedBody(
@@ -63060,6 +63136,7 @@ struct BodyFinishInput {
   dependencies: Vector<Dependency>
   control: CheckedControl
   relations: Vector<BodySafetyObligation>
+  shortened: Vector<Span>
 }
 
 effect fn resolveBody(
@@ -63389,7 +63466,7 @@ effect fn checkPreparedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
   )
   run takeOccurrenceFacts(&mut resolver.*, &mut staticIterations)
   let closed = leaveRootBodyFrame(&mut resolver.*)
-  let ClosedBody {obligations: relations, recovered} = move closed
+  let ClosedBody {obligations: relations, recovered, shortened} = move closed
   let control = match move checked {
     BlockList.Checked {control} => move control
     BlockList.Recovered {control, failure} => {
@@ -63437,6 +63514,7 @@ effect fn checkPreparedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
     dependencies: move dependencies,
     control: move control,
     relations: move relations,
+    shortened: move shortened,
   })
 }
 
@@ -63477,7 +63555,7 @@ effect fn selectStaticBodyApplication(
 
 effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key, finished: BodyFinishInput)
 -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  let BodyFinishInput {module, resultType, constraints, sourceAnswer, staticIterations: preparedIterations, block, identity, locals: preparedLocals, initialLocals, nodes: preparedNodes, signatureDependencies: preparedSignatureDependencies, requiredBodies: preparedRequiredBodies, cursor, abstractBody, staticBody, dependencies: preparedDependencies, control, relations} = move finished
+  let BodyFinishInput {module, resultType, constraints, sourceAnswer, staticIterations: preparedIterations, block, identity, locals: preparedLocals, initialLocals, nodes: preparedNodes, signatureDependencies: preparedSignatureDependencies, requiredBodies: preparedRequiredBodies, cursor, abstractBody, staticBody, dependencies: preparedDependencies, control, relations, shortened} = move finished
   let mut staticIterations = move preparedIterations
   let mut locals = move preparedLocals
   let mut nodes = move preparedNodes
@@ -63641,6 +63719,19 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
     }
   }
   if assumed && unchecked == BodyBorrowStatus.Checked { unchecked = BodyBorrowStatus.Regions }
+  // A shortened call binder holds only where the borrow check proves the whole body: a body left
+  // unchecked could carry the shortened result past the loan it names, so each such call keeps the
+  // refusal of its bound at the binder's unshortened 'static (SEM0212).
+  let shortenedSites = Vector<Span>.asSlice(&shortened)
+  if shortenedSites.length != usize.ZERO && unchecked != BodyBorrowStatus.Checked {
+    let mut refusals = Vector<Shared<Rejection>>.make()
+    let mut siteAt = usize.ZERO
+    while siteAt < shortenedSites.length {
+      run insertByPosition(&mut refusals, run reject(&resolver.*, &module, RejectionCode.UnsatisfiedLifetimeBound, shortenedSites[siteAt]))
+      siteAt = siteAt + usize.ONE
+    }
+    return rejectedBodyDiagnostics(move refusals, move dependencies)
+  }
   let mut stage = BodyStage.FullyChecked
   if (needsObligations || assumed) && unchecked != BodyBorrowStatus.Checked {
     stage = BodyStage.ContractTyped {obligations: move obligations}
@@ -75210,8 +75301,9 @@ effect fn contextualCallableContract(resolver: &mut Resolver, owner: &mut Query<
       at = at + usize.ONE
     }
   }
+  let unwritten = Vector<usize>.make()
   drop run outlivesShortenedBinders(&mut resolver.*, &mut owner.*, &mut dependencies.*, &opened, &fresh, &mut inferred,
-    Vector<Constraint>.asSlice(&premises), span)
+    Vector<usize>.asSlice(&unwritten), Vector<Constraint>.asSlice(&premises), span)
   let mut bounds = Vector<Constraint>.make()
   at = usize.ZERO
   while at < facts.constraints {
@@ -76364,8 +76456,9 @@ effect fn schemaCallableApplication(resolver: &mut Resolver, owner: &mut Query<A
       }
       boundAt = boundAt + usize.ONE
     }
+    let unwritten = Vector<usize>.make()
     if run outlivesShortenedBinders(&mut resolver.*, &mut owner.*, &mut dependencies.*, &opened, &fresh, &mut inferred,
-      premises, span) {
+      Vector<usize>.asSlice(&unwritten), premises, span) {
       shortened = true
     }
     if shortened {
