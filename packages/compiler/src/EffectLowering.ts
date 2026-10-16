@@ -1748,7 +1748,7 @@ export const endLoan = (
 ): void => {
   const key = borrowKey(borrow)
   const held = fn.loanLocals.get(key)
-  if (held === undefined) return
+  if (held === undefined || !fn.endsLoan(key)) return
   fn.emit({
     _tag: 'EndLoan',
     borrow,
