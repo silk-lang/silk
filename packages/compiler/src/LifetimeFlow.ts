@@ -912,7 +912,8 @@ export const analyze = (
         return
       }
       if (expression._tag === 'Replace') {
-        const source = expressionRoot(expression, context, builder)
+        const destination = expressionRoot(expression.destination, context, builder)
+        const source = destination === undefined ? undefined : canonicalRoot(destination)
         if (source !== undefined)
           invalidations.push({ root: rootSite(source, builder), path: source.path, expression })
       }
@@ -1829,6 +1830,46 @@ interface LoanLiveness {
   readonly required: BodyControlFlow.Reachable
   readonly observedHolderUse: boolean
   readonly retainedEnds: Map<number, BodyControlFlow.Reachable>
+  /** Whether the loan's region must outlive a universal region, which outlives the whole body. */
+  readonly universal: boolean
+}
+
+const universalOriginsCache = new WeakMap<LifetimeFlow, ReadonlySet<string>>()
+
+/**
+ * The regions that must outlive a universal region: `'static`, or a lifetime chosen before the body
+ * runs. Such a region outlives every point of the body, so a loan of it stays live wherever its
+ * creation reaches, whether or not a holder still uses it.
+ */
+const universalOrigins = (self: LifetimeFlow): ReadonlySet<string> => {
+  const cached = universalOriginsCache.get(self)
+  if (cached !== undefined) return cached
+  const longerThan = new Map<string, Array<string>>()
+  const universal = new Set<string>()
+  const pending: Array<string> = []
+  for (const bound of self.input.constraints) {
+    const shorter = Lifetime.key(bound.shorter)
+    const longer = Lifetime.key(bound.longer)
+    const listed = longerThan.get(shorter)
+    if (listed === undefined) longerThan.set(shorter, [longer])
+    else listed.push(longer)
+    // Outliving an intersection requires outliving only its shortest member, so the bound is
+    // universal only when every member is.
+    if (
+      Lifetime.atoms(bound.shorter).every(
+        (atom) => atom._tag === 'BoundLifetime' || atom._tag === 'StaticLifetime',
+      )
+    )
+      pending.push(longer)
+  }
+  while (pending.length > 0) {
+    const key = pending.pop()
+    if (key === undefined || universal.has(key)) continue
+    universal.add(key)
+    pending.push(...(longerThan.get(key) ?? []))
+  }
+  universalOriginsCache.set(self, universal)
+  return universal
 }
 
 // Ownership probes many accesses against the same loan. Reverse its fixed required uses once,
@@ -1880,11 +1921,13 @@ const resolveLoanLiveness = (
       if (use.start !== undefined && use.start >= start.end) observedHolderUse = true
       if (!use.retired && use.after !== undefined) targets.push(use.after)
     }
+  const universal = universalOrigins(self)
   const answer: LoanLiveness = {
     created,
     required: BodyControlFlow.predecessors(self.controlFlow, targets, created.before),
     observedHolderUse,
     retainedEnds: new Map(),
+    universal: origins.some((key) => universal.has(key)),
   }
   if (byOrigin === undefined) {
     byOrigin = new Map()
@@ -1923,7 +1966,7 @@ export const liveAt = (
   if (liveness === undefined) return undefined
   const { created } = liveness
   if (!BodyControlFlow.reaches(self.controlFlow, created.after, at, created.before)) return false
-  if (BodyControlFlow.includes(liveness.required, at)) return true
+  if (liveness.universal || BodyControlFlow.includes(liveness.required, at)) return true
   if (liveness.observedHolderUse) return false
   const retainedEnd = BodyControlFlow.at(self.controlFlow, end)
   if (retainedEnd === undefined) return false
@@ -2102,7 +2145,10 @@ export const validateCleanup = (
   ownership: Ownership.FunctionOwnership,
   context: SemanticContext.SemanticContext,
 ): {
+  /** The violations elaboration has not already reported. */
   readonly diagnostics: ReadonlyArray<Diagnostic.Diagnostic>
+  /** The first violation of the replay, reported here or by elaboration. */
+  readonly violation: Diagnostic.Diagnostic | undefined
   readonly work?: Lifetime.Work
 } => {
   // Fresh destructor points are outside the analyzed domain, so the solver treats every region as
@@ -2243,15 +2289,37 @@ export const validateCleanup = (
     }
     solution = { ...solved, violations }
   }
-  return {
-    diagnostics: diagnosticsOf(
-      solution,
+  const report = (reported: Lifetime.Solution) =>
+    diagnosticsOf(
+      reported,
       self.origins,
       (origin) => origin.span,
       spans,
       context.spanOf(ownership.declaration.anchor),
       SourceSpan.key,
-    ),
+    )
+  // The replay re-solves elaboration's regions, so it finds each violation elaboration already
+  // reported again at the same lifetime and point.
+  const elaborated = new Set(
+    self.solution._tag === 'Solved'
+      ? self.solution.violations.map(
+          (violation) => `${Lifetime.key(violation.lifetime)}:${violation.point}`,
+        )
+      : [],
+  )
+  const unreported: Lifetime.Solution =
+    solution._tag === 'Solved'
+      ? {
+          ...solution,
+          violations: solution.violations.filter(
+            (violation) =>
+              !elaborated.has(`${Lifetime.key(violation.lifetime)}:${violation.point}`),
+          ),
+        }
+      : solution
+  return {
+    diagnostics: report(unreported),
+    violation: report(solution).at(0),
     ...(solution._tag === 'Solved' ? { work: solution.work } : {}),
   }
 }

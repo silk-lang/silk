@@ -65,6 +65,12 @@ export const mirType = (
 export const local = (ordinal: number): Mir.LocalId => ({ _tag: 'Local', ordinal })
 
 export const spanKey = (span: SourceSpan.SourceSpan): string => `${span.start}:${span.end}`
+/** Whether `inner` lies within `outer` in the same source. */
+export const spanWithin = (
+  outer: Pick<SourceSpan.SourceSpan, 'sourceId' | 'start' | 'end'>,
+  inner: SourceSpan.SourceSpan,
+): boolean =>
+  inner.sourceId === outer.sourceId && inner.start >= outer.start && inner.end <= outer.end
 export const patternKey = (binding: Match.BindingId | Tir.LocalId): string =>
   binding._tag === 'TirLocal'
     ? `local:${binding.ordinal}`

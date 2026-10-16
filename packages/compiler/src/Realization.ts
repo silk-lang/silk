@@ -827,12 +827,7 @@ const finalizeMir = Effect.fn('Realization.finalizeMir')(function* (
     index,
     opaqueRealizations,
   )
-  const diagnostics = [
-    ...ownership.violations.map((violation) =>
-      Diagnostic.invalidSuspensionOwnership(violation.detail, violation.span),
-    ),
-    ...(yield* checkNativeAssembly(normalized, profile)),
-  ]
+  const diagnostics = yield* checkNativeAssembly(normalized, profile)
   if (diagnostics.length > 0) return { program: undefined, diagnostics }
   if (normalization === 'Preserve') return { program: normalized, diagnostics }
   const suspended = yield* finalizeSuspensionMir(normalized, provisional, ownership, index)

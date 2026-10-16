@@ -12,7 +12,8 @@ const files = readdirSync(`${library}silk`, { recursive: true })
 
 if (
   new Set(modules).size !== modules.length ||
-  files.join('\n') !== [...modules].sort().join('\n')
+  files.join('\n') !==
+    [...modules].sort((left, right) => Number(left > right) - Number(left < right)).join('\n')
 ) {
   throw new Error('The standard-library manifest must list each silk/*.silk module exactly once')
 }

@@ -4,10 +4,16 @@ import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import * as Config from 'effect/Config'
 import * as Console from 'effect/Console'
 import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
+import * as Schema from 'effect/Schema'
+
+// The ambient search path; tests prepend their own tools to it.
+const ambientPath = Config.String('PATH').pipe(Config.withDefault(''), Effect.orDie)
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 
 class VerificationError extends Data.TaggedError('NativeBuildVerificationError')<{
   readonly message: string
@@ -119,7 +125,7 @@ const program = Effect.gen(function* () {
   yield* fs.symlink(sentinel, join(pathTools, 'clang'))
   const onPath = yield* invoke(silk, argumentsFor('on-path'), directory, {
     ...ambient,
-    PATH: `${pathTools}:${process.env.PATH ?? ''}`,
+    PATH: `${pathTools}:${yield* ambientPath}`,
   })
   assert.notEqual(onPath.status, 0, 'the sentinel clang fails the link')
   assert.equal(yield* fs.exists(marker), true, 'the clang on PATH must run')
@@ -145,7 +151,7 @@ const program = Effect.gen(function* () {
   const named = yield* invoke(silk, [...argumentsFor('named'), '--clang', 'clang'], directory, {
     ...process.env,
     SILK_CLANG: clang,
-    PATH: `${pathTools}:${process.env.PATH ?? ''}`,
+    PATH: `${pathTools}:${yield* ambientPath}`,
   })
   assert.notEqual(named.status, 0, 'the sentinel clang fails the link')
   assert.equal(yield* fs.exists(marker), true, 'a bare --clang name must run from PATH')
@@ -243,7 +249,7 @@ const program = Effect.gen(function* () {
   assert.match(symlinked.stdout, /Hello, world!/)
   const searched = yield* invoke('silk', ['run'], join(directory, 'greeting'), {
     ...process.env,
-    PATH: `${links}:${process.env.PATH ?? ''}`,
+    PATH: `${links}:${yield* ambientPath}`,
     SILK_CLANG: clang,
   })
   assert.equal(searched.status, 0, searched.stderr)
@@ -535,7 +541,7 @@ const program = Effect.gen(function* () {
     [
       'run',
       '--profile-input',
-      JSON.stringify({
+      encodeJson({
         target: hostTarget,
         bindings: [
           {
@@ -569,7 +575,7 @@ const program = Effect.gen(function* () {
     [
       'run',
       '--profile-input',
-      JSON.stringify({ target: hostTarget, runtime: { kind: 'none' } }),
+      encodeJson({ target: hostTarget, runtime: { kind: 'none' } }),
       '--stdlib',
       standardLibrary,
     ],

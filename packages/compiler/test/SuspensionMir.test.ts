@@ -137,7 +137,6 @@ it.layer(Layer.effect(Suspended, snapshot()))((it) => {
           module: 'suspension-mir/main',
           plans: [],
           executionPackages: [],
-          violations: [],
         },
         self.index,
       )
