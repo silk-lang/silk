@@ -2381,3 +2381,24 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   semantic failure alone; the `statement-recovery-ownership` invalid-corpus program pins the
   conflicts both compilers report.
 - Retire this entry when native checks recovered bodies with the failed statements' effects.
+
+### Reads of a failed binding
+
+- **Status:** recorded on 2026-10-15 from bootstrap probes; Julia chose to suppress the dependents
+  of an unavailable binding. Bootstrap divergence.
+- **Rule:** a rejected body reports each independent failure once. A binding whose `let` failed is
+  unavailable, and a statement that fails only by reading it, directly or through another
+  unavailable binding, reports nothing of its own.
+- **Compilers:** native checks the statements after a failed `let` in a runtime body, binds none of
+  its names, and fails a statement that reads one silently; a binding that reads one is
+  unavailable in turn. The bootstrap types the failed binding from its initializer and reports the
+  cascades: for `let first: i32 = flag` (with `flag: bool`) it adds SEM0012 at `first + 1` and
+  SEM0135 at a later `second + 2`, SEM0129 at `return captured` in a callable literal, SEM0040 at
+  a match whose arm yields the binding, and SEM0129 at `return held` after
+  `let held: i32 = flag`. For `let Token { absentField, .. } = Token { value: 1 }` it reports
+  OWN0003, SEM0133 and SEM0022 at the binding and SEM0006 at `return absentField`; native reports
+  the binding's own failure only. A static body still stops at its first failed statement.
+- **Source migration:** none. Both compilers reject the body.
+- **Evidence:** the `statementsAfterBinding`, `bindingChain`, `bindingClosure`, `bindingArm` and
+  `bindingPattern` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
