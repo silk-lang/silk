@@ -688,21 +688,21 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
 
 ### Bootstrap misses implied outlives from reference-to-lifetime-parameterized types
 
-- **Status:** recorded on 2026-10-14 while validating the native imprecise-retention slice (#1698).
-  It is retired when the bootstrap's loan pass, or a native region slice that makes such callers
-  `Checked`, proves the implied bound.
+- **Status:** recorded on 2026-10-14 while validating native imprecise retention (#1698).
+  Native now rejects the direct and implicit-receiver conflicts after the R3 retention work and
+  #1821. The bootstrap gap remains until its loan pass tracks the implied source relation.
 - **Rule:** LIFE-002: `&'a T` implies `T: 'a`, so `&'a Shelf<'b>` implies `'b: 'a`. A callee may
   return the `'b` contents of its argument as `&'a`, and the result then aliases them.
 - **Compilers:** the bootstrap accepts a write to the `'b` referent while such a result lives:
   `let shelf = Shelf {inner: &held}`, `let view = unshelve(&shelf)` (or `shelf.shelved()`), then
-  `held = Token {value: 2}` and a read of `view`. Native keeps that caller `imprecise`: the call
-  result keeps the contents loan approximately because the implied fact links its region to the
-  result's, so the body is never `Checked`.
-- **Source migration:** none. The compiler and standard library have no such caller: their
-  self-build reports no `imprecise` body.
+  `held = Token {value: 2}` and a read of `view`. Native rejects both call forms with OWN0011.
+  An implicit receiver borrow records the same stored-content obligations as an explicit borrow;
+  those obligations are checked against actual source loans, not added as declared premises.
+- **Source migration:** none. The compiler and standard library have no such conflicting caller.
 - **Evidence:** `SemanticCaptureCases::returnedViewsKeepTheirSourceLoans` (`unshelveThenReplace`,
-  `shelvedThenReplace`).
-
+  `shelvedThenReplace`) and `implicitReceiverBorrowsRetainStoredSources` (write and move rejections,
+  last-use release, and an unrelated static-result control). Rejected programs are checked through
+  compile-time verdicts and Cases only.
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
 - **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
