@@ -159,46 +159,21 @@ void test('exact-head full verification remains explicit and complete', () => {
     ...['push', 'pull_request', 'schedule'].map((event) => ({
       event,
       full: false,
-      workload: '',
       enabled: ['platform-supplies'],
     })),
-    {
-      event: 'workflow_dispatch',
-      full: false,
-      workload: '',
-      enabled: ['platform-supplies'],
-    },
-    {
-      event: 'workflow_dispatch',
-      full: false,
-      workload: 'a'.repeat(40),
-      enabled: ['selfhost-bootstrap-plan'],
-    },
-    {
-      event: 'workflow_dispatch',
-      full: true,
-      workload: '',
-      enabled: ['full-verification'],
-    },
-    {
-      event: 'workflow_dispatch',
-      full: true,
-      workload: 'a'.repeat(40),
-      enabled: ['full-verification'],
-    },
+    { event: 'workflow_dispatch', full: false, enabled: ['platform-supplies'] },
+    { event: 'workflow_dispatch', full: true, enabled: ['full-verification'] },
   ]
   for (const scenario of scenarios) {
-    const enabled = ['full-verification', 'selfhost-bootstrap-plan', 'platform-supplies'].filter(
-      (job) => {
-        const condition = /^    if: ([^\n]+)$/m.exec(ciJobBody(job))?.[1]
-        assert.ok(condition, `${job} must declare its event gate`)
-        // These repository-owned GitHub gates use the shared JavaScript boolean/string operators.
-        return runInNewContext(condition, {
-          github: { event_name: scenario.event },
-          inputs: { full_verification: scenario.full, selfhost_sha: scenario.workload },
-        })
-      },
-    )
+    const enabled = ['full-verification', 'platform-supplies'].filter((job) => {
+      const condition = /^    if: ([^\n]+)$/m.exec(ciJobBody(job))?.[1]
+      assert.ok(condition, `${job} must declare its event gate`)
+      // These repository-owned GitHub gates use the shared JavaScript boolean/string operators.
+      return runInNewContext(condition, {
+        github: { event_name: scenario.event },
+        inputs: { full_verification: scenario.full },
+      })
+    })
     assert.deepEqual(enabled, scenario.enabled, JSON.stringify(scenario))
   }
 })
