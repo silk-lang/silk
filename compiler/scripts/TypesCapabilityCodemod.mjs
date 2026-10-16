@@ -56,7 +56,10 @@ if (check) {
 function ensureImport(text, name) {
   const existing = /^import semantic\.Types \{([^}]*)\}$/m.exec(text)
   if (existing !== null) {
-    const names = existing[1].split(',').map((entry) => entry.trim()).filter(Boolean)
+    const names = existing[1]
+      .split(',')
+      .map((entry) => entry.trim())
+      .filter(Boolean)
     if (names.includes(name)) return text
     names.push(name)
     names.sort()
@@ -76,9 +79,17 @@ if (silk === undefined) throw new Error('set SILK_COMPILER to a native silk')
 // drift apart.
 const workflow = readFileSync(join(compiler, '../.github/workflows/selfhost.yml'), 'utf8')
 const entries = new Set(['src/main.silk'])
-for (const match of workflow.matchAll(/"\$SILK_COMPILER" build "[^"]*\/compiler\/(src\/[\w/]+\.silk)"/g)) entries.add(match[1])
-const testRoots = [...workflow.matchAll(/roots: >-\n((?:[ \t]+src\/\S.*\n)+)/g)].flatMap((match) => match[1].trim().split(/\s+/))
-const roots = [...[...entries].map((root) => ({ kind: 'build', root })), ...testRoots.map((root) => ({ kind: 'test', root }))]
+for (const match of workflow.matchAll(
+  /"\$SILK_COMPILER" build "[^"]*\/compiler\/(src\/[\w/]+\.silk)"/g,
+))
+  entries.add(match[1])
+const testRoots = [...workflow.matchAll(/roots: >-\n((?:[ \t]+src\/\S.*\n)+)/g)].flatMap((match) =>
+  match[1].trim().split(/\s+/),
+)
+const roots = [
+  ...[...entries].map((root) => ({ kind: 'build', root })),
+  ...testRoots.map((root) => ({ kind: 'test', root })),
+]
 
 // Build outputs go to a scratch directory, removed on exit.
 const scratch = mkdtempSync(join(tmpdir(), 'types-codemod-'))
@@ -88,11 +99,25 @@ const diagnostics = (target) => {
   const output = join(scratch, 'output')
   const args =
     target.kind === 'build'
-      ? ['build', join(compiler, target.root), '-o', output, '--emit', 'llvm-ir', '--stdlib', stdlib]
+      ? [
+          'build',
+          join(compiler, target.root),
+          '-o',
+          output,
+          '--emit',
+          'llvm-ir',
+          '--stdlib',
+          stdlib,
+        ]
       : ['test', join(compiler, target.root), '-o', output, '--stdlib', stdlib, '--no-cache']
   let text
   try {
-    text = execFileSync(silk, args, { cwd: join(compiler, '..'), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 1 << 28 })
+    text = execFileSync(silk, args, {
+      cwd: join(compiler, '..'),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      maxBuffer: 1 << 28,
+    })
   } catch (failure) {
     text = `${failure.stdout ?? ''}${failure.stderr ?? ''}`
   }
@@ -111,13 +136,23 @@ const bodyOf = (text, start) => {
     if (open === -1) {
       if (c === '(' || c === '<' || c === '[') depth += 1
       else if (c === ')' || c === '>' || c === ']') depth = Math.max(0, depth - 1)
-      else if (c === '{' && depth === 0) { open = at; depth = 1 }
+      else if (c === '{' && depth === 0) {
+        open = at
+        depth = 1
+      }
       continue
     }
-    if (text.startsWith('"""', at)) { const end = text.indexOf('"""', at + 3); at = end === -1 ? text.length : end + 2 }
-    else if (c === '"') { at += 1; while (at < text.length && text[at] !== '"') at += text[at] === '\\' ? 2 : 1 }
-    else if (c === '{') depth += 1
-    else if (c === '}') { depth -= 1; if (depth === 0) return { open, close: at } }
+    if (text.startsWith('"""', at)) {
+      const end = text.indexOf('"""', at + 3)
+      at = end === -1 ? text.length : end + 2
+    } else if (c === '"') {
+      at += 1
+      while (at < text.length && text[at] !== '"') at += text[at] === '\\' ? 2 : 1
+    } else if (c === '{') depth += 1
+    else if (c === '}') {
+      depth -= 1
+      if (depth === 0) return { open, close: at }
+    }
   }
   return undefined
 }
@@ -128,11 +163,20 @@ const literals = (text) => {
   for (let at = 0; at < text.length; at += 1) {
     const start = at
     // A quote character literal, `'"'`, opens no string.
-    if (text.startsWith(`'"'`, at)) { at += 2; continue }
-    if (text.startsWith('//', at)) { const end = text.indexOf('\n', at); at = end === -1 ? text.length : end }
-    else if (text.startsWith('"""', at)) { const end = text.indexOf('"""', at + 3); at = end === -1 ? text.length : end + 2 }
-    else if (text[at] === '"') { at += 1; while (at < text.length && text[at] !== '"') at += text[at] === '\\' ? 2 : 1 }
-    else continue
+    if (text.startsWith(`'"'`, at)) {
+      at += 2
+      continue
+    }
+    if (text.startsWith('//', at)) {
+      const end = text.indexOf('\n', at)
+      at = end === -1 ? text.length : end
+    } else if (text.startsWith('"""', at)) {
+      const end = text.indexOf('"""', at + 3)
+      at = end === -1 ? text.length : end + 2
+    } else if (text[at] === '"') {
+      at += 1
+      while (at < text.length && text[at] !== '"') at += text[at] === '\\' ? 2 : 1
+    } else continue
     ranges.push([start, at + 1])
   }
   return ranges
@@ -163,7 +207,11 @@ const declaration = (text, fn) => {
   const head = text.slice(fn.start, fn.body)
   if (/&mut Types\b/.test(head)) return undefined
   const trimmed = head.replace(/\s+$/, '')
-  return { at: fn.start + trimmed.length, text: head.lastIndexOf('?') > head.lastIndexOf('->') ? ' | &mut Types' : ' ? &mut Types', key: `row:${fn.start}` }
+  return {
+    at: fn.start + trimmed.length,
+    text: head.lastIndexOf('?') > head.lastIndexOf('->') ? ' | &mut Types' : ' ? &mut Types',
+    key: `row:${fn.start}`,
+  }
 }
 
 // The edits providing `fn`'s table to the run expression at `offset`: the provider beside its
@@ -178,9 +226,19 @@ const provision = (text, fn, offset) => {
   if (allocatorAt === -1 || allocatorAt > statementEnd) {
     // A statement providing no allocator: the provider closes the statement.
     const end = offset + text.slice(offset, statementEnd).replace(/\s+$/, '').length
-    return [{ at: end, text: ' |> Effect.provideMut<Types>(&mut typeTable)', key: `provide:${end}` }, ...tableDeclaration(text, fn)]
+    return [
+      { at: end, text: ' |> Effect.provideMut<Types>(&mut typeTable)', key: `provide:${end}` },
+      ...tableDeclaration(text, fn),
+    ]
   }
-  return [{ at: allocatorAt, text: '|> Effect.provideMut<Types>(&mut typeTable) ', key: `provide:${allocatorAt}` }, ...tableDeclaration(text, fn)]
+  return [
+    {
+      at: allocatorAt,
+      text: '|> Effect.provideMut<Types>(&mut typeTable) ',
+      key: `provide:${allocatorAt}`,
+    },
+    ...tableDeclaration(text, fn),
+  ]
 }
 
 // The edit declaring `fn`'s table beside its allocator, or none when it is declared.
@@ -189,9 +247,21 @@ const tableDeclaration = (text, fn) => {
   const extent = bodyOf(text, fn.start)
   const body = text.slice(fn.body, extent === undefined ? text.length : extent.close)
   if (!/let mut typeTable = TypeTable\.make\(\)/.test(body)) {
-    const allocator = /\n([ \t]*)let mut allocator = Allocator\.systemAllocatorProvider\(\)\n/.exec(body)
-    if (allocator === null) edits.push({ at: fn.body + 1, text: '\n  let mut typeTable = TypeTable.make()', key: `table:${fn.start}` })
-    else edits.push({ at: fn.body + allocator.index + allocator[0].length, text: `${allocator[1]}let mut typeTable = TypeTable.make()\n`, key: `table:${fn.start}` })
+    const allocator = /\n([ \t]*)let mut allocator = Allocator\.systemAllocatorProvider\(\)\n/.exec(
+      body,
+    )
+    if (allocator === null)
+      edits.push({
+        at: fn.body + 1,
+        text: '\n  let mut typeTable = TypeTable.make()',
+        key: `table:${fn.start}`,
+      })
+    else
+      edits.push({
+        at: fn.body + allocator.index + allocator[0].length,
+        text: `${allocator[1]}let mut typeTable = TypeTable.make()\n`,
+        key: `table:${fn.start}`,
+      })
   }
   return edits
 }
@@ -199,10 +269,13 @@ const tableDeclaration = (text, fn) => {
 for (const target of roots) {
   for (let round = 1; ; round += 1) {
     const found = diagnostics(target)
-    const actionable = found.filter((error) =>
-      error.code === 'SEM0071' || error.code === 'SEM0006' || error.code === 'SEM0123')
+    const actionable = found.filter(
+      (error) => error.code === 'SEM0071' || error.code === 'SEM0006' || error.code === 'SEM0123',
+    )
     const other = found.filter((error) => !actionable.includes(error))
-    console.log(`${target.root} round ${round}: ${actionable.length} sites, ${other.length} other errors`)
+    console.log(
+      `${target.root} round ${round}: ${actionable.length} sites, ${other.length} other errors`,
+    )
     if (actionable.length === 0) {
       if (other.length > 0) {
         for (const error of other) console.error(JSON.stringify(error))
@@ -222,7 +295,8 @@ for (const target of roots) {
       // Diagnostic spans are UTF-8 byte offsets; the edits index the decoded text.
       const bytes = Buffer.from(before, 'utf8')
       const character = (offset) => bytes.subarray(0, offset).toString('utf8').length
-      for (const error of errors) error.span = { start: character(error.span.start), end: character(error.span.end) }
+      for (const error of errors)
+        error.span = { start: character(error.span.start), end: character(error.span.end) }
       const edits = new Map()
       const imports = new Set()
       for (const error of errors) {
@@ -233,14 +307,16 @@ for (const target of roots) {
           else if (name === 'typeTable') {
             // A provider whose table declaration is missing: declare it beside the allocator.
             const fn = enclosing(before, error.span.start)
-            if (fn === undefined) throw new Error(`${module}:${error.span.start}: no enclosing function`)
+            if (fn === undefined)
+              throw new Error(`${module}:${error.span.start}: no enclosing function`)
             for (const edit of tableDeclaration(before, fn)) edits.set(edit.key, edit)
             imports.add('TypeTable')
           }
           continue
         }
         const fn = enclosing(before, error.span.start)
-        if (fn === undefined) throw new Error(`${module}:${error.span.start}: no enclosing function`)
+        if (fn === undefined)
+          throw new Error(`${module}:${error.span.start}: no enclosing function`)
         if (fn.test || fn.name === 'main') {
           const provided = provision(before, fn, error.span.start)
           for (const edit of provided) edits.set(edit.key, edit)
@@ -252,7 +328,8 @@ for (const target of roots) {
         }
       }
       let text = before
-      for (const edit of [...edits.values()].sort((a, b) => b.at - a.at)) text = text.slice(0, edit.at) + edit.text + text.slice(edit.at)
+      for (const edit of [...edits.values()].sort((a, b) => b.at - a.at))
+        text = text.slice(0, edit.at) + edit.text + text.slice(edit.at)
       for (const name of imports) text = ensureImport(text, name)
       if (text !== before) {
         writeFileSync(path, text)

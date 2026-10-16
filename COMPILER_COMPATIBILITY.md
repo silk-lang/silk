@@ -19,9 +19,9 @@ diagnosis, and it may be a real bug.
 
 ## The two compilers
 
-| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
-| ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
+| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------ | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                  |
 | Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silk build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
@@ -105,7 +105,6 @@ Each entry records:
   with Clang O0 and O2 on Darwin; this does not claim Linux ABI execution or an N1 executable.
 - **Open questions:** remaining native compiler self-build refusals are measured separately.
 
-
 ### Shared-loan lifetime shortening in selfhost call inference
 
 - **Status:** implemented on 2026-10-04 on PR #787; verification is pending exact-head CI.
@@ -148,7 +147,7 @@ Each entry records:
 - **Status:** implemented on 2026-10-06 on PR #1076.
 - **Rule:** a lifetime binder that only a call's result, failure or requirements mention, such as
   the impl lifetime of `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() ->
-  TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
+TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
 - **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
   call: a complete ordinary call takes the region its expected result names, and otherwise binds
   `'static`, since the outcome retains no operand region through that binder. A lifetime binder
@@ -370,8 +369,7 @@ Each entry records:
   control and aggregate actors remain in the coordinated proof root. The permanent
   `selectedStaticRecursionSharesConfiguredDepthBudget` actor retains selected and ordinary
   recursion refusals, post-failure recovery, and depth-two refusal followed by depth-64 success
-  for the same selected application. The coordinated executable ran all eleven actors and returned
-  42. Rebuilding the same eleven actors with scoped reservation cleanup retained all passes,
+  for the same selected application. The coordinated executable ran all eleven actors and returned 42. Rebuilding the same eleven actors with scoped reservation cleanup retained all passes,
   including the larger-budget retry after refusal. Optimized compiler source probes are reported
   below.
 - **Optimized evidence:** the corrected private native-produced N1 built from frozen source
@@ -1182,6 +1180,7 @@ Each entry records:
     reached instance of its declaration. A calm use is therefore unproved when another reached
     instance of the same declaration parks, or when no instance is reached at all. The bootstrap
     proves the function itself.
+
 - **Source migration:** none for ordinary programs. Do not give an Execution body state whose
   Drop hook parks. Do not pass a never-invoked function with deferred binders to a
   NonParking-bounded parameter.
@@ -2358,6 +2357,7 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   | Pattern                             | ~5 KB                    | 16     |
 
   An arm level costs a grouped child, a `match` and a block: 8 + 16 + 68 = 92 units.
+
 - **Source migration:** none expected. The deepest nesting in the standard library, the compiler
   sources, the corpus and the examples (850 files) is 14 nested braces, 15 nested delimiters, 7
   nested parentheses and a 5-operator prefix run, about 1.2K of the 4096 units.
