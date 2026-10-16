@@ -673,23 +673,24 @@ const releasedStorageState = (key: string): ReleasedStorageState => {
 }
 
 /**
- * Proves that no path uses storage after a Drop releases it. The rule keys on the Drop rather than
- * on EndLoan: an EndLoan emits nothing for a plain owner, and a loan's recorded end can precede a
- * retaining value's last use (a view stored in a struct ends at the construction), so only the
- * release of a temporary or binding with cleanup can make a later use read freed storage.
+ * Proves that no path uses a borrowed temporary after the Drop that releases its hidden owner.
+ * The rule keys on that Drop rather than on EndLoan: an EndLoan emits nothing for a plain owner,
+ * and a loan's recorded end can precede a retaining value's last use (a view stored in a struct
+ * ends at the construction), so the release is where a later use reads freed storage.
  *
- * The storage is one local that some loan borrows. After the Drop, any use of it is invalid. A
- * binding's Drop follows its scope's exit plan, and borrow checking proves its views end first.
- * A hidden owner's Drop is placed by lowering at its loan's end, so for a hidden owner
- * (`tracksViews`) a value produced from a view of it, whose type may hold a view of it (see
- * `mayRetainView`), holds one too, and any use of such a view after the Drop is invalid as well,
- * including a Drop of the view whose cleanup runs a destructor. Returns the first offending
- * operation, if any.
+ * Only hidden owners are checked. Lowering places their Drop at a loan end, while a binding's
+ * Drop follows its scope's exit plan and borrow checking proves its views end first; a borrow
+ * check hole there is not caught here. Bindings are also conditionally bound and dropped under
+ * drop flags, which this path analysis, merging states at each join, cannot correlate.
+ *
+ * A value produced from a view of the temporary, whose type may hold a view of it (see
+ * `mayRetainView`), holds one too. After the Drop, any use of the temporary or of such a view is
+ * invalid, including a Drop of the view whose cleanup runs a destructor. Returns the first
+ * offending operation, if any.
  */
 const releasedStorageUse = (
   fn: MirFunction,
   root: number,
-  tracksViews: boolean,
   byId: ReadonlyMap<number, Region>,
   loops: ReadonlyMap<number, LoopRegion>,
 ): Operation | undefined => {
@@ -713,7 +714,7 @@ const releasedStorageUse = (
     }
     if (operation._tag === 'BeginLoan') {
       if (state.dropped && held(operation.root)) offending ??= operation
-      if (tracksViews && held(operation.root)) views.add(operation.destination.ordinal)
+      if (held(operation.root)) views.add(operation.destination.ordinal)
       else views.delete(operation.destination.ordinal)
       return { dropped: state.dropped, views: [...views].sort((left, right) => left - right) }
     }
@@ -768,7 +769,6 @@ const releasedStorageUse = (
       const borrowing =
         binding.access === 'Shared' || binding.access === 'Exclusive' || binding.access === 'Place'
       if (
-        tracksViews &&
         viewed &&
         (borrowing ||
           (scrutinee !== undefined && scrutinee.ordinal !== root && mayRetainView(fn, local, root)))
@@ -6175,23 +6175,20 @@ const computeVerify = Effect.fnUntraced(function* (
       }
     }
     const borrowedRoots = new Set([...globalBeginnings.values()].map((loan) => loan.root.ordinal))
-    // Each borrowed local a Drop with cleanup releases, and whether that release is a hidden
-    // owner's, whose derived views are tracked too.
-    const releasedRoots = new Map<number, boolean>()
+    // Each borrowed temporary a hidden owner's Drop with cleanup releases.
+    const releasedRoots = new Set<number>()
     for (const region of fn.regions)
       for (const operation of operationsOf(region).flatMap(operationTree))
         if (
           operation._tag === 'Drop' &&
+          operation.hiddenOwner === true &&
           operation.cleanup._tag !== 'NoCleanup' &&
           (operation.selectors ?? []).length === 0 &&
           borrowedRoots.has(operation.local.ordinal)
         )
-          releasedRoots.set(
-            operation.local.ordinal,
-            (releasedRoots.get(operation.local.ordinal) ?? false) || operation.hiddenOwner === true,
-          )
-    for (const [root, tracksViews] of releasedRoots) {
-      const offending = releasedStorageUse(fn, root, tracksViews, byId, loops)
+          releasedRoots.add(operation.local.ordinal)
+    for (const root of releasedRoots) {
+      const offending = releasedStorageUse(fn, root, byId, loops)
       if (offending !== undefined)
         violations.push({
           _tag: 'Violation',
