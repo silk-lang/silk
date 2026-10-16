@@ -48,6 +48,8 @@ import backend.DropGlue {
   Variant as GlueVariant,
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
+import backend.MirVerification
+import backend.MirVerification {UseAfterDrop}
 import backend.InstanceRecipe {InstanceRecipe}
 import backend.InstanceIdentity {InstanceIdentity}
 import semantic.RuntimeEncoding {Coordinates}
@@ -53685,22 +53687,403 @@ effect fn checkedStaticRoot(
   )
 }
 
-effect fn storeMir(resolver: &mut Resolver, function: MirFunction, dependencies: Vector<Dependency>) -> Answer
-! OutOfMemoryError
-? &mut Allocator {
+// A lowering defect is never a program verdict: stop before the MIR can be cached or emitted.
+// Every fact the check reads joins `dependencies`, so a revision that changes one re-verifies
+// the body.
+effect fn verifyLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  function: &MirFunction) -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut found = run unexcusedUses(&mut resolver.*, &mut owner.*, &mut dependencies.*, function)
+  if let Option<UseAfterDrop>.Some {value: misuse} = move Vector<UseAfterDrop>.pop(&mut found) {
+    let mut reason = run Bytes.copy(b"lowered MIR of ")
+    let symbol = run InstanceKey.encoding(&function.key)
+    run Bytes.append(&mut reason, Bytes.asSlice(&symbol))
+    run Bytes.append(&mut reason, b" uses storage after the drop of local ")
+    run appendDecimal(&mut reason, misuse.dropped)
+    run Bytes.append(&mut reason, b" (block ")
+    run appendDecimal(&mut reason, misuse.block)
+    run Bytes.append(&mut reason, b", statement ")
+    run appendDecimal(&mut reason, misuse.statement)
+    run Bytes.append(&mut reason, b"):")
+    let listing = run MirVerification.describe(function)
+    run Bytes.append(&mut reason, Bytes.asSlice(&listing))
+    return CompilerBug.panic(Bytes.asSlice(&reason))
+  }
+}
+
+// The uses after drop in `function` that no semantic fact excuses. A part read after its owner's
+// drop is excused when it runs no cleanup and refers to no other storage; a drop that touches a
+// view its value holds directly is excused unless the value's type has its own `Drop`. A fact
+// that cannot be decided excuses the use: the check reports only what is certain.
+effect fn unexcusedUses(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  function: &MirFunction) -> Vector<UseAfterDrop>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let flows = run callFlows(&mut resolver.*, &mut owner.*, &mut dependencies.*, function)
+  let mut found = run MirVerification.useAfterDrop(function, Vector<Option<Vector<bool>>>.asSlice(&flows))
+  let mut kept = Vector<UseAfterDrop>.make()
+  while Vector<UseAfterDrop>.length(&found) != usize.ZERO {
+    let misuse = match move Vector<UseAfterDrop>.pop(&mut found) {
+      Option<UseAfterDrop>.Some {value} => move value
+      Option<UseAfterDrop>.None => { return move kept }
+    }
+    let mut excused = false
+    if let Option<Shared<Type>>.Some {value: part} = &misuse.read {
+      if !MirVerification.carriesView(&part) {
+        let mut visiting = Vector<Shared<Type>>.make()
+        let premises = Vector<Constraint>.make()
+        excused = match move run cleanupFree(&mut resolver.*, &mut owner.*, &mut dependencies.*, &part, Vector<Constraint>.asSlice(&premises),
+          &mut visiting, Span.make(usize.ZERO, usize.ZERO)) {
+          Result<bool, Shared<Rejection>>.Success {value} => value
+          Result<bool, Shared<Rejection>>.Failure {..} => true
+        }
+      }
+    }
+    if let Option<Shared<Type>>.Some {value: dropped} = &misuse.observer {
+      let premises = Vector<Constraint>.make()
+      excused = match move run dropImplementation(&mut resolver.*, &mut owner.*, &mut dependencies.*, &dropped, Vector<Constraint>.asSlice(&premises)) {
+        Result<Option<SealedMatch>, Shared<Rejection>>.Success {value: Option<SealedMatch>.Some {..}} => false
+        _ => true
+      }
+    }
+    if !excused { run Vector<UseAfterDrop>.append(&mut kept, move misuse) }
+  }
+  return move kept
+}
+
+// Per block, which arguments of the call ending it certainly pass a view into its result, read
+// from the callee's declared signature; `None` where the signature does not tell, so none does.
+// Only a body that drops a temporary has views to carry, so only it reads signatures.
+effect fn callFlows(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  function: &MirFunction) -> Vector<Option<Vector<bool>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut flows = Vector<Option<Vector<bool>>>.make()
+  if !MirVerification.dropsTemporary(function) { return move flows }
+  let blocks = Vector<MirBlock>.asSlice(&function.blocks)
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let mut flow = Option<Vector<bool>>.none()
+    if let MirTerminator.Call {callee: MirCallee.Instance {key: InstanceKey.Function {application, ..}}, arguments, destination, ..} = &blocks[at].terminator {
+      let named = Shared<Application>.with<Option<DeclarationId>>(&application, fn(value: &Application) -> Option<DeclarationId> {
+        return match &value.target {
+          SpecializationTarget.Named {declaration} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+          _ => Option<DeclarationId>.none()
+        }
+      })
+      if let Option<DeclarationId>.Some {value: declaration} = move named {
+        let module = ModuleId.copy(DeclarationId.moduleId(&declaration))
+        let moduleOrdinal = run internModule(&mut resolver.*, &module)
+        let identity = run Shared<DeclarationId>.make(move declaration)
+        if let Option<usize>.Some {value: ordinal} = move run ordinalOfIdentity(&mut resolver.*, &module, &identity) {
+          let request = Key {family: Family.Signature, module: moduleOrdinal, name: usize.ZERO, declaration: ordinal, member: usize.ZERO, external: false}
+          let interned = run internDeclaration(&mut resolver.*, request)
+          let header = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, interned, Span.make(usize.ZERO, usize.ZERO))
+          // A member of an `impl` also assumes the impl's outlives bounds.
+          let mut bounds = Vector<Constraint>.make()
+          if let Option<DeclarationId>.Some {value: enclosing} = move run enclosingIdentity(&mut resolver.*, &module, ordinal) {
+            if DeclarationId.kind(&enclosing) == OwnerKind.Implementation {
+              let parent = run Shared<DeclarationId>.make(move enclosing)
+              if let Option<usize>.Some {value: parentOrdinal} = move run ordinalOfIdentity(&mut resolver.*, &module, &parent) {
+                let headKey = Key {family: Family.ImplementationHead, module: moduleOrdinal, name: usize.ZERO, declaration: parentOrdinal, member: usize.ZERO, external: false}
+                let headInterned = run internDeclaration(&mut resolver.*, headKey)
+                let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, headInterned, Span.make(usize.ZERO, usize.ZERO))
+                if let Option<Shared<ImplementationHead>>.Some {value: head} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<ImplementationHead>>>(&answer, headOf) {
+                  let count = Shared<ImplementationHead>.with<usize>(&head, fn(value: &ImplementationHead) -> usize { return Vector<Constraint>.length(&value.binders.constraints) })
+                  let mut bound = usize.ZERO
+                  while bound < count {
+                    run Vector<Constraint>.append(&mut bounds, Shared<ImplementationHead>.with<Constraint>(&head, fn(value: &ImplementationHead) -> Constraint {
+                      let declared = Vector<Constraint>.asSlice(&value.binders.constraints)
+                      return copyConstraint(&declared[bound])
+                    }))
+                    bound = bound + usize.ONE
+                  }
+                }
+              }
+            }
+          }
+          // A fused `run` of an `effect fn` writes the success value, which only the declared result
+          // describes; a call that builds an Effect stores every argument.
+          let locals = Vector<MirLocal>.asSlice(&function.locals)
+          let built = Shared<Type>.with<bool>(&locals[destination.local].ty, buildsExecution)
+          if Vector<MirProjection>.length(&destination.projections) == usize.ZERO {
+            let next = run signatureFlows(&header, Vector<MirOperand>.length(&arguments), built, Vector<Constraint>.asSlice(&bounds))
+            flow = move next
+          }
+        }
+      }
+    }
+    run Vector<Option<Vector<bool>>>.append(&mut flows, move flow)
+    at = at + usize.ONE
+  }
+  return move flows
+}
+
+// One type parameter a declared type mentions.
+struct FlowParameter {
+  declaration: DeclarationId
+  ordinal: usize
+}
+
+// Which arguments certainly pass a view of what they borrow into the result, so that using the
+// result needs the argument's borrow alive. An Effect the call builds stores every argument. A
+// borrowed argument's view sits at its parameter's outer region: it reaches the result when the
+// result names that region, or a region a declared outlives bound chain leads it to. An argument
+// passed as a bare type parameter reaches a result whose shape names that parameter. Every other
+// argument, and every argument of a signature this cannot read, carries nothing, so an uncertain
+// view never produces a report.
+effect fn signatureFlows(header: &Shared<Result<Answer, NoRejection>>, count: usize, built: bool, assumed: &[Constraint])
+-> Option<Vector<bool>>
+! OutOfMemoryError ? &mut Allocator {
+  let constructs = Shared<Result<Answer, NoRejection>>.with<bool>(header, signatureIsEffect)
+  let variadic = Shared<Result<Answer, NoRejection>>.with<bool>(header, signatureIsVariadic)
+  let statics = Shared<Result<Answer, NoRejection>>.with<usize>(header, signatureStaticCount)
+  if variadic || statics != usize.ZERO { return Option<Vector<bool>>.none() }
+  let parameters = run signatureParameterTypes(header)
+  let declared = Vector<Shared<Type>>.asSlice(&parameters)
+  if declared.length != count { return Option<Vector<bool>>.none() }
+  let mut carried = Vector<bool>.make()
+  let mut at = usize.ZERO
+  if constructs && built {
+    while at < count {
+      run Vector<bool>.append(&mut carried, true)
+      at = at + usize.ONE
+    }
+    return Option<Vector<bool>>.some(move carried)
+  }
+  if built { return Option<Vector<bool>>.none() }
+  let result = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(header, signatureResult) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return Option<Vector<bool>>.none() }
+  }
+  let mut produced = Vector<Shared<Lifetime>>.make()
+  run Type.regionAtoms(&result, &mut produced)
+  let mut named = Vector<FlowParameter>.make()
+  let shaped = run flowParameters(&mut named, &result)
+  // Each declared `'longer: 'shorter`, atom by atom.
+  let mut longer = Vector<Shared<Lifetime>>.make()
+  let mut shorter = Vector<Shared<Lifetime>>.make()
+  at = usize.ZERO
+  while at < assumed.length {
+    run outlivesEdges(&mut longer, &mut shorter, &assumed[at])
+    at = at + usize.ONE
+  }
+  let bounds = Shared<Result<Answer, NoRejection>>.with<usize>(header, signatureConstraintCount)
+  at = usize.ZERO
+  while at < bounds {
+    let bound = Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(header, fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> {
+      return signatureConstraint(answer, at)
+    })
+    if let Option<Constraint>.Some {value: constraint} = move bound { run outlivesEdges(&mut longer, &mut shorter, &constraint) }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < declared.length {
+    let mut flows = false
+    if let Option<Shared<Lifetime>>.Some {value: region} = move Shared<Type>.with<Option<Shared<Lifetime>>>(&declared[at], flowRegion) {
+      flows = run regionReaches(&region, Vector<Shared<Lifetime>>.asSlice(&produced), Vector<Shared<Lifetime>>.asSlice(&longer),
+        Vector<Shared<Lifetime>>.asSlice(&shorter))
+    }
+    if let Option<FlowParameter>.Some {value: parameter} = move Shared<Type>.with<Option<FlowParameter>>(&declared[at], flowParameter) {
+      flows = shaped && namesParameter(Vector<FlowParameter>.asSlice(&named), &parameter)
+    }
+    run Vector<bool>.append(&mut carried, flows)
+    at = at + usize.ONE
+  }
+  return Option<Vector<bool>>.some(move carried)
+}
+
+effect fn outlivesEdges(longer: &mut Vector<Shared<Lifetime>>, shorter: &mut Vector<Shared<Lifetime>>, constraint: &Constraint) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if let Constraint.Outlives {longer: from, shorter: to} = &constraint.* {
+    let sources = Lifetime.atomCount(&from)
+    let targets = Lifetime.atomCount(&to)
+    let mut source = usize.ZERO
+    while source < sources {
+      let mut target = usize.ZERO
+      while target < targets {
+        run Vector<Shared<Lifetime>>.append(&mut longer.*, Lifetime.atomAt(&from, source))
+        run Vector<Shared<Lifetime>>.append(&mut shorter.*, Lifetime.atomAt(&to, target))
+        target = target + usize.ONE
+      }
+      source = source + usize.ONE
+    }
+  }
+}
+
+fn listsRegion(regions: &[Shared<Lifetime>], region: &Shared<Lifetime>) -> bool {
+  let mut at = usize.ZERO
+  while at < regions.length {
+    if Lifetime.equalsShared(&regions[at], region) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether some atom of `region`, or a region declared bounds make it outlive, is named in
+// `produced`.
+effect fn regionReaches(region: &Shared<Lifetime>, produced: &[Shared<Lifetime>], longer: &[Shared<Lifetime>], shorter: &[Shared<Lifetime>]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut reached = Vector<Shared<Lifetime>>.make()
+  let count = Lifetime.atomCount(region)
+  let mut at = usize.ZERO
+  while at < count {
+    let atom = Lifetime.atomAt(region, at)
+    if !listsRegion(Vector<Shared<Lifetime>>.asSlice(&reached), &atom) { run Vector<Shared<Lifetime>>.append(&mut reached, move atom) }
+    at = at + usize.ONE
+  }
+  let mut next = usize.ZERO
+  while next < Vector<Shared<Lifetime>>.length(&reached) {
+    let listed = Vector<Shared<Lifetime>>.asSlice(&reached)
+    let current = Shared<Lifetime>.clone(&listed[next])
+    if listsRegion(produced, &current) { return true }
+    let mut edge = usize.ZERO
+    while edge < longer.length {
+      if Lifetime.equalsShared(&longer[edge], &current) && !listsRegion(Vector<Shared<Lifetime>>.asSlice(&reached), &shorter[edge]) {
+        run Vector<Shared<Lifetime>>.append(&mut reached, Shared<Lifetime>.clone(&shorter[edge]))
+      }
+      edge = edge + usize.ONE
+    }
+    next = next + usize.ONE
+  }
+  return false
+}
+
+fn namesParameter(named: &[FlowParameter], parameter: &FlowParameter) -> bool {
+  let mut at = usize.ZERO
+  while at < named.length {
+    if named[at].ordinal == parameter.ordinal && DeclarationId.equals(&named[at].declaration, &parameter.declaration) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether a call result of this type is an execution value that stores its inputs rather than
+// a result computed from them.
+fn buildsExecution(value: &Type) -> bool {
+  return match &value.* {
+    Type.Primitive {..} => false
+    Type.Unit => false
+    Type.Parameter {..} => false
+    Type.String {..} => false
+    Type.Reference {..} => false
+    Type.Slice {..} => false
+    Type.Pointer {..} => false
+    Type.Array {..} => false
+    Type.Nominal {..} => false
+    Type.Union {..} => false
+    Type.Anonymous {..} => false
+    _ => true
+  }
+}
+
+// The declared shapes whose type parameters the walk can name.
+fn flowShape(value: &Type) -> usize {
+  return match &value.* {
+    Type.Primitive {..} => usize.ZERO
+    Type.Unit => usize.ZERO
+    Type.Parameter {..} => usize.ZERO
+    Type.String {..} => usize.ZERO
+    Type.Reference {..} => usize.ONE
+    Type.Slice {..} => usize.ONE
+    Type.Array {..} => usize.ONE
+    Type.Nominal {..} => usize.ONE
+    Type.Union {..} => usize.ONE
+    _ => usize.MAX
+  }
+}
+
+// The outer region of a borrowed parameter.
+fn flowRegion(value: &Type) -> Option<Shared<Lifetime>> {
+  return match &value.* {
+    Type.String {lifetime} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    Type.Reference {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    Type.Slice {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    _ => Option<Shared<Lifetime>>.none()
+  }
+}
+
+fn flowParameter(value: &Type) -> Option<FlowParameter> {
+  return match &value.* {
+    Type.Parameter {declaration, ordinal} => Option<FlowParameter>.some(FlowParameter {declaration: DeclarationId.copy(&declaration), ordinal: ordinal})
+    _ => Option<FlowParameter>.none()
+  }
+}
+
+fn flowChildCount(value: &Type) -> usize {
+  return match &value.* {
+    Type.Reference {..} => usize.ONE
+    Type.Slice {..} => usize.ONE
+    Type.Array {..} => usize.ONE
+    Type.Nominal {arguments, ..} => Vector<Argument>.length(&arguments)
+    Type.Union {members} => Vector<Shared<Type>>.length(&members)
+    _ => usize.ZERO
+  }
+}
+
+fn flowChildAt(value: &Type, at: usize) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Reference {referent, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&referent))
+    Type.Slice {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+    Type.Array {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+    Type.Nominal {arguments, ..} => match &Vector<Argument>.asSlice(&arguments)[at] {
+      Argument.Type {value: argument} => Option<Shared<Type>>.some(Shared<Type>.clone(&argument))
+      _ => Option<Shared<Type>>.none()
+    }
+    Type.Union {members} => unionMember(&members, at)
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+fn unionMember(members: &Vector<Shared<Type>>, at: usize) -> Option<Shared<Type>> {
+  let listed = Vector<Shared<Type>>.asSlice(members)
+  return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at]))
+}
+
+// Appends the type parameters `value` names; false when a part of it is a shape the walk does
+// not read, so a parameter it names may be missed.
+effect fn flowParameters(named: &mut Vector<FlowParameter>, value: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if Shared<Type>.with<usize>(value, flowShape) == usize.MAX { return false }
+  if let Option<FlowParameter>.Some {value: parameter} = move Shared<Type>.with<Option<FlowParameter>>(value, flowParameter) {
+    run Vector<FlowParameter>.append(&mut named.*, move parameter)
+  }
+  let mut complete = true
+  let count = Shared<Type>.with<usize>(value, flowChildCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let child = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return flowChildAt(node, at) })
+    if let Option<Shared<Type>>.Some {value: nested} = move child {
+      if !run flowParameters(&mut named.*, &nested) { complete = false }
+    }
+    at = at + usize.ONE
+  }
+  return complete
+}
+
+effect fn storeMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, function: MirFunction, dependencies: Vector<Dependency>) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let mut read = move dependencies
+  run verifyLowered(&mut resolver.*, &mut owner.*, &mut read, &function)
   let index = Vector<MirFunction>.length(&resolver.mirValues)
   run Vector<MirFunction>.append(&mut resolver.*.mirValues, move function)
-  return memberSuccess(Value.Mir {index: index}, move dependencies)
+  return memberSuccess(Value.Mir {index: index}, move read)
 }
 
 // Helpers follow their creator, where their own queries find them.
-effect fn storeLowered(resolver: &mut Resolver, lowered: Lowered, dependencies: Vector<Dependency>) -> Answer
-! OutOfMemoryError ? &mut Allocator {
+effect fn storeLowered(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, lowered: Lowered, dependencies: Vector<Dependency>) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let Lowered {function, helpers} = move lowered
-  let answer = run storeMir(&mut resolver.*, move function, move dependencies)
+  let mut read = move dependencies
+  let listed = Vector<MirFunction>.asSlice(&helpers)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run verifyLowered(&mut resolver.*, &mut owner.*, &mut read, &listed[at])
+    at = at + usize.ONE
+  }
+  let answer = run storeMir(&mut resolver.*, &mut owner.*, move function, move read)
   let mut pending = move helpers
   while Vector<MirFunction>.length(&pending) > usize.ZERO {
-    run Vector<MirFunction>.append(&mut resolver.*.mirValues, Vector<MirFunction>.remove(&mut pending, usize.ZERO))
+    let helper = Vector<MirFunction>.remove(&mut pending, usize.ZERO)
+    run Vector<MirFunction>.append(&mut resolver.*.mirValues, move helper)
   }
   return move answer
 }
@@ -54630,7 +55013,7 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Answer, NoR
   if core == SealedKind.Allocation {
     let free = run SealedCore.cFunction(&anchor, SealedFunction.Free)
     let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Allocation {free: move free}, observing)
-    return run storeMir(&mut resolver.*, move function, move tracked)
+    return run storeMir(&mut resolver.*, &mut owner.*, move function, move tracked)
   }
   let allocationType = run SealedCore.allocationBeside(&anchor)
   if core == SealedKind.RawBuffer {
@@ -54648,7 +55031,7 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Answer, NoR
     run Vector<GlueChild>.append(&mut fields, move allocation)
     let function = run DropGlue.lower(DropGlue {key: move instance, ty: Shared<Type>.clone(ty), hook: Option<InstanceKey>.none(),
       children: GlueChildren.Fields {fields: move fields}}, observing)
-    return run storeMir(&mut resolver.*, move function, move tracked)
+    return run storeMir(&mut resolver.*, &mut owner.*, move function, move tracked)
   }
   // A package drops its unstarted body, its readiness state and endpoint where they need cleanup,
   // and then releases its handle's authority over its own allocation, which the header holds; the
@@ -54693,7 +55076,7 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Answer, NoR
     let unstarted = Vector<Option<GlueChild>>.remove(&mut children, usize.ZERO)
     let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Package {body: move unstarted, ready: move ready,
       endpoint: move endpoint, allocation: move allocation}, observing)
-    return run storeMir(&mut resolver.*, move function, move tracked)
+    return run storeMir(&mut resolver.*, &mut owner.*, move function, move tracked)
   }
   // A reference releases one unit of authority and, with the last, the package's allocation.
   if core == SealedKind.ExecutionRef {
@@ -54711,7 +55094,7 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Answer, NoR
     let header = run SealedCore.headerBeside(&anchor, &unit)
     let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Reference {header: move header, allocation: move allocation},
       observing)
-    return run storeMir(&mut resolver.*, move function, move tracked)
+    return run storeMir(&mut resolver.*, &mut owner.*, move function, move tracked)
   }
   // An unstarted Execution releases its package through the package's own erased glue.
   if core == SealedKind.Execution {
@@ -54721,7 +55104,7 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Answer, NoR
     }
     let header = run SealedCore.headerBeside(&anchor, &result)
     let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Execution {header: move header}, observing)
-    return run storeMir(&mut resolver.*, move function, move tracked)
+    return run storeMir(&mut resolver.*, &mut owner.*, move function, move tracked)
   }
   if core != SealedKind.SharedCore { return memberSuccess(move gap, move tracked) }
   let element = match move SealedCore.element(ty) {
@@ -54761,7 +55144,7 @@ effect fn resolveCoreGlue(resolver: &mut Resolver, owner: &mut Query<Answer, NoR
   }
   let function = run DropGlue.lowerCore(move instance, ty, CoreCleanup.Shared {block: move block, value: move value,
     allocation: move allocation}, observing)
-  return run storeMir(&mut resolver.*, move function, move tracked)
+  return run storeMir(&mut resolver.*, &mut owner.*, move function, move tracked)
 }
 
 // Drop glue reads its type's Drop hook and member shapes, never a function body. A cleanup form
@@ -54786,7 +55169,7 @@ effect fn resolveGlueMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRe
     Result<GlueChildren, PreparationFailure>.Failure {error} => { return run preparationQueryAnswer(&identity, move error, move dependencies) }
   }
   let function = run DropGlue.lower(DropGlue {key: move instance, ty: Shared<Type>.clone(ty), hook: move hook, children: move children}, observing)
-  return run storeMir(&mut resolver.*, move function, move dependencies)
+  return run storeMir(&mut resolver.*, &mut owner.*, move function, move dependencies)
 }
 
 // An origin demand cannot read a body whose own checking is waiting on that origin. This
@@ -58958,7 +59341,7 @@ effect fn exportShim(
     at = at + usize.ONE
   }
   let shim = run MirFunction.cExport(identity, symbol, Vector<Shared<Type>>.asSlice(&parameters), &signature.result.ty, observing)
-  return run storeMir(&mut resolver.*, move shim, move evidence)
+  return run storeMir(&mut resolver.*, &mut owner.*, move shim, move evidence)
 }
 
 effect fn lowerMir(
@@ -59687,7 +60070,7 @@ effect fn lowerMir(
   while Vector<MirNonParkingRun>.length(&owed) > usize.ZERO {
     run Vector<MirNonParkingRun>.append(&mut completed.function.nonParking, Vector<MirNonParkingRun>.remove(&mut owed, usize.ZERO))
   }
-  return run storeLowered(&mut resolver.*, move completed, move dependencies)
+  return run storeLowered(&mut resolver.*, &mut owner.*, move completed, move dependencies)
 }
 
 fn singleMemberType(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
@@ -71387,6 +71770,14 @@ impl Semantic {
     let answer = run demandNamed(&mut self.resolver, &mut self.query, module, name, Family.Mir)
     run recordRoot(&mut request.*, Family.Mir, module, name, &answer)
     return move answer
+  }
+  /// The uses after drop in `function` that the lowering verifier rejects, with the call flows
+  /// and excuses it reads in this request.
+  pub effect fn useAfterDrop(self: &mut Self, request: &mut Request, function: &MirFunction) -> Vector<UseAfterDrop>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    run selectRequest(&mut self.resolver, &request.*)
+    let mut read = Vector<Dependency>.make()
+    return run unexcusedUses(&mut self.resolver, &mut self.query, &mut read, function)
   }
   /// Demands backend-neutral target layout facts for one runtime type.
   pub effect fn demandLayout(self: &mut Self, request: &mut Request, module: &ModuleId, ty: &Shared<Type>) -> Shared<Result<Answer, NoRejection>>
