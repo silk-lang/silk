@@ -40,6 +40,8 @@ definition and reference live in `apps/docs/content/reference/`.
 ## Repository workflow
 
 - The workspace uses pnpm, Turbo, strict TypeScript, Oxfmt, Oxlint, and Vitest.
+- Run `pnpm format` before every commit. A format slip is the most common first-try CI failure
+  and costs a full CI round.
 - Put public LLVM code in `packages/llvm/src` and tests in `packages/llvm/test`.
 - Keep the public barrel at `packages/llvm/src/index.ts` explicit.
 - Prefer opening a draft PR early, as soon as there is a coherent task-scoped commit to publish.
