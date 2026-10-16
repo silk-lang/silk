@@ -119,12 +119,12 @@ Jobs in `.github/workflows/selfhost.yml`:
    gap check until `update` records it.
 4. **Native chain and corpus / aarch64-unknown-linux-gnu** runs on `ubuntu-24.04-arm`;
    **Native chain and corpus / aarch64-apple-darwin** runs on `macos-15`. Both run on pull requests,
-   pushes, and dispatches. A pinned target verifies its own seed and builds N1 from the committed
-   snapshot. Before its first pin, verified Linux x86-64 N1 cross-emits the target's compiler IR,
-   and the native runner links N1 with LLVM 22. Each runner builds N2, requires byte-identical
-   N1/N2 IR (and cross-emitted IR for the initial hop), runs the native corpus with N1, and uses
-   N2 to compile and execute the `trivial-features` smoke program. The required aggregate check
-   includes both targets.
+   in the merge queue, and on pushes that do not reuse a merge-group run. A pinned target verifies
+   its own seed and builds N1 from the committed snapshot. Before its first pin, verified Linux
+   x86-64 N1 cross-emits the target's compiler IR, and the native runner links N1 with LLVM 22.
+   Each runner builds N2, requires byte-identical N1/N2 IR (and cross-emitted IR for the initial
+   hop), runs the native corpus with N1, and uses N2 to compile and execute the `trivial-features`
+   smoke program. The required aggregate check includes both targets.
 5. **Native selfhost cases** shards build each source test root's runner with N1 (`silk test`)
    and run it under the per-test time guard.
 
@@ -142,34 +142,33 @@ meaning of the compiler source. The job records a receipt (checkout commit, boot
 digest, stage times and peak memory, IR hashes) as the `selfhost-bootstrap-ddc` artifact, so drift
 stays visible.
 
-It runs on every push and dispatch, and on pull requests that change `compiler/`, `packages/` or
-`pnpm-lock.yaml`; on other pull requests it exits at once and passes. It is part of the required
-**Focused Linux Silk** check, so a change the checkout's bootstrap cannot compile, or compiles
-differently, is red on its own pull request. Measured locally on 4 cores, the T1 build took 19
-minutes at 10.6 GB peak; the receipt records the runner figures.
+It runs in the merge queue, on every push that does not reuse a merge-group run, and on pull
+requests that change `compiler/`, `packages/` or `pnpm-lock.yaml`; on other pull requests it exits
+at once and passes. It is part of the required **Focused Linux Silk** check, so a change the
+checkout's bootstrap cannot compile, or compiles differently, is red on its own pull request.
+Measured locally on 4 cores, the T1 build took 19 minutes at 10.6 GB peak; the receipt records the
+runner figures.
 
 The bootstrap and the compiler come from the same commit, so no bootstrap artifact is downloaded and
 none can expire. A red job means the compiler uses something the bootstrap cannot compile or
 compiles differently: repair the bootstrap in the same pull request, or respell the compiler source
 and record the divergence in `COMPILER_COMPATIBILITY.md`.
 
-### Reusing a pull request run
+### Reusing the merge queue run
 
-Every `main` push runs in its own concurrency group, so no merge's run is replaced while it
-waits. A pull request run records the full Git tree it tested (`refs/pull/N/merge`). The first job
-of a push or dispatch, **Reuse a green PR run of the same tree**, looks for a completed, fully green
-pull request run of the merge commit's second parent whose recorded tree equals `HEAD^{tree}` and
-whose N2 artifact verifies by SHA-256 against its pin and receipt. When it finds one, the gate jobs
-are skipped, the required check passes on that verdict, both ARM64 legs run (using the reused N1
-when initial cross-emission is needed), and publication uses the reused x86-64 N2: its pin names the
-push commit, while its `chain-receipt.json` still names the pull request merge ref that N2 was built
-from, whose tree is identical. The run summary names the reused run. Otherwise, including an expired
-or unverifiable artifact, the full gate runs.
+Every merge-group and `main` push run has its own concurrency group, so no merge's run is replaced
+while it waits. The merge queue runs the full gate on the exact commit it then fast-forwards `main`
+to. The first job of a push, **Reuse the merge queue run**, looks for a green `merge_group` run of
+the pushed commit whose x86-64 N2 verifies by SHA-256 against its pin and receipt. When it finds
+one, every gate job is skipped, the required check passes on that verdict, and publication uses that
+run's candidates for all three targets. The run summary names the reused run. Otherwise, including a
+push that bypassed the queue or an expired or unverifiable artifact, the full gate runs.
 
 ## Publication
 
-A successful `main` push run (every job above green) runs **Publish native seed candidate**. It
-creates the prerelease `native-seed-<commit>` targeting that commit with:
+A successful `main` push run (every job above green, or a reused green merge-group run of the same
+commit) runs **Publish native seed candidate**. It creates the prerelease `native-seed-<commit>`
+targeting that commit with:
 
 - `silk-compiler-x86_64-unknown-linux-gnu`, `silk-compiler-aarch64-unknown-linux-gnu`, and
   `silk-compiler-aarch64-apple-darwin`: each target's native N2;
@@ -178,10 +177,11 @@ creates the prerelease `native-seed-<commit>` targeting that commit with:
   run's diagnostics artifact;
 - `native-seed.json`: the complete ready-to-commit per-target pin for these candidates.
 
-Publication waits for the existing Linux gates, both ARM64 chains and corpora, and bootstrap DDC.
-Before the first ARM64 pins, this establishes the initial candidates through native cross-emission,
-without building a compiler with TypeScript. After a green post-merge push publishes the candidates,
-a reviewed PR copies the generated pin; this infrastructure PR advances no pin.
+Publication waits for the existing Linux gates, both ARM64 chains and corpora, and bootstrap DDC,
+in its own run or in the merge-group run it reuses. Before the first ARM64 pins, this establishes
+the initial candidates through native cross-emission, without building a compiler with TypeScript.
+After a green post-merge push publishes the candidates, a reviewed PR copies the generated pin; this
+infrastructure PR advances no pin.
 
 A rerun of the same push run is idempotent: an existing release with byte-identical compiler assets
 and pin, and matching receipt compiler/IR identities, passes; differing identities fail. Receipt

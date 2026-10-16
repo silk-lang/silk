@@ -78,9 +78,8 @@ VMs. WebAssembly (`wasm32-unknown-unknown`) is an output target.
 
 CI uses standard GitHub-hosted `ubuntu-24.04` (x86-64), `ubuntu-24.04-arm` (ARM64), and
 `macos-15` (Apple Silicon) runners. Both [repository CI](.github/workflows/ci.yml) and
-[selfhost CI](.github/workflows/selfhost.yml) are maintained on `main`, so shared workflow
-changes land there before synchronization into `selfhost`. The selfhost workflow runs only
-for `selfhost` pushes and pull requests targeting the selfhost or native stack branches.
+[selfhost CI](.github/workflows/selfhost.yml) run for pull requests into `main` and in the merge
+queue that lands them. A `main` push reuses the queue's green run of its commit.
 
 CI can use the [standalone bootstrap compiler](packages/cli/README.md#standalone-compiler-for-ci)
 stored as a GitHub Actions artifact from passing `main` commits: download `silk.mjs` and run it
