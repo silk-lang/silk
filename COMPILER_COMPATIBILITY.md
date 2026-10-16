@@ -164,6 +164,29 @@ Each entry records:
   `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in
   `compiler/src/semantic/SemanticConformanceCases.silk`.
 
+### Selfhost rejects an outlives bound on a result-only call lifetime
+
+- **Status:** known divergence; recorded on 2026-10-16 on PR #1823.
+- **Rule:** a result-only lifetime binder is chosen by the call's use (LIFE-003), so the bootstrap
+  infers the shorter region that satisfies the binder's outlives bounds.
+- **Compilers:** selfhost binds a result-only binder that neither an operand nor the expected result
+  fixes to `'static` (see "Result-only call lifetimes in selfhost"), then proves the call's bounds
+  against it. A bound whose shorter side is that binder, such as `'b: 'a` in
+  `fn widen<'a, 'b: 'a>(value: &'b Token) -> &'a Token`, then fails at the call: native reports
+  SEM0212 where the bootstrap accepts.
+  - Already on selfhost before PR #1823, for a function's own bound: `widen(&t).value`,
+    `let r = widen(&t)` then `r.value`, `widen(short).value` in a `'s` function, and `widen`
+    relaying through `inspect<'x>(value: &'x Token) -> &'x Token`.
+  - New with PR #1823, which proves an inherent impl's `where` bounds at each member call: the same
+    shape through `impl<'a, 'b: 'a> Pair<'a, 'b> { fn widen(value: &'b Token) -> &'a Token }`, as in
+    `Pair.widen(&t).value`.
+- **Source migration:** none needed; the rejection is conservative. Native rejects a program the
+  bootstrap accepts and never accepts one it rejects. Writing the lifetime explicitly, as in
+  `Pair<'s, 's>.widen(short)`, is accepted.
+- **Diagnostics and limits:** shortening a result-only binder to the region its bound's longer side
+  lends removes this divergence; it follows separately.
+- **Evidence:** the probes `f1`, `f2`, `f4`, `x3f` and `x3b` in PR #1823's description.
+
 ### Caller-local region relations and 'static binder shortening in selfhost
 
 - **Status:** implemented on 2026-10-07 on PR #1091.
