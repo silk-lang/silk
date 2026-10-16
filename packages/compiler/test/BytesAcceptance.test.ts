@@ -804,7 +804,6 @@ pub fn main() -> i32 { return 0 }`
       [
         { code: 'SEM0212', span: '&certificate' },
         { code: 'OWN0019', span: 'HttpsIdentity.reference(OriginHost.Dns { bytes: &bytes })' },
-        { code: 'OWN0019', span: 'HttpsIdentity.reference(OriginHost.Dns { bytes: &bytes })' },
         { code: 'SEM0212', span: '&bytes' },
         { code: 'OWN0011', span: 'bytes[0]' },
         { code: 'OWN0019', span: '&reference' },

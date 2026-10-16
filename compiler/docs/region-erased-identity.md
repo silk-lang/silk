@@ -62,19 +62,19 @@ cause was not isolated.
 
 All eleven examples were attempted with the optimized N1:
 
-| Example | Result |
-| --- | --- |
-| breadth-first-search | Compiled; expected exit `0` |
-| crc-32 | Compiled; expected exit `7` |
-| fft | Compiled; expected exit `208` |
-| game-of-life | Compiled; expected exit `7` |
-| matrix-multiplication | Compiled; expected exit `137` |
-| quicksort | Compiled; expected exit `50` |
-| sieve | Compiled; expected exit `77` |
-| language-pressure/lexer | Compiled; expected exit `0` |
-| language-pressure/local-shared-slp1 | Compiled; expected exit `42` |
-| file-system | `TypeArity`, `main.silk` bytes 3510–3538, at omitted `Intrinsic.bindRequirementMut` selector arguments |
-| language-pressure/stack-vm | `core-type`, `silk/format.silk` bytes 23721–23751, at a phase-only field |
+| Example                             | Result                                                                                                 |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| breadth-first-search                | Compiled; expected exit `0`                                                                            |
+| crc-32                              | Compiled; expected exit `7`                                                                            |
+| fft                                 | Compiled; expected exit `208`                                                                          |
+| game-of-life                        | Compiled; expected exit `7`                                                                            |
+| matrix-multiplication               | Compiled; expected exit `137`                                                                          |
+| quicksort                           | Compiled; expected exit `50`                                                                           |
+| sieve                               | Compiled; expected exit `77`                                                                           |
+| language-pressure/lexer             | Compiled; expected exit `0`                                                                            |
+| language-pressure/local-shared-slp1 | Compiled; expected exit `42`                                                                           |
+| file-system                         | `TypeArity`, `main.silk` bytes 3510–3538, at omitted `Intrinsic.bindRequirementMut` selector arguments |
+| language-pressure/stack-vm          | `core-type`, `silk/format.silk` bytes 23721–23751, at a phase-only field                               |
 
 The two refusals also occur, with identical codes and spans, using the fresh baseline N0 at
 `fed79ee8e` before the region-sensitivity change, which this rule later removed. The omitted-argument frontend work is owned by

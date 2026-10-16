@@ -617,6 +617,194 @@ const loanAncestryPathsValid = (
   return valid && pathsValid
 }
 
+const localLifetimeKeys = (fn: MirFunction, local: number): ReadonlySet<string> => {
+  const type = fn.localTypes.at(local)
+  return new Set(
+    type === undefined ? [] : SilkType.freeLifetimes(semanticType(type)).map(Lifetime.key),
+  )
+}
+
+/**
+ * Whether a value of this local's type may hold a view of the root's own storage: a borrow, an
+ * executable environment, or a lifetime the root's type does not itself mention.
+ *
+ * A value whose only lifetimes are ones the root's type carries cannot point into the root. A
+ * type's lifetimes must outlive every value of it, so storage typed `Holder<'a>` ends within
+ * `'a`, and a reference into that storage valid for `'a` would outlive it. Borrow checking
+ * rejects such a reference, so the argument leans on borrow-check soundness: an unsound accepted
+ * program can make this rule miss a use. It also leans on MIR keeping the region typing chose at
+ * each borrow and call site, so a value derived from a borrow of the root carries that site's
+ * region rather than one of the root's: `keep(&holder)` for `keep<'a>(&'a Holder<'a>)` has a call
+ * region in both positions, distinct from `holder`'s own.
+ */
+const mayRetainView = (fn: MirFunction, local: number, root: number): boolean => {
+  const type = fn.localTypes.at(local)
+  if (type === undefined) return true
+  const semantic = semanticType(type)
+  const inherited = localLifetimeKeys(fn, root)
+  const lifetimes = SilkType.freeLifetimes(semantic).map(Lifetime.key)
+  if (lifetimes.length > 0) return lifetimes.some((key) => !inherited.has(key))
+  return SilkType.containsBorrow(semantic) || SilkType.containsExecutableRepresentation(semantic)
+}
+
+const writtenLocal = (operation: Operation): LocalId | undefined =>
+  'destination' in operation &&
+  typeof operation.destination === 'object' &&
+  operation.destination !== null &&
+  '_tag' in operation.destination &&
+  operation.destination._tag === 'Local'
+    ? operation.destination
+    : undefined
+
+interface ReleasedStorageState {
+  readonly dropped: boolean
+  readonly views: ReadonlyArray<number>
+}
+
+const releasedStorageKey = (state: ReleasedStorageState): string =>
+  `${state.dropped ? 1 : 0}:${state.views.join(',')}`
+
+const releasedStorageState = (key: string): ReleasedStorageState => {
+  const [dropped, views] = key.split(':')
+  return {
+    dropped: dropped === '1',
+    views: views === undefined || views === '' ? [] : views.split(',').map(Number),
+  }
+}
+
+/**
+ * Proves that no path uses a borrowed temporary after the Drop that releases its hidden owner.
+ * The rule keys on that Drop rather than on EndLoan: an EndLoan emits nothing for a plain owner,
+ * and a loan's recorded end can precede a retaining value's last use (a view stored in a struct
+ * ends at the construction), so the release is where a later use reads freed storage.
+ *
+ * Only hidden owners are checked. Lowering places their Drop at a loan end, while a binding's
+ * Drop follows its scope's exit plan and borrow checking proves its views end first; a borrow
+ * check hole there is not caught here. Bindings are also conditionally bound and dropped under
+ * drop flags, which this path analysis, merging states at each join, cannot correlate.
+ *
+ * A value produced from a view of the temporary, whose type may hold a view of it (see
+ * `mayRetainView`), holds one too. After the Drop, any use of the temporary or of such a view is
+ * invalid, including a Drop of the view whose cleanup runs a destructor. Returns the first
+ * offending operation, if any.
+ */
+const releasedStorageUse = (
+  fn: MirFunction,
+  root: number,
+  byId: ReadonlyMap<number, Region>,
+  loops: ReadonlyMap<number, LoopRegion>,
+): Operation | undefined => {
+  let offending: Operation | undefined
+  const step = (operation: Operation, state: ReleasedStorageState): ReleasedStorageState => {
+    const views = new Set(state.views)
+    const held = (local: LocalId): boolean => local.ordinal === root || views.has(local.ordinal)
+    if (operation._tag === 'EndLoan' || operation._tag === 'SetInitialized') return state
+    if (operation._tag === 'Drop') {
+      if (operation.local.ordinal === root && (operation.selectors ?? []).length === 0) {
+        if (state.dropped && operation.cleanup._tag !== 'NoCleanup') offending ??= operation
+        return { dropped: true, views: state.views }
+      }
+      if (
+        state.dropped &&
+        operation.cleanup._tag !== 'NoCleanup' &&
+        (held(operation.local) || selectorLocals(operation.selectors ?? []).some(held))
+      )
+        offending ??= operation
+      return state
+    }
+    if (operation._tag === 'BeginLoan') {
+      if (state.dropped && held(operation.root)) offending ??= operation
+      if (held(operation.root)) views.add(operation.destination.ordinal)
+      else views.delete(operation.destination.ordinal)
+      return { dropped: state.dropped, views: [...views].sort((left, right) => left - right) }
+    }
+    // Checking and writing a place of the dropped local re-initializes it; a whole write makes it
+    // live again. Writing a view of it elsewhere is still a use.
+    if (operation._tag === 'CheckPlace') {
+      if (state.dropped && operation.root.ordinal !== root && held(operation.root))
+        offending ??= operation
+      return state
+    }
+    if (operation._tag === 'WritePlace') {
+      if (
+        state.dropped &&
+        (held(operation.source) || (operation.root.ordinal !== root && held(operation.root)))
+      )
+        offending ??= operation
+      if (operation.root.ordinal === root && operation.selectors.length === 0)
+        return { dropped: false, views: state.views }
+      if (views.has(operation.source.ordinal) && mayRetainView(fn, operation.root.ordinal, root))
+        views.add(operation.root.ordinal)
+      return { dropped: state.dropped, views: [...views].sort((left, right) => left - right) }
+    }
+    const written = writtenLocal(operation)
+    const used = operationLocals(operation).filter(
+      (local) => written === undefined || local !== written,
+    )
+    if (state.dropped && used.some(held)) offending ??= operation
+    if (written === undefined) return state
+    if (written.ordinal === root) return { dropped: false, views: state.views }
+    if (used.some((local) => views.has(local.ordinal)) && mayRetainView(fn, written.ordinal, root))
+      views.add(written.ordinal)
+    else views.delete(written.ordinal)
+    return { dropped: state.dropped, views: [...views].sort((left, right) => left - right) }
+  }
+  // A selected arm binds its pattern locals from the scrutinee: a borrowing or place binding views
+  // it, and a moved or copied binding carries any view it held. Binding re-initializes the local.
+  const matches = new Map<MatchArm, MatchOperation>()
+  for (const region of fn.regions)
+    for (const operation of operationsOf(region).flatMap(operationTree))
+      if (operation._tag === 'Match') for (const arm of operation.arms) matches.set(arm, operation)
+  const bind = (arm: MatchArm, state: ReleasedStorageState): ReleasedStorageState => {
+    const match = matches.get(arm)
+    const scrutinee = match?.scrutinee
+    const views = new Set(state.views)
+    const viewed =
+      scrutinee !== undefined && (scrutinee.ordinal === root || views.has(scrutinee.ordinal))
+    let dropped = state.dropped
+    if (dropped && viewed && arm.bindings.length > 0) offending ??= match
+    for (const binding of arm.bindings) {
+      const local = binding.destination.ordinal
+      if (local === root) dropped = false
+      const borrowing =
+        binding.access === 'Shared' || binding.access === 'Exclusive' || binding.access === 'Place'
+      if (
+        viewed &&
+        (borrowing ||
+          (scrutinee !== undefined && scrutinee.ordinal !== root && mayRetainView(fn, local, root)))
+      )
+        views.add(local)
+      else views.delete(local)
+    }
+    for (const cleanup of arm.cleanupBindings) {
+      if (cleanup.destination.ordinal === root) dropped = false
+      views.delete(cleanup.destination.ordinal)
+    }
+    return { dropped, views: [...views].sort((left, right) => left - right) }
+  }
+  const enterArm = (arm: MatchArm, incoming: ReadonlySet<string>): ReadonlySet<string> =>
+    new Set([...incoming].map((key) => releasedStorageKey(bind(arm, releasedStorageState(key)))))
+  const structured = new Set(['Match', 'Conditional', 'ShortCircuit', 'DiagnosticScope'])
+  const before = (operation: Operation, incoming: ReadonlySet<string>): ReadonlySet<string> =>
+    structured.has(operation._tag)
+      ? incoming
+      : new Set(
+          [...incoming].map((key) =>
+            releasedStorageKey(step(operation, releasedStorageState(key))),
+          ),
+        )
+  structuredCfgPathsValid(fn, byId, loops, {
+    initial: new Set([releasedStorageKey({ dropped: false, views: [] })]),
+    before,
+    enterArm,
+    transfer: (_operation, incoming) => incoming,
+    terminal: () => undefined,
+    repeat: (states) => states,
+    merge: mergePathStates,
+  })
+  return offending
+}
+
 const cyclicOperation = (operation: Operation): boolean => {
   const active = new Set<Operation>()
   const completed = new Set<Operation>()
@@ -5985,6 +6173,30 @@ const computeVerify = Effect.fnUntraced(function* (
           detail: `loan ${key} must begin once and end exactly once on every terminating path`,
         })
       }
+    }
+    const borrowedRoots = new Set([...globalBeginnings.values()].map((loan) => loan.root.ordinal))
+    // Each borrowed temporary a hidden owner's Drop with cleanup releases.
+    const releasedRoots = new Set<number>()
+    for (const region of fn.regions)
+      for (const operation of operationsOf(region).flatMap(operationTree))
+        if (
+          operation._tag === 'Drop' &&
+          operation.hiddenOwner === true &&
+          operation.cleanup._tag !== 'NoCleanup' &&
+          (operation.selectors ?? []).length === 0 &&
+          borrowedRoots.has(operation.local.ordinal)
+        )
+          releasedRoots.add(operation.local.ordinal)
+    for (const root of releasedRoots) {
+      const offending = releasedStorageUse(fn, root, byId, loops)
+      if (offending !== undefined)
+        violations.push({
+          _tag: 'Violation',
+          rule: 'UseAfterDrop',
+          function: fn.id,
+          provenance: offending.provenance,
+          detail: `${offending._tag} uses %${root}, or a view of it, after its Drop`,
+        })
     }
     const beginningsByDestination = new Map<
       number,

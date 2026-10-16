@@ -97,7 +97,6 @@ pub fn main() -> i32 {
       // generic call's is, so escaping that Effect also expires the borrow.
       [
         { code: 'OWN0019', reason: 'ExpiredLifetime', sourceId: 'interface-bounds/main' },
-        { code: 'OWN0019', reason: 'ExpiredLifetime', sourceId: 'interface-bounds/main' },
         { code: 'SEM0129', reason: 'ReturnTypeMismatch', sourceId: 'interface-bounds/main' },
       ],
     )

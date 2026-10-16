@@ -138,7 +138,7 @@ const lowerBuiltinOperation = (
     )
     for (const borrow of endings.values()) {
       const loan = fn.loanLocals.get(borrowKey(borrow))
-      if (loan === undefined) continue
+      if (loan === undefined || !fn.endsLoan(borrowKey(borrow))) continue
       fn.emit({
         _tag: 'EndLoan' as const,
         borrow,
