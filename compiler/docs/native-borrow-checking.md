@@ -342,10 +342,14 @@ not: an unreached function is never emitted, so only this line shows it unchecke
 or a deferred static template is not counted, since the sweep does not check it in the form a build
 reaches, and each reached instance is checked in its own right. A build, not a test runner,
 follows the line with one `SILK_GAP borrow-check body: <module> <start>-<end> <reason> <codes>`
-line per counted body, by the byte offsets of its body block. `<codes>` are the catalog codes of the
-checks that decide a body's status and are unfinished in it: loan liveness
-(`BorrowCheck.livenessCodes`, derived from the conflict and expiry reports) and declared region
-relations. Typing and moves are checked whatever the status, so their codes are never listed.
+line per counted body, by the byte offsets of its body block. `<codes>` (`-` for none) are the
+catalog codes of the checks that decide a body's status and that this body left open, as its
+producer records them in `TypedBody.undecided`: loan liveness (`BorrowCheck.livenessCodes`, derived
+from the conflict and expiry reports) when the body has loans whose check did not finish, and the
+declared-region-relation code when `checkDeclaredRegions` left a relation pending. Typing and moves
+are checked whatever the status, so their codes are never listed. Typing also reports `SEM0212`
+and `OWN0019` at some sites; a program carried for such a code is the one ambiguity left, and the
+`carried` ratchet below keeps it visible.
 
 The corpus harness treats an accepted invalid program as a `BORROW_CHECK_GAP` only when every
 expected diagnostic lies inside the block of one of those bodies with one of the codes listed for
