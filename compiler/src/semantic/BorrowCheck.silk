@@ -115,11 +115,62 @@ pub struct Verdict {
   pub code: RejectionCode
   pub access: Location
   pub earlier: Option<Location>
+  /// Every conflict the body reports, the one above included, ordered by span as the bootstrap
+  /// lists them; empty unless the body reports more than one.
+  pub reports: Vector<Report>
+}
+
+/// One reported conflict: the rejected access and, when `related`, the borrow or move it conflicts
+/// with at `earlier`.
+pub struct Report {
+  pub code: RejectionCode
+  pub access: Location
+  pub related: bool
+  pub earlier: Location
+}
+
+impl Copy for Report {}
+
+// Records a conflict unless one with the same code and span was already found.
+effect fn addReport(reports: &mut Vector<Report>, report: Report) -> () ! OutOfMemoryError ? &mut Allocator {
+  let found = Vector<Report>.asSlice(&reports.*)
+  let mut at = usize.ZERO
+  while at < found.length {
+    if found[at].code == report.code && found[at].access.start == report.access.start && found[at].access.end == report.access.end {
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  run Vector<Report>.append(&mut reports.*, report)
+  return ()
+}
+
+// The reports ordered by span, earlier first; reports with one span keep the order they were found.
+effect fn bySpan(reports: &[Report]) -> Vector<Report> ! OutOfMemoryError ? &mut Allocator {
+  let mut sorted = Vector<Report>.make()
+  let mut at = usize.ZERO
+  while at < reports.length {
+    run Vector<Report>.append(&mut sorted, reports[at])
+    let mut slot = Vector<Report>.length(&sorted) - usize.ONE
+    while slot > usize.ZERO {
+      let mut items = Vector<Report>.asMutSlice(&mut sorted)
+      let previous = items[slot - usize.ONE]
+      let current = items[slot]
+      let later = previous.access.start > current.access.start
+        || (previous.access.start == current.access.start && previous.access.end > current.access.end)
+      if !later { break }
+      items[slot - usize.ONE] = current
+      items[slot] = previous
+      slot = slot - usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move sorted
 }
 
 fn verdict(outcome: Outcome, status: BorrowStatus) -> Verdict {
   return Verdict {outcome: outcome, status: status, code: RejectionCode.Unsupported, access: Location.make(usize.ZERO, usize.ZERO),
-    earlier: Option<Location>.none()}
+    earlier: Option<Location>.none(), reports: Vector<Report>.make()}
 }
 
 // The kind of one place step. Each kind numbers its own steps, so no field, element or member
@@ -397,6 +448,9 @@ struct LoopCleanup {
 impl Copy for LoopCleanup {}
 
 struct Walker {
+  // Per local, whether it is an Effect not yet used: one never run or used keeps its captured
+  // loans until its scope ends (EFFECT-OWN-001).
+  unrun: Vector<bool>
   points: Vector<Point>
   loans: Vector<Loan>
   events: Vector<Event>
@@ -1098,6 +1152,7 @@ effect fn access(walker: &mut Walker, path: &Path, kind: Kind, span: Location, a
   let point = run newPoint(&mut walker.*, at)
   let holder = holderOf(&walker.*, path.root)
   let read = run readPath(&mut walker.*, path)
+  if kind != Kind.Write && kind != Kind.End && kind != Kind.Expire { usedEffect(&mut walker.*, holder) }
   let mut points = Vector<Point>.asMutSlice(&mut walker.points)
   points[point].event = Vector<Event>.length(&walker.events)
   points[point].span = span
@@ -1134,6 +1189,7 @@ effect fn useHolder(walker: &mut Walker, root: usize, read: usize, span: Locatio
   let point = run newPoint(&mut walker.*, at)
   let mut carried = Vector<Carry>.make()
   let local = holderOf(&walker.*, root)
+  usedEffect(&mut walker.*, local)
   let mut points = Vector<Point>.asMutSlice(&mut walker.points)
   points[point].uses = local
   points[point].read = read
@@ -1318,6 +1374,15 @@ fn holderOf(walker: &Walker, root: usize) -> usize {
     return walker.localCount + root - usize.MAX / 4
   }
   return root
+}
+
+// An Effect local that is used is no longer held to the end of its scope.
+fn usedEffect(walker: &mut Walker, local: usize) -> () {
+  if local < Vector<bool>.length(&walker.unrun) {
+    let mut unrun = Vector<bool>.asMutSlice(&mut walker.unrun)
+    unrun[local] = false
+  }
+  return ()
 }
 
 fn holds(walker: &Walker, root: usize) -> bool {
@@ -2271,6 +2336,18 @@ fn isBorrow(nodes: &[Node], id: NodeId) -> bool {
   return false
 }
 
+// Whether a type is an Effect value, whose environment holds its captured loans: an Effect, or an
+// `effect` block's callable value whose contract is one.
+fn effectValue(ty: &Type) -> bool {
+  return match &ty.* {
+    Type.Effect {..} => true
+    Type.EffectComposite {..} => true
+    Type.EffectJoin {..} => true
+    Type.CallableValue {contract, ..} => Shared<Type>.with<bool>(&contract, effectValue)
+    _ => false
+  }
+}
+
 // Whether a local of this type is a callable value in any of its typed forms.
 fn callableValue(ty: &Type) -> bool {
   return match &ty.* {
@@ -2708,8 +2785,11 @@ effect fn releaseScopes(walker: &mut Walker, keep: usize, span: Location, at: us
       current = run access(&mut walker.*, &path, Kind.Expire, span, current, usize.MAX)
     } else {
       let holder = holderOf(&walker.*, root)
-      if lexicalHolder(&walker.*, root) {
-        // A borrowed destructuring `let` lends its subject until its bindings' scope ends.
+      let unrun = holder < Vector<bool>.length(&walker.unrun) && Vector<bool>.asSlice(&walker.unrun)[holder]
+      if lexicalHolder(&walker.*, root) || (unrun && holds(&walker.*, root)) {
+        // A borrowed destructuring `let` lends its subject until its bindings' scope ends, and an
+        // Effect that is never run or used keeps what it captured until its scope ends
+        // (EFFECT-OWN-001); one that is used holds its captures through its last use.
         current = run newPoint(&mut walker.*, current)
         let mut points = Vector<Point>.asMutSlice(&mut walker.points)
         points[current].uses = holder
@@ -3866,7 +3946,8 @@ effect fn expiredUse(
   loan: usize,
   event: &Event,
   definitions: &[u64],
-  definitionWidth: usize
+  definitionWidth: usize,
+  localOnly: bool
 ) -> Location
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -3878,6 +3959,7 @@ effect fn expiredUse(
     let mut at = usize.ZERO
     while at < all.length {
       if all[at].loan == loan && points[point].uses == all[at].holder && !all[at].shadowed && !all[at].inherited
+        && (!localOnly || all[at].holder < walker.localCount)
         && pathsOverlap(walker, points[point].read, all[at].field)
         && !overwrites(walker, points[point].written, all[at].field)
         && reaches(definitions, definitionWidth, point, at)
@@ -4197,7 +4279,14 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     }
     obligation = obligation + usize.ONE
   }
+  let mut unrun = Vector<bool>.make()
+  let mut declared = usize.ZERO
+  while declared < locals.length {
+    run Vector<bool>.append(&mut unrun, Shared<Type>.with<bool>(&localType(locals, declared), effectValue))
+    declared = declared + usize.ONE
+  }
   let mut walker = Walker {
+    unrun: move unrun,
     points: Vector<Point>.make(),
     loans: Vector<Loan>.make(),
     events: Vector<Event>.make(),
@@ -4248,7 +4337,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
   // unchanged payload when the guard is false (MATCH-002).
   if let Option<Location>.Some {value: consumed} = &walker.guardConsumed {
     return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.GuardConsumesPattern,
-      access: consumed, earlier: Option<Location>.none()}
+      access: consumed, earlier: Option<Location>.none(), reports: Vector<Report>.make()}
   }
   if walker.outside {
     return verdict(Outcome.NotChecked, walker.reason)
@@ -4293,6 +4382,12 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
   let mut replacementReaches = Vector<ReplacementReach>.make()
   let mut checkedLoops = usize.ZERO
   let mut unknown = false
+  // The conflicts found so far, in the order found. After the first, the walk goes on to report the
+  // other accesses that conflict with a live loan and the storage they leave expired, as the
+  // bootstrap's loan and lifetime analyses report every one; any other kind of conflict found later
+  // ends the walk unreported.
+  let mut reports = Vector<Report>.make()
+  let mut stopped = false
   at = usize.ZERO
   while at <= events.length {
     // A loop header is checked in evaluation order, before the first access after it.
@@ -4300,17 +4395,24 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
       let repeats = run refinementRepeats(&walker, events, &loops[checkedLoops], &mut replacementReaches)
       if (moveWidth > usize.ZERO && !compatibleHeader(&walker, events, moved, &reach, moveWidth, &loops[checkedLoops])) || !repeats {
         let span = loops[checkedLoops].span
-        return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.IncompatibleLoopHeader, access: span, earlier: Option<Location>.none()}
+        if Vector<Report>.length(&reports) == usize.ZERO {
+          return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.IncompatibleLoopHeader, access: span, earlier: Option<Location>.none(), reports: Vector<Report>.make()}
+        }
+        stopped = true
+        break
       }
       checkedLoops = checkedLoops + usize.ONE
     }
-    if at == events.length {
+    if stopped || at == events.length {
       break
     }
     let event = &events[at]
     if event.consumesTarget == usize.ONE {
-      return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.OverlappingAssignment, access: event.span,
-        earlier: Option<Location>.none()}
+      if Vector<Report>.length(&reports) == usize.ZERO {
+        return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.OverlappingAssignment, access: event.span,
+          earlier: Option<Location>.none(), reports: Vector<Report>.make()}
+      }
+      break
     }
     if event.consumesTarget != usize.ZERO {
       unknown = true
@@ -4329,13 +4431,15 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
             // Inspecting the tag of an owner reads none of its moved parts.
             let partial = event.kind == Kind.Inspect && !covers(&source.place, &event.place)
             // A write behind a moved reference uses the reference to reach its referent.
-            if shared == usize.ONE && (event.kind != Kind.Write || behind(&source.place, &event.place)) && !partial {
-              return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UseAfterMove, access: event.span, earlier: Option<Location>.some(source.span)}
-            }
             // A runtime index may name the moved element itself, so reading or writing through it
             // uses the moved place, as the bootstrap reports (OWN0001).
-            if shared == 2 && !partial && determined(&source.place) {
-              return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UseAfterMove, access: event.span, earlier: Option<Location>.some(source.span)}
+            let used = shared == usize.ONE && (event.kind != Kind.Write || behind(&source.place, &event.place)) && !partial
+            if used || (shared == 2 && !partial && determined(&source.place)) {
+              if Vector<Report>.length(&reports) == usize.ZERO {
+                return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UseAfterMove, access: event.span, earlier: Option<Location>.some(source.span), reports: Vector<Report>.make()}
+              }
+              stopped = true
+              break
             }
             // A partial replacement of a moved place, or an overlap decided by an unknown index.
             if !partial {
@@ -4345,6 +4449,9 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
         }
       }
       bit = bit + usize.ONE
+    }
+    if stopped {
+      break
     }
     // A `match place` binding names the payload its match selected. Once the subject place is
     // replaced, the binding no longer denotes a place of it, as the bootstrap reports (OWN0002).
@@ -4356,8 +4463,12 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
         if replaces(written.kind)
           && coversRefined(&written.place, &event.place, event.refinedDepth)
           && run reachesAvoiding(&walker, &mut replacementReaches, written.point, event.point, test) {
-          return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.ExtractionBoundary,
-            access: event.span, earlier: Option<Location>.some(written.span)}
+          // The same write also meets the subject's loans, which the bootstrap reports beside it.
+          if Vector<Report>.length(&reports) == usize.ZERO {
+            run Vector<Report>.append(&mut reports, Report {code: RejectionCode.ExtractionBoundary, access: event.span,
+              related: true, earlier: written.span})
+          }
+          break
         }
         source = source + usize.ONE
       }
@@ -4383,10 +4494,9 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
             if stale != usize.MAX {
               required = run holdingUse(&walker, stale, event.span, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
             } else if !carried || temporary(nodes, loans[index].place.root) {
-              required = run expiredUse(&walker, index, event, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
+              required = run expiredUse(&walker, index, event, Vector<u64>.asSlice(&definitions.entering), definitionWidth, false)
             }
-            return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.ExpiredLifetime,
-              access: required, earlier: Option<Location>.some(loans[index].origin)}
+            run addReport(&mut reports, Report {code: RejectionCode.ExpiredLifetime, access: required, related: true, earlier: loans[index].origin})
           }
         }
       } else if index != event.loan && !lentTo(&loans[index], &event.binders) {
@@ -4420,7 +4530,20 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
               // An approximate loan's conflict is not a proof either way: the body answers
               // `imprecise`, which is unchecked, never `Checked`.
               if (shared == usize.ONE || indexed) && loans[index].precision == Precision.Exact {
-                return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: value, access: event.target, earlier: Option<Location>.some(loans[index].origin)}
+                run addReport(&mut reports, Report {code: value, access: event.target, related: true, earlier: loans[index].origin})
+                // A write, move or drop of body storage leaves a view its borrow made expired, which
+                // the view's next use reports (OWN0019), as the bootstrap's lifetime analysis
+                // invalidates a borrow's origin. A match binding's loan is not such an origin.
+                if (event.kind == Kind.Write || event.kind == Kind.Move || event.kind == Kind.Drop)
+                  && loans[index].local && loans[index].binder == usize.MAX {
+                  // Only a local that holds the view reads it again; a match's bindings view their
+                  // subject's place, which the access itself reports.
+                  let use = run expiredUse(&walker, index, event, Vector<u64>.asSlice(&definitions.entering), definitionWidth, true)
+                  if use.start != event.span.start || use.end != event.span.end {
+                    run addReport(&mut reports, Report {code: RejectionCode.ExpiredLifetime, access: use, related: true, earlier: loans[index].origin})
+                  }
+                }
+                break
               }
               unknown = true
             }
@@ -4430,6 +4553,15 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
       index = index + usize.ONE
     }
     at = at + usize.ONE
+  }
+  if Vector<Report>.length(&reports) > usize.ZERO {
+    let first = Vector<Report>.asSlice(&reports)[usize.ZERO]
+    let mut listed = Vector<Report>.make()
+    if Vector<Report>.length(&reports) > usize.ONE { listed = run bySpan(Vector<Report>.asSlice(&reports)) }
+    let mut earlier = Option<Location>.none()
+    if first.related { earlier = Option<Location>.some(first.earlier) }
+    return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: first.code, access: first.access, earlier: move earlier,
+      reports: move listed}
   }
   if unknown {
     return verdict(Outcome.NotChecked, BorrowStatus.Imprecise)
