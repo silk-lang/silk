@@ -192,20 +192,25 @@ export interface UncheckedBody {
   readonly module: string
   readonly span: { readonly start: number; readonly end: number }
   readonly reason: string
+  /** The catalog codes the body's unfinished checks report, as the compiler derives them. */
+  readonly codes: ReadonlyArray<string>
 }
 
-/** Reads every `SILK_GAP borrow-check body: <module> <start>-<end> <reason>` line of a build. */
+/** Reads every `SILK_GAP borrow-check body: <module> <start>-<end> <reason> <codes>` line of a build. */
 export const parseUncheckedBodies = (stderr: string): ReadonlyArray<UncheckedBody> =>
   stderr
     .split('\n')
     .filter((line) => line.startsWith(uncheckedBodyPrefix))
     .map((line) => {
-      const match = /^(\S+) (\d+)-(\d+) ([a-z-]+)$/.exec(line.slice(uncheckedBodyPrefix.length))
+      const match = /^(\S+) (\d+)-(\d+) ([a-z-]+) ([A-Z0-9]+(?:,[A-Z0-9]+)*)$/.exec(
+        line.slice(uncheckedBodyPrefix.length),
+      )
       if (match === null) throw new Error(`malformed unchecked body line: ${line}`)
       return {
         module: match[1] ?? '',
         span: { start: Number(match[2]), end: Number(match[3]) },
         reason: match[4] ?? '',
+        codes: (match[5] ?? '').split(','),
       }
     })
 
@@ -236,14 +241,11 @@ const notAfter = (left: number[], right: number[]): boolean => {
   return true
 }
 
-// The codes borrow checking reports: every ownership and borrow code, and the unsatisfied
-// lifetime bound a region relation fails with. Any other code comes from a checker that ran.
-const borrowCheckingCode = (code: string): boolean => code.startsWith('OWN') || code === 'SEM0212'
-
 /**
- * Whether every expected diagnostic is a borrow-checking code inside the block of a body the
- * build reported not borrow-checked. Only then is accepting the program a declared gap; any other
- * diagnostic, or one in a checked body or a declaration's header, is a hole.
+ * Whether every expected diagnostic lies inside the block of a body the build reported not
+ * borrow-checked, with one of the codes the build says that body's unfinished checks report. Only
+ * then is accepting the program a declared gap; any other code, a diagnostic in a checked body or
+ * in a declaration's header, is a hole.
  */
 export const coveredByUncheckedBodies = (
   source: string,
@@ -253,14 +255,14 @@ export const coveredByUncheckedBodies = (
   const ranges = reportedDiagnostics(
     source,
     bodies.map(({ module, span }) => ({ code: '', module, span })),
-  ).map(({ span }) => spanRange(span))
+  ).map(({ span }, index) => ({ ...spanRange(span), codes: bodies[index]?.codes ?? [] }))
   return (
     expected.length > 0 &&
     expected.every(({ code, span }) => {
-      if (!borrowCheckingCode(code)) return false
       const diagnostic = spanRange(span)
       return ranges.some(
         (body) =>
+          body.codes.includes(code) &&
           body.module === diagnostic.module &&
           notAfter(body.start, diagnostic.start) &&
           notAfter(diagnostic.end, body.end),

@@ -113,8 +113,8 @@ Jobs in `.github/workflows/selfhost.yml`:
 3. **Selfhost native corpus** builds the formatter safety gate with N1 and verifies repository
    formatting with it, then runs the full corpus with N1 (the verification harness's
    `--mode corpus-full`). Any failed program fails the job. An invalid program the compiler accepts
-   is a failure unless every expected diagnostic is a borrow-checking code inside the block of a
-   root-package body the build reports it did not borrow-check; then it is a `BORROW_CHECK_GAP`,
+   is a failure unless every expected diagnostic lies inside the block of a root-package body the
+   build reports it did not borrow-check, with a code the build lists for that body; then it is a `BORROW_CHECK_GAP`,
    recorded as `carried` in `compiler/borrow-check-gap.txt`, and a new or vanished carry fails the
    gap check until `update` records it.
 4. **Native chain and corpus / aarch64-unknown-linux-gnu** runs on `ubuntu-24.04-arm`;

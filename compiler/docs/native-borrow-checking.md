@@ -341,13 +341,16 @@ counts the same way over the concrete root-package bodies the declaration sweep 
 not: an unreached function is never emitted, so only this line shows it unchecked. An open generic
 or a deferred static template is not counted, since the sweep does not check it in the form a build
 reaches, and each reached instance is checked in its own right. A build, not a test runner,
-follows the line with one `SILK_GAP borrow-check body: <module> <start>-<end> <reason>` line per
-counted body, by the byte offsets of its body block.
+follows the line with one `SILK_GAP borrow-check body: <module> <start>-<end> <reason> <codes>`
+line per counted body, by the byte offsets of its body block. `<codes>` are the catalog codes of the
+checks that decide a body's status and are unfinished in it: loan liveness
+(`BorrowCheck.livenessCodes`, derived from the conflict and expiry reports) and declared region
+relations. Typing and moves are checked whatever the status, so their codes are never listed.
 
 The corpus harness treats an accepted invalid program as a `BORROW_CHECK_GAP` only when every
-expected diagnostic has a borrow-checking code (`OWN*` or `SEM0212`) and lies inside the block of
-one of those bodies. Any other code, a diagnostic in a header, or one in a checked body is a
-failure, whatever else is unchecked. `compiler/borrow-check-gap.txt` records each carried program
+expected diagnostic lies inside the block of one of those bodies with one of the codes listed for
+it. Any other code, a diagnostic in a header, or one in a checked body is a failure, whatever else
+is unchecked. `compiler/borrow-check-gap.txt` records each carried program
 as a `carried <program>` line, so a new carry fails until `check-borrow-gap.mjs update` records
 it: a checker that stops checking a body cannot quietly turn a rejected program into a gap.
 
