@@ -30,7 +30,10 @@ const fixture = Effect.fnUntraced(function* () {
       yield* fs.writeFileString(join(repository, path), text)
     },
   )
-  yield* put('compiler/silk.toml', '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
+  yield* put(
+    'compiler/silk.toml',
+    '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
   yield* put('compiler/src/main.silk', main)
   yield* put('compiler/src/nested/Dependency.silk', 'pub fn value() -> i32 { return 1 }\n')
   yield* put('packages/compiler/stdlib/silk/i32.silk', 'pub let ZERO = 0\n')
@@ -228,7 +231,7 @@ it("retains the union of each target's newest assets, current pins, and immutabl
   assert.isTrue(kept.has('linux-19'))
   assert.isFalse(kept.has('linux-20'))
   assert.deepEqual(kept.get('old-arm-and-mac'), [`${arm}: 20 newest`, `${mac}: 20 newest`])
-  assert.include(kept.get('old-pinned'), `${x86}: pinned in selfhost history`)
+  assert.include(kept.get('old-pinned'), `${x86}: pinned in main history`)
   assert.include(kept.get('old-current'), `${mac}: current pin`)
   const release = { _tag: 'Release', target: x86, tag: 'historical-release' }
   assert.deepEqual(historicalSeeds({ schemaVersion: 1, seed: release }), [release])

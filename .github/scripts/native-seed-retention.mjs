@@ -7,7 +7,7 @@ export const reasons = (releases, historyPins, current, newest = 20) => {
       .filter(({ assets }) => assets.includes(`silk-compiler-${target}`))
       .slice(0, newest))
       keep(tag, `${target}: ${newest} newest`)
-    for (const tag of pins) keep(tag, `${target}: pinned in selfhost history`)
+    for (const tag of pins) keep(tag, `${target}: pinned in main history`)
   }
   for (const [target, seed] of current) keep(seed.tag, `${target}: current pin`)
   return kept
