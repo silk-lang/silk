@@ -1,7 +1,11 @@
 // Holds the bodies native borrow checking leaves unchecked to compiler/borrow-check-gap.txt.
 //
 //   check-borrow-gap.mjs corpus <corpus log>
-//     Compares each corpus program's SELFHOST_BORROW_GAP receipt with its baseline line. Any
+//     Compares each corpus program's SELFHOST_BORROW_GAP receipt with its baseline line, and the
+//     invalid programs the run carried as BORROW_CHECK_GAP (SELFHOST_BORROW_CARRY receipts) with the
+//     baseline's `carried` lines. A new carry fails: a checker that stops checking a body must not
+//     quietly turn a rejected invalid program into a gap. A recorded carry the run no longer makes
+//     fails too, until `update` retires it. Any
 //     difference, a rise or a fall, fails until `update` records it, and so does a program that ran
 //     without a line. A line whose program did not run is only a notice, since a run filtered to
 //     some programs measures only those.
@@ -21,7 +25,8 @@
 //     Checks the corpus comparison rules against fixed baselines and receipts.
 //
 // The baseline has one physical line per program, `<name> <reason>=<count> ...` (a bare name when
-// nothing is unchecked), plus one `retired <reason> ...` line. Lines are self-contained and their order is irrelevant, so git
+// nothing is unchecked), one `carried <program>` line per carried invalid program, plus one
+// `retired <reason> ...` line. Lines are self-contained and their order is irrelevant, so git
 // merges concurrent edits with `merge=union`; totals are computed, never stored. Two lines for one
 // program mean two branches changed it, and fail until `update` reruns on the merged tree.
 //
@@ -35,6 +40,7 @@ const baselineUrl = new URL('../../compiler/borrow-check-gap.txt', import.meta.u
 const updateHint = 'run `node .github/scripts/check-borrow-gap.mjs update <corpus log>`'
 const gapPrefix = 'SILK_GAP borrow-check: '
 const receiptPrefix = 'SELFHOST_BORROW_GAP='
+const carryPrefix = 'SELFHOST_BORROW_CARRY='
 const failures = []
 const notices = []
 const print = (line) => process.stdout.write(`${line}\n`)
@@ -43,6 +49,7 @@ const byText = (left, right) => Number(left > right) - Number(left < right)
 // A baseline file's retired reasons and per-program counts. Repeated program lines are failures.
 const parseBaseline = (text, where) => {
   const retired = new Set()
+  const carried = new Set()
   const programs = new Map()
   for (const [index, raw] of text.split('\n').entries()) {
     const line = raw.trim()
@@ -50,6 +57,12 @@ const parseBaseline = (text, where) => {
     const [name, ...fields] = line.split(/\s+/)
     if (name === 'retired') {
       for (const reason of fields) retired.add(reason)
+      continue
+    }
+    if (name === 'carried') {
+      if (fields.length !== 1)
+        throw new Error(`${where}:${index + 1}: a carried line names one program`)
+      carried.add(fields[0])
       continue
     }
     const reasons = {}
@@ -64,7 +77,7 @@ const parseBaseline = (text, where) => {
       )
     programs.set(name, reasons)
   }
-  return { retired, programs }
+  return { retired, carried, programs }
 }
 
 // Why a corpus log cannot become a baseline, or undefined when it can: a failed program, or a run
@@ -93,7 +106,38 @@ const receiptsOf = (text) => {
   return programs
 }
 
-const parseReceipts = (log) => receiptsOf(readFileSync(log, 'utf8'))
+// The invalid programs a corpus log's run carried as BORROW_CHECK_GAP.
+const carriesOf = (text) => {
+  const carried = new Set()
+  for (const line of text.split('\n')) {
+    const at = line.indexOf(carryPrefix)
+    if (at >= 0) carried.add(JSON.parse(line.slice(at + carryPrefix.length)).name)
+  }
+  return carried
+}
+
+// Records a failure for every carry the baseline does not hold, and for every baseline carry of a
+// program that ran without being carried.
+const compareCarries = (baseline, carried, ran) => {
+  for (const name of [...carried].sort(byText))
+    if (!baseline.carried.has(name))
+      failures.push(
+        `${name}: newly carried as BORROW_CHECK_GAP; a checker that stopped checking its offending body is a regression, and a deliberate carry needs ${updateHint}`,
+      )
+  for (const name of [...baseline.carried].sort(byText))
+    if (ran.has(name) && !carried.has(name))
+      failures.push(`${name}: is no longer carried; ${updateHint}`)
+}
+
+// The program names a corpus log's run reported a result for.
+const ranOf = (text) => {
+  const ran = new Set()
+  for (const line of text.split('\n')) {
+    const match = /(?:^|\s)(?:PASS|FAIL|UNSUPPORTED) (\S+?)(?::|$)/.exec(line)
+    if (match !== null) ran.add(match[1])
+  }
+  return ran
+}
 
 const format = (reasons) =>
   Object.keys(reasons)
@@ -145,14 +189,24 @@ const updatedLines = (current, actual, prune) => {
   return { lines, absent }
 }
 
+// The carried programs `update` writes: the run's carries, plus recorded carries of programs that
+// did not run, unless pruned.
+const updatedCarries = (current, carried, ran, prune) => {
+  const kept = new Set(carried)
+  if (!prune) for (const name of current.carried) if (!ran.has(name)) kept.add(name)
+  return [...kept].sort(byText)
+}
+
 const [mode, ...operands] = process.argv.slice(2)
 const prune = mode === 'update' && operands[0] === '--prune'
 const [first, second] = prune ? operands.slice(1) : operands
 
 if (mode === 'corpus') {
   const baseline = parseBaseline(readFileSync(baselineUrl, 'utf8'), 'compiler/borrow-check-gap.txt')
-  const actual = parseReceipts(first)
+  const text = readFileSync(first, 'utf8')
+  const actual = receiptsOf(text)
   compare(baseline, actual)
+  compareCarries(baseline, carriesOf(text), ranOf(text))
   const sums = totals(actual)
   for (const reason of Object.keys(sums).sort(byText))
     print(`borrow-check ${reason}: ${sums[reason]}`)
@@ -174,7 +228,17 @@ if (mode === 'corpus') {
   const { lines, absent } = updatedLines(current, actual, prune)
   for (const name of absent) print(`${prune ? 'pruned' : 'not run'}: ${name}`)
   const retired = [...current.retired].sort(byText).join(' ')
-  writeFileSync(baselineUrl, [...header, `retired ${retired}`, ...lines, ''].join('\n'))
+  const carries = updatedCarries(current, carriesOf(text), ranOf(text), prune)
+  writeFileSync(
+    baselineUrl,
+    [
+      ...header,
+      `retired ${retired}`,
+      ...carries.map((name) => `carried ${name}`),
+      ...lines,
+      '',
+    ].join('\n'),
+  )
 } else if (mode === 'diff') {
   const before = parseBaseline(readFileSync(first, 'utf8'), first).programs
   const after = parseBaseline(readFileSync(second, 'utf8'), second).programs
@@ -271,6 +335,28 @@ if (mode === 'corpus') {
   const empty = 'Selfhost corpus: pass=0 fail=0 unsupported=0 track=0\n'
   if (refusal(empty, receiptsOf(empty)) === undefined)
     throw new Error('update refuses a run with no program receipts')
+  const carryBaseline = parseBaseline('carried alpha\nalpha\n', 'fixture')
+  const carryFailures = (carried, ran) => {
+    failures.length = 0
+    compareCarries(carryBaseline, new Set(carried), new Set(ran))
+    return failures.length
+  }
+  if (carryFailures(['alpha'], ['alpha']) !== 0) throw new Error('a recorded carry passes')
+  if (carryFailures(['alpha', 'beta'], ['alpha', 'beta']) !== 1)
+    throw new Error('a new carry fails')
+  if (carryFailures([], ['alpha']) !== 1) throw new Error('a carry the run no longer makes fails')
+  if (carryFailures([], []) !== 0) throw new Error('a carry whose program did not run is kept')
+  const carryLog = `UNSUPPORTED beta: BORROW_CHECK_GAP: x\nSELFHOST_BORROW_CARRY={"name":"beta"}\nPASS alpha\n`
+  if (
+    [...carriesOf(carryLog)].join() !== 'beta' ||
+    [...ranOf(carryLog)].sort(byText).join() !== 'alpha,beta'
+  )
+    throw new Error('carries and ran programs are read from the log')
+  if (
+    updatedCarries(carryBaseline, new Set(['beta']), new Set(['beta']), false).join() !==
+    'alpha,beta'
+  )
+    throw new Error('update keeps a carry whose program did not run')
   failures.length = 0
   notices.length = 0
   print('borrow-gap guard self-test passed')
