@@ -6,7 +6,7 @@ import * as NativeSeedRetention from './native-seed-retention.mjs'
 
 const [repository, ref, ...extra] = process.argv.slice(2)
 if (!repository || !ref || extra.length > 0) {
-  process.stderr.write('usage: node prune-native-seeds.mjs <repository> <selfhost-ref>\n')
+  process.stderr.write('usage: node prune-native-seeds.mjs <repository> <pin-history-ref>\n')
   process.exit(2)
 }
 const newest = 20

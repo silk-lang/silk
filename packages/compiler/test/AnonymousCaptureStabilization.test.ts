@@ -205,7 +205,7 @@ pub fn main() -> i32 { return 42 }`
           source.replace("Effect<'call & 'env;", "Effect<'call;"),
           ['OWN0019', 'SEM0129'],
         ],
-        ['unbounded', source.replace("T: 'env", 'T'), ['SEM0212', 'OWN0019', 'OWN0019']],
+        ['unbounded', source.replace("T: 'env", 'T'), ['SEM0212', 'OWN0019']],
       ] as const) {
         const snapshot = yield* Analysis.ofSource(`anonymous-capture/${name}`, ascii(program))
         assert.deepEqual(codesOf(snapshot), expected)

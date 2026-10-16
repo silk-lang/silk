@@ -1278,8 +1278,9 @@ where applicable.
 **Status:** Confirmed
 
 `[T; N]` is one inline fixed-array type whose identity contains the canonical element type `T` and
-non-negative integer length `N`. Different lengths are different types. Nested and zero-length
-arrays retain every element type and length in their identity.
+non-negative integer length `N`. `N` is at most 2147483647, the `i32` maximum, whether it is written
+as a literal or as a constant expression. Different lengths are different types. Nested and
+zero-length arrays retain every element type and length in their identity.
 
 ```silk
 fn pair(values: [i32; 2]) -> [i32; 2] {
@@ -1293,8 +1294,8 @@ though neither contains a runtime element.
 **Boundary:** `Array<T, N>` is a compiler display encoding found in older artifacts, not valid Silk
 source syntax. Length is not inferred across a declared parameter or result type.
 
-**Diagnostics:** Malformed fixed-array syntax receives a parser diagnostic. A contextual array
-literal with the wrong length reports `SEM0031`.
+**Diagnostics:** Malformed fixed-array syntax receives a parser diagnostic. A length above
+2147483647 reports `SEM0002`. A contextual array literal with the wrong length reports `SEM0031`.
 
 **Evidence:** [fixed-array source syntax](../../../../openspec/specs/bootstrap-syntax/spec.md),
 [fixed-array specification](../../../../openspec/specs/bootstrap-fixed-arrays/spec.md),
