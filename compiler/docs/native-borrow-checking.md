@@ -223,8 +223,11 @@ The R3 premise check runs inside the body query. It checks retained relations ma
 of `'static` and authenticated declared lifetime atoms against `BodyPremises`, including
 inherited impl/function constraints and input well-formedness edges. Goals never become premises.
 A rigid relation absent from that closure is `UnsatisfiedLifetimeBound` (SEM0212) at the retained
-origin. The point proof treats those same authenticated parameters as universal, relying on the
-prior premise check for universal-to-universal relations. Anonymous bodies keep their enclosing
+origin. An inherent implementation's head bounds are premises no member call proves yet, so a body
+under one is never `Checked`, and only the remaining premises reach the loan proof. The point proof
+treats those same authenticated parameters as universal, relying on the prior premise check for
+universal-to-universal relations whose whole offered side is declared; each universal constituent
+of a meet that also holds a local atom is proved there against the target. Anonymous bodies keep their enclosing
 function's lifetime identities and premises; storing the callable in a local does not change them.
 Local, invocation, supplied, and unrelated-owner atoms remain pending. Open capture contents still
 prevent `Checked`.
@@ -268,12 +271,18 @@ conflicts or storage-end checks. A reverse local-to-universal goal still needs s
 provenance; unknown domains, provisional-static inference and capture contents remain pending.
 
 An external reborrow may cross a body scope when its actual storage parent bounds the reborrow.
-The parent is taken from the innermost dereference or slice backing store; a lifetime merely
+The parent is the meet of the dereferenced descriptors on the borrowed path, from the innermost
+dereference or slice backing store outward: a reborrow through several references is valid only
+while each of them is. A shared descriptor is Copy, so the chain ends at the first shared one, and a
+shared reborrow through shared references keeps the innermost lifetime. A lifetime merely
 nested in a field type is not such evidence. A universal parent covers finite body-local uses.
 A universal target retains its exact identity and must follow declared/header premises, including
 input well-formedness bounds. Retained goals never supply those premises.
 A local parent is traced through every outer loan naming that inference atom until it reaches
-sufficient universal parents. Owned storage, unknown provenance, a cycle without such roots, and
+sufficient universal parents. Values also enter a local region without a loan, such as a passed
+reference meeting a fresh borrow in one call region. Typing retains each such source as a relation
+even when an enclosing lifetime trivially covers the local region, and every source of a relation
+whose wanted side is the local atom must reach the target too, recursively. Owned storage, unknown provenance, a cycle without such roots, and
 an atom used only as another loan's inner retained region stay pending. Cyclic reborrows are
 proved only when every reachable local component reaches a sufficient real parent; a grounded
 branch cannot justify an ungrounded sibling cycle. The symbolic proof caches completed results
