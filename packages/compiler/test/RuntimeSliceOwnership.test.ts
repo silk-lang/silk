@@ -1944,10 +1944,7 @@ fn bad(flag: bool) -> i32 {
           code: diagnostic.code,
           span: source.slice(diagnostic.span.start, diagnostic.span.end),
         })),
-        [
-          { code: 'OWN0019', span: 'held.*' },
-          { code: 'OWN0019', span: 'held.*' },
-        ],
+        [{ code: 'OWN0019', span: 'held.*' }],
       )
     }),
   )
@@ -1972,10 +1969,7 @@ fn bad(flag: bool) -> i32 {
         code: diagnostic.code,
         span: source.slice(diagnostic.span.start, diagnostic.span.end),
       })),
-      [
-        { code: 'OWN0019', span: 'held.*' },
-        { code: 'OWN0019', span: 'held.*' },
-      ],
+      [{ code: 'OWN0019', span: 'held.*' }],
     )
   }),
 )
@@ -2035,12 +2029,7 @@ fn check(flag: bool) -> i32 {
           code: diagnostic.code,
           span: source.slice(diagnostic.span.start, diagnostic.span.end),
         })),
-        valid
-          ? []
-          : [
-              { code: 'OWN0019', span: 'held.*' },
-              { code: 'OWN0019', span: 'held.*' },
-            ],
+        valid ? [] : [{ code: 'OWN0019', span: 'held.*' }],
       )
     }),
   )
@@ -2078,12 +2067,7 @@ fn check(flag: bool) -> i32 {
           code: diagnostic.code,
           span: source.slice(diagnostic.span.start, diagnostic.span.end),
         })),
-        valid
-          ? []
-          : [
-              { code: 'OWN0019', span: 'held.*' },
-              { code: 'OWN0019', span: 'held.*' },
-            ],
+        valid ? [] : [{ code: 'OWN0019', span: 'held.*' }],
       )
     }),
   )

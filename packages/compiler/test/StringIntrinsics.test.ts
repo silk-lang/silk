@@ -239,7 +239,6 @@ it.effect('rejects escaping a subrange of local backing storage', () =>
       })),
       [
         { code: 'OWN0019', span: 'Intrinsic.sliceView(&bytes, 1, 1)' },
-        { code: 'OWN0019', span: 'Intrinsic.sliceView(&bytes, 1, 1)' },
         { code: 'SEM0212', span: '&bytes' },
       ],
     )
@@ -283,7 +282,6 @@ fn conflict() -> bool {
       })),
       [
         { code: 'SEM0212', span: '&bytes' },
-        { code: 'OWN0019', span: 'Uri.parse(text)' },
         { code: 'OWN0019', span: 'Uri.parse(text)' },
         { code: 'OWN0011', span: 'bytes[2]' },
         { code: 'OWN0019', span: 'move parsed' },

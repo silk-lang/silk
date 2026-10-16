@@ -1350,6 +1350,7 @@ export const analyzeStatements = (
               context.resolution.bodyLifetimes,
               context.resolution.lifetimeCompatibility,
               element.anchor,
+              destination.type === undefined ? [] : Type.storageLifetimes(destination.type),
               root?.anchor,
             )
       const writeResolution: ResolutionContext = {
