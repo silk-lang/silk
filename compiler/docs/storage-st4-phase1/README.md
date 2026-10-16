@@ -14,15 +14,15 @@ St4 is at design review. This directory publishes the completed census and propo
 
 The throwaway compiler splits the first unchecked storage reason by operation. It does not implement contract checking or change which bodies are checked.
 
-| Operation | Corpus bodies | Programs with reason | Clean-source self-build bodies |
-|---|---:|---:|---:|
-| executionFromAllocation | 514 | 423 | 0 |
-| executionDrive | 475 | 423 | 0 |
-| executionNotify | 430 | 423 | 0 |
-| executionCurrent | 68 | 44 | 0 |
-| relinquish | 0 | 0 | 0 |
-| slotAddress | 1 | 1 | 0 |
-| Total storage | 1488 | 423 | 0 |
+| Operation               | Corpus bodies | Programs with reason | Clean-source self-build bodies |
+| ----------------------- | ------------: | -------------------: | -----------------------------: |
+| executionFromAllocation |           514 |                  423 |                              0 |
+| executionDrive          |           475 |                  423 |                              0 |
+| executionNotify         |           430 |                  423 |                              0 |
+| executionCurrent        |            68 |                   44 |                              0 |
+| relinquish              |             0 |                    0 |                              0 |
+| slotAddress             |             1 |                    1 |                              0 |
+| Total storage           |          1488 |                  423 |                              0 |
 
 Full published corpus: **423 pass, 0 fail, 0 unsupported, 328 tracked**. Other corpus reasons: regions 15882, stored-loans 93, imprecise 6. These are first-reason body counts, not occurrence counts; zero for relinquish can reflect masking by an earlier reason.
 

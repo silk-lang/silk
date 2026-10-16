@@ -1468,6 +1468,11 @@ export interface DropOperation {
     readonly state: MovePath.State
     readonly flags: ReadonlyArray<{ readonly path: MovePath.Path; readonly local: LocalId }>
   }
+  /**
+   * Releases the hidden owner of a borrowed temporary (BORROW-006) at its loan's end. Lowering
+   * places this release, so verification also tracks the views derived from the temporary.
+   */
+  readonly hiddenOwner?: true
   /** Exact target plan for an opaque local-shared core drop. Absent for every other cleanup. */
   readonly localShared?: {
     readonly element: SilkType.Type
@@ -2189,6 +2194,7 @@ export interface Violation {
     | 'InvalidInitializationState'
     | 'InvalidWrite'
     | 'InvalidLoan'
+    | 'UseAfterDrop'
     | 'InvalidSliceOperation'
     | 'InvalidStringOperation'
     | 'InvalidEnumOperation'

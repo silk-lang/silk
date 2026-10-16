@@ -354,6 +354,13 @@ export class FunctionLowering {
   readonly incomingCallables = new Map<number, Tir.NodeRef>()
   // Allocation metadata survives branch/loop rewrites; loanLocals tracks path-local liveness.
   readonly temporaryBorrowOwners = new Map<string, TemporaryBorrowOwner>()
+  // A loan of a hidden temporary owner ends, and drops its owner, only in the cleanup of the scope
+  // that owns the temporary, after that scope's other releases, or at an exit leaving that scope:
+  // a binding or effect that retains its view may outlive the loan's recorded last use.
+  scopeCleanup = false
+  // The loans each loop holds on entry; a `break` or `continue` ends the temporary loans its loop
+  // began.
+  readonly loopEntryLoans = new Map<number, ReadonlySet<string>>()
   readonly expressionLocals = new Map<string, Mir.LocalId>()
   readonly matchCleanupLocals = new Map<string, Mir.LocalId>()
   readonly extractedRegions = new Set<number>()
@@ -541,6 +548,20 @@ export class FunctionLowering {
     const id = local(this.localTypes.length)
     this.localTypes.push(type)
     return id
+  }
+
+  /** Whether the current site may end this loan: a temporary's only in scope cleanup. */
+  endsLoan(key: string): boolean {
+    return this.scopeCleanup || !this.temporaryBorrowOwners.has(key)
+  }
+
+  /** Runs `body` as the cleanup of a scope, where temporary loans may end. */
+  inScopeCleanup<A>(body: () => A): A {
+    const previous = this.scopeCleanup
+    this.scopeCleanup = true
+    const result = body()
+    this.scopeCleanup = previous
+    return result
   }
 
   emit(operation: Mir.Operation): void {
