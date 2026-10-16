@@ -187,7 +187,7 @@ export const parseBorrowGap = (stderr: string): BorrowGap | undefined => {
   return { total: Number(match[1]), reasons }
 }
 
-/** A root-package body the build left without borrow checking, by byte offsets of its declaration. */
+/** A concrete root-package body the build left without borrow checking, by byte offsets of its block. */
 export interface UncheckedBody {
   readonly module: string
   readonly span: { readonly start: number; readonly end: number }
@@ -236,9 +236,14 @@ const notAfter = (left: number[], right: number[]): boolean => {
   return true
 }
 
+// The codes borrow checking reports: every ownership and borrow code, and the unsatisfied
+// lifetime bound a region relation fails with. Any other code comes from a checker that ran.
+const borrowCheckingCode = (code: string): boolean => code.startsWith('OWN') || code === 'SEM0212'
+
 /**
- * Whether every expected diagnostic lies inside a body the build reported not borrow-checked.
- * Only then is accepting the program a declared gap; a diagnostic in a checked body is a hole.
+ * Whether every expected diagnostic is a borrow-checking code inside the block of a body the
+ * build reported not borrow-checked. Only then is accepting the program a declared gap; any other
+ * diagnostic, or one in a checked body or a declaration's header, is a hole.
  */
 export const coveredByUncheckedBodies = (
   source: string,
@@ -251,7 +256,8 @@ export const coveredByUncheckedBodies = (
   ).map(({ span }) => spanRange(span))
   return (
     expected.length > 0 &&
-    expected.every(({ span }) => {
+    expected.every(({ code, span }) => {
+      if (!borrowCheckingCode(code)) return false
       const diagnostic = spanRange(span)
       return ranges.some(
         (body) =>
@@ -754,6 +760,11 @@ export const runCorpus = async (
         )
         .join('; ')}`
     process.stdout.write(`${result.status.toUpperCase()} ${result.name}${detail}\n`)
+    if (
+      result.status === 'unsupported' &&
+      result.gaps.some(({ code }) => code === 'BORROW_CHECK_GAP')
+    )
+      process.stdout.write(`SELFHOST_BORROW_CARRY=${JSON.stringify({ name: result.name })}\n`)
     if (result.status !== 'unsupported' && result.borrowGap !== undefined)
       process.stdout.write(
         `SELFHOST_BORROW_GAP=${JSON.stringify({ name: result.name, ...result.borrowGap })}\n`,

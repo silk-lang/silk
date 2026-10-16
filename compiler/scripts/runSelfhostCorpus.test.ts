@@ -413,20 +413,29 @@ exit 1`
     assert.strictEqual(result.status, 'fail')
     assert.strictEqual(result.status === 'fail' ? result.code : '', 'ACCEPTED_INVALID')
   })
-  // An acceptance claims nothing only where the build left the offending body unchecked. The
-  // diagnostic is in `f` (bytes 0-29); `main` (bytes 30-64) is unrelated.
-  const accepting = (bodies: string) =>
-    `printf '${bodies}' >&2
-${compiled}`
-  for (const [bodies, expected] of [
-    ['', 'ACCEPTED_INVALID'],
-    ['SILK_GAP borrow-check body: memory/driver.silk 0-29 regions\\n', 'BORROW_CHECK_GAP'],
+  // An acceptance claims nothing only where the build left the offending body unchecked: a
+  // borrow-checking code inside that body's block. `f`'s block is bytes 25-43 and `main`'s 65-77.
+  const borrowing = (code: string, span: string): Corpus.Program => ({
+    ...literal,
+    name: 'borrowing',
+    source: 'fn f(value: &i32) -> i32 { return value.* }\npub fn main() -> i32 { return 0 }',
+    outcome: { schemaVersion: 1, expected: { kind: 'rejected', diagnostics: [{ code, span }] } },
+  })
+  const inBlock = borrowing('OWN0011', '1:35-1:42')
+  const body = (module: string, start: number, end: number) =>
+    `SILK_GAP borrow-check body: ${module} ${start}-${end} regions\\n`
+  for (const [program, bodies, expected] of [
+    [inBlock, '', 'ACCEPTED_INVALID'],
+    [inBlock, body('memory/driver.silk', 25, 43), 'BORROW_CHECK_GAP'],
     // A checked offending body next to an unchecked helper is a hole, not a gap.
-    ['SILK_GAP borrow-check body: memory/driver.silk 30-64 regions\\n', 'ACCEPTED_INVALID'],
-    ['SILK_GAP borrow-check body: other/module.silk 0-29 regions\\n', 'ACCEPTED_INVALID'],
+    [inBlock, body('memory/driver.silk', 65, 77), 'ACCEPTED_INVALID'],
+    [inBlock, body('other/module.silk', 25, 43), 'ACCEPTED_INVALID'],
+    // A code another checker reports, and a diagnostic in the header, came from checkers that ran.
+    [borrowing('SEM0001', '1:35-1:42'), body('memory/driver.silk', 25, 43), 'ACCEPTED_INVALID'],
+    [borrowing('OWN0011', '1:6-1:11'), body('memory/driver.silk', 25, 43), 'ACCEPTED_INVALID'],
   ] as const)
-    await withStub(accepting(bodies), async (silkc) => {
-      const result = await runCase(silkc, rejected)
+    await withStub(`printf '${bodies}' >&2\n${compiled}`, async (silkc) => {
+      const result = await runCase(silkc, program)
       if (result.status === 'pass') assert.fail('an accepted invalid program cannot pass')
       assert.strictEqual(
         result.status === 'fail' ? result.code : result.gaps.map((gap) => gap.code).join(),

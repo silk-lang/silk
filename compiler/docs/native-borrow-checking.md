@@ -337,13 +337,21 @@ The checker is part of the `Body` unit, as the v2 note's checking-unit rule requ
 
 `SILK_GAP borrow-check: N bodies not borrow-checked (reason n, ...)` counts emitted definitions
 whose body is not `Checked`, with one count per reason. `SILK_GAP borrow-check root-package: ...`
-counts the same way over every root-package body the declaration sweep checks, reached or not, with
-a deferred static template counted as `awaiting`: an unreached function is never emitted, so only
-this line shows it unchecked. A build, not a test runner, follows it with
-one `SILK_GAP borrow-check body: <module> <start>-<end> <reason>` line for each of those bodies, by
-the byte offsets of its whole declaration. The corpus harness
-treats an accepted invalid program as a `BORROW_CHECK_GAP` only when every expected diagnostic lies
-in one of those bodies; a diagnostic in a checked body is a failure, whatever else is unchecked. A body is `Checked` exactly when its stage
+counts the same way over the concrete root-package bodies the declaration sweep checks, reached or
+not: an unreached function is never emitted, so only this line shows it unchecked. An open generic
+or a deferred static template is not counted, since the sweep does not check it in the form a build
+reaches, and each reached instance is checked in its own right. A build, not a test runner,
+follows the line with one `SILK_GAP borrow-check body: <module> <start>-<end> <reason>` line per
+counted body, by the byte offsets of its body block.
+
+The corpus harness treats an accepted invalid program as a `BORROW_CHECK_GAP` only when every
+expected diagnostic has a borrow-checking code (`OWN*` or `SEM0212`) and lies inside the block of
+one of those bodies. Any other code, a diagnostic in a header, or one in a checked body is a
+failure, whatever else is unchecked. `compiler/borrow-check-gap.txt` records each carried program
+as a `carried <program>` line, so a new carry fails until `check-borrow-gap.mjs update` records
+it: a checker that stops checking a body cannot quietly turn a rejected program into a gap.
+
+A body is `Checked` exactly when its stage
 is `FullyChecked`. Every other body carries the `BorrowStatus` that names what a later slice must
 cover first:
 
