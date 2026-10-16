@@ -71,19 +71,11 @@ export interface Plan {
   readonly failure: ResumePlan
 }
 
-export interface Violation {
-  readonly _tag: 'SuspensionOwnershipViolation'
-  readonly function: Instances.InstanceKey
-  readonly span: SourceSpan.SourceSpan
-  readonly detail: string
-}
-
 export interface Module {
   readonly _tag: 'SuspensionOwnershipModule'
   readonly module: string
   readonly plans: ReadonlyArray<Plan>
   readonly executionPackages: ReadonlyArray<ExecutionPackageOwnershipPlan>
-  readonly violations: ReadonlyArray<Violation>
 }
 
 /** One exact compiler-private package slot governed by the canonical ownership planner. */
@@ -752,7 +744,22 @@ const comparePlan = (left: Plan, right: Plan): number =>
   left.span.start - right.span.start ||
   left.point.ordinal - right.point.ordinal
 
-/** Plans exact post-normalization local ownership for every matched complete-or-relay control. */
+// Ownership the planner cannot preserve is a compiler defect, never a source diagnostic: invalid
+// source ownership is rejected by the ordinary ownership rules before MIR exists (SUSP-011,
+// SUSP-013).
+const plannerDefect = (
+  fn: Instances.InstanceKey,
+  span: SourceSpan.SourceSpan,
+  detail: string,
+): RangeError =>
+  new RangeError(
+    `Suspension ownership planning failed in ${Instances.keyText(fn)} at ${span.sourceId}:${span.start}: ${detail}`,
+  )
+
+/**
+ * Plans exact post-normalization local ownership for every matched complete-or-relay control.
+ * Throws a defect when a planner invariant fails.
+ */
 export const plan = (
   program: Mir.Module,
   provisional: ProvisionalMir.Module,
@@ -760,7 +767,6 @@ export const plan = (
   opaqueRealizations: OpaqueRealization.Catalog,
 ): Module => {
   const plans: Array<Plan> = []
-  const violations: Array<Violation> = []
   for (const fn of program.functions) {
     // Most functions have no relay control. Their fixed-point liveness cannot contribute a plan.
     let live: ReturnType<typeof liveness> | undefined
@@ -786,15 +792,12 @@ export const plan = (
           fn.instance,
           operation.provenance.span,
         )
-        if (control === undefined) {
-          violations.push({
-            _tag: 'SuspensionOwnershipViolation',
-            function: fn.instance,
-            span: operation.provenance.span,
-            detail: 'suspendable MIR run has no exact provisional control',
-          })
-          continue
-        }
+        if (control === undefined)
+          throw plannerDefect(
+            fn.instance,
+            operation.provenance.span,
+            'suspendable MIR run has no exact provisional control',
+          )
         live ??= liveness(fn)
         const retainedInputs = MirVerification.invocationRetentions(fn, program, [
           ...MirVerification.operationLocals(operation).filter(
@@ -809,17 +812,9 @@ export const plan = (
           ...MirVerification.invocationUseIssues(fn, program),
           ...retainedInputs.issues,
         ]
-        if (invocationIssues.length > 0) {
-          violations.push(
-            ...invocationIssues.map((issue): Violation => ({
-              _tag: 'SuspensionOwnershipViolation',
-              function: fn.instance,
-              span: issue.operation.provenance.span,
-              detail: issue.detail,
-            })),
-          )
-          continue
-        }
+        const issue = invocationIssues.at(0)
+        if (issue !== undefined)
+          throw plannerDefect(fn.instance, issue.operation.provenance.span, issue.detail)
         const planned = planFor(
           program,
           index,
@@ -830,15 +825,12 @@ export const plan = (
           control,
           opaqueRealizations,
         )
-        if (planned === undefined) {
-          violations.push({
-            _tag: 'SuspensionOwnershipViolation',
-            function: fn.instance,
-            span: operation.provenance.span,
-            detail: 'invocation input cleanup dependencies are cyclic or duplicate',
-          })
-          continue
-        }
+        if (planned === undefined)
+          throw plannerDefect(
+            fn.instance,
+            operation.provenance.span,
+            'invocation input cleanup dependencies are cyclic or duplicate',
+          )
         const assignedFlags = MirVerification.initializationOf(fn, program.layout).flagsBefore.get(
           operation,
         )
@@ -856,16 +848,12 @@ export const plan = (
                     ),
                 )),
           )
-        ) {
-          violations.push({
-            _tag: 'SuspensionOwnershipViolation',
-            function: fn.instance,
-            span: operation.provenance.span,
-            detail:
-              'suspended partial ownership requires every conditional initialization flag to be assigned and retained',
-          })
-          continue
-        }
+        )
+          throw plannerDefect(
+            fn.instance,
+            operation.provenance.span,
+            'suspended partial ownership requires every conditional initialization flag to be assigned and retained',
+          )
         plans.push(planned)
       }
     }
@@ -877,7 +865,6 @@ export const plan = (
     executionPackages: program.layout.executionPackages.plans.map((package_) =>
       executionPackagePlan(index, package_),
     ),
-    violations: violations,
   }
 }
 
@@ -915,9 +902,5 @@ export const encode = (self: Module): string =>
       ),
       `  cleanup completion=${plan_.completion.releases.map((slot) => slot.role.toLowerCase()).join('>')} unstarted=${plan_.unstarted.releases.map((slot) => slot.role.toLowerCase()).join('>')} relinquished=${plan_.relinquished.releases.map((slot) => slot.role.toLowerCase()).join('>')}`,
     ]),
-    ...self.violations.map(
-      (violation) =>
-        `violation ${Instances.keyText(violation.function)}@${violation.span.sourceId}:${violation.span.start} ${violation.detail}`,
-    ),
     '',
   ].join('\n')

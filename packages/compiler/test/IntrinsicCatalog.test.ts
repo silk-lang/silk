@@ -571,7 +571,6 @@ pub fn main() -> i32 { return 42 }`),
       [
         ['SEM0212', 0],
         ['OWN0019', unbounded.indexOf('Intrinsic.observeDiagnostics')],
-        ['OWN0019', unbounded.indexOf('Intrinsic.observeDiagnostics')],
       ],
     )
   }),

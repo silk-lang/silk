@@ -1336,15 +1336,15 @@ const verifyLiteralVerdicts = Effect.fn('LayoutVerify.verifyLiteralVerdicts')(fu
     unavailable.some((verdict) =>
       self.diagnostics.every(
         (diagnostic) =>
-          diagnostic.code !== Diagnostic.wordLiteralOutOfRangeCode ||
+          diagnostic.code !== Diagnostic.integerOutOfRangeCode ||
           diagnostic.span.sourceId !== verdict.span.sourceId ||
           diagnostic.span.start !== verdict.span.start ||
           diagnostic.span.end !== verdict.span.end ||
-          diagnostic.reason._tag !== 'WordLiteralOutOfRange' ||
+          diagnostic.reason._tag !== 'IntegerOutOfRange' ||
           diagnostic.reason.type !== verdict.type ||
           diagnostic.reason.spelling !== verdict.value.toString() ||
-          diagnostic.reason.target !== self.target.id ||
-          diagnostic.reason.bits !== bits,
+          diagnostic.reason.minimum !== wordRange(verdict.type, bits).minimum.toString() ||
+          diagnostic.reason.maximum !== wordRange(verdict.type, bits).maximum.toString(),
       ),
     )
   ) {

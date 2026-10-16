@@ -204,8 +204,10 @@ calls `free` on its context, a raw buffer drops only its allocation, and shared-
 references and drops the value and allocation with the last handle. Raw-buffer and slot contents
 stay owned by library code. `layoutOf`, `sharedLayout` and `systemAllocationAcquire` exchange the
 standard library's `silk/layout` `Layout` record, as the bootstrap's contracts name it.
-Borrow checking remains step 14: successful builds print one `SILK_GAP borrow-check` summary, with
-a per-reason breakdown, when reached bodies are not yet borrow-checked. The TypeScript bootstrap compiler still builds it, as
+Borrow checking remains step 14: successful builds print a `SILK_GAP borrow-check` summary of the
+emitted bodies and a `SILK_GAP borrow-check root-package` summary of the concrete root-package
+bodies, each with a per-reason breakdown, then one `SILK_GAP borrow-check body` line naming each
+unchecked concrete root-package body by its block. The TypeScript bootstrap compiler still builds it, as
 the bootstrap DDC job in `selfhost.yml` checks (see `docs/native-seed-chain.md#bootstrap-ddc`).
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
@@ -487,39 +489,33 @@ reads only the syntax index, so a name with a conditional candidate there is the
 
 ## Development branches and bootstrap
 
-`selfhost` is the integration branch for the source-written compiler. Start native compiler work on
-`selfhost-*` branches from the current `selfhost` tip, and target their pull requests at `selfhost`.
-Use a hyphen after `selfhost`: Git cannot hold both the `selfhost` branch and a `selfhost/...`
-branch. Keep the merged M1 history and later `main` work in this branch's ancestry.
+`main` is the only integration branch, for the source-written compiler, the TypeScript bootstrap
+and the standard library they share. Start native compiler work on a `selfhost-*` branch from the
+current `main` and target its pull request at `main`; an upper PR of a native stack targets the
+`selfhost-*` branch below it. A pull request merges when `CI result` and `Focused Linux Silk` pass on
+its head. Merge `main` into the branch before its final run, with a merge that retains both
+parents, so the merge commit reuses that run's verdict.
 
-Repairs to the TypeScript compiler, CLI, or standard library that the native compiler needs start
-from a freshly fetched `main`. Review and merge each repair through a pull request targeting
-`main`, with that branch's normal checks. Then fetch the merged `main` and merge it into a new
-`selfhost-sync-*` branch based on the current `selfhost` tip. Review the merge and any conflict
-resolution, run the focused native checks below, and target the synchronization pull request at
-`selfhost`. Use a merge that retains both parents; do not copy repair commits into a private
-bootstrap patch stream or reset `selfhost` onto another history. Update native feature branches
-from the synchronized `selfhost` tip as needed.
+The TypeScript compiler and CLI are frozen. A repair the native compiler needs from them, or a
+standard-library change, lands in the same pull request as the native change that needs it; the
+bootstrap DDC in that pull request proves the checkout's bootstrap still builds the checkout's
+compiler.
 
 ### The native seed pin
 
 `compiler/native-seed.json` names the published native compiler that builds N1 (see
 [the native seed chain](docs/native-seed-chain.md)). Advance it weekly, and immediately after any
 soundness or code generation fix that N1 must not be built without. Pin only a candidate whose
-`selfhost` push run summary says **Full gate**; never pin a candidate published from a run that
+`main` push run summary says **Full gate**; never pin a candidate published from a run that
 reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a pull request to
-`selfhost`; its CI proves the new seed builds the checkout, reaches the N1/N2 fixpoint and passes
+`main`; its CI proves the new seed builds the checkout, reaches the N1/N2 fixpoint and passes
 the corpus.
 
-For each bootstrap build, record the `selfhost` commit, the downloaded main compiler commit and CI
-run, the host platform and LLVM target. The focused selfhost workflow downloads the latest verified
-`silk-bootstrap` artifact using `.github/actions/download-bootstrap` and records its provenance in
-the job summary. Invoke its `silk.mjs` with Node 24; native builds also require LLVM. Selfhost jobs
-install workspace dependencies only for Node tooling (seed verification, source snapshots, generated
-contract checks); no selfhost job builds the TypeScript compiler from source or packages the verifier.
-The bootstrap DDC job runs the downloaded `silk-bootstrap` artifact.
-Main also publishes `silk-selfhost-verification`; the download action fetches it from the same run
-as the compiler. The verifier reads `compiler/scripts/selfhost-track.json` from this checkout and
+The bootstrap DDC job bundles the TypeScript bootstrap from the checkout with `pnpm bundle:cli` and
+records the bundle's digest with the checkout commit in its receipt. Invoke the bundled `silk.mjs`
+with Node 24; native builds also require LLVM. The other native jobs install workspace dependencies
+only for Node tooling (seed verification, source snapshots, generated contract checks).
+The corpus jobs build the verification harness from the checkout. The verifier reads `compiler/scripts/selfhost-track.json` from this checkout and
 checks its intrinsic catalog, authored corpus fixtures, and live formatted standard library,
 preserving the native compiler safety gates.
 
@@ -1334,9 +1330,9 @@ inside that return have different codes. Do not relabel a propagated failure by 
 
 While both compilers exist, `packages/compiler/src/Diagnostic.ts` remains the authoritative code
 and message-template catalog, and its generated documentation keeps the existing wording gate.
-New allocations land on `main` with complete templates and generated documentation, then reach
-`selfhost` through a sync. Full parameterized native message rendering is a separate migration
-that must finish before removing the bootstrap catalog and its generation checks.
+New allocations land with complete templates and generated documentation. Full parameterized
+native message rendering is a separate migration that must finish before removing the bootstrap
+catalog and its generation checks.
 
 Run `node compiler/scripts/DiagnosticCatalog.mjs` to check each annotated native mapping against
 its exact bootstrap constant, all lexical/static mappings, and the generated catalog. The guard
@@ -1353,9 +1349,9 @@ query and source-index cases. The semantic cases are split by topic into six roo
 their own roots to keep each native compilation within the CI time and heap limits. The HIR root
 runs the lowering, fingerprint, and parser cases without pulling the semantic engine into their
 binary. `--no-cache` executes assertions even if a previous run stored passing results. The focused
-Linux workflow runs these commands for pull requests targeting `selfhost` and pushes to `selfhost`.
-Other pull-request targets and main pushes keep their existing broad CI. Native work branches are
-named `selfhost-*`; pushing one does not start a second CI run before its pull request.
+Linux workflow runs these commands for pull requests targeting `main` and pushes to `main`, beside
+the broad TypeScript CI. Native work branches are named `selfhost-*`; pushing one does not start a
+second CI run before its pull request.
 The heaps match the cases matrix in `.github/workflows/selfhost.yml`: a semantic root peaks near
 11.3 GB, so run one at a time on a 15 GB machine.
 
