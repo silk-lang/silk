@@ -143,18 +143,30 @@ In-memory callers register the root bytes with their resolver, just as they regi
 `shared/Value` belongs to the closure once. A source available to the resolver but unreachable from
 `app/Main` is not part of that compilation merely because it exists below the source root.
 
-**Boundary:** Loading a module makes its declarations available for static analysis; it does not
-mean that every function in that module is executable or included in the emitted program. Runtime
-reachability is a separate property beginning at the selected entry point.
+Every loaded root-package module has its active nongeneric, provider-free declarations checked,
+even when no executable use reaches them. A dependency module, including a toolchain standard-
+library module, is checked where a use reaches its declarations. Generic and provider-dependent
+bodies retain existing symbolic contract typing where possible. Complete MIR and ownership
+verdicts require a concrete use; full standalone checking of unspecialized bodies is deferred.
+Bodies with unsupplied static inputs or generic-dependent static expansion defer whole-body typing.
+The standard library can itself be compiled as the root package to check its otherwise unreached
+closed declarations under the same rule.
+
+**Boundary:** Loading still parses the whole source and makes its declarations available for static
+analysis. Declaration checking does not make every function executable or include it in the emitted
+program. Runtime reachability is a separate property beginning at the selected entry point.
 
 **Diagnostics:** Each absent reachable target reports its import diagnostic. A damaged import path
 retains its parser diagnostic without also requesting a fabricated module or emitting `MOD0001`.
-One operational resolution failure does not erase successfully loaded modules, although the
-compilation cannot commit its requested artifact.
+An unused invalid closed root-package declaration rejects the build with its ordinary source
+diagnostic; an unreached dependency body has no independent body verdict. One operational resolution
+failure does not erase successfully loaded modules, although the compilation cannot commit its
+requested artifact.
 
 **Evidence:** [reachable module closure](../../../../openspec/specs/bootstrap-module-closure/spec.md),
 [module closure tests](../../../../packages/compiler/test/ModuleClosure.test.ts),
-[executable closure](../../../../openspec/specs/bootstrap-intrinsic-target-availability/spec.md).
+[executable closure](../../../../openspec/specs/bootstrap-intrinsic-target-availability/spec.md),
+[native declaration checking](../../../../compiler/docs/loaded-declaration-checking.md).
 
 ### MODULE-005 — Imports have no runtime behavior
 

@@ -1,0 +1,643 @@
+import semantic.SourceLocations {Location}
+//! Drop glue: the MIR that cleans one complete value of a type (MIR core shape §3).
+//!
+//! # When to use
+//! Build a [`DropGlue`] recipe from a type's resolved Drop hook and member shapes, then lower it
+//! with [`DropGlue.lower`]. Every `Drop(place)` statement calls the glue of the place's type.
+//!
+//! # Details
+//! Glue receives the value through `&mut T`. It runs the Drop hook first, then drops each child
+//! that needs cleanup: fields in declaration order, array elements in ascending order, and only the
+//! active member of a structural union or the active variant's fields of a nominal union
+//! (CLEANUP-002). Children proven cleanup-free are omitted. Glue never fails and never traps.
+
+import semantic.Types {Types}
+import backend.CAbi
+import backend.InstanceKey {InstanceKey}
+import backend.Layout {Layout}
+import backend.Mir {
+  Block,
+  Cancel,
+  EscapeSite,
+  NonParkingRun,
+  SharedAccess,
+  Callee,
+  ContextText,
+  TrapSite,
+  causeType,
+  observerAddress,
+  Diagnostics,
+  FailureEdge,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Reference,
+  Rvalue,
+  Statement,
+  SwitchCase,
+  Terminator,
+}
+import hir.Hir {Access, HirId, InfixOperator}
+import lexer.Span {Span}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {Lifetime}
+import semantic.SealedCore
+import semantic.SealedCore {Field as CoreField}
+import semantic.Specialization {Edge}
+import semantic.Type {Type}
+import semantic.TypedBody {BorrowStatus, Origin}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+
+/// One child that needs cleanup: its field ordinal or union tag, its type, and that type's glue.
+pub struct Child {
+  pub index: usize
+  pub ty: Shared<Type>
+  pub glue: InstanceKey
+}
+
+/// The fields of one nominal union variant that need cleanup.
+pub struct Variant {
+  pub tag: usize
+  pub fields: Vector<Child>
+}
+
+/// The children of a value that need cleanup after its Drop hook.
+pub union Children {
+  /// Record, tuple or anonymous aggregate fields in declaration order.
+  Fields {pub fields: Vector<Child>},
+  /// Every element of a fixed array, in ascending order.
+  Elements {pub element: Child, pub count: usize},
+  /// The active member of a structural union with `count` canonical members.
+  Members {pub members: Vector<Child>, pub count: usize},
+  /// The active variant's fields of a nominal union with `count` variants.
+  Variants {pub variants: Vector<Variant>, pub count: usize},
+}
+
+/// One owner a partially moved place passes through: whether it has a Drop hook, and the children
+/// its glue would drop. A hole beneath a hooked owner cannot be cleaned (OWN-004).
+pub struct RemainderLevel {
+  pub hooked: bool
+  pub children: Children
+}
+
+/// One partial consuming site: the moved path in MIR projections from its owner, and for each step
+/// the owner it leaves. Lowering expands a partial owner into drops of its remaining children and
+/// never passes it to its glue (MIR core shape §3).
+pub struct Remainder {
+  /// The consuming site's node in the typed body.
+  pub node: usize
+  pub steps: Vector<Projection>
+  pub levels: Vector<RemainderLevel>
+}
+
+/// The cleanup of one sealed core value, after the bootstrap's allocation and local-shared cleanup.
+/// A raw buffer is an ordinary record glue over its allocation and needs no core recipe.
+pub union CoreCleanup {
+  /// Releases an allocation's system storage through its reclaim context with C `free`.
+  Allocation {pub free: Shared<DeclarationId>},
+  /// Releases one strong handle of a shared core whose control block `block` addresses. The last
+  /// handle drops `value` when it needs cleanup and then the block's own allocation; any other
+  /// handle only decrements the strong count.
+  Shared {pub block: Shared<Type>, pub value: Option<Child>, pub allocation: Child},
+  /// Releases one execution package through the erased drop function its `header` records, which
+  /// is the glue of the complete package.
+  Execution {pub header: Shared<Type>},
+  /// Cleans one complete package: its body while it has not started, then its readiness state and
+  /// endpoint where they need cleanup, and last its handle's authority over the allocation its
+  /// header holds. A drop while its readiness endpoint runs waits until the endpoint returns.
+  Package {pub body: Option<Child>, pub ready: Option<Child>, pub endpoint: Option<Child>, pub allocation: Child},
+  /// Releases one `ExecutionRef`'s authority over the package allocation that `header`, any
+  /// package's header, holds; the last authority drops the allocation.
+  Reference {pub header: Shared<Type>, pub allocation: Child},
+}
+
+/// The recipe for one type's drop glue.
+pub struct DropGlue {
+  pub key: InstanceKey
+  pub ty: Shared<Type>
+  /// The resolved Drop hook instance, called with the value's address before any child.
+  pub hook: Option<InstanceKey>
+  pub children: Children
+}
+
+struct Builder {
+  locals: Vector<Local>
+  blocks: Vector<Block>
+  references: Vector<Reference>
+  origin: Origin
+  // Whether the program observes diagnostics: glue then passes its observer and cause (locals 2
+  // and 3) to every hook and child glue (failure observer note N1).
+  observing: bool
+}
+
+impl DropGlue {
+  /// Lowers the recipe into the glue instance's MIR. Local 1 is the `&mut T` parameter; in a program
+  /// that observes diagnostics, locals 2 and 3 are the hidden observer and cause addresses.
+  pub effect fn lower(self: DropGlue, observing: bool) -> MirFunction ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let origin = Origin {node: usize.ZERO, location: Location.generated()}
+    let unit = run Types.intern(Type.Unit)
+    let parameter = run Types.intern(Type.Reference {
+      referent: Shared<Type>.clone(&self.ty), access: Access.Mutable, lifetime: run Shared<Lifetime>.make(Lifetime.Static),
+    })
+    let mut builder = Builder {locals: Vector<Local>.make(), blocks: Vector<Block>.make(), references: Vector<Reference>.make(),
+      origin: origin, observing: observing}
+    run Vector<Local>.append(&mut builder.locals, Local {ty: Shared<Type>.clone(&unit), kind: LocalKind.Return, origin: origin})
+    run Vector<Local>.append(&mut builder.locals, Local {ty: Shared<Type>.clone(&parameter), kind: LocalKind.Parameter {index: usize.ZERO}, origin: origin})
+    if observing {
+      run Vector<Local>.append(&mut builder.locals, Local {ty: run observerAddress(), kind: LocalKind.Observer, origin: origin})
+      run Vector<Local>.append(&mut builder.locals, Local {ty: run causeType(), kind: LocalKind.Cause, origin: origin})
+    }
+    let mut current = run block(&mut builder)
+    if let Option<InstanceKey>.Some {value: hook} = move self.hook {
+      let result = run temporary(&mut builder, &unit)
+      let next = run block(&mut builder)
+      let mut arguments = Vector<Operand>.make()
+      run Vector<Operand>.append(&mut arguments, Operand.Copy {place: place(usize.ONE)})
+      run Vector<Reference>.append(&mut builder.references, Reference {key: InstanceKey.copy(&hook), edge: Edge.Direct, origin: origin})
+      let diagnostics = run hidden(&builder)
+      terminate(&mut builder, current, Terminator.Call {
+        callee: Callee.Instance {key: move hook}, arguments: move arguments, providers: Vector<Operand>.make(),
+        diagnostics: move diagnostics, destination: place(result), normal: next,
+        failure: Option<FailureEdge>.none(), origin: origin,
+      })
+      current = next
+    }
+    match move self.children {
+      Children.Fields {fields} => {
+        let listed = Vector<Child>.asSlice(&fields)
+        let mut at = usize.ZERO
+        while at < listed.length {
+          run dropChild(&mut builder, current, &listed[at], Projection.Field {index: listed[at].index})
+          at = at + usize.ONE
+        }
+      }
+      Children.Elements {element, count} => { current = run dropElements(&mut builder, current, &element, count) }
+      Children.Members {members, count} => {
+        let listed = Vector<Child>.asSlice(&members)
+        let mut arms = Vector<usize>.make()
+        let mut at = usize.ZERO
+        while at < listed.length {
+          let arm = run block(&mut builder)
+          run dropChild(&mut builder, arm, &listed[at], Projection.Payload {index: listed[at].index, ty: Shared<Type>.clone(&listed[at].ty)})
+          run Vector<usize>.append(&mut arms, arm)
+          at = at + usize.ONE
+        }
+        let tags = run tagsOf(listed)
+        current = run dispatch(&mut builder, current, count, Vector<usize>.asSlice(&tags), Vector<usize>.asSlice(&arms))
+      }
+      Children.Variants {variants, count} => {
+        let listed = Vector<Variant>.asSlice(&variants)
+        let mut arms = Vector<usize>.make()
+        let mut tags = Vector<usize>.make()
+        let mut at = usize.ZERO
+        while at < listed.length {
+          let arm = run block(&mut builder)
+          let fields = Vector<Child>.asSlice(&listed[at].fields)
+          let mut field = usize.ZERO
+          while field < fields.length {
+            run dropChild(&mut builder, arm, &fields[field], Projection.VariantField {variant: listed[at].tag, field: fields[field].index})
+            field = field + usize.ONE
+          }
+          run Vector<usize>.append(&mut arms, arm)
+          run Vector<usize>.append(&mut tags, listed[at].tag)
+          at = at + usize.ONE
+        }
+        current = run dispatch(&mut builder, current, count, Vector<usize>.asSlice(&tags), Vector<usize>.asSlice(&arms))
+      }
+    }
+    terminate(&mut builder, current, Terminator.Return {origin: origin})
+    run MirFunction.sortReferences(&mut builder.references)
+    let mut parameters = Vector<Shared<Type>>.make()
+    run Vector<Shared<Type>>.append(&mut parameters, move parameter)
+    return MirFunction {
+      key: move self.key, borrow: BorrowStatus.Checked, result: move unit, parameters: move parameters, locals: move builder.locals,
+      blocks: move builder.blocks, references: move builder.references, externs: Vector<Shared<DeclarationId>>.make(),
+      observes: false, contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: false, nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make(),
+    }
+  }
+
+  /// Lowers one sealed core's own cleanup. Local 1 is the `&mut T` parameter, as for [`lower`].
+  pub effect fn lowerCore(key: InstanceKey, ty: &Shared<Type>, cleanup: CoreCleanup, observing: bool) -> MirFunction
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    // An Execution handle's cleanup runs its package glue through the erased drop.
+    let releases = match &cleanup { CoreCleanup.Execution {..} => true _ => false }
+    let origin = Origin {node: usize.ZERO, location: Location.generated()}
+    let unit = run Types.intern(Type.Unit)
+    let parameter = run Types.intern(Type.Reference {
+      referent: Shared<Type>.clone(ty), access: Access.Mutable, lifetime: run Shared<Lifetime>.make(Lifetime.Static),
+    })
+    let mut builder = Builder {locals: Vector<Local>.make(), blocks: Vector<Block>.make(), references: Vector<Reference>.make(),
+      origin: origin, observing: observing}
+    run Vector<Local>.append(&mut builder.locals, Local {ty: Shared<Type>.clone(&unit), kind: LocalKind.Return, origin: origin})
+    run Vector<Local>.append(&mut builder.locals, Local {ty: Shared<Type>.clone(&parameter), kind: LocalKind.Parameter {index: usize.ZERO}, origin: origin})
+    if observing {
+      run Vector<Local>.append(&mut builder.locals, Local {ty: run observerAddress(), kind: LocalKind.Observer, origin: origin})
+      run Vector<Local>.append(&mut builder.locals, Local {ty: run causeType(), kind: LocalKind.Cause, origin: origin})
+    }
+    let word = run Types.intern(Type.Primitive {name: run Bytes.copy(b"usize")})
+    let mut externs = Vector<Shared<DeclarationId>>.make()
+    let mut current = run block(&mut builder)
+    match move cleanup {
+      CoreCleanup.Allocation {free} => {
+        let address = run SealedCore.bytes()
+        let context = run temporary(&mut builder, &word)
+        let released = run temporary(&mut builder, &address)
+        let finished = run temporary(&mut builder, &unit)
+        run statement(&mut builder, current, Statement.Assign {destination: place(context), value: Rvalue.Use {
+          value: Operand.Copy {place: run childPlace(Projection.Field {index: SealedCore.ordinal(CoreField.AllocationContext)})},
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(released), value: Rvalue.AddressIntegerConversion {
+          operand: Operand.Copy {place: place(context)}, destinationType: Shared<Type>.clone(&address),
+        }, origin: origin})
+        let next = run block(&mut builder)
+        let mut arguments = Vector<Operand>.make()
+        run Vector<Operand>.append(&mut arguments, Operand.Copy {place: place(released)})
+        terminate(&mut builder, current, Terminator.Call {
+          callee: Callee.Extern {declaration: Shared<DeclarationId>.clone(&free), variadicArguments: Vector<CAbi.VariadicArgument>.make()}, arguments: move arguments,
+          providers: Vector<Operand>.make(), diagnostics: Option<Diagnostics>.none(), destination: place(finished), normal: next,
+          failure: Option<FailureEdge>.none(), origin: origin,
+        })
+        run Vector<Shared<DeclarationId>>.append(&mut externs, move free)
+        current = next
+      }
+      CoreCleanup.Shared {block: addressed, value, allocation} => {
+        let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+        let pointer = run temporary(&mut builder, &addressed)
+        let count = run temporary(&mut builder, &word)
+        let last = run temporary(&mut builder, &boolean)
+        let strong = SealedCore.ordinal(CoreField.BlockStrong)
+        run statement(&mut builder, current, Statement.Assign {destination: place(pointer), value: Rvalue.Use {
+          value: Operand.Copy {place: run childPlace(Projection.Field {index: SealedCore.ordinal(CoreField.CoreBlock)})},
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(count), value: Rvalue.Use {
+          value: Operand.Copy {place: run blockPlace(pointer, strong)},
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(last), value: Rvalue.Binary {
+          operation: InfixOperator.LessOrEqual, left: Operand.Copy {place: place(count)},
+          right: Operand.Integer {decimal: run Bytes.copy(b"1"), negative: false, ty: Shared<Type>.clone(&word)},
+        }, origin: origin})
+        let decrement = run block(&mut builder)
+        let release = run block(&mut builder)
+        let exit = run block(&mut builder)
+        terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(last)}, thenBlock: release,
+          elseBlock: decrement, origin: origin})
+        run statement(&mut builder, decrement, Statement.Assign {destination: run blockPlace(pointer, strong), value: Rvalue.Binary {
+          operation: InfixOperator.Subtract, left: Operand.Copy {place: place(count)},
+          right: Operand.Integer {decimal: run Bytes.copy(b"1"), negative: false, ty: Shared<Type>.clone(&word)},
+        }, origin: origin})
+        terminate(&mut builder, decrement, Terminator.Goto {target: exit, origin: origin})
+        if let Option<Child>.Some {value: stored} = &value {
+          run dropAt(&mut builder, release, &stored, run blockPlace(pointer, stored.index))
+        }
+        run dropAt(&mut builder, release, &allocation, run blockPlace(pointer, allocation.index))
+        terminate(&mut builder, release, Terminator.Goto {target: exit, origin: origin})
+        current = exit
+      }
+      CoreCleanup.Package {body: started, ready, endpoint, allocation} => {
+        let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+        let mut header = place(usize.ONE)
+        run Vector<Projection>.append(&mut header.projections, Projection.Deref)
+        run Vector<Projection>.append(&mut header.projections, Projection.Field {index: SealedCore.ordinal(CoreField.PackageHeader)})
+        let marker = run temporary(&mut builder, &word)
+        let notifying = run temporary(&mut builder, &boolean)
+        run statement(&mut builder, current, Statement.Assign {destination: place(marker), value: Rvalue.Use {
+          value: Operand.Copy {place: run fieldOf(&header, CoreField.HeaderNotifying)}}, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(notifying), value: Rvalue.Binary {
+          operation: InfixOperator.NotEquals, left: Operand.Copy {place: place(marker)}, right: run wordOf(b"0", &word)}, origin: origin})
+        let deferred = run block(&mut builder)
+        let cleaning = run block(&mut builder)
+        let exit = run block(&mut builder)
+        terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(notifying)}, thenBlock: deferred,
+          elseBlock: cleaning, origin: origin})
+        run statement(&mut builder, deferred, Statement.Assign {destination: run fieldOf(&header, CoreField.HeaderNotifying),
+          value: Rvalue.Use {value: run wordOf(b"2", &word)}, origin: origin})
+        terminate(&mut builder, deferred, Terminator.Goto {target: exit, origin: origin})
+        current = cleaning
+        let state = run temporary(&mut builder, &word)
+        run statement(&mut builder, current, Statement.Assign {destination: place(state), value: Rvalue.Use {
+          value: Operand.Copy {place: run fieldOf(&header, CoreField.HeaderLifecycle)}}, origin: origin})
+        if let Option<Child>.Some {value: stored} = &started {
+          let unstarted = run temporary(&mut builder, &boolean)
+          run statement(&mut builder, current, Statement.Assign {destination: place(unstarted), value: Rvalue.Binary {
+            operation: InfixOperator.Equals, left: Operand.Copy {place: place(state)},
+            right: run wordOf(b"0", &word)}, origin: origin})
+          let release = run block(&mut builder)
+          let rest = run block(&mut builder)
+          terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(unstarted)}, thenBlock: release,
+            elseBlock: rest, origin: origin})
+          run dropAt(&mut builder, release, &stored, run childPlace(Projection.Field {index: stored.index}))
+          terminate(&mut builder, release, Terminator.Goto {target: rest, origin: origin})
+          current = rest
+        }
+        // The frames a relinquished body left in the package are cancelled top-down by its own
+        // driver: a step that finds the package destroyed drops what is live at its point and
+        // abandons its frame, and the driver then destroys the storage state. Wakes see the
+        // package dead from here on.
+        let relinquished = run temporary(&mut builder, &boolean)
+        run statement(&mut builder, current, Statement.Assign {destination: place(relinquished), value: Rvalue.Binary {
+          operation: InfixOperator.Equals, left: Operand.Copy {place: place(state)}, right: run wordOf(b"2", &word)}, origin: origin})
+        let cancelled = run block(&mut builder)
+        let settled = run block(&mut builder)
+        terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(relinquished)}, thenBlock: cancelled,
+          elseBlock: settled, origin: origin})
+        run statement(&mut builder, cancelled, Statement.Assign {destination: run fieldOf(&header, CoreField.HeaderLifecycle),
+          value: Rvalue.Use {value: run wordOf(b"4", &word)}, origin: origin})
+        let erased = run SealedCore.packageAddress()
+        let bytes = run SealedCore.bytes()
+        let package = run temporary(&mut builder, &erased)
+        let start = run temporary(&mut builder, &bytes)
+        let finished = run temporary(&mut builder, &unit)
+        // The header records the package's own erased address, which its start takes.
+        run statement(&mut builder, cancelled, Statement.Assign {destination: place(package), value: Rvalue.Use {
+          value: Operand.Copy {place: run fieldOf(&header, CoreField.HeaderPackage)}}, origin: origin})
+        run statement(&mut builder, cancelled, Statement.Assign {destination: place(start), value: Rvalue.Use {
+          value: Operand.Copy {place: run fieldOf(&header, CoreField.HeaderStart)}}, origin: origin})
+        let mut arguments = Vector<Operand>.make()
+        run Vector<Operand>.append(&mut arguments, Operand.Copy {place: place(package)})
+        // Like a drive, the cancelling driver runs as an independent diagnostic invocation.
+        let mut diagnostics = Option<Diagnostics>.none()
+        if builder.observing {
+          diagnostics = Option<Diagnostics>.some(Diagnostics {observer: Operand.Null {ty: run observerAddress()},
+            cause: Operand.Null {ty: run causeType()}})
+        }
+        terminate(&mut builder, cancelled, Terminator.Call {
+          callee: Callee.Indirect {address: Operand.Copy {place: place(start)}}, arguments: move arguments,
+          providers: Vector<Operand>.make(), diagnostics: move diagnostics, destination: place(finished), normal: settled,
+          failure: Option<FailureEdge>.none(), origin: origin,
+        })
+        current = settled
+        if let Option<Child>.Some {value: stored} = &ready {
+          run dropAt(&mut builder, current, &stored, run childPlace(Projection.Field {index: stored.index}))
+        }
+        if let Option<Child>.Some {value: stored} = &endpoint {
+          run dropAt(&mut builder, current, &stored, run childPlace(Projection.Field {index: stored.index}))
+        }
+        // A completed activation keeps its record; any other package now has no live handle.
+        let completed = run temporary(&mut builder, &boolean)
+        run statement(&mut builder, current, Statement.Assign {destination: place(completed), value: Rvalue.Binary {
+          operation: InfixOperator.Equals, left: Operand.Copy {place: place(state)}, right: run wordOf(b"3", &word)}, origin: origin})
+        let destroyed = run block(&mut builder)
+        let releasing = run block(&mut builder)
+        terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(completed)}, thenBlock: releasing,
+          elseBlock: destroyed, origin: origin})
+        run statement(&mut builder, destroyed, Statement.Assign {destination: run fieldOf(&header, CoreField.HeaderLifecycle),
+          value: Rvalue.Use {value: run wordOf(b"4", &word)}, origin: origin})
+        terminate(&mut builder, destroyed, Terminator.Goto {target: releasing, origin: origin})
+        let released = run releaseAuthority(&mut builder, releasing, &header, &allocation)
+        terminate(&mut builder, released, Terminator.Goto {target: exit, origin: origin})
+        current = exit
+      }
+      CoreCleanup.Reference {header: headerType, allocation} => {
+        let erased = run SealedCore.packageAddress()
+        let headerPointer = run SealedCore.address(&headerType)
+        let package = run temporary(&mut builder, &erased)
+        let integer = run temporary(&mut builder, &word)
+        let pointer = run temporary(&mut builder, &headerPointer)
+        run statement(&mut builder, current, Statement.Assign {destination: place(package), value: Rvalue.Use {
+          value: Operand.Copy {place: run childPlace(Projection.Field {index: SealedCore.ordinal(CoreField.RefPackage)})},
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(integer), value: Rvalue.AddressIntegerConversion {
+          operand: Operand.Copy {place: place(package)}, destinationType: Shared<Type>.clone(&word),
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(pointer), value: Rvalue.AddressIntegerConversion {
+          operand: Operand.Copy {place: place(integer)}, destinationType: Shared<Type>.clone(&headerPointer),
+        }, origin: origin})
+        let mut header = place(pointer)
+        run Vector<Projection>.append(&mut header.projections, Projection.Deref)
+        current = run releaseAuthority(&mut builder, current, &header, &allocation)
+      }
+      CoreCleanup.Execution {header} => {
+        let erased = run SealedCore.packageAddress()
+        let bytes = run SealedCore.bytes()
+        let headerPointer = run SealedCore.address(&header)
+        let package = run temporary(&mut builder, &erased)
+        let integer = run temporary(&mut builder, &word)
+        let pointer = run temporary(&mut builder, &headerPointer)
+        let function = run temporary(&mut builder, &bytes)
+        let finished = run temporary(&mut builder, &unit)
+        run statement(&mut builder, current, Statement.Assign {destination: place(package), value: Rvalue.Use {
+          value: Operand.Copy {place: run childPlace(Projection.Field {index: SealedCore.ordinal(CoreField.ExecutionPackage)})},
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(integer), value: Rvalue.AddressIntegerConversion {
+          operand: Operand.Copy {place: place(package)}, destinationType: Shared<Type>.clone(&word),
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(pointer), value: Rvalue.AddressIntegerConversion {
+          operand: Operand.Copy {place: place(integer)}, destinationType: Shared<Type>.clone(&headerPointer),
+        }, origin: origin})
+        run statement(&mut builder, current, Statement.Assign {destination: place(function), value: Rvalue.Use {
+          value: Operand.Copy {place: run blockPlace(pointer, SealedCore.ordinal(CoreField.HeaderDrop))},
+        }, origin: origin})
+        let next = run block(&mut builder)
+        let mut arguments = Vector<Operand>.make()
+        run Vector<Operand>.append(&mut arguments, Operand.Copy {place: place(package)})
+        let diagnostics = run hidden(&builder)
+        terminate(&mut builder, current, Terminator.Call {
+          callee: Callee.Indirect {address: Operand.Copy {place: place(function)}}, arguments: move arguments,
+          providers: Vector<Operand>.make(), diagnostics: move diagnostics, destination: place(finished), normal: next,
+          failure: Option<FailureEdge>.none(), origin: origin,
+        })
+        current = next
+      }
+    }
+    terminate(&mut builder, current, Terminator.Return {origin: origin})
+    run MirFunction.sortReferences(&mut builder.references)
+    let mut parameters = Vector<Shared<Type>>.make()
+    run Vector<Shared<Type>>.append(&mut parameters, move parameter)
+    return MirFunction {
+      key: move key, borrow: BorrowStatus.Checked, result: move unit, parameters: move parameters, locals: move builder.locals,
+      blocks: move builder.blocks, references: move builder.references, externs: move externs,
+      observes: false, contexts: Vector<ContextText>.make(), traps: Vector<TrapSite>.make(), suspension: Option<Origin>.none(), parks: Option<Origin>.none(), releasesPackages: releases, nonParking: Vector<NonParkingRun>.make(), cancels: Vector<Cancel>.make(), accesses: Vector<SharedAccess>.make(), escapes: Vector<EscapeSite>.make(),
+    }
+  }
+}
+
+// Releases one unit of authority over the package allocation the header at `header` holds; the
+// last unit drops that allocation, after which nothing reads the package. Returns the block that
+// continues.
+effect fn releaseAuthority(builder: &mut Builder, at: usize, header: &Place, allocation: &Child) -> usize
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let origin = builder.origin
+  let word = run Types.intern(Type.Primitive {name: run Bytes.copy(b"usize")})
+  let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+  let count = run temporary(&mut builder.*, &word)
+  let last = run temporary(&mut builder.*, &boolean)
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(count), value: Rvalue.Use {
+    value: Operand.Copy {place: run fieldOf(header, CoreField.HeaderAuthority)}}, origin: origin})
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(last), value: Rvalue.Binary {
+    operation: InfixOperator.LessOrEqual, left: Operand.Copy {place: place(count)}, right: run wordOf(b"1", &word)}, origin: origin})
+  let decrement = run block(&mut builder.*)
+  let release = run block(&mut builder.*)
+  let exit = run block(&mut builder.*)
+  terminate(&mut builder.*, at, Terminator.Branch {condition: Operand.Copy {place: place(last)}, thenBlock: release,
+    elseBlock: decrement, origin: origin})
+  run statement(&mut builder.*, decrement, Statement.Assign {destination: run fieldOf(header, CoreField.HeaderAuthority),
+    value: Rvalue.Binary {operation: InfixOperator.Subtract, left: Operand.Copy {place: place(count)}, right: run wordOf(b"1", &word)},
+    origin: origin})
+  terminate(&mut builder.*, decrement, Terminator.Goto {target: exit, origin: origin})
+  run dropAt(&mut builder.*, release, allocation, run fieldOf(header, CoreField.HeaderAllocation))
+  terminate(&mut builder.*, release, Terminator.Goto {target: exit, origin: origin})
+  return exit
+}
+
+// One field of the package header at `header`.
+effect fn fieldOf(header: &Place, field: CoreField) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut projected = place(header.local)
+  let steps = Vector<Projection>.asSlice(&header.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    run Vector<Projection>.append(&mut projected.projections, copyStep(&steps[at]))
+    at = at + usize.ONE
+  }
+  run Vector<Projection>.append(&mut projected.projections, Projection.Field {index: SealedCore.ordinal(field)})
+  return move projected
+}
+
+fn copyStep(value: &Projection) -> Projection {
+  return match &value.* {
+    Projection.Field {index} => Projection.Field {index: index}
+    Projection.Payload {index, ty} => Projection.Payload {index: index, ty: Shared<Type>.clone(&ty)}
+    Projection.VariantField {variant, field} => Projection.VariantField {variant: variant, field: field}
+    Projection.Index {local} => Projection.Index {local: local}
+    Projection.ConstIndex {index} => Projection.ConstIndex {index: index}
+    Projection.Deref => Projection.Deref
+  }
+}
+
+effect fn wordOf(decimal: &[u8], word: &Shared<Type>) -> Operand ! OutOfMemoryError ? &mut Allocator {
+  return Operand.Integer {decimal: run Bytes.copy(decimal), negative: false, ty: Shared<Type>.clone(word)}
+}
+
+// One field of the control block a pointer local addresses.
+effect fn blockPlace(pointer: usize, field: usize) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut projected = place(pointer)
+  run Vector<Projection>.append(&mut projected.projections, Projection.Deref)
+  run Vector<Projection>.append(&mut projected.projections, Projection.Field {index: field})
+  return move projected
+}
+
+// Drops one child at an explicit place through its glue.
+effect fn dropAt(builder: &mut Builder, at: usize, child: &Child, destination: Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let diagnostics = run hidden(&builder.*)
+  run statement(&mut builder.*, at, Statement.Drop {destination: move destination, glue: InstanceKey.copy(&child.glue),
+    diagnostics: move diagnostics, origin: origin})
+  return run Vector<Reference>.append(&mut builder.*.references, Reference {key: InstanceKey.copy(&child.glue), edge: Edge.Direct, origin: origin})
+}
+
+// The glue's own observer and cause, passed on unchanged (N1).
+effect fn hidden(builder: &Builder) -> Option<Diagnostics> ! OutOfMemoryError ? &mut Allocator {
+  if !builder.observing { return Option<Diagnostics>.none() }
+  return Option<Diagnostics>.some(Diagnostics {observer: Operand.Copy {place: place(2)}, cause: Operand.Copy {place: place(3)}})
+}
+
+fn place(local: usize) -> Place {
+  return Place {local: local, projections: Vector<Projection>.make()}
+}
+
+// The child `step` beneath the value the parameter addresses.
+effect fn childPlace(step: Projection) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut projected = place(usize.ONE)
+  run Vector<Projection>.append(&mut projected.projections, Projection.Deref)
+  run Vector<Projection>.append(&mut projected.projections, move step)
+  return move projected
+}
+
+effect fn block(builder: &mut Builder) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let index = Vector<Block>.length(&builder.blocks)
+  run Vector<Block>.append(&mut builder.*.blocks, Block {statements: Vector<Statement>.make(), terminator: Terminator.Unreachable {origin: origin}})
+  return index
+}
+
+effect fn temporary(builder: &mut Builder, ty: &Shared<Type>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let index = Vector<Local>.length(&builder.locals)
+  run Vector<Local>.append(&mut builder.*.locals, Local {ty: Shared<Type>.clone(ty), kind: LocalKind.Temp, origin: origin})
+  return index
+}
+
+fn terminate(builder: &mut Builder, at: usize, terminator: Terminator) -> () {
+  let mut blocks = Vector<Block>.asMutSlice(&mut builder.*.blocks)
+  blocks[at].terminator = move terminator
+  return ()
+}
+
+effect fn statement(builder: &mut Builder, at: usize, value: Statement) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut blocks = Vector<Block>.asMutSlice(&mut builder.*.blocks)
+  return run Vector<Statement>.append(&mut blocks[at].statements, move value)
+}
+
+effect fn dropChild(builder: &mut Builder, at: usize, child: &Child, step: Projection) -> () ! OutOfMemoryError ? &mut Allocator {
+  let origin = builder.origin
+  let diagnostics = run hidden(&builder.*)
+  run statement(&mut builder.*, at, Statement.Drop {destination: run childPlace(move step), glue: InstanceKey.copy(&child.glue),
+    diagnostics: move diagnostics, origin: origin})
+  return run Vector<Reference>.append(&mut builder.*.references, Reference {key: InstanceKey.copy(&child.glue), edge: Edge.Direct, origin: origin})
+}
+
+// Drops elements 0 through `count - 1` in ascending order with one counted loop.
+effect fn dropElements(builder: &mut Builder, at: usize, element: &Child, count: usize) -> usize ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let origin = builder.origin
+  let index = run Types.intern(Type.Primitive {name: run Bytes.copy(b"usize")})
+  let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+  let counter = run temporary(&mut builder.*, &index)
+  let condition = run temporary(&mut builder.*, &boolean)
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(counter), value: Rvalue.Use {
+    value: Operand.Integer {decimal: run Bytes.copy(b"0"), negative: false, ty: Shared<Type>.clone(&index)},
+  }, origin: origin})
+  let header = run block(&mut builder.*)
+  let body = run block(&mut builder.*)
+  let exit = run block(&mut builder.*)
+  terminate(&mut builder.*, at, Terminator.Goto {target: header, origin: origin})
+  run statement(&mut builder.*, header, Statement.Assign {destination: place(condition), value: Rvalue.Binary {
+    operation: InfixOperator.LessThan, left: Operand.Copy {place: place(counter)},
+    right: Operand.Integer {decimal: run Type.extentText(count), negative: false, ty: Shared<Type>.clone(&index)},
+  }, origin: origin})
+  terminate(&mut builder.*, header, Terminator.Branch {condition: Operand.Copy {place: place(condition)}, thenBlock: body, elseBlock: exit, origin: origin})
+  run dropChild(&mut builder.*, body, element, Projection.Index {local: counter})
+  run statement(&mut builder.*, body, Statement.Assign {destination: place(counter), value: Rvalue.Binary {
+    operation: InfixOperator.Add, left: Operand.Copy {place: place(counter)},
+    right: Operand.Integer {decimal: run Bytes.copy(b"1"), negative: false, ty: Shared<Type>.clone(&index)},
+  }, origin: origin})
+  terminate(&mut builder.*, body, Terminator.Goto {target: header, origin: origin})
+  return exit
+}
+
+effect fn tagsOf(children: &[Child]) -> Vector<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut tags = Vector<usize>.make()
+  let mut at = usize.ZERO
+  while at < children.length {
+    run Vector<usize>.append(&mut tags, children[at].index)
+    at = at + usize.ONE
+  }
+  return move tags
+}
+
+// Switches on the union tag: each listed tag runs its arm, and every other tag cleans nothing.
+effect fn dispatch(builder: &mut Builder, at: usize, count: usize, tags: &[usize], arms: &[usize]) -> usize
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let origin = builder.origin
+  let exit = run block(&mut builder.*)
+  let tagType = run Layout.tagType(count)
+  let tag = run temporary(&mut builder.*, &tagType)
+  let mut subject = place(usize.ONE)
+  run Vector<Projection>.append(&mut subject.projections, Projection.Deref)
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(tag), value: Rvalue.Discriminant {place: move subject}, origin: origin})
+  let mut cases = Vector<SwitchCase>.make()
+  let mut index = usize.ZERO
+  while index < tags.length {
+    run Vector<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(tags[index]), negative: false, target: arms[index]})
+    terminate(&mut builder.*, arms[index], Terminator.Goto {target: exit, origin: origin})
+    index = index + usize.ONE
+  }
+  terminate(&mut builder.*, at, Terminator.Switch {value: Operand.Copy {place: place(tag)}, cases: move cases, otherwise: exit, origin: origin})
+  return exit
+}

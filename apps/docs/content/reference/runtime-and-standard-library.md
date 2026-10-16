@@ -693,9 +693,11 @@ have explicit ownership and cleanup; there is no private generated host-input st
 
 **Status:** Confirmed
 
-Explicit imports determine the dependency-complete source closure that must parse and type-check.
-Concrete specialization and artifact-root reachability determine the executable closure that may emit code,
-static data, host imports, adapters, and toolchain runtime support.
+Explicit imports determine the dependency-complete source closure that must parse. Active closed
+declarations in loaded root-package modules are checked even when unused; dependency declarations,
+including the standard library, are checked when reached. Concrete specialization and artifact-root
+reachability determine the executable closure that may emit code, static data, host imports,
+adapters, and toolchain runtime support.
 
 Importing an unused module therefore has source-analysis cost but no runtime behavior. An unreachable
 function, constant, provider, or intrinsic contributes no executable support solely because its
@@ -721,8 +723,9 @@ source compatibility after the fact.
 verification rejects unrelated host imports, runtime symbols, static tables, or adapters not
 justified by the retained executable inventory.
 
-**Current compiler:** Aligned for intrinsic operations. Source analysis follows explicit import
-closure, while executable support follows reachable specialized operations.
+**Current compiler:** Aligned for intrinsic operations. Source loading follows explicit import
+closure, root-package declaration checking follows MODULE-004, and executable support follows
+reachable specialized operations.
 
 **Evidence:** [TARGET-002](unsafe-intrinsics-and-targets.md#target-002--unreachable-target-specific-primitives-have-no-artifact-cost),
 [explicit module closure](modules-names-and-visibility.md#module-004--compilation-loads-only-the-transitively-reachable-module-closure),

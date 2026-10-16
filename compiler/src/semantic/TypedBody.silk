@@ -1,0 +1,1548 @@
+//! Typed nodes and retained evidence for one function body.
+//!
+//! # When to use
+//! Use [`TypedBody`] after a body demand succeeds. Inspect [`Stage`] before treating a body as
+//! fully checked: abstract and other non-scalar bodies retain safety obligations.
+//!
+//! # Details
+//! Syntax identities in nodes and local entries belong to the source observation returned with
+//! the body result. Local IDs belong only to this body. Direct calls use canonical identities.
+
+import semantic.Types {Types}
+import hir.Hir {CallableMode, Access, HirId, InfixOperator, PrefixOperator}
+import backend.CAbi
+import lexer.Span {Span}
+import semantic.Anchor {Anchor}
+import semantic.SourceLocations {Location}
+import semantic.DeclarationId {DeclarationId}
+import semantic.CallableSchema {CallableSchema}
+import semantic.Lifetime {Lifetime}
+import semantic.Intrinsic {Member}
+import semantic.StorageOperation {StorageOperation}
+import semantic.Type {Argument, Binding, KeptRegions, Type}
+import semantic.Specialization {Application}
+import semantic.StaticValue {IntegerType as StaticIntegerType, Value as StaticData}
+import silk.bytes {Bytes}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.shared {Shared}
+import silk.u64
+import silk.usize
+import silk.vector {Vector}
+
+/// The position of one typed node in its owning body.
+pub struct NodeId {
+  /// The zero-based position in `TypedBody.nodes`.
+  pub index: usize
+}
+
+impl Copy for NodeId {}
+
+/// The position of one parameter or binding in its owning body.
+pub struct LocalId {
+  /// The zero-based position in `TypedBody.locals`.
+  pub index: usize
+}
+
+impl Copy for LocalId {}
+
+/// The declared way a receiver-call argument is passed to parameter zero.
+pub enum ReceiverPass {
+  /// Share a loan of the receiver place.
+  Shared,
+  /// Take an exclusive loan of the receiver place.
+  Mutable,
+  /// Transfer ownership of the receiver value.
+  Take,
+}
+
+/// A syntax node and token-boundary range relative to the declaration that owns a typed body.
+/// Trivia edits preserve this value. Read it back through
+/// `Origin.syntax` and `Origin.span` against the current source.
+pub struct Origin {
+  /// The HIR node, counted from the declaration's first node.
+  pub node: usize
+  /// Significant-token boundaries, counted from the declaration's first token.
+  pub location: Location
+}
+
+impl Copy for Origin {}
+
+impl Origin {
+  /// The origin of node `syntax` at `span`, both inside the declaration `anchor` starts.
+  pub fn at(anchor: &Anchor, syntax: HirId, span: Span) -> Origin {
+    return Origin {node: Anchor.node(anchor, syntax), location: Anchor.location(anchor, span)}
+  }
+  /// The current node this origin names, given its declaration's current anchor.
+  pub fn syntax(self: Self, anchor: &Anchor) -> HirId {
+    return Anchor.hir(anchor, self.node)
+  }
+  /// The current byte span this origin names, given its declaration's current anchor.
+  pub fn span(self: Self, anchor: &Anchor) -> Span {
+    return Anchor.span(anchor, self.location)
+  }
+}
+
+/// One parameter or binding whose type is fixed in a checked body.
+pub struct Local {
+  /// The source binder that introduced this local.
+  pub origin: Origin
+  /// The type selected when the parameter or binding was declared.
+  pub ty: Shared<Type>
+  /// Whether this body may replace the complete stored value.
+  pub mutable: bool
+  /// The loop depth of an unannotated reassignable binding. An assignment at that depth meets the
+  /// binding's regions with the assigned value's (LIFE-003); none for every other local.
+  pub meetDepth: Option<usize>
+}
+
+/// One expression form accepted by body checking.
+pub union Expression {
+  /// An integer whose exact sign and magnitude remain in the owning HIR node.
+  Integer {
+    /// The integer literal's node, counted from the body's anchor.
+    pub literal: usize,
+  },
+  /// A floating literal whose width was selected by checking its source context.
+  Float {
+    /// The floating literal's node, counted from the body's anchor.
+    pub literal: usize,
+  },
+  /// A decoded text or byte-string literal retained in its owning HIR node, counted from the
+  /// body's anchor.
+  Text {pub literal: usize},
+  /// A Boolean value.
+  Boolean {
+    /// The checked Boolean value.
+    pub value: bool,
+  },
+  /// The unit value.
+  Unit,
+  /// A parameter or binding in this body.
+  Local {
+    /// The body-local entry for this use.
+    pub local: LocalId,
+  },
+  /// A loan of a checked place; lifetime safety remains an explicit obligation.
+  Borrow {pub access: Access, pub value: NodeId},
+  /// Remove a raw pointer's mutation capability or add nullability, retaining its actual source
+  /// operand.
+  PointerWeaken {pub value: NodeId},
+  /// A checked projection through one reference or raw pointer.
+  Dereference {pub value: NodeId},
+  /// One checked record projection; the ordinal belongs to its nominal declaration.
+  Field {pub value: NodeId, pub index: usize},
+  /// An explicit array reference converted to a borrowed pointer/length descriptor.
+  ArraySlice {pub value: NodeId, pub count: usize},
+  /// A slice subject is evaluated before reading its runtime logical length.
+  SliceLength {pub value: NodeId},
+  /// One checked array or slice element; the index is evaluated after the subject. `element` is
+  /// the in-bounds element a non-negative integer literal names in a fixed array, the static
+  /// component ownership tracks, or `usize.MAX` for an index that names an element only at run
+  /// time.
+  Index {pub value: NodeId, pub index: NodeId, pub element: usize},
+  /// The array subject is evaluated before its type-known logical length is read.
+  ArrayLength {pub value: NodeId, pub count: usize},
+  /// Aggregate operands in source evaluation order, retaining destination field ordinals.
+  Aggregate {pub fields: Vector<AggregateField>},
+  /// Construction of an exact anonymous environment. Its checked body is a separate declaration.
+  /// `referents` names the fields that hold a captured exclusive reference descriptor.
+  Callable {pub fields: Vector<AggregateField>, pub referents: Vector<ReferentCapture>, pub body: Shared<TypedBody>},
+  /// A stored callable evaluated once, followed by newly retained trailing operands. The exact
+  /// result type describes whether its original environment stays nested or its fields flatten.
+  StagedCallable {pub callee: NodeId, pub mode: CallableMode, pub arguments: Vector<NodeId>},
+  /// A static body's constant read at its declared type; static execution demands the value only
+  /// if reached. A runtime body reads a constant as its published `Embedded` value instead.
+  Constant {pub declaration: Shared<DeclarationId>},
+  /// One read of an imported C static. Its admitted scalar or pointer type is copied.
+  ForeignStatic {pub declaration: Shared<DeclarationId>},
+  /// The guarded C entry symbol of one monomorphic exported function.
+  ForeignAddress {pub declaration: Shared<DeclarationId>, pub symbol: Shared<Bytes>},
+  /// One selected scalar enum member, carrying its validated representation value.
+  EnumMember {pub member: EnumMember},
+  /// A scalar enum operand read as its backing integer; the bits are unchanged.
+  EnumValue {pub value: NodeId},
+  /// A closed member value stored in its structural union under the member's canonical tag.
+  UnionInject {pub tag: usize, pub value: NodeId},
+  /// A structural union value stored in a wider union: each of its members keeps its value under
+  /// that member's canonical tag in the wider union.
+  UnionWiden {pub value: NodeId},
+  /// One nominal union variant with its written fields in source order and declaration-order tag.
+  VariantConstruct {pub tag: usize, pub fields: Vector<AggregateField>},
+  /// A pattern binding: a place reached from the matched subject by `path`, read as `access`. Its
+  /// arm lists the node that declares it; every use is a separate node with the same subject and path.
+  PatternBinding {pub subject: NodeId, pub path: Vector<PlaceStep>, pub access: BindingAccess},
+  /// A subject evaluated once, then tested against arms in written order. A `Place` access
+  /// addresses the subject's own storage; otherwise arms read the evaluated subject. `tags` counts
+  /// the members or variants of a tagged union subject and is zero otherwise.
+  Match {
+    pub subject: NodeId,
+    pub access: SubjectAccess,
+    pub tags: usize,
+    /// Whole subject members for flow coverage; MAX denotes an open scalar domain.
+    /// Enum members are finite even though their scalar representation needs no union tags.
+    pub domain: usize,
+    pub arms: Vector<MatchArm>,
+    /// The form this match was written as, which fixes where a consuming match's arm bindings and
+    /// the subject parts no binding took end.
+    pub syntax: MatchSyntax,
+  },
+  /// A statically reached error; the checked message is evaluated before the diagnostic.
+  CompileError {pub message: NodeId},
+  /// A static value selected for this body, checked at its exact type. It has no runtime
+  /// local, call or reference: a `let static` read, a static-helper call or a constant read.
+  Embedded {pub value: Shared<StaticData>},
+  /// A transfer of an owned value: an explicit `move`, or a by-value receiver of an affine place.
+  Move {
+    /// The typed operand being transferred.
+    pub value: NodeId,
+    /// The place the operand leaves without an owner, or absence for an owned rvalue operand.
+    pub consumed: Option<ConsumedPlace>,
+  },
+  /// Invocation through an exact representation; specialization chooses its direct body target.
+  CallableCall {
+    pub callee: NodeId,
+    pub mode: CallableMode,
+    pub arguments: Vector<NodeId>,
+    /// The fresh owner and inferred invocation assignments, retained until direct specialization.
+    pub inference: Shared<DeclarationId>,
+    pub bindings: Shared<Vector<Binding>>,
+    /// Pipelines finish their input before evaluating the callable target.
+    pub pipeline: bool,
+    /// Whether this invokes an `effect fn` value, constructing its Effect. Only a `run` of the
+    /// invocation calls the target; otherwise its operands are stored as the Effect (EFF-001).
+    pub constructs: bool,
+    /// What the callee can keep of each argument once the call returns, in argument order, as
+    /// this body's regions. Borrow checking reads them to decide whether a loan the body made at one
+    /// of its universal regions outlives it (R3 amendment 4).
+    pub kept: Shared<Vector<KeptRegions>>,
+  },
+  /// A call to a canonical function declaration with arguments in evaluation order.
+  DirectCall {
+    /// The canonical called declaration.
+    pub declaration: DeclarationId,
+    /// The complete canonical target environment after call inference.
+    pub application: Shared<Application>,
+    /// The selected receiver pass, absent for an explicitly written call.
+    pub receiverPass: Option<ReceiverPass>,
+    /// Whether the declaration is an `effect fn`: the call constructs the Effect it promises, with
+    /// its written arguments as the Effect's fields, and only the `run` it is the immediate operand
+    /// of executes it (EFF-001, EFFECT-OWN-001).
+    pub constructs: bool,
+    /// Arguments whose outer shared-reference region is the result's same declared parameter.
+    /// Recorded before inference coalesces caller atoms; this grants no region-validity premise.
+    pub resultBorrows: Vector<NodeId>,
+    /// The arguments in evaluation order.
+    pub arguments: Vector<NodeId>,
+    /// What the callee can keep of each argument once the call returns, in argument order, as
+    /// this body's regions. Borrow checking reads them to decide whether a loan the body made at one
+    /// of its universal regions outlives it (R3 amendment 4).
+    pub kept: Shared<Vector<KeptRegions>>,
+  },
+  /// An immediate C call. Its signature is a dependency, never a runtime body.
+  ForeignCall {
+    pub declaration: DeclarationId,
+    pub arguments: Vector<NodeId>,
+    /// Source types and their C promotions, one per unnamed integer argument.
+    pub variadicArguments: Shared<Vector<CAbi.VariadicArgument>>,
+  },
+  /// `run` executes exactly one Effect layer (EFF-003). The operand's exact representation names
+  /// its runner; its failures propagate through the enclosing failure channel.
+  Run {pub value: NodeId, pub access: RunAccess},
+  /// A sealed compiler primitive selected and type-checked by the semantic resolver.
+  IntrinsicCall {pub member: Member, pub arguments: Vector<NodeId>},
+  /// A sealed storage primitive over the core storage types, instantiated from `typeArguments`.
+  /// `replace` reads its first argument as the mutable place it displaces.
+  StorageCall {pub operation: StorageOperation, pub typeArguments: Vector<Shared<Type>>, pub arguments: Vector<NodeId>},
+  /// A closed scalar prefix operation, with its operand evaluated once.
+  ConcretePrefix {pub operator: PrefixOperator, pub operand: NodeId},
+  /// A closed scalar or string infix operation; left precedes right at runtime.
+  ConcreteInfix {pub operator: InfixOperator, pub left: NodeId, pub right: NodeId},
+  /// An interface operation selected with a declared bound or a concrete witness.
+  InterfaceCall {
+    /// The exact selected interface application.
+    pub contract: Shared<Type>,
+    /// The exact provider type used for conformance selection.
+    pub provider: Shared<Type>,
+    /// The canonical operation declared by the interface.
+    pub operation: DeclarationId,
+    /// Existing argument-checking assignments, retaining actual caller regions.
+    pub bindings: Shared<Vector<Binding>>,
+    /// The selected concrete witness, or absence when a declared bound supplies the operation.
+    pub implementation: Option<Shared<DeclarationId>>,
+    /// The selected receiver pass, absent for a qualified or operator call.
+    pub receiverPass: Option<ReceiverPass>,
+    /// Whether the operation is an `effect fn`: the call constructs the Effect its contract
+    /// promises, and only the `run` it is the immediate operand of may execute it, as one call of
+    /// the selected witness.
+    pub isEffect: bool,
+    /// The arguments in source evaluation order, including a written or adapted receiver.
+    pub arguments: Vector<NodeId>,
+    /// What the callee can keep of each argument once the call returns, in argument order, as
+    /// this body's regions. Borrow checking reads them to decide whether a loan the body made at one
+    /// of its universal regions outlives it (R3 amendment 4).
+    pub kept: Shared<Vector<KeptRegions>>,
+  },
+}
+
+/// One scalar enum member and its validated representation value in sign-magnitude form.
+pub struct EnumMember {
+  /// The member's position in its enum declaration.
+  pub ordinal: usize
+  pub negative: bool
+  pub magnitude: u64
+  /// The enum's representation integer type, which a static enum value records.
+  pub representation: StaticIntegerType
+}
+
+impl Copy for EnumMember {}
+
+/// One structural-union member selected by its original source ordinal.
+pub struct UnionMember {
+  pub tag: usize
+  pub ty: Shared<Type>
+  pub source: Shared<Type>
+}
+
+/// A checked pattern. Coverage was validated against the subject's complete member set.
+pub union Pattern {
+  /// Accepts every value not selected by an earlier arm.
+  Universal,
+  /// Selects exactly one scalar enum member.
+  EnumMember {pub member: EnumMember},
+  /// Selects one structural-union member, or the record subject itself, with irrefutable fields.
+  Record {pub member: Option<UnionMember>},
+  /// Selects one nominal union variant by its declaration-order tag.
+  Variant {pub tag: usize},
+  /// Selects one integer value of an integer scrutinee: its decimal magnitude and sign.
+  Integer {pub magnitude: u64, pub negative: bool},
+}
+
+/// One statically known projection from a matched subject or consumed root toward a place.
+pub union PlaceStep {
+  /// The payload selected by an ordinal in the retained original source union.
+  Member {pub tag: usize, pub ty: Shared<Type>, pub source: Shared<Type>},
+  /// One field of the nominal union variant with this declaration-order tag.
+  VariantField {pub tag: usize, pub field: usize},
+  /// One record field.
+  Field {pub index: usize},
+  /// One fixed-array element at a statically known in-bounds index.
+  Element {pub index: usize},
+}
+
+/// The owner a consumed place is projected from.
+pub union PlaceRoot {
+  /// A parameter or binding of this body.
+  Local {pub local: LocalId},
+  /// The evaluated subject of the match whose arm binds the consumed place.
+  Subject {pub subject: NodeId},
+}
+
+/// An owned place a consuming site transfers out of: its root and static projection path. An empty
+/// path consumes the complete root (OWN-003); a non-empty path is a partial move (OWN-004).
+pub struct ConsumedPlace {
+  pub root: PlaceRoot
+  pub steps: Vector<PlaceStep>
+}
+
+/// How a match reads its subject (MATCH-001).
+pub union SubjectAccess {
+  /// A bare match reads one copy of a Copy subject.
+  Copy,
+  /// `match move` consumes the subject: its place when it names one, otherwise an owned rvalue.
+  Consume {pub consumed: Option<ConsumedPlace>},
+  /// `match place`, `match &` and `match &mut` address the subject's own storage.
+  /// The access distinguishes owned inspection from a borrowing read for ownership diagnostics.
+  Place {pub access: BindingAccess},
+}
+
+/// How a `run` reaches its operand.
+pub enum RunAccess {
+  /// The operand is itself an `effect fn` call, an `effect fn` interface operation call, or an
+  /// invocation of an `effect fn` value: the run is that one call (EFF-003).
+  Immediate,
+  /// A stored Effect runs through its runner (D1) with shared access and may run again
+  /// (EFFECT-OWN-002).
+  Shared,
+  /// A stored `mut Effect` runs through exclusive access to its place.
+  Exclusive,
+  /// A stored `once Effect` is consumed by its run; the operand is a typed move.
+  Once,
+}
+
+/// How an arm-local binding reaches the matched subject.
+pub enum BindingAccess {
+  /// A bare match's binding reads a copy of a Copy subject.
+  Copied,
+  /// A `match move` binding owns its part of the consumed subject (MATCH-002).
+  Moved,
+  /// A `match place` binding names the subject's own storage.
+  Place,
+  /// A `match &` binding is a shared view of the subject.
+  Shared,
+  /// A `match &mut` binding, the only binding that may be borrowed or assigned exclusively.
+  Exclusive,
+}
+
+/// The form a match was written as. For a consuming match it fixes where the selected arm's
+/// by-value bindings and the subject parts that no binding took end.
+pub enum MatchSyntax {
+  /// A written `match`: both end with the selected arm (MATCH-002).
+  Match,
+  /// An `if let`: the taken body keeps the parts no binding took until it exits, after its
+  /// bindings (MATCH-002); a mismatch drops the whole subject before its path runs (PATT-008).
+  IfLet,
+  /// A destructuring `let`: the parts no binding took are dropped when it binds, and its bindings
+  /// stay in the enclosing block (PATT-006).
+  Let,
+}
+
+/// One match arm; a guard, when present, is tested only after its pattern selects the value.
+/// One nested refutable test of an arm: the union value at `path` from the subject must hold the
+/// member or variant `tag` of its `tags` alternatives.
+pub struct PatternTest {
+  pub path: Vector<PlaceStep>
+  pub tag: usize
+  pub tags: usize
+  /// Present for structural unions; nominal variants keep their declaration-order tags.
+  pub source: Option<Shared<Type>>
+}
+
+pub struct MatchArm {
+  pub origin: Origin
+  pub pattern: Pattern
+  /// Nested tests in preorder; the arm is selected only when every one holds.
+  pub tests: Vector<PatternTest>
+  pub guard: Option<NodeId>
+  pub result: NodeId
+  /// The `PatternBinding` nodes that declare this arm's bindings, in pattern order. No expression
+  /// references them, so a binding that is never used is still declared (MATCH-002).
+  pub bindings: Vector<NodeId>
+}
+
+/// A written aggregate operand and its canonical destination field.
+pub struct AggregateField {
+  pub index: usize
+  pub value: NodeId
+}
+
+/// An environment field holding a captured exclusive reference. The field keeps the descriptor, and
+/// construction takes a loan of its referent with the access the body needs through it, so the
+/// capture suspends the parent reference while the callable lives (CAPTURE-002, ANON-OWN-001).
+pub struct ReferentCapture {
+  pub field: usize
+  pub access: Access
+}
+
+impl Copy for ReferentCapture {}
+
+/// One typed expression or control-flow node in a checked body.
+pub union NodeKind {
+  /// An expression with its resolved semantic type.
+  Expression {
+    /// The checked semantic type.
+    pub ty: Shared<Type>,
+    /// The accepted expression form.
+    pub form: Expression,
+  },
+  /// An immutable local and its initializer.
+  LocalBinding {
+    /// The body-local entry introduced by this statement.
+    pub local: LocalId,
+    /// The initializing expression.
+    pub initializer: NodeId,
+  },
+  /// A mutable evaluator-local slot and its initial complete value.
+  MutableBinding {pub local: LocalId, pub initializer: NodeId},
+  /// Replacement of one complete mutable evaluator-local value.
+  Assignment {pub local: LocalId, pub value: NodeId},
+  /// Replacement through a checked mutable projected place.
+  PlaceAssignment {pub target: NodeId, pub value: NodeId},
+  /// An explicit return, with no value for unit return.
+  Return {
+    /// The returned expression, or absence for unit return.
+    pub value: Option<NodeId>,
+  },
+  /// A runtime branch with both arms retained in source order.
+  Branch {
+    /// The checked Boolean condition.
+    pub condition: NodeId,
+    /// The arm executed when the condition is true.
+    pub thenBranch: NodeId,
+    /// The arm executed when the condition is false, if written.
+    pub elseBranch: Option<NodeId>,
+    /// Whether at least one runtime arm can continue after the branch.
+    pub canComplete: bool,
+  },
+  /// A static loop with a checked Boolean condition and body.
+  While {pub condition: NodeId, pub body: NodeId},
+  /// Exit the nearest static loop.
+  Break,
+  /// Restart the nearest static loop.
+  Continue,
+  /// `fail value` exits through the enclosing failure channel after ordinary cleanup (FAIL-002).
+  /// The value already has the body's failure type.
+  Fail {pub value: NodeId},
+  /// `drop value` ends the operand's ownership and cleans its live remainder here (DROP-001).
+  Drop {
+    /// The typed operand, evaluated before its cleanup.
+    pub value: NodeId,
+    /// The place whose ownership ends, or absence for an owned rvalue operand.
+    pub consumed: Option<ConsumedPlace>,
+  },
+  /// A statement whose check failed in a body that is rejected. Only that body's ownership check
+  /// reads it, as a point no path continues past; no checked body contains one.
+  Recovered {
+    /// Whether the statement surely let a path continue past it: it holds only literals, `if`,
+    /// `else`, `while` and braces, so the statements after it are checked from the body's entry.
+    pub resumes: bool,
+  },
+  /// A sequence of statements in source order.
+  Block {
+    /// The statements in source order.
+    pub statements: Vector<NodeId>,
+    /// Whether a reachable path can continue after the block.
+    pub canComplete: bool,
+  },
+}
+
+/// A typed node and its exact source position.
+pub struct Node {
+  /// The syntax node and byte span in the body source.
+  pub origin: Origin
+  /// The typed expression or statement form.
+  pub kind: NodeKind
+}
+
+/// A canonical function signature required to type this body.
+pub struct SignatureDependency {
+  /// The declaration whose written signature was demanded.
+  pub declaration: DeclarationId
+}
+
+/// Safety work retained after typing a body against its written contract.
+pub union SafetyObligation {
+  /// A call-prefix lifetime hole absent from all parameter types remains a body-scoped
+  /// inference choice. Its later relations constrain it; this fact is never a universal premise.
+  RegionChoice {pub origin: Origin, pub region: Shared<Lifetime>},
+  /// Symbolic owned contents were captured for finite body use. This local requirement is
+  /// retained for borrow checking and is never a declared outlives premise.
+  Contents {pub origin: Origin, pub subject: Shared<Type>, pub region: Shared<Lifetime>},
+  /// A non-scalar value was introduced, read, or forwarded; ownership and cleanup remain open.
+  WholeValue {
+    /// The source place that must be checked in the later safety stage.
+    pub origin: Origin,
+    /// The exact type at that place, including any declaration-owned symbolic parameters.
+    pub ty: Shared<Type>,
+  },
+  /// A written-signature or interface call was typed; argument ownership and lifetimes remain open.
+  Invocation {
+    /// The call that must be checked in the later safety stage.
+    pub origin: Origin,
+    /// The called declaration or interface operation, without requiring its body to type this call.
+    pub declaration: DeclarationId,
+  },
+  /// A delayed invocation retains its exact callable contract and receiver place.
+  CallableInvocation {pub origin: Origin, pub callee: NodeId, pub contract: Shared<Type>},
+  /// A receiver pass needs place, move, and loan validation at the later safety stage.
+  ReceiverPass {
+    /// The receiver-call source site.
+    pub origin: Origin,
+    /// The selected receiver operand, evaluated once in the typed call.
+    pub receiver: NodeId,
+    /// The pass mode from the selected member contract.
+    pub mode: ReceiverPass,
+  },
+  /// Typing admitted a value whose region `offered` is caller-local, or meets a binder an earlier
+  /// operand fixed to inferred `'static`, where its boundary fixes `wanted`, without proving how the
+  /// two relate. The later safety stage must prove every use of `wanted` at this site is valid
+  /// within `offered`.
+  RegionRelation {
+    /// The admitted value's source site.
+    pub origin: Origin,
+    /// The region the value actually carries.
+    pub offered: Shared<Lifetime>,
+    /// The region the boundary fixed: written, inferred from earlier evidence, or 'static.
+    pub wanted: Shared<Lifetime>,
+    /// The exact fresh binder whose earlier inferred static evidence may still shorten.
+    /// Pending inference is never a rigid static promise or a discharged region relation.
+    pub inferredStatic: Option<Shared<Lifetime>>,
+  },
+}
+
+/// Whether native borrow checking proved a body, or the reason it has not yet. A body is
+/// `Checked` exactly when its stage is `FullyChecked`; every other status names what the next
+/// borrow-checking slices must cover first.
+pub enum BorrowStatus {
+  /// Every loan, move, region and obligation of the body is proved.
+  Checked,
+  /// No borrow checker covers this unit yet: selected static bodies, member bodies, and the
+  /// compile-time prefixes static evaluation copies.
+  Awaiting,
+  /// Loans, explicit moves and every by-value affine use, forwarded exclusive views included, are
+  /// proved, but the body names a region from outside it (another declaration's lifetime
+  /// parameter, an invocation lifetime or a supplied region), or retains a region relation or
+  /// capture contents; later slices prove those.
+  Regions,
+  /// A loan is stored in a value, joined across paths, returned, or borrowed from a place that is
+  /// not rooted in a local.
+  StoredLoans,
+  /// A loan conflict or a moved-place use is decided only by an unknown index, a partial
+  /// replacement, a loan a retaining result carries approximately, or a move of a reference whose
+  /// referent is reborrowed. This is an unchecked
+  /// status like every other non-`Checked` one: such a body is never `FullyChecked`, and it counts
+  /// in the gap baseline as any reason does.
+  Imprecise,
+}
+
+/// The guarantee carried by a successful body demand.
+pub union Stage {
+  /// Existing scalar body checking has discharged the supported safety claims.
+  FullyChecked,
+  /// The body was typed against its written signature and declared bounds only.
+  /// Ownership, lifetime, cleanup, and Effect execution safety are not discharged.
+  ContractTyped {
+    /// Specific source places retained for the later safety stage.
+    pub obligations: Vector<SafetyObligation>,
+  },
+}
+
+/// Owned header inputs for specializing one checked interface call.
+pub struct InterfaceCallInputs {
+  pub contract: Shared<Type>
+  pub provider: Shared<Type>
+  pub operation: Shared<DeclarationId>
+  pub bindings: Shared<Vector<Binding>>
+  pub origin: Origin
+  pub result: Shared<Type>
+  pub count: usize
+}
+
+/// Inputs retained for direct invocation of one exact callable environment.
+pub struct CallableCallInputs {
+  pub receiver: Shared<Type>
+  pub inference: Shared<DeclarationId>
+  pub bindings: Shared<Vector<Binding>>
+  pub mode: CallableMode
+  pub callee: NodeId
+  pub result: Shared<Type>
+  pub count: usize
+  pub origin: Origin
+}
+
+/// One sealed intrinsic call: its member, checked result type and origin.
+pub struct IntrinsicCallInputs {
+  pub member: Member
+  pub result: Shared<Type>
+  pub origin: Origin
+}
+
+/// A stored Effect value run by one `run` node: its exact type, success type and operand node.
+pub struct RunOperand {
+  pub receiver: Shared<Type>
+  pub result: Shared<Type>
+  pub callee: NodeId
+  pub origin: Origin
+}
+
+/// One already checked argument, retained without extending its body borrow.
+pub struct CallArgument {
+  pub ty: Shared<Type>
+  pub origin: Origin
+}
+
+struct InterfaceOperation {
+  node: NodeId
+  declaration: Shared<DeclarationId>
+}
+
+/// One selected static-for occurrence and the ordinary node/local ranges it generated.
+/// The syntax node counts from the owning declaration's anchor.
+pub struct StaticIteration {
+  pub syntax: usize
+  pub ordinal: usize
+  pub nodeStart: usize
+  pub nodeEnd: usize
+  pub localStart: usize
+  pub localEnd: usize
+}
+
+impl Copy for StaticIteration {}
+
+/// A lexical local represented by one environment field in an anonymous function.
+pub struct EnvironmentCapture {
+  pub local: LocalId
+  pub field: usize
+  /// Borrowed captures address the referent stored in the field.
+  pub dereference: bool
+}
+
+impl Copy for EnvironmentCapture {}
+
+/// The exact environment parameter and lexical aliases of one anonymous function.
+pub struct Environment {
+  pub ty: Shared<Type>
+  pub outerCount: usize
+  pub captures: Vector<EnvironmentCapture>
+}
+
+/// The number of reasons a body is not borrow-checked: every `BorrowStatus` but `Checked`.
+pub fn uncheckedReasonCount() -> usize {
+  return 4
+}
+
+/// The position of an unchecked status among the reasons, in declaration order; `usize.MAX` for
+/// `Checked`.
+pub fn uncheckedReason(status: BorrowStatus) -> usize {
+  return match status {
+    BorrowStatus.Checked => usize.MAX
+    BorrowStatus.Awaiting => 0
+    BorrowStatus.Regions => 1
+    BorrowStatus.StoredLoans => 2
+    BorrowStatus.Imprecise => 3
+  }
+}
+
+/// The reported name of the unchecked reason at `position`.
+pub fn uncheckedReasonName(position: usize) -> string<'static> {
+  if position == 0 { return "awaiting" }
+  if position == 1 { return "regions" }
+  if position == 2 { return "stored-loans" }
+  return "imprecise"
+}
+
+/// What the checks deciding a body's borrow status left open: whether a declared region relation
+/// stayed pending, and whether its loans' lifetimes stayed unproved. A borrow-checked body leaves
+/// neither open.
+pub struct Undecided {
+  pub regions: bool
+  pub loans: bool
+}
+
+impl Copy for Undecided {}
+
+// A `FullyChecked` body is `Checked`; any other body keeps the reason its producer names.
+fn borrowOf(stage: &Stage, unchecked: BorrowStatus) -> BorrowStatus {
+  return match &stage.* {
+    Stage.FullyChecked => BorrowStatus.Checked
+    Stage.ContractTyped {..} => unchecked
+  }
+}
+
+// A `FullyChecked` body leaves nothing open; any other body keeps what its producer recorded.
+fn decidedOf(stage: &Stage, undecided: Undecided) -> Undecided {
+  return match &stage.* {
+    Stage.FullyChecked => Undecided {regions: false, loans: false}
+    Stage.ContractTyped {..} => undecided
+  }
+}
+
+/// A typed body and the evidence needed by later consumers.
+///
+/// # Details
+///
+/// Every position in the payload counts from its declaration's anchor, so moving the declaration
+/// leaves the payload equal; it is kept across an edit when its declaration and dependencies
+/// validate. Required bodies name runtime callees that a later program build must close.
+pub struct TypedBody {
+  /// The canonical function declaration that owns this body.
+  declaration: DeclarationId
+  environment: Option<Environment>
+  /// Parameters and bindings in the order they become available.
+  locals: Vector<Local>
+  /// The typed nodes, referenced by indices local to this body.
+  nodes: Vector<Node>
+  /// The checked block or reached expression that roots this payload.
+  root: NodeId
+  /// The written signatures demanded during body checking.
+  dependencies: Vector<SignatureDependency>
+  /// The canonical callees whose runtime bodies remain required.
+  foreignDeclarations: Vector<Shared<DeclarationId>>
+  requiredBodies: Vector<DeclarationId>
+  interfaceOperations: Vector<InterfaceOperation>
+  stage: Stage
+  borrow: BorrowStatus
+  /// What its borrow-status checks left open; nothing when it is borrow-checked.
+  leftOpen: Undecided
+  /// Retained static-for occurrences; empty when the body expands no static iteration.
+  iterations: Vector<StaticIteration>
+}
+
+fn callArgumentNode(arguments: &Vector<NodeId>, at: usize) -> Option<NodeId> {
+  let nodes = Vector<NodeId>.asSlice(arguments)
+  if at < nodes.length { return Option<NodeId>.some(nodes[at]) }
+  return Option<NodeId>.none()
+}
+
+impl TypedBody {
+  /// Finishes an anonymous body with environment field places before publishing it.
+  /// Capture metadata retains the original lexical binding indices and first-use order.
+  pub effect fn materializeEnvironment(self: Self, environment: Environment) -> Option<Self>
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut checked = move self
+    checked.environment = Option<Environment>.some(move environment)
+    return run environmentBody(&checked)
+  }
+  /// The environment parameter for an anonymous body, absent for a named function.
+  pub fn environmentOf(self: &Self) -> &Option<Environment> {
+    return &self.environment
+  }
+
+  /// Retains a checked direct call's complete application under a short body borrow.
+  pub fn directApplication(self: &Shared<Self>, node: NodeId) -> Option<Shared<Application>> {
+    return Shared<TypedBody>.with<Option<Shared<Application>>>(self, fn(body: &TypedBody) -> Option<Shared<Application>> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.DirectCall {application, ..}, ..} = &nodes[node.index].kind {
+          return Option<Shared<Application>>.some(Shared<Application>.clone(&application))
+        }
+      }
+      return Option<Shared<Application>>.none()
+    })
+  }
+
+  /// Retains a callable's checked environment and invocation substitutions.
+  pub fn callableCall(self: &Shared<Self>, node: NodeId) -> Option<CallableCallInputs> {
+    return Shared<TypedBody>.with<Option<CallableCallInputs>>(self, fn(body: &TypedBody) -> Option<CallableCallInputs> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.CallableCall {callee, mode, inference, bindings, arguments, ..}, ty} = &nodes[node.index].kind {
+          if let NodeKind.Expression {ty: receiver, ..} = &nodes[callee.index].kind {
+            return Option<CallableCallInputs>.some(CallableCallInputs {
+              receiver: Shared<Type>.clone(&receiver), inference: Shared<DeclarationId>.clone(&inference),
+              bindings: Shared<Vector<Binding>>.clone(&bindings), mode: mode, callee: callee,
+              result: Shared<Type>.clone(&ty), count: Vector<NodeId>.length(&arguments), origin: nodes[node.index].origin,
+            })
+          }
+        }
+      }
+      return Option<CallableCallInputs>.none()
+    })
+  }
+
+  /// The sealed member a call node selects, and the call's checked result type.
+  pub fn intrinsicCall(self: &Shared<Self>, node: NodeId) -> Option<IntrinsicCallInputs> {
+    return Shared<TypedBody>.with<Option<IntrinsicCallInputs>>(self, fn(body: &TypedBody) -> Option<IntrinsicCallInputs> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.IntrinsicCall {member, ..}, ty} = &nodes[node.index].kind {
+          return Option<IntrinsicCallInputs>.some(IntrinsicCallInputs {member: member, result: Shared<Type>.clone(&ty),
+            origin: nodes[node.index].origin})
+        }
+      }
+      return Option<IntrinsicCallInputs>.none()
+    })
+  }
+
+  /// The operand of a `run` of a stored Effect value. An immediate `effect fn` construction has
+  /// its own direct call target instead.
+  pub fn runOperand(self: &Shared<Self>, node: NodeId) -> Option<RunOperand> {
+    return Shared<TypedBody>.with<Option<RunOperand>>(self, fn(body: &TypedBody) -> Option<RunOperand> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.Run {value, access}, ty} = &nodes[node.index].kind {
+          if access != RunAccess.Immediate {
+            if let NodeKind.Expression {ty: receiver, ..} = &nodes[value.index].kind {
+              return Option<RunOperand>.some(RunOperand {receiver: Shared<Type>.clone(&receiver),
+                result: Shared<Type>.clone(&ty), callee: value, origin: nodes[node.index].origin})
+            }
+          }
+        }
+      }
+      return Option<RunOperand>.none()
+    })
+  }
+
+  /// Whether this `run` node is one immediate call rather than a stored Effect's runner.
+  pub fn immediateRun(self: &Shared<Self>, node: NodeId) -> bool {
+    return Shared<TypedBody>.with<bool>(self, fn(body: &TypedBody) -> bool {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.Run {access, ..}, ..} = &nodes[node.index].kind { return access == RunAccess.Immediate }
+      }
+      return false
+    })
+  }
+
+  /// Retains interface header inputs under a short body borrow; no target body is selected here.
+  pub fn interfaceCall(self: &Shared<Self>, node: NodeId) -> Option<InterfaceCallInputs> {
+    return Shared<TypedBody>.with<Option<InterfaceCallInputs>>(self, fn(body: &TypedBody) -> Option<InterfaceCallInputs> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.InterfaceCall {contract, provider, bindings, arguments, ..}, ty} = &nodes[node.index].kind {
+          let operations = Vector<InterfaceOperation>.asSlice(&body.interfaceOperations)
+          let mut at = usize.ZERO
+          while at < operations.length {
+            if operations[at].node.index == node.index {
+              return Option<InterfaceCallInputs>.some(InterfaceCallInputs {
+                contract: Shared<Type>.clone(&contract), provider: Shared<Type>.clone(&provider),
+                operation: Shared<DeclarationId>.clone(&operations[at].declaration), bindings: Shared<Vector<Binding>>.clone(&bindings), origin: nodes[node.index].origin, result: Shared<Type>.clone(&ty), count: Vector<NodeId>.length(&arguments),
+              })
+            }
+            at = at + usize.ONE
+          }
+        }
+      }
+      return Option<InterfaceCallInputs>.none()
+    })
+  }
+
+  /// The storage primitive a node calls, absent for every other node.
+  pub fn storageOperation(self: &Shared<Self>, node: NodeId) -> Option<StorageOperation> {
+    return Shared<TypedBody>.with<Option<StorageOperation>>(self, fn(body: &TypedBody) -> Option<StorageOperation> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.StorageCall {operation, ..}, ..} = &nodes[node.index].kind {
+          return Option<StorageOperation>.some(operation)
+        }
+      }
+      return Option<StorageOperation>.none()
+    })
+  }
+
+  /// One written type argument of a storage primitive call, as checked in its body.
+  pub fn storageTypeArgument(self: &Shared<Self>, node: NodeId, at: usize) -> Option<Shared<Type>> {
+    return Shared<TypedBody>.with<Option<Shared<Type>>>(self, fn(body: &TypedBody) -> Option<Shared<Type>> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.StorageCall {typeArguments, ..}, ..} = &nodes[node.index].kind {
+          let listed = Vector<Shared<Type>>.asSlice(&typeArguments)
+          if at < listed.length { return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at])) }
+        }
+      }
+      return Option<Shared<Type>>.none()
+    })
+  }
+
+  /// One argument node of a storage primitive call.
+  pub fn storageArgument(self: &Shared<Self>, node: NodeId, at: usize) -> Option<NodeId> {
+    return Shared<TypedBody>.with<Option<NodeId>>(self, fn(body: &TypedBody) -> Option<NodeId> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.StorageCall {arguments, ..}, ..} = &nodes[node.index].kind {
+          return callArgumentNode(&arguments, at)
+        }
+      }
+      return Option<NodeId>.none()
+    })
+  }
+
+  /// Retains the checked type and source origin of one written call argument.
+  pub fn callArgument(self: &Shared<Self>, node: NodeId, at: usize) -> Option<CallArgument> {
+    return Shared<TypedBody>.with<Option<CallArgument>>(self, fn(body: &TypedBody) -> Option<CallArgument> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form, ..} = &nodes[node.index].kind {
+          let selected = match &form {
+            Expression.DirectCall {arguments, ..} => callArgumentNode(&arguments, at)
+            Expression.CallableCall {arguments, ..} => callArgumentNode(&arguments, at)
+            Expression.InterfaceCall {arguments, ..} => callArgumentNode(&arguments, at)
+            Expression.IntrinsicCall {arguments, ..} => callArgumentNode(&arguments, at)
+            _ => Option<NodeId>.none()
+          }
+          if let Option<NodeId>.Some {value: argument} = move selected {
+            if let NodeKind.Expression {ty, ..} = &nodes[argument.index].kind {
+              return Option<CallArgument>.some(CallArgument {ty: Shared<Type>.clone(&ty), origin: nodes[argument.index].origin})
+            }
+          }
+        }
+      }
+      return Option<CallArgument>.none()
+    })
+  }
+
+  /// The node that declares binding `binding`, in pattern order, of arm `arm` of the match at `node`.
+  pub fn armBinding(self: &Shared<Self>, node: NodeId, arm: usize, binding: usize) -> Option<NodeId> {
+    return Shared<TypedBody>.with<Option<NodeId>>(self, fn(body: &TypedBody) -> Option<NodeId> {
+      let nodes = TypedBody.nodeSlice(body)
+      if node.index < nodes.length {
+        if let NodeKind.Expression {form: Expression.Match {arms, ..}, ..} = &nodes[node.index].kind {
+          let written = Vector<MatchArm>.asSlice(&arms)
+          if arm < written.length {
+            let declared = Vector<NodeId>.asSlice(&written[arm].bindings)
+            if binding < declared.length { return Option<NodeId>.some(declared[binding]) }
+          }
+        }
+      }
+      return Option<NodeId>.none()
+    })
+  }
+
+  /// Copies a checked prefix without changing its node or local identities. The semantic checker
+  /// owns every supplied node; evaluation cannot add authored syntax to this checkpoint.
+  pub effect fn checkpoint(declaration: &DeclarationId, locals: &[Local],
+    nodes: &[Node], root: NodeId, iterations: Vector<StaticIteration>) -> TypedBody
+  ! OutOfMemoryError ? &mut Allocator {
+    let fields = Vector<EnvironmentCapture>.make()
+    let places = Vector<NodeId>.make()
+    let mapping = EnvironmentMap {identity: true, outer: usize.ZERO, offset: usize.ZERO,
+      base: NodeId {index: usize.ZERO}, fields: Vector<EnvironmentCapture>.asSlice(&fields), places: Vector<NodeId>.asSlice(&places)}
+    let mut copiedLocals = Vector<Local>.make()
+    let mut at = usize.ZERO
+    while at < locals.length {
+      run Vector<Local>.append(&mut copiedLocals, Local {origin: locals[at].origin,
+        ty: Shared<Type>.clone(&locals[at].ty), mutable: locals[at].mutable, meetDepth: Option<usize>.none()})
+      at = at + usize.ONE
+    }
+    let mut copiedNodes = Vector<Node>.make()
+    at = usize.ZERO
+    while at < nodes.length {
+      run Vector<Node>.append(&mut copiedNodes, Node {origin: nodes[at].origin, kind: run environmentKind(&mapping, &nodes[at].kind)})
+      at = at + usize.ONE
+    }
+    return run TypedBody.make(declaration, move copiedLocals, move copiedNodes, root,
+      Vector<SignatureDependency>.make(), Vector<DeclarationId>.make(), Stage.ContractTyped {obligations: Vector<SafetyObligation>.make()},
+      BorrowStatus.Awaiting, Undecided {regions: true, loans: true}, move iterations)
+  }
+
+  /// Creates a typed body of `declaration` with owned checked nodes.
+  pub effect fn make(
+    declaration: &DeclarationId,
+    locals: Vector<Local>,
+    nodes: Vector<Node>,
+    root: NodeId,
+    dependencies: Vector<SignatureDependency>,
+    requiredBodies: Vector<DeclarationId>,
+    stage: Stage,
+    unchecked: BorrowStatus,
+    undecided: Undecided,
+    iterations: Vector<StaticIteration>,
+  ) -> TypedBody ! OutOfMemoryError ? &mut Allocator {
+    let mut foreignHandles = Vector<Shared<DeclarationId>>.make()
+    let mut operations = Vector<InterfaceOperation>.make()
+    let checked = Vector<Node>.asSlice(&nodes)
+    let mut at = usize.ZERO
+    while at < checked.length {
+      if let NodeKind.Expression {form: Expression.ForeignCall {declaration: foreignDeclaration, ..}, ..} = &checked[at].kind {
+        run Vector<Shared<DeclarationId>>.append(
+          &mut foreignHandles,
+          run Shared<DeclarationId>.make(DeclarationId.copy(&foreignDeclaration)),
+        )
+      }
+      if let NodeKind.Expression {form: Expression.InterfaceCall {operation, ..}, ..} = &checked[at].kind {
+        run Vector<InterfaceOperation>.append(&mut operations, InterfaceOperation {
+          node: NodeId {index: at}, declaration: run Shared<DeclarationId>.make(DeclarationId.copy(&operation)),
+        })
+      }
+      at = at + usize.ONE
+    }
+    return TypedBody {
+      environment: Option<Environment>.none(),
+      foreignDeclarations: move foreignHandles,
+      declaration: DeclarationId.copy(declaration),
+      locals: move locals,
+      nodes: move nodes,
+      root: root,
+      dependencies: move dependencies,
+      requiredBodies: move requiredBodies,
+      interfaceOperations: move operations,
+      borrow: borrowOf(&stage, unchecked),
+      leftOpen: decidedOf(&stage, undecided),
+      stage: move stage,
+      iterations: move iterations,
+    }
+  }
+  /// Static-for occurrences in expansion order, with declaration-relative syntax and body-local ranges.
+  pub fn staticIterations(self: &Self) -> &[StaticIteration] {
+    return Vector<StaticIteration>.asSlice(&self.iterations)
+  }
+  /// Borrows the canonical declaration that owns this checked body.
+  pub fn declarationId(self: &Self) -> &DeclarationId {
+    return &self.declaration
+  }
+  /// Borrows the entries addressed by this body's `LocalId` values.
+  pub fn localSlice(self: &Self) -> &[Local] {
+    return Vector<Local>.asSlice(&self.locals)
+  }
+  /// Borrows the checked nodes in this body.
+  pub fn nodeSlice(self: &Self) -> &[Node] {
+    return Vector<Node>.asSlice(&self.nodes)
+  }
+  /// Returns the index of the checked block or reached expression.
+  pub fn rootNode(self: &Self) -> NodeId {
+    return self.root
+  }
+  /// Borrows the canonical signatures demanded while checking this body.
+  pub fn signatureDependencies(self: &Self) -> &[SignatureDependency] {
+    return Vector<SignatureDependency>.asSlice(&self.dependencies)
+  }
+  /// Borrows the canonical callees whose runtime bodies remain required.
+  pub fn runtimeBodies(self: &Self) -> &[DeclarationId] {
+    return Vector<DeclarationId>.asSlice(&self.requiredBodies)
+  }
+  /// Borrows the identity handles of immediate foreign calls.
+  pub fn foreignHandles(self: &Self) -> &[Shared<DeclarationId>] {
+    return Vector<Shared<DeclarationId>>.asSlice(&self.foreignDeclarations)
+  }
+  /// Borrows the exact guarantee of this body result.
+  pub fn checkingStage(self: &Self) -> &Stage {
+    return &self.stage
+  }
+  /// This body's borrow-checking status.
+  pub fn borrowStatus(self: &Self) -> BorrowStatus {
+    return self.borrow
+  }
+  /// What this body's borrow-status checks left open.
+  pub fn undecided(self: &Self) -> Undecided {
+    return self.leftOpen
+  }
+}
+
+struct EnvironmentMap<'a, 'b> {
+  identity: bool
+  outer: usize
+  offset: usize
+  base: NodeId
+  fields: &'a [EnvironmentCapture]
+  places: &'b [NodeId]
+}
+
+fn environmentAlias<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, local: LocalId) -> usize {
+  let mut at = usize.ZERO
+  while at < mapping.fields.length {
+    if mapping.fields[at].local.index == local.index { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn environmentNode<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, node: NodeId) -> NodeId {
+  return NodeId {index: node.index + mapping.offset}
+}
+
+fn environmentLocal<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, local: LocalId) -> LocalId {
+  if mapping.identity { return local }
+  return LocalId {index: local.index - mapping.outer + usize.ONE}
+}
+
+fn environmentOptionalNode<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, node: &Option<NodeId>) -> Option<NodeId> {
+  return match &node.* {
+    Option<NodeId>.Some {value} => Option<NodeId>.some(environmentNode(mapping, value))
+    Option<NodeId>.None => Option<NodeId>.none()
+  }
+}
+
+effect fn environmentNodes<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, nodes: &[NodeId]) -> Vector<NodeId> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<NodeId>.make()
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    run Vector<NodeId>.append(&mut copied, environmentNode(mapping, nodes[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn environmentFields<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, fields: &[AggregateField]) -> Vector<AggregateField>
+! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<AggregateField>.make()
+  let mut at = usize.ZERO
+  while at < fields.length {
+    run Vector<AggregateField>.append(&mut copied, AggregateField {index: fields[at].index, value: environmentNode(mapping, fields[at].value)})
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn copyReferents(referents: &[ReferentCapture]) -> Vector<ReferentCapture> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<ReferentCapture>.make()
+  let mut at = usize.ZERO
+  while at < referents.length {
+    run Vector<ReferentCapture>.append(&mut copied, referents[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn environmentSteps(steps: &[PlaceStep]) -> Vector<PlaceStep> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<PlaceStep>.make()
+  let mut at = usize.ZERO
+  while at < steps.length {
+    let step = match &steps[at] {
+      PlaceStep.Field {index} => PlaceStep.Field {index: index}
+      PlaceStep.Element {index} => PlaceStep.Element {index: index}
+      PlaceStep.Member {tag, ty, source} => PlaceStep.Member {tag: tag, ty: Shared<Type>.clone(&ty), source: Shared<Type>.clone(&source)}
+      PlaceStep.VariantField {tag, field} => PlaceStep.VariantField {tag: tag, field: field}
+    }
+    run Vector<PlaceStep>.append(&mut copied, move step)
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn environmentConsumed<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, consumed: &Option<ConsumedPlace>) -> Option<ConsumedPlace>
+! OutOfMemoryError ? &mut Allocator {
+  if let Option<ConsumedPlace>.Some {value} = &consumed.* {
+    let mut steps = Vector<PlaceStep>.make()
+    let mut root = PlaceRoot.Local {local: LocalId {index: usize.ZERO}}
+    match &value.root {
+      PlaceRoot.Local {local} => {
+        if local.index < mapping.outer {
+          let alias = environmentAlias(mapping, local)
+          run Vector<PlaceStep>.append(&mut steps, PlaceStep.Field {index: mapping.fields[alias].field})
+        } else { root = PlaceRoot.Local {local: environmentLocal(mapping, local)} }
+      }
+      PlaceRoot.Subject {subject} => { root = PlaceRoot.Subject {subject: environmentNode(mapping, subject)} }
+    }
+    let mut rest = run environmentSteps(Vector<PlaceStep>.asSlice(&value.steps))
+    while Vector<PlaceStep>.length(&rest) > usize.ZERO {
+      let step = Vector<PlaceStep>.remove(&mut rest, usize.ZERO)
+      run Vector<PlaceStep>.append(&mut steps, move step)
+    }
+    return Option<ConsumedPlace>.some(ConsumedPlace {root: move root, steps: move steps})
+  }
+  return Option<ConsumedPlace>.none()
+}
+
+effect fn environmentPattern(pattern: &Pattern) -> Pattern ! OutOfMemoryError ? &mut Allocator {
+  return match &pattern.* {
+    Pattern.Universal => Pattern.Universal
+    Pattern.EnumMember {member} => Pattern.EnumMember {member: member}
+    Pattern.Variant {tag} => Pattern.Variant {tag: tag}
+    Pattern.Integer {magnitude, negative} => Pattern.Integer {magnitude: magnitude, negative: negative}
+    Pattern.Record {member} => {
+      let mut copied = Option<UnionMember>.none()
+      if let Option<UnionMember>.Some {value} = &member {
+        copied = Option<UnionMember>.some(UnionMember {tag: value.tag, ty: Shared<Type>.clone(&value.ty), source: Shared<Type>.clone(&value.source)})
+      }
+      return Pattern.Record {member: move copied}
+    }
+  }
+}
+
+effect fn environmentArms<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, arms: &[MatchArm]) -> Vector<MatchArm>
+! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<MatchArm>.make()
+  let mut at = usize.ZERO
+  while at < arms.length {
+    let mut tests = Vector<PatternTest>.make()
+    let written = Vector<PatternTest>.asSlice(&arms[at].tests)
+    let mut testAt = usize.ZERO
+    while testAt < written.length {
+      run Vector<PatternTest>.append(&mut tests, PatternTest {path: run environmentSteps(Vector<PlaceStep>.asSlice(&written[testAt].path)),
+        tag: written[testAt].tag, tags: written[testAt].tags, source: copyOptionalType(&written[testAt].source)})
+      testAt = testAt + usize.ONE
+    }
+    run Vector<MatchArm>.append(&mut copied, MatchArm {origin: arms[at].origin, pattern: run environmentPattern(&arms[at].pattern),
+      tests: move tests, guard: environmentOptionalNode(mapping, &arms[at].guard), result: environmentNode(mapping, arms[at].result),
+      bindings: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arms[at].bindings))})
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn environmentExpression<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, form: &Expression) -> Expression ! OutOfMemoryError ? &mut Allocator {
+  return match &form.* {
+    Expression.Integer {literal} => Expression.Integer {literal: literal}
+    Expression.Float {literal} => Expression.Float {literal: literal}
+    Expression.Text {literal} => Expression.Text {literal: literal}
+    Expression.Boolean {value} => Expression.Boolean {value: value}
+    Expression.Unit => Expression.Unit
+    Expression.Local {local} => {
+      if local.index < mapping.outer {
+        let alias = environmentAlias(mapping, local)
+        if mapping.fields[alias].dereference {
+          return Expression.Dereference {value: NodeId {index: mapping.places[alias].index - usize.ONE}}
+        } else { return Expression.Field {value: mapping.base, index: mapping.fields[alias].field} }
+      } else { return Expression.Local {local: environmentLocal(mapping, local)} }
+    }
+    Expression.Borrow {access, value} => Expression.Borrow {access: access, value: environmentNode(mapping, value)}
+    Expression.PointerWeaken {value} => Expression.PointerWeaken {value: environmentNode(mapping, value)}
+    Expression.Dereference {value} => Expression.Dereference {value: environmentNode(mapping, value)}
+    Expression.Field {value, index} => Expression.Field {value: environmentNode(mapping, value), index: index}
+    Expression.ArraySlice {value, count} => Expression.ArraySlice {value: environmentNode(mapping, value), count: count}
+    Expression.SliceLength {value} => Expression.SliceLength {value: environmentNode(mapping, value)}
+    Expression.Index {value, index, element} => Expression.Index {value: environmentNode(mapping, value), index: environmentNode(mapping, index), element: element}
+    Expression.ArrayLength {value, count} => Expression.ArrayLength {value: environmentNode(mapping, value), count: count}
+    Expression.Aggregate {fields} => Expression.Aggregate {fields: run environmentFields(mapping, Vector<AggregateField>.asSlice(&fields))}
+    Expression.Callable {fields, referents, body} => Expression.Callable {fields: run environmentFields(mapping, Vector<AggregateField>.asSlice(&fields)),
+      referents: run copyReferents(Vector<ReferentCapture>.asSlice(&referents)), body: Shared<TypedBody>.clone(&body)}
+    Expression.StagedCallable {callee, mode, arguments} => Expression.StagedCallable {
+      callee: environmentNode(mapping, callee), mode: mode,
+      arguments: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arguments)),
+    }
+    Expression.Constant {declaration} => Expression.Constant {declaration: Shared<DeclarationId>.clone(&declaration)}
+    Expression.ForeignAddress {declaration, symbol} => Expression.ForeignAddress {
+      declaration: Shared<DeclarationId>.clone(&declaration), symbol: Shared<Bytes>.clone(&symbol),
+    }
+    Expression.ForeignStatic {declaration} => Expression.ForeignStatic {declaration: Shared<DeclarationId>.clone(&declaration)}
+    Expression.EnumMember {member} => Expression.EnumMember {member: member}
+    Expression.EnumValue {value} => Expression.EnumValue {value: environmentNode(mapping, value)}
+    Expression.UnionInject {tag, value} => Expression.UnionInject {tag: tag, value: environmentNode(mapping, value)}
+    Expression.UnionWiden {value} => Expression.UnionWiden {value: environmentNode(mapping, value)}
+    Expression.VariantConstruct {tag, fields} => Expression.VariantConstruct {tag: tag, fields: run environmentFields(mapping, Vector<AggregateField>.asSlice(&fields))}
+    Expression.PatternBinding {subject, path, access} => Expression.PatternBinding {subject: environmentNode(mapping, subject), path: run environmentSteps(Vector<PlaceStep>.asSlice(&path)), access: access}
+    Expression.Match {subject, access, tags, domain, arms, syntax} => {
+      let selected = match &access {
+        SubjectAccess.Copy => SubjectAccess.Copy
+        SubjectAccess.Place {access: selected} => SubjectAccess.Place {access: selected}
+        SubjectAccess.Consume {consumed} => SubjectAccess.Consume {consumed: run environmentConsumed(mapping, &consumed)}
+      }
+      return Expression.Match {subject: environmentNode(mapping, subject), access: move selected, tags: tags, domain: domain,
+        arms: run environmentArms(mapping, Vector<MatchArm>.asSlice(&arms)), syntax: syntax}
+    }
+    Expression.CompileError {message} => Expression.CompileError {message: environmentNode(mapping, message)}
+    Expression.Embedded {value} => Expression.Embedded {value: Shared<StaticData>.clone(&value)}
+    Expression.Move {value, consumed} => Expression.Move {value: environmentNode(mapping, value), consumed: run environmentConsumed(mapping, &consumed)}
+    Expression.CallableCall {callee, mode, arguments, inference, bindings, pipeline, constructs, kept} => Expression.CallableCall {
+      callee: environmentNode(mapping, callee), mode: mode, arguments: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arguments)),
+      inference: Shared<DeclarationId>.clone(&inference), bindings: Shared<Vector<Binding>>.clone(&bindings), pipeline: pipeline,
+      constructs: constructs, kept: Shared<Vector<KeptRegions>>.clone(&kept),
+    }
+    Expression.DirectCall {declaration, application, receiverPass, constructs, resultBorrows, arguments, kept} => Expression.DirectCall {
+      declaration: DeclarationId.copy(&declaration), application: Shared<Application>.clone(&application),
+      receiverPass: environmentReceiver(&receiverPass), constructs: constructs, arguments: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arguments)),
+      resultBorrows: run environmentNodes(mapping, Vector<NodeId>.asSlice(&resultBorrows)),
+      kept: Shared<Vector<KeptRegions>>.clone(&kept),
+    }
+    Expression.ForeignCall {declaration, arguments, variadicArguments} => Expression.ForeignCall {
+      declaration: DeclarationId.copy(&declaration), arguments: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arguments)),
+      variadicArguments: Shared<Vector<CAbi.VariadicArgument>>.clone(&variadicArguments),
+    }
+    Expression.Run {value, access} => Expression.Run {value: environmentNode(mapping, value), access: access}
+    Expression.IntrinsicCall {member, arguments} => Expression.IntrinsicCall {member: member, arguments: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arguments))}
+    Expression.StorageCall {operation, typeArguments, arguments} => Expression.StorageCall {operation: operation,
+      typeArguments: run copyTypes(Vector<Shared<Type>>.asSlice(&typeArguments)), arguments: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arguments))}
+    Expression.ConcretePrefix {operator, operand} => Expression.ConcretePrefix {operator: operator, operand: environmentNode(mapping, operand)}
+    Expression.ConcreteInfix {operator, left, right} => Expression.ConcreteInfix {operator: operator, left: environmentNode(mapping, left), right: environmentNode(mapping, right)}
+    Expression.InterfaceCall {contract, provider, operation, bindings, implementation, receiverPass, isEffect, arguments, kept} => {
+      let mut selected = Option<Shared<DeclarationId>>.none()
+      if let Option<Shared<DeclarationId>>.Some {value} = &implementation { selected = Option<Shared<DeclarationId>>.some(Shared<DeclarationId>.clone(&value)) }
+      return Expression.InterfaceCall {contract: Shared<Type>.clone(&contract), provider: Shared<Type>.clone(&provider), operation: DeclarationId.copy(&operation),
+        bindings: Shared<Vector<Binding>>.clone(&bindings), implementation: move selected, receiverPass: environmentReceiver(&receiverPass),
+        isEffect: isEffect, arguments: run environmentNodes(mapping, Vector<NodeId>.asSlice(&arguments)),
+        kept: Shared<Vector<KeptRegions>>.clone(&kept)}
+    }
+  }
+}
+
+fn environmentReceiver(pass: &Option<ReceiverPass>) -> Option<ReceiverPass> {
+  return match &pass.* {
+    Option<ReceiverPass>.Some {value} => Option<ReceiverPass>.some(value)
+    Option<ReceiverPass>.None => Option<ReceiverPass>.none()
+  }
+}
+
+effect fn environmentKind<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, kind: &NodeKind) -> NodeKind ! OutOfMemoryError ? &mut Allocator {
+  return match &kind.* {
+    NodeKind.Expression {ty, form} => NodeKind.Expression {ty: Shared<Type>.clone(&ty), form: run environmentExpression(mapping, &form)}
+    NodeKind.LocalBinding {local, initializer} => NodeKind.LocalBinding {local: environmentLocal(mapping, local), initializer: environmentNode(mapping, initializer)}
+    NodeKind.MutableBinding {local, initializer} => NodeKind.MutableBinding {local: environmentLocal(mapping, local), initializer: environmentNode(mapping, initializer)}
+    NodeKind.Assignment {local, value} => {
+      if !mapping.identity && local.index < mapping.outer { return NodeKind.PlaceAssignment {target: mapping.places[environmentAlias(mapping, local)], value: environmentNode(mapping, value)} }
+      else { return NodeKind.Assignment {local: environmentLocal(mapping, local), value: environmentNode(mapping, value)} }
+    }
+    NodeKind.PlaceAssignment {target, value} => NodeKind.PlaceAssignment {target: environmentNode(mapping, target), value: environmentNode(mapping, value)}
+    NodeKind.Return {value} => NodeKind.Return {value: environmentOptionalNode(mapping, &value)}
+    NodeKind.Branch {condition, thenBranch, elseBranch, canComplete} => NodeKind.Branch {condition: environmentNode(mapping, condition), thenBranch: environmentNode(mapping, thenBranch), elseBranch: environmentOptionalNode(mapping, &elseBranch), canComplete: canComplete}
+    NodeKind.While {condition, body} => NodeKind.While {condition: environmentNode(mapping, condition), body: environmentNode(mapping, body)}
+    NodeKind.Break => NodeKind.Break
+    NodeKind.Continue => NodeKind.Continue
+    NodeKind.Recovered {resumes} => NodeKind.Recovered {resumes: resumes}
+    NodeKind.Fail {value} => NodeKind.Fail {value: environmentNode(mapping, value)}
+    NodeKind.Drop {value, consumed} => NodeKind.Drop {value: environmentNode(mapping, value), consumed: run environmentConsumed(mapping, &consumed)}
+    NodeKind.Block {statements, canComplete} => NodeKind.Block {statements: run environmentNodes(mapping, Vector<NodeId>.asSlice(&statements)), canComplete: canComplete}
+  }
+}
+
+effect fn environmentObligation<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, obligation: &SafetyObligation) -> SafetyObligation
+! OutOfMemoryError ? &mut Allocator {
+  return match &obligation.* {
+    SafetyObligation.Contents {origin, subject, region} => SafetyObligation.Contents {
+      origin: origin, subject: Shared<Type>.clone(&subject), region: Shared<Lifetime>.clone(&region),
+    }
+    SafetyObligation.RegionChoice {origin, region} => SafetyObligation.RegionChoice {
+      origin: origin, region: Shared<Lifetime>.clone(&region),
+    }
+    SafetyObligation.WholeValue {origin, ty} => SafetyObligation.WholeValue {origin: origin, ty: Shared<Type>.clone(&ty)}
+    SafetyObligation.Invocation {origin, declaration} => SafetyObligation.Invocation {origin: origin, declaration: DeclarationId.copy(&declaration)}
+    SafetyObligation.CallableInvocation {origin, callee, contract} => SafetyObligation.CallableInvocation {
+      origin: origin, callee: environmentNode(mapping, callee), contract: Shared<Type>.clone(&contract),
+    }
+    SafetyObligation.ReceiverPass {origin, receiver, mode} => SafetyObligation.ReceiverPass {origin: origin, receiver: environmentNode(mapping, receiver), mode: mode}
+    SafetyObligation.RegionRelation {origin, offered, wanted, inferredStatic} => SafetyObligation.RegionRelation {
+      origin: origin, offered: Shared<Lifetime>.clone(&offered), wanted: Shared<Lifetime>.clone(&wanted), inferredStatic: match &inferredStatic {
+        Option<Shared<Lifetime>>.Some {value} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&value))
+        _ => Option<Shared<Lifetime>>.none()
+      },
+    }
+  }
+}
+
+effect fn environmentStage<'a, 'b>(mapping: &EnvironmentMap<'a, 'b>, stage: &Stage) -> Stage ! OutOfMemoryError ? &mut Allocator {
+  if let Stage.ContractTyped {obligations} = &stage.* {
+    let mut copied = Vector<SafetyObligation>.make()
+    let listed = Vector<SafetyObligation>.asSlice(&obligations)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let obligation = run environmentObligation(mapping, &listed[at])
+      run Vector<SafetyObligation>.append(&mut copied, move obligation)
+      at = at + usize.ONE
+    }
+    return Stage.ContractTyped {obligations: move copied}
+  }
+  return Stage.FullyChecked
+}
+
+fn callableMode(value: &Type) -> CallableMode {
+  return match &value.* { Type.Callable {mode, ..} => mode Type.Effect {mode, ..} => mode _ => CallableMode.Once }
+}
+
+fn environmentMode(value: &Type) -> CallableMode {
+  return match &value.* {
+    Type.CallableValue {contract, ..} => Shared<Type>.with<CallableMode>(&contract, callableMode)
+    Type.CallableSchema {schema, ..} => Shared<CallableSchema>.with<CallableMode>(&schema,
+      fn(selected: &CallableSchema) -> CallableMode { return Shared<Type>.with<CallableMode>(&selected.contract, callableMode) })
+    _ => CallableMode.Once
+  }
+}
+
+effect fn environmentBody(body: &TypedBody) -> Option<TypedBody> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<Environment>.Some {value} = &body.environment {
+    return run environmentPrepared(body, &value)
+  }
+  return Option<TypedBody>.none()
+}
+
+effect fn environmentPrepared(body: &TypedBody, environment: &Environment) -> Option<TypedBody>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mode = Shared<Type>.with<CallableMode>(&environment.ty, environmentMode)
+  let retainedFields = run Type.recordFields(&environment.ty)
+  let fieldTypes = match move retainedFields {
+    Option<Vector<Shared<Type>>>.Some {value} => move value
+    Option<Vector<Shared<Type>>>.None => { return Option<TypedBody>.none() }
+  }
+  let mut parameter = Shared<Type>.clone(&environment.ty)
+  if mode != CallableMode.Once {
+    parameter = run Types.intern(Type.Reference {referent: Shared<Type>.clone(&environment.ty),
+      access: match mode { CallableMode.Mutable => Access.Mutable _ => Access.Shared },
+      lifetime: run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&body.declaration), ordinal: usize.MAX})})
+  }
+  let written = Vector<Node>.asSlice(&body.nodes)
+  let origin = written[body.root.index].origin
+  let mut nodes = Vector<Node>.make()
+  run Vector<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Expression {ty: Shared<Type>.clone(&parameter), form: Expression.Local {local: LocalId {index: usize.ZERO}}}})
+  let mut base = NodeId {index: usize.ZERO}
+  if mode != CallableMode.Once {
+    base = NodeId {index: usize.ONE}
+    run Vector<Node>.append(&mut nodes, Node {origin: origin, kind: NodeKind.Expression {ty: Shared<Type>.clone(&environment.ty), form: Expression.Dereference {value: NodeId {index: usize.ZERO}}}})
+  }
+  let captures = Vector<EnvironmentCapture>.asSlice(&environment.captures)
+  let types = Vector<Shared<Type>>.asSlice(&fieldTypes)
+  let lexical = Vector<Local>.asSlice(&body.locals)
+  let mut places = Vector<NodeId>.make()
+  let mut at = usize.ZERO
+  while at < captures.length {
+    let capture = captures[at]
+    let source = &lexical[capture.local.index]
+    let sourceOrigin = source.origin
+    let fieldType = Shared<Type>.clone(&types[capture.field])
+    let field = NodeId {index: Vector<Node>.length(&nodes)}
+    run Vector<Node>.append(&mut nodes, Node {origin: sourceOrigin, kind: NodeKind.Expression {
+      ty: move fieldType, form: Expression.Field {value: base, index: capture.field}}})
+    let mut place = field
+    if capture.dereference {
+      let originalType = Shared<Type>.clone(&source.ty)
+      place = NodeId {index: Vector<Node>.length(&nodes)}
+      run Vector<Node>.append(&mut nodes, Node {origin: sourceOrigin, kind: NodeKind.Expression {
+        ty: move originalType, form: Expression.Dereference {value: field}}})
+    }
+    run Vector<NodeId>.append(&mut places, place)
+    at = at + usize.ONE
+  }
+  let mapping = EnvironmentMap {identity: false, outer: environment.outerCount, offset: Vector<Node>.length(&nodes), base: base,
+    fields: captures, places: Vector<NodeId>.asSlice(&places)}
+  // Capture analysis must account for every lexical local referenced by the retained body.
+  let mut scan = usize.ZERO
+  while scan < written.length {
+    let local = match &written[scan].kind {
+      NodeKind.Expression {form: Expression.Local {local}, ..} => Option<LocalId>.some(local)
+      NodeKind.Assignment {local, ..} => Option<LocalId>.some(local)
+      _ => Option<LocalId>.none()
+    }
+    if let Option<LocalId>.Some {value} = move local {
+      if value.index < mapping.outer && environmentAlias(&mapping, value) == usize.MAX { return Option<TypedBody>.none() }
+    }
+    run Vector<Node>.append(&mut nodes, Node {origin: written[scan].origin, kind: run environmentKind(&mapping, &written[scan].kind)})
+    scan = scan + usize.ONE
+  }
+  let locals = run environmentLocals(body, move parameter, origin, mode, environment.outerCount)
+  let mut dependencies = Vector<SignatureDependency>.make()
+  let signatures = Vector<SignatureDependency>.asSlice(&body.dependencies)
+  let mut depAt = usize.ZERO
+  while depAt < signatures.length {
+    run Vector<SignatureDependency>.append(&mut dependencies, SignatureDependency {declaration: DeclarationId.copy(&signatures[depAt].declaration)})
+    depAt = depAt + usize.ONE
+  }
+  let mut required = Vector<DeclarationId>.make()
+  let callees = Vector<DeclarationId>.asSlice(&body.requiredBodies)
+  let mut calleeAt = usize.ZERO
+  while calleeAt < callees.length { run Vector<DeclarationId>.append(&mut required, DeclarationId.copy(&callees[calleeAt])) calleeAt = calleeAt + usize.ONE }
+  let mut iterations = Vector<StaticIteration>.make()
+  let selected = Vector<StaticIteration>.asSlice(&body.iterations)
+  let mut selectedAt = usize.ZERO
+  while selectedAt < selected.length {
+    let source = &selected[selectedAt]
+    let fact = StaticIteration {
+      syntax: source.syntax, ordinal: source.ordinal,
+      nodeStart: environmentNode(&mapping, NodeId {index: source.nodeStart}).index,
+      nodeEnd: environmentNode(&mapping, NodeId {index: source.nodeEnd - usize.ONE}).index + usize.ONE,
+      localStart: environmentLocal(&mapping, LocalId {index: source.localStart}).index,
+      localEnd: environmentLocal(&mapping, LocalId {index: source.localEnd}).index,
+    }
+    run Vector<StaticIteration>.append(&mut iterations, move fact)
+    selectedAt = selectedAt + usize.ONE
+  }
+  let mut prepared = run TypedBody.make(&body.declaration, move locals, move nodes,
+    environmentNode(&mapping, body.root), move dependencies, move required, run environmentStage(&mapping, &body.stage), body.borrow,
+    body.leftOpen, move iterations)
+  let aliases = run environmentAliases(environment)
+  prepared.environment = Option<Environment>.some(Environment {ty: Shared<Type>.clone(&environment.ty), outerCount: environment.outerCount, captures: move aliases})
+  return Option<TypedBody>.some(move prepared)
+}
+
+// Keep this scan apart from capture projection construction: the bootstrap's debug backend
+// cannot yet index the same slice spill from two loops in one function (PAPERCUTS.md).
+effect fn environmentLocals(body: &TypedBody, parameter: Shared<Type>, origin: Origin,
+  mode: CallableMode, outer: usize) -> Vector<Local> ! OutOfMemoryError ? &mut Allocator {
+  let mut locals = Vector<Local>.make()
+  run Vector<Local>.append(&mut locals, Local {origin: origin, ty: move parameter, mutable: mode == CallableMode.Once,
+    meetDepth: Option<usize>.none()})
+  let lexical = Vector<Local>.asSlice(&body.locals)
+  let mut at = outer
+  while at < lexical.length {
+    run Vector<Local>.append(&mut locals, Local {origin: lexical[at].origin, ty: Shared<Type>.clone(&lexical[at].ty), mutable: lexical[at].mutable,
+      meetDepth: Option<usize>.none()})
+    at = at + usize.ONE
+  }
+  return move locals
+}
+
+effect fn environmentAliases(environment: &Environment) -> Vector<EnvironmentCapture>
+! OutOfMemoryError ? &mut Allocator {
+  let captures = Vector<EnvironmentCapture>.asSlice(&environment.captures)
+  let mut aliases = Vector<EnvironmentCapture>.make()
+  let mut at = usize.ZERO
+  while at < captures.length {
+    run Vector<EnvironmentCapture>.append(&mut aliases, captures[at])
+    at = at + usize.ONE
+  }
+  return move aliases
+}
+
+effect fn copyTypes(values: &[Shared<Type>]) -> Vector<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<Shared<Type>>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run Vector<Shared<Type>>.append(&mut copied, Shared<Type>.clone(&values[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+fn copyOptionalType(value: &Option<Shared<Type>>) -> Option<Shared<Type>> {
+  return match &value.* {
+    Option<Shared<Type>>.Some {value: ty} => Option<Shared<Type>>.some(Shared<Type>.clone(&ty))
+    _ => Option<Shared<Type>>.none()
+  }
+}

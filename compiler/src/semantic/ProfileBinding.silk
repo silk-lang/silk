@@ -1,0 +1,1017 @@
+//! Portable package-parameter bindings and their concrete validation.
+//!
+//! # When to use
+//! Build [`Supplied`] values at an application edge and call [`prepare`] with registered shapes.
+//! The batch checks all provenance before it looks up a schema. It checks every value before it
+//! selects a precedence tier. Use [`admit`], [`header`], and [`check`] for individual steps.
+
+import semantic.Types {Types}
+import hir.Hir {OwnerKind}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {Lifetime}
+import semantic.ModuleId {ModuleId}
+import semantic.ParameterSchema {ParameterSchema}
+import semantic.StaticValue
+import semantic.StaticValue {IntegerType, Sign, Value as StaticData}
+import semantic.Type {Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.box {Box}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.u32
+import silk.u64
+import silk.u8
+import silk.utf8_decoder {Utf8Decoder, Utf8Step}
+import silk.vector {Vector}
+import silk.usize
+
+/// An untrusted portable binding value. Integer text is exact decimal, never a JSON number.
+pub union Input {
+  /// An exact decimal integer. The declared type supplies its width and signedness.
+  Integer {pub decimal: Bytes},
+  /// A Boolean value.
+  Boolean {pub value: bool},
+  /// UTF-8 text bytes.
+  String {pub text: Bytes},
+  /// A named member of one canonical enum type.
+  Enum {pub nominal: Bytes, pub member: Bytes},
+  /// The fieldless variant of a structural optional.
+  None,
+  /// The single-field variant of a structural optional.
+  Some {pub value: Box<Input>},
+  /// Ordered elements of a fixed array.
+  Array {pub values: Vector<Box<Input>>},
+  /// Named fields of a record. The order does not affect field identity.
+  Record {pub fields: Vector<Field>},
+}
+
+/// One name and value in a record input. Field order does not define record identity.
+pub struct Field {
+  /// The declared field name.
+  pub name: Bytes
+  /// The supplied field value.
+  pub value: Box<Input>
+}
+
+/// The origin of a supplied value. Public translation has a stable logical translator identity.
+pub union Provenance {
+  /// A concrete value written in a request or project file.
+  Literal,
+  /// A deterministic value from a public translator with a logical identity.
+  TranslatedPublic {pub translator: Bytes},
+  /// A value marked as a secret.
+  Secret,
+  /// A value obtained from a physical supply.
+  PhysicalSupply,
+  /// A value obtained from runtime state.
+  Runtime,
+}
+
+/// Project and workspace inputs share a tier; artifact and selected-profile overrides share one.
+pub enum Tier {
+  /// A project or workspace binding.
+  Project,
+  /// An artifact or selected-profile override.
+  Override,
+}
+
+/// A raw binding from the request edge. It is not safe to put in a cache or diagnostic.
+pub struct Supplied {
+  /// The canonical package name and version.
+  pub package: Bytes
+  /// The canonical path relative to the package.
+  pub module: Bytes
+  /// The declared parameter name.
+  pub parameter: Bytes
+  /// The portable value before type checking.
+  pub value: Input
+  /// The origin classification that [`admit`] checks first.
+  pub provenance: Provenance
+  /// The request-assigned precedence tier.
+  pub tier: Tier
+}
+
+/// A binding whose provenance may enter semantic validation, but whose type is still unchecked.
+pub struct Accepted {
+  /// The canonical package name and version.
+  pub package: Bytes
+  /// The canonical path relative to the package.
+  pub module: Bytes
+  /// The declared parameter name.
+  pub parameter: Bytes
+  /// The portable value before type checking.
+  pub value: Input
+  /// Literal or public-translation provenance.
+  pub provenance: Provenance
+  /// The request-assigned precedence tier.
+  pub tier: Tier
+}
+
+/// The value had prohibited provenance and must not enter diagnostic details or a cache key.
+pub struct ProhibitedProvenance {}
+
+/// A concrete, recursively admissible parameter type. Nominal identities and field order come
+/// from resolved declarations, never from a transport object's spelling or field order.
+pub union Shape {
+  /// An integer with the exact signedness and target-resolved bit width.
+  Integer {pub kind: IntegerType, pub bits: u32},
+  /// A Boolean value.
+  Boolean,
+  /// UTF-8 text.
+  String,
+  /// Scalar members of one canonical enum type spelling and their resolved values.
+  Enum {pub canonical: Bytes, pub members: Vector<EnumMember>},
+  /// A two-variant nominal union with fieldless and single-field variants.
+  Optional {pub absent: usize, pub present: usize, pub elementType: Shared<Type>, pub element: Box<Shape>},
+  /// A fixed array with its resolved element schema.
+  Array {pub length: usize, pub elementType: Shared<Type>, pub element: Box<Shape>},
+  /// A nominal record with fields in declaration order.
+  Record {pub fields: Vector<NamedShape>},
+}
+
+/// One declared record field and its resolved configuration shape.
+pub struct NamedShape {
+  /// The declared field name.
+  pub name: Bytes
+  /// The resolved type of this field.
+  pub ty: Shared<Type>
+  /// The concrete schema of this field.
+  pub value: Box<Shape>
+}
+
+/// A resolved enum member and its already checked canonical static value.
+pub struct EnumMember {
+  /// The declared member name.
+  pub name: Bytes
+  /// The value U8 resolved from the enum declaration, including its identity and discriminant.
+  pub value: Shared<StaticData>
+}
+
+/// A public binding whose complete value matches its declared concrete schema.
+pub struct Checked {
+  package: Bytes
+  module: Bytes
+  parameter: Bytes
+  schema: Shared<ParameterSchema>
+  value: Shared<StaticData>
+  provenance: Provenance
+  tier: Tier
+  ordinal: usize
+}
+
+/// One source schema and its concrete shape, supplied by the profile bootstrap.
+pub struct RegisteredShape {
+  /// The canonical parameter header.
+  pub schema: Shared<ParameterSchema>
+  /// The complete shape of `schema.ty` after forward references and extents resolve.
+  pub shape: Shape
+}
+
+/// A binding does not name this public schema or does not match its concrete value type.
+enum CheckError {
+  /// The binding identity does not match the selected schema.
+  UnknownParameter,
+  /// The selected schema does not permit external bindings.
+  PrivateParameter,
+  /// The portable value does not match the selected shape.
+  WrongType,
+}
+
+/// Two valid bindings target the same declaration at one precedence tier.
+struct SameTierConflict {}
+
+/// A binding failure with indexes into the request's original binding list.
+pub struct BindingError {
+  /// The specific failed validation step.
+  pub code: BindingIssue
+  /// The binding that failed.
+  pub ordinal: usize
+  /// The earlier binding at the same tier, if this is a conflict.
+  pub previous: Option<usize>
+}
+
+/// The reason a complete binding batch cannot be selected.
+pub enum BindingIssue {
+  /// A secret, physical, or runtime value entered the request.
+  ProhibitedProvenance,
+  /// No registered parameter has the supplied canonical identity.
+  UnknownParameter,
+  /// A private parameter received an external binding.
+  PrivateParameter,
+  /// The value did not exactly match its concrete schema.
+  WrongType,
+  /// Two bindings named the same parameter at one tier.
+  SameTierConflict,
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn matchesIdentity(binding: &Accepted, schema: &ParameterSchema) -> bool {
+  let id = &schema.declaration
+  let module = DeclarationId.moduleId(id)
+  return ModuleId.withComponents<bool>(module, fn(origin: &[u8], package: &[u8], path: &[u8]) -> bool {
+    return same(Bytes.asSlice(&binding.package), package) && same(Bytes.asSlice(&binding.module), path)
+  }) && DeclarationId.named(id, Bytes.asSlice(&binding.parameter))
+}
+
+/// Rejects untrusted origins before inspecting, copying, or publishing the supplied value.
+pub fn admit(binding: Supplied) -> Result<Accepted, ProhibitedProvenance> {
+  let Supplied {package, module, parameter, value, provenance, tier} = move binding
+  return match move provenance {
+    Provenance.Literal => Result<Accepted, ProhibitedProvenance>.succeed(
+      Accepted {package: move package, module: move module, parameter: move parameter,
+        value: move value, provenance: Provenance.Literal, tier: tier},
+    )
+    Provenance.TranslatedPublic {translator} => Result<Accepted, ProhibitedProvenance>.succeed(
+      Accepted {package: move package, module: move module, parameter: move parameter,
+        value: move value, provenance: Provenance.TranslatedPublic {translator: move translator}, tier: tier},
+    )
+    Provenance.Secret => Result<Accepted, ProhibitedProvenance>.failResult(ProhibitedProvenance {})
+    Provenance.PhysicalSupply => Result<Accepted, ProhibitedProvenance>.failResult(ProhibitedProvenance {})
+    Provenance.Runtime => Result<Accepted, ProhibitedProvenance>.failResult(ProhibitedProvenance {})
+  }
+}
+
+fn integerFits(decimal: &[u8], signed: bool, bits: u32) -> bool {
+  if decimal.length == usize.ZERO || bits == 0 || bits > 64 {
+    return false
+  }
+  let mut at = usize.ZERO
+  let mut negative = false
+  if decimal[at] == 45 {
+    negative = true
+    at = at + usize.ONE
+  }
+  if at == decimal.length || (negative && !signed) {
+    return false
+  }
+  let mut magnitude: u64 = 0
+  while at < decimal.length {
+    let digit = decimal[at]
+    if digit < 48 || digit > 57 {
+      return false
+    }
+    magnitude = match move u64.checkedMultiply(magnitude, 10) {
+      Option<u64>.Some {value} => value
+      Option<u64>.None => { return false }
+    }
+    magnitude = match move u64.checkedAdd(magnitude, u8.toU64(digit - 48)) {
+      Option<u64>.Some {value} => value
+      Option<u64>.None => { return false }
+    }
+    at = at + usize.ONE
+  }
+  if !signed {
+    if bits == 64 { return true }
+    return magnitude <= u64.subtract(u64.shiftLeft(1, u32.toU64(bits)), 1)
+  }
+  let edge = u64.shiftLeft(1, u32.toU64(bits - 1))
+  if negative { return magnitude <= edge }
+  return magnitude < edge
+}
+
+fn validText(bytes: &[u8]) -> bool {
+  let mut decoder = Utf8Decoder.make()
+  let mut at = usize.ZERO
+  while at < bytes.length {
+    if let Utf8Step.Invalid {..} = move Utf8Decoder.step(&mut decoder, bytes[at], at) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return !Utf8Decoder.pending(&decoder)
+}
+
+fn integerTypeName(name: &[u8], kind: IntegerType) -> bool {
+  return match kind {
+    IntegerType.U8 => same(name, b"u8")
+    IntegerType.U16 => same(name, b"u16")
+    IntegerType.U32 => same(name, b"u32")
+    IntegerType.U64 => same(name, b"u64")
+    IntegerType.Usize => same(name, b"usize")
+    IntegerType.I8 => same(name, b"i8")
+    IntegerType.I16 => same(name, b"i16")
+    IntegerType.I32 => same(name, b"i32")
+    IntegerType.I64 => same(name, b"i64")
+    IntegerType.Isize => same(name, b"isize")
+  }
+}
+
+fn arrayLength(extent: &[u8]) -> Option<usize> {
+  if extent.length == usize.ZERO { return Option<usize>.none() }
+  let mut length = usize.ZERO
+  let mut at = usize.ZERO
+  while at < extent.length {
+    if extent[at] < 48 || extent[at] > 57 { return Option<usize>.none() }
+    length = match move usize.checkedMultiply(length, 10) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<usize>.none() }
+    }
+    length = match move usize.checkedAdd(length, u8.toUsize(extent[at] - 48)) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<usize>.none() }
+    }
+    at = at + usize.ONE
+  }
+  return Option<usize>.some(length)
+}
+
+fn nominalKind(ty: &Shared<Type>, expected: OwnerKind) -> bool {
+  return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* {
+      Type.Nominal {declaration, ..} => DeclarationId.kind(&declaration) == expected
+      _ => false
+    }
+  })
+}
+
+fn sameAt(whole: &[u8], start: usize, part: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < part.length {
+    if whole[start + at] != part[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The portable enum tag is its logical package, module path, and declaration spelling.
+fn canonicalEnumName(declaration: &DeclarationId, canonical: &[u8]) -> bool {
+  return DeclarationId.withSpelling<bool>(declaration, fn(name: &[u8]) -> bool {
+    return canonicalEnumSpelling(DeclarationId.moduleId(declaration), canonical, name)
+  })
+}
+
+fn canonicalEnumSpelling(module: &ModuleId, canonical: &[u8], name: &[u8]) -> bool {
+  return ModuleId.withComponents<bool>(module, fn(origin: &[u8], package: &[u8], path: &[u8]) -> bool {
+    if canonical.length != package.length + usize.ONE + path.length + usize.ONE + name.length { return false }
+    if !sameAt(canonical, usize.ZERO, package) || canonical[package.length] != 47 { return false }
+    let pathAt = package.length + usize.ONE
+    if !sameAt(canonical, pathAt, path) || canonical[pathAt + path.length] != 47 { return false }
+    return sameAt(canonical, pathAt + path.length + usize.ONE, name)
+  })
+}
+
+fn enumIdentity(value: &StaticData, expected: &DeclarationId, ordinal: usize) -> bool {
+  return match &value.* {
+    StaticData.Enum {declaration, member: index, ..} => {
+      if index != ordinal { return false }
+      return Shared<DeclarationId>.with<bool>(&declaration, fn(id: &DeclarationId) -> bool {
+        return DeclarationId.equals(expected, id)
+      })
+    }
+    _ => false
+  }
+}
+
+fn enumValueIdentity(value: &Shared<StaticData>, expected: &DeclarationId, ordinal: usize) -> bool {
+  return Shared<StaticData>.with<bool>(value, fn(selected: &StaticData) -> bool {
+    return enumIdentity(selected, expected, ordinal)
+  })
+}
+
+fn nominalEnumIdentity(found: &Type, entry: &EnumMember, ordinal: usize) -> bool {
+  return match &found.* {
+    Type.Nominal {declaration, ..} => enumValueIdentity(&entry.value, &declaration, ordinal)
+    _ => false
+  }
+}
+
+fn enumMemberType(ty: &Shared<Type>, entry: &EnumMember, ordinal: usize) -> bool {
+  return Shared<Type>.with<bool>(ty, fn(found: &Type) -> bool {
+    return nominalEnumIdentity(found, entry, ordinal)
+  })
+}
+
+fn staticLifetime(value: &Lifetime) -> bool {
+  return match &value.* {
+    Lifetime.Static => true
+    _ => false
+  }
+}
+
+fn staticStringType(found: &Type) -> bool {
+  return match &found.* {
+    Type.String {lifetime} => Shared<Lifetime>.with<bool>(&lifetime, staticLifetime)
+    _ => false
+  }
+}
+
+// The element type of an array type whose extent is exactly `length`.
+fn fixedArrayElement(found: &Type, length: usize) -> Option<Shared<Type>> {
+  return match &found.* {
+    Type.Array {extent, element} => elementForExtent(Bytes.asSlice(&extent), &element, length)
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+fn elementForExtent(extent: &[u8], element: &Shared<Type>, length: usize) -> Option<Shared<Type>> {
+  let actual = match move arrayLength(extent) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option<Shared<Type>>.none() }
+  }
+  if actual != length { return Option<Shared<Type>>.none() }
+  return Option<Shared<Type>>.some(Shared<Type>.clone(element))
+}
+
+fn repeatsEarlierEnumName(listed: &[EnumMember], at: usize) -> bool {
+  let mut earlier = usize.ZERO
+  while earlier < at {
+    if same(Bytes.asSlice(&listed[earlier].name), Bytes.asSlice(&listed[at].name)) { return true }
+    earlier = earlier + usize.ONE
+  }
+  return false
+}
+
+fn repeatsEarlierFieldName(listed: &[NamedShape], at: usize) -> bool {
+  let mut earlier = usize.ZERO
+  while earlier < at {
+    if same(Bytes.asSlice(&listed[earlier].name), Bytes.asSlice(&listed[at].name)) { return true }
+    earlier = earlier + usize.ONE
+  }
+  return false
+}
+
+/// Checks a resolved shape against its type at every represented node before constructing a
+/// value. U8 supplies nominal declaration members and must only build nominal shapes for source
+/// declarations that have no resource or Drop behavior.
+pub effect fn correspondsToType(ty: &Shared<Type>, shape: &Shape) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  return match &shape.* {
+    Shape.Integer {kind, bits} => Shared<Type>.with<bool>(ty, fn(found: &Type) -> bool {
+      return match &found.* {
+        Type.Primitive {name} => {
+          let width = StaticValue.integerBits(kind, bits)
+          let concrete = match move width {
+            Option<u32>.Some {value} => value == bits
+            Option<u32>.None => false
+          }
+          return integerTypeName(Bytes.asSlice(&name), kind) && concrete
+        }
+        _ => false
+      }
+    })
+    Shape.Boolean => Shared<Type>.with<bool>(ty, fn(found: &Type) -> bool {
+      return match &found.* {
+        Type.Primitive {name} => same(Bytes.asSlice(&name), b"bool")
+        _ => false
+      }
+    })
+    Shape.String => Shared<Type>.with<bool>(ty, staticStringType)
+    Shape.Enum {canonical, members} => {
+      let listed = Vector<EnumMember>.asSlice(&members)
+      if listed.length == usize.ZERO || !nominalKind(ty, OwnerKind.Enumeration) { return false }
+      let canonicalType = Shared<Type>.with<bool>(ty, fn(found: &Type) -> bool {
+        return match &found.* {
+          Type.Nominal {declaration, ..} => canonicalEnumName(&declaration, Bytes.asSlice(&canonical))
+          _ => false
+        }
+      })
+      if !canonicalType { return false }
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if !enumMemberType(ty, &listed[at], at) || repeatsEarlierEnumName(listed, at) { return false }
+        at = at + usize.ONE
+      }
+      return true
+    }
+    Shape.Optional {absent, present, elementType, element} => {
+      if absent == present || !nominalKind(ty, OwnerKind.Union) { return false }
+      let inner = Box<Shape>.get(&element)
+      return run correspondsToType(&elementType, &inner[usize.ZERO])
+    }
+    Shape.Array {length, elementType, element} => {
+      let actual = Shared<Type>.with<Option<Shared<Type>>>(ty, fn(found: &Type) -> Option<Shared<Type>> {
+        return fixedArrayElement(found, length)
+      })
+      let resolved = match move actual {
+        Option<Shared<Type>>.Some {value} => move value
+        Option<Shared<Type>>.None => { return false }
+      }
+      if !run Type.equalsShared(&resolved, &elementType) { return false }
+      let inner = Box<Shape>.get(&element)
+      return run correspondsToType(&resolved, &inner[usize.ZERO])
+    }
+    Shape.Record {fields} => {
+      if !nominalKind(ty, OwnerKind.Struct) { return false }
+      let listed = Vector<NamedShape>.asSlice(&fields)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if repeatsEarlierFieldName(listed, at) { return false }
+        let inner = Box<Shape>.get(&listed[at].value)
+        if !run correspondsToType(&listed[at].ty, &inner[usize.ZERO]) { return false }
+        at = at + usize.ONE
+      }
+      return true
+    }
+  }
+}
+
+fn indexOfEnumMember(listed: &[EnumMember], member: &[u8]) -> Option<usize> {
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(member, Bytes.asSlice(&listed[at].name)) { return Option<usize>.some(at) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+fn arrayFits(supplied: &[Box<Input>], length: usize, element: &Box<Shape>) -> bool {
+  if supplied.length != length { return false }
+  let mut at = usize.ZERO
+  while at < supplied.length {
+    let inner = Box<Shape>.get(element)
+    let item = Box<Input>.get(&supplied[at])
+    let valid = fits(&item[usize.ZERO], &inner[usize.ZERO])
+    if !valid { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// True when exactly one supplied field carries the expected name and that field fits.
+fn namedFieldFits(expected: &NamedShape, values: &[Field]) -> bool {
+  let mut matches = usize.ZERO
+  let mut candidate = usize.ZERO
+  while candidate < values.length {
+    if same(Bytes.asSlice(&expected.name), Bytes.asSlice(&values[candidate].name)) {
+      matches = matches + usize.ONE
+      let inner = Box<Shape>.get(&expected.value)
+      let item = Box<Input>.get(&values[candidate].value)
+      let valid = fits(&item[usize.ZERO], &inner[usize.ZERO])
+      if !valid { return false }
+    }
+    candidate = candidate + usize.ONE
+  }
+  return matches == usize.ONE
+}
+
+fn recordFits(expected: &[NamedShape], values: &[Field]) -> bool {
+  if expected.length != values.length { return false }
+  let mut at = usize.ZERO
+  while at < expected.length {
+    if !namedFieldFits(&expected[at], values) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Check the complete transport value against a resolved concrete shape without coercion.
+/// This must run for every admitted binding, including one at a losing tier.
+pub fn fits(input: &Input, shape: &Shape) -> bool {
+  return match &shape.* {
+    Shape.Integer {kind, bits} => match &input.* {
+      Input.Integer {decimal} => {
+        let width = StaticValue.integerBits(kind, bits)
+        let concrete = match move width {
+          Option<u32>.Some {value} => value == bits
+          Option<u32>.None => false
+        }
+        return concrete && integerFits(Bytes.asSlice(&decimal), StaticValue.signed(kind), bits)
+      }
+      _ => false
+    }
+    Shape.Boolean => match &input.* {
+      Input.Boolean {..} => true
+      _ => false
+    }
+    Shape.String => match &input.* {
+      Input.String {text} => validText(Bytes.asSlice(&text))
+      _ => false
+    }
+    Shape.Enum {canonical, members} => match &input.* {
+      Input.Enum {nominal, member} => {
+        if !same(Bytes.asSlice(&nominal), Bytes.asSlice(&canonical)) { return false }
+        let listed = Vector<EnumMember>.asSlice(&members)
+        return match move indexOfEnumMember(listed, Bytes.asSlice(&member)) {
+          Option<usize>.Some {value: _} => true
+          Option<usize>.None => false
+        }
+      }
+      _ => false
+    }
+    Shape.Optional {element, ..} => match &input.* {
+      Input.None => true
+      Input.Some {value} => {
+        let inner = Box<Shape>.get(&element)
+        let payload = Box<Input>.get(&value)
+        return fits(&payload[usize.ZERO], &inner[usize.ZERO])
+      }
+      _ => false
+    }
+    Shape.Array {length, element, ..} => match &input.* {
+      Input.Array {values} => arrayFits(Vector<Box<Input>>.asSlice(&values), length, &element)
+      _ => false
+    }
+    Shape.Record {fields} => match &input.* {
+      Input.Record {fields: supplied} => {
+        let expected = Vector<NamedShape>.asSlice(&fields)
+        return recordFits(expected, Vector<Field>.asSlice(&supplied))
+      }
+      _ => false
+    }
+  }
+}
+
+struct ParsedInteger {
+  sign: Sign
+  magnitude: u64
+}
+
+fn parseInteger(decimal: &[u8]) -> Option<ParsedInteger> {
+  if decimal.length == usize.ZERO { return Option<ParsedInteger>.none() }
+  let mut at = usize.ZERO
+  let mut sign = Sign.Positive
+  if decimal[at] == 45 {
+    sign = Sign.Negative
+    at = at + usize.ONE
+  }
+  if at == decimal.length { return Option<ParsedInteger>.none() }
+  let mut magnitude: u64 = 0
+  while at < decimal.length {
+    let digit = decimal[at]
+    if digit < 48 || digit > 57 { return Option<ParsedInteger>.none() }
+    magnitude = match move u64.checkedMultiply(magnitude, 10) {
+      Option<u64>.Some {value} => value
+      Option<u64>.None => { return Option<ParsedInteger>.none() }
+    }
+    magnitude = match move u64.checkedAdd(magnitude, u8.toU64(digit - 48)) {
+      Option<u64>.Some {value} => value
+      Option<u64>.None => { return Option<ParsedInteger>.none() }
+    }
+    at = at + usize.ONE
+  }
+  return Option<ParsedInteger>.some(ParsedInteger {sign: sign, magnitude: magnitude})
+}
+
+fn fieldIndex(fields: &Vector<Field>, name: &[u8]) -> Option<usize> {
+  let values = Vector<Field>.asSlice(fields)
+  let mut at = usize.ZERO
+  while at < values.length {
+    if same(Bytes.asSlice(&values[at].name), name) { return Option<usize>.some(at) }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+effect fn share(value: Option<StaticData>) -> Option<Shared<StaticData>>
+! OutOfMemoryError ? &mut Allocator {
+  return match move value {
+    Option<StaticData>.Some {value: selected} => Option<Shared<StaticData>>.some(run Shared<StaticData>.make(move selected))
+    Option<StaticData>.None => Option<Shared<StaticData>>.none()
+  }
+}
+
+// The member's canonical value, provided it carries the member's own ordinal.
+fn enumMemberValue(entry: &EnumMember, ordinal: usize) -> Option<Shared<StaticData>> {
+  let valid = Shared<StaticData>.with<bool>(&entry.value, fn(value: &StaticData) -> bool {
+    return match &value.* {
+      StaticData.Enum {member: selectedMember, ..} => selectedMember == ordinal
+      _ => false
+    }
+  })
+  if valid { return Option<Shared<StaticData>>.some(Shared<StaticData>.clone(&entry.value)) }
+  return Option<Shared<StaticData>>.none()
+}
+
+// Materializes one child and appends it; false when the child cannot be materialized.
+effect fn appendMaterialized(
+  raw: Box<Input>,
+  shape: &Box<Shape>,
+  ty: Shared<Type>,
+  values: &mut Vector<Shared<StaticData>>,
+) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let inner = Box<Shape>.get(shape)
+  let child = run materialize(Box<Input>.into(move raw), &inner[usize.ZERO], move ty)
+  let selected = match move child {
+    Option<Shared<StaticData>>.Some {value: selectedValue} => move selectedValue
+    Option<Shared<StaticData>>.None => { return false }
+  }
+  run Vector<Shared<StaticData>>.append(&mut values.*, move selected)
+  return true
+}
+
+// U8 supplies a resolved shape with each child type and canonical enum value. This operation
+// consumes only a value that has passed `fits`; construction does not grant general static purity.
+effect fn materialize(input: Input, shape: &Shape, ty: Shared<Type>) -> Option<Shared<StaticData>>
+! OutOfMemoryError ? &mut Allocator {
+  return match &shape.* {
+    Shape.Integer {kind, bits} => match move input {
+      Input.Integer {decimal} => {
+        let parsed = parseInteger(Bytes.asSlice(&decimal))
+        return match move parsed {
+          Option<ParsedInteger>.Some {value} => run share(StaticValue.integer(kind, value.sign, value.magnitude, bits))
+          Option<ParsedInteger>.None => Option<Shared<StaticData>>.none()
+        }
+      }
+      _ => Option<Shared<StaticData>>.none()
+    }
+    Shape.Boolean => match move input {
+      Input.Boolean {value} => Option<Shared<StaticData>>.some(run Shared<StaticData>.make(StaticData.Boolean {value: value}))
+      _ => Option<Shared<StaticData>>.none()
+    }
+    Shape.String => match move input {
+      Input.String {text} => run share(StaticValue.text(move text))
+      _ => Option<Shared<StaticData>>.none()
+    }
+    Shape.Enum {members, ..} => match move input {
+      Input.Enum {nominal: _, member} => {
+        let listed = Vector<EnumMember>.asSlice(&members)
+        let found = indexOfEnumMember(listed, Bytes.asSlice(&member))
+        return match move found {
+          Option<usize>.Some {value: at} => enumMemberValue(&listed[at], at)
+          Option<usize>.None => Option<Shared<StaticData>>.none()
+        }
+      }
+      _ => Option<Shared<StaticData>>.none()
+    }
+    Shape.Optional {absent, present, elementType, element} => match move input {
+      Input.None => Option<Shared<StaticData>>.some(run Shared<StaticData>.make(
+        StaticValue.optionalVariant(move ty, absent, Vector<Shared<StaticData>>.make()),
+      ))
+      Input.Some {value} => {
+        let mut fields = Vector<Shared<StaticData>>.make()
+        if !run appendMaterialized(move value, &element, Shared<Type>.clone(&elementType), &mut fields) {
+          return Option<Shared<StaticData>>.none()
+        }
+        return Option<Shared<StaticData>>.some(run Shared<StaticData>.make(
+          StaticValue.optionalVariant(move ty, present, move fields),
+        ))
+      }
+      _ => Option<Shared<StaticData>>.none()
+    }
+    Shape.Array {elementType, element, ..} => match move input {
+      Input.Array {values} => {
+        let mut remaining = move values
+        let mut fields = Vector<Shared<StaticData>>.make()
+        while Vector<Box<Input>>.length(&remaining) > usize.ZERO {
+          let raw = Vector<Box<Input>>.remove(&mut remaining, usize.ZERO)
+          if !run appendMaterialized(move raw, &element, Shared<Type>.clone(&elementType), &mut fields) {
+            return Option<Shared<StaticData>>.none()
+          }
+        }
+        return run share(StaticValue.fixedArray(move ty, move fields))
+      }
+      _ => Option<Shared<StaticData>>.none()
+    }
+    Shape.Record {fields} => match move input {
+      Input.Record {fields: supplied} => {
+        let mut remaining = move supplied
+        let expected = Vector<NamedShape>.asSlice(&fields)
+        let mut values = Vector<Shared<StaticData>>.make()
+        let mut at = usize.ZERO
+        while at < expected.length {
+          let found = fieldIndex(&remaining, Bytes.asSlice(&expected[at].name))
+          let index = match move found {
+            Option<usize>.Some {value} => value
+            Option<usize>.None => { return Option<Shared<StaticData>>.none() }
+          }
+          let raw = Vector<Field>.remove(&mut remaining, index)
+          let childType = Shared<Type>.clone(&expected[at].ty)
+          if !run appendMaterialized(move raw.value, &expected[at].value, move childType, &mut values) {
+            return Option<Shared<StaticData>>.none()
+          }
+          at = at + usize.ONE
+        }
+        return Option<Shared<StaticData>>.some(run Shared<StaticData>.make(StaticValue.record(move ty, move values)))
+      }
+      _ => Option<Shared<StaticData>>.none()
+    }
+  }
+}
+
+/// Publish a binding as checked only after complete recursive type validation. A losing-tier
+/// binding must also pass this operation before any precedence comparison is performed. The
+/// caller supplies the concrete shape of `schema.ty`.
+effect fn check(binding: Accepted, schema: Shared<ParameterSchema>, shape: &Shape) -> Result<Checked, CheckError>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let known = Shared<ParameterSchema>.with<bool>(&schema, fn(selected: &ParameterSchema) -> bool {
+    return matchesIdentity(&binding, selected)
+  })
+  if !known { return Result<Checked, CheckError>.failResult(CheckError.UnknownParameter) }
+  let public = Shared<ParameterSchema>.with<bool>(&schema, fn(selected: &ParameterSchema) -> bool {
+    return selected.isPublic
+  })
+  if !public { return Result<Checked, CheckError>.failResult(CheckError.PrivateParameter) }
+  let ty = Shared<ParameterSchema>.with<Shared<Type>>(&schema, fn(selected: &ParameterSchema) -> Shared<Type> {
+    return Shared<Type>.clone(&selected.ty)
+  })
+  let corresponding = run correspondsToType(&ty, shape)
+  if !corresponding || !fits(&binding.value, shape) {
+    return Result<Checked, CheckError>.failResult(CheckError.WrongType)
+  }
+  let typed = run materialize(move binding.value, shape, move ty)
+  let value = match move typed {
+    Option<Shared<StaticData>>.Some {value} => move value
+    Option<Shared<StaticData>>.None => { return Result<Checked, CheckError>.failResult(CheckError.WrongType) }
+  }
+  return Result<Checked, CheckError>.succeed(Checked {
+    package: move binding.package,
+    module: move binding.module,
+    parameter: move binding.parameter,
+    schema: move schema,
+    value: move value,
+    provenance: move binding.provenance,
+    tier: binding.tier,
+    ordinal: usize.ZERO,
+  })
+}
+
+/// True when `candidate` outranks `current`; equal tiers always conflict, even for equal values.
+/// Both bindings must target the same parameter and pass provenance, header, and type checks.
+fn outranks(current: &Checked, candidate: &Checked) -> Result<bool, SameTierConflict> {
+  if current.tier == candidate.tier {
+    return Result<bool, SameTierConflict>.failResult(SameTierConflict {})
+  }
+  return Result<bool, SameTierConflict>.succeed(candidate.tier == Tier.Override)
+}
+
+/// Whether this checked binding targets the given canonical declaration.
+pub fn targets(binding: &Checked, identity: &DeclarationId) -> bool {
+  return Shared<ParameterSchema>.with<bool>(&binding.schema, fn(schema: &ParameterSchema) -> bool {
+    return DeclarationId.equals(&schema.declaration, identity)
+  })
+}
+
+/// The complete typed static value selected for this public binding.
+pub fn value(binding: &Checked) -> Shared<StaticData> { return Shared<StaticData>.clone(&binding.value) }
+
+/// The winning binding's admitted logical provenance.
+pub fn provenance(binding: &Checked) -> &Provenance { return &binding.provenance }
+
+/// Returns the original request position of this selected binding.
+pub fn ordinal(binding: &Checked) -> usize { return binding.ordinal }
+
+fn allowed(origin: &Provenance) -> bool {
+  return match &origin.* {
+    Provenance.Literal => true
+    Provenance.TranslatedPublic {..} => true
+    _ => false
+  }
+}
+
+fn entryMatches(binding: &Accepted, entry: &RegisteredShape) -> bool {
+  return Shared<ParameterSchema>.with<bool>(&entry.schema, fn(schema: &ParameterSchema) -> bool {
+    return matchesIdentity(binding, schema)
+  })
+}
+
+fn isPublic(entry: &RegisteredShape) -> bool {
+  return Shared<ParameterSchema>.with<bool>(&entry.schema, fn(schema: &ParameterSchema) -> bool {
+    return schema.isPublic
+  })
+}
+
+effect fn checkAgainst(binding: Accepted, entry: &RegisteredShape) -> Result<Checked, CheckError>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  return run check(move binding, Shared<ParameterSchema>.clone(&entry.schema), &entry.shape)
+}
+
+fn sameChecked(left: &Checked, right: &Checked) -> bool {
+  return same(Bytes.asSlice(&left.package), Bytes.asSlice(&right.package)) && same(
+    Bytes.asSlice(&left.module), Bytes.asSlice(&right.module),
+  ) && same(Bytes.asSlice(&left.parameter), Bytes.asSlice(&right.parameter))
+}
+
+/// Validates every provenance before schema lookup, then every type before tier selection.
+/// Equal same-tier bindings conflict even when their values are equal. Selected values keep
+/// their original request positions so the caller can attach current diagnostic origins. Each
+/// registered shape must describe its header's resolved type.
+pub effect fn prepare(
+  supplied: Vector<Supplied>,
+  schemas: &[RegisteredShape],
+) -> Result<Vector<Checked>, BindingError> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let raw = Vector<Supplied>.asSlice(&supplied)
+  let mut at = usize.ZERO
+  while at < raw.length {
+    if !allowed(&raw[at].provenance) {
+      return Result<Vector<Checked>, BindingError>.failResult(BindingError {
+        code: BindingIssue.ProhibitedProvenance,
+        ordinal: at,
+        previous: Option<usize>.none(),
+      })
+    }
+    at = at + usize.ONE
+  }
+  let mut remaining = move supplied
+  let mut checked = Vector<Checked>.make()
+  let mut ordinal = usize.ZERO
+  while Vector<Supplied>.length(&remaining) > usize.ZERO {
+    let rawBinding = Vector<Supplied>.remove(&mut remaining, usize.ZERO)
+    let accepted = match move admit(move rawBinding) {
+      Result<Accepted, ProhibitedProvenance>.Success {value} => move value
+      Result<Accepted, ProhibitedProvenance>.Failure {error: _} => {
+        return Result<Vector<Checked>, BindingError>.failResult(BindingError {
+          code: BindingIssue.ProhibitedProvenance,
+          ordinal: ordinal,
+          previous: Option<usize>.none(),
+        })
+      }
+    }
+    let mut found = Option<usize>.none()
+    let mut schemaAt = usize.ZERO
+    while schemaAt < schemas.length {
+      if entryMatches(&accepted, &schemas[schemaAt]) {
+        found = Option<usize>.some(schemaAt)
+        break
+      }
+      schemaAt = schemaAt + usize.ONE
+    }
+    let selected = match move found {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => {
+        return Result<Vector<Checked>, BindingError>.failResult(BindingError {
+          code: BindingIssue.UnknownParameter,
+          ordinal: ordinal,
+          previous: Option<usize>.none(),
+        })
+      }
+    }
+    if !isPublic(&schemas[selected]) {
+      return Result<Vector<Checked>, BindingError>.failResult(BindingError {
+        code: BindingIssue.PrivateParameter,
+        ordinal: ordinal,
+        previous: Option<usize>.none(),
+      })
+    }
+    let mut value = match move run checkAgainst(move accepted, &schemas[selected]) {
+      Result<Checked, CheckError>.Success {value} => move value
+      Result<Checked, CheckError>.Failure {error: _} => {
+        return Result<Vector<Checked>, BindingError>.failResult(BindingError {
+          code: BindingIssue.WrongType,
+          ordinal: ordinal,
+          previous: Option<usize>.none(),
+        })
+      }
+    }
+    value.ordinal = ordinal
+    run Vector<Checked>.append(&mut checked, move value)
+    ordinal = ordinal + usize.ONE
+  }
+  let mut selected = Vector<Checked>.make()
+  // Compare every validated binding with earlier bindings at its own tier. A higher-tier
+  // winner must not hide two project bindings that arrived on either side of it.
+  let valid = Vector<Checked>.asSlice(&checked)
+  let mut candidateAt = usize.ZERO
+  while candidateAt < valid.length {
+    let mut previousAt = usize.ZERO
+    while previousAt < candidateAt {
+      if sameChecked(&valid[previousAt], &valid[candidateAt]) && valid[previousAt].tier == valid[candidateAt].tier {
+        return Result<Vector<Checked>, BindingError>.failResult(BindingError {
+          code: BindingIssue.SameTierConflict,
+          ordinal: valid[candidateAt].ordinal,
+          previous: Option<usize>.some(valid[previousAt].ordinal),
+        })
+      }
+      previousAt = previousAt + usize.ONE
+    }
+    candidateAt = candidateAt + usize.ONE
+  }
+  while Vector<Checked>.length(&checked) > usize.ZERO {
+    let candidate = Vector<Checked>.remove(&mut checked, usize.ZERO)
+    let current = Vector<Checked>.asSlice(&selected)
+    let mut found = Option<usize>.none()
+    let mut at = usize.ZERO
+    while at < current.length {
+      if sameChecked(&current[at], &candidate) {
+        found = Option<usize>.some(at)
+        break
+      }
+      at = at + usize.ONE
+    }
+    if let Option<usize>.Some {value: index} = move found {
+      let prior = Vector<Checked>.asSlice(&selected)
+      let outranks = match move outranks(&prior[index], &candidate) {
+        Result<bool, SameTierConflict>.Success {value} => value
+        Result<bool, SameTierConflict>.Failure {error: _} => {
+          return Result<Vector<Checked>, BindingError>.failResult(BindingError {
+            code: BindingIssue.SameTierConflict,
+            ordinal: candidate.ordinal,
+            previous: Option<usize>.some(prior[index].ordinal),
+          })
+        }
+      }
+      if outranks {
+        let replaced = Vector<Checked>.remove(&mut selected, index)
+        drop replaced
+        run Vector<Checked>.append(&mut selected, move candidate)
+      }
+    } else {
+      run Vector<Checked>.append(&mut selected, move candidate)
+    }
+  }
+  return Result<Vector<Checked>, BindingError>.succeed(move selected)
+}

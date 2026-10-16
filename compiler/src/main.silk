@@ -1,9 +1,12 @@
+import semantic.Types {TypeTable, Types}
+import diagnostic.JsonText
+import diagnostic.Report as Reports {RelatedLocation, RenderedDiagnostic}
 import hir.Draft
+import format.Command as FormatCommand {FileOutcome}
 import hir.Fingerprint
 import hir.Hir
 import hir.Lower
 import hir.LowerDeclaration
-import hir.LoweringCases
 import hir.LowerExpression
 import hir.LowerPattern
 import hir.LowerStatement
@@ -12,26 +15,87 @@ import lexer.Lexer {Lexer}
 import Stream {Stream}
 import lexer.Token {Token}
 import parser.Parser
-import parser.ParserCases
 import parser.SyntaxTree
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
+import silk.child_process {ChildProcess, ProcessError, ProcessRequest}
 import silk.effect {Effect}
 import silk.filesystem {FileError, FileSystem, Path}
 import silk.host_input {HostInput, HostInputError}
 import silk.option {Option}
 import silk.os_filesystem {OsFileSystem}
-import silk.os_writer {StdoutWriter}
+import silk.os_child_process {OsChildProcess}
+import silk.os_writer {StderrWriter, StdoutWriter}
 import silk.result {Result}
 import silk.string {InvalidUtf8, String}
 import silk.usize
 import silk.vector {Vector}
 import silk.writer {Writer, WriterError}
+import semantic.ExecutionStorage {ExecutionStorage}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.Query {Cycle}
+import semantic.TypedBody {uncheckedReasonCount, uncheckedReasonName}
+import driver.ModuleSources as ModuleSourceFiles {InvalidBuildComposition, InvalidSourceRoot, MissingManifest, ModuleSources}
+import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput}
+import driver.CommandPath
+import driver.PlatformSupply as PlatformSupplies {Request as SupplyRequest, Supply, SupplyError}
+import driver.NativeToolchain
+import driver.InstalledCompiler
+import driver.ProcessImage
+import driver.Project as Projects {Form, Project, ProjectError, SourceSelection, Stage}
+import driver.ProjectCommand as ProjectCommands {Build as BuildCommand, Check as CheckCommand, Clean as CleanCommand, Init as InitCommand, InvalidProjectCommand, Options as ProjectOptions, Run as RunCommand, Test as TestCommand}
+import driver.ProjectProfile as ProjectProfiles {Code as ProfileCode}
+import driver.ProjectPlan as ProjectPlans {PlanError, ProjectPlan}
+import driver.ProjectInitializer as ProjectInitializers {InitializationError, Initialized}
+import silk.toml_scanner { TomlError }
+import silk.toml_value { Value as TomlValue }
+import semantic.Semantic {
+  BackendBuild,
+  Request as SemanticRequest,
+  Semantic,
+  Statistics,
+  TestCatalog,
+  DeferredStaticTemplate,
+  UncheckedBody,
+  staticClosureNodes,
+  uncheckedBodyCodes,
+  RegistrationClosed,
+  ConflictingPackageSource
+}
+import semantic.DependencyGraph { Counters as GraphCounters }
+import semantic.FinalProfile { FinalProfile }
+import semantic.InitialProfile {
+  Input as ProfileInput,
+  InitialProfile,
+  Problem as InitialProfileProblem,
+}
+import semantic.ProfileBinding {Supplied}
+import semantic.ProfileAssembly {AssemblyProblem, assemble as assembleProfile}
+import semantic.ProfileShape {Registered, Problem as ShapeProblem, registered as registeredShapes}
+import semantic.SourceIndex {RevisionMismatch}
+import semantic.Target {Id as TargetId, Target}
+import driver.TestRun
+import silk.i32
+import silk.i64
+import silk.os_system_clock {OsSystemClock}
+import silk.sha2 {Sha256}
+import silk.system_clock {SystemClock}
+import silk.u64
+import backend.EmissionPlan {EmissionPlan}
+import backend.Gap {Code as GapCode, Gap, Source as GapSource}
+import backend.InstanceKey {InstanceKey}
+import lexer.Span {Span}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Rejection as Rejections {RelatedSite, Rejection, RejectionCode}
+import silk.shared {Shared}
+import silk.u8
 
 /// A command-line contract failure before source reading begins.
 pub union ApplicationError {
   InvalidArgumentCount {pub actual: usize},
   InvalidWorkingDirectoryEncoding,
+  InvalidBuildProfile,
+  InvalidPath {pub argument: Bytes},
 }
 
 effect fn invalidArgumentCount(actual: usize) -> never ! ApplicationError {
@@ -42,10 +106,20 @@ effect fn invalidWorkingDirectoryEncoding() -> never ! ApplicationError {
   fail ApplicationError.InvalidWorkingDirectoryEncoding
 }
 
-/// One parsed command line: the source file to read and which dump to print.
-struct Request {
-  source: Bytes
-  hir: bool
+/// One parsed command line: the source file to read and the requested artifact or dump. A test
+/// request builds the bundled runner for its discovery root and runs the selected tests.
+union Request {
+  Dump {source: Bytes, hir: bool},
+  Build {source: Bytes, output: Bytes, stage: Option<Stage>, standardLibrary: Option<Bytes>, input: ProfileInput, stats: bool, clang: Option<Bytes>},
+  Test {source: Bytes, output: Bytes, standardLibrary: Option<Bytes>, profile: InitialProfile, filter: Option<Bytes>, file: Option<Bytes>, noCache: bool},
+  Run {command: RunCommand},
+  Init {command: InitCommand},
+  Clean {command: CleanCommand},
+  ProjectBuild {command: BuildCommand},
+  ProjectTest {command: TestCommand},
+  Check {command: CheckCommand},
+  Help,
+  Version,
 }
 
 /// Reports whether `argument` spells the `hir` mode selector.
@@ -64,6 +138,20 @@ fn selectsHir(argument: &[u8]) -> bool {
   return true
 }
 
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
 effect fn argumentAt(index: usize, count: usize) -> Bytes
 ! ApplicationError | HostInputError | OutOfMemoryError
 ? &mut HostInput | &mut Allocator {
@@ -74,14 +162,319 @@ effect fn argumentAt(index: usize, count: usize) -> Bytes
   }
 }
 
-/// Reads the command line: `<file>` dumps the syntax tree, `hir <file>` dumps the lowered module.
-effect fn request() -> Request
+fn hasFilter(value: &Option<Bytes>) -> bool {
+  return match &value.* {
+    Option<Bytes>.Some {..} => true
+    Option<Bytes>.None => false
+  }
+}
+
+// One line per counter group, in a fixed form a script can parse: `silk-stats <group>` then
+// space-separated `name=value` pairs.
+effect fn writeStatistics(counted: &Statistics) -> () ! WriterError | OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(b"silk-stats demand demands=")
+  run JsonText.appendDecimal(&mut text, counted.demands)
+  run Bytes.append(&mut text, b" hits=")
+  run JsonText.appendDecimal(&mut text, counted.hits)
+  run Bytes.append(&mut text, b" units-run=")
+  run JsonText.appendDecimal(&mut text, counted.runs)
+  run Bytes.append(&mut text, b"\n")
+  if let Option<GraphCounters>.Some {value: graph} = &counted.graph {
+    run Bytes.append(&mut text, b"silk-stats graph units=")
+    run JsonText.appendDecimal(&mut text, graph.units)
+    run Bytes.append(&mut text, b" dependees=")
+    run JsonText.appendDecimal(&mut text, graph.dependees)
+    run Bytes.append(&mut text, b" edges=")
+    run JsonText.appendDecimal(&mut text, graph.edges)
+    run Bytes.append(&mut text, b" free-edges=")
+    run JsonText.appendDecimal(&mut text, graph.freeEdges)
+    run Bytes.append(&mut text, b" edges-recorded=")
+    run JsonText.appendDecimal(&mut text, graph.edgesRecorded)
+    run Bytes.append(&mut text, b" edges-deduplicated=")
+    run JsonText.appendDecimal(&mut text, graph.edgesDeduplicated)
+    run Bytes.append(&mut text, b" marked-outdated=")
+    run JsonText.appendDecimal(&mut text, graph.markedOutdated)
+    run Bytes.append(&mut text, b" bytes=")
+    run JsonText.appendDecimal(&mut text, graph.bytes)
+    run Bytes.append(&mut text, b"\n")
+  }
+  return run writeError(Bytes.asSlice(&text))
+}
+
+// Coverage evidence for --stats: every structurally deferred body, with its full authored owner
+// address. This reports no success verdict for a template awaiting selected static inputs.
+effect fn writeDeferredTemplates(deferred: &[DeferredStaticTemplate]) -> ()
+  ! WriterError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < deferred.length {
+    let declaration = &deferred[at].declaration
+    let mut line = run Bytes.copy(b"silk-stats deferred-static ")
+    let module = DeclarationId.moduleId(declaration)
+    let path = run ModuleId.copyPath(module)
+    run Bytes.append(&mut line, Bytes.asSlice(&path))
+    let mut owner = usize.ZERO
+    while owner < DeclarationId.ownerCount(declaration) {
+      run Bytes.append(&mut line, b"::")
+      if DeclarationId.ownerNamed(declaration, owner) {
+        let name = run DeclarationId.copyOwnerName(declaration, owner)
+        run Bytes.append(&mut line, Bytes.asSlice(&name))
+      } else {
+        run JsonText.appendDecimal(&mut line, DeclarationId.ownerOccurrence(declaration, owner))
+      }
+      owner = owner + usize.ONE
+    }
+    run Bytes.append(&mut line, b"\n")
+    run writeError(Bytes.asSlice(&line))
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn invalidBuildProfile() -> never ! ApplicationError {
+  fail ApplicationError.InvalidBuildProfile
+}
+
+// The arguments after the command name.
+effect fn commandArguments(count: usize) -> Vector<Bytes>
 ! ApplicationError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator {
+  let mut arguments = Vector<Bytes>.make()
+  let mut at = usize.add(0, 2)
+  while at < count {
+    run Vector<Bytes>.append(&mut arguments, run argumentAt(at, count))
+    at = at + usize.ONE
+  }
+  return move arguments
+}
+
+// Reads the arguments after `init`; a malformed command line reports the usage.
+effect fn initRequest(count: usize) -> InitCommand
+! ApplicationError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator {
+  let arguments = run commandArguments(count)
+  let parsed = run Effect.result(ProjectCommands.parseInit(Vector<Bytes>.asSlice(&arguments)))
+  return match move parsed {
+    Result<InitCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => move value
+    Result<InitCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidProjectCommand invalid => run invalidArgumentCount(count)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Reads the arguments after `run`; a malformed command line reports the usage.
+effect fn runRequest(count: usize) -> RunCommand
+! ApplicationError | HostInputError | OutOfMemoryError
+? &mut HostInput | &mut Allocator {
+  let arguments = run commandArguments(count)
+  let parsed = run Effect.result(ProjectCommands.parseRun(Vector<Bytes>.asSlice(&arguments)))
+  return match move parsed {
+    Result<RunCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => move value
+    Result<RunCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+      InvalidProjectCommand invalid => run invalidArgumentCount(count)
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// The command-line synopsis that `--help` prints and a malformed command line repeats.
+fn usage() -> &'static [u8] {
+  return b"silk: usage: silk build <source> -o <output> [--emit final|llvm-ir|llvm-bitcode|assembly|object] [--target <triple>] [--clang <path>] [--stdlib <directory>] [--optimization none|speed] [--debug true|false] [--stats]\n       silk test <root> -o <executable> [--stdlib <directory>] [--filter <text>] [--file <path>] [--optimization none|speed] [--debug true|false] --no-cache\n       silk build [--manifest-path <path>] [--target <host|triple>]... [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>]\n       silk run [--manifest-path <path>] [--target <host|triple>] [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>] [arguments...] [-- arguments...]\n       silk test [--manifest-path <path>] [--target <host|triple>] [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>] [--root <path>] [--file <path>] [--filter <text>] --no-cache\n       silk check [--manifest-path <path>] [--target <host|triple>]... [--release] [--optimization <profile>] [--profile <name>] [--profile-input <json>] [--stdlib <directory>] [--json]\n       silk format [paths] [--check] [--manifest-path <path>]\n       silk init [path] [--name <name>]\n       silk clean [--manifest-path <path>]\n       silk --help | --version\n"
+}
+
+// The compiler's release, its package version in `compiler/silk.toml`.
+fn version() -> &'static [u8] {
+  return b"silk v0.1.0\n"
+}
+
+// Whether the command at argument 1 has no source operand, which makes it a project command: no
+// further argument, or an option next, since a source file never begins with `-`.
+effect fn projectForm(count: usize) -> bool ! ApplicationError | HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator {
+  if count == usize.add(0, 2) {
+    return true
+  }
+  let first = run argumentAt(usize.add(0, 2), count)
+  let text = Bytes.asSlice(&first)
+  return text.length > usize.ZERO && text[usize.ZERO] == 45
+}
+
+/// Reads `build <source> -o <output> [--emit <stage>] [--target <triple>] [--clang <path>] [--stats]`,
+/// `test <root> -o <output> [--filter <text>] [--file <path>] --no-cache`, and dump modes. A build's
+/// form and stage come from its package manifest; `--emit` replaces the stage with one of the
+/// `[build].stage` spellings.
+effect fn request() -> Request
+! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError
 ? &mut HostInput | &mut Allocator {
   let count = run HostInput.argumentCount()
   if count == usize.add(0, 2) {
+    let only = run argumentAt(usize.ONE, count)
+    let flag = Bytes.asSlice(&only)
+    if same(flag, b"--help") || same(flag, b"-h") {
+      return Request.Help
+    }
+    if same(flag, b"--version") || same(flag, b"-v") {
+      return Request.Version
+    }
+  }
+  if count >= usize.add(0, 2) {
+    let command = run argumentAt(usize.ONE, count)
+    if same(Bytes.asSlice(&command), b"run") {
+      return Request.Run {command: run runRequest(count)}
+    }
+    if same(Bytes.asSlice(&command), b"init") {
+      return Request.Init {command: run initRequest(count)}
+    }
+    if same(Bytes.asSlice(&command), b"clean") {
+      let arguments = run commandArguments(count)
+      let parsed = run Effect.result(ProjectCommands.parseClean(Vector<Bytes>.asSlice(&arguments)))
+      return match move parsed {
+        Result<CleanCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.Clean {command: move value}
+        Result<CleanCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+          InvalidProjectCommand invalid => run invalidArgumentCount(count)
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    if same(Bytes.asSlice(&command), b"check") {
+      let arguments = run commandArguments(count)
+      let parsed = run Effect.result(ProjectCommands.parseCheck(Vector<Bytes>.asSlice(&arguments)))
+      return match move parsed {
+        Result<CheckCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.Check {command: move value}
+        Result<CheckCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+          InvalidProjectCommand invalid => run invalidArgumentCount(count)
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    // `build` without a source file builds the project; a source file never begins with `-`.
+    if same(Bytes.asSlice(&command), b"build") {
+      if run projectForm(count) {
+        let arguments = run commandArguments(count)
+        let parsed = run Effect.result(ProjectCommands.parseBuild(Vector<Bytes>.asSlice(&arguments)))
+        return match move parsed {
+          Result<BuildCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.ProjectBuild {command: move value}
+          Result<BuildCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+            InvalidProjectCommand invalid => run invalidArgumentCount(count)
+            OutOfMemoryError exhausted => { fail move exhausted }
+          }
+        }
+      }
+    }
+    // `test` without a discovery root tests the project.
+    if same(Bytes.asSlice(&command), b"test") {
+      if run projectForm(count) {
+        let arguments = run commandArguments(count)
+        let parsed = run Effect.result(ProjectCommands.parseTest(Vector<Bytes>.asSlice(&arguments)))
+        return match move parsed {
+          Result<TestCommand, InvalidProjectCommand | OutOfMemoryError>.Success {value} => Request.ProjectTest {command: move value}
+          Result<TestCommand, InvalidProjectCommand | OutOfMemoryError>.Failure {error} => match move error {
+            InvalidProjectCommand invalid => run invalidArgumentCount(count)
+            OutOfMemoryError exhausted => { fail move exhausted }
+          }
+        }
+      }
+    }
+  }
+  if count == usize.add(0, 2) {
     let source = run argumentAt(usize.ONE, count)
-    return Request {source: move source, hir: false}
+    return Request.Dump {source: move source, hir: false}
+  }
+  if count >= usize.add(0, 5) {
+    let mode = run argumentAt(usize.ONE, count)
+    let source = run argumentAt(usize.add(0, 2), count)
+    let selector = run argumentAt(usize.add(0, 3), count)
+    let output = run argumentAt(usize.add(0, 4), count)
+    let testing = same(Bytes.asSlice(&mode), b"test")
+    if (!testing && !same(Bytes.asSlice(&mode), b"build")) || !same(Bytes.asSlice(&selector), b"-o") {
+      return run invalidArgumentCount(count)
+    }
+    let mut filter = Option<Bytes>.none()
+    let mut file = Option<Bytes>.none()
+    let mut noCache = false
+    let mut stats = false
+    let mut standardLibrary = Option<Bytes>.none()
+    let mut clang = Option<Bytes>.none()
+    let mut input = ProfileInput.make()
+    let target = hostTarget()
+    input.target = Option<Bytes>.some(run Bytes.copy(Target.name(&target)))
+    input.optimization = Option<Bytes>.some(run Bytes.copy(b"speed"))
+    input.debug = Option<bool>.some(false)
+    let mut hasStdlib = false
+    let mut hasOptimization = false
+    let mut hasDebug = false
+    let mut hasEmit = false
+    let mut hasTarget = false
+    let mut stage = Option<Stage>.none()
+    let mut at = usize.add(0, 5)
+    while at < count {
+      let selector = run argumentAt(at, count)
+      // Test-result reuse needs execution identities the native compiler does not publish yet
+      // (TEST-008), so a test run states that it reads and publishes no results.
+      if testing && same(Bytes.asSlice(&selector), b"--no-cache") && !noCache {
+        noCache = true
+        at = at + usize.ONE
+        continue
+      }
+      // The build's counters go to standard error after it finishes.
+      if !testing && same(Bytes.asSlice(&selector), b"--stats") && !stats {
+        stats = true
+        at = at + usize.ONE
+        continue
+      }
+      if at + usize.ONE >= count {
+        return run invalidArgumentCount(count)
+      }
+      let value = run argumentAt(at + usize.ONE, count)
+      if testing && same(Bytes.asSlice(&selector), b"--filter") && !hasFilter(&filter) {
+        filter = Option<Bytes>.some(move value)
+      } else if testing && same(Bytes.asSlice(&selector), b"--file") && !hasFilter(&file) {
+        file = Option<Bytes>.some(move value)
+      } else if same(Bytes.asSlice(&selector), b"--emit") && !hasEmit && !testing {
+        stage = match move Projects.stageNamed(Bytes.asSlice(&value)) {
+          Option<Stage>.Some {value: named} => Option<Stage>.some(named)
+          Option<Stage>.None => run invalidArgumentCount(count)
+        }
+        hasEmit = true
+      } else if same(Bytes.asSlice(&selector), b"--target") && !hasTarget && !testing {
+        input.target = Option<Bytes>.some(move value)
+        hasTarget = true
+      } else if same(Bytes.asSlice(&selector), b"--clang") && !hasFilter(&clang) && !testing && Bytes.asSlice(&value).length > usize.ZERO {
+        clang = Option<Bytes>.some(move value)
+      } else if same(Bytes.asSlice(&selector), b"--stdlib") && !hasStdlib {
+        standardLibrary = Option<Bytes>.some(move value)
+        hasStdlib = true
+      } else if same(Bytes.asSlice(&selector), b"--optimization") && !hasOptimization {
+        input.optimization = Option<Bytes>.some(move value)
+        hasOptimization = true
+      } else if same(Bytes.asSlice(&selector), b"--debug") && !hasDebug {
+        if same(Bytes.asSlice(&value), b"true") {
+          input.debug = Option<bool>.some(true)
+        } else if same(Bytes.asSlice(&value), b"false") {
+          input.debug = Option<bool>.some(false)
+        } else {
+          return run invalidBuildProfile()
+        }
+        hasDebug = true
+      } else {
+        return run invalidArgumentCount(count)
+      }
+      at = at + usize.add(0, 2)
+    }
+    if testing {
+      // A test build is always the runner's executable, whatever its manifest selects.
+      input.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(Form.Executable)))
+      let initial = run InitialProfile.freeze(&input)
+      if Target.id(InitialProfile.target(&initial)) != Target.id(&target) {
+        return run invalidBuildProfile()
+      }
+      return Request.Test {source: move source, output: move output, standardLibrary: move standardLibrary,
+        profile: move initial, filter: move filter, file: move file, noCache: noCache}
+    }
+    return Request.Build {
+      source: move source, output: move output, stage: move stage, standardLibrary: move standardLibrary,
+      input: move input, stats: stats, clang: move clang,
+    }
   }
   if count != usize.add(0, 3) {
     return run invalidArgumentCount(count)
@@ -93,17 +486,17 @@ effect fn request() -> Request
   }
   drop mode
   let source = run argumentAt(usize.add(0, 2), count)
-  return Request {source: move source, hir: true}
+  return Request.Dump {source: move source, hir: true}
 }
 
 effect fn lex<'source>(lexer: &mut Lexer<'source>) -> Vector<Token>
 ! OutOfMemoryError
 ? &mut Allocator {
-  let mut tokens = Vector.make<Token>()
+  let mut tokens = Vector<Token>.make()
   while true {
-    let taken = run Stream.take(lexer)
+    let taken = run Stream.take(&mut lexer)
     if let Option<Token>.Some {value} = move taken {
-      run Vector.append<Token>(&mut tokens, move value)
+      run Vector<Token>.append(&mut tokens, move value)
     } else {
       break
     }
@@ -111,41 +504,1962 @@ effect fn lex<'source>(lexer: &mut Lexer<'source>) -> Vector<Token>
   return move tokens
 }
 
-effect fn program() -> ()
-! ApplicationError | HostInputError | OutOfMemoryError | FileError | WriterError
-? &mut HostInput | &mut Allocator | &mut Writer {
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  fn hostTarget() -> Target {
+    return Target.forId(TargetId.Aarch64AppleDarwin)
+  }
+} else {
+  static if Intrinsic.targetArchitecture() == "aarch64" {
+    fn hostTarget() -> Target {
+      return Target.forId(TargetId.Aarch64UnknownLinuxGnu)
+    }
+  } else {
+    fn hostTarget() -> Target {
+      return Target.forId(TargetId.X8664UnknownLinuxGnu)
+    }
+  }
+}
+
+fn originalGapReason(gap: &Gap) -> Option<RejectionCode> {
+  return match &gap.source {
+    GapSource.Diagnostic {diagnostic} => Option<RejectionCode>.some(Shared<Rejection>.with<RejectionCode>(
+      &diagnostic, fn(value: &Rejection) -> RejectionCode { return value.code }))
+    _ => Option<RejectionCode>.none()
+  }
+}
+
+effect fn gapSummary(gaps: &[Shared<Gap>]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut message = run Bytes.copy(b"SILK_UNSUPPORTED_JSON={\"gaps\":[")
+  let mut at = usize.ZERO
+  while at < gaps.length {
+    if at > usize.ZERO {
+      run Bytes.append(&mut message, b",")
+    }
+    let code = Shared<Gap>.with<GapCode>(
+      &gaps[at],
+      fn(gap: &Gap) -> GapCode {
+        return gap.code
+      },
+    )
+    let span = Shared<Gap>.with<Span>(
+      &gaps[at],
+      fn(gap: &Gap) -> Span {
+        return Gap.span(gap)
+      },
+    )
+    let owner = Shared<Gap>.with<Shared<DeclarationId>>(
+      &gaps[at],
+      fn(gap: &Gap) -> Shared<DeclarationId> {
+        return Shared<DeclarationId>.clone(&gap.owner)
+      },
+    )
+    let key = run InstanceKey.named(&owner)
+    let symbol = run InstanceKey.runtimeName(&key)
+    run Bytes.append(&mut message, b"{\"code\":\"")
+    run Bytes.append(&mut message, Gap.name(code))
+    run Bytes.append(&mut message, b"\",\"reason\":\"Not supported by this compiler yet: ")
+    let original = Shared<Gap>.with<Option<RejectionCode>>(&gaps[at], originalGapReason)
+    match move original {
+      Option<RejectionCode>.Some {value: reason} => { run Bytes.append(&mut message, Rejection.name(reason)) }
+      Option<RejectionCode>.None => { run Bytes.append(&mut message, Gap.name(code)) }
+    }
+    run Bytes.append(&mut message, b"; reached in ")
+    run Bytes.append(&mut message, Bytes.asSlice(&symbol))
+    run Bytes.append(&mut message, b" at bytes ")
+    run JsonText.appendDecimal(&mut message, span.start)
+    run Bytes.append(&mut message, b"-")
+    run JsonText.appendDecimal(&mut message, span.end)
+    let gap = Shared<Gap>.with<Gap>(&gaps[at], fn(value: &Gap) -> Gap { return Gap.copy(value) })
+    let sourcePath = run Gap.sourcePath(&gap)
+    run Bytes.append(&mut message, b"\",\"source\":{\"module\":")
+    run JsonText.appendString(&mut message, Bytes.asSlice(&sourcePath))
+    run Bytes.append(&mut message, b",\"span\":{\"start\":")
+    run JsonText.appendDecimal(&mut message, span.start)
+    run Bytes.append(&mut message, b",\"end\":")
+    run JsonText.appendDecimal(&mut message, span.end)
+    run Bytes.append(&mut message, b"}}}")
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut message, b"]}\n")
+  return move message
+}
+
+fn diagnosticStatus(diagnostic: &Shared<Rejection>) -> i32 {
+  let code = Shared<Rejection>.with<RejectionCode>(diagnostic, fn(value: &Rejection) -> RejectionCode { return value.code })
+  if Rejections.stableCode(code).length == usize.ZERO { return 2 }
+  return 1
+}
+
+effect fn rejectionSummary(diagnostic: &Shared<Rejection>) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let code = Shared<Rejection>.with<RejectionCode>(diagnostic, fn(rejection: &Rejection) -> RejectionCode {
+    return rejection.code
+  })
+  let span = Shared<Rejection>.with<Span>(diagnostic, fn(rejection: &Rejection) -> Span {
+    return rejection.span
+  })
+  let catalogCode = Rejections.stableCode(code)
+  if catalogCode.length == usize.ZERO {
+    let module = Shared<Rejection>.with<ModuleId>(diagnostic, fn(value: &Rejection) -> ModuleId {
+      return ModuleId.copy(&value.module)
+    })
+    let path = run ModuleId.copyPath(&module)
+    let mut refusal = run Bytes.copy(b"SILK_UNSUPPORTED_JSON={\"gaps\":[{\"code\":")
+    run JsonText.appendString(&mut refusal, Rejection.name(code))
+    run Bytes.append(&mut refusal, b",\"reason\":\"")
+    if code == RejectionCode.IdentityUnavailable {
+      run Bytes.append(&mut refusal, b"Identity unavailable in this revision")
+    } else {
+      run Bytes.append(&mut refusal, b"Not supported by this compiler yet: ")
+      run Bytes.append(&mut refusal, Rejection.name(code))
+    }
+    run Bytes.append(&mut refusal, b"\",\"source\":{\"module\":")
+    run JsonText.appendString(&mut refusal, Bytes.asSlice(&path))
+    run Bytes.append(&mut refusal, b",\"span\":{\"start\":")
+    run JsonText.appendDecimal(&mut refusal, span.start)
+    run Bytes.append(&mut refusal, b",\"end\":")
+    run JsonText.appendDecimal(&mut refusal, span.end)
+    run Bytes.append(&mut refusal, b"}}}]}\n")
+    return move refusal
+  }
+  let mut message = run Bytes.copy(b"SILK_BUILD_ERROR={\"code\":\"")
+  run Bytes.append(&mut message, catalogCode)
+  run Bytes.append(&mut message, b"\",\"span\":{\"start\":")
+  run JsonText.appendDecimal(&mut message, span.start)
+  run Bytes.append(&mut message, b",\"end\":")
+  run JsonText.appendDecimal(&mut message, span.end)
+  // The rejected source's logical module, which may be an imported or standard-library module.
+  let module = Shared<Rejection>.with<ModuleId>(diagnostic, fn(rejection: &Rejection) -> ModuleId {
+    return ModuleId.copy(&rejection.module)
+  })
+  let path = run ModuleId.copyPath(&module)
+  run Bytes.append(&mut message, b"},\"module\":")
+  run JsonText.appendString(&mut message, Bytes.asSlice(&path))
+  run Bytes.append(&mut message, b"}\n")
+  return move message
+}
+
+effect fn writeOutput(bytes: &[u8]) -> () ! WriterError {
+  let mut stdout = StdoutWriter.make()
+  return run Writer.writeAll(bytes)
+    |> Effect.provideMut<Writer>(&mut stdout)
+}
+
+// Writes each format outcome's line: unchanged and formatted files on standard output, and drift,
+// damage and failures on standard error, as the TypeScript CLI writes them.
+effect fn reportFormat(outcomes: &[FileOutcome]) -> () ! WriterError | OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < outcomes.length {
+    let text = run FormatCommand.line(&outcomes[at])
+    if FormatCommand.toStandardOutput(&outcomes[at]) {
+      run writeOutput(Bytes.asSlice(&text))
+    } else {
+      run writeError(Bytes.asSlice(&text))
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Writes the TypeScript CLI's line for one compiled artifact on standard output:
+// `Compiled <source> -> <output> (llvm, <target>, <n> symbols)`, with both paths relative to
+// `display`.
+effect fn reportCompiled(display: &Path, source: &Path, output: &Path, target: &Target, symbols: usize) -> ()
+! WriterError | OutOfMemoryError ? &mut Allocator {
+  let mut line = run Bytes.copy(b"Compiled ")
+  let from = run CommandPath.relative(display, source)
+  run Bytes.append(&mut line, Bytes.asSlice(&from))
+  run Bytes.append(&mut line, b" -> ")
+  let to = run CommandPath.relative(display, output)
+  run Bytes.append(&mut line, Bytes.asSlice(&to))
+  run Bytes.append(&mut line, b" (llvm, ")
+  run Bytes.append(&mut line, Target.name(target))
+  run Bytes.append(&mut line, b", ")
+  run JsonText.appendDecimal(&mut line, symbols)
+  run Bytes.append(&mut line, b" symbols)\n")
+  run writeOutput(Bytes.asSlice(&line))
+}
+
+// Writes a refused platform supply as the TypeScript CLI does: `<code>: <subject> (<origin>)`, the
+// correction, and any tool output.
+effect fn reportSupply(refused: &SupplyError) -> () ! WriterError | OutOfMemoryError ? &mut Allocator {
+  let mut text = run Bytes.copy(refused.code)
+  run Bytes.append(&mut text, b": ")
+  run Bytes.append(&mut text, Bytes.asSlice(&refused.subject))
+  run Bytes.append(&mut text, b" (")
+  run Bytes.append(&mut text, Bytes.asSlice(&refused.origin))
+  run Bytes.append(&mut text, b")\n")
+  run Bytes.append(&mut text, Bytes.asSlice(&refused.correction))
+  run Bytes.append(&mut text, b"\n")
+  if Bytes.length(&refused.detail) > usize.ZERO {
+    run Bytes.append(&mut text, Bytes.asSlice(&refused.detail))
+    run Bytes.append(&mut text, b"\n")
+  }
+  run writeError(Bytes.asSlice(&text))
+}
+
+effect fn writeError(bytes: &[u8]) -> () ! WriterError {
+  let mut stderr = StderrWriter.make()
+  return run Writer.writeAll(bytes)
+    |> Effect.provideMut<Writer>(&mut stderr)
+}
+
+/// Compiles the completed LLVM text into `form` at `stage` and writes it to `output`.
+///
+/// An executable's final stage links the declared inputs and the C libraries for the host. Every
+/// other form or stage is compiled for its target with the profile's relocation model and needs no
+/// linker. An object's final stage merges declared objects and archives by a relocatable link; a
+/// static library's final stage archives its compiled object beside the declared objects. Each
+/// refuses any other declared input; an intermediate stage takes no declared inputs.
+effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
+  target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], selectedClang: &Option<Bytes>) -> i32
+! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let mut intermediate = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut intermediate, b".silk.ll")
+  let irPath = run Path.fromBytes(Bytes.asSlice(&intermediate))
+  // A static library's single compiled member is written beside the archive, then removed.
+  let mut memberBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut memberBytes, b".silk.o")
+  let member = run Path.fromBytes(Bytes.asSlice(&memberBytes))
+  let mut named = Option<&[u8]>.none()
+  if let Option<Bytes>.Some {value} = &selectedClang.* { named = Option<&[u8]>.some(Bytes.asSlice(&value)) }
+  let clang = match move run NativeToolchain.compiler(move named) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => {
+      if let Option<Bytes>.Some {value: missing} = &selectedClang.* {
+        run writeError(b"silk: cannot find ")
+        run writeError(Bytes.asSlice(&missing))
+        run writeError(b" on PATH; pass --clang the path of the Clang executable\n")
+      } else {
+        run writeError(b"silk: cannot find clang on PATH; set SILK_CLANG to the Clang executable\n")
+      }
+      return 2
+    }
+  }
+  let mut process = run NativeToolchain.request(&clang)
+  let final = stage == Stage.Final
+  let linked = final && form == Form.Executable
+  let merged = final && form == Form.Object && linkInputs.length > usize.ZERO
+  let archive = final && form == Form.StaticLibrary
+  if !linked {
+    // The IR names no triple, so a cross-target output states its target to Clang.
+    let mut selected = run Bytes.copy(b"--target=")
+    run Bytes.append(&mut selected, Target.name(target))
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&selected))
+    if merged {
+      run ChildProcess.addArgument(&mut process, b"-r")
+      run ChildProcess.addArgument(&mut process, b"-nostdlib")
+    } else if stage == Stage.Assembly {
+      run ChildProcess.addArgument(&mut process, b"-S")
+    } else {
+      run ChildProcess.addArgument(&mut process, b"-c")
+      if stage == Stage.LlvmBitcode { run ChildProcess.addArgument(&mut process, b"-emit-llvm") }
+    }
+    if same(relocation, b"pic") {
+      run ChildProcess.addArgument(&mut process, b"-fPIC")
+    } else {
+      run ChildProcess.addArgument(&mut process, b"-fno-pic")
+    }
+  }
+  let mut optimizationFlag: &[u8] = b"-O0"
+  if same(optimization, b"speed") {
+    optimizationFlag = b"-O2"
+  }
+  run ChildProcess.addArgument(&mut process, optimizationFlag)
+  if debug {
+    run ChildProcess.addArgument(&mut process, b"-g")
+  }
+  // A link uses its resolved supply, never ambient SDK, sysroot or linker settings.
+  if let Option<Supply>.Some {value: selected} = &supply.* {
+    if selected.darwin {
+      run ChildProcess.addArgument(&mut process, b"-isysroot")
+      run ChildProcess.addArgument(&mut process, Path.rawBytes(&selected.root))
+      let mut minimum = run Bytes.copy(b"-mmacosx-version-min=")
+      run Bytes.append(&mut minimum, Bytes.asSlice(&selected.deployment))
+      run ChildProcess.addArgument(&mut process, Bytes.asSlice(&minimum))
+    } else {
+      let mut sysroot = run Bytes.copy(b"--sysroot=")
+      run Bytes.append(&mut sysroot, Path.rawBytes(&selected.root))
+      run ChildProcess.addArgument(&mut process, Bytes.asSlice(&sysroot))
+    }
+    if let Option<Path>.Some {value: installation} = &selected.support {
+      let mut gcc = run Bytes.copy(b"--gcc-install-dir=")
+      run Bytes.append(&mut gcc, Path.rawBytes(&installation))
+      run ChildProcess.addArgument(&mut process, Bytes.asSlice(&gcc))
+    }
+    if let Option<Path>.Some {value: tool} = &selected.linker {
+      let mut ldPath = run Bytes.copy(b"--ld-path=")
+      run Bytes.append(&mut ldPath, Path.rawBytes(&tool))
+      run ChildProcess.addArgument(&mut process, Bytes.asSlice(&ldPath))
+    }
+  }
+  run ChildProcess.addArgument(&mut process, b"-x")
+  run ChildProcess.addArgument(&mut process, b"ir")
+  run ChildProcess.addArgument(&mut process, Bytes.asSlice(&intermediate))
+  // Restore extension-based input kinds so declared objects and archives are not read as IR.
+  run ChildProcess.addArgument(&mut process, b"-x")
+  run ChildProcess.addArgument(&mut process, b"none")
+  run ChildProcess.addArgument(&mut process, b"-o")
+  let mut archiver = Option<ProcessRequest>.none()
+  if archive {
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&memberBytes))
+    // `rcsD`: replace members, create the archive, write its symbol index, and zero member times.
+    let mut request = run NativeToolchain.archiver(&clang)
+    run ChildProcess.addArgument(&mut request, b"rcsD")
+    run ChildProcess.addArgument(&mut request, Path.rawBytes(output))
+    run ChildProcess.addArgument(&mut request, Bytes.asSlice(&memberBytes))
+    let mut declared = usize.ZERO
+    while declared < linkInputs.length {
+      run NativeLinkInputs.appendArchiveMember(&linkInputs[declared], &mut request)
+      declared = declared + usize.ONE
+    }
+    archiver = Option<ProcessRequest>.some(move request)
+  } else {
+    run ChildProcess.addArgument(&mut process, Path.rawBytes(output))
+  }
+  if final && !archive {
+    // Declared inputs precede the C libraries so their own references to libc and libm resolve.
+    let mut input = usize.ZERO
+    while input < linkInputs.length {
+      if !linked && !NativeLinkInputs.relocatable(&linkInputs[input]) { fail InvalidNativeLinkInput {} }
+      run NativeLinkInputs.appendArguments(&linkInputs[input], target, &mut process)
+      input = input + usize.ONE
+    }
+  }
+  if linked {
+    run ChildProcess.addArgument(&mut process, b"-lc")
+    run ChildProcess.addArgument(&mut process, b"-lm")
+  }
+  // The link consumes the supply only while its selected files keep the bytes resolution read.
+  if let Option<Supply>.Some {value: selected} = &supply.* {
+    let checked = run Effect.result(PlatformSupplies.validate(&selected))
+    match move checked {
+      Result<(), SupplyError | OutOfMemoryError>.Success {value: _} => {}
+      Result<(), SupplyError | OutOfMemoryError>.Failure {error} => match move error {
+        SupplyError changed => {
+          run reportSupply(&changed)
+          return 2
+        }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+  let use = effect fn(resource: &mut Path) -> i32
+  ! FileError | ProcessError | OutOfMemoryError | WriterError
+  ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
+    run FileSystem.writeFile(&resource.*, Bytes.asSlice(ir))
+    let compiled = run submitted(&process)
+    if compiled != 0 { return compiled }
+    if let Option<ProcessRequest>.Some {value: archiving} = &archiver {
+      // A stale archive would keep members this build no longer produces.
+      run removeQuietly(output)
+      return run submitted(&archiving)
+    }
+    return 0
+  }
+  let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem {
+    run removeQuietly(&resource.*)
+    if archive { run removeQuietly(&member) }
+    return ()
+  }
+  return run Effect.useReleaseNonParking(move irPath, move use, move release)
+}
+
+// Runs one native tool: 0 when it exits successfully, else 1 after forwarding its diagnostics.
+effect fn submitted(process: &ProcessRequest) -> i32
+! ProcessError | OutOfMemoryError | WriterError
+? &mut ChildProcess | &mut Allocator {
+  let outcome = run ChildProcess.submit(process)
+  if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) {
+    if value == 0 { return 0 }
+  }
+  run writeError(ChildProcess.errorBytes(&outcome))
+  return 1
+}
+
+/// A finished compilation: its process status, or for a test build that linked, the identities
+/// of the discovered tests in catalog order.
+union Compiled {
+  Finished {status: i32},
+  Tests {identities: Vector<Bytes>},
+}
+
+// How a command writes the language rejections and refusals of one analysis.
+union DiagnosticFormat {
+  /// One `SILK_BUILD_ERROR=` or `SILK_UNSUPPORTED_JSON=` line each, for the build harnesses.
+  Machine,
+  /// `path:line:col: error[CODE] message`, as the TypeScript CLI prints it.
+  Human,
+  /// One JSON object per line, naming the analysis `target`.
+  Json {target: Bytes},
+}
+
+// The analysis state a build or check holds once its profile is assembled.
+struct Analysis {
+  sources: ModuleSources
+  store: Semantic
+  request: SemanticRequest
+  rootPackage: Vector<ModuleId>
+  identity: ModuleId
+  /// The selected runtime, absent for a library or object form without one.
+  runtime: Option<ModuleId>
+}
+
+union Prepared {
+  Ready {analysis: Analysis},
+  Finished {status: i32},
+}
+
+// Loads the program rooted at `sourcePath` (within `manifest`'s package when given), publishes
+// every module reachable through imports, and assembles the final profile with `bindings`. A test
+// analysis is rooted at the bundled runner. A refused profile is reported in `format` and answers
+// its status instead, appended to `out`.
+effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: Option<Path>, profile: &InitialProfile, bindings: Vector<Supplied>, testing: bool, format: &DiagnosticFormat, out: &mut Bytes) -> Prepared
+! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let target = Target.forId(Target.id(InitialProfile.target(profile)))
+  let libc = match move InitialProfile.text(profile, b"libc") {
+    Option<&[u8]>.Some {value} => run Bytes.copy(value)
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let executable = match move InitialProfile.text(profile, b"artifact") {
+    Option<&[u8]>.Some {value} => same(value, b"executable")
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let mut sources = match move manifest {
+    Option<&Path>.Some {value} => run ModuleSourceFiles.makeInPackage(sourcePath, value, move standardLibrary, Target.name(&target), Bytes.asSlice(&libc), executable, run InitialProfile.runtimeRequest(profile))
+    Option<&Path>.None => run ModuleSourceFiles.make(sourcePath, move standardLibrary, Target.name(&target), Bytes.asSlice(&libc), executable, run InitialProfile.runtimeRequest(profile))
+  }
+  let identity = ModuleId.copy(ModuleSourceFiles.entry(&sources))
+  let mut runtime = Option<ModuleId>.none()
+  if let Option<&ModuleId>.Some {value} = move ModuleSourceFiles.runtime(&sources) {
+    runtime = Option<ModuleId>.some(ModuleId.copy(value))
+  }
+  // A test build's application is the bundled runner; the source file is its discovery root.
+  let mut application = ModuleId.copy(&identity)
+  if testing { application = run ModuleSourceFiles.module(&sources, b"silk/test_runner.silk") }
+  // One build sees the whole program: every module reachable through imports from the build's
+  // roots is published before semantic analysis starts.
+  run ModuleSourceFiles.preloadProgram(&mut sources, &application)
+  let rootPackage = run ModuleSourceFiles.loadedRootModules(&sources)
+  let mut store = Semantic.oneShot(run ModuleSourceFiles.revision(&sources), target, Option<FinalProfile>.none())
+  if let Option<&ExecutionStorage>.Some {value: storage} = move ModuleSourceFiles.executionStorage(&sources) {
+    Semantic.selectExecutionStorage(&mut store, run ExecutionStorage.copy(storage))
+  }
+  Semantic.selectRetention(&mut store, run ModuleSourceFiles.retention(&sources))
+  if testing {
+    Semantic.selectDiscovery(&mut store, ModuleId.copy(&identity), run Bytes.copy(ModuleSourceFiles.moduleDirectory(&sources)))
+  }
+  let mut request = SemanticRequest.forApplication(ModuleId.copy(&application))
+  run SemanticRequest.registerSchemaModule(&mut request, &identity)
+  let shapes = run registeredShapes(&mut store, &mut request, &target)
+  let assembled = match move shapes {
+    Result<Registered, ShapeProblem>.Success {value} => run assembleProfile(
+      run InitialProfile.copy(profile), &mut store, &mut request, &value, move bindings)
+    Result<Registered, ShapeProblem>.Failure {error: _} => Result<FinalProfile, AssemblyProblem>.failResult(
+      AssemblyProblem.InputMismatch)
+  }
+  match move assembled {
+    Result<FinalProfile, AssemblyProblem>.Success {value} => {
+      run Semantic.reviseProfile(&mut store, Option<FinalProfile>.some(move value))
+    }
+    Result<FinalProfile, AssemblyProblem>.Failure {error} => {
+      if let AssemblyProblem.Default {rejection} = move error {
+        return Prepared.Finished {status: run reportRejection(&sources, &rejection, format, &mut out.*)}
+      } else {
+        run writeError(b"silk: invalid package parameter profile\n")
+      }
+      return Prepared.Finished {status: 1}
+    }
+  }
+  return Prepared.Ready {analysis: Analysis {
+    sources: move sources, store: move store, request: move request, rootPackage: move rootPackage,
+    identity: move identity, runtime: move runtime,
+  }}
+}
+
+effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, display: &Path, form: Form, stage: Stage, standardLibrary: Option<Path>, profile: InitialProfile, bindings: Vector<Supplied>, supplyRequest: &SupplyRequest, testing: bool, stats: bool, clang: &Option<Bytes>) -> Compiled
+! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
+  let optimization = match move InitialProfile.text(&profile, b"optimization") {
+    Option<&[u8]>.Some {value} => run Bytes.copy(value)
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let debug = match move InitialProfile.flag(&profile, b"debug") {
+    Option<bool>.Some {value} => value
+    Option<bool>.None => run invalidBuildProfile()
+  }
+  let relocation = match move InitialProfile.text(&profile, b"relocation") {
+    Option<&[u8]>.Some {value} => run Bytes.copy(value)
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let libc = match move InitialProfile.text(&profile, b"libc") {
+    Option<&[u8]>.Some {value} => run Bytes.copy(value)
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let deployment = match move InitialProfile.text(&profile, b"deployment") {
+    Option<&[u8]>.Some {value} => run Bytes.copy(value)
+    Option<&[u8]>.None => Bytes.make()
+  }
+  let machine = DiagnosticFormat.Machine
+  let mut refused = Bytes.make()
+  let prepared = run prepare(sourcePath, move manifest, move standardLibrary, &profile, move bindings, testing, &machine, &mut refused)
+  run writeError(Bytes.asSlice(&refused))
+  let analysis = match move prepared {
+    Prepared.Ready {analysis} => move analysis
+    Prepared.Finished {status} => { return Compiled.Finished {status: status} }
+  }
+  let Analysis {sources, store: analyzed, request: requested, rootPackage, identity, runtime} = move analysis
+  drop identity
+  let mut store = move analyzed
+  let mut request = move requested
+  let selectedRuntime: Option<&ModuleId> = match &runtime {
+    Option<ModuleId>.Some {value} => Option<&ModuleId>.some(&value)
+    Option<ModuleId>.None => Option<&ModuleId>.none()
+  }
+  let compiled = run Semantic.buildArtifact(&mut store, &mut request, move selectedRuntime, Vector<ModuleId>.asSlice(&rootPackage), staticClosureNodes)
+  if stats {
+    run writeStatistics(&Semantic.statistics(&store))
+    run writeDeferredTemplates(Semantic.deferredStaticTemplates(&store))
+  }
+  if ModuleSourceFiles.missedSource(&sources, Semantic.sourceEvents(&store)) {
+    run writeError(b"silk: internal error: the build read a module outside its preloaded import graph\n")
+    return Compiled.Finished {status: 1}
+  }
+  // A loaded module is parsed whole: its syntax errors reject the build even where no declaration
+  // of it was demanded (MODULE-004), before any artifact is written.
+  let syntax = run Semantic.syntaxRejections(&store)
+  let malformed = Vector<Shared<Rejection>>.asSlice(&syntax)
+  if malformed.length > usize.ZERO {
+    let mut at = usize.ZERO
+    let mut failureStatus = 2
+    while at < malformed.length {
+      if diagnosticStatus(&malformed[at]) == 1 { failureStatus = 1 }
+      let message = run rejectionSummary(&malformed[at])
+      run writeError(Bytes.asSlice(&message))
+      at = at + usize.ONE
+    }
+    return Compiled.Finished {status: failureStatus}
+  }
+  // A reached module's selected imports are checked whole as well, used or not (IMPORT-003).
+  let mut imported = Bytes.make()
+  let importStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut imported)
+  run writeError(Bytes.asSlice(&imported))
+  if importStatus != 0 { return Compiled.Finished {status: importStatus} }
+  let mut status = 0
+  match move compiled {
+    BackendBuild.Module {text, unchecked, plan} => {
+      // Emit zero too: absence of a receipt cannot distinguish a fully checked build from a
+      // missing measurement. The corpus harness records this line for every successful program.
+      run writeBorrowGap(b"SILK_GAP borrow-check: ", Vector<usize>.asSlice(&unchecked))
+      // The emitted count covers only reached instances. Every root-package body was checked as
+      // well, reached or not, so its unchecked count shows a body no build path reaches, and each
+      // such body of a build is named, so the corpus harness can tell which diagnostics it covers.
+      // A test runner's thousands of bodies would only bury its results, so it keeps the count.
+      run writeRootBorrowGap(Semantic.uncheckedRootBodies(&store), !testing)
+      // With --stats, name each counted body, so two compilers' lists can be diffed.
+      if stats {
+        let bodies = run EmissionPlan.uncheckedBodies(&plan)
+        let lines = Vector<Bytes>.asSlice(&bodies)
+        let mut line = usize.ZERO
+        while line < lines.length {
+          let mut text = run Bytes.copy(b"silk-stats unchecked\t")
+          run Bytes.append(&mut text, Bytes.asSlice(&lines[line]))
+          run Bytes.append(&mut text, b"\n")
+          run writeError(Bytes.asSlice(&text))
+          line = line + usize.ONE
+        }
+      }
+      // A debug build names each content-derived symbol beside its output; the IR is unchanged.
+      if debug {
+        let mut mapPath = run Bytes.copy(Path.rawBytes(output))
+        run Bytes.append(&mut mapPath, b".symbols")
+        let mapFile = run Path.fromBytes(Bytes.asSlice(&mapPath))
+        let map = run EmissionPlan.symbolMap(&plan)
+        run FileSystem.writeFile(&mapFile, Bytes.asSlice(&map))
+      }
+      if stage == Stage.LlvmIr {
+        run FileSystem.writeFile(output, Bytes.asSlice(&text))
+        run reportCompiled(display, sourcePath, output, &target, EmissionPlan.symbolCount(&plan))
+        return Compiled.Finished {status: 0}
+      }
+      // Only a link consumes a platform supply; compiling to an object or an intermediate stage
+      // needs no SDK, so a cross-target object never runs discovery.
+      let mut supply = Option<Supply>.none()
+      if form == Form.Executable && stage == Stage.Final {
+        let resolved = run Effect.result(PlatformSupplies.resolve(&target, &hostTarget(), Bytes.asSlice(&libc), Bytes.asSlice(&deployment), supplyRequest))
+        supply = match move resolved {
+          Result<Option<Supply>, SupplyError | FileError | HostInputError | OutOfMemoryError>.Success {value} => move value
+          Result<Option<Supply>, SupplyError | FileError | HostInputError | OutOfMemoryError>.Failure {error} => match move error {
+            SupplyError unavailable => {
+              run reportSupply(&unavailable)
+              return Compiled.Finished {status: 2}
+            }
+            FileError failed => { fail move failed }
+            HostInputError failed => { fail move failed }
+            OutOfMemoryError exhausted => { fail move exhausted }
+          }
+        }
+      }
+      status = run compileIr(
+        &text, output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation), &target,
+        &supply, ModuleSourceFiles.nativeLinkInputs(&sources), clang,
+      )
+      if status == 0 {
+        run reportCompiled(display, sourcePath, output, &target, EmissionPlan.symbolCount(&plan))
+      }
+    }
+    BackendBuild.Unsupported {gaps} => {
+      let message = run gapSummary(Vector<Shared<Gap>>.asSlice(&gaps))
+      run writeError(Bytes.asSlice(&message))
+      status = 2
+    }
+    BackendBuild.Rejected {first, further, gaps} => {
+      // Every refusal the walk reached, first one first, then the gaps reached beside them.
+      status = diagnosticStatus(&first)
+      let message = run rejectionSummary(&first)
+      run writeError(Bytes.asSlice(&message))
+      let others = Vector<Shared<Rejection>>.asSlice(&further)
+      let mut at = usize.ZERO
+      while at < others.length {
+        if diagnosticStatus(&others[at]) == 1 { status = 1 }
+        let next = run rejectionSummary(&others[at])
+        run writeError(Bytes.asSlice(&next))
+        at = at + usize.ONE
+      }
+      if Vector<Shared<Gap>>.length(&gaps) > usize.ZERO {
+        let summary = run gapSummary(Vector<Shared<Gap>>.asSlice(&gaps))
+        run writeError(Bytes.asSlice(&summary))
+      }
+    }
+  }
+  if !testing || status != 0 { return Compiled.Finished {status: status} }
+  // The linked runner iterates this same catalog; its identities bind the plan (TEST-004).
+  let catalog = match move run Semantic.demandTests(&mut store, &mut request) {
+    Result<Shared<TestCatalog>, Shared<Rejection>>.Success {value} => move value
+    Result<Shared<TestCatalog>, Shared<Rejection>>.Failure {error} => {
+      let message = run rejectionSummary(&error)
+      run writeError(Bytes.asSlice(&message))
+      return Compiled.Finished {status: diagnosticStatus(&error)}
+    }
+  }
+  // Discovery reaches the test modules, whose selected imports are checked like the build's.
+  let mut discovered = Bytes.make()
+  let discoveredImportStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut discovered)
+  run writeError(Bytes.asSlice(&discovered))
+  if discoveredImportStatus != 0 { return Compiled.Finished {status: discoveredImportStatus} }
+  return Compiled.Tests {identities: run Semantic.testIdentities(&catalog)}
+}
+
+// Appends selected import refusals to `out`; 0 when absent, 1 for a language rejection, 2 for
+// uncoded coverage.
+effect fn reportedImportRejections(store: &mut Semantic, request: &mut SemanticRequest, sources: &ModuleSources, format: &DiagnosticFormat, out: &mut Bytes) -> i32
+! Cycle | InvalidModulePath | RevisionMismatch | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
+  let rejections = run Semantic.importRejections(&mut store.*, &mut request.*)
+  let listed = Vector<Shared<Rejection>>.asSlice(&rejections)
+  let mut status = 0
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let current = run reportRejection(sources, &listed[at], format, &mut out.*)
+    if status != 1 { status = current }
+    at = at + usize.ONE
+  }
+  return status
+}
+
+// The source file and text of `module`, when the analysis reads it from disk.
+effect fn moduleSource(sources: &ModuleSources, module: &ModuleId) -> Option<Bytes>
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run ModuleSourceFiles.sourceLocation(sources, module)
+  return match &location.path {
+    Option<Path>.Some {value} => {
+      let read = run Effect.result(FileSystem.readFile(&value))
+      return match move read {
+        Result<Bytes, FileError | OutOfMemoryError>.Success {value: text} => Option<Bytes>.some(move text)
+        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError unreadable => {
+            drop unreadable
+            return Option<Bytes>.none()
+          }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    Option<Path>.None => Option<Bytes>.none()
+  }
+}
+
+// Appends `path:line:col` for `span` in `module`, `path:?:?` when its source cannot be read.
+// The path a diagnostic in `module` names: its source file, else its logical path.
+effect fn displayPath(sources: &ModuleSources, module: &ModuleId) -> Bytes
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run ModuleSourceFiles.sourceLocation(sources, module)
+  return match &location.path {
+    Option<Path>.Some {value} => run Bytes.copy(Path.rawBytes(&value))
+    Option<Path>.None => run ModuleId.copyPath(module)
+  }
+}
+
+effect fn appendLocation(line: &mut Bytes, sources: &ModuleSources, module: &ModuleId, span: Span, json: bool) -> ()
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let path = run displayPath(sources, module)
+  let text = run moduleSource(sources, module)
+  if json {
+    run Bytes.append(&mut line.*, b"\"path\":")
+    run JsonText.appendString(&mut line.*, Bytes.asSlice(&path))
+    if let Option<Bytes>.Some {value} = &text {
+      let position = Reports.position(Bytes.asSlice(&value), span.start)
+      run Bytes.append(&mut line.*, b",\"line\":")
+      run JsonText.appendDecimal(&mut line.*, position.line)
+      run Bytes.append(&mut line.*, b",\"column\":")
+      run JsonText.appendDecimal(&mut line.*, position.column)
+    } else {
+      run Bytes.append(&mut line.*, b",\"line\":null,\"column\":null")
+    }
+    run Bytes.append(&mut line.*, b",\"start\":")
+    run JsonText.appendDecimal(&mut line.*, span.start)
+    run Bytes.append(&mut line.*, b",\"end\":")
+    run JsonText.appendDecimal(&mut line.*, span.end)
+    return ()
+  }
+  run Bytes.append(&mut line.*, Bytes.asSlice(&path))
+  if let Option<Bytes>.Some {value} = &text {
+    let position = Reports.position(Bytes.asSlice(&value), span.start)
+    run Bytes.append(&mut line.*, b":")
+    run JsonText.appendDecimal(&mut line.*, position.line)
+    run Bytes.append(&mut line.*, b":")
+    run JsonText.appendDecimal(&mut line.*, position.column)
+  } else {
+    run Bytes.append(&mut line.*, b":?:?")
+  }
+}
+
+// Appends one `--json` diagnostic line: the target, then the rendered parts in the bootstrap's
+// field order.
+effect fn appendJson(out: &mut Bytes, target: &[u8], rendered: &RenderedDiagnostic) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut out.*, b"{\"target\":")
+  run JsonText.appendString(&mut out.*, target)
+  run Bytes.append(&mut out.*, b",\"code\":")
+  run JsonText.appendString(&mut out.*, Bytes.asSlice(&rendered.code))
+  run Bytes.append(&mut out.*, b",\"severity\":")
+  run JsonText.appendString(&mut out.*, Bytes.asSlice(&rendered.severity))
+  run Bytes.append(&mut out.*, b",\"path\":")
+  run JsonText.appendString(&mut out.*, Bytes.asSlice(&rendered.path))
+  run Bytes.append(&mut out.*, b",\"line\":")
+  run JsonText.appendDecimal(&mut out.*, rendered.line)
+  run Bytes.append(&mut out.*, b",\"column\":")
+  run JsonText.appendDecimal(&mut out.*, rendered.column)
+  run Bytes.append(&mut out.*, b",\"start\":")
+  run JsonText.appendDecimal(&mut out.*, rendered.start)
+  run Bytes.append(&mut out.*, b",\"end\":")
+  run JsonText.appendDecimal(&mut out.*, rendered.end)
+  run Bytes.append(&mut out.*, b",\"message\":")
+  if let Option<Bytes>.Some {value: message} = &rendered.message {
+    run JsonText.appendString(&mut out.*, Bytes.asSlice(&message))
+  } else {
+    run Bytes.append(&mut out.*, b"null")
+  }
+  run Bytes.append(&mut out.*, b",\"notes\":[")
+  let notes = Vector<Bytes>.asSlice(&rendered.notes)
+  let mut at = usize.ZERO
+  while at < notes.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, b",") }
+    run JsonText.appendString(&mut out.*, Bytes.asSlice(&notes[at]))
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut out.*, b"],\"related\":[")
+  let related = Vector<RelatedLocation>.asSlice(&rendered.related)
+  at = usize.ZERO
+  while at < related.length {
+    if at > usize.ZERO { run Bytes.append(&mut out.*, b",") }
+    run Bytes.append(&mut out.*, b"{\"path\":")
+    run JsonText.appendString(&mut out.*, Bytes.asSlice(&related[at].path))
+    run Bytes.append(&mut out.*, b",\"line\":")
+    run JsonText.appendDecimal(&mut out.*, related[at].line)
+    run Bytes.append(&mut out.*, b",\"column\":")
+    run JsonText.appendDecimal(&mut out.*, related[at].column)
+    run Bytes.append(&mut out.*, b",\"start\":")
+    run JsonText.appendDecimal(&mut out.*, related[at].start)
+    run Bytes.append(&mut out.*, b",\"end\":")
+    run JsonText.appendDecimal(&mut out.*, related[at].end)
+    run Bytes.append(&mut out.*, b",\"label\":")
+    if let Option<Bytes>.Some {value: label} = &related[at].label {
+      run JsonText.appendString(&mut out.*, Bytes.asSlice(&label))
+    } else {
+      run Bytes.append(&mut out.*, b"null")
+    }
+    run Bytes.append(&mut out.*, b"}")
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut out.*, b"]}\n")
+}
+
+// Appends one rejection or refusal to `out` in `format` and answers its status: 1 for a language
+// rejection, 2 for a construct this compiler does not support yet.
+effect fn reportRejection(sources: &ModuleSources, diagnostic: &Shared<Rejection>, format: &DiagnosticFormat, out: &mut Bytes) -> i32
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let status = diagnosticStatus(diagnostic)
+  let target = match &format.* {
+    DiagnosticFormat.Machine => {
+      let message = run rejectionSummary(diagnostic)
+      run Bytes.append(&mut out.*, Bytes.asSlice(&message))
+      return status
+    }
+    DiagnosticFormat.Human => Option<&[u8]>.none()
+    DiagnosticFormat.Json {target} => Option<&[u8]>.some(Bytes.asSlice(&target))
+  }
+  let code = Shared<Rejection>.with<RejectionCode>(diagnostic, fn(value: &Rejection) -> RejectionCode { return value.code })
+  let span = Shared<Rejection>.with<Span>(diagnostic, fn(value: &Rejection) -> Span { return value.span })
+  let module = Shared<Rejection>.with<ModuleId>(diagnostic, fn(value: &Rejection) -> ModuleId { return ModuleId.copy(&value.module) })
+  let related = Shared<Rejection>.with<Option<RelatedSite>>(diagnostic, fn(value: &Rejection) -> Option<RelatedSite> {
+    return match &value.related {
+      Option<RelatedSite>.Some {value: site} => Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&site.module), span: site.span})
+      Option<RelatedSite>.None => Option<RelatedSite>.none()
+    }
+  })
+  // A catalog diagnostic in a module read from disk renders as the bootstrap CLI prints it.
+  if let Option<Bytes>.Some {value: text} = move run moduleSource(sources, &module) {
+    let path = run displayPath(sources, &module)
+    if let DiagnosticFormat.Json {target: targetName} = &format.* {
+      if let Option<RenderedDiagnostic>.Some {value: rendered} = move run Reports.fields(diagnostic, Bytes.asSlice(&text), Bytes.asSlice(&path)) {
+        run appendJson(&mut out.*, Bytes.asSlice(&targetName), &rendered)
+        return status
+      }
+    } else if let Option<Bytes>.Some {value: rendered} = move run Reports.render(diagnostic, Bytes.asSlice(&text), Bytes.asSlice(&path)) {
+      run Bytes.append(&mut out.*, Bytes.asSlice(&rendered))
+      run Bytes.append(&mut out.*, b"\n")
+      return status
+    }
+  }
+  // A refusal has no catalog code; it names the unsupported construct instead.
+  let mut name = Rejections.stableCode(code)
+  if name.length == usize.ZERO { name = Rejection.name(code) }
+  let mut line = Bytes.make()
+  if let Option<&[u8]>.Some {value: targetName} = move target {
+    run Bytes.append(&mut line, b"{\"target\":")
+    run JsonText.appendString(&mut line, targetName)
+    run Bytes.append(&mut line, b",\"code\":")
+    run JsonText.appendString(&mut line, name)
+    if status == 1 {
+      run Bytes.append(&mut line, b",\"severity\":\"error\",")
+    } else {
+      run Bytes.append(&mut line, b",\"severity\":\"unsupported\",")
+    }
+    run appendLocation(&mut line, sources, &module, span, true)
+    run Bytes.append(&mut line, b",\"message\":null,\"notes\":[],\"related\":[")
+    if let Option<RelatedSite>.Some {value: site} = &related {
+      run Bytes.append(&mut line, b"{")
+      run appendLocation(&mut line, sources, &site.module, site.span, true)
+      run Bytes.append(&mut line, b",\"label\":null}")
+    }
+    run Bytes.append(&mut line, b"]}\n")
+  } else {
+    run appendLocation(&mut line, sources, &module, span, false)
+    if status == 1 {
+      run Bytes.append(&mut line, b": error[")
+      run Bytes.append(&mut line, name)
+      run Bytes.append(&mut line, b"]\n")
+    } else {
+      run Bytes.append(&mut line, b": unsupported[")
+      run Bytes.append(&mut line, name)
+      run Bytes.append(&mut line, b"] not supported by the native compiler yet\n")
+    }
+  }
+  run Bytes.append(&mut out.*, Bytes.asSlice(&line))
+  return status
+}
+
+// One invocation nonce: no two runs share a plan, so a stale receipt never binds a new run.
+effect fn testNonce(output: &[u8], digest: &[u8]) -> [u8; 32] {
+  let mut clock = OsSystemClock.make()
+  let now = run SystemClock.now()
+    |> Effect.provideMut<SystemClock>(&mut clock)
+  let mut state = Sha256.make()
+  Sha256.update(&mut state, b"silk-test-nonce")
+  let stamp = [i64.toU64(SystemClock.seconds(&now)), i64.toU64(SystemClock.nanoseconds(&now))]
+  let mut at = usize.ZERO
+  while at < 2 {
+    let mut shift = usize.ZERO
+    while shift < 8 {
+      let byte = [u64.toU8(u64.bitAnd(u64.shiftRight(stamp[at], usize.toU64(shift * 8)), 255))]
+      Sha256.update(&mut state, &byte)
+      shift = shift + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  Sha256.update(&mut state, output)
+  Sha256.update(&mut state, digest)
+  return state.finish()
+}
+
+effect fn removeQuietly(path: &Path) -> () ? &mut FileSystem {
+  let removed = run Effect.result(FileSystem.removeFile(path))
+  drop removed
+  return ()
+}
+
+// Builds the bundled runner for the discovery root `sourcePath` (within `manifest`'s package when
+// given), runs it with an uncached plan, and returns its status once its receipt is admitted: 0 or
+// 1 from the runner, 2 for an operational failure, or the raw status of an abnormal exit
+// (TEST-007, TEST-008).
+effect fn test(sourcePath: &Path, manifest: Option<&Path>, output: &Path, display: &Path, request: &SupplyRequest, standardLibrary: Option<Path>, profile: InitialProfile,
+  bindings: Vector<Supplied>, filter: Option<Bytes>, file: Option<Bytes>) -> i32
+! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Writer | &mut Types {
+  let built = run build(sourcePath, move manifest, output, display, Form.Executable, Stage.Final, move standardLibrary, move profile, move bindings, request, true, false, &Option<Bytes>.none())
+  let identities = match move built {
+    Compiled.Finished {status} => { return status }
+    Compiled.Tests {identities} => move identities
+  }
+  let digest = TestRun.catalogDigest(Vector<Bytes>.asSlice(&identities))
+  let nonce = run testNonce(Path.rawBytes(output), &digest)
+  let plan = run TestRun.uncachedPlan(&nonce, &digest, usize.toU64(Vector<Bytes>.length(&identities)))
+  let mut planBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut planBytes, b".plan")
+  let planPath = run Path.fromBytes(Bytes.asSlice(&planBytes))
+  let mut receiptBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut receiptBytes, b".receipt")
+  let receiptPath = run Path.fromBytes(Bytes.asSlice(&receiptBytes))
+  run removeQuietly(&receiptPath)
+  run FileSystem.writeFile(&planPath, Bytes.asSlice(&plan))
+  let mut process = run ChildProcess.request(output)
+  if let Option<Bytes>.Some {value} = &file {
+    run ChildProcess.addArgument(&mut process, b"--file")
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&value))
+  }
+  if let Option<Bytes>.Some {value} = &filter {
+    run ChildProcess.addArgument(&mut process, b"--filter")
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&value))
+  }
+  run ChildProcess.addArgument(&mut process, b"--silk-test-plan")
+  run ChildProcess.addArgument(&mut process, Bytes.asSlice(&planBytes))
+  run ChildProcess.addArgument(&mut process, b"--silk-test-result")
+  run ChildProcess.addArgument(&mut process, Bytes.asSlice(&receiptBytes))
+  let outcome = run ChildProcess.submit(&process)
+  run Writer.writeAll(ChildProcess.outputBytes(&outcome))
+  run writeError(ChildProcess.errorBytes(&outcome))
+  let mut status = 2
+  if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) {
+    status = value
+  } else if let Option<i32>.Some {value: signal} = move ChildProcess.terminatingSignal(&outcome) {
+    status = 128 + signal
+  }
+  if status >= 0 && status <= 1 {
+    let received = run Effect.result(FileSystem.readFile(&receiptPath))
+    let admitted = match &received {
+      Result<Bytes, FileError | OutOfMemoryError>.Success {value} => match move TestRun.admitReceipt(Bytes.asSlice(&plan), Bytes.asSlice(&value), status) {
+        Option<TestRun.Counts>.Some {..} => true
+        Option<TestRun.Counts>.None => false
+      }
+      Result<Bytes, FileError | OutOfMemoryError>.Failure {..} => false
+    }
+    drop received
+    if !admitted {
+      run writeError(b"silk test: the test runner did not write a valid receipt\n")
+      status = 2
+    }
+  }
+  run removeQuietly(&planPath)
+  run removeQuietly(&receiptPath)
+  return status
+}
+
+// Writes one project failure as the TypeScript CLI words it.
+effect fn reportProject(problem: &ProjectError) -> () ! WriterError {
+  return match &problem.* {
+    ProjectError.ManifestNotFound {start} => {
+      run writeError(b"No silk.toml found from ")
+      run writeError(Path.rawBytes(&start))
+      run writeError(b"; create one\n")
+    }
+    ProjectError.Uninspectable {path} => {
+      run writeError(b"Cannot inspect ")
+      run writeError(Path.rawBytes(&path))
+      run writeError(b" while discovering a Silk project\n")
+    }
+    ProjectError.Unreadable {manifest} => {
+      run writeError(b"Cannot read Silk project manifest ")
+      run writeError(Path.rawBytes(&manifest))
+      run writeError(b"\n")
+    }
+    ProjectError.InvalidProfile {manifest: _, code, subject} => run reportProfile(code, Bytes.asSlice(&subject))
+    ProjectError.InvalidManifest {manifest, detail} => {
+      run writeError(b"Invalid Silk project manifest ")
+      run writeError(Path.rawBytes(&manifest))
+      run writeError(b": ")
+      run writeError(Bytes.asSlice(&detail))
+      run writeError(b"\n")
+    }
+  }
+}
+
+// Builds `sourcePath` in the form and stage its nearest project manifest selects, as the TypeScript
+// CLI does; `stage` replaces the manifest's stage. Only the host target links an executable.
+effect fn buildSource(sourcePath: &Path, output: &Path, stage: Option<Stage>, standardLibrary: Option<Path>,
+  input: ProfileInput, stats: bool, clang: &Option<Bytes>) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let directory = match move run Path.parent(sourcePath) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { fail InvalidSourceRoot {} }
+  }
+  let project = match move run locateProject(&directory, &Option<Bytes>.none()) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  let form = Projects.form(&project)
+  let selected = match move stage {
+    Option<Stage>.Some {value} => value
+    Option<Stage>.None => Projects.stage(&project)
+  }
+  // A shared library needs hidden visibility for its non-exported definitions; it is not native yet.
+  if form == Form.SharedLibrary {
+    run writeError(b"SILK_GAP artifact-form: the ")
+    run writeError(Projects.formSpelling(form))
+    run writeError(b" form is not native yet\n")
+    return 2
+  }
+  let mut configured = move input
+  configured.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(form)))
+  let profile = run InitialProfile.freeze(&configured)
+  let host = hostTarget()
+  if form == Form.Executable && selected == Stage.Final && Target.id(InitialProfile.target(&profile)) != Target.id(&host) {
+    return run invalidBuildProfile()
+  }
+  let automatic = SupplyRequest.Automatic
+  let built = run build(sourcePath, Option<&Path>.none(), output, &directory, form, selected, move standardLibrary, move profile, Vector<Supplied>.make(), &automatic, false, stats, clang)
+  return match move built {
+    Compiled.Finished {status} => status
+    Compiled.Tests {identities} => {
+      drop identities
+      return 2
+    }
+  }
+}
+
+effect fn discoveredProject(working: &Path, manifestPath: &Option<Bytes>) -> Project
+! ApplicationError | ProjectError | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let manifest = match &manifestPath.* {
+    Option<Bytes>.Some {value} => run pathArgument(working, Bytes.asSlice(&value))
+    Option<Bytes>.None => run Projects.discover(working)
+  }
+  return run Projects.load(&manifest)
+}
+
+// Loads the project that `--manifest-path` names, or else the one whose manifest is nearest above
+// `working`; when there is none it reports why and answers `None`.
+effect fn locateProject(working: &Path, manifestPath: &Option<Bytes>) -> Option<Project>
+! ApplicationError | FileError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut Allocator {
+  let located = run Effect.result(discoveredProject(working, manifestPath))
+  return match move located {
+    Result<Project, ApplicationError | ProjectError | FileError | OutOfMemoryError>.Success {value} => Option<Project>.some(move value)
+    Result<Project, ApplicationError | ProjectError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+      ProjectError problem => {
+        run reportProject(&problem)
+        return Option<Project>.none()
+      }
+      ApplicationError application => { fail move application }
+      FileError file => { fail move file }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Removes the project's output directory: status 0, or 2 when it cannot.
+effect fn cleanProject(working: &Path, command: CleanCommand) -> i32
+! ApplicationError | FileError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut Allocator | &mut Writer {
+  let project = match move run locateProject(working, &command.manifestPath) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  let removed = run Effect.result(Projects.clean(&project))
+  let output = Path.rawBytes(Projects.outputDirectory(&project))
+  return match move removed {
+    Result<(), FileError | OutOfMemoryError>.Success {value: _} => {
+      run Writer.writeAll(b"Removed ")
+      run Writer.writeAll(output)
+      run Writer.writeAll(b"\n")
+      return 0
+    }
+    Result<(), FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        run writeError(b"Cannot remove build directory ")
+        run writeError(output)
+        run writeError(b"\n")
+        return 2
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// One attempted project compilation.
+struct ProjectArtifact {
+  status: i32
+  target: Target
+  path: Path
+}
+
+// Writes a refused profile or binding as the TypeScript `<code>: <subject>`.
+effect fn reportProfile(code: ProfileCode, subject: &[u8]) -> () ! WriterError {
+  run writeError(ProjectProfiles.codeName(code))
+  run writeError(b": ")
+  run writeError(subject)
+  run writeError(b"\n")
+}
+
+// Writes the TypeScript refusal of `--release` with another `--optimization`.
+effect fn reportOptimizationConflict(options: &ProjectOptions) -> () ! WriterError {
+  run writeError(b"--release conflicts with --optimization ")
+  if let Option<Bytes>.Some {value} = &options.optimization {
+    run writeError(Bytes.asSlice(&value))
+  }
+  run writeError(b"\n")
+}
+
+// Plans the project's compilations (see `driver/ProjectPlan`), or answers `None` after reporting
+// why there are none as the TypeScript CLI words it.
+effect fn projectPlans(project: &Project, options: &ProjectOptions, fallback: &[Bytes]) -> Option<Vector<ProjectPlan>>
+! TomlError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let planned = run Effect.result(ProjectPlans.make(project, options, fallback, hostTarget()))
+  return match move planned {
+    Result<Vector<ProjectPlan>, PlanError | TomlError | OutOfMemoryError>.Success {value} => Option<Vector<ProjectPlan>>.some(move value)
+    Result<Vector<ProjectPlan>, PlanError | TomlError | OutOfMemoryError>.Failure {error} => match move error {
+      PlanError problem => {
+        match move problem {
+          PlanError.ConflictingSelection => run writeError(b"Named/full profiles conflict with target and optimization flags\n")
+          PlanError.UnknownTarget {selector} => {
+            run writeError(b"Unsupported target ")
+            run writeError(Bytes.asSlice(&selector))
+            run writeError(b"\n")
+          }
+          PlanError.Profile {code, subject} => run reportProfile(code, Bytes.asSlice(&subject))
+          PlanError.InvalidProfileInput => run writeError(b"Invalid --profile-input JSON\n")
+        }
+        return Option<Vector<ProjectPlan>>.none()
+      }
+      TomlError malformed => { fail move malformed }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+// Builds one planned compilation into `<output-dir>/llvm/<target>/<profile>/`, where the profile
+// directory is `debug`, `release` or `release-with-debug` from the plan's optimization and debug
+// information, in the form and stage the manifest selects and with the file name
+// `Projects.artifact` gives. A plan whose profile names no artifact takes the manifest's form.
+// Only the host target links an executable, and a shared library is not native yet.
+effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>) -> ProjectArtifact
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let ProjectPlan {input: planned, bindings} = move plan
+  let form = Projects.form(project)
+  let stage = Projects.stage(project)
+  let mut input = move planned
+  if let Option<Bytes>.None = &input.artifact {
+    input.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(form)))
+  }
+  let profile = run InitialProfile.freeze(&input)
+  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
+  let optimization = match move InitialProfile.text(&profile, b"optimization") {
+    Option<&[u8]>.Some {value} => value
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let debug = match move InitialProfile.flag(&profile, b"debug") {
+    Option<bool>.Some {value} => value
+    Option<bool>.None => run invalidBuildProfile()
+  }
+  let profileName = Projects.profileName(optimization, debug)
+  let path = run Projects.artifact(project, Target.name(&target), profileName)
+  if form == Form.SharedLibrary {
+    run writeError(b"SILK_GAP artifact-form: the ")
+    run writeError(Projects.formSpelling(form))
+    run writeError(b" form is not native yet\n")
+    return ProjectArtifact {status: 2, target: target, path: move path}
+  }
+  if form == Form.Executable && stage == Stage.Final && Target.id(&target) != Target.id(&hostTarget()) {
+    run writeError(b"Cannot link an executable for target ")
+    run writeError(Target.name(&target))
+    run writeError(b" on host ")
+    run writeError(Target.name(&hostTarget()))
+    run writeError(b"\n")
+    return ProjectArtifact {status: 2, target: target, path: move path}
+  }
+  if let Option<Path>.Some {value: directory} = move run Path.parent(&path) {
+    run FileSystem.createDirectoriesRecursively(&directory)
+  }
+  let library = match &standardLibrary.* {
+    Option<Path>.Some {value} => Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
+    Option<Path>.None => Option<Path>.none()
+  }
+  let built = run build(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), &path, Projects.directory(project), form, stage, move library, move profile, move bindings, Projects.supply(project), false, false, &Option<Bytes>.none())
+  return match move built {
+    Compiled.Finished {status} => ProjectArtifact {status: status, target: target, path: move path}
+    Compiled.Tests {identities} => {
+      drop identities
+      return ProjectArtifact {status: 2, target: target, path: move path}
+    }
+  }
+}
+
+// The standard-library root: the `--stdlib` argument resolved against the working directory, or
+// else the library installed beside this compiler (`<prefix>/lib/silk/stdlib`), when there is one.
+effect fn standardLibraryFor(working: &Path, configured: &Option<Bytes>) -> Option<Path>
+! ApplicationError | HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if let Option<Bytes>.Some {value} = &configured.* {
+    return Option<Path>.some(run pathArgument(working, Bytes.asSlice(&value)))
+  }
+  let invoked = match move run HostInput.argument(usize.ZERO) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Path>.none() }
+  }
+  let searchPath = run HostInput.variableNamed("PATH")
+  return match &searchPath {
+    Option<Bytes>.Some {value} => run InstalledCompiler.standardLibrary(working, Bytes.asSlice(&invoked), Option<&[u8]>.some(Bytes.asSlice(&value)))
+    Option<Bytes>.None => run InstalledCompiler.standardLibrary(working, Bytes.asSlice(&invoked), Option<&[u8]>.none())
+  }
+}
+
+// Builds every planned compilation of the project in order and reports each attempt and a summary
+// as the TypeScript `silk build` does. The status is 2 when any compilation failed operationally,
+// else 1 when any build was refused, else 0.
+effect fn buildProject(working: &Path, command: BuildCommand) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let BuildCommand {options} = move command
+  if ProjectCommands.conflicting(&options) {
+    run reportOptimizationConflict(&options)
+    return 2
+  }
+  let project = match move run locateProject(working, &options.manifestPath) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  let mut plans = match move run projectPlans(&project, &options, Projects.targets(&project)) {
+    Option<Vector<ProjectPlan>>.Some {value} => move value
+    Option<Vector<ProjectPlan>>.None => { return 2 }
+  }
+  let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
+  let mut attempts = Vector<ProjectArtifact>.make()
+  while Vector<ProjectPlan>.length(&plans) > usize.ZERO {
+    let plan = Vector<ProjectPlan>.remove(&mut plans, usize.ZERO)
+    run Vector<ProjectArtifact>.append(&mut attempts, run buildProjectTarget(&project, move plan, &standardLibrary))
+  }
+  let attempted = Vector<ProjectArtifact>.asSlice(&attempts)
+  let mut succeeded = usize.ZERO
+  let mut status = 0
+  let mut at = usize.ZERO
+  while at < attempted.length {
+    let mut line = run Bytes.copy(b"build llvm/")
+    run Bytes.append(&mut line, Target.name(&attempted[at].target))
+    if attempted[at].status == 0 {
+      succeeded = succeeded + usize.ONE
+      run Bytes.append(&mut line, b": ok ")
+      run Bytes.append(&mut line, Path.rawBytes(&attempted[at].path))
+    } else {
+      run Bytes.append(&mut line, b": failed (exit ")
+      run JsonText.appendDecimal(&mut line, i32.toUsize(attempted[at].status))
+      run Bytes.append(&mut line, b")")
+      if attempted[at].status == 2 || status == 2 { status = 2 } else { status = 1 }
+    }
+    run Bytes.append(&mut line, b"\n")
+    run Writer.writeAll(Bytes.asSlice(&line))
+    at = at + usize.ONE
+  }
+  let mut summary = run Bytes.copy(b"Build summary: ")
+  run JsonText.appendDecimal(&mut summary, succeeded)
+  run Bytes.append(&mut summary, b" succeeded, ")
+  run JsonText.appendDecimal(&mut summary, attempted.length - succeeded)
+  run Bytes.append(&mut summary, b" failed\n")
+  run Writer.writeAll(Bytes.asSlice(&summary))
+  return status
+}
+
+// Writes one target's diagnostics to standard error: after a `[<target>]` header in the human
+// format, as the TypeScript `silk check` does, and only when there are any.
+effect fn writeDiagnostics(target: &Target, json: bool, diagnostics: &Bytes) -> () ! WriterError {
+  if Bytes.length(diagnostics) == usize.ZERO {
+    return ()
+  }
+  if !json {
+    run writeError(b"[")
+    run writeError(Target.name(target))
+    run writeError(b"]\n")
+  }
+  run writeError(Bytes.asSlice(diagnostics))
+}
+
+// Analyzes the project for one planned compilation without producing an artifact: every
+// root-package declaration is checked, used or not (MODULE-004), with the syntax of every loaded
+// module and the imports of every reached one. Diagnostics go to standard error in `format`,
+// after a `[<target>]` header in the human format, as the TypeScript `silk check` writes them.
+// The status is 0, 1 when a declaration is rejected, or 2 for an unsupported construct.
+effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool) -> ProjectArtifact
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let ProjectPlan {input: planned, bindings} = move plan
+  let mut input = move planned
+  if let Option<Bytes>.None = &input.artifact {
+    input.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(Projects.form(project))))
+  }
+  let profile = run InitialProfile.freeze(&input)
+  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
+  let path = run Path.fromBytes(Path.rawBytes(Projects.manifest(project)))
+  let library = match &standardLibrary.* {
+    Option<Path>.Some {value} => Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
+    Option<Path>.None => Option<Path>.none()
+  }
+  let mut format = DiagnosticFormat.Human
+  if json { format = DiagnosticFormat.Json {target: run Bytes.copy(Target.name(&target))} }
+  let mut out = Bytes.make()
+  let prepared = run prepare(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), move library, &profile, move bindings, false, &format, &mut out)
+  let analysis = match move prepared {
+    Prepared.Ready {analysis} => move analysis
+    Prepared.Finished {status} => {
+      run writeDiagnostics(&target, json, &out)
+      return ProjectArtifact {status: status, target: target, path: move path}
+    }
+  }
+  let Analysis {sources, store: analyzed, request: requested, rootPackage, identity, runtime} = move analysis
+  drop identity
+  drop runtime
+  let mut store = move analyzed
+  let mut request = move requested
+  let checked = run Semantic.checkDeclarations(&mut store, &mut request, Vector<ModuleId>.asSlice(&rootPackage))
+  let mut status = 0
+  let syntax = run Semantic.syntaxRejections(&store)
+  let malformed = Vector<Shared<Rejection>>.asSlice(&syntax)
+  let mut at = usize.ZERO
+  while at < malformed.length {
+    status = worse(status, run reportRejection(&sources, &malformed[at], &format, &mut out))
+    at = at + usize.ONE
+  }
+  status = worse(status, run reportedImportRejections(&mut store, &mut request, &sources, &format, &mut out))
+  let rejected = Vector<Shared<Rejection>>.asSlice(&checked.rejections)
+  at = usize.ZERO
+  while at < rejected.length {
+    status = worse(status, run reportRejection(&sources, &rejected[at], &format, &mut out))
+    at = at + usize.ONE
+  }
+  if Vector<Shared<Gap>>.length(&checked.gaps) > usize.ZERO {
+    let message = run gapSummary(Vector<Shared<Gap>>.asSlice(&checked.gaps))
+    run Bytes.append(&mut out, Bytes.asSlice(&message))
+    status = 2
+  }
+  run writeDiagnostics(&target, json, &out)
+  return ProjectArtifact {status: status, target: target, path: move path}
+}
+
+// Writes one borrow-check gap line: `<prefix>3 bodies not borrow-checked (regions 2, captures 1;
+// ...)`, the total and then each reason with bodies, per `uncheckedReason`.
+effect fn writeBorrowGap(prefix: &[u8], counts: &[usize]) -> () ! OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut total = usize.ZERO
+  let mut at = usize.ZERO
+  while at < counts.length {
+    total = total + counts[at]
+    at = at + usize.ONE
+  }
+  let mut message = run Bytes.copy(prefix)
+  run JsonText.appendDecimal(&mut message, total)
+  run Bytes.append(&mut message, b" bodies not borrow-checked (")
+  let mut listed = false
+  at = usize.ZERO
+  while at < counts.length {
+    if counts[at] > usize.ZERO {
+      if listed {
+        run Bytes.append(&mut message, b", ")
+      }
+      run Bytes.append(&mut message, String.utf8Bytes(uncheckedReasonName(at)))
+      run Bytes.append(&mut message, b" ")
+      run JsonText.appendDecimal(&mut message, counts[at])
+      listed = true
+    }
+    at = at + usize.ONE
+  }
+  if !listed { run Bytes.append(&mut message, b"all checked") }
+  run Bytes.append(&mut message, b"; native borrow checking is roadmap step 14)\n")
+  run writeError(Bytes.asSlice(&message))
+}
+
+// Writes the root-package count line, then, when `named`, one `SILK_GAP borrow-check body:
+// <module> <start>-<end> <reason> <codes>` line per unchecked concrete root-package body, by the
+// byte offsets of its body block, with the comma-separated catalog codes the checks it left open
+// report, or `-` when it left none of them open.
+effect fn writeRootBorrowGap(bodies: &[UncheckedBody], named: bool) -> () ! OutOfMemoryError | WriterError ? &mut Allocator {
+  let mut counts = Vector<usize>.make()
+  let mut at = usize.ZERO
+  while at < uncheckedReasonCount() {
+    run Vector<usize>.append(&mut counts, usize.ZERO)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < bodies.length {
+    let mut slots = Vector<usize>.asMutSlice(&mut counts)
+    slots[bodies[at].reason] = slots[bodies[at].reason] + usize.ONE
+    at = at + usize.ONE
+  }
+  run writeBorrowGap(b"SILK_GAP borrow-check root-package: ", Vector<usize>.asSlice(&counts))
+  if !named { return () }
+  at = usize.ZERO
+  while at < bodies.length {
+    let mut line = run Bytes.copy(b"SILK_GAP borrow-check body: ")
+    let path = run ModuleId.copyPath(&bodies[at].module)
+    run Bytes.append(&mut line, Bytes.asSlice(&path))
+    run Bytes.append(&mut line, b" ")
+    run JsonText.appendDecimal(&mut line, bodies[at].block.start)
+    run Bytes.append(&mut line, b"-")
+    run JsonText.appendDecimal(&mut line, bodies[at].block.end)
+    run Bytes.append(&mut line, b" ")
+    run Bytes.append(&mut line, String.utf8Bytes(uncheckedReasonName(bodies[at].reason)))
+    run Bytes.append(&mut line, b" ")
+    let skipped = run uncheckedBodyCodes(bodies[at].undecided)
+    let codes = Vector<RejectionCode>.asSlice(&skipped)
+    if codes.length == usize.ZERO { run Bytes.append(&mut line, b"-") }
+    let mut code = usize.ZERO
+    while code < codes.length {
+      if code > usize.ZERO { run Bytes.append(&mut line, b",") }
+      run Bytes.append(&mut line, Rejections.stableCode(codes[code]))
+      code = code + usize.ONE
+    }
+    run Bytes.append(&mut line, b"\n")
+    run writeError(Bytes.asSlice(&line))
+    at = at + usize.ONE
+  }
+}
+
+// The combined status of two outcomes: 2 dominates 1, which dominates 0.
+fn worse(left: i32, right: i32) -> i32 {
+  if left == 2 || right == 2 { return 2 }
+  if left == 1 || right == 1 { return 1 }
+  return 0
+}
+
+// Analyzes every planned compilation of the project in order and writes one `check <target>:`
+// line per target and a `Check summary` on standard output, as the TypeScript `silk check` does.
+effect fn checkProject(working: &Path, command: CheckCommand) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let CheckCommand {options, json} = move command
+  if ProjectCommands.conflicting(&options) {
+    run reportOptimizationConflict(&options)
+    return 2
+  }
+  let project = match move run locateProject(working, &options.manifestPath) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  let mut plans = match move run projectPlans(&project, &options, Projects.targets(&project)) {
+    Option<Vector<ProjectPlan>>.Some {value} => move value
+    Option<Vector<ProjectPlan>>.None => { return 2 }
+  }
+  let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
+  let mut attempts = Vector<ProjectArtifact>.make()
+  while Vector<ProjectPlan>.length(&plans) > usize.ZERO {
+    let plan = Vector<ProjectPlan>.remove(&mut plans, usize.ZERO)
+    run Vector<ProjectArtifact>.append(&mut attempts, run checkTarget(&project, move plan, &standardLibrary, json))
+  }
+  let attempted = Vector<ProjectArtifact>.asSlice(&attempts)
+  let mut succeeded = usize.ZERO
+  let mut status = 0
+  let mut at = usize.ZERO
+  while at < attempted.length {
+    let mut line = run Bytes.copy(b"check ")
+    run Bytes.append(&mut line, Target.name(&attempted[at].target))
+    if attempted[at].status == 0 {
+      succeeded = succeeded + usize.ONE
+      run Bytes.append(&mut line, b": ok")
+    } else {
+      run Bytes.append(&mut line, b": failed (exit ")
+      run JsonText.appendDecimal(&mut line, i32.toUsize(attempted[at].status))
+      run Bytes.append(&mut line, b")")
+      status = worse(status, attempted[at].status)
+    }
+    run Bytes.append(&mut line, b"\n")
+    run Writer.writeAll(Bytes.asSlice(&line))
+    at = at + usize.ONE
+  }
+  let mut summary = run Bytes.copy(b"Check summary: ")
+  run JsonText.appendDecimal(&mut summary, succeeded)
+  run Bytes.append(&mut summary, b" succeeded, ")
+  run JsonText.appendDecimal(&mut summary, attempted.length - succeeded)
+  run Bytes.append(&mut summary, b" failed\n")
+  run Writer.writeAll(Bytes.asSlice(&summary))
+  return status
+}
+
+// Builds the project's executable for the host, then replaces this process with it. `run` ignores
+// `[build].targets`: it builds the named profile, else the first `--target`, else the host, and a
+// foreign target is refused before building. A project that cannot be loaded or run is status 2;
+// a refused build keeps the build's status.
+effect fn runProject(working: &Path, command: RunCommand) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
+  let RunCommand {options, arguments} = move command
+  if ProjectCommands.conflicting(&options) {
+    run reportOptimizationConflict(&options)
+    return 2
+  }
+  let project = match move run locateProject(working, &options.manifestPath) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  if !Projects.runnable(&project) {
+    run writeError(b"Cannot run ")
+    run writeError(Projects.formSpelling(Projects.form(&project)))
+    run writeError(b" artifact\n")
+    return 2
+  }
+  let host = [run Bytes.copy(b"host")]
+  let hostSelector: &[Bytes] = &host
+  let mut plans = match move run projectPlans(&project, &options, hostSelector) {
+    Option<Vector<ProjectPlan>>.Some {value} => move value
+    Option<Vector<ProjectPlan>>.None => { return 2 }
+  }
+  let plan = Vector<ProjectPlan>.remove(&mut plans, usize.ZERO)
+  let planned = match &plan.input.target {
+    Option<Bytes>.Some {value} => Target.resolve(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<Target>.none()
+  }
+  let target = match move planned {
+    Option<Target>.Some {value} => value
+    Option<Target>.None => run invalidBuildProfile()
+  }
+  if Target.id(&target) != Target.id(&hostTarget()) {
+    run writeError(b"Cannot run target ")
+    run writeError(Target.name(&target))
+    run writeError(b" on host ")
+    run writeError(Target.name(&hostTarget()))
+    run writeError(b"\n")
+    return 2
+  }
+  let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
+  let built = run buildProjectTarget(&project, move plan, &standardLibrary)
+  if built.status != 0 { return built.status }
+  let failure = run ProcessImage.replace(&built.path, Vector<Bytes>.asSlice(&arguments))
+  drop failure
+  run writeError(b"Cannot run compiled program ")
+  run writeError(Path.rawBytes(&built.path))
+  run writeError(b"\n")
+  return 2
+}
+
+// Selects the source file `written` names, relative to the project directory, for a test run:
+// its project-relative path, or `None` after reporting why it cannot be selected as the
+// TypeScript `SourceEntry.select` words it.
+effect fn testSource(project: &Project, written: &[u8]) -> Option<Bytes>
+! ApplicationError | OutOfMemoryError | WriterError ? &mut Allocator {
+  let path = run pathArgument(Projects.directory(project), written)
+  return match move run Projects.selectSource(project, &path) {
+    SourceSelection.Module {relative} => Option<Bytes>.some(move relative)
+    SourceSelection.Outside {sourceRoot} => {
+      run writeError(b"Source entry ")
+      run writeError(Path.rawBytes(&path))
+      run writeError(b" is outside source root ")
+      run writeError(Path.rawBytes(&sourceRoot))
+      run writeError(b"\n")
+      return Option<Bytes>.none()
+    }
+    SourceSelection.NotModule => {
+      run writeError(b"Source entry ")
+      run writeError(Path.rawBytes(&path))
+      run writeError(b" must be a canonical relative path ending in .silk\n")
+      return Option<Bytes>.none()
+    }
+  }
+}
+
+// Builds the project's test runner for the host and runs the selected tests, as the TypeScript
+// `silk test` does. Discovery starts at `--root`, else at `[package].root`; `--file` and
+// `--filter` select tests at run time. The runner is always a final executable, whatever the
+// manifest's form and stage, at `<output-dir>/test/llvm/<target>/<profile>/<name>`. A project,
+// selection or plan that cannot be used is status 2; otherwise the status is the test run's.
+effect fn testProject(working: &Path, command: TestCommand) -> i32
+! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types | &mut Writer {
+  let TestCommand {options, root, file, filter, noCache} = move command
+  if !noCache {
+    run writeError(b"SILK_GAP test-result-cache: test-result reuse (TEST-008) is not native yet; pass --no-cache\n")
+    return 2
+  }
+  if ProjectCommands.conflicting(&options) {
+    run reportOptimizationConflict(&options)
+    return 2
+  }
+  let project = match move run locateProject(working, &options.manifestPath) {
+    Option<Project>.Some {value} => move value
+    Option<Project>.None => { return 2 }
+  }
+  let mut discovery = run Path.fromBytes(Path.rawBytes(Projects.entry(&project)))
+  if let Option<Bytes>.Some {value} = &root {
+    if let Option<Bytes>.None = move run testSource(&project, Bytes.asSlice(&value)) {
+      return 2
+    }
+    discovery = run pathArgument(Projects.directory(&project), Bytes.asSlice(&value))
+  }
+  let mut selectedFile = Option<Bytes>.none()
+  if let Option<Bytes>.Some {value} = &file {
+    selectedFile = match move run testSource(&project, Bytes.asSlice(&value)) {
+      Option<Bytes>.Some {value: relative} => Option<Bytes>.some(move relative)
+      Option<Bytes>.None => { return 2 }
+    }
+  }
+  let host = [run Bytes.copy(b"host")]
+  let hostSelector: &[Bytes] = &host
+  let mut plans = match move run projectPlans(&project, &options, hostSelector) {
+    Option<Vector<ProjectPlan>>.Some {value} => move value
+    Option<Vector<ProjectPlan>>.None => { return 2 }
+  }
+  let plan = Vector<ProjectPlan>.remove(&mut plans, usize.ZERO)
+  let ProjectPlan {input: planned, bindings} = move plan
+  let mut input = move planned
+  input.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(Form.Executable)))
+  let profile = run InitialProfile.freeze(&input)
+  let target = Target.forId(Target.id(InitialProfile.target(&profile)))
+  if Target.id(&target) != Target.id(&hostTarget()) {
+    run writeError(b"Cannot run target ")
+    run writeError(Target.name(&target))
+    run writeError(b" on host ")
+    run writeError(Target.name(&hostTarget()))
+    run writeError(b"\n")
+    return 2
+  }
+  let optimization = match move InitialProfile.text(&profile, b"optimization") {
+    Option<&[u8]>.Some {value} => value
+    Option<&[u8]>.None => run invalidBuildProfile()
+  }
+  let debug = match move InitialProfile.flag(&profile, b"debug") {
+    Option<bool>.Some {value} => value
+    Option<bool>.None => run invalidBuildProfile()
+  }
+  let output = run Projects.testExecutable(&project, Target.name(&target), Projects.profileName(optimization, debug))
+  if let Option<Path>.Some {value: directory} = move run Path.parent(&output) {
+    run FileSystem.createDirectoriesRecursively(&directory)
+  }
+  let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
+  return run test(&discovery, Option<&Path>.some(Projects.manifest(&project)), &output, Projects.directory(&project), Projects.supply(&project), move standardLibrary, move profile,
+    move bindings, move filter, move selectedFile)
+}
+
+// Writes one refused initialization as the TypeScript CLI words it.
+effect fn reportInitialization(problem: &InitializationError) -> () ! WriterError {
+  return match &problem.* {
+    InitializationError.InvalidPackageName {name, derived} => {
+      if derived {
+        run writeError(b"Cannot derive a portable package name from ")
+        run writeError(Bytes.asSlice(&name))
+        run writeError(b"; pass --name\n")
+      } else {
+        run writeError(b"Package name ")
+        run writeError(Bytes.asSlice(&name))
+        run writeError(b" must start with a lowercase letter and contain only lowercase letters, digits, or hyphens\n")
+      }
+    }
+    InitializationError.ExistingFile {path} => {
+      run writeError(b"Refusing to overwrite existing project file ")
+      run writeError(Path.rawBytes(&path))
+      run writeError(b"\n")
+    }
+    InitializationError.SourceNotDirectory {path} => {
+      run writeError(b"Managed source path ")
+      run writeError(Path.rawBytes(&path))
+      run writeError(b" is not a directory\n")
+    }
+    InitializationError.AncestorNotDirectory {path} => {
+      run writeError(b"Initialization path ancestor ")
+      run writeError(Path.rawBytes(&path))
+      run writeError(b" is not a directory\n")
+    }
+    InitializationError.Failed {path} => {
+      run writeError(b"Cannot initialize Silk project at ")
+      run writeError(Path.rawBytes(&path))
+      run writeError(b"\n")
+    }
+  }
+}
+
+// Creates a project in the selected directory and reports it: status 0, or 2 when refused.
+effect fn initProject(working: &Path, command: InitCommand) -> i32
+! ApplicationError | FileError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut Allocator | &mut Writer {
+  let InitCommand {path, name} = move command
+  let directory = match move path {
+    Option<Bytes>.Some {value} => run pathArgument(working, Bytes.asSlice(&value))
+    Option<Bytes>.None => run Path.fromBytes(Path.rawBytes(working))
+  }
+  let initialized = run Effect.result(ProjectInitializers.initialize(&directory, move name))
+  return match move initialized {
+    Result<Initialized, InitializationError | OutOfMemoryError>.Success {value} => {
+      run Writer.writeAll(b"Initialized Silk project ")
+      run Writer.writeAll(Bytes.asSlice(&value.name))
+      run Writer.writeAll(b" at ")
+      run Writer.writeAll(Path.rawBytes(&value.directory))
+      run Writer.writeAll(b"\n")
+      return 0
+    }
+    Result<Initialized, InitializationError | OutOfMemoryError>.Failure {error} => match move error {
+      InitializationError problem => {
+        run reportInitialization(&problem)
+        return 2
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+/// Resolves one command-line path, naming the rejected argument when no path can spell it.
+effect fn pathArgument(working: &Path, argument: &[u8]) -> Path
+! ApplicationError | OutOfMemoryError ? &mut Allocator {
+  let resolved = run Effect.result(CommandPath.resolve(working, argument))
+  return match move resolved {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError invalid => {
+        drop invalid
+        fail ApplicationError.InvalidPath {argument: run Bytes.copy(argument)}
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+}
+
+effect fn program() -> i32
+! ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch
+? &mut HostInput | &mut Allocator | &mut Writer | &mut Types {
+  let captured = run Effect.result(HostInput.argument(usize.ONE))
+  let selector = match move captured {
+    Result<Option<Bytes>, HostInputError | OutOfMemoryError>.Success {value: argument} => move argument
+    Result<Option<Bytes>, HostInputError | OutOfMemoryError>.Failure {error: _} => {
+      let mut diagnostics = StderrWriter.make()
+      let reported = run Effect.result(Writer.writeAll(b"silk: cannot read command argument\n")
+        |> Effect.provideMut<Writer>(&mut diagnostics))
+      drop reported
+      return 2
+    }
+  }
+  if let Option<Bytes>.Some {value} = move selector {
+    if same(Bytes.asSlice(&value), b"format") {
+      let mut diagnostics = StderrWriter.make()
+      let initialized = run Effect.result(OsFileSystem.make(b"/"))
+      let mut files = match move initialized {
+        Result<OsFileSystem, OutOfMemoryError>.Success {value: provider} => move provider
+        Result<OsFileSystem, OutOfMemoryError>.Failure {error: _} => {
+          let reported = run Effect.result(Writer.writeAll(b"silk format: cannot initialize filesystem\n")
+            |> Effect.provideMut<Writer>(&mut diagnostics))
+          drop reported
+          return 2
+        }
+      }
+      let ran = run FormatCommand.runHost()
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<Writer>(&mut diagnostics)
+      let reported = run Effect.result(reportFormat(Vector<FileOutcome>.asSlice(&ran.outcomes)))
+      if let Result<(), WriterError | OutOfMemoryError>.Failure {error: _} = move reported { return 2 }
+      return ran.status
+    }
+  }
   let command = run request()
-  let Request {source: argument, hir: dumpHir} = move command
   let workingDirectory = run HostInput.workingDirectory()
   let validated = match move HostInput.text(Bytes.asSlice(&workingDirectory)) {
     Result<string, InvalidUtf8>.Success {value: _} => ()
     Result<string, InvalidUtf8>.Failure {error: _} => run invalidWorkingDirectoryEncoding()
   }
-  let mut files = run OsFileSystem.make(Bytes.asSlice(&workingDirectory))
-  let root = run Path.root()
-  let path = run Path.joinUtf8(&root, Bytes.asSlice(&argument))
-  let source = run FileSystem.readFile(&path)
-    |> Effect.provideMut<FileSystem>(&mut files)
-  let mut lexer = Lexer.make(Bytes.asSlice(&source))
-  let tokens = run lex(&mut lexer)
-  let tree = run Parser.parse(move source, move tokens)
-  if dumpHir {
-    let module = run Lower.lower(&tree)
-    run Hir.write(&module)
-    run Fingerprint.writeFingerprints(&module)
-    let result = run Hir.writeViolations(&module)
-    drop module
-    return result
+  let mut files = run OsFileSystem.make(b"/")
+  let working = run Path.fromBytes(Bytes.asSlice(&workingDirectory))
+  return match move command {
+    Request.Build {source, output, stage, standardLibrary: configured, input, stats, clang} => {
+      let sourcePath = run pathArgument(&working, Bytes.asSlice(&source))
+      let outputPath = run pathArgument(&working, Bytes.asSlice(&output))
+      // A `--clang` path resolves against the working directory; a bare name is searched on PATH.
+      let mut selectedClang = Option<Bytes>.none()
+      if let Option<Bytes>.Some {value} = move clang {
+        if CommandPath.contains(Bytes.asSlice(&value), 47) {
+          let resolved = run pathArgument(&working, Bytes.asSlice(&value))
+          selectedClang = Option<Bytes>.some(run Bytes.copy(Path.rawBytes(&resolved)))
+        } else {
+          selectedClang = Option<Bytes>.some(move value)
+        }
+      }
+      let standardLibrary = run standardLibraryFor(&working, &configured)
+        |> Effect.provideMut<FileSystem>(&mut files)
+      let mut process = OsChildProcess.make()
+      return run buildSource(&sourcePath, &outputPath, move stage, move standardLibrary, move input, stats, &selectedClang)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.Test {source, output, standardLibrary: configured, profile, filter, file, noCache} => {
+      if !noCache {
+        run writeError(b"SILK_GAP test-result-cache: test-result reuse (TEST-008) is not native yet; pass --no-cache\n")
+        return 2
+      }
+      let sourcePath = run pathArgument(&working, Bytes.asSlice(&source))
+      let outputPath = run pathArgument(&working, Bytes.asSlice(&output))
+      let standardLibrary = run standardLibraryFor(&working, &configured)
+        |> Effect.provideMut<FileSystem>(&mut files)
+      let mut process = OsChildProcess.make()
+      let display = match move run Path.parent(&sourcePath) {
+        Option<Path>.Some {value} => move value
+        Option<Path>.None => run Path.root()
+      }
+      let automatic = SupplyRequest.Automatic
+      return run test(&sourcePath, Option<&Path>.none(), &outputPath, &display, &automatic, move standardLibrary, move profile, Vector<Supplied>.make(), move filter, move file)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.Run {command: invocation} => {
+      let mut process = OsChildProcess.make()
+      return run runProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.Clean {command: invocation} => {
+      return run cleanProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+    }
+    Request.Check {command: invocation} => {
+      let mut process = OsChildProcess.make()
+      return run checkProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.ProjectBuild {command: invocation} => {
+      let mut process = OsChildProcess.make()
+      return run buildProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.ProjectTest {command: invocation} => {
+      let mut process = OsChildProcess.make()
+      return run testProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+        |> Effect.provideMut<ChildProcess>(&mut process)
+    }
+    Request.Help => {
+      let mut stdout = StdoutWriter.make()
+      run Writer.writeAll(usage()) |> Effect.provideMut<Writer>(&mut stdout)
+      return 0
+    }
+    Request.Version => {
+      let mut stdout = StdoutWriter.make()
+      run Writer.writeAll(version()) |> Effect.provideMut<Writer>(&mut stdout)
+      return 0
+    }
+    Request.Init {command: invocation} => {
+      return run initProject(&working, move invocation)
+        |> Effect.provideMut<FileSystem>(&mut files)
+    }
+    Request.Dump {source: argument, hir: dumpHir} => {
+      let path = run pathArgument(&working, Bytes.asSlice(&argument))
+      let source = run FileSystem.readFile(&path)
+        |> Effect.provideMut<FileSystem>(&mut files)
+      let mut lexer = Lexer.make(Bytes.asSlice(&source))
+      let tokens = run lex(&mut lexer)
+      let tree = run Parser.parse(move source, move tokens)
+      if dumpHir {
+        let module = run Lower.lower(&tree)
+        run Hir.write(&module)
+        run Fingerprint.writeFingerprints(&module)
+        run Hir.writeViolations(&module)
+        return 0
+      }
+      run SyntaxTree.write(&tree)
+      return 0
+    }
   }
-  return run SyntaxTree.write(&tree)
 }
 
-pub effect fn main() -> ()
-! ApplicationError | HostInputError | OutOfMemoryError | FileError | WriterError
-? &mut HostInput {
+/// Names one portable file operation code for a failure report.
+fn fileOperationName(code: i32) -> &'static [u8] {
+  if code == 0 { return b"read" }
+  if code == 1 { return b"write" }
+  if code == 2 { return b"inspect" }
+  if code == 3 { return b"list" }
+  if code == 4 { return b"create directory" }
+  if code == 5 { return b"remove" }
+  if code == 6 { return b"remove directory" }
+  if code == 7 { return b"resolve path" }
+  return b"create temporary directory"
+}
+
+/// Names one portable file failure reason code for a failure report.
+fn fileReasonName(code: i32) -> &'static [u8] {
+  if code == 0 { return b"not found" }
+  if code == 1 { return b"already exists" }
+  if code == 2 { return b"permission denied" }
+  if code == 3 { return b"invalid path" }
+  if code == 4 { return b"wrong file type" }
+  if code == 5 { return b"directory not empty" }
+  if code == 6 { return b"no space left" }
+  if code == 7 { return b"too large" }
+  if code == 8 { return b"unsupported" }
+  return b"other failure"
+}
+
+/// Writes one line naming a failure that escaped the command, so no failure exits silently.
+///
+/// The synchronous native startup maps an unhandled failure to status 1 without a report, so the
+/// command reports its own failures before returning that status.
+effect fn report(failure: ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch) -> () ! WriterError {
+  return match move failure {
+    ApplicationError application => match move application {
+      ApplicationError.InvalidArgumentCount {actual: _} => run writeError(usage())
+      ApplicationError.InvalidWorkingDirectoryEncoding => run writeError(b"silk: the working directory is not UTF-8\n")
+      ApplicationError.InvalidBuildProfile => run writeError(b"silk: invalid build profile\n")
+      ApplicationError.InvalidPath {argument} => {
+        run writeError(b"silk: invalid path argument: ")
+        run writeError(Bytes.asSlice(&argument))
+        run writeError(b"\n")
+      }
+    }
+    InitialProfileProblem problem => {
+      drop problem
+      run writeError(b"silk: invalid build profile\n")
+    }
+    HostInputError ignored => run writeError(b"silk: cannot read host input\n")
+    OutOfMemoryError ignored => run writeError(b"silk: out of memory\n")
+    FileError file => {
+      run writeError(b"silk: cannot ")
+      run writeError(fileOperationName(file.operation.code))
+      run writeError(b": ")
+      run writeError(fileReasonName(file.reason.code))
+      run writeError(b"\n")
+    }
+    WriterError ignored => run writeError(b"silk: cannot write output\n")
+    ProcessError ignored => run writeError(b"silk: cannot run the C compiler\n")
+    InvalidModulePath ignored => run writeError(b"silk: invalid module path\n")
+    InvalidSourceRoot ignored => run writeError(b"silk: invalid source root\n")
+    MissingManifest missing => {
+      run writeError(b"silk: no silk.toml in ")
+      run writeError(Path.rawBytes(&missing.directory))
+      run writeError(b" or any parent directory; a build needs a package manifest\n")
+    }
+    InvalidBuildComposition ignored => run writeError(b"silk: the build selects no single runtime (ARTIFACT-001)\n")
+    InvalidNativeLinkInput ignored => run writeError(b"silk: invalid native link input\n")
+    TomlError ignored => run writeError(b"silk: invalid TOML manifest\n")
+    RegistrationClosed ignored => run writeError(b"silk: internal error: query registration closed\n")
+    ConflictingPackageSource ignored => run writeError(b"silk: conflicting package sources\n")
+    Cycle ignored => run writeError(b"silk: internal error: query cycle\n")
+    RevisionMismatch ignored => run writeError(b"silk: internal error: source revision mismatch\n")
+  }
+}
+
+pub effect fn main() -> i32 ? &mut HostInput {
   let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
   let mut output = StdoutWriter.make()
-  return run program()
-    |> Effect.provideMut<Allocator>(&mut allocator)
-    |> Effect.provideMut<Writer>(&mut output)
+  let outcome = run Effect.result(
+    program()
+      |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+      |> Effect.provideMut<Writer>(&mut output),
+  )
+  return match move outcome {
+    Result<i32, ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch>.Success {value} => value
+    Result<i32, ApplicationError | InitialProfileProblem | HostInputError | OutOfMemoryError | FileError | WriterError | ProcessError | InvalidModulePath | InvalidSourceRoot | MissingManifest | InvalidBuildComposition | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch>.Failure {error} => {
+      let reported = run Effect.result(report(move error))
+      drop reported
+      return 1
+    }
+  }
 }

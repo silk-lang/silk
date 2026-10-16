@@ -1,0 +1,610 @@
+//! Backend-neutral size, alignment, and ABI facts for runtime representations.
+
+import semantic.Types {Types}
+import semantic.Target {Target}
+import semantic.DeclarationId {DeclarationId}
+import semantic.RuntimeEncoding
+import semantic.Type {Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.shared {Shared}
+import silk.u32
+import silk.vector {Vector}
+import silk.usize
+
+/// A runtime representation's target facts without backend type spelling.
+pub struct Layout {
+  pub size: usize
+  pub alignment: usize
+  pub abi: Abi
+  pub storage: Storage
+}
+
+/// Copyable boundary facts; field topology stays in the owning layout.
+pub struct Metrics {
+  pub size: usize
+  pub alignment: usize
+  pub abi: Abi
+}
+
+impl Copy for Metrics {}
+
+impl Metrics {
+  /// The distance between consecutive elements: the size rounded up to the alignment.
+  pub fn stride(self: &Self) -> Option<usize> {
+    return alignUp(self.size, self.alignment)
+  }
+}
+
+/// Storage topology in declaration order, independent of backend type spelling.
+pub union Storage {
+  Scalar,
+  Record {pub fields: Vector<Field>},
+  /// Fixed elements retain one type and stride, without expanding the array length.
+  Sequence {pub element: Shared<Type>, pub count: usize, pub stride: usize},
+  /// A borrowed runtime view stores its address and logical length, not its elements.
+  Slice {pub element: Shared<Type>, pub stride: usize, pub lengthOffset: usize},
+  /// A structural union stores an unsigned tag at offset zero and one member at `payloadOffset`.
+  /// `members` follow the union's canonical order, so member `tag` is `members[tag]`.
+  Tagged {pub members: Vector<Shared<Type>>, pub tagSize: usize, pub payloadOffset: usize},
+  /// A nominal union stores its declaration-order tag first and one variant's fields after it;
+  /// each variant lays out its fields like a record starting at `payloadOffset`.
+  Variants {pub variants: Vector<Vector<Field>>, pub tagSize: usize, pub payloadOffset: usize},
+}
+
+/// Tag width and payload position of a structural union.
+pub struct Tagged {
+  pub tagSize: usize
+  pub payloadOffset: usize
+}
+
+impl Copy for Tagged {}
+
+/// Compact contiguous-storage facts, including logical bounds for zero-size elements.
+pub struct Sequence {
+  pub element: Shared<Type>
+  pub count: usize
+  pub stride: usize
+}
+
+/// Neutral descriptor facts; element storage is borrowed and the length is runtime data.
+pub struct Slice {
+  pub element: Shared<Type>
+  pub stride: usize
+  pub lengthOffset: usize
+}
+
+/// One field's runtime type and byte offset in its enclosing record.
+pub struct Field {
+  pub ty: Shared<Type>
+  pub offset: usize
+}
+
+/// A resolved field type and the child layout's target facts.
+pub struct FieldInput {
+  pub ty: Shared<Type>
+  pub metrics: Metrics
+}
+
+/// A demanded runtime representation and its neutral target facts, supplied to emission.
+pub struct TypeLayout {
+  pub ty: Shared<Type>
+  pub layout: Shared<Layout>
+}
+
+/// How a value is passed and returned at the native function boundary.
+pub enum Abi {
+  Unit,
+  Integer,
+  Floating,
+  Pointer,
+  Indirect,
+}
+
+fn alignUp(size: usize, alignment: usize) -> Option<usize> {
+  if alignment == usize.ZERO { return Option<usize>.none() }
+  let remainder = usize.remainder(size, alignment)
+  let mut padding = usize.ZERO
+  if remainder != usize.ZERO { padding = alignment - remainder }
+  if padding > usize.MAX - size { return Option<usize>.none() }
+  return Option<usize>.some(size + padding)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+impl Layout {
+  /// Complete immutable layout content consumed by code emission.
+  pub effect fn encoding(value: &Shared<Layout>, owner: &DeclarationId) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let metrics = Shared<Layout>.with<Metrics>(value, Layout.metrics)
+    let mut output = Bytes.make()
+    run RuntimeEncoding.word(&mut output, usize.toU64(metrics.size))
+    run RuntimeEncoding.word(&mut output, usize.toU64(metrics.alignment))
+    run RuntimeEncoding.word(
+      &mut output,
+      match metrics.abi {
+        Abi.Unit => 0
+        Abi.Integer => 1
+        Abi.Floating => 2
+        Abi.Pointer => 3
+        Abi.Indirect => 4
+      },
+    )
+    let kind = Shared<Layout>.with<u64>(
+      value,
+      fn(layout: &Layout) -> u64 {
+        return match & layout.storage {
+          Storage.Scalar => 0
+          Storage.Record {..} => 1
+          Storage.Sequence {..} => 2
+          Storage.Slice {..} => 3
+          Storage.Tagged {..} => 4
+          Storage.Variants {..} => 5
+        }
+      },
+    )
+    run RuntimeEncoding.word(&mut output, kind)
+    let count = Shared<Layout>.with<usize>(value, Layout.childCount)
+    run RuntimeEncoding.word(&mut output, usize.toU64(count))
+    let mut at = usize.ZERO
+    while at < count {
+      let selectedChild = Shared<Layout>.with<Option<Shared<Type>>>(
+        value,
+        fn(layout: &Layout) -> Option<Shared<Type>> {
+          return Layout.childAt(layout, at)
+        },
+      )
+      if let Option<Shared<Type>>.Some {value: child} = move selectedChild {
+        let encoded = run Type.runtimeEncoding(&child, owner)
+        run RuntimeEncoding.field(&mut output, Bytes.asSlice(&encoded))
+      }
+      let offset = Shared<Layout>.with<usize>(
+        value,
+        fn(layout: &Layout) -> usize {
+          if let Storage.Record {fields} = &layout.storage {
+            return Vector<Field>.asSlice(&fields)[at].offset
+          }
+          return usize.ZERO
+        },
+      )
+      run RuntimeEncoding.word(&mut output, usize.toU64(offset))
+      at = at + usize.ONE
+    }
+    let sequenceFacts = Shared<Layout>.with<Option<Sequence>>(value, Layout.sequenceFacts)
+    if let Option<Sequence>.Some {value: facts} = move sequenceFacts {
+      run RuntimeEncoding.word(&mut output, usize.toU64(facts.count))
+      run RuntimeEncoding.word(&mut output, usize.toU64(facts.stride))
+    }
+    let sliceFacts = Shared<Layout>.with<Option<Slice>>(value, Layout.sliceFacts)
+    if let Option<Slice>.Some {value: facts} = move sliceFacts {
+      run RuntimeEncoding.word(&mut output, usize.toU64(facts.stride))
+      run RuntimeEncoding.word(&mut output, usize.toU64(facts.lengthOffset))
+    }
+    let taggedFacts = Shared<Layout>.with<Option<Tagged>>(value, Layout.taggedFacts)
+    if let Option<Tagged>.Some {value: facts} = move taggedFacts {
+      run RuntimeEncoding.word(&mut output, usize.toU64(facts.tagSize))
+      run RuntimeEncoding.word(&mut output, usize.toU64(facts.payloadOffset))
+    }
+    let variants = Shared<Layout>.with<usize>(
+      value,
+      fn(layout: &Layout) -> usize {
+        return match & layout.storage {
+          Storage.Variants {variants, ..} => Vector<Vector<Field>>.length(&variants)
+          _ => usize.ZERO
+        }
+      },
+    )
+    run RuntimeEncoding.word(&mut output, usize.toU64(variants))
+    at = usize.ZERO
+    while at < variants {
+      let fields = Shared<Layout>.with<usize>(
+        value,
+        fn(layout: &Layout) -> usize {
+          return match & layout.storage {
+            Storage.Variants {variants: entries, ..} => {
+              let listed = Vector<Vector<Field>>.asSlice(&entries)
+              return Vector<Field>.length(&listed[at])
+            }
+            _ => usize.ZERO
+          }
+        },
+      )
+      run RuntimeEncoding.word(&mut output, usize.toU64(fields))
+      let mut field = usize.ZERO
+      while field < fields {
+        let selectedMember = Shared<Layout>.with<Option<Field>>(
+          value,
+          fn(layout: &Layout) -> Option<Field> {
+            return Layout.variantField(layout, at, field)
+          },
+        )
+        if let Option<Field>.Some {value: member} = move selectedMember {
+          run RuntimeEncoding.word(&mut output, usize.toU64(member.offset))
+        }
+        field = field + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    return move output
+  }
+  /// Returns the target's size, alignment and boundary classification.
+  pub fn metrics(self: &Layout) -> Metrics {
+    return Metrics {size: self.size, alignment: self.alignment, abi: self.abi}
+  }
+
+  /// Counts the declared fields retained by a record layout.
+  pub fn fieldCount(self: &Layout) -> usize {
+    return match &self.storage {
+      Storage.Record {fields} => Vector<Field>.length(&fields)
+      Storage.Sequence {count, ..} => count
+      Storage.Slice {..} => usize.ZERO
+      Storage.Tagged {..} => usize.ZERO
+      Storage.Variants {..} => usize.ZERO
+      Storage.Scalar => usize.ZERO
+    }
+  }
+
+  /// Returns an owned field fact without retaining a loan of the layout cache.
+  pub fn fieldAt(self: &Layout, index: usize) -> Option<Field> {
+    if let Storage.Record {fields} = &self.storage {
+      let entries = Vector<Field>.asSlice(&fields)
+      if index < entries.length {
+        return Option<Field>.some(Field {ty: Shared<Type>.clone(&entries[index].ty), offset: entries[index].offset})
+      }
+    }
+    if let Storage.Sequence {element, count, stride} = &self.storage {
+      if index < count {
+        return Option<Field>.some(Field {ty: Shared<Type>.clone(&element), offset: index * stride})
+      }
+    }
+    return Option<Field>.none()
+  }
+
+  /// Returns contiguous storage facts without retaining a loan of the layout cache.
+  pub fn sequenceFacts(self: &Layout) -> Option<Sequence> {
+    if let Storage.Sequence {element, count, stride} = &self.storage {
+      return Option<Sequence>.some(Sequence {element: Shared<Type>.clone(&element), count: count, stride: stride})
+    }
+    return Option<Sequence>.none()
+  }
+
+  /// Reads descriptor offsets and the borrowed element stride without retaining a cache loan.
+  pub fn sliceFacts(self: &Layout) -> Option<Slice> {
+    if let Storage.Slice {element, stride, lengthOffset} = &self.storage {
+      return Option<Slice>.some(Slice {element: Shared<Type>.clone(&element), stride: stride, lengthOffset: lengthOffset})
+    }
+    return Option<Slice>.none()
+  }
+
+  /// Reads a structural union's tag width and payload offset without retaining a cache loan.
+  pub fn taggedFacts(self: &Layout) -> Option<Tagged> {
+    if let Storage.Tagged {tagSize, payloadOffset, ..} = &self.storage {
+      return Option<Tagged>.some(Tagged {tagSize: tagSize, payloadOffset: payloadOffset})
+    }
+    if let Storage.Variants {tagSize, payloadOffset, ..} = &self.storage {
+      return Option<Tagged>.some(Tagged {tagSize: tagSize, payloadOffset: payloadOffset})
+    }
+    return Option<Tagged>.none()
+  }
+
+  /// One variant field's type and its offset from the start of the union.
+  pub fn variantField(self: &Layout, variant: usize, field: usize) -> Option<Field> {
+    if let Storage.Variants {variants, payloadOffset, ..} = &self.storage {
+      let listed = Vector<Vector<Field>>.asSlice(&variants)
+      if variant < listed.length {
+        let fields = Vector<Field>.asSlice(&listed[variant])
+        if field < fields.length {
+          return Option<Field>.some(Field {ty: Shared<Type>.clone(&fields[field].ty), offset: payloadOffset + fields[field].offset})
+        }
+      }
+    }
+    return Option<Field>.none()
+  }
+
+  /// The smallest unsigned tag width, in bytes, that distinguishes `count` members.
+  pub fn tagBytes(count: usize) -> usize {
+    if count <= 256 { return usize.ONE }
+    if count <= 65536 { return 2 }
+    return 4
+  }
+
+  /// The unsigned integer type a tagged union with `count` members or variants stores its tag in.
+  pub effect fn tagType(count: usize) -> Shared<Type> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let bytes = Layout.tagBytes(count)
+    if bytes == usize.ONE { return run Types.intern(Type.Primitive {name: run Bytes.copy(b"u8")}) }
+    if bytes == 2 { return run Types.intern(Type.Primitive {name: run Bytes.copy(b"u16")}) }
+    return run Types.intern(Type.Primitive {name: run Bytes.copy(b"u32")})
+  }
+
+  /// Counts distinct child facts required by emission, independently of repeated storage.
+  pub fn childCount(self: &Layout) -> usize {
+    return match &self.storage {
+      Storage.Scalar => usize.ZERO
+      Storage.Record {fields} => Vector<Field>.length(&fields)
+      Storage.Sequence {..} => usize.ONE
+      Storage.Slice {..} => usize.ONE
+      Storage.Tagged {members, ..} => Vector<Shared<Type>>.length(&members)
+      Storage.Variants {variants, ..} => {
+        let listed = Vector<Vector<Field>>.asSlice(&variants)
+        let mut total = usize.ZERO
+        let mut at = usize.ZERO
+        while at < listed.length {
+          total = total + Vector<Field>.length(&listed[at])
+          at = at + usize.ONE
+        }
+        return total
+      }
+    }
+  }
+
+  /// Returns a child type whose layout must be supplied alongside this layout.
+  pub fn childAt(self: &Layout, index: usize) -> Option<Shared<Type>> {
+    return match &self.storage {
+      Storage.Sequence {element, ..} => {
+        if index == usize.ZERO { return Option<Shared<Type>>.some(Shared<Type>.clone(&element)) }
+        return Option<Shared<Type>>.none()
+      }
+      Storage.Slice {element, ..} => {
+        if index == usize.ZERO { return Option<Shared<Type>>.some(Shared<Type>.clone(&element)) }
+        return Option<Shared<Type>>.none()
+      }
+      Storage.Record {fields} => {
+        let entries = Vector<Field>.asSlice(&fields)
+        if index < entries.length { return Option<Shared<Type>>.some(Shared<Type>.clone(&entries[index].ty)) }
+        return Option<Shared<Type>>.none()
+      }
+      Storage.Tagged {members, ..} => {
+        let entries = Vector<Shared<Type>>.asSlice(&members)
+        if index < entries.length { return Option<Shared<Type>>.some(Shared<Type>.clone(&entries[index])) }
+        return Option<Shared<Type>>.none()
+      }
+      Storage.Variants {variants, ..} => {
+        let listed = Vector<Vector<Field>>.asSlice(&variants)
+        let mut remaining = index
+        let mut at = usize.ZERO
+        while at < listed.length {
+          let fields = Vector<Field>.asSlice(&listed[at])
+          if remaining < fields.length { return Option<Shared<Type>>.some(Shared<Type>.clone(&fields[remaining].ty)) }
+          remaining = remaining - fields.length
+          at = at + usize.ONE
+        }
+        return Option<Shared<Type>>.none()
+      }
+      Storage.Scalar => Option<Shared<Type>>.none()
+    }
+  }
+
+  /// Resolves contiguous array storage, retaining logical bounds for empty and zero-size elements.
+  pub fn sequence(element: &Shared<Type>, count: usize, child: Metrics) -> Option<Layout> {
+    let padded = Metrics.stride(&child)
+    let stride = match move padded {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<Layout>.none() }
+    }
+    if stride != usize.ZERO && count > usize.MAX / stride { return Option<Layout>.none() }
+    return Option<Layout>.some(Layout {
+      size: count * stride, alignment: child.alignment, abi: Abi.Indirect,
+      storage: Storage.Sequence {element: Shared<Type>.clone(element), count: count, stride: stride},
+    })
+  }
+
+  /// Resolves a two-word borrowed descriptor and its element stride from demanded target facts.
+  pub fn slice(element: &Shared<Type>, child: Metrics, target: &Target) -> Option<Layout> {
+    let padded = Metrics.stride(&child)
+    let stride = match move padded {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<Layout>.none() }
+    }
+    let word = u32.toUsize(Target.pointerBits(target)) / 8
+    let alignment = u32.toUsize(Target.pointerAlignment(target))
+    return Option<Layout>.some(Layout {
+      size: word + word, alignment: alignment, abi: Abi.Indirect,
+      storage: Storage.Slice {element: Shared<Type>.clone(element), stride: stride, lengthOffset: word},
+    })
+  }
+
+  /// Resolves `string`: a UTF-8 view stored exactly like `&[u8]`, its byte address at offset zero
+  /// and its byte length in the following word (TEXT-001).
+  pub effect fn text(target: &Target) -> Option<Layout> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let byte = run Types.intern(Type.Primitive {name: run Bytes.copy(b"u8")})
+    return Layout.slice(&byte, Metrics {size: usize.ONE, alignment: usize.ONE, abi: Abi.Integer}, target)
+  }
+
+  /// Places an unsigned tag first and the largest member after it at the strictest member
+  /// alignment; the size is rounded to the union's alignment. Order-independent in its inputs.
+  pub effect fn tagged(inputs: &[FieldInput]) -> Option<Layout>
+  ! OutOfMemoryError ? &mut Allocator {
+    let tagSize = Layout.tagBytes(inputs.length)
+    let mut alignment = tagSize
+    let mut payload = usize.ZERO
+    let mut members = Vector<Shared<Type>>.make()
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      let child = inputs[at].metrics
+      if child.alignment > alignment { alignment = child.alignment }
+      if child.size > payload { payload = child.size }
+      run Vector<Shared<Type>>.append(&mut members, Shared<Type>.clone(&inputs[at].ty))
+      at = at + usize.ONE
+    }
+    let offset = match move alignUp(tagSize, alignment) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<Layout>.none() }
+    }
+    if payload > usize.MAX - offset { return Option<Layout>.none() }
+    return match move alignUp(offset + payload, alignment) {
+      Option<usize>.Some {value} => Option<Layout>.some(Layout {
+        size: value, alignment: alignment, abi: Abi.Indirect,
+        storage: Storage.Tagged {members: move members, tagSize: tagSize, payloadOffset: offset},
+      })
+      Option<usize>.None => Option<Layout>.none()
+    }
+  }
+
+  /// Places the declaration-order tag first and the largest variant record after it at the
+  /// strictest variant alignment. Each variant's fields keep their record offsets.
+  pub effect fn variants(records: &[Shared<Layout>], count: usize) -> Option<Layout>
+  ! OutOfMemoryError ? &mut Allocator {
+    let tagSize = Layout.tagBytes(count)
+    let mut alignment = tagSize
+    let mut payload = usize.ZERO
+    let mut variants = Vector<Vector<Field>>.make()
+    let mut at = usize.ZERO
+    while at < records.length {
+      let size = Shared<Layout>.with<usize>(&records[at], fn(layout: &Layout) -> usize { return layout.size })
+      let aligned = Shared<Layout>.with<usize>(&records[at], fn(layout: &Layout) -> usize { return layout.alignment })
+      if aligned > alignment { alignment = aligned }
+      if size > payload { payload = size }
+      let fieldTotal = Shared<Layout>.with<usize>(&records[at], Layout.fieldCount)
+      let mut fields = Vector<Field>.make()
+      let mut field = usize.ZERO
+      while field < fieldTotal {
+        let selected = Shared<Layout>.with<Option<Field>>(&records[at], fn(layout: &Layout) -> Option<Field> {
+          return Layout.fieldAt(layout, field)
+        })
+        if let Option<Field>.Some {value} = move selected { run Vector<Field>.append(&mut fields, move value) }
+        field = field + usize.ONE
+      }
+      run Vector<Vector<Field>>.append(&mut variants, move fields)
+      at = at + usize.ONE
+    }
+    let offset = match move alignUp(tagSize, alignment) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<Layout>.none() }
+    }
+    if payload > usize.MAX - offset { return Option<Layout>.none() }
+    return match move alignUp(offset + payload, alignment) {
+      Option<usize>.Some {value} => Option<Layout>.some(Layout {
+        size: value, alignment: alignment, abi: Abi.Indirect,
+        storage: Storage.Variants {variants: move variants, tagSize: tagSize, payloadOffset: offset},
+      })
+      Option<usize>.None => Option<Layout>.none()
+    }
+  }
+
+  /// Lays fields out in declaration order, retaining padding and final record alignment.
+  /// An unrepresentable size remains a structured layout gap at the query boundary.
+  pub effect fn record(inputs: &[FieldInput]) -> Option<Layout>
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut fields = Vector<Field>.make()
+    let mut size = usize.ZERO
+    let mut alignment = usize.ONE
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      let child = inputs[at].metrics
+      let offset = alignUp(size, child.alignment)
+      let aligned = match move offset {
+        Option<usize>.Some {value} => value
+        Option<usize>.None => { return Option<Layout>.none() }
+      }
+      if child.size > usize.MAX - aligned { return Option<Layout>.none() }
+      run Vector<Field>.append(&mut fields, Field {
+        ty: Shared<Type>.clone(&inputs[at].ty), offset: aligned,
+      })
+      size = aligned + child.size
+      if child.alignment > alignment { alignment = child.alignment }
+      at = at + usize.ONE
+    }
+    let padded = alignUp(size, alignment)
+    return match move padded {
+      Option<usize>.Some {value} => Option<Layout>.some(Layout {
+        size: value, alignment: alignment, abi: Abi.Indirect,
+        storage: Storage.Record {fields: move fields},
+      })
+      Option<usize>.None => Option<Layout>.none()
+    }
+  }
+
+  /// Resolves scalars and machine addresses; aggregate and slice facts remain explicit gaps.
+  pub fn scalar(ty: &Shared<Type>, target: &Target) -> Option<Layout> {
+    let pointer = Shared<Type>.with<bool>(
+      ty,
+      fn(value: &Type) -> bool {
+        return match & value.* {
+          Type.Reference {..} => true
+          Type.ForeignFunction {..} => true
+          Type.Pointer {..} => true
+          _ => false
+        }
+      },
+    )
+    if pointer {
+      let bytes = u32.toUsize(Target.pointerBits(target)) / 8
+      return Option<Layout>.some(
+        Layout {
+          size: bytes,
+          alignment: u32.toUsize(Target.pointerAlignment(target)),
+          abi: Abi.Pointer,
+          storage: Storage.Scalar,
+        },
+      )
+    }
+    let bits = Shared<Type>.with<usize>(
+      ty,
+      fn(value: &Type) -> usize {
+        return match & value.* {
+          Type.Unit => usize.ZERO
+          Type.Pointer {..} => u32.toUsize(Target.pointerBits(target))
+          Type.Primitive {name} => {
+            let text = Bytes.asSlice(&name)
+            if same(text, b"bool") || same(text, b"i8") || same(text, b"u8") {
+              return 8
+            }
+            if same(text, b"i16") || same(text, b"u16") {
+              return 16
+            }
+            if same(text, b"i32") || same(text, b"u32") || same(text, b"f32") || same(text, b"char") {
+              return 32
+            }
+            if same(text, b"i64") || same(text, b"u64") || same(text, b"f64") {
+              return 64
+            }
+            if same(text, b"isize") || same(text, b"usize") {
+              return u32.toUsize(Target.pointerBits(target))
+            }
+            return usize.MAX
+          }
+          _ => usize.MAX
+        }
+      },
+    )
+    if bits == usize.MAX {
+      return Option<Layout>.none()
+    }
+    if bits == usize.ZERO {
+      return Option<Layout>.some(Layout {size: usize.ZERO, alignment: usize.ONE, abi: Abi.Unit, storage: Storage.Scalar})
+    }
+    let abi = Shared<Type>.with<Abi>(
+      ty,
+      fn(value: &Type) -> Abi {
+        return match & value.* {
+          Type.Pointer {..} => Abi.Pointer
+          Type.Primitive {name} => {
+            let text = Bytes.asSlice(&name)
+            if same(text, b"f32") || same(text, b"f64") {
+              return Abi.Floating
+            }
+            return Abi.Integer
+          }
+          _ => Abi.Integer
+        }
+      },
+    )
+    let bytes = bits / 8
+    return Option<Layout>.some(Layout {size: bytes, alignment: bytes, abi: abi, storage: Storage.Scalar})
+  }
+}

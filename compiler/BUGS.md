@@ -1,5 +1,34 @@
 # Compiler findings
 
+## Scalar enum equality native call target (fixed)
+
+**Status:** fixed in the bootstrap by [#571](https://github.com/julia-script/silk/pull/571) and
+synced into selfhost by [#572](https://github.com/julia-script/silk/pull/572). The failure below
+was observed on 2026-09-28 before those fixes.
+
+At selfhost method head `08d5ce8aa2fe12f7760d1ed87ee831d00333fc7c`, the single semantic test root of
+that time, `SemanticCases.silk`, defines `bodyRetainsReceiverPass(body, mode)` and calls it from a
+`Shared.with` callback. That helper now lives in `SemanticCaseSupport.silk`. The helper compares
+`TypedBody.ReceiverPass` scalar-enum values with `value == mode` and `retained == mode`. The
+TypeScript bootstrap accepts the source and reaches native emission, then fails with `RangeError:
+Backend cannot resolve call target bodyRetainsReceiverPass` in `NativeCallOperation.js:193`. A
+previous `Type.equals` scalar-enum comparison produced the same unresolved-target failure (see
+`PAPERCUTS.md`, 2026-09-26).
+
+Reproduce the observed failure on that exact head, where the root still exists, with Node 24 and
+LLVM 22:
+
+```sh
+NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test \
+  --manifest-path compiler/silk.toml \
+  --root src/semantic/SemanticCases.silk --no-cache
+```
+
+The [Focused Linux run](https://github.com/julia-script/silk/actions/runs/36417381326)
+records the historical failure before any native test executes. A worktree whose generated
+`packages/compiler/dist` predates #571 can reproduce it even after merging the fixed source;
+rebuild the bootstrap dependencies before interpreting a local native-emission result.
+
 ## Instance discovery multiplies call-path contexts for the full parser
 
 **Status:** repaired in bootstrap instance discovery; the full self-hosted parser now checks,
@@ -308,3 +337,46 @@ deletes the branch in `Parser/Declaration.ts`; the surrounding field loop alread
 The regression lives in `packages/compiler/test/Parser.test.ts`, "parses an empty union variant
 field block as a braced variant with no fields". The neighbouring damaged-union case previously
 asserted the synthesized field as intended recovery and now asserts `Empty {}` parses clean.
+
+## Cleanup-subterm search exceeds the V8 map limit through a borrowed `Semantic` (fixed)
+
+**Status:** repaired in the bootstrap on `main` by
+[#675](https://github.com/julia-script/silk/pull/675) (`cf53040d`). The fix reaches selfhost
+through the next main→selfhost sync. No limit was raised.
+
+At selfhost head `d4c8f98059e504acc8e54a6830158255352b22bf` (#671), building
+`compiler/silk.toml` fails during `Realization.discoverInstances` with
+`RangeError: Map maximum size exceeded` at `strictCleanupSubtermUnder`
+(`packages/compiler/dist/Instances.js`), before any test runs
+([Focused Linux run](https://github.com/julia-script/silk/actions/runs/36984616674)).
+The source is valid; the previous head `cb31280d` builds.
+
+The trigger was `struct ClosureDraft<'a> { semantic: &'a mut Semantic, ... }` used as an
+`Effect.useReleaseNonParking` resource. `nominalsIn` collects nominals with `Type.visit`, which
+descends through reference types, so a cleanup root holding `&mut Semantic` reaches the whole
+`Semantic` graph together with the closure draft's own nominals. Its reaching set exceeds the
+512-type budget, and the path-keyed unfolding memo of one question then grows past V8's map
+size. Even on `cb31280d`, the `Query.Entry ⊂ Semantic` question already holds about 1.2 million
+memo entries.
+
+Selfhost `c871c5ea` removed the borrowed field from the draft: the draft owns only its vectors,
+and `Semantic` reaches the walk separately.
+
+The overflow itself was in the memo key. Stopping the search at reference types was rejected: the
+cleanup subterm also feeds the hook-recursion measure (`cleanupTransition`,
+`cleanupPermitsSpecialization`). That measure is a termination argument over finite type
+structure, so reference descent is sound and cutting it would reject valid programs.
+
+#675 instead keys the per-question memo by `whole` and only the unfolding entries for declarations
+reachable below it. The reachable set is the closure of template field types over the nominals the
+type contains. The search reads and extends the unfolding only at those declarations, so no answer
+changes.
+
+- **Regression:** `Instances.test.ts`, "shares cleanup subterm answers across unfoldings of
+  unreachable declarations". Without the fix it overflows the same `Map.set` in
+  `strictCleanupSubtermUnder` after 128 s
+  ([run 37004791353](https://github.com/julia-script/silk/actions/runs/37004791353)). With it the
+  test passes in 2.5 s ([run 37008205332](https://github.com/julia-script/silk/actions/runs/37008205332)).
+- **Original tree:** `d4c8f980` with `cf53040d` merged builds past instance discovery with no
+  RangeError ([run 37009575278](https://github.com/julia-script/silk/actions/runs/37009575278),
+  throwaway #680).
