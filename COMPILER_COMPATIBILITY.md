@@ -2439,3 +2439,27 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** the `statementsAfterBinding`, `bindingChain`, `bindingClosure`, `bindingArm` and
   `bindingPattern` fixtures in `compiler/src/semantic/SemanticLoweringCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Struct literals infer the meet of their field lifetimes
+
+- **Status:** Approved on 2026-10-16 by Julia; implemented natively on the
+  `selfhost-regions-meet-locals` branch. Bootstrap divergence.
+- **Rule:** a struct literal whose fields offer different regions for an inferred lifetime binder
+  infers their meet, the shortest region, in any field order, as Rust does. A lifetime parameter of
+  the enclosing declaration outlives every region local to its body, so a literal mixing parameter
+  views with borrows of locals holds the local region. The literal still cannot outlive that local.
+- **Compilers:** native infers the meet. For `struct Trio<'a> {e: &'a i32, f: &'a i32, g: &'a i32}`
+  in `fn f(p: &i32)` with locals `one` and `two`, `Trio { e: p, f: &one, g: &two }` is accepted and
+  Checked, as are the orders with a local first. The bootstrap fixes the binder from the first
+  field, so with `p` first it rejects with SEM0212 at the first later borrow of a local.
+- **Source migration:** none. Write the fields in any order.
+- **Diagnostics and limits:** a literal holding a local borrow that is returned is rejected
+  (OWN0019 at the literal), and one read through a binding after the local ends is rejected
+  (OWN0019 at the read). One stored through `&mut` into a caller region stays unchecked natively
+  (`stored-loans`) until native rejects a local loan stored into caller-owned storage.
+  Known parity difference: for `S { x: p, y: &l }` with a parameter first and a direct borrow of a
+  local, before this change native reported OWN0019 where the bootstrap reports SEM0212; both
+  reject. Native now accepts it when the literal stays local.
+- **Evidence:** `binderMeetsKeepBodyLocalRegions` in
+  `compiler/src/semantic/SemanticCaptureCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
