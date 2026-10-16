@@ -10090,6 +10090,955 @@ impl Type {
   }
 }
 
+/// The caller regions a call can keep one argument in once it returns (R3 amendment 4). `outer`
+/// answers for the borrow the argument itself makes, which the callee holds only as the reference
+/// it receives; `whole` answers for every loan the argument carries.
+pub struct KeptRegions {
+  pub outer: Vector<Shared<Lifetime>>
+  pub whole: Vector<Shared<Lifetime>>
+  // What a channel the analysis only approximates can also keep: a conformance's witness, a callee
+  // read as conforming, or a callable value whose contract names type parameters. Native region
+  // bindings are not minimal, so such a region may be longer than any solution needs.
+  pub outerApproximate: Vector<Shared<Lifetime>>
+  pub wholeApproximate: Vector<Shared<Lifetime>>
+  // Whether the argument reaches a callee this analysis cannot describe at all, such as a callable
+  // value whose contract still names a type parameter of the caller.
+  pub undescribed: bool
+}
+
+/// A declared or implied constraint through which a callee can store a value beyond its parameter
+/// positions (R3 amendment 4).
+pub union KeptBound {
+  /// `'longer: 'shorter`: a value valid for `longer` can be stored wherever `shorter` is kept.
+  Outlives {pub longer: Shared<Lifetime>, pub shorter: Shared<Lifetime>},
+  /// `T: 'region`: a `T` can be stored wherever `region` is kept.
+  Contents {pub subject: Shared<Type>, pub region: Shared<Lifetime>},
+  /// A conformance, whose witness can store anything the constraint names.
+  Storing {pub value: Shared<Type>},
+  /// A value held for the call, such as a provided service: the callee can store into the positions
+  /// it reaches, as through a parameter of its type.
+  Reaching {pub value: Shared<Type>},
+  /// A conformance `provider: contract`: its witness can store anything the contract names, but only
+  /// into the provider's own storage, which lasts as long as every region its instantiation holds
+  /// invariantly.
+  Witness {pub provider: Shared<Type>, pub contract: Shared<Type>},
+}
+
+/// A binder of a struct, tuple, union or enum that occurs only covariantly in its fields (bootstrap
+/// NominalVariance): storage holding an instantiation of it cannot be written through to store
+/// something longer-lived there, so it is a storing position only where its context is.
+pub struct CovariantSlot {
+  pub declaration: DeclarationId
+  pub ordinal: usize
+}
+
+fn covariantSlot(slots: &[CovariantSlot], declaration: &DeclarationId, ordinal: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < slots.length {
+    if slots[at].ordinal == ordinal && DeclarationId.equals(&slots[at].declaration, declaration) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn nominalDeclaration(value: &Type) -> Option<DeclarationId> {
+  return match &value.* {
+    Type.Nominal {declaration, ..} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+    _ => Option<DeclarationId>.none()
+  }
+}
+
+fn nominalArgumentCount(value: &Type) -> usize {
+  return match &value.* {
+    Type.Nominal {arguments, ..} => Vector<Argument>.length(&arguments)
+    _ => usize.ZERO
+  }
+}
+
+fn nominalLifetimeAt(value: &Type, at: usize) -> Option<Shared<Lifetime>> {
+  if let Type.Nominal {arguments, ..} = &value.* {
+    if let Argument.Lifetime {value: lifetime} = &Vector<Argument>.asSlice(&arguments)[at] { return Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime)) }
+  }
+  return Option<Shared<Lifetime>>.none()
+}
+
+// The atoms declared parameter types name: region atoms and type parameters.
+struct KeptAtoms {
+  regions: Vector<Shared<Lifetime>>
+  parameters: Vector<Shared<Type>>
+}
+
+// How a callee can use what a position of its parameter types holds.
+enum KeptPosition {
+  // Holds no region or type parameter.
+  Leaf,
+  // A type parameter: whatever the caller supplies.
+  Parameter,
+  // A shared view the callee can only read through.
+  ReadView,
+  // An exclusive view the callee can store through.
+  WriteView,
+  // A tuple, array or union, whose members keep their own positions.
+  Transparent,
+  // A callable or Effect taken by value. Its environment keeps only what is passed into it, so its
+  // own regions are storable only where another position names them, while whatever it takes as an
+  // argument it can store in that environment.
+  Callable,
+  // A type whose contents the walk cannot see, such as a nominal, callable, Effect or pointer: it
+  // can store anything it names.
+  Opaque,
+}
+
+fn keptPosition(value: &Type) -> KeptPosition {
+  return match &value.* {
+    Type.Primitive {..} => KeptPosition.Leaf
+    Type.Unit => KeptPosition.Leaf
+    Type.Parameter {..} => KeptPosition.Parameter
+    Type.String {..} => KeptPosition.ReadView
+    Type.Reference {access, ..} => {
+      if access == Access.Mutable { return KeptPosition.WriteView }
+      return KeptPosition.ReadView
+    }
+    Type.Slice {access, ..} => {
+      if access == Access.Mutable { return KeptPosition.WriteView }
+      return KeptPosition.ReadView
+    }
+    Type.Array {..} => KeptPosition.Transparent
+    Type.Anonymous {..} => KeptPosition.Transparent
+    Type.Union {..} => KeptPosition.Transparent
+    Type.Callable {..} => KeptPosition.Callable
+    Type.Effect {..} => KeptPosition.Callable
+    _ => KeptPosition.Opaque
+  }
+}
+
+fn keptChildCount(value: &Type) -> usize {
+  if let Type.Union {members} = &value.* { return Vector<Shared<Type>>.length(&members) }
+  return childCount(value)
+}
+
+// Whether the child at `at` of a callable is one of its parameters.
+fn callableParameterChild(value: &Type, at: usize) -> bool {
+  if let Type.Callable {parameters, ..} = &value.* { return at < Vector<Shared<Type>>.length(&parameters) }
+  return false
+}
+
+fn keptChildAt(value: &Type, at: usize) -> Option<Shared<Type>> {
+  if let Type.Union {members} = &value.* {
+    let listed = Vector<Shared<Type>>.asSlice(&members)
+    return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[at]))
+  }
+  return childAt(value, at)
+}
+
+// Appends the atoms `value` names. With `sinks`, appends only those in a position the callee can
+// store into: the referent of an exclusive view, a callable's parameter, or anything an opaque type
+// names. `storing` says whether `value` itself is in such a position. A nominal's `covariant`
+// binders are storing only where `value` is.
+effect fn collectKeptAtoms(value: &Shared<Type>, sinks: bool, storing: bool, atoms: &mut KeptAtoms, covariant: &[CovariantSlot]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let position = Shared<Type>.with<KeptPosition>(value, keptPosition)
+  if position == KeptPosition.Leaf { return () }
+  if position == KeptPosition.Parameter {
+    if !sinks || storing { run Vector<Shared<Type>>.append(&mut atoms.parameters, Shared<Type>.clone(value)) }
+    return ()
+  }
+  if sinks && !storing && covariant.length != usize.ZERO {
+    if let Option<DeclarationId>.Some {value: declaration} = move Shared<Type>.with<Option<DeclarationId>>(value, nominalDeclaration) {
+      let arguments = Shared<Type>.with<usize>(value, nominalArgumentCount)
+      let mut ordinal = usize.ZERO
+      while ordinal < arguments {
+        let held = !covariantSlot(covariant, &declaration, ordinal)
+        let lifetime = Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> { return nominalLifetimeAt(node, ordinal) })
+        if let Option<Shared<Lifetime>>.Some {value: region} = move lifetime {
+          if held {
+            let count = Lifetime.atomCount(&region)
+            let mut atom = usize.ZERO
+            while atom < count {
+              run Vector<Shared<Lifetime>>.append(&mut atoms.regions, Lifetime.atomAt(&region, atom))
+              atom = atom + usize.ONE
+            }
+          }
+        }
+        let child = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return childAt(node, ordinal) })
+        if let Option<Shared<Type>>.Some {value: nested} = move child { run collectKeptAtoms(&nested, sinks, held, &mut atoms.*, covariant) }
+        ordinal = ordinal + usize.ONE
+      }
+      return ()
+    }
+  }
+  let opaque = position == KeptPosition.Opaque
+  let regions = Shared<Type>.with<usize>(value, comparedLifetimeCount)
+  let mut at = usize.ZERO
+  while at < regions {
+    let found = Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> {
+      return comparedLifetimeAt(node, at)
+    })
+    if let Option<Shared<Lifetime>>.Some {value: lifetime} = move found {
+      if !sinks || storing || opaque {
+        let count = Lifetime.atomCount(&lifetime)
+        let mut atom = usize.ZERO
+        while atom < count {
+          run Vector<Shared<Lifetime>>.append(&mut atoms.regions, Lifetime.atomAt(&lifetime, atom))
+          atom = atom + usize.ONE
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  let inner = storing || opaque || position == KeptPosition.WriteView
+  let count = Shared<Type>.with<usize>(value, keptChildCount)
+  at = usize.ZERO
+  while at < count {
+    let child = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return keptChildAt(node, at) })
+    let parameter = position == KeptPosition.Callable && Shared<Type>.with<bool>(value, fn(node: &Type) -> bool { return callableParameterChild(node, at) })
+    // What a callable or Effect produces is a new value, not storage it can keep anything in.
+    let produced = sinks && position == KeptPosition.Callable && !parameter
+    if let Option<Shared<Type>>.Some {value: nested} = move child {
+      if !produced { run collectKeptAtoms(&nested, sinks, inner || parameter, &mut atoms.*, covariant) }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Appends the atoms of what a value of `value`'s type holds, and so of the loans it can carry: a
+// callable or Effect holds only its environment, which its own regions bound, not values of its
+// parameter or result types.
+effect fn collectHeldAtoms(value: &Shared<Type>, atoms: &mut KeptAtoms, covariant: &[CovariantSlot]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let position = Shared<Type>.with<KeptPosition>(value, keptPosition)
+  if position == KeptPosition.Leaf { return () }
+  if position == KeptPosition.Parameter {
+    run Vector<Shared<Type>>.append(&mut atoms.parameters, Shared<Type>.clone(value))
+    return ()
+  }
+  // A `'static` argument of a nominal binder that occurs only covariantly could be shortened to any
+  // region the call needs, so it does not hold what the value carries forever.
+  if covariant.length != usize.ZERO {
+    if let Option<DeclarationId>.Some {value: declaration} = move Shared<Type>.with<Option<DeclarationId>>(value, nominalDeclaration) {
+      let arguments = Shared<Type>.with<usize>(value, nominalArgumentCount)
+      let mut ordinal = usize.ZERO
+      while ordinal < arguments {
+        let lifetime = Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> { return nominalLifetimeAt(node, ordinal) })
+        if let Option<Shared<Lifetime>>.Some {value: region} = move lifetime {
+          let shortened = covariantSlot(covariant, &declaration, ordinal)
+          let count = Lifetime.atomCount(&region)
+          let mut atom = usize.ZERO
+          while atom < count {
+            let member = Lifetime.atomAt(&region, atom)
+            if !(shortened && Shared<Lifetime>.with<bool>(&member, staticAtom)) { run Vector<Shared<Lifetime>>.append(&mut atoms.regions, move member) }
+            atom = atom + usize.ONE
+          }
+        }
+        let child = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return childAt(node, ordinal) })
+        if let Option<Shared<Type>>.Some {value: nested} = move child { run collectHeldAtoms(&nested, &mut atoms.*, covariant) }
+        ordinal = ordinal + usize.ONE
+      }
+      return ()
+    }
+  }
+  let regions = Shared<Type>.with<usize>(value, comparedLifetimeCount)
+  let mut at = usize.ZERO
+  while at < regions {
+    let found = Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> {
+      return comparedLifetimeAt(node, at)
+    })
+    if let Option<Shared<Lifetime>>.Some {value: lifetime} = move found {
+      let count = Lifetime.atomCount(&lifetime)
+      let mut atom = usize.ZERO
+      while atom < count {
+        run Vector<Shared<Lifetime>>.append(&mut atoms.regions, Lifetime.atomAt(&lifetime, atom))
+        atom = atom + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  if position == KeptPosition.Callable { return () }
+  let count = Shared<Type>.with<usize>(value, keptChildCount)
+  at = usize.ZERO
+  while at < count {
+    let child = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return keptChildAt(node, at) })
+    if let Option<Shared<Type>>.Some {value: nested} = move child { run collectHeldAtoms(&nested, &mut atoms.*, covariant) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The atoms of the borrow a parameter receives: a view's own region, or a type parameter itself.
+// `none` when the parameter's outermost type is neither.
+effect fn outerKeptAtoms(value: &Shared<Type>) -> Option<KeptAtoms> ! OutOfMemoryError ? &mut Allocator {
+  let position = Shared<Type>.with<KeptPosition>(value, keptPosition)
+  let mut atoms = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+  if position == KeptPosition.Parameter {
+    run Vector<Shared<Type>>.append(&mut atoms.parameters, Shared<Type>.clone(value))
+    return Option<KeptAtoms>.some(move atoms)
+  }
+  if position != KeptPosition.ReadView && position != KeptPosition.WriteView { return Option<KeptAtoms>.none() }
+  let found = Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> { return ownLifetimeAt(node, usize.ZERO) })
+  if let Option<Shared<Lifetime>>.Some {value: lifetime} = move found {
+    let count = Lifetime.atomCount(&lifetime)
+    let mut atom = usize.ZERO
+    while atom < count {
+      run Vector<Shared<Lifetime>>.append(&mut atoms.regions, Lifetime.atomAt(&lifetime, atom))
+      atom = atom + usize.ONE
+    }
+  }
+  return Option<KeptAtoms>.some(move atoms)
+}
+
+fn invocationAtom(value: &Lifetime) -> bool {
+  return match &value.* { Lifetime.Invocation {..} => true _ => false }
+}
+
+fn staticAtom(value: &Lifetime) -> bool {
+  return match &value.* { Lifetime.Static => true _ => false }
+}
+
+// Whether two type-parameter atoms name the same parameter. They may be clones of one handle, so
+// each is read on its own.
+fn sameParameter(left: &Shared<Type>, right: &Shared<Type>) -> bool {
+  let first = Shared<Type>.with<Option<DeclarationId>>(left, parameterOwner)
+  let second = Shared<Type>.with<Option<DeclarationId>>(right, parameterOwner)
+  if let Option<DeclarationId>.Some {value: owner} = &first {
+    if let Option<DeclarationId>.Some {value: other} = &second {
+      return Shared<Type>.with<usize>(left, parameterOrdinal) == Shared<Type>.with<usize>(right, parameterOrdinal)
+        && DeclarationId.equals(&owner, &other)
+    }
+  }
+  return false
+}
+
+fn parameterOwner(value: &Type) -> Option<DeclarationId> {
+  return match &value.* {
+    Type.Parameter {declaration, ..} => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+    _ => Option<DeclarationId>.none()
+  }
+}
+
+fn parameterOrdinal(value: &Type) -> usize {
+  return match &value.* {
+    Type.Parameter {ordinal, ..} => ordinal
+    _ => usize.MAX
+  }
+}
+
+// Appends the bounds a type implies by being well formed: whatever a view's referent names
+// outlives the view's own region.
+effect fn impliedKeptBounds(value: &Shared<Type>, bounds: &mut Vector<KeptBound>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let position = Shared<Type>.with<KeptPosition>(value, keptPosition)
+  if position == KeptPosition.ReadView || position == KeptPosition.WriteView {
+    let own = run outerKeptAtoms(value)
+    let referent = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return childAt(node, usize.ZERO) })
+    if let Option<KeptAtoms>.Some {value: outer} = &own {
+      if let Option<Shared<Type>>.Some {value: inner} = &referent {
+        let mut named = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+        let invariant = Vector<CovariantSlot>.make()
+        run collectKeptAtoms(&inner, false, false, &mut named, Vector<CovariantSlot>.asSlice(&invariant))
+        let shorter = Vector<Shared<Lifetime>>.asSlice(&outer.regions)
+        let mut at = usize.ZERO
+        while at < shorter.length {
+          let longer = Vector<Shared<Lifetime>>.asSlice(&named.regions)
+          let mut each = usize.ZERO
+          while each < longer.length {
+            run Vector<KeptBound>.append(&mut bounds.*, KeptBound.Outlives {longer: Shared<Lifetime>.clone(&longer[each]),
+              shorter: Shared<Lifetime>.clone(&shorter[at])})
+            each = each + usize.ONE
+          }
+          let subjects = Vector<Shared<Type>>.asSlice(&named.parameters)
+          each = usize.ZERO
+          while each < subjects.length {
+            run Vector<KeptBound>.append(&mut bounds.*, KeptBound.Contents {subject: Shared<Type>.clone(&subjects[each]),
+              region: Shared<Lifetime>.clone(&shorter[at])})
+            each = each + usize.ONE
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
+  }
+  let count = Shared<Type>.with<usize>(value, keptChildCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let child = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return keptChildAt(node, at) })
+    if let Option<Shared<Type>>.Some {value: nested} = move child { run impliedKeptBounds(&nested, &mut bounds.*) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn keptRegion(sinks: &KeptAtoms, region: &Shared<Lifetime>) -> bool {
+  let listed = Vector<Shared<Lifetime>>.asSlice(&sinks.regions)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if Lifetime.equalsShared(&listed[at], region) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether any atom of `region` is kept.
+fn keptAnyAtom(sinks: &KeptAtoms, region: &Shared<Lifetime>) -> bool {
+  let count = Lifetime.atomCount(region)
+  let mut at = usize.ZERO
+  while at < count {
+    let atom = Lifetime.atomAt(region, at)
+    if keptRegion(sinks, &atom) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Closes the storing atoms under the bounds: whatever outlives a kept region can be stored there
+// too, and a conformance's witness can store anything its constraint names.
+effect fn closeKeptAtoms(bounds: &[KeptBound], sinks: &mut KeptAtoms, covariant: &[CovariantSlot]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < bounds.length {
+    match &bounds[at] {
+      KeptBound.Storing {value} => run collectKeptAtoms(&value, false, false, &mut sinks.*, covariant)
+      KeptBound.Reaching {value} => run collectKeptAtoms(&value, true, false, &mut sinks.*, covariant)
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    at = usize.ZERO
+    while at < bounds.length {
+      match &bounds[at] {
+        KeptBound.Outlives {longer, shorter} => {
+          if keptAnyAtom(&sinks.*, &shorter) {
+            let count = Lifetime.atomCount(&longer)
+            let mut atom = usize.ZERO
+            while atom < count {
+              let member = Lifetime.atomAt(&longer, atom)
+              if !keptRegion(&sinks.*, &member) {
+                run Vector<Shared<Lifetime>>.append(&mut sinks.regions, move member)
+                changed = true
+              }
+              atom = atom + usize.ONE
+            }
+          }
+        }
+        KeptBound.Contents {subject, region} => {
+          if keptAnyAtom(&sinks.*, &region) {
+            let before = Vector<Shared<Lifetime>>.length(&sinks.regions) + Vector<Shared<Type>>.length(&sinks.parameters)
+            let mut named = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+            run collectKeptAtoms(&subject, false, false, &mut named, covariant)
+            run mergeKeptAtoms(&named, &mut sinks.*)
+            if Vector<Shared<Lifetime>>.length(&sinks.regions) + Vector<Shared<Type>>.length(&sinks.parameters) != before { changed = true }
+          }
+        }
+        KeptBound.Storing {..} => ()
+        KeptBound.Reaching {..} => ()
+        KeptBound.Witness {..} => ()
+      }
+      at = at + usize.ONE
+    }
+  }
+  return ()
+}
+
+// Adds the atoms of `named` that `sinks` does not hold yet.
+effect fn mergeKeptAtoms(named: &KeptAtoms, sinks: &mut KeptAtoms) -> () ! OutOfMemoryError ? &mut Allocator {
+  let regions = Vector<Shared<Lifetime>>.asSlice(&named.regions)
+  let mut at = usize.ZERO
+  while at < regions.length {
+    if !keptRegion(&sinks.*, &regions[at]) { run Vector<Shared<Lifetime>>.append(&mut sinks.regions, Shared<Lifetime>.clone(&regions[at])) }
+    at = at + usize.ONE
+  }
+  let parameters = Vector<Shared<Type>>.asSlice(&named.parameters)
+  at = usize.ZERO
+  while at < parameters.length {
+    let mut held = false
+    let listed = Vector<Shared<Type>>.asSlice(&sinks.parameters)
+    let mut each = usize.ZERO
+    while !held && each < listed.length {
+      held = sameParameter(&parameters[at], &listed[each])
+      each = each + usize.ONE
+    }
+    if !held { run Vector<Shared<Type>>.append(&mut sinks.parameters, Shared<Type>.clone(&parameters[at])) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Appends, under `bindings`, the caller regions of the `candidates` the callee can keep: those a
+// storing position also names, or `'static`. A region bound fresh at each invocation is never kept.
+effect fn appendKept(candidates: &KeptAtoms, sinks: &KeptAtoms, bindings: &[Binding], witnesses: &[WitnessTarget], outer: bool,
+  kept: &mut Vector<Shared<Lifetime>>) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  // A candidate a conformance's contract names is kept in that conformance's provider.
+  let mut witnessed = usize.ZERO
+  while witnessed < witnesses.length {
+    if let Option<Shared<Lifetime>>.Some {value: holder} = &witnesses[witnessed].holder {
+      if sharesKeptAtom(candidates, &witnesses[witnessed].atoms) { run Vector<Shared<Lifetime>>.append(&mut kept.*, Shared<Lifetime>.clone(&holder)) }
+    }
+    witnessed = witnessed + usize.ONE
+  }
+  let regions = Vector<Shared<Lifetime>>.asSlice(&candidates.regions)
+  let storing = Vector<Shared<Lifetime>>.asSlice(&sinks.regions)
+  let mut at = usize.ZERO
+  while at < regions.length {
+    let mut keeps = false
+    if !Shared<Lifetime>.with<bool>(&regions[at], invocationAtom) {
+      // A `'static` borrow can be kept anywhere; what an argument carries is kept at `'static` only
+      // where a storing position names it.
+      keeps = outer && Shared<Lifetime>.with<bool>(&regions[at], staticAtom)
+      let mut sink = usize.ZERO
+      while !keeps && sink < storing.length {
+        keeps = Lifetime.equalsShared(&regions[at], &storing[sink])
+        sink = sink + usize.ONE
+      }
+    }
+    // A bound intersection stays whole: what the callee keeps there lasts only as long as its
+    // shortest member.
+    if keeps { run Vector<Shared<Lifetime>>.append(&mut kept.*, run Type.applyLifetimeBindings(&regions[at], bindings)) }
+    at = at + usize.ONE
+  }
+  let parameters = Vector<Shared<Type>>.asSlice(&candidates.parameters)
+  let held = Vector<Shared<Type>>.asSlice(&sinks.parameters)
+  at = usize.ZERO
+  while at < parameters.length {
+    let mut keeps = false
+    let mut sink = usize.ZERO
+    while !keeps && sink < held.length {
+      keeps = sameParameter(&parameters[at], &held[sink])
+      sink = sink + usize.ONE
+    }
+    // A stored value of the parameter's instantiation lasts only as long as every region it names.
+    if keeps {
+      let bound = run Type.applyBindings(&parameters[at], bindings, true)
+      let mut named = Vector<Shared<Lifetime>>.make()
+      run Type.regionAtoms(&bound, &mut named)
+      if Vector<Shared<Lifetime>>.length(&named) != usize.ZERO {
+        run Vector<Shared<Lifetime>>.append(&mut kept.*, run Lifetime.meet(Vector<Shared<Lifetime>>.asSlice(&named)))
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+impl Type {
+  /// What a callee with declared `parameters` can keep of each argument once the call returns, as
+  /// regions of the caller under the call's `bindings` (R3 amendment 4). A callee keeps part of an
+  /// argument only where one of its atoms also appears in a position it can store into: through an
+  /// exclusive view, as a callable's argument, or inside a type whose contents the walk cannot see,
+  /// closed under the `declared` constraints and the bounds the parameter types imply.
+  ///
+  /// A `conforming` callee, such as an interface operation's provider or a member whose
+  /// implementation declares lifetimes, can also store through a witness or bounds its signature
+  /// does not carry: every type parameter and every region outside its `own` lifetime parameters
+  /// is a storing position too.
+  pub effect fn keptRegions(parameters: &[Shared<Type>], declared: &[KeptBound], bindings: &[Binding], conforming: bool,
+    own: &[Shared<Lifetime>], covariant: &[CovariantSlot])
+  -> Vector<KeptRegions> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut precise = run keptCore(parameters, declared, bindings, false, false, own, covariant)
+    let approximate = run keptCore(parameters, declared, bindings, conforming, true, own, covariant)
+    let wider = Vector<KeptRegions>.asSlice(&approximate)
+    let mut entries = Vector<KeptRegions>.asMutSlice(&mut precise)
+    let mut at = usize.ZERO
+    while at < entries.length && at < wider.length {
+      entries[at].outerApproximate = run copyKept(Vector<Shared<Lifetime>>.asSlice(&wider[at].outer))
+      entries[at].wholeApproximate = run copyKept(Vector<Shared<Lifetime>>.asSlice(&wider[at].whole))
+      at = at + usize.ONE
+    }
+    return move precise
+  }
+}
+
+effect fn copyKept(regions: &[Shared<Lifetime>]) -> Vector<Shared<Lifetime>> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = Vector<Shared<Lifetime>>.make()
+  let mut at = usize.ZERO
+  while at < regions.length {
+    run Vector<Shared<Lifetime>>.append(&mut copied, Shared<Lifetime>.clone(&regions[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// One kept analysis; `witnessed` also keeps what conformances' contracts name in their providers.
+effect fn keptCore(parameters: &[Shared<Type>], declared: &[KeptBound], bindings: &[Binding], conforming: bool, witnessed: bool,
+  own: &[Shared<Lifetime>], covariant: &[CovariantSlot])
+-> Vector<KeptRegions> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut sinks = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+    let mut bounds = Vector<KeptBound>.make()
+    let mut at = usize.ZERO
+    while at < declared.length {
+      run Vector<KeptBound>.append(&mut bounds, KeptBound.copy(&declared[at]))
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < parameters.length {
+      run collectKeptAtoms(&parameters[at], true, false, &mut sinks, covariant)
+      run impliedKeptBounds(&parameters[at], &mut bounds)
+      if conforming {
+        let mut named = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+        run collectKeptAtoms(&parameters[at], false, false, &mut named, covariant)
+        let mut foreign = Vector<Shared<Lifetime>>.make()
+        let regions = Vector<Shared<Lifetime>>.asSlice(&named.regions)
+        let mut each = usize.ZERO
+        while each < regions.length {
+          if !ownedRegion(&regions[each], own) { run Vector<Shared<Lifetime>>.append(&mut foreign, Shared<Lifetime>.clone(&regions[each])) }
+          each = each + usize.ONE
+        }
+        named.regions = move foreign
+        run mergeKeptAtoms(&named, &mut sinks)
+      }
+      at = at + usize.ONE
+    }
+    // The type parameters the parameters themselves hold where the callee can store, before bounds.
+    let mut positional = Vector<Shared<Type>>.make()
+    let placed = Vector<Shared<Type>>.asSlice(&sinks.parameters)
+    at = usize.ZERO
+    while at < placed.length {
+      run Vector<Shared<Type>>.append(&mut positional, Shared<Type>.clone(&placed[at]))
+      at = at + usize.ONE
+    }
+    run closeKeptAtoms(Vector<KeptBound>.asSlice(&bounds), &mut sinks, covariant)
+    let mut witnesses = Vector<WitnessTarget>.make()
+    let listedBounds = Vector<KeptBound>.asSlice(&bounds)
+    at = usize.ZERO
+    while witnessed && at < listedBounds.length {
+      if let KeptBound.Witness {provider, contract} = &listedBounds[at] {
+        let mut atoms = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+        run collectKeptAtoms(&contract, false, false, &mut atoms, covariant)
+        // A provider the parameters hold where the callee can store is pinned to its instantiation.
+        // Otherwise a covariant region of that instantiation could have been bound shorter, so only
+        // the regions it holds invariantly bound how long its storage lasts.
+        let bound = run Type.applyBindings(&provider, bindings, true)
+        let mut pinned = false
+        let held = Vector<Shared<Type>>.asSlice(&positional)
+        let mut each = usize.ZERO
+        while each < held.length {
+          if sameParameter(&provider, &held[each]) { pinned = true }
+          each = each + usize.ONE
+        }
+        let mut fixed = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+        run collectKeptAtoms(&bound, true, pinned, &mut fixed, covariant)
+        let mut holder = Option<Shared<Lifetime>>.none()
+        if Vector<Shared<Lifetime>>.length(&fixed.regions) != usize.ZERO { holder = Option<Shared<Lifetime>>.some(run Lifetime.meet(Vector<Shared<Lifetime>>.asSlice(&fixed.regions))) }
+        run Vector<WitnessTarget>.append(&mut witnesses, WitnessTarget {atoms: move atoms, holder: move holder})
+      }
+      at = at + usize.ONE
+    }
+    let mut result = Vector<KeptRegions>.make()
+    at = usize.ZERO
+    while at < parameters.length {
+      let mut whole = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+      run collectHeldAtoms(&parameters[at], &mut whole, covariant)
+      let mut keptWhole = Vector<Shared<Lifetime>>.make()
+      run appendKept(&whole, &sinks, bindings, Vector<WitnessTarget>.asSlice(&witnesses), false, &mut keptWhole)
+      let mut keptOuter = Vector<Shared<Lifetime>>.make()
+      let outer = run outerKeptAtoms(&parameters[at])
+      if let Option<KeptAtoms>.Some {value: reference} = &outer {
+        run appendKept(&reference, &sinks, bindings, Vector<WitnessTarget>.asSlice(&witnesses), true, &mut keptOuter)
+      } else {
+        run appendKept(&whole, &sinks, bindings, Vector<WitnessTarget>.asSlice(&witnesses), true, &mut keptOuter)
+      }
+      run Vector<KeptRegions>.append(&mut result, KeptRegions {outer: move keptOuter, whole: move keptWhole,
+        outerApproximate: Vector<Shared<Lifetime>>.make(), wholeApproximate: Vector<Shared<Lifetime>>.make(), undescribed: false})
+      at = at + usize.ONE
+    }
+    return move result
+}
+
+// A conformance's contract atoms and the region its provider's storage lasts, or none when the
+// provider's instantiation names no region and so holds no loan.
+struct WitnessTarget {
+  atoms: KeptAtoms
+  holder: Option<Shared<Lifetime>>
+}
+
+// Whether `candidates` names any atom of `named`, other than one bound fresh at each invocation.
+fn sharesKeptAtom(candidates: &KeptAtoms, named: &KeptAtoms) -> bool {
+  let regions = Vector<Shared<Lifetime>>.asSlice(&candidates.regions)
+  let listed = Vector<Shared<Lifetime>>.asSlice(&named.regions)
+  let mut at = usize.ZERO
+  while at < regions.length {
+    if !Shared<Lifetime>.with<bool>(&regions[at], invocationAtom) {
+      let mut each = usize.ZERO
+      while each < listed.length {
+        if Lifetime.equalsShared(&regions[at], &listed[each]) { return true }
+        each = each + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let parameters = Vector<Shared<Type>>.asSlice(&candidates.parameters)
+  let held = Vector<Shared<Type>>.asSlice(&named.parameters)
+  at = usize.ZERO
+  while at < parameters.length {
+    let mut each = usize.ZERO
+    while each < held.length {
+      if sameParameter(&parameters[at], &held[each]) { return true }
+      each = each + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether a region atom outlives an invocation by `caller` (see `Type.namesLastingRegion`).
+fn lastingAtom(atom: &Lifetime, caller: &DeclarationId) -> bool {
+  return match &atom.* {
+    Lifetime.Static => true
+    Lifetime.Parameter {declaration, ..} => DeclarationId.equals(&declaration, caller) || (DeclarationId.kind(&declaration) != OwnerKind.Anonymous
+      && DeclarationId.kind(&declaration) != OwnerKind.EffectBlock && DeclarationId.isPrefixOf(&declaration, caller))
+    _ => false
+  }
+}
+
+// Whether a region atom is one of a signature's `own` lifetime parameters.
+fn ownedRegion(region: &Shared<Lifetime>, own: &[Shared<Lifetime>]) -> bool {
+  let mut at = usize.ZERO
+  while at < own.length {
+    if Lifetime.equalsShared(region, &own[at]) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+impl KeptBound {
+  pub fn copy(value: &KeptBound) -> KeptBound {
+    return match &value.* {
+      KeptBound.Outlives {longer, shorter} => KeptBound.Outlives {longer: Shared<Lifetime>.clone(&longer), shorter: Shared<Lifetime>.clone(&shorter)}
+      KeptBound.Contents {subject, region} => KeptBound.Contents {subject: Shared<Type>.clone(&subject), region: Shared<Lifetime>.clone(&region)}
+      KeptBound.Storing {value: stored} => KeptBound.Storing {value: Shared<Type>.clone(&stored)}
+      KeptBound.Reaching {value: reached} => KeptBound.Reaching {value: Shared<Type>.clone(&reached)}
+      KeptBound.Witness {provider, contract} => KeptBound.Witness {provider: Shared<Type>.clone(&provider), contract: Shared<Type>.clone(&contract)}
+    }
+  }
+}
+
+impl Type {
+  /// Appends the regions a value of `value`'s type can store into: those it names through an
+  /// exclusive view, as a callable's argument, or inside a type whose contents the walk cannot see.
+  pub effect fn storedRegions(value: &Shared<Type>, regions: &mut Vector<Shared<Lifetime>>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let mut sinks = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+    let invariant = Vector<CovariantSlot>.make()
+    run collectKeptAtoms(value, true, false, &mut sinks, Vector<CovariantSlot>.asSlice(&invariant))
+    let listed = Vector<Shared<Lifetime>>.asSlice(&sinks.regions)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector<Shared<Lifetime>>.append(&mut regions.*, Shared<Lifetime>.clone(&listed[at]))
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// Appends the regions a constructed callable can store what it captured into: those its use
+  /// contract's parameters reach where a callee can store, as for a declared parameter list. Its
+  /// captures are values of their own types.
+  pub effect fn callableStoredRegions(value: &Shared<Type>, regions: &mut Vector<Shared<Lifetime>>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let contract = Shared<Type>.with<Option<Shared<Type>>>(value, callableContract)
+    if let Option<Shared<Type>>.Some {value: used} = move contract { return run Type.callableStoredRegions(&used, &mut regions.*) }
+    let count = Shared<Type>.with<usize>(value, fn(node: &Type) -> usize {
+      if let Type.Callable {parameters, ..} = &node.* { return Vector<Shared<Type>>.length(&parameters) }
+      return usize.MAX
+    })
+    if count == usize.MAX { return run Type.storedRegions(value, &mut regions.*) }
+    let mut at = usize.ZERO
+    while at < count {
+      let parameter = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return childAt(node, at) })
+      if let Option<Shared<Type>>.Some {value: declared} = move parameter { run Type.storedRegions(&declared, &mut regions.*) }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+}
+
+impl Type {
+  /// The region of a reference, slice or string view, or none for any other type.
+  pub fn viewRegion(value: &Shared<Type>) -> Option<Shared<Lifetime>> {
+    let position = Shared<Type>.with<KeptPosition>(value, keptPosition)
+    if position != KeptPosition.ReadView && position != KeptPosition.WriteView { return Option<Shared<Lifetime>>.none() }
+    return Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> { return ownLifetimeAt(node, usize.ZERO) })
+  }
+
+  /// Whether `value` names a region that outlives an invocation by `caller`: `'static`, or a lifetime
+  /// parameter of `caller` or of a named declaration enclosing it. A contract's own `binders` and
+  /// regions bound fresh at each invocation do not.
+  pub effect fn namesLastingRegion(value: &Shared<Type>, caller: &DeclarationId, binders: &[Shared<Lifetime>]) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+    let mut named = Vector<Shared<Lifetime>>.make()
+    run Type.regionAtoms(value, &mut named)
+    let atoms = Vector<Shared<Lifetime>>.asSlice(&named)
+    let mut at = usize.ZERO
+    while at < atoms.length {
+      if Shared<Lifetime>.with<bool>(&atoms[at], fn(atom: &Lifetime) -> bool { return lastingAtom(atom, caller) }) && !ownedRegion(&atoms[at], binders) {
+        return true
+      }
+      at = at + usize.ONE
+    }
+    return false
+  }
+
+  /// Appends every struct, tuple, union or enum type `value` names, at any depth.
+  pub effect fn nominalOccurrences(value: &Shared<Type>, found: &mut Vector<Shared<Type>>) -> () ! OutOfMemoryError ? &mut Allocator {
+    if let Option<DeclarationId>.Some {..} = move Shared<Type>.with<Option<DeclarationId>>(value, nominalDeclaration) {
+      run Vector<Shared<Type>>.append(&mut found.*, Shared<Type>.clone(value))
+    }
+    let count = Shared<Type>.with<usize>(value, keptChildCount)
+    let mut at = usize.ZERO
+    while at < count {
+      let child = Shared<Type>.with<Option<Shared<Type>>>(value, fn(node: &Type) -> Option<Shared<Type>> { return keptChildAt(node, at) })
+      if let Option<Shared<Type>>.Some {value: nested} = move child { run Type.nominalOccurrences(&nested, &mut found.*) }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// Whether a constructed callable's use contract, or `value` itself when it has none, names a type
+  /// parameter.
+  pub effect fn contractNamesTypeParameter(value: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let contract = Shared<Type>.with<Option<Shared<Type>>>(value, callableContract)
+    if let Option<Shared<Type>>.Some {value: used} = move contract { return run Type.namesTypeParameter(&used) }
+    return run Type.namesTypeParameter(value)
+  }
+
+  /// Whether the borrow an argument passes for `value` can outlive the invocation: a view's own
+  /// region is lasting, or any other parameter names a lasting region (see `namesLastingRegion`).
+  pub effect fn outerLasting(value: &Shared<Type>, caller: &DeclarationId, binders: &[Shared<Lifetime>]) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+    let position = Shared<Type>.with<KeptPosition>(value, keptPosition)
+    if position != KeptPosition.ReadView && position != KeptPosition.WriteView { return run Type.namesLastingRegion(value, caller, binders) }
+    let found = Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> { return ownLifetimeAt(node, usize.ZERO) })
+    if let Option<Shared<Lifetime>>.Some {value: lifetime} = move found {
+      let count = Lifetime.atomCount(&lifetime)
+      let mut atom = usize.ZERO
+      while atom < count {
+        let member = Lifetime.atomAt(&lifetime, atom)
+        if Shared<Lifetime>.with<bool>(&member, fn(region: &Lifetime) -> bool { return lastingAtom(region, caller) }) && !ownedRegion(&member, binders) {
+          return true
+        }
+        atom = atom + usize.ONE
+      }
+    }
+    return false
+  }
+
+  /// Appends, for each type parameter `parameters` name in a position a callee can store into, the
+  /// region its instantiation under `bindings` lasts: the meet of every region it names.
+  pub effect fn storingInstantiations(parameters: &[Shared<Type>], bindings: &[Binding], regions: &mut Vector<Shared<Lifetime>>,
+    covariant: &[CovariantSlot]) -> ()
+  ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let mut sinks = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+    let mut at = usize.ZERO
+    while at < parameters.length {
+      run collectKeptAtoms(&parameters[at], true, false, &mut sinks, covariant)
+      at = at + usize.ONE
+    }
+    let storing = Vector<Shared<Type>>.asSlice(&sinks.parameters)
+    at = usize.ZERO
+    while at < storing.length {
+      let bound = run Type.applyBindings(&storing[at], bindings, true)
+      let mut named = Vector<Shared<Lifetime>>.make()
+      run Type.regionAtoms(&bound, &mut named)
+      if Vector<Shared<Lifetime>>.length(&named) != usize.ZERO {
+        run Vector<Shared<Lifetime>>.append(&mut regions.*, run Lifetime.meet(Vector<Shared<Lifetime>>.asSlice(&named)))
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+
+  /// Whether any of `values` names a lifetime parameter other than `own`, such as one an enclosing
+  /// implementation declares, whose bounds a member's signature does not carry.
+  pub effect fn namesForeignLifetime(values: &[Shared<Type>], own: &[Shared<Lifetime>]) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let mut named = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+    let mut at = usize.ZERO
+    while at < values.length {
+      let invariant = Vector<CovariantSlot>.make()
+      run collectKeptAtoms(&values[at], false, false, &mut named, Vector<CovariantSlot>.asSlice(&invariant))
+      at = at + usize.ONE
+    }
+    let regions = Vector<Shared<Lifetime>>.asSlice(&named.regions)
+    at = usize.ZERO
+    while at < regions.length {
+      if Shared<Lifetime>.with<bool>(&regions[at], parameterAtom) {
+        let mut declared = false
+        let mut each = usize.ZERO
+        while !declared && each < own.length {
+          declared = Lifetime.equalsShared(&regions[at], &own[each])
+          each = each + usize.ONE
+        }
+        if !declared { return true }
+      }
+      at = at + usize.ONE
+    }
+    return false
+  }
+
+  /// Whether `value` names anything a callable's environment can hold, which was chosen before a
+  /// call: a type parameter, a lifetime parameter or `'static`.
+  pub effect fn namesHeldAtom(value: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let mut named = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+    let invariant = Vector<CovariantSlot>.make()
+    run collectKeptAtoms(value, false, false, &mut named, Vector<CovariantSlot>.asSlice(&invariant))
+    if Vector<Shared<Type>>.length(&named.parameters) > usize.ZERO { return true }
+    let regions = Vector<Shared<Lifetime>>.asSlice(&named.regions)
+    let mut at = usize.ZERO
+    while at < regions.length {
+      if Shared<Lifetime>.with<bool>(&regions[at], parameterAtom) || Shared<Lifetime>.with<bool>(&regions[at], staticAtom) { return true }
+      at = at + usize.ONE
+    }
+    return false
+  }
+
+  /// Whether `value` names a type parameter anywhere, whose instantiation and conformances can
+  /// store what the analysis cannot see.
+  pub effect fn namesTypeParameter(value: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator {
+    let mut named = KeptAtoms {regions: Vector<Shared<Lifetime>>.make(), parameters: Vector<Shared<Type>>.make()}
+    let invariant = Vector<CovariantSlot>.make()
+    run collectKeptAtoms(value, false, false, &mut named, Vector<CovariantSlot>.asSlice(&invariant))
+    return Vector<Shared<Type>>.length(&named.parameters) > usize.ZERO
+  }
+}
+
+fn parameterAtom(value: &Lifetime) -> bool {
+  return match &value.* { Lifetime.Parameter {..} => true _ => false }
+}
+
+impl Type {
+  /// Appends the regions a callable value's environment names: what its captures live in.
+  /// `withStatic` keeps `'static` members, which hold no loan of a body.
+  pub effect fn environmentRegions(value: &Shared<Type>, regions: &mut Vector<Shared<Lifetime>>, withStatic: bool) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let contract = Shared<Type>.with<Option<Shared<Type>>>(value, callableContract)
+    if let Option<Shared<Type>>.Some {value: used} = move contract { return run Type.environmentRegions(&used, &mut regions.*, withStatic) }
+    let count = Shared<Type>.with<usize>(value, fn(node: &Type) -> usize {
+      return match &node.* {
+        Type.Callable {environment, ..} => environmentSize(&environment)
+        Type.Effect {environment, ..} => environmentSize(&environment)
+        _ => usize.ZERO
+      }
+    })
+    let mut at = usize.ZERO
+    while at < count {
+      let member = Shared<Type>.with<Option<Shared<Lifetime>>>(value, fn(node: &Type) -> Option<Shared<Lifetime>> { return ownLifetimeAt(node, at) })
+      if let Option<Shared<Lifetime>>.Some {value: region} = move member {
+        if withStatic || !Lifetime.allAtoms(&region, staticAtom) { run Vector<Shared<Lifetime>>.append(&mut regions.*, move region) }
+      }
+      at = at + usize.ONE
+    }
+    return ()
+  }
+}
+
+// The use contract a constructed callable's type satisfies, when it has one.
+fn callableContract(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.CallableValue {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+    Type.CallableStage {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+    Type.CallableView {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+    Type.CallableOrigin {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
 impl Type {
   /// Appends the `owner` lifetime parameters `value` exposes to a holder: an opaque representation
   /// exposes only its contract, never the application that produced it.
