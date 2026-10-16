@@ -297,8 +297,11 @@ by source and target within this one body; a proof for one universal cannot prov
 A call result that names only caller regions drops the body-region loans its operands carry,
 since a body region cannot outlive a caller region. When a relation still makes such a dropped
 loan's region outlive a universal region, the walk no longer sees where the loan goes, so the
-loan is treated as an escaping loan: an access that would conflict with it anywhere its creation
-reaches keeps the relation pending.
+loan is treated as an escaping loan. The same holds for every loan its region proof can ground
+on: the loans naming a region the proof walks from the dropped loan's regions, through their
+parents and retention relations, such as the loan of a local view the dropped loan reborrows. An
+access that would conflict with any of them after the dropped loan's creation contests every
+region of that walk, and a universal relation whose proof reaches a contested region stays pending.
 Loan conflicts and all other retained goals are checked independently. When several call operands
 name the known result region, the retained loans form a complete union of possible sources. A
 region proof must succeed for every source in that union. A conflict with one possible source
