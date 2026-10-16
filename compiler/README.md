@@ -276,7 +276,7 @@ of that name and never a default, and `{ kind = "none" }` selects no runtime and
 component, so the application's own `export "C"` functions are the roots. The nearest `silk.toml` selects `[package].root`; its `[package].source-root`
 (resolved against the manifest's directory), else the root's containing directory, is the root for
 local module paths, and the root must be a module below it. Every module identity names the package by its logical
-identity, `[package].name` or `name@version` when a version is declared, never by the checkout's
+identity, `name@version` from the required `[package].name` and `[package].version`, never by the checkout's
 directory, so one package built from two directories emits identical bytes. An entry with no
 manifest above it has no package identity and is refused. Paths must be normalized; absolute CLI paths and paths relative to the working directory are
 accepted.
@@ -428,9 +428,12 @@ root, and select only exact `.silk` extensions. Selection is sorted by normalize
 deduplicated; symbolic links are rejected by the native filesystem provider. Use `--` before a
 filename beginning with a dash.
 
-Write mode replaces changed files; `--check` reports changes without writing. Damaged source is
-reported with its first offending byte offset and remains untouched. Other readable selected
-files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
+Write mode replaces changed files; `--check` reports changes without writing. Each selected file
+reports one line, as the TypeScript CLI words it: `<path>: unchanged` and `<path>: formatted` on
+standard output, and `<path>: needs formatting`, `<path>: cannot format damaged source (<codes>)`
+with the distinct lexical and syntax diagnostic codes, or `<path>: Cannot read source file
+<path>` and the other failure messages on standard error. Damaged source remains untouched.
+Other readable selected files are still processed. Exit status is `0` for success, `1` for damaged syntax or check-mode
 drift, and `2` for project, selection, filesystem, allocation, or diagnostic-output failures.
 The portable filesystem uses complete create-or-truncate writes; an interrupted or failed write
 can leave a partial file, so formatter writes currently have the same limitation.
