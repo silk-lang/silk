@@ -648,6 +648,9 @@ struct Walker {
   // The writes through a reference and into locals: each statement's span and the universal
   // lifetime parameters its target's type names (`escapingOwnedLoan`).
   stores: Vector<StoreWindow>
+  // The `return` statements whose value's type names a universal lifetime parameter: the caller's
+  // result slot, which `escapingOwnedLoan` reads only when no other conflict decides the body.
+  returns: Vector<StoreWindow>
   // The locals whose value a write through a reference stores.
   escaping: Vector<usize>
 }
@@ -3761,6 +3764,15 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       let mut flow = flowAt(at)
       let mut required = span
       if let Option<NodeId>.Some {value: operand} = &value {
+        // A returned value is stored in the caller's result slot, typed at the body's lifetime
+        // parameters its result names, as a write through a reference is (`storedGoal`).
+        if let NodeKind.Return {..} = &nodes[id.index].kind {
+          if let Option<Shared<Type>>.Some {value: returned} = move expressionType(nodes, operand) {
+            if let Option<StoreWindow>.Some {value: window} = move run storeWindow(owner, &returned, span, usize.MAX) {
+              run Vector<StoreWindow>.append(&mut walker.returns, move window)
+            }
+          }
+        }
         flow = run visit(nodes, locals, owner, &mut walker.*, operand, at)
         if let NodeKind.Return {..} = &nodes[id.index].kind {
           required = nodes[operand.index].origin.location
@@ -4887,6 +4899,7 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
     lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
@@ -4920,17 +4933,24 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
   // its region to outlive a universal region is refuted, reported at the borrow as the bootstrap
   // reports the unsatisfied region bound (SEM0212). The walk records every loan even where it leaves
   // the body unchecked, and this refutation reads only loans and relations, not their flow.
-  let escaping = run escapingOwnedLoan(&walker, owner, obligations)
+  let escaping = run escapingOwnedLoan(&walker, owner, obligations, false)
   if escaping != usize.MAX {
     let all = Vector<Loan>.asSlice(&walker.loans)
     return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UnsatisfiedLifetimeBound,
       access: all[escaping].origin, earlier: Option<Location>.none(), reports: Vector<Report>.make()}
   }
+  // A returned value is stored in the caller's result slot, so the same refutation holds for goals
+  // admitted inside a `return`. It decides a body only where the walk itself finds no conflict: the
+  // walk reports a loan of body storage a returned value holds where it escapes (OWN0019).
+  let mut returnedEscape = usize.MAX
+  if Vector<StoreWindow>.length(&walker.returns) > usize.ZERO {
+    returnedEscape = run escapingOwnedLoan(&walker, owner, obligations, true)
+  }
   if walker.outside {
-    return verdict(Outcome.NotChecked, walker.reason)
+    return refutedOr(&walker, returnedEscape, verdict(Outcome.NotChecked, walker.reason))
   }
   let released = run releaseScopes(&mut walker, usize.ZERO, nodes[root.index].origin.location, flow.at)
-  if walker.outside { return verdict(Outcome.NotChecked, walker.reason) }
+  if walker.outside { return refutedOr(&walker, returnedEscape, verdict(Outcome.NotChecked, walker.reason)) }
   if released != usize.MAX {
     // Body statements produce no implicit escaping value. Explicit returns consume their value
     // after scope release; this statement tail may coincide with the final End safely.
@@ -5170,10 +5190,10 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
       reports: move listed}
   }
   if walker.storing {
-    return verdict(Outcome.NotChecked, BorrowStatus.StoredLoans)
+    return refutedOr(&walker, returnedEscape, verdict(Outcome.NotChecked, BorrowStatus.StoredLoans))
   }
   if unknown {
-    return verdict(Outcome.NotChecked, BorrowStatus.Imprecise)
+    return refutedOr(&walker, returnedEscape, verdict(Outcome.NotChecked, BorrowStatus.Imprecise))
   }
   walker.contested = move contested
   let mut symbolic = Vector<SymbolicRegion>.make()
@@ -5184,9 +5204,18 @@ pub effect fn check(owner: &DeclarationId, locals: &[Local], nodes: &[Node], roo
       Vector<u64>.asSlice(&liveOut), Vector<u64>.asSlice(&definitions.entering), definitionWidth, !crossingsProved)
   }
   if relationsProved && run regionClosed(owner, locals, nodes) {
-    return verdict(Outcome.Clear, BorrowStatus.Checked)
+    return refutedOr(&walker, returnedEscape, verdict(Outcome.Clear, BorrowStatus.Checked))
   }
-  return verdict(Outcome.Clear, BorrowStatus.Regions)
+  return refutedOr(&walker, returnedEscape, verdict(Outcome.Clear, BorrowStatus.Regions))
+}
+
+// The SEM0212 refutation of the loan at `escaping` (`escapingOwnedLoan`), or `otherwise` when
+// `escaping` is `usize.MAX`.
+fn refutedOr(walker: &Walker, escaping: usize, otherwise: Verdict) -> Verdict {
+  if escaping == usize.MAX { return move otherwise }
+  let all = Vector<Loan>.asSlice(&walker.loans)
+  return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UnsatisfiedLifetimeBound,
+    access: all[escaping].origin, earlier: Option<Location>.none(), reports: Vector<Report>.make()}
 }
 
 // R3 uses the Walker's points and edges. Required sets over-approximate its exact loan flow;
@@ -6116,6 +6145,16 @@ fn ownedStorageLoan(loan: &Loan) -> bool {
 // lifetime parameter of the body or a named enclosing declaration.
 effect fn recordStore(walker: &mut Walker, owner: &DeclarationId, written: &Shared<Type>, span: Location, holder: usize) -> ()
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<StoreWindow>.Some {value} = move run storeWindow(owner, written, span, holder) {
+    run Vector<StoreWindow>.append(&mut walker.stores, move value)
+  }
+  return ()
+}
+
+// The window of a write at `span` whose target's type is `written`: the universal lifetime
+// parameters that type names, or none when it names none.
+effect fn storeWindow(owner: &DeclarationId, written: &Shared<Type>, span: Location, holder: usize) -> Option<StoreWindow>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut atoms = Vector<Shared<Lifetime>>.make()
   run Type.regionAtoms(written, &mut atoms)
   let mut regions = Vector<Shared<Lifetime>>.make()
@@ -6130,10 +6169,8 @@ effect fn recordStore(walker: &mut Walker, owner: &DeclarationId, written: &Shar
     }
     at = at + usize.ONE
   }
-  if Vector<Shared<Lifetime>>.length(&regions) > usize.ZERO {
-    run Vector<StoreWindow>.append(&mut walker.stores, StoreWindow {span: span, regions: move regions, holder: holder})
-  }
-  return ()
+  if Vector<Shared<Lifetime>>.length(&regions) == usize.ZERO { return Option<StoreWindow>.none() }
+  return Option<StoreWindow>.some(StoreWindow {span: span, regions: move regions, holder: holder})
 }
 
 // The operand a `move` takes, or `id` itself.
@@ -6154,10 +6191,15 @@ fn listsLocal(listed: &[usize], local: usize) -> bool {
 
 // Whether a goal into `wanted`, admitted at `site`, belongs to a recorded write whose target's type
 // names `wanted`: a write through a reference, or one into a local whose value a write through a
-// reference stores. A local has one region, so every value written into it must outlive what the
+// reference stores; with `returned`, also a value a `return` stores in the caller's result slot. A local has one region, so every value written into it must outlive what the
 // stored value must.
-fn storedGoal(walker: &Walker, wanted: &Shared<Lifetime>, site: Location) -> bool {
-  let windows = Vector<StoreWindow>.asSlice(&walker.stores)
+fn storedGoal(walker: &Walker, wanted: &Shared<Lifetime>, site: Location, returned: bool) -> bool {
+  if returned && windowGoal(walker, Vector<StoreWindow>.asSlice(&walker.returns), wanted, site) { return true }
+  return windowGoal(walker, Vector<StoreWindow>.asSlice(&walker.stores), wanted, site)
+}
+
+// Whether one of `windows` admits a goal into `wanted` at `site` (`storedGoal`).
+fn windowGoal(walker: &Walker, windows: &[StoreWindow], wanted: &Shared<Lifetime>, site: Location) -> bool {
   let mut at = usize.ZERO
   while at < windows.length {
     if site.start >= windows[at].span.start && site.end <= windows[at].span.end
@@ -6171,16 +6213,16 @@ fn storedGoal(walker: &Walker, wanted: &Shared<Lifetime>, site: Location) -> boo
 // The first loan of storage this body owns whose region the retained relations require to outlive
 // a lifetime parameter of the body or a named enclosing declaration, or `usize.MAX`. The relations
 // are the body's region goals: each offered region must outlive its wanted one. A seed is a goal
-// admitted inside a write whose target's type names its single wanted parameter (`storedGoal`):
-// the value is stored in caller storage typed at that parameter, directly or through a local whose
-// value is, so every atom of its offered side must outlive it. A goal into a single atom so required passes the requirement on to
+// admitted inside a write whose target's type names its single wanted parameter (`storedGoal`), or,
+// with `returned`, inside a `return`: the value is stored in caller storage typed at that parameter,
+// directly, as the caller's result, or through a local whose value is, so every atom of its offered side must outlive it. A goal into a single atom so required passes the requirement on to
 // its offered atoms. Other goals are not seeds: a call's region binding need not be minimal, so a
 // goal it admits into a universal region may be longer than any solution needs, and a goal into
 // 'static may be an Effect environment that a run in this body uses only finitely. A goal into a
 // meet requires only the meet, so it passes nothing on, and a provisional goal waiting on an
 // inferred 'static is no requirement yet. Owned storage ends with the body at the latest, so a loan
 // of it so required is never valid.
-effect fn escapingOwnedLoan(walker: &Walker, owner: &DeclarationId, obligations: &[SafetyObligation]) -> usize
+effect fn escapingOwnedLoan(walker: &Walker, owner: &DeclarationId, obligations: &[SafetyObligation], returned: bool) -> usize
 ! OutOfMemoryError ? &mut Allocator {
   let mut required = Vector<Shared<Lifetime>>.make()
   let mut changed = true
@@ -6191,7 +6233,7 @@ effect fn escapingOwnedLoan(walker: &Walker, owner: &DeclarationId, obligations:
       if let SafetyObligation.RegionRelation {origin, offered, wanted, inferredStatic} = &obligations[at] {
         let provisional = match &inferredStatic { Option<Shared<Lifetime>>.Some {..} => true _ => false }
         if !provisional && Lifetime.atomCount(&wanted) == usize.ONE
-          && (storedGoal(walker, &wanted, origin.location) || proofContains(Vector<Shared<Lifetime>>.asSlice(&required), &wanted)) {
+          && (storedGoal(walker, &wanted, origin.location, returned) || proofContains(Vector<Shared<Lifetime>>.asSlice(&required), &wanted)) {
           let count = Lifetime.atomCount(&offered)
           let mut atom = usize.ZERO
           while atom < count {
@@ -6726,6 +6768,7 @@ effect fn wrappedRegionClaims() -> ()
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
@@ -6814,6 +6857,7 @@ effect fn symbolicRootClaims() -> ()
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
@@ -7126,6 +7170,7 @@ effect fn finiteParentClaims() -> ()
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
@@ -7270,6 +7315,7 @@ effect fn intervalRequirementClaims() -> ()
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
@@ -7352,6 +7398,7 @@ effect fn ownedInitializationClaims() -> ()
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
@@ -7477,6 +7524,7 @@ effect fn offeredMeetClaims() -> ()
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
@@ -7562,6 +7610,7 @@ effect fn regionChoiceClaims() -> ()
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
+    returns: Vector<StoreWindow>.make(),
     escaping: Vector<usize>.make(),
   }
   run Vector<Vector<Step>>.append(&mut walker.paths, Vector<Step>.make())
