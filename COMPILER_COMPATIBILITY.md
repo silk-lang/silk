@@ -786,6 +786,24 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
 
+### Native ends a loan an explicit call lifetime argument types at its last use
+
+- **Status:** recorded on 2026-10-17 with the written-binding fix. It is retired when native keeps
+  live through the body a loan whose region an explicit call lifetime argument names universal.
+- **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a loan
+  typed at one stays valid, and its place borrowed, for the rest of the body.
+- **Compilers:** the bootstrap rejects `let view = pass<'a>(&src.t)` and `pass<'a>(&src.t).value`
+  with OWN0011 at a later write to `src.t`, where `'a` is a lifetime parameter of the body. Native
+  ends that loan at its last use and accepts the write. A written binding type,
+  `let view: &'a Token = …`, is held live through the body by both compilers. Native records which
+  local types are written; it does not record which call lifetime arguments are.
+- **Source migration:** none.
+- **Diagnostics and limits:** native under-rejects only where nothing stores or returns the loan,
+  so no reference outlives its place: a stored or returned loan already escapes the body.
+- **Evidence:** native compile verdicts for both forms on main 74bc91cf; the written form is
+  `SemanticCaptureCases::universalLoansOutliveTheBody` (`o2Written`, `o2Reborrow`) and
+  `invalid/written-universal-view-write`.
+
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
 - **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
