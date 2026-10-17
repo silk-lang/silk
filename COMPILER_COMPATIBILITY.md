@@ -808,6 +808,34 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   compilers reject are pinned in `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs`
   (`scopeEnd`, `loopStore`, `loopCarried`, `escape`, `projection`).
 
+### Bootstrap runs a retained temporary's Drop hook after its loans end
+
+- **Status:** recorded on 2026-10-17 from the independent review of #1904, with the native fix
+  that holds a retained temporary's loans until its cleanup. The bootstrap gap remains until its
+  loan pass treats a retained temporary's cleanup as a use of the loans its hook can observe.
+- **Rule:** BORROW-006 and DROP-002. A binding that can hold a view keeps its initializer's
+  temporaries until its scope ends, and their cleanup runs there. A Drop hook that runs at that
+  cleanup observes every loan its value holds, so those loans stay live until the cleanup.
+- **Compilers:** with `struct Hooked<'a, 'b> { left: &'a i32  right: &'b i32 }`, whose Drop hook
+  reads `self.left`, and `fn hooked<'a, 'b>(left: &'a i32, right: &'b i32) -> Hooked<'a, 'b>`:
+  `let r = hooked(&owner, x).right  let s = r.*  owner = 1` keeps the `Hooked` temporary until
+  `r`'s scope ends, and the hook then reads `owner` after the write. The bootstrap compiles this,
+  and also `spend(move owner)` in place of the write, where the hook reads a moved-from place. The
+  same holds for a hook on a field's type (`Guarded { hooked: Hooked<'a, 'b>  right: &'b i32 }`)
+  and for the projection passed through a call (`viewOf(hooked(&owner, x).right)`). Native
+  reports OWN0011 at the write or move.
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects. It reads a projection out of a retained temporary
+  whose cleanup can observe a loan through the temporary's hidden owner, which holds that loan
+  until the cleanup. These are not corpus programs, because the bootstrap's corpus tests require
+  every `invalid/` program to be rejected with its listed diagnostics. A temporary that ends with
+  its statement (a scalar binding), one in an inner scope that ends before the write, and one whose
+  type runs no hook stay accepted by both compilers.
+- **Evidence:** `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs` (`hookedRead`,
+  `hookedMove`, `hookedField`, `hookedArgument`, `hookedStatement`, `hookedScoped` and
+  `plainRead`). Native and bootstrap compile verdicts on the fix's head. In the native IR for
+  `let s = hooked(&owner, x).left.*`, the hook runs before the following move.
+
 ### Native holds every loan of a literal in each of its field projections
 
 - **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
