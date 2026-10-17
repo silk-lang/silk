@@ -733,6 +733,29 @@ Each entry records:
   `shelvedThenReplace`) and `implicitReceiverBorrowsRetainStoredSources` (write and move rejections,
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
+### Native holds every loan of a literal in each of its field projections
+
+- **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
+  retired when native carries a field projection of a value that is no place only through the
+  regions its declared field type names.
+- **Rule:** LIFE-002 and BORROW-008. A field read of a struct literal holds the loans the
+  projected field's type can reach; a sibling field typed by a different lifetime parameter holds
+  its own loans.
+- **Compilers:** the bootstrap types each field of `TwoRegions<'a, 'b> {first: &base, second:
+  &Token {value: 4}}.first` at its own region, so the temporary lent to `second` ends with the
+  statement and a later read of the projection is accepted. Native's borrow check carries every
+  loan the literal holds into the projection, even when the fields name distinct lifetime
+  parameters, and reports OWN0019 at that later read. With one shared region (`TwoViews<'a>`) both
+  compilers reject.
+- **Source migration:** bind the literal in a `let` before projecting it, or borrow the temporary
+  from a named local.
+- **Diagnostics and limits:** native over-rejects only; it never accepts a projection whose own
+  field holds an expired loan.
+- **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
+  (`projectedTemporaryEscape`, `projectedRegionsEscape`);
+  `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
+  spelling.
+
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
 - **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
