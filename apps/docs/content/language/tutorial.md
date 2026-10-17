@@ -25,25 +25,37 @@ You get this layout:
 
 ```
 hello/
-  silk.toml      # [package] name, version, root
+  silk.toml      # [package] name, version, silk-version, root
   .gitignore     # ignores the build/ directory
   src/main.silk  # the entry point named by root
 ```
 
-The generated `silk.toml` names the entry file:
+The generated `silk.toml` names the entry file and records, as `silk-version`, the release of the
+compiler that created the project:
 
 ```toml
 [package]
 name = "hello"
 version = "0.1.0"
+silk-version = "0.1.0"
 root = "src/main.silk"
 ```
 
-And the generated `src/main.silk` is the smallest program that does nothing:
+`silk-version` is optional. When present it must be a semantic version; no command compares it with
+the running compiler.
+
+And the generated `src/main.silk` logs a greeting:
 
 ```silk
-pub effect fn main() -> () {
-  return ()
+import silk.effect { Effect }
+import silk.logger { LogError }
+import silk.os_logger { StdoutLogger }
+
+pub effect fn main() -> ()
+  ! LogError {
+  let mut logger = StdoutLogger.make()
+
+  run Effect.log("Hello, world!", &()) |> Effect.provideMut(&mut logger)
 }
 ```
 
@@ -52,6 +64,8 @@ Run it:
 ```console
 $ silk run
 ```
+
+`silk run` reports the build, then the program prints `Hello, world!`.
 
 ## Your first program
 
