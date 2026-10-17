@@ -147,7 +147,7 @@ Each entry records:
 - **Status:** implemented on 2026-10-06 on PR #1076.
 - **Rule:** a lifetime binder that only a call's result, failure or requirements mention, such as
   the impl lifetime of `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() ->
-  TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
+TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
 - **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
   call: a complete ordinary call takes the region its expected result names, and otherwise binds
   `'static`, since the outcome retains no operand region through that binder. A direct call's
