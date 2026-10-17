@@ -2605,6 +2605,28 @@ src.t = Token { value: 1 }
 - **Native:** rejects the direct store with OWN0011 at the write, and the Effect forms the same
   way.
 
+### Bootstrap accepts a closure storing one captured loan where another capture reaches
+
+CAPTURE-002 and ANON-OWN-001 keep a captured loan for as long as anything the closure stored it in
+is used:
+
+```silk
+let mut slot = Slot {view: Option<&i32>.none()}
+if true {
+  let count = 41
+  let mut store = fn() -> () { slot.view = Option<&i32>.some(&count) }
+  store()
+}
+return read(&slot)
+```
+
+- **Bootstrap:** accepts it, and the program reads `count` after its block ends. It also accepts
+  the aliasing form, which writes `count` while `slot` still holds the loan.
+- **Native:** rejects the first program with OWN0019 at `&slot`, and the aliasing form with OWN0011
+  at the write. Passing the closure to a call that may invoke it rejects the same way. A store
+  through a local reference to body storage leaves the body unchecked
+  (`invalid/closure-capture-store-expired`, `invalid/closure-capture-store-alias`).
+
 ### Bootstrap MIR verification treats an unreachable match fallthrough as terminating
 
 When a member's last match candidates all carry nested pattern tests, exhaustiveness proves
