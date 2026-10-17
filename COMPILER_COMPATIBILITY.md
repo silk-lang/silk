@@ -2242,6 +2242,8 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   view the call returns. Accepting it also needs MIR loan ends for the loans that temporary
   retains, so the rejection currently prevents a miscompile.
 - **Native:** accepts it.
+- The same bootstrap rejection covers a shared borrow of a field of an owned temporary,
+  `read(&outer().a.b)`; native accepts it and keeps the temporary until the end of the statement.
 - **Source migration:** `ModuleIndex.fingerprint` and `Semantic.reconcileDeclarationChange` in
   `compiler/` bind the slice to a local before indexing it, which both compilers accept. Declaration
   handle Cases use the same direct-view form.
@@ -2623,8 +2625,9 @@ return read(&slot)
 - **Bootstrap:** accepts it, and the program reads `count` after its block ends. It also accepts
   the aliasing form, which writes `count` while `slot` still holds the loan.
 - **Native:** rejects the first program with OWN0019 at `&slot`, and the aliasing form with OWN0011
-  at the write. Passing the closure to a call that may invoke it rejects the same way. A store
-  through a local reference to body storage leaves the body unchecked
+  at the write. Passing the closure to a call that may invoke it, by value, by reference or in a
+  holder's field, rejects the same way. A store through a local reference to body storage leaves
+  the body unchecked
   (`invalid/closure-capture-store-expired`, `invalid/closure-capture-store-alias`).
 
 ### Bootstrap MIR verification treats an unreachable match fallthrough as terminating
