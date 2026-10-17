@@ -353,6 +353,8 @@ export const endWitnessReborrows = (
   reborrows: WitnessArguments['reborrows'],
   span: SourceSpan.SourceSpan,
 ): void => {
+  // A witness reborrow spans exactly its witness call over an operand the call owns, so it ends,
+  // and drops that operand, right after the call even though the operand is a hidden owner.
   for (const reborrow of reborrows)
     if (fn.loanLocals.delete(borrowKey(reborrow.borrow)))
       fn.emit({

@@ -728,10 +728,7 @@ it.effect('rejects a public invocation computation escape and a fixed Static rec
 }
 pub fn main() -> i32 { return 0 }
 `,
-        [
-          ['OWN0019', 137, 157],
-          ['OWN0019', 137, 157],
-        ],
+        [['OWN0019', 137, 157]],
         'callback(move value)',
       ],
       [

@@ -2,19 +2,20 @@
 
 Census source: merged S2 `20327d2ea`. The throwaway build changes only the first unchecked storage operation's reported reason, following #1598. Current published corpus: 423 pass, 0 fail, 0 unsupported, 328 tracked. All 423 emitted per-program receipts.
 
-| Primitive | Corpus bodies | Programs | Self-build |
-|---|---:|---:|---:|
-| `executionFromAllocation` | 514 | 423 | 0 |
-| `executionDrive` | 475 | 423 | 0 |
-| `executionNotify` | 430 | 423 | 0 |
-| `executionCurrent` | 68 | 44 | 0 |
-| `relinquish` | 0 | 0 | 0 |
-| `slotAddress` | 1 | 1 | 0 |
-| Total storage | 1488 | 423 | 0 |
+| Primitive                 | Corpus bodies | Programs | Self-build |
+| ------------------------- | ------------: | -------: | ---------: |
+| `executionFromAllocation` |           514 |      423 |          0 |
+| `executionDrive`          |           475 |      423 |          0 |
+| `executionNotify`         |           430 |      423 |          0 |
+| `executionCurrent`        |            68 |       44 |          0 |
+| `relinquish`              |             0 |        0 |          0 |
+| `slotAddress`             |             1 |        1 |          0 |
+| Total storage             |          1488 |      423 |          0 |
 
 These are first-reason body counts, not all occurrences: relinquish=0 means another reason masks it, not that it is unused. Other corpus reasons: regions 15882, stored-loans 93, imprecise 6. Clean S2 self-build under the probe: regions 8931, stored-loans 137, storage 0. Raw receipts are in `receipts/`; `make-probe.py` records the instrumentation. No production checker changes are included.
 
 Proposed implementation:
+
 1. executionNotify becomes an ordinary contract call on its shared ExecutionRef operand. Its loan lasts through the call (BORROW-004); counted authority does not borrow caller lexical storage. The separate reached-callback gate still rejects notification while a local-shared access is held. SHARED-003 expressly requires OWN0016 at direct notification; Semantic.buildFrom/localSharedEscapes applies it independently of a body's Checked status. Existing SemanticLoweringCases::localSharedAccessRejectsEveryReachedEscape pins the exact Intrinsic.executionNotify(&reference) primary and related wrap(&core, signals) access spans, including forwarding, recursion and other-module runs. SHARED-004 runtime reentry checks remain the ordinary-source Wake path's guard.
 2. Immediate run of executionDrive becomes a contract call: consume Execution, branchState, onComplete and onSuspend; keep all operand/capture loans alive through activation and its normal/failure edges. Completion/suspension callbacks consume their supplied state under EXEC-002/EXEC-004. Do NOT clear stored/unrun drive Effects with that same rule: native currently gives the intrinsic Effect an empty environment, so its type does not account for captured operands. Keep that delayed construction explicitly StoredLoans until those captures have a retention proof; otherwise finish could end the loans too early. This is a diagnostic reason boundary, not a compatibility path.
 3. relinquish and executionCurrent are zero-operand primitives. Their construction adds no caller capture loan; an immediate run is one call at the existing S2 graph point. Relinquish saves the running frame chain; current creates counted affine ExecutionRef authority. Existing S2 scope/failure edges and ordinary affine/capture checking still apply. No reference becomes Copy or thread-transferable (EXEC-004); executing a run inside local-shared access remains subject to OWN0016.
