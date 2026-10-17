@@ -815,26 +815,39 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
 
-### Native leaves a literal nested in a written one unchecked
+### Native leaves a few written lifetime arguments unpinned
 
 - **Status:** recorded on 2026-10-17 with the written-binding fix (#1888), narrowed with the
-  written call and literal fix (#1897) and with the written-operand fix that follows it. It is
-  retired when native types a literal nested without arguments in a written one at the written
-  regions.
+  written call and literal fix (#1897) and with the written-operand fix (#1899). It is retired when
+  native pins a borrow at every written region the bootstrap does.
 - **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a borrow
   a written lifetime argument types at one stays valid, and its place borrowed, for the rest of the
   body.
-- **Compilers:** in `let o = Outer<'a> {inner: Holder {view: &src.t}}` followed by a write to
-  `src.t`, where `'a` is a lifetime parameter of the body, the bootstrap reports OWN0011 at the
-  write. Native leaves the body unchecked, as a regions gap: the nested `Holder` literal writes no
-  arguments, so its field types are its own binders rather than the outer literal's written `'a`.
-  Every other written form, a binding type, a call or method or constructor argument, an Effect call
-  run at once, a record literal field and a reborrow through a body-local reference, keeps the
-  borrow live through the body natively as well.
+- **Compilers:** in each form below, `'a` is a lifetime parameter of the body and the statement is
+  followed by a write to `src.t`. The bootstrap reports OWN0011 at the write in all four.
+  - `let o = Outer<'a> {inner: Holder {view: &src.t}}`: native leaves the body unchecked, as a
+    regions gap. The nested `Holder` literal writes no arguments, so its field types are its own
+    binders rather than the outer literal's written `'a`.
+  - `lenH<'a>(HoldT {view: &src.t})` with `fn lenH<'p, T>(h: HoldT<'p, T>)` and
+    `struct HoldT<'h, T> { view: &'h T }`: native reports the body Checked.
+  - `takeP<'a>(PairWith {view: &src.t, extra: 5})` with `fn takeP<'p, T>(p: PairWith<'p, T>)` and
+    `struct PairWith<'h, T> { view: &'h Token  extra: T }`: native reports the body Checked.
+  - `lenB<'a>(&src.u, &src.t)` with `fn lenB<'p, T: 'p>(v: &'p Token, extra: T)`: native reports
+    the body Checked.
+
+  Native types a call's argument at its parameter type under the arguments the source wrote, and
+  neutralizes an inferred type argument to `()` only where the parameter type names it beneath a
+  reference or slice, whose well-formedness bounds it by the view's region. Anywhere else,
+  including as a nominal type's argument and under a `T: 'p` bound, it becomes `&'static ()`, so
+  the parameter type no longer names only universal regions and the borrow is not pinned. Every
+  other written form keeps the borrow live through the body natively as well: a binding type, a
+  call or method or constructor argument, including one whose inferred type sits beneath a view, an
+  Effect call run at once, a record literal field and a reborrow through a body-local reference.
 - **Source migration:** none.
-- **Diagnostics and limits:** native never accepts this form as Checked.
-- **Evidence:** native compile verdicts on the written-operand fix's head; the covered forms are
-  `SemanticCaptureCases::universalLoansOutliveTheBody` and the corpus programs
+- **Diagnostics and limits:** native reports the three call forms Checked, and leaves the nested
+  literal as a regions gap, while the bootstrap rejects all four with OWN0011.
+- **Evidence:** native and bootstrap compile verdicts on the written-operand fix's head; the
+  covered forms are `SemanticCaptureCases::universalLoansOutliveTheBody` and the corpus programs
   `invalid/written-universal-view-write`, `invalid/written-call-lifetime-argument` and
   `invalid/written-literal-lifetime-argument`.
 
