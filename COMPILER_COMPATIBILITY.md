@@ -755,6 +755,57 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   (`impliedByDeclaration`, `impliedByContents` are never Checked). Rejected or unchecked programs
   are checked through compile-time verdicts and Cases only.
 
+### Bootstrap does not hold calls to their signatures' implied bounds
+
+- **Status:** recorded on 2026-10-17 from the regions census (residue). Native holds the call; the
+  bootstrap gap remains.
+- **Rule:** LIFE-002: a parameter or result type's well-formedness implies bounds the callee's body
+  assumes, so a call instantiating the signature must prove them like declared bounds:
+  `fn viaPair<'a, 'b>(x: &'a Key, p: Pair<'b, 'a>) -> &'b Key { return x }` with
+  `struct Pair<'b, 'a: 'b>` returns its `&'a Key` as `&'b Key` on `Pair`'s `'a: 'b` alone, so the
+  result keeps the key's loan.
+- **Compilers:** the bootstrap accepts `let r = viaPair(&k, Pair {short: &v, long: &w})`, then a
+  write to `k` and a read of `r`; with a key that has `Drop` this reads freed storage. Native holds
+  every call to the bounds its callee's parameter and result types imply: each nominal's declared
+  region bounds and each view's referent bound (`impliedSignatureBounds`). It covers direct and
+  member calls, operator calls, invoked callable values, staged schemas and named sections
+  (`holdImpliedBounds`). A call proves them under the caller's premises and the bounds its own
+  signature implies. A relation between the caller's own loans is retained for the borrow checker,
+  which is how the result keeps the key's loan. An implied bound typing neither proves nor retains
+  leaves the body unchecked (`UnprovedImpliedBound`) and does not refuse the call, so no program the
+  declared bounds admit is newly rejected. Bounds on a callable's invocation regions are owed at its
+  invocation, and so are those on a section's unsupplied binders.
+- **Source migration:** none. The compiler and standard library have no such caller.
+- **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall`. Direct, nested-view,
+  drop-carrying, qualified member, receiver member, callable-value and section calls are never
+  Checked. Clean calls, a write after the result's last use and callers that forward their own
+  parameters stay Checked. An operator implementation with this shape is not yet accepted
+  (SEM0135), so the operator path has no Case.
+
+### Native holds every loan of a literal in each of its field projections
+
+- **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
+  retired when native carries a field projection of a value that is no place only through the
+  regions its declared field type names.
+- **Rule:** LIFE-002 and BORROW-008. A field read of a struct literal holds the loans the
+  projected field's type can reach; a sibling field typed by a different lifetime parameter holds
+  its own loans.
+- **Compilers:** in `TwoRegions {first: &base, second: &Token {value: 4}}.first`, where
+  `TwoRegions<'a, 'b>` types each field by its own parameter, the bootstrap types each field at its
+  own region, so the temporary lent to `second` ends with the statement and a later read of the
+  projection is accepted. Native's borrow check carries every
+  loan the literal holds into the projection, even when the fields name distinct lifetime
+  parameters, and reports OWN0019 at that later read. With one shared region (`TwoViews<'a>`) both
+  compilers reject.
+- **Source migration:** bind the literal in a `let` before projecting it, or borrow the temporary
+  from a named local.
+- **Diagnostics and limits:** native over-rejects only; it never accepts a projection whose own
+  field holds an expired loan.
+- **Evidence:** `SemanticCaptureCases::sliceConversionsRetainRegionAccessAndDiagnostics`
+  (`projectedTemporaryEscape`, `projectedRegionsEscape`);
+  `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
+  spelling.
+
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
 - **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
@@ -2626,6 +2677,29 @@ src.t = Token { value: 1 }
   deferred.
 - **Native:** rejects the direct store with OWN0011 at the write, and the Effect forms the same
   way.
+
+### Bootstrap accepts a closure storing one captured loan where another capture reaches
+
+CAPTURE-002 and ANON-OWN-001 keep a captured loan for as long as anything the closure stored it in
+is used:
+
+```silk
+let mut slot = Slot {view: Option<&i32>.none()}
+if true {
+  let count = 41
+  let mut store = fn() -> () { slot.view = Option<&i32>.some(&count) }
+  store()
+}
+return read(&slot)
+```
+
+- **Bootstrap:** accepts it, and the program reads `count` after its block ends. It also accepts
+  the aliasing form, which writes `count` while `slot` still holds the loan.
+- **Native:** rejects the first program with OWN0019 at `&slot`, and the aliasing form with OWN0011
+  at the write. Passing the closure to a call that may invoke it, by value, by reference or in a
+  holder's field, rejects the same way. A store through a local reference to body storage leaves
+  the body unchecked
+  (`invalid/closure-capture-store-expired`, `invalid/closure-capture-store-alias`).
 
 ### Bootstrap MIR verification treats an unreachable match fallthrough as terminating
 

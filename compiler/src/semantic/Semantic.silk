@@ -280,6 +280,7 @@ import semantic.Type {
   Unification,
 }
 import semantic.TypedBody {
+  CaptureHold,
   Environment as BodyEnvironment,
   EnvironmentCapture as BodyEnvironmentCapture,
   ReferentCapture as BodyReferentCapture,
@@ -2187,6 +2188,9 @@ struct BodyFrame {
   /// (`outlivesShortenedBinders`). Their binding is admitted only when the borrow check proves the
   /// whole body; otherwise each call keeps its unshortened bound refusal (SEM0212).
   shortened: Vector<Span>
+  /// A declaration body's own signature, whose parameter and result types' implied bounds its
+  /// calls assume (`holdImpliedBounds`); none for every other frame.
+  signature: Option<Shared<Result<Answer, NoRejection>>>
   /// Whether this frame begins a body of its own: a declaration's body or a static root. A frame
   /// nested in it (a callable literal, an Effect block) reads its failed statements; a frame of
   /// another body pushed above it never does.
@@ -3172,6 +3176,224 @@ effect fn providerDeclaredBounds(resolver: &mut Resolver, owner: &mut Query<Answ
     }
   }
   return Vector<Constraint>.make()
+}
+
+// The region bounds the types of a signature imply by being well formed (LIFE-002): each nominal's
+// declared outlives and contents bounds applied to its arguments, in every type they hold, and a
+// view's referent outliving the view's region. The callee's body assumes them of its parameters and
+// result, so a call instantiating the signature proves them as it proves the declared bounds.
+effect fn impliedSignatureBounds(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, types: &[Shared<Type>], span: Span) -> Vector<Constraint>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut implied = Vector<Constraint>.make()
+  let mut pending = Vector<Shared<Type>>.make()
+  let mut at = usize.ZERO
+  while at < types.length {
+    let mut views = Vector<KeptBound>.make()
+    run Type.impliedBounds(&types[at], &mut views)
+    let bounds = Vector<KeptBound>.asSlice(&views)
+    let mut each = usize.ZERO
+    while each < bounds.length {
+      match &bounds[each] {
+        KeptBound.Outlives {longer, shorter} => run Vector<Constraint>.append(&mut implied,
+          Constraint.Outlives {longer: Shared<Lifetime>.clone(&longer), shorter: Shared<Lifetime>.clone(&shorter)})
+        KeptBound.Contents {subject, region} => run Vector<Constraint>.append(&mut implied,
+          Constraint.Contents {subject: Shared<Type>.clone(&subject), region: Shared<Lifetime>.clone(&region)})
+        _ => ()
+      }
+      each = each + usize.ONE
+    }
+    run Vector<Shared<Type>>.append(&mut pending, Shared<Type>.clone(&types[at]))
+    at = at + usize.ONE
+  }
+  while Vector<Shared<Type>>.length(&pending) > usize.ZERO {
+    let last = Vector<Shared<Type>>.length(&pending) - usize.ONE
+    let current = Vector<Shared<Type>>.remove(&mut pending, last)
+    // A compiler-sealed family (the `silk/core` cores, the `Intrinsic` families) has no source
+    // declaration to read bounds from; its arguments are still walked.
+    let named = Shared<Type>.with<Option<DeclarationId>>(&current, fn(node: &Type) -> Option<DeclarationId> {
+      if let Type.Nominal {declaration, ..} = &node.* { return Option<DeclarationId>.some(DeclarationId.copy(&declaration)) }
+      return Option<DeclarationId>.none()
+    })
+    let mut nominal = false
+    if let Option<DeclarationId>.Some {value: identity} = &named {
+      nominal = !ModuleId.withOrigin<bool>(DeclarationId.moduleId(&identity), sealedOrigin)
+    }
+    if nominal {
+      let declared = run providerDeclaredBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &current, span)
+      let listed = Vector<Constraint>.asSlice(&declared)
+      let mut each = usize.ZERO
+      while each < listed.length {
+        match &listed[each] {
+          Constraint.Outlives {..} => run Vector<Constraint>.append(&mut implied, copyConstraint(&listed[each]))
+          Constraint.Contents {..} => run Vector<Constraint>.append(&mut implied, copyConstraint(&listed[each]))
+          _ => ()
+        }
+        each = each + usize.ONE
+      }
+    }
+    run Type.structuralChildren(&current, &mut pending)
+  }
+  // A callable's invocation regions are fresh at each of its invocations, which owe the bounds its
+  // contract's types imply there; a call that only passes or returns the callable owes none of them.
+  let mut held = Vector<Constraint>.make()
+  let listed = Vector<Constraint>.asSlice(&implied)
+  at = usize.ZERO
+  while at < listed.length {
+    let quantified = match &listed[at] {
+      Constraint.Outlives {longer, shorter} => Lifetime.anyAtom(&longer, invocationRegion) || Lifetime.anyAtom(&shorter, invocationRegion)
+      Constraint.Contents {region, ..} => Lifetime.anyAtom(&region, invocationRegion)
+      _ => false
+    }
+    if !quantified { run Vector<Constraint>.append(&mut held, copyConstraint(&listed[at])) }
+    at = at + usize.ONE
+  }
+  return move held
+}
+
+fn sealedOrigin(origin: &[u8]) -> bool { return same(origin, b"compiler-sealed-core") || same(origin, b"compiler-sealed-intrinsic") }
+
+fn invocationRegion(value: &Lifetime) -> bool { return match &value.* { Lifetime.Invocation {..} => true _ => false } }
+
+// The bounds a resolved signature's parameter and result types imply (`impliedSignatureBounds`),
+// in its own binders' terms.
+effect fn signatureImpliedBounds(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, signature: &Shared<Result<Answer, NoRejection>>, span: Span) -> Vector<Constraint>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut types = run signatureParameterTypes(signature)
+  if let Option<Shared<Type>>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(signature, signatureResult) {
+    run Vector<Shared<Type>>.append(&mut types, move value)
+  }
+  return run impliedSignatureBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, Vector<Shared<Type>>.asSlice(&types), span)
+}
+
+// Holds a call to the bounds its callee's parameter and result types imply, applied to the call's
+// bindings. The callee's body assumes them, so the call proves them as it proves its declared
+// bounds, under the caller's premises and the bounds the caller's own signature implies. A bound
+// that typing neither proves nor retains, or that still names an unbound binder (`unbound`), leaves
+// the innermost body unchecked (`UnprovedImpliedBound`) rather than refusing a call the declared
+// bounds admit. Outside a body frame, lowering replays a call whose body typing already judged, so
+// there is nothing left to mark.
+effect fn holdImpliedBounds(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, declared: &[Constraint], implied: &[Constraint], unbound: bool,
+  module: &ModuleId, span: Span, origin: Option<BodyOrigin>) -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if unbound { return run retainUnprovedImpliedBound(&mut resolver.*) }
+  if implied.length == usize.ZERO { return () }
+  let mut premises = run copyConstraints(declared)
+  if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: own} = move rootBodySignature(&resolver.*) {
+    let assumed = run signatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &own, span)
+    let listed = Vector<Constraint>.asSlice(&assumed)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run Vector<Constraint>.append(&mut premises, copyConstraint(&listed[at]))
+      at = at + usize.ONE
+    }
+  }
+  // A contents bound at one of the caller's own loans holds of every type its declaration names,
+  // since all of them outlive its body; only the regions the subject names are left to relate.
+  let anchor = run DeclarationId.fromParts(ModuleId.copy(module), Vector<OwnerStep>.make())
+  let representations = Vector<Option<Shared<Type>>>.make()
+  let mut bounds = Vector<Constraint>.make()
+  let mut at = usize.ZERO
+  while at < implied.length {
+    let mut reduced = false
+    if let Constraint.Contents {subject, region} = &implied[at] {
+      if Lifetime.allAtoms(&region, bodyLoan) {
+        let mut retained = Vector<Shared<Lifetime>>.make()
+        drop run Type.retainedRegions(&subject, &anchor, Vector<Option<Shared<Type>>>.asSlice(&representations), &mut retained, false)
+        let regions = Vector<Shared<Lifetime>>.asSlice(&retained)
+        let mut regionAt = usize.ZERO
+        while regionAt < regions.length {
+          run Vector<Constraint>.append(&mut bounds, Constraint.Outlives {longer: Shared<Lifetime>.clone(&regions[regionAt]),
+            shorter: Shared<Lifetime>.clone(&region)})
+          regionAt = regionAt + usize.ONE
+        }
+        reduced = true
+      }
+    }
+    if !reduced { run Vector<Constraint>.append(&mut bounds, copyConstraint(&implied[at])) }
+    at = at + usize.ONE
+  }
+  // Only a relation that touches the caller's own loans is the borrow checker's to prove, so only
+  // such a bound may be retained on the body. Every other one holds under the premises or not at all.
+  let mut local = Vector<Constraint>.make()
+  let mut universal = Vector<Constraint>.make()
+  let listed = Vector<Constraint>.asSlice(&bounds)
+  at = usize.ZERO
+  while at < listed.length {
+    let loan = match &listed[at] {
+      Constraint.Outlives {longer, shorter} => Lifetime.anyAtom(&longer, bodyLoan) || Lifetime.anyAtom(&shorter, bodyLoan)
+      _ => false
+    }
+    if loan {
+      run Vector<Constraint>.append(&mut local, copyConstraint(&listed[at]))
+    } else {
+      run Vector<Constraint>.append(&mut universal, copyConstraint(&listed[at]))
+    }
+    at = at + usize.ONE
+  }
+  let refused = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &premises,
+    Vector<Constraint>.asSlice(&universal), module, span, Option<BodyOrigin>.none())
+  if let Option<Shared<Rejection>>.Some {..} = move refused { return run retainUnprovedImpliedBound(&mut resolver.*) }
+  let unretained = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &premises,
+    Vector<Constraint>.asSlice(&local), module, span, move origin)
+  if let Option<Shared<Rejection>>.Some {..} = move unretained { run retainUnprovedImpliedBound(&mut resolver.*) }
+  return ()
+}
+
+// Holds a call to `signature`'s implied bounds (`holdImpliedBounds`) under the call's `bindings`. A
+// bound that still names one of the call's fresh binders (`fresh`) is unbound, unless the call is a
+// section (`deferred`): a section binds such a binder only when its result is invoked, which owes
+// the bound then.
+effect fn holdSignatureImpliedBounds(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, signature: &Shared<Result<Answer, NoRejection>>, bindings: &[Binding],
+  fresh: &DeclarationId, deferred: bool, declared: &[Constraint], module: &ModuleId, span: Span, origin: Option<BodyOrigin>)
+  -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let written = run signatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, signature, span)
+  let listed = Vector<Constraint>.asSlice(&written)
+  let mut held = Vector<Constraint>.make()
+  let mut unbound = false
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let applied = run bindConstraint(&listed[at], bindings)
+    if run constraintMentionsOwner(&applied, fresh) {
+      if !deferred { unbound = true }
+    } else {
+      run Vector<Constraint>.append(&mut held, move applied)
+    }
+    at = at + usize.ONE
+  }
+  return run holdImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, declared,
+    Vector<Constraint>.asSlice(&held), unbound, module, span, move origin)
+}
+
+// The signature of the declaration whose body the innermost root frame checks, if it has one.
+fn rootBodySignature(resolver: &Resolver) -> Option<Shared<Result<Answer, NoRejection>>> {
+  let bodies = Vector<BodyFrame>.asSlice(&resolver.bodies)
+  let mut at = bodies.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    if bodies[at].root {
+      return match &bodies[at].signature {
+        Option<Shared<Result<Answer, NoRejection>>>.Some {value} => Option<Shared<Result<Answer, NoRejection>>>.some(Shared<Result<Answer, NoRejection>>.clone(&value))
+        _ => Option<Shared<Result<Answer, NoRejection>>>.none()
+      }
+    }
+  }
+  return Option<Shared<Result<Answer, NoRejection>>>.none()
+}
+
+// Leaves the innermost body unchecked for a callee's implied bound typing could not prove.
+effect fn retainUnprovedImpliedBound(resolver: &mut Resolver) -> () ! OutOfMemoryError ? &mut Allocator {
+  let popped = Vector<BodyFrame>.pop(&mut resolver.*.bodies)
+  if let Option<BodyFrame>.Some {value} = move popped {
+    let mut current = move value
+    run Vector<BodySafetyObligation>.append(&mut current.obligations, BodySafetyObligation.UnprovedImpliedBound)
+    run Vector<BodyFrame>.append(&mut resolver.*.bodies, move current)
+  }
+  return ()
 }
 
 fn sameHeadWith(first: &ImplementationHead, right: &Shared<ImplementationHead>) -> bool {
@@ -22003,28 +22225,9 @@ effect fn signatureRequirements(answer: &Shared<Result<Answer, NoRejection>>) ->
   }
 }
 
-// The requirement rows of the Effects a signature's result holds: the result itself, or an Effect
-// inside one of its type arguments, union members or array elements.
-effect fn signatureResultRequirements(answer: &Shared<Result<Answer, NoRejection>>) -> Vector<Shared<Row>>
-! OutOfMemoryError ? &mut Allocator {
-  let mut rows = Vector<Shared<Row>>.make()
-  let result = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(answer, fn(value: &Result<Answer, NoRejection>) -> Option<Shared<Type>> {
-    if let Result<Answer, NoRejection>.Success {value: resolved} = &value.* {
-      if let Outcome.Success {value: Value.Signature {signature}} = &resolved.outcome {
-        return Option<Shared<Type>>.some(Shared<Type>.clone(&signature.result))
-      }
-    }
-    return Option<Shared<Type>>.none()
-  })
-  if let Option<Shared<Type>>.Some {value} = &result {
-    run heldEffectRequirements(&value, &mut rows)
-  }
-  return move rows
-}
-
 // Appends the requirement row of each Effect a value of this type is or holds: through an Effect's
-// success value or contract, a nominal's type arguments, a union's members or an array's elements. A
-// callable's Effect is constructed only when it is called, so it is not held.
+// success value or contract, a callable's result, a nominal's type arguments, a union's members or an
+// array's elements. A callable holds the Effect its call produces from what it captures.
 effect fn heldEffectRequirements(value: &Shared<Type>, rows: &mut Vector<Shared<Row>>) -> () ! OutOfMemoryError ? &mut Allocator {
   if let Option<Shared<Row>>.Some {value: row} = move Shared<Type>.with<Option<Shared<Row>>>(value, ownEffectRequirements) {
     run Vector<Shared<Row>>.append(&mut rows.*, move row)
@@ -22041,6 +22244,136 @@ effect fn heldEffectRequirements(value: &Shared<Type>, rows: &mut Vector<Shared<
   return ()
 }
 
+// Appends the requirement rows of the Effects the members of each nominal in `value` hold, read from
+// the member types instantiated for that nominal's application, so a field typed `Effect<'k; …>`
+// counts as well as a type argument. Each application is walked once per signature, which bounds
+// the walk over shared and recursive member graphs. A declaration met again inside its own walk under
+// another application recurses polymorphically and may grow without bound, so it is not walked again.
+// What its members name under the new application differs from what the enclosing walk of that
+// declaration finds only through the arguments that differ, so those arguments are `reached` instead.
+// A nominal without arguments holds only Effects typed at 'static, which no body loan can reach, so it
+// is not walked.
+effect fn memberEffectRequirements(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  value: &Shared<Type>, rows: &mut Vector<Shared<Row>>, reached: &mut Vector<Shared<Type>>, walked: &mut Vector<usize>,
+  active: &mut Vector<Shared<Type>>, span: Span) -> ()
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut nominals = Vector<Shared<Type>>.make()
+  run Type.nominalOccurrences(value, &mut nominals)
+  let found = Vector<Shared<Type>>.asSlice(&nominals)
+  let mut at = usize.ZERO
+  while at < found.length {
+    let named = Shared<Type>.with<Option<DeclarationId>>(&found[at], nominalOf)
+    if let Option<DeclarationId>.Some {value: declaration} = move named {
+      let kind = DeclarationId.kind(&declaration)
+      let moduleOrdinal = declaringModuleOrdinal(&resolver.*, &found[at])
+      let generic = Shared<Type>.with<usize>(&found[at], nominalArity) != usize.ZERO
+      if generic && (kind == OwnerKind.Struct || kind == OwnerKind.Tuple || kind == OwnerKind.Union) && moduleOrdinal != usize.MAX {
+        let declaredModule = resolvedModule(&resolver.*, moduleOrdinal)
+        let ordinal = run ordinalOfProvider(&mut resolver.*, &declaredModule, &found[at])
+        if let Option<usize>.Some {value: declarationOrdinal} = move ordinal {
+          let written = run header(&mut resolver.*, &declaredModule, declarationOrdinal)
+          let count = match move written {
+            Option<HeaderSyntax>.Some {value: syntax} => match syntax.header {
+              Node.StructHeader {fields, ..} => fields.length
+              Node.TupleHeader {elements, ..} => elements.length
+              Node.UnionHeader {variants, ..} => variants.length
+              _ => usize.ZERO
+            }
+            Option<HeaderSyntax>.None => usize.ZERO
+          }
+          let application = run internApplication(&mut resolver.*, &found[at])
+          let prior = Vector<usize>.asSlice(&walked.*)
+          let mut seen = usize.ZERO
+          let mut fresh = true
+          while fresh && seen < prior.length {
+            if prior[seen] == application { fresh = false }
+            seen = seen + usize.ONE
+          }
+          let ancestors = Vector<Shared<Type>>.asSlice(&active.*)
+          let mut ancestor = ancestors.length
+          while fresh && ancestor > usize.ZERO {
+            ancestor = ancestor - usize.ONE
+            let enclosing = Shared<Type>.with<Option<DeclarationId>>(&ancestors[ancestor], nominalOf)
+            if let Option<DeclarationId>.Some {value: walking} = &enclosing {
+              if DeclarationId.equals(&walking, &declaration) {
+                run reachChangedArguments(&ancestors[ancestor], &found[at], &mut rows.*, &mut reached.*)
+                fresh = false
+              }
+            }
+          }
+          if fresh {
+            run Vector<usize>.append(&mut walked.*, application)
+            run Vector<Shared<Type>>.append(&mut active.*, Shared<Type>.clone(&found[at]))
+          }
+          let mut member = usize.ZERO
+          while fresh && member < count {
+            let request = Key {
+              family: Family.MemberShape, module: moduleOrdinal, name: application,
+              declaration: declarationOrdinal, member: member, external: false,
+            }
+            let shapeKey = run internDeclaration(&mut resolver.*, request)
+            let shape = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, shapeKey, span)
+            let length = Shared<Result<Answer, NoRejection>>.with<usize>(&shape, shapeLength)
+            let mut part = usize.ZERO
+            while length != usize.MAX && part < length {
+              let stored = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&shape,
+                fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return shapeTypeAt(answer, part) })
+              if let Option<Shared<Type>>.Some {value: held} = &stored {
+                run heldEffectRequirements(&held, &mut rows.*)
+                run memberEffectRequirements(&mut resolver.*, &mut owner.*, &mut dependencies.*, &held, &mut rows.*, &mut reached.*,
+                  &mut walked.*, &mut active.*, span)
+              }
+              part = part + usize.ONE
+            }
+            member = member + usize.ONE
+          }
+          if fresh { drop Vector<Shared<Type>>.pop(&mut active.*) }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Reaches each argument of `current` that differs from the one `enclosing`, an application of the
+// same declaration, has at its position: a type as itself, a row through its services, and a lifetime
+// through a place that stores at it.
+effect fn reachChangedArguments(enclosing: &Shared<Type>, current: &Shared<Type>, rows: &mut Vector<Shared<Row>>,
+  reached: &mut Vector<Shared<Type>>) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let count = nominalArgumentCount(current)
+  let mut at = usize.ZERO
+  while at < count {
+    let before = Shared<Type>.with<Option<Argument>>(enclosing, fn(node: &Type) -> Option<Argument> { return nominalArgument(node, at) })
+    let after = Shared<Type>.with<Option<Argument>>(current, fn(node: &Type) -> Option<Argument> { return nominalArgument(node, at) })
+    if let Option<Argument>.Some {value: changed} = move after {
+      match move changed {
+        Argument.Type {value} => {
+          let mut same = false
+          if let Option<Argument>.Some {value: Argument.Type {value: prior}} = &before { same = run Type.equalsShared(&prior, &value) }
+          if !same { run Vector<Shared<Type>>.append(&mut reached.*, move value) }
+        }
+        Argument.Lifetime {value} => {
+          let mut same = false
+          if let Option<Argument>.Some {value: Argument.Lifetime {value: prior}} = &before { same = Lifetime.equalsShared(&prior, &value) }
+          if !same {
+            let unit = run Types.intern(Type.Unit)
+            let held = run Types.intern(Type.Reference {referent: move unit, access: Access.Shared, lifetime: Shared<Lifetime>.clone(&value)})
+            run Vector<Shared<Type>>.append(&mut reached.*, run Types.intern(Type.Reference {referent: move held, access: Access.Mutable, lifetime: move value}))
+          }
+        }
+        Argument.Row {value} => {
+          let mut same = false
+          if let Option<Argument>.Some {value: Argument.Row {value: prior}} = &before { same = run Row.equalsShared(&prior, &value) }
+          if !same { run Vector<Shared<Row>>.append(&mut rows.*, move value) }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
 // The requirement row of an Effect type itself, not of the contract it is read through.
 fn ownEffectRequirements(value: &Type) -> Option<Shared<Row>> {
   if let Type.Effect {requirements, ..} = &value.* { return Option<Shared<Row>>.some(Shared<Row>.clone(&requirements)) }
@@ -22048,11 +22381,12 @@ fn ownEffectRequirements(value: &Type) -> Option<Shared<Row>> {
 }
 
 // The parts a value of this type holds that can be an Effect: an Effect's success value, the contract
-// of an opaque representation, join or composition, a nominal's type arguments, a union's members or
-// an array's element.
+// of an opaque representation, join or composition, a callable's result, a nominal's type arguments, a
+// union's members or an array's element.
 fn heldPartCount(value: &Type) -> usize {
   return match &value.* {
     Type.Effect {..} => usize.ONE
+    Type.Callable {..} => usize.ONE
     Type.OpaqueRepresentation {..} => usize.ONE
     Type.EffectJoin {..} => usize.ONE
     Type.EffectComposite {..} => usize.ONE
@@ -22066,6 +22400,7 @@ fn heldPartCount(value: &Type) -> usize {
 fn heldPartAt(value: &Type, at: usize) -> Option<Shared<Type>> {
   return match &value.* {
     Type.Effect {success, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&success))
+    Type.Callable {result, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&result))
     Type.OpaqueRepresentation {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
     Type.EffectJoin {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
     Type.EffectComposite {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
@@ -22101,8 +22436,10 @@ effect fn enterBodyFrame(resolver: &mut Resolver, signature: &Shared<Result<Answ
   let failure = run signatureFailure(signature)
   let requirements = run signatureRequirements(signature)
   let isEffect = Shared<Result<Answer, NoRejection>>.with<bool>(signature, signatureIsEffect)
+  let mut own = Option<Shared<Result<Answer, NoRejection>>>.none()
+  if root { own = Option<Shared<Result<Answer, NoRejection>>>.some(Shared<Result<Answer, NoRejection>>.clone(signature)) }
   return run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: isEffect, failure: move failure,
-    requirements: move requirements, derived: Option<DerivedChannels>.none(), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: root})
+    requirements: move requirements, derived: Option<DerivedChannels>.none(), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), signature: move own, root: root})
 }
 
 // Closes the innermost body frame of a block nested in a body, returning the region relations its
@@ -28519,6 +28856,8 @@ effect fn checkedOperatorCall(
   if let Option<Shared<Rejection>>.Some {value} = move failed {
     return Result<CheckedOperatorCall, Shared<Rejection>>.failResult(move value)
   }
+  run holdSignatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &signature,
+    Vector<Binding>.asSlice(&inferred), &operation, false, constraints, module, span, Option<BodyOrigin>.none())
   let result = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(
     &signature,
     signatureResult,
@@ -37216,8 +37555,18 @@ effect fn keptArguments(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
     at = at + usize.ONE
   }
   let covariant = run covariantSlots(&mut resolver.*, &mut owner.*, &mut dependencies.*, Vector<Shared<Type>>.asSlice(&variant), span)
+  // The requirement rows of the Effects the result is or holds, in its types or its members.
+  let mut rows = Vector<Shared<Row>>.make()
+  let mut reached = Vector<Shared<Type>>.make()
+  let result = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(signature, signatureResult)
+  if let Option<Shared<Type>>.Some {value: returned} = &result {
+    run heldEffectRequirements(&returned, &mut rows)
+    let mut walked = Vector<usize>.make()
+    let mut active = Vector<Shared<Type>>.make()
+    run memberEffectRequirements(&mut resolver.*, &mut owner.*, &mut dependencies.*, &returned, &mut rows, &mut reached, &mut walked, &mut active, span)
+  }
   let mut kept = run describedKept(signature, Vector<Shared<Type>>.asSlice(&declared), bindings, conforming, Vector<Shared<Lifetime>>.asSlice(&own),
-    Vector<CovariantSlot>.asSlice(&covariant))
+    Vector<CovariantSlot>.asSlice(&covariant), Vector<Shared<Row>>.asSlice(&rows), Vector<Shared<Type>>.asSlice(&reached))
   // A call's operands are its runtime arguments: a static parameter's argument is evaluated during
   // static evaluation and has no operand. Any other mismatch records nothing.
   let recordedCount = Vector<KeptRegions>.length(&kept)
@@ -37328,7 +37677,7 @@ effect fn signatureLifetimeList(signature: &Shared<Result<Answer, NoRejection>>)
 // What a callee keeps of each argument, from its `declared` parameter types, constraints,
 // environment and requirements; a `conforming` one also through what its signature does not carry.
 effect fn describedKept(signature: &Shared<Result<Answer, NoRejection>>, declared: &[Shared<Type>], bindings: &[Binding],
-  conforming: bool, own: &[Shared<Lifetime>], covariant: &[CovariantSlot])
+  conforming: bool, own: &[Shared<Lifetime>], covariant: &[CovariantSlot], rows: &[Shared<Row>], reached: &[Shared<Type>])
 -> Vector<KeptRegions> ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut bounds = run keptBounds(signature)
   // An Effect's environment outlives nothing its inputs retain (LIFE-004): every input outlives it.
@@ -37362,8 +37711,6 @@ effect fn describedKept(signature: &Shared<Result<Answer, NoRejection>>, declare
   // A returned Effect, or one the result holds, carries what it holds until it runs, and its run
   // reaches every service its requirement row names, so the callee can store an argument wherever
   // that row reaches.
-  let returnedRows = run signatureResultRequirements(signature)
-  let rows = Vector<Shared<Row>>.asSlice(&returnedRows)
   let mut row = usize.ZERO
   while row < rows.length {
     let returned = Shared<Row>.clone(&rows[row])
@@ -37378,6 +37725,12 @@ effect fn describedKept(signature: &Shared<Result<Answer, NoRejection>>, declare
       at = at + usize.ONE
     }
     row = row + usize.ONE
+  }
+  // A member walk cut short at a growing application reaches the arguments that changed.
+  at = usize.ZERO
+  while at < reached.length {
+    run Vector<KeptBound>.append(&mut bounds, KeptBound.Reaching {value: Shared<Type>.clone(&reached[at])})
+    at = at + usize.ONE
   }
   return run Type.keptRegions(declared, Vector<KeptBound>.asSlice(&bounds), bindings, conforming, own, covariant)
 }
@@ -37567,65 +37920,108 @@ effect fn collectHeld(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
   return ()
 }
 
-// Whether a value of type `value`, found in a position a callable can write when `storing`, has a
-// slot that can be given a borrow of a type in `held`. Writing through an exclusive borrow or a
-// pointer stores; a shared borrow's referent can be written only through a nested exclusive borrow
-// or pointer. A pointer is an address with no loan claim, so only what is written through it, never
-// where it points, can hold a loan. A type naming no region but `'static` and no contract holds none. A type parameter, an opaque or callable contract, an Effect, a service or interface,
-// a declaration whose members are not authored, and a walk deeper than its bound can hold anything.
+// Where a value of type `value`, found in a position a callable can write when `storing`, has a
+// slot that can be given a borrow of a type in `held` (`CaptureHold`). Writing through an exclusive
+// borrow or a pointer stores; a shared borrow's referent can be written only through a nested
+// exclusive borrow or pointer. A pointer is an address with no loan claim, so only what is written
+// through it, never where it points, can hold a loan. A type naming no region but `'static` and no
+// contract holds none. A slot is `Universal` when its own region names only `caller`'s lifetime
+// parameters, those of a named declaration enclosing it, or `'static` (`universalSlot`). A type
+// parameter, an opaque or callable contract, an Effect, a service or interface, a declaration whose
+// members are not authored, and a walk deeper than its bound can hold anything.
 effect fn positionHolds(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
-  value: &Shared<Type>, storing: bool, held: &[Shared<Type>], visited: &mut Vector<Shared<Type>>, depth: usize, span: Span) -> bool
+  value: &Shared<Type>, storing: bool, held: &[Shared<Type>], visited: &mut Vector<Shared<Type>>, caller: &DeclarationId, depth: usize,
+  span: Span) -> CaptureHold
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
-  if depth > holdDepth() { return true }
+  if depth > holdDepth() { return CaptureHold.Any }
   let form = Shared<Type>.with<HoldForm>(value, holdForm)
-  if form == HoldForm.Contract { return true }
-  if run loanFree(value) { return false }
+  if form == HoldForm.Contract { return CaptureHold.Any }
+  if run loanFree(value) { return CaptureHold.Never }
   // A string written where the callable stores can be given a view of held bytes.
   if form == HoldForm.Text {
     let mut at = usize.ZERO
     while storing && at < held.length {
-      if Shared<Type>.with<bool>(&held[at], fn(node: &Type) -> bool { return primitiveNamed(node, b"u8") }) { return true }
+      if Shared<Type>.with<bool>(&held[at], fn(node: &Type) -> bool { return primitiveNamed(node, b"u8") }) {
+        return Shared<Type>.with<CaptureHold>(value, fn(node: &Type) -> CaptureHold { return universalSlot(node, caller) })
+      }
       at = at + usize.ONE
     }
-    return false
+    return CaptureHold.Never
   }
   if form == HoldForm.Borrow || form == HoldForm.Store {
     let viewed = match move Shared<Type>.with<Option<Shared<Type>>>(value, holdReferent) {
       Option<Shared<Type>>.Some {value: found} => move found
-      Option<Shared<Type>>.None => { return true }
+      Option<Shared<Type>>.None => { return CaptureHold.Any }
     }
-    if storing && form == HoldForm.Borrow && run listsRuntimeType(held, &viewed) { return true }
+    let mut found = CaptureHold.Never
+    if storing && form == HoldForm.Borrow && run listsRuntimeType(held, &viewed) {
+      found = Shared<Type>.with<CaptureHold>(value, fn(node: &Type) -> CaptureHold { return universalSlot(node, caller) })
+      if found == CaptureHold.Any { return CaptureHold.Any }
+    }
     let inner = form == HoldForm.Store || Shared<Type>.with<bool>(value, holdExclusive)
-    return run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &viewed, inner, held, &mut visited.*, depth + usize.ONE, span)
+    return wider(found, run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &viewed, inner, held, &mut visited.*, caller,
+      depth + usize.ONE, span))
   }
-  // A type already walked in a storing position was fully walked there.
+  // A type already walked in a storing position was fully walked there, and its answer joined.
   if storing {
-    if run listsType(Vector<Shared<Type>>.asSlice(&visited.*), value) { return false }
+    if run listsType(Vector<Shared<Type>>.asSlice(&visited.*), value) { return CaptureHold.Never }
     run Vector<Shared<Type>>.append(&mut visited.*, Shared<Type>.clone(value))
   }
+  let mut parts = Vector<Shared<Type>>.make()
   if form == HoldForm.Nominal {
-    return match move run nominalMembers(&mut resolver.*, &mut owner.*, &mut dependencies.*, value, span) {
-      Option<Vector<Shared<Type>>>.Some {value: members} => {
-        let listed = Vector<Shared<Type>>.asSlice(&members)
-        let mut at = usize.ZERO
-        while at < listed.length {
-          if run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at], storing, held, &mut visited.*, depth + usize.ONE, span) { return true }
-          at = at + usize.ONE
-        }
-        return false
-      }
-      Option<Vector<Shared<Type>>>.None => true
+    parts = match move run nominalMembers(&mut resolver.*, &mut owner.*, &mut dependencies.*, value, span) {
+      Option<Vector<Shared<Type>>>.Some {value: members} => move members
+      Option<Vector<Shared<Type>>>.None => { return CaptureHold.Any }
     }
+  } else {
+    run Type.structuralChildren(value, &mut parts)
   }
-  let mut children = Vector<Shared<Type>>.make()
-  run Type.structuralChildren(value, &mut children)
-  let listed = Vector<Shared<Type>>.asSlice(&children)
+  let listed = Vector<Shared<Type>>.asSlice(&parts)
+  let mut found = CaptureHold.Never
   let mut at = usize.ZERO
   while at < listed.length {
-    if run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at], storing, held, &mut visited.*, depth + usize.ONE, span) { return true }
+    found = wider(found, run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at], storing, held, &mut visited.*, caller,
+      depth + usize.ONE, span))
+    if found == CaptureHold.Any { return CaptureHold.Any }
     at = at + usize.ONE
   }
-  return false
+  return found
+}
+
+// The wider of two hold answers: `Any` over `Universal` over `Never`.
+fn wider(left: CaptureHold, right: CaptureHold) -> CaptureHold {
+  if left == CaptureHold.Any || right == CaptureHold.Any { return CaptureHold.Any }
+  if left == CaptureHold.Universal || right == CaptureHold.Universal { return CaptureHold.Universal }
+  return CaptureHold.Never
+}
+
+// Whether a borrow, slice or string slot's own region names only `caller`'s lifetime parameters,
+// those of a named declaration enclosing it, or `'static`: a loan of a body local cannot be given to
+// such a slot, since the region of a body local outlives none of them. A parameter of an anonymous
+// body or an Effect block, an invocation binder, and any other atom answer `Any`.
+fn universalSlot(value: &Type, caller: &DeclarationId) -> CaptureHold {
+  let region = match &value.* {
+    Type.Reference {lifetime, ..} => Shared<Lifetime>.clone(&lifetime)
+    Type.Slice {lifetime, ..} => Shared<Lifetime>.clone(&lifetime)
+    Type.String {lifetime} => Shared<Lifetime>.clone(&lifetime)
+    _ => { return CaptureHold.Any }
+  }
+  if Lifetime.allAtoms(&region, fn(atom: &Lifetime) -> bool { return universalAtomOf(atom, caller) }) { return CaptureHold.Universal }
+  return CaptureHold.Any
+}
+
+// Whether a region atom outlives every body of `caller`: `'static`, or a lifetime parameter of `caller`
+// or of a named declaration enclosing it.
+fn universalAtomOf(atom: &Lifetime, caller: &DeclarationId) -> bool {
+  return match &atom.* {
+    Lifetime.Static => true
+    Lifetime.Parameter {declaration, ..} => {
+      let kind = DeclarationId.kind(&declaration)
+      return kind != OwnerKind.Anonymous && kind != OwnerKind.EffectBlock
+        && (DeclarationId.equals(&declaration, caller) || DeclarationId.isPrefixOf(&declaration, caller))
+    }
+    _ => false
+  }
 }
 
 // Whether no value of `value`'s type can hold a loan of a body: it names no region but `'static` and
@@ -37678,43 +38074,47 @@ effect fn listsType(listed: &[Shared<Type>], value: &Shared<Type>) -> bool ! Out
   return false
 }
 
-// Whether a callable could store a loan its capture `at` carries: some position it can write holds a
-// slot that can be given a borrow of what the capture views. The positions are the exclusive and
-// pointer-reached storage of its parameters and of every capture, the values it returns or fails
-// with, and the services its requirement rows name, which a run reaches as storage. A value of a
-// type no such slot admits is never written there, so the loan it carries stays in the callable's
-// environment.
+// Where a callable could store a loan its capture `at` carries (`CaptureHold`): the widest slot some
+// position it can write has that can be given a borrow of what the capture views. The positions are
+// the exclusive and pointer-reached storage of its parameters and of every capture, the values it
+// returns or fails with, and the services its requirement rows name, which a run reaches as storage.
+// A value of a type no such slot admits is never written there, so the loan it carries stays in the
+// callable's environment. `caller` is the declaration whose body constructs the callable.
 effect fn captureHoldable(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
-  captures: &[Shared<Type>], at: usize, contract: &Shared<Type>, span: Span) -> bool
+  captures: &[Shared<Type>], at: usize, contract: &Shared<Type>, caller: &DeclarationId, span: Span) -> CaptureHold
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut held = HeldTypes {types: Vector<Shared<Type>>.make(), open: false}
   let mut seen = Vector<Shared<Type>>.make()
   run collectHeld(&mut resolver.*, &mut owner.*, &mut dependencies.*, &captures[at], false, &mut held, &mut seen, span)
-  if held.open { return true }
+  if held.open { return CaptureHold.Any }
   let views = Vector<Shared<Type>>.asSlice(&held.types)
-  if views.length == usize.ZERO { return false }
-  let mut visited = Vector<Shared<Type>>.make()
-  let mut each = usize.ZERO
-  while each < captures.length {
-    if run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &captures[each], false, views, &mut visited, usize.ZERO, span) { return true }
-    each = each + usize.ONE
-  }
+  if views.length == usize.ZERO { return CaptureHold.Never }
   let mut positions = Vector<Shared<Type>>.make()
   let mut outputs = Vector<Shared<Type>>.make()
-  if run contractPositions(contract, &mut positions, &mut outputs) { return true }
+  if run contractPositions(contract, &mut positions, &mut outputs) { return CaptureHold.Any }
+  let mut visited = Vector<Shared<Type>>.make()
+  let mut found = CaptureHold.Never
+  let mut each = usize.ZERO
+  while each < captures.length && found != CaptureHold.Any {
+    found = wider(found, run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &captures[each], false, views, &mut visited, caller,
+      usize.ZERO, span))
+    each = each + usize.ONE
+  }
   let parameters = Vector<Shared<Type>>.asSlice(&positions)
   each = usize.ZERO
-  while each < parameters.length {
-    if run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &parameters[each], false, views, &mut visited, usize.ZERO, span) { return true }
+  while each < parameters.length && found != CaptureHold.Any {
+    found = wider(found, run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &parameters[each], false, views, &mut visited, caller,
+      usize.ZERO, span))
     each = each + usize.ONE
   }
   let reached = Vector<Shared<Type>>.asSlice(&outputs)
   each = usize.ZERO
-  while each < reached.length {
-    if run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &reached[each], true, views, &mut visited, usize.ZERO, span) { return true }
+  while each < reached.length && found != CaptureHold.Any {
+    found = wider(found, run positionHolds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &reached[each], true, views, &mut visited, caller,
+      usize.ZERO, span))
     each = each + usize.ONE
   }
-  return false
+  return found
 }
 
 // The parameter types of a callable use contract, and as outputs what it returns (`effectOutputs`);
@@ -38263,7 +38663,7 @@ effect fn checkEffectBlock<'scope>(
   if let Option<EffectChannels>.Some {value: declared} = move expectedChannels {
     run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: true, failure: Shared<Type>.clone(&declared.failure),
       requirements: Shared<Row>.clone(&declared.requirements), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false})
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), signature: Option<Shared<Result<Answer, NoRejection>>>.none(), root: false})
     let declaredCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
       &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
       &mut checkedNodes, &mut signatures, &mut required, block, &declared.success, constraints, true, false, usize.ZERO, false)
@@ -38287,7 +38687,7 @@ effect fn checkEffectBlock<'scope>(
     failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
     requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.some(DerivedChannels {
       returns: Vector<Shared<Type>>.make(), failed: Vector<Shared<Type>>.make(), failures: Vector<Shared<Type>>.make(),
-      requirements: Row.empty()}), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false})
+      requirements: Row.empty()}), obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), signature: Option<Shared<Result<Answer, NoRejection>>>.none(), root: false})
   let derivedCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
     &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
     &mut checkedNodes, &mut signatures, &mut required, block, &unit, constraints, true, false, usize.ZERO, false)
@@ -38335,7 +38735,7 @@ effect fn checkEffectBlock<'scope>(
     required = Vector<DeclarationId>.make()
     run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: true, failure: Shared<Type>.clone(&failure),
       requirements: Shared<Row>.clone(&requirements), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false})
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), signature: Option<Shared<Result<Answer, NoRejection>>>.none(), root: false})
     let declaredCheck = run checkBlock(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor, &identity,
       &mut locals, Vector<ResolvedAnnotation>.asSlice(&resolvedAnnotations), Vector<ResolvedCall>.asSlice(&calls),
       &mut checkedNodes, &mut signatures, &mut required, block, &success, constraints, true, false, usize.ZERO, false)
@@ -38531,13 +38931,14 @@ effect fn finishLiteral(
     Option<Shared<Type>>.Some {value} => move value
     Option<Shared<Type>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
   }
-  // Whether the callable could store what each capture carries, judged by the types its positions
-  // admit (`captureHoldable`).
-  let mut holdableFields = Vector<bool>.make()
+  // Where the callable could store what each capture carries, judged by the types and regions its
+  // positions admit (`captureHoldable`).
+  let mut holdableFields = Vector<CaptureHold>.make()
   let captureTypes = Vector<Shared<Type>>.asSlice(&fieldTypes)
   let mut field = usize.ZERO
   while field < captureTypes.length {
-    run Vector<bool>.append(&mut holdableFields, run captureHoldable(&mut resolver.*, &mut owner.*, &mut dependencies.*, captureTypes, field, &selectedContract, span))
+    run Vector<CaptureHold>.append(&mut holdableFields, run captureHoldable(&mut resolver.*, &mut owner.*, &mut dependencies.*, captureTypes, field,
+      &selectedContract, caller, span))
     field = field + usize.ONE
   }
   let exact = match move representationSignature {
@@ -38547,7 +38948,12 @@ effect fn finishLiteral(
   let obligations = run bodySafetyObligations(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes),
     bodyConstraints, move relations)
   // The anonymous body is checked like any body: its outer locals are the captured places, and
-  // its own loans and moves are proved before it is published (ANON-OWN-001).
+  // its own implicit moves, loans and moves are proved before it is published (ANON-OWN-001).
+  let implicit = run implicitAffineUse(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
+    Vector<BodyNode>.asSlice(&checkedNodes), bodyConstraints, &run cursorAnchor(cursor))
+  if let Option<Shared<Rejection>>.Some {value: rejection} = move implicit {
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(move rejection)
+  }
   let mut unchecked = BodyBorrowStatus.Regions
   let mut loansOpen = false
   let declared = match move run checkDeclaredRegions(&identity, bodyConstraints, Vector<BodySafetyObligation>.asSlice(&obligations)) {
@@ -39333,12 +39739,12 @@ effect fn currentBodyChannels(resolver: &Resolver) -> BodyFrame ! OutOfMemoryErr
   if bodies.length == usize.ZERO {
     return BodyFrame {isEffect: false, failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
       requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.none(),
-      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false}
+      obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), signature: Option<Shared<Result<Answer, NoRejection>>>.none(), root: false}
   }
   let current = &bodies[bodies.length - usize.ONE]
   return BodyFrame {isEffect: current.isEffect, failure: Shared<Type>.clone(&current.failure),
     requirements: Shared<Row>.clone(&current.requirements), derived: Option<DerivedChannels>.none(),
-    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: false}
+    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), signature: Option<Shared<Result<Answer, NoRejection>>>.none(), root: false}
 }
 
 // Whether the innermost body derives its channels from its `return`, `fail` and `run` sites.
@@ -44133,6 +44539,9 @@ effect fn invokeCallableValue<'scope>(
     Vector<Constraint>.asSlice(&applied), module, span, Option<BodyOrigin>.some(run originAt(cursor, expression, span)),
   )
   if let Option<Shared<Rejection>>.Some {value} = move failure { return Result<BodyNodeId, Shared<Rejection>>.failResult(move value) }
+  run holdSignatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &inference,
+    Vector<Binding>.asSlice(&inferred), &fresh, false, Vector<Constraint>.asSlice(&declared), module, span,
+    Option<BodyOrigin>.some(run originAt(cursor, expression, span)))
   let mut result = run Type.applyBindings(&facts.result, Vector<Binding>.asSlice(&inferred), true)
   // Invoking a generic `effect fn` section constructs the Effect its contract promises (EFF-001).
   if facts.isEffect {
@@ -44725,6 +45134,7 @@ effect fn checkDeclaredRegions(caller: &DeclarationId, constraints: &[Constraint
       }
       BodySafetyObligation.Contents {..} => { pending = true }
       BodySafetyObligation.RegionChoice {..} => { pending = true }
+      BodySafetyObligation.UnprovedImpliedBound => { pending = true }
       _ => ()
     }
     at = at + usize.ONE
@@ -46169,6 +46579,7 @@ Option<Shared<StaticData>>,
   let mut requirementRow = run signatureRequirements(&inference)
   let mut directApplication = Option<Application>.none()
   let mut appliedBounds = Vector<Constraint>.make()
+  let mut impliedBounds = Vector<Constraint>.make()
   if originalBinderCount == usize.ZERO {
     let boundCount = Shared<Result<Answer, NoRejection>>.with<usize>(
       &target.signature,
@@ -46258,6 +46669,10 @@ Option<Shared<StaticData>>,
           }
         }
         appliedBounds = run copyConstraints(Vector<Constraint>.asSlice(&signature.constraints))
+        let mut typed = run copyTypes(Vector<Shared<Type>>.asSlice(&signature.parameters))
+        run Vector<Shared<Type>>.append(&mut typed, Shared<Type>.clone(&signature.result))
+        impliedBounds = run impliedSignatureBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+          Vector<Shared<Type>>.asSlice(&typed), span)
         result = Option<Shared<Type>>.some(Shared<Type>.clone(&signature.result))
         failureType = Shared<Type>.clone(&signature.failure)
         requirementRow = Shared<Row>.clone(&signature.requirements)
@@ -46296,6 +46711,21 @@ Option<Shared<StaticData>>,
   if let Option<Shared<Rejection>>.Some {value} = move failed {
     return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
   }
+  let mut unbound = false
+  let mut heldBounds = Vector<Constraint>.make()
+  let impliedListed = Vector<Constraint>.asSlice(&impliedBounds)
+  boundAt = usize.ZERO
+  while boundAt < impliedListed.length {
+    if run constraintMentionsOwner(&impliedListed[boundAt], &freshOwner) {
+      unbound = true
+    } else {
+      run Vector<Constraint>.append(&mut heldBounds, copyConstraint(&impliedListed[boundAt]))
+    }
+    boundAt = boundAt + usize.ONE
+  }
+  run holdImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+    Vector<Constraint>.asSlice(&declaredBounds), Vector<Constraint>.asSlice(&heldBounds), unbound, module, span,
+    Option<BodyOrigin>.some(run originAt(cursor, expression, span)))
   let callResult = match move result {
     Option<Shared<Type>>.Some {value} => move value
     Option<Shared<Type>>.None => {
@@ -54919,7 +55349,7 @@ effect fn checkedStaticRoot(
   run Vector<BodyFrame>.append(&mut resolver.*.bodies, BodyFrame {isEffect: false,
     failure: run Types.intern(Type.Union {members: Vector<Shared<Type>>.make()}),
     requirements: run Shared<Row>.make(Row.empty()), derived: Option<DerivedChannels>.none(),
-    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), root: true})
+    obligations: Vector<BodySafetyObligation>.make(), occurrences: Vector<StaticIteration>.make(), staticApplication: Option<Application>.none(), staticPrefixes: Vector<Vector<StaticPrefixWork>>.make(), recovered: Vector<Shared<Rejection>>.make(), failedStatements: Vector<FailedStatement>.make(), shortened: Vector<Span>.make(), signature: Option<Shared<Result<Answer, NoRejection>>>.none(), root: true})
   let checked = run checkExpression(
     &mut resolver.*,
     &mut owner.*,
@@ -57561,6 +57991,8 @@ effect fn stagedCallableSchema(resolver: &mut Resolver, owner: &mut Query<Answer
   if let Option<Shared<Rejection>>.Some {value} = move refused {
     return Result<Shared<Type>, Shared<Rejection>>.failResult(move value)
   }
+  run holdSignatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &opened,
+    Vector<Binding>.asSlice(&inferred), &fresh, true, premises, module, span, Option<BodyOrigin>.none())
   // The source promise determines transport; exact storage retains the actual invocation mode.
   let actual = match move run CallableContract.ofType(&copied.contract) {
     Option<CallableFacts>.Some {value} => move value
@@ -76660,6 +77092,8 @@ effect fn finishDeferredNamedSection(resolver: &mut Resolver, owner: &mut Query<
   let refused = run proveAppliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &declared,
     Vector<Constraint>.asSlice(&fixedBounds), module, span, Option<BodyOrigin>.none())
   if let Option<Shared<Rejection>>.Some {value} = move refused { return Result<BodyNodeId, Shared<Rejection>>.failResult(move value) }
+  run holdSignatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, inference,
+    inferred, fresh, true, constraints, module, span, Option<BodyOrigin>.none())
   let mut result = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(signature, signatureResult) {
     Option<Shared<Type>>.Some {value} => move value
     _ => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
