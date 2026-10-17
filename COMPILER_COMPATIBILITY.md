@@ -735,6 +735,27 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
 
+### Bootstrap does not hold calls to their signatures' implied bounds
+
+- **Status:** recorded on 2026-10-17 from the regions census (residue). Native holds the call; the
+  bootstrap gap remains.
+- **Rule:** LIFE-002: a parameter or result type's well-formedness implies bounds the callee's body
+  assumes, so a call instantiating the signature must prove them like declared bounds:
+  `fn viaPair<'a, 'b>(x: &'a Key, p: Pair<'b, 'a>) -> &'b Key { return x }` with
+  `struct Pair<'b, 'a: 'b>` returns its `&'a Key` as `&'b Key` on `Pair`'s `'a: 'b` alone, so the
+  result keeps the key's loan.
+- **Compilers:** the bootstrap accepts `let r = viaPair(&k, Pair {short: &v, long: &w})`, then a
+  write to `k` and a read of `r`; with a key that has `Drop` this reads freed storage. Native adds
+  each nominal's declared region bounds and each view's referent bound of the signature's parameter
+  and result types to the bounds a direct or member call proves (`impliedSignatureBounds`), so the
+  result keeps the loan and such a body is never Checked. It is left unchecked rather than rejected:
+  the result's loans are alternatives across operands, and a conflict with an alternative loan is
+  not a proof.
+- **Source migration:** none. The compiler and standard library have no such caller.
+- **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall` (direct, nested-view,
+  drop-carrying, qualified and receiver member, and callable-value calls are never Checked; clean
+  calls and a write after the result's last use stay Checked).
+
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
 - **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
