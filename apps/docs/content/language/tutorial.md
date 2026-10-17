@@ -25,19 +25,24 @@ You get this layout:
 
 ```
 hello/
-  silk.toml      # [package] name, version, root
+  silk.toml      # [package] name, version, silk-version, root
   .gitignore     # ignores the build/ directory
   src/main.silk  # the entry point named by root
 ```
 
-The generated `silk.toml` names the entry file:
+The generated `silk.toml` names the entry file and records, as `silk-version`, the release of the
+compiler that created the project:
 
 ```toml
 [package]
 name = "hello"
 version = "0.1.0"
+silk-version = "0.1.0"
 root = "src/main.silk"
 ```
+
+`silk-version` is optional. When present it must be a semantic version; no command compares it with
+the running compiler.
 
 And the generated `src/main.silk` is the smallest program that does nothing:
 
