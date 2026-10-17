@@ -758,8 +758,9 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   declared bounds admit is newly rejected. Bounds on a callable's invocation regions are owed at its
   invocation, and so are those on a section's unsupplied binders.
   A nominal that declares no bound can still imply one through its stored data: with
-  `struct Outer<'a, 'b> { inner: Pair<'a, 'b> }`, `fn stash<'a, 'b>(other: &'b i32, slot: &mut
-  Slot<'a>, o: Outer<'a, 'b>)` may store `other` at `'a`. The bootstrap accepts
+  `struct Outer<'a, 'b> { inner: Pair<'a, 'b> }`, the callee
+  `fn stash<'a, 'b>(other: &'b i32, slot: &mut Slot<'a>, o: Outer<'a, 'b>)` may store `other` at
+  `'a`. The bootstrap accepts
   `stash(&c, &mut slot.*, move o)` with a local `c` and a caller's `slot`, which leaves the
   caller's slot pointing at `c` after it ends; it gives SEM0212 when the section `stash(&c)` binds
   only `other`. Native leaves both bodies unchecked.
