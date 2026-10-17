@@ -348,6 +348,23 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   still refuse runtime embedding, and arrays of nominal values retain their static construction refusal.
   The five required corpus programs and all eleven authored examples pass.
 
+### Bootstrap accepts a reflected borrow of another parameter at the first's region
+
+- **Status:** recorded on 2026-10-17 from the independent review of #1896. Bootstrap divergence.
+- **Rule:** LIFE-002. `borrowField(owner, field)` returns a view at `owner`'s region. Storing it
+  in a local typed by another parameter's region and returning it there needs that relation.
+- **Compilers:** in `fn pick<'a, 'b>(x: &'a Box, y: &'b Box) -> &'a i32 { let mut r = &x.first
+static for field in Intrinsic.reflectFields<Box>() { r = Reflect.borrowField<Box, i32>(y, field) }
+return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
+  accepts the program whether `pick` is called with one owner for both parameters or with two
+  distinct owners. The bootstrap also accepts a caller that passes a shorter-lived second owner
+  (`fn apart<'p>(v: &'p Box) -> &'p i32 { let w = Box { first: 1, second: 2 }  return pick(v, &w) }`),
+  which returns a view of a dead local.
+- **Source migration:** none. Declare `'b: 'a` when the result may come from `y`.
+- **Evidence:** `BorrowFieldCases::selectedBodiesProveOnlyTheirOwnSuppliedRegions`
+  (`reflectedOther`) pins the native rejection's code and span.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
 ### Checked local control in native static functions
 
 - **Status:** focused native control claims passed on 2026-10-10 in the coordinated eleven-actor
