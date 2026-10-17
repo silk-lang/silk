@@ -389,6 +389,7 @@ export const loanEndOperations = (
       _tag: 'Drop',
       local: temporary.local,
       cleanup: cleanupForLocal(fn, temporary.cleanup, localType),
+      hiddenOwner: true,
       provenance: generated(temporary.span),
     },
   ]
@@ -515,6 +516,7 @@ export const propagationReleases = (
       _tag: 'Drop',
       local: temporary.local,
       cleanup: cleanupForLocal(fn, temporary.cleanup, localType),
+      hiddenOwner: true,
       provenance: generated(temporary.span),
     })
     retained.add(temporary.local.ordinal)
@@ -575,7 +577,8 @@ export const emitReleases = (fn: FunctionLowering, exit: Ownership.ExitPlan | un
   const [, endings] = fn.capture(() => {
     for (const borrow of exit?.loanEnds ?? []) {
       const slice = fn.loanLocals.get(borrowKey(borrow))
-      if (slice === undefined) continue
+      if (slice === undefined || (exit?.kind !== 'Return' && !fn.endsLoan(borrowKey(borrow))))
+        continue
       const call = BodyView.node(fn.owner.view, borrow.call)
       if (call === undefined) throw new RangeError('loan refers to a node outside its body')
       fn.emit({
@@ -587,15 +590,24 @@ export const emitReleases = (fn: FunctionLowering, exit: Ownership.ExitPlan | un
       fn.loanLocals.delete(borrowKey(borrow))
     }
     if (exit?.kind === 'Return') {
-      endLoans(
-        fn,
-        [...fn.loanLocals.keys()].flatMap((key) => {
-          const borrow = fn.loanIds.get(key)
-          return borrow === undefined ? [] : [borrow]
-        }),
-        exit.span,
+      fn.inScopeCleanup(() =>
+        endLoans(
+          fn,
+          [...fn.loanLocals.keys()].flatMap((key) => {
+            const borrow = fn.loanIds.get(key)
+            return borrow === undefined ? [] : [borrow]
+          }),
+          exit.span,
+        ),
       )
     }
+    // Leaving a loop ends the temporary loans an iteration began; the scopes that own them end.
+    const entered =
+      (exit?.kind === 'Break' || exit?.kind === 'Continue') && exit.target !== undefined
+        ? fn.loopEntryLoans.get(exit.target.ordinal)
+        : undefined
+    if (exit !== undefined && entered !== undefined)
+      fn.inScopeCleanup(() => endLoans(fn, temporaryLoansBegunSince(fn, entered), exit.span))
     for (const release of exit?.releases ?? []) {
       if (release.binding.site._tag !== 'Let') continue
       const ordinal = release.binding.site.binding.ordinal
@@ -608,6 +620,19 @@ export const emitReleases = (fn: FunctionLowering, exit: Ownership.ExitPlan | un
   )
   fn.appendCaptured(orderedCleanup(fn, [...cleanup, ...exitDrops(fn, exit)]))
 }
+
+/** The held temporary loans begun since `entered`, latest first. */
+export const temporaryLoansBegunSince = (
+  fn: FunctionLowering,
+  entered: ReadonlySet<string>,
+): ReadonlyArray<Tir.BorrowId> =>
+  [...fn.loanLocals.keys()]
+    .filter((key) => !entered.has(key) && fn.temporaryBorrowOwners.has(key))
+    .reverse()
+    .flatMap((key) => {
+      const borrow = fn.loanIds.get(key)
+      return borrow === undefined ? [] : [borrow]
+    })
 
 /** Resolves every live acquisition category through one reverse acquisition order. */
 const exitDrops = (
@@ -660,6 +685,10 @@ const exitDrops = (
         span: temporary.span,
       })
   }
+  // An exit temporary that a loan borrows is a hidden owner, however its release is emitted.
+  const hiddenOwners = new Set(
+    [...fn.temporaryBorrowOwners.values()].map((owner) => owner.local.ordinal),
+  )
   return releases
     .sort((left, right) => right.ordinal - left.ordinal)
     .flatMap((release): ReadonlyArray<Mir.DropOperation> => {
@@ -674,6 +703,7 @@ const exitDrops = (
               ...(release.initialization === undefined
                 ? {}
                 : { initialization: release.initialization }),
+              ...(hiddenOwners.has(release.local.ordinal) ? { hiddenOwner: true as const } : {}),
               provenance: generated(release.span),
             },
           ]
@@ -1079,6 +1109,73 @@ export const terminalLoopLoanEndings = (
     }
     return outcome._tag === 'Trap' ? [ending] : loanEndOperations(fn, ending)
   })
+
+/** The operation with each nested execution (scope body, branch, operand, guard or arm) transformed. */
+const mapNestedExecutions = (
+  operation: Mir.Operation,
+  transform: (execution: Mir.Execution) => Mir.Execution,
+): Mir.Operation => {
+  if (operation._tag === 'DiagnosticScope') return { ...operation, body: transform(operation.body) }
+  if (operation._tag === 'Conditional')
+    return {
+      ...operation,
+      taken: transform(operation.taken),
+      otherwise: transform(operation.otherwise),
+    }
+  if (operation._tag === 'ShortCircuit') return { ...operation, right: transform(operation.right) }
+  if (operation._tag === 'Match')
+    return {
+      ...operation,
+      arms: operation.arms.map((arm) => ({
+        ...arm,
+        ...(arm.guard === undefined
+          ? {}
+          : { guard: { ...arm.guard, execution: transform(arm.guard.execution) } }),
+        selected: { ...arm.selected, execution: transform(arm.selected.execution) },
+      })),
+    }
+  return operation
+}
+
+/**
+ * Ends loop-entry loans at the returns and traps nested in a loop region's operations, such as a
+ * `return` inside a match arm. `withoutLoanEndings` removed their endings there too.
+ */
+export const withNestedTerminalLoanEndings = (
+  fn: FunctionLowering,
+  operations: ReadonlyArray<Mir.Operation>,
+  loans: ReadonlyArray<DelayedLoopLoan>,
+): ReadonlyArray<Mir.Operation> =>
+  operations.map((operation) =>
+    mapNestedExecutions(operation, (execution) => ({
+      ...execution,
+      regions: execution.regions.map((region): Mir.Region => {
+        if (region._tag !== 'OperationRegion' && region._tag !== 'CleanupRegion') return region
+        const last = region._tag === 'OperationRegion' ? region.operations.at(-1) : undefined
+        // A trap after an expression whose every path transferred is unreachable, and those paths
+        // end the loans at their own exits.
+        const transferred =
+          region.outcome._tag === 'Trap' &&
+          (last?._tag === 'Match' ||
+            last?._tag === 'Conditional' ||
+            last?._tag === 'DiagnosticScope' ||
+            last?._tag === 'PropagateEffectFailure')
+        const terminalEndings =
+          !transferred && (region.outcome._tag === 'Return' || region.outcome._tag === 'Trap')
+            ? terminalLoopLoanEndings(fn, loans, region.outcome)
+            : []
+        if (region._tag === 'OperationRegion')
+          return {
+            ...region,
+            operations: [
+              ...withNestedTerminalLoanEndings(fn, region.operations, loans),
+              ...terminalEndings,
+            ],
+          }
+        return { ...region, releases: orderedCleanup(fn, [...terminalEndings, ...region.releases]) }
+      }),
+    })),
+  )
 
 /** Adds loop-entry loans to failure exits after their authored success endings move past the loop. */
 export const withDelayedFailureLoanEndings = (
