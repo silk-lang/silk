@@ -11,8 +11,9 @@ Defines how the Silk CLI safely creates a minimal executable project in a new or
 `silk init [path]` SHALL create a sparse `silk.toml`, a `src/main.silk` executable entry declared as
 a public zero-argument `effect fn main() -> ()`, and a `/build/` ignore rule at the selected project
 directory. An omitted path SHALL select the current directory, and a missing selected directory
-SHALL be created. The generated project SHALL load, check, build, and run using manifest defaults
-without further configuration.
+SHALL be created. The generated manifest SHALL record the creating compiler's release version as
+`[package].silk-version`. The generated project SHALL load, check, build, and run using manifest
+defaults without further configuration.
 
 #### Scenario: Initialize a named child directory
 
