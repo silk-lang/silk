@@ -743,9 +743,10 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
 - **Rule:** LIFE-002 and BORROW-008. A field read of a struct literal holds the loans the
   projected field's type can reach; a sibling field typed by a different lifetime parameter holds
   its own loans.
-- **Compilers:** the bootstrap types each field of `TwoRegions<'a, 'b> {first: &base, second:
-  &Token {value: 4}}.first` at its own region, so the temporary lent to `second` ends with the
-  statement and a later read of the projection is accepted. Native's borrow check carries every
+- **Compilers:** in `TwoRegions {first: &base, second: &Token {value: 4}}.first`, where
+  `TwoRegions<'a, 'b>` types each field by its own parameter, the bootstrap types each field at its
+  own region, so the temporary lent to `second` ends with the statement and a later read of the
+  projection is accepted. Native's borrow check carries every
   loan the literal holds into the projection, even when the fields name distinct lifetime
   parameters, and reports OWN0019 at that later read. With one shared region (`TwoViews<'a>`) both
   compilers reject.
