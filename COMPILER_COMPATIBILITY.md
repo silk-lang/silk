@@ -843,6 +843,7 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   other written form keeps the borrow live through the body natively as well: a binding type, a
   call or method or constructor argument, including one whose inferred type sits beneath a view, an
   Effect call run at once, a record literal field and a reborrow through a body-local reference.
+
 - **Source migration:** none.
 - **Diagnostics and limits:** native reports the three call forms Checked, and leaves the nested
   literal as a regions gap, while the bootstrap rejects all four with OWN0011.
