@@ -758,8 +758,10 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
 - **Source migration:** none. The compiler and standard library have no such caller.
 - **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall`. Direct, nested-view,
   drop-carrying, qualified member, receiver member, callable-value and section calls are never
-  Checked. Clean calls, a write after the result's last use and callers that forward their own
-  parameters stay Checked. An operator implementation with this shape is not yet accepted
+  Checked. An Effect value run under such a bound keeps the key's loan, so a write while its result
+  lives is rejected (OWN0011 at the write, OWN0019 at the read); the bootstrap accepts it. Clean
+  calls, a write after the result's last use and callers that forward their own parameters stay
+  Checked. An operator implementation with this shape is not yet accepted
   (SEM0135), so the operator path has no Case.
 
 ### Native holds every loan of a literal in each of its field projections
