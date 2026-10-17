@@ -365,6 +365,22 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   (`reflectedOther`) pins the native rejection's code and span.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
 
+### Bootstrap binds a receiver call's written list to its owner's parameters
+
+- **Status:** recorded on 2026-10-17 while lent receivers moved to open owners. Bootstrap divergence.
+- **Rule:** GEN-008. A generic type's parameters are written on the type and a member's own on the
+  member. In `value.member<B>(...)` the receiver supplies the owner's arguments and `B` is the
+  member's own explicit prefix under GEN-003.
+- **Compilers:** with `impl<'o, T> C<'o, T> { fn conv<U>(self: &'o Self, u: U) -> U }` and a `c`
+  of type `C<'a, u64>`, native accepts `c.conv<u8>(3)` and rejects `c.conv<u8>(true)` with SEM0012.
+  The bootstrap binds `u8` to `T` and rejects both with SEM0012 at the receiver. Both reject the
+  qualified `C.conv<u8>(&c, 3)` with SEM0221.
+- **Source migration:** none for native. For the bootstrap, omit the list and let the argument
+  infer `U`.
+- **Evidence:** `SemanticCaptureCases::lentReceiversMeetTheirExplicitLoan` (`writtenList`,
+  `writtenListMismatch`, `writtenOwnerSlot` and `writtenOwnerSlotMismatch`) pins the native binding.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
 ### Checked local control in native static functions
 
 - **Status:** focused native control claims passed on 2026-10-10 in the coordinated eleven-actor

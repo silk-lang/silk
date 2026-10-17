@@ -1852,6 +1852,8 @@ struct CallReceiver {
   subject: HirId
   memberSpan: Span
   bound: bool
+  // The receiver is an implicit loan of a place, matched as the `&place` argument it stands for.
+  lent: bool
 }
 
 // A written call prefix and its private templates for omitted body regions.
@@ -29111,10 +29113,11 @@ effect fn selectInterfaceReceiverCall(
 }
 
 // A receiver call's written list binds a prefix of its member's own type binders; more arguments
-// than the member declares is an arity error at the call (the receiver supplies the owner's).
+// than the member declares is an arity error at the call (the receiver supplies the owner's). An
+// open owner's `ownerTypes` binders lead the signature's list and are never written here.
 effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor,
   caller: &DeclarationId, annotations: &[ResolvedAnnotation], signature: &Shared<Result<Answer, NoRejection>>,
-  member: &DeclarationId, generics: HirRef, span: Span) -> Result<CallPrefix, Shared<Rejection>>
+  member: &DeclarationId, generics: HirRef, ownerTypes: usize, span: Span) -> Result<CallPrefix, Shared<Rejection>>
 ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
   let mut arguments = Vector<Argument>.make()
   let mut slots = Vector<CallPrefixSlot>.make()
@@ -29132,7 +29135,7 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
   if !supported {
     return Result<CallPrefix, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Unsupported, listSpan))
   }
-  let declared = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureTypeParameterCount)
+  let declared = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureTypeParameterCount) - ownerTypes
   if written.length > declared {
     return Result<CallPrefix, Shared<Rejection>>.failResult(run rejectArity(resolver, module, span, declared, written.length))
   }
@@ -29155,7 +29158,7 @@ effect fn writtenMemberPrefix(resolver: &Resolver, module: &ModuleId, cursor: &A
     }
     // A region elided inside a written argument has no call-site inference lane yet.
     let parameter = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(signature,
-      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureTypeParameter(answer, at) })
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureTypeParameter(answer, ownerTypes + at) })
     let binder = match move parameter {
       Option<Shared<Type>>.Some {value} => move value
       Option<Shared<Type>>.None => {
@@ -29213,13 +29216,28 @@ effect fn matchReceiverOperand(resolver: &mut Resolver, owner: &mut Query<Answer
   return move failed
 }
 
+// Whether an inherent call lends its receiver: it borrows a receiver value that is not already a
+// reference, as the explicit `&place` or `&mut place` argument would.
+fn lentReceiver(choice: &InherentCallChoice, receiverType: &Shared<Type>) -> bool {
+  if let InherentCallChoice.Selected {receiver, ..} = &choice.* {
+    if let Option<ReceiverPosition>.Some {value} = &receiver {
+      return value.mode != BodyReceiverPass.Take && !Shared<Type>.with<bool>(receiverType, referenceValue)
+    }
+  }
+  return false
+}
+
+fn referenceValue(value: &Type) -> bool {
+  return match &value.* { Type.Reference {..} => true _ => false }
+}
+
 // Adapts a checked receiver to its selected receiver parameter: a loan of the receiver's place,
 // through a dereference when the receiver is a reference to it, or the transfer of a by-value place.
 effect fn adaptReceiver<'scope>(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
   statementScope: &mut StatementScope<'scope>, nodes: &mut Vector<BodyNode>, constraints: &[Constraint], subject: HirId,
   span: Span, memberSpan: Span, receiverNode: BodyNodeId, receiverType: &Shared<Type>, provider: &Shared<Type>,
-  mode: BodyReceiverPass, expectedReceiver: &Shared<Type>, bound: bool) -> Result<BodyNodeId, Shared<Rejection>>
+  mode: BodyReceiverPass, expectedReceiver: &Shared<Type>, bound: bool, openOwner: bool) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let exactReceiver = run Type.equalsShared(receiverType, expectedReceiver)
   let borrowed = Shared<Type>.with<Option<ReferenceReceiver>>(
@@ -29321,8 +29339,15 @@ effect fn adaptReceiver<'scope>(resolver: &mut Resolver, owner: &mut Query<Answe
     ) {
       return run bodyRejection(&resolver.*, module, RejectionCode.ExclusiveBorrowRequiresMutable, memberSpan)
     }
+    // An open owner's receiver parameter still names its binders; the loan holds the receiver's
+    // own type, which inference then meets with that parameter.
+    let mut loanShape = Shared<Type>.clone(expectedReceiver)
+    if openOwner {
+      loanShape = run Types.intern(Type.Reference {referent: Shared<Type>.clone(provider), access: access,
+        lifetime: run Shared<Lifetime>.make(Lifetime.Static)})
+    }
     let borrowedReceiver = run callerReferenceType(
-      expectedReceiver,
+      &loanShape,
       caller,
       subject, &run cursorAnchor(cursor),
     )
@@ -29510,10 +29535,41 @@ effect fn checkReceiverCall<'scope>(
     module,
     memberSpan,
   )
-  let own = match move inherent {
+  let mut own = match move inherent {
     Result<InherentCallChoice, Shared<Rejection>>.Success {value} => move value
     Result<InherentCallChoice, Shared<Rejection>>.Failure {error} => {
       return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+    }
+  }
+  // A receiver lent for the call is the `&place` argument it stands for. As in the unapplied
+  // `Owner.member(&place)`, the loan's referent supplies the owner's binders by inference instead
+  // of fixing them, so a covariant owner's regions meet the loan's own region. A written list still
+  // binds only the member's own binders, which follow the owner's in the open signature.
+  let lent = lentReceiver(&own, &receiverType)
+  let mut ownerTypes = usize.ZERO
+  if lent {
+    // The open signature still names the owner's binders, so the receiver position comes from the
+    // applied selection of the same member.
+    let mut applied = Option<ReceiverPosition>.none()
+    let mut appliedTypes = usize.ZERO
+    if let InherentCallChoice.Selected {target, receiver} = &own {
+      appliedTypes = Shared<Result<Answer, NoRejection>>.with<usize>(&target.signature, signatureTypeParameterCount)
+      if let Option<ReceiverPosition>.Some {value} = &receiver {
+        applied = Option<ReceiverPosition>.some(ReceiverPosition {ordinal: value.ordinal, mode: value.mode})
+      }
+    }
+    let reopened = run selectInherentReceiverCall(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+      true, &provider, Bytes.asSlice(&member), true, false, module, memberSpan)
+    own = match move reopened {
+      Result<InherentCallChoice, Shared<Rejection>>.Success {value: InherentCallChoice.Selected {target, ..}} =>
+        InherentCallChoice.Selected {target: move target, receiver: move applied}
+      Result<InherentCallChoice, Shared<Rejection>>.Success {value} => move value
+      Result<InherentCallChoice, Shared<Rejection>>.Failure {error} => {
+        return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
+      }
+    }
+    if let InherentCallChoice.Selected {target, ..} = &own {
+      ownerTypes = Shared<Result<Answer, NoRejection>>.with<usize>(&target.signature, signatureTypeParameterCount) - appliedTypes
     }
   }
   let mut maybeChoice = Option<ReceiverCallChoice>.none()
@@ -29624,7 +29680,7 @@ effect fn checkReceiverCall<'scope>(
   }
   let adapted = run adaptReceiver(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
     &mut statementScope.*, &mut nodes.*, constraints, subject, span, memberSpan, receiverNode, &receiverType, &provider,
-    receiverPositionValue.mode, &expectedReceiver, false)
+    receiverPositionValue.mode, &expectedReceiver, false, lent)
   let adaptedReceiver = match move adapted {
     Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
     Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
@@ -29636,7 +29692,7 @@ effect fn checkReceiverCall<'scope>(
     ReceiverCallChoice.Inherent {target, ..} => {
       let mut declaration = move target
       let prefix = run writtenMemberPrefix(&resolver.*, module, cursor, caller, statementScope.annotations,
-        &signature, &callDeclaration, generics, span)
+        &signature, &callDeclaration, generics, ownerTypes, span)
       let written = match move prefix {
         Result<CallPrefix, Shared<Rejection>>.Success {value} => move value
         Result<CallPrefix, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
@@ -29647,7 +29703,7 @@ effect fn checkReceiverCall<'scope>(
       declaration.prefixLifetimes = written.lifetimes
       declaration.explicitSyntax = generics.present
       let operand = Option<CallReceiver>.some(CallReceiver {node: adaptedReceiver, pass: receiverPass, subject: subject,
-        memberSpan: memberSpan, bound: false})
+        memberSpan: memberSpan, bound: false, lent: lent})
       return run checkDeclarationCall(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
         caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, expression, span,
         move declaration, arguments, false, &operand, expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed,
@@ -29662,7 +29718,8 @@ effect fn checkReceiverCall<'scope>(
   )
   let mut inferred = Vector<Binding>.make()
   let none = Vector<usize>.make()
-  let operand = CallReceiver {node: adaptedReceiver, pass: receiverPass, subject: subject, memberSpan: memberSpan, bound: false}
+  let operand = CallReceiver {node: adaptedReceiver, pass: receiverPass, subject: subject, memberSpan: memberSpan, bound: false,
+    lent: false}
   let receiverFailure = run matchReceiverOperand(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
     Vector<BodyNode>.asSlice(&nodes.*), &operand, &expectedReceiver, &callDeclaration, caller, Vector<Shared<DeclarationId>>.asSlice(&variables),
     Vector<usize>.asSlice(&none), &mut inferred, constraints)
@@ -39239,7 +39296,7 @@ effect fn checkBoundMethod<'scope>(resolver: &mut Resolver, owner: &mut Query<An
   }
   let adapted = run adaptReceiver(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
     &mut statementScope.*, &mut nodes.*, constraints, subject, span, memberSpan, receiverNode, receiverType, receiverType,
-    position.mode, &expectedReceiver, true)
+    position.mode, &expectedReceiver, true, false)
   let receiver = match move adapted {
     Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
     Result<BodyNodeId, Shared<Rejection>>.Failure {error: diagnostic} => {
@@ -39253,7 +39310,7 @@ effect fn checkBoundMethod<'scope>(resolver: &mut Resolver, owner: &mut Query<An
   target.prefixLifetimes = usize.ZERO
   target.explicitSyntax = false
   let operand = Option<CallReceiver>.some(CallReceiver {node: receiver, pass: position.mode, subject: subject,
-    memberSpan: memberSpan, bound: true})
+    memberSpan: memberSpan, bound: true, lent: false})
   return run checkDeclarationCall(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
     caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, expression, span,
     move target, CallArguments.Written {range: Range.empty()}, false, &operand, expected, mismatchCode, constraints, contractBody, staticBody,
@@ -46280,9 +46337,25 @@ Option<Shared<StaticData>>,
       }
       if let Option<CallReceiver>.Some {value: operand} = &receiver.* {
         if at == usize.ZERO {
-          let failed = run matchReceiverOperand(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
-            Vector<BodyNode>.asSlice(&nodes.*), &operand, &parameterType, &freshOwner, caller,
-            Vector<Shared<DeclarationId>>.asSlice(&variables), explicitOrdinals, &mut inferred, constraints)
+          let mut failed = Option<Shared<Rejection>>.none()
+          if operand.lent {
+            // A lent receiver meets its parameter as the explicit `&place` operand would.
+            let actual = match move bodyExpressionType(Vector<BodyNode>.asSlice(&nodes.*), &operand.node) {
+              Option<Shared<Type>>.Some {value} => move value
+              Option<Shared<Type>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, operand.memberSpan) }
+            }
+            let pattern = run callArgumentType(&parameterType, &target.signature, &freshOwner, Vector<Binding>.asSlice(&inferred),
+              caller, expression, false, &run cursorAnchor(cursor))
+            let subjectSpan = run bodySpan(&resolver.source, cursor, operand.subject)
+            failed = run matchArgumentRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, &parameterType,
+              &pattern, &actual, &target.signature, &freshOwner, Vector<Shared<DeclarationId>>.asSlice(&variables), &mut inferred,
+              explicitOrdinals, constraints, run originAt(cursor, operand.subject, subjectSpan), operand.memberSpan,
+              operand.memberSpan, false)
+          } else {
+            failed = run matchReceiverOperand(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
+              Vector<BodyNode>.asSlice(&nodes.*), &operand, &parameterType, &freshOwner, caller,
+              Vector<Shared<DeclarationId>>.asSlice(&variables), explicitOrdinals, &mut inferred, constraints)
+          }
           if let Option<Shared<Rejection>>.Some {value} = move failed {
             return Result<BodyNodeId, Shared<Rejection>>.failResult(move value)
           }
