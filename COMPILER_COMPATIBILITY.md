@@ -357,8 +357,9 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
 static for field in Intrinsic.reflectFields<Box>() { r = Reflect.borrowField<Box, i32>(y, field) }
 return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   accepts the program whether `pick` is called with one owner for both parameters or with two
-  distinct owners. A caller passing a shorter-lived second owner is the same program; the
-  bootstrap fails to parse that variant, so it is not a further acceptance.
+  distinct owners. The bootstrap also accepts a caller that passes a shorter-lived second owner
+  (`fn apart<'p>(v: &'p Box) -> &'p i32 { let w = Box { first: 1, second: 2 }  return pick(v, &w) }`),
+  which returns a view of a dead local.
 - **Source migration:** none. Declare `'b: 'a` when the result may come from `y`.
 - **Evidence:** `BorrowFieldCases::selectedBodiesProveOnlyTheirOwnSuppliedRegions`
   (`reflectedOther`) pins the native rejection's code and span.
