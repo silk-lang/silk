@@ -855,30 +855,48 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
 
-### Native ends a borrow some written lifetime arguments type at its last use
+### Native leaves a few written lifetime arguments unpinned
 
-- **Status:** recorded on 2026-10-17 with the written-binding fix (#1888) and narrowed with the
-  written call and literal fix (#1897). It is retired when native keeps every borrow a written
-  lifetime argument types at a universal region live through the body.
+- **Status:** recorded on 2026-10-17 with the written-binding fix (#1888), narrowed with the
+  written call and literal fix (#1897) and with the written-operand fix (#1899). It is retired when
+  native pins a borrow at every written region the bootstrap does.
 - **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a borrow
   a written lifetime argument types at one stays valid, and its place borrowed, for the rest of the
   body.
-- **Compilers:** the bootstrap rejects each form below with OWN0011 at a later write to `src.t`,
-  where `'a` is a lifetime parameter of the body. Native keeps a written binding type, a written
-  direct call argument and a written record literal field live through the body, but not these:
-  - Checked natively: a reborrow through a body-local reference, `let r = &src.t` and then
-    `lenOf<'a>(&r.*)`, or `let r = &mut src.*` and then `lenOf<'a>(&r.t)`, where the operand's
-    own loan is of a local and the loan it carries is left to its last use; a method called through
-    its type, `Box1.peek<'a>(&src.*)`; and an Effect call run at once, `run lenE<'a>(&src.t)`.
-  - Unchecked natively, as a regions gap: a literal nested in a written one,
-    `Outer<'a> {inner: Holder {view: &src.t}}`; a constructor called through its applied type,
-    `Holder<'a>.make(&src.t)`; and `pass<'a>(&r.*)` or `Holder<'a> {view: &r.*}` through a
-    body-local reference.
+- **Compilers:** in each form below, `'a` is a lifetime parameter of the body and the statement is
+  followed by a write to `src.t`. The bootstrap reports OWN0011 at the write in each.
+  - `let o = Outer<'a> {inner: Holder {view: &src.t}}`: native leaves the body unchecked, as a
+    regions gap. The nested `Holder` literal writes no arguments, so its field types are its own
+    binders rather than the outer literal's written `'a`.
+  - `lenH<'a>(HoldT {view: &src.t})` with `fn lenH<'p, T>(h: HoldT<'p, T>)` and
+    `struct HoldT<'h, T> { view: &'h T }`: native reports the body Checked.
+  - `takeP<'a>(PairWith {view: &src.t, extra: 5})` with `fn takeP<'p, T>(p: PairWith<'p, T>)` and
+    `struct PairWith<'h, T> { view: &'h Token  extra: T }`: native reports the body Checked.
+  - `lenB<'a>(&src.u, &src.t)` with `fn lenB<'p, T: 'p>(v: &'p Token, extra: T)`: native reports
+    the body Checked.
+  - `lenTwoU<'a>(Two {a: &src.t, b: 5})` with `fn lenTwoU<'p, T, U>(v: Two<&'p T, U>)`: native
+    reports the body Checked. So does a parameter `Two<&'p T, Wrap<T>>` or `Two<&'p T, [T; 1]>`,
+    and an Effect call taking `Two<&'p T, U>` run at once. An inferred type beneath the view does
+    not pin the borrow while another inferred type in the same parameter sits outside every view.
+  - `Lent<Token>.peekLP<'a>(&src.u, &src.t)`, whose qualifier omits the owner's lifetime argument
+    while the call writes the method's own `'a`: native reports the body Checked. An owner whose
+    arguments the qualifier does not all write is inferred, so its bindings are neutralized.
+
+  Native types a call's argument at its parameter type under the arguments the source wrote, and
+  neutralizes an inferred type argument to `()` only where the parameter type names it beneath a
+  reference or slice, whose well-formedness bounds it by the view's region. Anywhere else,
+  including as a nominal type's argument and under a `T: 'p` bound, it becomes `&'static ()`, so
+  the parameter type no longer names only universal regions and the borrow is not pinned. The
+  choice is made per parameter, so one inferred type outside a view leaves every view in that
+  parameter unpinned. Every other written form keeps the borrow live through the body natively as
+  well: a binding type, a call or method or constructor argument, including one whose inferred type
+  sits beneath a view when no other inferred type in that parameter sits outside one, an Effect
+  call run at once, a record literal field and a reborrow through a body-local reference.
+
 - **Source migration:** none.
-- **Diagnostics and limits:** the Checked forms are false acceptances, though nothing in them stores
-  or returns the loan, so no reference outlives its place. Removing the written argument makes both
-  compilers accept every form.
-- **Evidence:** native compile verdicts on #1897's head against main 2952e899, from its review. The
+- **Diagnostics and limits:** native reports these call forms Checked, and leaves the nested
+  literal as a regions gap, while the bootstrap rejects each with OWN0011.
+- **Evidence:** native and bootstrap compile verdicts on the written-operand fix's head; the
   covered forms are `SemanticCaptureCases::universalLoansOutliveTheBody` and the corpus programs
   `invalid/written-universal-view-write`, `invalid/written-call-lifetime-argument` and
   `invalid/written-literal-lifetime-argument`.
