@@ -63,17 +63,12 @@ definition and reference live in `apps/docs/content/reference/`.
 - Before the final push, finish every repository mutation, including generated artifacts and any
   implementation-task checkboxes in an explicitly requested OpenSpec change, then audit, commit,
   and push the intended head.
-- On `main`, required pull-request CI on that exact head is the authoritative full-repository
-  completion guard; wait for it to pass before handoff. If it fails, fix the cause, run affected
-  focused checks, push the new head, and wait for that head's CI.
-- On `selfhost`, CI does not gate the loop. Validate with the cheapest focused local checks that
-  cover the change (the affected test filters, a type-check, the touched corpus programs), then
-  merge the PR into `selfhost` without waiting for its CI, and continue with the next task. The
-  coordinating session watches one run, the `selfhost` branch CI after merges. When it fails, the
-  coordinator identifies the cause and sends the fix to the session that owns the change, or to a
-  new session when that is simpler. A session may therefore receive a request to fix a failure in
-  work it already shipped; fix it in a new PR the same way. Bootstrap inputs still land on `main`
-  first and reach `selfhost` through a sync merge.
+- `main` is the only integration branch. A pull request merges when its required checks pass on
+  its exact head: `CI result` (the TypeScript lanes) and `Focused Linux Silk` (the native lanes,
+  including the bootstrap DDC). Merge `main` into the branch before its final run, so the merge
+  commit reuses that run's verdict. If a check fails, fix the cause, run the affected focused
+  checks, and push the new head. A session may receive a request to fix a failure in work it
+  already shipped; fix it in a new PR the same way.
 - Never edit `compiler/borrow-check-gap.txt` by hand: after a corpus run, write it with
   `node .github/scripts/check-borrow-gap.mjs update <corpus log>`, and put the table that
   `check-borrow-gap.mjs diff <old> <new>` prints in the PR description.

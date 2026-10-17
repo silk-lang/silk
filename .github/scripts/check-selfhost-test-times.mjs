@@ -6,7 +6,7 @@ if (!logPath) {
 }
 
 const lines = readFileSync(logPath, 'utf8')
-  .replaceAll(/\u001b\[[0-9;]*m/g, '')
+  .replaceAll(new RegExp(`${String.fromCharCode(27)}\\[[0-9;]*m`, 'g'), '')
   .split(/\r?\n/)
 // Tests should finish within 1 s; the failing limit leaves headroom so runner noise near the
 // target does not fail CI.
@@ -48,10 +48,11 @@ if (measured !== executed) {
     `Measured ${measured} per-test timings, but the runner executed ${executed ?? 'an unknown number of'} tests`,
   )
 }
-for (const line of overTarget) console.warn(`::warning::Selfhost test over the 1 s target: ${line}`)
+for (const line of overTarget)
+  process.stderr.write(`::warning::Selfhost test over the 1 s target: ${line}\n`)
 if (slow.length > 0) {
   throw new Error(`Selfhost tests took 3 s or longer:\n${slow.join('\n')}`)
 }
-console.log(
-  `All ${measured} selfhost tests finished under 3 s (${overTarget.length} over the 1 s target)`,
+process.stdout.write(
+  `All ${measured} selfhost tests finished under 3 s (${overTarget.length} over the 1 s target)\n`,
 )

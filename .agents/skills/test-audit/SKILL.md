@@ -50,9 +50,10 @@ isolated checkout for controls and report missing control evidence explicitly.
   of execution.
 - Target-neutral runtime behavior belongs in the shared native corpus, exercised
   by `compiler/scripts/runSelfhostCorpus.ts` and its `selfhostTrack.ts`. The corpus
-  data in `packages/compiler/test/support/corpus.ts` is main-owned: route changes
-  there through main, then bring them into selfhost. Do not add per-feature native
-  compilations merely to show that the binary agrees.
+  data in `packages/compiler/test/support/corpus.ts` is shared with the bootstrap's
+  acceptance tests, so a change there runs both compilers' corpus lanes in its own
+  pull request. Do not add per-feature native compilations merely to show that the
+  binary agrees.
 - Lowering and ABI claims use retained MIR, LLVM IR, objects, symbols, relocations,
   disassembly, or separately compiled C fixtures. Execute Wasm only for intended
   WebAssembly behavior. Do not claim a deferred C/ABI fixture was checked.
