@@ -786,6 +786,50 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
 
+### Native ends a borrow some written lifetime arguments type at its last use
+
+- **Status:** recorded on 2026-10-17 with the written-binding fix (#1888) and narrowed with the
+  written call and literal fix (#1897). It is retired when native keeps every borrow a written
+  lifetime argument types at a universal region live through the body.
+- **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a borrow
+  a written lifetime argument types at one stays valid, and its place borrowed, for the rest of the
+  body.
+- **Compilers:** the bootstrap rejects each form below with OWN0011 at a later write to `src.t`,
+  where `'a` is a lifetime parameter of the body. Native keeps a written binding type, a written
+  direct call argument and a written record literal field live through the body, but not these:
+  - Checked natively: a reborrow through a body-local reference, `let r = &src.t` and then
+    `lenOf<'a>(&r.*)`, or `let r = &mut src.*` and then `lenOf<'a>(&r.t)`, where the operand's
+    own loan is of a local and the loan it carries is left to its last use; a method called through
+    its type, `Box1.peek<'a>(&src.*)`; and an Effect call run at once, `run lenE<'a>(&src.t)`.
+  - Unchecked natively, as a regions gap: a literal nested in a written one,
+    `Outer<'a> {inner: Holder {view: &src.t}}`; a constructor called through its applied type,
+    `Holder<'a>.make(&src.t)`; and `pass<'a>(&r.*)` or `Holder<'a> {view: &r.*}` through a
+    body-local reference.
+- **Source migration:** none.
+- **Diagnostics and limits:** the Checked forms are false acceptances, though nothing in them stores
+  or returns the loan, so no reference outlives its place. Removing the written argument makes both
+  compilers accept every form.
+- **Evidence:** native compile verdicts on #1897's head against main 2952e899, from its review. The
+  covered forms are `SemanticCaptureCases::universalLoansOutliveTheBody` and the corpus programs
+  `invalid/written-universal-view-write`, `invalid/written-call-lifetime-argument` and
+  `invalid/written-literal-lifetime-argument`.
+
+### Native rejects a loop-carried write over a borrow kept in caller storage
+
+- **Status:** recorded on 2026-10-17 with the written call and literal fix (#1897). It is retired
+  when the bootstrap rejects the loop-carried form.
+- **Rule:** LIFE-001 and BORROW-001. A borrow kept where a universal region reaches stays valid for
+  it, so a later write to its place conflicts, including a write reached on a later iteration.
+- **Compilers:** in a loop that first writes `src.t` and then keeps `pass<'a>(&src.t)` in a
+  `&mut Holder<'b>` parameter through `keep<'b>`, the write on the second iteration mutates `src.t`
+  while the caller's holder still holds the first iteration's view. Native reports OWN0011 at that
+  write. The bootstrap accepts the loop, though it rejects the straight-line form that writes after
+  the keep.
+- **Source migration:** none; the program is invalid.
+- **Diagnostics and limits:** the bootstrap under-rejects only the loop-carried order.
+- **Evidence:** the #1897 review's program `p20_loop_write_before`, against its straight-line
+  companion `p19`.
+
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
 - **Status:** recorded on 2026-10-03 with Step 6c; callable availability extended with Step 8d;
