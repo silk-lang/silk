@@ -2242,6 +2242,8 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   view the call returns. Accepting it also needs MIR loan ends for the loans that temporary
   retains, so the rejection currently prevents a miscompile.
 - **Native:** accepts it.
+- The same bootstrap rejection covers a shared borrow of a field of an owned temporary,
+  `read(&outer().a.b)`; native accepts it and keeps the temporary until the end of the statement.
 - **Source migration:** `ModuleIndex.fingerprint` and `Semantic.reconcileDeclarationChange` in
   `compiler/` bind the slice to a local before indexing it, which both compilers accept. Declaration
   handle Cases use the same direct-view form.
