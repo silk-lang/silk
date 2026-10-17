@@ -1492,7 +1492,10 @@ repeated invocation and capture-only drop glue.
   independent applications, visibility, static-data exclusion and diagnostic codes/spans.
   `qualifiedFunctionValuesRetainOwnerSelectionAndDirectAbi` covers namespace and imported
   inherent values, applied-owner selections, empty construction, unsafe invocation and foreign
-  callback/visibility diagnostics.
+  callback/visibility diagnostics. The invalid-corpus program `inherent-head-bound-member-value`
+  pins the bootstrap's SEM0168 over `Boxed<&'x Token>`; native reports the unproven `A: 'static`
+  head bound as SEM0212 over `Boxed<&'x Token>.make`, and the selfhost corpus reports it as a
+  DIAGNOSTIC_PARITY gap.
 
 ### Native direct opaque callable results retain exact environments
 
@@ -2548,6 +2551,42 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   reject. Native now accepts it when the literal stays local.
 - **Evidence:** `binderMeetsKeepBodyLocalRegions` and `binderMeetsNeverWidenFixedRegions` in
   `compiler/src/semantic/SemanticCaptureCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### A local escaping through a call result or aggregate is reported once
+
+- **Status:** recorded on 2026-10-17 from the selfhost corpus's diagnostic-parity census.
+  Bootstrap divergence; it follows the policy of "Reads of a failed binding" and the region of
+  "Struct literals infer the meet of their field lifetimes".
+- **Rule:** LIFE-002 and BORROW-008. A view of storage the body owns cannot leave the body. A
+  rejected body reports each independent failure once.
+- **Compilers:** both reject every program below. The bootstrap reports from its whole-body region
+  proof: once at each borrow of the local and once for each loan at each read that lets it escape.
+  Native reports one diagnostic for the escape.
+  - Through a call result (`let held = hold(&owner)`, then `return held.inner`, or a payload of an
+    `Option`, `Either` or generic wrapper returned from a match or `if let`): both report SEM0212
+    at the borrow argument. The bootstrap adds OWN0019 at each read of the result that returns
+    it, and at a later `return x` of the parameter itself; native adds nothing.
+  - Through an aggregate whose elements or fields are all local borrows (`[&local, &local]` or
+    `Pair { left: &local, right: &local }`, then a parameter view stored into a slot and a slot
+    returned): the bootstrap reports SEM0212 at each borrow and OWN0019 once per loan at the
+    return; native holds the local region and reports OWN0019 once at the return.
+  - Returning a struct literal holding a local borrow, directly, through a binding of the borrow,
+    nested, or of an owned parameter: the bootstrap reports SEM0212 at the borrow and OWN0019 at
+    the return; native reports OWN0019 at the return only. A union variant
+    (`return Slot.Held { token: &local }`) or array literal (`return [x, &local]`) takes its
+    expected type from the return, so native reports its one OWN0019 at the `&local` operand
+    instead.
+  - Storing such a literal through `&mut` into a caller region reports SEM0212 at the borrow in
+    both.
+- **Source migration:** none. Both compilers reject the body.
+- **Evidence:** the invalid-corpus programs `call-result-field-escape`,
+  `call-result-pair-field-escape`, `call-result-option-payload-escape`,
+  `call-result-option-match-escape`, `call-result-either-payload-escape`,
+  `call-result-wrapper-payload-escape`, `aggregate-element-indexed-escape`,
+  `aggregate-element-other-escape`, `aggregate-element-region-escape`,
+  `aggregate-other-field-escape` and `aggregate-escape-local` pin the bootstrap's list; the
+  selfhost corpus reports each as a DIAGNOSTIC_PARITY gap.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
 
 ## Bootstrap cleans borrowed temporaries at the end of their scope
