@@ -836,6 +836,29 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   `plainRead`). Native and bootstrap compile verdicts on the fix's head. In the native IR for
   `let s = hooked(&owner, x).left.*`, the hook runs before the following move.
 
+### Bootstrap accepts an inferred view a closure gives its requirement row's service
+
+- **Status:** recorded on 2026-10-17 with the closure-row regression Cases. Native rejects; the
+  bootstrap gap remains until its loan pass keeps a loan a closure's row service receives.
+- **Rule:** BORROW-008 and LIFE-002. Running `Keeper<'b>.put(v: &'b Token)` stores `v` in the
+  caller's provider, so the loan `v` carries must stay valid for `'b`, past the body. A later write
+  to its place conflicts with it (OWN0011).
+- **Compilers:** with `let view = &src.t` (its type inferred) captured by
+  `effect fn() -> () ? &mut Keeper<'b> { run keepEffect<'b>(view) }`, run before `src.t` is
+  written, the bootstrap compiles the body with no diagnostic. It rejects the same run made directly
+  in the body, and the closure form whose view is typed at `'a` (written, or through
+  `Holder<'a> { view: &src.t }`), with OWN0011 at the write. Native rejects the inferred closure
+  form at typing, with SEM0012 at `keepEffect<'b>(view)`: the capture's inferred region does not
+  meet `'b`. A plain closure returning `keepEffect<'b>(view)` behaves the same in both compilers.
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native never accepts the inferred form. It is not a corpus program,
+  because the bootstrap's corpus tests require every `invalid/` program to be rejected with its
+  listed diagnostics.
+- **Evidence:** compile-only verdicts on main 1329f4c2: the frozen bootstrap's `check` succeeds;
+  native `build` reports SEM0012 at the call. The typed forms, which both compilers reject, are
+  `SemanticCaptureCases::universalLoansOutliveTheBody` (`rowRunsUniversal`, `rowReturnsUniversal`)
+  and `invalid/effect-closure-row-universal-view-write`.
+
 ### Native holds every loan of a literal in each of its field projections
 
 - **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
