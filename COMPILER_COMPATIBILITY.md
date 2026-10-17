@@ -758,9 +758,38 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
 - **Source migration:** none. The compiler and standard library have no such caller.
 - **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall`. Direct, nested-view,
   drop-carrying, qualified member, receiver member, callable-value and section calls are never
-  Checked. Clean calls, a write after the result's last use and callers that forward their own
-  parameters stay Checked. An operator implementation with this shape is not yet accepted
+  Checked. An Effect value run under such a bound keeps the key's loan, so a write while its result
+  lives is rejected (OWN0011 at the write, OWN0019 at the read); the bootstrap accepts it. Clean
+  calls, a write after the result's last use and callers that forward their own parameters stay
+  Checked. An operator implementation with this shape is not yet accepted
   (SEM0135), so the operator path has no Case.
+
+### Bootstrap accepts a loan stored into a local holder after its storage ends
+
+- **Status:** recorded on 2026-10-17 from the independent review of #1886. #1886 lets native region
+  proofs use loans a field store gives a local holder. The bootstrap gap remains until its loan
+  pass carries a field-stored loan through every later use of its holder.
+- **Rule:** BORROW-008 and LIFE-002. A field store `v.oid = &y` puts the loan of `y` in the holder
+  `v`. Every later use of `v`, or of a value that takes `v`'s contents, needs `y`'s storage, so a
+  use after `y`'s scope ends is OWN0019.
+- **Compilers:** the bootstrap compiles each of these programs with no diagnostic. Native rejects
+  each with OWN0019 at the dangling read. All three use `struct View<'a> { oid: &'a i32 }`.
+  - A loop reads the loan the previous iteration stored, after the new iteration's `let`:
+    `while i < 3 { let y = i  t = t + v.oid.*  v.oid = &y  i = i + 1 }` (OWN0019 at `v.oid.*`).
+  - The holder is moved into another holder inside the scope, and that holder is read after it:
+    `if x == 1 { let y = 2  v.oid = &y  s = Shelf { held: move v } }  return s.held.oid.*`, with
+    `struct Shelf<'s> { held: View<'s> }` (OWN0019 at `s.held.oid.*`).
+  - A view taken from the holder inside the scope is read after it:
+    `if x == 1 { let y = 2  v.oid = &y  p = get(&v) }  return p.*`, with
+    `fn get<'a>(v: &View<'a>) -> &'a i32` (OWN0019 at `p.*`).
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects; it never accepts a read of a field-stored loan past
+  its storage end. These are not corpus programs, because the bootstrap's corpus tests require
+  every `invalid/` program to be rejected with its listed diagnostics.
+- **Evidence:** compile-only verdicts on main 3f297962: the frozen bootstrap's `check` succeeds;
+  native `build --emit llvm-ir` reports OWN0019 at the spans above. The neighboring shapes that both
+  compilers reject are pinned in `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs`
+  (`scopeEnd`, `loopStore`, `loopCarried`, `escape`, `projection`).
 
 ### Native holds every loan of a literal in each of its field projections
 
@@ -785,6 +814,24 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   (`projectedTemporaryEscape`, `projectedRegionsEscape`);
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
+
+### Native ends a loan an explicit call lifetime argument types at its last use
+
+- **Status:** recorded on 2026-10-17 with the written-binding fix. It is retired when native keeps
+  live through the body a loan whose region an explicit call lifetime argument names universal.
+- **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a loan
+  typed at one stays valid, and its place borrowed, for the rest of the body.
+- **Compilers:** the bootstrap rejects `let view = pass<'a>(&src.t)` and `pass<'a>(&src.t).value`
+  with OWN0011 at a later write to `src.t`, where `'a` is a lifetime parameter of the body. Native
+  ends that loan at its last use and accepts the write. A written binding type,
+  `let view: &'a Token = …`, is held live through the body by both compilers. Native records which
+  local types are written; it does not record which call lifetime arguments are.
+- **Source migration:** none.
+- **Diagnostics and limits:** native under-rejects only where nothing stores or returns the loan,
+  so no reference outlives its place: a stored or returned loan already escapes the body.
+- **Evidence:** native compile verdicts for both forms on main 74bc91cf; the written form is
+  `SemanticCaptureCases::universalLoansOutliveTheBody` (`o2Written`, `o2Reborrow`) and
+  `invalid/written-universal-view-write`.
 
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
@@ -1474,7 +1521,10 @@ repeated invocation and capture-only drop glue.
   independent applications, visibility, static-data exclusion and diagnostic codes/spans.
   `qualifiedFunctionValuesRetainOwnerSelectionAndDirectAbi` covers namespace and imported
   inherent values, applied-owner selections, empty construction, unsafe invocation and foreign
-  callback/visibility diagnostics.
+  callback/visibility diagnostics. The invalid-corpus program `inherent-head-bound-member-value`
+  pins the bootstrap's SEM0168 over `Boxed<&'x Token>`; native reports the unproven `A: 'static`
+  head bound as SEM0212 over `Boxed<&'x Token>.make`, and the selfhost corpus reports it as a
+  DIAGNOSTIC_PARITY gap.
 
 ### Native direct opaque callable results retain exact environments
 
@@ -2530,6 +2580,42 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   reject. Native now accepts it when the literal stays local.
 - **Evidence:** `binderMeetsKeepBodyLocalRegions` and `binderMeetsNeverWidenFixedRegions` in
   `compiler/src/semantic/SemanticCaptureCases.silk`.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### A local escaping through a call result or aggregate is reported once
+
+- **Status:** recorded on 2026-10-17 from the selfhost corpus's diagnostic-parity census.
+  Bootstrap divergence; it follows the policy of "Reads of a failed binding" and the region of
+  "Struct literals infer the meet of their field lifetimes".
+- **Rule:** LIFE-002 and BORROW-008. A view of storage the body owns cannot leave the body. A
+  rejected body reports each independent failure once.
+- **Compilers:** both reject every program below. The bootstrap reports from its whole-body region
+  proof: once at each borrow of the local and once for each loan at each read that lets it escape.
+  Native reports one diagnostic for the escape.
+  - Through a call result (`let held = hold(&owner)`, then `return held.inner`, or a payload of an
+    `Option`, `Either` or generic wrapper returned from a match or `if let`): both report SEM0212
+    at the borrow argument. The bootstrap adds OWN0019 at each read of the result that returns
+    it, and at a later `return x` of the parameter itself; native adds nothing.
+  - Through an aggregate whose elements or fields are all local borrows (`[&local, &local]` or
+    `Pair { left: &local, right: &local }`, then a parameter view stored into a slot and a slot
+    returned): the bootstrap reports SEM0212 at each borrow and OWN0019 once per loan at the
+    return; native holds the local region and reports OWN0019 once at the return.
+  - Returning a struct literal holding a local borrow, directly, through a binding of the borrow,
+    nested, or of an owned parameter: the bootstrap reports SEM0212 at the borrow and OWN0019 at
+    the return; native reports OWN0019 at the return only. A union variant
+    (`return Slot.Held { token: &local }`) or array literal (`return [x, &local]`) takes its
+    expected type from the return, so native reports its one OWN0019 at the `&local` operand
+    instead.
+  - Storing such a literal through `&mut` into a caller region reports SEM0212 at the borrow in
+    both.
+- **Source migration:** none. Both compilers reject the body.
+- **Evidence:** the invalid-corpus programs `call-result-field-escape`,
+  `call-result-pair-field-escape`, `call-result-option-payload-escape`,
+  `call-result-option-match-escape`, `call-result-either-payload-escape`,
+  `call-result-wrapper-payload-escape`, `aggregate-element-indexed-escape`,
+  `aggregate-element-other-escape`, `aggregate-element-region-escape`,
+  `aggregate-other-field-escape` and `aggregate-escape-local` pin the bootstrap's list; the
+  selfhost corpus reports each as a DIAGNOSTIC_PARITY gap.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
 
 ## Bootstrap cleans borrowed temporaries at the end of their scope
