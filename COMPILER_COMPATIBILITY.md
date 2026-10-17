@@ -735,6 +735,26 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
 
+### Bootstrap shortens call binders past implied well-formedness bounds
+
+- **Status:** recorded on 2026-10-17 during the review of #1880 (unobserved call binders take their
+  operands' meet). The bootstrap gap remains; native does not shorten such a binder.
+- **Rule:** LIFE-002: a parameter type's well-formedness implies bounds the callee's body assumes.
+  `Bounded<'a, 'b>` with `struct Bounded<'a, 'b: 'a>` implies `'b: 'a`, and `&Hold<'a, &'b Token>`
+  with `struct Hold<'a, T: 'a>` implies `&'b Token: 'a`. A callee may then store its `&'b` argument
+  where `'a` is kept. Choosing the meet of the operands' regions for `'b` must keep those bounds.
+- **Compilers:** the bootstrap accepts a caller that fixes `'a` and `'b` to its own `'p` through
+  the first operand and then passes `&local` for `'b`, with `'a` kept in caller storage:
+  `boundedStash(Bounded { first: x, second: x }, &mut shelf.*, &local)` and the `Hold` form. Its
+  region inference shortens `'b` past the implied bound, so a body-local borrow reaches the
+  caller's storage. Native never shortens a binder that a bound implied by a parameter type's
+  well-formedness names (a view's referent outliving the view, or a nominal type's declared
+  bounds), nor one any non-region constraint names; such bodies stay unchecked.
+- **Source migration:** none. The compiler and standard library have no such caller.
+- **Evidence:** `SemanticCallableCases::unobservedBindersTakeTheirOperandsMeet`
+  (`impliedByDeclaration`, `impliedByContents` are never Checked). Rejected or unchecked programs
+  are checked through compile-time verdicts and Cases only.
+
 ### Bootstrap does not hold calls to their signatures' implied bounds
 
 - **Status:** recorded on 2026-10-17 from the regions census (residue). Native holds the call; the
