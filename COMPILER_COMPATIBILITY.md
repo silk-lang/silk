@@ -832,33 +832,44 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   compilers reject are pinned in `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs`
   (`scopeEnd`, `loopStore`, `loopCarried`, `escape`, `projection`).
 
-### Bootstrap runs a retained temporary's Drop hook after its loans end
+### Bootstrap runs a temporary's Drop hook after its loans end
 
-- **Status:** recorded on 2026-10-17 from the independent review of #1904, with the native fix
-  that holds a retained temporary's loans until its cleanup. The bootstrap gap remains until its
-  loan pass treats a retained temporary's cleanup as a use of the loans its hook can observe.
-- **Rule:** BORROW-006 and DROP-002. A binding that can hold a view keeps its initializer's
-  temporaries until its scope ends, and their cleanup runs there. A Drop hook that runs at that
-  cleanup observes every loan its value holds, so those loans stay live until the cleanup.
+- **Status:** recorded on 2026-10-17 from the independent reviews of #1904 and #1912, with the
+  native fix that holds a temporary's loans until its cleanup. The bootstrap gap remains until its
+  loan pass treats a temporary's cleanup as a use of the loans its hook can observe.
+- **Rule:** BORROW-006 and DROP-002. A temporary's cleanup runs at the end of its statement, or,
+  when the initializer of a binding that can hold a view retains it, when that binding's scope
+  ends. A Drop hook that runs at that cleanup observes every loan its value holds, so those loans
+  stay live until the cleanup.
 - **Compilers:** with `struct Hooked<'a, 'b> { left: &'a i32  right: &'b i32 }`, whose Drop hook
   reads `self.left`, and `fn hooked<'a, 'b>(left: &'a i32, right: &'b i32) -> Hooked<'a, 'b>`:
-  `let r = hooked(&owner, x).right  let s = r.*  owner = 1` keeps the `Hooked` temporary until
-  `r`'s scope ends, and the hook then reads `owner` after the write. The bootstrap compiles this,
-  and also `spend(move owner)` in place of the write, where the hook reads a moved-from place. The
-  same holds for a hook on a field's type (`Guarded { hooked: Hooked<'a, 'b>  right: &'b i32 }`)
-  and for the projection passed through a call (`viewOf(hooked(&owner, x).right)`). Native
-  reports OWN0011 at the write or move.
+  - `let r = hooked(&owner, x).right  let s = r.*  owner = 1` keeps the `Hooked` temporary until
+    `r`'s scope ends, and the hook then reads `owner` after the write. So does `spend(move owner)`
+    in place of the write, where the hook reads a moved-from place, a hook on a field's type
+    (`Guarded { hooked: Hooked<'a, 'b>  right: &'b i32 }`), and the projection passed through a
+    call (`viewOf(hooked(&owner, x).right)`).
+  - Within one statement, `pairSum(hooked(&owner, x).left.*, spend(move owner))` and
+    `if hooked(&owner, x).right.* > spend(move owner) { … }` move `owner` before the temporary's
+    cleanup at the statement's end. So do the same move in a binary operand, an assignment, a
+    `return`, a struct literal, a short-circuit operand, a pipe or a `run`.
+
+  The bootstrap compiles each of these. Native reports OWN0011 at the write or move, or OWN0010
+  where the later operand borrows `owner` exclusively.
+
 - **Source migration:** none. The compiler and standard library have no such program.
-- **Diagnostics and limits:** native rejects. It reads a projection out of a retained temporary
-  whose cleanup can observe a loan through the temporary's hidden owner, which holds that loan
-  until the cleanup. These are not corpus programs, because the bootstrap's corpus tests require
-  every `invalid/` program to be rejected with its listed diagnostics. A temporary that ends with
-  its statement (a scalar binding), one in an inner scope that ends before the write, and one whose
-  type runs no hook stay accepted by both compilers.
+- **Diagnostics and limits:** native rejects. It reads a projection out of a temporary whose
+  cleanup can observe a loan through the temporary's hidden owner, which holds that loan until the
+  cleanup in the scope lowering drops it in. These are not corpus programs, because the bootstrap's
+  corpus tests require every `invalid/` program to be rejected with its listed diagnostics. A move
+  in the next statement after a statement temporary, a binding in an inner scope that ends before
+  the write, and a temporary whose type runs no hook stay accepted by both compilers. A temporary
+  whose cleanup native cannot bound, such as a generic `TD<'a, 'b, T>` whose hook is written for
+  every `T`, leaves its body unchecked (stored loans) rather than Checked.
 - **Evidence:** `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs` (`hookedRead`,
-  `hookedMove`, `hookedField`, `hookedArgument`, `hookedStatement`, `hookedScoped` and
-  `plainRead`). Native and bootstrap compile verdicts on the fix's head. In the native IR for
-  `let s = hooked(&owner, x).left.*`, the hook runs before the following move.
+  `hookedMove`, `hookedField`, `hookedArgument`, `hookedOperand`, `hookedCondition`,
+  `hookedStatement`, `hookedNext`, `hookedScoped` and `plainRead`), with native and bootstrap
+  compile verdicts on the fix's head. In the native IR for `let s = hooked(&owner, x).left.*`, the
+  hook runs before the next statement's move.
 
 ### Bootstrap accepts an inferred view a closure gives its requirement row's service
 
