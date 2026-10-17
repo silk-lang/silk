@@ -505,6 +505,57 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(rooted.status, 9, rooted.stderr)
+  // A path dependency's modules are imported under its dependency name; its own imports stay in
+  // its own package, so both packages can have a `util/digits` module.
+  yield* fs.makeDirectory(join(directory, 'packaged/app/util'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'packaged/numbers/src/util'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/util/digits.silk'),
+    'pub fn base() -> i32 {\n  return 10\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/scale.silk'),
+    'import util.digits { base }\n\npub fn scale(value: i32) -> i32 {\n  return value * base()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/silk.toml'),
+    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource-root = "src"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/util/digits.silk'),
+    'pub fn base() -> i32 {\n  return 4\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/main.silk'),
+    'import numbers.scale { scale }\nimport util.digits { base }\n\npub fn main() -> i32 {\n  return scale(base()) + 2\n}\n',
+  )
+  const packagedManifest = (dependency: string) =>
+    `[package]\nname = "app"\nversion = "1.0.0"\nroot = "main.silk"\n\n[dependencies]\n${dependency}\n`
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/silk.toml'),
+    packagedManifest('numbers = { path = "../numbers", package = "silk-numbers" }'),
+  )
+  const packaged = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(packaged.status, 42, packaged.stderr)
+  // A dependency name that is also a top-level directory of the source root is refused.
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/silk.toml'),
+    packagedManifest('util = { path = "../numbers" }'),
+  )
+  const shadowed = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.notEqual(shadowed.status, 0, 'a shadowing dependency name was accepted')
+  assert.match(shadowed.stderr, /silk: invalid dependency `util` of app@1\.0\.0: the name is also/)
+  assert.equal(yield* fs.exists(marker), false)
   // A composition retention root keeps a private function from a module nothing imports.
   yield* fs.makeDirectory(join(directory, 'retained/support'), { recursive: true })
   yield* fs.writeFileString(
@@ -856,7 +907,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
