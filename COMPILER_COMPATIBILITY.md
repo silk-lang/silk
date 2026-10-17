@@ -747,7 +747,9 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
 - **Compilers:** the bootstrap accepts `let r = viaPair(&k, Pair {short: &v, long: &w})`, then a
   write to `k` and a read of `r`; with a key that has `Drop` this reads freed storage. Native holds
   every call to the bounds its callee's parameter and result types imply: each nominal's declared
-  region bounds and each view's referent bound (`impliedSignatureBounds`). It covers direct and
+  region bounds, each view's referent bound, and the same bounds of every field, element and
+  variant payload type under its application, at any depth (`impliedSignatureBounds`), which is
+  what the callee's premises assume (`appendStoredFieldPremises`). It covers direct and
   member calls, operator calls, invoked callable values, staged schemas and named sections
   (`holdImpliedBounds`). A call proves them under the caller's premises and the bounds its own
   signature implies. A relation between the caller's own loans is retained for the borrow checker,
@@ -755,6 +757,12 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   leaves the body unchecked (`UnprovedImpliedBound`) and does not refuse the call, so no program the
   declared bounds admit is newly rejected. Bounds on a callable's invocation regions are owed at its
   invocation, and so are those on a section's unsupplied binders.
+  A nominal that declares no bound can still imply one through its stored data: with
+  `struct Outer<'a, 'b> { inner: Pair<'a, 'b> }`, `fn stash<'a, 'b>(other: &'b i32, slot: &mut
+  Slot<'a>, o: Outer<'a, 'b>)` may store `other` at `'a`. The bootstrap accepts
+  `stash(&c, &mut slot.*, move o)` with a local `c` and a caller's `slot`, which leaves the
+  caller's slot pointing at `c` after it ends; it gives SEM0212 when the section `stash(&c)` binds
+  only `other`. Native leaves both bodies unchecked.
 - **Source migration:** none. The compiler and standard library have no such caller.
 - **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall`. Direct, nested-view,
   drop-carrying, qualified member, receiver member, callable-value and section calls are never
@@ -763,6 +771,10 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   calls, a write after the result's last use and callers that forward their own parameters stay
   Checked. An operator implementation with this shape is not yet accepted
   (SEM0135), so the operator path has no Case.
+  `SemanticCaptureCases::impliedFieldBoundsHoldAtTheCall`: a call through a field, a field's
+  contents bound, a union payload, a local passed before the nominal that relates it, and a section
+  binding only the local are never Checked; a call whose field-implied bounds hold, or follow from
+  the caller's own parameters, stays Checked.
 
 ### Bootstrap accepts a loan stored into a local holder after its storage ends
 
