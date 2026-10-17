@@ -735,6 +735,35 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
 
+### Bootstrap does not hold calls to their signatures' implied bounds
+
+- **Status:** recorded on 2026-10-17 from the regions census (residue). Native holds the call; the
+  bootstrap gap remains.
+- **Rule:** LIFE-002: a parameter or result type's well-formedness implies bounds the callee's body
+  assumes, so a call instantiating the signature must prove them like declared bounds:
+  `fn viaPair<'a, 'b>(x: &'a Key, p: Pair<'b, 'a>) -> &'b Key { return x }` with
+  `struct Pair<'b, 'a: 'b>` returns its `&'a Key` as `&'b Key` on `Pair`'s `'a: 'b` alone, so the
+  result keeps the key's loan.
+- **Compilers:** the bootstrap accepts `let r = viaPair(&k, Pair {short: &v, long: &w})`, then a
+  write to `k` and a read of `r`; with a key that has `Drop` this reads freed storage. Native holds
+  every call to the bounds its callee's parameter and result types imply: each nominal's declared
+  region bounds and each view's referent bound (`impliedSignatureBounds`). It covers direct and
+  member calls, operator calls, invoked callable values, staged schemas and named sections
+  (`holdImpliedBounds`). A call proves them under the caller's premises and the bounds its own
+  signature implies. A relation between the caller's own loans is retained for the borrow checker,
+  which is how the result keeps the key's loan. An implied bound typing neither proves nor retains
+  leaves the body unchecked (`UnprovedImpliedBound`) and does not refuse the call, so no program the
+  declared bounds admit is newly rejected. Bounds on a callable's invocation regions are owed at its
+  invocation, and so are those on a section's unsupplied binders.
+- **Source migration:** none. The compiler and standard library have no such caller.
+- **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall`. Direct, nested-view,
+  drop-carrying, qualified member, receiver member, callable-value and section calls are never
+  Checked. An Effect value run under such a bound keeps the key's loan, so a write while its result
+  lives is rejected (OWN0011 at the write, OWN0019 at the read); the bootstrap accepts it. Clean
+  calls, a write after the result's last use and callers that forward their own parameters stay
+  Checked. An operator implementation with this shape is not yet accepted
+  (SEM0135), so the operator path has no Case.
+
 ### Bootstrap accepts a loan stored into a local holder after its storage ends
 
 - **Status:** recorded on 2026-10-17 from the independent review of #1886. #1886 lets native region
