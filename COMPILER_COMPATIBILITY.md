@@ -832,6 +832,30 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
 
+### Native narrows a field read of a bound call result to the field's regions
+
+- **Status:** recorded on 2026-10-17 with the call-result field narrowing (k6). It is retired when
+  both compilers attribute a call result's loans to its fields alike.
+- **Rule:** LIFE-002 and BORROW-008. A field read holds the loans the read field's type can reach;
+  a sibling field typed by a different lifetime parameter holds its own loans.
+- **Compilers:** with `fn pair<'a, 'b>(left: &'a Token, right: &'b Token) -> Couple<'a, 'b>`, a
+  read of `pair(&owner, x).right`, followed by a write to `owner` and a use of the read, is
+  accepted by both compilers. Bound first, as `let both = pair(&owner, x)` and
+  `let r = both.right`, the bootstrap keeps `owner`'s loan in `r` and reports OWN0011 at the write,
+  while native forwards a loan only along the field path that holds it and accepts. Matching
+  `Either<&'a Token, &'b Token>.Right {value}` out of `pick(&owner, x)` is the reverse: the
+  bootstrap accepts the write in the arm, and native keeps `owner`'s loan in the payload and
+  reports OWN0011.
+- **Source migration:** none for the accepted form. For the matched payload, copy the view out
+  before writing, or bind the borrow from a separate local.
+- **Diagnostics and limits:** native accepts the bound read only when the read field's declared
+  type names none of the loan's regions. A field that names the loan's region, a sibling sharing
+  it (`Couple<'a, 'a>`), and a generic field that may hold it all keep the loan, in both
+  compilers.
+- **Evidence:** `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs` (`resultSibling`,
+  `resultField`, `resultShared` and `resultGeneric`) and native and bootstrap compile verdicts on
+  the k6 head.
+
 ### Native ends a borrow some written lifetime arguments type at its last use
 
 - **Status:** recorded on 2026-10-17 with the written-binding fix (#1888) and narrowed with the

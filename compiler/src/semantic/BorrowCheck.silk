@@ -80,6 +80,7 @@ import semantic.TypedBody {
   ConsumedPlace,
   Expression,
   BindingAccess,
+  ImpliedOutlives,
   Local,
   MatchArm,
   MatchSyntax,
@@ -607,6 +608,14 @@ struct StoreWindow {
   holder: usize
 }
 
+// A whole-value hold `finish` gave a result: the loan and the result node. Only a call its
+// signature `described` bounds where in the result the loan can lie.
+struct WholeHold {
+  loan: usize
+  result: NodeId
+  described: bool
+}
+
 struct Walker {
   // The Supplied atoms this body's own selected application binds its region parameters to.
   // They name caller regions valid for the whole invocation; every other Supplied atom stays open.
@@ -646,6 +655,8 @@ struct Walker {
   settled: bool
   // Open relations used only to conservatively retain possible source loans, never proof premises.
   retentionRelations: Vector<ImpliedGroup>
+  // Every whole-value hold of a loan a result took, for narrowing a later read within it.
+  wholeHolds: Vector<WholeHold>
   // Atoms of the local regions a retained open contents bound names: values of unknown regions
   // enter them, so no symbolic proof relates them to a universal target.
   openContents: Vector<Shared<Lifetime>>
@@ -1091,7 +1102,7 @@ effect fn extendPath(nodes: &[Node], id: NodeId, temporary: usize, path: &mut Pa
         path.root = local.index
         return ()
       }
-      Expression.Field {value, index} => {
+      Expression.Field {value, index, ..} => {
         run extendPath(nodes, value, temporary, &mut path.*)
         if path.root != usize.MAX {
           run Vector<Step>.append(&mut path.steps, fieldStep(index))
@@ -1124,7 +1135,7 @@ effect fn extendPath(nodes: &[Node], id: NodeId, temporary: usize, path: &mut Pa
         }
         return ()
       }
-      Expression.PatternBinding {subject, path: steps, access} => {
+      Expression.PatternBinding {subject, path: steps, access, ..} => {
         run bindingPath(nodes, subject, Vector<PlaceStep>.asSlice(&steps), access, &mut path.*)
         return ()
       }
@@ -1462,25 +1473,98 @@ effect fn useHolder(walker: &mut Walker, root: usize, read: usize, span: Locatio
 // The loans a read of `path` carries, each with where the value read holds it: a loan's field is
 // kept only when the read contains where the loan is held, which a read through a reference reaches
 // past its `Referent` step. The reference's own loan is held by the whole reference, which no such
-// read contains. Anything else keeps an unknown field, which nothing forwards.
-effect fn attributeRead(walker: &mut Walker, path: &Path, carried: &[Carry]) -> Vector<Carry> ! OutOfMemoryError ? &mut Allocator {
+// read contains. Anything else keeps an unknown field, which nothing forwards, except a read strictly
+// within a call result's whole-value hold whose `declared` field type the loan provably cannot reach
+// (`unreachableField`): that part of the result holds none of it.
+effect fn attributeRead(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, path: &Path, carried: &[Carry],
+  declared: &DeclaredRead) -> Vector<Carry>
+! OutOfMemoryError ? &mut Allocator {
   let steps = Vector<Step>.asSlice(&path.steps)
   let mut read = Vector<Carry>.make()
   let mut index = usize.ZERO
   while index < carried.length {
     let mut carry = carried[index]
+    let mut held = true
     if carry.field != usize.MAX {
-      let held = run copyPath(&walker.*, carry.field)
-      if pathContains(steps, Vector<Step>.asSlice(&held)) {
+      let heldPath = run copyPath(&walker.*, carry.field)
+      let heldSteps = Vector<Step>.asSlice(&heldPath)
+      if pathContains(steps, heldSteps) {
         carry.field = run strippedPath(&mut walker.*, carry.field, steps.length)
       } else {
         carry.field = usize.MAX
+        if !path.through && declared.known && pathContains(heldSteps, steps)
+          && !reborrowedByCarried(Vector<Loan>.asSlice(&walker.loans), carried, index) {
+          held = !run unreachableField(nodes, owner, &walker.*, carry, Vector<Shared<Lifetime>>.asSlice(&declared.regions))
+        }
       }
     }
-    run Vector<Carry>.append(&mut read, carry)
+    if held { run Vector<Carry>.append(&mut read, carry) }
     index = index + usize.ONE
   }
   return move read
+}
+
+// Whether another carried loan reborrows the loan `carried[index]` carries, so it stays live with it.
+fn reborrowedByCarried(loans: &[Loan], carried: &[Carry], index: usize) -> bool {
+  if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loans[carried[index].loan].borrowed {
+    let mut at = usize.ZERO
+    while at < carried.length {
+      if at != index {
+        if let Option<Shared<Lifetime>>.Some {value: parent} = &loans[carried[at].loan].parent {
+          if meetMember(&parent, &borrowed) { return true }
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return false
+}
+
+// Whether the loan `carry` carries provably lies in no part of a call result typed by `named`: the
+// same test `finish` applies to a whole result, with the field's declared regions in place of the
+// result's. The loan is exact, all its regions are body regions that no named region shares, it is
+// no retained source outlives requirements need, and the facts every call that holds it implies
+// (the body's open relations and the well-formedness of the call's argument and result types) lead
+// none of its regions to a named region or outside the body. A hold no signature describes, such
+// as a callable invocation's or a built value's, decides nothing.
+effect fn unreachableField(nodes: &[Node], owner: &DeclarationId, walker: &Walker, carry: Carry, named: &[Shared<Lifetime>]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let loans = Vector<Loan>.asSlice(&walker.loans)
+  let loan = &loans[carry.loan]
+  let regionsOf = Vector<Shared<Lifetime>>.asSlice(&loan.regions)
+  if loan.precision != LoanPrecision.Exact || regionsOf.length == usize.ZERO || !bodyRegions(regionsOf, owner) || sharesAtom(regionsOf, named) {
+    return false
+  }
+  let mut single = Vector<Carry>.make()
+  run Vector<Carry>.append(&mut single, carry)
+  let required = run requiredRetainedRegions(loans, Vector<Carry>.asSlice(&single), named, owner,
+    Vector<RetentionEdge>.asSlice(&walker.requirements))
+  if requiredLoan(loan, owner, Vector<usize>.asSlice(&required)) { return false }
+  let mut implied = Implied {groups: Vector<ImpliedGroup>.make(), known: walker.settled}
+  let holds = Vector<WholeHold>.asSlice(&walker.wholeHolds)
+  let mut found = false
+  let mut at = usize.ZERO
+  while at < holds.length {
+    if holds[at].loan == carry.loan {
+      if !holds[at].described { return false }
+      found = true
+      let facts = run signatureImplied(nodes, walker, holds[at].result)
+      if !facts.known { implied.known = false }
+      let groups = Vector<ImpliedGroup>.asSlice(&facts.groups)
+      let mut group = usize.ZERO
+      while group < groups.length {
+        let mut members = Vector<Shared<Lifetime>>.make()
+        run appendAllAtoms(&mut members, Vector<Shared<Lifetime>>.asSlice(&groups[group].members))
+        let mut container = Vector<Shared<Lifetime>>.make()
+        run appendAllAtoms(&mut container, Vector<Shared<Lifetime>>.asSlice(&groups[group].container))
+        run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move members})
+        group = group + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  if !found || !implied.known { return false }
+  return !run mayOutlive(&implied, regionsOf, named, owner)
 }
 
 // Where a reference to the sub-place `borrowed` of a holder holds a loan the holder holds at
@@ -2313,6 +2397,10 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
             }
           }
           run Vector<Carry>.append(&mut onward, Carry {loan: loan, since: point, operand: usize.MAX, definition: loans[index].definition, read: loans[index].read, field: field})
+          if field == usize.ZERO && forwarding != Forwarding.Matched {
+            run Vector<WholeHold>.append(&mut walker.wholeHolds, WholeHold {loan: loan, result: result,
+              described: !stores && forwarding == Forwarding.None && typed.length > usize.ZERO})
+          }
         }
         if dropped { run Vector<usize>.append(&mut walker.unretained, loan) }
         index = index + usize.ONE
@@ -2320,6 +2408,28 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
     }
   }
   return Flow {at: point, carried: move onward}
+}
+
+// The regions a field or pattern binding read holds as its place is declared, the subject's type
+// instantiated into the field's declared type before typing fits the read's own type to its use;
+// unknown for any other read, or when the declared type's regions are unknown.
+struct DeclaredRead {
+  known: bool
+  regions: Vector<Shared<Lifetime>>
+}
+
+effect fn declaredRead(nodes: &[Node], read: NodeId, owner: &DeclarationId) -> DeclaredRead
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut regions = Vector<Shared<Lifetime>>.make()
+  let mut known = false
+  if let NodeKind.Expression {form, ..} = &nodes[read.index].kind {
+    if let Expression.Field {declared, ..} = &form {
+      known = run bodyRetainedRegions(&declared, owner, &mut regions)
+    } else if let Expression.PatternBinding {declared, ..} = &form {
+      known = run bodyRetainedRegions(&declared, owner, &mut regions)
+    }
+  }
+  return DeclaredRead {known: known, regions: move regions}
 }
 
 // The regions `result`'s value can retain; `false` when they are unknown, as for a callable, whose
@@ -2454,6 +2564,42 @@ struct UnretainedChain {
 
 fn noImplied() -> Implied {
   return Implied {groups: Vector<ImpliedGroup>.make(), known: false}
+}
+
+// The facts a direct call `result` implies, exactly: the body's open region relations and the
+// outlives bounds its callee's signature implies (`impliedSignatureBounds`), which typing proved of
+// the call. An immediate run implies those of the call it executes; any other node, nothing known.
+effect fn signatureImplied(nodes: &[Node], walker: &Walker, result: NodeId) -> Implied
+! OutOfMemoryError ? &mut Allocator {
+  let mut call = result
+  if let NodeKind.Expression {form: Expression.Run {value, access}, ..} = &nodes[result.index].kind {
+    if access == RunAccess.Immediate { call = value }
+  }
+  if let NodeKind.Expression {form: Expression.DirectCall {implied: stated, ..}, ..} = &nodes[call.index].kind {
+    let mut implied = Implied {groups: Vector<ImpliedGroup>.make(), known: walker.settled}
+    let premises = Vector<ImpliedGroup>.asSlice(&walker.retentionRelations)
+    let mut premise = usize.ZERO
+    while premise < premises.length {
+      let mut members = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut members, Vector<Shared<Lifetime>>.asSlice(&premises[premise].members))
+      let mut container = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut container, Vector<Shared<Lifetime>>.asSlice(&premises[premise].container))
+      run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move members})
+      premise = premise + usize.ONE
+    }
+    let facts = Vector<ImpliedOutlives>.asSlice(&stated)
+    let mut fact = usize.ZERO
+    while fact < facts.length {
+      let mut members = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut members, Vector<Shared<Lifetime>>.asSlice(&facts[fact].longer))
+      let mut container = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut container, Vector<Shared<Lifetime>>.asSlice(&facts[fact].shorter))
+      run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move members})
+      fact = fact + usize.ONE
+    }
+    return move implied
+  }
+  return noImplied()
 }
 
 // The facts a call implies: the body's open region relations and the well-formedness of the
@@ -3730,7 +3876,8 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         if Vector<Carry>.length(&flow.carried) > usize.ZERO || (path.through && holds(&walker.*, path.root)) {
           let retained = run nodeRetains(nodes, id, owner)
           if retained {
-            let read = run attributeRead(&mut walker.*, &path, Vector<Carry>.asSlice(&flow.carried))
+            let declared = run declaredRead(nodes, id, owner)
+            let read = run attributeRead(nodes, owner, &mut walker.*, &path, Vector<Carry>.asSlice(&flow.carried), &declared)
             let unplaced = Vector<Vector<Step>>.make()
             let untyped = Vector<NodeId>.make()
             let noSinks = Vector<OperandSink>.make()
@@ -4236,7 +4383,9 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       return flowAt(at)
     }
     let moved = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Move, span, at)
-    flow = Flow {at: moved.at, carried: run attributeRead(&mut walker.*, &path, Vector<Carry>.asSlice(&moved.carried))}
+    // The subject is read whole, so no loan it holds is within a narrower read.
+    let whole = DeclaredRead {known: false, regions: Vector<Shared<Lifetime>>.make()}
+    flow = Flow {at: moved.at, carried: run attributeRead(nodes, owner, &mut walker.*, &path, Vector<Carry>.asSlice(&moved.carried), &whole)}
     attributed = true
   } else if (access == Scrutinee.Exclusive || access == Scrutinee.Place) && path.root != usize.MAX {
     let mut kind = Kind.Inspect
@@ -4425,13 +4574,38 @@ effect fn settled(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walke
 }
 
 // A field, index or dereference of a value that is not a written place: its operand is evaluated
-// and consumed by the projection.
+// and consumed by the projection. A field holds every loan its operand holds, as a literal's field
+// does under the literal's meet of its field regions, except a loan the operand holds as a call's
+// whole result where the field's declared type provably cannot reach it (`unreachableField`).
 effect fn readValue(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, id: NodeId, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut values = Vector<NodeId>.make()
   if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
     match &form {
-      Expression.Field {value, ..} => { run Vector<NodeId>.append(&mut values, value) }
+      Expression.Field {value, ..} => {
+        let subject = run visit(nodes, locals, owner, &mut walker.*, value, at)
+        let declared = run declaredRead(nodes, id, owner)
+        let held = Vector<Carry>.asSlice(&subject.carried)
+        let mut carried = Vector<Carry>.make()
+        let mut index = usize.ZERO
+        while index < held.length {
+          let mut kept = true
+          if declared.known && held[index].field == usize.ZERO && !reborrowedByCarried(Vector<Loan>.asSlice(&walker.loans), held, index) {
+            kept = !run unreachableField(nodes, owner, &walker.*, held[index], Vector<Shared<Lifetime>>.asSlice(&declared.regions))
+          }
+          if kept {
+            let carry = held[index]
+            run Vector<Carry>.append(&mut carried, Carry {loan: carry.loan, since: carry.since, operand: usize.ZERO,
+              definition: carry.definition, read: carry.read, field: carry.field})
+          }
+          index = index + usize.ONE
+        }
+        let unplaced = Vector<Vector<Step>>.make()
+        let untyped = Vector<NodeId>.make()
+        let noSinks = Vector<OperandSink>.make()
+        return run finish(nodes, owner, &mut walker.*, id, subject.at, &carried, false, Forwarding.Operands,
+          Vector<Vector<Step>>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
+      }
       Expression.Dereference {value} => { run Vector<NodeId>.append(&mut values, value) }
       Expression.Index {value, index, ..} => {
         run Vector<NodeId>.append(&mut values, value)
@@ -5140,7 +5314,7 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
     guardConsumed: Option<Location>.none(),
     retention: Retention.None, requirements: move requirements,
     settled: settled,
-    retentionRelations: move retentionRelations,
+    retentionRelations: move retentionRelations, wholeHolds: Vector<WholeHold>.make(),
     openContents: move openContents,
     unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(),
@@ -7157,7 +7331,7 @@ effect fn wrappedRegionClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7248,7 +7422,7 @@ effect fn symbolicRootClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7606,7 +7780,7 @@ effect fn finiteParentClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7753,7 +7927,7 @@ effect fn intervalRequirementClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7838,7 +8012,7 @@ effect fn ownedInitializationClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7982,7 +8156,7 @@ effect fn offeredMeetClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -8070,7 +8244,7 @@ effect fn regionChoiceClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
