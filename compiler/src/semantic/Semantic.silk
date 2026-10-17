@@ -181,7 +181,7 @@ import semantic.ModuleIndex {
   NameObservation,
 }
 import semantic.Operator
-import semantic.BorrowCheck {Outcome as LoanOutcome, Report as LoanReport, check as checkLoans, regionClosed, storageNodes, LoanCleanup, RegionBound}
+import semantic.BorrowCheck {Outcome as LoanOutcome, Report as LoanReport, check as checkLoans, livenessCodes, regionClosed, storageNodes, LoanCleanup, RegionBound}
 import semantic.ReturnFlow
 import semantic.OpaqueRealization
 import semantic.CallableOrigin
@@ -303,6 +303,7 @@ import semantic.TypedBody {
   SignatureDependency,
   Stage as BodyStage,
   BorrowStatus as BodyBorrowStatus,
+  Undecided as BodyUndecided,
   uncheckedReason,
   uncheckedReasonCount,
   TypedBody,
@@ -1192,10 +1193,22 @@ pub struct DeferredStaticTemplate {
   pub reason: StaticTemplate.Reason
 }
 
+/// A concrete root-package body the declaration sweep left without borrow checking: its module,
+/// the source span of its body block, and its `uncheckedReason`.
+pub struct UncheckedBody {
+  pub module: ModuleId
+  pub block: Span
+  pub reason: usize
+  /// What its borrow-status checks left open, which decides the codes it may be missing.
+  pub undecided: BodyUndecided
+}
+
 struct DeclarationCheck {
   identity: DeclarationId
   ordinal: usize
   span: Span
+  // The body block, when the declaration has one.
+  block: Span
   body: bool
   callable: bool
   conditional: bool
@@ -1286,6 +1299,37 @@ fn bodyAnswerPresent(answer: &Result<Answer, NoRejection>) -> bool {
     }
     _ => false
   }
+}
+
+// A Body answer's `uncheckedReason`, `usize.MAX` for a borrow-checked body or any other answer,
+// and what its borrow-status checks left open.
+struct BodyUnchecked {
+  reason: usize
+  undecided: BodyUndecided
+}
+
+impl Copy for BodyUnchecked {}
+
+fn bodyUnchecked(answer: &Result<Answer, NoRejection>) -> BodyUnchecked {
+  let decided = BodyUnchecked {reason: usize.MAX, undecided: BodyUndecided {regions: false, loans: false}}
+  return match &answer.* {
+    Result<Answer, NoRejection>.Success { value } => match &value.outcome {
+      Outcome.Success { value: Value.Body { body, .. } } => Shared<TypedBody>.with<BodyUnchecked>(&body, fn(checked: &TypedBody) -> BodyUnchecked {
+        return BodyUnchecked {reason: uncheckedReason(TypedBody.borrowStatus(checked)), undecided: TypedBody.undecided(checked)}
+      })
+      _ => decided
+    }
+    _ => decided
+  }
+}
+
+// Records the body block at `block` of `module` as `unchecked` says, unless it is borrow-checked.
+effect fn recordUnchecked(bodies: &mut Vector<UncheckedBody>, module: &ModuleId, block: Span, unchecked: BodyUnchecked) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if unchecked.reason == usize.MAX { return () }
+  run Vector<UncheckedBody>.append(&mut bodies.*, UncheckedBody {module: ModuleId.copy(module), block: block,
+    reason: unchecked.reason, undecided: unchecked.undecided})
 }
 
 fn declarationMemberCount(answer: &Result<Answer, NoRejection>) -> usize {
@@ -2231,6 +2275,7 @@ pub struct Semantic {
   resolver: Resolver
   query: Query<Answer, NoRejection>
   deferredTemplates: Vector<DeferredStaticTemplate>
+  uncheckedRoot: Vector<UncheckedBody>
 }
 
 /// An owned snapshot of one checked direct call's canonical selection.
@@ -37834,13 +37879,14 @@ effect fn finishLiteral(
   // The anonymous body is checked like any body: its outer locals are the captured places, and
   // its own loans and moves are proved before it is published (ANON-OWN-001).
   let mut unchecked = BodyBorrowStatus.Regions
+  let mut loansOpen = false
   let checkedPremises = run callerCheckedPremises(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &identity, bodyConstraints)
   let declared = match move run checkDeclaredRegions(&identity, bodyConstraints, Vector<Constraint>.asSlice(&checkedPremises),
     Vector<BodySafetyObligation>.asSlice(&obligations)) {
     Result<DeclaredRegions, BodyOrigin>.Success {value} => move value
     Result<DeclaredRegions, BodyOrigin>.Failure {error: origin} => {
       return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module,
-        RejectionCode.UnsatisfiedLifetimeBound, BodyOrigin.span(origin, &run cursorAnchor(cursor))))
+        declaredRegionCode(), BodyOrigin.span(origin, &run cursorAnchor(cursor))))
     }
   }
   if bodyHasLoans(Vector<BodyNode>.asSlice(&checkedNodes)) {
@@ -37853,6 +37899,7 @@ effect fn finishLiteral(
     let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&checkedNodes), root, declared.pending,
       Vector<BodySafetyObligation>.asSlice(&obligations), Vector<RegionBound>.asSlice(&declared.premises), move observers)
     unchecked = verdict.status
+    loansOpen = verdict.status != BodyBorrowStatus.Checked
     if verdict.outcome == LoanOutcome.Conflict {
       let mut related = Option<RelatedSite>.none()
       if let Option<Location>.Some {value: earlier} = &verdict.earlier {
@@ -37873,7 +37920,7 @@ effect fn finishLiteral(
     stage = BodyStage.FullyChecked
   }
   let mut body = run TypedBody.make(&identity, move locals, move checkedNodes, root, move signatures,
-    move required, move stage, unchecked, Vector<StaticIteration>.make())
+    move required, move stage, unchecked, BodyUndecided {regions: declared.pending, loans: loansOpen}, Vector<StaticIteration>.make())
   let preparedEnvironment = run TypedBody.materializeEnvironment(move body, BodyEnvironment {ty: Shared<Type>.clone(&exact), outerCount: outerCount, captures: move aliases})
   let ready = match move preparedEnvironment {
     Option<TypedBody>.Some {value} => move value
@@ -43961,6 +44008,22 @@ fn declaredBodyRegion(region: &Shared<Lifetime>, caller: &DeclarationId) -> bool
 struct DeclaredRegions {
   pending: bool
   premises: Vector<RegionBound>
+}
+
+// The code for a body whose declared region relations do not hold.
+fn declaredRegionCode() -> RejectionCode {
+  return RejectionCode.UnsatisfiedLifetimeBound
+}
+
+/// The codes a body that is not borrow-checked may be missing, from what its borrow-status checks
+/// left open: those of loan liveness when its loans' lifetimes are unproved, and that of declared
+/// region relations when one stayed pending. Its typing and moves are checked whatever the status,
+/// so their codes are never missing.
+pub effect fn uncheckedBodyCodes(undecided: BodyUndecided) -> Vector<RejectionCode> ! OutOfMemoryError ? &mut Allocator {
+  let mut codes = Vector<RejectionCode>.make()
+  if undecided.loans { codes = run livenessCodes() }
+  if undecided.regions { run Vector<RejectionCode>.append(&mut codes, declaredRegionCode()) }
+  return move codes
 }
 
 // Returns whether obligations remain, or the origin of a rigid relation not implied by the body's
@@ -54247,6 +54310,7 @@ effect fn checkedStaticRoot(
     Vector<DeclarationId>.make(),
     move stage,
     BodyBorrowStatus.Awaiting,
+    BodyUndecided {regions: true, loans: true},
     Vector<StaticIteration>.make(),
   )
   return memberSuccess(
@@ -63664,6 +63728,8 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
   }
   // A body without loans or moves has only its regions left to prove.
   let mut unchecked = BodyBorrowStatus.Regions
+  // No checker covers a static body yet, so both its relations and its loans stay open.
+  let mut undecided = BodyUndecided {regions: true, loans: true}
   // Whether typing may have relied on a premise no caller is held to; see checkDeclaredRegions.
   let mut assumed = false
   if staticBody {
@@ -63676,7 +63742,7 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
       Vector<BodySafetyObligation>.asSlice(&obligations)) {
       Result<DeclaredRegions, BodyOrigin>.Success {value} => move value
       Result<DeclaredRegions, BodyOrigin>.Failure {error: origin} => {
-        return run rejectedBody(run reject(&resolver.*, &module, RejectionCode.UnsatisfiedLifetimeBound,
+        return run rejectedBody(run reject(&resolver.*, &module, declaredRegionCode(),
           BodyOrigin.span(origin, &run cursorAnchor(&cursor))), move dependencies)
       }
     }
@@ -63690,6 +63756,7 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
       let verdict = run checkLoans(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes), control.node, declared.pending,
         Vector<BodySafetyObligation>.asSlice(&obligations), Vector<RegionBound>.asSlice(&declared.premises), move observers)
       unchecked = verdict.status
+      undecided = BodyUndecided {regions: declared.pending, loans: verdict.status != BodyBorrowStatus.Checked}
       if verdict.outcome == LoanOutcome.Conflict {
         let listed = Vector<LoanReport>.asSlice(&verdict.reports)
         if listed.length > usize.ONE {
@@ -63714,8 +63781,11 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
         }
         return run rejectedBody(run rejectWithRelated(&resolver.*, &module, verdict.code, Anchor.span(&run cursorAnchor(&cursor), verdict.access), move related), move dependencies)
       }
-    } else if !declared.pending && run regionClosed(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes)) {
-      unchecked = BodyBorrowStatus.Checked
+    } else {
+      undecided = BodyUndecided {regions: declared.pending, loans: false}
+      if !declared.pending && run regionClosed(&identity, Vector<BodyLocal>.asSlice(&locals), Vector<BodyNode>.asSlice(&nodes)) {
+        unchecked = BodyBorrowStatus.Checked
+      }
     }
   }
   if assumed && unchecked == BodyBorrowStatus.Checked { unchecked = BodyBorrowStatus.Regions }
@@ -63753,6 +63823,7 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
       move requiredBodies,
       move stage,
       unchecked,
+      undecided,
       move staticIterations,
     )
     return Answer {
@@ -69817,6 +69888,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
     },
     query: Query<Answer, NoRejection>.make(),
     deferredTemplates: Vector<DeferredStaticTemplate>.make(),
+    uncheckedRoot: Vector<UncheckedBody>.make(),
   }
 }
 
@@ -70236,6 +70308,7 @@ impl Semantic {
     ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, &request.*)
     self.deferredTemplates = Vector<DeferredStaticTemplate>.make()
+    self.uncheckedRoot = Vector<UncheckedBody>.make()
     let mut modules = Vector<usize>.make()
     let mut rootAt = usize.ZERO
     while rootAt < rootPackage.length {
@@ -70293,6 +70366,7 @@ impl Semantic {
             _ => false
           }
           let mut default = false
+          let mut blockSpan = Span.make(usize.ZERO, usize.ZERO)
           let conformance = match Module.node(hir, declaration.header) {
             Node.ImplHeader { target, .. } => target.present
             _ => false
@@ -70303,6 +70377,7 @@ impl Semantic {
                 body = block.present
                 if block.present {
                   staticWork = run bodyHasStaticWork(hir, block.id)
+                  blockSpan = Module.span(hir, block.id)
                 }
               }
               Node.PackageParameterBody { default: written, .. } => {
@@ -70319,6 +70394,7 @@ impl Semantic {
               identity: DeclarationId.copy(&declaration.identity),
               ordinal: ordinal,
               span: Module.span(hir, declaration.header),
+              block: blockSpan,
               body: body,
               callable: callable,
               conditional: conditional,
@@ -70421,6 +70497,13 @@ impl Semantic {
                 &signature
               )
               run appendCheckedAnswer(&mut rejections, &mut gaps, &mut self.query, &declaration.identity, &body)
+              // Only a concrete body's sweep status is the status of the instance a build reaches.
+              // An open template is checked abstractly and a deferred one not at all here, while
+              // the instances a build reaches are checked in their own right.
+              if !declaration.open {
+                run recordUnchecked(&mut self.uncheckedRoot, &module, declaration.block,
+                  Shared<Result<Answer, NoRejection>>.with<BodyUnchecked>(&body, bodyUnchecked))
+              }
               if
                 !declaration.open
                   && Shared<Result<Answer, NoRejection>>.with<bool>(&body, bodyAnswerPresent) {
@@ -70684,6 +70767,14 @@ impl Semantic {
   /// evidence, never a checked Body answer. Selected applications still demand their exact Body.
   pub fn deferredStaticTemplates(self: &Self) -> &[DeferredStaticTemplate] {
     return Vector<DeferredStaticTemplate>.asSlice(&self.deferredTemplates)
+  }
+
+  /// The concrete root-package bodies the last loaded-declaration sweep left without borrow
+  /// checking, reached or not, in sweep order. Open and deferred templates are not listed: the
+  /// instances a build reaches are checked separately. The emitted count covers only the reached
+  /// instances, so an unreached unchecked body is visible here alone.
+  pub fn uncheckedRootBodies(self: &Self) -> &[UncheckedBody] {
+    return Vector<UncheckedBody>.asSlice(&self.uncheckedRoot)
   }
 
   // Checks OWN0016 using a MIR-only closure. No declaration added here becomes an emission root.

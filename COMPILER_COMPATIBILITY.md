@@ -19,9 +19,9 @@ diagnosis, and it may be a real bug.
 
 ## The two compilers
 
-| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                       |
-| ------------------------------ | --------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                   |
+| Compiler                       | Location                                                        | Role today                                                                                                                                                                                                                                                                                                                      |
+| ------------------------------ | --------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TypeScript bootstrap (stage 0) | `packages/compiler`, `packages/cli`                             | Builds and checks every Silk program today: the standard library in `packages/compiler/stdlib`, examples, and the self-hosted compiler's own sources. Repairs start from `main` (see the [development branches and bootstrap](compiler/README.md#development-branches-and-bootstrap) section).                                  |
 | Self-hosted native frontend    | `compiler/` (developed on `selfhost` and `selfhost-*` branches) | Lexer, parser, HIR lowering, demanded semantic queries, and native `silk build` for the documented closed-body subset. Its semantic and backend coverage is incomplete. The TypeScript CLI commands `silk build`, `check`, and `test` still use the bootstrap. [compiler/README.md](compiler/README.md) lists what it supports. |
 
 Consequences:
@@ -105,7 +105,6 @@ Each entry records:
   with Clang O0 and O2 on Darwin; this does not claim Linux ABI execution or an N1 executable.
 - **Open questions:** remaining native compiler self-build refusals are measured separately.
 
-
 ### Shared-loan lifetime shortening in selfhost call inference
 
 - **Status:** implemented on 2026-10-04 on PR #787; verification is pending exact-head CI.
@@ -148,7 +147,7 @@ Each entry records:
 - **Status:** implemented on 2026-10-06 on PR #1076.
 - **Rule:** a lifetime binder that only a call's result, failure or requirements mention, such as
   the impl lifetime of `impl<'names> TrailerPolicy<'names> { fn defaultPolicy() ->
-  TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
+TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand constrains it.
 - **Compilers:** the bootstrap solves the region with the rest of the body. Selfhost fixes it at the
   call: a complete ordinary call takes the region its expected result names, and otherwise binds
   `'static`, since the outcome retains no operand region through that binder. A direct call's
@@ -166,16 +165,19 @@ Each entry records:
 - **Source migration:** none.
 - **Diagnostics and limits:** when a later use needs a shorter region in an invariant position,
   selfhost reports that use's exact type mismatch or the deferred lifetime-shortening gap where the
-  bootstrap infers the shorter region. Where the bootstrap reports a shortened result escaping
+  bootstrap infers the shorter region. Where the bootstrap reports a shortened result returned
   through another call, a field or a binding as OWN0019 at the use and SEM0212 at the borrowed
-  argument, selfhost reports SEM0212 at the call, or OWN0019 where its borrow check sees the escape
-  first. A call under several bounds on one binder, or one in a body the borrow check leaves
-  unproved, keeps SEM0212 where the bootstrap accepts.
+  argument, selfhost reports one of them: OWN0019 where its borrow check follows the loan to the
+  return, and otherwise SEM0212 at the borrow, since a returned value is stored in the caller's
+  result slot and a region goal admitted into a lifetime parameter the result names refutes a
+  borrow of a local or a temporary there. A call under several bounds on one
+  binder, or one in a body the borrow check leaves unproved, keeps SEM0212 at the call where the
+  bootstrap accepts.
 - **Evidence:** `resultOnlyLifetimeBindersFollowTheirUse` in
   `compiler/src/semantic/SemanticCaptureCases.silk`,
   `bodyChecksDirectCallsWithoutDemandingCalleeBodies` in
   `compiler/src/semantic/SemanticConformanceCases.silk`, and `resultOnlyBindersShortenToTheirBound`
-  in `compiler/src/semantic/SemanticCallableCases.silk`.
+  and `returnedLoansOutliveTheBody` in `compiler/src/semantic/SemanticCallableCases.silk`.
 
 ### Caller-local region relations and 'static binder shortening in selfhost
 
@@ -383,8 +385,7 @@ Each entry records:
   control and aggregate actors remain in the coordinated proof root. The permanent
   `selectedStaticRecursionSharesConfiguredDepthBudget` actor retains selected and ordinary
   recursion refusals, post-failure recovery, and depth-two refusal followed by depth-64 success
-  for the same selected application. The coordinated executable ran all eleven actors and returned
-  42. Rebuilding the same eleven actors with scoped reservation cleanup retained all passes,
+  for the same selected application. The coordinated executable ran all eleven actors and returned 42. Rebuilding the same eleven actors with scoped reservation cleanup retained all passes,
   including the larger-budget retry after refusal. Optimized compiler source probes are reported
   below.
 - **Optimized evidence:** the corrected private native-produced N1 built from frozen source
@@ -733,6 +734,7 @@ Each entry records:
   `shelvedThenReplace`) and `implicitReceiverBorrowsRetainStoredSources` (write and move rejections,
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
+
 ### Native holds every loan of a literal in each of its field projections
 
 - **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
@@ -1233,6 +1235,7 @@ Each entry records:
     reached instance of its declaration. A calm use is therefore unproved when another reached
     instance of the same declaration parks, or when no instance is reached at all. The bootstrap
     proves the function itself.
+
 - **Source migration:** none for ordinary programs. Do not give an Execution body state whose
   Drop hook parks. Do not pass a never-invoked function with deferred binders to a
   NonParking-bounded parameter.
@@ -1955,6 +1958,22 @@ repeated invocation and capture-only drop glue.
   This correction does not establish native self-build success.
 - **Source migration:** none.
 
+## Cancellation cleanup order
+
+EXEC-008 cleans the owners of a cancelled frame in structured-exit order: innermost exited region
+first, reverse acquisition within a region, so a consuming match arm's bindings drop before the
+subject's remainder.
+
+- **Bootstrap:** releases a cancelled frame's affine owners in local-ordinal order
+  (`Ownership.inReleaseOrder` over the suspension planner's slots). A consuming match of a subject
+  cancelled inside its arm drops the subject's remainder before the arm's binding. An ordinary
+  `return` from the same arm already drops the binding first.
+- **Native:** a cancel exit is the structured-exit cleanup of its point, so it matches EXEC-008.
+- **Source migration:** none. The consuming-match cancel case is pinned by a native Case and stays
+  out of the shared corpus until both compilers agree.
+- Retire this entry when the bootstrap cancels in structured-exit order and the case joins the
+  shared corpus.
+
 ## Explicit synchronous source startup
 
 The bootstrap can select `silk/native_start_sync` through ordinary runtime composition for an i32
@@ -2393,6 +2412,7 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
   | Pattern                             | ~5 KB                    | 16     |
 
   An arm level costs a grouped child, a `match` and a block: 8 + 16 + 68 = 92 units.
+
 - **Source migration:** none expected. The deepest nesting in the standard library, the compiler
   sources, the corpus and the examples (850 files) is 14 nested braces, 15 nested delimiters, 7
   nested parentheses and a 5-operator prefix run, about 1.2K of the 4096 units.
@@ -2481,3 +2501,167 @@ BORROW-006 keeps a temporary alive for as long as a borrow of it, so
 - **Evidence:** `binderMeetsKeepBodyLocalRegions` and `binderMeetsNeverWidenFixedRegions` in
   `compiler/src/semantic/SemanticCaptureCases.silk`.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+## Bootstrap cleans borrowed temporaries at the end of their scope
+
+BORROW-006 keeps a borrowed temporary's hidden owner live for every view derived from the borrow,
+then cleans it under the ordinary ownership rules; `read(&[1, 2])` cleans the array after the call.
+
+- **Bootstrap:** cleans a borrowed temporary when the scope that owns it ends: its block, branch,
+  statement arm, loop condition or iteration, a value arm whose result holds no view, or an exit
+  leaving that scope. It runs after that scope's other cleanup, so a binding or Effect that
+  retains the view is dropped first. Its recorded loan end is not used, because that end can fall
+  before a retaining value's last use: a view stored in a struct ends at the construction, and an
+  Effect that captures one ends at a `run` on another path. A view that outlives its temporary's
+  scope, such as an arm result or a branch assignment, is rejected with OWN0019; lowering never
+  ends such a loan at a join, so MIR verification would reject one that reached it.
+- **Native:** not changed here. Poison-on-drop probes of the reviewed shapes saw live storage in
+  every destructor.
+- **Source migration:** none. Only destructor timing changes: a temporary with a destructor now
+  runs it at its scope's end, after that scope's other owners.
+- Retire this entry with the bootstrap, or when its loan facts record the last use of every
+  retaining value.
+
+## Loans of lifetime-annotated and universally bounded borrows
+
+VIEW-002 ends a loan at its last use or the last use of a value retaining it. Annotating a binding
+with a lifetime, including one of the function's lifetime parameters, does not extend the loan.
+
+- **Bootstrap:** keeps a borrow live to the end of the body when its region must outlive a lifetime
+  chosen outside it: an annotated `let view: &'a T = &place` binding, or an unannotated borrow a
+  call constrains to outlive such a lifetime. It therefore rejects a write to the borrowed place
+  after the view's last use, even when nothing stores the view. Stricter is safe.
+- **Native:** ends such a loan at its last use unless a call or callable can store it where the
+  caller can still read it, then keeps it live wherever its creation reaches.
+- **Source migration:** none.
+- Retire this entry when the bootstrap is deleted.
+
+## Frozen-bootstrap defects
+
+The bootstrap receives only fixes that keep CI green, so the defects below stay in it. One, the
+`lowerMir` early free, was removed by #1833 but remains in compilers an earlier bootstrap built.
+Native rejects each program, lowers it correctly, or does not have the defect. Retire each entry
+with the bootstrap.
+
+### Bootstrap frees a borrowed temporary before a binding that retains its view
+
+BORROW-006 keeps a borrowed temporary alive for every view derived from it.
+
+```silk
+let base = [make(1)]
+let mut h = Holder { view: &base }
+let view = identity(&[make(5)])
+h = Holder { view: view }
+return 0
+```
+
+- **Bootstrap:** accepts it. At the return, cleanup orders the temporary's hidden-owner Drop by
+  acquisition ordinal, so the temporary is freed before `h`, and `h`'s destructor reads freed
+  storage. The same happens at an extra early return, `run` propagation, `fail`, a return in a
+  match arm, and `return read(&[make(2)])`. With `--verify-ir`, MIR verification reports
+  UseAfterDrop.
+- **Native:** rejects every variant with OWN0019, as the bootstrap does once the temporary is
+  named.
+
+### Bootstrap leaks a temporary borrowed in a value arm whose result may hold a view
+
+A value arm ends the temporaries it borrows only when its result cannot hold a view. When the
+result type may hold one but the value does not retain the temporary, the temporary is never
+ended:
+
+```silk
+fn pick<'a, 'b>(left: &'a [Token], right: &'b [Token]) -> &'a [Token] { return left }
+let chosen = match move p {
+  Packet.Ready { value } => pick(&base, &[make(value)])
+  Packet.Empty => pick(&base, &base)
+}
+```
+
+- **Bootstrap:** with `--verify-ir`, MIR verification reports InvalidLoan. Without it the
+  temporary leaks and its destructor never runs. An Effect-valued arm such as
+  `pure(read(&[make(value)]))` and `return match …` behave the same.
+- **Native:** not affected.
+
+### Bootstrap before #1833 freed a temporary before running an Effect built from its view
+
+In `Semantic.lowerMir` in `compiler/`, near the `callableResultType` run:
+
+```silk
+result = match move run callableResultType(&mut resolver.*, &mut owner.*, &mut dependencies,
+    &callerApplication, Vector<Constraint>.asSlice(&Vector<Constraint>.make()), Span.make(usize.ZERO, usize.ZERO)) {
+  Success {value} => move value
+  Failure {error} => { return run mirRejection(&identity, move error, move dependencies) }
+}
+```
+
+- **Bootstrap before #1833:** its MIR builds the Effect (`make-effect`, capturing the slice),
+  then ends the loan and drops the temporary Vector, and only then runs the Effect
+  (`run-effect-value`).
+  MirNormalization does not fuse the pair into one `run-static-effect` because the
+  `&mut resolver.*` and `&mut owner.*` captures are exclusive. The fused form always drops the
+  temporary after the run. The Vector is empty and no element is read, so the practical risk is
+  low. With `--verify-ir`, MIR verification reports UseAfterDrop in `lowerMir`. Nine reduced
+  probes did not reproduce it. It appears only in the whole-compiler build, probably through
+  cross-module instantiation or the real `Shared.with` and service context.
+- **Bootstrap since #1833:** a borrowed temporary ends only in its scope's cleanup, after the run,
+  and the compiler build reports no UseAfterDrop. Compilers that an earlier bootstrap built,
+  including the current native seed, still carry the early free.
+- **Native:** lowers the site as one direct call and drops the Vector after it on every exit.
+
+### Bootstrap accepts programs that read storage after its owner is dropped
+
+- **Bootstrap:** accepts thirteen use-after-drop programs that reviews of #1851 and #1855 found.
+  In two of them, a `keep` call retains the previous iteration's owner in a loop, and a later
+  iteration reads it.
+- **Native:** rejects them or leaves their bodies unchecked.
+
+### Bootstrap accepts a view stored past a write
+
+```silk
+let view: &'b Token = &src.t
+keep<'b>(&mut out.*, view)
+src.t = Token { value: 1 }
+```
+
+- **Bootstrap:** accepts it, including the Effect form `run keepLater<'b>(view)`, run at once or
+  deferred.
+- **Native:** rejects the direct store with OWN0011 at the write, and the Effect forms the same
+  way.
+
+### Bootstrap MIR verification treats an unreachable match fallthrough as terminating
+
+When a member's last match candidates all carry nested pattern tests, exhaustiveness proves
+that falling past them is impossible:
+
+```silk
+let found = tokens(&shelf.items)
+match move selection {
+  Result<Option<i32>, i32>.Success {value: Option<i32>.Some {..}} => { return 2 }
+  Result<Option<i32>, i32>.Failure {error} => { return error }
+  Result<Option<i32>, i32>.Success {value: Option<i32>.None} => ()
+}
+return found[0].value
+```
+
+- **Bootstrap:** the structured path analysis in MirVerification still treats that fallthrough
+  as a terminating path. No region exists there to end a loan, so a loan held across the match
+  fails InvalidLoan. A borrowed temporary held to the end of its scope hits the same path. It has
+  no codegen effect.
+- **Native:** the clean fix belongs in the native MIR verifier: lowering records the Match's
+  exhaustive coverage, and the verifier stops treating candidate exhaustion as terminal when that
+  coverage is recorded.
+
+### Bootstrap's compiler build does not pass `--verify-ir`
+
+The compiler sources built by the bootstrap (T1) have never verified clean with `--verify-ir`. At
+selfhost 6d5dd194 after #1833, verification reports:
+
+- InvalidLoan: 52 (388 before #1833);
+- InvalidMatchOwnership: 31;
+- InvalidLocalSharedOperation: 5;
+- InvalidSliceOperation: 5;
+- UseAfterDrop: none (1 before #1833, the `lowerMir` defect above).
+
+Of the 52 InvalidLoan, one is the unreachable match fallthrough above. Another known source is a
+plain loan carried out of a loop by `break`, which the loop's restored entry state never ends.
+Neither has a codegen effect.

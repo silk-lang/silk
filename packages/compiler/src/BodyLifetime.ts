@@ -198,16 +198,22 @@ export const constrain = (
   self.constraints.set(normalized.key, bound)
 }
 
-/** Defers concrete storage obligations until a successful assignment installs its incoming value. */
+/**
+ * Defers the obligations into the destination's own storage until a successful assignment
+ * installs its incoming value. Every other obligation the incoming value raises, such as a call
+ * relating its argument loans to its result, holds wherever its regions are live.
+ */
 export const activatedCompatibility = (
   self: BodyLifetime,
   base: TypeCompatibility.Context,
   installed: AuthoredHir.Anchor,
+  storage: ReadonlyArray<Lifetime.Lifetime>,
   owner?: AuthoredHir.Anchor,
 ): TypeCompatibility.Context => {
+  const replaced = new Set(storage.map(Lifetime.key))
   const retain = (longer: Lifetime.Lifetime, shorter: Lifetime.Lifetime): void => {
     // A caller-owned universal lifetime remains a whole-contract requirement.
-    if (shorter._tag !== 'LocalLifetime') {
+    if (shorter._tag !== 'LocalLifetime' || !replaced.has(Lifetime.key(shorter))) {
       base.commitOutlives?.(longer, shorter)
       return
     }
