@@ -2623,8 +2623,9 @@ return read(&slot)
 - **Bootstrap:** accepts it, and the program reads `count` after its block ends. It also accepts
   the aliasing form, which writes `count` while `slot` still holds the loan.
 - **Native:** rejects the first program with OWN0019 at `&slot`, and the aliasing form with OWN0011
-  at the write. Passing the closure to a call that may invoke it rejects the same way. A store
-  through a local reference to body storage leaves the body unchecked
+  at the write. Passing the closure to a call that may invoke it, by value, by reference or in a
+  holder's field, rejects the same way. A store through a local reference to body storage leaves
+  the body unchecked
   (`invalid/closure-capture-store-expired`, `invalid/closure-capture-store-alias`).
 
 ### Bootstrap MIR verification treats an unreachable match fallthrough as terminating
