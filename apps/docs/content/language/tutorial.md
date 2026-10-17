@@ -44,18 +44,11 @@ root = "src/main.silk"
 `silk-version` is optional. When present it must be a semantic version; no command compares it with
 the running compiler.
 
-And the generated `src/main.silk` logs a greeting:
+And the generated `src/main.silk` is the smallest program that does nothing:
 
 ```silk
-import silk.effect { Effect }
-import silk.logger { LogError }
-import silk.os_logger { StdoutLogger }
-
-pub effect fn main() -> ()
-  ! LogError {
-  let mut logger = StdoutLogger.make()
-
-  run Effect.log("Hello, world!", &()) |> Effect.provideMut(&mut logger)
+pub effect fn main() -> () {
+  return ()
 }
 ```
 
@@ -64,8 +57,6 @@ Run it:
 ```console
 $ silk run
 ```
-
-`silk run` reports the build, then the program prints `Hello, world!`.
 
 ## Your first program
 
