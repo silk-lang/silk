@@ -745,16 +745,22 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `struct Pair<'b, 'a: 'b>` returns its `&'a Key` as `&'b Key` on `Pair`'s `'a: 'b` alone, so the
   result keeps the key's loan.
 - **Compilers:** the bootstrap accepts `let r = viaPair(&k, Pair {short: &v, long: &w})`, then a
-  write to `k` and a read of `r`; with a key that has `Drop` this reads freed storage. Native adds
-  each nominal's declared region bounds and each view's referent bound of the signature's parameter
-  and result types to the bounds a direct or member call proves (`impliedSignatureBounds`), so the
-  result keeps the loan and such a body is never Checked. It is left unchecked rather than rejected:
-  the result's loans are alternatives across operands, and a conflict with an alternative loan is
-  not a proof.
+  write to `k` and a read of `r`; with a key that has `Drop` this reads freed storage. Native holds
+  every call to the bounds its callee's parameter and result types imply: each nominal's declared
+  region bounds and each view's referent bound (`impliedSignatureBounds`). It covers direct and
+  member calls, operator calls, invoked callable values, staged schemas and named sections
+  (`holdImpliedBounds`). A call proves them under the caller's premises and the bounds its own
+  signature implies. A relation between the caller's own loans is retained for the borrow checker,
+  which is how the result keeps the key's loan. An implied bound typing neither proves nor retains
+  leaves the body unchecked (`UnprovedImpliedBound`) and does not refuse the call, so no program the
+  declared bounds admit is newly rejected. Bounds on a callable's invocation regions are owed at its
+  invocation, and so are those on a section's unsupplied binders.
 - **Source migration:** none. The compiler and standard library have no such caller.
-- **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall` (direct, nested-view,
-  drop-carrying, qualified and receiver member, and callable-value calls are never Checked; clean
-  calls and a write after the result's last use stay Checked).
+- **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall`. Direct, nested-view,
+  drop-carrying, qualified member, receiver member, callable-value and section calls are never
+  Checked. Clean calls, a write after the result's last use and callers that forward their own
+  parameters stay Checked. An operator implementation with this shape is not yet accepted
+  (SEM0135), so the operator path has no Case.
 
 ### Native holds every loan of a literal in each of its field projections
 
