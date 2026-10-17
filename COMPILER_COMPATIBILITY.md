@@ -815,31 +815,26 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
 
-### Native ends a borrow some written lifetime arguments type at its last use
+### Native leaves a literal nested in a written one unchecked
 
-- **Status:** recorded on 2026-10-17 with the written-binding fix (#1888) and narrowed with the
-  written call and literal fix (#1897). It is retired when native keeps every borrow a written
-  lifetime argument types at a universal region live through the body.
+- **Status:** recorded on 2026-10-17 with the written-binding fix (#1888), narrowed with the
+  written call and literal fix (#1897) and with the written-operand fix that follows it. It is
+  retired when native types a literal nested without arguments in a written one at the written
+  regions.
 - **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a borrow
   a written lifetime argument types at one stays valid, and its place borrowed, for the rest of the
   body.
-- **Compilers:** the bootstrap rejects each form below with OWN0011 at a later write to `src.t`,
-  where `'a` is a lifetime parameter of the body. Native keeps a written binding type, a written
-  direct call argument and a written record literal field live through the body, but not these:
-  - Checked natively: a reborrow through a body-local reference, `let r = &src.t` and then
-    `lenOf<'a>(&r.*)`, or `let r = &mut src.*` and then `lenOf<'a>(&r.t)`, where the operand's
-    own loan is of a local and the loan it carries is left to its last use; a method called through
-    its type, `Box1.peek<'a>(&src.*)`; and an Effect call run at once, `run lenE<'a>(&src.t)`.
-  - Unchecked natively, as a regions gap: a literal nested in a written one,
-    `Outer<'a> {inner: Holder {view: &src.t}}`; a constructor called through its applied type,
-    `Holder<'a>.make(&src.t)`; and `pass<'a>(&r.*)` or `Holder<'a> {view: &r.*}` through a
-    body-local reference.
+- **Compilers:** in `let o = Outer<'a> {inner: Holder {view: &src.t}}` followed by a write to
+  `src.t`, where `'a` is a lifetime parameter of the body, the bootstrap reports OWN0011 at the
+  write. Native leaves the body unchecked, as a regions gap: the nested `Holder` literal writes no
+  arguments, so its field types are its own binders rather than the outer literal's written `'a`.
+  Every other written form, a binding type, a call or method or constructor argument, an Effect call
+  run at once, a record literal field and a reborrow through a body-local reference, keeps the
+  borrow live through the body natively as well.
 - **Source migration:** none.
-- **Diagnostics and limits:** the Checked forms are false acceptances, though nothing in them stores
-  or returns the loan, so no reference outlives its place. Removing the written argument makes both
-  compilers accept every form.
-- **Evidence:** native compile verdicts on #1897's head against main 2952e899, from its review. The
-  covered forms are `SemanticCaptureCases::universalLoansOutliveTheBody` and the corpus programs
+- **Diagnostics and limits:** native never accepts this form as Checked.
+- **Evidence:** native compile verdicts on the written-operand fix's head; the covered forms are
+  `SemanticCaptureCases::universalLoansOutliveTheBody` and the corpus programs
   `invalid/written-universal-view-write`, `invalid/written-call-lifetime-argument` and
   `invalid/written-literal-lifetime-argument`.
 
