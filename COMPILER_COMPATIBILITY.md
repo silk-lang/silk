@@ -355,7 +355,7 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   in a local typed by another parameter's region and returning it there needs that relation.
 - **Compilers:** in `fn pick<'a, 'b>(x: &'a Box, y: &'b Box) -> &'a i32 { let mut r = &x.first
 static for field in Intrinsic.reflectFields<Box>() { r = Reflect.borrowField<Box, i32>(y, field) }
-return r }`, native rejects with SEM0212 at the `y` argument of `borrowField`. The bootstrap
+return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   accepts the program whether `pick` is called with one owner for both parameters or with two
   distinct owners. A caller passing a shorter-lived second owner is the same program; the
   bootstrap fails to parse that variant, so it is not a further acceptance.
