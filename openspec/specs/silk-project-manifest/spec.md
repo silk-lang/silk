@@ -8,7 +8,7 @@ Defines how Silk language-tool commands discover, validate, and materialize one 
 
 ### Requirement: Minimal project manifest
 
-The system SHALL accept a UTF-8 `silk.toml` containing a `[package]` table with required `name`, `version`, and `root` strings and an optional `source-root` string. The package name SHALL be a portable lowercase identifier beginning with an ASCII letter and continuing with lowercase letters, digits, or hyphens. The version SHALL be a valid semantic version. Manifest paths SHALL be interpreted relative to the manifest directory.
+The system SHALL accept a UTF-8 `silk.toml` containing a `[package]` table with required `name`, `version`, and `root` strings and optional `source-root` and `silk-version` strings. The package name SHALL be a portable lowercase identifier beginning with an ASCII letter and continuing with lowercase letters, digits, or hyphens. The version SHALL be a valid semantic version. A present `silk-version` records the compiler release that created the project and SHALL be a valid semantic version; no command SHALL compare it with the running compiler. Manifest paths SHALL be interpreted relative to the manifest directory.
 
 #### Scenario: Load the minimal manifest
 
@@ -20,9 +20,14 @@ The system SHALL accept a UTF-8 `silk.toml` containing a `[package]` table with 
 - **WHEN** the package root is `src/app/Main.silk` and `source-root = "src"`
 - **THEN** the project source root is `src` and the root module identity is `app/Main`
 
+#### Scenario: Record the creating compiler release
+
+- **WHEN** `silk.toml` declares `silk-version = "0.1.0"` under `[package]`
+- **THEN** the manifest loads, and a build with any compiler release proceeds as without the field
+
 #### Scenario: Reject an invalid manifest
 
-- **WHEN** TOML is malformed, a required field is absent, the package name or version is invalid, the entry is not an exact `.silk` file, or the entry escapes its source root
+- **WHEN** TOML is malformed, a required field is absent, the package name, version, or `silk-version` is invalid, the entry is not an exact `.silk` file, or the entry escapes its source root
 - **THEN** project loading fails with a typed project error that identifies the manifest and reason
 
 ### Requirement: Upward project discovery
