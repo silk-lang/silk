@@ -735,6 +735,33 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
 
+### Bootstrap accepts a loan stored into a local holder after its storage ends
+
+- **Status:** recorded on 2026-10-17 from the independent review of #1886. #1886 lets native region
+  proofs use loans a field store gives a local holder. The bootstrap gap remains until its loan
+  pass carries a field-stored loan through every later use of its holder.
+- **Rule:** BORROW-008 and LIFE-002. A field store `v.oid = &y` puts the loan of `y` in the holder
+  `v`. Every later use of `v`, or of a value that takes `v`'s contents, needs `y`'s storage, so a
+  use after `y`'s scope ends is OWN0019.
+- **Compilers:** the bootstrap compiles each of these programs with no diagnostic. Native rejects
+  each with OWN0019 at the dangling read. All three use `struct View<'a> { oid: &'a i32 }`.
+  - A loop reads the loan the previous iteration stored, after the new iteration's `let`:
+    `while i < 3 { let y = i  t = t + v.oid.*  v.oid = &y  i = i + 1 }` (OWN0019 at `v.oid.*`).
+  - The holder is moved into another holder inside the scope, and that holder is read after it:
+    `if x == 1 { let y = 2  v.oid = &y  s = Shelf { held: move v } }  return s.held.oid.*`, with
+    `struct Shelf<'s> { held: View<'s> }` (OWN0019 at `s.held.oid.*`).
+  - A view taken from the holder inside the scope is read after it:
+    `if x == 1 { let y = 2  v.oid = &y  p = get(&v) }  return p.*`, with
+    `fn get<'a>(v: &View<'a>) -> &'a i32` (OWN0019 at `p.*`).
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects; it never accepts a read of a field-stored loan past
+  its storage end. These are not corpus programs, because the bootstrap's corpus tests require
+  every `invalid/` program to be rejected with its listed diagnostics.
+- **Evidence:** compile-only verdicts on main 3f297962: the frozen bootstrap's `check` succeeds;
+  native `build --emit llvm-ir` reports OWN0019 at the spans above. The neighboring shapes that both
+  compilers reject are pinned in `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs`
+  (`scopeEnd`, `loopStore`, `loopCarried`, `escape`, `projection`).
+
 ### Native holds every loan of a literal in each of its field projections
 
 - **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
