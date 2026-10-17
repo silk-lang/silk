@@ -3144,6 +3144,9 @@ export const tirAssignmentWritePlace = (
   if ('origin' in fact)
     return tirBorrowedWritePlace(fact, root, options) ?? tirWritePlace(fact, root, options)
   const access = assignmentRootAccess(root, fact)
+  // A `match &mut` binding names the selected payload, so its write is rooted in the binding.
+  if (root._tag === 'PatternBinding' && access === 'ExclusiveBorrowed')
+    return tirWritePlace(fact, root, options)
   if (access === 'ExclusiveBorrowed') return tirBorrowedWritePlace(fact, root, options)
   if (access === 'MutableOwned') return tirWritePlace(fact, root, options)
   return undefined

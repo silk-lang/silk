@@ -66,6 +66,60 @@ pub fn main() -> i32 { return 0 }`),
   }),
 )
 
+it.effect('writes through a match &mut binding and keeps a nested place binding read-only', () =>
+  Effect.gen(function* () {
+    const writes = yield* AnalysisFixture.retainingMain(
+      'place-replace/exclusive-binding',
+      ascii(`struct Token { value: i32 }
+union Packet { Empty, Ready { left: Token, right: Token } }
+pub fn main() -> i32 {
+  let mut packet = Packet.Ready { left: Token { value: 1 }, right: Token { value: 2 } }
+  let mut seen = 0
+  match &mut packet {
+    Packet.Ready { left, right } => {
+      left = Token { value: 4 }
+      right.value = 5
+      let displaced = Intrinsic.replace(left, Token { value: 6 })
+      seen = displaced.value
+    }
+    Packet.Empty => {}
+  }
+  return seen
+}`),
+    )
+    assert.deepEqual(Analysis.diagnostics(writes), [])
+    assert.deepEqual(yield* MirVerification.verify(Analysis.loweredMir(writes)), [])
+
+    const nested = yield* AnalysisFixture.retainingMain(
+      'place-replace/exclusive-nested-place',
+      ascii(`struct Token { value: i32 }
+union Packet { Empty, Ready { left: Token, right: Token } }
+struct Holder {
+  packet: Packet
+  n: i32
+}
+union Slot { Vacant, Filled { holder: Holder } }
+pub fn main() -> i32 {
+  let mut slot = Slot.Filled { holder: Holder { packet: Packet.Empty, n: 0 } }
+  match &mut slot {
+    Slot.Filled { holder } => {
+      match place holder.packet {
+        Packet.Ready { left, .. } => { left.value = 5 }
+        Packet.Empty => {}
+      }
+    }
+    Slot.Vacant => {}
+  }
+  return 0
+}`),
+    )
+    assert.deepEqual(
+      Analysis.diagnostics(nested).map((diagnostic) => diagnostic.code),
+      ['SEM0035'],
+    )
+  }),
+)
+
 it.effect('validates replacement cleanup of a lifetime-bearing union field', () =>
   Effect.gen(function* () {
     const snapshot = yield* AnalysisFixture.retainingMain(
