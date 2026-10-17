@@ -1,0 +1,324 @@
+//! The packages one build reads: the root package and every package its `[dependencies]` reach.
+//!
+//! # Details
+//! Each manifest's `[dependencies]` table maps a dependency name to `{ path, package? }`
+//! (PACKAGE-002). Loading follows those tables depth first from the root package and checks the
+//! rules a build relies on: identifier names other than `silk` and `Intrinsic`, a readable manifest
+//! at each path, a matching `package` name, no name that is also one of the owner's own top-level
+//! modules (PACKAGE-003), no package cycle, and one version and one directory per package name
+//! (PACKAGE-004).
+
+import driver.CommandPath
+import semantic.ModuleId {ModuleId}
+import semantic.PackageGraph {PackageGraph}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.box {Box}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.filesystem {FileError, FileSystem, Path}
+import silk.option {Option}
+import silk.result {Result}
+import silk.string {String}
+import silk.toml_scanner {TomlError}
+import silk.toml_value {Toml, TomlChild, Value as TomlValue}
+import silk.usize
+import silk.vector {Vector}
+
+/// A dependency the build cannot use. `detail` names the dependency and what is wrong with it.
+pub struct InvalidDependency {
+  pub detail: Bytes
+}
+
+// One package of the build.
+struct Package {
+  // `name@version`, the identity its module identities carry.
+  identity: Bytes
+  name: Bytes
+  // The directory holding its manifest.
+  manifest: Path
+  // The directory its module paths resolve below.
+  sourceRoot: Path
+}
+
+// One edge of the graph: package `owner` imports package `package` as `name`.
+struct Edge {
+  owner: Bytes
+  name: Bytes
+  package: Bytes
+}
+
+/// Every package of one build, the root first, and the dependency names each one declares.
+pub struct Packages {
+  packages: Vector<Package>
+  edges: Vector<Edge>
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `text` is an identifier: an ASCII letter or `_`, then letters, digits or `_`.
+fn identifier(text: &[u8]) -> bool {
+  if text.length == usize.ZERO { return false }
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    let letter = (byte >= 65 && byte <= 90) || (byte >= 97 && byte <= 122) || byte == 95
+    let digit = byte >= 48 && byte <= 57
+    if !letter && !(digit && at > usize.ZERO) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn copyPath(path: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  return run Path.fromBytes(Path.rawBytes(path))
+}
+
+// Fails with `dependency <name> of <owner>: <reason>`.
+effect fn invalid(owner: &[u8], name: &[u8], reason: &[u8]) -> never ! InvalidDependency | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(b"dependency `")
+  run Bytes.append(&mut detail, name)
+  run Bytes.append(&mut detail, b"` of ")
+  run Bytes.append(&mut detail, owner)
+  run Bytes.append(&mut detail, b": ")
+  run Bytes.append(&mut detail, reason)
+  fail InvalidDependency {detail: move detail}
+}
+
+// The manifest's `[package].name` and `name@version`, or `None` when either is missing.
+effect fn identityOf(document: &TomlValue) -> Option<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let name = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "name")) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => { return Option<Bytes>.none() }
+  }
+  let version = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "version")) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => { return Option<Bytes>.none() }
+  }
+  if name.length == usize.ZERO || version.length == usize.ZERO { return Option<Bytes>.none() }
+  let mut identity = run Bytes.copy(name)
+  run Bytes.append(&mut identity, b"@")
+  run Bytes.append(&mut identity, version)
+  return Option<Bytes>.some(move identity)
+}
+
+// A dependency's source root: `[package].source-root`, else the directory of `[package].root`
+// (PACKAGE-001); `None` when the manifest names neither.
+effect fn dependencySourceRoot(directory: &Path, document: &TomlValue) -> Option<Path>
+! FileError | OutOfMemoryError ? &mut Allocator {
+  if let Option<string>.Some {value} = move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "source-root")) {
+    return Option<Path>.some(run CommandPath.resolve(directory, String.utf8Bytes(value)))
+  }
+  if let Option<string>.Some {value} = move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "root")) {
+    let entry = run CommandPath.resolve(directory, String.utf8Bytes(value))
+    return run Path.parent(&entry)
+  }
+  return Option<Path>.none()
+}
+
+// Whether `sourceRoot` holds a module `name.silk` or a directory `name`, which a dependency of the
+// same name would hide (PACKAGE-003).
+effect fn shadows(sourceRoot: &Path, name: &[u8]) -> bool ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let directory = run Path.joinBytes(sourceRoot, name)
+  let found = run FileSystem.exists(&directory)
+  if found { return true }
+  let mut file = run Bytes.copy(name)
+  run Bytes.append(&mut file, b".silk")
+  let module = run Path.joinBytes(sourceRoot, Bytes.asSlice(&file))
+  return run FileSystem.exists(&module)
+}
+
+// The members of a table, or `None` for another kind of value.
+fn members<'a>(value: &'a TomlValue) -> Option<&'a [TomlChild]> {
+  return match &value.* {
+    TomlValue.Table {entries, kind: _} => {
+      let boxed = Box<Vector<TomlChild>>.get(&entries)
+      return Option<&'a [TomlChild]>.some(Vector<TomlChild>.asSlice(&boxed[0]))
+    }
+    _ => Option<&'a [TomlChild]>.none()
+  }
+}
+
+fn indexOf(packages: &[Package], name: &[u8]) -> usize {
+  let mut at = usize.ZERO
+  while at < packages.length {
+    if same(Bytes.asSlice(&packages[at].name), name) { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn onStack(stack: &[Bytes], identity: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < stack.length {
+    if same(Bytes.asSlice(&stack[at]), identity) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Loads every dependency the package at `owner` declares in `document`, then theirs.
+effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, stack: &mut Vector<Bytes>) -> ()
+! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let listed = match move Toml.field(document, "dependencies") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return () }
+  }
+  let listedOwner = Vector<Package>.asSlice(&packages.packages)
+  let ownerIdentity = run Bytes.copy(Bytes.asSlice(&listedOwner[owner].identity))
+  let ownerManifest = run copyPath(&listedOwner[owner].manifest)
+  let ownerSourceRoot = run copyPath(&listedOwner[owner].sourceRoot)
+  let owned = Bytes.asSlice(&ownerIdentity)
+  let children = match move members(listed) {
+    Option<&[TomlChild]>.Some {value} => value
+    Option<&[TomlChild]>.None => {
+      let mut detail = run Bytes.copy(b"[dependencies] of ")
+      run Bytes.append(&mut detail, owned)
+      run Bytes.append(&mut detail, b" must be a table")
+      fail InvalidDependency {detail: move detail}
+    }
+  }
+  let mut at = usize.ZERO
+  while at < children.length {
+    if let TomlChild.Member {entry} = &children[at] {
+      let name = String.ownedUtf8Bytes(&entry.key)
+      if !identifier(name) { run invalid(owned, name, b"a dependency name must be an identifier") }
+      if same(name, b"silk") || same(name, b"Intrinsic") {
+        run invalid(owned, name, b"the name is reserved for the toolchain")
+      }
+      let table = match &entry.value {
+        TomlValue.Table {..} => true
+        _ => false
+      }
+      if !table { run invalid(owned, name, b"a dependency must be a table such as { path = \"../library\" }") }
+      let written = match move Toml.asString(Toml.field(&entry.value, "path")) {
+        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.None => run invalid(owned, name, b"path must name the directory of the dependency's silk.toml")
+      }
+      let hidden = run shadows(&ownerSourceRoot, name)
+      if hidden {
+        run invalid(owned, name, b"the name is also a top-level module or directory of this package's source root")
+      }
+      let directory = run CommandPath.resolve(&ownerManifest, written)
+      let manifest = run Path.join(&directory, "silk.toml")
+      let read = run Effect.result(FileSystem.readFile(&manifest))
+      let contents = match move read {
+        Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError missing => {
+            drop missing
+            run invalid(owned, name, b"no readable silk.toml at its path")
+          }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+      let parsed = run Effect.result(Toml.parse(Bytes.asSlice(&contents)))
+      let dependency = match move parsed {
+        Result<TomlValue, TomlError | OutOfMemoryError>.Success {value} => move value
+        Result<TomlValue, TomlError | OutOfMemoryError>.Failure {error} => match move error {
+          TomlError malformed => {
+            drop malformed
+            run invalid(owned, name, b"its silk.toml is not valid TOML")
+          }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+      let identity = match move run identityOf(&dependency) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => run invalid(owned, name, b"its silk.toml has no [package] name and version")
+      }
+      let packageName = match move Toml.asString(Toml.fieldAt(Toml.field(&dependency, "package"), "name")) {
+        Option<string>.Some {value} => String.utf8Bytes(value)
+        Option<string>.None => run invalid(owned, name, b"its silk.toml has no [package] name")
+      }
+      if let Option<string>.Some {value: expected} = move Toml.asString(Toml.field(&entry.value, "package")) {
+        if !same(String.utf8Bytes(expected), packageName) {
+          run invalid(owned, name, b"package does not match the name in the dependency's silk.toml")
+        }
+      }
+      if onStack(Vector<Bytes>.asSlice(&stack.*), Bytes.asSlice(&identity)) {
+        run invalid(owned, name, b"packages cannot depend on each other in a cycle")
+      }
+      let known = indexOf(Vector<Package>.asSlice(&packages.packages), packageName)
+      if known != usize.MAX {
+        let listed = Vector<Package>.asSlice(&packages.packages)
+        let sameVersion = same(Bytes.asSlice(&listed[known].identity), Bytes.asSlice(&identity))
+        let sameDirectory = same(Path.rawBytes(&listed[known].manifest), Path.rawBytes(&directory))
+        if !sameVersion || !sameDirectory {
+          run invalid(owned, name, b"the build already has a different version or copy of this package")
+        }
+      } else {
+        let sourceRoot = match move run dependencySourceRoot(&directory, &dependency) {
+          Option<Path>.Some {value} => move value
+          Option<Path>.None => run invalid(owned, name, b"its silk.toml names neither package.source-root nor package.root")
+        }
+        run Vector<Package>.append(&mut packages.packages, Package {
+          identity: run Bytes.copy(Bytes.asSlice(&identity)), name: run Bytes.copy(packageName),
+          manifest: move directory, sourceRoot: move sourceRoot,
+        })
+        run Vector<Bytes>.append(&mut stack.*, run Bytes.copy(Bytes.asSlice(&identity)))
+        let added = Vector<Package>.length(&packages.packages) - usize.ONE
+        run visit(&mut packages.*, added, &dependency, &mut stack.*)
+        let top = Vector<Bytes>.length(&stack.*) - usize.ONE
+        let finished = Vector<Bytes>.remove(&mut stack.*, top)
+        drop finished
+      }
+      run Vector<Edge>.append(&mut packages.edges, Edge {
+        owner: run Bytes.copy(owned), name: run Bytes.copy(name), package: move identity,
+      })
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Loads the root package, whose manifest `document` sits in `manifest` with module identity
+/// `identity` and modules below `sourceRoot`, and every package its dependencies reach.
+pub effect fn load(manifest: &Path, document: &TomlValue, identity: &[u8], sourceRoot: &Path) -> Packages
+! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let name = match move Toml.asString(Toml.fieldAt(Toml.field(document, "package"), "name")) {
+    Option<string>.Some {value} => String.utf8Bytes(value)
+    Option<string>.None => b""
+  }
+  let mut packages = Packages {packages: Vector<Package>.make(), edges: Vector<Edge>.make()}
+  run Vector<Package>.append(&mut packages.packages, Package {
+    identity: run Bytes.copy(identity), name: run Bytes.copy(name), manifest: run copyPath(manifest),
+    sourceRoot: run copyPath(sourceRoot),
+  })
+  let mut stack = Vector<Bytes>.make()
+  run Vector<Bytes>.append(&mut stack, run Bytes.copy(identity))
+  run visit(&mut packages, usize.ZERO, document, &mut stack)
+  return move packages
+}
+
+/// The package graph of these packages, whose standard-library paths belong to `owner`'s package.
+pub effect fn graph(self: &Packages, owner: &ModuleId) -> PackageGraph ! OutOfMemoryError ? &mut Allocator {
+  let mut graph = PackageGraph.make(owner)
+  let edges = Vector<Edge>.asSlice(&self.edges)
+  let mut at = usize.ZERO
+  while at < edges.length {
+    run PackageGraph.depend(&mut graph, Bytes.asSlice(&edges[at].owner), Bytes.asSlice(&edges[at].name),
+      Bytes.asSlice(&edges[at].package))
+    at = at + usize.ONE
+  }
+  return move graph
+}
+
+/// The source root of the dependency whose identity is `package`, or `None` for the root package
+/// and for an identity no dependency has.
+pub fn dependencyRoot(self: &Packages, package: &[u8]) -> Option<&Path> {
+  let listed = Vector<Package>.asSlice(&self.packages)
+  let mut at = usize.ONE
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at].identity), package) { return Option<&Path>.some(&listed[at].sourceRoot) }
+    at = at + usize.ONE
+  }
+  return Option<&Path>.none()
+}

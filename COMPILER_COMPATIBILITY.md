@@ -83,6 +83,30 @@ Each entry records:
 
 ## Entries
 
+### Package path dependencies are native only
+
+- **Status:** approved by Julia on 2026-10-17 (package design); implemented and locally verified
+  in the native compiler on 2026-10-17.
+- **Rule:** a manifest's `[dependencies]` table names path dependencies; the dependency name is the
+  first segment of the import paths that reach that package's modules (PACKAGE-001 to
+  PACKAGE-005 in the [modules reference](apps/docs/content/reference/modules-names-and-visibility.md#packages)).
+- **Compilers:** the native compiler loads every dependency's manifest, checks the PACKAGE rules
+  and resolves dependency imports into the dependency's own package identity. The TypeScript
+  bootstrap stays a single-package compiler: it ignores `[dependencies]`, so an import through a
+  dependency name fails there as a missing module. This divergence is intended; the bootstrap is
+  frozen.
+- **Source migration:** none; no existing program uses `[dependencies]`. Programs that the
+  bootstrap must build, such as the standard library and the native compiler's own sources, do not
+  use dependencies.
+- **Diagnostics and limits:** an invalid dependency is reported as ``silk: invalid dependency
+`name` of package@version: reason``. Manifest `exports` (PACKAGE-006) and workspaces
+  (PACKAGE-007) are not implemented yet; every module of a dependency is importable. The standard
+  library still shares the root package identity under its `silk/` paths.
+- **Evidence:** `dependencyNamesSelectAnotherPackagesModules` in SemanticConformanceCases,
+  `pathDependenciesLoadTheirOwnPackages` in SemanticLoweringCases, and the path-dependency run and
+  shadowing refusal in `compiler/scripts/test-native-build.ts`.
+- **Open questions:** none.
+
 ### Native integer C variadic imports
 
 - **Status:** implemented and locally verified on 2026-10-07; Linux integration remains pending.

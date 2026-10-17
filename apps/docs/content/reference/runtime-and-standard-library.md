@@ -309,8 +309,8 @@ standard-library names remain explicit in source; entry adaptation is defined se
 
 **Status:** Confirmed
 
-Before Silk has a native package and re-export model, every canonical module in the shipped catalog
-may be imported explicitly. Its `pub` declarations are visible across modules and its private
+Until the standard library lists its `exports` (PACKAGE-006), every canonical module in the shipped
+catalog may be imported explicitly. Its `pub` declarations are visible across modules and its private
 declarations are not. There is no second hidden “standard-library internal” visibility level.
 
 Implementation details that must not become callable from user source stay private within their
@@ -318,9 +318,9 @@ module. A support module that must expose declarations to several canonical modu
 an importable low-level module in this first model; documentation may discourage direct use, but the
 compiler does not pretend its `pub` declarations are private only to outsiders.
 
-**Boundary:** A future package system may add package-private modules, explicit public exports, or
-re-exported facades. That model must apply uniformly to ordinary packages and the standard library.
-Until then, a catalog flag cannot silently override the language's confirmed `pub` meaning.
+**Boundary:** Package `exports` (PACKAGE-006) choose which modules other packages may import, and
+they apply uniformly to ordinary packages and the standard library. Until the standard library lists
+them, a catalog flag cannot silently override the language's confirmed `pub` meaning.
 
 **Diagnostics:** Imports and member access use the ordinary module and visibility diagnostics. The
 compiler does not report an “internal standard library API” error for a declaration that is
@@ -861,8 +861,8 @@ No special compiler entry-shape diagnostic or generated status/report protocol r
 
 **Status:** Confirmed
 
-Before a native package and dependency system exists, the official compiler, canonical
-standard-library source catalog, intrinsic catalog, target support, and required runtime-support artifacts
+The standard library is the implicit dependency `silk` of every package (PACKAGE-005). The official
+compiler, canonical standard-library source catalog, intrinsic catalog, target support, and required runtime-support artifacts
 are one versioned toolchain distribution. Components the official compiler requires are built and
 verified together and are not
 independently selected, upgraded, overridden, or compatibility-negotiated by a Silk program.
@@ -872,9 +872,9 @@ intrinsic/runtime inventory records enough identity for the compiler to reject a
 installation before source behavior depends on it.
 
 **Boundary:** Lockstep distribution does not make the standard library part of the language or
-promise source compatibility between pre-1.0 releases. It is an operational integrity rule. A
-future package model may allow an independently versioned public library while required toolchain
-support remains matched to the compiler.
+promise source compatibility between pre-1.0 releases. It is an operational integrity rule. Other
+libraries are ordinary packages with their own versions (PACKAGE-001); required toolchain support
+remains matched to the compiler.
 
 **Diagnostics:** Mixed component versions, missing catalog files, digest mismatches, and absent
 required runtime artifacts report one deterministic broken-toolchain diagnostic naming the expected
@@ -1223,7 +1223,7 @@ return/eviction policy are intentionally deferred to JUL-23 and JUL-197.
 
 The following are deliberately outside the first stable model:
 
-- native package acquisition, registries, version solving, and explicit re-exports;
+- package acquisition from registries or repositories, and version solving;
 - independently selected standard-library or required runtime-support versions;
 - target-conditional source and module-level availability annotations;
 - compiler-selected or overridable default service providers;

@@ -5,8 +5,9 @@ to the compilation source root, and imports create explicit names for declaratio
 modules. Imports are compile-time only: they do not run code or create values.
 
 This page defines module identity, source lookup, import bindings, name collisions, and
-cross-module visibility. Declaration-specific contracts remain on their corresponding reference
-pages. Package acquisition and version selection are outside the language.
+cross-module visibility, and how packages depend on each other. Declaration-specific contracts
+remain on their corresponding reference pages. Registries, remote acquisition, and version solving
+are outside the language.
 
 ## Terminology
 
@@ -23,6 +24,10 @@ pages. Package acquisition and version selection are outside the language.
 - A **module scope** is the set of top-level declaration and import names visible throughout one
   module.
 - A **module closure** is the root module and every module reachable through its transitive imports.
+- A **package** is one `silk.toml` manifest and the source root it selects. Its identity is
+  `name@version` from the manifest.
+- A **dependency name** is the key a manifest's `[dependencies]` table gives another package. It is
+  the first segment of every import path that names that package's modules.
 
 ## Module identity and loading
 
@@ -906,6 +911,175 @@ Selected binding collisions retain their ordinary diagnostic and declaration ori
 
 **Evidence:** [module static selection](module-static-selection.md) and
 [selection design](../../../../openspec/changes/add-module-static-selection/design.md).
+
+## Packages
+
+### PACKAGE-001 — A package is one manifest and its source root
+
+**Status:** Confirmed
+
+A `silk.toml` manifest defines one package. `[package].name` and `[package].version` form its
+identity, `name@version`, and its modules are the `.silk` files below its source root under
+MODULE-001. A package's own imports keep the source-root rule of MODULE-003.
+
+```toml
+[package]
+name = "silk-json"
+version = "0.2.0"
+source-root = "src"
+```
+
+The source root is `[package].source-root` when the manifest names one, else the directory of
+`[package].root`. A package that is only ever a dependency needs no `root`, but it must name a
+`source-root`.
+
+**Boundary:** The identity is logical. Two checkouts of the same package at different host paths
+have the same identity, and a module's identity never contains a host path.
+
+**Diagnostics:** A manifest without a name, a version, or a source root is an invalid-manifest error
+from the build, not a Silk source diagnostic.
+
+**Evidence:** [native package sources](../../../../compiler/src/driver/ModuleSources.silk),
+[native manifest decoding](../../../../compiler/src/driver/Project.silk).
+
+### PACKAGE-002 — A dependency name is the first segment of its import paths
+
+**Status:** Confirmed
+
+`[dependencies]` names the packages this package may import. Each key is the dependency name source
+code uses; `path` names the directory holding that package's manifest, relative to this manifest.
+
+```toml
+[dependencies]
+json = { path = "../silk-json" }
+syntax = { path = "../tools/syntax", package = "silk-syntax" }
+```
+
+```silk
+import json.Value { Value, parse }
+import syntax.Parser as P
+import model.User
+```
+
+`json.Value` names module `Value` below the source root of `silk-json`. `model.User` still names this
+package's own `model/User.silk`, because `model` is not a dependency name. A dependency's modules
+resolve their own imports against that package's source root and its own `[dependencies]`.
+
+The module identity is the dependency's package identity and its path below that package's source
+root; the dependency name plays no role. Two packages that depend on the same package share its
+modules and declarations, whatever names they give it.
+
+**Boundary:** A dependency name must be an identifier other than `silk` or `Intrinsic`. When
+`package` is present it must equal the dependency's `[package].name`. Dependencies are not
+transitive: a package imports only the packages its own manifest lists. Packages cannot depend on
+each other in a cycle. Only `path` dependencies exist; a dependency on a registry or a repository is
+outside the language for now.
+
+**Diagnostics:** An invalid dependency name, a missing or unreadable dependency manifest, a
+`package` name that does not match, and a package cycle are invalid-manifest errors that name the
+dependency. A path below a dependency with no exact module reports `MOD0001` like any other import.
+
+**Evidence:** [native package graph](../../../../compiler/src/semantic/PackageGraph.silk),
+[package dependency loading](../../../../compiler/src/driver/Packages.silk),
+[dependency resolution cases](../../../../compiler/src/semantic/SemanticConformanceCases.silk),
+[dependency loading cases](../../../../compiler/src/semantic/SemanticLoweringCases.silk),
+[native build contract](../../../../compiler/scripts/test-native-build.ts).
+
+### PACKAGE-003 — A dependency name is reserved in its package's source root
+
+**Status:** Confirmed
+
+A dependency name cannot also be the first segment of one of the package's own modules. A source
+root that holds `json.silk` or a `json/` directory cannot also list a dependency named `json`.
+
+**Boundary:** The reservation is per package. A dependency may have its own `json/` modules even
+when the package that imports it calls it `json`.
+
+**Diagnostics:** The build reports an invalid-manifest error naming the dependency and the
+conflicting source path. Neither side silently wins.
+
+**Evidence:** [native build contract](../../../../compiler/scripts/test-native-build.ts).
+
+### PACKAGE-004 — A build holds one version of each package
+
+**Status:** Confirmed
+
+Every package in a build has a distinct name. Two dependencies that reach the same package name
+must reach the same version from the same directory, and then they are one package.
+
+**Boundary:** Two different versions of one package, or one `name@version` read from two different
+directories, cannot be combined. Because only path dependencies exist, there are no version ranges
+and no lockfile.
+
+**Diagnostics:** The build reports an invalid-manifest error naming the package and both sources.
+
+**Evidence:** [native build contract](../../../../compiler/scripts/test-native-build.ts).
+
+### PACKAGE-005 — The standard library is the implicit dependency `silk`
+
+**Status:** Confirmed
+
+Every package depends on the toolchain's standard library under the dependency name `silk`, without
+listing it. The toolchain supplies it and versions it with the compiler (DIST-001), and every package
+in a build shares the same standard-library modules.
+
+This is an implicit dependency, not an implicit import. PRELUDE-001 still requires each module to
+import the standard-library names it uses.
+
+**Boundary:** A manifest cannot list a dependency named `silk`, and a project file cannot shadow a
+standard-library module.
+
+**Diagnostics:** Listing `silk` is an invalid-manifest error.
+
+**Evidence:** [native package graph](../../../../compiler/src/semantic/PackageGraph.silk).
+
+### PACKAGE-006 — `exports` choose the modules other packages may import
+
+**Status:** Confirmed contract; not implemented yet.
+
+`[package].exports` lists the module paths, in import spelling, that other packages may import.
+Inside the package every module stays importable. A package without `exports` exposes no module to
+other packages.
+
+```toml
+[package]
+name = "silk-json"
+version = "0.2.0"
+source-root = "src"
+exports = ["Value", "Parser"]
+```
+
+A library keeps its implementation in internal modules and publishes a small facade with selective
+`pub import` (EXPORT-001). The standard library lists its catalog the same way, which replaces the
+interim rule of STDLIB-006.
+
+**Boundary:** `pub` still decides which declarations of an exported module are visible. An exported
+module cannot publish a private declaration.
+
+**Diagnostics:** Importing an unlisted module from another package reports a dedicated
+internal-module error at the import path, distinct from `MOD0001` for a module that does not exist.
+Its code is not assigned yet.
+
+**Evidence:** Design approved on 2026-10-17; implementation pending.
+
+### PACKAGE-007 — A workspace groups packages that build together
+
+**Status:** Confirmed contract; not implemented yet.
+
+A manifest with a `[workspace]` table lists member package directories. Members can depend on each
+other by path, a build can start from any member, and members share one output directory.
+
+```toml
+[workspace]
+members = ["compiler", "libs/*"]
+```
+
+**Boundary:** A workspace adds no import rule: members still import each other only through
+`[dependencies]`.
+
+**Diagnostics:** A member directory without a package manifest is an invalid-manifest error.
+
+**Evidence:** Design approved on 2026-10-17; implementation pending.
 
 ## Implementation evidence
 
