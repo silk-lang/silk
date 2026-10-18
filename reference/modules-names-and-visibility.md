@@ -1092,8 +1092,10 @@ directory.
 `[dependencies]`.
 
 **Diagnostics:** A member entry that escapes the workspace, names a missing directory, or names a
-directory without a package manifest is an invalid-manifest error, as are two members with the
-same package name, since they would share artifact paths. A member's own `[build].output-dir` is an
+directory without a package manifest is an invalid-manifest error, as are a member listed twice and
+two members with the same package name, since they would share artifact paths. Every child
+directory of a `dir/*` entry must hold a package manifest. These errors are reported only to the
+workspace's members; a package the workspace does not list ignores it. A member's own `[build].output-dir` is an
 invalid-manifest error. A project command run on a manifest with only a `[workspace]` table is an
 invalid-manifest error that points to the member directories.
 
