@@ -3,15 +3,16 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 #
-# A manually published build of main is a `native-seed-<commit>` release holding one
-# `silk-<version>-<target>.tar.gz` archive per target. This script picks the newest one for the
-# running host, checks its compiler against the release's `native-seed.json`, and unpacks it into
-# `$SILK_INSTALL` (default `~/.silk`): `bin/silk` beside the standard library in `lib/silk/stdlib`.
+# A manually published build of main is a `v<version>` release, such as `v0.1.0-dev.8796+440201f`,
+# holding one `silk-<version>-<target>.tar.gz` archive per target. This script picks the newest one
+# for the running host, checks its compiler against the release's `native-seed.json`, and unpacks
+# it into `$SILK_INSTALL` (default `~/.silk`): `bin/silk` beside the standard library in
+# `lib/silk/stdlib`.
 # Downloads made by curl carry no macOS quarantine mark, so Gatekeeper lets the compiler run.
 #
 # Environment:
 #   SILK_INSTALL   install directory (default: ~/.silk)
-#   SILK_RELEASE   a release tag to install instead of the newest build of main
+#   SILK_RELEASE   a release tag to install instead of the newest build of main, such as v0.1.0
 #   GITHUB_TOKEN   optional; raises the GitHub API rate limit
 set -eu
 
@@ -68,7 +69,7 @@ case "$os" in
   *) fail "Silk has no build for $os yet" ;;
 esac
 
-# The most recently published `native-seed-*` release. The releases API does not list them by date,
+# The most recently published `v*` release. The releases API does not list them by date,
 # so read every page and compare `published_at` (ISO 8601, so it sorts as text). Each release's
 # `tag_name` precedes its `published_at`; a draft's `published_at` is null and never matches.
 if [ -z "$release" ]; then
@@ -78,7 +79,7 @@ if [ -z "$release" ]; then
     tags=$(api "releases?per_page=100&page=$page") || fail "cannot list releases from GitHub"
     tags=$(printf '%s\n' "$tags" |
       grep -o '"tag_name": *"[^"]*"\|"published_at": *"[^"]*"' |
-      awk -F'"' '$2 == "tag_name" { tag = $4; next } tag ~ /^native-seed-/ { print $4, tag } { tag = "" }') || true
+      awk -F'"' '$2 == "tag_name" { tag = $4; next } tag ~ /^v[0-9]/ { print $4, tag } { tag = "" }') || true
     [ -n "$tags" ] || break
     found=$(printf '%s\n%s\n' "$found" "$tags")
     page=$((page + 1))
@@ -87,7 +88,9 @@ if [ -z "$release" ]; then
   [ -n "$release" ] || fail "no published build of main found"
 fi
 
-url=$(api "releases/tags/$release" 2> /dev/null |
+# A dev version's `+<commit>` must reach GitHub as `%2B` in a URL path.
+release_path=$(printf '%s' "$release" | sed 's/+/%2B/g')
+url=$(api "releases/tags/$release_path" 2> /dev/null |
   grep -o "\"browser_download_url\": *\"[^\"]*/silk-[^/\"]*-$target\\.tar\\.gz\"" |
   head -n 1 | cut -d'"' -f4) || true
 [ -n "$url" ] || fail "release $release has no archive for $target"
@@ -106,7 +109,7 @@ tar -xzf "$tmp/$archive" -C "$tmp/unpacked" || fail "cannot unpack $archive"
 
 # A seed release names each target compiler's SHA-256; release archives without one skip the check.
 if curl -fsSL -o "$tmp/native-seed.json" \
-  "https://github.com/$repo/releases/download/$release/native-seed.json" 2> /dev/null; then
+  "https://github.com/$repo/releases/download/$release_path/native-seed.json" 2> /dev/null; then
   expected=$(tr -d ' \t\r\n' < "$tmp/native-seed.json" | grep -o "\"$target\":{[^}]*}" |
     grep -o '"sha256":"[0-9a-f]*"' | cut -d'"' -f4) || true
   [ -n "$expected" ] || fail "native-seed.json of $release names no compiler for $target"

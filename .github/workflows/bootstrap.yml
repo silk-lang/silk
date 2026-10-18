@@ -2,7 +2,11 @@ name: Bootstrap
 
 # The TypeScript bootstrap is frozen: it only has to compile the anchored first native compiler
 # (bootstrap/anchor.json), and the native compiler builds itself from there. This workflow runs
-# only when the bootstrap or what builds it changes.
+# when the bootstrap or what builds it changes, and weekly so the chain's start stays replayable.
+#
+# n0 is the anchor's compiler built from the bootstrap: the bundle builds T1, T1 emits the anchor
+# compiler's IR for every target, each target links that IR into N1, and N1 builds n0. N1 and n0
+# must emit T1's IR byte for byte. Once n0 is published, every run must rebuild its exact bytes.
 on:
   push:
     branches:
@@ -11,7 +15,9 @@ on:
       - bootstrap/**
       - .github/workflows/bootstrap.yml
       - .github/actions/setup-linux-llvm/**
+      - .github/actions/setup-native-llvm/**
       - compiler/scripts/NativeSeed.mjs
+      - compiler/scripts/ReleaseArchive.ts
       - package.json
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
@@ -23,12 +29,21 @@ on:
       - bootstrap/**
       - .github/workflows/bootstrap.yml
       - .github/actions/setup-linux-llvm/**
+      - .github/actions/setup-native-llvm/**
       - compiler/scripts/NativeSeed.mjs
+      - compiler/scripts/ReleaseArchive.ts
       - package.json
       - pnpm-lock.yaml
       - pnpm-workspace.yaml
       - scripts/setup-linux-llvm.sh
+  schedule:
+    - cron: '41 6 * * 2'
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the bootstrap and n0 releases (main only)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -39,9 +54,13 @@ concurrency:
 
 jobs:
   bootstrap:
-    name: Bundle the bootstrap and check it builds the anchored compiler
+    name: Bundle the bootstrap and emit the anchor compiler's IR
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      anchor: ${{ steps.release.outputs.anchor }}
+      version: ${{ steps.release.outputs.version }}
+      bootstrap-version: ${{ steps.release.outputs.bootstrap-version }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -61,80 +80,64 @@ jobs:
       - run: pnpm bundle:bootstrap
       - run: node bootstrap/packages/cli/scripts/test-bundle.mjs node --native
       - run: node bootstrap/packages/cli/scripts/test-bundle.mjs bun --native
-      - name: Check out the anchor and its pinned seed
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Name the releases
+        id: release
         run: |
           set -euo pipefail
           anchor=$(jq -er .commit bootstrap/anchor.json)
-          git worktree add --detach "$RUNNER_TEMP/anchor" "$anchor"
-          git show "$anchor:compiler/native-seed.json" > "$RUNNER_TEMP/anchor-pin.json"
-          node compiler/scripts/NativeSeed.mjs outputs "$RUNNER_TEMP/anchor-pin.json" x86_64-unknown-linux-gnu > "$RUNNER_TEMP/seed.env"
-          tag=$(sed -n 's/^tag=//p' "$RUNNER_TEMP/seed.env")
-          asset=$(sed -n 's/^asset=//p' "$RUNNER_TEMP/seed.env")
-          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern "$asset" --dir "$RUNNER_TEMP/seed-download"
-          mkdir "$RUNNER_TEMP/seed"
-          node compiler/scripts/NativeSeed.mjs verify "$RUNNER_TEMP/anchor-pin.json" x86_64-unknown-linux-gnu "$RUNNER_TEMP/seed-download/$asset" "$RUNNER_TEMP/seed/seed"
-      # Diverse double compilation: the bootstrap builds the anchor's compiler (T1), the anchor's
-      # pinned seed builds it too (N1), and both must emit the anchor compiler's LLVM IR byte for byte.
-      - name: Build T1 with the bootstrap and N1 with the seed, then compare their compiler IR
+          # The anchor must stay reachable from main, or nothing keeps its commit alive.
+          git merge-base --is-ancestor "$anchor" HEAD
+          {
+            echo "anchor=$anchor"
+            echo "version=$(node compiler/scripts/NativeSeed.mjs version "$anchor")"
+            echo "bootstrap-version=$(jq -er .version bootstrap/packages/cli/package.json)"
+          } | tee -a "$GITHUB_OUTPUT"
+      - name: Build T1 with the bootstrap and emit the anchor compiler's IR for every target
         env:
           SILK_CLANG: ${{ env.SILK_TEST_CLANG }}
           NODE_OPTIONS: --max-old-space-size=12288
+          ANCHOR: ${{ steps.release.outputs.anchor }}
         run: |
           set -euo pipefail
-          out="$RUNNER_TEMP/ddc"
-          mkdir -p "$out"
+          out="$RUNNER_TEMP/t1"
+          mkdir -p "$out/ir"
           stage() {
             local name="$1"
             shift
             /usr/bin/time -f '%e %M' -o "$out/$name-time.txt" "$@" > "$out/$name.log" 2>&1 || {
               tail -n 60 "$out/$name.log"
-              echo "::error title=Bootstrap DDC stage $name failed::See the bootstrap-ddc artifact."
+              echo "::error title=Bootstrap stage $name failed::See the bootstrap-t1 artifact."
               exit 1
             }
           }
           bootstrap="$PWD/bootstrap/packages/cli/dist/silk.mjs"
           anchor="$RUNNER_TEMP/anchor"
+          git worktree add --detach "$anchor" "$ANCHOR"
           cd "$anchor/compiler"
           stage t1 node "$bootstrap" build --manifest-path silk.toml --release --target x86_64-unknown-linux-gnu
           t1="$(find "$anchor/compiler/build/llvm/x86_64-unknown-linux-gnu" -type f -name 'silk-compiler*' -perm -u+x | head -n 1)"
           [ -n "$t1" ] || { echo "::error title=T1 missing::The bootstrap build produced no compiler executable."; exit 1; }
-          args=(--stdlib "$anchor/packages/compiler/stdlib" --optimization speed --debug false)
-          # The anchor's seed predates SILK_CLANG and reads SILKC_CLANG.
-          stage n1 env SILKC_CLANG="$SILK_CLANG" "$RUNNER_TEMP/seed/seed" build src/main.silk -o "$out/N1" "${args[@]}"
-          stage t1-ir "$t1" build src/main.silk -o "$out/t1.ll" --emit llvm-ir "${args[@]}"
-          stage n1-ir "$out/N1" build src/main.silk -o "$out/n1.ll" --emit llvm-ir "${args[@]}"
-          identical=true
-          if ! cmp -s "$out/t1.ll" "$out/n1.ll"; then
-            identical=false
-            diff "$out/n1.ll" "$out/t1.ll" | head -n 200 | cut -c 1-300 > "$out/ir-diff.txt" || true
-          fi
-          jq -n --arg head "$GITHUB_SHA" --arg anchor "$(git -C "$anchor" rev-parse HEAD)" \
-            --arg bootstrap "$(sha256sum "$bootstrap" | cut -d' ' -f1)" \
-            --arg t1 "$(cat "$out/t1-time.txt")" --arg n1 "$(cat "$out/n1-time.txt")" \
-            --arg t1ir "$(cat "$out/t1-ir-time.txt")" --arg n1ir "$(cat "$out/n1-ir-time.txt")" \
-            --arg t1sha "$(sha256sum "$out/t1.ll" | cut -d' ' -f1)" --arg n1sha "$(sha256sum "$out/n1.ll" | cut -d' ' -f1)" \
-            --argjson identical "$identical" \
-            '{head: $head, anchor: $anchor, bootstrapSha256: $bootstrap, identical: $identical,
-              stages: {t1: $t1, n1: $n1, t1Ir: $t1ir, n1Ir: $n1ir}, irSha256: {t1: $t1sha, n1: $n1sha}}' \
-            | tee "$out/receipt.json"
-          if [ "$identical" != true ]; then
-            cat "$out/ir-diff.txt"
-            echo "::error title=Bootstrap DDC mismatch::T1 and N1 emit different compiler IR; see ir-diff.txt in the bootstrap-ddc artifact."
-            exit 1
-          fi
-      - name: Preserve the DDC receipt and logs
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            stage "ir-$target" "$t1" build src/main.silk -o "$out/ir/$target.ll" --emit llvm-ir --target "$target" \
+              --stdlib ../packages/compiler/stdlib --optimization speed --debug false
+          done
+          sha256sum "$out"/ir/*.ll
+      - name: Preserve the T1 logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bootstrap-ddc
+          name: bootstrap-t1
           path: |
-            ${{ runner.temp }}/ddc/*.json
-            ${{ runner.temp }}/ddc/*.log
-            ${{ runner.temp }}/ddc/*.txt
+            ${{ runner.temp }}/t1/*.log
+            ${{ runner.temp }}/t1/*.txt
           if-no-files-found: ignore
           retention-days: 90
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-anchor-ir
+          path: ${{ runner.temp }}/t1/ir/
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@v4
         with:
           name: bootstrap-${{ github.sha }}
@@ -142,31 +145,236 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # A bootstrap that passed the DDC on main becomes a release: silk.mjs runs with Node 24 or Bun
-  # and needs no checkout, dependencies or build.
-  publish:
-    name: Publish the bootstrap release
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  n0:
+    name: Build n0 / ${{ matrix.target }}
     needs: bootstrap
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ matrix.target }}
+      ANCHOR: ${{ needs.bootstrap.outputs.anchor }}
+      VERSION: ${{ needs.bootstrap.outputs.version }}
     steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: ./.github/actions/setup-native-llvm
       - uses: actions/download-artifact@v4
         with:
-          name: bootstrap-${{ github.sha }}
-      - env:
+          name: bootstrap-anchor-ir
+          path: ${{ runner.temp }}/ir
+      - name: Link N1 from T1's IR, build n0 with it, and compare their compiler IR
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/n0"
+          mkdir -p "$out"
+          anchor="$RUNNER_TEMP/anchor"
+          git worktree add --detach "$anchor" "$ANCHOR"
+          # Relative paths keep the emitted IR independent of where each runner checks out the anchor.
+          args=(--stdlib ../packages/compiler/stdlib --optimization speed --debug false)
+          stage() {
+            local name="$1"
+            shift
+            "$@" > "$out/$name.log" 2>&1 || {
+              tail -n 60 "$out/$name.log"
+              echo "::error title=n0 stage $name failed::See the bootstrap-n0 artifact."
+              exit 1
+            }
+          }
+          stage n1 "$SILK_CLANG" -O2 -x ir "$RUNNER_TEMP/ir/$TARGET.ll" -x none -o "$out/N1" -lc -lm
+          chmod 0555 "$out/N1"
+          cd "$anchor/compiler"
+          stage n0 "$out/N1" build src/main.silk -o "$out/n0" "${args[@]}"
+          chmod 0555 "$out/n0"
+          stage n1-ir "$out/N1" build src/main.silk -o "$out/n1.ll" --emit llvm-ir "${args[@]}"
+          stage n0-ir "$out/n0" build src/main.silk -o "$out/n0.ll" --emit llvm-ir "${args[@]}"
+          cmp "$RUNNER_TEMP/ir/$TARGET.ll" "$out/n1.ll"
+          cmp "$out/n1.ll" "$out/n0.ll"
+          ir=$(shasum -a 256 "$out/n0.ll" | cut -d' ' -f1)
+          jq -n --arg target "$TARGET" --arg source "$ANCHOR" \
+            --arg n1 "$(shasum -a 256 "$out/N1" | cut -d' ' -f1)" \
+            --arg n0 "$(shasum -a 256 "$out/n0" | cut -d' ' -f1)" --arg ir "$ir" \
+            '{status: "passed", target: $target, inputs: {sourceCommit: $source}, origin: "bootstrap-T1-IR",
+              producer: {generation: "N1", sha256: $n1}, output: {generation: "n0", sha256: $n0},
+              fixpoint: {producerIrSha256: $ir, outputIrSha256: $ir}}' | tee "$out/chain-receipt.json"
+      # n0 becomes the pinned seed, so it must build the compiler of this checkout.
+      - name: n0 builds this checkout's compiler
+        run: |
+          set -euo pipefail
+          cd compiler
+          "$RUNNER_TEMP/n0/n0" build src/main.silk -o "$RUNNER_TEMP/n0/next" --stdlib ../stdlib \
+            --optimization speed --debug false > "$RUNNER_TEMP/n0/next.log" 2>&1 || {
+            tail -n 60 "$RUNNER_TEMP/n0/next.log"
+            echo "::error title=n0 cannot build this checkout::Pinning n0 would break the native chain."
+            exit 1
+          }
+          "$RUNNER_TEMP/n0/next" --version
+      - name: Package the release archive and run a new project from it
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/release" "$RUNNER_TEMP/installed"
+          archive=$(node compiler/scripts/ReleaseArchive.ts --compiler "$RUNNER_TEMP/n0/n0" \
+            --stdlib "$RUNNER_TEMP/anchor/packages/compiler/stdlib" --target "$TARGET" --version "$VERSION" \
+            --output "$RUNNER_TEMP/release")
+          tar -xzf "$archive" -C "$RUNNER_TEMP/installed"
+          silk=$(echo "$RUNNER_TEMP"/installed/silk-*/bin/silk)
+          "$silk" --version
+          cd "$RUNNER_TEMP/installed"
+          env -u SILK_CLANG -u SDKROOT "$silk" init hello
+          # `run` reports the build on standard output before the program's own output.
+          output=$(cd hello && env -u SILK_CLANG -u SDKROOT "$silk" run)
+          printf '%s\n' "$output" | head -n 1 | grep -q '^Compiled src/main.silk -> '
+          test "$(printf '%s\n' "$output" | tail -n 1)" = 'Hello, world!'
+      - name: Prepare the n0 seed candidate
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/candidate"
+          cp "$RUNNER_TEMP/n0/n0" "$RUNNER_TEMP/candidate/silk-compiler-$TARGET"
+          cp "$RUNNER_TEMP/n0/chain-receipt.json" "$RUNNER_TEMP/candidate/chain-receipt-$TARGET.json"
+          cp "$RUNNER_TEMP"/release/*.tar.gz "$RUNNER_TEMP/candidate/"
+          node compiler/scripts/NativeSeed.mjs candidate "$RUNNER_TEMP/n0/chain-receipt.json" "$GITHUB_RUN_ID" "v$VERSION" \
+            > "$RUNNER_TEMP/candidate/native-seed-$TARGET.json"
+      # Once n0 is published, the bootstrap must still produce its exact bytes.
+      - name: Rebuild the published n0
+        env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="bootstrap-$GITHUB_SHA"
+          tag="v$VERSION"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "### $TARGET: $tag is not published yet" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern native-seed.json --dir "$RUNNER_TEMP/published"
+          published=$(jq -er --arg target "$TARGET" '.seeds[$target].sha256' "$RUNNER_TEMP/published/native-seed.json")
+          built=$(jq -er .output.sha256 "$RUNNER_TEMP/n0/chain-receipt.json")
+          if [ "$built" != "$published" ]; then
+            echo "::error title=n0 is not reproducible::The bootstrap built n0 with SHA-256 $built, but $tag publishes $published."
+            exit 1
+          fi
+          echo "### $TARGET: rebuilt the published $tag byte for byte" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-n0-candidate-${{ matrix.target }}
+          path: ${{ runner.temp }}/candidate/
+          if-no-files-found: error
+          retention-days: 7
+      - name: Preserve the n0 receipt, logs, and IR
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bootstrap-n0-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/n0/*.json
+            ${{ runner.temp }}/n0/*.log
+            ${{ runner.temp }}/n0/*.ll
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # A manual dispatch of main with `publish` set publishes the bundle as `bootstrap-v<version>` and
+  # n0 as `v<version>`. Both are immutable: a rerun may confirm their bytes, never replace them.
+  # silk.mjs runs with Node 24 or Bun and needs no checkout, dependencies or build.
+  publish:
+    name: Publish the bootstrap and n0 releases
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: [bootstrap, n0]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      ANCHOR: ${{ needs.bootstrap.outputs.anchor }}
+      VERSION: ${{ needs.bootstrap.outputs.version }}
+      BOOTSTRAP_VERSION: ${{ needs.bootstrap.outputs.bootstrap-version }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@v4
+        with:
+          name: bootstrap-${{ github.sha }}
+          path: ${{ runner.temp }}/bootstrap
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bootstrap-n0-candidate-*
+          path: ${{ runner.temp }}/n0
+          merge-multiple: true
+      - name: Publish the bootstrap
+        working-directory: ${{ runner.temp }}/bootstrap
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="bootstrap-v$BOOTSTRAP_VERSION"
           sha256sum silk.mjs > silk.mjs.sha256
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            # A rerun may confirm the published bytes, never replace them.
             gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir published
             cmp silk.mjs published/silk.mjs
+            echo "Release $tag already holds this bundle"
           else
             gh release create "$tag" silk.mjs silk.mjs.sha256 --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --prerelease --title "Bootstrap ${GITHUB_SHA:0:12}" \
-              --notes "The frozen TypeScript bootstrap compiler of main $GITHUB_SHA. Run it with Node 24 or Bun: \`node silk.mjs --help\`. It builds the anchored first native compiler; the native compiler builds itself from there."
+              --prerelease --title "Bootstrap $BOOTSTRAP_VERSION" \
+              --notes "The frozen TypeScript bootstrap compiler, bundled from main $GITHUB_SHA. Run it with Node 24 or Bun: \`node silk.mjs --help\`. Its only job is to build n0, the anchor commit $ANCHOR's compiler, released as v$VERSION; the native compiler builds itself from there."
           fi
+      - name: Publish n0
+        working-directory: ${{ runner.temp }}/n0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          jq -s '{schemaVersion: 2, seeds: (map(.seeds) | add)}' native-seed-*.json > native-seed.json
+          rm native-seed-*.json
+          files=(native-seed.json)
+          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+            asset="silk-compiler-$target"
+            receipt="chain-receipt-$target.json"
+            node "$GITHUB_WORKSPACE/compiler/scripts/NativeSeed.mjs" outputs native-seed.json "$target" > /dev/null
+            test "$(jq -er --arg target "$target" '.seeds[$target].tag' native-seed.json)" = "$tag"
+            test "$(jq -er --arg target "$target" '.seeds[$target].sourceCommit' native-seed.json)" = "$ANCHOR"
+            sha=$(jq -er --arg target "$target" '.seeds[$target].sha256' native-seed.json)
+            echo "$sha  $asset" | sha256sum -c -
+            test "$sha" = "$(jq -er .output.sha256 "$receipt")"
+            archives=(silk-*-"$target".tar.gz)
+            test "${#archives[@]}" = 1 && test -f "${archives[0]}"
+            test "$(tar -xzOf "${archives[0]}" "${archives[0]%.tar.gz}/bin/silk" | sha256sum | cut -d' ' -f1)" = "$sha"
+            files+=("$asset" "$receipt" "${archives[0]}")
+          done
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir published
+            for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
+              cmp "silk-compiler-$target" "published/silk-compiler-$target"
+              for archive in silk-*-"$target".tar.gz; do cmp "$archive" "published/$archive"; done
+            done
+            echo "Release $tag already holds these compilers"
+          else
+            gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$ANCHOR" \
+              --prerelease --title "Silk $VERSION (n0)" \
+              --notes "n0, the first native Silk compiler: the anchor commit $ANCHOR's compiler, built from bootstrap-v$BOOTSTRAP_VERSION for x86-64 Linux, ARM64 Linux, and macOS arm64 (run $GITHUB_RUN_ID). The bootstrap builds T1, T1 emits the compiler's IR, and N1 linked from that IR builds n0; all three emit identical compiler IR. To install one, extract its silk-<version>-<target>.tar.gz, which holds bin/silk and the standard library it finds at lib/silk/stdlib. To pin them, commit native-seed.json as compiler/native-seed.json."
+          fi
+          {
+            echo "### Releases"
+            echo "Bootstrap: \`bootstrap-v$BOOTSTRAP_VERSION\`, n0: \`$tag\`"
+            echo '```json'
+            cat native-seed.json
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

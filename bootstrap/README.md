@@ -5,16 +5,19 @@ the first native compiler, the commit named in [`anchor.json`](anchor.json), fro
 there the native compiler in [`compiler/`](../compiler) builds itself from its pinned seed.
 
 Change it only when that build breaks. [Bootstrap CI](../.github/workflows/bootstrap.yml) runs
-only when this directory or what builds it changes. It bundles the compiler into one `silk.mjs`,
-smoke-tests the bundle with Node 24 and Bun, and runs a diverse double compilation: the bundle
-builds the anchor's compiler (T1), the anchor's pinned seed builds it too (N1), and both must emit
-the anchor compiler's LLVM IR byte for byte.
+when this directory or what builds it changes, and weekly. It bundles the compiler into one
+`silk.mjs`, smoke-tests the bundle with Node 24 and Bun, and builds n0: the bundle builds the
+anchor's compiler (T1), T1 emits that compiler's LLVM IR for each target, each target links the IR
+into N1, and N1 builds n0. N1 and n0 must emit T1's IR byte for byte, n0 must build the current
+native compiler, and once n0 is published every run must rebuild its exact bytes.
 
-On `main`, a passing run publishes the bundle as the `bootstrap-<commit>` GitHub release, with
-`silk.mjs` and its SHA-256. It needs no checkout, dependencies, or build:
+A manual run of the workflow on `main` with publish ticked publishes the bundle as
+`bootstrap-v<version>` (the version of `packages/cli/package.json`), with `silk.mjs` and its
+SHA-256, and n0 as `v<version>` (see `compiler/README.md`). Both releases are immutable. The
+bundle needs no checkout, dependencies, or build:
 
 ```sh
-gh release download bootstrap-<commit> --repo silk-lang/silk --pattern 'silk.mjs*'
+gh release download bootstrap-v0.0.0 --repo silk-lang/silk --pattern 'silk.mjs*'
 sha256sum -c silk.mjs.sha256
 node silk.mjs --help
 ```

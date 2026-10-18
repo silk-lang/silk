@@ -124,8 +124,12 @@ const tree = Effect.fnUntraced(function* (root: string, base: string) {
   return entries
 })
 
-/** The archive's file name and top-level directory: `silk-<version>-<target>`. */
-export const name = (version: string, target: string) => `silk-${version}-${target}`
+/**
+ * The archive's file name and top-level directory: `silk-<version>-<target>`, without the
+ * version's `+<commit>` build metadata, since GitHub renames release assets that contain `+`.
+ */
+export const name = (version: string, target: string) =>
+  `silk-${version.replace(/\+.*$/, '')}-${target}`
 
 /** Writes the target's gzip-compressed release archive and answers its path. */
 export const write = Effect.fn('ReleaseArchive.write')(function* (options: ArchiveOptions) {
@@ -169,7 +173,7 @@ const compilerVersion = Effect.fnUntraced(function* () {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const usage =
-    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> --stdlib <directory> --target <triple> --output <directory>'
+    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> --stdlib <directory> --target <triple> --output <directory> [--version <version>]'
   const cli = Effect.gen(function* () {
     const { values } = yield* Effect.try({
       try: () =>
@@ -179,6 +183,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
             stdlib: { type: 'string' },
             target: { type: 'string' },
             output: { type: 'string' },
+            version: { type: 'string' },
           },
         }),
       catch: (cause) => new ReleaseArchiveError({ message: usage, cause }),
@@ -189,7 +194,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       compiler: resolve(values.compiler),
       standardLibrary: resolve(values.stdlib),
       target: values.target,
-      version: yield* compilerVersion(),
+      version: values.version ?? (yield* compilerVersion()),
       outputDirectory: resolve(values.output),
     })
     yield* Effect.sync(() => process.stdout.write(`${path}\n`))

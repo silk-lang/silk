@@ -52,6 +52,17 @@ it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibl
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
+it('names an archive by its version without build metadata', () => {
+  assert.strictEqual(
+    ReleaseArchive.name('0.1.0-dev.8624+5081812', 'aarch64-apple-darwin'),
+    'silk-0.1.0-dev.8624-aarch64-apple-darwin',
+  )
+  assert.strictEqual(
+    ReleaseArchive.name('0.1.0', 'x86_64-unknown-linux-gnu'),
+    'silk-0.1.0-x86_64-unknown-linux-gnu',
+  )
+})
+
 it('refuses a member path that fits no ustar prefix and name split', () => {
   const unsplittable = `${'a'.repeat(160)}/${'b'.repeat(101)}`
   assert.strictEqual(ReleaseArchive.tar([{ _tag: 'Directory', path: unsplittable }]), undefined)

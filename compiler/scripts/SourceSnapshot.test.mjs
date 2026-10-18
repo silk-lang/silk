@@ -8,8 +8,14 @@ import * as Result from 'effect/Result'
 import * as Schema from 'effect/Schema'
 import * as NativeProcess from './NativeProcess.ts'
 import { historicalSeeds } from '../../.github/scripts/native-seed-history.mjs'
-import * as NativeSeedRetention from '../../.github/scripts/native-seed-retention.mjs'
-import { candidate, readPin, selectSeed, targets, verifySeed } from './NativeSeed.mjs'
+import {
+  candidate,
+  readPin,
+  releaseVersion,
+  selectSeed,
+  targets,
+  verifySeed,
+} from './NativeSeed.mjs'
 import { createSnapshot, hash, verifySnapshot } from './SourceSnapshot.mjs'
 
 const require = createRequire(new URL('../../package.json', import.meta.url))
@@ -97,13 +103,15 @@ it.effect('installs only downloaded bytes that match a Release pin', () =>
     const f = yield* fixture()
     const seed = '#!/bin/sh\nexit 42\n'
     const target = 'x86_64-unknown-linux-gnu'
+    const tag = `v0.1.0-dev.1+${f.revision.slice(0, 7)}`
     const pin = yield* candidate({
       target,
+      tag,
       sha256: hash(seed),
       sourceCommit: f.revision,
       runId: '38110973077',
     })
-    assert.strictEqual(pin.seeds[target].tag, `native-seed-${f.revision}`)
+    assert.strictEqual(pin.seeds[target].tag, tag)
     const pinPath = join(f.temporary, 'native-seed.json')
     yield* f.fs.writeFileString(pinPath, yield* encodeJson(pin))
     const download = join(f.temporary, 'download')
@@ -130,10 +138,24 @@ it.effect('installs only downloaded bytes that match a Release pin', () =>
       pinPath,
       yield* encodeJson({
         ...pin,
-        seeds: { [target]: { ...pin.seeds[target], tag: `native-seed-${'0'.repeat(40)}` } },
+        seeds: { [target]: { ...pin.seeds[target], tag: 'v0.1.0-dev.1+0000000' } },
       }),
     )
-    yield* failure(readPin(pinPath), /tag must name its source commit/)
+    yield* failure(readPin(pinPath), /tag must be a release version naming its source commit/)
+    for (const accepted of ['v0.1.0', `native-seed-${f.revision}`]) {
+      const seeds = { [target]: { ...pin.seeds[target], tag: accepted } }
+      yield* f.fs.writeFileString(pinPath, yield* encodeJson({ ...pin, seeds }))
+      assert.strictEqual((yield* readPin(pinPath)).seeds[target].tag, accepted)
+    }
+    for (const rejected of [
+      `native-seed-${'0'.repeat(40)}`,
+      `v0.1.0-dev.1+${f.revision}`,
+      '0.1.0',
+    ]) {
+      const seeds = { [target]: { ...pin.seeds[target], tag: rejected } }
+      yield* f.fs.writeFileString(pinPath, yield* encodeJson({ ...pin, seeds }))
+      yield* failure(readPin(pinPath), /tag must be a release version/)
+    }
     yield* f.fs.writeFileString(
       pinPath,
       yield* encodeJson({ schemaVersion: 1, seed: { _tag: 'Bootstrap', reason: 're-seed' } }),
@@ -156,6 +178,7 @@ it.effect(
       for (const target of targets) {
         const pin = yield* candidate({
           target,
+          tag: `v0.1.0-dev.1+${f.revision.slice(0, 7)}`,
           sha256: hash(target),
           sourceCommit: f.revision,
           runId: '1',
@@ -206,30 +229,45 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
-it("retains the union of each target's newest assets, current pins, and immutable pin history", () => {
+it.effect('counts dev versions from the newest plain release tag', () =>
+  Effect.gen(function* () {
+    const f = yield* fixture()
+    const commit = Effect.fnUntraced(function* () {
+      yield* f.git(
+        '-c',
+        'user.name=Snapshot Test',
+        '-c',
+        'user.email=snapshot@example.invalid',
+        'commit',
+        '-q',
+        '--allow-empty',
+        '-m',
+        'next',
+      )
+      return yield* f.git('rev-parse', 'HEAD')
+    })
+    const next = /^version = "([^"]+)"$/m.exec(
+      yield* f.fs.readFileString(new URL('../silk.toml', import.meta.url).pathname),
+    )[1]
+    assert.strictEqual(
+      releaseVersion(f.revision, f.repository),
+      `${next}-dev.1+${f.revision.slice(0, 7)}`,
+    )
+    const second = yield* commit()
+    // Dev builds and other tags do not restart the count.
+    yield* f.git('tag', `v${next}-dev.2+${second.slice(0, 7)}`)
+    yield* f.git('tag', 'bootstrap-v0.0.0')
+    assert.strictEqual(releaseVersion(second, f.repository), `${next}-dev.2+${second.slice(0, 7)}`)
+    yield* f.git('tag', 'v0.0.1')
+    const third = yield* commit()
+    assert.strictEqual(releaseVersion(third, f.repository), `${next}-dev.1+${third.slice(0, 7)}`)
+    yield* f.git('tag', `v${next}`)
+    assert.throws(() => releaseVersion(third, f.repository), /raise compiler\/silk.toml/)
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
+it('reads archival seeds from every historical pin schema', () => {
   const x86 = 'x86_64-unknown-linux-gnu'
-  const arm = 'aarch64-unknown-linux-gnu'
-  const mac = 'aarch64-apple-darwin'
-  const releases = [
-    ...Array.from({ length: 21 }, (_, index) => ({
-      tag: `linux-${index}`,
-      assets: [`silk-compiler-${x86}`],
-    })),
-    { tag: 'old-arm-and-mac', assets: [`silk-compiler-${arm}`, `silk-compiler-${mac}`] },
-    { tag: 'old-pinned', assets: [`silk-compiler-${x86}`] },
-    { tag: 'old-current', assets: [`silk-compiler-${mac}`] },
-  ]
-  const history = new Map([
-    [x86, new Set(['old-pinned'])],
-    [arm, new Set()],
-    [mac, new Set()],
-  ])
-  const kept = NativeSeedRetention.reasons(releases, history, [[mac, { tag: 'old-current' }]])
-  assert.isTrue(kept.has('linux-19'))
-  assert.isFalse(kept.has('linux-20'))
-  assert.deepEqual(kept.get('old-arm-and-mac'), [`${arm}: 20 newest`, `${mac}: 20 newest`])
-  assert.include(kept.get('old-pinned'), `${x86}: pinned in main history`)
-  assert.include(kept.get('old-current'), `${mac}: current pin`)
   const release = { _tag: 'Release', target: x86, tag: 'historical-release' }
   assert.deepEqual(historicalSeeds({ schemaVersion: 1, seed: release }), [release])
   assert.deepEqual(historicalSeeds({ schemaVersion: 2, seeds: { [x86]: release } }), [release])
