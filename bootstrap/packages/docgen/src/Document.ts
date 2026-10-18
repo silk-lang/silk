@@ -16,25 +16,6 @@ export interface SourceRange {
   readonly end: number
 }
 
-/** A declaration target resolved from a Rust-style intra-documentation link. */
-export interface LinkTarget {
-  readonly id: string
-  readonly module: string
-  readonly name: string
-  readonly kind:
-    | 'Function'
-    | 'Struct'
-    | 'Enum'
-    | 'EnumMember'
-    | 'Union'
-    | 'UnionVariant'
-    | 'Service'
-    | 'Interface'
-    | 'Constant'
-    | 'Role'
-    | 'Alias'
-}
-
 export type Inline =
   | { readonly _tag: 'Text'; readonly value: string; readonly source: SourceRange }
   | { readonly _tag: 'InlineCode'; readonly value: string; readonly source: SourceRange }
@@ -58,7 +39,6 @@ export type Inline =
   | {
       readonly _tag: 'SymbolLink'
       readonly spelling: string
-      readonly target?: LinkTarget
       readonly source: SourceRange
     }
   | { readonly _tag: 'Break'; readonly source: SourceRange }
@@ -457,62 +437,6 @@ export const parse = (
   }
   return fallback(block, normalized)
 }
-
-export type Resolver = (spelling: string) => LinkTarget | undefined
-
-const resolveInline = (value: Inline, resolver: Resolver): Inline => {
-  switch (value._tag) {
-    case 'SymbolLink': {
-      const target = resolver(value.spelling)
-      return target === undefined
-        ? value
-        : Object.freeze({ ...value, target: Object.freeze(target) })
-    }
-    case 'Emphasis':
-    case 'Strong':
-    case 'Link':
-      return Object.freeze({
-        ...value,
-        children: Object.freeze(value.children.map((child) => resolveInline(child, resolver))),
-      })
-    default:
-      return value
-  }
-}
-
-const resolveBlock = (value: Block, resolver: Resolver): Block => {
-  switch (value._tag) {
-    case 'Paragraph':
-    case 'Heading':
-      return Object.freeze({
-        ...value,
-        children: Object.freeze(value.children.map((child) => resolveInline(child, resolver))),
-      })
-    case 'BlockQuote':
-      return Object.freeze({
-        ...value,
-        children: Object.freeze(value.children.map((child) => resolveBlock(child, resolver))),
-      })
-    case 'List':
-      return Object.freeze({
-        ...value,
-        items: Object.freeze(
-          value.items.map((item) =>
-            Object.freeze(item.map((child) => resolveBlock(child, resolver))),
-          ),
-        ),
-      })
-    default:
-      return value
-  }
-}
-
-/** Resolves best-effort symbol links while preserving unresolved links as inline code. */
-export const resolve = (self: Document, resolver: Resolver): Document =>
-  Object.freeze({
-    ...self,
-    blocks: Object.freeze(self.blocks.map((block) => resolveBlock(block, resolver))),
-  })
 
 const escapeText = (value: string): string =>
   value.replaceAll('\\', '\\\\').replace(/([`*_[\]<>])/g, '\\$1')
