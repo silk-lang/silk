@@ -495,15 +495,27 @@ reads only the syntax index, so a name with a conditional candidate there is the
 Silk` pass on its head. Merge `main` into the branch before its final run, with a merge that retains
 both parents, so the merge commit reuses that run's verdict.
 
-The frozen TypeScript bootstrap in [`bootstrap/`](../bootstrap) only builds the first native
-compiler, the commit in `bootstrap/anchor.json`; Bootstrap CI checks that build by diverse double
-compilation. Every later compiler is built by the native seed chain, so a compiler or
+The frozen TypeScript bootstrap in [`bootstrap/`](../bootstrap) only builds n0, the first native
+compiler, from the commit in `bootstrap/anchor.json`; Bootstrap CI rebuilds n0 from the bootstrap
+every week. Every later compiler is built by the native seed chain, so a compiler or
 standard-library change never needs a bootstrap change.
+
+### Release versions
+
+Every published compiler is a GitHub prerelease tagged `v<version>`. Between releases, a build of
+`main` is `<next>-dev.<n>+<commit>`, as in `v0.1.0-dev.8796+440201f`: `<next>` is
+`[package].version` of `compiler/silk.toml`, `<n>` counts the commits since the newest plain
+`v<x.y.z>` tag (all of history before the first release), and `<commit>` is the 7-hex commit.
+`node compiler/scripts/NativeSeed.mjs version <commit>` prints it. Archives are named without the
+`+<commit>`, because GitHub renames release assets that contain `+`. After tagging a plain
+release, raise `compiler/silk.toml` to the next version; the version script refuses until then.
+n0 is `v0.1.0-dev.8624+5081812`, and the bootstrap bundle is `bootstrap-v0.0.0`.
 
 ### The native seed pin
 
 `compiler/native-seed.json` names the published native compiler that builds N1. Seeds are
-published on demand by running Selfhost Silk on `main` with publish ticked. Advance the pin weekly,
+published on demand by running Selfhost Silk on `main` with publish ticked, as `v<version>`
+releases. Advance the pin weekly,
 and immediately after any soundness or code generation fix that N1 must not be built without. Pin
 only a candidate whose publishing run summary says **Full gate**; never pin a candidate published
 from a run that reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a
