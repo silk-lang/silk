@@ -253,9 +253,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return yield* reject(`${producerGeneration} SHA-256 differs from its verified identity`)
       const manifest = yield* SourceSnapshot.verifySnapshot({ directory: snapshot })
       const compilerFiles = manifest.files.filter((file) => file.path.startsWith('compiler/'))
-      const stdlibFiles = manifest.files.filter((file) =>
-        file.path.startsWith('packages/compiler/stdlib/'),
-      )
+      const stdlibFiles = manifest.files.filter((file) => file.path.startsWith('stdlib/'))
       if (compilerFiles.length === 0 || stdlibFiles.length === 0)
         return yield* reject('snapshot must account for compiler and standard-library inputs')
       receipt.inputs = {
@@ -364,7 +362,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         yield* checkInputs()
         return result
       })
-    const stdlib = join(snapshot, 'packages/compiler/stdlib')
+    const stdlib = join(snapshot, 'stdlib')
     const compilerRoot = join(snapshot, 'compiler/src/main.silk')
     // The compiler's manifest selects a final executable, so only IR emission names a stage.
     const argumentsFor = (
@@ -542,11 +540,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       process.exitCode = receipt.status === 'passed' ? 0 : 1
     })
   })
-  const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-  const {
-    NodeServices,
-  }: typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js') =
-    await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
+  const require = createRequire(new URL('../../package.json', import.meta.url))
+  const { NodeServices }: typeof import('@effect/platform-node') = await import(
+    pathToFileURL(require.resolve('@effect/platform-node')).href
+  )
   await Effect.runPromise(
     cli.pipe(
       Effect.provide(NodeServices.layer),
