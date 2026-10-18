@@ -534,14 +534,15 @@ compatibility and contribute ordinary surrounding generic constraints, but it do
 missing parameter, result, failure, or requirement annotation and does not rewrite a conflicting
 annotation. Anonymous callables cannot declare independent type parameters, name themselves, refer
 to themselves recursively, carry declaration modifiers, or participate in overloads. An anonymous
-body nested inside another anonymous body is unsupported in this language slice. Invocation mode is
-derived from captures under
+body may be nested inside another anonymous body or an `effect` block, at any depth; it sees every
+binder of the enclosing function: its lifetime, type and row parameters and `Self`. Invocation mode
+is derived from captures under
 [ANON-OWN-001](ownership-and-borrowing.md#anon-own-001--anonymous-captures-determine-environment-ownership-and-invocation-mode);
 source does not spell `mut fn` or `once fn` when constructing the value.
 
 **Diagnostics:** An incomplete written contract receives a syntax or type diagnostic at the missing
-or incompatible contract part. A nested body, self-reference, independent type parameter,
-declaration modifier, or overload use receives a semantic diagnostic at that unsupported construct.
+or incompatible contract part. A self-reference, independent type parameter, declaration
+modifier, or overload use receives a semantic diagnostic at that unsupported construct.
 
 **Evidence:** anonymous callable value specification,
 anonymous semantic-fact specification,
