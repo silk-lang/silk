@@ -8,8 +8,8 @@ import * as Result from 'effect/Result'
 import * as Coverage from './RepositoryCoverage.ts'
 import * as NativeProcess from './NativeProcess.ts'
 
-const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-/** @type {typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js')} */
+const require = createRequire(new URL('../../package.json', import.meta.url))
+/** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 const processOutcome = (status, stderr = '', signal = null) => ({
   status,
@@ -92,15 +92,10 @@ it.effect(
       const sources = {
         'examples/new/main.silk': 'pub fn main() -> i32 { return 0 }',
         'examples/new/Util.silk': 'pub fn answer() -> i32 { return 42 }',
-        'packages/compiler/conformance/new/library.silk': 'pub fn answer() -> i32 { return 42 }',
-        'packages/compiler/test/goldens/canonical.silk': 'pub fn main() -> i32 { return 0 }',
-        'packages/compiler/test/fixtures/complete-interface-contracts/provider-equality.silk':
-          'fn main() -> i32 { return 0 }',
-        'openspec/changes/archive/old/evidence/captured-resource.silk':
-          'pub fn main() -> i32 { return 0 }',
+        'compiler/conformance/new/library.silk': 'pub fn answer() -> i32 { return 42 }',
+        'bootstrap/packages/compiler/fixture.silk': 'pub fn main() -> i32 { return 0 }',
         'corpus/native/new/main.silk': 'pub fn main() -> i32 { return 0 }',
-        'packages/compiler/stdlib/new.silk':
-          '//! ```silk\n//! pub fn main() -> i32 { return 42 }\n//! ```',
+        'stdlib/new.silk': '//! ```silk\n//! pub fn main() -> i32 { return 42 }\n//! ```',
       }
       for (const [path, source] of Object.entries(sources)) {
         yield* fs.makeDirectory(join(root, path, '..'), { recursive: true })
@@ -118,12 +113,12 @@ it.effect(
       assert.deepStrictEqual(
         inventory.programs.map(({ id }) => id),
         [
+          'compiler/conformance/new/library.silk',
           'examples/new/main.silk',
-          'packages/compiler/conformance/new/library.silk',
-          'packages/compiler/stdlib/new.silk#doc-1',
+          'stdlib/new.silk#doc-1',
         ],
       )
-      assert.strictEqual(inventory.excluded.length, 6)
+      assert.strictEqual(inventory.excluded.length, 4)
       assert.isTrue(inventory.excluded.every(({ reason }) => reason.length > 0))
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
@@ -190,7 +185,7 @@ it.effect(
         'corpus/native/fixture/main.silk': 'pub fn main() -> i32 { return 7 }',
         'examples/measured/main.silk': 'pub fn main() -> i32 { return 7 }',
         'examples/new/main.silk': 'pub fn main() -> i32 { return 42 }',
-        'packages/compiler/conformance/new/library.silk': 'pub fn answer() -> i32 { return 42 }',
+        'compiler/conformance/new/library.silk': 'pub fn answer() -> i32 { return 42 }',
         'compiler/scripts/repository-coverage-track.json': '["examples/new/main.silk"]',
       }
       for (const [path, source] of Object.entries(files)) {

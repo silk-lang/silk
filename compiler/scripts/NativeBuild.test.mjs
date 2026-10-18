@@ -15,8 +15,8 @@ import * as Effect from 'effect/Effect'
 import * as Schema from 'effect/Schema'
 import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
-const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-/** @type {typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js')} */
+const require = createRequire(new URL('../../package.json', import.meta.url))
+/** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 import * as NativeBuild from './NativeBuild.ts'
 import * as SourceSnapshot from './SourceSnapshot.mjs'
@@ -42,10 +42,7 @@ const fixture = Effect.fnUntraced(
             '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
           ],
           ['compiler/src/main.silk', 'pub fn main() -> i32 { return 0 }'],
-          [
-            'packages/compiler/stdlib/silk/i32.silk',
-            'pub fn identity(value: i32) -> i32 { return value }',
-          ],
+          ['stdlib/silk/i32.silk', 'pub fn identity(value: i32) -> i32 { return value }'],
         ]
         const files = inputs.map(([path, bytes]) => {
           const target = join(snapshot, path)
@@ -65,7 +62,7 @@ const fixture = Effect.fnUntraced(
             files.filter(({ path }) => path.startsWith('compiler/')),
           ),
           stdlibDigest: SourceSnapshot.fileDigest(
-            files.filter(({ path }) => path.startsWith('packages/compiler/stdlib/')),
+            files.filter(({ path }) => path.startsWith('stdlib/')),
           ),
           archive: 'authored-inputs.tar',
           archiveSha256: SourceSnapshot.hash('fixture archive'),
@@ -318,7 +315,7 @@ sleep 60`,
         '-o',
         result.output.path,
         '--stdlib',
-        join(options.snapshot, 'packages/compiler/stdlib'),
+        join(options.snapshot, 'stdlib'),
         '--optimization',
         'speed',
         '--debug',

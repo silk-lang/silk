@@ -1,9 +1,9 @@
 #!/bin/sh
-# Installs the Silk compiler from the newest green build of main.
+# Installs the Silk compiler from the newest published build of main.
 #
 #   curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 #
-# Every green main push publishes a `native-seed-<commit>` release holding one
+# A manually published build of main is a `native-seed-<commit>` release holding one
 # `silk-<version>-<target>.tar.gz` archive per target. This script picks the newest one for the
 # running host, checks its compiler against the release's `native-seed.json`, and unpacks it into
 # `$SILK_INSTALL` (default `~/.silk`): `bin/silk` beside the standard library in `lib/silk/stdlib`.
@@ -68,21 +68,23 @@ case "$os" in
   *) fail "Silk has no build for $os yet" ;;
 esac
 
-# The newest main commit with a published build. A commit's own `sha` is the one followed by a
-# commit node id (`C_…`); tree and parent shas carry none.
+# The most recently published `native-seed-*` release. The releases API does not list them by date,
+# so read every page and compare `published_at` (ISO 8601, so it sorts as text). Each release's
+# `tag_name` precedes its `published_at`; a draft's `published_at` is null and never matches.
 if [ -z "$release" ]; then
-  commits=$(api 'commits?sha=main&per_page=30' |
-    grep -o '"sha": *"[0-9a-f]*"\|"node_id": *"[^"]*"' |
-    awk -F'"' '$2 == "sha" { sha = $4; next } $4 ~ /^C_/ && sha != "" { print sha } { sha = "" }')
-  [ -n "$commits" ] || fail "cannot list main's commits from GitHub"
-  for sha in $commits; do
-    if curl -fsSL -r 0-0 -o /dev/null \
-      "https://github.com/$repo/releases/download/native-seed-$sha/native-seed.json" 2> /dev/null; then
-      release=native-seed-$sha
-      break
-    fi
+  page=1
+  found=
+  while [ "$page" -le 20 ]; do
+    tags=$(api "releases?per_page=100&page=$page") || fail "cannot list releases from GitHub"
+    tags=$(printf '%s\n' "$tags" |
+      grep -o '"tag_name": *"[^"]*"\|"published_at": *"[^"]*"' |
+      awk -F'"' '$2 == "tag_name" { tag = $4; next } tag ~ /^native-seed-/ { print $4, tag } { tag = "" }') || true
+    [ -n "$tags" ] || break
+    found=$(printf '%s\n%s\n' "$found" "$tags")
+    page=$((page + 1))
   done
-  [ -n "$release" ] || fail "none of main's last 30 commits has a published build"
+  release=$(printf '%s\n' "$found" | grep . | sort -r | head -n 1 | cut -d' ' -f2) || true
+  [ -n "$release" ] || fail "no published build of main found"
 fi
 
 url=$(api "releases/tags/$release" 2> /dev/null |
