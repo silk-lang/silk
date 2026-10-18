@@ -61,16 +61,18 @@ commitments.
 
 - [`@silklang/compiler`](packages/compiler) — the stage-0 compiler, LLVM backend, compile-time
   static evaluator, embedded Silk standard library, and supported analysis facade.
-- [`@silklang/cli`](packages/cli) — project initialization, checking,
-  multi-target builds, native execution, formatting, and documentation generation through `silk`.
+- [`@silklang/cli`](packages/cli) — bootstrap project initialization, checking,
+  multi-target builds, native execution, and formatting.
 - [`@silklang/llvm`](packages/llvm) — Effect-native LLVM IR construction and deterministic text
   and bitcode emission.
 - [`@silklang/editor-support`](packages/editor-support) — portable CodeMirror integration,
   TextMate grammar, semantic editor projections, and the `<silk-snippet>` custom element.
 - [`@silklang/lsp`](packages/lsp) — project-aware diagnostics, hover, navigation, completion,
   inlay hints, symbols, and canonical formatting over stdio.
-- [`@silklang/docgen`](packages/docgen) — CommonMark documentation models, semantic links,
-  highlighting, doctesting, deterministic JSON, and static-site rendering.
+- [`@silklang/docgen`](packages/docgen) — CommonMark hover, documentation highlighting, and
+  fenced-code formatting support for TypeScript editor clients.
+- [`compiler/src/documentation`](compiler/src/documentation) — native Silk documentation
+  extraction, symbol links, JSON reporting, Markdown reference generation/checking, and doctests.
 - [`silk-language`](apps/vscode) — the private Cursor/VS Code extension app.
 
 ## Evidence and direction

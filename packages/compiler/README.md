@@ -254,8 +254,10 @@ points to the shipped `.silk` source rather than virtual intrinsic files.
 
 `///` declaration documentation and leading `//!` module documentation remain lossless source
 tokens. `DocBlock` attaches them to modules, declarations, type parameters, parameters, fields,
-implementations, and implementation operations. Markdown parsing and generated documentation
-models belong to `@silklang/docgen` so ordinary compilation does not pay that cost.
+implementations, and implementation operations. Editor Markdown parsing belongs to
+`@silklang/docgen` so ordinary compilation does not pay that cost. Documentation generation,
+doctesting, and reference Markdown rendering belong to the native Silk compiler's `documentation` actors,
+not this bootstrap package.
 
 ## Byte and span conventions
 

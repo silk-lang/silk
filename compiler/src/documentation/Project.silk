@@ -1,0 +1,876 @@
+//! Header-only native documentation extraction from a final-profile semantic store.
+//!
+//! The caller preloads project or standard-library roots and assembles the final profile once.
+//! Extraction owns only byte strings and compact records; the caller may immediately drop the
+//! semantic store and source revision. Ordinary callable bodies are never demanded or formatted.
+
+import documentation.Attached
+import documentation.Identity
+import documentation.Markdown
+import documentation.Model {Document, Item, Link, Module as DocModule, Project, Source}
+import hir.Hir {HirId, Module, Node, OwnerKind, Range}
+import lexer.Span {Span}
+import lexer.Token {Token, TokenKind, kind as tokenKind, span as tokenSpan}
+import parser.SyntaxTree {SyntaxTree}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.ModuleIndex {CandidateKind, IndexedDeclaration, ModuleIndex}
+import semantic.Query {Cycle}
+import semantic.Rejection {Rejection}
+import semantic.Semantic {Dependency, DocumentationBinding, Semantic, StaticPort}
+import semantic.SourceIndex {AuthoredCursor, IndexedSource, RevisionMismatch}
+import semantic.Types {Types}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.slice {Slice}
+import silk.string {InvalidUtf8, String}
+import silk.usize
+import silk.vector {Vector}
+
+/// A source/profile failure, never a silently omitted declaration or successful partial model.
+pub union Error {
+  MissingSource,
+  InvalidSources,
+  /// Invalid retained UTF-8. Markdown/signature offsets address source bytes; metadata offsets
+  /// address the named field. The path itself remains raw bytes for diagnostic reporting.
+  InvalidText {pub sourcePath: Bytes, pub field: &'static [u8], pub offset: usize},
+  Rejected {pub rejection: Shared<Rejection>},
+}
+
+struct Selection {
+  identity: DeclarationId
+  ordinal: usize
+  parent: usize
+  span: Span
+  kind: &'static [u8]
+  isPublic: bool
+  admitted: bool
+  published: bool
+  inherent: bool
+  owner: Option<DeclarationId>
+}
+
+struct OwnerLookup {
+  local: Option<Vector<DeclarationId>>
+  imported: Option<Vector<DeclarationId>>
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn publicHeader(node: Node) -> bool {
+  return match node {
+    Node.FunctionHeader {isPublic, ..} => isPublic
+    Node.OperationHeader {isPublic, ..} => isPublic
+    Node.StructHeader {isPublic, ..} => isPublic
+    Node.TupleHeader {isPublic, ..} => isPublic
+    Node.EnumHeader {isPublic, ..} => isPublic
+    Node.UnionHeader {isPublic, ..} => isPublic
+    Node.ServiceHeader {isPublic, ..} => isPublic
+    Node.InterfaceHeader {isPublic, ..} => isPublic
+    Node.RoleHeader {isPublic, ..} => isPublic
+    Node.ConstantHeader {isPublic, ..} => isPublic
+    Node.PackageParameterHeader {isPublic, ..} => isPublic
+    Node.AliasHeader {isPublic, ..} => isPublic
+    Node.StaticHeader {isPublic, ..} => isPublic
+    Node.ImplAliasHeader {isPublic, ..} => isPublic
+    Node.ImportHeader {isPublic, ..} => isPublic
+    _ => false
+  }
+}
+
+fn kind(node: Node) -> &'static [u8] {
+  return match node {
+    Node.FunctionHeader {..} => b"Function"
+    Node.OperationHeader {..} => b"Operation"
+    Node.StructHeader {..} => b"Struct"
+    Node.TupleHeader {..} => b"Struct"
+    Node.EnumHeader {..} => b"Enum"
+    Node.UnionHeader {..} => b"Union"
+    Node.ServiceHeader {..} => b"Service"
+    Node.InterfaceHeader {..} => b"Interface"
+    Node.RoleHeader {..} => b"Role"
+    Node.ConstantHeader {..} => b"Constant"
+    Node.PackageParameterHeader {..} => b"Parameter"
+    Node.AliasHeader {..} => b"Alias"
+    Node.StaticHeader {..} => b"Constant"
+    Node.ImplAliasHeader {..} => b"Operation"
+    Node.ImplHeader {..} => b"Implementation"
+    _ => b""
+  }
+}
+
+fn inherited(node: Node) -> bool {
+  return match node { Node.OperationHeader {..} => true Node.ImplAliasHeader {..} => true _ => false }
+}
+
+fn ownerKind(identity: &DeclarationId) -> bool {
+  let value = DeclarationId.kind(identity)
+  return value == OwnerKind.Struct || value == OwnerKind.Tuple || value == OwnerKind.Enumeration || value == OwnerKind.Union || value == OwnerKind.Service || value == OwnerKind.Interface
+}
+
+effect fn selectedBinding<'s>(port: &mut StaticPort<'s>, module: &ModuleId, name: &[u8], external: bool)
+-> Option<DocumentationBinding> ! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  return match move run StaticPort.documentationBinding(&mut port.*, module, name, external) {
+    Result<Option<DocumentationBinding>, Shared<Rejection>>.Success {value} => move value
+    Result<Option<DocumentationBinding>, Shared<Rejection>>.Failure {error} => { fail Error.Rejected {rejection: move error} }
+  }
+}
+
+effect fn inventory<'s>(port: &mut StaticPort<'s>, module: &ModuleId, cursor: &AuthoredCursor) -> Vector<Selection>
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut selected = Vector<Selection>.make()
+  if let Option<&IndexedSource>.Some {value: indexed} = move StaticPort.sourceAtCursor(&port.*, cursor) {
+    let hir = IndexedSource.authored(indexed)
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let declaration = &declarations[at]
+      let mut parent = usize.MAX
+      if let Option<usize>.Some {value} = &declaration.parent { parent = value }
+      let inherent = match Module.node(hir, declaration.header) { Node.ImplHeader {target, ..} => !target.present _ => false }
+      run Vector<Selection>.append(&mut selected, Selection {
+        identity: DeclarationId.copy(&declaration.identity), ordinal: at, parent: parent,
+        span: Module.span(hir, declaration.local), kind: kind(Module.node(hir, declaration.header)),
+        isPublic: publicHeader(Module.node(hir, declaration.header)), admitted: false, published: false,
+        owner: Option<DeclarationId>.none(), inherent: inherent,
+      })
+      at = at + usize.ONE
+    }
+  } else { fail Error.MissingSource }
+  let mut at = usize.ZERO
+  while at < Vector<Selection>.length(&selected) {
+    let selection = &Vector<Selection>.asSlice(&selected)[at]
+    let available = run StaticPort.declarationAvailable(&mut port.*, module, selection.ordinal, selection.span)
+    let admitted = match move available {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => { fail Error.Rejected {rejection: move error} }
+    }
+    let mutable = Vector<Selection>.asMutSlice(&mut selected)
+    mutable[at].admitted = admitted
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < Vector<Selection>.length(&selected) {
+    let entry = &Vector<Selection>.asSlice(&selected)[at]
+    let mut published = entry.admitted && entry.kind.length > usize.ZERO
+    let mut visible = entry.isPublic
+    let mut owner = Option<DeclarationId>.none()
+    if published {
+      if same(entry.kind, b"Implementation") {
+        owner = match move run StaticPort.documentationProvider(&mut port.*, module, entry.ordinal, entry.span) {
+          Result<Option<DeclarationId>, Shared<Rejection>>.Success {value} => move value
+          Result<Option<DeclarationId>, Shared<Rejection>>.Failure {error} => { fail Error.Rejected {rejection: move error} }
+        }
+        visible = match move run StaticPort.documentationImplementationPublic(&mut port.*, module, entry.ordinal, entry.span) {
+          Result<bool, Shared<Rejection>>.Success {value} => value
+          Result<bool, Shared<Rejection>>.Failure {error} => { fail Error.Rejected {rejection: move error} }
+        }
+      } else if entry.parent == usize.MAX {
+        let name = run DeclarationId.copySpelling(&entry.identity)
+        let binding = run selectedBinding(&mut port.*, module, Bytes.asSlice(&name), false)
+        published = false
+        if let Option<DocumentationBinding>.Some {value: DocumentationBinding.Declaration {identity, isPublic}} = move binding {
+          published = DeclarationId.equals(&identity, &entry.identity)
+          visible = isPublic
+        }
+      } else {
+        let parent = &Vector<Selection>.asSlice(&selected)[entry.parent]
+        published = parent.published
+        visible = visible && parent.isPublic
+        if same(parent.kind, b"Service") || same(parent.kind, b"Interface") {
+          visible = parent.isPublic
+          owner = Option<DeclarationId>.some(DeclarationId.copy(&parent.identity))
+        }
+        if same(parent.kind, b"Implementation") {
+          if let Option<DeclarationId>.Some {value} = &parent.owner {
+            owner = Option<DeclarationId>.some(DeclarationId.copy(&value))
+            if parent.inherent {
+            let ownerName = run DeclarationId.copySpelling(&value)
+            let name = run DeclarationId.copySpelling(&entry.identity)
+            match move run StaticPort.documentationMember(&mut port.*, module, Bytes.asSlice(&ownerName), Bytes.asSlice(&name)) {
+              Result<Option<DeclarationId>, Shared<Rejection>>.Success {value: found} => {
+                published = false
+                if let Option<DeclarationId>.Some {value: identity} = move found { published = DeclarationId.equals(&identity, &entry.identity) }
+              }
+              Result<Option<DeclarationId>, Shared<Rejection>>.Failure {error} => { fail Error.Rejected {rejection: move error} }
+            }
+            }
+            else { visible = parent.isPublic }
+          } else { visible = parent.isPublic }
+        }
+      }
+    }
+    let changed = &mut Vector<Selection>.asMutSlice(&mut selected)[at]
+    changed.published = published
+    changed.isPublic = visible
+    changed.owner = move owner
+    at = at + usize.ONE
+  }
+  return move selected
+}
+
+fn trimmed(bytes: &[u8], span: Span) -> Span {
+  let mut end = span.end
+  while end > span.start && (bytes[end - usize.ONE] == 32 || bytes[end - usize.ONE] == 9 || bytes[end - usize.ONE] == 10 || bytes[end - usize.ONE] == 13) { end = end - usize.ONE }
+  return Span {start: span.start, end: end}
+}
+
+fn signatureSpan(tree: &SyntaxTree, hir: &Module, declaration: &IndexedDeclaration) -> Span {
+  let mut span = Module.span(hir, declaration.header)
+  if let Node.Declaration {body, ..} = Module.node(hir, declaration.local) {
+    if let Node.CallableBody {block} = Module.node(hir, body) {
+      if block.present { span.end = Module.span(hir, block.id).start }
+      return trimmed(Bytes.asSlice(&tree.source), span)
+    }
+    let mut boundary = usize.MAX
+    let mut initializer = false
+    match Module.node(hir, body) {
+      Node.InitializerBody {value} => {
+        if value.present { boundary = Module.span(hir, value.id).start initializer = true }
+      }
+      Node.PackageParameterBody {default, validation} => {
+        if default.present { boundary = Module.span(hir, default.id).start initializer = true }
+        else if validation.present { boundary = Module.span(hir, validation.id).start }
+      }
+      _ => {}
+    }
+    if boundary != usize.MAX {
+      let tokens = Vector<Token>.asSlice(&tree.tokens)
+      let bytes = Bytes.asSlice(&tree.source)
+      let mut low = usize.ZERO
+      let mut high = tokens.length
+      while low < high {
+        let middle = low + (high - low) / 2
+        if tokenSpan(tokens[middle]).start < boundary { low = middle + usize.ONE } else { high = middle }
+      }
+      while low > usize.ZERO {
+        low = low - usize.ONE
+        let token = tokenSpan(tokens[low])
+        if token.start < span.start { break }
+        if (initializer && tokenKind(tokens[low]) == TokenKind.Equals) || (!initializer && same(Slice.view<u8>(bytes, token.start, token.end - token.start), b"where")) {
+          span.end = token.start
+          return trimmed(bytes, span)
+        }
+      }
+    }
+  }
+  let node = Module.node(hir, declaration.header)
+  let container = match node {
+    Node.StructHeader {..} => true Node.EnumHeader {..} => true Node.UnionHeader {..} => true
+    Node.ServiceHeader {..} => true Node.InterfaceHeader {..} => true Node.ImplHeader {..} => true
+    _ => false
+  }
+  if container {
+    let tokens = Vector<Token>.asSlice(&tree.tokens)
+    let mut low = usize.ZERO
+    let mut high = tokens.length
+    while low < high {
+      let middle = low + (high - low) / 2
+      if tokenSpan(tokens[middle]).start < span.start { low = middle + usize.ONE } else { high = middle }
+    }
+    while low < tokens.length && tokenSpan(tokens[low]).start < span.end {
+      let token = tokenSpan(tokens[low])
+      if token.end == token.start + usize.ONE && Bytes.asSlice(&tree.source)[token.start] == 123 { span.end = token.start break }
+      low = low + usize.ONE
+    }
+  }
+  return trimmed(Bytes.asSlice(&tree.source), span)
+}
+
+fn childName(hir: &Module, id: HirId) -> HirId {
+  return match Module.node(hir, id) {
+    Node.Field {name, ..} => name Node.EnumMember {name, ..} => name Node.Variant {name, ..} => name
+    Node.Parameter {name, ..} => name Node.TypeParameter {name, ..} => name
+    Node.RowParameter {name, ..} => name Node.LifetimeParameter {name, ..} => name
+    _ => id
+  }
+}
+
+fn childKind(node: Node) -> &'static [u8] {
+  return match node {
+    Node.Field {..} => b"Field" Node.EnumMember {..} => b"EnumMember" Node.Variant {..} => b"UnionVariant"
+    Node.Parameter {..} => b"Parameter" _ => b"TypeParameter"
+  }
+}
+
+effect fn appendChildren(out: &mut DocModule, tree: &SyntaxTree, hir: &Module, range: Range, parent: usize, starts: &[usize], includePrivate: bool) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < range.length {
+    let id = Module.child(hir, range, at)
+    let node = Module.node(hir, id)
+    let mut visible = true
+    if let Node.Field {isPublic, ..} = node { visible = isPublic }
+    if visible || includePrivate {
+      let nameSpan = Module.span(hir, childName(hir, id))
+      let bytes = Bytes.asSlice(&tree.source)
+      let name = Slice.view<u8>(bytes, nameSpan.start, nameSpan.end - nameSpan.start)
+      let category = childKind(node)
+      let identity = run Identity.child(Bytes.asSlice(&Vector<Item>.asSlice(&out.items)[parent].id), category, name)
+      let span = Module.span(hir, id)
+      let mut signatureEnd = span.end
+      if let Node.Variant {..} = node {
+        signatureEnd = nameSpan.end
+      }
+      let index = Vector<Item>.length(&out.items)
+      let mut visibility = b"Inherited"
+      if let Node.Field {..} = node {
+        visibility = b"Private"
+        if visible { visibility = b"Public" }
+      }
+      run Vector<Item>.append(&mut out.items, Item {
+        id: move identity, kind: run Bytes.copy(category), name: run Bytes.copy(name), visibility: run Bytes.copy(visibility),
+        signature: run Bytes.copy(Slice.view<u8>(bytes, span.start, signatureEnd - span.start)), source: Attached.source(span, starts),
+        parent: Option<usize>.some(parent), documentation: run Attached.declaration(tree, span.start, starts),
+      })
+      if let Node.Variant {fields, ..} = node { run appendChildren(&mut out.*, tree, hir, fields, index, starts, includePrivate) }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn headerChildren(out: &mut DocModule, tree: &SyntaxTree, hir: &Module, node: Node, parent: usize, starts: &[usize], includePrivate: bool) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut generics = Range.empty()
+  let mut children = Range.empty()
+  match node {
+    Node.FunctionHeader {contract, ..} => {
+      if let Node.CallableContract {generics: written, parameters, ..} = Module.node(hir, contract) { generics = written children = parameters }
+    }
+    Node.OperationHeader {contract, ..} => {
+      if let Node.CallableContract {generics: written, parameters, ..} = Module.node(hir, contract) { generics = written children = parameters }
+    }
+    Node.StructHeader {generics: written, fields, ..} => { generics = written children = fields }
+    Node.TupleHeader {generics: written, ..} => { generics = written }
+    Node.EnumHeader {members, ..} => { children = members }
+    Node.UnionHeader {generics: written, variants, ..} => { generics = written children = variants }
+    Node.ServiceHeader {generics: written, ..} => { generics = written }
+    Node.InterfaceHeader {generics: written, ..} => { generics = written }
+    Node.AliasHeader {generics: written, ..} => { generics = written }
+    Node.ImplHeader {generics: written, ..} => { generics = written }
+    _ => {}
+  }
+  run appendChildren(&mut out.*, tree, hir, generics, parent, starts, includePrivate)
+  run appendChildren(&mut out.*, tree, hir, children, parent, starts, includePrivate)
+  return ()
+}
+
+effect fn authoredModule<'s>(port: &StaticPort<'s>, cursor: &AuthoredCursor, selected: &[Selection], name: Bytes, path: &[u8], includePrivate: bool) -> DocModule
+! Error | OutOfMemoryError ? &mut Allocator {
+  let indexed = match move StaticPort.sourceAtCursor(port, cursor) {
+    Option<&IndexedSource>.Some {value} => value
+    Option<&IndexedSource>.None => { fail Error.MissingSource }
+  }
+  let tree = &IndexedSource.sourceUnit(indexed).syntax
+  let hir = IndexedSource.authored(indexed)
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  let starts = run Attached.lines(Bytes.asSlice(&tree.source))
+  let lineStarts = Vector<usize>.asSlice(&starts)
+  let mut out = DocModule {name: move name, sourcePath: run Bytes.copy(path), documentation: run Attached.module(tree, lineStarts), items: Vector<Item>.make()}
+  let mut positions = Vector<usize>.make()
+  let mut at = usize.ZERO
+  while at < selected.length {
+    let entry = &selected[at]
+    let mut position = usize.MAX
+    if entry.published && (entry.isPublic || includePrivate) {
+      let declaration = &declarations[entry.ordinal]
+      let header = Module.node(hir, declaration.header)
+      let mut category = entry.kind
+      if let Option<DeclarationId>.Some {..} = &entry.owner {
+        if let Node.FunctionHeader {contract, ..} = header {
+          category = b"AssociatedFunction"
+          if let Node.CallableContract {parameters, ..} = Module.node(hir, contract) {
+            if parameters.length > usize.ZERO {
+              let first = Module.child(hir, parameters, usize.ZERO)
+              if let Node.Name {text} = Module.node(hir, childName(hir, first)) {
+                if same(Module.text(hir, text), b"self") { category = b"Method" }
+              }
+            }
+          }
+        }
+      }
+      if entry.parent != usize.MAX {
+        let parent = &selected[entry.parent]
+        if same(parent.kind, b"Implementation") && !parent.inherent { category = b"Operation" }
+      }
+      let mut parent = Option<usize>.none()
+      if entry.parent != usize.MAX {
+        let parentPosition = Vector<usize>.get(&positions, entry.parent)
+        if parentPosition != usize.MAX { parent = Option<usize>.some(parentPosition) }
+      }
+      let signature = signatureSpan(tree, hir, declaration)
+      let mut visibility = b"Private"
+      if entry.isPublic { visibility = b"Public" }
+      if inherited(header) || same(category, b"Implementation") { visibility = b"Inherited" }
+      position = Vector<Item>.length(&out.items)
+      run Vector<Item>.append(&mut out.items, Item {
+        id: run Identity.declaration(&entry.identity), kind: run Bytes.copy(category), name: run DeclarationId.copySpelling(&entry.identity),
+        visibility: run Bytes.copy(visibility), signature: run Bytes.copy(Slice.view<u8>(Bytes.asSlice(&tree.source), signature.start, signature.end - signature.start)),
+        source: Attached.source(entry.span, lineStarts), parent: move parent, documentation: run Attached.declaration(tree, entry.span.start, lineStarts),
+      })
+      run headerChildren(&mut out, tree, hir, header, position, lineStarts, includePrivate)
+    }
+    run Vector<usize>.append(&mut positions, position)
+    at = at + usize.ONE
+  }
+  return move out
+}
+
+struct ImportBinding {
+  name: Bytes
+  identity: Bytes
+  ordinal: usize
+  source: Source
+  signature: Bytes
+}
+
+effect fn publicImports<'s>(port: &mut StaticPort<'s>, module: &ModuleId, cursor: &AuthoredCursor, output: &mut DocModule) -> ()
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut imports = Vector<ImportBinding>.make()
+  if let Option<&IndexedSource>.Some {value} = move StaticPort.sourceAtCursor(&port.*, cursor) {
+    let index = IndexedSource.moduleIndex(value)
+    let candidates = ModuleIndex.listCandidates(index)
+    let hir = IndexedSource.authored(value)
+    let tree = &IndexedSource.sourceUnit(value).syntax
+    let lines = run Attached.lines(Bytes.asSlice(&tree.source))
+    let mut at = usize.ZERO
+    while at < candidates.length {
+      let candidate = &candidates[at]
+      if candidate.isPublic && candidate.kind == CandidateKind.ImportMember {
+        let declaration = &ModuleIndex.listDeclarations(index)[candidate.declaration]
+        let span = Module.span(hir, declaration.local)
+        let declarationId = run Identity.declaration(&declaration.identity)
+        run Vector<ImportBinding>.append(&mut imports, ImportBinding {
+          name: run Bytes.copy(Bytes.asSlice(&candidate.name)), ordinal: candidate.declaration,
+          identity: run Identity.child(Bytes.asSlice(&declarationId), b"Alias", Bytes.asSlice(&candidate.name)),
+          source: Attached.source(span, Vector<usize>.asSlice(&lines)),
+          signature: run Bytes.copy(Slice.view<u8>(Bytes.asSlice(&tree.source), span.start, span.end - span.start)),
+        })
+      }
+      at = at + usize.ONE
+    }
+  }
+  let listed = Vector<ImportBinding>.asSlice(&imports)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let admitted = match move run StaticPort.declarationAvailable(&mut port.*, module, listed[at].ordinal, Span {start: listed[at].source.start, end: listed[at].source.end}) {
+      Result<bool, Shared<Rejection>>.Success {value} => value
+      Result<bool, Shared<Rejection>>.Failure {error} => { fail Error.Rejected {rejection: move error} }
+    }
+    let mut repeated = false
+    let existing = Vector<Item>.asSlice(&output.items)
+    let mut prior = usize.ZERO
+    while prior < existing.length {
+      if let Option<usize>.None = &existing[prior].parent {
+        if same(Bytes.asSlice(&existing[prior].name), Bytes.asSlice(&listed[at].name)) { repeated = true }
+      }
+      prior = prior + usize.ONE
+    }
+    if !admitted || repeated { at = at + usize.ONE continue }
+    if let Option<DocumentationBinding>.Some {value: DocumentationBinding.Declaration {identity, ..}} = move run selectedBinding(&mut port.*, module, Bytes.asSlice(&listed[at].name), true) {
+      let target = ModuleId.copy(DeclarationId.moduleId(&identity))
+      let ordinal = run StaticPort.declarationOrdinal(&mut port.*, &identity)
+      let targetCursor = run StaticPort.authoredCursor(&mut port.*, &target)
+      if let Option<AuthoredCursor>.Some {value: authored} = move targetCursor {
+        if let Option<usize>.Some {value: position} = move ordinal {
+          if let Option<&IndexedSource>.Some {value} = move StaticPort.sourceAtCursor(&port.*, &authored) {
+            let hir = IndexedSource.authored(value)
+            let declaration = &ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))[position]
+            let category = kind(Module.node(hir, declaration.header))
+            if category.length > usize.ZERO {
+              let mut insertion = usize.ZERO
+              let items = Vector<Item>.asMutSlice(&mut output.items)
+              while insertion < items.length && items[insertion].source.start <= listed[at].source.start { insertion = insertion + usize.ONE }
+              let mut child = insertion
+              while child < items.length {
+                let parent = match &items[child].parent {
+                  Option<usize>.Some {value: parentIndex} => parentIndex
+                  Option<usize>.None => usize.MAX
+                }
+                if parent != usize.MAX && parent >= insertion { items[child].parent = Option<usize>.some(parent + usize.ONE) }
+                child = child + usize.ONE
+              }
+              run Vector<Item>.insert(&mut output.items, insertion, Item {
+                id: run Bytes.copy(Bytes.asSlice(&listed[at].identity)), kind: run Bytes.copy(b"Alias"), name: run Bytes.copy(Bytes.asSlice(&listed[at].name)),
+                visibility: run Bytes.copy(b"Public"), signature: run Bytes.copy(Bytes.asSlice(&listed[at].signature)),
+                source: Source {start: listed[at].source.start, end: listed[at].source.end, line: listed[at].source.line},
+                parent: Option<usize>.none(), documentation: Option<Document>.none(),
+              })
+            }
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Extracts owned documentation for exactly `roots`, with matching filesystem `paths`, using
+/// the already selected final profile. Public-only is the default policy chosen by callers;
+/// `includePrivate` also retains private declarations and fields without changing admission.
+pub effect fn extract(store: &mut Semantic, roots: &[ModuleId], paths: &[Bytes], target: &[u8], profile: &[u8], includePrivate: bool) -> Project
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if roots.length != paths.length { fail Error.InvalidSources }
+  let mut dependencies = Vector<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let mut project = Project {target: run Bytes.copy(target), profile: run Bytes.copy(profile), modules: Vector<DocModule>.make()}
+  let mut selections = Vector<Vector<Selection>>.make()
+  let mut at = usize.ZERO
+  while at < roots.length {
+    let cursor = match move run StaticPort.authoredCursor(&mut port, &roots[at]) {
+      Option<AuthoredCursor>.Some {value} => move value
+      Option<AuthoredCursor>.None => { fail Error.MissingSource }
+    }
+    let selected = run inventory(&mut port, &roots[at], &cursor)
+    let mut output = run authoredModule(&port, &cursor, Vector<Selection>.asSlice(&selected), run Identity.module(&roots[at]), Bytes.asSlice(&paths[at]), includePrivate)
+    run publicImports(&mut port, &roots[at], &cursor, &mut output)
+    run Vector<DocModule>.append(&mut project.modules, move output)
+    run Vector<Vector<Selection>>.append(&mut selections, move selected)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < roots.length {
+    run resolveModule(&mut port, &roots[at], Vector<Selection>.asSlice(&Vector<Vector<Selection>>.asSlice(&selections)[at]), &mut project, at)
+    at = at + usize.ONE
+  }
+  drop port
+  let syntax = run Semantic.syntaxRejections(&store.*)
+  if Vector<Shared<Rejection>>.length(&syntax) > usize.ZERO {
+    fail Error.Rejected {rejection: Shared<Rejection>.clone(&Vector<Shared<Rejection>>.asSlice(&syntax)[usize.ZERO])}
+  }
+  run validateText(&project)
+  return move project
+}
+fn itemExists(project: &Project, identity: &[u8], external: bool) -> bool {
+  let modules = Vector<DocModule>.asSlice(&project.modules)
+  let mut module = usize.ZERO
+  while module < modules.length {
+    let items = Vector<Item>.asSlice(&modules[module].items)
+    let mut at = usize.ZERO
+    while at < items.length {
+      if same(Bytes.asSlice(&items[at].id), identity) && (!external || !same(Bytes.asSlice(&items[at].visibility), b"Private")) { return true }
+      at = at + usize.ONE
+    }
+    module = module + usize.ONE
+  }
+  return false
+}
+
+effect fn structuralMember(project: &Project, owner: &DeclarationId, name: &[u8], external: bool, casesOnly: bool) -> Option<Bytes>
+! OutOfMemoryError ? &mut Allocator {
+  let ownerId = run Identity.declaration(owner)
+  let modules = Vector<DocModule>.asSlice(&project.modules)
+  let mut module = usize.ZERO
+  while module < modules.length {
+    let items = Vector<Item>.asSlice(&modules[module].items)
+    let mut at = usize.ZERO
+    while at < items.length {
+      let caseMember = same(Bytes.asSlice(&items[at].kind), b"EnumMember") || same(Bytes.asSlice(&items[at].kind), b"UnionVariant")
+      if (!casesOnly || caseMember) && same(Bytes.asSlice(&items[at].name), name) && (!external || !same(Bytes.asSlice(&items[at].visibility), b"Private")) {
+        if let Option<usize>.Some {value: parent} = &items[at].parent {
+          if same(Bytes.asSlice(&items[parent].id), Bytes.asSlice(&ownerId)) {
+            return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&items[at].id)))
+          }
+        }
+      }
+      at = at + usize.ONE
+    }
+    module = module + usize.ONE
+  }
+  return Option<Bytes>.none()
+}
+
+effect fn memberTarget<'s>(port: &mut StaticPort<'s>, project: &Project, owner: &DeclarationId, name: &[u8], external: bool) -> Option<Bytes>
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let structural = run structuralMember(project, owner, name, external, false)
+  if let Option<Bytes>.Some {value} = move structural { return Option<Bytes>.some(move value) }
+  if !ownerKind(owner) { return Option<Bytes>.none() }
+  let ownerName = run DeclarationId.copySpelling(owner)
+  let selected = run StaticPort.documentationMember(&mut port.*, DeclarationId.moduleId(owner), Bytes.asSlice(&ownerName), name)
+  match move selected {
+    Result<Option<DeclarationId>, Shared<Rejection>>.Failure {error} => { fail Error.Rejected {rejection: move error} }
+    Result<Option<DeclarationId>, Shared<Rejection>>.Success {value} => {
+      if let Option<DeclarationId>.Some {value: identity} = move value {
+        let encoded = run Identity.declaration(&identity)
+        if itemExists(project, Bytes.asSlice(&encoded), external) { return Option<Bytes>.some(move encoded) }
+      }
+    }
+  }
+  return Option<Bytes>.none()
+}
+
+effect fn qualifiedTarget<'s>(port: &mut StaticPort<'s>, project: &Project, module: &ModuleId, spelling: &[u8], external: bool) -> Option<Bytes>
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dot = usize.ZERO
+  while dot < spelling.length && spelling[dot] != 46 { dot = dot + usize.ONE }
+  let first = Slice.view<u8>(spelling, usize.ZERO, dot)
+  let binding = run selectedBinding(&mut port.*, module, first, external)
+  if let Option<DocumentationBinding>.Some {value} = move binding {
+    match move value {
+      DocumentationBinding.Declaration {identity, isPublic} => {
+        if dot == spelling.length {
+          let encoded = run Identity.declaration(&identity)
+          if isPublic || itemExists(project, Bytes.asSlice(&encoded), external) { return Option<Bytes>.some(move encoded) }
+        } else {
+          return run memberTarget(&mut port.*, project, &identity, Slice.view<u8>(spelling, dot + usize.ONE, spelling.length - dot - usize.ONE), external || !ModuleId.equals(module, DeclarationId.moduleId(&identity)))
+        }
+      }
+      DocumentationBinding.Namespace {module: target, ..} => {
+        if dot < spelling.length {
+          return run qualifiedTarget(&mut port.*, project, &target, Slice.view<u8>(spelling, dot + usize.ONE, spelling.length - dot - usize.ONE), true)
+        }
+      }
+    }
+  }
+  return Option<Bytes>.none()
+}
+
+// Cache local owners separately so a successful or ambiguous local match never discovers
+// imported owners. Aliases share one canonical candidate within either set.
+effect fn visibleOwners<'s>(port: &mut StaticPort<'s>, module: &ModuleId, imported: bool) -> Vector<DeclarationId>
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let cursor = match move run StaticPort.authoredCursor(&mut port.*, module) {
+    Option<AuthoredCursor>.Some {value} => move value
+    Option<AuthoredCursor>.None => { fail Error.MissingSource }
+  }
+  let mut names = Vector<Bytes>.make()
+  if let Option<&IndexedSource>.Some {value} = move StaticPort.sourceAtCursor(&port.*, &cursor) {
+    let index = IndexedSource.moduleIndex(value)
+    let candidates = ModuleIndex.listCandidates(index)
+    let mut at = usize.ZERO
+    while at < candidates.length {
+      let selectedKind = (!imported && candidates[at].kind == CandidateKind.Declaration) || (imported && candidates[at].kind == CandidateKind.ImportMember)
+      if selectedKind {
+        run Vector<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&candidates[at].name)))
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut owners = Vector<DeclarationId>.make()
+  let listed = Vector<Bytes>.asSlice(&names)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Option<DocumentationBinding>.Some {value: DocumentationBinding.Declaration {identity, ..}} = move run selectedBinding(&mut port.*, module, Bytes.asSlice(&listed[at]), false) {
+      if ownerKind(&identity) && ModuleId.equals(module, DeclarationId.moduleId(&identity)) != imported {
+        let existing = Vector<DeclarationId>.asSlice(&owners)
+        let mut repeated = false
+        let mut prior = usize.ZERO
+        while prior < existing.length {
+          if DeclarationId.equals(&existing[prior], &identity) { repeated = true break }
+          prior = prior + usize.ONE
+        }
+        if !repeated { run Vector<DeclarationId>.append(&mut owners, move identity) }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move owners
+}
+
+effect fn links<'s>(port: &mut StaticPort<'s>, module: &ModuleId, owners: &mut OwnerLookup, project: &Project, owner: Option<&DeclarationId>, document: &Document) -> Vector<Link>
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let symbols = run Markdown.symbols(document)
+  let listed = Vector<Markdown.Symbol>.asSlice(&symbols)
+  let mut resolved = Vector<Link>.make()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let spelling = Bytes.asSlice(&listed[at].spelling)
+    let mut target = Option<Bytes>.none()
+    if let Option<&DeclarationId>.Some {value} = &owner {
+      if same(spelling, b"Self") { target = Option<Bytes>.some(run Identity.declaration(value)) }
+      else if spelling.length > 5 && same(Slice.view<u8>(spelling, usize.ZERO, 5), b"Self.") {
+        target = run memberTarget(&mut port.*, project, value, Slice.view<u8>(spelling, 5, spelling.length - 5), false)
+      } else { target = run memberTarget(&mut port.*, project, value, spelling, false) }
+    }
+    if let Option<Bytes>.None = &target {
+      target = run qualifiedTarget(&mut port.*, project, module, spelling, false)
+    }
+    if let Option<Bytes>.None = &target {
+      let mut bare = true
+      let mut byte = usize.ZERO
+      while byte < spelling.length {
+        if spelling[byte] == 46 { bare = false break }
+        byte = byte + usize.ONE
+      }
+      if bare {
+        let mut candidates = usize.ZERO
+        let mut candidate = Option<Bytes>.none()
+        if let Option<Vector<DeclarationId>>.None = &owners.local {
+          owners.local = Option<Vector<DeclarationId>>.some(run visibleOwners(&mut port.*, module, false))
+        }
+        if let Option<Vector<DeclarationId>>.Some {value: visible} = &owners.local {
+          let candidatesOwners = Vector<DeclarationId>.asSlice(&visible)
+          let mut entry = usize.ZERO
+          while entry < candidatesOwners.length {
+            let found = run memberTarget(&mut port.*, project, &candidatesOwners[entry], spelling, false)
+            if let Option<Bytes>.Some {value} = move found {
+              candidates = candidates + usize.ONE
+              candidate = Option<Bytes>.some(move value)
+            }
+            entry = entry + usize.ONE
+          }
+        }
+        // Bare associated members belong to this module. Imported owners contribute only
+        // enum/union cases, and only when no local member matched; local ambiguity stays final.
+        if candidates == usize.ZERO {
+          if let Option<Vector<DeclarationId>>.None = &owners.imported {
+            owners.imported = Option<Vector<DeclarationId>>.some(run visibleOwners(&mut port.*, module, true))
+          }
+          if let Option<Vector<DeclarationId>>.Some {value: visible} = &owners.imported {
+            let candidatesOwners = Vector<DeclarationId>.asSlice(&visible)
+            let mut entry = usize.ZERO
+            while entry < candidatesOwners.length {
+              let importedOwner = &candidatesOwners[entry]
+              let category = DeclarationId.kind(importedOwner)
+              if category == OwnerKind.Enumeration || category == OwnerKind.Union {
+                let found = run structuralMember(project, importedOwner, spelling, true, true)
+                if let Option<Bytes>.Some {value} = move found {
+                  candidates = candidates + usize.ONE
+                  candidate = Option<Bytes>.some(move value)
+                }
+              }
+              entry = entry + usize.ONE
+            }
+          }
+        }
+        if candidates == usize.ONE { target = move candidate }
+      }
+    }
+    if let Option<Bytes>.Some {value} = move target {
+      run Vector<Link>.append(&mut resolved, Link {spelling: run Bytes.copy(spelling), target: move value})
+    }
+    at = at + usize.ONE
+  }
+  return move resolved
+}
+
+effect fn resolveModule<'s>(port: &mut StaticPort<'s>, module: &ModuleId, selected: &[Selection], project: &mut Project, index: usize) -> ()
+! Error | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut owners = OwnerLookup {local: Option<Vector<DeclarationId>>.none(), imported: Option<Vector<DeclarationId>>.none()}
+  let mut moduleLinks = Vector<Link>.make()
+  let originalModules = Vector<DocModule>.asSlice(&project.modules)
+  if let Option<Document>.Some {value} = &originalModules[index].documentation {
+    moduleLinks = run links(&mut port.*, module, &mut owners, &project.*, Option<&DeclarationId>.none(), &value)
+  }
+  if true {
+    let updatedModules = Vector<DocModule>.asMutSlice(&mut project.modules)
+    if let Option<Document>.Some {value} = &mut updatedModules[index].documentation { value.links = move moduleLinks }
+  }
+  let count = Vector<Item>.length(&Vector<DocModule>.asSlice(&project.modules)[index].items)
+  let mut at = usize.ZERO
+  while at < count {
+    let items = Vector<Item>.asSlice(&Vector<DocModule>.asSlice(&project.modules)[index].items)
+    let mut owner = Option<&DeclarationId>.none()
+    let mut enclosing = at
+    let mut searching = true
+    while searching {
+      let mut entry = usize.ZERO
+      while entry < selected.length {
+        if selected[entry].span.start == items[enclosing].source.start && selected[entry].published {
+          owner = Option<&DeclarationId>.some(&selected[entry].identity)
+          if let Option<DeclarationId>.Some {value} = &selected[entry].owner { owner = Option<&DeclarationId>.some(&value) }
+          searching = false
+          break
+        }
+        entry = entry + usize.ONE
+      }
+      if searching {
+        if let Option<usize>.Some {value} = &items[enclosing].parent { enclosing = value } else { searching = false }
+      }
+    }
+    let mut resolved = Vector<Link>.make()
+    if let Option<Document>.Some {value} = &items[at].documentation {
+      resolved = run links(&mut port.*, module, &mut owners, &project.*, move owner, &value)
+    }
+    if true {
+      let updatedModules = Vector<DocModule>.asMutSlice(&mut project.modules)
+      let updatedItems = Vector<Item>.asMutSlice(&mut updatedModules[index].items)
+      if let Option<Document>.Some {value} = &mut updatedItems[at].documentation { value.links = move resolved }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn invalidOffset(bytes: &[u8]) -> Option<usize> {
+  return match move String.fromUtf8(bytes) {
+    Result<string, InvalidUtf8>.Success {value: _} => Option<usize>.none()
+    Result<string, InvalidUtf8>.Failure {error} => Option<usize>.some(error.offset)
+  }
+}
+
+effect fn validField(bytes: &[u8], path: &[u8], field: &'static [u8], base: usize) -> ()
+! Error | OutOfMemoryError ? &mut Allocator {
+  if let Option<usize>.Some {value} = move invalidOffset(bytes) {
+    fail Error.InvalidText {sourcePath: run Bytes.copy(path), field: field, offset: base + value}
+  }
+  return ()
+}
+
+effect fn validDocument(document: &Document, path: &[u8]) -> ()
+! Error | OutOfMemoryError ? &mut Allocator {
+  let markdown = Bytes.asSlice(&document.markdown)
+  if let Option<usize>.Some {value: offset} = move invalidOffset(markdown) {
+    let mut line = usize.ZERO
+    let mut start = usize.ZERO
+    let mut at = usize.ZERO
+    while at < offset {
+      if markdown[at] == 10 { line = line + usize.ONE start = at + usize.ONE }
+      at = at + usize.ONE
+    }
+    let sourceOffset = Vector<usize>.asSlice(&document.lineStarts)[line] + offset - start
+    fail Error.InvalidText {sourcePath: run Bytes.copy(path), field: b"markdown", offset: sourceOffset}
+  }
+  let links = Vector<Link>.asSlice(&document.links)
+  let mut at = usize.ZERO
+  while at < links.length {
+    run validField(Bytes.asSlice(&links[at].spelling), path, b"link.spelling", usize.ZERO)
+    run validField(Bytes.asSlice(&links[at].target), path, b"link.target", usize.ZERO)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Model.encode writes UTF-8 string bytes directly. Establish the invariant once here for every
+// retained JSON string, including filesystem paths that need not be valid UTF-8 on the host.
+effect fn validateText(project: &Project) -> () ! Error | OutOfMemoryError ? &mut Allocator {
+  run validField(Bytes.asSlice(&project.target), b"", b"target", usize.ZERO)
+  run validField(Bytes.asSlice(&project.profile), b"", b"profile", usize.ZERO)
+  let modules = Vector<DocModule>.asSlice(&project.modules)
+  let mut module = usize.ZERO
+  while module < modules.length {
+    let value = &modules[module]
+    let path = Bytes.asSlice(&value.sourcePath)
+    run validField(path, path, b"sourcePath", usize.ZERO)
+    run validField(Bytes.asSlice(&value.name), path, b"module.name", usize.ZERO)
+    if let Option<Document>.Some {value: document} = &value.documentation { run validDocument(&document, path) }
+    let items = Vector<Item>.asSlice(&value.items)
+    let mut at = usize.ZERO
+    while at < items.length {
+      let item = &items[at]
+      run validField(Bytes.asSlice(&item.id), path, b"item.id", usize.ZERO)
+      run validField(Bytes.asSlice(&item.kind), path, b"item.kind", usize.ZERO)
+      run validField(Bytes.asSlice(&item.name), path, b"item.name", usize.ZERO)
+      run validField(Bytes.asSlice(&item.visibility), path, b"item.visibility", usize.ZERO)
+      run validField(Bytes.asSlice(&item.signature), path, b"signature", item.source.start)
+      if let Option<Document>.Some {value: document} = &item.documentation { run validDocument(&document, path) }
+      at = at + usize.ONE
+    }
+    module = module + usize.ONE
+  }
+  return ()
+}

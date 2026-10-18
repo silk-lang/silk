@@ -236,44 +236,16 @@ The canonical representation uses a 100-column target, two-space indentation, LF
 trailing whitespace, and one final newline. Damaged syntax is reported and left unchanged while
 other selected files continue.
 
-## Generate documentation
+## Native documentation commands
 
-`silk doc` analyzes the reachable project source closure without invoking a backend, linker, or
-program. It writes deterministic, formatter-neutral JSON to `build/documentation.json` by default:
+Documentation generation is owned by the native Silk compiler, not this bootstrap CLI.
+Use the native `silk doc`, `silk doctest`, and `silk doc-reference` commands described in the
+[native compiler documentation](../../compiler/README.md).
 
-```bash
-silk doc
-silk doc --output artifacts/api.json
-silk doc --include-private
-```
-
-Public declarations and public struct fields are included by default. `--include-private` retains
-private items with their visibility. The complete model includes module and declaration documents,
-first-class parameter/field documentation, compiler-derived signatures, examples, best-effort
-semantic links, and logical source provenance. Output is marked experimental and is intentionally
-not yet a versioned compatibility contract. Source damage or resolution failures are reported
-before the atomic destination write, so no partial JSON is committed.
-
-`silk doctest` compiles fenced Silk examples carried by that JSON. `--source-root` lets reports map
-source byte offsets back to one-based lines; `--stdlib` checks compiler-shipped standard-library
-documentation instead of a JSON file.
-
-```bash
-silk doctest --input build/documentation.json --source-root src
-silk doctest --stdlib
-```
-
-`silk docs-site` renders the formatter-neutral JSON as a standalone static HTML site with a search
-index and the embeddable Silk snippet element:
-
-```bash
-silk docs-site --input build/documentation.json --output build/site --title "My library"
-silk docs-site --input build/documentation.json --output build/site \
-  --snippet-bundle node_modules/@silklang/editor-support/dist/silk-snippet.bundle.js
-```
-
-Without `--snippet-bundle`, fenced Silk examples render as static code blocks. Supplying a bundle
-adds it to the generated files and upgrades the examples when the site loads.
+Repository automation requires `SILK_COMPILER` to name the absolute path of a native compiler
+built from this checkout. `pnpm --filter @silklang/cli doctest:stdlib` uses the native launcher,
+without a bootstrap fallback. The bootstrap package retains documentation code-fence support
+only for formatting.
 
 ## Direct-file compilation
 
@@ -296,9 +268,6 @@ It supports `--source-root`, `--output`/`-o`, native `--target`, `--optimization
   precedence over exit `1` in a mixed batch.
 - `silk format` uses `1` for drift/damaged syntax and `2` for project, selection, storage, or write
   failures.
-- `silk doc` uses `1` for source rejection and `2` for project, resolution, or destination failure.
-- `silk doctest` uses `1` for failing examples and `2` for invalid or unreadable input.
-- `silk docs-site` uses `2` for invalid input, unavailable assets, or output failures.
 - `silk run` returns the program's exit status after a successful build.
 
 Each target commits atomically. A failed target leaves no partial destination and does not remove a

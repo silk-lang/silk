@@ -34,9 +34,11 @@ the language that the current alpha compiler implements.
 - **[Glossary](./glossary.md)** — canonical names for language, compiler, bootstrap, and runtime
   concepts.
 
-The standard-library and diagnostic pages are generated. Regenerate them with
-`pnpm --filter @silklang/compiler documentation:generate`. The compiler test suite rejects stale
-generated pages and compiles every active Silk example in the hand-written pages.
+The standard-library and diagnostic pages are generated. Set `SILK_COMPILER` to a native Silk
+compiler built from this checkout, then run
+`pnpm --filter @silklang/compiler documentation:generate`. Native CI rejects stale reference
+pages and checks their active Silk examples. The bootstrap diagnostic index is generated
+independently by a text-only scanner.
 
 ## Rule evidence
 

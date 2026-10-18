@@ -1,76 +1,41 @@
 # `@silklang/docgen`
 
-Documentation generation for Silk source. The compiler retains raw attached comment blocks; this
-package interprets them as CommonMark only when hover, highlighting, documentation generation,
-doctesting, or site rendering asks for them.
+CommonMark documentation support for Silk editors and formatters. The compiler retains raw
+attached comment blocks; this package interprets them on demand for language-server hover,
+editor highlighting, and lossless documentation code-fence formatting. Ordinary compilation
+does not require Markdown parsing.
 
-## Source syntax
+## Editor and formatter APIs
 
-Use `//!` for a module document at the beginning of a source file and `///` immediately above a
-documented declaration. Declaration documents attach to functions, structs, fields, parameters,
-type parameters, implementations, and implementation operations.
+- `Document` normalizes compiler-owned documentation blocks, parses CommonMark into an immutable
+  package-owned tree, and renders Markdown for editor hover, including symbol references as code.
+  Malformed Markdown remains readable rather than becoming a compiler diagnostic.
+- `Highlight` supplies documentation and fenced Silk syntax ranges for editor presentation.
+- `CodeFence` discovers CommonMark fences with source byte ranges and rewrites selected bodies
+  while preserving surrounding prose and unselected fence bytes. It is used by the canonical
+  formatter and the standard-library documentation formatting script.
 
-````silk
-//! Recovery utilities.
+The internal `CommonMark` parser is shared by `Document` and `CodeFence`; it is not a public
+package subpath. These APIs intentionally remain TypeScript dependencies of the LSP,
+editor-support, and formatter packages.
 
-/// Recovers a [`Problem`] by returning its code.
-///
-/// # Examples
-/// ```silk
-/// recover(Problem { code: 1 })
-/// ```
-effect fn recover(
-  /// The problem to inspect.
-  problem: Problem
-) -> I32 {
-  return problem.code
-}
-````
+## Native documentation generation
 
-A blank line or ordinary `//` comment between a `///` block and its declaration breaks attachment.
-`////` is an ordinary line comment. Documentation is CommonMark rather than a tag language:
-examples live under an `Examples` heading, while return types, failures, and requirements come from
-the compiler-derived signature. Rust-style links such as ``[`Problem`]`` resolve against compiler
-scope facts when possible and remain readable inline code when unresolved.
+Reference Markdown generation/checking, project JSON, symbol links, and doctests
+belong to the [native Silk compiler](../../compiler/README.md), implemented under
+`compiler/src/documentation`. This package has no generation commands or compatibility exports.
 
-Documentation cannot reject a program. Markdown is parsed as a total, best-effort operation; an
-unexpected parser failure produces a plain-text document. Markdown interpretation never runs as
-part of ordinary compiler analysis.
+Use native `silk doc`, `silk doctest`, and `silk doc-reference`; the native compiler README documents
+their arguments and the repository generation commands. Repository automation requires
+`SILK_COMPILER` to name the absolute path of a native compiler built from the current checkout.
 
-## Package interfaces
+## Development
 
-- `Document` normalizes raw markers into an immutable package-owned CommonMark model, discovers
-  examples, resolves semantic links, and renders editor Markdown.
-- `Highlight` returns doc-only ranges for markers, Markdown constructs, links, and nested fenced
-  Silk source.
-- `Project` projects an analysis snapshot into source-ordered, public-by-default documentation with
-  compiler-derived signatures and first-class child documents.
-- `Json` deterministically encodes that project model with one final newline.
-- `Doctest`, `Example`, `Report`, `Sources`, and `Stdlib` collect and compile fenced Silk examples.
-- `Model`, `Prose`, `Search`, `Site`, and `Html` decode documentation JSON and render a static,
-  searchable HTML site.
-
-The JSON identifies itself with `"schema": "silk-documentation"` and
-`"experimental": true`. It is a formatter-neutral intermediate representation, not a stable schema
-or an HTML/site format. During bootstrap its shape may change without migration support. Consumers
-can build Markdown, HTML, terminal, or site formatters over the model.
-
-## Command-line use
-
-This package has no executable entry point and performs no process-level orchestration. The
-`@silklang/cli` package owns the commands:
-
-```console
-$ silk doc --output build/documentation.json
-$ silk doctest --input build/documentation.json --source-root src
-$ silk docs-site --input build/documentation.json --output build/site --title "My library"
+```bash
+pnpm --filter @silklang/docgen build
+pnpm --filter @silklang/docgen typecheck
+pnpm --filter @silklang/docgen test
 ```
 
-`silk doctest --stdlib` checks the compiler-shipped standard library. A doctest is one complete
-module exactly as written; use a `silk,ignore` fence when an example is intentionally illustrative
-rather than compilable.
-
-The static renderer writes plain HTML, CSS, and JavaScript search data. A caller may provide a
-`<silk-snippet>` bundle as opaque text; otherwise examples use the renderer's static code fallback.
-Rendering is deterministic and filesystem-independent; reading inputs, loading optional assets,
-and writing outputs are responsibilities of the CLI package.
+The retained tests cover editor document parsing/rendering and lossless code-fence
+rewriting. Native documentation behavior is tested with the native compiler.

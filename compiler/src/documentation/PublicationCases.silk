@@ -1,0 +1,184 @@
+//! Native publication contracts: complete replacement, failed-write isolation, and rename cleanup.
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import documentation.Publication
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { DirectoryEntry, DirectoryInfo, FileError, FileInfo, FileSystem, Path }
+import silk.option { Option }
+import silk.os_filesystem { OsFileSystem }
+import silk.result { Result }
+import silk.testing { AssertionError, Testing }
+import silk.vector { Vector }
+import silk.bool
+import silk.i32
+import silk.u8
+import silk.usize
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn ignoreCleanup(error: FileError | OutOfMemoryError) -> () { return () }
+effect fn cleanup(path: &Path) -> () ? &mut FileSystem | &mut Allocator {
+  return run Effect.catchAll(FileSystem.removeDirectoryRecursively(path), ignoreCleanup)
+}
+
+effect fn replacementClaims(root: &Path) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  // Linux also exercises a non-UTF-8 name; APFS requires valid UTF-8. Contents remain binary.
+  let mut leaf: [u8; 6] = [255, 46, 106, 115, 111, 110]
+  static if Intrinsic.targetOperatingSystem() == "darwin" { leaf[usize.ZERO] = 97 }
+  let destination = run Path.joinBytes(root, &leaf)
+  run FileSystem.writeFile(&destination, b"previous longer output")
+  let contents: [u8; 4] = [123, 0, 255, 125]
+  run Publication.publish(Path.rawBytes(&destination), &contents)
+  let output = run FileSystem.readFile(&destination)
+  run Testing.expect(same(Bytes.asSlice(&output), &contents), "publication replaces the complete previous output with exact bytes")
+  let children = run FileSystem.listDirectory(root)
+  run Testing.expect(Vector<DirectoryEntry>.length(&children) == usize.ONE, "successful publication leaves only the destination")
+  run Publication.publish(Path.rawBytes(&destination), b"")
+  let empty = run FileSystem.readFile(&destination)
+  run Testing.expect(Bytes.length(&empty) == usize.ZERO, "empty publication replaces rather than preserving old bytes")
+
+  run FileSystem.writeFile(&destination, b"kept")
+  let mut invalid = run Bytes.copy(Path.rawBytes(&destination))
+  let ending: [u8; 1] = [0]
+  run Bytes.append(&mut invalid, &ending)
+  run Bytes.append(&mut invalid, b"ignored")
+  let rejected = run Effect.result(Publication.publish(Bytes.asSlice(&invalid), b"must not publish"))
+  let invalidPath = match move rejected {
+    Result<(), FileError | OutOfMemoryError>.Success { value } => false
+    Result<(), FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => failure.reason.code == FileSystem.invalidPath().code
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let kept = run FileSystem.readFile(&destination)
+  let remaining = run FileSystem.listDirectory(root)
+  run Testing.expect(invalidPath && same(Bytes.asSlice(&kept), b"kept") && Vector<DirectoryEntry>.length(&remaining) == usize.ONE,
+    "embedded NUL is rejected rather than publishing to its truncated native prefix")
+  return ()
+}
+
+// The provider performs a genuine partial write before returning its sentinel failure. All other
+// operations still use the same host-root native filesystem; this is not a virtual path namespace.
+struct PartialWriteFailure {
+  native: OsFileSystem
+  wrote: bool
+}
+impl FileSystem for PartialWriteFailure {
+  effect fn readFile(self: &mut Self, path: &Path) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+    return run FileSystem.readFile(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn writeFile(self: &mut Self, path: &Path, bytes: &[u8]) -> () ! FileError {
+    run FileSystem.writeFile(path, b"partial") |> Effect.provideMut<FileSystem>(&mut self.native)
+    self.wrote = true
+    fail FileSystem.errorWithCode(FileSystem.writeFileOperation(), FileSystem.noSpace(), 1234)
+  }
+  effect fn stat(self: &mut Self, path: &Path) -> FileInfo | DirectoryInfo ! FileError {
+    return run FileSystem.stat(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn listDirectory(self: &mut Self, path: &Path) -> Vector<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut Allocator {
+    return run FileSystem.listDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn createDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.createDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn removeFile(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.removeFile(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn removeDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.removeDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn createTemporaryDirectory(self: &mut Self, parent: &Path, prefix: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+    return run FileSystem.createTemporaryDirectory(parent, prefix) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+}
+
+effect fn failedWriteClaims(root: &Path) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let destination = run Path.join(root, "output.json")
+  run FileSystem.writeFile(&destination, b"previous")
+  let native = run OsFileSystem.make(b"/")
+  let mut refusing = PartialWriteFailure { native: move native, wrote: false }
+  let attempted = run Effect.result(Publication.publish(Path.rawBytes(&destination), b"new document")
+    |> Effect.provideMut<FileSystem>(&mut refusing))
+  let preservedFailure = match move attempted {
+    Result<(), FileError | OutOfMemoryError>.Success { value } => false
+    Result<(), FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => match move FileSystem.providerCode(&failure) {
+        Option<i32>.Some { value } => value == 1234 && failure.reason.code == FileSystem.noSpace().code
+        Option<i32>.None => false
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let output = run FileSystem.readFile(&destination)
+  let children = run FileSystem.listDirectory(root)
+  run Testing.expect(refusing.wrote && preservedFailure && same(Bytes.asSlice(&output), b"previous"),
+    "a partial temporary write retains the old destination and its original typed failure")
+  run Testing.expect(Vector<DirectoryEntry>.length(&children) == usize.ONE, "failed publication removes its sibling temporary file")
+  return ()
+}
+
+effect fn failedRenameClaims(root: &Path) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let destination = run Path.join(root, "existing-directory")
+  run FileSystem.createDirectory(&destination)
+  let retained = run Path.join(&destination, "keep")
+  run FileSystem.writeFile(&retained, b"unrelated")
+  let attempted = run Effect.result(Publication.publish(Path.rawBytes(&destination), b"new document"))
+  let renameFailure = match move attempted {
+    Result<(), FileError | OutOfMemoryError>.Success { value } => false
+    Result<(), FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError failure => failure.operation.code == FileSystem.writeFileOperation().code && match move FileSystem.providerCode(&failure) {
+        Option<i32>.Some { value } => value != 0
+        Option<i32>.None => false
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let output = run FileSystem.readFile(&retained)
+  let children = run FileSystem.listDirectory(root)
+  run Testing.expect(renameFailure && same(Bytes.asSlice(&output), b"unrelated"), "a native rename error retains errno and never removes the occupied destination")
+  run Testing.expect(Vector<DirectoryEntry>.length(&children) == usize.ONE, "rename failure removes only its completed sibling temporary file")
+  return ()
+}
+
+effect fn claims(which: i32) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let parent = run Path.make(temporaryParent())
+  let temporary = run FileSystem.temporaryDirectory(&parent, "silk-publication-case")
+  if which == 0 { return run Effect.ensuring(replacementClaims(&temporary.path), cleanup(&temporary.path)) }
+  if which == 1 { return run Effect.ensuring(failedWriteClaims(&temporary.path), cleanup(&temporary.path)) }
+  return run Effect.ensuring(failedRenameClaims(&temporary.path), cleanup(&temporary.path))
+}
+fn temporaryParent() -> string<'static> {
+  static if Intrinsic.targetOperatingSystem() == "darwin" { return "/private/tmp" }
+  else { return "/tmp" }
+}
+
+effect fn exercise(which: i32) -> () ! FileError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make(b"/") |> Effect.provideMut<Allocator>(&mut allocator)
+  return run claims(which) |> Effect.provideMut<FileSystem>(&mut files) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn publicationReplacesExactBytesAndRejectsNulPaths() -> () ! FileError | OutOfMemoryError | AssertionError<'static> {
+  return run exercise(0)
+}
+test effect fn publicationPreservesPreviousOutputAfterPartialWriteFailure() -> () ! FileError | OutOfMemoryError | AssertionError<'static> {
+  return run exercise(1)
+}
+test effect fn publicationCleansOnlyItsTemporaryAfterRenameFailure() -> () ! FileError | OutOfMemoryError | AssertionError<'static> {
+  return run exercise(2)
+}
+}

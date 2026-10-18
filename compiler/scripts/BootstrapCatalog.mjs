@@ -6,7 +6,7 @@
 // Message expressions are walked character by character with string, template and bracket state,
 // because a regular expression cannot see where a template hole or a conditional branch ends once
 // literals nest inside interpolations. The scanners follow
-// packages/compiler/scripts/generate-documentation.mjs, which renders the same templates into the
+// packages/compiler/scripts/generate-diagnostics.mjs, which renders the same templates into the
 // generated diagnostics page.
 
 /** Index just past the string or template literal opening at `index`. */

@@ -1,37 +1,15 @@
-import * as Option from 'effect/Option'
-import * as SourceOrigin from '../dist/SourceOrigin.js'
-// Regenerates apps/docs/content/language/stdlib/ and diagnostics.md.
-//
-// The standard library page comes from the same documentation model `silk doc` emits, so the
-// rendered signatures and prose are exactly the `///` comments in stdlib/silk/*.silk. The
-// diagnostic index comes from the code constants and message templates in src/Diagnostic.ts.
-//
-// Run with: pnpm --filter @silklang/compiler documentation:generate
-
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+// The bootstrap diagnostic catalog is a text-only index of Diagnostic.ts. It does not load the
+// compiler. Source documentation generation belongs to the native Silk documentation commands.
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import * as Console from 'effect/Console'
 import * as Data from 'effect/Data'
-import * as Duration from 'effect/Duration'
 import * as Effect from 'effect/Effect'
 import { format } from 'oxfmt'
-import * as DocumentationPolicy from '../../docgen/dist/Policy.js'
-import * as DocumentationProject from '../../docgen/dist/Project.js'
-import * as DocumentationReference from '../../docgen/dist/Reference.js'
-import * as ProjectAnalysis from '../dist/ProjectAnalysis.js'
-import * as SourceFile from '../dist/SourceFile.js'
-import * as SourceResolver from '../dist/SourceResolver.js'
-import * as Stdlib from '../dist/Stdlib.js'
-import { documentationProfiles } from './documentation-profiles.mjs'
 
 const logError = (...values) => Effect.runSync(Console.error(...values))
-const log = (...values) => Effect.runSync(Console.log(...values))
-
 const documentationRoot = fileURLToPath(
   new URL('../../../apps/docs/content/language/', import.meta.url),
-)
-const stdlibRoot = fileURLToPath(
-  new URL('../../../apps/docs/content/language/stdlib/', import.meta.url),
 )
 const diagnosticSource = fileURLToPath(new URL('../src/Diagnostic.ts', import.meta.url))
 const formatterConfig = JSON.parse(
@@ -40,111 +18,15 @@ const formatterConfig = JSON.parse(
 
 class DocumentationFormatError extends Data.TaggedError('DocumentationFormatError') {}
 
-const lineAt = (bytes, offset) => {
-  const limit = Math.max(0, Math.min(offset, bytes.length))
-  let line = 1
-  for (let index = 0; index < limit; index += 1) if (bytes[index] === 0x0a) line += 1
-  return line
-}
-
-const formatMarkdown = Effect.fnUntraced(
-  function* (/** @type {string} */ path, /** @type {string} */ contents) {
-    const result = yield* Effect.tryPromise({
-      try: () => format(path, contents, formatterConfig),
-      catch: (cause) => new DocumentationFormatError({ path, cause }),
-    })
-    if (result.errors.length > 0)
-      return yield* new DocumentationFormatError({ path, cause: result.errors })
-    return result.code
-  },
-)
-
-const analyzeDocumentationProfile = async (selected, analyzed) => {
-  const [elapsed, analysis] = await Effect.runPromise(
-    ProjectAnalysis.make(
-      analyzed.map((entry) => entry.root).map((source) => source.id),
-      { configuration: { profile: selected.profile } },
-    ).pipe(
-      Effect.provideService(SourceResolver.SourceResolver, {
-        resolve: () => Effect.succeedNone(),
-        resolveStandardLibrary: (module) =>
-          Effect.succeed(
-            Option.fromUndefinedOr(analyzed.find((entry) => entry.root.id === module)).pipe(
-              Option.map((entry) => SourceResolver.resolved(entry.bytes, SourceOrigin.memory())),
-            ),
-          ),
-      }),
-      Effect.timed,
-    ),
-  )
-  log(`Documentation analysis ${selected.name}: ${Duration.toSeconds(elapsed).toFixed(2)}s`)
-  const project = DocumentationProject.fromProjectAnalysis(analysis)
-  const seen = new Set()
-  const violations = []
-  for (const entry of analyzed) {
-    const documented = project.modules.find((module) => module.name === entry.manifest.module)
-    const snapshot = ProjectAnalysis.view(analysis, entry.manifest.module)
-    if (documented === undefined || snapshot === undefined) {
-      logError(`Missing documentation model: ${entry.manifest.module}`)
-      process.exit(1)
-    }
-    if (documented.documentation === undefined && documented.items.length === 0) continue
-    seen.add(entry.manifest.module)
-    for (const violation of DocumentationPolicy.check(documented, snapshot, project))
-      violations.push({
-        violation,
-        path: entry.manifest.path,
-        line: lineAt(entry.bytes, violation.source.start),
-      })
-  }
-  return { project, seen, violations }
-}
-
-const stdlibTree = async () => {
-  const analyzed = []
-  for (const module of Stdlib.manifest) {
-    // Read the canonical source rather than the compiler's generated source map. Documentation is
-    // commonly regenerated immediately after editing a .silk file, before compiler dist has been
-    // rebuilt; using the embedded map there would quietly emit yesterday's prose.
-    const bytes = Uint8Array.from(
-      readFileSync(new URL(`../stdlib/${module.path}`, import.meta.url)),
-    )
-    analyzed.push({ manifest: module, bytes, root: SourceFile.make(module.module, bytes) })
-  }
-  const projects = []
-  const seen = new Set()
-  const violations = new Map()
-  for (const selected of documentationProfiles) {
-    const checked = await analyzeDocumentationProfile(selected, analyzed)
-    projects.push({ name: selected.name, project: checked.project })
-    for (const module of checked.seen) seen.add(module)
-    for (const entry of checked.violations) {
-      const key = `${entry.violation.code}:${entry.violation.identity}:${entry.violation.source.start}`
-      violations.set(key, entry)
-    }
-  }
-  for (const entry of analyzed) {
-    if (!seen.has(entry.manifest.module)) {
-      logError(`No admitted documentation profile exposes ${entry.manifest.module}`)
-      process.exit(1)
-    }
-  }
-  for (const { violation, path, line } of violations.values()) {
-    logError(`${path}:${line}: [${violation.code}] ${violation.identity}: ${violation.message}`)
-  }
-  log(
-    violations.size === 0
-      ? `Stdlib documentation policy: ${analyzed.length} modules checked, no violations.`
-      : `Stdlib documentation policy: ${analyzed.length} modules checked, ${violations.size} violations.`,
-  )
-  if (violations.size > 0) process.exit(1)
-  const rendered = DocumentationReference.makeProfiles(Stdlib.manifest, projects)
-  if (rendered._tag === 'Failure') {
-    for (const error of rendered.errors) logError('Stdlib reference generation failed:', error)
-    process.exit(1)
-  }
-  return rendered.reference.files
-}
+const formatMarkdown = Effect.fnUntraced(function* (path, contents) {
+  const result = yield* Effect.tryPromise({
+    try: () => format(path, contents, formatterConfig),
+    catch: (cause) => new DocumentationFormatError({ path, cause }),
+  })
+  if (result.errors.length > 0)
+    return yield* new DocumentationFormatError({ path, cause: result.errors })
+  return result.code
+})
 
 const phases = {
   LEX: 'Lexical',
@@ -422,7 +304,7 @@ const diagnosticsPage = () => {
     '',
     `Every diagnostic code the Silk compiler can report, with its meaning.`,
     '',
-    '<!-- Generated by scripts/generate-documentation.mjs. Do not edit by hand. -->',
+    '<!-- Generated by packages/compiler/scripts/generate-diagnostics.mjs. Do not edit by hand. -->',
     '',
     'Each code is stable: it identifies one condition and never changes meaning between releases.',
     'The prefix names the compiler phase that reports it. Regenerate this page with:',
@@ -494,56 +376,7 @@ const write = (name, contents) => {
   writeFileSync(destination, contents)
 }
 
-const writeStdlib = (files) => {
-  const expected = new Map(files.map((file) => [file.path, file.contents]))
-  const actual = existsSync(stdlibRoot)
-    ? readdirSync(stdlibRoot).filter((entry) => entry.endsWith('.md'))
-    : []
-  if (check) {
-    for (const path of expected.keys())
-      if (!actual.includes(path)) {
-        logError(
-          `stdlib/${path} is missing. Run pnpm --filter @silklang/compiler documentation:generate`,
-        )
-        process.exitCode = 1
-      }
-    for (const path of actual)
-      if (!expected.has(path)) {
-        logError(
-          `stdlib/${path} is extra or renamed. Run pnpm --filter @silklang/compiler documentation:generate`,
-        )
-        process.exitCode = 1
-      }
-    for (const [path, contents] of expected) {
-      const destination = `${stdlibRoot}${path}`
-      if (!existsSync(destination)) continue
-      if (readFileSync(destination, 'utf8') !== contents) {
-        logError(
-          `stdlib/${path} is stale. Run pnpm --filter @silklang/compiler documentation:generate`,
-        )
-        process.exitCode = 1
-      }
-    }
-    return
-  }
-  mkdirSync(stdlibRoot, { recursive: true })
-  for (const path of actual) if (!expected.has(path)) rmSync(`${stdlibRoot}${path}`)
-  for (const [path, contents] of expected) writeFileSync(`${stdlibRoot}${path}`, contents)
-}
-
-// The complete tree and diagnostic page are rendered before anything is written, so a collision
-// or rejected diagnostic index leaves generated documentation untouched.
-const rawStdlib = await stdlibTree()
-const [stdlib, diagnostics] = await Effect.runPromise(
-  Effect.all([
-    Effect.forEach(rawStdlib, (file) =>
-      formatMarkdown(`${stdlibRoot}${file.path}`, file.contents).pipe(
-        Effect.map((contents) => Object.freeze({ ...file, contents })),
-      ),
-    ),
-    formatMarkdown(`${documentationRoot}diagnostics.md`, diagnosticsPage()),
-  ]),
+write(
+  'diagnostics.md',
+  await Effect.runPromise(formatMarkdown(`${documentationRoot}diagnostics.md`, diagnosticsPage())),
 )
-
-writeStdlib(stdlib)
-write('diagnostics.md', diagnostics)
