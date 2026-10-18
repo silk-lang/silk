@@ -1070,7 +1070,7 @@ entry.
 
 ### PACKAGE-007 — A workspace groups packages that build together
 
-**Status:** Confirmed contract; not implemented yet.
+**Status:** Confirmed; implemented in the native compiler.
 
 A manifest with a `[workspace]` table lists member package directories. Members can depend on each
 other by path, a build can start from any member, and members share one output directory.
@@ -1078,14 +1078,30 @@ other by path, a build can start from any member, and members share one output d
 ```toml
 [workspace]
 members = ["compiler", "libs/*"]
+output-dir = "build"
 ```
+
+A `members` entry is a directory inside the workspace, or a directory followed by `/*` for each of
+its child directories. A package belongs to the nearest manifest at or above its directory that
+has a `[workspace]` table and lists it. Its artifacts then go below the workspace's `output-dir`,
+which defaults to `build`, instead of its own. A workspace manifest may also define a package; a
+manifest with only a `[workspace]` table has nothing to build, so project commands run in a member
+directory.
 
 **Boundary:** A workspace adds no import rule: members still import each other only through
 `[dependencies]`.
 
-**Diagnostics:** A member directory without a package manifest is an invalid-manifest error.
+**Diagnostics:** A member entry that escapes the workspace, names a missing directory, or names a
+directory without a package manifest is an invalid-manifest error, as are a member listed twice and
+two members with the same package name, since they would share artifact paths. Every child
+directory of a `dir/*` entry must hold a package manifest. These errors are reported only to the
+workspace's members; a package the workspace does not list ignores it. A member's own `[build].output-dir` is an
+invalid-manifest error. A project command run on a manifest with only a `[workspace]` table is an
+invalid-manifest error that points to the member directories.
 
-**Evidence:** Design approved on 2026-10-17; implementation pending.
+**Evidence:** [native project manifests](../../../../compiler/src/driver/Project.silk),
+[project manifest cases](../../../../compiler/src/driver/ProjectCases.silk),
+[native build contract](../../../../compiler/scripts/test-native-build.ts).
 
 ## Implementation evidence
 
