@@ -679,6 +679,14 @@ effect fn invalidMember(manifest: &Path, entry: &[u8], reason: &[u8]) -> never
 effect fn addMember(manifest: &Path, entry: &[u8], member: Path, members: &mut Vector<Path>, names: &mut Vector<Bytes>) -> ()
   ! ProjectError | FileError | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
+  let earlier = Vector<Path>.asSlice(&members.*)
+  let mut seen = usize.ZERO
+  while seen < earlier.length {
+    if same(Path.rawBytes(&earlier[seen]), Path.rawBytes(&member)) {
+      return run invalidMember(manifest, entry, b"names a member that another entry already lists")
+    }
+    seen = seen + usize.ONE
+  }
   let memberManifest = run Path.join(&member, "silk.toml")
   let present = run FileSystem.exists(&memberManifest)
   if !present {
@@ -762,12 +770,31 @@ effect fn members(manifest: &Path, directory: &Path, workspace: &TomlValue) -> V
       if !listable {
         return run invalidMember(manifest, entry, b"names a missing directory")
       }
-      let children = run FileSystem.listDirectory(&base)
+      let children = match move run Effect.result(FileSystem.listDirectory(&base)) {
+        Result<Vector<DirectoryEntry>, FileError | OutOfMemoryError>.Success { value } => move value
+        Result<Vector<DirectoryEntry>, FileError | OutOfMemoryError>.Failure { error } => match move error {
+          FileError failure => {
+            drop failure
+            return run invalidMember(manifest, entry, b"names a directory whose children cannot be listed")
+          }
+          OutOfMemoryError exhausted => {
+            fail move exhausted
+          }
+        }
+      }
       let listedChildren = Vector<DirectoryEntry>.asSlice(&children)
+      let prefix = Path.rawBytes(&base).length + usize.ONE
       let mut child = usize.ZERO
       while child < listedChildren.length {
         if listedChildren[child].kind.code == FileSystem.directory().code {
-          run addMember(manifest, entry, run copyPath(&listedChildren[child].path), &mut found, &mut names)
+          // Errors name the child, as in `libs/docs`, rather than the whole `libs/*` entry.
+          let spelled = Path.rawBytes(&listedChildren[child].path)
+          let mut label = run Bytes.copy(written)
+          run Bytes.append(&mut label, b"/")
+          if spelled.length > prefix {
+            run Bytes.append(&mut label, Slice.view<u8>(spelled, prefix, spelled.length - prefix))
+          }
+          run addMember(manifest, Bytes.asSlice(&label), run copyPath(&listedChildren[child].path), &mut found, &mut names)
         }
         child = child + usize.ONE
       }
@@ -779,8 +806,84 @@ effect fn members(manifest: &Path, directory: &Path, workspace: &TomlValue) -> V
   return move found
 }
 
+// Whether some `[workspace].members` entry of the workspace in `directory` could name `target`,
+// judged from the entries alone so that a workspace not listing `target` is never validated on its
+// behalf. A malformed list counts as listing it, so the error is reported rather than hidden.
+effect fn lists(directory: &Path, workspace: &TomlValue, target: &Path) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let listed = match move Toml.field(workspace, "members") {
+    Option<&TomlValue>.Some { value } => value
+    Option<&TomlValue>.None => {
+      return true
+    }
+  }
+  let array = match &listed.* {
+    TomlValue.Array { .. } => true
+    _ => false
+  }
+  if !array {
+    return true
+  }
+  let mut at = usize.ZERO
+  while true {
+    let item = match move Toml.item(listed, at) {
+      Option<&TomlValue>.Some { value } => value
+      Option<&TomlValue>.None => {
+        break
+      }
+    }
+    let entry = match move Toml.asString(Option<&TomlValue>.some(item)) {
+      Option<string>.Some { value } => String.utf8Bytes(value)
+      Option<string>.None => {
+        return true
+      }
+    }
+    let suffix = usize.ONE + usize.ONE
+    let wildcard = entry.length > suffix && entry[entry.length - usize.ONE] == 42 && entry[entry.length - suffix] == 47
+    let mut written = entry
+    if wildcard {
+      written = Slice.view<u8>(entry, usize.ZERO, entry.length - suffix)
+    }
+    if !isContainedDirectory(written) {
+      return true
+    }
+    let base = run CommandPath.resolve(directory, written)
+    if wildcard {
+      if let Option<Path>.Some { value: parent } = move run Path.parent(target) {
+        if same(Path.rawBytes(&parent), Path.rawBytes(&base)) {
+          return true
+        }
+      }
+    } else if same(Path.rawBytes(&base), Path.rawBytes(target)) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Parses an enclosing manifest, or answers None when it cannot be read or parsed: a manifest other
+// than the project's own only matters if it is a workspace listing the project.
+effect fn enclosing(manifest: &Path) -> Option<TomlValue>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(parsed(manifest)) {
+    Result<TomlValue, ProjectError | OutOfMemoryError>.Success { value } => Option<TomlValue>.some(move value)
+    Result<TomlValue, ProjectError | OutOfMemoryError>.Failure { error } => match move error {
+      ProjectError unusable => {
+        drop unusable
+        return Option<TomlValue>.none()
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
 // Places `project`'s output below the workspace that lists it as a member, if one encloses it:
-// the nearest manifest at or above its directory with a `[workspace]` table.
+// the nearest manifest at or above its directory whose `[workspace]` table lists it.
 effect fn joinWorkspace(project: &mut Project) -> ()
   ! ProjectError | FileError | OutOfMemoryError
   ? &mut FileSystem | &mut Allocator {
@@ -789,33 +892,37 @@ effect fn joinWorkspace(project: &mut Project) -> ()
     let candidate = run Path.join(&directory, "silk.toml")
     let present = run FileSystem.exists(&candidate)
     if present {
-      let document = run parsed(&candidate)
-      if let Option<&TomlValue>.Some { value: workspace } = move Toml.field(&document, "workspace") {
-        let listed = run members(&candidate, &directory, workspace)
-        let found = Vector<Path>.asSlice(&listed)
-        let mut at = usize.ZERO
-        while at < found.length {
-          if same(Path.rawBytes(&found[at]), Path.rawBytes(&project.directory)) {
-            if project.outputDeclared && !same(Path.rawBytes(&candidate), Path.rawBytes(&project.manifest)) {
-              return run invalid(&project.manifest, b"build.output-dir cannot be set in a workspace member; set workspace.output-dir instead")
-            }
-            let outputDetail = b"workspace.output-dir must be a non-empty manifest-relative directory that does not escape the workspace"
-            let mut output = run Bytes.copy(b"build")
-            if let Option<&TomlValue>.Some { value: written } = move Toml.field(workspace, "output-dir") {
-              output = match move Toml.asString(Option<&TomlValue>.some(written)) {
-                Option<string>.Some { value } => run Bytes.copy(String.utf8Bytes(value))
-                Option<string>.None => run invalid(&candidate, outputDetail)
+      if let Option<TomlValue>.Some { value: document } = move run enclosing(&candidate) {
+        if let Option<&TomlValue>.Some { value: workspace } = move Toml.field(&document, "workspace") {
+          let member = run lists(&directory, workspace, &project.directory)
+          if member {
+            let listed = run members(&candidate, &directory, workspace)
+            let found = Vector<Path>.asSlice(&listed)
+            let mut at = usize.ZERO
+            while at < found.length {
+              if same(Path.rawBytes(&found[at]), Path.rawBytes(&project.directory)) {
+                if project.outputDeclared && !same(Path.rawBytes(&candidate), Path.rawBytes(&project.manifest)) {
+                  return run invalid(&project.manifest, b"build.output-dir cannot be set in a workspace member; set workspace.output-dir instead")
+                }
+                let outputDetail = b"workspace.output-dir must be a non-empty manifest-relative directory that does not escape the workspace"
+                let mut output = run Bytes.copy(b"build")
+                if let Option<&TomlValue>.Some { value: written } = move Toml.field(workspace, "output-dir") {
+                  output = match move Toml.asString(Option<&TomlValue>.some(written)) {
+                    Option<string>.Some { value } => run Bytes.copy(String.utf8Bytes(value))
+                    Option<string>.None => run invalid(&candidate, outputDetail)
+                  }
+                }
+                if !isContainedDirectory(Bytes.asSlice(&output)) {
+                  return run invalid(&candidate, outputDetail)
+                }
+                project.outputDirectory = run CommandPath.resolve(&directory, Bytes.asSlice(&output))
+                return ()
               }
+              at = at + usize.ONE
             }
-            if !isContainedDirectory(Bytes.asSlice(&output)) {
-              return run invalid(&candidate, outputDetail)
-            }
-            project.outputDirectory = run CommandPath.resolve(&directory, Bytes.asSlice(&output))
             return ()
           }
-          at = at + usize.ONE
         }
-        return ()
       }
     }
     match move run Path.parent(&directory) {

@@ -623,7 +623,29 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: sentinel },
   )
   assert.notEqual(unmanifested.status, 0, 'a member without a manifest was accepted')
-  assert.match(unmanifested.stderr, /libs\/\*` names a directory without a silk\.toml/)
+  assert.match(unmanifested.stderr, /libs\/empty` names a directory without a silk\.toml/)
+  // A package the workspace does not list keeps its own output, and the workspace's broken
+  // entries are not its concern.
+  yield* fs.makeDirectory(join(workspace, 'tool'), { recursive: true })
+  yield* fs.writeFileString(
+    join(workspace, 'tool/silk.toml'),
+    '[package]\nname = "tool"\nversion = "0.1.0"\nroot = "main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(workspace, 'tool/main.silk'),
+    'pub fn main() -> i32 {\n  return 3\n}\n',
+  )
+  const outsider = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(workspace, 'tool'),
+    {
+      ...process.env,
+      SILK_CLANG: clang,
+    },
+  )
+  assert.equal(outsider.status, 3, outsider.stderr)
+  assert.equal(yield* fs.exists(join(workspace, 'tool/build')), true)
   assert.equal(yield* fs.exists(marker), false)
   // A composition retention root keeps a private function from a module nothing imports.
   yield* fs.makeDirectory(join(directory, 'retained/support'), { recursive: true })
