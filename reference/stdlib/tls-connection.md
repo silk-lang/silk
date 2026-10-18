@@ -472,7 +472,7 @@ and structured cancellation close an unpublished provider exactly once.
 ```silk
 pub effect<'env> fn withClient<'env, A, E, ?CallbackRequirements, P: 'env>(
   provider: P,
-  config: &ClientConfig,
+  config: &'env ClientConfig,
   trust: TrustSnapshot,
   options: ConnectionOptions,
   callback: for<'call> once fn<'env>(&'call mut OwnedConnection<P>) -> once Effect<'call & 'env; A ! E ? CallbackRequirements>,
