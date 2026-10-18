@@ -32,7 +32,7 @@ cap the result or stop after the first strong finding.
    from its display name. If it cannot be resolved, stop before writing. Read all canonical-project
    issues in every status for deduplication.
 3. Record the verified remote-main SHA and dirty paths. Review recent commits, active agent tasks or
-   worktrees visible in the current environment, open PRs, and active OpenSpec changes so work
+   worktrees visible in the current environment, and open PRs so work
    underway is not rediscovered.
 4. Execute the parallel assignments in `DISCOVERY.md`. Use the codebase graph first for structural
    discovery. If an index lookup fails, select the index that corresponds to the current repository

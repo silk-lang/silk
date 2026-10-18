@@ -6,7 +6,6 @@ import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Schema from 'effect/Schema'
-import * as BootstrapCatalog from './BootstrapCatalog.mjs'
 
 export class DiagnosticCatalogError extends Data.TaggedError('DiagnosticCatalogError') {}
 
@@ -40,6 +39,9 @@ const bodyOf = (source, declaration) => {
   return undefined
 }
 
+/** The escapes a Silk string literal in the catalog may use. */
+const escapes = { n: '\n', t: '\t' }
+
 const enumMembers = (source, name) => {
   const body = bodyOf(source, new RegExp(`^\\s*pub enum ${name}\\s*\\{`, 'm'))
   return body === undefined ? [] : [...mask(body).matchAll(/\b(\w+)\s*,/g)].map((match) => match[1])
@@ -49,10 +51,7 @@ const enumMembers = (source, name) => {
 const silkString = (text) => {
   const match = /^"((?:\\.|[^"\\])*)"/.exec(text)
   if (match === null) return undefined
-  return (match[1] ?? '').replace(
-    /\\(.)/g,
-    (_text, escaped) => BootstrapCatalog.escapes[escaped] ?? escaped,
-  )
+  return (match[1] ?? '').replace(/\\(.)/g, (_text, escaped) => escapes[escaped] ?? escaped)
 }
 
 /** The arms of a function that is one exhaustive `return match` over `enumName`. */
@@ -131,71 +130,25 @@ const nativeCatalog = (source, issues) => {
 }
 
 /** Checks semantic identity as well as code membership; a different valid code is still wrong. */
-export const verify = ({
-  bootstrap,
-  catalog,
-  rejection,
-  lexical,
-  staticExecution,
-  documentation,
-  references,
-  coverage,
-}) => {
+export const verify = ({ catalog, rejection, lexical, staticExecution, references, coverage }) => {
   const issues = []
-  const bootstrapEntries = BootstrapCatalog.read(bootstrap)
-  if (bootstrapEntries.length === 0) issues.push('bootstrap catalog is empty')
-  const holders = new Map()
-  for (const entry of bootstrapEntries) {
-    if (holders.has(entry.code)) issues.push(`duplicate catalog code ${entry.code}`)
-    holders.set(entry.code, entry)
-    if (entry.templates.length === 0 || entry.templates.some((text) => text.trim().length === 0))
-      issues.push(`${entry.code}: missing nonempty message template`)
-  }
-
-  // The native catalog matches the bootstrap template for template while the bootstrap exists.
   const native = nativeCatalog(catalog, issues)
-  const memberOf = (name) => `${name.slice(0, 1).toUpperCase()}${name.slice(1)}`
+  if (native.size === 0) issues.push('native catalog is empty')
+  const holders = new Set()
   const spellings = new Map()
-  for (const entry of bootstrapEntries) {
-    const member = memberOf(entry.name)
-    const mirrored = native.get(member)
-    if (mirrored === undefined) {
-      issues.push(`${entry.code}: Catalog.silk has no Code.${member}`)
+  for (const [member, entry] of native) {
+    if (entry.spelling === undefined || !/^[A-Z]{3}[0-9]{4}$/.test(entry.spelling)) {
+      issues.push(`Code.${member}: no stable spelling`)
       continue
     }
-    if (mirrored.spelling !== entry.code)
-      issues.push(`Code.${member}: spelled ${mirrored.spelling}, bootstrap ${entry.code}`)
-    if (mirrored.meaning !== entry.meaning)
-      issues.push(`Code.${member}: meaning differs from the bootstrap`)
-    if (mirrored.templates.length !== entry.templates.length)
-      issues.push(
-        `Code.${member}: ${mirrored.templates.length} templates, bootstrap ${entry.templates.length}`,
-      )
-    else
-      entry.templates.forEach((text, index) => {
-        if (
-          BootstrapCatalog.shape(mirrored.templates[index] ?? '') !== BootstrapCatalog.shape(text)
-        )
-          issues.push(`Code.${member}: template ${index} differs from the bootstrap`)
-      })
+    if (holders.has(entry.spelling)) issues.push(`duplicate catalog code ${entry.spelling}`)
+    holders.add(entry.spelling)
+    spellings.set(member, entry.spelling)
+    if (entry.meaning === undefined || entry.meaning.trim().length === 0)
+      issues.push(`Code.${member}: no meaning`)
+    if (entry.templates.length === 0 || entry.templates.some((text) => text.trim().length === 0))
+      issues.push(`Code.${member}: missing nonempty message template`)
   }
-  for (const [member, entry] of native) {
-    if (entry.spelling === undefined) issues.push(`Code.${member}: no spelling`)
-    else spellings.set(member, entry.spelling)
-    if (!bootstrapEntries.some((bootstrapEntry) => memberOf(bootstrapEntry.name) === member))
-      issues.push(`Code.${member}: not in the bootstrap catalog`)
-  }
-
-  const documented = new Set()
-  for (const match of documentation.matchAll(/^\| `([A-Z]{3}[0-9]{4})` \| (.*)$/gm)) {
-    const [, code, row] = match
-    if (documented.has(code)) issues.push(`duplicate documentation code ${code}`)
-    if (!holders.has(code)) issues.push(`undocumented catalog declaration for ${code}`)
-    if (!/`[^`]+`/.test(row)) issues.push(`${code}: documentation has no message template`)
-    documented.add(code)
-  }
-  for (const code of holders.keys())
-    if (!documented.has(code)) issues.push(`${code}: missing generated documentation row`)
 
   const used = new Set()
   const checkCode = (owner, member) => {
@@ -255,7 +208,7 @@ export const verify = ({
     if (gap.reason.trim().length === 0) issues.push(`${gap.code}: coverage gap has no explanation`)
     gaps.add(gap.code)
   }
-  for (const code of holders.keys())
+  for (const code of holders)
     if (!used.has(code) && !gaps.has(code))
       issues.push(`${code}: no native producer or explicit gap`)
   return issues
@@ -264,30 +217,28 @@ export const verify = ({
 /** Reads only the consuming checkout; no network, compiler build, or generated-file mutation. */
 export const check = Effect.fn('DiagnosticCatalog.check')(function* () {
   const fs = yield* FileSystem.FileSystem
-  const referenceDirectory = 'apps/docs/content/reference'
+  const referenceDirectory = 'reference'
   const referenceFiles = yield* fs.readDirectory(referenceDirectory)
   const references = yield* Effect.forEach(
     referenceFiles.filter((file) => file.endsWith('.md')),
     (file) => fs.readFileString(`${referenceDirectory}/${file}`),
   )
   const sources = yield* Effect.all({
-    bootstrap: fs.readFileString('packages/compiler/src/Diagnostic.ts'),
     catalog: fs.readFileString('compiler/src/diagnostic/Catalog.silk'),
     rejection: fs.readFileString('compiler/src/semantic/Rejection.silk'),
     lexical: fs.readFileString('compiler/src/lexer/LexicalDiagnostic.silk'),
     staticExecution: fs.readFileString('compiler/src/semantic/StaticExecution.silk'),
-    documentation: fs.readFileString('apps/docs/content/language/diagnostics.md'),
     coverage: fs
       .readFileString('compiler/diagnostic-coverage.json')
       .pipe(Effect.flatMap(Schema.decodeUnknownEffect(Schema.fromJsonString(CoverageSchema)))),
   })
   const issues = verify({ ...sources, references: references.join('\n') })
   if (issues.length > 0) return yield* new DiagnosticCatalogError({ issues })
-  return yield* Console.log('Native diagnostic catalog agrees with bootstrap and documentation')
+  return yield* Console.log('Native diagnostic catalog is complete')
 })
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
+  const require = createRequire(new URL('../../package.json', import.meta.url))
   /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
   const { NodeServices } = await import(
     pathToFileURL(require.resolve('@effect/platform-node')).href
