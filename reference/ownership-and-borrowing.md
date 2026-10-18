@@ -579,9 +579,11 @@ The reference retains its projection path and accesses the original storage rath
 projected value. When the compiler cannot prove indexed places disjoint, it may conservatively treat
 their complete root as borrowed.
 
-Borrowing an owned temporary creates a hidden owner. The compiler keeps that owner live for the
-complete lifetime of every view derived from the borrow, then cleans it under the ordinary ownership
-rules.
+Borrowing an owned temporary creates a hidden owner, which is live for every view derived from the
+borrow within the statement that evaluates it and is then cleaned under the ordinary ownership
+rules. Only a borrowed array keeps its hidden owner past that statement, for the views a binding
+holds, as described below. The hidden owner of any other temporary, such as a struct value, a call
+result or a `Vector`, ends with its statement, so a view of it used after that statement has expired.
 
 ```silk
 fn read(values: &[i32]) -> i32 { return 1 }
@@ -635,10 +637,30 @@ and cleans its own storage. Fatal traps retain their existing no-unwind behavior
 Storage in an aggregate or capture by an Effect does not detach the view. Returning any such value
 from the function is rejected when it retains the function-local hidden storage.
 
+A view of any other temporary does not extend its hidden owner:
+
+```silk,ignore
+struct Item { path: i32 }
+struct Holder { item: Item }
+
+fn make() -> Holder { return Holder {item: Item {path: 1}} }
+
+fn view<'a>(holder: &'a Holder) -> &'a Holder { return holder }
+
+fn invalid() -> i32 {
+  let path = &view(&make()).item.path
+  return path.*
+}
+```
+
+The `Holder` temporary's hidden owner ends with the `let` statement, so the later read uses an
+expired view.
+
 **Diagnostics:** Forming an exclusive borrow from an immutable existing root reports `SEM0057`.
 Passing a fixed array directly where a slice is expected reports `SEM0059` and requires an explicit
 borrow. A temporary-derived view that escapes its hidden owner reports the applicable returned-view
-or stored-borrow diagnostic at the escape boundary.
+or stored-borrow diagnostic at the escape boundary. A view used after its temporary's hidden owner
+has ended reports `OWN0019` at that use.
 
 The compiler materializes temporary owners and retains indexed-place selectors through TIR and MIR.
 `SEM0056` remains appropriate only for operands that cannot denote or produce owned storage.
