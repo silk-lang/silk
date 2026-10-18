@@ -31,8 +31,7 @@ says otherwise, choose stabilization leads before feature leads for the default 
    evidence there, and mark the others Duplicate with a native relation. Split an overly broad lead
    when independent changes have separate value. Leave uncertain groupings separate.
 4. For each selected issue, verify the five triage claims in `WORKFLOW.md`. Use the current
-   baseline, codebase graph, relevant docs, tests, package exports, open and archived OpenSpec
-   changes, and GitHub PRs. Treat the issue's proposed solution as a hypothesis. Explicitly decide
+   baseline, codebase graph, relevant docs, tests, package exports, and GitHub PRs. Treat the issue's proposed solution as a hypothesis. Explicitly decide
    whether the issue is still wanted, already delivered, outdated, newly owned elsewhere, or in need
    of revised acceptance because of changes since its Review baseline.
    When the issue concerns a language, compiler, runtime, ABI, ownership, or standard-library
@@ -89,6 +88,5 @@ state` and `## Desired behavior` snippets under `WORKFLOW.md`. Verify the curren
     and one-line reason. Report the new Backlog order separately from the untouched Todo order, and
     name any untriaged Triage issue that plausibly outranks the new Backlog head.
 
-Language and standard-library changes must have acceptance that includes the OpenSpec artifacts
-required by `AGENTS.md`. Do not preserve compatibility paths merely because the current code has
+Do not preserve compatibility paths merely because the current code has
 them; this repository is green-field.
