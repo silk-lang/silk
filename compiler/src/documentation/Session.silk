@@ -1,0 +1,245 @@
+//! Owned source snapshots and profile assembly for documentation and complete-module examples.
+
+import documentation.Project as Extraction {Error as ExtractionError}
+import documentation.Model {Project}
+import documentation.Reference {ManifestEntry}
+import driver.CommandPath
+import driver.ModuleSources as Sources {ModuleSources, InvalidSourceRoot, InvalidBuildComposition, MissingManifest, MissingStandardLibrary}
+import driver.Packages {InvalidDependency}
+import driver.NativeLinkInput {InvalidNativeLinkInput}
+import driver.ProjectCommand as ProjectCommands {InvalidProjectCommand}
+import driver.Project as Projects {Project as Package, ProjectError}
+import driver.ProjectPlan as Plans {PlanError, ProjectPlan}
+import semantic.ModuleId {ModuleId, InvalidModulePath}
+import semantic.PackageGraph {PackageGraph}
+import semantic.SourceRevision {Revision}
+import semantic.SourceIndex {RevisionMismatch}
+import semantic.Semantic {Semantic, Request, RegistrationClosed, ConflictingPackageSource}
+import semantic.Query {Cycle}
+import semantic.Types {Types}
+import semantic.Target {Target}
+import semantic.InitialProfile {InitialProfile, Input, Problem, Selection}
+import semantic.FinalProfile {FinalProfile}
+import semantic.ProfileBinding {Supplied}
+import semantic.ProfileShape {Registered, Problem as ShapeProblem, registered}
+import semantic.ProfileAssembly {AssemblyProblem, assemble}
+import semantic.Rejection {Rejection}
+import silk.shared {Shared}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.box {Box}
+import silk.bytes {Bytes}
+import silk.filesystem {FileSystem, FileError, Path, DirectoryEntry}
+import silk.json_scanner {JsonError}
+import silk.json_value {Json, Value, JsonChild}
+import silk.option {Option}
+import silk.result {Result}
+import silk.slice {Slice}
+import silk.string {String}
+import silk.toml_scanner {TomlError}
+import silk.vector {Vector}
+
+/// A rejected documentation request or profile, with its CLI exit class.
+pub struct Failure {
+  pub message: &'static [u8]
+  pub status: i32
+}
+
+/// Failures from native source loading, profile assembly, and extraction.
+pub type Error = Failure | FileError | OutOfMemoryError | JsonError | TomlError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | Problem | ProjectError | PlanError | ExtractionError | InvalidProjectCommand
+
+/// One immutable standard-library input shared by sequential profile sessions.
+pub struct Library {
+  pub revision: Revision
+  pub roots: Vector<ModuleId>
+  pub paths: Vector<Bytes>
+  pub manifest: Vector<ManifestEntry>
+}
+
+/// One fully assembled semantic session. Dropping it releases all semantic caches.
+pub struct Session {
+  pub target: Target
+  pub store: Semantic
+  pub request: Request
+  pub roots: Vector<ModuleId>
+  pub paths: Vector<Bytes>
+}
+
+/// Exact byte comparison used by command input and output contracts.
+pub fn same(a: &[u8], b: &[u8]) -> bool {
+  if a.length != b.length { return false }
+  let mut at: usize = 0
+  while at < a.length { if a[at] != b[at] { return false } at = at + 1 }
+  return true
+}
+
+fn silkFile(path: &[u8]) -> bool {
+  return path.length >= 5 && same(Slice.view<u8>(path, path.length - 5, 5), b".silk")
+}
+
+/// Publishes a source directory in deterministic filesystem order, without parsing bodies.
+pub effect fn publishTree(revision: &mut Revision, base: &Path, directory: &Path, owner: &ModuleId) -> ()
+! FileError | InvalidModulePath | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let entries = run FileSystem.listDirectory(directory)
+  let listed = Vector<DirectoryEntry>.asSlice(&entries)
+  let mut at: usize = 0
+  while at < listed.length {
+    let entry = &listed[at]
+    if entry.kind.code == FileSystem.directory().code {
+      run publishTree(&mut revision.*, base, &entry.path, owner)
+    } else if silkFile(Path.rawBytes(&entry.path)) {
+      let relative = run CommandPath.relative(base, &entry.path)
+      let identity = run ModuleId.sibling(owner, Bytes.asSlice(&relative))
+      let content = Option<Bytes>.some(run FileSystem.readFile(&entry.path))
+      revision.* = run Revision.publish(&revision.*, &identity, &content)
+    }
+    at = at + 1
+  }
+}
+
+effect fn text(value: &Value, key: string) -> Bytes ! Failure | OutOfMemoryError ? &mut Allocator {
+  return match move Json.asString(Json.field(value, key)) {
+    Option<string>.Some {value: decoded} => run Bytes.copy(String.utf8Bytes(decoded))
+    Option<string>.None => { fail Failure {message: b"invalid standard-library manifest", status: 2} }
+  }
+}
+
+/// Loads the installed or explicitly selected source distribution, including intrinsic modules.
+pub effect fn library(root: &Path) -> Library ! Error ? &mut FileSystem | &mut Allocator {
+  let manifestPath = run Path.join(root, "manifest.json")
+  let contents = run FileSystem.readFile(&manifestPath)
+  let json = run Json.parse(Bytes.asSlice(&contents))
+  let entries = match &json {
+    Value.Array {values} => Vector<JsonChild>.asSlice(&Box<Vector<JsonChild>>.get(&values)[0])
+    _ => { fail Failure {message: b"standard-library manifest must be an array", status: 2} }
+  }
+  let owner = run ModuleId.make(b"file", b"documentation", b"stdlib.silk")
+  let mut revision = Revision.make()
+  run publishTree(&mut revision, root, root, &owner)
+  let mut roots = Vector<ModuleId>.make()
+  let mut paths = Vector<Bytes>.make()
+  let mut manifest = Vector<ManifestEntry>.make()
+  let mut at: usize = 0
+  while at < entries.length {
+    let entry = match &entries[at] {
+      JsonChild.Item {value} => &value
+      _ => { fail Failure {message: b"invalid standard-library manifest entry", status: 2} }
+    }
+    let module = run text(entry, "module")
+    let path = run text(entry, "path")
+    let mut namespace = Option<Bytes>.none()
+    if let Option<&Value>.Some {value: _} = move Json.field(entry, "namespace") {
+      namespace = Option<Bytes>.some(run text(entry, "namespace"))
+    }
+    let identity = run ModuleId.sibling(&owner, Bytes.asSlice(&path))
+    if !Revision.presents(&revision, &identity) {
+      fail Failure {message: b"standard-library manifest source is missing", status: 2}
+    }
+    run Vector<ModuleId>.append(&mut roots, move identity)
+    let absolute = run Path.joinBytes(root, Bytes.asSlice(&path))
+    run Vector<Bytes>.append(&mut paths, run Bytes.copy(Path.rawBytes(&absolute)))
+    run Vector<ManifestEntry>.append(&mut manifest, ManifestEntry {module: move module, namespace: move namespace})
+    at = at + 1
+  }
+  if entries.length == 0 { fail Failure {message: b"empty standard-library manifest", status: 2} }
+  return Library {revision: move revision, roots: move roots, paths: move paths, manifest: move manifest}
+}
+
+/// Creates explicit target facts; `noLibc` selects the additional raw Linux reference profile.
+pub effect fn profile(target: &[u8], noLibc: bool) -> InitialProfile ! Problem | OutOfMemoryError ? &mut Allocator {
+  let mut input = Input.make()
+  input.target = Option<Bytes>.some(run Bytes.copy(target))
+  if noLibc { input.libc = Option<Bytes>.some(run Bytes.copy(b"none")) }
+  return run InitialProfile.freeze(&input)
+}
+
+/// Assembles registered package schemas before any profile-dependent declaration extraction.
+pub effect fn configure(store: &mut Semantic, request: &mut Request, roots: &[ModuleId], initial: InitialProfile, supplied: Vector<Supplied>) -> ()
+! Error ? &mut Allocator | &mut Types {
+  let mut at: usize = 0
+  while at < roots.length {
+    run Request.registerSchemaModule(&mut request.*, &roots[at])
+    at = at + 1
+  }
+  let target = Target.forId(Target.id(InitialProfile.target(&initial)))
+  let shapes = match move run registered(&mut store.*, &mut request.*, &target) {
+    Result<Registered, ShapeProblem>.Success {value} => move value
+    Result<Registered, ShapeProblem>.Failure {error: _} => { fail Failure {message: b"invalid documentation profile schemas", status: 1} }
+  }
+  let final = match move run assemble(move initial, &mut store.*, &mut request.*, &shapes, move supplied) {
+    Result<FinalProfile, AssemblyProblem>.Success {value} => move value
+    Result<FinalProfile, AssemblyProblem>.Failure {error: _} => { fail Failure {message: b"invalid documentation parameter profile", status: 1} }
+  }
+  run Semantic.reviseProfile(&mut store.*, Option<FinalProfile>.some(move final))
+}
+
+/// Extracts one standard-library profile without retaining semantic state between profiles.
+pub effect fn extractLibrary(library: &Library, target: &[u8], identity: &[u8], noLibc: bool, includePrivate: bool) -> Project
+! Error ? &mut Allocator | &mut Types {
+  let initial = run profile(target, noLibc)
+  let machine = Target.forId(Target.id(InitialProfile.target(&initial)))
+  let mut store = Semantic.oneShot(run Revision.copy(&library.revision), machine, Option<FinalProfile>.none())
+  let roots = Vector<ModuleId>.asSlice(&library.roots)
+  Semantic.selectPackages(&mut store, PackageGraph.make(&roots[0]))
+  let mut request = Request.make()
+  run configure(&mut store, &mut request, roots, move initial, Vector<Supplied>.make())
+  return run Extraction.extract(&mut store, roots, Vector<Bytes>.asSlice(&library.paths), target, identity, includePrivate)
+}
+
+/// Loads a project's own source closure using the same package graph and profile planner as build.
+pub effect fn package(project: &Package, library: Option<Path>, targetOverride: &Option<Bytes>, host: Target) -> Session
+! Error ? &mut FileSystem | &mut Allocator | &mut Types {
+  let empty = Vector<Bytes>.make()
+  let parsed = run ProjectCommands.parseBuild(Vector<Bytes>.asSlice(&empty))
+  let mut options = move parsed.options
+  if let Option<Bytes>.Some {value} = &targetOverride.* {
+    run Vector<Bytes>.append(&mut options.targets, run Bytes.copy(Bytes.asSlice(&value)))
+  }
+  let mut plans = run Plans.make(project, &options, Projects.targets(project), host)
+  if Vector<ProjectPlan>.length(&plans) != 1 { fail Failure {message: b"documentation requires one target; pass --target", status: 2} }
+  let plan = Vector<ProjectPlan>.remove(&mut plans, 0)
+  let initial = run InitialProfile.freeze(&plan.input)
+  let target = Target.forId(Target.id(InitialProfile.target(&initial)))
+  let libc = match move InitialProfile.text(&initial, b"libc") {
+    Option<&[u8]>.Some {value} => value
+    Option<&[u8]>.None => { fail Failure {message: b"missing libc profile fact", status: 2} }
+  }
+  let mut sources = run Sources.makeInPackage(Projects.entry(project), Projects.manifest(project), move library, Target.name(&target), libc, false, Selection.None)
+  let identity = ModuleId.copy(Sources.entry(&sources))
+  run Sources.preload(&mut sources, &[ModuleId.copy(&identity)])
+  let roots = run Sources.loadedRootModules(&sources)
+  let mut paths = Vector<Bytes>.make()
+  let listed = Vector<ModuleId>.asSlice(&roots)
+  let mut at: usize = 0
+  while at < listed.length {
+    let location = run Sources.sourceLocation(&sources, &listed[at])
+    let path = match move location.path {
+      Option<Path>.Some {value} => move value
+      Option<Path>.None => { fail Failure {message: b"documentation source has no filesystem path", status: 2} }
+    }
+    run Vector<Bytes>.append(&mut paths, run Bytes.copy(Path.rawBytes(&path)))
+    at = at + 1
+  }
+  let mut store = Semantic.oneShot(run Sources.revision(&sources), target, Option<FinalProfile>.none())
+  Semantic.selectPackages(&mut store, run Sources.packageGraph(&sources))
+  let mut request = Request.forApplication(ModuleId.copy(&identity))
+  run configure(&mut store, &mut request, &[ModuleId.copy(&identity)], move initial, move plan.bindings)
+  return Session {target: target, store: move store, request: move request, roots: move roots, paths: move paths}
+}
+
+/// Rejects every loaded module's active imports before publishing extracted documentation.
+/// This validates private and unused imports without demanding ordinary function bodies.
+pub effect fn validateImports(session: &mut Session) -> () ! Error ? &mut Allocator | &mut Types {
+  let mut rejected = run Semantic.importRejections(&mut session.store, &mut session.request)
+  if Vector<Shared<Rejection>>.length(&rejected) > 0 {
+    fail ExtractionError.Rejected {rejection: Vector<Shared<Rejection>>.remove(&mut rejected, 0)}
+  }
+}
+
+/// Extracts a project's source closure and rejects invalid private or unused imports.
+pub effect fn extractPackage(session: &mut Session, includePrivate: bool) -> Project
+! Error ? &mut Allocator | &mut Types {
+  let project = run Extraction.extract(&mut session.store, Vector<ModuleId>.asSlice(&session.roots),
+    Vector<Bytes>.asSlice(&session.paths), Target.name(&session.target), Target.name(&session.target), includePrivate)
+  run validateImports(&mut session.*)
+  return move project
+}

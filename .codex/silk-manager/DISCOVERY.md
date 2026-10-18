@@ -26,7 +26,7 @@ baseline.
 ## Required fan-out
 
 Use the available collaboration slots. After the coordinator captures the baseline and current
-Linear/OpenSpec exclusion set, spawn three subagents in parallel. The coordinator remains active as
+Linear exclusion set, spawn three subagents in parallel. The coordinator remains active as
 the fourth scout. If collaboration tools are unavailable or the required scouts cannot be started,
 report the discovery run as incomplete and stop before filing issues. A sequential solo sweep does
 not satisfy this skill.
@@ -43,7 +43,7 @@ brittle boundary handling.
 
 ### Scout B — documentation and public surfaces
 
-Compare the prescriptive reference in `apps/docs/content/reference/`, tutorials, alpha-status page,
+Compare the prescriptive reference in `reference/`,
 package READMEs, generated standard-library and diagnostic docs, public barrels, package exports,
 examples, CLI help, editor behavior, and implemented APIs. Look for false claims, omissions, broken
 links, stale examples, export asymmetry, and undocumented public behavior.
@@ -58,7 +58,7 @@ calling anything dead.
 
 ### Coordinator — integration and project health
 
-Inspect build, test, release, CI, package boundaries, active and archived OpenSpec state, recent
+Inspect build, test, release, CI, package boundaries, recent
 churn, issue/PR duplication, and repository-wide gaps between packages. Inspect validation
 configuration and existing test coverage without running the full validation suite. Own fan-in,
 gap analysis, candidate clustering, and Linear writes.
@@ -110,7 +110,7 @@ articulable reason to investigate them.
 
 Wait for every scout. Normalize lead wording and merge only obvious duplicates that cite the same
 subject and suspected problem. Leave debatable grouping and splitting to triage. Search all Linear
-states, open PRs, and active OpenSpec changes before creating anything.
+states, and open PRs before creating anything.
 
 Spot-check lead identity, provenance, and rationale during fan-in. This is not a skeptical or
 adversarial review. Confirm that the cited subject exists, the evidence was not fabricated, the
@@ -124,9 +124,9 @@ Build a coverage ledger for these areas:
 - compiler frontend, analysis, HIR, MIR, ownership, compile-time evaluation, and diagnostics;
 - LLVM-native and LLVM-to-Wasm lowering, finalization, and runtime support;
 - standard library and runtime services;
-- CLI, formatter, LSP, editor support, docgen, VS Code, and webcontainer platform;
-- reference docs, tutorials, generated docs, READMEs, and examples;
-- tests, scripts, package exports, CI, release validation, and OpenSpec hygiene.
+- CLI, formatter, and documentation generation;
+- reference docs, READMEs, and examples;
+- tests, scripts, CI, and release validation.
 
 Run a gap-driven second pass whenever the first fan-in yields fewer than five novel investigable
 leads OR the coverage ledger contains a material weak or unchecked area. Lead count never excuses a
