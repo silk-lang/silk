@@ -5,6 +5,7 @@ import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Path from 'effect/Path'
+import * as Schema from 'effect/Schema'
 import * as Stream from 'effect/Stream'
 import { ChildProcess, ChildProcessSpawner } from 'effect/unstable/process'
 import { NodeRuntime, NodeServices } from '@effect/platform-node'
@@ -36,35 +37,41 @@ const program = Effect.gen(function* () {
     path.join(directory, 'publication-fixture.silk'),
     path.join(output, 'publication-fixture.silk'),
   )
-  const run = Effect.fnUntraced(function* (command, args) {
-    return yield* Effect.scoped(
-      Effect.gen(function* () {
-        const child = yield* spawner.spawn(
-          ChildProcess.make(command, args, {
-            cwd: output,
-            stdin: 'ignore',
-            stdout: 'pipe',
-            stderr: 'pipe',
-          }),
-        )
-        const [status, stdout, stderr] = yield* Effect.all(
-          [
-            child.exitCode,
-            Stream.mkString(Stream.decodeText(child.stdout)),
-            Stream.mkString(Stream.decodeText(child.stderr)),
-          ],
-          { concurrency: 'unbounded' },
-        )
-        if (status !== 0)
-          return yield* new PublicationConformanceError({
-            message: `${command} ${args.join(' ')}: status ${status}\n${stdout}${stderr}`,
-          })
-        if (stdout !== '') yield* Console.log(stdout.trimEnd())
-        if (stderr !== '') yield* Console.error(stderr.trimEnd())
-        return { command, arguments: args, status, stdout, stderr }
-      }),
-    )
-  })
+  const run = Effect.fnUntraced(
+    /**
+     * @param {string} command
+     * @param {ReadonlyArray<string>} args
+     */
+    function* (command, args) {
+      return yield* Effect.scoped(
+        Effect.gen(function* () {
+          const child = yield* spawner.spawn(
+            ChildProcess.make(command, args, {
+              cwd: output,
+              stdin: 'ignore',
+              stdout: 'pipe',
+              stderr: 'pipe',
+            }),
+          )
+          const [status, stdout, stderr] = yield* Effect.all(
+            [
+              child.exitCode,
+              Stream.mkString(Stream.decodeText(child.stdout)),
+              Stream.mkString(Stream.decodeText(child.stderr)),
+            ],
+            { concurrency: 'unbounded' },
+          )
+          if (status !== 0)
+            return yield* new PublicationConformanceError({
+              message: `${command} ${args.join(' ')}: status ${status}\n${stdout}${stderr}`,
+            })
+          if (stdout !== '') yield* Console.log(stdout.trimEnd())
+          if (stderr !== '') yield* Console.error(stderr.trimEnd())
+          return { command, arguments: args, status, stdout, stderr }
+        }),
+      )
+    },
+  )
   if (process.platform !== 'darwin' && process.platform !== 'linux')
     return yield* new PublicationConformanceError({
       message: `Unsupported host: ${process.platform}`,
@@ -126,19 +133,15 @@ const program = Effect.gen(function* () {
   }
   yield* fs.writeFileString(
     path.join(output, 'publication-evidence.json'),
-    JSON.stringify(
-      {
-        schema: 1,
-        compiler,
-        standardLibrary,
-        host: `${process.platform}/${process.arch}`,
-        lanes,
-        durabilityLimit:
-          'Real fsync calls and ordering; not hardware-cache flush or physical power-loss recovery.',
-      },
-      null,
-      2,
-    ) + '\n',
+    (yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+      schema: 1,
+      compiler,
+      standardLibrary,
+      host: `${process.platform}/${process.arch}`,
+      lanes,
+      durabilityLimit:
+        'Real fsync calls and ordering; not hardware-cache flush or physical power-loss recovery.',
+    })) + '\n',
   )
 })
 
