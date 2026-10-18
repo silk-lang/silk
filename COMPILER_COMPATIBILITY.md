@@ -83,7 +83,7 @@ Each entry records:
 
 ## Entries
 
-### Package path dependencies are native only
+### Packages, exports and workspaces are native only
 
 - **Status:** approved by Julia on 2026-10-17 (package design); implemented and locally verified
   in the native compiler on 2026-10-17.
@@ -101,12 +101,14 @@ Each entry records:
 - **Diagnostics and limits:** an invalid dependency or `exports` entry is reported as
   `silk: invalid <detail>`, where the detail names the dependency or entry and the reason. Only
   modules a dependency lists in `[package].exports` are importable from other packages; any other
-  reports `MOD0003` (PACKAGE-006), which the bootstrap never reports. Workspaces (PACKAGE-007) are
-  not implemented yet. The standard library still shares the root package identity under its
-  `silk/` paths and lists no exports.
+  reports `MOD0003` (PACKAGE-006), which the bootstrap never reports. A `[workspace]` above a member
+  places its artifacts in the workspace's output directory (PACKAGE-007); the bootstrap ignores
+  `[workspace]`. The standard library still shares the root package identity under its `silk/`
+  paths and lists no exports.
 - **Evidence:** `dependencyNamesSelectAnotherPackagesModules` in SemanticConformanceCases,
   `pathDependenciesLoadTheirOwnPackages` in SemanticLoweringCases, and the path-dependency run,
-  unexported-module refusal and shadowing refusal in `compiler/scripts/test-native-build.ts`.
+  unexported-module refusal, shadowing refusal and workspace runs in
+  `compiler/scripts/test-native-build.ts`.
 - **Open questions:** none.
 
 ### Native integer C variadic imports
