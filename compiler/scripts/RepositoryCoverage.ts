@@ -36,7 +36,7 @@ interface Receipt {
 }
 
 const invalid = (message: string) => new CoverageError({ message })
-const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
+const require = createRequire(new URL('../../package.json', import.meta.url))
 const hash = (source: string) => createHash('sha256').update(source.trim()).digest('hex')
 
 /** Remove comments and quoted literals before recognizing an exported entry declaration. */
@@ -120,19 +120,12 @@ export const docPrograms = Effect.fn('RepositoryCoverage.docPrograms')(function*
 })
 
 export const exclusion = (path: string) => {
-  if (path === 'packages/compiler/test/goldens/canonical.silk')
-    return 'Virtual Core.* modules in a canonicalization golden.'
-  if (
-    path === 'packages/compiler/test/fixtures/complete-interface-contracts/provider-equality.silk'
-  )
-    return 'Analysis-only fixture with a private main.'
-  if (path.startsWith('openspec/'))
-    return 'Archived OpenSpec evidence, including captured-resource; not a current program.'
+  if (path.startsWith('bootstrap/'))
+    return 'Frozen TypeScript bootstrap; it only compiles the anchored first native compiler.'
   if (path.startsWith('compiler/src/'))
     return 'Compiler implementation and source cases; covered by self-build and native-cases.'
   if (path.startsWith('compiler/fixtures/'))
     return 'Lexer/parser input or the separately gated stdlib-root fixture.'
-  if (path.startsWith('compiler/docs/')) return 'Compiler design probes; documentation evidence.'
   if (path.startsWith('corpus/')) return 'Native corpus program or module; measured by the corpus.'
   return undefined
 }
@@ -171,7 +164,7 @@ export const discover = Effect.fn('RepositoryCoverage.discover')(function* (
     const source = yield* fs.readFileString(join(repository, path))
     const reason = exclusion(path)
     if (reason !== undefined) excluded.push({ path, reason })
-    else if (path.startsWith('packages/compiler/stdlib/')) {
+    else if (path.startsWith('stdlib/')) {
       programs.push(...(yield* docPrograms(path, source)))
       excluded.push({
         path,
@@ -182,7 +175,7 @@ export const discover = Effect.fn('RepositoryCoverage.discover')(function* (
         path,
         reason: 'Exact source already measured by the native corpus (outer whitespace ignored).',
       })
-    else if (path.startsWith('packages/compiler/conformance/') || hasMain(source))
+    else if (path.startsWith('compiler/conformance/') || hasMain(source))
       programs.push({ id: path, path, source })
     else
       excluded.push({
@@ -294,16 +287,7 @@ export const run = Effect.fn('RepositoryCoverage.run')(function* ({
         yield* fs.remove(ir, { force: true })
         const result = yield* NativeProcess.execute(
           compiler,
-          [
-            'build',
-            source,
-            '-o',
-            ir,
-            '--emit',
-            'llvm-ir',
-            '--stdlib',
-            join(repository, 'packages/compiler/stdlib'),
-          ],
+          ['build', source, '-o', ir, '--emit', 'llvm-ir', '--stdlib', join(repository, 'stdlib')],
           { cwd: root, timeoutMs: 120000 },
         )
         yield* fs.writeFile(join(output, `${index}.stderr`), result.stderr)
@@ -366,10 +350,9 @@ export const run = Effect.fn('RepositoryCoverage.run')(function* ({
 })
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const {
-    NodeServices,
-  }: typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js') =
-    await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
+  const { NodeServices }: typeof import('@effect/platform-node') = await import(
+    pathToFileURL(require.resolve('@effect/platform-node')).href
+  )
   const [compiler, output, mode] = process.argv.slice(2)
   await Effect.runPromise(
     Effect.gen(function* () {

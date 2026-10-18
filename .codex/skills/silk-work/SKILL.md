@@ -1,6 +1,6 @@
 ---
 name: silk-work
-description: Claim and implement one triaged Silk Linear issue, follow repository and OpenSpec rules, verify the change, and finish with a draft pull request. Use only when Julia explicitly invokes this skill, names an issue to implement, or asks to work the next queued Silk issue.
+description: Claim and implement one triaged Silk Linear issue, follow repository rules, verify the change, and finish with a draft pull request. Use only when Julia explicitly invokes this skill, names an issue to implement, or asks to work the next queued Silk issue.
 ---
 
 # Work a Silk issue
@@ -59,9 +59,6 @@ baseline to `Stage: work admission` and
   on `main`.
 - Preserve unrelated and uncommitted changes. Stop if they overlap in a way that cannot be handled
   safely.
-- For any Silk language or standard-library change, use the project OpenSpec workflow before
-  implementation. Use OpenSpec for other medium or large architectural changes when a written
-  design materially reduces risk.
 - Implement the clean green-field design and update all callers, tests, fixtures, generated
   artifacts, and docs in the same change. Remove the superseded path.
 - Meet the Linear acceptance criteria literally. If investigation changes the correct solution,
@@ -77,8 +74,7 @@ implementation, checks, and reviews explicitly pending. Link the draft from Line
 the issue In Progress and preserving its work-admission Review baseline until handoff.
 
 Use early pushes to get CI feedback while implementation continues. Before the final push, finish
-all repository mutations, including generated artifacts and OpenSpec implementation-task
-checkboxes, then audit, commit, and push the intended issue head. After a review or CI fix, run the
+all repository mutations, including generated artifacts, then audit, commit, and push the intended issue head. After a review or CI fix, run the
 affected focused checks, audit, commit, and push the replacement head.
 
 ## Verification and review
@@ -90,7 +86,7 @@ authoritative full-repository completion guard; do not duplicate its full suite 
 ceremony. Do not say work is complete while required CI is pending or failed; name the exact gap
 and whether it predates the change.
 
-OpenSpec task lists contain implementation deliverables, not workflow gates. Never add or retain a
+Task lists contain implementation deliverables, not workflow gates. Never add or retain a
 task whose sole action is running or recording verification commands, obtaining review approval,
 waiting for CI, updating the PR or Linear issue, or reporting handoff. Test code and other durable
 acceptance evidence may be implementation tasks; executing the eventual gate is not. Complete all
@@ -127,7 +123,7 @@ draft opened during implementation:
    fix-and-push cycle; a pass requires no repository change.
 4. Update the draft PR under the Pull request quality bar in `WORKFLOW.md`. Include the Linear
    issue link, outcome, acceptance evidence, focused checks run, exact-head CI result,
-   test-review verdict and timing delta, risks or deferred checks, and relevant OpenSpec change.
+   test-review verdict and timing delta, and risks or deferred checks.
    Strongly prefer concise `Before` and `After` code or output examples when they materially clarify
    the delivered change; omit them only when examples would add no useful signal or would
    misrepresent the work.
