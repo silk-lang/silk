@@ -18,15 +18,18 @@ const formatterConfig = JSON.parse(
 
 class DocumentationFormatError extends Data.TaggedError('DocumentationFormatError') {}
 
-const formatMarkdown = Effect.fnUntraced(function* (path, contents) {
-  const result = yield* Effect.tryPromise({
-    try: () => format(path, contents, formatterConfig),
-    catch: (cause) => new DocumentationFormatError({ path, cause }),
-  })
-  if (result.errors.length > 0)
-    return yield* new DocumentationFormatError({ path, cause: result.errors })
-  return result.code
-})
+const formatMarkdown = Effect.fnUntraced(
+  /** @param {string} path @param {string} contents */
+  function* (path, contents) {
+    const result = yield* Effect.tryPromise({
+      try: () => format(path, contents, formatterConfig),
+      catch: (cause) => new DocumentationFormatError({ path, cause }),
+    })
+    if (result.errors.length > 0)
+      return yield* new DocumentationFormatError({ path, cause: result.errors })
+    return result.code
+  },
+)
 
 const phases = {
   LEX: 'Lexical',
