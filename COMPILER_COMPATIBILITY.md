@@ -863,11 +863,12 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   corpus tests require every `invalid/` program to be rejected with its listed diagnostics. A move
   in the next statement after a statement temporary, a binding in an inner scope that ends before
   the write, and a temporary whose type runs no hook stay accepted by both compilers. A temporary
-  whose cleanup native cannot bound, such as a generic `TD<'a, 'b, T>` whose hook is written for
-  every `T`, leaves its body unchecked (stored loans) rather than Checked.
+  whose cleanup's observed regions a type parameter leaves unknown, such as a generic
+  `AnyHooked<'a, 'b, T>` whose hook is written for every `T`, is taken to observe every loan it
+  holds (`hookedGeneric`).
 - **Evidence:** `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs` (`hookedRead`,
   `hookedMove`, `hookedField`, `hookedArgument`, `hookedOperand`, `hookedCondition`,
-  `hookedStatement`, `hookedNext`, `hookedScoped` and `plainRead`), with native and bootstrap
+  `hookedGeneric`, `hookedStatement`, `hookedNext`, `hookedScoped` and `plainRead`), with native and bootstrap
   compile verdicts on the fix's head. In the native IR for `let s = hooked(&owner, x).left.*`, the
   hook runs before the next statement's move.
 
