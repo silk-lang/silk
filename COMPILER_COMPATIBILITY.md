@@ -868,9 +868,9 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   holds (`hookedGeneric`).
 - **Evidence:** `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs` (`hookedRead`,
   `hookedMove`, `hookedField`, `hookedArgument`, `hookedOperand`, `hookedCondition`,
-  `hookedGeneric`, `hookedStatement`, `hookedNext`, `hookedScoped` and `plainRead`), with native and bootstrap
-  compile verdicts on the fix's head. In the native IR for `let s = hooked(&owner, x).left.*`, the
-  hook runs before the next statement's move.
+  `hookedGeneric`, `hookedStatement`, `hookedNext`, `hookedScoped` and `plainRead`), with native
+  and bootstrap compile verdicts on the fix's head. In the native IR for
+  `let s = hooked(&owner, x).left.*`, the hook runs before the next statement's move.
 
 ### Bootstrap accepts an inferred view a closure gives its requirement row's service
 
