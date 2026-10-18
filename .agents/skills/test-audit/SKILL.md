@@ -13,10 +13,8 @@ for confidence, not deletion count.
 
 Read root and scoped `AGENTS.md` files, `compiler/README.md`, and the current
 `.github/workflows/selfhost.yml` routing. The language definition lives in
-`apps/docs/content/reference/`. Apply the green-field policy: replace superseded
-paths and update callers, fixtures, and docs together. Create OpenSpec artifacts
-only when Julia requests them. Read `COMPILER_COMPATIBILITY.md` before classifying
-a bootstrap/selfhost difference as a defect.
+`reference/`. Apply the green-field policy: replace superseded paths and update
+callers, fixtures, and docs together.
 
 ## Authoring gate
 
@@ -49,11 +47,9 @@ isolated checkout for controls and report missing control evidence explicitly.
   `StaticExecution`; successful typing or residual structure alone is not proof
   of execution.
 - Target-neutral runtime behavior belongs in the shared native corpus, exercised
-  by `compiler/scripts/runSelfhostCorpus.ts` and its `selfhostTrack.ts`. The corpus
-  data in `packages/compiler/test/support/corpus.ts` is shared with the bootstrap's
-  acceptance tests, so a change there runs both compilers' corpus lanes in its own
-  pull request. Do not add per-feature native compilations merely to show that the
-  binary agrees.
+  by `compiler/scripts/runSelfhostCorpus.ts` over the programs in `corpus/`, with
+  `compiler/scripts/selfhost-track.json` naming the cases that must pass. Do not add
+  per-feature native compilations merely to show that the binary agrees.
 - Lowering and ABI claims use retained MIR, LLVM IR, objects, symbols, relocations,
   disassembly, or separately compiled C fixtures. Execute Wasm only for intended
   WebAssembly behavior. Do not claim a deferred C/ABI fixture was checked.
@@ -126,18 +122,16 @@ support in the same change. Preserve useful provider boundaries and unrelated
 work. Inspect imports and `selfhost.yml` filters when moving tests so retained
 cases are still discovered. Do not invent inventories or line-count gates.
 
-Use the existing bootstrap CLI and prerequisites from `selfhost.yml`. From the
-repository root, select an existing root and, when useful, a test-name filter:
+Use a native compiler (an installed `silk`, or N1 as `selfhost.yml` builds it) and the
+prerequisites from `selfhost.yml`. From the repository root, select an existing root:
 
 ```sh
-node packages/cli/dist/bin.js check --manifest-path compiler/silk.toml
-NODE_OPTIONS=--max-old-space-size=6144 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticStaticCases.silk --filter '<test-name>' --no-cache > /tmp/selfhost-tests.log
+silk test compiler/src/semantic/SemanticStaticCases.silk -o /tmp/selfhost-tests --stdlib stdlib --no-cache > /tmp/selfhost-tests.log
 cat /tmp/selfhost-tests.log
 node .github/scripts/check-selfhost-test-times.mjs /tmp/selfhost-tests.log
 ```
 
-Check the test command's exit status before accepting the timing result. Replace
-placeholders with real names; `--root` paths are relative to `compiler/`. Use
+Check the test command's exit status before accepting the timing result. Use
 `--no-cache` so assertions execute. Local timings are diagnostic; Linux CI is the
 budget authority. Honor session restrictions on local builds: use focused Linux
 CI when native compilation is prohibited, and report what was not run.
@@ -145,14 +139,12 @@ CI when native compilation is prohibited, and report what was not run.
 For corpus work, use the runner command in `selfhost.yml` with `SILK_COMPILER` naming the
 built selfhost executable; `SILK_SELFHOST_CORPUS_CASES` selects comma-separated
 existing case names. The runner's TypeScript tests protect runner classification,
-not compiler semantics. Parser comparison work uses the existing
-`compiler/scripts/test-parser.mjs` harness and an already-built executable.
-Do not run the full bootstrap suite or rebuild compilers as handoff ceremony.
+not compiler semantics. Do not rebuild compilers as handoff ceremony.
 
 ## Publish and hand off
 
 Follow existing authorization and repository workflow. Normally reuse the task's
-PR targeting `selfhost`; an explicit direct-push instruction takes precedence.
+PR targeting `main`; an explicit direct-push instruction takes precedence.
 Finish all edits before the final push and use CI on that exact head as the
 completion guard. Report failures and whether they predate the change.
 

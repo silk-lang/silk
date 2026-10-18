@@ -1,20 +1,11 @@
 import { readFile, mkdir, writeFile } from 'node:fs/promises'
 import { createRequire, isBuiltin } from 'node:module'
 import { relative, resolve } from 'node:path'
-const { build } = createRequire(new URL('../../packages/cli/package.json', import.meta.url))(
-  'esbuild',
-)
+const { build } = createRequire(new URL('../../package.json', import.meta.url))('esbuild')
 
-// Usage: bundle-selfhost-verification.mjs [harness|inventory|all]
-//
-// `harness` writes `.scratch/selfhost-verification.mjs`, the formatter and corpus verification
-// that selfhost CI builds from its own checkout. It must not depend on the TypeScript compiler, so
-// it builds from a checkout with installed dependencies and no compiler build. `inventory` writes
-// `.scratch/inventory-verification.mjs`, which captures the TypeScript bootstrap's closure and so
-// needs the built compiler package. `all` (the default) writes both.
-const selection = process.argv[2] ?? 'all'
-if (!['harness', 'inventory', 'all'].includes(selection) || process.argv.length > 3)
-  throw new Error('Usage: bundle-selfhost-verification.mjs [harness|inventory|all]')
+// Writes `.scratch/selfhost-verification.mjs`, the formatter and corpus verification that
+// selfhost CI builds from its own checkout with installed dependencies.
+if (process.argv.length > 2) throw new Error('Usage: bundle-selfhost-verification.mjs')
 
 const repository = resolve('.')
 
@@ -34,8 +25,8 @@ const runner = (imports, dispatch) => `
 
 const harness = runner(
   `
-  import * as Verification from '../../compiler/scripts/FormatterVerification.js'
-  import * as CorpusVerification from '../../compiler/scripts/CorpusVerification.js'
+  import * as Verification from './compiler/scripts/FormatterVerification.js'
+  import * as CorpusVerification from './compiler/scripts/CorpusVerification.js'
   `,
   `
   let mode = args.length === 0 ? 'formatter' : undefined
@@ -54,29 +45,12 @@ const harness = runner(
   `,
 )
 
-const inventory = runner(
-  `
-  import * as InventoryVerification from '../../compiler/scripts/InventoryVerification.js'
-  `,
-  `
-  const verification = Effect.gen(function* () {
-    if (args.length !== 2 || args[0] !== '--mode' || args[1] !== 'inventory')
-      return yield* Effect.fail(new Error('Usage: inventory-verification.mjs --mode inventory'))
-    return yield* InventoryVerification.runConfigured()
-  }).pipe(Effect.tapError((error) => Console.error(error.message)))
-  // Keep inventory stdout a single parseable JSON transport, including red Incomplete.
-  NodeRuntime.runMain(verification.pipe(Effect.provide(NodeServices.layer)), {
-    disableErrorReporting: true,
-  })
-  `,
-)
-
 const bundle = async (contents, sourcefile, outfile) => {
   const result = await build({
-    stdin: { contents, resolveDir: resolve('packages/compiler'), sourcefile, loader: 'js' },
+    stdin: { contents, resolveDir: repository, sourcefile, loader: 'js' },
     outfile,
     bundle: true,
-    nodePaths: [resolve('packages/compiler/node_modules')],
+    nodePaths: [resolve('node_modules')],
     splitting: false,
     platform: 'node',
     format: 'esm',
@@ -116,25 +90,6 @@ const bundle = async (contents, sourcefile, outfile) => {
   }
   await mkdir('.scratch', { recursive: true })
   for (const output of result.outputFiles) await writeFile(output.path, output.contents)
-  return Object.keys(result.metafile.inputs)
 }
 
-if (selection !== 'inventory') {
-  const inputs = await bundle(
-    harness,
-    'selfhost-verification.mjs',
-    '.scratch/selfhost-verification.mjs',
-  )
-  const compiler = inputs.filter(
-    (input) =>
-      input.startsWith('packages/compiler/src/') ||
-      input.startsWith('packages/compiler/dist/') ||
-      input.includes('@silklang/compiler'),
-  )
-  if (compiler.length > 0)
-    throw new Error(
-      `The selfhost harness must not depend on the TypeScript compiler: ${compiler.join(', ')}`,
-    )
-}
-if (selection !== 'harness')
-  await bundle(inventory, 'inventory-verification.mjs', '.scratch/inventory-verification.mjs')
+await bundle(harness, 'selfhost-verification.mjs', '.scratch/selfhost-verification.mjs')

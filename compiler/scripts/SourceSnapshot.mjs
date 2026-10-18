@@ -12,7 +12,7 @@ import * as NativeProcess from './NativeProcess.ts'
 
 export class SourceSnapshotError extends Data.TaggedError('SourceSnapshotError') {}
 const invalid = (message) => Effect.fail(new SourceSnapshotError({ message }))
-export const roots = ['compiler', 'packages/compiler/stdlib']
+export const roots = ['compiler', 'stdlib']
 export const InputSnapshotSchema = Schema.Struct({
   schemaVersion: Schema.Literal(1),
   sourceCommit: Schema.String,
@@ -86,7 +86,7 @@ export const createSnapshot = Effect.fn('SourceSnapshot.createSnapshot')(
     if (
       !entries.some(({ path }) => path === 'compiler/silk.toml') ||
       !entries.some(({ path }) => path === 'compiler/src/main.silk') ||
-      !entries.some(({ path }) => path.startsWith('packages/compiler/stdlib/'))
+      !entries.some(({ path }) => path.startsWith('stdlib/'))
     )
       return yield* invalid('Incomplete compiler/manifest/stdlib closure')
     yield* fs.makeDirectory(directory, { recursive: true })
@@ -121,9 +121,7 @@ export const createSnapshot = Effect.fn('SourceSnapshot.createSnapshot')(
       files,
       normalizedDigest: fileDigest(files),
       compilerDigest: fileDigest(files.filter(({ path }) => path.startsWith('compiler/'))),
-      stdlibDigest: fileDigest(
-        files.filter(({ path }) => path.startsWith('packages/compiler/stdlib/')),
-      ),
+      stdlibDigest: fileDigest(files.filter(({ path }) => path.startsWith('stdlib/'))),
       archive: 'authored-inputs.tar',
       archiveSha256: hash(yield* fs.readFile(join(directory, 'authored-inputs.tar'))),
     }
@@ -193,7 +191,7 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
       fileDigest(ordered) !== receipt.normalizedDigest ||
       fileDigest(ordered.filter(({ path }) => path.startsWith('compiler/'))) !==
         receipt.compilerDigest ||
-      fileDigest(ordered.filter(({ path }) => path.startsWith('packages/compiler/stdlib/'))) !==
+      fileDigest(ordered.filter(({ path }) => path.startsWith('stdlib/'))) !==
         receipt.stdlibDigest ||
       hash(yield* fs.readFile(join(directory, receipt.archive))) !== receipt.archiveSha256
     )
@@ -237,7 +235,7 @@ export const restoreSnapshot = Effect.fn('SourceSnapshot.restoreSnapshot')(
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const [command, directory, revision = 'HEAD'] = process.argv.slice(2)
-  const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
+  const require = createRequire(new URL('../../package.json', import.meta.url))
   /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
   const { NodeServices } = await import(
     pathToFileURL(require.resolve('@effect/platform-node')).href
