@@ -40276,7 +40276,8 @@ effect fn forcedByArgument(
     if containsOrdinal(&lifetimes, ordinal)
       && !run flowsCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*, &wanted, &marker, true, &mut active, span) {
       if let Option<Shared<Type>>.Some {value: evidence} = move bodyExpressionType(nodes, &typed[position - firstSupplied]) {
-        if let Option<SuppliedOperand>.Some {value: supplied} = move run suppliedOperand(&resolver.*, &evidence) {
+        if let Option<SuppliedOperand>.Some {value: supplied} = move run suppliedOperand(&mut resolver.*, &mut owner.*,
+          &mut dependencies.*, &evidence, span) {
           let pattern = run Type.applyBindings(&wanted, Vector<Binding>.asSlice(&open), true)
           if supplied.generic {
             // A generic callable's contract keeps its own binders and quantifies none of the call's
@@ -40284,7 +40285,9 @@ effect fn forcedByArgument(
             // 'static it holds where the parameter names the binder contravariantly or invariantly
             // cannot meet the shorter loan; one at a covariant position coerces to it.
             let mut held = Vector<Shared<Lifetime>>.make()
-            run Type.collectBinderRegions(&supplied.ty, &pattern, fresh, ordinal, &mut held)
+            let mut walked = Vector<DeclarationId>.make()
+            run collectForcedRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, &supplied.ty, &pattern, fresh, ordinal,
+              BinderPosition.Covariant, &supplied.represented, &mut held, &mut walked, span)
             if someRegionStatic(Vector<Shared<Lifetime>>.asSlice(&held)) { return true }
           } else {
             let mut scratch = run copyBindings(Vector<Binding>.asSlice(&open))
@@ -40309,6 +40312,15 @@ effect fn forcedByArgument(
 struct SuppliedOperand {
   ty: Shared<Type>
   generic: bool
+  // For a generic callable, its target's own signature and the bindings it already selected: a
+  // callable parameter of the target is its representation parameter, whose contract the
+  // signature gives (`representedContract`).
+  represented: Option<RepresentedSource>
+}
+
+struct RepresentedSource {
+  signature: Shared<Result<Answer, NoRejection>>
+  selected: Vector<Binding>
 }
 
 // The exact type an operand supplies to its parameter: a plain value's own type, an exact callable
@@ -40319,15 +40331,16 @@ struct SuppliedOperand {
 // (`fn idS2(r: &'static i32, q: &i32)`); a region it leaves to each use (`fn read<'r>(r: &'r i32)`)
 // can take any binding, and a 'static result (`fn constS<T>(x: T) -> &'static i32`) coerces. The other callable
 // recipes are not yet exact, so none of them supplies a type that could force a binder.
-effect fn suppliedOperand(resolver: &Resolver, evidence: &Shared<Type>) -> Option<SuppliedOperand>
-! OutOfMemoryError ? &mut Allocator | &mut Types {
+effect fn suppliedOperand(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  evidence: &Shared<Type>, span: Span) -> Option<SuppliedOperand>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let parameter = Shared<Type>.with<bool>(evidence, fn(value: &Type) -> bool {
     return match &value.* { Type.Parameter {..} => true _ => false }
   })
   if parameter {
-    if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: own} = move rootBodySignature(resolver) {
+    if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: own} = move rootBodySignature(&resolver.*) {
       if let Option<Shared<Type>>.Some {value: contract} = move run representedContract(&own, evidence) {
-        return Option<SuppliedOperand>.some(SuppliedOperand {ty: move contract, generic: false})
+        return Option<SuppliedOperand>.some(SuppliedOperand {ty: move contract, generic: false, represented: Option<RepresentedSource>.none()})
       }
     }
   }
@@ -40337,7 +40350,10 @@ effect fn suppliedOperand(resolver: &Resolver, evidence: &Shared<Type>) -> Optio
   if let Option<Shared<SectionSchema>>.Some {value: generic} = move schema {
     let opened = run CallableSchema.copy(&generic)
     let contract = run Type.applyBindings(&opened.contract, Vector<Binding>.asSlice(&opened.selected), true)
-    return Option<SuppliedOperand>.some(SuppliedOperand {ty: move contract, generic: true})
+    let target = DeclarationId.copyShared(&opened.target)
+    let signature = run sectionOriginalSignature(&mut resolver.*, &mut owner.*, &mut dependencies.*, &target, span)
+    return Option<SuppliedOperand>.some(SuppliedOperand {ty: move contract, generic: true,
+      represented: Option<RepresentedSource>.some(RepresentedSource {signature: move signature, selected: move opened.selected})})
   }
   let exact = Shared<Type>.with<Option<Shared<Type>>>(evidence, fn(value: &Type) -> Option<Shared<Type>> {
     return match &value.* {
@@ -40351,9 +40367,135 @@ effect fn suppliedOperand(resolver: &Resolver, evidence: &Shared<Type>) -> Optio
     }
   })
   if let Option<Shared<Type>>.Some {value} = move exact {
-    return Option<SuppliedOperand>.some(SuppliedOperand {ty: move value, generic: false})
+    return Option<SuppliedOperand>.some(SuppliedOperand {ty: move value, generic: false, represented: Option<RepresentedSource>.none()})
   }
   return Option<SuppliedOperand>.none()
+}
+
+// The variance of a position a binder's region occupies, as `collectForcedRegions` walks it.
+enum BinderPosition {
+  Covariant,
+  Contravariant,
+  Invariant,
+}
+
+fn flippedPosition(position: BinderPosition) -> BinderPosition {
+  return match position {
+    BinderPosition.Covariant => BinderPosition.Contravariant
+    BinderPosition.Contravariant => BinderPosition.Covariant
+    BinderPosition.Invariant => BinderPosition.Invariant
+  }
+}
+
+// Appends the regions `offered` holds wherever `promised` names inference binder `ordinal` of
+// `fresh` at a contravariant or invariant `position`, walking both types in step from a covariant
+// start. A callable's parameters flip the position; an exclusive referent or slice element, and a
+// nominal argument its declaration does not hold covariantly (`covariantParameter`), fix it. Only
+// references, slices, string views, callables and nominal applications of one declaration are
+// walked; any other pair, or a pair whose shapes differ, contributes nothing.
+effect fn collectForcedRegions(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut Vector<Dependency>,
+  offered: &Shared<Type>, promised: &Shared<Type>, fresh: &DeclarationId, ordinal: usize, position: BinderPosition,
+  represented: &Option<RepresentedSource>, regions: &mut Vector<Shared<Lifetime>>, active: &mut Vector<DeclarationId>, span: Span,
+) -> () ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let wanted = run Type.copy(promised)
+  // A callable parameter of a generic callable's target is its representation parameter: read the
+  // contract its signature gives it in its place.
+  if let Option<RepresentedSource>.Some {value: source} = &represented.* {
+    let parameter = Shared<Type>.with<bool>(offered, fn(value: &Type) -> bool { return match &value.* { Type.Parameter {..} => true _ => false } })
+    if parameter {
+      if let Option<Shared<Type>>.Some {value: contract} = move run representedContract(&source.signature, offered) {
+        let applied = run Type.applyBindings(&contract, Vector<Binding>.asSlice(&source.selected), true)
+        return run collectForcedRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, &applied, promised, fresh, ordinal,
+          position, represented, &mut regions.*, &mut active.*, span)
+      }
+    }
+  }
+  let held = run Type.copy(offered)
+  match move wanted {
+    Type.Reference {referent: wantedReferent, access: wantedAccess, lifetime: wantedLifetime} => {
+      if let Type.Reference {referent: heldReferent, access: heldAccess, lifetime: heldLifetime} = move held {
+        run collectForcedRegion(&heldLifetime, &wantedLifetime, fresh, ordinal, position, &mut regions.*)
+        let mut inner = position
+        if wantedAccess == Access.Mutable || heldAccess == Access.Mutable { inner = BinderPosition.Invariant }
+        return run collectForcedRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, &heldReferent, &wantedReferent,
+          fresh, ordinal, inner, represented, &mut regions.*, &mut active.*, span)
+      }
+    }
+    Type.Slice {element: wantedElement, access: wantedAccess, lifetime: wantedLifetime} => {
+      if let Type.Slice {element: heldElement, access: heldAccess, lifetime: heldLifetime} = move held {
+        run collectForcedRegion(&heldLifetime, &wantedLifetime, fresh, ordinal, position, &mut regions.*)
+        let mut inner = position
+        if wantedAccess == Access.Mutable || heldAccess == Access.Mutable { inner = BinderPosition.Invariant }
+        return run collectForcedRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, &heldElement, &wantedElement,
+          fresh, ordinal, inner, represented, &mut regions.*, &mut active.*, span)
+      }
+    }
+    Type.String {lifetime: wantedLifetime} => {
+      if let Type.String {lifetime: heldLifetime} = move held {
+        run collectForcedRegion(&heldLifetime, &wantedLifetime, fresh, ordinal, position, &mut regions.*)
+      }
+    }
+    Type.Callable {parameters: wantedParameters, result: wantedResult, ..} => {
+      if let Type.Callable {parameters: heldParameters, result: heldResult, ..} = move held {
+        let wantedListed = Vector<Shared<Type>>.asSlice(&wantedParameters)
+        let heldListed = Vector<Shared<Type>>.asSlice(&heldParameters)
+        if wantedListed.length != heldListed.length { return () }
+        let mut at = usize.ZERO
+        while at < wantedListed.length {
+          run collectForcedRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, &heldListed[at], &wantedListed[at],
+            fresh, ordinal, flippedPosition(position), represented, &mut regions.*, &mut active.*, span)
+          at = at + usize.ONE
+        }
+        return run collectForcedRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, &heldResult, &wantedResult,
+          fresh, ordinal, position, represented, &mut regions.*, &mut active.*, span)
+      }
+    }
+    Type.Nominal {declaration: wantedDeclaration, arguments: wantedArguments, ..} => {
+      if let Type.Nominal {declaration: heldDeclaration, arguments: heldArguments, ..} = move held {
+        if !DeclarationId.equals(&wantedDeclaration, &heldDeclaration) { return () }
+        let wantedListed = Vector<Argument>.asSlice(&wantedArguments)
+        let heldListed = Vector<Argument>.asSlice(&heldArguments)
+        if wantedListed.length != heldListed.length { return () }
+        let mut at = usize.ZERO
+        while at < wantedListed.length {
+          let mut inner = position
+          if !run covariantParameter(&mut resolver.*, &mut owner.*, &mut dependencies.*, &wantedDeclaration, wantedListed, at,
+            &mut active.*, span) {
+            inner = BinderPosition.Invariant
+          }
+          match &wantedListed[at] {
+            Argument.Lifetime {value: wantedLifetime} => {
+              if let Argument.Lifetime {value: heldLifetime} = &heldListed[at] {
+                run collectForcedRegion(&heldLifetime, &wantedLifetime, fresh, ordinal, inner, &mut regions.*)
+              }
+            }
+            Argument.Type {value: wantedType} => {
+              if let Argument.Type {value: heldType} = &heldListed[at] {
+                run collectForcedRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, &heldType, &wantedType,
+                  fresh, ordinal, inner, represented, &mut regions.*, &mut active.*, span)
+              }
+            }
+            _ => ()
+          }
+          at = at + usize.ONE
+        }
+      }
+    }
+    _ => ()
+  }
+  return ()
+}
+
+// Appends `held` when `wanted` names inference binder `ordinal` of `fresh` at a non-covariant
+// `position`.
+effect fn collectForcedRegion(held: &Shared<Lifetime>, wanted: &Shared<Lifetime>, fresh: &DeclarationId, ordinal: usize,
+  position: BinderPosition, regions: &mut Vector<Shared<Lifetime>>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if position == BinderPosition.Covariant { return () }
+  let mut named = Vector<usize>.make()
+  run Type.collectOwnedLifetime(wanted, fresh, &mut named)
+  if containsOrdinal(&named, ordinal) { run Vector<Shared<Lifetime>>.append(&mut regions.*, Shared<Lifetime>.clone(held)) }
+  return ()
 }
 
 // Whether some region in `regions` is 'static.
