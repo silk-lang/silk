@@ -15,6 +15,14 @@ Use this boundary to implement OsFileSystem. Portable code requires FileSystem.
 Native records, flags, error capture and descriptor-relative traversal are selected source.
 Handles own one close obligation; explicit close reports failure and Drop preserves an earlier
 failure during structured unwinding. Native members are absent on unsupported supplies.
+Atomic publication owns the containing directory and its exclusively claimed staging file until
+cleanup completes. Replace renames the entry itself, including a final symlink, without following
+its referent; create-new uses linkat's atomic absent-name claim followed by staging unlink.
+Both create fresh regular inodes with mode 0666 filtered by umask and filesystem inheritance;
+replacement preserves no old permissions, ownership, ACLs, extended attributes or hard-link identity.
+Synchronized publication uses fsync on the actual staged descriptor before publication and on
+the owned parent afterward. On Darwin and GNU/Linux this is ordinary filesystem synchronization,
+not Darwin F\_FULLFSYNC or a guarantee about hardware caches or physical power-loss recovery.
 
 Import as `NativeFileSystem` with `import silk.native_filesystem { NativeFileSystem }`.
 
@@ -63,17 +71,77 @@ Descriptor-relative filesystem operations with source-owned error and lifetime p
 ### Associated function `NativeFileSystem.openFile`
 
 ```silk
-pub effect<'life0 & 'life1> fn openFile<'life0, 'life1>(root: &'life0 [u8], path: &'life1 [u8], writing: bool, operation: i32) -> FileHandle ! FileError
+pub effect<'env> fn openFile<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], writing: bool, operation: i32) -> FileHandle ! FileError
 ```
 
 Opens and validates a regular file; writes truncate only after successful kind inspection.
+
+<a id="declaration-73696c6b2f6e61746976655f66696c6573797374656d3a3a4e617469766546696c6553797374656d2e63726561746546696c65"></a>
+
+### Associated function `NativeFileSystem.createFile`
+
+```silk
+pub effect<'env> fn createFile<'life0: 'env, 'life1: 'env, 'life2: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], bytes: &'life2 [u8]) -> () ! FileError
+```
+
+Exclusively creates a regular file without inspecting, following or truncating existing entries.
+
+#### Details
+
+Existing files, directories and final symlinks report AlreadyExists. A successful claim uses
+mode 0666 filtered by umask. Readers may see a prefix while writing; a later write or close
+failure leaves the newly created, possibly partial file in place. This does not synchronize.
+
+<a id="declaration-73696c6b2f6e61746976655f66696c6573797374656d3a3a4e617469766546696c6553797374656d2e777269746546696c6541746f6d6963"></a>
+
+### Associated function `NativeFileSystem.writeFileAtomic`
+
+```silk
+pub effect<'env> fn writeFileAtomic<'life0: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], bytes: &'life2 [u8], policy: i32, durability: i32, counter: &'life3 mut u64) -> () ! AtomicWriteError
+```
+
+Stages complete contents in the destination directory, then atomically publishes one entry.
+
+#### Details
+
+Policy 0 uses renameat: an absent name or regular file is allowed, a final symlink is replaced
+without following it, and directories and other inspected entry kinds report WrongType.
+Policy 1 uses linkat without a preflight existence check: any existing entry reports
+AlreadyExists. The staging name is O\_EXCL-claimed, skipping collisions and the destination
+itself; at most 128 candidate names are tried. Unneeded staging entries are unlinked through
+the same owned parent descriptor, never by re-resolving a pathname.
+
+Durability 0 is buffered; 1 fsyncs the actual staged file before closing and publishing, then
+fsyncs the parent after publication and staging cleanup. Unsupported policies or sync support
+are explicit failures. A parent-sync or parent-close failure reports published=true.
+The first failure remains cause; a failed staging unlink is separately retained in
+cleanupError with its exact residual leaf bytes. Close is attempted once, including EINTR.
+
+Newly published inodes use 0666 filtered by umask and normal filesystem inheritance. No old
+metadata is copied and old hard links retain the old inode. Callers must not concurrently
+remove or replace provider-owned staging entries; this is not a hostile-directory sandbox.
+
+<a id="declaration-73696c6b2f6e61746976655f66696c6573797374656d3a3a4e617469766546696c6553797374656d2e73796e634469726563746f7279"></a>
+
+### Associated function `NativeFileSystem.syncDirectory`
+
+```silk
+pub effect<'env> fn syncDirectory<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8]) -> () ! FileError
+```
+
+Synchronizes an owned no-follow directory descriptor and reports sync or one-shot close failure.
+
+#### Details
+
+Darwin and GNU/Linux use ordinary fsync, not a stronger hardware-cache flush. EINVAL,
+ENOTSUP/EOPNOTSUPP and ENOSYS from synchronization report Unsupported with the native code.
 
 <a id="declaration-73696c6b2f6e61746976655f66696c6573797374656d3a3a4e617469766546696c6553797374656d2e6f70656e4469726563746f7279"></a>
 
 ### Associated function `NativeFileSystem.openDirectory`
 
 ```silk
-pub effect<'life0 & 'life1> fn openDirectory<'life0, 'life1>(root: &'life0 [u8], path: &'life1 [u8], operation: i32) -> DirectoryHandle ! FileError
+pub effect<'env> fn openDirectory<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], operation: i32) -> DirectoryHandle ! FileError
 ```
 
 Opens a directory and transfers its descriptor to a stream only after fdopendir succeeds.
@@ -83,7 +151,7 @@ Opens a directory and transfers its descriptor to a stream only after fdopendir 
 ### Associated function `NativeFileSystem.inspect`
 
 ```silk
-pub effect<'life0 & 'life1 & 'life2 & 'life3> fn inspect<'life0, 'life1, 'life2, 'life3>(root: &'life0 [u8], path: &'life1 [u8], outputKind: &'life2 mut i32, length: &'life3 mut usize, operation: i32) -> () ! FileError
+pub effect<'env> fn inspect<'life0: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], outputKind: &'life2 mut i32, length: &'life3 mut usize, operation: i32) -> () ! FileError
 ```
 
 Inspects a no-follow child and returns regular-file or directory metadata.
@@ -93,7 +161,7 @@ Inspects a no-follow child and returns regular-file or directory metadata.
 ### Associated function `NativeFileSystem.command`
 
 ```silk
-pub effect<'life0 & 'life1> fn command<'life0, 'life1>(root: &'life0 [u8], path: &'life1 [u8], command: i32, operation: i32) -> () ! FileError
+pub effect<'env> fn command<'life0: 'env, 'life1: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], command: i32, operation: i32) -> () ! FileError
 ```
 
 Creates or removes one normalized child, rejecting replacement through symlinks.
@@ -103,7 +171,7 @@ Creates or removes one normalized child, rejecting replacement through symlinks.
 ### Associated function `NativeFileSystem.readFile`
 
 ```silk
-pub effect<'life0 & 'life1> fn readFile<'life0, 'life1>(handle: &'life0 mut silk/native_filesystem.FileHandle, output: &'life1 mut [u8], operation: i32) -> usize ! FileError
+pub effect<'env> fn readFile<'life0: 'env, 'life1: 'env, 'env>(handle: &'life0 mut silk/native_filesystem.FileHandle, output: &'life1 mut [u8], operation: i32) -> usize ! FileError
 ```
 
 Reads one checked prefix, retrying EINTR and leaving the remaining initialized tail unchanged.
@@ -113,7 +181,7 @@ Reads one checked prefix, retrying EINTR and leaving the remaining initialized t
 ### Associated function `NativeFileSystem.writeFile`
 
 ```silk
-pub effect<'life0 & 'life1> fn writeFile<'life0, 'life1>(handle: &'life0 mut silk/native_filesystem.FileHandle, input: &'life1 [u8], operation: i32) -> () ! FileError
+pub effect<'env> fn writeFile<'life0: 'env, 'life1: 'env, 'env>(handle: &'life0 mut silk/native_filesystem.FileHandle, input: &'life1 [u8], operation: i32) -> () ! FileError
 ```
 
 Completes initialized bytes, advancing after positive counts and preserving failure prefixes.
@@ -123,7 +191,7 @@ Completes initialized bytes, advancing after positive counts and preserving fail
 ### Associated function `NativeFileSystem.next`
 
 ```silk
-pub effect<'life0 & 'life1 & 'life2 & 'life3 & 'life4> fn next<'life0, 'life1, 'life2, 'life3, 'life4>(handle: &'life0 mut silk/native_filesystem.DirectoryHandle, output: &'life1 mut [u8], count: &'life2 mut usize, required: &'life3 mut usize, outputKind: &'life4 mut i32, operation: i32) -> bool ! FileError
+pub effect<'env> fn next<'life0: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'env>(handle: &'life0 mut silk/native_filesystem.DirectoryHandle, output: &'life1 mut [u8], count: &'life2 mut usize, required: &'life3 mut usize, outputKind: &'life4 mut i32, operation: i32) -> bool ! FileError
 ```
 
 Copies the next owned byte name, retaining it when output capacity is insufficient.
@@ -137,7 +205,7 @@ False reports required capacity without advancing; true with zero count is latch
 ### Associated function `NativeFileSystem.createUnique`
 
 ```silk
-pub effect<'life0 & 'life1 & 'life2 & 'life3 & 'life4 & 'life5 & 'life6> fn createUnique<'life0, 'life1, 'life2, 'life3, 'life4, 'life5, 'life6>(root: &'life0 [u8], path: &'life1 [u8], prefix: &'life2 [u8], counter: &'life3 mut u64, output: &'life4 mut [u8], count: &'life5 mut usize, required: &'life6 mut usize, operation: i32) -> bool ! FileError
+pub effect<'env> fn createUnique<'life0: 'env, 'life1: 'env, 'life2: 'env, 'life3: 'env, 'life4: 'env, 'life5: 'env, 'life6: 'env, 'env>(root: &'life0 [u8], path: &'life1 [u8], prefix: &'life2 [u8], counter: &'life3 mut u64, output: &'life4 mut [u8], count: &'life5 mut usize, required: &'life6 mut usize, operation: i32) -> bool ! FileError
 ```
 
 Exclusively creates one predictable counter name, retrying at most 128 collisions.
