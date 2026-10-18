@@ -83,6 +83,32 @@ Each entry records:
 
 ## Entries
 
+### Package path dependencies are native only
+
+- **Status:** approved by Julia on 2026-10-17 (package design); implemented and locally verified
+  in the native compiler on 2026-10-17.
+- **Rule:** a manifest's `[dependencies]` table names path dependencies; the dependency name is the
+  first segment of the import paths that reach that package's modules (PACKAGE-001 to
+  PACKAGE-005 in the [modules reference](apps/docs/content/reference/modules-names-and-visibility.md#packages)).
+- **Compilers:** the native compiler loads every dependency's manifest, checks the PACKAGE rules
+  and resolves dependency imports into the dependency's own package identity. The TypeScript
+  bootstrap stays a single-package compiler: it ignores `[dependencies]`, so an import through a
+  dependency name fails there as a missing module. This divergence is intended; the bootstrap is
+  frozen.
+- **Source migration:** none; no existing program uses `[dependencies]`. Programs that the
+  bootstrap must build, such as the standard library and the native compiler's own sources, do not
+  use dependencies.
+- **Diagnostics and limits:** an invalid dependency or `exports` entry is reported as
+  `silk: invalid <detail>`, where the detail names the dependency or entry and the reason. Only
+  modules a dependency lists in `[package].exports` are importable from other packages; any other
+  reports `MOD0003` (PACKAGE-006), which the bootstrap never reports. Workspaces (PACKAGE-007) are
+  not implemented yet. The standard library still shares the root package identity under its
+  `silk/` paths and lists no exports.
+- **Evidence:** `dependencyNamesSelectAnotherPackagesModules` in SemanticConformanceCases,
+  `pathDependenciesLoadTheirOwnPackages` in SemanticLoweringCases, and the path-dependency run,
+  unexported-module refusal and shadowing refusal in `compiler/scripts/test-native-build.ts`.
+- **Open questions:** none.
+
 ### Native integer C variadic imports
 
 - **Status:** implemented and locally verified on 2026-10-07; Linux integration remains pending.
@@ -347,6 +373,39 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   outside storage. Whole nominal values
   still refuse runtime embedding, and arrays of nominal values retain their static construction refusal.
   The five required corpus programs and all eleven authored examples pass.
+
+### Bootstrap accepts a reflected borrow of another parameter at the first's region
+
+- **Status:** recorded on 2026-10-17 from the independent review of #1896. Bootstrap divergence.
+- **Rule:** LIFE-002. `borrowField(owner, field)` returns a view at `owner`'s region. Storing it
+  in a local typed by another parameter's region and returning it there needs that relation.
+- **Compilers:** in `fn pick<'a, 'b>(x: &'a Box, y: &'b Box) -> &'a i32 { let mut r = &x.first
+static for field in Intrinsic.reflectFields<Box>() { r = Reflect.borrowField<Box, i32>(y, field) }
+return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
+  accepts the program whether `pick` is called with one owner for both parameters or with two
+  distinct owners. The bootstrap also accepts a caller that passes a shorter-lived second owner
+  (`fn apart<'p>(v: &'p Box) -> &'p i32 { let w = Box { first: 1, second: 2 }  return pick(v, &w) }`),
+  which returns a view of a dead local.
+- **Source migration:** none. Declare `'b: 'a` when the result may come from `y`.
+- **Evidence:** `BorrowFieldCases::selectedBodiesProveOnlyTheirOwnSuppliedRegions`
+  (`reflectedOther`) pins the native rejection's code and span.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Bootstrap binds a receiver call's written list to its owner's parameters
+
+- **Status:** recorded on 2026-10-17 while lent receivers moved to open owners. Bootstrap divergence.
+- **Rule:** GEN-008. A generic type's parameters are written on the type and a member's own on the
+  member. In `value.member<B>(...)` the receiver supplies the owner's arguments and `B` is the
+  member's own explicit prefix under GEN-003.
+- **Compilers:** with `impl<'o, T> C<'o, T> { fn conv<U>(self: &'o Self, u: U) -> U }` and a `c`
+  of type `C<'a, u64>`, native accepts `c.conv<u8>(3)` and rejects `c.conv<u8>(true)` with SEM0012.
+  The bootstrap binds `u8` to `T` and rejects both with SEM0012 at the receiver. Both reject the
+  qualified `C.conv<u8>(&c, 3)` with SEM0221.
+- **Source migration:** none for native. For the bootstrap, omit the list and let the argument
+  infer `U`.
+- **Evidence:** `SemanticCaptureCases::lentReceiversMeetTheirExplicitLoan` (`writtenList`,
+  `writtenListMismatch`, `writtenOwnerSlot` and `writtenOwnerSlotMismatch`) pins the native binding.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
 
 ### Checked local control in native static functions
 
@@ -735,6 +794,35 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   last-use release, and an unrelated static-result control). Rejected programs are checked through
   compile-time verdicts and Cases only.
 
+### Bootstrap does not hold calls to their signatures' implied bounds
+
+- **Status:** recorded on 2026-10-17 from the regions census (residue). Native holds the call; the
+  bootstrap gap remains.
+- **Rule:** LIFE-002: a parameter or result type's well-formedness implies bounds the callee's body
+  assumes, so a call instantiating the signature must prove them like declared bounds:
+  `fn viaPair<'a, 'b>(x: &'a Key, p: Pair<'b, 'a>) -> &'b Key { return x }` with
+  `struct Pair<'b, 'a: 'b>` returns its `&'a Key` as `&'b Key` on `Pair`'s `'a: 'b` alone, so the
+  result keeps the key's loan.
+- **Compilers:** the bootstrap accepts `let r = viaPair(&k, Pair {short: &v, long: &w})`, then a
+  write to `k` and a read of `r`; with a key that has `Drop` this reads freed storage. Native holds
+  every call to the bounds its callee's parameter and result types imply: each nominal's declared
+  region bounds and each view's referent bound (`impliedSignatureBounds`). It covers direct and
+  member calls, operator calls, invoked callable values, staged schemas and named sections
+  (`holdImpliedBounds`). A call proves them under the caller's premises and the bounds its own
+  signature implies. A relation between the caller's own loans is retained for the borrow checker,
+  which is how the result keeps the key's loan. An implied bound typing neither proves nor retains
+  leaves the body unchecked (`UnprovedImpliedBound`) and does not refuse the call, so no program the
+  declared bounds admit is newly rejected. Bounds on a callable's invocation regions are owed at its
+  invocation, and so are those on a section's unsupplied binders.
+- **Source migration:** none. The compiler and standard library have no such caller.
+- **Evidence:** `SemanticCaptureCases::impliedSignatureBoundsHoldAtTheCall`. Direct, nested-view,
+  drop-carrying, qualified member, receiver member, callable-value and section calls are never
+  Checked. An Effect value run under such a bound keeps the key's loan, so a write while its result
+  lives is rejected (OWN0011 at the write, OWN0019 at the read); the bootstrap accepts it. Clean
+  calls, a write after the result's last use and callers that forward their own parameters stay
+  Checked. An operator implementation with this shape is not yet accepted
+  (SEM0135), so the operator path has no Case.
+
 ### Bootstrap accepts a loan stored into a local holder after its storage ends
 
 - **Status:** recorded on 2026-10-17 from the independent review of #1886. #1886 lets native region
@@ -762,6 +850,102 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   compilers reject are pinned in `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs`
   (`scopeEnd`, `loopStore`, `loopCarried`, `escape`, `projection`).
 
+### Bootstrap runs a temporary's Drop hook after its loans end
+
+- **Status:** recorded on 2026-10-17 from the independent reviews of #1904 and #1912, with the
+  native fix that holds a temporary's loans until its cleanup. The bootstrap gap remains until its
+  loan pass treats a temporary's cleanup as a use of the loans its hook can observe.
+- **Rule:** BORROW-006 and DROP-002. A temporary's cleanup runs at the end of its statement, or,
+  when the initializer of a binding that can hold a view retains it, when that binding's scope
+  ends. A Drop hook that runs at that cleanup observes every loan its value holds, so those loans
+  stay live until the cleanup.
+- **Compilers:** with `struct Hooked<'a, 'b> { left: &'a i32  right: &'b i32 }`, whose Drop hook
+  reads `self.left`, and `fn hooked<'a, 'b>(left: &'a i32, right: &'b i32) -> Hooked<'a, 'b>`:
+  - `let r = hooked(&owner, x).right  let s = r.*  owner = 1` keeps the `Hooked` temporary until
+    `r`'s scope ends, and the hook then reads `owner` after the write. So does `spend(move owner)`
+    in place of the write, where the hook reads a moved-from place, a hook on a field's type
+    (`Guarded { hooked: Hooked<'a, 'b>  right: &'b i32 }`), and the projection passed through a
+    call (`viewOf(hooked(&owner, x).right)`).
+  - Within one statement, `pairSum(hooked(&owner, x).left.*, spend(move owner))` and
+    `if hooked(&owner, x).right.* > spend(move owner) { … }` move `owner` before the temporary's
+    cleanup at the statement's end. So do the same move in a binary operand, an assignment, a
+    `return`, a struct literal, a short-circuit operand, a pipe or a `run`.
+
+  The bootstrap compiles each of these. Native reports OWN0011 at the write or move, or OWN0010
+  where the later operand borrows `owner` exclusively.
+
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects. It reads a projection out of a temporary whose
+  cleanup can observe a loan through the temporary's hidden owner, which holds that loan until the
+  cleanup in the scope lowering drops it in. These are not corpus programs, because the bootstrap's
+  corpus tests require every `invalid/` program to be rejected with its listed diagnostics. A move
+  in the next statement after a statement temporary, a binding in an inner scope that ends before
+  the write, and a temporary whose type runs no hook stay accepted by both compilers. A temporary
+  whose cleanup's observed regions a type parameter leaves unknown, such as a generic
+  `AnyHooked<'a, 'b, T>` whose hook is written for every `T`, is taken to observe every loan it
+  holds (`hookedGeneric`).
+- **Evidence:** `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs` (`hookedRead`,
+  `hookedMove`, `hookedField`, `hookedArgument`, `hookedOperand`, `hookedCondition`,
+  `hookedGeneric`, `hookedStatement`, `hookedNext`, `hookedScoped` and `plainRead`), with native
+  and bootstrap compile verdicts on the fix's head. In the native IR for
+  `let s = hooked(&owner, x).left.*`, the hook runs before the next statement's move.
+
+### Bootstrap accepts an inferred view a closure gives its requirement row's service
+
+- **Status:** recorded on 2026-10-17 with the closure-row regression Cases. Native rejects; the
+  bootstrap gap remains until its loan pass keeps a loan a closure's row service receives.
+- **Rule:** BORROW-008 and LIFE-002. Running `Keeper<'b>.put(v: &'b Token)` stores `v` in the
+  caller's provider, so the loan `v` carries must stay valid for `'b`, past the body. A later write
+  to its place conflicts with it (OWN0011).
+- **Compilers:** with `let view = &src.t` (its type inferred) captured by
+  `effect fn() -> () ? &mut Keeper<'b> { run keepEffect<'b>(view) }`, run before `src.t` is
+  written, the bootstrap compiles the body with no diagnostic. It rejects the same run made directly
+  in the body, and the closure form whose view is typed at `'a` (written, or through
+  `Holder<'a> { view: &src.t }`), with OWN0011 at the write. Native rejects the inferred closure
+  form at typing, with SEM0012 at `keepEffect<'b>(view)`: the capture's inferred region does not
+  meet `'b`. A plain closure returning `keepEffect<'b>(view)` behaves the same in both compilers.
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native never accepts the inferred form. It is not a corpus program,
+  because the bootstrap's corpus tests require every `invalid/` program to be rejected with its
+  listed diagnostics.
+- **Evidence:** compile-only verdicts on main 1329f4c2: the frozen bootstrap's `check` succeeds;
+  native `build` reports SEM0012 at the call. The typed forms, which both compilers reject, are
+  `SemanticCaptureCases::universalLoansOutliveTheBody` (`rowRunsUniversal`, `rowReturnsUniversal`)
+  and `invalid/effect-closure-row-universal-view-write`.
+
+### Bootstrap ignores an instantiation's Drop hook in a generic body
+
+- **Status:** recorded on 2026-10-18 from the independent review of #1912, with the native fix
+  that treats a Drop impl written for some instantiation as possible in a generic body. The
+  bootstrap gap remains until its loan and move checks consider every Drop impl of a generic
+  value's declaration.
+- **Rule:** DROP-002, BORROW-006 and OWN-004. A value's Drop hook runs at its cleanup in every
+  instance, so a generic body's value whose type may instantiate to a hooked type keeps the loans
+  the hook can observe until its cleanup, and no part may be moved out of it.
+- **Compilers:** with `struct Slotted<'a, T> { target: &'a D  extra: T }` and a Drop impl written
+  only for `Slotted<'a, i32>`, whose hook reads `self.target`:
+  - `fn specialized<T>(extra: T)` binds `Slotted {target: &owner, extra: move extra}` and then
+    moves `owner`. The `i32` instance's hook reads the moved-from `owner`. The same holds with
+    `Boxed<T>` against an impl for `Slotted<'a, Boxed<i32>>`, inside a field of another struct, and
+    in a union payload.
+  - With an impl for `Slotted<'a, D>` whose hook reads `self.extra`, `move held.extra` in a generic
+    body leaves the `D` instance's hook reading a moved-out field.
+
+  The bootstrap compiles each of these. Native reports OWN0011 at the move of `owner`, or OWN0002
+  at the partial move, as it does for the non-generic forms.
+
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects. A generic value whose declaration has any Drop impl
+  is taken to run a hook, even when no impl matches the open type. A generic value whose
+  declaration has no Drop impl keeps no loan for cleanup. A body's own type parameter retains no
+  region the cleanup could observe, because a value it stands for is received, not created in the
+  body. These are not corpus programs, because the bootstrap's corpus tests require every
+  `invalid/` program to be rejected with its listed diagnostics.
+- **Evidence:** `SemanticCaptureCases::temporaryCleanupFollowsLowering` (`specialized`,
+  `specializedNested`, `specializedField`, `specializedOption`, `specializedProjected`,
+  `specializedWritten`, `specializedMoveOut`, `specializedStatement` and `bare`),
+  with native and bootstrap compile verdicts on the fix's head.
+
 ### Native holds every loan of a literal in each of its field projections
 
 - **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
@@ -786,23 +970,67 @@ TrailerPolicy<'names> }`, is chosen by the call's use (LIFE-003): no operand con
   `SemanticLoweringCases::useAfterDropReportsAMisplacedTemporaryDrop` (`e3`) uses the named-local
   spelling.
 
-### Native ends a loan an explicit call lifetime argument types at its last use
+### Native leaves a few written lifetime arguments unpinned
 
-- **Status:** recorded on 2026-10-17 with the written-binding fix. It is retired when native keeps
-  live through the body a loan whose region an explicit call lifetime argument names universal.
-- **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a loan
-  typed at one stays valid, and its place borrowed, for the rest of the body.
-- **Compilers:** the bootstrap rejects `let view = pass<'a>(&src.t)` and `pass<'a>(&src.t).value`
-  with OWN0011 at a later write to `src.t`, where `'a` is a lifetime parameter of the body. Native
-  ends that loan at its last use and accepts the write. A written binding type,
-  `let view: &'a Token = …`, is held live through the body by both compilers. Native records which
-  local types are written; it does not record which call lifetime arguments are.
+- **Status:** recorded on 2026-10-17 with the written-binding fix (#1888), narrowed with the
+  written call and literal fix (#1897) and with the written-operand fix (#1899). It is retired when
+  native pins a borrow at every written region the bootstrap does.
+- **Rule:** LIFE-001. A lifetime parameter names a region chosen before the body runs, so a borrow
+  a written lifetime argument types at one stays valid, and its place borrowed, for the rest of the
+  body.
+- **Compilers:** in each form below, `'a` is a lifetime parameter of the body and the statement is
+  followed by a write to `src.t`. The bootstrap reports OWN0011 at the write in each.
+  - `let o = Outer<'a> {inner: Holder {view: &src.t}}`: native leaves the body unchecked, as a
+    regions gap. The nested `Holder` literal writes no arguments, so its field types are its own
+    binders rather than the outer literal's written `'a`.
+  - `lenH<'a>(HoldT {view: &src.t})` with `fn lenH<'p, T>(h: HoldT<'p, T>)` and
+    `struct HoldT<'h, T> { view: &'h T }`: native reports the body Checked.
+  - `takeP<'a>(PairWith {view: &src.t, extra: 5})` with `fn takeP<'p, T>(p: PairWith<'p, T>)` and
+    `struct PairWith<'h, T> { view: &'h Token  extra: T }`: native reports the body Checked.
+  - `lenB<'a>(&src.u, &src.t)` with `fn lenB<'p, T: 'p>(v: &'p Token, extra: T)`: native reports
+    the body Checked.
+  - `lenTwoU<'a>(Two {a: &src.t, b: 5})` with `fn lenTwoU<'p, T, U>(v: Two<&'p T, U>)`: native
+    reports the body Checked. So does a parameter `Two<&'p T, Wrap<T>>` or `Two<&'p T, [T; 1]>`,
+    and an Effect call taking `Two<&'p T, U>` run at once. An inferred type beneath the view does
+    not pin the borrow while another inferred type in the same parameter sits outside every view.
+  - `Lent<Token>.peekLP<'a>(&src.u, &src.t)`, whose qualifier omits the owner's lifetime argument
+    while the call writes the method's own `'a`: native reports the body Checked. An owner whose
+    arguments the qualifier does not all write is inferred, so its bindings are neutralized.
+
+  Native types a call's argument at its parameter type under the arguments the source wrote, and
+  neutralizes an inferred type argument to `()` only where the parameter type names it beneath a
+  reference or slice, whose well-formedness bounds it by the view's region. Anywhere else,
+  including as a nominal type's argument and under a `T: 'p` bound, it becomes `&'static ()`, so
+  the parameter type no longer names only universal regions and the borrow is not pinned. The
+  choice is made per parameter, so one inferred type outside a view leaves every view in that
+  parameter unpinned. Every other written form keeps the borrow live through the body natively as
+  well: a binding type, a call or method or constructor argument, including one whose inferred type
+  sits beneath a view when no other inferred type in that parameter sits outside one, an Effect
+  call run at once, a record literal field and a reborrow through a body-local reference.
+
 - **Source migration:** none.
-- **Diagnostics and limits:** native under-rejects only where nothing stores or returns the loan,
-  so no reference outlives its place: a stored or returned loan already escapes the body.
-- **Evidence:** native compile verdicts for both forms on main 74bc91cf; the written form is
-  `SemanticCaptureCases::universalLoansOutliveTheBody` (`o2Written`, `o2Reborrow`) and
-  `invalid/written-universal-view-write`.
+- **Diagnostics and limits:** native reports these call forms Checked, and leaves the nested
+  literal as a regions gap, while the bootstrap rejects each with OWN0011.
+- **Evidence:** native and bootstrap compile verdicts on the written-operand fix's head; the
+  covered forms are `SemanticCaptureCases::universalLoansOutliveTheBody` and the corpus programs
+  `invalid/written-universal-view-write`, `invalid/written-call-lifetime-argument` and
+  `invalid/written-literal-lifetime-argument`.
+
+### Native rejects a loop-carried write over a borrow kept in caller storage
+
+- **Status:** recorded on 2026-10-17 with the written call and literal fix (#1897). It is retired
+  when the bootstrap rejects the loop-carried form.
+- **Rule:** LIFE-001 and BORROW-001. A borrow kept where a universal region reaches stays valid for
+  it, so a later write to its place conflicts, including a write reached on a later iteration.
+- **Compilers:** in a loop that first writes `src.t` and then keeps `pass<'a>(&src.t)` in a
+  `&mut Holder<'b>` parameter through `keep<'b>`, the write on the second iteration mutates `src.t`
+  while the caller's holder still holds the first iteration's view. Native reports OWN0011 at that
+  write. The bootstrap accepts the loop, though it rejects the straight-line form that writes after
+  the keep.
+- **Source migration:** none; the program is invalid.
+- **Diagnostics and limits:** the bootstrap under-rejects only the loop-carried order.
+- **Evidence:** the #1897 review's program `p20_loop_write_before`, against its straight-line
+  companion `p19`.
 
 ### Selfhost guard ownership checks provisional bindings, not ordinary locals
 
