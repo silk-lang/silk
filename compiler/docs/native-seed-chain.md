@@ -8,11 +8,11 @@ recovers from an earlier published native seed.
 
 ## Generations
 
-| Name | Built by                   | From                                                       |
-| ---- | -------------------------- | ---------------------------------------------------------- |
-| seed | an earlier `main` push run | the pin                                                    |
-| N1   | the seed                   | this checkout's `compiler/` and `packages/compiler/stdlib` |
-| N2   | N1                         | the same inputs                                            |
+| Name | Built by                         | From                                                       |
+| ---- | -------------------------------- | ---------------------------------------------------------- |
+| seed | an earlier `main` publishing run | the pin                                                    |
+| N1   | the seed                         | this checkout's `compiler/` and `packages/compiler/stdlib` |
+| N2   | N1                               | the same inputs                                            |
 
 Every generation compiles the exact committed inputs exported by `SourceSnapshot.mjs` from Git
 objects, never the working tree. Each compiler build passes `--stdlib` pointing at the snapshot's
@@ -38,7 +38,7 @@ requesting a seed.
       "asset": "silk-compiler-x86_64-unknown-linux-gnu",
       "sha256": "<64 hex>",
       "sourceCommit": "<40 hex>",
-      "runId": "<publishing main push run>"
+      "runId": "<publishing main run>"
     }
   }
 }
@@ -91,8 +91,8 @@ Why releases:
   artifact silently stops working when the branch is quiet for a week.
 - A release asset is durable, addressable by tag and name, readable with the default
   `contents: read` token, and needs no extra service, registry or secret.
-- Only one job needs write access: the publisher, on `main` pushes, with job-scoped
-  `contents: write`. Pull requests never publish.
+- Only one job needs write access: the publisher, on manual `main` dispatches with `publish` set,
+  with job-scoped `contents: write`. Pull requests and pushes never publish.
 - A committed binary would grow the repository on every advance. The pin stays a few lines.
 
 The SHA-256 in the pin is the trust anchor; the release only stores bytes. A replaced asset fails
@@ -168,8 +168,10 @@ or unverifiable artifact, the full gate runs.
 
 ## Publication
 
-A successful `main` push run (every job above green) runs **Publish native seed candidate**. It
-creates the prerelease `native-seed-<commit>` targeting that commit with:
+Main pushes publish nothing. To publish, run **Selfhost Silk** by hand on `main` (Actions → Selfhost
+Silk → Run workflow, or `gh workflow run selfhost.yml --ref main -f publish=true`) with **publish**
+set. When every job above is green, **Publish native seed candidate** creates the prerelease
+`native-seed-<commit>` targeting `main`'s head with:
 
 - `silk-compiler-x86_64-unknown-linux-gnu`, `silk-compiler-aarch64-unknown-linux-gnu`, and
   `silk-compiler-aarch64-apple-darwin`: each target's native N2;
@@ -180,23 +182,23 @@ creates the prerelease `native-seed-<commit>` targeting that commit with:
 
 Publication waits for the existing Linux gates, both ARM64 chains and corpora, and bootstrap DDC.
 Before the first ARM64 pins, this establishes the initial candidates through native cross-emission,
-without building a compiler with TypeScript. After a green post-merge push publishes the candidates,
-a reviewed PR copies the generated pin; this infrastructure PR advances no pin.
+without building a compiler with TypeScript. After a green publishing run publishes the candidates,
+a reviewed PR copies the generated pin.
 
-A rerun of the same push run is idempotent: an existing release with byte-identical compiler assets
-and pin, and matching receipt compiler/IR identities, passes; differing identities fail. Receipt
-timings and runner paths may vary, but published receipts are never replaced. Publication never
-edits the pin. The pin advances only by a reviewed commit that replaces `compiler/native-seed.json`
+A rerun of the same publishing run is idempotent: an existing release with byte-identical compiler
+assets and pin, and matching receipt compiler/IR identities, passes; differing identities fail.
+Receipt timings and runner paths may vary, but published receipts are never replaced. Publication
+never edits the pin. The pin advances only by a reviewed commit that replaces `compiler/native-seed.json`
 with a candidate's `native-seed.json`.
 
-To verify publication after a push run: open the run's **Publish native seed candidate** job, then
-the release `native-seed-<commit>`; `sha256sum` of the downloaded compiler must equal the `sha256`
+To verify publication after a publishing run: open the run's **Publish native seed candidate** job,
+then the release `native-seed-<commit>`; `sha256sum` of the downloaded compiler must equal the `sha256`
 in its target entry in `native-seed.json` and `output.sha256` of N2 in
 `chain-receipt-<target>.json`.
 
 ### Retention
 
-One prerelease per green push accumulates. **A release that any `main` pin has ever named is
+One prerelease per publishing run accumulates. **A release that any `main` pin has ever named is
 never deleted**: [hop replay](#hop-replay) rebuilds each pinned seed from the one before it, so the
 chain back to the first seed needs every hop. The rule also keeps the 20 newest candidates **per
 target asset**. Since a release holds multiple targets, retention keeps the union of those target
@@ -226,7 +228,7 @@ For a change that makes the compiler's own source use a feature the seed does no
 
 1. Land the compiler support for the feature without using it in `compiler/` or in the stdlib.
    The current seed compiles that commit.
-2. After its `main` push run publishes a candidate, land a PR that advances the pin to it.
+2. After a `main` publishing run publishes a candidate, land a PR that advances the pin to it.
 3. Land the change that uses the feature.
 
 The author of the feature runs these steps. Stdlib changes follow the same rule: the pinned seed
@@ -270,7 +272,7 @@ fault and still compiles the checkout, and restore that target's release coordin
 version-2 pin. Preserve the other targets. Older releases published before the per-target schema
 have immutable single-seed metadata; copy their x86-64 coordinates into the current target entry
 rather than installing their old schema. The rest of the gate is unchanged: N1 is built by that seed
-from this checkout, so the published N2 carries every fix since. After the push run publishes a
+from this checkout, so the published N2 carries every fix since. After a publishing run publishes a
 candidate, advance the pin to it.
 
 An older seed knows fewer language features. If the checkout already uses a feature that no
