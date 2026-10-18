@@ -42,7 +42,8 @@ quarantined by macOS; files fetched by the script are not, so Gatekeeper lets th
 - [`compiler/`](compiler) — the native compiler, written in Silk, and the tooling CI runs around
   it in [`compiler/scripts/`](compiler/scripts).
 - [`stdlib/`](stdlib) — the standard library.
-- [`reference/`](reference/index.md) — the prescriptive language reference.
+- [`reference/`](reference/index.md) — the prescriptive language reference, and the generated
+  [standard-library reference](reference/stdlib/index.md).
 - [`corpus/`](corpus) — the shared native acceptance corpus.
 - [`bootstrap/`](bootstrap) — the frozen TypeScript compiler, kept only to build the first native
   compiler from source.

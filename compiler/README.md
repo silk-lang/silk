@@ -520,13 +520,9 @@ The native compiler selects this host automatically. Install Node 24, the reposi
 version, GitHub CLI, `jq`, `build-essential`, and LLVM 22.1.8 for Linux ARM64. Put the complete
 LLVM `bin` directory on `PATH`.
 
-Start with the ARM64 entry in `native-seed.json` once a reviewed pin exists, following
-Install a verified native seed with
-`target=aarch64-unknown-linux-gnu`. The script verifies SHA-256 before creating the executable;
-no TypeScript compiler or CPU emulation is needed. The initial per-target schema change preserves
-the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first green push publishes
-ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
-verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
+Download the seed that `native-seed.json` pins for your host from its release and check the
+asset's SHA-256 against the pin before running it; no TypeScript compiler or CPU emulation is
+needed.
 
 A single-file `build` takes `--clang <path>` as the TypeScript `build-exe` does; it wins over
 `SILK_CLANG`. A value with a `/` is a path against the working directory and a bare name is
@@ -548,6 +544,74 @@ Use the existing source-written `*Cases.silk` roots and their filters for focuse
 ARM64 Linux CI on `ubuntu-24.04-arm` checks N1/N2 compiler IR identity and the native corpus;
 macOS arm64 has the same seed verification and native chain on `macos-15`. The pin and its
 provenance remain governed by the native seed chain.
+
+### Native documentation
+
+Documentation generation is implemented in `src/documentation/`.
+Use a native compiler built from this checkout:
+
+```sh
+export SILK_COMPILER=/absolute/path/to/silk
+"$SILK_COMPILER" doc --manifest-path silk.toml --output build/documentation.json \
+  --stdlib-root "$PWD/stdlib"
+"$SILK_COMPILER" doctest --input build/documentation.json \
+  --stdlib-root "$PWD/stdlib"
+```
+
+`doc` selects the project's profile and public declarations; `--include-private` also publishes
+private declarations. JSON contains owned flat items, authored signatures, normalized Markdown,
+resolved symbol links, and original source positions. Its versioned experimental shape is not a
+compatibility contract. Ordinary documentation extraction does not typecheck function bodies.
+`doctest` checks complete modules from active Silk fences, reports ignored examples separately,
+and rejects unknown fence attributes even when `ignore` is also present.
+Standard-library mode defaults to the compiler's host target; `--target` overrides it. The
+standard-library examples include hosted OS APIs, so the complete set is not portable to Wasm.
+Project JSON supplies its recorded target unless explicitly overridden.
+
+Symbol links first use the attached declaration's owner and module-level bindings. Bare member
+names then prefer a unique local inherent member over fields or interface/service operations:
+`display` in `silk/format` links to `Format.display`, not `Display.display`. Distinct inherent
+members remain ambiguous. Qualified links such as `Display.display` and links inside that
+interface's own documentation still select its contract operation.
+Reference pages anchor each declaration at its owner path within the module, such as
+`AesGcmError.InvalidTagLength` or `impl.drop`; a repeated path gets `-2`, `-3` in source order.
+
+The standard-library reference lives in `reference/stdlib/`. Regenerate it, check it without
+writing, and check the standard-library examples from the repository root:
+
+```sh
+"$SILK_COMPILER" doc-reference --stdlib-root "$PWD/stdlib" --output "$PWD/reference/stdlib"
+"$SILK_COMPILER" doc-reference --stdlib-root "$PWD/stdlib" --output "$PWD/reference/stdlib" --check
+"$SILK_COMPILER" doctest --stdlib --stdlib-root "$PWD/stdlib"
+```
+
+`node compiler/scripts/documentation.mjs <command> ...` runs the same commands with
+`--stdlib-root` defaulting to this checkout's `stdlib/`.
+
+The reference command uses the canonical stdlib manifest and all six target/libc profiles.
+Profile stores are released after extraction; rendering retains documentation records and page
+bytes, not compiler analyses. Generated reference Markdown is formatted by the native renderer
+and excluded from Oxfmt. Native CI checks the reference and examples with the exact-head N1.
+
+The native pipeline preserves authored Markdown rather than enforcing prose style. It does not
+generate a standalone HTML site or a coverage inventory. JSON is the reporter boundary: alternative
+renderers can consume its module/item hierarchy, raw Markdown, source locations, and resolved links.
+
+The JSON envelope has `schema: "silk-documentation"`, `experimental: true`, `version: 1`,
+`target`, `profile`, and `modules`. Reporters consume these records:
+
+| Record        | Fields and interpretation                                                                                                                                                         |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Module        | `name`, `sourcePath`, optional `documentation`, and source-ordered `items`.                                                                                                       |
+| Item          | Opaque canonical `id`, `kind`, `name`, `visibility`, authored `signature`, `source`, optional `documentation`, and optional `parent` indexing an earlier item in the same module. |
+| Documentation | Authored `markdown` with comment markers removed, `source`, resolved `links`, and `lineStarts` mapping each normalized line to its original source byte offset.                   |
+| Source        | Half-open UTF-8 byte offsets `start`/`end` and one-based `line`.                                                                                                                  |
+| Link          | Authored symbol `spelling` and the target item's canonical `id` as `target`; reporters choose their own URLs and anchors.                                                         |
+
+Missing documentation is omitted rather than encoded as `null`. Declaration signatures omit
+callable bodies and constant initializers. Extraction rejects invalid UTF-8 instead of publishing
+malformed JSON. Treat Markdown as authored input when rendering HTML; this pipeline does not
+sanitize it for a particular reporter.
 
 ## Anonymous declaration identities
 

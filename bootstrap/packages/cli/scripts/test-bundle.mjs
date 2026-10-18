@@ -58,14 +58,6 @@ try {
     'pub static fn message() -> string<\'static> { return "Hello, world!" }\n',
   )
   cli('check', '--manifest-path', manifest)
-  // Documentation is target-neutral; select a source without the host logger's target selection.
-  await writeFile(
-    join(project, 'src/Documentation.silk'),
-    'import silk.result { Result }\npub fn answer() -> i32 { return 42 }\n',
-  )
-  await writeFile(manifest, original.replace('src/main.silk', 'src/Documentation.silk'))
-  cli('doc', '--manifest-path', manifest, '--output', 'documentation.json')
-  JSON.parse(await readFile(join(project, 'documentation.json'), 'utf8'))
   await writeFile(manifest, `${original}\n[build]\nstage = "llvm-bitcode"\n`)
   cli('build', '--manifest-path', manifest)
   const artifacts = await readdir(join(project, 'build'), { recursive: true })

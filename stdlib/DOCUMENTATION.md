@@ -8,13 +8,19 @@ This file defines the additional repository workflow for standard-library docume
 
 ## Generated outputs
 
-The native `silk doc` reads the same `//!` and `///` blocks for generated reference pages and
-editor hovers. Until it lands, Selfhost CI's repository coverage builds every active `silk` fence
-in these comments with the native compiler.
+`silk doc-reference` renders these `//!` and `///` blocks into the generated reference in
+[`reference/stdlib/`](../reference/stdlib/index.md); never edit those pages by hand. After changing
+a comment, regenerate them with a native compiler built from this checkout:
+
+```sh
+"$SILK_COMPILER" doc-reference --stdlib-root "$PWD/stdlib" --output "$PWD/reference/stdlib"
+```
+
+Selfhost CI fails when the committed pages differ from the generator's output.
 
 ## Example evidence
 
-The doctest compiles each ordinary `silk` fence exactly as written. It adds no prelude or hidden
+`silk doctest --stdlib` compiles each ordinary `silk` fence exactly as written. It adds no prelude or hidden
 wrapper. Use `silk ignore` only when an intentionally invalid example becomes less clear as a
 complete valid program.
 
