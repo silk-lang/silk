@@ -7,6 +7,14 @@
 //! Native records, flags, error capture and descriptor-relative traversal are selected source.
 //! Handles own one close obligation; explicit close reports failure and Drop preserves an earlier
 //! failure during structured unwinding. Native members are absent on unsupported supplies.
+//! Atomic publication owns the containing directory and its exclusively claimed staging file until
+//! cleanup completes. Replace renames the entry itself, including a final symlink, without following
+//! its referent; create-new uses linkat's atomic absent-name claim followed by staging unlink.
+//! Both create fresh regular inodes with mode 0666 filtered by umask and filesystem inheritance;
+//! replacement preserves no old permissions, ownership, ACLs, extended attributes or hard-link identity.
+//! Synchronized publication uses fsync on the actual staged descriptor before publication and on
+//! the owned parent afterward. On Darwin and GNU/Linux this is ordinary filesystem synchronization,
+//! not Darwin F_FULLFSYNC or a guarantee about hardware caches or physical power-loss recovery.
 
 static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
 import silk.ownership { Drop }
@@ -16,7 +24,7 @@ import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.result { Result }
 import silk.option { Option }
-import silk.filesystem { FileSystem, FileError, FileOperation, FileReason }
+import silk.filesystem { FileSystem, FileError, FileOperation, FileReason, AtomicWriteError }
 import silk.u8
 import silk.u16
 import silk.u32
@@ -152,6 +160,9 @@ unsafe extern "C" fn fstat(fd: i32, value: *mut Stat) -> i32 with Intrinsic.fore
 unsafe extern "C" fn fstatat(fd: i32, path: ?[*]const u8, value: *mut Stat, flags: i32) -> i32 with Intrinsic.foreign(noCapture: ("path", "value"))
 unsafe extern "C" fn ftruncate(fd: i32, length: i64) -> i32
 unsafe extern "C" fn unlinkat(fd: i32, path: ?[*]const u8, flags: i32) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+unsafe extern "C" fn renameat(oldfd: i32, oldpath: ?[*]const u8, newfd: i32, newpath: ?[*]const u8) -> i32 with Intrinsic.foreign(noCapture: ("oldpath", "newpath"))
+unsafe extern "C" fn linkat(oldfd: i32, oldpath: ?[*]const u8, newfd: i32, newpath: ?[*]const u8, flags: i32) -> i32 with Intrinsic.foreign(noCapture: ("oldpath", "newpath"))
+unsafe extern "C" fn fsync(fd: i32) -> i32
 unsafe extern "C" fn fdopendir(fd: i32) -> ?*mut DirectoryStream
 unsafe extern "C" fn dirfd(stream: *mut DirectoryStream) -> i32 with Intrinsic.foreign(noCapture: ("stream",))
 unsafe extern "C" fn readdir(stream: *mut DirectoryStream) -> ?*const DirectoryRecord with Intrinsic.foreign(noCapture: ("stream",))
@@ -163,9 +174,13 @@ extern "C" struct DirectoryRecord {
 }
 static if Intrinsic.targetOperatingSystem() == "darwin" {
   unsafe extern "C" fn __error() -> *mut i32
+  const NOT_SUPPORTED: i32 = 45
+  const NOT_IMPLEMENTED: i32 = 78
   unsafe fn errorSlot() -> *mut i32 { unsafe { return __error() } }
 } else {
   unsafe extern "C" fn __errno_location() -> *mut i32
+  const NOT_SUPPORTED: i32 = 95
+  const NOT_IMPLEMENTED: i32 = 38
   unsafe fn errorSlot() -> *mut i32 { unsafe { return __errno_location() } }
 }
 unsafe fn currentError() -> i32 { unsafe { return Pointer.read(errorSlot()) } }
@@ -209,6 +224,7 @@ fn reason(code: i32) -> FileReason {
   if code == NOT_EMPTY { return FileSystem.notEmpty() }
   if code == 28 || code == 12 { return FileSystem.noSpace() }
   if code == 27 || code == OVERFLOW { return FileSystem.tooLarge() }
+  if code == NOT_SUPPORTED || code == NOT_IMPLEMENTED { return FileSystem.unsupported() }
   return FileSystem.other()
 }
 effect fn reject(operation: FileOperation, code: i32) -> never ! FileError {
@@ -364,6 +380,183 @@ effect fn copyNameAllocated(pointer: [*]const u8, length: usize) -> Bytes ! OutO
   return move result
 }
 
+// The owner keeps cleanup descriptor-relative even if an ancestor is renamed. Drop is the
+// exceptional-unwind backstop; ordinary completion explicitly captures every cleanup/close result.
+struct Publication {
+  parent: Parent
+  file: FileHandle
+  name: Bytes
+  pending: bool
+  published: bool
+}
+impl Drop for Publication {
+  fn drop(self: &mut Publication) -> () {
+    if self.pending {
+      self.pending = false
+      let ignored = unsafe unlinkat(self.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&self.name)), 0)
+    }
+  }
+}
+
+fn rememberFailure(primary: &mut Option<FileError>, error: FileError) -> () {
+  let previous = Intrinsic.replace(primary.*, Option<FileError>.none())
+  primary.* = match move previous {
+    Option<FileError>.Some { value } => Option<FileError>.some(move value)
+    Option<FileError>.None => Option<FileError>.some(move error)
+  }
+}
+fn rememberResult(primary: &mut Option<FileError>, result: Result<(), FileError>) -> () {
+  match move result {
+    Result<(), FileError>.Success { value } => ()
+    Result<(), FileError>.Failure { error } => rememberFailure(move primary, move error)
+  }
+}
+fn copyError(error: &FileError) -> FileError {
+  let operation = FileOperation { code: error.operation.code }
+  let why = FileReason { code: error.reason.code }
+  return match move FileSystem.providerCode(error) {
+    Option<i32>.Some { value } => FileSystem.errorWithCode(move operation, move why, value)
+    Option<i32>.None => FileSystem.error(move operation, move why)
+  }
+}
+effect fn finishFile(primary: Option<FileError>) -> () ! FileError {
+  match move primary {
+    Option<FileError>.Some { value } => { fail move value }
+    Option<FileError>.None => ()
+  }
+}
+effect fn rejectAtomic(error: FileError) -> never ! AtomicWriteError {
+  fail AtomicWriteError { published: false, cause: move error, cleanupError: Option<FileError>.none(), stagingName: Bytes.make() }
+}
+effect fn exclusiveFile(parent: i32, name: &Bytes, operation: i32) -> Descriptor ! FileError {
+  while true {
+    let fd = unsafe openat(parent, Pointer.fromSlice(Bytes.asSlice(name)), 1 + CREATE + EXCLUSIVE + NOFOLLOW + CLOEXEC, fileMode())
+    if fd >= 0 { return Descriptor { fd: fd } }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+  return run logical(FileOperation { code: operation }, FileSystem.other())
+}
+effect fn synchronize(fd: i32, operation: i32) -> () ! FileError {
+  while true {
+    let status = unsafe fsync(fd)
+    if status == 0 { return () }
+    let code = unsafe currentError()
+    if code == 22 || code == NOT_SUPPORTED || code == NOT_IMPLEMENTED {
+      fail FileSystem.errorWithCode(FileOperation { code: operation }, FileSystem.unsupported(), code)
+    }
+    if code != 4 { return run reject(FileOperation { code: operation }, code) }
+  }
+}
+effect fn makePublication(root: &[u8], path: &[u8]) -> Publication ! FileError {
+  let parent = run parentOf(root, path, 10)
+  let template = b".silk-stage-0000000000000000"
+  let name = run terminatedRange(template, 0, template.length, 10)
+  return Publication { parent: move parent, file: FileHandle { descriptor: Descriptor { fd: -1 } }, name: move name, pending: false, published: false }
+}
+fn sameName(left: &Bytes, right: &Bytes) -> bool {
+  let a = Bytes.asSlice(left)
+  let b = Bytes.asSlice(right)
+  if a.length != b.length { return false }
+  let mut index: usize = 0
+  while index < a.length {
+    if a[index] != b[index] { return false }
+    index = index + 1
+  }
+  return true
+}
+fn chooseStagingName(name: &mut Bytes, counter: &mut u64) -> () {
+  let mut candidate = counter.*
+  if counter.* == u64.MAX { counter.* = 0 } else { counter.* = counter.* + 1 }
+  let digits = b"0123456789abcdef"
+  let output = Bytes.asMutSlice(move name)
+  let mut remaining: usize = 16
+  while remaining > 0 {
+    remaining = remaining - 1
+    output[12 + remaining] = digits[u64.toUsize(candidate % 16)]
+    candidate = candidate / 16
+  }
+}
+effect fn claimStaging(owner: &mut Publication, counter: &mut u64) -> () ! FileError {
+  let mut attempts = 0
+  while attempts < 128 {
+    chooseStagingName(&mut owner.name, &mut counter)
+    // The public destination may itself have our staging spelling. Never claim it as a temporary.
+    if sameName(&owner.name, &owner.parent.leaf) == false {
+      let attempted = run Effect.result(exclusiveFile(owner.parent.descriptor.fd, &owner.name, 10))
+      match move attempted {
+        Result<Descriptor, FileError>.Success { value } => {
+          owner.file.descriptor = move value
+          owner.pending = true
+          return ()
+        }
+        Result<Descriptor, FileError>.Failure { error } => {
+          if error.reason.code != 1 { fail move error }
+        }
+      }
+    }
+    attempts = attempts + 1
+  }
+  return run logical(FileSystem.writeFileAtomicOperation(), FileSystem.alreadyExists())
+}
+effect fn replacementKind(parent: i32, name: &Bytes) -> () ! FileError {
+  let attempted = run Effect.result(childStat(parent, name, 10))
+  match move attempted {
+    Result<Stat, FileError>.Success { value } => {
+      let mode = u32.bitAnd(statMode(&value), u32.toU32(61440))
+      if mode != u32.toU32(32768) && mode != u32.toU32(40960) {
+        return run logical(FileSystem.writeFileAtomicOperation(), FileSystem.wrongType())
+      }
+    }
+    Result<Stat, FileError>.Failure { error } => {
+      if error.reason.code != 0 { fail move error }
+    }
+  }
+}
+effect fn closeStaging(owner: &mut Publication) -> () ! FileError {
+  if owner.file.descriptor.fd >= 0 {
+    let descriptor = Intrinsic.replace(owner.file.descriptor, Descriptor { fd: -1 })
+    run closeDescriptor(move descriptor, FileSystem.writeFileAtomicOperation())
+  }
+}
+effect fn publish(owner: &mut Publication, bytes: &[u8], policy: i32, durability: i32, counter: &mut u64) -> () ! FileError {
+  run claimStaging(&mut owner, move counter)
+  run NativeFileSystem.writeFile(&mut owner.file, bytes, 10)
+  if durability == 1 { run synchronize(owner.file.descriptor.fd, 11) }
+  // A close failure is still pre-publication; never retry close, including EINTR.
+  run closeStaging(&mut owner)
+  if policy == 0 { run replacementKind(owner.parent.descriptor.fd, &owner.parent.leaf) }
+  while true {
+    let mut status = 0
+    if policy == 0 {
+      status = unsafe renameat(owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.name)), owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.parent.leaf)))
+    } else {
+      // flags=0 does not follow a source symlink; the source is our O_EXCL-owned regular file.
+      status = unsafe linkat(owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.name)), owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.parent.leaf)), 0)
+    }
+    if status == 0 {
+      owner.published = true
+      if policy == 0 { owner.pending = false }
+      return ()
+    }
+    let code = unsafe currentError()
+    if code != 4 { return run reject(FileSystem.writeFileAtomicOperation(), code) }
+  }
+}
+effect fn removeStaging(owner: &mut Publication) -> () ! FileError {
+  if owner.pending {
+    // Do not let Drop silently retry a failed explicit cleanup after we report a residual name.
+    owner.pending = false
+    while true {
+      let status = unsafe unlinkat(owner.parent.descriptor.fd, Pointer.fromSlice(Bytes.asSlice(&owner.name)), 0)
+      if status == 0 { return () }
+      let code = unsafe currentError()
+      if code == 2 { return () }
+      if code != 4 { return run reject(FileSystem.writeFileAtomicOperation(), code) }
+    }
+  }
+}
+
 /// Descriptor-relative filesystem operations with source-owned error and lifetime policy.
 pub struct NativeFileSystem {}
 impl NativeFileSystem {
@@ -400,6 +593,107 @@ impl NativeFileSystem {
     }
     run closeDescriptor(move parent.descriptor, FileOperation { code: operation })
     return FileHandle { descriptor: move descriptor }
+  }
+
+  /// Exclusively creates a regular file without inspecting, following or truncating existing entries.
+  ///
+  /// # Details
+  ///
+  /// Existing files, directories and final symlinks report AlreadyExists. A successful claim uses
+  /// mode 0666 filtered by umask. Readers may see a prefix while writing; a later write or close
+  /// failure leaves the newly created, possibly partial file in place. This does not synchronize.
+  pub effect fn createFile(root: &[u8], path: &[u8], bytes: &[u8]) -> () ! FileError {
+    let parent = run parentOf(root, path, 9)
+    let descriptor = run exclusiveFile(parent.descriptor.fd, &parent.leaf, 9)
+    let mut handle = FileHandle { descriptor: move descriptor }
+    let mut primary = Option<FileError>.none()
+    let attempted = run Effect.result(NativeFileSystem.writeFile(&mut handle, bytes, 9))
+    rememberResult(&mut primary, move attempted)
+    let closed = run Effect.result(NativeFileSystem.closeFile(move handle, FileSystem.createFileOperation()))
+    rememberResult(&mut primary, move closed)
+    let parentClosed = run Effect.result(closeDescriptor(move parent.descriptor, FileSystem.createFileOperation()))
+    rememberResult(&mut primary, move parentClosed)
+    return run finishFile(move primary)
+  }
+
+  /// Stages complete contents in the destination directory, then atomically publishes one entry.
+  ///
+  /// # Details
+  ///
+  /// Policy 0 uses renameat: an absent name or regular file is allowed, a final symlink is replaced
+  /// without following it, and directories and other inspected entry kinds report WrongType.
+  /// Policy 1 uses linkat without a preflight existence check: any existing entry reports
+  /// AlreadyExists. The staging name is O_EXCL-claimed, skipping collisions and the destination
+  /// itself; at most 128 candidate names are tried. Unneeded staging entries are unlinked through
+  /// the same owned parent descriptor, never by re-resolving a pathname.
+  ///
+  /// Durability 0 is buffered; 1 fsyncs the actual staged file before closing and publishing, then
+  /// fsyncs the parent after publication and staging cleanup. Unsupported policies or sync support
+  /// are explicit failures. A parent-sync or parent-close failure reports published=true.
+  /// The first failure remains cause; a failed staging unlink is separately retained in
+  /// cleanupError with its exact residual leaf bytes. Close is attempted once, including EINTR.
+  ///
+  /// Newly published inodes use 0666 filtered by umask and normal filesystem inheritance. No old
+  /// metadata is copied and old hard links retain the old inode. Callers must not concurrently
+  /// remove or replace provider-owned staging entries; this is not a hostile-directory sandbox.
+  pub effect fn writeFileAtomic(root: &[u8], path: &[u8], bytes: &[u8], policy: i32, durability: i32, counter: &mut u64) -> () ! AtomicWriteError {
+    if (policy != 0 && policy != 1) || (durability != 0 && durability != 1) {
+      return run rejectAtomic(FileSystem.error(FileSystem.writeFileAtomicOperation(), FileSystem.unsupported()))
+    }
+    let prepared = run Effect.result(makePublication(root, path))
+    let mut owner = match move prepared {
+      Result<Publication, FileError>.Success { value } => move value
+      Result<Publication, FileError>.Failure { error } => run rejectAtomic(move error)
+    }
+    let mut primary = Option<FileError>.none()
+    let attempted = run Effect.result(publish(&mut owner, bytes, policy, durability, move counter))
+    rememberResult(&mut primary, move attempted)
+    let closed = run Effect.result(closeStaging(&mut owner))
+    rememberResult(&mut primary, move closed)
+    let mut cleanupError = Option<FileError>.none()
+    let mut residual = Bytes.make()
+    let cleaned = run Effect.result(removeStaging(&mut owner))
+    match move cleaned {
+      Result<(), FileError>.Success { value } => ()
+      Result<(), FileError>.Failure { error } => {
+        rememberFailure(&mut primary, copyError(&error))
+        cleanupError = Option<FileError>.some(move error)
+        residual = Intrinsic.replace(owner.name, Bytes.make())
+        let length = Bytes.asSlice(&residual).length
+        Bytes.truncate(&mut residual, length - 1)
+      }
+    }
+    if owner.published && durability == 1 {
+      let synchronized = run Effect.result(synchronize(owner.parent.descriptor.fd, 12))
+      rememberResult(&mut primary, move synchronized)
+    }
+    let parent = Intrinsic.replace(owner.parent.descriptor, Descriptor { fd: -1 })
+    let parentClosed = run Effect.result(closeDescriptor(move parent, FileSystem.writeFileAtomicOperation()))
+    rememberResult(&mut primary, move parentClosed)
+    match move primary {
+      Option<FileError>.Some { value } => {
+        fail AtomicWriteError { published: owner.published, cause: move value, cleanupError: move cleanupError, stagingName: move residual }
+      }
+      Option<FileError>.None => ()
+    }
+  }
+
+  /// Synchronizes an owned no-follow directory descriptor and reports sync or one-shot close failure.
+  ///
+  /// # Details
+  ///
+  /// Darwin and GNU/Linux use ordinary fsync, not a stronger hardware-cache flush. EINVAL,
+  /// ENOTSUP/EOPNOTSUPP and ENOSYS from synchronization report Unsupported with the native code.
+  pub effect fn syncDirectory(root: &[u8], path: &[u8]) -> () ! FileError {
+    let parent = run parentOf(root, path, 12)
+    let directory = run childDirectory(parent.descriptor.fd, &parent.leaf, 12)
+    run closeDescriptor(move parent.descriptor, FileSystem.syncDirectoryOperation())
+    let mut primary = Option<FileError>.none()
+    let synchronized = run Effect.result(synchronize(directory.fd, 12))
+    rememberResult(&mut primary, move synchronized)
+    let closed = run Effect.result(closeDescriptor(move directory, FileSystem.syncDirectoryOperation()))
+    rememberResult(&mut primary, move closed)
+    return run finishFile(move primary)
   }
 
   /// Opens a directory and transfers its descriptor to a stream only after fdopendir succeeds.
