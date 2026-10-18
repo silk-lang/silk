@@ -194,11 +194,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     })
     yield* Effect.sync(() => process.stdout.write(`${path}\n`))
   })
-  const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-  const {
-    NodeServices,
-  }: typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js') =
-    await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
+  const require = createRequire(new URL('../../package.json', import.meta.url))
+  const { NodeServices }: typeof import('@effect/platform-node') = await import(
+    pathToFileURL(require.resolve('@effect/platform-node')).href
+  )
   await Effect.runPromise(
     cli.pipe(
       Effect.provide(NodeServices.layer),

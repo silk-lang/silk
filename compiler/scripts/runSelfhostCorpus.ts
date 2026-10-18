@@ -596,7 +596,7 @@ const compareRun = (
 export const runCase = async (
   silkc: string,
   program: Corpus.Program,
-  stdlib = fileURLToPath(new URL('../../packages/compiler/stdlib', import.meta.url)),
+  stdlib = fileURLToPath(new URL('../../stdlib', import.meta.url)),
   cCompiler = defaultCCompiler,
 ): Promise<CaseResult> => {
   const directory = mkdtempSync(join(tmpdir(), 'silk-selfhost-corpus-'))
