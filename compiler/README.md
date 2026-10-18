@@ -586,6 +586,12 @@ Standard-library mode defaults to the compiler's host target; `--target` overrid
 standard-library examples include hosted OS APIs, so the complete set is not portable to Wasm.
 Project JSON supplies its recorded target unless explicitly overridden.
 
+Symbol links first use the attached declaration's owner and module-level bindings. Bare member
+names then prefer a unique local inherent member over fields or interface/service operations:
+`display` in `silk/format` links to `Format.display`, not `Display.display`. Distinct inherent
+members remain ambiguous. Qualified links such as `Display.display` and links inside that
+interface's own documentation still select its contract operation.
+
 From the repository root, `pnpm --filter @silklang/compiler documentation:generate` regenerates
 the standard-library reference and independent diagnostic index. `documentation:check` checks
 without writing; `documentation:examples` checks standard-library examples. These commands require
