@@ -24,7 +24,7 @@ function sourceFiles() {
     ...filesUnder('compiler/fixtures'),
     // The source-written parser tests run explicitly and are not part of this corpus.
     ...filesUnder('compiler/src').filter((file) => file !== 'compiler/src/parser/ParserCases.silk'),
-    ...filesUnder('packages/compiler/stdlib/silk'),
+    ...filesUnder('stdlib/silk'),
   ]
 }
 

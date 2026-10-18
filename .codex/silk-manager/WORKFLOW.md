@@ -102,11 +102,6 @@ Research depth is proportional to uncertainty: a mechanical fix may need only re
 a new protocol or ABI requires primary authorities and pinned implementation/fixture references.
 Unresolved contract questions remain in Triage rather than becoming research-only tickets.
 
-OpenSpec remains required for language and standard-library implementation. It records and
-validates the researched contract as part of delivering the implementation, not as a separate
-design-only ticket. Historic completed research tickets retain their provenance; this rule does
-not require rewriting history.
-
 Discovery is broad intake, not final triage. Favor recall over certainty. A Triage issue needs:
 
 - a specific lead anchored to paths, symbols, output, a documentation passage, or a structural
@@ -117,7 +112,7 @@ Discovery is broad intake, not final triage. Favor recall over certainty. A Tria
 - enough breadcrumbs for triage to investigate it;
 - explicit uncertainty and the question triage must answer.
 
-Discovery removes only exact duplicates, work clearly owned by an active PR or OpenSpec change,
+Discovery removes only exact duplicates, work clearly owned by an active PR,
 and vague observations with no investigable subject. It does not prove impact, select the final
 solution, consolidate debatable overlaps, write final acceptance, size, prioritize, or decide that
 a lead is worth implementing. Those are triage decisions.
@@ -242,7 +237,7 @@ history. Keep the description as the current specification rather than an activi
 Prefer creating the draft PR during implementation, as soon as a coherent issue-scoped commit can
 be published, so CI can start while implementation and review continue. Run focused development
 checks where they give useful feedback. Before the final push, finish every repository mutation,
-including generated artifacts and OpenSpec implementation-task checkboxes, then audit the staged
+including generated artifacts, then audit the staged
 changes and complete branch diff. Required pull-request CI on the exact intended head and reviewer
 approval gate handoff. Do not duplicate the complete CI-covered suite locally as ceremony; use
 broader local runs only for change-specific evidence, CI diagnosis, or an explicit request.
@@ -254,15 +249,14 @@ head, and wait again. Keep the Linear issue In Progress until the required imple
 reviews are complete; merely opening a draft does not justify In Review or advancing the Review
 baseline to implementation complete.
 
-CI, review, PR updates, and handoff are workflow gates, not OpenSpec implementation tasks. Never
+CI, review, PR updates, and handoff are workflow gates, not implementation tasks. Never
 add a task-list item whose sole action is running or recording checks, obtaining approval, waiting
 for CI, or reporting the handoff. Complete all implementation-task checkboxes before the final
 push. A passing gate must not cause a follow-up repository edit or empty push.
 
 A draft PR must be understandable to a reviewer who has not read the agent conversation. Give it a
 specific outcome-oriented title. In the body, explain the problem and why it mattered, summarize
-the delivered behavior and meaningful design choices, link the Linear issue and relevant OpenSpec
-change, and report verification, test-economics evidence, risks, and deferred work truthfully.
+the delivered behavior and meaningful design choices, link the Linear issue, and report verification, test-economics evidence, risks, and deferred work truthfully.
 
 Strongly prefer short paired `Before` and `After` code or output examples when they make the change
 concrete. This is the default for API-shape changes, call-site changes, diagnostics, generated
