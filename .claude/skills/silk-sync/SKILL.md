@@ -1,6 +1,6 @@
 ---
 name: silk-sync
-description: Reconcile Silk Linear issues with repository, OpenSpec, branch, and GitHub PR reality. Use only when Julia explicitly invokes this skill or asks to sync the Silk queue.
+description: Reconcile Silk Linear issues with repository, branch, and GitHub PR reality. Use only when Julia explicitly invokes this skill or asks to sync the Silk queue.
 ---
 
 # Claude entrypoint for Silk sync

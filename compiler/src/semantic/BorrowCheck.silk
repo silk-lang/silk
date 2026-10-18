@@ -7,8 +7,8 @@
 //! or `IncompatibleLoopHeader` (`OWN0005`), relating the earlier loan or move when there is one.
 //!
 //! # Details
-//! The proof follows `compiler/docs/native-borrow-checking.md` §3 and §4 on the typed body. It
-//! numbers evaluation points in evaluation order and links them into a control-flow graph. A loan
+//! The proof runs on the typed body. It numbers evaluation points in evaluation order and links
+//! them into a control-flow graph. A loan
 //! comes from a written borrow, a shared or mutable receiver pass, or a borrowed capture of a
 //! constructed callable or section, which carries it like any value. A place behind a reference
 //! names the referent's storage, so a reborrow is a loan of that place and carries the parent
@@ -72,7 +72,7 @@ import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.Lifetime {Lifetime}
 import semantic.Rejection {RejectionCode}
 import semantic.StorageOperation {StorageOperation}
-import semantic.Type {Argument, Binding, KeptRegions, Type}
+import semantic.Type {Argument, Binding, KeptRegions, KeptSlot, Type}
 import semantic.TypedBody {
   AggregateField,
   BorrowStatus,
@@ -80,6 +80,7 @@ import semantic.TypedBody {
   ConsumedPlace,
   Expression,
   BindingAccess,
+  ImpliedOutlives,
   Local,
   MatchArm,
   MatchSyntax,
@@ -324,6 +325,13 @@ struct Loan {
   // A point the loan stays live to whether or not a holder uses it there, or `usize.MAX`: an unrun
   // `effect` block keeps its own captures to its scope end (EFFECT-OWN-001).
   until: usize
+  // The referent of the reference the borrow is typed as, or none, and a call then judges a carried
+  // loan by its whole operand.
+  referent: Option<Shared<Type>>
+  // Whether a result keeps the loan only because typing requires its region to outlive a caller
+  // region the result names (`outlivesResult`): where the return-slot refutation decides that
+  // relation, the walk leaves the loan's conflicts to it.
+  bound: bool
 }
 
 enum Kind {
@@ -417,6 +425,9 @@ struct Carry {
   // Where in the carrying value the loan is held: a `Walker.paths` entry naming the sub-place the
   // loan lies somewhere within (entry 0 is the whole value), or `usize.MAX` when that is unknown.
   field: usize
+  // Whether the sub-place `field` names is the loan's own reference, only moved, copied or placed
+  // since the borrow: no projection, call or read through it, so it is still typed as the borrow.
+  direct: bool
 }
 
 impl Copy for Carry {}
@@ -449,8 +460,9 @@ struct Holding {
   point: usize
   source: usize
   read: usize
-  // Where in the holder's value the loan is held, as `Carry.field`.
+  // Where in the holder's value the loan is held, as `Carry.field` and `Carry.direct`.
   field: usize
+  direct: bool
   // Whether the place that held the loan was overwritten: no later read of the holder reaches the
   // loan, yet a value read from that place still carries it, as typing relates the holder's whole
   // region to every loan it ever held there.
@@ -607,6 +619,14 @@ struct StoreWindow {
   holder: usize
 }
 
+// A whole-value hold `finish` gave a result: the loan and the result node. Only a call its
+// signature `described` bounds where in the result the loan can lie.
+struct WholeHold {
+  loan: usize
+  result: NodeId
+  described: bool
+}
+
 struct Walker {
   // The Supplied atoms this body's own selected application binds its region parameters to.
   // They name caller regions valid for the whole invocation; every other Supplied atom stays open.
@@ -646,6 +666,8 @@ struct Walker {
   settled: bool
   // Open relations used only to conservatively retain possible source loans, never proof premises.
   retentionRelations: Vector<ImpliedGroup>
+  // Every whole-value hold of a loan a result took, for narrowing a later read within it.
+  wholeHolds: Vector<WholeHold>
   // Atoms of the local regions a retained open contents bound names: values of unknown regions
   // enter them, so no symbolic proof relates them to a universal target.
   openContents: Vector<Shared<Lifetime>>
@@ -935,7 +957,7 @@ effect fn rejoin(walker: &mut Walker, carried: &[Carry], end: usize, joined: usi
   run consume(&mut walker.*, carried, end)
   let mut at = usize.ZERO
   while at < carried.length {
-    run Vector<Carry>.append(&mut onward.*, Carry {loan: carried[at].loan, since: joined, operand: usize.MAX, definition: carried[at].definition, read: carried[at].read, field: carried[at].field})
+    run Vector<Carry>.append(&mut onward.*, Carry {loan: carried[at].loan, since: joined, operand: usize.MAX, definition: carried[at].definition, read: carried[at].read, field: carried[at].field, direct: carried[at].direct})
     at = at + usize.ONE
   }
   return ()
@@ -945,7 +967,7 @@ effect fn rejoin(walker: &mut Walker, carried: &[Carry], end: usize, joined: usi
 effect fn appendOperand(target: &mut Vector<Carry>, source: &[Carry], operand: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut at = usize.ZERO
   while at < source.length {
-    run Vector<Carry>.append(&mut target.*, Carry {loan: source[at].loan, since: source[at].since, operand: operand, definition: source[at].definition, read: source[at].read, field: source[at].field})
+    run Vector<Carry>.append(&mut target.*, Carry {loan: source[at].loan, since: source[at].since, operand: operand, definition: source[at].definition, read: source[at].read, field: source[at].field, direct: source[at].direct})
     at = at + usize.ONE
   }
   return ()
@@ -1104,7 +1126,7 @@ effect fn extendPath(nodes: &[Node], id: NodeId, temporary: usize, path: &mut Pa
         path.root = local.index
         return ()
       }
-      Expression.Field {value, index} => {
+      Expression.Field {value, index, ..} => {
         run extendPath(nodes, value, temporary, &mut path.*)
         if path.root != usize.MAX {
           run Vector<Step>.append(&mut path.steps, fieldStep(index))
@@ -1137,7 +1159,7 @@ effect fn extendPath(nodes: &[Node], id: NodeId, temporary: usize, path: &mut Pa
         }
         return ()
       }
-      Expression.PatternBinding {subject, path: steps, access} => {
+      Expression.PatternBinding {subject, path: steps, access, ..} => {
         run bindingPath(nodes, subject, Vector<PlaceStep>.asSlice(&steps), access, &mut path.*)
         return ()
       }
@@ -1466,7 +1488,7 @@ effect fn useHolder(walker: &mut Walker, root: usize, read: usize, span: Locatio
   let mut at = usize.ZERO
   while at < definitions.length {
     let definition = definitions[at]
-    run Vector<Carry>.append(&mut carried, Carry {loan: all[definition].loan, since: point, operand: usize.MAX, definition: definition, read: point, field: all[definition].field})
+    run Vector<Carry>.append(&mut carried, Carry {loan: all[definition].loan, since: point, operand: usize.MAX, definition: definition, read: point, field: all[definition].field, direct: all[definition].direct})
     at = at + usize.ONE
   }
   return Flow {at: point, carried: move carried}
@@ -1475,25 +1497,99 @@ effect fn useHolder(walker: &mut Walker, root: usize, read: usize, span: Locatio
 // The loans a read of `path` carries, each with where the value read holds it: a loan's field is
 // kept only when the read contains where the loan is held, which a read through a reference reaches
 // past its `Referent` step. The reference's own loan is held by the whole reference, which no such
-// read contains. Anything else keeps an unknown field, which nothing forwards.
-effect fn attributeRead(walker: &mut Walker, path: &Path, carried: &[Carry]) -> Vector<Carry> ! OutOfMemoryError ? &mut Allocator {
+// read contains. Anything else keeps an unknown field, which nothing forwards, except a read strictly
+// within a call result's whole-value hold whose `declared` field type the loan provably cannot reach
+// (`unreachableField`): that part of the result holds none of it.
+effect fn attributeRead(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, path: &Path, carried: &[Carry],
+  declared: &DeclaredRead) -> Vector<Carry>
+! OutOfMemoryError ? &mut Allocator {
   let steps = Vector<Step>.asSlice(&path.steps)
   let mut read = Vector<Carry>.make()
   let mut index = usize.ZERO
   while index < carried.length {
     let mut carry = carried[index]
+    let mut held = true
     if carry.field != usize.MAX {
-      let held = run copyPath(&walker.*, carry.field)
-      if pathContains(steps, Vector<Step>.asSlice(&held)) {
+      let heldPath = run copyPath(&walker.*, carry.field)
+      let heldSteps = Vector<Step>.asSlice(&heldPath)
+      if pathContains(steps, heldSteps) {
         carry.field = run strippedPath(&mut walker.*, carry.field, steps.length)
       } else {
         carry.field = usize.MAX
+        carry.direct = false
+        if !path.through && declared.known && pathContains(heldSteps, steps)
+          && !reborrowedByCarried(Vector<Loan>.asSlice(&walker.loans), carried, index) {
+          held = !run unreachableField(nodes, owner, &walker.*, carry, Vector<Shared<Lifetime>>.asSlice(&declared.regions))
+        }
       }
     }
-    run Vector<Carry>.append(&mut read, carry)
+    if held { run Vector<Carry>.append(&mut read, carry) }
     index = index + usize.ONE
   }
   return move read
+}
+
+// Whether another carried loan reborrows the loan `carried[index]` carries, so it stays live with it.
+fn reborrowedByCarried(loans: &[Loan], carried: &[Carry], index: usize) -> bool {
+  if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loans[carried[index].loan].borrowed {
+    let mut at = usize.ZERO
+    while at < carried.length {
+      if at != index {
+        if let Option<Shared<Lifetime>>.Some {value: parent} = &loans[carried[at].loan].parent {
+          if meetMember(&parent, &borrowed) { return true }
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return false
+}
+
+// Whether the loan `carry` carries provably lies in no part of a call result typed by `named`: the
+// same test `finish` applies to a whole result, with the field's declared regions in place of the
+// result's. The loan is exact, all its regions are body regions that no named region shares, it is
+// no retained source outlives requirements need, and the facts every call that holds it implies
+// (the body's open relations and the well-formedness of the call's argument and result types) lead
+// none of its regions to a named region or outside the body. A hold no signature describes, such
+// as a callable invocation's or a built value's, decides nothing.
+effect fn unreachableField(nodes: &[Node], owner: &DeclarationId, walker: &Walker, carry: Carry, named: &[Shared<Lifetime>]) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let loans = Vector<Loan>.asSlice(&walker.loans)
+  let loan = &loans[carry.loan]
+  let regionsOf = Vector<Shared<Lifetime>>.asSlice(&loan.regions)
+  if loan.precision != LoanPrecision.Exact || regionsOf.length == usize.ZERO || !bodyRegions(regionsOf, owner) || sharesAtom(regionsOf, named) {
+    return false
+  }
+  let mut single = Vector<Carry>.make()
+  run Vector<Carry>.append(&mut single, carry)
+  let required = run requiredRetainedRegions(loans, Vector<Carry>.asSlice(&single), named, owner,
+    Vector<RetentionEdge>.asSlice(&walker.requirements))
+  if requiredLoan(loan, owner, Vector<usize>.asSlice(&required)) { return false }
+  let mut implied = Implied {groups: Vector<ImpliedGroup>.make(), known: walker.settled}
+  let holds = Vector<WholeHold>.asSlice(&walker.wholeHolds)
+  let mut found = false
+  let mut at = usize.ZERO
+  while at < holds.length {
+    if holds[at].loan == carry.loan {
+      if !holds[at].described { return false }
+      found = true
+      let facts = run signatureImplied(nodes, walker, holds[at].result)
+      if !facts.known { implied.known = false }
+      let groups = Vector<ImpliedGroup>.asSlice(&facts.groups)
+      let mut group = usize.ZERO
+      while group < groups.length {
+        let mut members = Vector<Shared<Lifetime>>.make()
+        run appendAllAtoms(&mut members, Vector<Shared<Lifetime>>.asSlice(&groups[group].members))
+        let mut container = Vector<Shared<Lifetime>>.make()
+        run appendAllAtoms(&mut container, Vector<Shared<Lifetime>>.asSlice(&groups[group].container))
+        run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move members})
+        group = group + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  if !found || !implied.known { return false }
+  return !run mayOutlive(&implied, regionsOf, named, owner)
 }
 
 // Where a reference to the sub-place `borrowed` of a holder holds a loan the holder holds at
@@ -1708,6 +1804,7 @@ effect fn borrow(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker
     while index < travelling.length {
       let mut carry = travelling[index]
       carry.field = run referencedPath(&mut walker.*, Vector<Step>.asSlice(&path.steps), carry.field)
+      carry.direct = carry.direct && carry.field != usize.MAX
       run Vector<Carry>.append(&mut carried, carry)
       index = index + usize.ONE
     }
@@ -1855,6 +1952,14 @@ effect fn reborrowReferent(nodes: &[Node], owner: &DeclarationId, walker: &mut W
   return run takeLoan(nodes, owner, &mut walker.*, &path, exclusive, span, operand.index, move source, at, Vector<Carry>.make())
 }
 
+// The referent of a borrow typed as a reference.
+fn loanReferent(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Reference {referent, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&referent))
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
 // Records a new loan of `path` at a fresh point after `at`; the borrowing value carries it after
 // `carried`. `node` is the expression whose type names the loan's regions, or `usize.MAX`.
 effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, path: &Path, exclusive: bool, span: Location, node: usize,
@@ -1863,6 +1968,7 @@ effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, p
   let mut onward = move carried
   let mut regions = Vector<Shared<Lifetime>>.make()
   let mut borrowed = Option<Shared<Lifetime>>.none()
+  let mut viewed = Option<Shared<Type>>.none()
   if node != usize.MAX {
     borrowed = nodeLoanLifetime(nodes, NodeId {index: node})
     let typed = expressionType(nodes, NodeId {index: node})
@@ -1871,6 +1977,7 @@ effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, p
       if !known {
         regions = Vector<Shared<Lifetime>>.make()
       }
+      viewed = Shared<Type>.with<Option<Shared<Type>>>(&value, loanReferent)
     }
   }
   let created = Vector<Loan>.length(&walker.loans)
@@ -1892,6 +1999,8 @@ effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, p
       binder: usize.MAX,
       block: usize.MAX,
       until: usize.MAX,
+      referent: move viewed,
+      bound: false,
     },
   )
   let mut kind = Kind.SharedBorrow
@@ -1901,7 +2010,7 @@ effect fn takeLoan(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, p
   let point = run access(&mut walker.*, path, kind, span, at, created)
   let mut loans = Vector<Loan>.asMutSlice(&mut walker.loans)
   loans[created].created = point
-  run Vector<Carry>.append(&mut onward, Carry {loan: created, since: point, operand: usize.MAX, definition: usize.MAX, read: usize.MAX, field: usize.ZERO})
+  run Vector<Carry>.append(&mut onward, Carry {loan: created, since: point, operand: usize.MAX, definition: usize.MAX, read: usize.MAX, field: usize.ZERO, direct: true})
   return Flow {at: point, carried: move onward}
 }
 
@@ -2059,6 +2168,40 @@ effect fn retainedParents(loans: &[Loan], carried: &[Carry], named: &[Shared<Lif
     next = next + usize.ONE
   }
   return move supported
+}
+
+// Whether `region` is a meet of this body's regions with universal ones. Such a meet is valid only
+// while each of its local constituents is, and the universal ones outlive the body, so its local
+// constituents carry every finite requirement it has: a binding that held a parameter's reference
+// and is then assigned a borrow types the borrow under that meet.
+fn localMeet(region: &Shared<Lifetime>, owner: &DeclarationId, supplied: &[Shared<Lifetime>]) -> bool {
+  let count = Lifetime.atomCount(region)
+  if count <= usize.ONE { return false }
+  let mut local = false
+  let mut at = usize.ZERO
+  while at < count {
+    let domain = regionDomain(&Lifetime.atomAt(region, at), owner, supplied)
+    if domain == RegionDomain.Unknown { return false }
+    if domain == RegionDomain.Local { local = true }
+    at = at + usize.ONE
+  }
+  return local
+}
+
+// Whether `region` is `named` itself or a local constituent of `named`, a `localMeet`.
+fn carriesRegion(named: &Shared<Lifetime>, region: &Shared<Lifetime>, owner: &DeclarationId, supplied: &[Shared<Lifetime>]) -> bool {
+  if Lifetime.equalsShared(named, region) { return true }
+  return localMeet(named, owner, supplied) && meetMember(named, region)
+}
+
+// Whether one of `regions` carries `region` (`carriesRegion`).
+fn regionsCarry(regions: &[Shared<Lifetime>], region: &Shared<Lifetime>, owner: &DeclarationId, supplied: &[Shared<Lifetime>]) -> bool {
+  let mut at = usize.ZERO
+  while at < regions.length {
+    if carriesRegion(&regions[at], region, owner, supplied) { return true }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 // Whether some constituent of the meet `bound` is a region local to `owner`'s body.
@@ -2223,6 +2366,19 @@ fn retainedOperand(nodes: &[Node], result: NodeId, operand: usize) -> bool {
   return true
 }
 
+// Whether typing requires one of `regions` to outlive one of `named`: a relation offers a region of
+// the loan and wants a region of the result.
+fn outlivesResult(relations: &[ImpliedGroup], regions: &[Shared<Lifetime>], named: &[Shared<Lifetime>]) -> bool {
+  let mut at = usize.ZERO
+  while at < relations.length {
+    if sharesAtom(Vector<Shared<Lifetime>>.asSlice(&relations[at].members), regions)
+      && sharesAtom(Vector<Shared<Lifetime>>.asSlice(&relations[at].container), named) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+
 fn outerSharedRegion(value: &Type) -> Option<Shared<Lifetime>> {
   if let Type.Reference {access, lifetime, ..} = &value.* {
     if access == Access.Shared { return Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime)) }
@@ -2238,6 +2394,9 @@ fn outerSharedRegion(value: &Type) -> Option<Shared<Lifetime>> {
 //   outlive them; the region slice proves that relation. A result that `forwards` its operands'
 //   values (an aggregate or an operator) is the exception for a loan of storage the body owns:
 //   the value still holds it, so it keeps flowing exactly and its storage end reports the escape.
+//   So is a call or `run` result that can retain such a loan when typing requires the loan's
+//   region to outlive a result region: typing's binding to caller regions then demands what no
+//   solution gives.
 //   A read place does not forward: reading through a borrow of a local carries that borrow's
 //   loan, which a value copied out of it does not hold.
 // - When exactly one operand's loans name a result region, the result may hold them: a conflict
@@ -2276,12 +2435,7 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
   run recordUnheld(nodes, &mut walker.*, result)
   // A loan a call can keep in a universal region must outlive the body; one that reaches a call this
   // walk cannot describe leaves the body unchecked.
-  let passed = Vector<Carry>.asSlice(carried)
-  let mut passing = usize.ZERO
-  while passing < passed.length {
-    if passed[passing].operand < sinks.length { keepLoan(&mut walker.*, owner, passed[passing].loan, &sinks[passed[passing].operand]) }
-    passing = passing + usize.ONE
-  }
+  run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(carried), sinks, usize.MAX)
   if Vector<Carry>.length(carried) > usize.ZERO {
     run consume(&mut walker.*, Vector<Carry>.asSlice(carried), point)
     let retained = run nodeRetains(nodes, result, owner)
@@ -2337,11 +2491,15 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
         // Where the result holds the loan: where a read found it, under its operand's place in a
         // built aggregate, or somewhere within the whole result.
         let mut field = usize.ZERO
+        let mut direct = false
         if forwarding == Forwarding.Matched {
           field = loans[index].field
+          direct = loans[index].direct
         } else if loans[index].operand < placed.length {
           field = run prefixedPath(&mut walker.*, Vector<Step>.asSlice(&placed[loans[index].operand]), loans[index].field)
+          direct = loans[index].direct
         }
+        direct = direct && field != usize.MAX
         let mut all = Vector<Loan>.asMutSlice(&mut walker.loans)
         let mut kept = true
         let mut exact = false
@@ -2360,6 +2518,18 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
             // whatever typing related: the result keeps it exactly so the walk reports where it
             // escapes (OWN0019).
             exact = true
+          } else if outside && all[loan].local && forwarding != Forwarding.Matched
+            && outlivesResult(Vector<ImpliedGroup>.asSlice(&walker.retentionRelations), regionsOf, named) {
+            // A call or `run` result that can retain the loan holds a loan of storage this body owns
+            // when typing requires the loan's own region to outlive a region the result names:
+            // typing bound the result to caller regions only, which no solution lets the loan
+            // outlive. The result keeps it exactly, as when the binding names the loan's own
+            // region, so the walk reports where it escapes (OWN0019) rather than leaving the
+            // relation unproved, unless the return-slot refutation decides it (`Loan.bound`). A
+            // value read from where the loan lies somewhere within is not that result: it may be a
+            // part the loan does not reach.
+            exact = true
+            all[loan].bound = true
           } else if outside && (all[loan].local || bodyRegions(regionsOf, owner)) {
             kept = false
             dropped = true
@@ -2397,7 +2567,11 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
               all[loan].precision = LoanPrecision.Unknown
             }
           }
-          run Vector<Carry>.append(&mut onward, Carry {loan: loan, since: point, operand: usize.MAX, definition: loans[index].definition, read: loans[index].read, field: field})
+          run Vector<Carry>.append(&mut onward, Carry {loan: loan, since: point, operand: usize.MAX, definition: loans[index].definition, read: loans[index].read, field: field, direct: direct})
+          if field == usize.ZERO && forwarding != Forwarding.Matched {
+            run Vector<WholeHold>.append(&mut walker.wholeHolds, WholeHold {loan: loan, result: result,
+              described: !stores && forwarding == Forwarding.None && typed.length > usize.ZERO})
+          }
         }
         if dropped { run Vector<usize>.append(&mut walker.unretained, loan) }
         index = index + usize.ONE
@@ -2405,6 +2579,28 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
     }
   }
   return Flow {at: point, carried: move onward}
+}
+
+// The regions a field or pattern binding read holds as its place is declared, the subject's type
+// instantiated into the field's declared type before typing fits the read's own type to its use;
+// unknown for any other read, or when the declared type's regions are unknown.
+struct DeclaredRead {
+  known: bool
+  regions: Vector<Shared<Lifetime>>
+}
+
+effect fn declaredRead(nodes: &[Node], read: NodeId, owner: &DeclarationId) -> DeclaredRead
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut regions = Vector<Shared<Lifetime>>.make()
+  let mut known = false
+  if let NodeKind.Expression {form, ..} = &nodes[read.index].kind {
+    if let Expression.Field {declared, ..} = &form {
+      known = run bodyRetainedRegions(&declared, owner, &mut regions)
+    } else if let Expression.PatternBinding {declared, ..} = &form {
+      known = run bodyRetainedRegions(&declared, owner, &mut regions)
+    }
+  }
+  return DeclaredRead {known: known, regions: move regions}
 }
 
 // The regions `result`'s value can retain; `false` when they are unknown, as for a callable, whose
@@ -2539,6 +2735,42 @@ struct UnretainedChain {
 
 fn noImplied() -> Implied {
   return Implied {groups: Vector<ImpliedGroup>.make(), known: false}
+}
+
+// The facts a direct call `result` implies, exactly: the body's open region relations and the
+// outlives bounds its callee's signature implies (`impliedSignatureBounds`), which typing proved of
+// the call. An immediate run implies those of the call it executes; any other node, nothing known.
+effect fn signatureImplied(nodes: &[Node], walker: &Walker, result: NodeId) -> Implied
+! OutOfMemoryError ? &mut Allocator {
+  let mut call = result
+  if let NodeKind.Expression {form: Expression.Run {value, access}, ..} = &nodes[result.index].kind {
+    if access == RunAccess.Immediate { call = value }
+  }
+  if let NodeKind.Expression {form: Expression.DirectCall {implied: stated, ..}, ..} = &nodes[call.index].kind {
+    let mut implied = Implied {groups: Vector<ImpliedGroup>.make(), known: walker.settled}
+    let premises = Vector<ImpliedGroup>.asSlice(&walker.retentionRelations)
+    let mut premise = usize.ZERO
+    while premise < premises.length {
+      let mut members = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut members, Vector<Shared<Lifetime>>.asSlice(&premises[premise].members))
+      let mut container = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut container, Vector<Shared<Lifetime>>.asSlice(&premises[premise].container))
+      run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move members})
+      premise = premise + usize.ONE
+    }
+    let facts = Vector<ImpliedOutlives>.asSlice(&stated)
+    let mut fact = usize.ZERO
+    while fact < facts.length {
+      let mut members = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut members, Vector<Shared<Lifetime>>.asSlice(&facts[fact].longer))
+      let mut container = Vector<Shared<Lifetime>>.make()
+      run appendAllAtoms(&mut container, Vector<Shared<Lifetime>>.asSlice(&facts[fact].shorter))
+      run Vector<ImpliedGroup>.append(&mut implied.groups, ImpliedGroup {container: move container, members: move members})
+      fact = fact + usize.ONE
+    }
+    return move implied
+  }
+  return noImplied()
 }
 
 // The facts a call implies: the body's open region relations and the well-formedness of the
@@ -2842,11 +3074,135 @@ effect fn call(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: 
   let sinks = run operandSinks(nodes, result, arguments, owner)
   let unplaced = Vector<Vector<Step>>.make()
   let called = run finish(nodes, owner, &mut walker.*, result, current, &carried, exact, Forwarding.None, Vector<Vector<Step>>.asSlice(&unplaced), Vector<NodeId>.asSlice(&typed), Vector<OperandSink>.asSlice(&sinks))
+  let lent = run storeIntoLent(nodes, locals, owner, &mut walker.*, result, arguments, Vector<Carry>.asSlice(&carried),
+    nodes[result.index].origin.location, called.at)
   // The callee may invoke a closure an argument carries, whether passed by value, by reference, or
   // within a holder, so its storable loans reach the call as that closure's do.
   let stored = run storeThroughExclusive(locals, owner, &mut walker.*, Vector<Carry>.asSlice(&carried), Vector<Carry>.asSlice(&carried),
-    nodes[result.index].origin.location, called.at)
+    nodes[result.index].origin.location, lent)
   return Flow {at: stored, carried: move called.carried}
+}
+
+// A call can keep an operand's loans in the caller regions its signature lets it write (`KeptRegions`,
+// R3 amendment 4). A body holder the call lends exclusively, whose type names such a region, may
+// receive through that `&mut` each of them that lies in the operand's value (`liesIn`), so it holds
+// those from the call on, as a field store into it would: an access to their referents conflicts
+// with them while the holder lives, and a value read from the holder carries them. A holder that is
+// a reference holding body loans may reach body storage the walk cannot place, so such a store
+// leaves the body unchecked; a reference this body was passed reaches caller storage, which the
+// region proof answers for.
+effect fn storeIntoLent(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, result: NodeId, arguments: &[NodeId],
+  carried: &[Carry], span: Location, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if carried.length == usize.ZERO || walker.outside || at == usize.MAX { return at }
+  let recorded = match move callKept(nodes, result) {
+    Option<Shared<Vector<KeptRegions>>>.Some {value} => move value
+    _ => { return at }
+  }
+  let mut holders = Vector<usize>.make()
+  let mut index = usize.ZERO
+  let loans = Vector<Loan>.asSlice(&walker.loans)
+  while index < carried.length {
+    let lent = loans[carried[index].loan].place.root
+    if loans[carried[index].loan].exclusive && lent < walker.localCount && !listsIndex(Vector<usize>.asSlice(&holders), lent) {
+      run Vector<usize>.append(&mut holders, lent)
+    }
+    index = index + usize.ONE
+  }
+  let mut point = at
+  let roots = Vector<usize>.asSlice(&holders)
+  let mut holder = usize.ZERO
+  while holder < roots.length {
+    let root = roots[holder]
+    let ty = localType(locals, root)
+    let mut named = Vector<Shared<Lifetime>>.make()
+    run Type.regionAtoms(&ty, &mut named)
+    let mut received = Vector<Carry>.make()
+    if run retains(&ty, owner) {
+      index = usize.ZERO
+      while index < carried.length {
+        let operand = carried[index].operand
+        let loan = carried[index].loan
+        let lent = &Vector<Loan>.asSlice(&walker.loans)[loan]
+        let own = operand < arguments.length && lent.origin.start == nodes[arguments[operand].index].origin.location.start
+          && lent.origin.end == nodes[arguments[operand].index].origin.location.end
+        if lent.place.root != root && operand < arguments.length && keptIn(&recorded, operand, own, Vector<Shared<Lifetime>>.asSlice(&named))
+          && run liesIn(nodes, arguments[operand], lent) {
+          let mut carry = carried[index]
+          carry.field = usize.MAX
+          carry.direct = false
+          run Vector<Carry>.append(&mut received, carry)
+        }
+        index = index + usize.ONE
+      }
+    }
+    if Vector<Carry>.length(&received) > usize.ZERO {
+      if Shared<Type>.with<bool>(&ty, referenceType) {
+        if holds(&walker.*, root) {
+          leave(&mut walker.*, BorrowStatus.StoredLoans)
+          return point
+        }
+      } else {
+        // The new definition replaces the holder's earlier ones, so it holds what they did, once
+        // per loan: re-holding every earlier holding would double them at each such call.
+        let used = run useHolder(&mut walker.*, root, usize.MAX, span, point)
+        let mut carrying = Vector<Carry>.make()
+        run appendDistinctLoans(&mut carrying, Vector<Carry>.asSlice(&used.carried))
+        run appendDistinctLoans(&mut carrying, Vector<Carry>.asSlice(&received))
+        run hold(&mut walker.*, root, Vector<Carry>.asSlice(&carrying), used.at, false)
+        point = used.at
+      }
+    }
+    holder = holder + usize.ONE
+  }
+  return point
+}
+
+// Appends each of `carries` whose loan `carrying` does not already hold.
+effect fn appendDistinctLoans(carrying: &mut Vector<Carry>, carries: &[Carry]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < carries.length {
+    let listed = Vector<Carry>.asSlice(&carrying.*)
+    let mut seen = false
+    let mut each = usize.ZERO
+    while each < listed.length {
+      if listed[each].loan == carries[at].loan { seen = true }
+      each = each + usize.ONE
+    }
+    if !seen { run Vector<Carry>.append(&mut carrying.*, carries[at]) }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether `loan`'s own borrow lies in the value `argument` passes: the argument's type names the
+// borrow's region, or a type parameter that may hold it. The regions a borrow retains from its
+// referent's type name what that referent views, not the borrowed storage itself.
+effect fn liesIn(nodes: &[Node], argument: NodeId, loan: &Loan) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, argument) {
+    if run Type.namesTypeParameter(&value) { return true }
+    let mut atoms = Vector<Shared<Lifetime>>.make()
+    run Type.regionAtoms(&value, &mut atoms)
+    let named = Vector<Shared<Lifetime>>.asSlice(&atoms)
+    if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loan.borrowed {
+      let mut own = Vector<Shared<Lifetime>>.make()
+      run Vector<Shared<Lifetime>>.append(&mut own, Shared<Lifetime>.clone(&borrowed))
+      return sharesAtom(Vector<Shared<Lifetime>>.asSlice(&own), named)
+    }
+    return sharesAtom(Vector<Shared<Lifetime>>.asSlice(&loan.regions), named)
+  }
+  return true
+}
+
+// Whether the call can keep operand `operand`'s loans in one of `named`'s regions: the operand's own
+// borrow where it keeps the reference it receives (`outer`), any other where it keeps the operand.
+fn keptIn(recorded: &Shared<Vector<KeptRegions>>, operand: usize, own: bool, named: &[Shared<Lifetime>]) -> bool {
+  return Shared<Vector<KeptRegions>>.with<bool>(recorded, fn(values: &Vector<KeptRegions>) -> bool {
+    let entries = Vector<KeptRegions>.asSlice(values)
+    if operand >= entries.length { return false }
+    if own { return sharesAtom(Vector<Shared<Lifetime>>.asSlice(&entries[operand].outer), named) }
+    return sharesAtom(Vector<Shared<Lifetime>>.asSlice(&entries[operand].whole), named)
+  })
 }
 
 // An invoked callable whose body may store a loan it carries stores it wherever it can write
@@ -2885,6 +3241,7 @@ effect fn storeThroughExclusive(locals: &[Local], owner: &DeclarationId, walker:
         if listsIndex(Vector<usize>.asSlice(&walker.storable), loan) && Vector<Loan>.asSlice(&walker.loans)[loan].place.root != root {
           let mut carry = stored[index]
           carry.field = usize.MAX
+          carry.direct = false
           run Vector<Carry>.append(&mut kept, carry)
         }
         index = index + usize.ONE
@@ -2985,11 +3342,15 @@ effect fn construct(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
   }
   if universalRegions(&stored, owner) {
     // Whether the callable's body stores a capture is not visible here: a loan typed at a universal
-    // region escapes, and any other leaves the body unchecked. A capture whose type no position the
-    // callable can write admits is never stored, so the loans it carries stay in the environment. A
-    // body loan cannot be given to a slot whose region names only universal regions: the callable's
-    // own body would have to prove a body region outlives one, which a body the borrow check closed
-    // has done; any other body leaves this one unchecked below.
+    // region escapes. A capture whose type no position the callable can write admits is never
+    // stored, so the loans it carries stay in the environment. A loan of storage the body owns
+    // (`ownedStorageLoan`), typed only at body regions (`typedLocally`), stays with a callable whose
+    // body the borrow check closed and whose types name no type parameter: that storage ends within
+    // the body, so no region proof shows its region outlives a universal one, and a slot whose region
+    // names only universal regions never admits it. A reborrow through a reference is not such a
+    // loan: its region may be proved to outlive the reference's. Any other loan leaves the body
+    // unchecked: an unclosed body (`stores`) may store it anywhere it can write, and an
+    // instantiation (`opaque`) may hold it where no region shows.
     let captured = Vector<Carry>.asSlice(&carried)
     let entered = Vector<usize>.asSlice(&sources)
     let mut unchecked = false
@@ -3000,7 +3361,8 @@ effect fn construct(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       if held < entered.length && entered[held] < holdable.length { hold = holdable[entered[held]] }
       if universalRegions(&all[captured[held].loan].regions, owner) {
         if hold != CaptureHold.Never { all[captured[held].loan].escapes = true }
-      } else if hold == CaptureHold.Any {
+      } else if hold == CaptureHold.Any && (stores || opaque || !typedLocally(&all[captured[held].loan].regions, owner)
+        || !ownedStorageLoan(&all[captured[held].loan])) {
         unchecked = true
       }
       held = held + usize.ONE
@@ -3099,7 +3461,7 @@ effect fn defer(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
   let kept = Vector<OperandSink>.asSlice(&sinks)
   if pipeline && arguments.length > usize.ZERO {
     let input = run visit(nodes, locals, owner, &mut walker.*, arguments[0], current)
-    keepLoans(&mut walker.*, owner, Vector<Carry>.asSlice(&input.carried), &kept[0])
+    run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(&input.carried), kept, usize.ZERO)
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&input.carried))
     current = input.at
     first = usize.ONE
@@ -3110,7 +3472,7 @@ effect fn defer(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
   let mut index = first
   while index < arguments.length {
     let flow = run visit(nodes, locals, owner, &mut walker.*, arguments[index], current)
-    keepLoans(&mut walker.*, owner, Vector<Carry>.asSlice(&flow.carried), &kept[index])
+    run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(&flow.carried), kept, index)
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&flow.carried))
     current = flow.at
     index = index + usize.ONE
@@ -3837,7 +4199,8 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         if Vector<Carry>.length(&flow.carried) > usize.ZERO || (path.through && holds(&walker.*, path.root)) {
           let retained = run nodeRetains(nodes, id, owner)
           if retained {
-            let read = run attributeRead(&mut walker.*, &path, Vector<Carry>.asSlice(&flow.carried))
+            let declared = run declaredRead(nodes, id, owner)
+            let read = run attributeRead(nodes, owner, &mut walker.*, &path, Vector<Carry>.asSlice(&flow.carried), &declared)
             let unplaced = Vector<Vector<Step>>.make()
             let untyped = Vector<NodeId>.make()
             let noSinks = Vector<OperandSink>.make()
@@ -4053,6 +4416,7 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
         while index < stored.length {
           let mut moved = stored[index]
           moved.field = run prefixedPath(&mut walker.*, Vector<Step>.asSlice(&path.steps), stored[index].field)
+          moved.direct = moved.direct && moved.field != usize.MAX
           run Vector<Carry>.append(&mut carrying, moved)
           index = index + usize.ONE
         }
@@ -4343,7 +4707,9 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       return flowAt(at)
     }
     let moved = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Move, span, at)
-    flow = Flow {at: moved.at, carried: run attributeRead(&mut walker.*, &path, Vector<Carry>.asSlice(&moved.carried))}
+    // The subject is read whole, so no loan it holds is within a narrower read.
+    let whole = DeclaredRead {known: false, regions: Vector<Shared<Lifetime>>.make()}
+    flow = Flow {at: moved.at, carried: run attributeRead(nodes, owner, &mut walker.*, &path, Vector<Carry>.asSlice(&moved.carried), &whole)}
     attributed = true
   } else if (access == Scrutinee.Exclusive || access == Scrutinee.Place) && path.root != usize.MAX {
     let mut kind = Kind.Inspect
@@ -4507,7 +4873,7 @@ effect fn matchArms(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
   let mut onward = Vector<Carry>.make()
   index = usize.ZERO
   while index < carried.length {
-    run Vector<Carry>.append(&mut onward, Carry {loan: carried[index].loan, since: joined, operand: usize.MAX, definition: carried[index].definition, read: carried[index].read, field: carried[index].field})
+    run Vector<Carry>.append(&mut onward, Carry {loan: carried[index].loan, since: joined, operand: usize.MAX, definition: carried[index].definition, read: carried[index].read, field: carried[index].field, direct: carried[index].direct})
     index = index + usize.ONE
   }
   Vector<Scope>.truncate(&mut walker.scopes, enclosing)
@@ -4532,13 +4898,38 @@ effect fn settled(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walke
 }
 
 // A field, index or dereference of a value that is not a written place: its operand is evaluated
-// and consumed by the projection.
+// and consumed by the projection. A field holds every loan its operand holds, as a literal's field
+// does under the literal's meet of its field regions, except a loan the operand holds as a call's
+// whole result where the field's declared type provably cannot reach it (`unreachableField`).
 effect fn readValue(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, id: NodeId, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut values = Vector<NodeId>.make()
   if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
     match &form {
-      Expression.Field {value, ..} => { run Vector<NodeId>.append(&mut values, value) }
+      Expression.Field {value, ..} => {
+        let subject = run visit(nodes, locals, owner, &mut walker.*, value, at)
+        let declared = run declaredRead(nodes, id, owner)
+        let held = Vector<Carry>.asSlice(&subject.carried)
+        let mut carried = Vector<Carry>.make()
+        let mut index = usize.ZERO
+        while index < held.length {
+          let mut kept = true
+          if declared.known && held[index].field == usize.ZERO && !reborrowedByCarried(Vector<Loan>.asSlice(&walker.loans), held, index) {
+            kept = !run unreachableField(nodes, owner, &walker.*, held[index], Vector<Shared<Lifetime>>.asSlice(&declared.regions))
+          }
+          if kept {
+            let carry = held[index]
+            run Vector<Carry>.append(&mut carried, Carry {loan: carry.loan, since: carry.since, operand: usize.ZERO,
+              definition: carry.definition, read: carry.read, field: carry.field, direct: false})
+          }
+          index = index + usize.ONE
+        }
+        let unplaced = Vector<Vector<Step>>.make()
+        let untyped = Vector<NodeId>.make()
+        let noSinks = Vector<OperandSink>.make()
+        return run finish(nodes, owner, &mut walker.*, id, subject.at, &carried, false, Forwarding.Operands,
+          Vector<Vector<Step>>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
+      }
       Expression.Dereference {value} => { run Vector<NodeId>.append(&mut values, value) }
       Expression.Index {value, index, ..} => {
         run Vector<NodeId>.append(&mut values, value)
@@ -4586,10 +4977,14 @@ effect fn hold(walker: &mut Walker, root: usize, carried: &[Carry], at: usize, a
   while index < carried.length {
     let definition = Vector<Holding>.length(&walker.definitions)
     let mut field = usize.MAX
-    if attributed { field = carried[index].field }
+    let mut direct = false
+    if attributed {
+      field = carried[index].field
+      direct = carried[index].direct && field != usize.MAX
+    }
     let inherited = shadowedSource(&walker.*, carried[index].definition)
     run Vector<Holding>.append(&mut walker.definitions, Holding {loan: carried[index].loan, holder: local, point: at,
-      source: carried[index].definition, read: carried[index].read, field: field, shadowed: false, inherited: inherited})
+      source: carried[index].definition, read: carried[index].read, field: field, direct: direct, shadowed: false, inherited: inherited})
     let mut held = Vector<Vector<usize>>.asMutSlice(&mut walker.held)
     run Vector<usize>.append(&mut held[local], definition)
     index = index + usize.ONE
@@ -4613,7 +5008,7 @@ effect fn shadow(walker: &mut Walker, root: usize, carried: &[Carry], at: usize)
   while index < carried.length {
     let definition = Vector<Holding>.length(&walker.definitions)
     run Vector<Holding>.append(&mut walker.definitions, Holding {loan: carried[index].loan, holder: local, point: at,
-      source: carried[index].definition, read: carried[index].read, field: carried[index].field, shadowed: true, inherited: false})
+      source: carried[index].definition, read: carried[index].read, field: carried[index].field, direct: false, shadowed: true, inherited: false})
     let mut held = Vector<Vector<usize>>.asMutSlice(&mut walker.held)
     run Vector<usize>.append(&mut held[local], definition)
     index = index + usize.ONE
@@ -5247,7 +5642,7 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
     guardConsumed: Option<Location>.none(),
     retention: Retention.None, requirements: move requirements,
     settled: settled,
-    retentionRelations: move retentionRelations,
+    retentionRelations: move retentionRelations, wholeHolds: Vector<WholeHold>.make(),
     openContents: move openContents,
     unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(),
@@ -5448,7 +5843,10 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
     }
     let mut index = usize.ZERO
     while index < loans.length {
-      if (event.kind == Kind.End || event.kind == Kind.Expire) && loans[index].local && covers(&event.place, &loans[index].place) {
+      // A loan kept only by a typing relation the return-slot refutation decides is reported there
+      // (SEM0212), at its borrow, rather than where the walk finds it.
+      let deferred = loans[index].bound && returnedEscape != usize.MAX
+      if (event.kind == Kind.End || event.kind == Kind.Expire) && loans[index].local && !deferred && covers(&event.place, &loans[index].place) {
         let carried = run flightEnds(&walker, &loans[index], event.point, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
         let mut held = definitionWidth > usize.ZERO
           && heldLive(&walker, index, Vector<u64>.asSlice(&liveOut), Vector<u64>.asSlice(&definitions.entering), definitionWidth, event.point)
@@ -5475,7 +5873,7 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
             run addReport(&mut reports, Report {code: expiredCode(), access: required, related: true, earlier: loans[index].origin})
           }
         }
-      } else if index != event.loan && !lentTo(&loans[index], &event.binders) {
+      } else if index != event.loan && !deferred && !lentTo(&loans[index], &event.binders) {
         let code = conflictCode(event.kind, loans[index].exclusive)
         if let Option<RejectionCode>.Some {value} = move code {
           let mut shared = overlap(&loans[index].place, &event.place)
@@ -5593,8 +5991,9 @@ fn refutedOr(walker: &Walker, escaping: usize, otherwise: Verdict) -> Verdict {
 // OWN0019/conflict diagnostics. Unknown mappings cannot upgrade a body; a complete union of
 // possible loans can prove safety only when every possible source satisfies the proof.
 // `required` holds the region's own requirement and every point propagated into it; `incoming` only
-// the propagated points. A local region's own requirement was checked loan by loan against that
-// loan's validity; propagated points must lie where every loan of the region is valid.
+// the points propagated from other regions. A local region's own requirement was checked loan by
+// loan against that loan's validity; propagated points must lie where every loan of the region is
+// valid.
 struct RegionPoints {
   region: Shared<Lifetime>
   required: Vector<u64>
@@ -6056,11 +6455,11 @@ effect fn finiteParentRoots(loans: &[Loan], owner: &DeclarationId, supplied: &[S
     let mut at = usize.ZERO
     while at < loans.length {
       let loan = &loans[at]
-      if proofContains(Vector<Shared<Lifetime>>.asSlice(&loan.regions), &region) {
+      if regionsCarry(Vector<Shared<Lifetime>>.asSlice(&loan.regions), &region, owner, supplied) {
         found = true
         if !provable(loan.precision) { return false }
         if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loan.borrowed {
-          if !Lifetime.equalsShared(&borrowed, &region) { return false }
+          if !carriesRegion(&borrowed, &region, owner, supplied) { return false }
         } else { return false }
         if loan.local {
           if let Option<Shared<Lifetime>>.Some {..} = &loan.parent { return false }
@@ -6104,7 +6503,18 @@ effect fn finiteCrossingsProved(walker: &Walker, owner: &DeclarationId, premises
     let loan = &loans[at]
     if loan.crossed && !run loanParentBoundProved(walker, owner, loan, premises, &mut symbolic.*) {
       if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loan.borrowed {
-        drop run symbolicRootIndex(&mut roots, &borrowed)
+        if localMeet(&borrowed, owner, Vector<Shared<Lifetime>>.asSlice(&walker.supplied)) {
+          // The meet's local constituents carry its finite requirements; its universal ones
+          // outlive the body.
+          let mut atom = usize.ZERO
+          while atom < Lifetime.atomCount(&borrowed) {
+            let member = Lifetime.atomAt(&borrowed, atom)
+            if regionLocal(&member, owner) { drop run symbolicRootIndex(&mut roots, &member) }
+            atom = atom + usize.ONE
+          }
+        } else {
+          drop run symbolicRootIndex(&mut roots, &borrowed)
+        }
       } else { return false }
     }
     at = at + usize.ONE
@@ -6200,9 +6610,12 @@ effect fn localAvailable(walker: &Walker, loan: &Loan, sourceBound: bool, ownedS
     let event = &events[at]
     let ends = event.kind == Kind.End || event.kind == Kind.Expire || event.kind == Kind.Write
       || event.kind == Kind.Move || event.kind == Kind.Drop
-    // Ending or replacing the descriptor does not end an independently bounded referent.
-    // Actual referent events still invalidate availability, and Walker conflicts are unchanged.
-    let descriptorOnly = (event.kind == Kind.Write || sourceBound) && behind(&event.place, &loan.place)
+    // Ending or replacing the descriptor does not end an independently bounded referent, and
+    // ending a descriptor's storage never ends what it refers to: a reborrow through a reference
+    // a scope or statement ends stays bounded by the loan that reference carries. Actual referent
+    // events still invalidate availability, and Walker conflicts are unchanged.
+    let storageEnds = event.kind == Kind.End || event.kind == Kind.Expire
+    let descriptorOnly = (event.kind == Kind.Write || storageEnds || sourceBound) && behind(&event.place, &loan.place)
     if ends && !descriptorOnly && event.point != loan.created && overlap(&event.place, &loan.place) != usize.ZERO
       && excludeRegionPoint(&mut available.*, event.point) {
       run Vector<usize>.append(&mut queue, event.point)
@@ -6440,7 +6853,8 @@ effect fn initializedOwnedRegion(walker: &Walker, loan: &Loan, region: &Shared<L
 // checks each loan's own requirement against that loan's availability. Its required set is their
 // union; incoming requirements must fit their availability intersection. An atom no
 // loan names remains pending unless typing authenticated it as an unconstrained call-prefix
-// choice. Outside-owner, invocation, supplied and meet terms and unknown mappings remain pending.
+// choice. A loan typed under a `localMeet` names each of the meet's local constituents. Outside-owner,
+// invocation and supplied terms and unknown mappings remain pending.
 effect fn regionPoints(walker: &Walker, owner: &DeclarationId, region: &Shared<Lifetime>,
   liveOut: &[u64], definitions: &[u64], definitionWidth: usize,
   regions: &mut Vector<RegionPoints>, premises: &[RegionBound], symbolic: &mut Vector<SymbolicRegion>, flow: &mut IntervalFlow, storage: &mut RegionAvailability) -> usize
@@ -6458,14 +6872,7 @@ effect fn regionPoints(walker: &Walker, owner: &DeclarationId, region: &Shared<L
   if domain == RegionDomain.Local {
     at = usize.ZERO
     while at < loans.length {
-      let named = Vector<Shared<Lifetime>>.asSlice(&loans[at].regions)
-      let mut atom = usize.ZERO
-      let mut found = false
-      while atom < named.length {
-        if Lifetime.equalsShared(&named[atom], region) { found = true }
-        atom = atom + usize.ONE
-      }
-      if found {
+      if regionsCarry(Vector<Shared<Lifetime>>.asSlice(&loans[at].regions), region, owner, Vector<Shared<Lifetime>>.asSlice(&walker.supplied)) {
         if !provable(loans[at].precision) { return usize.MAX }
         run Vector<usize>.append(&mut selected, at)
       }
@@ -6575,9 +6982,10 @@ effect fn regionPoints(walker: &Walker, owner: &DeclarationId, region: &Shared<L
 
 // Whether `loan` is an exact loan of storage the body owns: rooted in a local or a temporary's
 // hidden owner, which ends with its statement, with no reference step and no parent region, so no
-// reborrow of storage reached through a reference.
+// reborrow of storage reached through a reference. A field store keeps its carriers exact
+// (`LoanPrecision.Stored`), and what it borrows is unchanged.
 fn ownedStorageLoan(loan: &Loan) -> bool {
-  if !loan.local || loan.precision != LoanPrecision.Exact { return false }
+  if !loan.local || (loan.precision != LoanPrecision.Exact && loan.precision != LoanPrecision.Stored) { return false }
   if let Option<Shared<Lifetime>>.Some {..} = &loan.parent { return false }
   let steps = Vector<Step>.asSlice(&loan.place.steps)
   let mut at = usize.ZERO
@@ -6857,47 +7265,62 @@ fn finiteCaptureContents(owner: &DeclarationId, origin: Origin, subject: &Shared
 
 effect fn solveRegionRequirements(regions: &mut Vector<RegionPoints>, links: &[RegionEdge]) -> bool
 ! OutOfMemoryError ? &mut Allocator {
-  let mut queue = Vector<usize>.make()
-  let mut queued = Vector<bool>.make()
+  // Each region's own requirement reaches every region that must outlive it. One that returns to its
+  // origin through a cycle of relations, as two regions related both ways do, was already checked
+  // loan by loan there; checking it again against every loan of the origin would refuse a loan
+  // whose own validity ends before another loan of the same region is still needed.
+  let count = Vector<RegionPoints>.length(&regions.*)
+  let mut own = Vector<Vector<u64>>.make()
   let mut at = usize.ZERO
-  while at < Vector<RegionPoints>.length(&regions.*) {
-    run Vector<usize>.append(&mut queue, at)
-    run Vector<bool>.append(&mut queued, true)
+  while at < count {
+    let entries = Vector<RegionPoints>.asSlice(&regions.*)
+    let mut words = Vector<u64>.make()
+    let required = Vector<u64>.asSlice(&entries[at].required)
+    let mut word = usize.ZERO
+    while word < required.length { run Vector<u64>.append(&mut words, required[word]) word = word + usize.ONE }
+    run Vector<Vector<u64>>.append(&mut own, move words)
     at = at + usize.ONE
   }
-  at = usize.ZERO
-  while at < Vector<usize>.length(&queue) {
-    let source = Vector<usize>.asSlice(&queue)[at]
-    let mut leaving = Vector<bool>.asMutSlice(&mut queued)
-    leaving[source] = false
-    let mut edge = usize.ZERO
-    while edge < links.length {
-      let link = links[edge]
-      if link.shorter == source && link.longer != source {
-        let mut entries = Vector<RegionPoints>.asMutSlice(&mut regions.*)
-        let count = Vector<u64>.length(&entries[source].required)
-        let mut word = usize.ZERO
-        let mut changed = false
-        while word < count {
-          let sourceWords = Vector<u64>.asSlice(&entries[source].required)
-          let added = sourceWords[word]
-          let mut words = Vector<u64>.asMutSlice(&mut entries[link.longer].required)
-          let before = words[word]
-          words[word] = u64.bitOr(before, added)
-          if before != words[word] { changed = true }
-          let mut arrived = Vector<u64>.asMutSlice(&mut entries[link.longer].incoming)
-          arrived[word] = u64.bitOr(arrived[word], added)
-          word = word + usize.ONE
-        }
-        let mut waiting = Vector<bool>.asMutSlice(&mut queued)
-        if changed && !waiting[link.longer] {
-          waiting[link.longer] = true
+  let mut origin = usize.ZERO
+  while origin < count {
+    let mut reached = Vector<bool>.make()
+    at = usize.ZERO
+    while at < count { run Vector<bool>.append(&mut reached, at == origin) at = at + usize.ONE }
+    let mut queue = Vector<usize>.make()
+    run Vector<usize>.append(&mut queue, origin)
+    let mut next = usize.ZERO
+    while next < Vector<usize>.length(&queue) {
+      let source = Vector<usize>.asSlice(&queue)[next]
+      let mut edge = usize.ZERO
+      while edge < links.length {
+        let link = links[edge]
+        if link.shorter == source && link.longer < count && !Vector<bool>.asSlice(&reached)[link.longer] {
+          let mut marked = Vector<bool>.asMutSlice(&mut reached)
+          marked[link.longer] = true
           run Vector<usize>.append(&mut queue, link.longer)
         }
+        edge = edge + usize.ONE
       }
-      edge = edge + usize.ONE
+      next = next + usize.ONE
     }
-    at = at + usize.ONE
+    let sourceWords = Vector<u64>.asSlice(&Vector<Vector<u64>>.asSlice(&own)[origin])
+    let flags = Vector<bool>.asSlice(&reached)
+    at = usize.ZERO
+    while at < count {
+      if at != origin && flags[at] {
+        let mut entries = Vector<RegionPoints>.asMutSlice(&mut regions.*)
+        let mut word = usize.ZERO
+        while word < sourceWords.length {
+          let mut words = Vector<u64>.asMutSlice(&mut entries[at].required)
+          words[word] = u64.bitOr(words[word], sourceWords[word])
+          let mut arrived = Vector<u64>.asMutSlice(&mut entries[at].incoming)
+          arrived[word] = u64.bitOr(arrived[word], sourceWords[word])
+          word = word + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+    origin = origin + usize.ONE
   }
   let solved = Vector<RegionPoints>.asSlice(&regions.*)
   at = usize.ZERO
@@ -6930,10 +7353,13 @@ effect fn solveRegionRequirements(regions: &mut Vector<RegionPoints>, links: &[R
 /// this body proves only its own uses (R3 amendment 4). Owned body storage cannot outlive the
 /// body. An inferred region can satisfy a universal bound only through the separate symbolic
 /// source proof; classifying its atoms here does not prove that bound. A callable contract's
-/// invocation binders describe future calls. Exact callable lifetime/row application arguments
-/// are selection metadata; Type.bodyRegionAtoms still checks their contracts, captures and type
-/// evidence. A Supplied atom is closed only when it is one of `supplied`, the body's own selected
-/// application regions; any other remains open. Callee
+/// invocation binders describe future calls, so a nested callable's own parameters are closed
+/// wherever its value is held, as in an Effect application that carries it, and an invocation
+/// region is closed where it occurs only inside the callables a type holds. A parent's binder in
+/// an escaped child's contract is not the child's own and stays open. Exact callable lifetime and
+/// row application arguments are selection metadata; Type.bodyRegionAtoms still checks their
+/// contracts, captures and type evidence. A Supplied atom is closed only when it is one of
+/// `supplied`, the body's own selected application regions; any other remains open. Callee
 /// contracts and outside-body type parameters cannot smuggle in a fresh body-local region.
 pub effect fn regionClosed(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals: &[Local], nodes: &[Node]) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut at = usize.ZERO
@@ -6963,15 +7389,14 @@ fn namedEnclosing(declaration: &DeclarationId, owner: &DeclarationId) -> bool {
   return kind != OwnerKind.Anonymous && kind != OwnerKind.EffectBlock && DeclarationId.isPrefixOf(declaration, owner)
 }
 
-// Marks a loan one operand carries into a call that can keep it in a universal region as escaping;
-// one that reaches a call this walk cannot describe leaves the body unchecked.
-fn keepLoan(walker: &mut Walker, owner: &DeclarationId, loan: usize, sink: &OperandSink) -> () {
+// Where a call can keep a loan one operand carries: `Local` also when the operand holds none of it.
+fn keptSink(walker: &Walker, owner: &DeclarationId, loan: usize, direct: bool, sink: &OperandSink) -> CallSink {
   let recorded = Vector<Loan>.asSlice(&walker.loans)
   let origin = recorded[loan].origin
   // An operand whose type names only `'static` holds no loan of the body unless typing gave that
   // loan a `'static` region; one the walk carries into it otherwise is not part of its value.
   let regions = Vector<Shared<Lifetime>>.asSlice(&recorded[loan].regions)
-  if !sink.holds && (regions.length == usize.ZERO || !staticRegions(&recorded[loan].regions)) { return () }
+  if !sink.holds && (regions.length == usize.ZERO || !staticRegions(&recorded[loan].regions)) { return CallSink.Local }
   let mut kept = sink.whole
   let mut approximate = sink.wholeApproximate
   let mut own = origin.start == sink.span.start && origin.end == sink.span.end
@@ -6986,6 +7411,8 @@ fn keepLoan(walker: &mut Walker, owner: &DeclarationId, loan: usize, sink: &Oper
   if own {
     kept = sink.outer
     approximate = sink.outerApproximate
+  } else if direct {
+    narrowSlots(&recorded[loan], sink, &mut kept, &mut approximate)
   }
   // A loan the operand carries, rather than its own borrow, lies where typing placed it: one typed
   // only at regions within the body cannot be at a universal position unless typing related
@@ -7002,22 +7429,118 @@ fn keepLoan(walker: &mut Walker, owner: &DeclarationId, loan: usize, sink: &Oper
   } else if kept == CallSink.Local && approximate == CallSink.Unknown {
     kept = CallSink.Unknown
   }
-  if kept == CallSink.Universal {
-    let mut all = Vector<Loan>.asMutSlice(&mut walker.loans)
-    all[loan].escapes = true
-  } else if kept == CallSink.Unknown {
-    leave(&mut walker.*, BorrowStatus.StoredLoans)
+  return kept
+}
+
+// Marks each loan the operands carry into a call that can keep it in a universal region as
+// escaping. A reborrow keeps its parent's storage borrowed while it lives, so a loan of body storage
+// that the parent regions of an escaping loan reach among those its operand carries escapes with
+// it, wherever typing placed it. Any other loan that reaches a call this walk cannot describe leaves the body
+// unchecked. Each carry is judged by `sinks[only]`, or by its own operand's sink when `only` is
+// `usize.MAX`; a carry with no sink is kept nowhere.
+effect fn keepCarried(walker: &mut Walker, owner: &DeclarationId, carries: &[Carry], sinks: &[OperandSink], only: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut kept = Vector<CallSink>.make()
+  let mut escaping = Vector<usize>.make()
+  let mut at = usize.ZERO
+  while at < carries.length {
+    let mut operand = only
+    if operand == usize.MAX { operand = carries[at].operand }
+    let mut decided = CallSink.Local
+    if operand < sinks.length { decided = keptSink(&walker.*, owner, carries[at].loan, carries[at].direct, &sinks[operand]) }
+    run Vector<CallSink>.append(&mut kept, decided)
+    if decided == CallSink.Universal { run Vector<usize>.append(&mut escaping, at) }
+    at = at + usize.ONE
+  }
+  let loans = Vector<Loan>.asSlice(&walker.loans)
+  let mut reached = Vector<bool>.make()
+  at = usize.ZERO
+  while at < carries.length {
+    run Vector<bool>.append(&mut reached, Vector<CallSink>.asSlice(&kept)[at] == CallSink.Universal)
+    at = at + usize.ONE
+  }
+  let mut next = usize.ZERO
+  while next < Vector<usize>.length(&escaping) {
+    let child = Vector<usize>.asSlice(&escaping)[next]
+    if let Option<Shared<Lifetime>>.Some {value: parent} = &loans[carries[child].loan].parent {
+      at = usize.ZERO
+      while at < carries.length {
+        let seen = Vector<bool>.asSlice(&reached)[at]
+        if !seen && (only != usize.MAX || carries[at].operand == carries[child].operand) {
+          if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loans[carries[at].loan].borrowed {
+            if meetMember(&parent, &borrowed) {
+              let mut marked = Vector<bool>.asMutSlice(&mut reached)
+              marked[at] = true
+              run Vector<usize>.append(&mut escaping, at)
+              // Storage this body owns cannot outlive it. A reborrow through a reference keeps its
+              // own judgment: the region proof bounds the caller storage it reaches.
+              if loans[carries[at].loan].local {
+                let mut decisions = Vector<CallSink>.asMutSlice(&mut kept)
+                decisions[at] = CallSink.Universal
+              }
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+    next = next + usize.ONE
+  }
+  let decisions = Vector<CallSink>.asSlice(&kept)
+  at = usize.ZERO
+  while at < carries.length {
+    if decisions[at] == CallSink.Universal {
+      let mut all = Vector<Loan>.asMutSlice(&mut walker.loans)
+      all[carries[at].loan].escapes = true
+    } else if decisions[at] == CallSink.Unknown {
+      leave(&mut walker.*, BorrowStatus.StoredLoans)
+    }
+    at = at + usize.ONE
   }
   return ()
 }
 
-fn keepLoans(walker: &mut Walker, owner: &DeclarationId, carries: &[Carry], sink: &OperandSink) -> () {
+// Narrows where a call keeps a loan an operand carries to the slots its value can lie in
+// (`Type.mayHoldLoan`): an opaque slot keeps it wherever the whole operand does. Only a loan the
+// operand carries as its own reference (`Carry.direct`) is narrowed: a projection or call result
+// carries it in a value of another type, which may lie in any slot. A loan typed as no reference, an
+// operand the call could not describe, or a loan no slot can hold stays judged by the whole operand.
+fn narrowSlots(loan: &Loan, sink: &OperandSink, kept: &mut CallSink, approximate: &mut CallSink) -> () {
+  let referent = match &loan.referent {
+    Option<Shared<Type>>.Some {value} => Shared<Type>.clone(&value)
+    Option<Shared<Type>>.None => { return () }
+  }
+  let slots = Vector<SlotSink>.asSlice(&sink.slots)
+  if sink.undescribed || slots.length == usize.ZERO { return () }
+  let mut occupied = false
+  let mut precise = CallSink.Local
+  let mut wider = CallSink.Local
   let mut at = usize.ZERO
-  while at < carries.length {
-    keepLoan(&mut walker.*, owner, carries[at].loan, sink)
+  while at < slots.length {
+    if Type.mayHoldLoan(slots[at].view, &slots[at].referent, slots[at].exclusive, &referent, loan.exclusive) {
+      occupied = true
+      let mut slotKept = slots[at].kept
+      let mut slotApproximate = slots[at].approximate
+      if !slots[at].view {
+        slotKept = sink.whole
+        slotApproximate = sink.wholeApproximate
+      }
+      precise = joinSinks(precise, slotKept)
+      wider = joinSinks(wider, slotApproximate)
+    }
     at = at + usize.ONE
   }
+  if !occupied { return () }
+  kept.* = precise
+  approximate.* = wider
   return ()
+}
+
+// The longer of two sinks: unknown over universal over local.
+fn joinSinks(left: CallSink, right: CallSink) -> CallSink {
+  if left == CallSink.Unknown || right == CallSink.Unknown { return CallSink.Unknown }
+  if left == CallSink.Universal || right == CallSink.Universal { return CallSink.Universal }
+  return CallSink.Local
 }
 
 // Whether a region atom is chosen before the body runs and outlives it: `'static`, or a lifetime
@@ -7095,6 +7618,20 @@ struct OperandSink {
   // The operand's own region when it is a view: a carried loan typed at it is the view's own borrow,
   // made earlier as when a call returns a view of its argument, so it is judged as `outer`.
   view: Option<Shared<Lifetime>>
+  // Where the callee can keep a loan by where it lies in the operand (`KeptSlot`), or none.
+  slots: Vector<SlotSink>
+  // Whether the call could not describe the operand at all.
+  undescribed: bool
+}
+
+// One `KeptSlot` of an operand: whether a loan can lie there and where the callee keeps it then. An
+// opaque slot keeps a loan wherever the whole operand does.
+struct SlotSink {
+  view: bool
+  referent: Shared<Type>
+  exclusive: bool
+  kept: CallSink
+  approximate: CallSink
 }
 
 // An approximate channel's sink: unknown where the call could not describe the operand at all.
@@ -7156,7 +7693,7 @@ effect fn operandSinks(nodes: &[Node], call: NodeId, arguments: &[NodeId], owner
       holds = generic || !staticRegions(&named)
     }
     let mut sink = OperandSink {outer: unrecorded, whole: unrecorded, outerApproximate: unrecorded, wholeApproximate: unrecorded,
-      span: span, holds: holds, view: Option<Shared<Lifetime>>.none()}
+      span: span, holds: holds, view: Option<Shared<Lifetime>>.none(), slots: Vector<SlotSink>.make(), undescribed: false}
     if let Option<Shared<Vector<KeptRegions>>>.Some {value: kept} = &recorded {
       let listed = Shared<Vector<KeptRegions>>.with<usize>(&kept, fn(values: &Vector<KeptRegions>) -> usize { return Vector<KeptRegions>.length(values) })
       if at < listed {
@@ -7165,8 +7702,24 @@ effect fn operandSinks(nodes: &[Node], call: NodeId, arguments: &[NodeId], owner
           return OperandSink {outer: regionSink(&entries[at].outer, owner), whole: regionSink(&entries[at].whole, owner),
             outerApproximate: approximateSink(&entries[at].outerApproximate, entries[at].undescribed, owner),
             wholeApproximate: approximateSink(&entries[at].wholeApproximate, entries[at].undescribed, owner),
-            span: span, holds: holds, view: Option<Shared<Lifetime>>.none()}
+            span: span, holds: holds, view: Option<Shared<Lifetime>>.none(), slots: Vector<SlotSink>.make(),
+            undescribed: entries[at].undescribed}
         })
+        let count = Shared<Vector<KeptRegions>>.with<usize>(&kept, fn(values: &Vector<KeptRegions>) -> usize {
+          let entries = Vector<KeptRegions>.asSlice(values)
+          return Vector<KeptSlot>.length(&entries[at].slots)
+        })
+        let mut index = usize.ZERO
+        while index < count {
+          let slot = Shared<Vector<KeptRegions>>.with<SlotSink>(&kept, fn(values: &Vector<KeptRegions>) -> SlotSink {
+            let entries = Vector<KeptRegions>.asSlice(values)
+            let listed = Vector<KeptSlot>.asSlice(&entries[at].slots)
+            return SlotSink {view: listed[index].view, referent: Shared<Type>.clone(&listed[index].referent), exclusive: listed[index].exclusive,
+              kept: regionSink(&listed[index].kept, owner), approximate: approximateSink(&listed[index].keptApproximate, entries[at].undescribed, owner)}
+          })
+          run Vector<SlotSink>.append(&mut sink.slots, move slot)
+          index = index + usize.ONE
+        }
       }
     }
     sink.view = move view
@@ -7176,6 +7729,26 @@ effect fn operandSinks(nodes: &[Node], call: NodeId, arguments: &[NodeId], owner
   return move sinks
 }
 
+// Whether any of `atoms` is an invocation region.
+fn anyInvocationAtom(atoms: &[Shared<Lifetime>]) -> bool {
+  let mut at = usize.ZERO
+  while at < atoms.length {
+    if Shared<Lifetime>.with<bool>(&atoms[at], fn(region: &Lifetime) -> bool { return match &region.* { Lifetime.Invocation {..} => true _ => false } }) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether `declaration` is one of the callable values a type holds (`Type.appendCallableTargets`).
+fn namesTarget(targets: &[DeclarationId], declaration: &DeclarationId) -> bool {
+  let mut at = usize.ZERO
+  while at < targets.length {
+    if DeclarationId.equals(&targets[at], declaration) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 effect fn typeRegionClosed(ty: &Shared<Type>, owner: &DeclarationId, supplied: &[Shared<Lifetime>]) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut atoms = Vector<Shared<Lifetime>>.make()
   run Type.bodyRegionAtoms(ty, &mut atoms)
@@ -7183,6 +7756,14 @@ effect fn typeRegionClosed(ty: &Shared<Type>, owner: &DeclarationId, supplied: &
   let kind = DeclarationId.kind(owner)
   let anonymous = kind == OwnerKind.Anonymous || kind == OwnerKind.EffectBlock
   let callable = Shared<Type>.with<bool>(ty, callableValue)
+  let mut nested = Vector<DeclarationId>.make()
+  run Type.appendCallableTargets(ty, &mut nested)
+  let targets = Vector<DeclarationId>.asSlice(&nested)
+  // An invocation region describes a callable's future calls only inside that callable: one the type
+  // names outside every callable it holds is open.
+  let mut outside = Vector<Shared<Lifetime>>.make()
+  run Type.regionAtomsOutsideCallables(ty, &mut outside)
+  let invocationOutside = anyInvocationAtom(Vector<Shared<Lifetime>>.asSlice(&outside))
   let mut at = usize.ZERO
   while at < listed.length {
     if suppliedAtom(&listed[at]) {
@@ -7196,7 +7777,8 @@ effect fn typeRegionClosed(ty: &Shared<Type>, owner: &DeclarationId, supplied: &
         Lifetime.Local {declaration, ..} => DeclarationId.equals(&declaration, owner) || namedEnclosing(&declaration, owner)
         Lifetime.Parameter {declaration, ..} => DeclarationId.isPrefixOf(&declaration, owner)
           || (callable && DeclarationId.isPrefixOf(owner, &declaration))
-        Lifetime.Invocation {..} => anonymous || callable
+          || (DeclarationId.isPrefixOf(owner, &declaration) && namesTarget(targets, &declaration))
+        Lifetime.Invocation {..} => anonymous || callable || !invocationOutside
         _ => false
       }
     })
@@ -7268,7 +7850,7 @@ effect fn wrappedRegionClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7295,8 +7877,9 @@ effect fn wrappedRegionClaims() -> ()
     origin: Location.make(0, 1), intervals: move intervals, precision: LoanPrecision.Exact,
     regions: move named, local: true, borrowed: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&region)),
     parent: Option<Shared<Lifetime>>.none(), crossed: false, created: 1, escapes: false, binder: usize.MAX, block: usize.MAX, until: usize.MAX,
+    referent: Option<Shared<Type>>.none(), bound: false,
   })
-  run Vector<Holding>.append(&mut walker.definitions, Holding {loan: 0, holder: 0, point: 4, source: usize.MAX, read: usize.MAX, field: usize.MAX,
+  run Vector<Holding>.append(&mut walker.definitions, Holding {loan: 0, holder: 0, point: 4, source: usize.MAX, read: usize.MAX, field: usize.MAX, direct: false,
     shadowed: false, inherited: false})
   // A definition created at the bottom of the loop reaches the next header read. There is no
   // numeric interior in [4, 2]; only heldLive supplies points 2 and 3 to the region requirement.
@@ -7339,7 +7922,8 @@ effect fn symbolicTestLoan(region: &Shared<Lifetime>, parent: &Shared<Lifetime>,
   return Loan {place: Place {root: 0, steps: Vector<Step>.make()}, exclusive: false,
     origin: Location.make(0, 1), intervals: Vector<Interval>.make(), precision: LoanPrecision.Exact,
     regions: move regions, local: local, borrowed: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(region)),
-    parent: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(parent)), crossed: true, created: 1, escapes: false, binder: usize.MAX, block: usize.MAX, until: usize.MAX}
+    parent: Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(parent)), crossed: true, created: 1, escapes: false, binder: usize.MAX, block: usize.MAX, until: usize.MAX,
+    referent: Option<Shared<Type>>.none(), bound: false}
 }
 
 effect fn symbolicRootClaims() -> ()
@@ -7360,7 +7944,7 @@ effect fn symbolicRootClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7451,7 +8035,7 @@ effect fn retainedParentClaims() -> ()
   let mut at = usize.ZERO
   while at < 4 {
     run Vector<Carry>.append(&mut carried, Carry {loan: at, since: 0, operand: at,
-      definition: usize.MAX, read: usize.MAX, field: usize.MAX})
+      definition: usize.MAX, read: usize.MAX, field: usize.MAX, direct: false})
     at = at + usize.ONE
   }
   let mut result = Vector<Shared<Lifetime>>.make()
@@ -7596,7 +8180,7 @@ effect fn requiredRetentionClaims() -> ()
   let mut loans = Vector<Loan>.make()
   run Vector<Loan>.append(&mut loans, move actual)
   let mut carried = Vector<Carry>.make()
-  run Vector<Carry>.append(&mut carried, Carry {loan: 0, since: 1, operand: 0, definition: usize.MAX, read: usize.MAX, field: usize.MAX})
+  run Vector<Carry>.append(&mut carried, Carry {loan: 0, since: 1, operand: 0, definition: usize.MAX, read: usize.MAX, field: usize.MAX, direct: false})
   let mut named = Vector<Shared<Lifetime>>.make()
   run Vector<Shared<Lifetime>>.append(&mut named, Shared<Lifetime>.clone(&extent))
   let mut edges = Vector<RetentionEdge>.make()
@@ -7685,7 +8269,7 @@ effect fn descriptorSourceClaims() -> ()
   let mut loans = Vector<Loan>.make()
   run Vector<Loan>.append(&mut loans, run symbolicTestLoan(&inner, &inner, true))
   let mut carried = Vector<Carry>.make()
-  run Vector<Carry>.append(&mut carried, Carry {loan: 0, since: 1, operand: 0, definition: usize.MAX, read: usize.MAX, field: usize.MAX})
+  run Vector<Carry>.append(&mut carried, Carry {loan: 0, since: 1, operand: 0, definition: usize.MAX, read: usize.MAX, field: usize.MAX, direct: false})
   run Testing.expect(completeLocalResultSources(Vector<Loan>.asSlice(&loans), Vector<Carry>.asSlice(&carried), Vector<Shared<Lifetime>>.asSlice(&named), &owner, Vector<Shared<Lifetime>>.asSlice(&Vector<Shared<Lifetime>>.make())), "the exact actual source covers this local result")
   let mut listed = Vector<Loan>.asMutSlice(&mut loans)
   listed[0].precision = LoanPrecision.Unknown
@@ -7719,7 +8303,7 @@ effect fn finiteParentClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7867,7 +8451,7 @@ effect fn intervalRequirementClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -7953,7 +8537,7 @@ effect fn ownedInitializationClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -8098,7 +8682,7 @@ effect fn offeredMeetClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),
@@ -8187,7 +8771,7 @@ effect fn regionChoiceClaims() -> ()
     cleanup: Vector<LoanCleanup>.make(), loopCleanup: Vector<LoopCleanup>.make(), exit: 0, entry: 1,
     outside: false, reason: BorrowStatus.Regions, guarded: Vector<usize>.make(),
     guardConsumed: Option<Location>.none(), retention: Retention.None, requirements: Vector<RetentionEdge>.make(),
-    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
+    settled: true, retentionRelations: Vector<ImpliedGroup>.make(), wholeHolds: Vector<WholeHold>.make(), openContents: Vector<Shared<Lifetime>>.make(), unretained: Vector<usize>.make(), contested: Vector<Shared<Lifetime>>.make(), storing: false, inherited: BorrowStatus.Checked, storable: Vector<usize>.make(),
     refinements: Vector<Refinement>.make(), lexicalHolders: Vector<usize>.make(),
     paths: Vector<Vector<Step>>.make(),
     stores: Vector<StoreWindow>.make(),

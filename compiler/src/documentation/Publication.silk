@@ -1,0 +1,138 @@
+//! Compiler-internal, same-directory atomic publication on the supported native libc targets.
+//!
+//! Ordinary writes use FileSystem; the small native boundary exclusively claims a sibling file,
+//! closes that claim, and renames the completed file. The supplied filesystem must use the host
+//! root `/`, matching the compiler command edge. This is atomic replacement, not crash durability.
+
+static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileReason, FileSystem, Path }
+import silk.pointer { Pointer }
+import silk.slice { Slice }
+import silk.bool
+import silk.i32
+import silk.u8
+import silk.usize
+
+unsafe extern "C" fn mkstemp(template: ?[*]mut u8) -> i32 with Intrinsic.foreign(noCapture: ("template",))
+unsafe extern "C" fn close(fd: i32) -> i32
+unsafe extern "C" fn rename(source: ?[*]const u8, destination: ?[*]const u8) -> i32 with Intrinsic.foreign(noCapture: ("source", "destination"))
+unsafe extern "C" fn unlink(path: ?[*]const u8) -> i32 with Intrinsic.foreign(noCapture: ("path",))
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  unsafe extern "C" fn __error() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read(__error()) } }
+} else {
+  unsafe extern "C" fn __errno_location() -> *mut i32
+  unsafe fn currentError() -> i32 { unsafe { return Pointer.read(__errno_location()) } }
+}
+
+struct TemporaryFile {
+  name: Bytes
+  descriptor: i32
+  pending: bool
+}
+
+fn reason(code: i32) -> FileReason {
+  if code == 2 { return FileSystem.notFound() }
+  if code == 17 { return FileSystem.alreadyExists() }
+  if code == 1 || code == 13 { return FileSystem.permissionDenied() }
+  if code == 20 || code == 21 { return FileSystem.wrongType() }
+  if code == 12 || code == 28 { return FileSystem.noSpace() }
+  if code == 27 { return FileSystem.tooLarge() }
+  if code == 22 { return FileSystem.invalidPath() }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    if code == 62 || code == 63 { return FileSystem.invalidPath() }
+    if code == 66 { return FileSystem.notEmpty() }
+    if code == 84 { return FileSystem.tooLarge() }
+  } else {
+    if code == 36 || code == 40 { return FileSystem.invalidPath() }
+    if code == 39 { return FileSystem.notEmpty() }
+    if code == 75 { return FileSystem.tooLarge() }
+  }
+  return FileSystem.other()
+}
+
+effect fn reject(code: i32) -> never ! FileError {
+  fail FileSystem.errorWithCode(FileSystem.writeFileOperation(), reason(code), code)
+}
+
+// No allocation or provider lookup is permitted here: even Path construction can be the primary
+// failure. Only the exact exclusively claimed name is unlinked, never a parent or guessed path.
+// A secondary close/unlink error cannot replace the protected Effect's primary failure.
+effect fn release(temporary: &mut TemporaryFile) -> () {
+  let fd = Intrinsic.replace(temporary.descriptor, -1)
+  if fd >= 0 { let ignored = unsafe close(fd) }
+  if temporary.pending {
+    let mut finished = false
+    while !finished {
+      let status = unsafe unlink(Pointer.fromSlice(Bytes.asSlice(&temporary.name)))
+      if status == 0 { finished = true } else {
+        let code = unsafe currentError()
+        if code != 4 { finished = true }
+      }
+    }
+    temporary.pending = false
+  }
+  return ()
+}
+
+effect fn complete(temporary: &mut TemporaryFile, destination: &[u8], contents: &[u8]) -> ()
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let fd = unsafe mkstemp(Pointer.fromMutSlice(Bytes.asMutSlice(&mut temporary.name)))
+  if fd < 0 { return run reject(unsafe currentError()) }
+  temporary.descriptor = fd
+  temporary.pending = true
+  // A failed close must not be retried: the descriptor may already have been released.
+  let owned = Intrinsic.replace(temporary.descriptor, -1)
+  let closed = unsafe close(owned)
+  if closed != 0 { return run reject(unsafe currentError()) }
+  let name = Bytes.asSlice(&temporary.name)
+  let path = run Path.fromBytes(Slice.view<u8>(name, usize.ZERO, name.length - usize.ONE))
+  // OsFileSystem completes short writes and checks close before returning success.
+  run FileSystem.writeFile(&path, contents)
+  let status = unsafe rename(Pointer.fromSlice(Bytes.asSlice(&temporary.name)), Pointer.fromSlice(destination))
+  if status != 0 { return run reject(unsafe currentError()) }
+  // Rename transfers the directory entry. Never unlink the old name after this point: another
+  // writer could have claimed it by the time the scope finalizer runs.
+  temporary.pending = false
+  return ()
+}
+
+/// Atomically replaces one native output file after its entire contents have been written.
+///
+/// The destination must be a normalized absolute byte path with an existing parent. Embedded NUL
+/// and malformed paths fail before native calls. The FileSystem provider must be rooted at host
+/// `/`; a confined or virtual provider cannot be combined with native rename. Files are published
+/// with mkstemp's private permissions. A failed write, close, allocation, or rename leaves the old
+/// destination untouched. The owned temporary name is cleaned on every structured Effect exit;
+/// fatal traps bypass finalization, and an OS refusal to unlink preserves the primary error.
+/// Native failures retain errno in FileError with writeFileOperation; allocation failures remain
+/// OutOfMemoryError. No fsync or parent-directory durability is promised.
+pub effect fn publish(path: &[u8], contents: &[u8]) -> ()
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let checked = run Path.fromBytes(path)
+  if Path.isRoot(&checked) {
+    fail FileSystem.error(FileSystem.writeFileOperation(), FileSystem.wrongType())
+  }
+  let values = Path.rawBytes(&checked)
+  let mut parentEnd = values.length
+  while values[parentEnd - usize.ONE] != 47 { parentEnd = parentEnd - usize.ONE }
+  let mut name = run Bytes.copy(Slice.view<u8>(values, usize.ZERO, parentEnd))
+  run Bytes.append(&mut name, b".silk-doc-XXXXXX")
+  let ending: [u8; 1] = [0]
+  run Bytes.append(&mut name, &ending)
+  let mut destination = run Bytes.copy(values)
+  run Bytes.append(&mut destination, &ending)
+  let use = effect fn(temporary: &mut TemporaryFile) -> ()
+  ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+    return run complete(&mut temporary.*, Bytes.asSlice(&destination), contents)
+  }
+  return run Effect.useReleaseNonParking(
+    TemporaryFile { name: move name, descriptor: -1, pending: false },
+    move use,
+    release,
+  )
+}
+}

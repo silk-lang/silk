@@ -9,8 +9,11 @@ scalar references, dereference reads and stores, and receiver auto-borrows are s
 auto-borrowed receiver or `match &` subject that names no existing storage (a call result, a
 literal, or a field of one) addresses a compiler temporary holding the evaluated value; that hidden
 owner follows the owned-rvalue temporary rules below, and a mutable loan of it needs no named
-mutable owner (BORROW-006). A borrowing binding, including a destructuring `let P = &e`, keeps its
-initializer's temporaries until its scope exits. A `match &mut`, `match place` or `let P = &mut e`
+mutable owner (BORROW-006). A destructuring `let P = &e` keeps its subject's
+temporaries until its scope exits. Any other borrowing binding keeps only a borrowed array's hidden
+owner that long; another temporary's hidden owner ends with the binding's statement, so a view of it
+used after that statement has expired (`ExpiredLifetime`, the bootstrap's `OWN0019`).
+A `match &mut`, `match place` or `let P = &mut e`
 subject must name an existing place (`InvalidMatchScrutineePlace`, the bootstrap's `OWN0009`), and
 a `match &mut` or `let P = &mut e` subject must be a mutable place (`ExclusiveMatchRequiresMutable`,
 the bootstrap's `OWN0007`). A guard cannot move or drop a binding of its consuming arm
@@ -52,7 +55,7 @@ Runtime string `==` and `!=` compare byte lengths and then exact UTF-8 bytes wit
 loop. Both operands are evaluated once, left to right; empty views and unequal lengths require no
 backing-byte reads. Comparison does not allocate, normalize text, or compare descriptor identity.
 The sealed operator declarations and `Intrinsic.Ordering` load on demand from the same
-`packages/compiler/stdlib/intrinsic/operators.silk` file used by the bootstrap. A reachable
+`stdlib/intrinsic/operators.silk` file used by the bootstrap. A reachable
 reference to a declared member, including through a public alias, triggers semantic loading;
 ordinary intrinsic calls and comments do not. Preload reads and lexes the fixed compiler-owned
 file once to derive its public interface and enum names, and retains those same bytes for
@@ -207,8 +210,7 @@ standard library's `silk/layout` `Layout` record, as the bootstrap's contracts n
 Borrow checking remains step 14: successful builds print a `SILK_GAP borrow-check` summary of the
 emitted bodies and a `SILK_GAP borrow-check root-package` summary of the concrete root-package
 bodies, each with a per-reason breakdown, then one `SILK_GAP borrow-check body` line naming each
-unchecked concrete root-package body by its block. The TypeScript bootstrap compiler still builds it, as
-the bootstrap DDC job in `selfhost.yml` checks (see `docs/native-seed-chain.md#bootstrap-ddc`).
+unchecked concrete root-package body by its block.
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
 referent, an array element and a covariant nominal lifetime argument may differ: a `'static`
@@ -284,7 +286,7 @@ accepted.
 Test invocation: `silk test <root> -o <executable> --stdlib <directory> [--filter <text>]
 [--file <path>] [--optimization <none|speed>] [--debug <true|false>] --no-cache`. It builds the
 bundled runner `silk/test_runner` with `<root>` as its discovery root, runs it with an uncached
-plan, admits its receipt and exits with its status; see [Native `silk test`](docs/native-test.md).
+plan, admits its receipt and exits with its status; see Native `silk test`.
 
 Project build invocation: `silk build [--manifest-path <path>] [--target <host|triple>]...
 [--release] [--optimization <debug|release|release-with-debug>] [--profile <name>]
@@ -480,52 +482,39 @@ reads only the syntax index, so a name with a conditional candidate there is the
 
 ## Design notes
 
-- [MIR core shape](docs/mir-core-shape.md): the final MIR forms, cleanup, failure edges,
+- MIR core shape: the final MIR forms, cleanup, failure edges,
   suspension, closures and the opt-in MIR check.
-- [Effect calling convention](docs/effect-calling-convention.md): how native code receives Effect
+- Effect calling convention: how native code receives Effect
   providers, returns typed failures, and expands the Effect composition intrinsics (roadmap step 5).
-- [Native `silk test`](docs/native-test.md): test discovery, the runner exchange, and the CI
+- Native `silk test`: test discovery, the runner exchange, and the CI
   switch of the Cases shards.
 
-## Development branches and bootstrap
+## Development and the native seed
 
-`main` is the only integration branch, for the source-written compiler, the TypeScript bootstrap
-and the standard library they share. Start native compiler work on a `selfhost-*` branch from the
-current `main` and target its pull request at `main`; an upper PR of a native stack targets the
-`selfhost-*` branch below it. A pull request merges when `CI result` and `Focused Linux Silk` pass on
-its head. Merge `main` into the branch before its final run, with a merge that retains both
-parents, so the merge commit reuses that run's verdict.
+`main` is the only integration branch. A pull request merges when `CI result` and `Focused Linux
+Silk` pass on its head. Merge `main` into the branch before its final run, with a merge that retains
+both parents, so the merge commit reuses that run's verdict.
 
-The TypeScript compiler and CLI are frozen. A repair the native compiler needs from them, or a
-standard-library change, lands in the same pull request as the native change that needs it; the
-bootstrap DDC in that pull request proves the checkout's bootstrap still builds the checkout's
-compiler.
+The frozen TypeScript bootstrap in [`bootstrap/`](../bootstrap) only builds the first native
+compiler, the commit in `bootstrap/anchor.json`; Bootstrap CI checks that build by diverse double
+compilation. Every later compiler is built by the native seed chain, so a compiler or
+standard-library change never needs a bootstrap change.
 
 ### The native seed pin
 
-`compiler/native-seed.json` names the published native compiler that builds N1 (see
-[the native seed chain](docs/native-seed-chain.md)). Advance it weekly, and immediately after any
-soundness or code generation fix that N1 must not be built without. Pin only a candidate whose
-publishing run summary says **Full gate**; never pin a candidate published from a run that
-reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a pull request to
-`main`; its CI proves the new seed builds the checkout, reaches the N1/N2 fixpoint and passes
-the corpus.
+`compiler/native-seed.json` names the published native compiler that builds N1. Seeds are
+published on demand by running Selfhost Silk on `main` with publish ticked. Advance the pin weekly,
+and immediately after any soundness or code generation fix that N1 must not be built without. Pin
+only a candidate whose publishing run summary says **Full gate**; never pin a candidate published
+from a run that reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a
+pull request to `main`; its CI proves the new seed builds the checkout, reaches the N1/N2 fixpoint
+and passes the corpus.
 
-The bootstrap DDC job bundles the TypeScript bootstrap from the checkout with `pnpm bundle:cli` and
-records the bundle's digest with the checkout commit in its receipt. Invoke the bundled `silk.mjs`
-with Node 24; native builds also require LLVM. The other native jobs install workspace dependencies
-only for Node tooling (seed verification, source snapshots, generated contract checks).
-The corpus jobs build the verification harness from the checkout. The verifier reads `compiler/scripts/selfhost-track.json` from this checkout and
-checks its intrinsic catalog, authored corpus fixtures, and live formatted standard library,
-preserving the native compiler safety gates.
-
-For a local source bootstrap, the checkout supplies the TypeScript compiler and CLI sources in
-`packages/compiler` and `packages/cli`, the standard library in `packages/compiler/stdlib`, and the
-native sources and manifests in `compiler`. Install with `pnpm install --frozen-lockfile`, then
-build the CLI. To use the same CI bootstrap locally instead, download `silk-bootstrap` from a
-verified main run and use `node /absolute/path/silk.mjs` in place of `node packages/cli/dist/bin.js`
-in the commands below. See [bundled CLI downloads](../packages/cli/README.md) for retention and
-pinning instructions.
+The native jobs install workspace dependencies only for Node tooling (seed verification, source
+snapshots, contract checks). The corpus jobs build the verification harness from the checkout. The
+verifier reads `compiler/scripts/selfhost-track.json` from this checkout and checks its intrinsic
+catalog, authored corpus fixtures, and live formatted standard library, preserving the native
+compiler safety gates.
 
 ### ARM64 Linux development
 
@@ -534,13 +523,9 @@ The native compiler selects this host automatically. Install Node 24, the reposi
 version, GitHub CLI, `jq`, `build-essential`, and LLVM 22.1.8 for Linux ARM64. Put the complete
 LLVM `bin` directory on `PATH`.
 
-Start with the ARM64 entry in `native-seed.json` once a reviewed pin exists, following
-[Install a verified native seed](docs/native-seed-chain.md#install-a-verified-native-seed) with
-`target=aarch64-unknown-linux-gnu`. The script verifies SHA-256 before creating the executable;
-no TypeScript compiler or CPU emulation is needed. The initial per-target schema change preserves
-the existing x86-64 pin only; it does not invent an ARM64 pin. Until the first green push publishes
-ARM64 candidates and a reviewed PR pins one, use a known verified ARM64 native compiler or a
-verified ARM64 native CI candidate. The install script fails explicitly for an unpinned target.
+Download the seed that `native-seed.json` pins for your host from its release and check the
+asset's SHA-256 against the pin before running it; no TypeScript compiler or CPU emulation is
+needed.
 
 A single-file `build` takes `--clang <path>` as the TypeScript `build-exe` does; it wins over
 `SILK_CLANG`. A value with a `/` is a path against the working directory and a bare name is
@@ -553,15 +538,83 @@ re-pin:
 ```sh
 mkdir -p .scratch
 "$SILK_COMPILER" build compiler/src/main.silk -o .scratch/silk-next \
-  --stdlib "$PWD/packages/compiler/stdlib" --optimization speed
+  --stdlib "$PWD/stdlib" --optimization speed
 "$SILK_COMPILER" test compiler/src/semantic/TargetCases.silk -o .scratch/target-tests \
-  --stdlib "$PWD/packages/compiler/stdlib" --no-cache --filter frozenTarget
+  --stdlib "$PWD/stdlib" --no-cache --filter frozenTarget
 ```
 
 Use the existing source-written `*Cases.silk` roots and their filters for focused changes.
 ARM64 Linux CI on `ubuntu-24.04-arm` checks N1/N2 compiler IR identity and the native corpus;
 macOS arm64 has the same seed verification and native chain on `macos-15`. The pin and its
-provenance remain governed by [the native seed chain](docs/native-seed-chain.md).
+provenance remain governed by the native seed chain.
+
+### Native documentation
+
+Documentation generation is implemented in `src/documentation/`.
+Use a native compiler built from this checkout:
+
+```sh
+export SILK_COMPILER=/absolute/path/to/silk
+"$SILK_COMPILER" doc --manifest-path silk.toml --output build/documentation.json \
+  --stdlib-root "$PWD/stdlib"
+"$SILK_COMPILER" doctest --input build/documentation.json \
+  --stdlib-root "$PWD/stdlib"
+```
+
+`doc` selects the project's profile and public declarations; `--include-private` also publishes
+private declarations. JSON contains owned flat items, authored signatures, normalized Markdown,
+resolved symbol links, and original source positions. Its versioned experimental shape is not a
+compatibility contract. Ordinary documentation extraction does not typecheck function bodies.
+`doctest` checks complete modules from active Silk fences, reports ignored examples separately,
+and rejects unknown fence attributes even when `ignore` is also present.
+Standard-library mode defaults to the compiler's host target; `--target` overrides it. The
+standard-library examples include hosted OS APIs, so the complete set is not portable to Wasm.
+Project JSON supplies its recorded target unless explicitly overridden.
+
+Symbol links first use the attached declaration's owner and module-level bindings. Bare member
+names then prefer a unique local inherent member over fields or interface/service operations:
+`display` in `silk/format` links to `Format.display`, not `Display.display`. Distinct inherent
+members remain ambiguous. Qualified links such as `Display.display` and links inside that
+interface's own documentation still select its contract operation.
+Reference pages anchor each declaration at its owner path within the module, such as
+`AesGcmError.InvalidTagLength` or `impl.drop`; a repeated path gets `-2`, `-3` in source order.
+
+The standard-library reference lives in `reference/stdlib/`. Regenerate it, check it without
+writing, and check the standard-library examples from the repository root:
+
+```sh
+"$SILK_COMPILER" doc-reference --stdlib-root "$PWD/stdlib" --output "$PWD/reference/stdlib"
+"$SILK_COMPILER" doc-reference --stdlib-root "$PWD/stdlib" --output "$PWD/reference/stdlib" --check
+"$SILK_COMPILER" doctest --stdlib --stdlib-root "$PWD/stdlib"
+```
+
+`node compiler/scripts/documentation.mjs <command> ...` runs the same commands with
+`--stdlib-root` defaulting to this checkout's `stdlib/`.
+
+The reference command uses the canonical stdlib manifest and all six target/libc profiles.
+Profile stores are released after extraction; rendering retains documentation records and page
+bytes, not compiler analyses. Generated reference Markdown is formatted by the native renderer
+and excluded from Oxfmt. Native CI checks the reference and examples with the exact-head N1.
+
+The native pipeline preserves authored Markdown rather than enforcing prose style. It does not
+generate a standalone HTML site or a coverage inventory. JSON is the reporter boundary: alternative
+renderers can consume its module/item hierarchy, raw Markdown, source locations, and resolved links.
+
+The JSON envelope has `schema: "silk-documentation"`, `experimental: true`, `version: 1`,
+`target`, `profile`, and `modules`. Reporters consume these records:
+
+| Record        | Fields and interpretation                                                                                                                                                         |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Module        | `name`, `sourcePath`, optional `documentation`, and source-ordered `items`.                                                                                                       |
+| Item          | Opaque canonical `id`, `kind`, `name`, `visibility`, authored `signature`, `source`, optional `documentation`, and optional `parent` indexing an earlier item in the same module. |
+| Documentation | Authored `markdown` with comment markers removed, `source`, resolved `links`, and `lineStarts` mapping each normalized line to its original source byte offset.                   |
+| Source        | Half-open UTF-8 byte offsets `start`/`end` and one-based `line`.                                                                                                                  |
+| Link          | Authored symbol `spelling` and the target item's canonical `id` as `target`; reporters choose their own URLs and anchors.                                                         |
+
+Missing documentation is omitted rather than encoded as `null`. Declaration signatures omit
+callable bodies and constant initializers. Extraction rejects invalid UTF-8 instead of publishing
+malformed JSON. Treat Markdown as authored input when rendering HTML; this pipeline does not
+sanitize it for a particular reporter.
 
 ## Anonymous declaration identities
 
@@ -574,7 +627,7 @@ does not change these identities. Inserting a same-kind literal before another c
 Literal declarations do not create module name candidates. Their written headers and body content
 have separate fingerprints. Non-effect capture checking, capture-ordered environment layout and
 drop glue, sections and direct invocation are implemented. See the
-[Step 8 coverage receipt](docs/step8-callable-sweep.md) for structured claims, pins and remaining gaps.
+Step 8 coverage receipt for structured claims, pins and remaining gaps.
 
 ## In-memory semantic queries
 
@@ -1328,45 +1381,33 @@ Choose a diagnostic at the producer that knows the failed condition. Expected-va
 carries its diagnostic purpose through nested expressions: a bad return value and a bad argument
 inside that return have different codes. Do not relabel a propagated failure by comparing spans.
 
-While both compilers exist, `packages/compiler/src/Diagnostic.ts` remains the authoritative code
-and message-template catalog, and its generated documentation keeps the existing wording gate.
-New allocations land with complete templates and generated documentation. Full parameterized
-native message rendering is a separate migration that must finish before removing the bootstrap
-catalog and its generation checks.
-
-Run `node compiler/scripts/DiagnosticCatalog.mjs` to check each annotated native mapping against
-its exact bootstrap constant, all lexical/static mappings, and the generated catalog. The guard
-rejects missing, duplicate, default and unregistered mappings. `compiler/diagnostic-coverage.json`
-records every catalog code without a dedicated native producer, including its reference rules.
+`compiler/src/diagnostic/Catalog.silk` is the authoritative code and message-template catalog.
+Run `node compiler/scripts/DiagnosticCatalog.mjs` to check that every code has a unique spelling,
+a meaning and nonempty templates, and that all rejection, lexical and static mappings name catalog
+codes. The guard rejects missing, duplicate, default and unregistered mappings.
+`compiler/diagnostic-coverage.json` records every catalog code without a dedicated native
+producer, including its reference rules.
 A coverage gap does not mean the compiler accepts the invalid program; another reason may reject
 it earlier, or the native compiler may lack the feature. Tests assert codes and source spans.
 
 ## Verification
 
-Build this checkout's bootstrap CLI, then run the source-written cases. The M1 query root imports
-query and source-index cases. The semantic cases are split by topic into six roots that share
-`semantic/SemanticCaseSupport.silk`; they, the callable-result cases and the frozen-target cases use
-their own roots to keep each native compilation within the CI time and heap limits. The HIR root
-runs the lowering, fingerprint, and parser cases without pulling the semantic engine into their
-binary. `--no-cache` executes assertions even if a previous run stored passing results. The focused
-Linux workflow runs these commands for pull requests targeting `main` and pushes to `main`, beside
-the broad TypeScript CI. Native work branches are named `selfhost-*`; pushing one does not start a
-second CI run before its pull request.
-The heaps match the cases matrix in `.github/workflows/selfhost.yml`: a semantic root peaks near
-11.3 GB, so run one at a time on a 15 GB machine.
+Build a native compiler (an installed `silk`, or N1 from the pinned seed), then run the
+source-written cases. The M1 query root imports query and source-index cases. The semantic cases
+are split by topic into six roots that share `semantic/SemanticCaseSupport.silk`; they, the
+callable-result cases and the frozen-target cases use their own roots to keep each native
+compilation within the CI time limits. The HIR root runs the lowering, fingerprint, and parser
+cases without pulling the semantic engine into their binary. `--no-cache` executes assertions even
+if a previous run stored passing results. The focused Linux workflow runs every root listed in the
+cases matrix of `.github/workflows/selfhost.yml`.
 
 ```sh
-CI=true node scripts/turbo.mjs run build --filter=@silklang/cli...
-NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/M1Cases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticStaticCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticSignatureCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticConformanceCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticLoweringCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCaptureCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=12288 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/SemanticCallableCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/CallableResultCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/semantic/TargetCases.silk --no-cache
-NODE_OPTIONS=--max-old-space-size=8192 node packages/cli/dist/bin.js test --manifest-path compiler/silk.toml --root src/hir/LoweringCases.silk --no-cache
+for root in M1Cases semantic/SemanticStaticCases semantic/SemanticSignatureCases \
+  semantic/SemanticConformanceCases semantic/SemanticLoweringCases semantic/SemanticCaptureCases \
+  semantic/SemanticCallableCases semantic/CallableResultCases semantic/TargetCases hir/LoweringCases; do
+  "$SILK_COMPILER" test "compiler/src/$root.silk" -o ".scratch/$(basename "$root")-tests" \
+    --stdlib "$PWD/stdlib" --optimization speed --no-cache
+done
 ```
 
 The cases inspect query and source events, retained request evidence, and rejection codes and byte
@@ -1390,57 +1431,18 @@ and each source-written compile-and-run command. Those last commands include nat
 test execution; their combined duration is not a runtime-only measurement. Compare actual cold and
 warm CI runs before setting a time target; five minutes is an aspiration, not a correctness bound.
 
-Check the self-hosted program with the bootstrap compiler when changing source outside that
-focused entry:
-
-```sh
-pnpm exec silk check --manifest-path compiler/silk.toml
-```
-
 The source-written parser tests in `src/parser/ParserCases.silk` parse source strings, including
 malformed syntax, and assert self-hosted parser behavior. The HIR lowering root imports them, so
-the focused HIR run above discovers them; `src/main.silk` imports no test modules. The JavaScript
-harness below remains the TypeScript-versus-self-hosted comparison.
+the focused HIR run above discovers them; `src/main.silk` imports no test modules.
 
-After building the executable, run the parser corpus with its path:
-
-```sh
-node compiler/scripts/test-parser.mjs compiler/build/llvm/aarch64-apple-darwin/debug/silk-compiler
-```
-
-The harness reuses one built executable. It compares significant AST structure with the bootstrap
-parser across grammar fixtures, the self-hosted sources, and the standard library. It also checks
-postorder IDs, source spans, reachability, unique token ownership, and preservation of following
-declarations after malformed syntax. Extra file paths after the executable select a smaller corpus.
-The JavaScript harness imports the bootstrap package's built `dist` modules.
-
-The default run also executes the behavioral cases in `scripts/parser-cases.mjs`, adapted from
-the bootstrap parser tests. These compare acceptance and require specific valid constructs to
-survive damage in both parsers. They do not compare diagnostic wording, diagnostic counts, error
-tree shapes, or the two implementations' numerical resource budgets. Every native tree must
-still satisfy the flat-tree invariants, and every diagnostic must address a valid source span.
-The existing valid-file corpus retains its significant-tree comparison as a separate regression
-check; a representation change can update that check without changing the behavioral cases.
-
-Run only the behavioral cases, or select individual cases by name:
-
-```sh
-node compiler/scripts/test-parser.mjs compiler/build/llvm/aarch64-apple-darwin/debug/silk-compiler --cases
-node compiler/scripts/test-parser.mjs compiler/build/llvm/aarch64-apple-darwin/debug/silk-compiler --cases missing-parameter-comma overdeep-call
-```
-
-Each case uses a temporary source file beneath `compiler/fixtures/`, which the harness removes
-after success or failure. The native executable is built once, not once per test. The nesting
-cases exercise both accepted inputs and diagnostic recovery, including depth-budget reuse by
-sibling expressions and a following declaration after unclosed delimiters.
-
-Lower the same corpus and check the arena the lowering produces:
+Lower the grammar fixtures, the self-hosted sources and the standard library, and check the
+arena the lowering produces:
 
 ```sh
 node compiler/scripts/lower-corpus.mjs compiler/build/llvm/aarch64-apple-darwin/debug/silk-compiler
 ```
 
-This harness reuses one built executable too, and imports nothing from the bootstrap package: every
+This harness reuses one built executable and imports nothing from the bootstrap: every
 assertion is a property of the self-hosted dump alone, never a comparison against
 `AuthoredLowering`. It runs `hir` mode over the grammar fixtures, the self-hosted sources, and the
 standard library, and asserts that the process exits cleanly, that the dump reads back with each
@@ -1466,7 +1468,7 @@ The typed literal retains its separately checked body and environment aliases fo
 The application retains enclosing generic scopes, including inputs used only by the body, and the
 use contract quantifies the anonymous parameters' invocation lifetimes. Runtime construction,
 invocation and capture glue use the exact environment type and original body instance, as
-recorded in the [Step 8 coverage receipt](docs/step8-callable-sweep.md).
+recorded in the Step 8 coverage receipt.
 
 ### Complete caller-region canonicalization
 

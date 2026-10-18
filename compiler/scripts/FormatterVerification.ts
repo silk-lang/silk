@@ -44,7 +44,7 @@ export const runtimeIntrinsicNames = Effect.fn('FormatterVerification.runtimeInt
   > {
     const fs = yield* FileSystem.FileSystem
     const text = yield* fs.readFileString(
-      `${repository}/packages/compiler/test/fixtures/intrinsic-inventory.json`,
+      `${repository}/compiler/fixtures/intrinsic-inventory.json`,
     )
     const inventory = yield* Schema.decodeEffect(Schema.fromJsonString(Inventory))(text).pipe(
       Effect.mapError(
