@@ -924,7 +924,8 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   body. These are not corpus programs, because the bootstrap's corpus tests require every
   `invalid/` program to be rejected with its listed diagnostics.
 - **Evidence:** `SemanticCaptureCases::temporaryCleanupFollowsLowering` (`specialized`,
-  `specializedNested`, `specializedField`, `specializedOption`, `specializedMoveOut` and `bare`),
+  `specializedNested`, `specializedField`, `specializedOption`, `specializedProjected`,
+  `specializedWritten`, `specializedMoveOut`, `specializedStatement` and `bare`),
   with native and bootstrap compile verdicts on the fix's head.
 
 ### Native holds every loan of a literal in each of its field projections
