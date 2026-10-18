@@ -1,6 +1,6 @@
 ---
 name: silk-sync
-description: Reconcile Silk Linear issues with repository, OpenSpec, branch, and GitHub PR reality, applying only unambiguous status corrections and reporting uncertain drift. Use only when Julia explicitly invokes this skill or asks to sync the Silk queue.
+description: Reconcile Silk Linear issues with repository, branch, and GitHub PR reality, applying only unambiguous status corrections and reporting uncertain drift. Use only when Julia explicitly invokes this skill or asks to sync the Silk queue.
 ---
 
 # Sync the Silk queue
@@ -17,8 +17,7 @@ new maintenance issues.
 1. Fetch the canonical Linear project by ID from `LINEAR.md` and verify its team. Never resolve or
    recreate it by display name. Read its nonterminal issues. If it cannot be resolved, stop before
    writing.
-2. Inspect the current checkout, local and remote branch information already available, active and
-   archived OpenSpec changes, and GitHub PRs for `julia-script/silk`. Do not fetch unless Julia asks.
+2. Inspect the current checkout, local and remote branch information already available, and GitHub PRs for `julia-script/silk`. Do not fetch unless Julia asks.
    For each issue selected for technical reconciliation, read its Review baseline, resolve the exact
    main, PR-head, or merged commit that can support the conclusion, and inspect the changed relevant
    paths since its previous review.

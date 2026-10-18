@@ -128,7 +128,7 @@ const BuildReceiptSchema = Schema.Struct({
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const [command, first, second, third, fourth, ...extra] = process.argv.slice(2)
-  const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
+  const require = createRequire(new URL('../../package.json', import.meta.url))
   /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
   const { NodeServices } = await import(
     pathToFileURL(require.resolve('@effect/platform-node')).href
