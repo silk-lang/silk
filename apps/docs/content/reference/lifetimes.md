@@ -187,7 +187,10 @@ writes `effect<'env> fn`. A written environment carries the obligation that ever
 outlives it: each call, and each witness of an interface or service operation, must satisfy it. A
 `T: 'env` bound states that obligation explicitly and is optional; it adds nothing the written
 environment does not already require, including for a parameter of an enclosing `impl`,
-interface, or service.
+interface, or service. A receiver is not covered: as a witness, its provider comes from the
+provision, which no call relates to the operation's environment, so the body never assumes its
+receiver outlives the written environment. A method that returns a view of `self` at that
+environment writes the relation in its receiver type, as `self: &'env Cell`.
 
 An ordinary named function whose result is an `Effect` with an omitted environment elides it from
 the header under LIFE-003. A single borrowed input supplies the environment, and several borrowed
