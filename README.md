@@ -1,140 +1,296 @@
-# Silk
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/assets/silk-wordmark-dark.svg">
+    <img src=".github/assets/silk-wordmark-light.svg" alt="Silk" width="280">
+  </picture>
+</p>
 
-Silk is an unreleased low-level systems language built around explicit memory and execution
-control, typed failures, replaceable service requirements, deterministic cleanup, and
-tooling-friendly semantics. The repository is a strict TypeScript, ESM-only monorepo containing the
-stage-0 compiler, runtime-facing libraries, editor tooling, and language-pressure programs.
+<p align="center">
+  <strong>A systems language where every failure, requirement and resource is part of the type.</strong>
+</p>
 
-Silk currently compiles one source program through a lossless frontend, module and type analysis,
-HIR, ownership and cleanup planning, specialization, and MIR. Runtime artifacts—native executables
-and WebAssembly modules—are emitted through LLVM. Target-sensitive compile-time constants are
-resolved separately by static evaluation while the program is being analyzed.
+<p align="center">
+  <a href="https://github.com/silk-lang/silk/actions/workflows/selfhost.yml"><img src="https://github.com/silk-lang/silk/actions/workflows/selfhost.yml/badge.svg?branch=main" alt="Selfhost"></a>
+  <a href="https://github.com/silk-lang/silk/actions/workflows/ci.yml"><img src="https://github.com/silk-lang/silk/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c6a678" alt="MIT license"></a>
+  <img src="https://img.shields.io/badge/status-pre--alpha-8b5cf6" alt="Pre-alpha">
+</p>
 
-The implemented bootstrap language includes modules and visibility, scalar families, typed scalar
-constants, structs, fixed arrays, runtime slices, structural unions and exhaustive matching,
-generics, first-class callables and pipelines, mutation, structured loops, recursion, affine
-ownership, shared and exclusive borrowing, deterministic `Drop`, explicit allocation, static text
-and byte data, and typed `Effect` computations with explicit service requirements. Canonical
-`Result`, `Effect`, and `Vector` operations are ordinary navigable Silk source rather than
-compiler-recognized library names. Portable semantic logging is likewise source-defined:
-`Effect.log` and its level-specific aliases submit one complete borrowed `string` and a closed
-`LogLevel` through an explicit replaceable `Logger`, with stdout and deterministic in-memory
-providers supplied by the standard library.
-Portable whole-file interaction is source-defined as well: normalized provider-absolute `Path`
-values and a seven-operation mutable `FileSystem` service can be implemented by application-owned
-native, browser, Wasm, or test providers without introducing ambient storage or host imports.
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#a-short-tour">Tour</a> ·
+  <a href="reference/index.md">Language reference</a> ·
+  <a href="reference/stdlib/index.md">Standard library</a> ·
+  <a href="#contributing">Contributing</a>
+</p>
+
+---
+
+Silk compiles to native code and WebAssembly through LLVM, with no garbage collector, no hidden
+allocation and no ambient I/O. A function's signature tells you everything it can do: what it
+returns, how it can fail, and which services it needs. The compiler checks all of it, and cleanup
+runs at a point you can see in the source.
+
+```silk
+effect fn remaining(deadline: u64) -> u64 ! Expired | LogError ? &Clock | &mut Logger {
+  let now = run Clock.now()
+  if now > deadline { fail Expired {} }
+  run Effect.log("{left} ticks left\n", &.{ left: deadline - now })
+  return deadline - now
+}
+```
+
+Read it as "returns a `u64`, may fail with `Expired` or `LogError`, and needs a `Clock` to read and
+a `Logger` to write to". The function doesn't know which clock or logger it gets. The caller
+decides, and a test can hand it fakes.
+
+The compiler is written in Silk and builds itself.
+
+## Why Silk
+
+- **Typed failures.** `! E` lists every error a computation can raise. `fail` raises one,
+  `Effect.catch` handles it, and the handled error leaves the type.
+- **Requirements instead of globals.** Clocks, loggers, allocators, file systems, sockets and
+  random sources are `service`s that a computation asks for with `? &Service`. Providers are
+  ordinary values, so a test or a browser host swaps one in without mocking anything global.
+- **Ownership without a runtime.** Values are affine: `move` transfers them, `&` and `&mut` borrow
+  them, and `Drop` runs exactly once at a deterministic point. Using a value after it moved is a
+  compile error.
+- **Explicit allocation.** Allocation is never hidden. Anything that allocates asks for
+  `? &mut Allocator`, and you choose which allocator it gets.
+- **Compile-time evaluation.** `static` parameters, `let static` and `static if` run at compile time
+  against the selected target, and only the chosen branch reaches the program.
+- **Little compiler magic.** Compiler operations that source can call live in the sealed
+  `Intrinsic` namespace. `Effect`, `Result`, `Vector`, logging and the file system are ordinary Silk
+  in [`stdlib/`](stdlib), and you can read them like your own code.
 
 ## Install
 
-On macOS (Apple Silicon) or Linux (x86-64 or ARM64), install the native compiler from the newest
-published build of `main`:
+On macOS (Apple Silicon) or Linux (x86-64 or ARM64):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 ```
 
-The script puts `silk` in `~/.silk/bin` (set `SILK_INSTALL` to change it) with its standard
+The script puts `silk` in `~/.silk/bin` (set `SILK_INSTALL` to change it), with its standard
 library beside it, and checks the compiler's SHA-256 against the release. Building programs needs
-Clang 22 or newer on `PATH`, or `SILK_CLANG` set to it. Archives downloaded through a browser are
-quarantined by macOS; files fetched by the script are not, so Gatekeeper lets them run.
+Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
 
-## Language documentation
+## Quick start
 
-- [Getting started](apps/docs/content/language/tutorial.md) — build a first project and learn the core
-  language through compiler-checked programs.
-- [Language reference](apps/docs/content/reference/index.md) — prescriptive syntax, type,
-  ownership, Effect, declaration, and control-flow rules with supporting evidence.
-- [Ownership](apps/docs/content/language/ownership.md),
-  [Effects and services](apps/docs/content/language/effects.md), and
-  [Fibers](apps/docs/content/language/fibers.md) — focused explanations of Silk's central model.
-- [Alpha status](apps/docs/content/language/alpha-status.md) — implemented scope, supported targets,
-  and compatibility boundaries.
-- [Standard library](apps/docs/content/language/stdlib/index.md) and
-  [diagnostics](apps/docs/content/language/diagnostics.md) — generated lookup references.
+```sh
+silk init hello && cd hello
+silk run
+```
 
-This is still an alpha language. APIs may break freely. Cooperative single-threaded Fibers are
-implemented; parallelism, multithreading, networking, a package registry, broad FFI, and
-self-hosting remain future work chosen from executable evidence rather than compatibility
-commitments.
+```console
+Hello, world!
+```
 
-## Packages
+`silk init` writes a `silk.toml` and a `src/main.silk`. Even "hello world" names what it needs:
 
-- [`@silklang/compiler`](packages/compiler) — the stage-0 compiler, LLVM backend, compile-time
-  static evaluator, embedded Silk standard library, and supported analysis facade.
-- [`@silklang/cli`](packages/cli) — project initialization, checking,
-  multi-target builds, native execution, formatting, and documentation generation through `silk`.
-- [`@silklang/llvm`](packages/llvm) — Effect-native LLVM IR construction and deterministic text
-  and bitcode emission.
-- [`@silklang/editor-support`](packages/editor-support) — portable CodeMirror integration,
-  TextMate grammar, semantic editor projections, and the `<silk-snippet>` custom element.
-- [`@silklang/lsp`](packages/lsp) — project-aware diagnostics, hover, navigation, completion,
-  inlay hints, symbols, and canonical formatting over stdio.
-- [`@silklang/docgen`](packages/docgen) — CommonMark documentation models, semantic links,
-  highlighting, doctesting, deterministic JSON, and static-site rendering.
-- [`silk-language`](apps/vscode) — the private Cursor/VS Code extension app.
+```silk
+import silk.effect { Effect }
+import silk.logger { LogError }
+import silk.os_logger { StdoutLogger }
 
-## Evidence and direction
+pub effect fn main() -> ()
+  ! LogError {
+  let mut logger = StdoutLogger.make()
 
-The compiler is exercised by seven familiar algorithms plus Silk-written lexer and bounded stack
-VM pressure programs. A shared native acceptance corpus pins runtime outcomes independently, while
-LLVM IR, object, C-fixture, and LLVM-to-Wasm tests cover their authoritative target boundaries.
+  run Effect.log("Hello, world!", &()) |> Effect.provideMut(&mut logger)
+}
+```
 
-Current specifications live under [`openspec/specs`](openspec/specs); active changes live under
-[`openspec/changes`](openspec/changes), and completed design records live under
-[`openspec/changes/archive`](openspec/changes/archive).
+## A short tour
 
-## Development
+### Services and providers
 
-Supported native hosts are ARM64 Linux (`aarch64-unknown-linux-gnu`), x86-64 Linux
-(`x86_64-unknown-linux-gnu`), and Apple Silicon macOS (`aarch64-apple-darwin`). Both the
-TypeScript compiler and the source-written compiler support ARM64 Linux, including Debian cloud
-VMs. WebAssembly (`wasm32-unknown-unknown`) is an output target.
+A `service` declares operations. Any value can provide it through an `impl`, and `Effect.provide`
+hands that value to a computation.
 
-CI uses standard GitHub-hosted `ubuntu-24.04` (x86-64), `ubuntu-24.04-arm` (ARM64), and
-`macos-15` (Apple Silicon) runners. Both [repository CI](.github/workflows/ci.yml) and
-[selfhost CI](.github/workflows/selfhost.yml) are maintained on `main`, so shared workflow
-changes land there before synchronization into `selfhost`. The selfhost workflow runs only
-for `selfhost` pushes and pull requests targeting the selfhost or native stack branches.
+```silk
+service Clock {
+  effect fn now() -> u64 ? &Clock
+}
 
-CI can use the [standalone bootstrap compiler](packages/cli/README.md#standalone-compiler-for-ci)
-stored as a GitHub Actions artifact from passing `main` commits: download `silk.mjs` and run it
-with Node 24 or Bun.
+struct FixedClock { at: u64 }
+
+impl Clock for FixedClock {
+  effect fn now(self: &Self) -> u64 { return self.at }
+}
+
+struct Expired {}
+
+effect fn expired(error: Expired) -> u64 { return 0 }
+
+pub effect fn main() -> () ! LogError {
+  let clock = FixedClock { at: 58 }
+  let mut logger = StdoutLogger.make()
+  let left = run Effect.catch<Expired>(remaining(100), expired)
+    |> Effect.provide(&clock)
+    |> Effect.provideMut(&mut logger)
+}
+```
+
+```console
+42 ticks left
+```
+
+`Effect.catch<Expired>` takes `Expired` out of the error type. `main` still declares `LogError`,
+because nothing handled it.
+
+### Tests swap the providers
+
+`silk test` finds `test` declarations through the import graph. This one runs `remaining` against
+the fixed clock and the standard library's in-memory logger:
+
+```silk
+test effect fn reportsTheTimeLeft() -> () ! AssertionError<'static> | Expired | LogError {
+  let clock = FixedClock { at: 58 }
+  let mut logger = Logger.inMemoryProvider()
+  let left = run remaining(100)
+    |> Effect.provide(&clock)
+    |> Effect.provideMut(&mut logger)
+  run Testing.expect(left == 42 && Logger.length(&logger) == 1, "one log line, 42 ticks left")
+}
+```
+
+```console
+$ silk test --no-cache
+  main::reportsTheTimeLeft
+    PASS  19 us
+
+Tests  1 passed, 0 failed (0 cached, 1 executed, 1 selected, 1 discovered)
+```
+
+### Ownership and cleanup
+
+```silk
+import silk.ownership { Drop }
+
+struct Connection { id: i32 }
+
+impl Drop for Connection {
+  fn drop(self: &mut Connection) -> () { return () }
+}
+
+fn peek(connection: &Connection) -> i32 { return connection.id }
+
+fn close(connection: Connection) -> i32 { return connection.id }
+
+pub fn main() -> i32 {
+  let connection = Connection { id: 7 }
+  let seen = peek(&connection)
+  let closed = close(move connection)
+  return seen + closed
+}
+```
+
+`peek` borrows the connection. `close` takes ownership, so `drop` runs when `close` returns. Change
+the last line to `return seen + closed + connection.id` and the compiler stops you:
+
+```console
+src/main.silk:17:26: error[OWN0001] connection was moved and cannot be used again
+```
+
+### Unions and matching
+
+Unions are structural, and a `match` has to cover every case.
+
+```silk
+struct Circle { radius: f64 }
+struct Rect { width: f64 height: f64 }
+
+fn area(shape: Circle | Rect) -> f64 {
+  return match move shape {
+    Circle c => 3.14159 * c.radius * c.radius
+    Rect r => r.width * r.height
+  }
+}
+```
+
+### Compile-time selection
+
+```silk
+import silk.target { Target, Arch }
+
+fn wordBits() -> u32 {
+  static if Target.arch() == Arch.Wasm32 {
+    return 32
+  } else {
+    return 64
+  }
+}
+```
+
+The condition is evaluated for the target being built. Only the chosen branch reaches the program,
+so nothing is checked at run time.
+
+## What's in the box
+
+| Command                     | What it does                                                         |
+| --------------------------- | -------------------------------------------------------------------- |
+| `silk init`                 | Create a package with `silk.toml` and `src/main.silk`                |
+| `silk build` / `silk run`   | Compile for one or more targets, in debug or `--release`             |
+| `silk check`                | Check types, ownership and effects without building                  |
+| `silk test`                 | Discover and run `test` declarations                                 |
+| `silk format`               | Format source canonically, with `--check` for CI                     |
+| `silk doc` / `silk doctest` | Extract documentation from `///` comments and compile their examples |
+| `silk clean`                | Remove build output                                                  |
+
+The [standard library](reference/stdlib/index.md) is written in Silk and documented with `silk doc`.
+It includes:
+
+- **Core:** `Effect`, `Result`, `Option`, `Vector`, `HashMap`, `Box`, `Shared`, strings, Unicode,
+  formatting, and checked arithmetic for every scalar type.
+- **Systems:** files, child processes, sockets, clocks, randomness, single-threaded fibers and
+  schedulers, and WebAssembly start-up.
+- **Data:** JSON and TOML, Base64, URIs, and Zstandard and DEFLATE/gzip decoding.
+- **Network:** an HTTP client and server, a WebSocket server, connection pooling, and TLS with X.509
+  certificate path validation.
+- **Crypto:** SHA-1, SHA-2 and SHA-3, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, and ECDSA
+  P-256 and RSA signature verification.
+
+## Platforms
+
+Native hosts are Apple Silicon macOS (`aarch64-apple-darwin`), x86-64 Linux
+(`x86_64-unknown-linux-gnu`) and ARM64 Linux (`aarch64-unknown-linux-gnu`). WebAssembly
+(`wasm32-unknown-unknown`) is an output target.
+
+## Status
+
+Silk is pre-alpha. The language is still being designed, and any API may change without notice.
+The [language reference](reference/index.md) is prescriptive, and each rule says whether it is
+confirmed, a candidate or still open.
+
+Every change has to build the compiler with itself twice in a row and get identical LLVM IR both
+times. It also has to run a shared corpus of 443 programs with exactly the expected results.
+
+## Repository
+
+| Path                      | Contents                                                  |
+| ------------------------- | --------------------------------------------------------- |
+| [`compiler/`](compiler)   | The compiler, written in Silk                             |
+| [`stdlib/`](stdlib)       | The standard library                                      |
+| [`reference/`](reference) | The language reference and the generated stdlib reference |
+| [`corpus/`](corpus)       | The shared acceptance corpus                              |
+| [`examples/`](examples)   | Larger example programs                                   |
+
+## Contributing
+
+The compiler builds itself from the published seed pinned in
+[`compiler/native-seed.json`](compiler/native-seed.json). [`compiler/README.md`](compiler/README.md)
+walks through building it and running its source-written test suites. Repository tooling runs on
+Node and pnpm:
 
 ```sh
 pnpm install
-pnpm dev
-pnpm build
-pnpm check
+pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:scripts
 ```
 
-`pnpm dev` runs package compilers in watch mode alongside the documentation app. `pnpm build`
-creates a dependency-ordered production build of every workspace package and app.
-
-### Linux compiler development
-
-Install Node 24 and the pnpm version in `package.json`. On Debian or Ubuntu, install the host C
-development libraries and the verified LLVM tools, then build the CLI:
-
-```sh
-sudo apt-get update
-sudo apt-get install build-essential curl xz-utils ca-certificates
-bash scripts/setup-linux-llvm.sh
-export PATH="$PWD/.scratch/llvm-22.1.8/bin:$PATH"
-pnpm install --frozen-lockfile
-pnpm --filter @silklang/cli... run build
-node packages/cli/dist/bin.js init /tmp/silk-hello
-node packages/cli/dist/bin.js run --manifest-path /tmp/silk-hello/silk.toml
-```
-
-The installer selects x86-64 or ARM64 from the running host and verifies the LLVM archive's
-SHA-256. Native compilation selects the host target automatically. Keep the LLVM `bin` directory
-on `PATH` in development shells; an older distribution Clang may not read Silk's LLVM 22 bitcode.
-For the source-written compiler, use the `selfhost` branch and its
-[bootstrap instructions](https://github.com/silk-lang/silk/blob/selfhost/compiler/README.md#development-branches-and-bootstrap). The published
-native seed's host architecture is separate from the compiler's supported output targets.
-
-Effect-returning tests use `it.effect` from `@effect/vitest`; pure tests use ordinary `it` with
-`assert`.
+On Debian or Ubuntu, `bash scripts/setup-linux-llvm.sh` installs the verified LLVM 22 toolchain
+under `.scratch/llvm-22.1.8`. Put its `bin` directory on `PATH`.
 
 ## License
 

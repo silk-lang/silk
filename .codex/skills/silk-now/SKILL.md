@@ -69,7 +69,7 @@ use subagents and remains read-only with respect to repository files:
    old-to-new changed relevant paths, and suspected overlaps. Require evidence for all five triage
    claims and a queue-ready shape.
 2. Give a different subagent the issue and proposed verdict for independent skeptical review.
-3. Adjudicate both passes against primary repository, Linear, OpenSpec, and GitHub evidence.
+3. Adjudicate both passes against primary repository, Linear, and GitHub evidence.
 
 Direct demand is strong evidence of value, not proof that the requested diagnosis or solution is
 correct. Preserve Julia's desired outcome while allowing triage to replace a proposed mechanism
@@ -101,16 +101,11 @@ Then follow the full `silk-work` implementation contract:
 
 - create or preserve a non-`main`, `julia/`-prefixed branch before source edits;
 - preserve unrelated and uncommitted work, stopping when overlap cannot be handled safely;
-- during admission, identify an active OpenSpec change that owns the scope or establish that a new
-  change is required; before source edits, use the applicable propose or update workflow to complete
-  its planning artifacts and any required confirmation, then record the relationship in Linear;
-- invoke the apply workflow for that exact admitted OpenSpec change when implementation begins;
 - implement the clean green-field design, including callers, tests, fixtures, generated artifacts,
   and documentation, and delete the superseded path;
 - keep the Linear specification current when implementation evidence changes the correct scope;
 - follow the early draft publication steps below, using focused checks during implementation and
-  completing all repository mutations and OpenSpec implementation-task checkboxes before the
-  final push;
+  completing all repository mutations before the final push;
 - treat required pull-request CI on the exact final head as the authoritative full-repository
   completion guard; do not duplicate the complete CI-covered suite locally as handoff ceremony.
 
@@ -133,12 +128,11 @@ the draft.
 3. Push the audited branch and create or reuse a draft PR targeting the verified base. Reuse a PR
    only when its head branch and complete scope belong to this issue. Never repurpose an unrelated
    PR or turn a PR that is already ready for review back into a draft.
-4. Follow the Pull request quality bar in `WORKFLOW.md`, linking the Linear issue and relevant
-   OpenSpec change and describing the current implementation. Mark remaining work, focused checks,
+4. Follow the Pull request quality bar in `WORKFLOW.md`, linking the Linear issue and
+   describing the current implementation. Mark remaining work, focused checks,
    CI, and reviews as pending where appropriate. Confirm the PR URL, base, head branch, and draft
    state, and link it from Linear. Keep the issue In Progress until the verified handoff.
-5. Complete every repository mutation and OpenSpec implementation-task checkbox before the final
-   push. If isolation, commit hooks, formatting, generated artifacts, or review fixes change the
+5. Complete every repository mutation before the final push. If isolation, commit hooks, formatting, generated artifacts, or review fixes change the
    branch diff, audit, run affected focused checks, commit, push, and repeat the independent
    reviews as needed.
 
@@ -165,7 +159,7 @@ Finish exactly as `silk-work` requires:
    fix-and-push cycle; a pass requires no repository edit.
 3. Update the existing draft under the Pull request quality bar in `WORKFLOW.md`. Include the
    Linear link, accepted outcome, focused local evidence, exact-head CI result, test-review verdict
-   and timing delta, risks, and relevant OpenSpec change in a clear PR body. Strongly prefer concise
+   and timing delta, and risks in a clear PR body. Strongly prefer concise
    `Before` and `After` code or output examples when they
    materially clarify the delivered change; omit them only when examples would add no useful signal
    or would misrepresent the work.

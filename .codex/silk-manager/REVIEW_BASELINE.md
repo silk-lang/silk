@@ -51,14 +51,14 @@ Before changing the section:
    handoff uses the exact committed PR head; sync uses the exact main, PR-head, or merged commit that
    supports its conclusion.
 3. Compare the previous review commit with the target commit. Start with changed relevant paths and
-   commit history, then inspect the affected symbols, docs, tests, issues, PRs, and OpenSpec changes
+   commit history, then inspect the affected symbols, docs, tests, issues, and PRs
    needed to answer:
 
    - Is the requested outcome still wanted under current explicit demand and project direction?
    - Has it already been implemented, fixed, removed, or otherwise delivered?
    - Did code or documentation changes make the evidence, rationale, scope, or proposed mechanism
      stale?
-   - Does another issue, branch, PR, or OpenSpec change now own or supersede the work?
+   - Does another issue, branch, or PR now own or supersede the work?
    - Do the acceptance criteria still describe the smallest correct remaining change?
 
 4. Apply the resulting specification, relation, gate, priority, or status correction first.

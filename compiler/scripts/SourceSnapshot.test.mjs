@@ -12,7 +12,7 @@ import * as NativeSeedRetention from '../../.github/scripts/native-seed-retentio
 import { candidate, readPin, selectSeed, targets, verifySeed } from './NativeSeed.mjs'
 import { createSnapshot, hash, verifySnapshot } from './SourceSnapshot.mjs'
 
-const require = createRequire(new URL('../../packages/compiler/package.json', import.meta.url))
+const require = createRequire(new URL('../../package.json', import.meta.url))
 /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
 /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
@@ -36,7 +36,7 @@ const fixture = Effect.fnUntraced(function* () {
   )
   yield* put('compiler/src/main.silk', main)
   yield* put('compiler/src/nested/Dependency.silk', 'pub fn value() -> i32 { return 1 }\n')
-  yield* put('packages/compiler/stdlib/silk/i32.silk', 'pub let ZERO = 0\n')
+  yield* put('stdlib/silk/i32.silk', 'pub let ZERO = 0\n')
   const git = Effect.fnUntraced(
     /** @param {...string} args */
     function* (...args) {
@@ -87,10 +87,7 @@ it.effect(
       yield* f.fs.writeFileString(join(second, 'compiler/src/extra.silk'), 'unrecorded input')
       yield* failure(verifySnapshot({ directory: second }), /Unrecorded snapshot input/)
       yield* f.fs.remove(join(second, 'compiler/src/extra.silk'))
-      yield* f.fs.writeFileString(
-        join(second, 'packages/compiler/stdlib/silk/i32.silk'),
-        'changed stdlib',
-      )
+      yield* f.fs.writeFileString(join(second, 'stdlib/silk/i32.silk'), 'changed stdlib')
       yield* failure(verifySnapshot({ directory: second }), /Snapshot bytes or mode changed/)
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
