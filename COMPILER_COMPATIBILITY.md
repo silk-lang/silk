@@ -855,6 +855,38 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   `SemanticCaptureCases::universalLoansOutliveTheBody` (`rowRunsUniversal`, `rowReturnsUniversal`)
   and `invalid/effect-closure-row-universal-view-write`.
 
+### Bootstrap ignores an instantiation's Drop hook in a generic body
+
+- **Status:** recorded on 2026-10-18 from the independent review of #1912, with the native fix
+  that treats a Drop impl written for some instantiation as possible in a generic body. The
+  bootstrap gap remains until its loan and move checks consider every Drop impl of a generic
+  value's declaration.
+- **Rule:** DROP-002, BORROW-006 and OWN-004. A value's Drop hook runs at its cleanup in every
+  instance, so a generic body's value whose type may instantiate to a hooked type keeps the loans
+  the hook can observe until its cleanup, and no part may be moved out of it.
+- **Compilers:** with `struct Slotted<'a, T> { target: &'a D  extra: T }` and a Drop impl written
+  only for `Slotted<'a, i32>`, whose hook reads `self.target`:
+  - `fn specialized<T>(extra: T)` binds `Slotted {target: &owner, extra: move extra}` and then
+    moves `owner`. The `i32` instance's hook reads the moved-from `owner`. The same holds with
+    `Boxed<T>` against an impl for `Slotted<'a, Boxed<i32>>`, inside a field of another struct, and
+    in a union payload.
+  - With an impl for `Slotted<'a, D>` whose hook reads `self.extra`, `move held.extra` in a generic
+    body leaves the `D` instance's hook reading a moved-out field.
+
+  The bootstrap compiles each of these. Native reports OWN0011 at the move of `owner`, or OWN0002
+  at the partial move, as it does for the non-generic forms.
+
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects. A generic value whose declaration has any Drop impl
+  is taken to run a hook, even when no impl matches the open type. A generic value whose
+  declaration has no Drop impl keeps no loan for cleanup. A body's own type parameter retains no
+  region the cleanup could observe, because a value it stands for is received, not created in the
+  body. These are not corpus programs, because the bootstrap's corpus tests require every
+  `invalid/` program to be rejected with its listed diagnostics.
+- **Evidence:** `SemanticCaptureCases::temporaryCleanupFollowsLowering` (`specialized`,
+  `specializedNested`, `specializedField`, `specializedOption`, `specializedMoveOut` and `bare`),
+  with native and bootstrap compile verdicts on the fix's head.
+
 ### Native holds every loan of a literal in each of its field projections
 
 - **Status:** recorded on 2026-10-16 with the aggregate-operand placement fix (#1866). It is
