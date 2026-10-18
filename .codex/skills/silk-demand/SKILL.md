@@ -16,7 +16,7 @@ Capture the requested implementation or concrete shipped outcome, not a research
 definition, or ticket-writing deliverable. Keep uncertain acceptance provisional in Triage and
 record the research questions on that implementation issue. Research and independent skeptical
 review are mandatory triage work before implementation admission; every decomposed child must
-pass that process too. OpenSpec artifacts ship with the implementation when required.
+pass that process too.
 
 ## Procedure
 
@@ -50,4 +50,4 @@ pass that process too. OpenSpec artifacts ship with the implementation when requ
    Review baseline commit and stage.
 
 This skill records demand. It does not decide that the requested solution is correct, admit the
-issue to Backlog or Todo, create an OpenSpec change, edit code, or create a PR.
+issue to Backlog or Todo, edit code, or create a PR.
