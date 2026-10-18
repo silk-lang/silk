@@ -24,6 +24,20 @@ Portable whole-file interaction is source-defined as well: normalized provider-a
 values and a seven-operation mutable `FileSystem` service can be implemented by application-owned
 native, browser, Wasm, or test providers without introducing ambient storage or host imports.
 
+## Install
+
+On macOS (Apple Silicon) or Linux (x86-64 or ARM64), install the native compiler from the newest
+published build of `main`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
+```
+
+The script puts `silk` in `~/.silk/bin` (set `SILK_INSTALL` to change it) with its standard
+library beside it, and checks the compiler's SHA-256 against the release. Building programs needs
+Clang 22 or newer on `PATH`, or `SILK_CLANG` set to it. Archives downloaded through a browser are
+quarantined by macOS; files fetched by the script are not, so Gatekeeper lets them run.
+
 ## Language documentation
 
 - [Getting started](apps/docs/content/language/tutorial.md) — build a first project and learn the core

@@ -73,6 +73,9 @@ export const unknownModuleCode = 'MOD0001' as const
 /** Stable code for an import redundantly naming its own containing module. */
 export const selfImportCode = 'MOD0002' as const
 
+/** Stable code for an import of another package's module that its manifest does not export. */
+export const internalModuleCode = 'MOD0003' as const
+
 /** Stable code for a present return-type name that is not a bootstrap built-in. */
 export const unknownTypeCode = 'SEM0001' as const
 
@@ -577,6 +580,7 @@ export type Code =
   | typeof expressionNestingLimitExceededCode
   | typeof unknownModuleCode
   | typeof selfImportCode
+  | typeof internalModuleCode
   | typeof unknownTypeCode
   | typeof integerOutOfRangeCode
   | typeof duplicateDeclarationNameCode
@@ -920,6 +924,7 @@ export type Reason<L = SourceSpan.SourceSpan> =
     }
   | { readonly _tag: 'UnknownModule'; readonly module: string }
   | { readonly _tag: 'SelfImport'; readonly module: string }
+  | { readonly _tag: 'InternalModule'; readonly module: string; readonly package: string }
   | { readonly _tag: 'UnknownType'; readonly spelling: string }
   | { readonly _tag: 'UnknownLifetime'; readonly spelling: string }
   | { readonly _tag: 'AmbiguousLifetimeElision' }
@@ -2141,6 +2146,17 @@ export const selfImport = <L>(module: string, span: L): Diagnostic<L> => ({
   severity: 'error',
   message: `Module ${module} imports itself`,
   reason: { _tag: 'SelfImport' as const, module },
+  span,
+})
+
+/** Creates the diagnostic for an import of a module another package does not export. */
+export const internalModule = <L>(module: string, packageName: string, span: L): Diagnostic<L> => ({
+  _tag: 'Diagnostic',
+  phase: 'module',
+  code: internalModuleCode,
+  severity: 'error',
+  message: `Module ${module} is not exported by package ${packageName}`,
+  reason: { _tag: 'InternalModule' as const, module, package: packageName },
   span,
 })
 
