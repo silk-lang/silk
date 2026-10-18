@@ -64,7 +64,7 @@ pub fn main() -> i32 {
 
 Import as `FileSystem` with `import silk.filesystem { FileSystem }`.
 
-Public declarations: 10.
+Public declarations: 13.
 
 <a id="declaration-73696c6b2f66696c6573797374656d3a3a50617468"></a>
 
@@ -413,6 +413,110 @@ pub reason: FileReason
 
 The portable reason callers can recover by.
 
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a5075626c69636174696f6e506f6c696379"></a>
+
+## `PublicationPolicy`
+
+```silk
+pub struct PublicationPolicy
+```
+
+Destination policy for atomic whole-file publication.
+
+### Details
+
+Construct with [`FileSystem.replaceExisting`](#declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e7265706c6163654578697374696e67) or [`FileSystem.createNew`](#declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e6372656174654e6577).
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a5075626c69636174696f6e506f6c6963793a3a6669656c643a30"></a>
+
+### Field `code`
+
+```silk
+pub code: i32
+```
+
+`0` replaces a destination entry; `1` claims only an absent entry.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a4475726162696c697479"></a>
+
+## `Durability`
+
+```silk
+pub struct Durability
+```
+
+Explicit synchronization policy for atomic publication.
+
+### Details
+
+Construct with [`FileSystem.buffered`](#declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e6275666665726564) or [`FileSystem.synchronized`](#declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e73796e6368726f6e697a6564).
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a4475726162696c6974793a3a6669656c643a30"></a>
+
+### Field `code`
+
+```silk
+pub code: i32
+```
+
+`0` requests no synchronization; `1` synchronizes the file before and parent after publication.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a41746f6d696357726974654572726f72"></a>
+
+## `AtomicWriteError`
+
+```silk
+pub struct AtomicWriteError
+```
+
+An atomic write failure that retains whether its namespace publication succeeded.
+
+### Details
+
+`published == false` means this operation did not change the destination. `true` means the
+complete new file became visible, but a later synchronization, cleanup, or close failed.
+Never blindly retry a published operation, particularly with create-new policy.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a41746f6d696357726974654572726f723a3a6669656c643a30"></a>
+
+### Field `published`
+
+```silk
+pub published: bool
+```
+
+Whether this operation successfully published its complete new contents.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a41746f6d696357726974654572726f723a3a6669656c643a31"></a>
+
+### Field `cause`
+
+```silk
+pub cause: FileError
+```
+
+Primary failure, including its operation, portable reason, and available native code.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a41746f6d696357726974654572726f723a3a6669656c643a32"></a>
+
+### Field `cleanupError`
+
+```silk
+pub cleanupError: silk/option.Option<silk/filesystem.FileError>
+```
+
+Secondary staging cleanup failure, without replacing the primary failure.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a41746f6d696357726974654572726f723a3a6669656c643a33"></a>
+
+### Field `stagingName`
+
+```silk
+pub stagingName: Bytes
+```
+
+Exact temporary leaf name left in the destination directory if cleanup failed; empty otherwise.
+
 <a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d"></a>
 
 ## `FileSystem`
@@ -463,6 +567,71 @@ Writes one complete byte view with create-or-truncate semantics.
 
 A missing file is created; an existing regular file is replaced by exactly `bytes`. The call
 does not create missing parent directories—use [`writeFileWithParents`](#declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e777269746546696c6557697468506172656e7473) for that workflow.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d3a3a6f7065726174696f6e3a63726561746546696c65"></a>
+
+### Operation `createFile`
+
+```silk
+effect<'life0 & 'life1> fn createFile<'life0, 'life1>(path: &'life0 silk/filesystem.Path, bytes: &'life1 [u8]) -> () ! FileError ? &mut FileSystem
+```
+
+Exclusively creates a regular file and writes its contents without replacing any existing entry.
+
+#### Details
+
+Existing files, directories, and symlink entries fail with `AlreadyExists`, without following
+or modifying them. The claim is atomic, but readers can observe incomplete contents while the
+write proceeds. A write or close failure after creation leaves the new, possibly partial file
+in place. Use `FileSystem.writeFileAtomic` with [`createNew`](#declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e6372656174654e6577) for complete-content publication instead.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d3a3a6f7065726174696f6e3a777269746546696c6541746f6d6963"></a>
+
+### Operation `writeFileAtomic`
+
+```silk
+effect<'life0 & 'life1> fn writeFileAtomic<'life0, 'life1>(path: &'life0 silk/filesystem.Path, bytes: &'life1 [u8], policy: PublicationPolicy, durability: Durability) -> () ! AtomicWriteError ? &mut FileSystem
+```
+
+Publishes complete contents with one atomic destination namespace change.
+
+#### Details
+
+The provider exclusively stages a regular file in the destination directory. Replace policy
+replaces a regular file or creates an absent name; native providers may replace a symlink
+entry itself, never its referent. Directories and other unsupported kinds fail with `WrongType`.
+Create-new policy refuses every existing entry with `AlreadyExists` using an atomic no-replace
+operation, not an existence check. Concurrent readers opening the destination see complete
+old or new contents, with no replacement-induced missing-name interval.
+
+Synchronized publication synchronizes the owned staged file before publication and the
+containing directory afterward. This is normal filesystem synchronization, not a guarantee
+that hardware caches survive power loss. Providers unable to supply the requested semantics
+fail with `Unsupported`; they never downgrade to an ordinary write.
+
+Native publication creates a new inode with mode `0666` filtered by the process umask and
+normal filesystem inheritance. It does not preserve the old inode's mode, ownership, ACLs,
+extended attributes, or hard-link identity; existing hard links still name the old inode.
+A failed pre-publication operation leaves the destination unchanged. Cleanup is attempted
+and residual staging names are retained in [`AtomicWriteError`](#declaration-73696c6b2f66696c6573797374656d3a3a41746f6d696357726974654572726f72).
+Atomic publication is one-file visibility, not a transaction across paths.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d3a3a6f7065726174696f6e3a73796e634469726563746f7279"></a>
+
+### Operation `syncDirectory`
+
+```silk
+effect<'life0> fn syncDirectory<'life0>(path: &'life0 silk/filesystem.Path) -> () ! FileError ? &mut FileSystem
+```
+
+Synchronizes one existing directory so callers can order durable namespace updates.
+
+#### Details
+
+Native providers synchronize an owned no-follow directory descriptor. After creating or
+removing an entry, synchronize its parent directory; after creating a directory, synchronize
+its parent as well as any contents whose durability is required. Unsupported providers return
+`Unsupported`. This operation alone does not synchronize ordinary file contents.
 
 <a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d3a3a6f7065726174696f6e3a73746174"></a>
 
@@ -551,6 +720,46 @@ provider can create and claim a name in one step. A caller that supplied the nam
 to check-then-create, and the gap between those two is exactly the race this avoids.
 `prefix` is a byte prefix for the provider-chosen child name, not a complete path. The returned
 directory already exists and is an immediate child of `parent`.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e7265706c6163654578697374696e67"></a>
+
+### Associated function `FileSystem.replaceExisting`
+
+```silk
+pub fn replaceExisting() -> PublicationPolicy
+```
+
+Selects atomic replacement or creation of an absent destination.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e6372656174654e6577"></a>
+
+### Associated function `FileSystem.createNew`
+
+```silk
+pub fn createNew() -> PublicationPolicy
+```
+
+Selects atomic publication only when no destination entry exists.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e6275666665726564"></a>
+
+### Associated function `FileSystem.buffered`
+
+```silk
+pub fn buffered() -> Durability
+```
+
+Requests atomic visibility without explicit filesystem synchronization.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e73796e6368726f6e697a6564"></a>
+
+### Associated function `FileSystem.synchronized`
+
+```silk
+pub fn synchronized() -> Durability
+```
+
+Requests file synchronization before publication and parent synchronization afterward.
 
 <a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e66696c65"></a>
 
@@ -701,6 +910,46 @@ pub fn createTemporaryDirectoryOperation() -> FileOperation
 ```
 
 Selects the create-temporary-directory operation.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e63726561746546696c654f7065726174696f6e"></a>
+
+### Associated function `FileSystem.createFileOperation`
+
+```silk
+pub fn createFileOperation() -> FileOperation
+```
+
+Selects exclusive regular-file creation.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e777269746546696c6541746f6d69634f7065726174696f6e"></a>
+
+### Associated function `FileSystem.writeFileAtomicOperation`
+
+```silk
+pub fn writeFileAtomicOperation() -> FileOperation
+```
+
+Selects atomic whole-file publication.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e73796e6346696c654f7065726174696f6e"></a>
+
+### Associated function `FileSystem.syncFileOperation`
+
+```silk
+pub fn syncFileOperation() -> FileOperation
+```
+
+Selects synchronization of an owned file descriptor.
+
+<a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e73796e634469726563746f72794f7065726174696f6e"></a>
+
+### Associated function `FileSystem.syncDirectoryOperation`
+
+```silk
+pub fn syncDirectoryOperation() -> FileOperation
+```
+
+Selects directory synchronization.
 
 <a id="declaration-73696c6b2f66696c6573797374656d3a3a46696c6553797374656d2e6f7065726174696f6e436f6465"></a>
 

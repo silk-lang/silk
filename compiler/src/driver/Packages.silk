@@ -6,7 +6,8 @@
 //! rules a build relies on: identifier names other than `silk` and `Intrinsic`, a readable manifest
 //! at each path, a matching `package` name, no name that is also one of the owner's own top-level
 //! modules (PACKAGE-003), no package cycle, and one version and one directory per package name
-//! (PACKAGE-004).
+//! (PACKAGE-004). A dependency's `[package].exports` must list modules that exist in it
+//! (PACKAGE-006).
 
 import driver.CommandPath
 import semantic.ModuleId {ModuleId}
@@ -18,6 +19,7 @@ import silk.effect {Effect}
 import silk.filesystem {FileError, FileSystem, Path}
 import silk.option {Option}
 import silk.result {Result}
+import silk.slice {Slice}
 import silk.string {String}
 import silk.toml_scanner {TomlError}
 import silk.toml_value {Toml, TomlChild, Value as TomlValue}
@@ -38,6 +40,8 @@ struct Package {
   manifest: Path
   // The directory its module paths resolve below.
   sourceRoot: Path
+  // The canonical paths, such as `codec/Json.silk`, of the modules other packages may import.
+  exports: Vector<Bytes>
 }
 
 // One edge of the graph: package `owner` imports package `package` as `name`.
@@ -133,6 +137,64 @@ effect fn shadows(sourceRoot: &Path, name: &[u8]) -> bool ! FileError | OutOfMem
   run Bytes.append(&mut file, b".silk")
   let module = run Path.joinBytes(sourceRoot, Bytes.asSlice(&file))
   return run FileSystem.exists(&module)
+}
+
+// Fails with `exports of <package>: <entry> <reason>`.
+effect fn invalidExport(package: &[u8], entry: &[u8], reason: &[u8]) -> never ! InvalidDependency | OutOfMemoryError ? &mut Allocator {
+  let mut detail = run Bytes.copy(b"exports of ")
+  run Bytes.append(&mut detail, package)
+  run Bytes.append(&mut detail, b": ")
+  run Bytes.append(&mut detail, entry)
+  run Bytes.append(&mut detail, b" ")
+  run Bytes.append(&mut detail, reason)
+  fail InvalidDependency {detail: move detail}
+}
+
+// The canonical module paths `[package].exports` lists in import spelling (`codec.Json` becomes
+// `codec/Json.silk`), each checked to name a module below `sourceRoot` (PACKAGE-006).
+effect fn exportsOf(package: &[u8], document: &TomlValue, sourceRoot: &Path) -> Vector<Bytes>
+! InvalidDependency | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut exports = Vector<Bytes>.make()
+  let listed = match move Toml.fieldAt(Toml.field(document, "package"), "exports") {
+    Option<&TomlValue>.Some {value} => value
+    Option<&TomlValue>.None => { return move exports }
+  }
+  let array = match &listed.* {
+    TomlValue.Array {..} => true
+    _ => false
+  }
+  if !array { run invalidExport(package, b"[package].exports", b"must be an array of module names") }
+  let mut at = usize.ZERO
+  while true {
+    let item = match move Toml.item(listed, at) {
+      Option<&TomlValue>.Some {value} => value
+      Option<&TomlValue>.None => { return move exports }
+    }
+    let spelling = match move Toml.asString(Option<&TomlValue>.some(item)) {
+      Option<string>.Some {value} => String.utf8Bytes(value)
+      Option<string>.None => run invalidExport(package, b"[package].exports", b"must list module names as strings")
+    }
+    let mut path = Bytes.make()
+    let mut start = usize.ZERO
+    let mut cursor = usize.ZERO
+    while cursor <= spelling.length {
+      if cursor == spelling.length || spelling[cursor] == 46 {
+        let segment = Slice.view<u8>(spelling, start, cursor - start)
+        if !identifier(segment) { run invalidExport(package, spelling, b"is not a module name such as `codec.Json`") }
+        if start > usize.ZERO { run Bytes.append(&mut path, b"/") }
+        run Bytes.append(&mut path, segment)
+        start = cursor + usize.ONE
+      }
+      cursor = cursor + usize.ONE
+    }
+    run Bytes.append(&mut path, b".silk")
+    let file = run Path.joinBytes(sourceRoot, Bytes.asSlice(&path))
+    let found = run FileSystem.exists(&file)
+    if !found { run invalidExport(package, spelling, b"is not a module of the package") }
+    run Vector<Bytes>.append(&mut exports, move path)
+    at = at + usize.ONE
+  }
+  return move exports
 }
 
 // The members of a table, or `None` for another kind of value.
@@ -259,9 +321,10 @@ effect fn visit(packages: &mut Packages, owner: usize, document: &TomlValue, sta
           Option<Path>.Some {value} => move value
           Option<Path>.None => run invalid(owned, name, b"its silk.toml names neither package.source-root nor package.root")
         }
+        let exports = run exportsOf(Bytes.asSlice(&identity), &dependency, &sourceRoot)
         run Vector<Package>.append(&mut packages.packages, Package {
           identity: run Bytes.copy(Bytes.asSlice(&identity)), name: run Bytes.copy(packageName),
-          manifest: move directory, sourceRoot: move sourceRoot,
+          manifest: move directory, sourceRoot: move sourceRoot, exports: move exports,
         })
         run Vector<Bytes>.append(&mut stack.*, run Bytes.copy(Bytes.asSlice(&identity)))
         let added = Vector<Package>.length(&packages.packages) - usize.ONE
@@ -290,7 +353,7 @@ pub effect fn load(manifest: &Path, document: &TomlValue, identity: &[u8], sourc
   let mut packages = Packages {packages: Vector<Package>.make(), edges: Vector<Edge>.make()}
   run Vector<Package>.append(&mut packages.packages, Package {
     identity: run Bytes.copy(identity), name: run Bytes.copy(name), manifest: run copyPath(manifest),
-    sourceRoot: run copyPath(sourceRoot),
+    sourceRoot: run copyPath(sourceRoot), exports: Vector<Bytes>.make(),
   })
   let mut stack = Vector<Bytes>.make()
   run Vector<Bytes>.append(&mut stack, run Bytes.copy(identity))
@@ -307,6 +370,17 @@ pub effect fn graph(self: &Packages, owner: &ModuleId) -> PackageGraph ! OutOfMe
     run PackageGraph.depend(&mut graph, Bytes.asSlice(&edges[at].owner), Bytes.asSlice(&edges[at].name),
       Bytes.asSlice(&edges[at].package))
     at = at + usize.ONE
+  }
+  let packages = Vector<Package>.asSlice(&self.packages)
+  let mut packageAt = usize.ZERO
+  while packageAt < packages.length {
+    let exports = Vector<Bytes>.asSlice(&packages[packageAt].exports)
+    let mut exportAt = usize.ZERO
+    while exportAt < exports.length {
+      run PackageGraph.publish(&mut graph, Bytes.asSlice(&packages[packageAt].identity), Bytes.asSlice(&exports[exportAt]))
+      exportAt = exportAt + usize.ONE
+    }
+    packageAt = packageAt + usize.ONE
   }
   return move graph
 }
