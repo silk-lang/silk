@@ -573,6 +573,58 @@ const program = Effect.gen(function* () {
   assert.notEqual(shadowed.status, 0, 'a shadowing dependency name was accepted')
   assert.match(shadowed.stderr, /silk: invalid dependency `util` of app@1\.0\.0: the name is also/)
   assert.equal(yield* fs.exists(marker), false)
+  // A workspace member builds against a sibling member by path and shares the workspace's output.
+  const workspace = join(directory, 'workspace')
+  yield* fs.makeDirectory(join(workspace, 'app'), { recursive: true })
+  yield* fs.makeDirectory(join(workspace, 'libs/math'), { recursive: true })
+  yield* fs.writeFileString(
+    join(workspace, 'silk.toml'),
+    '[workspace]\nmembers = ["app", "libs/*"]\n',
+  )
+  yield* fs.writeFileString(
+    join(workspace, 'libs/math/silk.toml'),
+    '[package]\nname = "math"\nversion = "0.1.0"\nsource-root = "."\nexports = ["twice"]\n',
+  )
+  yield* fs.writeFileString(
+    join(workspace, 'libs/math/twice.silk'),
+    'pub fn twice(value: i32) -> i32 {\n  return value * 2\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(workspace, 'app/silk.toml'),
+    '[package]\nname = "workspace-app"\nversion = "0.1.0"\nroot = "main.silk"\n\n[dependencies]\nmath = { path = "../libs/math" }\n',
+  )
+  yield* fs.writeFileString(
+    join(workspace, 'app/main.silk'),
+    'import math.twice { twice }\n\npub fn main() -> i32 {\n  return twice(4)\n}\n',
+  )
+  const member = yield* invoke(silk, ['run', '--stdlib', standardLibrary], join(workspace, 'app'), {
+    ...process.env,
+    SILK_CLANG: clang,
+  })
+  assert.equal(member.status, 8, member.stderr)
+  assert.equal(
+    yield* fs.exists(join(workspace, 'build')),
+    true,
+    'members share the workspace output',
+  )
+  assert.equal(yield* fs.exists(join(workspace, 'app/build')), false)
+  // The workspace manifest itself has no package to build, and every member needs a manifest.
+  const virtualRoot = yield* invoke(silk, ['run', '--stdlib', standardLibrary], workspace, {
+    ...process.env,
+    SILK_CLANG: sentinel,
+  })
+  assert.notEqual(virtualRoot.status, 0, 'a workspace-only manifest was built')
+  assert.match(virtualRoot.stderr, /only defines a workspace/)
+  yield* fs.makeDirectory(join(workspace, 'libs/empty'), { recursive: true })
+  const unmanifested = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(workspace, 'app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.notEqual(unmanifested.status, 0, 'a member without a manifest was accepted')
+  assert.match(unmanifested.stderr, /libs\/\*` names a directory without a silk\.toml/)
+  assert.equal(yield* fs.exists(marker), false)
   // A composition retention root keeps a private function from a module nothing imports.
   yield* fs.makeDirectory(join(directory, 'retained/support'), { recursive: true })
   yield* fs.writeFileString(
@@ -924,7 +976,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
