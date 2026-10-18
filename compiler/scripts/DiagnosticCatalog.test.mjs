@@ -9,14 +9,7 @@ const definitions = [
   ['unknownType', 'SEM0001', 'Unknown type {spelling}'],
 ]
 const member = (name) => `${name.slice(0, 1).toUpperCase()}${name.slice(1)}`
-const typescript = (template) => template.replace(/\{(\w+)\}/g, (_text, hole) => `\${${hole}}`)
 const fixture = () => ({
-  bootstrap: definitions
-    .map(
-      ([name, code, template]) =>
-        `/** Meaning of ${code}. */\nexport const ${name}Code = '${code}' as const\nconst ${name} = (span) => ({ code: ${name}Code, message: \`${typescript(template)}\`, span })`,
-    )
-    .join('\n'),
   catalog: `pub enum Code {
 ${definitions.map(([name]) => `  ${member(name)},`).join('\n')}
 }
@@ -57,9 +50,6 @@ fn faultCatalogCode(fault: Fault) -> Option<Code> {
     Fault.StaticPhaseViolation => Option<Code>.some(Code.StaticPhaseViolation)
   }
 }`,
-  documentation: definitions
-    .map(([, code]) => `| \`${code}\` | Meaning | \`A complete message\` |`)
-    .join('\n'),
   references: '## TYPE-001 Type names\n## PATT-005 Pattern bindings',
   coverage: [
     { code: 'SEM0001', rules: ['TYPE-001'], reason: 'No dedicated producer in this fixture' },
@@ -149,65 +139,37 @@ it('requires new lexical and static reasons to have a catalog mapping', () => {
   reports(fault, 'faultCatalogCode: missing arm NewFault')
 })
 
-it('requires the native catalog to match the bootstrap template for template', () => {
+it('requires every catalog code to carry a unique spelling, a meaning, and a message', () => {
   for (const [replace, expected] of [
     [
-      (text) => text.replace('"Unknown type {spelling}"', '"Unknown kind {spelling}"'),
-      'template 0 differs',
+      (text) => text.replace('=> "SEM0001"', '=> "unknown"'),
+      'Code.UnknownType: no stable spelling',
+    ],
+    [(text) => text.replace('=> "SEM0001"', '=> "SEM0012"'), 'duplicate catalog code SEM0012'],
+    [
+      (text) => text.replace('"Meaning of SEM0012."', '" "'),
+      'Code.ArgumentTypeMismatch: no meaning',
     ],
     [
-      (text) => text.replace('"Expected {expected} but', '"Expected {expected}{actual} but'),
-      'template 0 differs',
+      (text) => text.replace('"Unknown type {spelling}"', '""'),
+      'Code.UnknownType: missing nonempty message template',
     ],
-    [(text) => text.replace('"Meaning of SEM0012."', '"Another meaning."'), 'meaning differs'],
-    [(text) => text.replace('=> "SEM0001"', '=> "SEM0002"'), 'spelled SEM0002'],
-    [
-      (text) => text.replace('  UnknownType,\n', '  UnknownType,\n  Extra,\n'),
-      'Code.Extra: not in the bootstrap',
-    ],
-    [(text) => text.replace('  UnknownType,\n', ''), 'Catalog.silk has no Code.UnknownType'],
   ]) {
     const input = fixture()
     input.catalog = replace(input.catalog)
     reports(input, expected)
   }
-  const renamed = fixture()
-  renamed.catalog = renamed.catalog.replace('"Unknown type {spelling}"', '"Unknown type {name}"')
-  assert.deepStrictEqual(verify(renamed), [])
 })
 
-it('compares every template of a code that chooses among several', () => {
+it('reads every template of a code that chooses among several', () => {
   const input = fixture()
-  input.bootstrap = input.bootstrap.replace(
-    'message: `Unknown type ${spelling}`',
-    'message: generic ? `Unknown generic ${spelling}` : `Unknown type ${spelling}`',
-  )
-  reports(input, '1 templates, bootstrap 2')
   input.catalog = input.catalog.replace(
     '    Code.UnknownType => "Unknown type {spelling}"',
     '    Code.UnknownType => {\n      if choice == 1 { return "Unknown type {spelling}" }\n      return "Unknown generic {spelling}"\n    }',
   )
   assert.deepStrictEqual(verify(input), [])
-  input.catalog = input.catalog.replace(
-    'return "Unknown type {spelling}"',
-    'return "Unknown {spelling}"',
-  )
-  reports(input, 'template 1 differs')
-})
-
-it('rejects removed messages, missing documentation, and duplicate catalog codes', () => {
-  const missingMessage = fixture()
-  missingMessage.bootstrap = missingMessage.bootstrap.replace(
-    'message: `Unknown type ${spelling}`',
-    'templateRemoved: true',
-  )
-  reports(missingMessage, 'message template')
-  const missingDocumentation = fixture()
-  missingDocumentation.documentation = ''
-  reports(missingDocumentation, 'missing generated documentation')
-  const collision = fixture()
-  collision.bootstrap = collision.bootstrap.replace("'SEM0048' as const", "'SEM0012' as const")
-  reports(collision, 'duplicate catalog code')
+  input.catalog = input.catalog.replace('if choice == 1', 'if choice == 2')
+  reports(input, 'UnknownType skips choice 1')
 })
 
 it('requires gaps to have rules and reasons and rejects stale or missing gap entries', () => {
@@ -234,10 +196,6 @@ it('reads arms and template choices in the formatter wrapped layout', () => {
   input.rejection = input.rejection.replace(
     'RejectionCode.ArgumentTypeMismatch => Option<Code>.some(Code.ArgumentTypeMismatch)',
     'RejectionCode.ArgumentTypeMismatch => Option<\n      Code\n    >.some(Code.ArgumentTypeMismatch)',
-  )
-  input.bootstrap = input.bootstrap.replace(
-    'message: `Unknown type ${spelling}`',
-    'message: generic ? `Unknown generic ${spelling}` : `Unknown type ${spelling}`',
   )
   input.catalog = input.catalog.replace(
     '    Code.UnknownType => "Unknown type {spelling}"',

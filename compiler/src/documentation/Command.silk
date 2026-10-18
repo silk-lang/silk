@@ -1,0 +1,272 @@
+//! Native documentation workflows and their stable 0/1/2 command statuses.
+
+import documentation.Doctest
+import documentation.FileSet
+import documentation.Model {Project, DecodeError}
+import documentation.Model
+import documentation.Project as Extraction {Error as ExtractionError}
+import documentation.Reference {File, Group, ManifestEntry, RenderError}
+import documentation.Reference
+import documentation.Session as Sessions {Error as SessionError, Failure, Library}
+import semantic.ModuleId {ModuleId}
+import semantic.Target {Target, Id as TargetId}
+import semantic.Types {Types}
+import semantic.Rejection {Rejection}
+import silk.format {Format}
+import driver.Project as Projects
+import driver.CommandPath
+import driver.InstalledCompiler
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.effect {Effect}
+import silk.filesystem {FileSystem, FileError, Path}
+import silk.host_input {HostInput, HostInputError}
+import silk.option {Option}
+import silk.result {Result}
+import silk.shared {Shared}
+import silk.vector {Vector}
+import silk.writer {Writer, WriterError}
+
+/// One native documentation workflow.
+pub enum Kind { Doc, Doctest, Reference }
+
+/// Parsed command options. `--stdlib` is always boolean; `--stdlib-root` is always a path.
+pub struct Command {
+  pub kind: Kind
+  pub manifest: Option<Bytes>
+  pub input: Option<Bytes>
+  pub output: Option<Bytes>
+  pub target: Option<Bytes>
+  pub libraryRoot: Option<Bytes>
+  pub sourceRoot: Option<Bytes>
+  pub stdlib: bool
+  pub includePrivate: bool
+  pub check: bool
+  pub help: bool
+}
+
+/// Typed failures from source, model, renderer, process-input and output boundaries.
+pub type Error = SessionError | DecodeError | RenderError | HostInputError | WriterError
+
+fn present(value: &Option<Bytes>) -> bool { return match &value.* { Option<Bytes>.Some {..} => true Option<Bytes>.None => false } }
+
+effect fn option(slot: &mut Option<Bytes>, arguments: &[Bytes], at: &mut usize) -> () ! Failure | OutOfMemoryError ? &mut Allocator {
+  if present(&slot.*) || at.* + 1 >= arguments.length { fail Failure {message: b"duplicate option or missing option value", status: 2} }
+  at.* = at.* + 1
+  let value = Bytes.asSlice(&arguments[at.*])
+  if value.length == 0 || value[0] == 45 { fail Failure {message: b"missing option value (use ./ for paths beginning with a dash)", status: 2} }
+  slot.* = Option<Bytes>.some(run Bytes.copy(value))
+}
+
+/// Parses only the selected workflow's flags; paths never ambiguously consume `--stdlib`.
+pub effect fn make(selector: &[u8], arguments: &[Bytes]) -> Command ! Failure | OutOfMemoryError ? &mut Allocator {
+  let mut kind = Kind.Doc
+  if Sessions.same(selector, b"doctest") { kind = Kind.Doctest }
+  else if Sessions.same(selector, b"doc-reference") { kind = Kind.Reference }
+  else if !Sessions.same(selector, b"doc") { fail Failure {message: b"unknown documentation command", status: 2} }
+  let mut command = Command {kind: kind, manifest: Option<Bytes>.none(), input: Option<Bytes>.none(), output: Option<Bytes>.none(), target: Option<Bytes>.none(), libraryRoot: Option<Bytes>.none(), sourceRoot: Option<Bytes>.none(), stdlib: false, includePrivate: false, check: false, help: false}
+  let mut at: usize = 0
+  while at < arguments.length {
+    let argument = Bytes.asSlice(&arguments[at])
+    if Sessions.same(argument, b"--help") || Sessions.same(argument, b"-h") { command.help = true }
+    else if Sessions.same(argument, b"--manifest-path") && kind == Kind.Doc { run option(&mut command.manifest, arguments, &mut at) }
+    else if (Sessions.same(argument, b"--input") || Sessions.same(argument, b"-i")) && kind == Kind.Doctest { run option(&mut command.input, arguments, &mut at) }
+    else if (Sessions.same(argument, b"--output") || Sessions.same(argument, b"-o")) && kind != Kind.Doctest { run option(&mut command.output, arguments, &mut at) }
+    else if Sessions.same(argument, b"--target") && kind != Kind.Reference { run option(&mut command.target, arguments, &mut at) }
+    else if Sessions.same(argument, b"--stdlib-root") { run option(&mut command.libraryRoot, arguments, &mut at) }
+    else if Sessions.same(argument, b"--source-root") && kind == Kind.Doctest { run option(&mut command.sourceRoot, arguments, &mut at) }
+    else if Sessions.same(argument, b"--stdlib") && (kind == Kind.Doc || kind == Kind.Doctest) { command.stdlib = true }
+    else if Sessions.same(argument, b"--include-private") && kind == Kind.Doc { command.includePrivate = true }
+    else if Sessions.same(argument, b"--check") && kind == Kind.Reference { command.check = true }
+    else { fail Failure {message: b"unknown option for documentation command", status: 2} }
+    at = at + 1
+  }
+  if command.help { return move command }
+  if command.stdlib && (present(&command.input) || present(&command.manifest)) { fail Failure {message: b"--stdlib conflicts with --input and --manifest-path", status: 2} }
+  if kind == Kind.Doctest && !command.stdlib && !present(&command.input) { fail Failure {message: b"pass --input <documentation.json> or --stdlib", status: 2} }
+  if kind == Kind.Reference && !present(&command.output) { fail Failure {message: b"doc-reference requires --output", status: 2} }
+  return move command
+}
+
+static if Intrinsic.targetOperatingSystem() == "darwin" {
+  fn host() -> Target { return Target.forId(TargetId.Aarch64AppleDarwin) }
+} else {
+  static if Intrinsic.targetArchitecture() == "aarch64" {
+    fn host() -> Target { return Target.forId(TargetId.Aarch64UnknownLinuxGnu) }
+  } else {
+    fn host() -> Target { return Target.forId(TargetId.X8664UnknownLinuxGnu) }
+  }
+}
+
+fn selected<'a>(value: &'a Option<Bytes>, fallback: &'a [u8]) -> &'a [u8] {
+  return match &value.* { Option<Bytes>.Some {value: written} => Bytes.asSlice(&written) Option<Bytes>.None => fallback }
+}
+
+effect fn libraryPath(command: &Command, working: &Path, executable: &[u8]) -> Path ! Error ? &mut HostInput | &mut FileSystem | &mut Allocator {
+  if let Option<Bytes>.Some {value} = &command.libraryRoot { return run CommandPath.resolve(working, Bytes.asSlice(&value)) }
+  let search = run HostInput.variable(b"PATH")
+  let borrowed = match &search { Option<Bytes>.Some {value} => Option<&[u8]>.some(Bytes.asSlice(&value)) Option<Bytes>.None => Option<&[u8]>.none() }
+  return match move run InstalledCompiler.standardLibrary(working, executable, move borrowed) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => { fail Failure {message: b"no installed standard library; pass --stdlib-root <directory>", status: 2} }
+  }
+}
+
+effect fn loadModel(command: &Command, working: &Path) -> Project ! Error ? &mut FileSystem | &mut Allocator {
+  let input = run CommandPath.resolve(working, selected(&command.input, b""))
+  let bytes = run FileSystem.readFile(&input)
+  return run Model.decode(Bytes.asSlice(&bytes))
+}
+
+effect fn doctestModel(command: &Command, library: &Library, working: &Path) -> Project
+! Error ? &mut FileSystem | &mut Allocator | &mut Types {
+  if command.stdlib {
+    let hostTarget = host()
+    let target = selected(&command.target, Target.name(&hostTarget))
+    return run Sessions.extractLibrary(library, target, target, false, true)
+  }
+  return run loadModel(command, working)
+}
+
+effect fn reference(command: &Command, library: &Library, working: &Path) -> i32 ! Error ? &mut FileSystem | &mut Allocator | &mut Types | &mut Writer {
+  let targets: [&[u8]; 6] = [b"aarch64-apple-darwin", b"aarch64-unknown-linux-gnu", b"aarch64-unknown-linux-gnu", b"x86_64-unknown-linux-gnu", b"x86_64-unknown-linux-gnu", b"wasm32-unknown-unknown"]
+  let mut groups = Vector<Group>.make()
+  let manifest = Vector<ManifestEntry>.asSlice(&library.manifest)
+  let mut at: usize = 0
+  while at < targets.length {
+    let noLibc = at == 2 || at == 4
+    let mut name = run Bytes.copy(targets[at])
+    if noLibc { run Bytes.append(&mut name, b"-no-libc") }
+    let project = run Sessions.extractLibrary(library, targets[at], Bytes.asSlice(&name), noLibc, false)
+    // Capture owns only rendered files. The project and semantic session die each iteration.
+    run Vector<Group>.append(&mut groups, run Reference.capture(&project, manifest))
+    at = at + 1
+  }
+  let files = run Reference.merge(Vector<Group>.asSlice(&groups), manifest)
+  let output = run CommandPath.resolve(working, selected(&command.output, b""))
+  return run FileSet.apply(&output, Vector<File>.asSlice(&files), command.check)
+}
+
+/// Executes an already parsed request against host services, with no bootstrap process.
+pub effect fn execute(command: &Command, working: &Path, executable: &[u8]) -> i32
+! Error ? &mut HostInput | &mut FileSystem | &mut Allocator | &mut Writer | &mut Types {
+  if command.help {
+    run Writer.writeAll(b"silk doc [--manifest-path PATH] [-o JSON] [--include-private] [--target TARGET] [--stdlib] [--stdlib-root PATH]\nsilk doctest (--stdlib | -i JSON) [--source-root PATH] [--target TARGET] [--stdlib-root PATH]\nsilk doc-reference --stdlib-root PATH -o DIRECTORY [--check]\n")
+    return 0
+  }
+  let libraryRoot = run libraryPath(command, working, executable)
+  if command.kind == Kind.Doc && !command.stdlib {
+    let manifest = match &command.manifest {
+      Option<Bytes>.Some {value} => run CommandPath.resolve(working, Bytes.asSlice(&value))
+      Option<Bytes>.None => run Projects.discover(working)
+    }
+    let package = run Projects.load(&manifest)
+    let mut session = run Sessions.package(&package, Option<Path>.some(move libraryRoot), &command.target, host())
+    let project = run Sessions.extractPackage(&mut session, command.includePrivate)
+    let bytes = run Model.encode(&project)
+    let destination = match &command.output {
+      Option<Bytes>.Some {value} => run CommandPath.resolve(Projects.directory(&package), Bytes.asSlice(&value))
+      Option<Bytes>.None => run Path.join(Projects.outputDirectory(&package), "documentation.json")
+    }
+    run FileSet.publish(&destination, Bytes.asSlice(&bytes))
+    run Writer.writeAll(b"Documentation: ")
+    run Writer.writeAll(Path.rawBytes(&destination))
+    run Writer.writeAll(b"\n")
+    return 0
+  }
+  let library = run Sessions.library(&libraryRoot)
+  if command.kind == Kind.Reference { return run reference(command, &library, working) }
+  if command.kind == Kind.Doctest {
+    let project = run doctestModel(command, &library, working)
+    let mut revision = move library.revision
+    if let Option<Bytes>.Some {value} = &command.sourceRoot {
+      let root = run CommandPath.resolve(working, Bytes.asSlice(&value))
+      let owner = run ModuleId.make(b"file", b"documentation", b"doctest/example.silk")
+      run Sessions.publishTree(&mut revision, &root, &root, &owner)
+    }
+    let summary = run Doctest.execute(&project, &revision, &command.target)
+    return Doctest.status(&summary)
+  }
+  let hostTarget = host()
+  let target = selected(&command.target, Target.name(&hostTarget))
+  let project = run Sessions.extractLibrary(&library, target, target, false, command.includePrivate)
+  let bytes = run Model.encode(&project)
+  let destination = run CommandPath.resolve(working, selected(&command.output, b"documentation.json"))
+  run FileSet.publish(&destination, Bytes.asSlice(&bytes))
+  return 0
+}
+
+effect fn fromHost(selector: &[u8]) -> i32 ! Error
+? &mut HostInput | &mut FileSystem | &mut Allocator | &mut Writer | &mut Types {
+  let mut arguments = run HostInput.arguments()
+  if Vector<Bytes>.length(&arguments) < 2 { fail Failure {message: b"missing command arguments", status: 2} }
+  let executable = Vector<Bytes>.remove(&mut arguments, 0)
+  drop Vector<Bytes>.remove(&mut arguments, 0)
+  let command = run make(selector, Vector<Bytes>.asSlice(&arguments))
+  let directory = run HostInput.workingDirectory()
+  let working = run Path.fromBytes(Bytes.asSlice(&directory))
+  return run execute(&command, &working, Bytes.asSlice(&executable))
+}
+
+effect fn report(error: Error) -> i32 ! WriterError | OutOfMemoryError ? &mut Writer | &mut Allocator {
+  run Writer.writeAll(b"silk documentation: ")
+  let mut status: i32 = 2
+  match move error {
+    Failure value => { run Writer.writeAll(value.message) status = value.status }
+    DecodeError value => { run Writer.writeAll(value.message) }
+    RenderError value => { run Writer.writeAll(value.message) status = 1 }
+    ExtractionError value => {
+      status = 1
+      match move value {
+        ExtractionError.Rejected {rejection} => {
+          let module = Shared<Rejection>.with<ModuleId>(&rejection, fn(value: &Rejection) -> ModuleId { return ModuleId.copy(&value.module) })
+          let path = run ModuleId.copyPath(&module)
+          let start = Shared<Rejection>.with<usize>(&rejection, fn(value: &Rejection) -> usize { return value.span.start })
+          run Writer.writeAll(Bytes.asSlice(&path))
+          run Writer.writeAll(b" at byte ")
+          run Format.display<usize>(&start)
+          run Writer.writeAll(b": ")
+          let name = Shared<Rejection>.with<&'static [u8]>(&rejection, fn(value: &Rejection) -> &'static [u8] { return Rejection.name(value.code) })
+          run Writer.writeAll(name)
+        }
+        ExtractionError.MissingSource => { run Writer.writeAll(b"documentation source missing") status = 2 }
+        ExtractionError.InvalidSources => { run Writer.writeAll(b"invalid documentation source mapping") }
+        ExtractionError.InvalidText {sourcePath, field, offset} => {
+          status = 2
+          run Writer.writeAll(Bytes.asSlice(&sourcePath))
+          run Writer.writeAll(b": invalid UTF-8 in ")
+          run Writer.writeAll(field)
+          run Writer.writeAll(b" at byte ")
+          run Format.display<usize>(&offset)
+        }
+      }
+    }
+    OutOfMemoryError value => { drop value run Writer.writeAll(b"allocation failure") }
+    FileError value => {
+      run Writer.writeAll(b"filesystem operation ")
+      run Format.display<i32>(&value.operation.code)
+      run Writer.writeAll(b" failed (reason ")
+      run Format.display<i32>(&value.reason.code)
+      run Writer.writeAll(b")")
+    }
+    HostInputError value => { drop value run Writer.writeAll(b"cannot read process arguments or working directory") }
+    WriterError value => { fail move value }
+    _ => { run Writer.writeAll(b"invalid project, target, profile, source, or compiler analysis") }
+  }
+  run Writer.writeAll(b"\n")
+  return status
+}
+
+/// Runs the native command, containing every typed failure as stable success/failure/input status.
+pub effect fn runHost(selector: &[u8]) -> i32 ! never
+? &mut HostInput | &mut FileSystem | &mut Allocator | &mut Writer | &mut Types {
+  return match move run Effect.result(fromHost(selector)) {
+    Result<i32, Error>.Success {value} => value
+    Result<i32, Error>.Failure {error} => {
+      return match move run Effect.result(report(move error)) {
+        Result<i32, WriterError | OutOfMemoryError>.Success {value} => value
+        Result<i32, WriterError | OutOfMemoryError>.Failure {error: _} => 2
+      }
+    }
+  }
+}

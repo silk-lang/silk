@@ -10,8 +10,8 @@ import * as Fiber from 'effect/Fiber'
 import * as FileSystem from 'effect/FileSystem'
 import * as NativeProcess from './NativeProcess.ts'
 
-const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-/** @type {typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js')} */
+const require = createRequire(new URL('../../package.json', import.meta.url))
+/** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 
 const fixture = Effect.fnUntraced(
