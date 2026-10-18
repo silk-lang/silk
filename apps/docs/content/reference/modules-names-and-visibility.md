@@ -1035,7 +1035,8 @@ standard-library module.
 
 ### PACKAGE-006 — `exports` choose the modules other packages may import
 
-**Status:** Confirmed contract; not implemented yet.
+**Status:** Confirmed; implemented in the native compiler for dependencies. The standard library
+does not list exports yet.
 
 `[package].exports` lists the module paths, in import spelling, that other packages may import.
 Inside the package every module stays importable. A package without `exports` exposes no module to
@@ -1050,17 +1051,22 @@ exports = ["Value", "Parser"]
 ```
 
 A library keeps its implementation in internal modules and publishes a small facade with selective
-`pub import` (EXPORT-001). The standard library lists its catalog the same way, which replaces the
-interim rule of STDLIB-006.
+`pub import` (EXPORT-001). The standard library will list its catalog the same way, replacing the
+interim rule of STDLIB-006; until it does, every standard-library module stays importable.
 
 **Boundary:** `pub` still decides which declarations of an exported module are visible. An exported
 module cannot publish a private declaration.
 
-**Diagnostics:** Importing an unlisted module from another package reports a dedicated
-internal-module error at the import path, distinct from `MOD0001` for a module that does not exist.
-Its code is not assigned yet.
+**Diagnostics:** Importing an unlisted module from another package reports `MOD0003` at the import
+path, distinct from `MOD0001` for a module that does not exist. An `exports` entry that is not a
+dotted module name, or that names no module of the package, is an invalid-manifest error naming the
+entry.
 
-**Evidence:** Design approved on 2026-10-17; implementation pending.
+**Evidence:** [native package graph](../../../../compiler/src/semantic/PackageGraph.silk),
+[exports loading](../../../../compiler/src/driver/Packages.silk),
+[dependency resolution cases](../../../../compiler/src/semantic/SemanticConformanceCases.silk),
+[dependency loading cases](../../../../compiler/src/semantic/SemanticLoweringCases.silk),
+[native build contract](../../../../compiler/scripts/test-native-build.ts).
 
 ### PACKAGE-007 — A workspace groups packages that build together
 

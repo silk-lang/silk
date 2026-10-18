@@ -98,13 +98,15 @@ Each entry records:
 - **Source migration:** none; no existing program uses `[dependencies]`. Programs that the
   bootstrap must build, such as the standard library and the native compiler's own sources, do not
   use dependencies.
-- **Diagnostics and limits:** an invalid dependency is reported as ``silk: invalid dependency
-`name` of package@version: reason``. Manifest `exports` (PACKAGE-006) and workspaces
-  (PACKAGE-007) are not implemented yet; every module of a dependency is importable. The standard
-  library still shares the root package identity under its `silk/` paths.
+- **Diagnostics and limits:** an invalid dependency or `exports` entry is reported as
+  `silk: invalid <detail>`, where the detail names the dependency or entry and the reason. Only
+  modules a dependency lists in `[package].exports` are importable from other packages; any other
+  reports `MOD0003` (PACKAGE-006), which the bootstrap never reports. Workspaces (PACKAGE-007) are
+  not implemented yet. The standard library still shares the root package identity under its
+  `silk/` paths and lists no exports.
 - **Evidence:** `dependencyNamesSelectAnotherPackagesModules` in SemanticConformanceCases,
-  `pathDependenciesLoadTheirOwnPackages` in SemanticLoweringCases, and the path-dependency run and
-  shadowing refusal in `compiler/scripts/test-native-build.ts`.
+  `pathDependenciesLoadTheirOwnPackages` in SemanticLoweringCases, and the path-dependency run,
+  unexported-module refusal and shadowing refusal in `compiler/scripts/test-native-build.ts`.
 - **Open questions:** none.
 
 ### Native integer C variadic imports
@@ -387,6 +389,22 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
 - **Source migration:** none. Declare `'b: 'a` when the result may come from `y`.
 - **Evidence:** `BorrowFieldCases::selectedBodiesProveOnlyTheirOwnSuppliedRegions`
   (`reflectedOther`) pins the native rejection's code and span.
+- The bootstrap is not changed for this. Retire this entry with the bootstrap.
+
+### Bootstrap binds a receiver call's written list to its owner's parameters
+
+- **Status:** recorded on 2026-10-17 while lent receivers moved to open owners. Bootstrap divergence.
+- **Rule:** GEN-008. A generic type's parameters are written on the type and a member's own on the
+  member. In `value.member<B>(...)` the receiver supplies the owner's arguments and `B` is the
+  member's own explicit prefix under GEN-003.
+- **Compilers:** with `impl<'o, T> C<'o, T> { fn conv<U>(self: &'o Self, u: U) -> U }` and a `c`
+  of type `C<'a, u64>`, native accepts `c.conv<u8>(3)` and rejects `c.conv<u8>(true)` with SEM0012.
+  The bootstrap binds `u8` to `T` and rejects both with SEM0012 at the receiver. Both reject the
+  qualified `C.conv<u8>(&c, 3)` with SEM0221.
+- **Source migration:** none for native. For the bootstrap, omit the list and let the argument
+  infer `U`.
+- **Evidence:** `SemanticCaptureCases::lentReceiversMeetTheirExplicitLoan` (`writtenList`,
+  `writtenListMismatch`, `writtenOwnerSlot` and `writtenOwnerSlotMismatch`) pins the native binding.
 - The bootstrap is not changed for this. Retire this entry with the bootstrap.
 
 ### Checked local control in native static functions
@@ -832,6 +850,46 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   compilers reject are pinned in `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs`
   (`scopeEnd`, `loopStore`, `loopCarried`, `escape`, `projection`).
 
+### Bootstrap runs a temporary's Drop hook after its loans end
+
+- **Status:** recorded on 2026-10-17 from the independent reviews of #1904 and #1912, with the
+  native fix that holds a temporary's loans until its cleanup. The bootstrap gap remains until its
+  loan pass treats a temporary's cleanup as a use of the loans its hook can observe.
+- **Rule:** BORROW-006 and DROP-002. A temporary's cleanup runs at the end of its statement, or,
+  when the initializer of a binding that can hold a view retains it, when that binding's scope
+  ends. A Drop hook that runs at that cleanup observes every loan its value holds, so those loans
+  stay live until the cleanup.
+- **Compilers:** with `struct Hooked<'a, 'b> { left: &'a i32  right: &'b i32 }`, whose Drop hook
+  reads `self.left`, and `fn hooked<'a, 'b>(left: &'a i32, right: &'b i32) -> Hooked<'a, 'b>`:
+  - `let r = hooked(&owner, x).right  let s = r.*  owner = 1` keeps the `Hooked` temporary until
+    `r`'s scope ends, and the hook then reads `owner` after the write. So does `spend(move owner)`
+    in place of the write, where the hook reads a moved-from place, a hook on a field's type
+    (`Guarded { hooked: Hooked<'a, 'b>  right: &'b i32 }`), and the projection passed through a
+    call (`viewOf(hooked(&owner, x).right)`).
+  - Within one statement, `pairSum(hooked(&owner, x).left.*, spend(move owner))` and
+    `if hooked(&owner, x).right.* > spend(move owner) { … }` move `owner` before the temporary's
+    cleanup at the statement's end. So do the same move in a binary operand, an assignment, a
+    `return`, a struct literal, a short-circuit operand, a pipe or a `run`.
+
+  The bootstrap compiles each of these. Native reports OWN0011 at the write or move, or OWN0010
+  where the later operand borrows `owner` exclusively.
+
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects. It reads a projection out of a temporary whose
+  cleanup can observe a loan through the temporary's hidden owner, which holds that loan until the
+  cleanup in the scope lowering drops it in. These are not corpus programs, because the bootstrap's
+  corpus tests require every `invalid/` program to be rejected with its listed diagnostics. A move
+  in the next statement after a statement temporary, a binding in an inner scope that ends before
+  the write, and a temporary whose type runs no hook stay accepted by both compilers. A temporary
+  whose cleanup's observed regions a type parameter leaves unknown, such as a generic
+  `AnyHooked<'a, 'b, T>` whose hook is written for every `T`, is taken to observe every loan it
+  holds (`hookedGeneric`).
+- **Evidence:** `SemanticCaptureCases::fieldStoredLoansJoinRegionProofs` (`hookedRead`,
+  `hookedMove`, `hookedField`, `hookedArgument`, `hookedOperand`, `hookedCondition`,
+  `hookedGeneric`, `hookedStatement`, `hookedNext`, `hookedScoped` and `plainRead`), with native
+  and bootstrap compile verdicts on the fix's head. In the native IR for
+  `let s = hooked(&owner, x).left.*`, the hook runs before the next statement's move.
+
 ### Bootstrap accepts an inferred view a closure gives its requirement row's service
 
 - **Status:** recorded on 2026-10-17 with the closure-row regression Cases. Native rejects; the
@@ -854,6 +912,39 @@ return r }`, native rejects with SEM0212 at the returned `r`. The bootstrap
   native `build` reports SEM0012 at the call. The typed forms, which both compilers reject, are
   `SemanticCaptureCases::universalLoansOutliveTheBody` (`rowRunsUniversal`, `rowReturnsUniversal`)
   and `invalid/effect-closure-row-universal-view-write`.
+
+### Bootstrap ignores an instantiation's Drop hook in a generic body
+
+- **Status:** recorded on 2026-10-18 from the independent review of #1912, with the native fix
+  that treats a Drop impl written for some instantiation as possible in a generic body. The
+  bootstrap gap remains until its loan and move checks consider every Drop impl of a generic
+  value's declaration.
+- **Rule:** DROP-002, BORROW-006 and OWN-004. A value's Drop hook runs at its cleanup in every
+  instance, so a generic body's value whose type may instantiate to a hooked type keeps the loans
+  the hook can observe until its cleanup, and no part may be moved out of it.
+- **Compilers:** with `struct Slotted<'a, T> { target: &'a D  extra: T }` and a Drop impl written
+  only for `Slotted<'a, i32>`, whose hook reads `self.target`:
+  - `fn specialized<T>(extra: T)` binds `Slotted {target: &owner, extra: move extra}` and then
+    moves `owner`. The `i32` instance's hook reads the moved-from `owner`. The same holds with
+    `Boxed<T>` against an impl for `Slotted<'a, Boxed<i32>>`, inside a field of another struct, and
+    in a union payload.
+  - With an impl for `Slotted<'a, D>` whose hook reads `self.extra`, `move held.extra` in a generic
+    body leaves the `D` instance's hook reading a moved-out field.
+
+  The bootstrap compiles each of these. Native reports OWN0011 at the move of `owner`, or OWN0002
+  at the partial move, as it does for the non-generic forms.
+
+- **Source migration:** none. The compiler and standard library have no such program.
+- **Diagnostics and limits:** native rejects. A generic value whose declaration has any Drop impl
+  is taken to run a hook, even when no impl matches the open type. A generic value whose
+  declaration has no Drop impl keeps no loan for cleanup. A body's own type parameter retains no
+  region the cleanup could observe, because a value it stands for is received, not created in the
+  body. These are not corpus programs, because the bootstrap's corpus tests require every
+  `invalid/` program to be rejected with its listed diagnostics.
+- **Evidence:** `SemanticCaptureCases::temporaryCleanupFollowsLowering` (`specialized`,
+  `specializedNested`, `specializedField`, `specializedOption`, `specializedProjected`,
+  `specializedWritten`, `specializedMoveOut`, `specializedStatement` and `bare`),
+  with native and bootstrap compile verdicts on the fix's head.
 
 ### Native holds every loan of a literal in each of its field projections
 
