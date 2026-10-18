@@ -519,7 +519,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/numbers/silk.toml'),
-    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource-root = "src"\n',
+    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource-root = "src"\nexports = ["scale"]\n',
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/app/util/digits.silk'),
@@ -542,6 +542,23 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(packaged.status, 42, packaged.stderr)
+  // A module the dependency's manifest does not export stays internal to it.
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/peek.silk'),
+    'import numbers.util.digits { base }\n\npub fn peek() -> i32 {\n  return base()\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/main.silk'),
+    'import peek { peek }\n\npub fn main() -> i32 {\n  return peek()\n}\n',
+  )
+  const internal = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.notEqual(internal.status, 0, 'an unexported module was importable')
+  assert.match(internal.stderr, /MOD0003/)
   // A dependency name that is also a top-level directory of the source root is refused.
   yield* fs.writeFileString(
     join(directory, 'packaged/app/silk.toml'),
@@ -907,7 +924,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))

@@ -506,7 +506,7 @@ compiler.
 `compiler/native-seed.json` names the published native compiler that builds N1 (see
 [the native seed chain](docs/native-seed-chain.md)). Advance it weekly, and immediately after any
 soundness or code generation fix that N1 must not be built without. Pin only a candidate whose
-`main` push run summary says **Full gate**; never pin a candidate published from a run that
+publishing run summary says **Full gate**; never pin a candidate published from a run that
 reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a pull request to
 `main`; its CI proves the new seed builds the checkout, reaches the N1/N2 fixpoint and passes
 the corpus.
