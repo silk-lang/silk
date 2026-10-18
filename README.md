@@ -27,7 +27,7 @@ native, browser, Wasm, or test providers without introducing ambient storage or 
 ## Install
 
 On macOS (Apple Silicon) or Linux (x86-64 or ARM64), install the native compiler from the newest
-green build of `main`:
+published build of `main`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh

@@ -11,6 +11,14 @@ Use this boundary to implement OsFileSystem. Portable code requires FileSystem.
 Native records, flags, error capture and descriptor-relative traversal are selected source.
 Handles own one close obligation; explicit close reports failure and Drop preserves an earlier
 failure during structured unwinding. Native members are absent on unsupported supplies.
+Atomic publication owns the containing directory and its exclusively claimed staging file until
+cleanup completes. Replace renames the entry itself, including a final symlink, without following
+its referent; create-new uses linkat's atomic absent-name claim followed by staging unlink.
+Both create fresh regular inodes with mode 0666 filtered by umask and filesystem inheritance;
+replacement preserves no old permissions, ownership, ACLs, extended attributes or hard-link identity.
+Synchronized publication uses fsync on the actual staged descriptor before publication and on
+the owned parent afterward. On Darwin and GNU/Linux this is ordinary filesystem synchronization,
+not Darwin F_FULLFSYNC or a guarantee about hardware caches or physical power-loss recovery.
 
 Public declarations: 0.
 

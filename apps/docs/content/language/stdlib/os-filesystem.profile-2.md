@@ -10,16 +10,32 @@ code. Supply an in-memory `FileSystem` in tests or on targets without native OS 
 
 ## Details
 Portable `/` denotes the provider root rather than the host filesystem root. The native boundary
-rejects malformed portable paths and symlinks below the configured root. Whole-file
-reads and writes own or commit complete contents, directory listings retry oversized entries and
-sort complete child paths deterministically. Low-level failures become portable `FileError`
-values with retained native codes.
+rejects malformed portable paths and never follows symlinks below the configured root.
+Ordinary writes retain create-or-truncate semantics and can leave a partial file on failure.
+Exclusive creation refuses every existing entry with AlreadyExists; once claimed, a write or
+close failure leaves the new, possibly partial file in place. Atomic writes instead publish
+complete contents with renameat (replace) or linkat/unlinkat (create-new), staging in the same
+directory under an exclusively claimed temporary name. Replace can replace a final symlink
+entry itself, never its referent; directories and other unsupported destination kinds are refused.
+Directory listings sort complete child paths deterministically. Low-level failures become
+portable `FileError` values with retained native codes.
+
+Newly created or atomically published inodes use mode 0666 filtered by the process umask and
+normal filesystem inheritance. Atomic replacement preserves no old permission bits, ownership,
+ACLs, extended attributes or hard-link identity; existing hard links retain the old inode.
+Synchronized atomic writes fsync the actual staged descriptor before publication, then fsync
+the owned parent after publication and staging cleanup. `FileSystem.syncDirectory` also uses fsync.
+On Darwin and GNU/Linux these are ordinary filesystem synchronization, not F_FULLFSYNC or
+guarantees about hardware caches or physical power-loss recovery. Unsupported synchronization
+fails explicitly rather than silently downgrading.
 
 `make` copies its root. The root must be an absolute, non-empty, NUL-free native path. A root
-that violates this precondition traps. Open handles close on success and failure. If an
-operation and close both fail, the operation's original typed failure remains the reported
-result. The configured root and its ancestors must be trusted; confinement does not promise
-protection against hostile directory renames or privileged mount changes.
+that violates this precondition traps. Open handles close on success and failure; close is never
+retried after EINTR. An earlier failure takes precedence over close failure. `AtomicWriteError`
+distinguishes failure before publication from failure after complete new contents became visible,
+and retains a separate staging-cleanup failure plus its exact residual temporary leaf name.
+The configured root and its ancestors must be trusted; confinement does not promise protection
+against hostile directory renames, privileged mount changes, or tampering with staging entries.
 
 Constructing the provider performs no filesystem operation beyond owning the root bytes.
 Portable code uses `FileSystem` operations after the application supplies `&mut OsFileSystem`

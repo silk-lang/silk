@@ -15,11 +15,11 @@ $ pnpm --filter @silklang/compiler documentation:generate
 | ------ | --------- | ----- |
 | `LEX`  | Lexical   | 12    |
 | `PAR`  | Parser    | 5     |
-| `MOD`  | Module    | 2     |
+| `MOD`  | Module    | 3     |
 | `SEM`  | Semantic  | 206   |
 | `OWN`  | Ownership | 17    |
 
-There are 242 codes in total.
+There are 243 codes in total.
 
 ## Lexical (`LEX`)
 
@@ -50,10 +50,11 @@ There are 242 codes in total.
 
 ## Module (`MOD`)
 
-| Code      | Meaning                                                                     | Reported as                      |
-| --------- | --------------------------------------------------------------------------- | -------------------------------- |
-| `MOD0001` | Stable code for an import naming a module absent from the supplied sources. | `Unknown module <module>`        |
-| `MOD0002` | Stable code for an import redundantly naming its own containing module.     | `Module <module> imports itself` |
+| Code      | Meaning                                                                                  | Reported as                                                |
+| --------- | ---------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| `MOD0001` | Stable code for an import naming a module absent from the supplied sources.              | `Unknown module <module>`                                  |
+| `MOD0002` | Stable code for an import redundantly naming its own containing module.                  | `Module <module> imports itself`                           |
+| `MOD0003` | Stable code for an import of another package's module that its manifest does not export. | `Module <module> is not exported by package <packageName>` |
 
 ## Semantic (`SEM`)
 

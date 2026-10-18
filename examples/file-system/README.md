@@ -10,6 +10,11 @@ confined `OsFileSystem`; a browser or Wasm application can provide a virtual fil
 changing the consumer operations. Importing `silk.filesystem` never selects a platform or an
 ambient current directory.
 
+This minimal provider supports ordinary writes only. `createFile`, `writeFileAtomic`, and
+`syncDirectory` explicitly fail with `Unsupported`; it does not claim exclusive creation,
+atomic publication, or durability. Atomic-write failures report `published: false`, no cleanup
+failure, and an empty staging name because no staging file was created.
+
 This source is a standalone acceptance fixture rather than a manifest-based CLI project. Run its
 structured compiler checks from the repository root with:
 
