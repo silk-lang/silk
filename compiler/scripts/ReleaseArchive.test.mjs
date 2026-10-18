@@ -6,8 +6,8 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
-const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-/** @type {typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js')} */
+const require = createRequire(new URL('../../package.json', import.meta.url))
+/** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 import * as ReleaseArchive from './ReleaseArchive.ts'
 

@@ -55,7 +55,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(sentinel, `#!/bin/sh\nprintf called > ${quote(marker)}\nexit 99\n`)
   yield* fs.chmod(sentinel, 0o755)
   // The standard library supplies the catalog runtime that roots the build.
-  const standardLibrary = join(repository, 'packages/compiler/stdlib')
+  const standardLibrary = join(repository, 'stdlib')
   const argumentsFor = (output: string) => [
     'build',
     'main.silk',
@@ -927,9 +927,8 @@ const program = Effect.gen(function* () {
     'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
-const require = createRequire(new URL('../../packages/cli/package.json', import.meta.url))
-const {
-  NodeServices,
-}: typeof import('../../packages/cli/node_modules/@effect/platform-node/dist/index.js') =
-  await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
+const require = createRequire(new URL('../../package.json', import.meta.url))
+const { NodeServices }: typeof import('@effect/platform-node') = await import(
+  pathToFileURL(require.resolve('@effect/platform-node')).href
+)
 await Effect.runPromise(program.pipe(Effect.scoped, Effect.provide(NodeServices.layer)))

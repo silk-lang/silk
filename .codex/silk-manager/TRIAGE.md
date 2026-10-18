@@ -61,7 +61,7 @@ verdicts:
   worthwhile: {result: true|false|uncertain, evidence}
   bounded: {result: true|false|uncertain, evidence}
 overlaps:
-  - issue, PR, or OpenSpec change and relationship
+  - issue or PR and relationship
 recommended_shape:
   title
   pitch
