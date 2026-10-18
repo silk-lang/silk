@@ -7,8 +7,8 @@
 //! or `IncompatibleLoopHeader` (`OWN0005`), relating the earlier loan or move when there is one.
 //!
 //! # Details
-//! The proof follows `compiler/docs/native-borrow-checking.md` §3 and §4 on the typed body. It
-//! numbers evaluation points in evaluation order and links them into a control-flow graph. A loan
+//! The proof runs on the typed body. It numbers evaluation points in evaluation order and links
+//! them into a control-flow graph. A loan
 //! comes from a written borrow, a shared or mutable receiver pass, or a borrowed capture of a
 //! constructed callable or section, which carries it like any value. A place behind a reference
 //! names the referent's storage, so a reborrow is a loan of that place and carries the parent
@@ -1054,7 +1054,7 @@ fn temporary(nodes: &[Node], root: usize) -> bool {
 
 /// Which storage the loan walk ends beside the locals, by holder slot: slot `n` is the subject of a
 /// match at node `n`, and slot `nodes.length + n` the hidden owner of the temporary node `n` a
-/// borrow lends (BORROW-006). Their cleanup is observed like a local's.
+/// borrow lends or a projection reads (BORROW-006). Their cleanup is observed like a local's.
 pub effect fn storageNodes(nodes: &[Node]) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
   let mut owning = Vector<bool>.make()
   let mut at = usize.ZERO
@@ -1071,6 +1071,15 @@ pub effect fn storageNodes(nodes: &[Node]) -> Vector<bool> ! OutOfMemoryError ? 
         Expression.Borrow {value, ..} => {
           let path = run pathOf(nodes, value)
           if path.root == usize.MAX { owned = nodes.length + projectedBase(nodes, value).index }
+        }
+        // A projection out of a value with no place may read it through its hidden owner.
+        Expression.Field {..} => {
+          let path = run pathOf(nodes, NodeId {index: at})
+          if path.root == usize.MAX { owned = nodes.length + projectedBase(nodes, NodeId {index: at}).index }
+        }
+        Expression.Index {..} => {
+          let path = run pathOf(nodes, NodeId {index: at})
+          if path.root == usize.MAX { owned = nodes.length + projectedBase(nodes, NodeId {index: at}).index }
         }
         _ => {}
       }
@@ -3650,7 +3659,7 @@ effect fn releaseScopes(walker: &mut Walker, keep: usize, span: Location, at: us
           loan = loan + usize.ONE
         }
       }
-      current = run observeCleanup(&mut walker.*, holder, span, current)
+      current = run observeCleanup(&mut walker.*, holder, root >= usize.MAX / 4, span, current)
       current = run access(&mut walker.*, &path, Kind.End, span, current, usize.MAX)
     }
     index = index + usize.ONE
@@ -3658,9 +3667,19 @@ effect fn releaseScopes(walker: &mut Walker, keep: usize, span: Location, at: us
   return current
 }
 
+// Whether the cleanup of `holder`'s value can observe a loan: its type runs a hook that names a
+// borrowed region, or one whose regions are unknown.
+fn observingCleanup(walker: &Walker, holder: usize) -> bool {
+  let available = Vector<LoanCleanup>.asSlice(&walker.cleanup)
+  if holder >= available.length { return false }
+  return available[holder].unknown || Vector<Shared<Lifetime>>.length(&available[holder].regions) > usize.ZERO
+}
+
 // Cleanup uses just the initialized definitions whose named regions the hook can observe.
-// It is not a whole-holder read: a Drop in an unrelated field cannot extend every other loan.
-effect fn observeCleanup(walker: &mut Walker, holder: usize, span: Location, at: usize) -> usize
+// It is not a whole-holder read: a Drop in an unrelated field cannot extend every other loan. A
+// hidden owner's cleanup that observes unknown regions (`hidden`) uses every loan the owner holds:
+// it ends within the body, where the hook may observe any of them.
+effect fn observeCleanup(walker: &mut Walker, holder: usize, hidden: bool, span: Location, at: usize) -> usize
   ! OutOfMemoryError
   ? &mut Allocator {
   let available = Vector<LoanCleanup>.asSlice(&walker.cleanup)
@@ -3684,11 +3703,12 @@ effect fn observeCleanup(walker: &mut Walker, holder: usize, span: Location, at:
     let held = Vector<Vector<usize>>.asSlice(&walker.held)
     unknownHeld = Vector<usize>.length(&held[holder]) > usize.ZERO
   }
-  if unknownHeld {
+  if unknownHeld && !hidden {
     leave(&mut walker.*, BorrowStatus.StoredLoans)
     return at
   }
-  if Vector<Shared<Lifetime>>.length(&available[holder].regions) == usize.ZERO {
+  let everything = unknownHeld && hidden
+  if !everything && Vector<Shared<Lifetime>>.length(&available[holder].regions) == usize.ZERO {
     return at
   }
   let point = run newPoint(&mut walker.*, at)
@@ -3703,7 +3723,7 @@ effect fn observeCleanup(walker: &mut Walker, holder: usize, span: Location, at:
     if definition.holder == holder {
       let mut loans = Vector<Loan>.asMutSlice(&mut walker.loans)
       let named = Vector<Shared<Lifetime>>.asSlice(&loans[definition.loan].regions)
-      if named.length == usize.ZERO || sharesAtom(named, observed) {
+      if everything || named.length == usize.ZERO || sharesAtom(named, observed) {
         if named.length == usize.ZERO {
           loans[definition.loan].precision = LoanPrecision.Unknown
         }
@@ -3795,11 +3815,22 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       return flowAt(at)
     }
     Shape.ReadPlace => {
-      let path = run pathOf(nodes, id)
+      let mut path = run pathOf(nodes, id)
+      let mut current = at
       if path.root == usize.MAX {
-        return run readValue(nodes, locals, owner, &mut walker.*, id, at)
+        // Lowering drops a temporary that needs cleanup at the end of its statement, or of a
+        // viewing binding's scope when that binding's initializer retains it. A projection out of
+        // one whose cleanup can observe a loan is read through its hidden owner, which
+        // `holdTemporary` registers in that same scope, so the owner holds the loan until the
+        // cleanup (BORROW-006).
+        let base = projectedBase(nodes, id)
+        if !observingCleanup(&walker.*, holderOf(&walker.*, temporaryRoot(nodes, base.index))) {
+          return run readValue(nodes, locals, owner, &mut walker.*, id, at)
+        }
+        current = run holdTemporary(nodes, locals, owner, &mut walker.*, base, at)
+        path = run temporaryPath(nodes, id, base)
       }
-      let flow = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Read, span, at)
+      let flow = run place(nodes, locals, owner, &mut walker.*, &path, Kind.Read, span, current)
       if path.through || Vector<Step>.length(&path.steps) > usize.ZERO {
         // A read through or out of a holder copies a value; one that retains a region would carry
         // the holder's loan onward.
@@ -4260,7 +4291,7 @@ effect fn replace(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walke
     retained = run retains(&ty, owner)
   }
   let path = Path {root: local, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make(), refiner: usize.MAX, refinedDepth: usize.ZERO, binders: Vector<usize>.make()}
-  let cleaned = run observeCleanup(&mut walker.*, local, span, flow.at)
+  let cleaned = run observeCleanup(&mut walker.*, local, false, span, flow.at)
   let point = run access(&mut walker.*, &path, Kind.Write, target, cleaned, usize.MAX)
   markConsumedTarget(&mut walker.*, since, point, span)
   run consume(&mut walker.*, Vector<Carry>.asSlice(&flow.carried), point)

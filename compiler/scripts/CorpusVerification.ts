@@ -151,7 +151,7 @@ export const execute = Effect.fn('CorpusVerification.execute')(function* (
         corpus,
         required,
         selected,
-        path.join(self.repository, 'packages/compiler/stdlib'),
+        path.join(self.repository, 'stdlib'),
         self.cCompiler,
       ),
     catch: (cause) =>

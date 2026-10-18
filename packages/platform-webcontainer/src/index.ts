@@ -1,5 +1,0 @@
-export * as WebContainer from './WebContainer.js'
-export * as WebContainerError from './WebContainerError.js'
-export * as WebContainerEvent from './WebContainerEvent.js'
-export * as WebContainerFileSystem from './WebContainerFileSystem.js'
-export * as WebContainerProcess from './WebContainerProcess.js'
