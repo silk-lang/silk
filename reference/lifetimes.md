@@ -201,6 +201,15 @@ implied outlives bound explicitly does not change the contract. Immediate `run`,
 Effect, and a unit success type do not waive it. Finite loan-use proofs cannot establish an unrelated
 relationship between the caller's lifetime parameters or a requirement for `'static`.
 
+A freely inferred environment may instead be chosen within the current body's finite execution,
+including every retained use and cleanup of the resulting Effect. A caller type parameter is valid
+through that extent without a premise relating it to a named caller lifetime. This finite choice
+applies equally to immediate execution, local staging, and nested Effect bodies. It does not prove
+`T: 'caller` or `T: 'static`, and an explicitly selected or otherwise fixed environment cannot be
+replaced with this choice. Independent contents premises are alternative guarantees: either
+`T: 'a + 'static` or `T: 'static + 'a` proves a static contents obligation. Their written order does
+not turn the first guarantee into the only region the value retains.
+
 A short operation on longer-lived mutable storage can instead name its access environment and
 state the independent storage relationship explicitly:
 
