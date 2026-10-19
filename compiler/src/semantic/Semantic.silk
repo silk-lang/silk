@@ -5,6 +5,8 @@
 //! The store reads an import target only when a requested fact needs its binding.
 
 import semantic.Types {TypeTable, Types}
+import semantic.SourcePreparation as SourceInputs
+import semantic.SourcePreparation {RegionBound}
 import semantic.TypeText
 import CompilerBug
 import hir.Hir {
@@ -182,7 +184,7 @@ import semantic.ModuleIndex {
   NameObservation,
 }
 import semantic.Operator
-import semantic.BorrowCheck {Outcome as LoanOutcome, Report as LoanReport, check as checkLoans, livenessCodes, regionClosed, storageNodes, LoanCleanup, RegionBound}
+import semantic.BorrowCheck {Outcome as LoanOutcome, Report as LoanReport, check as checkLoans, livenessCodes, regionClosed, storageNodes, LoanCleanup}
 import semantic.ReturnFlow
 import semantic.OpaqueRealization
 import semantic.CallableOrigin
@@ -286,6 +288,8 @@ import semantic.Type {
   Unification,
 }
 import semantic.TypedBody {
+  SourceInference, SelectedSourceContract, SourceTarget, SourceInput, SourceInputMap,
+  SourceConstruction, SourcePlacement, SourceStep, SourceTransfer, copySourceInput,
   CaptureHold,
   Environment as BodyEnvironment,
   EnvironmentCapture as BodyEnvironmentCapture,
@@ -23229,6 +23233,14 @@ effect fn appendInferenceSlot(
   return ()
 }
 
+// Paired output at the only site that assigns the dense inference coordinates. Callers which
+// retain a descriptor must retain this map too; applied type equality cannot recover it.
+struct CallInference {
+  signature: Shared<Result<Answer, NoRejection>>
+  remapped: Vector<Binding>
+  scopesApplied: bool
+}
+
 // This transformation has no query/resolver calls. Fresh identities exist only in local owned
 // handles and unification bindings, never in query interning, caches or backend instance keys.
 // A call whose scope arguments are already applied, such as a receiver call or `Owner<'a>.member`,
@@ -23242,13 +23254,13 @@ effect fn callInferenceSignature(
   scopesApplied: bool,
   module: &ModuleId,
   span: Span,
-) -> Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>
+) -> Result<CallInference, Shared<Rejection>>
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let facts = match move Shared<Result<Answer, NoRejection>>.with<Option<SignatureFacts>>(signature, signatureFacts,
   ) {
     Option<SignatureFacts>.Some {value} => move value
     Option<SignatureFacts>.None => {
-      return Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Unsupported, span),
+      return Result<CallInference, Shared<Rejection>>.failResult(run reject(resolver, module, RejectionCode.Unsupported, span),
       )
     }
   }
@@ -23304,9 +23316,10 @@ effect fn callInferenceSignature(
     at = at + usize.ONE
     ownAt = ownAt + usize.ONE
   }
-  return Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.succeed(
-    run applyCallInferenceSignature(signature, &facts, move types, move lifetimes, move rows,
-      callableParameterStart, Vector<Binding>.asSlice(&remappedBindings)))
+  let opened = run applyCallInferenceSignature(signature, &facts, move types, move lifetimes, move rows,
+    callableParameterStart, Vector<Binding>.asSlice(&remappedBindings))
+  return Result<CallInference, Shared<Rejection>>.succeed(CallInference {
+    signature: move opened, remapped: move remappedBindings, scopesApplied: scopesApplied})
 }
 
 // Rebuild signature contents while retaining the binder lists and their dense coordinates.
@@ -24017,23 +24030,29 @@ effect fn closedCallPrefixRegion(inferred: &[Binding], fresh: &DeclarationId, or
   return Option<Shared<Lifetime>>.none()
 }
 
+struct ClosedCallPrefix {
+  original: Vector<Binding>
+  private: Vector<Binding>
+}
+
 // Close every extra slot first, then rewrite only original argument values. The returned vector
-// retains the original dense map for section selection; no extra coordinate can be published.
+// separates the original dense map for section selection from the private domain retained only
+// by semantic source evidence; no extra coordinate enters a runtime target application.
 effect fn closeCallPrefixBindings(inferred: &[Binding], fresh: &DeclarationId,
   template: &Option<Shared<DeclarationId>>, originalCount: usize, totalCount: usize)
-  -> Option<Vector<Binding>> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  -> Option<ClosedCallPrefix> ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let owner = run Shared<DeclarationId>.make(DeclarationId.copy(fresh))
   let mut regions = Vector<Binding>.make()
   let mut at = originalCount
   while at < totalCount {
     let value = match move run closedCallPrefixRegion(inferred, fresh, at, totalCount) {
       Option<Shared<Lifetime>>.Some {value} => move value
-      _ => { return Option<Vector<Binding>>.none() }
+      _ => { return Option<ClosedCallPrefix>.none() }
     }
     let argument = Argument.Lifetime {value: move value}
     if let Option<Shared<DeclarationId>>.Some {value: pending} = &template.* {
       let declared = DeclarationId.copyShared(&pending)
-      if run argumentMentionsOwner(&argument, &declared) { return Option<Vector<Binding>>.none() }
+      if run argumentMentionsOwner(&argument, &declared) { return Option<ClosedCallPrefix>.none() }
     }
     run Vector<Binding>.append(&mut regions, Binding {declaration: Shared<DeclarationId>.clone(&owner),
       ordinal: at, value: move argument})
@@ -24046,7 +24065,7 @@ effect fn closeCallPrefixBindings(inferred: &[Binding], fresh: &DeclarationId,
       let argument = run Argument.applyBindings(&value, Vector<Binding>.asSlice(&regions), true)
       if let Option<Shared<DeclarationId>>.Some {value: pending} = &template.* {
         let declared = DeclarationId.copyShared(&pending)
-        if run argumentMentionsOwner(&argument, &declared) { return Option<Vector<Binding>>.none() }
+        if run argumentMentionsOwner(&argument, &declared) { return Option<ClosedCallPrefix>.none() }
       }
       // An original binder may still be deferred; extra holes may not occur in that evidence.
       let mut types = Vector<usize>.make()
@@ -24060,14 +24079,14 @@ effect fn closeCallPrefixBindings(inferred: &[Binding], fresh: &DeclarationId,
       let used = Vector<usize>.asSlice(&lifetimes)
       let mut usedAt = usize.ZERO
       while usedAt < used.length {
-        if used[usedAt] >= originalCount { return Option<Vector<Binding>>.none() }
+        if used[usedAt] >= originalCount { return Option<ClosedCallPrefix>.none() }
         usedAt = usedAt + usize.ONE
       }
       run Vector<Binding>.append(&mut closed, Binding {declaration: Shared<DeclarationId>.clone(&owner), ordinal: at, value: move argument})
     }
     at = at + usize.ONE
   }
-  return Option<Vector<Binding>>.some(move closed)
+  return Option<ClosedCallPrefix>.some(ClosedCallPrefix {original: move closed, private: move regions})
 }
 
 fn bindingArgumentAt(bindings: &[Binding], ordinal: usize) -> Option<Argument> {
@@ -32054,7 +32073,7 @@ effect fn checkPositionalAggregate<'scope>(
   let index = Vector<BodyNode>.length(&nodes.*)
   run Vector<BodyNode>.append(&mut nodes.*, BodyNode {
     origin: run originAt(cursor, expression, span),
-    kind: BodyNodeKind.Expression {ty: move completed, form: BodyExpression.Aggregate {fields: move operands, written: Vector<Shared<Type>>.make()}},
+    kind: BodyNodeKind.Expression {ty: move completed, form: BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move operands, written: Vector<Shared<Type>>.make()}},
   })
   return run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints, &mut nodes.*,
     BodyNodeId {index: index}, expected, mismatchCode, span)
@@ -33080,7 +33099,7 @@ effect fn checkInferredCallArgument<'scope>(
     if run typeMentionsOwner(&actual, fresh) { return run bodyRejection(&resolver.*, module, RejectionCode.TypeArgumentInference, callSpan) }
     node = BodyNodeId {index: Vector<BodyNode>.length(&nodes.*)}
     run Vector<BodyNode>.append(&mut nodes.*, BodyNode {origin: run originAt(cursor, argument, span),
-      kind: BodyNodeKind.Expression {ty: move actual, form: BodyExpression.Aggregate {fields: move operands, written: Vector<Shared<Type>>.make()},
+      kind: BodyNodeKind.Expression {ty: move actual, form: BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move operands, written: Vector<Shared<Type>>.make()},
         },
     },
     )
@@ -35993,7 +36012,7 @@ effect fn checkTestDiscoveryCall<'scope>(
     run Vector<DeclarationId>.append(&mut requiredBodies.*, DeclarationId.copyShared(&declaration))
     run Vector<SignatureDependency>.append(&mut signatures.*, SignatureDependency {declaration: DeclarationId.copyShared(&declaration)})
     return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
-      expression, span, Shared<Type>.clone(&selected.callable), BodyExpression.Aggregate {fields: Vector<BodyAggregateField>.make(), written: Vector<Shared<Type>>.make()},
+      expression, span, Shared<Type>.clone(&selected.callable), BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: Vector<BodyAggregateField>.make(), written: Vector<Shared<Type>>.make()},
       false, expected, mismatchCode, contractBody, false)
   }
   if !staticBody { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
@@ -39012,7 +39031,7 @@ effect fn checkAnonymousAggregate<'scope>(
   let index = Vector<BodyNode>.length(&nodes.*)
   run Vector<BodyNode>.append(&mut nodes.*, BodyNode {
     origin: run originAt(cursor, expression, span),
-    kind: BodyNodeKind.Expression {ty: move ty, form: BodyExpression.Aggregate {fields: move operands, written: Vector<Shared<Type>>.make()}},
+    kind: BodyNodeKind.Expression {ty: move ty, form: BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move operands, written: Vector<Shared<Type>>.make()}},
   })
   return run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints, &mut nodes.*,
     BodyNodeId {index: index}, expected, mismatchCode, span)
@@ -42779,7 +42798,7 @@ effect fn checkComposition<'scope>(
   }
   return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
     expression, span, move ty,
-    BodyExpression.Aggregate {fields: move fields, written: Vector<Shared<Type>>.make()}, false, expected, mismatchCode, contractBody, false)
+    BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move fields, written: Vector<Shared<Type>>.make()}, false, expected, mismatchCode, contractBody, false)
 }
 
 // A checked scalar operation's carrier offers its expected contract's exact parameters and result
@@ -44721,7 +44740,7 @@ effect fn checkSourceArrayExpression<'scope>(
     Option<Shared<Type>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.UninferredArrayElement, span) }
   }
   ty = run Types.intern(Type.Array {element: move selected, extent: run Type.extentText(elements.length)})
-  form = BodyExpression.Aggregate {fields: move operands, written: Vector<Shared<Type>>.make()}
+  form = BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move operands, written: Vector<Shared<Type>>.make()}
   return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
     expression, span, move ty, move form,
     diverges, expected, mismatchCode, contractBody, staticBody)
@@ -45000,10 +45019,10 @@ effect fn checkSourceRecordExpression<'scope>(
   if let Option<InferredAggregateTarget>.Some {..} = &inference {
     return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
       expression, span, move completed.ty,
-      BodyExpression.Aggregate {fields: move completed.fields, written: Vector<Shared<Type>>.make()}, false, &Option<Shared<Type>>.none(), RejectionCode.TypeMismatch, contractBody, false)
+      BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move completed.fields, written: Vector<Shared<Type>>.make()}, false, &Option<Shared<Type>>.none(), RejectionCode.TypeMismatch, contractBody, false)
   }
   ty = move completed.ty
-  form = BodyExpression.Aggregate {fields: move completed.fields, written: Vector<Shared<Type>>.make()}
+  form = BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move completed.fields, written: Vector<Shared<Type>>.make()}
   return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
     expression, span, move ty, move form,
     diverges, expected, mismatchCode, contractBody, staticBody)
@@ -45197,7 +45216,7 @@ effect fn checkSourceStructExpression<
   // The completed literal meets its expectation at the ordinary expected-value boundary.
   let CheckedRecordFields {ty: completedType, fields: completedFields, written: completedWritten} = move completed
   ty = move completedType
-  form = BodyExpression.Aggregate {fields: move completedFields, written: move completedWritten}
+  form = BodyExpression.Aggregate {construction: Option<SourceConstruction>.none(), fields: move completedFields, written: move completedWritten}
   return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
     expression, span, move ty, move form,
     diverges, expected, mismatchCode, contractBody, staticBody)
@@ -48771,7 +48790,7 @@ effect fn checkDeclarationCall<'scope>(
     Option<TargetSchema>.Some {value} => move value
     Option<TargetSchema>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
   }
-  let originalInference = match move run callInferenceSignature(
+  let inferenceTransform = match move run callInferenceSignature(
     &resolver.*,
     &target.signature,
     &schema,
@@ -48780,11 +48799,12 @@ effect fn checkDeclarationCall<'scope>(
     module,
     span,
   ) {
-    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value} => move value
-    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => {
+    Result<CallInference, Shared<Rejection>>.Success {value} => move value
+    Result<CallInference, Shared<Rejection>>.Failure {error} => {
       return Result<BodyNodeId, Shared<Rejection>>.failResult(move error)
     }
   }
+  let originalInference = Shared<Result<Answer, NoRejection>>.clone(&inferenceTransform.signature)
   let originalBinderCount = Shared<Result<Answer, NoRejection>>.with<usize>(
     &originalInference,
     signatureBinderCount,
@@ -49125,6 +49145,7 @@ Option<Shared<StaticData>>,
       usedAt = usedAt + usize.ONE
     }
   }
+  let mut privatePrefixBindings = Vector<Binding>.make()
   if target.prefixLifetimes != usize.ZERO {
     run bindCallPrefixResult(&inference, &freshOwner, originalBinderCount, binderCount, expected, effectTarget, &mut inferred)
     run bindOutcomeCallPrefixRegions(&mut resolver.*, &inference, &freshOwner, caller, run originAt(cursor, expression, span), originalBinderCount, binderCount, &mut inferred)
@@ -49133,13 +49154,15 @@ Option<Shared<StaticData>>,
         run originAt(cursor, expression, span), originalBinderCount,
         Vector<usize>.asSlice(&open), &mut inferred, &run cursorAnchor(cursor))
     }
-    inferred = match move run closeCallPrefixBindings(Vector<Binding>.asSlice(&inferred), &freshOwner,
+    let closedPrefix = match move run closeCallPrefixBindings(Vector<Binding>.asSlice(&inferred), &freshOwner,
       &target.prefixOwner, originalBinderCount, binderCount) {
-      Option<Vector<Binding>>.Some {value} => move value
-      Option<Vector<Binding>>.None => {
+      Option<ClosedCallPrefix>.Some {value} => move value
+      Option<ClosedCallPrefix>.None => {
         return run bodyRejection(&resolver.*, module, RejectionCode.BodyLifetimeElisionUnavailable, span)
       }
     }
+    inferred = move closedPrefix.original
+    privatePrefixBindings = move closedPrefix.private
   }
   if target.prefixLifetimes != usize.ZERO {
     let scoped = Vector<Argument>.asSlice(&target.scopeArguments)
@@ -49193,7 +49216,8 @@ Option<Shared<StaticData>>,
         return run finishDeferredNamedSection(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
           module, cursor, caller, &mut nodes.*, expression, span, &target.declaration, &target.signature,
           Vector<Argument>.asSlice(&target.scopeArguments),
-          &originalInference, &freshOwner, Vector<Binding>.asSlice(&inferred), Vector<usize>.asSlice(&open), firstSupplied,
+          &originalInference, &inferenceTransform, &inference, target.prefixLifetimes, Vector<Binding>.asSlice(&privatePrefixBindings),
+          &freshOwner, Vector<Binding>.asSlice(&inferred), Vector<usize>.asSlice(&open), firstSupplied,
           move typedArguments, constraints, expected, mismatchCode, contractBody, sectionContext(expected, valueConstruction))
       }
       // Without a written type-argument prefix the call as a whole is uninferable (SEM0052); an
@@ -49612,9 +49636,12 @@ Option<Shared<StaticData>>,
           Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
         }
       }
+      let sourceScopes = run sourceEnclosingBindings(Vector<Binding>.asSlice(&sectionBindings), &target.declaration)
+      let sourceContract = run sourceNamedContract(&target.declaration, &target.signature, &inferenceTransform,
+        &inference, &freshOwner, Vector<Binding>.asSlice(&inferred), Vector<Binding>.asSlice(&sourceScopes), target.prefixLifetimes, Vector<Binding>.asSlice(&privatePrefixBindings))
       return run finishNamedSection(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller,
         &mut nodes.*, expression, span, &target.signature, Vector<Binding>.asSlice(&sectionBindings),
-        NamedSectionTarget.Application {value: move application, isPublic: target.isPublic}, Vector<usize>.asSlice(&open),
+        NamedSectionTarget.Application {value: move application, isPublic: target.isPublic}, move sourceContract, Vector<usize>.asSlice(&open),
         firstSupplied, move typedArguments, move sectionResult, constraints, expected, mismatchCode, contractBody,
       )
     }
@@ -49883,6 +49910,7 @@ effect fn finishNamedSection(resolver: &mut Resolver, owner: &mut Query<Answer, 
   dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
   nodes: &mut Vector<BodyNode>, expression: HirId, span: Span,
   signature: &Shared<Result<Answer, NoRejection>>, bindings: &[Binding], target: NamedSectionTarget,
+  source: Shared<SelectedSourceContract>,
   open: &[usize], first: usize, arguments: Vector<BodyNodeId>, result: Shared<Type>, constraints: &[Constraint],
   expected: &Option<Shared<Type>>, mismatchCode: RejectionCode, contractBody: bool) -> Result<BodyNodeId, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -49890,6 +49918,7 @@ effect fn finishNamedSection(resolver: &mut Resolver, owner: &mut Query<Answer, 
   let mut captures = Vector<Shared<Type>>.make()
   let mut fieldInputs = Vector<CallableFieldInput>.make()
   let mut fields = Vector<BodyAggregateField>.make()
+  let mut placements = Vector<SourcePlacement>.make()
   let mut regions = Vector<Shared<Lifetime>>.make()
   let supplied = Vector<BodyNodeId>.asSlice(&arguments)
   let mut at = usize.ZERO
@@ -49917,6 +49946,17 @@ effect fn finishNamedSection(resolver: &mut Resolver, owner: &mut Query<Answer, 
     run Vector<Shared<Type>>.append(&mut captures, move ty)
     run Vector<CallableFieldInput>.append(&mut fieldInputs, CallableFieldInput.Argument {parameter: first + at})
     run Vector<BodyAggregateField>.append(&mut fields, BodyAggregateField {index: at, value: supplied[at]})
+    let input = Shared<SelectedSourceContract>.with<SourceInputMap>(&source,
+      fn(contract: &SelectedSourceContract) -> SourceInputMap {
+        let entry = &Vector<SourceInputMap>.asSlice(&contract.inputs)[first + at]
+        return SourceInputMap {selected: copySourceInput(&entry.selected), original: copySourceInput(&entry.original)}
+      })
+    let mut capture = Vector<SourceStep>.make()
+    run Vector<SourceStep>.append(&mut capture, SourceStep.Field {index: at})
+    run Vector<SourcePlacement>.append(&mut placements, SourcePlacement {
+      operand: supplied[at], source: Vector<SourceStep>.make(), capture: move capture,
+      selected: move input.selected, original: move input.original, transfer: SourceTransfer.Evaluated,
+      origin: Vector<BodyNode>.asSlice(&nodes.*)[supplied[at].index].origin})
     at = at + usize.ONE
   }
   let mut parameters = Vector<Shared<Type>>.make()
@@ -49943,7 +49983,7 @@ effect fn finishNamedSection(resolver: &mut Resolver, owner: &mut Query<Answer, 
   }
   return run finishExpression(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, constraints, &mut nodes.*,
     expression, span, move ty,
-    BodyExpression.Aggregate {fields: move fields, written: Vector<Shared<Type>>.make()}, false, expected, mismatchCode, contractBody, false)
+    BodyExpression.Aggregate {construction: Option<SourceConstruction>.some(SourceConstruction {contract: move source, placements: move placements}), fields: move fields, written: Vector<Shared<Type>>.make()}, false, expected, mismatchCode, contractBody, false)
 }
 
 effect fn finishExpression(
@@ -62711,6 +62751,806 @@ effect fn cleanupLoanRegions(
     at = at + usize.ONE
   }
   return Result<bool, Shared<Rejection>>.succeed(known)
+}
+
+// A failed member query is never the same answer as a declaration with zero members.
+fn sourceMemberCount(answer: &Result<Answer, NoRejection>) -> Option<usize> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Members {members, ..}} = &value.outcome {
+      return Option<usize>.some(Vector<Member>.length(&members))
+    }
+  }
+  return Option<usize>.none()
+}
+
+// Retains declaration member/payload coordinates. storedMemberTypes deliberately flattens
+// these coordinates for its other consumer and cannot be used as a component inventory.
+effect fn sourceNominalShape(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, ty: &Shared<Type>, declaration: &DeclarationId, span: Span)
+  -> Result<SourceInputs.Shape, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let identity = run Shared<DeclarationId>.make(DeclarationId.copy(declaration))
+  let location = match move run locationOfIdentity(&mut resolver.*, &identity) {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => {
+      return Result<SourceInputs.Shape, Shared<Rejection>>.succeed(SourceInputs.Shape {
+        ty: Shared<Type>.clone(ty), state: SourceInputs.ShapeState.Unavailable {reason: SourceInputs.UnavailableReason.DeclarationUnavailable},
+        components: Vector<SourceInputs.Component>.make()})
+    }
+  }
+  let membersKey = run internDeclaration(&mut resolver.*, Key {family: Family.Members,
+    module: location.module, name: usize.ZERO, declaration: location.declaration, member: usize.ZERO, external: false})
+  let members = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, membersKey, span)
+  if let Option<Shared<Rejection>>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&members, answerCause) {
+    return Result<SourceInputs.Shape, Shared<Rejection>>.failResult(move value)
+  }
+  let count = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(&members, sourceMemberCount) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return CompilerBug.panic(b"source preparation: successful member inventory is absent") }
+  }
+  let mut components = Vector<SourceInputs.Component>.make()
+  if DeclarationId.kind(declaration) != OwnerKind.Enum {
+    let application = run internApplication(&mut resolver.*, ty)
+    let mut member = usize.ZERO
+    while member < count {
+      let key = run internDeclaration(&mut resolver.*, Key {family: Family.MemberShape,
+        module: location.module, name: application, declaration: location.declaration, member: member, external: false})
+      let shape = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span)
+      if let Option<Shared<Rejection>>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&shape, answerCause) {
+        return Result<SourceInputs.Shape, Shared<Rejection>>.failResult(move value)
+      }
+      let parts = Shared<Result<Answer, NoRejection>>.with<usize>(&shape, shapeLength)
+      if parts == usize.MAX { return CompilerBug.panic(b"source preparation: successful member shape is absent") }
+      let mut payload = usize.ZERO
+      while payload < parts {
+        let selected = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&shape,
+          fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return shapeTypeAt(answer, payload) })
+        let field = match move selected {
+          Option<Shared<Type>>.Some {value} => move value
+          Option<Shared<Type>>.None => { return CompilerBug.panic(b"source preparation: member payload is absent") }
+        }
+        run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+          selector: SourceInputs.Selector.Member {declaration: Shared<DeclarationId>.clone(&identity), member: member, payload: payload},
+          ty: move field, inline: true})
+        payload = payload + usize.ONE
+      }
+      member = member + usize.ONE
+    }
+  }
+  let state = if Vector<SourceInputs.Component>.length(&components) == usize.ZERO {
+    SourceInputs.ShapeState.KnownEmpty
+  } else { SourceInputs.ShapeState.Inline }
+  return Result<SourceInputs.Shape, Shared<Rejection>>.succeed(SourceInputs.Shape {ty: Shared<Type>.clone(ty), state: state, components: move components})
+}
+
+// One shallow shape. References and Effect channels stop inline storage expansion; their typed
+// boundary maps are reserved separately from the actual finite selectors which cross them.
+effect fn sourceShape(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, ty: &Shared<Type>, span: Span)
+  -> Result<SourceInputs.Shape, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let copied = run Type.copy(ty)
+  let mut state = SourceInputs.ShapeState.Opaque
+  let mut components = Vector<SourceInputs.Component>.make()
+  match &copied {
+    Type.Nominal {declaration, ..} => {
+      return run sourceNominalShape(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, &declaration, span)
+    }
+    Type.Primitive {..} => { state = SourceInputs.ShapeState.KnownEmpty }
+    Type.Unit => { state = SourceInputs.ShapeState.KnownEmpty }
+    Type.Pointer {..} => { state = SourceInputs.ShapeState.KnownEmpty }
+    Type.ForeignFunction {..} => { state = SourceInputs.ShapeState.KnownEmpty }
+    Type.TypeDescriptor {..} => { state = SourceInputs.ShapeState.KnownEmpty }
+    Type.Reference {referent, ..} => {
+      state = SourceInputs.ShapeState.Reference
+      run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+        selector: SourceInputs.Selector.Referent, ty: Shared<Type>.clone(&referent), inline: false})
+    }
+    Type.Slice {element, ..} => {
+      state = SourceInputs.ShapeState.Slice
+      run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+        selector: SourceInputs.Selector.Index {class: SourceInputs.IndexClass.Remainder}, ty: Shared<Type>.clone(&element), inline: false})
+    }
+    Type.Array {element, ..} => {
+      let shape = match move Type.arrayShape(ty) {
+        Option<ArrayShape>.Some {value} => move value
+        Option<ArrayShape>.None => {
+          return CompilerBug.panic(b"source preparation: typed array has no representable extent")
+        }
+      }
+      state = SourceInputs.ShapeState.Array {length: shape.length}
+      run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+        selector: SourceInputs.Selector.Index {class: SourceInputs.IndexClass.Remainder}, ty: Shared<Type>.clone(&element), inline: true})
+    }
+    Type.Anonymous {members, ..} => {
+      state = SourceInputs.ShapeState.Inline
+      let fields = Vector<Shared<Type>>.asSlice(&members)
+      let mut at = usize.ZERO
+      while at < fields.length {
+        run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+          selector: SourceInputs.Selector.Field {ordinal: at}, ty: Shared<Type>.clone(&fields[at]), inline: true})
+        at = at + usize.ONE
+      }
+      if fields.length == usize.ZERO { state = SourceInputs.ShapeState.KnownEmpty }
+    }
+    Type.Union {members} => {
+      state = SourceInputs.ShapeState.Inline
+      let fields = Vector<Shared<Type>>.asSlice(&members)
+      let mut at = usize.ZERO
+      while at < fields.length {
+        run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+          selector: SourceInputs.Selector.Variant {ordinal: at}, ty: Shared<Type>.clone(&fields[at]), inline: true})
+        at = at + usize.ONE
+      }
+      if fields.length == usize.ZERO { state = SourceInputs.ShapeState.KnownEmpty }
+    }
+    Type.CallableValue {captures, ..} => {
+      state = SourceInputs.ShapeState.Inline
+      let fields = Vector<Shared<Type>>.asSlice(&captures)
+      let mut at = usize.ZERO
+      while at < fields.length {
+        run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+          selector: SourceInputs.Selector.Field {ordinal: at}, ty: Shared<Type>.clone(&fields[at]), inline: true})
+        at = at + usize.ONE
+      }
+      if fields.length == usize.ZERO { state = SourceInputs.ShapeState.KnownEmpty }
+    }
+    Type.CallableSchema {captures, ..} => {
+      state = SourceInputs.ShapeState.Inline
+      let fields = Vector<Shared<Type>>.asSlice(&captures)
+      let mut at = usize.ZERO
+      while at < fields.length {
+        run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+          selector: SourceInputs.Selector.Field {ordinal: at}, ty: Shared<Type>.clone(&fields[at]), inline: true})
+        at = at + usize.ONE
+      }
+      if fields.length == usize.ZERO { state = SourceInputs.ShapeState.KnownEmpty }
+    }
+    Type.EffectComposite {parts, ..} => {
+      state = SourceInputs.ShapeState.Inline
+      let fields = Vector<Shared<Type>>.asSlice(&parts)
+      let mut at = usize.ZERO
+      while at < fields.length {
+        run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+          selector: SourceInputs.Selector.Field {ordinal: at}, ty: Shared<Type>.clone(&fields[at]), inline: true})
+        at = at + usize.ONE
+      }
+    }
+    Type.EffectJoin {alternatives, ..} => {
+      state = SourceInputs.ShapeState.Inline
+      let fields = Vector<Shared<Type>>.asSlice(&alternatives)
+      let mut at = usize.ZERO
+      while at < fields.length {
+        run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+          selector: SourceInputs.Selector.Variant {ordinal: at}, ty: Shared<Type>.clone(&fields[at]), inline: true})
+        at = at + usize.ONE
+      }
+    }
+    Type.CallableView {representation, ..} => {
+      state = SourceInputs.ShapeState.Inline
+      run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+        selector: SourceInputs.Selector.Identity, ty: Shared<Type>.clone(&representation), inline: true})
+    }
+    Type.Effect {..} => { state = SourceInputs.ShapeState.Effect }
+    _ => ()
+  }
+  if let Option<EffectChannels>.Some {value} = move Shared<Type>.with<Option<EffectChannels>>(ty, effectChannels) {
+    run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+      selector: SourceInputs.Selector.EffectSuccess, ty: move value.success, inline: false})
+    run Vector<SourceInputs.Component>.append(&mut components, SourceInputs.Component {
+      selector: SourceInputs.Selector.EffectFailure, ty: move value.failure, inline: false})
+  }
+  return Result<SourceInputs.Shape, Shared<Rejection>>.succeed(SourceInputs.Shape {
+    ty: Shared<Type>.clone(ty), state: state, components: move components})
+}
+
+// Interns by complete semantic type identity; neither region atom sets nor nominal spelling
+// identify an application. Query failures propagate without publishing a partial descriptor.
+effect fn sourceShapeId(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, shapes: &mut Vector<SourceInputs.Shape>, ty: &Shared<Type>, span: Span)
+  -> Result<SourceInputs.ShapeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let listed = Vector<SourceInputs.Shape>.asSlice(&shapes.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if run Type.equalsShared(&listed[at].ty, ty) {
+      return Result<SourceInputs.ShapeId, Shared<Rejection>>.succeed(SourceInputs.ShapeId {index: at})
+    }
+    at = at + usize.ONE
+  }
+  let shape = match move run sourceShape(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, span) {
+    Result<SourceInputs.Shape, Shared<Rejection>>.Success {value} => move value
+    Result<SourceInputs.Shape, Shared<Rejection>>.Failure {error} => { return Result<SourceInputs.ShapeId, Shared<Rejection>>.failResult(move error) }
+  }
+  let id = SourceInputs.ShapeId {index: Vector<SourceInputs.Shape>.length(&shapes.*)}
+  run Vector<SourceInputs.Shape>.append(&mut shapes.*, move shape)
+  return Result<SourceInputs.ShapeId, Shared<Rejection>>.succeed(id)
+}
+
+// Reserves an inline value/storage tree for one typed root. A separate root denotes a separate
+// value snapshot; common shape IDs grant no owner equality. Boundary children are added only by
+// finite authored/contract selectors, never by recursive reference unfolding.
+effect fn sourceEndpoint(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, shapes: &mut Vector<SourceInputs.Shape>, endpoints: &mut Vector<SourceInputs.Endpoint>,
+  root: SourceInputs.Root, parent: Option<SourceInputs.EndpointId>, selector: SourceInputs.Selector,
+  ty: &Shared<Type>, origin: BodyOrigin, span: Span) -> Result<SourceInputs.EndpointId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let shape = match move run sourceShapeId(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut shapes.*, ty, span) {
+    Result<SourceInputs.ShapeId, Shared<Rejection>>.Success {value} => value
+    Result<SourceInputs.ShapeId, Shared<Rejection>>.Failure {error} => { return Result<SourceInputs.EndpointId, Shared<Rejection>>.failResult(move error) }
+  }
+  let start = SourceInputs.EndpointId {index: Vector<SourceInputs.Endpoint>.length(&endpoints.*)}
+  run Vector<SourceInputs.Endpoint>.append(&mut endpoints.*, SourceInputs.Endpoint {
+    root: move root, parent: move parent, selector: move selector, shape: shape, origin: origin})
+  let mut at = start.index
+  while at < Vector<SourceInputs.Endpoint>.length(&endpoints.*) {
+    let here = SourceInputs.EndpointId {index: at}
+    let shape = Vector<SourceInputs.Endpoint>.asSlice(&endpoints.*)[at].shape
+    let count = Vector<SourceInputs.Component>.length(&Vector<SourceInputs.Shape>.asSlice(&shapes.*)[shape.index].components)
+    let mut field = usize.ZERO
+    while field < count {
+      let component = &Vector<SourceInputs.Component>.asSlice(&Vector<SourceInputs.Shape>.asSlice(&shapes.*)[shape.index].components)[field]
+      if component.inline {
+        let childType = Shared<Type>.clone(&component.ty)
+        let childSelector = SourceInputs.copySelector(&component.selector)
+        let childShape = match move run sourceShapeId(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut shapes.*, &childType, span) {
+          Result<SourceInputs.ShapeId, Shared<Rejection>>.Success {value} => value
+          Result<SourceInputs.ShapeId, Shared<Rejection>>.Failure {error} => { return Result<SourceInputs.EndpointId, Shared<Rejection>>.failResult(move error) }
+        }
+        let mut ancestor = Option<SourceInputs.EndpointId>.some(here)
+        while true {
+          let previous = match move ancestor {
+            Option<SourceInputs.EndpointId>.Some {value} => value
+            Option<SourceInputs.EndpointId>.None => { break }
+          }
+          let endpoint = &Vector<SourceInputs.Endpoint>.asSlice(&endpoints.*)[previous.index]
+          if endpoint.shape.index == childShape.index {
+            return CompilerBug.panic(b"source preparation: recursive inline storage reached a body")
+          }
+          ancestor = match &endpoint.parent { Option<SourceInputs.EndpointId>.Some {value} => Option<SourceInputs.EndpointId>.some(value)
+            Option<SourceInputs.EndpointId>.None => Option<SourceInputs.EndpointId>.none() }
+        }
+        let root = SourceInputs.copyRoot(&Vector<SourceInputs.Endpoint>.asSlice(&endpoints.*)[at].root)
+        run Vector<SourceInputs.Endpoint>.append(&mut endpoints.*, SourceInputs.Endpoint {
+          root: move root, parent: Option<SourceInputs.EndpointId>.some(here), selector: move childSelector,
+          shape: childShape, origin: origin})
+      }
+      field = field + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return Result<SourceInputs.EndpointId, Shared<Rejection>>.succeed(start)
+}
+
+fn sourceNodeRoot(endpoints: &[SourceInputs.Endpoint], node: BodyNodeId, role: SourceInputs.EndpointRole) -> SourceInputs.EndpointId {
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    if let Option<SourceInputs.EndpointId>.None = &endpoints[at].parent {
+      if let SourceInputs.Root.Node {node: found, role: selected} = &endpoints[at].root {
+        if found.index == node.index && selected == role { return SourceInputs.EndpointId {index: at} }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return CompilerBug.panic(b"source preparation: supported expression root is missing")
+}
+
+// Every ordinary local and expression root is reserved before source graph construction. Entry
+// locals retain their own origins and IDs, with no fabricated initializer node.
+effect fn sourceBodyEndpoints<'body>(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, prepared: &mut SourceInputs.SourcePreparation<'body>, anchor: &Anchor)
+  -> Result<(), Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let locals = prepared.body.locals
+  let mut at = usize.ZERO
+  while at < locals.length {
+    let mut role = usize.ZERO
+    while role < usize.ONE + usize.ONE {
+      let selected = if role == usize.ZERO { SourceInputs.EndpointRole.Value } else { SourceInputs.EndpointRole.Storage }
+      let result = run sourceEndpoint(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.shapes,
+        &mut prepared.endpoints, SourceInputs.Root.Local {local: BodyLocalId {index: at}, role: selected},
+        Option<SourceInputs.EndpointId>.none(), SourceInputs.Selector.Identity, &locals[at].ty, locals[at].origin,
+        BodyOrigin.span(locals[at].origin, anchor))
+      if let Result<SourceInputs.EndpointId, Shared<Rejection>>.Failure {error} = move result {
+        return Result<(), Shared<Rejection>>.failResult(move error)
+      }
+      role = role + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let nodes = prepared.body.nodes
+  at = usize.ZERO
+  while at < nodes.length {
+    if let BodyNodeKind.Expression {ty, ..} = &nodes[at].kind {
+      let mut role = usize.ZERO
+      while role < usize.ONE + usize.ONE {
+        let selected = if role == usize.ZERO { SourceInputs.EndpointRole.Value } else { SourceInputs.EndpointRole.Storage }
+        let result = run sourceEndpoint(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.shapes,
+          &mut prepared.endpoints, SourceInputs.Root.Node {node: BodyNodeId {index: at}, role: selected},
+          Option<SourceInputs.EndpointId>.none(), SourceInputs.Selector.Identity, &ty, nodes[at].origin,
+          BodyOrigin.span(nodes[at].origin, anchor))
+        if let Result<SourceInputs.EndpointId, Shared<Rejection>>.Failure {error} = move result {
+          return Result<(), Shared<Rejection>>.failResult(move error)
+        }
+        role = role + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Result<(), Shared<Rejection>>.succeed(())
+}
+
+// This is an indexed copy of actual semantic facts, not a conversion of retained goals into
+// premises. Every caller of this helper supplies the owning role for the resulting index.
+effect fn sourcePredicate(predicates: &mut Vector<SourceInputs.Predicate>, value: SourceInputs.Predicate)
+  -> SourceInputs.PredicateId ! OutOfMemoryError ? &mut Allocator {
+  let id = SourceInputs.PredicateId {index: Vector<SourceInputs.Predicate>.length(&predicates.*)}
+  run Vector<SourceInputs.Predicate>.append(&mut predicates.*, move value)
+  return id
+}
+
+effect fn sourceConstraint(predicates: &mut Vector<SourceInputs.Predicate>, constraint: &Constraint)
+  -> Option<SourceInputs.PredicateId> ! OutOfMemoryError ? &mut Allocator {
+  return match &constraint.* {
+    Constraint.Outlives {longer, shorter} => Option<SourceInputs.PredicateId>.some(run sourcePredicate(&mut predicates.*,
+      SourceInputs.Predicate.Outlives {longer: Shared<Lifetime>.clone(&longer), shorter: Shared<Lifetime>.clone(&shorter)}))
+    Constraint.Contents {subject, region} => Option<SourceInputs.PredicateId>.some(run sourcePredicate(&mut predicates.*,
+      SourceInputs.Predicate.Contents {subject: Shared<Type>.clone(&subject), region: Shared<Lifetime>.clone(&region)}))
+    _ => Option<SourceInputs.PredicateId>.none()
+  }
+}
+
+// Reads grouped binder vectors by their own declaration identities, not by assuming that each
+// group is a dense parameter range or that applied interface slots belong to the operation.
+fn sourceTypeBinderAt(answer: &Result<Answer, NoRejection>, at: usize) -> Shared<Type> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
+      return Shared<Type>.clone(&Vector<Shared<Type>>.asSlice(&signature.typeParameters)[at])
+    }
+  }
+  return CompilerBug.panic(b"source preparation: original type binder is unavailable")
+}
+fn sourceLifetimeBinderAt(answer: &Result<Answer, NoRejection>, at: usize) -> Shared<Lifetime> {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
+      return Shared<Lifetime>.clone(&Vector<Shared<Lifetime>>.asSlice(&signature.lifetimeParameters)[at])
+    }
+  }
+  return CompilerBug.panic(b"source preparation: original lifetime binder is unavailable")
+}
+fn sourceRowBinderCount(answer: &Result<Answer, NoRejection>) -> usize {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
+      return Vector<RowParameter>.length(&signature.rowParameters)
+    }
+  }
+  return CompilerBug.panic(b"source preparation: original row binders are unavailable")
+}
+fn sourceRowBinderAt(answer: &Result<Answer, NoRejection>, at: usize) -> RowParameter {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
+      let row = &Vector<RowParameter>.asSlice(&signature.rowParameters)[at]
+      return RowParameter {declaration: Shared<DeclarationId>.clone(&row.declaration), ordinal: row.ordinal}
+    }
+  }
+  return CompilerBug.panic(b"source preparation: original row binder is unavailable")
+}
+
+// Copy facts, not query objects: descriptor metadata must outlive the local inference query
+// handles without capturing its dependency collector or confusing it with a runtime recipe.
+effect fn sourceSignature(signature: &Shared<Result<Answer, NoRejection>>) -> Shared<Signature>
+! OutOfMemoryError ? &mut Allocator {
+  let facts = match move Shared<Result<Answer, NoRejection>>.with<Option<SignatureFacts>>(signature, signatureFacts) {
+    Option<SignatureFacts>.Some {value} => move value
+    _ => { return CompilerBug.panic(b"source contract: selected signature is unavailable") }
+  }
+  let mut types = Vector<Shared<Type>>.make()
+  let mut lifetimes = Vector<Shared<Lifetime>>.make()
+  let mut rows = Vector<RowParameter>.make()
+  let typeCount = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureTypeParameterCount)
+  let lifetimeCount = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureLifetimeCount)
+  let rowCount = Shared<Result<Answer, NoRejection>>.with<usize>(signature, sourceRowBinderCount)
+  let mut at = usize.ZERO
+  while at < typeCount {
+    run Vector<Shared<Type>>.append(&mut types, Shared<Result<Answer, NoRejection>>.with<Shared<Type>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Shared<Type> { return sourceTypeBinderAt(answer, at) }))
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < lifetimeCount {
+    run Vector<Shared<Lifetime>>.append(&mut lifetimes, Shared<Result<Answer, NoRejection>>.with<Shared<Lifetime>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Shared<Lifetime> { return sourceLifetimeBinderAt(answer, at) }))
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < rowCount {
+    run Vector<RowParameter>.append(&mut rows, Shared<Result<Answer, NoRejection>>.with<RowParameter>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> RowParameter { return sourceRowBinderAt(answer, at) }))
+    at = at + usize.ONE
+  }
+  let mut constraints = Vector<Constraint>.make()
+  at = usize.ZERO
+  while at < facts.constraints {
+    let constraint = Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
+    match move constraint {
+      Option<Constraint>.Some {value} => run Vector<Constraint>.append(&mut constraints, move value)
+      _ => { return CompilerBug.panic(b"source contract: selected constraint is unavailable") }
+    }
+    at = at + usize.ONE
+  }
+  let mut environment = Option<Intersection>.none()
+  if facts.environment != usize.MAX {
+    let regions = run environmentRegions(signature, facts.environment)
+    environment = Option<Intersection>.some(run Intersection.of(Vector<Shared<Lifetime>>.asSlice(&regions)))
+  }
+  return run Shared<Signature>.make(Signature {
+    typeParameters: move types, callableParameterStart: facts.callableParameterStart,
+    lifetimeParameters: move lifetimes, rowParameters: move rows, constraints: move constraints,
+    parameters: run signatureParameterTypes(signature), result: move facts.result, failure: move facts.failure,
+    requirements: move facts.requirements, isEffect: facts.isEffect, isVariadic: facts.isVariadic,
+    isUnsafe: facts.isUnsafe, isStatic: facts.isStatic, staticSlots: run signatureStaticSlotList(signature),
+    environment: move environment, environmentWritten: facts.environmentWritten, environmentExempt: facts.environmentExempt})
+}
+
+effect fn sourceEnclosingBindings(bindings: &[Binding], target: &DeclarationId) -> Vector<Binding>
+! OutOfMemoryError ? &mut Allocator {
+  let mut enclosing = Vector<Binding>.make()
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    let declaration = DeclarationId.copyShared(&bindings[at].declaration)
+    if !DeclarationId.equals(&declaration, target) {
+      run Vector<Binding>.append(&mut enclosing, Binding {declaration: Shared<DeclarationId>.clone(&bindings[at].declaration),
+        ordinal: bindings[at].ordinal, value: Argument.copy(&bindings[at].value)})
+    }
+    at = at + usize.ONE
+  }
+  return move enclosing
+}
+
+// This is paired with a real named producer. The original parameter ordinals are unchanged by
+// binder opening, even though their types are rewritten into a different declaration space.
+effect fn sourceNamedContract(target: &DeclarationId, signature: &Shared<Result<Answer, NoRejection>>,
+  transform: &CallInference, effective: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId,
+  inferred: &[Binding], enclosing: &[Binding], privatePrefixCount: usize, privateBindings: &[Binding]) -> Shared<SelectedSourceContract>
+! OutOfMemoryError ? &mut Allocator {
+  let originalCount = Shared<Result<Answer, NoRejection>>.with<usize>(&transform.signature, signatureBinderCount)
+  let inference = run Shared<SourceInference>.make(SourceInference {
+    owner: run Shared<DeclarationId>.make(DeclarationId.copy(fresh)),
+    original: run sourceSignature(&transform.signature), effective: run sourceSignature(effective),
+    remapped: run copyBindings(Vector<Binding>.asSlice(&transform.remapped)),
+    enclosing: run copyBindings(enclosing), scopesApplied: transform.scopesApplied,
+    privatePrefixFirst: originalCount, privatePrefixCount: privatePrefixCount, privateBindings: run copyBindings(privateBindings)})
+  let mut inputs = Vector<SourceInputMap>.make()
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureParameterCount)
+  let mut at = usize.ZERO
+  while at < count {
+    run Vector<SourceInputMap>.append(&mut inputs, SourceInputMap {
+      selected: SourceInput.Parameter {owner: run Shared<DeclarationId>.make(DeclarationId.copy(fresh)), ordinal: at},
+      original: SourceInput.Parameter {owner: run Shared<DeclarationId>.make(DeclarationId.copy(target)), ordinal: at}})
+    at = at + usize.ONE
+  }
+  return run Shared<SelectedSourceContract>.make(SelectedSourceContract {
+    target: SourceTarget.Direct {declaration: run Shared<DeclarationId>.make(DeclarationId.copy(target))},
+    signature: run sourceSignature(signature), owner: run Shared<DeclarationId>.make(DeclarationId.copy(target)),
+    inference: Option<Shared<SourceInference>>.some(move inference),
+    bindings: run Shared<Vector<Binding>>.make(run copyBindings(inferred)), inputs: move inputs})
+}
+
+// Dependencies and result correlation are established using the original selected signature.
+// Final inference only applies that already-authenticated relation to caller endpoints.
+effect fn sourceApplication<'body>(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, prepared: &mut SourceInputs.SourcePreparation<'body>,
+  site: BodyNodeId, target: SourceInputs.Target, declaration: &DeclarationId, bindings: Vector<Binding>,
+  arguments: &[BodyNodeId], signature: &Shared<Result<Answer, NoRejection>>, span: Span)
+  -> Result<SourceInputs.ApplicationId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<Shared<Rejection>>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(signature, answerCause) {
+    return Result<SourceInputs.ApplicationId, Shared<Rejection>>.failResult(move value)
+  }
+  let facts = match move Shared<Result<Answer, NoRejection>>.with<Option<SignatureFacts>>(signature, signatureFacts) {
+    Option<SignatureFacts>.Some {value} => move value
+    Option<SignatureFacts>.None => { return CompilerBug.panic(b"source preparation: original selected signature is missing") }
+  }
+  let mut types = Vector<Shared<Type>>.make()
+  let mut lifetimes = Vector<Shared<Lifetime>>.make()
+  let mut rows = Vector<RowParameter>.make()
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureTypeParameterCount)
+  let mut at = usize.ZERO
+  while at < count {
+    run Vector<Shared<Type>>.append(&mut types, Shared<Result<Answer, NoRejection>>.with<Shared<Type>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Shared<Type> { return sourceTypeBinderAt(answer, at) }))
+    at = at + usize.ONE
+  }
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureLifetimeCount)
+  at = usize.ZERO
+  while at < count {
+    run Vector<Shared<Lifetime>>.append(&mut lifetimes, Shared<Result<Answer, NoRejection>>.with<Shared<Lifetime>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Shared<Lifetime> { return sourceLifetimeBinderAt(answer, at) }))
+    at = at + usize.ONE
+  }
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(signature, sourceRowBinderCount)
+  at = usize.ZERO
+  while at < count {
+    run Vector<RowParameter>.append(&mut rows, Shared<Result<Answer, NoRejection>>.with<RowParameter>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> RowParameter { return sourceRowBinderAt(answer, at) }))
+    at = at + usize.ONE
+  }
+  let parameters = run signatureParameterTypes(signature)
+  let mut closed = true
+  let assigned = Vector<Binding>.asSlice(&bindings)
+  let written = Vector<Shared<Type>>.asSlice(&parameters)
+  at = usize.ZERO
+  while at < written.length {
+    if unboundTypeIn(&written[at], declaration, facts.binders, assigned) { closed = false }
+    at = at + usize.ONE
+  }
+  if unboundTypeIn(&facts.result, declaration, facts.binders, assigned)
+    || unboundTypeIn(&facts.failure, declaration, facts.binders, assigned)
+    || unboundRowIn(&facts.requirements, declaration, assigned) { closed = false }
+  let mut declaredConstraints = Vector<Constraint>.make()
+  let mut sourcePremises = Vector<SourceInputs.PredicateId>.make()
+  let mut constraints = run signatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, signature, false, span)
+  at = usize.ZERO
+  while at < facts.constraints {
+    if let Option<Constraint>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) }) {
+      run Vector<Constraint>.append(&mut declaredConstraints, copyConstraint(&value))
+      run Vector<Constraint>.append(&mut constraints, move value)
+    }
+    at = at + usize.ONE
+  }
+  let mut boundsComplete = true
+  let bounds = Vector<Constraint>.asSlice(&constraints)
+  at = usize.ZERO
+  while at < bounds.length {
+    match move run sourceConstraint(&mut prepared.predicates, &bounds[at]) {
+      Option<SourceInputs.PredicateId>.Some {value} => run Vector<SourceInputs.PredicateId>.append(&mut sourcePremises, value)
+      Option<SourceInputs.PredicateId>.None => {
+        if let Constraint.Copyable {..} = &bounds[at] { () } else { boundsComplete = false }
+      }
+    }
+    at = at + usize.ONE
+  }
+  let mut actual = Vector<BodyNodeId>.make()
+  at = usize.ZERO
+  while at < arguments.length {
+    run Vector<BodyNodeId>.append(&mut actual, arguments[at])
+    at = at + usize.ONE
+  }
+  let id = SourceInputs.ApplicationId {index: Vector<SourceInputs.Application>.length(&prepared.applications)}
+  let mut environment = Option<Intersection>.none()
+  if facts.environment != usize.MAX {
+    let regions = run environmentRegions(signature, facts.environment)
+    environment = Option<Intersection>.some(run Intersection.of(Vector<Shared<Lifetime>>.asSlice(&regions)))
+  }
+  let staticSlots = run signatureStaticSlotList(signature)
+  run Vector<SourceInputs.Application>.append(&mut prepared.applications, SourceInputs.Application {
+    site: site, origin: prepared.body.nodes[site.index].origin, target: move target,
+    owner: run Shared<DeclarationId>.make(DeclarationId.copy(declaration)), typeParameters: move types,
+    callableParameterStart: facts.callableParameterStart,
+    lifetimeParameters: move lifetimes, rowParameters: move rows, bindings: move bindings,
+    inference: Option<Shared<SourceInference>>.none(), constraints: move declaredConstraints,
+    isVariadic: facts.isVariadic, isUnsafe: facts.isUnsafe, isStatic: facts.isStatic, closed: closed,
+    staticSlots: move staticSlots, parameters: move parameters, result: move facts.result, failure: move facts.failure,
+    requirements: move facts.requirements, constructs: facts.isEffect, environment: move environment,
+    environmentWritten: facts.environmentWritten, environmentExempt: facts.environmentExempt,
+    premises: move sourcePremises, sourceBoundsComplete: boundsComplete, arguments: move actual})
+  return Result<SourceInputs.ApplicationId, Shared<Rejection>>.succeed(id)
+}
+
+// Query keys retain the exact original operation/contract/provider. No witness body and no
+// coalesced caller type supplies original result/source correspondence.
+effect fn sourceCallApplications<'body>(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, prepared: &mut SourceInputs.SourcePreparation<'body>, anchor: &Anchor)
+  -> Result<(), Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let nodes = prepared.body.nodes
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if let BodyNodeKind.Expression {form, ..} = &nodes[at].kind {
+      let site = BodyNodeId {index: at}
+      let span = BodyOrigin.span(nodes[at].origin, anchor)
+      match &form {
+        BodyExpression.DirectCall {declaration, application, arguments, ..} => {
+          let identity = run Shared<DeclarationId>.make(DeclarationId.copy(&declaration))
+          let location = match move run locationOfIdentity(&mut resolver.*, &identity) {
+            Option<InstanceLocation>.Some {value} => value
+            Option<InstanceLocation>.None => { return CompilerBug.panic(b"source preparation: selected direct declaration is missing") }
+          }
+          let key = run internDeclaration(&mut resolver.*, Key {family: Family.Signature, module: location.module,
+            name: usize.ZERO, declaration: location.declaration, member: usize.ZERO, external: false})
+          let signature = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span)
+          let selected = run Application.copyShared(&application)
+          let bindings = run Application.bindings(&selected)
+          let result = run sourceApplication(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.*, site,
+            SourceInputs.Target.Direct {declaration: move identity}, &declaration, move bindings,
+            Vector<BodyNodeId>.asSlice(&arguments), &signature, span)
+          if let Result<SourceInputs.ApplicationId, Shared<Rejection>>.Failure {error} = move result {
+            return Result<(), Shared<Rejection>>.failResult(move error)
+          }
+        }
+        BodyExpression.InterfaceCall {operation, contract, provider, bindings, arguments, ..} => {
+          let identity = run Shared<DeclarationId>.make(DeclarationId.copy(&operation))
+          let location = match move run locationOfIdentity(&mut resolver.*, &identity) {
+            Option<InstanceLocation>.Some {value} => value
+            Option<InstanceLocation>.None => { return CompilerBug.panic(b"source preparation: selected interface operation is missing") }
+          }
+          let key = run internDeclaration(&mut resolver.*, Key {family: Family.AppliedOperation, module: location.module,
+            name: run internApplication(&mut resolver.*, &contract), declaration: location.declaration,
+            member: run internApplication(&mut resolver.*, &provider), external: false})
+          let signature = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span)
+          let count = Shared<Vector<Binding>>.with<usize>(&bindings, fn(values: &Vector<Binding>) -> usize { return Vector<Binding>.length(values) })
+          let mut assigned = Vector<Binding>.make()
+          let mut binding = usize.ZERO
+          while binding < count {
+            let copied = Shared<Vector<Binding>>.with<Binding>(&bindings, fn(values: &Vector<Binding>) -> Binding {
+              let found = &Vector<Binding>.asSlice(values)[binding]
+              return Binding {declaration: Shared<DeclarationId>.clone(&found.declaration), ordinal: found.ordinal, value: Argument.copy(&found.value)}
+            })
+            run Vector<Binding>.append(&mut assigned, move copied)
+            binding = binding + usize.ONE
+          }
+          let result = run sourceApplication(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.*, site,
+            SourceInputs.Target.Operation {operation: move identity, contract: Shared<Type>.clone(&contract), provider: Shared<Type>.clone(&provider)},
+            &operation, move assigned, Vector<BodyNodeId>.asSlice(&arguments), &signature, span)
+          if let Result<SourceInputs.ApplicationId, Shared<Rejection>>.Failure {error} = move result {
+            return Result<(), Shared<Rejection>>.failResult(move error)
+          }
+        }
+        _ => ()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Result<(), Shared<Rejection>>.succeed(())
+}
+
+// Application endpoints keep original and finalized type spaces separate. The first success
+// of an effect function is its declared result; nested Effects remain ordinary typed channels.
+effect fn sourceApplicationPort<'body>(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, prepared: &mut SourceInputs.SourcePreparation<'body>, application: SourceInputs.ApplicationId,
+  port: SourceInputs.ContractPort, ordinal: usize, ty: &Shared<Type>, bindings: &[Binding], origin: BodyOrigin, span: Span)
+  -> Result<(), Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let original = run sourceEndpoint(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.shapes, &mut prepared.endpoints,
+    SourceInputs.Root.Application {application: application, port: port, ordinal: ordinal, space: SourceInputs.TypeSpace.Original},
+    Option<SourceInputs.EndpointId>.none(), SourceInputs.Selector.Identity, ty, origin, span)
+  if let Result<SourceInputs.EndpointId, Shared<Rejection>>.Failure {error} = move original {
+    return Result<(), Shared<Rejection>>.failResult(move error)
+  }
+  let applied = run Type.applyBindings(ty, bindings, true)
+  let actual = run sourceEndpoint(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.shapes, &mut prepared.endpoints,
+    SourceInputs.Root.Application {application: application, port: port, ordinal: ordinal, space: SourceInputs.TypeSpace.Applied},
+    Option<SourceInputs.EndpointId>.none(), SourceInputs.Selector.Identity, &applied, origin, span)
+  if let Result<SourceInputs.EndpointId, Shared<Rejection>>.Failure {error} = move actual {
+    return Result<(), Shared<Rejection>>.failResult(move error)
+  }
+  return Result<(), Shared<Rejection>>.succeed(())
+}
+
+effect fn sourceApplicationEndpoints<'body>(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut Vector<Dependency>, prepared: &mut SourceInputs.SourcePreparation<'body>, anchor: &Anchor)
+  -> Result<(), Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let count = Vector<SourceInputs.Application>.length(&prepared.applications)
+  let mut at = usize.ZERO
+  while at < count {
+    let application = &Vector<SourceInputs.Application>.asSlice(&prepared.applications)[at]
+    let origin = application.origin
+    let span = BodyOrigin.span(origin, anchor)
+    let id = SourceInputs.ApplicationId {index: at}
+    let bindings = run copyBindings(Vector<Binding>.asSlice(&application.bindings))
+    let parameters = run copyTypes(Vector<Shared<Type>>.asSlice(&application.parameters))
+    let result = Shared<Type>.clone(&application.result)
+    let failure = Shared<Type>.clone(&application.failure)
+    let resultPort = if application.constructs { SourceInputs.ContractPort.Success } else { SourceInputs.ContractPort.Result }
+    let inputs = Vector<Shared<Type>>.asSlice(&parameters)
+    let assigned = Vector<Binding>.asSlice(&bindings)
+    let mut input = usize.ZERO
+    while input < inputs.length {
+      let reserved = run sourceApplicationPort(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.*, id,
+        SourceInputs.ContractPort.Input, input, &inputs[input], assigned, origin, span)
+      if let Result<(), Shared<Rejection>>.Failure {error} = move reserved { return Result<(), Shared<Rejection>>.failResult(move error) }
+      input = input + usize.ONE
+    }
+    let reserved = run sourceApplicationPort(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.*, id,
+      resultPort, usize.ZERO, &result, assigned, origin, span)
+    if let Result<(), Shared<Rejection>>.Failure {error} = move reserved { return Result<(), Shared<Rejection>>.failResult(move error) }
+    let reserved = run sourceApplicationPort(&mut resolver.*, &mut owner.*, &mut dependencies.*, &mut prepared.*, id,
+      SourceInputs.ContractPort.Failure, usize.ZERO, &failure, assigned, origin, span)
+    if let Result<(), Shared<Rejection>>.Failure {error} = move reserved { return Result<(), Shared<Rejection>>.failResult(move error) }
+    at = at + usize.ONE
+  }
+  return Result<(), Shared<Rejection>>.succeed(())
+}
+
+fn sourceSameSelector(left: &SourceInputs.Selector, right: &SourceInputs.Selector) -> bool {
+  return match &left.* {
+    SourceInputs.Selector.Member {declaration, member, payload} => match &right.* {
+      SourceInputs.Selector.Member {declaration: other, member: found, payload: part} =>
+        member == found && payload == part && sameDeclarationShared(&declaration, &other)
+      _ => false
+    }
+    SourceInputs.Selector.Field {ordinal} => match &right.* { SourceInputs.Selector.Field {ordinal: found} => ordinal == found _ => false }
+    SourceInputs.Selector.Variant {ordinal} => match &right.* { SourceInputs.Selector.Variant {ordinal: found} => ordinal == found _ => false }
+    SourceInputs.Selector.Index {class: SourceInputs.IndexClass.Exact {index}} => match &right.* {
+      SourceInputs.Selector.Index {class: SourceInputs.IndexClass.Exact {index: found}} => index == found _ => false }
+    SourceInputs.Selector.Index {class: SourceInputs.IndexClass.Remainder} => match &right.* {
+      SourceInputs.Selector.Index {class: SourceInputs.IndexClass.Remainder} => true _ => false }
+    SourceInputs.Selector.Referent => match &right.* { SourceInputs.Selector.Referent => true _ => false }
+    SourceInputs.Selector.EffectSuccess => match &right.* { SourceInputs.Selector.EffectSuccess => true _ => false }
+    SourceInputs.Selector.EffectFailure => match &right.* { SourceInputs.Selector.EffectFailure => true _ => false }
+    SourceInputs.Selector.Identity => match &right.* { SourceInputs.Selector.Identity => true _ => false }
+    SourceInputs.Selector.Opaque => match &right.* { SourceInputs.Selector.Opaque => true _ => false }
+  }
+}
+
+fn sourceChild(endpoints: &[SourceInputs.Endpoint], parent: SourceInputs.EndpointId, selector: &SourceInputs.Selector)
+  -> Option<SourceInputs.EndpointId> {
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    if let Option<SourceInputs.EndpointId>.Some {value} = &endpoints[at].parent {
+      if value.index == parent.index && sourceSameSelector(&endpoints[at].selector, selector) {
+        return Option<SourceInputs.EndpointId>.some(SourceInputs.EndpointId {index: at})
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<SourceInputs.EndpointId>.none()
+}
+
+effect fn sourceMap(maps: &mut Vector<SourceInputs.SelectionMap>, site: BodyNodeId, origin: BodyOrigin,
+  source: SourceInputs.EndpointId, target: SourceInputs.EndpointId, selector: SourceInputs.Selector,
+  kind: SourceInputs.MapKind, application: Option<SourceInputs.ApplicationId>) -> SourceInputs.MapId
+! OutOfMemoryError ? &mut Allocator {
+  let id = SourceInputs.MapId {index: Vector<SourceInputs.SelectionMap>.length(&maps.*)}
+  run Vector<SourceInputs.SelectionMap>.append(&mut maps.*, SourceInputs.SelectionMap {
+    site: site, origin: origin, source: source, target: target, selector: move selector, kind: kind, application: move application})
+  return id
+}
+
+// Copies the existing generic goals without promoting them to premises. Original declared
+// RegionBounds remain in Body.premises; this indexed view adds no assumptions.
+effect fn sourceBodyPredicates<'body>(prepared: &mut SourceInputs.SourcePreparation<'body>, constraints: &[Constraint]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < constraints.length {
+    if let Option<SourceInputs.PredicateId>.Some {value} = move run sourceConstraint(&mut prepared.predicates, &constraints[at]) {
+      run Vector<SourceInputs.PredicateId>.append(&mut prepared.premises, value)
+    }
+    at = at + usize.ONE
+  }
+  let assumptions = prepared.body.premises
+  at = usize.ZERO
+  while at < assumptions.length {
+    let id = run sourcePredicate(&mut prepared.predicates, SourceInputs.Predicate.Outlives {
+      longer: Shared<Lifetime>.clone(&assumptions[at].longer), shorter: Shared<Lifetime>.clone(&assumptions[at].shorter)})
+    run Vector<SourceInputs.PredicateId>.append(&mut prepared.premises, id)
+    at = at + usize.ONE
+  }
+  let obligations = prepared.body.obligations
+  at = usize.ZERO
+  while at < obligations.length {
+    let mut selected = Option<SourceInputs.PredicateId>.none()
+    match &obligations[at] {
+      BodySafetyObligation.Contents {subject, region, ..} => {
+        selected = Option<SourceInputs.PredicateId>.some(run sourcePredicate(&mut prepared.predicates,
+          SourceInputs.Predicate.Contents {subject: Shared<Type>.clone(&subject), region: Shared<Lifetime>.clone(&region)}))
+      }
+      BodySafetyObligation.RegionRelation {offered, wanted, ..} => {
+        selected = Option<SourceInputs.PredicateId>.some(run sourcePredicate(&mut prepared.predicates,
+          SourceInputs.Predicate.Outlives {longer: Shared<Lifetime>.clone(&offered), shorter: Shared<Lifetime>.clone(&wanted)}))
+      }
+      _ => ()
+    }
+    if let Option<SourceInputs.PredicateId>.Some {value} = move selected {
+      run Vector<SourceInputs.Obligation>.append(&mut prepared.obligations, SourceInputs.Obligation {
+        ordinal: at, predicate: value, endpoint: Option<SourceInputs.EndpointId>.none()})
+    }
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 effect fn borrowCleanup(
@@ -80833,6 +81673,7 @@ effect fn finishDeferredNamedSection(resolver: &mut Resolver, owner: &mut Query<
   request: &mut Request, dependencies: &mut Vector<Dependency>, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
   nodes: &mut Vector<BodyNode>, expression: HirId, span: Span, target: &DeclarationId,
   signature: &Shared<Result<Answer, NoRejection>>, applied: &[Argument], inference: &Shared<Result<Answer, NoRejection>>,
+  transform: &CallInference, effective: &Shared<Result<Answer, NoRejection>>, privatePrefixCount: usize, privateBindings: &[Binding],
   fresh: &DeclarationId, inferred: &[Binding], open: &[usize], first: usize, arguments: Vector<BodyNodeId>,
   constraints: &[Constraint], expected: &Option<Shared<Type>>, mismatchCode: RejectionCode, contractBody: bool, contextual: bool)
   -> Result<BodyNodeId, Shared<Rejection>>
@@ -80896,10 +81737,12 @@ effect fn finishDeferredNamedSection(resolver: &mut Resolver, owner: &mut Query<
     }
     result = move promised
   }
+  let sourceContract = run sourceNamedContract(target, signature, transform, effective, fresh, inferred,
+    Vector<Binding>.asSlice(&scoped), privatePrefixCount, privateBindings)
   return run finishNamedSection(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor, caller, &mut nodes.*,
     expression, span, signature, Vector<Binding>.asSlice(&noBindings),
     NamedSectionTarget.Schema {target: run Shared<DeclarationId>.make(DeclarationId.copy(target)),
-      selected: move choice.selected, deferred: move choice.deferred}, open, first, move arguments, move result, constraints, expected, mismatchCode, contractBody)
+      selected: move choice.selected, deferred: move choice.deferred}, move sourceContract, open, first, move arguments, move result, constraints, expected, mismatchCode, contractBody)
 }
 
 effect fn sectionEligibleRepresentation(value: &Shared<Type>, owner: &DeclarationId, eligible: &Vector<usize>) -> bool
@@ -81048,8 +81891,8 @@ effect fn sectionCapturedParameters(resolver: &mut Resolver, owner: &mut Query<A
     _ => { return Result<Vector<Shared<Type>>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
   }
   let opened = match move run callInferenceSignature(&resolver.*, &original, &resolved, fresh, false, module, span) {
-    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value} => move value
-    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => { return Result<Vector<Shared<Type>>, Shared<Rejection>>.failResult(move error) }
+    Result<CallInference, Shared<Rejection>>.Success {value} => move value.signature
+    Result<CallInference, Shared<Rejection>>.Failure {error} => { return Result<Vector<Shared<Type>>, Shared<Rejection>>.failResult(move error) }
   }
   let all = run signatureParameterTypes(&opened)
   let listed = Vector<Shared<Type>>.asSlice(&all)
@@ -81085,8 +81928,8 @@ effect fn sectionSchemaSignature(resolver: &mut Resolver, owner: &mut Query<Answ
     _ => { return Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Unsupported, span)) }
   }
   let opened = match move run callInferenceSignature(&resolver.*, &original, &resolved, fresh, false, module, span) {
-    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Success {value} => move value
-    Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.Failure {error} => { return Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.failResult(move error) }
+    Result<CallInference, Shared<Rejection>>.Success {value} => move value.signature
+    Result<CallInference, Shared<Rejection>>.Failure {error} => { return Result<Shared<Result<Answer, NoRejection>>, Shared<Rejection>>.failResult(move error) }
   }
   let facts = match move Shared<Result<Answer, NoRejection>>.with<Option<SignatureFacts>>(&opened, signatureFacts) {
     Option<SignatureFacts>.Some {value} => move value
