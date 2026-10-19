@@ -14,8 +14,9 @@ selected one regular PEM bundle file. Provide it lexically as
 
 Construction copies an absolute native root and an existing normalized portable [`Path`](./filesystem.md#Path)
 without performing I/O. Each load opens the file anew, reads no more than the caller's input
-budget, closes it, then decodes the complete bytes through [`TrustSnapshot.fromPem`](./trust-snapshot.md#impl.fromPem). Returned
-snapshots own their anchors independently of this provider and every later load.
+budget, closes it, then decodes the complete bytes through [`TrustSnapshot.fromAnnotatedPem`](./trust-snapshot.md#impl.fromAnnotatedPem). Returned
+Printable annotations outside certificate blocks are accepted; malformed blocks fail the load.
+Snapshots own their anchors independently of this provider and every later load.
 
 The configured root and its ancestors are trusted application configuration. The root itself
 and every component beneath it use [`NativeFileSystem`](./native-filesystem.md#NativeFileSystem)'s descriptor-relative no-follow
@@ -33,8 +34,8 @@ on WebAssembly and native no-libc profiles.
 ### Configure explicit regular PEM files without reading them
 
 Debian applications can explicitly select the generated regular bundle without scanning its
-sibling certificate links. Darwin applications must first export their chosen authorities to a
-caller-managed regular PEM file; this actor does not read the system keychain. Both constructors
+sibling certificate links. Darwin applications can select a regular PEM bundle such as
+`/etc/ssl/cert.pem` or export their chosen authorities; this actor does not read the system keychain. Both constructors
 below only validate and copy configuration, so the example is executable on either supported
 platform without opening either file.
 

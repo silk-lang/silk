@@ -1,19 +1,139 @@
-# Handoff: unblock native HTTPS for upgrade history
+# Native HTTPS upgrade-history verification
 
-## Status and goal
+PR [#1970](https://github.com/silk-lang/silk/pull/1970) remains a draft until the exact-head
+Linux and selfhost gates pass. This replaces the original blocked-HTTPS handoff.
 
-PR [#1970](https://github.com/silk-lang/silk/pull/1970), branch
-`julia/integrate-native-changes`, is intentionally a **draft**. The user asked to push the
-working progress and hand off the HTTPS issue rather than switch transports.
+## Current status — 2026-10-18
 
-Implement secure, working native HTTPS for automatic compiler/dependency upgrade queries.
-Do not disable certificate or hostname verification, trust a certificate merely because the
-server supplied it, silently return an empty history, or introduce a curl fallback without
-agreement. No standard-library TLS code has been changed in this feature so far.
+Authenticated native HTTPS now works on macOS arm64 with the unmodified `/etc/ssl/cert.pem`,
+including its annotations. Both `api.github.com` release metadata and tag-pinned
+`raw.githubusercontent.com` content returned HTTP 200. No certificate or hostname check was
+disabled. There is no external-tool transport fallback, fetched-authority pin, or empty-history
+fallback.
 
-Read the repository's `AGENTS.md` first. Keep `bootstrap/` frozen and preserve unrelated local
-changes. The working tree had unrelated entries in `PAPERCUTS.md` and untracked `.turbo/`,
-`apps/`, `packages/`, and `examples/tiny-language/`; they are not part of this feature.
+The actual CLI now reaches the intended publication errors:
+
+```text
+silk changes --dir compiler since --from 0.0.0 --to 0.1.0-dev.8624+5081812 --json
+Incomplete release history: a required TOML archive is not committed at the selected GitHub release tag.
+
+silk changes --dir compiler since --from 0.0.0 --json
+No published stable GitHub release is available for this repository; choose an explicit published --to version.
+```
+
+These are successful authenticated requests followed by explicit metadata/history failures.
+They are not complete production upgrade-history success: the selected tag has no compiler
+release archive, and the latest-stable endpoint returned no release. Do not manufacture records
+from GitHub prose or infer a development build from the compiler's literal `0.1.0` version.
+
+A complete controlled history query also passes over real native TLS. A local server supplies
+release metadata, a stable archive, and its prerelease baseline archive. The test checks selected
+tag URLs, the fetched predecessor, deduplication against the installed prerelease, and exact
+Unicode/newline migration content. It routes the existing HTTP service to loopback; it does not
+replace `HttpNative`, TLS, HTTP framing, metadata parsing, or the history walk.
+
+Linux transport success is not yet claimed. Docker Desktop's local daemon accepted a socket but
+hung on bounded capability probes. The conformance command is wired into the Linux N1 and native
+target CI jobs; inspect their results on the PR's final head before marking it ready.
+
+## Diagnosed causes and fixes
+
+1. `NativeFileTrustSource` passed annotated platform bundles to the strict PEM decoder.
+   `CertificateBundle.decodeAnnotatedPem` and `TrustSnapshot.fromAnnotatedPem` now import printable
+   ASCII annotation lines between strict blocks. Native file trust uses this import path.
+   `decodePem` and `fromPem` retain their strict contracts. All blocks must decode; malformed
+   later certificates, unrelated PEM labels, suspect boundaries, and control bytes reject the
+   entire import. Annotation bytes count toward the input limit, and original offsets survive.
+2. The normalized-bundle failure was exactly `CertificatePath`, kind `Rejected`, reason
+   `NoValidPath`, detail `UnsupportedAlgorithm`, location `Intermediate 0`, offset `31`.
+   The captured Sectigo intermediate uses ECDSA/SHA-384; its issuer and the independently
+   configured USERTrust ECC authority have P-384 keys. The new `silk.p384` verifier and profile
+   admission validate those signatures. Independent RFC 6979 vectors cover the primitive;
+   the captured chain is an offline path regression with a fixed instant and an independently
+   configured root. Its positive assertion failed before the profile fix and passes afterward.
+3. A real OpenSSL/Node server exposed a separate `ProtocolViolation Extension`: its
+   EncryptedExtensions contained `supported_groups`, permitted by RFC 8446 section 4.2.7.
+   The TLS client now accepts its bounded, nonempty, correctly framed preference vector and
+   rejects a duplicate extension. The list is informational and cannot change the negotiated
+   key share or bypass authentication.
+
+`HttpError` retains the complete TLS connection or trust-source error through `Http`, `GitHub`,
+and the command. CLI TLS diagnostics distinguish alerts, negotiation, identity, signature,
+limits, I/O and timeout. Path diagnostics include primary reason, first rejected-candidate
+reason, location and offset. No temporary debug logging remains.
+
+## Verification completed on Darwin arm64
+
+- Native compiler build: 29,086 symbols; zero unchecked root-package bodies; eight unchecked
+  bodies across the closure, matching the prior feature's closure count.
+- All 36 changes-library tests passed, 36 selected and executed.
+- All 16 selected native corpus programs passed: new P-384 verification/path cases, certificate
+  decoding/profile/path cases, owned trust snapshots, existing P-256 cases, all six authenticated
+  TLS-client partitions, authenticated connection, and HTTP-over-TLS.
+- P-384 checks include RFC 6979 SHA-384 signatures, high/low `s`, changed message/signature,
+  off-curve/noncanonical/compressed/infinity keys, zero/out-of-range DER integers, noncanonical
+  DER, wrong curve/algorithm parameters, and nonzero unused bits.
+- Real TLS conformance passes plain/annotated explicit authority files, complete controlled
+  history, malformed later trust certificates, untrusted issuers, wrong hostnames, expired
+  certificates, forged certificate signatures, and HTTP 404 history errors. Authentication
+  failures send no HTTP request to the server.
+- Live native requests parse the real exact-release metadata, fetch its raw manifest, and
+  return HTTP 404 for the absent archive. The untouched default bundle is used.
+- Actual CLI smoke passes compiler/dependency baselines, explicit/default local targets,
+  `--from`, explicit-version queries, Unicode/newline migrations, missing migrations as null,
+  invalid/duplicate options, reversed/future targets, undeclared origins, and read-only behavior.
+- Generated standard-library reference pages were regenerated from the source comments.
+- Local formatting, lint, and tooling typecheck pass. A full new-head selfhost/fixpoint run is
+  left to CI. No Linux success or readiness is implied by the Darwin results.
+
+The measured borrow-gap update was generated with `check-borrow-gap.mjs update` from the
+successful selected corpus log; unselected programs were retained. Its diff is:
+
+| program | regions | stored-loans |
+| ------- | ------: | -----------: |
+| total   |   9 → 9 |      37 → 37 |
+
+## Reproduce
+
+Obtain the compatible native producer pinned in `compiler/native-seed.json`, verify its hash,
+and use the repository's native build instructions. These paths refer to local artifacts:
+
+```sh
+build/integration/silk-upgrade build compiler/src/main.silk \
+  -o build/integration/silk-https --stdlib stdlib \
+  --clang /path/to/working/clang --optimization speed --debug false
+
+build/integration/silk-https test --manifest-path changes/silk.toml \
+  --root src/tests.silk --no-cache --stdlib stdlib
+
+SILK_COMPILER="$PWD/build/integration/silk-https" SILK_CLANG=/path/to/working/clang \
+  node .github/scripts/test-native-https.mjs --live
+```
+
+The conformance script needs Node, the workspace dependencies, and OpenSSL. It creates an
+isolated test PKI, binds only loopback, compiles the real consumer, verifies rejection before
+application data, and removes its temporary files. `--live` additionally checks GitHub metadata
+and raw content. OpenSSL supplies only test certificates and the reference server's PKI; the
+Silk executable performs all client transport and authentication natively.
+
+On this machine Homebrew Clang's default SDK path was stale for standalone C fixtures. The
+local wrapper used `--no-default-config -isysroot <xcrun --show-sdk-path>`; this is a toolchain
+configuration repair, not a transport fallback.
+
+## Remaining scope and publication requirements
+
+Native DNS still has no overall acquisition deadline. The TLS handshake retains its 30-second
+bound; HTTP exchange has no wall-time bound. Responses remain bounded to 8 MiB. Redirects,
+proxies, authentication, retries and decompression remain outside this adapter.
+
+P-384 support is certificate-path signature verification. It adds no signing, P-384 key agreement,
+or P-384 TLS CertificateVerify negotiation. Existing TLS 1.3 suite and key-share selection remains
+unchanged. Verification does not add revocation, certificate-transparency or OS keychain policy.
+
+Before review readiness, inspect the exact-head Linux conformance and required CI results.
+Public Silk history still needs complete authoritative TOML records committed at a published
+release tag and a stable release for automatic latest-stable discovery. The controlled query
+proves the complete transport workflow without claiming that missing public data exists.
 
 ## Implemented feature contract
 
@@ -80,208 +200,3 @@ Compiler discovery uses `silk-lang/silk`, directory `compiler`.
 
 A dedicated history release asset is not required by this design. Existing source snapshots
 already include the package trees. No publishing workflow was changed in this follow-up.
-
-## Code map
-
-| File                                   | Responsibility                                                                                                             |
-| -------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- |
-| `changes/src/Command.silk`             | Optional selector and `--to` parsing, local/remote dispatch, native provider installation, resolved JSON output.           |
-| `changes/src/Dependency.silk`          | Compiler/dependency baselines, local target bounds, declared remote origins.                                               |
-| `changes/src/History.silk`             | One shared predecessor walk/dedup algorithm through `Source<E, ?R>`; local filesystem wrapper and common archive decoding. |
-| `changes/src/GitHub.silk`              | Release metadata, safe URL construction, tag-pinned remote TOML reader.                                                    |
-| `changes/src/Http.silk`                | Replaceable HTTP service returning owned status/body data.                                                                 |
-| `changes/src/HttpNative.silk`          | Current native HTTPS adapter and PEM trust selection; the integration blocker is here or in its stdlib dependencies.       |
-| `changes/src/tests/GitHubCases.silk`   | Discovery/protocol/history boundaries using a replacement HTTP provider, not live TLS proof.                               |
-| `changes/src/tests/WorkflowCases.silk` | Real release lifecycle, compiler baseline, explicit target, override, and failure scenarios.                               |
-
-Native transport uses `http_client_native.withConnection`, `NativeTransport`, request/exchange
-callbacks, native DNS/sockets, host clocks/random, and `NativeFileTrustSource`. It performs no
-external-tool invocation. Responses are bounded to 8 MiB; HTTP statuses are returned as values.
-The native DNS API rejects an overall deadline for hostname resolution, so acquisition has no
-overall deadline. TLS retains its 30-second handshake bound; HTTP exchange has no wall-time
-bound. Redirects, proxy discovery, authentication, retries, and decompression are not implemented.
-
-## Observed failures: two distinct layers
-
-Observed on macOS arm64, 2026-10-18. `SSL_CERT_FILE` was unset for the first case.
-
-### 1. The default macOS bundle fails to load
-
-```sh
-build/integration/silk-upgrade changes --dir compiler since \
-  --from 0.0.0 --to 0.1.0-dev.8624+5081812 --json
-```
-
-Observed exit status **1**:
-
-```text
-silk changes: Could not load the PEM trust bundle; set SSL_CERT_FILE to a readable regular PEM bundle of trusted authorities.
-```
-
-The selected file is `/etc/ssl/cert.pem`. It contains comments and human-readable certificate
-annotations outside its 128 `BEGIN CERTIFICATE` / `END CERTIFICATE` blocks. Its first line is:
-
-```text
-# $OpenBSD: cert.pem,v 1.22.2.1 2021/09/30 18:28:20 deraadt Exp $
-```
-
-`NativeFileTrustSource.loadCurrent` passes the entire file to `TrustSnapshot.fromPem`, which
-uses the strict `CertificateBundle.decodePem` decoder. The default path is a regular file;
-`/etc` itself is a macOS symlink. The adapter already separates the trusted native parent root
-from the portable filename to avoid traversing `/etc` with the portable no-follow policy.
-
-### 2. Plain PEM gets past loading but still fails TLS
-
-Extracting the same certificate blocks, without adding an authority or disabling verification,
-gets past the first error. The following reproduces the diagnostic experiment from the repo root:
-
-```sh
-python3 - <<'PY'
-import os
-from pathlib import Path
-import re
-import subprocess
-import tempfile
-
-compiler = Path("build/integration/silk-upgrade").resolve()
-source = Path("/etc/ssl/cert.pem").read_text()
-certificates = re.findall(
-    r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", source, re.S
-)
-with tempfile.TemporaryDirectory(prefix="silk-tls-probe-", dir="/private/tmp") as directory:
-    bundle = Path(directory) / "authorities.pem"
-    bundle.write_text("\n".join(certificates) + "\n")
-    result = subprocess.run(
-        [str(compiler), "changes", "--dir", "compiler", "since", "--from", "0.0.0",
-         "--to", "0.1.0-dev.8624+5081812", "--json"],
-        env={**os.environ, "SSL_CERT_FILE": str(bundle)},
-        timeout=60,
-    )
-    print("exit:", result.returncode)
-PY
-```
-
-Observed exit status **1**:
-
-```text
-silk changes: TLS authentication or communication failed; certificate and hostname verification are required.
-```
-
-This normalization is a diagnostic experiment, **not an implemented production fix**.
-`HttpNative` currently collapses nested `ConnectionError` details into that message, so the
-exact second failure has not yet been isolated.
-
-### Independently observed peer certificate profile
-
-This reference-client command succeeded with certificate and hostname verification enabled:
-
-```sh
-openssl s_client -connect api.github.com:443 -servername api.github.com \
-  -showcerts -verify_hostname api.github.com -verify_return_error </dev/null
-```
-
-The returned chain included:
-
-| Certificate                                                                  | Public key | Certificate signature |
-| ---------------------------------------------------------------------------- | ---------- | --------------------- |
-| `*.github.com`                                                               | P-256      | ECDSA/SHA-256         |
-| Sectigo Public Server Authentication CA DV E36                               | P-256      | ECDSA/SHA-384         |
-| Sectigo Public Server Authentication Root E46, cross-signed by USERTrust ECC | P-384      | ECDSA/SHA-384         |
-
-`certificate_profile.silk` currently admits P-256 and 2048–4096-bit RSA keys.
-**[INFERENCE]** Unsupported P-384/ECDSA-SHA-384 path processing is a strong candidate for the
-second failure. It is not yet established as the exact nested TLS error or the only remaining
-issue. Server chain selection may also differ between the reference client and Silk's ClientHello.
-
-## Next investigation and fix
-
-1. Keep the two reproductions separate. Inspect the nested `ConnectionError.Tls` / `TlsError`
-   before changing certificate policy. In particular, preserve `CertificatePath`'s
-   `ValidationError.reason`, `detailReason`, and `location`; distinguish it from peer alerts,
-   unsupported negotiation, timeout, or other handshake failures.
-2. Decide the proper owner for importing annotated platform CA bundles. Preserve strict PEM
-   decoding where that is its documented contract. Do not simply skip malformed certificates
-   or weaken verification to make the system file load.
-3. Diagnose and fix the actual TLS/path compatibility gap. If elliptic-curve/signature support
-   must expand, use independent known-answer and rejection tests, not only a successful live
-   handshake. Keep trust anchored in configured authorities; do not pin a fetched intermediate
-   as an ad-hoc workaround.
-4. Exercise both `api.github.com` and `raw.githubusercontent.com`; their certificate chains can
-   differ. Keep ordinary HTTP failures distinct from TLS failures.
-5. Add deterministic tests at the owning stdlib boundary. Existing prerecorded/in-memory HTTP
-   and TLS corpus fixtures demonstrate composition, not live GitHub compatibility.
-6. Finish the live transport checks below, update the handoff/PR with exact results, and only then
-   consider marking the PR ready.
-
-Useful stdlib starting points:
-
-- `stdlib/silk/native_file_trust_source.silk`: configured open, bounded read, close, strict decode.
-- `stdlib/silk/trust_snapshot.silk`: `fromPem` and owned anchors.
-- `stdlib/silk/certificate.silk`: certificate bundle decoding APIs.
-- `stdlib/silk/http_client_native.silk`: native acquisition and connection cleanup.
-- `stdlib/silk/tls_connection.silk`: scoped authentication and `ConnectionError`.
-- `stdlib/silk/tls_client.silk`: advertised profile, handshake, `TlsError`.
-- `stdlib/silk/certificate_profile.silk`: key/signature/extension admission.
-- `stdlib/silk/certificate_path.silk`: bounded path selection and structured rejection evidence.
-- `corpus/native/http-client-tls/main.silk`: existing prerecorded authenticated exchange.
-
-## Verification already completed
-
-- Native compiler build with the new HTTP stack passed: 29,015 symbols, zero unchecked
-  root-package bodies; eight unchecked bodies across the complete closure were reported.
-- All **36** changes-library tests passed, 36 selected and executed, in 183 ms runtime. The test
-  build reported one unchecked root-package body, as before this feature.
-- Actual CLI smoke against generated release histories passed: compiler default baseline,
-  compiler/dependency `--to`, compiler `--from`, preserved explicit-version queries, exact
-  migration text including Unicode/newlines, duplicate/missing options, reversed/future targets,
-  and refusal of undeclared dependency origins.
-- Queries left project/compiler manifests unchanged and did not create pending state.
-- The old compiler rejected the new compiler-default/`--to` workflow; the new binary returned
-  the expected bounded release records for the same fixture.
-- Live default-bundle and normalized-bundle probes failed exactly as recorded above.
-- No successful live native HTTPS query, Linux transport check, full new-head selfhost run, or
-  end-to-end remote upgrade-history success is claimed.
-
-Build and test commands used from the repository root:
-
-```sh
-build/llvm/aarch64-apple-darwin/release/silk-compiler build compiler/src/main.silk \
-  -o build/integration/silk-upgrade --stdlib stdlib \
-  --clang /opt/homebrew/opt/llvm/bin/clang --optimization speed --debug false
-
-build/llvm/aarch64-apple-darwin/release/silk-compiler test \
-  --manifest-path changes/silk.toml --root src/tests.silk --no-cache --stdlib stdlib
-```
-
-Those producer/output paths are local build artifacts, not committed binaries. Another machine
-must obtain a compatible native producer using the repository's normal seed/build instructions.
-Temporary smoke fixtures and normalized certificate files are not required; recreate them from
-this handoff rather than depending on paths from the previous session.
-
-## Publication prerequisites separate from HTTPS
-
-Even after TLS succeeds, missing release history must remain an explicit error:
-
-- No `compiler/.changes/releases/` directory exists in the inspected checkout. Do not fabricate
-  historical migration notes or convert GitHub release prose into authoritative TOML.
-- The inspected publishing workflows generate development prereleases. Automatic lookup is
-  deliberately latest **stable**, not the installer's newest-development-build policy. Live
-  stable-release availability has not been established by these failed native requests.
-- Current compiler `release()` still returns the literal `0.1.0`; development release tags use
-  a separate generated version. Do not infer an exact dev build from `package.silk-version`.
-- Existing tags may have no structured history. A successful HTTPS 404 for a required archive is
-  a correct incomplete-history failure, not evidence that the transport is still broken.
-
-## Acceptance before ready-for-review
-
-- Authenticated native GETs reach GitHub metadata and raw content on supported Darwin/Linux
-  profiles using the documented trust configuration, without bypasses or an unapproved fallback.
-- Supported platform PEM bundles and explicit `SSL_CERT_FILE` configurations work; malformed
-  trust input, an untrusted issuer, wrong hostname, and invalid/expired certificates still fail.
-- The actual nested TLS blocker has a focused regression test at its owning boundary.
-- Real metadata is parsed and unavailable releases/records produce the intended typed failures.
-- A complete controlled history query proves metadata selection, record fetching, and migration
-  filtering through the real transport; if public Silk history is still unavailable, document
-  that data prerequisite explicitly rather than claiming full live production success.
-- All 36 library cases and local CLI upgrade scenarios remain valid. Follow `AGENTS.md` for final
-  main integration, CI checks, and any measured borrow-gap updates; never hand-edit the gap file.

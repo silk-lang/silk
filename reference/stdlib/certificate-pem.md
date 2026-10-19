@@ -61,6 +61,22 @@ Internal strict certificate PEM operations.
 impl Pem
 ```
 
+<a id="impl.skipAnnotations"></a>
+
+### Associated function `skipAnnotations`
+
+```silk
+pub fn skipAnnotations(input: &[u8], offset: usize) -> usize
+```
+
+Skips printable annotation lines outside blocks, retaining suspect boundary bytes for rejection.
+
+#### Details
+
+ASCII text and whitespace are annotations only between complete blocks. A line containing
+a hyphen boundary, BEGIN or END is always sent to the strict block decoder, even when
+malformed or indented. Non-text control bytes are never discarded.
+
 <a id="impl.skipWhitespace"></a>
 
 ### Associated function `skipWhitespace`

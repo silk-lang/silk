@@ -444,6 +444,27 @@ decoding. Decoder failures retain their structured locations. Allocation refusal
 Empty or whitespace-only PEM is invalid. Import assigns explicit authority but does not
 authenticate a path or reproduce OS trust policy.
 
+<a id="impl.fromAnnotatedPem"></a>
+
+### Associated function `fromAnnotatedPem`
+
+```silk
+pub effect fn fromAnnotatedPem(input: &[u8], limits: TrustLoadLimits) -> Result<TrustSnapshot, TrustSourceError>
+  ! OutOfMemoryError ? &mut Allocator
+```
+
+Imports configured platform authorities from an annotated certificate PEM document.
+
+#### Details
+
+Uses [`CertificateBundle.decodeAnnotatedPem`](./certificate-bundle.md#impl.decodeAnnotatedPem), retaining all certificates, duplicates, limits,
+and rejection locations. Malformed certificates fail atomically; none are skipped.
+
+#### Gotchas
+
+Call only with explicitly trusted configuration, never peer-supplied authority. This does
+not import keychain settings or validate a certificate path. [`fromPem`](#impl.fromPem) remains strict.
+
 <a id="impl.anchors"></a>
 
 ### Method `anchors`
