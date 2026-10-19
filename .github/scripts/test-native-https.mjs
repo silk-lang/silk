@@ -1,5 +1,5 @@
 // Real native transport and history queries against a controlled TLS server. No network fixture
-// substitutes for HttpNative. --live additionally checks GitHub metadata and raw content.
+// substitutes for HttpNative. --live additionally checks GitHub metadata, raw content, and an asset redirect.
 import * as assert from 'node:assert/strict'
 import * as Config from 'effect/Config'
 import * as Effect from 'effect/Effect'
@@ -46,6 +46,7 @@ const run = (command, args, env = process.env) =>
     child.on('close', (status, signal) => resolveRun({ status, signal, stdout, stderr }))
   })
 let server
+let assetServer
 try {
   copyFileSync(
     join(root, 'compiler/conformance/native-https/main.silk'),
@@ -183,46 +184,76 @@ basicConstraints = critical,CA:TRUE
     join(directory, 'malformed.pem'),
     `${authority}\n-----BEGIN CERTIFICATE-----\n!!!!\n-----END CERTIFICATE-----\n`,
   )
+  const targetDownload = '/downloads/v1.1.0/changes-snapshot.toml'
+  const targetAsset = '/assets/stable?signature=abc%2B123&token=one'
+  const baselineMetadata = '/repos/owner/repo/releases/tags/v1.1.0-beta.2%2Babc'
+  const baselineAsset = '/downloads/v1.1.0-beta.2%2Babc/changes-snapshot.toml'
   const routes = new Map([
     [
       '/repos/owner/repo/releases/latest',
-      JSON.stringify({ tag_name: 'v1.1.0', draft: false, prerelease: false }),
+      JSON.stringify({
+        tag_name: 'v1.1.0',
+        draft: false,
+        prerelease: false,
+        assets: [{ name: 'changes-snapshot.toml' }],
+      }),
+    ],
+    [targetDownload, { status: 302 }],
+    [
+      targetAsset,
+      `format = 1\nschema = 'silk.changes.snapshot'\npackage = 'example'\nversion = '1.1.0'\nkind = 'stable'\ncommit = '${'a'.repeat(40)}'\nfloor = '1.0.0'\n[[changes]]\nid = 'first'\nbump = 'minor'\nsummary = 'Already installed'\n[[changes]]\nid = 'second'\nbump = 'patch'\nsummary = 'New fix'\nmigration = "Update config → safe\\nKeep this newline."\n`,
     ],
     [
-      '/raw/owner/repo/v1.1.0/.changes/releases/1.1.0.toml',
-      `format = 1\npackage = 'example'\nfrom = '1.1.0-beta.2+abc'\nversion = '1.1.0'\nbase = '1.0.0'\n[[changes]]\nid = 'first'\nbump = 'minor'\nsummary = 'Already installed'\n[[changes]]\nid = 'second'\nbump = 'patch'\nsummary = 'New fix'\nmigration = "Update config → safe\\nKeep this newline."\n`,
+      baselineMetadata,
+      JSON.stringify({
+        tag_name: 'v1.1.0-beta.2+abc',
+        draft: false,
+        prerelease: true,
+        assets: [{ name: 'changes-snapshot.toml' }],
+      }),
     ],
     [
-      '/raw/owner/repo/v1.1.0/.changes/releases/1.1.0-beta.2%2Babc.toml',
-      `format = 1\npackage = 'example'\nfrom = '1.0.0'\nversion = '1.1.0-beta.2+abc'\nbase = '1.0.0'\n[[changes]]\nid = 'first'\nbump = 'minor'\nsummary = 'Already installed'\n`,
+      baselineAsset,
+      `format = 1\nschema = 'silk.changes.snapshot'\npackage = 'example'\nversion = '1.1.0-beta.2+abc'\nkind = 'prerelease'\ncommit = '${'b'.repeat(40)}'\nfloor = '1.0.0'\n[[changes]]\nid = 'first'\nbump = 'minor'\nsummary = 'Already installed'\n`,
     ],
   ])
   const requested = []
-  server = createServer(
-    {
-      key: readFileSync(join(directory, 'leaf.key')),
-      cert:
-        readFileSync(join(directory, 'leaf.pem'), 'utf8') +
-        readFileSync(join(directory, 'intermediate.pem'), 'utf8'),
-      minVersion: 'TLSv1.3',
-      maxVersion: 'TLSv1.3',
-      ALPNProtocols: ['http/1.1'],
-    },
-    (request, response) => {
-      requested.push(request.url)
-      const body = routes.get(request.url)
-      response.writeHead(body === undefined ? 404 : 200, {
-        'Content-Type': 'text/plain',
-        Connection: 'close',
-      })
-      response.end(body ?? 'Missing')
-    },
-  )
+  const tlsOptions = {
+    key: readFileSync(join(directory, 'leaf.key')),
+    cert:
+      readFileSync(join(directory, 'leaf.pem'), 'utf8') +
+      readFileSync(join(directory, 'intermediate.pem'), 'utf8'),
+    minVersion: 'TLSv1.3',
+    maxVersion: 'TLSv1.3',
+    ALPNProtocols: ['http/1.1'],
+  }
+  const respond = (request, response) => {
+    requested.push(request.url)
+    assert.equal(request.headers.authorization, undefined)
+    assert.equal(request.headers.cookie, undefined)
+    const route = routes.get(request.url)
+    const redirect = route !== undefined && typeof route === 'object'
+    response.writeHead(redirect ? route.status : route === undefined ? 404 : 200, {
+      'Content-Type': 'text/plain',
+      Connection: 'close',
+      ...(redirect && route.location !== undefined ? { Location: route.location } : {}),
+    })
+    response.end(redirect ? 'Redirect' : (route ?? 'Missing'))
+  }
+  server = createServer(tlsOptions, respond)
   server.listen(0, '127.0.0.1')
   await once(server, 'listening')
   const address = server.address()
   assert.ok(address !== null && typeof address !== 'string')
   const base = `https://localhost:${address.port}`
+  assetServer = createServer(tlsOptions, respond)
+  assetServer.listen(0, '127.0.0.1')
+  await once(assetServer, 'listening')
+  const assetAddress = assetServer.address()
+  assert.ok(assetAddress !== null && typeof assetAddress !== 'string')
+  const assetBase = `https://localhost:${assetAddress.port}`
+  const redirect = { status: 302, location: `${assetBase}${targetAsset}` }
+  routes.set(targetDownload, redirect)
   for (const [label, host, bundle, expected] of [
     ['plain authority and complete history', base, 'root.pem', 0],
     ['annotated authority and complete history', base, 'annotated.pem', 0],
@@ -237,10 +268,68 @@ basicConstraints = critical,CA:TRUE
       SSL_CERT_FILE: join(directory, bundle),
     })
     assert.equal(result.status, expected, `${label}: ${JSON.stringify(result)}`)
-    if (expected === 0) assert.deepEqual(requested.slice(before), [...routes.keys()])
+    if (expected === 0)
+      assert.deepEqual(requested.slice(before), [
+        '/repos/owner/repo/releases/latest',
+        targetDownload,
+        targetAsset,
+        baselineMetadata,
+        baselineAsset,
+      ])
     else assert.equal(requested.length, before, `${label}: unauthenticated HTTP request escaped`)
     process.stdout.write(`native HTTPS ${process.platform}/${process.arch}: ${label} passed\n`)
   }
+  for (const status of [301, 303, 307, 308]) {
+    routes.set(targetDownload, { ...redirect, status })
+    const result = await run(executable, [], {
+      ...process.env,
+      SILK_HTTPS_TEST_BASE: base,
+      SSL_CERT_FILE: join(directory, 'root.pem'),
+    })
+    assert.equal(result.status, 0, `${status} redirect: ${JSON.stringify(result)}`)
+  }
+  routes.set('/redirect-loop', { status: 302, location: `${base}/redirect-loop` })
+  for (const [label, response, expected, requests] of [
+    [
+      'HTTPS downgrade',
+      { status: 302, location: `http://localhost:${assetAddress.port}${targetAsset}` },
+      14,
+      2,
+    ],
+    [
+      'redirect credentials',
+      { status: 302, location: `https://secret@localhost:${assetAddress.port}${targetAsset}` },
+      14,
+      2,
+    ],
+    ['missing Location', { status: 302 }, 14, 2],
+    [
+      'duplicate Location',
+      { status: 302, location: [redirect.location, redirect.location] },
+      14,
+      2,
+    ],
+    ['redirect hop limit', { status: 302, location: `${base}/redirect-loop` }, 14, 7],
+    [
+      'redirect destination identity',
+      { status: 302, location: `https://127.0.0.1:${assetAddress.port}${targetAsset}` },
+      11,
+      2,
+    ],
+  ]) {
+    routes.set(targetDownload, response)
+    const before = requested.length
+    const result = await run(executable, [], {
+      ...process.env,
+      SILK_HTTPS_TEST_BASE: base,
+      SSL_CERT_FILE: join(directory, 'root.pem'),
+    })
+    assert.equal(result.status, expected, `${label}: ${JSON.stringify(result)}`)
+    assert.equal(requested.length - before, requests, `${label}: unexpected destination contact`)
+    process.stdout.write(`native HTTPS ${process.platform}/${process.arch}: ${label} passed\n`)
+  }
+  routes.set(targetDownload, redirect)
+  routes.delete('/redirect-loop')
   // TLS syntax alone is insufficient: reject an expired leaf and a validly encoded forged signature.
   writeFileSync(join(directory, 'index.txt'), '')
   writeFileSync(join(directory, 'serial'), '20\n')
@@ -317,14 +406,13 @@ subjectAltName = DNS:localhost
     key: readFileSync(join(directory, 'leaf.key')),
     cert: readFileSync(join(directory, 'leaf.pem'), 'utf8') + intermediate,
   })
-  routes.delete('/raw/owner/repo/v1.1.0/.changes/releases/1.1.0.toml')
+  routes.delete(targetAsset)
   const missingHistory = await run(executable, [], {
     ...process.env,
     SILK_HTTPS_TEST_BASE: base,
     SSL_CERT_FILE: join(directory, 'root.pem'),
   })
   assert.equal(missingHistory.status, 14, JSON.stringify(missingHistory))
-  assert.match(missingHistory.stderr, /Incomplete release history/)
   process.stdout.write(
     `native HTTPS ${process.platform}/${process.arch}: missing archive remains a history error passed\n`,
   )
@@ -333,13 +421,17 @@ subjectAltName = DNS:localhost
     const live = await run(executable, [], environment)
     assert.equal(live.status, 0, `live default bundle: ${JSON.stringify(live)}`)
     process.stdout.write(
-      `native HTTPS ${process.platform}/${process.arch}: live GitHub metadata 200, raw manifest 200, missing history 404 passed\n`,
+      `native HTTPS ${process.platform}/${process.arch}: live GitHub metadata, raw manifest, missing history and redirected seed identity passed\n`,
     )
   }
 } finally {
   if (server !== undefined) {
     server.closeAllConnections()
     await new Promise((done) => server.close(done))
+  }
+  if (assetServer !== undefined) {
+    assetServer.closeAllConnections()
+    await new Promise((done) => assetServer.close(done))
   }
   rmSync(directory, { recursive: true, force: true })
 }

@@ -7,29 +7,54 @@ on:
   pull_request:
     branches:
       - main
-  # Runs the whole workflow on a branch, including the macOS leg, for changes to target or ABI code.
-  # On `main` with `publish` set, a green run also publishes its compilers as a release.
+  schedule:
+    - cron: '0 6 * * *'
+  # Explicit stable recovery still requires an exact managed release PR merge.
   workflow_dispatch:
     inputs:
-      publish:
-        description: Publish this run's compilers as a v<version> release (main only)
-        type: boolean
-        default: false
+      release:
+        description: Verify only, publish a dev, or recover the stable merge on main
+        type: choice
+        options: [none, dev, stable]
+        default: none
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  # A newer run of a branch supersedes the old one, whether it comes from a pull_request event or a
-  # manual dispatch of that branch, so a dispatch replaces the automatic PR run instead of running
-  # beside it. Every main push gets its own group, so no merge's run is replaced while it waits;
-  # a push whose tree a green PR or dispatch run already tested reuses it.
-  # A fork's pull request is grouped by its number: its branch name is not unique in this repository.
-  group: selfhost-${{ github.event_name == 'push' && github.sha || github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository && format('pr-{0}', github.event.pull_request.number) || github.head_ref || github.ref_name }}
-  cancel-in-progress: ${{ github.event_name != 'push' }}
+  # All main gates/publications share one lock. Reservations are durable before builds;
+  # a queued run never cancels a publishing run. Branch verification stays independent.
+  group: ${{ github.ref == 'refs/heads/main' && 'compiler-publication' || format('selfhost-{0}', github.event.pull_request.number || github.ref_name) }}
+  queue: max
+  cancel-in-progress: false
 
 jobs:
+  release-plan:
+    name: Reserve immutable compiler publication
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      counter: ${{ steps.plan.outputs.counter }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ github.event_name == 'schedule' && 'dev' || inputs.release || 'none' }}
+          EVENT: ${{ github.event_name }}
+        run: node compiler/scripts/CompilerRelease.mjs plan "$GITHUB_SHA" "$MODE" "$EVENT"
+
   # A main merge usually has exactly the tree its PR's last green run tested (the coordinator
   # merges main into a PR and gets it green right before merging). A push or dispatch on a merge
   # commit whose full tree equals the tree a fully green pull_request or workflow_dispatch run of its
@@ -39,6 +64,8 @@ jobs:
   # unverifiable artifact, runs the full gate.
   reuse:
     name: Reuse a green PR run of the same tree
+    needs: release-plan
+    if: ${{ !cancelled() && (needs.release-plan.result == 'success' || needs.release-plan.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -54,6 +81,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT: ${{ github.event_name }}
+          RELEASE_MODE: ${{ needs.release-plan.outputs.mode }}
         run: |
           set -euo pipefail
           tree=$(git rev-parse 'HEAD^{tree}')
@@ -62,6 +90,8 @@ jobs:
             printf "### Full gate\n%s\n\nTree \`%s\`.\n" "$1" "$tree" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           }
+          # Release snapshots name the exact publishing commit, never a reused PR head.
+          [ "$RELEASE_MODE" != none ] && [ -n "$RELEASE_MODE" ] && full 'Publication requires exact-commit projected inputs.'
           [ "$EVENT" = pull_request ] && full 'Pull request runs always run the full gate.'
           head=$(git rev-parse --verify --quiet 'HEAD^2') || full 'HEAD is not a merge commit.'
           runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/selfhost.yml/runs?head_sha=$head&per_page=40" \
@@ -72,6 +102,8 @@ jobs:
             gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selfhost-tested-tree --dir "$dir/tree" 2> /dev/null || continue
             [ "$(cat "$dir/tree/tree")" = "$tree" ] || continue
             gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selfhost-native-candidate --dir "$dir/candidate" 2> /dev/null || continue
+            gh run download "$id" --repo "$GITHUB_REPOSITORY" --name selfhost-build-inputs --dir "$dir/inputs" 2> /dev/null || continue
+            jq -e '.projection == null' "$dir/inputs/input-snapshot.json" > /dev/null || continue
             cd "$dir/candidate"
             sha=$(sha256sum silk-compiler-x86_64-unknown-linux-gnu | cut -d' ' -f1)
             if [ "$sha" = "$(jq -er '.seeds["x86_64-unknown-linux-gnu"].sha256' native-seed.json)" ] && [ "$sha" = "$(jq -er .output.sha256 chain-receipt.json)" ] \
@@ -93,8 +125,8 @@ jobs:
   # The pinned seed builds N1 from the exact committed inputs.
   native-n1:
     name: Native N1 from pinned seed
-    needs: reuse
-    if: needs.reuse.outputs.reused != 'true'
+    needs: [reuse, release-plan]
+    if: ${{ !cancelled() && needs.reuse.result == 'success' && needs.reuse.outputs.reused != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     outputs:
@@ -135,6 +167,39 @@ jobs:
           echo "SEED_SHA256=${{ steps.pin.outputs.sha256 }}" >> "$GITHUB_ENV"
       - name: Check type construction goes through Types
         run: node compiler/scripts/TypeConstructionCheck.mjs
+      - name: Build a planning compiler and project native release metadata
+        if: needs.release-plan.outputs.mode == 'dev' || needs.release-plan.outputs.mode == 'stable'
+        env:
+          RELEASE_MODE: ${{ needs.release-plan.outputs.mode }}
+          DEV_COUNTER: ${{ needs.release-plan.outputs.counter }}
+        run: |
+          set -euo pipefail
+          node compiler/scripts/NativeBuild.ts --producer "$SEED" --producer-sha256 "$SEED_SHA256" \
+            --producer-generation seed --generation N1 --clang "$SILK_TEST_CLANG" \
+            --snapshot "$RUNNER_TEMP/authored-inputs" --output "$RUNNER_TEMP/planning" \
+            --corpus-source "$GITHUB_WORKSPACE/corpus/native/trivial-features/main.silk"
+          args=()
+          if [ "$RELEASE_MODE" = dev ]; then args=(--dev "$DEV_COUNTER"); fi
+          "$RUNNER_TEMP/planning/N1" changes --dir "$RUNNER_TEMP/authored-inputs/compiler" \
+            snapshot --commit "$GITHUB_SHA" "${args[@]}" --json > "$RUNNER_TEMP/compiler-release.json"
+          mv "$RUNNER_TEMP/authored-inputs" "$RUNNER_TEMP/base-inputs"
+          node compiler/scripts/SourceSnapshot.mjs project "$RUNNER_TEMP/base-inputs" \
+            "$RUNNER_TEMP/compiler-release.json" "$RUNNER_TEMP/authored-inputs"
+      - name: Stage the flat immutable-input artifact
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/build-inputs"
+          cp "$RUNNER_TEMP/authored-inputs/input-snapshot.json" "$RUNNER_TEMP/authored-inputs/authored-inputs.tar" "$RUNNER_TEMP/build-inputs/"
+          if [ -f "$RUNNER_TEMP/compiler-release.json" ]; then
+            cp "$RUNNER_TEMP/compiler-release.json" "$RUNNER_TEMP/build-inputs/"
+          fi
+      - name: Share exact immutable build inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: selfhost-build-inputs
+          path: ${{ runner.temp }}/build-inputs/
+          if-no-files-found: error
+          retention-days: 7
       - name: Build N1 with the seed and smoke it
         id: n1
         run: |
@@ -149,6 +214,12 @@ jobs:
             exit 1
           fi
           echo "sha256=$(jq -er .output.sha256 "$RUNNER_TEMP/n1/build-receipt.json")" >> "$GITHUB_OUTPUT"
+      - name: Check the compiler's generated version against its manifest
+        run: node compiler/scripts/CompilerRelease.mjs verify-build "$RUNNER_TEMP/n1/N1" "$RUNNER_TEMP/authored-inputs"
+      - name: Test changes versioning, publication, and recovery with N1
+        env:
+          SILK_CLANG: ${{ env.SILK_TEST_CLANG }}
+        run: '"$RUNNER_TEMP/n1/N1" test --manifest-path changes/silk.toml --root src/tests.silk --no-cache --stdlib stdlib'
       - name: Verify native HTTPS trust and upgrade history
         run: SILK_COMPILER="$RUNNER_TEMP/n1/N1" SILK_CLANG="$SILK_TEST_CLANG" node .github/scripts/test-native-https.mjs --live
       - name: Check the native build CLI and artifact forms with N1
@@ -188,12 +259,12 @@ jobs:
   native-fixpoint:
     name: Native seed chain (N2 fixpoint)
     needs: native-n1
+    if: ${{ !cancelled() && needs.native-n1.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
-          # The release version counts commits since the last release.
           fetch-depth: 0
       - uses: pnpm/action-setup@v6
       - uses: actions/setup-node@v6
@@ -208,8 +279,12 @@ jobs:
         with:
           name: selfhost-native-n1
           path: ${{ runner.temp }}/n1-download
-      - name: Export exact committed authored inputs
-        run: node compiler/scripts/SourceSnapshot.mjs create "$RUNNER_TEMP/authored-inputs" HEAD
+      - uses: actions/download-artifact@v4
+        with:
+          name: selfhost-build-inputs
+          path: ${{ runner.temp }}/build-inputs
+      - name: Restore exact N1 build inputs
+        run: node compiler/scripts/SourceSnapshot.mjs restore "$RUNNER_TEMP/build-inputs" "$RUNNER_TEMP/authored-inputs"
       - name: Build N2 with N1, compare their compiler IR, and smoke N2
         env:
           N1_SHA256: ${{ needs.native-n1.outputs.sha256 }}
@@ -225,25 +300,34 @@ jobs:
             exit 1
           fi
           jq '{output, fixpoint, stages: [.stages[] | {name, wallTimeMs, peakRss: .peakRss.value}]}' "$RUNNER_TEMP/n2/build-receipt.json"
+          node compiler/scripts/CompilerRelease.mjs verify-build "$RUNNER_TEMP/n2/N2" "$RUNNER_TEMP/authored-inputs"
+          version=$("$RUNNER_TEMP/n2/N2" --version)
+          version=${version#silk v}
+          echo "VERSION=$version" >> "$GITHUB_ENV"
           mkdir "$RUNNER_TEMP/candidate"
           cp "$RUNNER_TEMP/n2/N2" "$RUNNER_TEMP/candidate/silk-compiler-x86_64-unknown-linux-gnu"
           cp "$RUNNER_TEMP/n2/build-receipt.json" "$RUNNER_TEMP/candidate/chain-receipt.json"
           cp "$RUNNER_TEMP/authored-inputs/input-snapshot.json" "$RUNNER_TEMP/authored-inputs/authored-inputs.tar" "$RUNNER_TEMP/candidate/"
           node compiler/scripts/NativeSeed.mjs candidate "$RUNNER_TEMP/n2/build-receipt.json" "$GITHUB_RUN_ID" \
-            "v$(node compiler/scripts/NativeSeed.mjs version HEAD)" > "$RUNNER_TEMP/candidate/native-seed.json"
+            "v$version" > "$RUNNER_TEMP/candidate/native-seed.json"
       # The release layout: an installed `silk` finds `lib/silk/stdlib`, the clang on PATH and, on
       # macOS, its SDK through xcrun discovery by itself.
       - name: Package the release archive and run a new project from it
         run: |
           set -euo pipefail
           mkdir "$RUNNER_TEMP/release" "$RUNNER_TEMP/installed"
-          archive=$(node compiler/scripts/ReleaseArchive.ts --compiler "$RUNNER_TEMP/n2/N2" \
-            --stdlib "$RUNNER_TEMP/authored-inputs/stdlib" --target "x86_64-unknown-linux-gnu" --output "$RUNNER_TEMP/release")
+          args=(--compiler "$RUNNER_TEMP/n2/N2" --stdlib "$RUNNER_TEMP/authored-inputs/stdlib"
+            --target "x86_64-unknown-linux-gnu" --version "$VERSION" --output "$RUNNER_TEMP/release")
+          if [ -f "$RUNNER_TEMP/authored-inputs/compiler/changes-snapshot.toml" ]; then
+            args+=(--snapshot "$RUNNER_TEMP/authored-inputs/compiler/changes-snapshot.toml")
+          fi
+          archive=$(node compiler/scripts/ReleaseArchive.ts "${args[@]}")
           tar -xzf "$archive" -C "$RUNNER_TEMP/installed"
           silk=$(echo "$RUNNER_TEMP"/installed/silk-*/bin/silk)
-          "$silk" --version
+          test "$("$silk" --version)" = "silk v$VERSION"
           cd "$RUNNER_TEMP/installed"
           env -u SILK_CLANG -u SDKROOT "$silk" init hello
+          grep -Fx "silk-version = \"$VERSION\"" hello/silk.toml
           # `run` reports the build on standard output before the program's own output.
           output=$(cd hello && env -u SILK_CLANG -u SDKROOT "$silk" run)
           printf '%s\n' "$output" | head -n 1 | grep -q '^Compiled src/main.silk -> '
@@ -286,6 +370,7 @@ jobs:
   corpus:
     name: Selfhost native corpus
     needs: native-n1
+    if: ${{ !cancelled() && needs.native-n1.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -385,6 +470,7 @@ jobs:
   repository-coverage:
     name: Native repository program coverage
     needs: native-n1
+    if: ${{ !cancelled() && needs.native-n1.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -428,6 +514,7 @@ jobs:
   stdlib-root:
     name: Standard library as root
     needs: native-n1
+    if: ${{ !cancelled() && needs.native-n1.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
@@ -471,6 +558,7 @@ jobs:
   native-cases:
     name: Native selfhost cases (${{ matrix.shard }})
     needs: native-n1
+    if: ${{ !cancelled() && needs.native-n1.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -596,9 +684,27 @@ jobs:
           path: ${{ runner.temp }}/n1-download
           run-id: ${{ needs.reuse.outputs.run-id }}
           github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v4
+        if: needs.target-plan.outputs[matrix.pinned-output] != 'true'
+        with:
+          name: selfhost-build-inputs
+          path: ${{ runner.temp }}/build-inputs
+          run-id: ${{ needs.reuse.outputs.run-id || github.run_id }}
+          github-token: ${{ github.token }}
+      - uses: pnpm/action-setup@v6
+        if: needs.target-plan.outputs[matrix.pinned-output] != 'true'
+      - uses: actions/setup-node@v6
+        if: needs.target-plan.outputs[matrix.pinned-output] != 'true'
+        with:
+          node-version: 24
+          cache: pnpm
+      - if: needs.target-plan.outputs[matrix.pinned-output] != 'true'
+        run: |
+          pnpm install --frozen-lockfile
+          node compiler/scripts/SourceSnapshot.mjs restore "$RUNNER_TEMP/build-inputs" "$RUNNER_TEMP/authored-inputs"
       - name: Cross-emit the compiler with verified Linux N1
         if: needs.target-plan.outputs[matrix.pinned-output] != 'true'
-        working-directory: compiler
+        working-directory: ${{ runner.temp }}/authored-inputs/compiler
         env:
           N1_SHA256: ${{ needs.native-n1.outputs.sha256 || needs.reuse.outputs.n1-sha256 }}
           TARGET: ${{ matrix.target }}
@@ -622,7 +728,7 @@ jobs:
   native-targets:
     name: Native chain and corpus / ${{ matrix.target }}
     if: ${{ !cancelled() && needs.target-ir.result == 'success' }}
-    needs: [target-plan, target-ir]
+    needs: [reuse, target-plan, target-ir]
     strategy:
       fail-fast: false
       matrix:
@@ -649,8 +755,14 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile
       - uses: ./.github/actions/setup-native-llvm
-      - name: Export exact committed authored inputs
-        run: node compiler/scripts/SourceSnapshot.mjs create "$RUNNER_TEMP/authored-inputs" HEAD
+      - uses: actions/download-artifact@v4
+        with:
+          name: selfhost-build-inputs
+          path: ${{ runner.temp }}/build-inputs
+          run-id: ${{ needs.reuse.outputs.run-id || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Restore exact N1 build inputs
+        run: node compiler/scripts/SourceSnapshot.mjs restore "$RUNNER_TEMP/build-inputs" "$RUNNER_TEMP/authored-inputs"
       - uses: actions/download-artifact@v4
         if: env.PINNED != 'true'
         with:
@@ -688,6 +800,9 @@ jobs:
           "$out/N1" build src/main.silk -o "$out/n1.ll" --emit llvm-ir "${args[@]}" > "$out/n1-ir.log" 2>&1 || { tail -n 60 "$out/n1-ir.log"; exit 1; }
           "$out/N2" build src/main.silk -o "$out/n2.ll" --emit llvm-ir "${args[@]}" > "$out/n2-ir.log" 2>&1 || { tail -n 60 "$out/n2-ir.log"; exit 1; }
           cmp "$out/n1.ll" "$out/n2.ll"
+          node "$GITHUB_WORKSPACE/compiler/scripts/CompilerRelease.mjs" verify-build "$out/N2" "$RUNNER_TEMP/authored-inputs"
+          version=$("$out/N2" --version)
+          echo "VERSION=${version#silk v}" >> "$GITHUB_ENV"
           node "$GITHUB_WORKSPACE/compiler/scripts/SourceSnapshot.mjs" verify "$RUNNER_TEMP/authored-inputs" > /dev/null
           if [ "$PINNED" != true ]; then cmp "$RUNNER_TEMP/target-ir/compiler.ll" "$out/n1.ll"; fi
           jq -n --arg target "$TARGET" --slurpfile snapshot "$RUNNER_TEMP/authored-inputs/input-snapshot.json" \
@@ -695,7 +810,7 @@ jobs:
             --arg n2 "$(shasum -a 256 "$out/N2" | cut -d' ' -f1)" \
             --arg ir "$(shasum -a 256 "$out/n2.ll" | cut -d' ' -f1)" --arg pinned "$PINNED" \
             '{schemaVersion: 2, status: "passed", target: $target,
-              inputs: ($snapshot[0] | {sourceCommit, normalizedDigest, archiveSha256, files}),
+              inputs: ($snapshot[0] | {sourceCommit, normalizedDigest, archiveSha256, files, projection: (.projection // null)}),
               origin: (if $pinned == "true" then "pinned-seed" else "cross-emitted-N1" end),
               producer: {generation: "N1", sha256: $n1}, output: {generation: "N2", sha256: $n2},
               fixpoint: {producerIrSha256: $ir, outputIrSha256: $ir}}' > "$out/chain-receipt.json"
@@ -735,13 +850,18 @@ jobs:
         run: |
           set -euo pipefail
           mkdir "$RUNNER_TEMP/release" "$RUNNER_TEMP/installed"
-          archive=$(node compiler/scripts/ReleaseArchive.ts --compiler "$RUNNER_TEMP/chain/N2" \
-            --stdlib "$RUNNER_TEMP/authored-inputs/stdlib" --target "$TARGET" --output "$RUNNER_TEMP/release")
+          args=(--compiler "$RUNNER_TEMP/chain/N2" --stdlib "$RUNNER_TEMP/authored-inputs/stdlib"
+            --target "$TARGET" --version "$VERSION" --output "$RUNNER_TEMP/release")
+          if [ -f "$RUNNER_TEMP/authored-inputs/compiler/changes-snapshot.toml" ]; then
+            args+=(--snapshot "$RUNNER_TEMP/authored-inputs/compiler/changes-snapshot.toml")
+          fi
+          archive=$(node compiler/scripts/ReleaseArchive.ts "${args[@]}")
           tar -xzf "$archive" -C "$RUNNER_TEMP/installed"
           silk=$(echo "$RUNNER_TEMP"/installed/silk-*/bin/silk)
-          "$silk" --version
+          test "$("$silk" --version)" = "silk v$VERSION"
           cd "$RUNNER_TEMP/installed"
           env -u SILK_CLANG -u SDKROOT "$silk" init hello
+          grep -Fx "silk-version = \"$VERSION\"" hello/silk.toml
           # `run` reports the build on standard output before the program's own output.
           output=$(cd hello && env -u SILK_CLANG -u SDKROOT "$silk" run)
           printf '%s\n' "$output" | head -n 1 | grep -q '^Compiled src/main.silk -> '
@@ -759,7 +879,7 @@ jobs:
           cp "$RUNNER_TEMP/chain/N2" "$RUNNER_TEMP/candidate/silk-compiler-$TARGET"
           cp "$RUNNER_TEMP/chain/chain-receipt.json" "$RUNNER_TEMP/candidate/chain-receipt-$TARGET.json"
           node compiler/scripts/NativeSeed.mjs candidate "$RUNNER_TEMP/chain/chain-receipt.json" "$GITHUB_RUN_ID" \
-            "v$(node compiler/scripts/NativeSeed.mjs version HEAD)" > "$RUNNER_TEMP/candidate/native-seed-$TARGET.json"
+            "v$VERSION" > "$RUNNER_TEMP/candidate/native-seed-$TARGET.json"
       - uses: actions/upload-artifact@v4
         with:
           name: selfhost-native-candidate-${{ matrix.target }}
@@ -778,21 +898,19 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-  # A green manual dispatch of main with `publish` set publishes its N2 as the next seed candidate;
-  # main pushes publish nothing. Only a reviewed commit to compiler/native-seed.json makes a
-  # candidate the pinned seed.
-  publish-seed:
-    name: Publish native seed candidate
+  # Stable merge and dev publication share the exact same native gates.
+  publish-release:
+    name: Publish the reserved compiler release
     if: >-
-      always() && github.event_name == 'workflow_dispatch' && inputs.publish
-      && github.ref == 'refs/heads/main'
-      && (needs.reuse.outputs.reused == 'true' || (needs.native-fixpoint.result == 'success'
+      always() && github.ref == 'refs/heads/main'
+      && (needs.release-plan.outputs.mode == 'dev' || needs.release-plan.outputs.mode == 'stable')
+      && needs.native-fixpoint.result == 'success'
       && needs.corpus.result == 'success' && needs.stdlib-root.result == 'success'
-      && needs.native-cases.result == 'success' && needs.repository-coverage.result == 'success'))
+      && needs.native-cases.result == 'success' && needs.repository-coverage.result == 'success'
       && needs.native-targets.result == 'success'
     needs:
       [
-        reuse,
+        release-plan,
         native-fixpoint,
         corpus,
         stdlib-root,
@@ -814,20 +932,10 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
-      - name: Name the release
-        run: echo "VERSION=$(node compiler/scripts/NativeSeed.mjs version "$GITHUB_SHA")" | tee -a "$GITHUB_ENV"
       - uses: actions/download-artifact@v4
-        if: needs.reuse.outputs.reused != 'true'
         with:
           name: selfhost-native-candidate
           path: ${{ runner.temp }}/candidate
-      - uses: actions/download-artifact@v4
-        if: needs.reuse.outputs.reused == 'true'
-        with:
-          name: selfhost-native-candidate
-          path: ${{ runner.temp }}/candidate
-          run-id: ${{ needs.reuse.outputs.run-id }}
-          github-token: ${{ github.token }}
       - uses: actions/download-artifact@v4
         with:
           pattern: selfhost-native-candidate-*
@@ -840,84 +948,77 @@ jobs:
           path: ${{ runner.temp }}/candidate
           merge-multiple: true
       - uses: actions/download-artifact@v4
-        if: needs.reuse.outputs.reused == 'true'
         with:
-          name: silk-release-x86_64-unknown-linux-gnu
-          path: ${{ runner.temp }}/candidate
-          run-id: ${{ needs.reuse.outputs.run-id }}
-          github-token: ${{ github.token }}
+          name: selfhost-build-inputs
+          path: ${{ runner.temp }}/build-inputs
+      - name: Validate exact source projection and compiler identity
+        working-directory: ${{ runner.temp }}/candidate
+        run: |
+          set -euo pipefail
+          node "$GITHUB_WORKSPACE/compiler/scripts/SourceSnapshot.mjs" restore . "$RUNNER_TEMP/release-source" > /dev/null
+          (cd "$GITHUB_WORKSPACE" && node compiler/scripts/SourceSnapshot.mjs create "$RUNNER_TEMP/publishing-base" "$GITHUB_SHA") > /dev/null
+          cp "$RUNNER_TEMP/build-inputs/compiler-release.json" "$RUNNER_TEMP/compiler-release.json"
+          node "$GITHUB_WORKSPACE/compiler/scripts/SourceSnapshot.mjs" project "$RUNNER_TEMP/publishing-base" \
+            "$RUNNER_TEMP/compiler-release.json" "$RUNNER_TEMP/publishing-inputs" > /dev/null
+          cmp input-snapshot.json "$RUNNER_TEMP/publishing-inputs/input-snapshot.json"
+          test "$(jq -er .sourceCommit input-snapshot.json)" = "$GITHUB_SHA"
+          node "$GITHUB_WORKSPACE/compiler/scripts/NativeSeed.mjs" verify native-seed.json x86_64-unknown-linux-gnu \
+            silk-compiler-x86_64-unknown-linux-gnu "$RUNNER_TEMP/release-compiler" > /dev/null
+          args=()
+          if [ "${{ needs.release-plan.outputs.mode }}" = dev ]; then args=(--dev "${{ needs.release-plan.outputs.counter }}"); fi
+          "$RUNNER_TEMP/release-compiler" changes --dir "$RUNNER_TEMP/publishing-base/compiler" snapshot \
+            --commit "$GITHUB_SHA" "${args[@]}" --json > "$RUNNER_TEMP/recomputed-release.json"
+          cmp "$RUNNER_TEMP/compiler-release.json" "$RUNNER_TEMP/recomputed-release.json"
+          jq -e '.package == "silk-compiler"' "$RUNNER_TEMP/compiler-release.json" > /dev/null
+          version=$(jq -er .version "$RUNNER_TEMP/compiler-release.json")
+          test "$("$RUNNER_TEMP/release-compiler" --version)" = "silk v$version"
+          cp "$RUNNER_TEMP/release-source/compiler/changes-snapshot.toml" changes-snapshot.toml
+          echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Assemble the ready-to-commit per-target pin
         working-directory: ${{ runner.temp }}/candidate
         run: |
           set -euo pipefail
           mv native-seed.json native-seed-x86_64-unknown-linux-gnu.json
           mv chain-receipt.json chain-receipt-x86_64-unknown-linux-gnu.json
-          # Reused x86-64 N2 has this exact tree; name the publishing commit in every target pin.
+          # Every target receipt names the same exact publishing commit and projected inputs.
           jq -s --arg tag "v$VERSION" --arg sha "$GITHUB_SHA" --arg run "$GITHUB_RUN_ID" \
             '{schemaVersion: 2, seeds: (map(.seeds) | add | with_entries(.value |=
               (.tag = $tag | .sourceCommit = $sha | .runId = $run)))}' \
             native-seed-*.json > native-seed.json
           rm native-seed-*.json
-          # Archives built by a run of another commit carry its version; rename them to this one.
-          for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
-            node "$GITHUB_WORKSPACE/compiler/scripts/NativeSeed.mjs" outputs native-seed.json "$target" > /dev/null
-            archives=(silk-*-"$target".tar.gz)
-            test "${#archives[@]}" = 1 && test -f "${archives[0]}"
-            mkdir unpacked
-            tar -xzf "${archives[0]}" -C unpacked
-            rm "${archives[0]}"
-            top="unpacked/${archives[0]%.tar.gz}"
-            node "$GITHUB_WORKSPACE/compiler/scripts/ReleaseArchive.ts" --compiler "$top/bin/silk" \
-              --stdlib "$top/lib/silk/stdlib" --target "$target" --version "$VERSION" --output . > /dev/null
-            rm -rf unpacked
-          done
-      - name: Create the immutable candidate release
+      - name: Publish the immutable compiler release
         working-directory: ${{ runner.temp }}/candidate
         env:
           GH_TOKEN: ${{ github.token }}
-          REUSED_RUN: ${{ needs.reuse.outputs.run-id }}
         run: |
           set -euo pipefail
           tag="v$VERSION"
-          node "$GITHUB_WORKSPACE/compiler/scripts/SourceSnapshot.mjs" restore . "$RUNNER_TEMP/release-source" > /dev/null
-          files=(native-seed.json input-snapshot.json authored-inputs.tar)
+          files=(native-seed.json input-snapshot.json authored-inputs.tar changes-snapshot.toml)
           for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
             asset="silk-compiler-$target"
+            node "$GITHUB_WORKSPACE/compiler/scripts/NativeSeed.mjs" outputs native-seed.json "$target" > /dev/null
             receipt="chain-receipt-$target.json"
             test "$(jq -er --arg target "$target" '.seeds[$target].tag' native-seed.json)" = "$tag"
+            test "$(jq -er --arg target "$target" '.seeds[$target].sourceCommit' native-seed.json)" = "$GITHUB_SHA"
             sha=$(jq -er --arg target "$target" '.seeds[$target].sha256' native-seed.json)
             echo "$sha  $asset" | sha256sum -c -
             test "$sha" = "$(jq -er .output.sha256 "$receipt")"
             test "$(jq -er .target "$receipt")" = "$target"
             test "$(jq -er .fixpoint.producerIrSha256 "$receipt")" = "$(jq -er .fixpoint.outputIrSha256 "$receipt")"
             test "$(jq -er .inputs.normalizedDigest "$receipt")" = "$(jq -er .normalizedDigest input-snapshot.json)"
+            test "$(jq -er .inputs.sourceCommit "$receipt")" = "$GITHUB_SHA"
             test "$(jq -er .inputs.archiveSha256 "$receipt")" = "$(jq -er .archiveSha256 input-snapshot.json)"
             # The installable archive must carry this exact compiler.
             archives=(silk-*-"$target".tar.gz)
             test "${#archives[@]}" = 1 && test -f "${archives[0]}"
+            test "${archives[0]}" = "silk-$VERSION-$target.tar.gz"
             test "$(tar -xzOf "${archives[0]}" "${archives[0]%.tar.gz}/bin/silk" | sha256sum | cut -d' ' -f1)" = "$sha"
+            tar -xzOf "${archives[0]}" "${archives[0]%.tar.gz}/lib/silk/changes-snapshot.toml" > "$RUNNER_TEMP/embedded-snapshot.toml"
+            cmp changes-snapshot.toml "$RUNNER_TEMP/embedded-snapshot.toml"
             files+=("$asset" "$receipt" "${archives[0]}")
           done
-          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            # A rerun may confirm all published assets, never replace or add bytes.
-            gh release download "$tag" --repo "$GITHUB_REPOSITORY" --dir published
-            cmp native-seed.json published/native-seed.json
-            cmp input-snapshot.json published/input-snapshot.json
-            cmp authored-inputs.tar published/authored-inputs.tar
-            for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin; do
-              cmp "silk-compiler-$target" "published/silk-compiler-$target"
-              for archive in silk-*-"$target".tar.gz; do cmp "$archive" "published/$archive"; done
-              # Receipt timings and runner paths can vary on a rerun; compiler identities cannot.
-              jq '{target, output: {sha256: .output.sha256}, fixpoint}' "chain-receipt-$target.json" > expected.json
-              jq '{target, output: {sha256: .output.sha256}, fixpoint}' "published/chain-receipt-$target.json" > actual.json
-              cmp expected.json actual.json
-            done
-            echo "Release $tag already holds these seed and receipt bytes"
-          else
-            gh release create "$tag" "${files[@]}" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              --prerelease --title "Silk $VERSION" \
-              --notes "Native N2 candidates for x86-64 Linux, ARM64 Linux, and macOS arm64 of main $GITHUB_SHA (run $GITHUB_RUN_ID${REUSED_RUN:+, reusing x86-64 N2 of PR run $REUSED_RUN with the same tree}). Each target passed N1/N2 compiler IR identity and its native corpus. To install one, extract its silk-<version>-<target>.tar.gz, which holds bin/silk and the standard library it finds at lib/silk/stdlib. To pin them, commit native-seed.json as compiler/native-seed.json."
-          fi
+          node "$GITHUB_WORKSPACE/compiler/scripts/CompilerRelease.mjs" publish \
+            "$RUNNER_TEMP/compiler-release.json" "$PWD" "${files[@]}"
           {
             echo "### Silk $VERSION"
             echo "Release: \`$tag\`"

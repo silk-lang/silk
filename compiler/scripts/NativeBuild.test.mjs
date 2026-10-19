@@ -27,7 +27,7 @@ const executable = (path, contents, mode = 0o555) => {
 }
 
 const fixture = Effect.fnUntraced(
-  /** @param {(inputs: {root:string,options: import('./NativeBuild.ts').BuildOptions,manifest: import('effect/Schema').Schema.Type<typeof SourceSnapshot.InputSnapshotSchema>}) => import('effect/Effect').fn.Return<void,import('./NativeBuild.ts').NativeBuildError|import('effect/PlatformError').PlatformError|import('effect/Schema').SchemaError,import('effect/FileSystem').FileSystem>} run */
+  /** @param {(inputs: {root:string,options: import('./NativeBuild.ts').BuildOptions,manifest: import('effect/Schema').Schema.Type<typeof SourceSnapshot.InputSnapshotSchema>}) => import('effect/Effect').fn.Return<void,import('./NativeBuild.ts').NativeBuildError|SourceSnapshot.SourceSnapshotError|import('effect/PlatformError').PlatformError|import('effect/Schema').SchemaError,import('effect/FileSystem').FileSystem>} run */
   function* (run) {
     return yield* Effect.scoped(
       Effect.gen(function* () {
@@ -44,7 +44,11 @@ const fixture = Effect.fnUntraced(
           ['changes/src/Command.silk', 'pub fn value() -> i32 { return 2 }'],
           [
             'compiler/silk.toml',
-            '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nchangeset = { path = "../changes" }\n',
+            '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nchangeset = { path = "../changes" }\n\n[changes]\nversion-file = "src/ReleaseVersion.silk"\n',
+          ],
+          [
+            'compiler/src/ReleaseVersion.silk',
+            'pub fn value() -> &\'static [u8] {\n  return b"0.1.0"\n}\n',
           ],
           ['compiler/src/main.silk', 'pub fn main() -> i32 { return 0 }'],
           ['silk.toml', '[workspace]\nmembers = ["compiler", "changes"]\noutput-dir = "build"\n'],
@@ -251,12 +255,14 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         assert.notStrictEqual(result.output.sha256, result.producer.sha256)
         assert.strictEqual(result.inputs.compiler.sha256, manifest.compilerDigest)
         assert.strictEqual(result.inputs.stdlib.sha256, manifest.stdlibDigest)
+        assert.strictEqual(result.inputs.projection, null)
         assert.deepStrictEqual(
           result.inputs.compiler.files.map(({ path }) => path),
           [
             'changes/silk.toml',
             'changes/src/Command.silk',
             'compiler/silk.toml',
+            'compiler/src/ReleaseVersion.silk',
             'compiler/src/main.silk',
             'silk.toml',
           ],
@@ -297,6 +303,62 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
           readFileSync(join(options.outputDirectory, 'smoke/silk.toml'), 'utf8'),
           '[package]\nname = "trivial-features"\nversion = "0.1.0"\nroot = "main.silk"\n',
         )
+      }),
+  )
+
+  it.effect(
+    'propagates projected identity and rejects projection metadata changed during a build',
+    () =>
+      Effect.gen(function* () {
+        for (const tamper of [false, true]) {
+          yield* fixture(function* ({ root, options, manifest }) {
+            const version = '0.2.0-dev.7+aaaaaaaaaaaa'
+            const native = {
+              package: 'compiler',
+              version,
+              tag: `v${version}`,
+              prerelease: true,
+              commit: manifest.sourceCommit,
+              notes: 'Dev notes',
+              toml: `format = 1\nschema = "silk.changes.snapshot"\npackage = "compiler"\nversion = "${version}"\nkind = "dev"\ncommit = "${manifest.sourceCommit}"\nfloor = "0.0.0"\n`,
+              manifest: readFileSync(join(options.snapshot, 'compiler/silk.toml'), 'utf8').replace(
+                'version = "0.1.0"',
+                `version = "${version}"`,
+              ),
+              versionFile: 'src/ReleaseVersion.silk',
+              versionSource: readFileSync(
+                join(options.snapshot, 'compiler/src/ReleaseVersion.silk'),
+                'utf8',
+              ).replace('b"0.1.0"', `b"${version}"`),
+            }
+            const input = join(root, 'native.json')
+            writeFileSync(
+              input,
+              yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(native),
+            )
+            const snapshot = join(root, 'projected')
+            const projected = yield* SourceSnapshot.projectSnapshot({
+              base: options.snapshot,
+              snapshot: input,
+              directory: snapshot,
+            })
+            executable(
+              options.producer,
+              producer() + (tamper ? `\nprintf '{}' > '${join(snapshot, 'projection.json')}'` : ''),
+            )
+            const result = yield* fixtureBuild({ ...options, snapshot })
+            assert.deepStrictEqual(result.inputs.projection, projected.projection)
+            assert.strictEqual(result.inputs.sourceCommit, manifest.sourceCommit)
+            if (tamper) {
+              assert.strictEqual(result.status, 'failed')
+              assert.match(result.failure.message, /Projection metadata digest mismatch/)
+              assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false)
+            } else {
+              assert.strictEqual(result.status, 'passed')
+              assert.strictEqual(result.inputs.normalizedDigest, projected.normalizedDigest)
+            }
+          })
+        }
       }),
   )
 
