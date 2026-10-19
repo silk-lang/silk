@@ -890,24 +890,32 @@ facts to the new request without rerunning its nested providers. Replayed discov
 new request ledger; the event log records only queries actually started or hit. Source bytes belong
 to the held revision, with no host file snapshot or mutable filesystem provider in this API.
 
-`Semantic.revise` selects another immutable revision. The next demand validates retained source
-bytes and absent paths before reuse, so changed imported headers or newly present paths recompute
-affected facts and diagnostics against the new source. Unrelated source changes leave completed
-facts reusable. The source index retains completed presence or absence queries when their exact
-content observation agrees, including parsed syntax, authored HIR, and name indexes for unchanged
-files. Each parsed declaration also owns a lazy shared `BodyInput`: its exact source span and
-canonical header/body bytes are captured once for typed bodies, selected static roots, and reuse
-checks. Changed content releases its parsed unit and declaration inputs; a same-path edit never
-reuses different bytes.
-Previously issued authored cursors expire on every revision selection. A body can also retain its
-checked payload after a same-file or imported callee body edit when its own declaration and the semantic results it consumed still match. That
-validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
-queries can run again. A store opened with `Semantic.traced` keeps `Semantic.eventLog`, the queries
-actually run or hit; `Semantic.make` records no events, so a build keeps no per-demand log. Replaying a completed
-answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
-reads and name observations. The focused source-written M1 checks use these records to prove
-avoided provider reads and semantic demands; they do not measure speed. The native `build`
-mode consumes these demanded facts for its documented closed-body subset.
+`Semantic.update` selects another immutable revision. Before the next demand can choose a
+key, project a retained declaration handle, or reuse an answer, it reconciles every changed module
+already observed by that session. Intermediate deletion or module absence ends a handle even if the
+same declaration is restored before any demand. Surviving declarations keep their handle at their
+new source position.
+
+Semantic units record consumed source inputs and other units' results. Presence, complete name
+buckets, selected import syntax and targets, and nominal identity are separate source inputs.
+Changing an unrelated field or function does not invalidate a nominal identity or an unchanged
+selective import. Readers that have not been partitioned still record the source's exact bytes;
+this includes the current body, storage-shape and operation-signature readers. There is no general
+semantic-result cutoff: changed inputs invalidate their consumers and transitive result dependers.
+Unchanged inputs keep completed answers available for an ordinary cache hit.
+
+Successful selected imports retain declaration handles, not parse positions. Retained diagnostic
+locations have explicit guarded token-coordinate observations; recovery positions that are not token
+aligned retain a source-prefix observation. Successful relative typed-body origins continue to use
+the existing declaration anchors. Previously issued authored cursors expire on revision selection.
+A failed reconciliation prevents cache reuse and leaves pending history retryable.
+
+A store opened with `Semantic.traced` keeps `Semantic.eventLog`: actual query `Start`, `Hit`, and
+`Finish` events. `Semantic.make` records no per-demand events. Replaying a completed answer's
+source/dependency evidence does not synthesize nested query hits. `Semantic.sourceEvents` records
+source reads and name observations. A oneShot store computes the same semantic facts without
+revision-observation bookkeeping. The focused source tests assert reuse through event intervals,
+not timing; the native build consumes the demanded facts for its documented closed-body subset.
 
 The current semantic subset resolves local names, ordinary namespace imports, selective imports,
 explicit aliases, and a hybrid namespace alias with selected members. Qualified type names have
