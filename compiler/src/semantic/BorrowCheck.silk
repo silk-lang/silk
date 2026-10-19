@@ -75,6 +75,7 @@ import semantic.StorageOperation {StorageOperation}
 import semantic.Type {Argument, Binding, KeptRegions, KeptSlot, KeptStep, KeptStepKind, Type}
 import semantic.TypedBody {
   AggregateField,
+  ResultBorrow,
   BorrowStatus,
   CaptureHold,
   ConsumedPlace,
@@ -1517,7 +1518,8 @@ effect fn attributeRead(nodes: &[Node], owner: &DeclarationId, walker: &mut Walk
       } else {
         carry.field = usize.MAX
         carry.direct = false
-        if !path.through && declared.known && pathContains(heldSteps, steps)
+        if !path.through && disjointFields(steps, heldSteps) { held = false }
+        if held && !path.through && declared.known && pathContains(heldSteps, steps)
           && !reborrowedByCarried(Vector<Loan>.asSlice(&walker.loans), carried, index) {
           held = !run unreachableField(nodes, owner, &walker.*, carry, Vector<Shared<Lifetime>>.asSlice(&declared.regions))
         }
@@ -1527,6 +1529,19 @@ effect fn attributeRead(nodes: &[Node], owner: &DeclarationId, walker: &mut Walk
     index = index + usize.ONE
   }
   return move read
+}
+
+// Different declared record fields store disjoint values, even when their lifetime arguments
+// happen to be equal. Unknown elements and reference boundaries provide no such separation.
+fn disjointFields(read: &[Step], held: &[Step]) -> bool {
+  let mut at = usize.ZERO
+  while at < read.length && at < held.length {
+    if read[at].kind == StepKind.Field && held[at].kind == StepKind.Field
+      && read[at].ordinal != held[at].ordinal { return true }
+    if !sameStep(read[at], held[at]) || read[at].kind == StepKind.Referent { return false }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 // Whether another carried loan reborrows the loan `carried[index]` carries, so it stays live with it.
@@ -2276,33 +2291,122 @@ fn unneededOwnedLoan(loan: &Loan, owner: &DeclarationId, named: &[Shared<Lifetim
   return false
 }
 
-// The declared result may retain this operand's actual outer source. Only an already-exact
-// scalar loan qualifies: an inner atom, an ancestor, or prior uncertainty is not repaired by
-// matching the same inferred call atom. The signature mapping is independent of that inference.
-fn declaredResultLoan(nodes: &[Node], result: NodeId, carry: &Carry, loan: &Loan) -> bool {
-  if loan.precision != LoanPrecision.Exact { return false }
-  let regions = Vector<Shared<Lifetime>>.asSlice(&loan.regions)
-  if regions.length != usize.ONE { return false }
-  if let NodeKind.Expression {form: Expression.DirectCall {arguments, resultBorrows, ..}, ..} = &nodes[result.index].kind {
-    let operands = Vector<NodeId>.asSlice(&arguments)
-    if carry.operand >= operands.length { return false }
-    let selected = Vector<NodeId>.asSlice(&resultBorrows)
-    let mut at = usize.ZERO
-    while at < selected.length {
-      if selected[at].index == operands[carry.operand].index {
-        if let NodeKind.Expression {ty, ..} = &nodes[selected[at].index].kind {
-          let region = Shared<Type>.with<Option<Shared<Lifetime>>>(&ty, outerSharedRegion)
-          if let Option<Shared<Lifetime>>.Some {value} = &region {
-            if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loan.borrowed {
-              return Lifetime.equalsShared(&value, &borrowed) && Lifetime.equalsShared(&regions[0], &borrowed)
+// Read the same source component as Semantic.resultSourceAtoms: a shared reference supplies
+// its outer access region, while other shapes require complete stored-region evidence. Knowing
+// an outer reference never authenticates an unknown referent or any loan within that referent.
+effect fn declaredSourceRegions(nodes: &[Node], source: NodeId, owner: &DeclarationId, regions: &mut Vector<Shared<Lifetime>>) -> bool
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<Shared<Type>>.Some {value} = move expressionType(nodes, source) {
+    if let Type.Reference {access, lifetime, ..} = move run Type.copy(&value) {
+      if access == Access.Shared {
+        run appendAtoms(&mut regions.*, &lifetime)
+        return true
+      }
+    }
+  }
+  return run resultRegions(nodes, source, owner, &mut regions.*)
+}
+
+// Preserve an exact finite source only when the declared signature permits this operand
+// to supply the result and its authenticated region is the loan's actual borrowed region.
+// Reborrow ancestors follow their authenticated parent edges within that same operand.
+// Neither an unrelated inner atom nor prior Alternatives/Unknown can acquire this evidence.
+effect fn declaredResultLoans(nodes: &[Node], result: NodeId, carried: &[Carry], loans: &[Loan], owner: &DeclarationId)
+-> Vector<bool> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut call = result
+  if let NodeKind.Expression {form: Expression.Run {value, access}, ..} = &nodes[result.index].kind {
+    if access == RunAccess.Immediate { call = value }
+  }
+  let mut proven = Vector<bool>.make()
+  let mut index = usize.ZERO
+  while index < carried.length {
+    let carry = &carried[index]
+    let loan = &loans[carry.loan]
+    let mut exact = false
+    if loan.precision == LoanPrecision.Exact && carry.field != usize.MAX {
+      if let NodeKind.Expression {form: Expression.DirectCall {arguments, resultBorrows, ..}, ..} = &nodes[call.index].kind {
+        let operands = Vector<NodeId>.asSlice(&arguments)
+        let selected = Vector<ResultBorrow>.asSlice(&resultBorrows)
+        let mut at = usize.ZERO
+        while carry.operand < operands.length && at < selected.length {
+          if selected[at].argument.index == operands[carry.operand].index {
+            let mut named = Vector<Shared<Lifetime>>.make()
+            if run declaredSourceRegions(nodes, selected[at].argument, owner, &mut named) {
+              let regions = Vector<Shared<Lifetime>>.asSlice(&named)
+              let actual = Vector<Shared<Lifetime>>.asSlice(&loan.regions)
+              if regions.length == usize.ONE && actual.length == usize.ONE {
+                if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loan.borrowed {
+                  exact = Lifetime.equalsShared(&regions[0], &borrowed) && Lifetime.equalsShared(&actual[0], &borrowed)
+                }
+              }
             }
           }
+          at = at + usize.ONE
         }
+      }
+    }
+    run Vector<bool>.append(&mut proven, exact)
+    index = index + usize.ONE
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    index = usize.ZERO
+    while index < carried.length {
+      if Vector<bool>.asSlice(&proven)[index] {
+        if let Option<Shared<Lifetime>>.Some {value: parent} = &loans[carried[index].loan].parent {
+          let mut ancestor = usize.ZERO
+          while ancestor < carried.length {
+            let loan = &loans[carried[ancestor].loan]
+            if !Vector<bool>.asSlice(&proven)[ancestor] && carried[ancestor].operand == carried[index].operand
+              && loan.precision == LoanPrecision.Exact {
+              if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loan.borrowed {
+                if meetMember(&parent, &borrowed) {
+                  let mut marked = Vector<bool>.asMutSlice(&mut proven)
+                  marked[ancestor] = true
+                  changed = true
+                }
+              }
+            }
+            ancestor = ancestor + usize.ONE
+          }
+        }
+      }
+      index = index + usize.ONE
+    }
+  }
+  return move proven
+}
+
+// Place an authenticated source at each complete result field path the signature can return it in.
+// This mapping must not be reconstructed from inferred output atoms: sibling binders may coincide.
+effect fn declaredResultCarries(nodes: &[Node], result: NodeId, walker: &mut Walker, carry: Carry, point: usize,
+  onward: &mut Vector<Carry>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut call = result
+  if let NodeKind.Expression {form: Expression.Run {value, access}, ..} = &nodes[result.index].kind {
+    if access == RunAccess.Immediate { call = value }
+  }
+  if let NodeKind.Expression {form: Expression.DirectCall {arguments, resultBorrows, ..}, ..} = &nodes[call.index].kind {
+    let operands = Vector<NodeId>.asSlice(&arguments)
+    let sources = Vector<ResultBorrow>.asSlice(&resultBorrows)
+    let mut at = usize.ZERO
+    while carry.operand < operands.length && at < sources.length {
+      if sources[at].argument.index == operands[carry.operand].index {
+        let mut path = Vector<Step>.make()
+        let fields = Vector<usize>.asSlice(&sources[at].fields)
+        let mut step = usize.ZERO
+        while step < fields.length {
+          run Vector<Step>.append(&mut path, fieldStep(fields[step]))
+          step = step + usize.ONE
+        }
+        let field = run internPath(&mut walker.*, move path)
+        run Vector<Carry>.append(&mut onward.*, Carry {loan: carry.loan, since: point, operand: usize.MAX,
+          definition: carry.definition, read: carry.read, field: field, direct: false})
       }
       at = at + usize.ONE
     }
   }
-  return false
+  return ()
 }
 
 // Records the operands of the direct call `result` whose loans its result cannot hold.
@@ -2379,13 +2483,6 @@ fn outlivesResult(relations: &[ImpliedGroup], regions: &[Shared<Lifetime>], name
 }
 
 
-fn outerSharedRegion(value: &Type) -> Option<Shared<Lifetime>> {
-  if let Type.Reference {access, lifetime, ..} = &value.* {
-    if access == Access.Shared { return Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime)) }
-  }
-  return Option<Shared<Lifetime>>.none()
-}
-
 // Consumes carried loans at a fresh point for `result`, which keeps carrying the loans it can
 // retain (VIEW-002), so a returned view holds its source loan through its last use. Typing gives the
 // result its instantiated regions, with the callee's bounds, type arguments and elisions applied:
@@ -2401,8 +2498,8 @@ fn outerSharedRegion(value: &Type) -> Option<Shared<Lifetime>> {
 //   loan, which a value copied out of it does not hold.
 // - When exactly one operand's loans name a result region, the result may hold them: a conflict
 //   rejects.
-// - A declared shared-reference result preserves the exact scalar sources its authored
-//   parameter names, even when other operands share the inferred call atom.
+// - A declared result preserves authenticated finite sources, including reborrow ancestors,
+//   through shared views and stored inputs. This proof precedes inference of call atoms.
 // - Other operands naming a known result form a complete union of possible source loans.
 //   The region proof must check all of them, while a conflict with one remains imprecise:
 //   sharing a fresh call atom does not prove which operand the result actually retains.
@@ -2450,6 +2547,8 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
         parents = run retainedParents(Vector<Loan>.asSlice(&walker.loans), loans, named)
       }
       let supported = Vector<bool>.asSlice(&parents)
+      let declared = run declaredResultLoans(nodes, result, loans, Vector<Loan>.asSlice(&walker.loans), owner)
+      let declaredSources = Vector<bool>.asSlice(&declared)
       let mut required = Vector<usize>.make()
       if known && !stores {
         required = run requiredRetainedRegions(Vector<Loan>.asSlice(&walker.loans), loans, named, owner,
@@ -2533,10 +2632,10 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
           } else if outside && (all[loan].local || bodyRegions(regionsOf, owner)) {
             kept = false
             dropped = true
+          } else if index < declaredSources.length && declaredSources[index] {
+            exact = true
           } else if complete && unneededOwnedLoan(&all[loan], owner, named, requiredSources, index < supported.length && supported[index]) {
             kept = false
-          } else if declaredResultLoan(nodes, result, &loans[index], &all[loan]) {
-            exact = true
           } else if several && forwarding == Forwarding.Operands && loans[index].operand < placed.length
             && regionsOf.length > usize.ZERO && (sharesAtom(regionsOf, named) || requiredLoan(&all[loan], owner, requiredSources)) {
             // A value built from its operands holds each operand's loans exactly where it places
@@ -2567,8 +2666,13 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
               all[loan].precision = LoanPrecision.Unknown
             }
           }
-          run Vector<Carry>.append(&mut onward, Carry {loan: loan, since: point, operand: usize.MAX, definition: loans[index].definition, read: loans[index].read, field: field, direct: direct})
-          if field == usize.ZERO && forwarding != Forwarding.Matched {
+          let declared = !stores && index < declaredSources.length && declaredSources[index]
+          if declared {
+            run declaredResultCarries(nodes, result, &mut walker.*, loans[index], point, &mut onward)
+          } else {
+            run Vector<Carry>.append(&mut onward, Carry {loan: loan, since: point, operand: usize.MAX, definition: loans[index].definition, read: loans[index].read, field: field, direct: direct})
+          }
+          if !declared && field == usize.ZERO && forwarding != Forwarding.Matched {
             run Vector<WholeHold>.append(&mut walker.wholeHolds, WholeHold {loan: loan, result: result,
               described: !stores && forwarding == Forwarding.None && typed.length > usize.ZERO})
           }
@@ -5027,9 +5131,9 @@ effect fn settled(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walke
 }
 
 // A field, index or dereference of a value that is not a written place: its operand is evaluated
-// and consumed by the projection. A field holds every loan its operand holds, as a literal's field
-// does under the literal's meet of its field regions, except a loan the operand holds as a call's
-// whole result where the field's declared type provably cannot reach it (`unreachableField`).
+// and consumed by the projection. A field selects the same carried source paths as a named holder
+// read, including disjoint sibling fields. Whole-value or unknown paths remain conservative unless
+// the field's declared type proves that the loan cannot reach it (`unreachableField`).
 effect fn readValue(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker: &mut Walker, id: NodeId, at: usize) -> Flow
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut values = Vector<NodeId>.make()
@@ -5038,26 +5142,20 @@ effect fn readValue(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       Expression.Field {value, ..} => {
         let subject = run visit(nodes, locals, owner, &mut walker.*, value, at)
         let declared = run declaredRead(nodes, id, owner)
-        let held = Vector<Carry>.asSlice(&subject.carried)
+        // Reuse the same field mapping as a named holder read. The synthetic temporary path
+        // describes only this projection; no storage or lifetime extension is introduced.
+        let path = run temporaryPath(nodes, id, value)
+        let selected = run attributeRead(nodes, owner, &mut walker.*, &path, Vector<Carry>.asSlice(&subject.carried), &declared)
         let mut carried = Vector<Carry>.make()
-        let mut index = usize.ZERO
-        while index < held.length {
-          let mut kept = true
-          if declared.known && held[index].field == usize.ZERO && !reborrowedByCarried(Vector<Loan>.asSlice(&walker.loans), held, index) {
-            kept = !run unreachableField(nodes, owner, &walker.*, held[index], Vector<Shared<Lifetime>>.asSlice(&declared.regions))
-          }
-          if kept {
-            let carry = held[index]
-            run Vector<Carry>.append(&mut carried, Carry {loan: carry.loan, since: carry.since, operand: usize.ZERO,
-              definition: carry.definition, read: carry.read, field: carry.field, direct: false})
-          }
-          index = index + usize.ONE
-        }
-        let unplaced = Vector<Vector<Step>>.make()
+        run appendOperand(&mut carried, Vector<Carry>.asSlice(&selected), usize.ZERO)
+        // The extracted value forwards each selected source at its residual field path.
+        // An empty prefix preserves that path across successive rvalue projections.
+        let mut placed = Vector<Vector<Step>>.make()
+        run Vector<Vector<Step>>.append(&mut placed, Vector<Step>.make())
         let untyped = Vector<NodeId>.make()
         let noSinks = Vector<OperandSink>.make()
         return run finish(nodes, owner, &mut walker.*, id, subject.at, &carried, false, Forwarding.Operands,
-          Vector<Vector<Step>>.asSlice(&unplaced), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
+          Vector<Vector<Step>>.asSlice(&placed), Vector<NodeId>.asSlice(&untyped), Vector<OperandSink>.asSlice(&noSinks))
       }
       Expression.Dereference {value} => { run Vector<NodeId>.append(&mut values, value) }
       Expression.Index {value, index, ..} => {
