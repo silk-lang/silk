@@ -73,6 +73,9 @@ import semantic.Lifetime {Lifetime}
 import semantic.Rejection {RejectionCode}
 import semantic.StorageOperation {StorageOperation}
 import semantic.SourcePreparation {RegionBound}
+import semantic.SourcePreparation as PreparedSources
+import semantic.SourceAnalysis as SourceGraph
+import semantic.SourceTraversal as SourceVisit
 import semantic.SourceRules {Atom as SourceAtom, Program as SourceProgram, Solution as SourceSolution, Truth as SourceTruth}
 import semantic.SourcePolicy
 import CompilerBug
@@ -2019,6 +2022,122 @@ fn loanReferent(value: &Type) -> Option<Shared<Type>> {
     Type.Reference {referent, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&referent))
     _ => Option<Shared<Type>>.none()
   }
+}
+
+// Actual loan declarations/events projected onto the source graph's reserved occurrences.
+// No held-value list or policy-selected result participates in creating these identities.
+struct SourceOwnership {
+  loans: Vector<Loan>
+  events: Vector<Event>
+}
+
+// Hidden owners use one dense identity per actual owner acquisition. A reused typed NodeId
+// does not merge its two temporary lifecycles. These roots belong to this projection only.
+fn sourceTemporaryRoot<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  evaluation: SourceGraph.EvalId) -> usize {
+  let owners = Vector<SourceVisit.Owner>.asSlice(&reservation.owners)
+  let mut at = usize.ZERO
+  while at < owners.length {
+    if let SourceVisit.OwnerRoot.Temporary {evaluation: actual} = owners[at].root {
+      if actual.index == evaluation.index { return prepared.body.locals.length + at }
+    }
+    at = at + usize.ONE
+  }
+  return CompilerBug.panic(b"source borrow has no actual temporary owner acquisition")
+}
+
+// Follow the recorded operand occurrences through the written projection. This is structural
+// identity only; a reference boundary remains in Path and still owes its descriptor proof.
+fn sourcePlaceBase<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  input: SourceVisit.Input) -> SourceVisit.Input {
+  let mut current = input
+  let mut remaining = Vector<SourceVisit.Visit>.length(&reservation.visits) + usize.ONE
+  while remaining > usize.ZERO {
+    let projected = match &prepared.body.nodes[current.node.index].kind {
+      NodeKind.Expression {form: Expression.Field {value, ..}, ..} => Option<NodeId>.some(value)
+      NodeKind.Expression {form: Expression.Index {value, ..}, ..} => Option<NodeId>.some(value)
+      NodeKind.Expression {form: Expression.Dereference {value}, ..} => Option<NodeId>.some(value)
+      _ => Option<NodeId>.none()
+    }
+    match projected {
+      Option<NodeId>.Some {value} => {
+        let actual = SourceVisit.occurrence(reservation, current.evaluation)
+        let inputs = Vector<SourceVisit.Input>.asSlice(&actual.inputs)
+        if inputs.length == usize.ZERO || inputs[usize.ZERO].node.index != value.index {
+          return CompilerBug.panic(b"source place projection lost its actual operand occurrence")
+        }
+        current = inputs[usize.ZERO]
+      }
+      Option<NodeId>.None => { return current }
+    }
+    remaining = remaining - usize.ONE
+  }
+  return CompilerBug.panic(b"source place occurrence chain is cyclic")
+}
+
+// First ownership projection phase: every authored Borrow activates its one real descriptor
+// leaf and event on the same reserved graph. Implicit receiver/pattern loans are added by their
+// owning operation phases; this phase does not infer them from types or capture mode.
+effect fn sourceAuthoredLoans<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &mut SourceVisit.Reservation)
+  -> SourceOwnership ! OutOfMemoryError ? &mut Allocator {
+  let mut ownership = SourceOwnership {loans: Vector<Loan>.make(), events: Vector<Event>.make()}
+  let nodes = prepared.body.nodes
+  let records = Vector<PreparedSources.Borrow>.asSlice(&prepared.borrows)
+  let active = SourceProgram.atom(&mut reservation.skeleton.rules)
+  run SourceProgram.fact(&mut reservation.skeleton.rules, active)
+  let count = Vector<SourceVisit.Visit>.length(&reservation.visits)
+  let mut at = usize.ZERO
+  while at < count {
+    let actual = &Vector<SourceVisit.Visit>.asSlice(&reservation.visits)[at]
+    let site = actual.node
+    if let NodeKind.Expression {form: Expression.Borrow {access, value}, ..} = &nodes[site.index].kind {
+      let inputs = Vector<SourceVisit.Input>.asSlice(&actual.inputs)
+      if inputs.length != usize.ONE || inputs[usize.ZERO].node.index != value.index {
+        CompilerBug.panic(b"authored borrow lost its actual operand evaluation")
+      }
+      let input = inputs[usize.ZERO]
+      let evaluation = actual.evaluation
+      let point = actual.execute.index
+      let mut path = run pathOf(nodes, value)
+      let mut parent = run borrowedPlaceLifetime(nodes, value)
+      if path.root == usize.MAX {
+        let base = sourcePlaceBase(prepared, &reservation.*, input)
+        path = run temporaryPath(nodes, value, base.node)
+        path.root = sourceTemporaryRoot(prepared, &reservation.*, base.evaluation)
+      }
+      // Preserve the accepted slice-reborrow boundary; explicit reference reborrows already
+      // contain their typed Dereference. No synthetic region or parent lifetime is introduced.
+      if sliceValue(nodes, value) && sliceValue(nodes, site) {
+        run Vector<Step>.append(&mut path.steps, referent())
+        path.through = true
+        parent = run descriptorLifetime(nodes, value)
+      }
+      let mut record = usize.MAX
+      let mut candidate = usize.ZERO
+      while candidate < records.length {
+        if records[candidate].site.index == site.index {
+          if record != usize.MAX { CompilerBug.panic(b"authored source borrow has duplicate preparation records") }
+          record = candidate
+        }
+        candidate = candidate + usize.ONE
+      }
+      if record == usize.MAX { CompilerBug.panic(b"authored source borrow has no prepared reference maps") }
+      let loan = Vector<Loan>.length(&ownership.loans)
+      let exclusive = access == Access.Mutable
+      run Vector<Loan>.append(&mut ownership.loans,
+        run loanAt(nodes, prepared.body.owner, &path, exclusive, nodes[site.index].origin.location, site.index, move parent, point))
+      let mut kind = Kind.SharedBorrow
+      if exclusive { kind = Kind.ExclusiveBorrow }
+      run Vector<Event>.append(&mut ownership.events, Event {point: point,
+        place: Place {root: path.root, steps: run copySteps(Vector<Step>.asSlice(&path.steps))}, kind: kind,
+        span: nodes[site.index].origin.location, target: nodes[site.index].origin.location, loan: loan,
+        consumesTarget: usize.ZERO, refiner: path.refiner, refinedDepth: path.refinedDepth,
+        binders: run copyBinders(Vector<usize>.asSlice(&path.binders))})
+      drop run SourceGraph.Skeleton.borrow(&mut reservation.skeleton, prepared, &records[record], input.evaluation, evaluation, loan, active)
+    }
+    at = at + usize.ONE
+  }
+  return move ownership
 }
 
 // Declaration-time loan facts, independent of eager carries or traversal. Both source and
