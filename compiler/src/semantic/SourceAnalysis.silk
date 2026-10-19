@@ -7,11 +7,13 @@
 import semantic.SourcePreparation {
   ApplicationId, ContractRouteId, Coverage, EndpointId, MapId, SelectionId as PreparedSelectionId,
   SourcePreparation, Selection, SelectionMap, ContractRoute, Root, Endpoint, Selector, MapKind,
+  InputRoute, Transport, EndpointRole, IndexClass, ShapeId,
 }
 import semantic.SourceFlow {ComponentId, Definition, DefinitionId, Flow, PointId, Read, ReadId, Reaching, Point, Pair, Write}
 import semantic.SourceRules {Atom, Program, Solution, Truth}
 import semantic.TypedBody {LocalId, NodeId, NodeKind, Origin}
 import semantic.SourceLocations {Location}
+import semantic.DeclarationId {DeclarationId}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.effect {Effect}
 import silk.option {Option}
@@ -361,6 +363,238 @@ impl Skeleton {
     let read = run Flow.read(&mut self.flow, point, ComponentId {index: storage.index})
     run Vector<ReadValue>.append(&mut self.reads, ReadValue {read: read, value: value, map: map})
     return read
+  }
+
+  /// Instantiates exactly the producer's frozen map family at two actual evaluations. Child
+  /// endpoints come from explicit child-map IDs, never a scan for equal types or same-site maps.
+  /// This only reserves transfers: it creates no source, owner, storage alias or evaluation.
+  pub effect fn transfer(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], map: MapId,
+    source: EvalId, target: EvalId, active: Atom, directness: Directness,
+    stored: Atom, alternatives: Atom) -> ValueId ! OutOfMemoryError ? &mut Allocator {
+    let family = run transferFamily(endpoints, maps, map)
+    let members = Vector<MapId>.asSlice(&family)
+    if source.index >= Vector<Evaluation>.length(&self.evaluations)
+      || target.index >= Vector<Evaluation>.length(&self.evaluations) {
+      CompilerBug.panic(b"a physical source transfer has no actual evaluation")
+    }
+    let occurrence = Vector<Evaluation>.asSlice(&self.evaluations)[target.index]
+    let sameSite = match occurrence.site {
+      EvaluationSite.Node {node} => node.index == maps[map.index].site.index
+      _ => false
+    }
+    if !sameSite { CompilerBug.panic(b"physical transfer was attached to another evaluation occurrence") }
+    let result = run Self.value(self, target, maps[map.index].target)
+    let mut at = usize.ZERO
+    while at < members.length {
+      let member = members[at]
+      let from = run Self.value(self, source, maps[member.index].source)
+      let to = run Self.value(self, target, maps[member.index].target)
+      run Vector<Transfer>.append(&mut self.transfers, Transfer {
+        source: from, target: to, active: active, directness: directness,
+        stored: stored, alternatives: alternatives,
+        definition: Option<DefinitionId>.none(), read: Option<ReadId>.none(),
+        map: Option<MapId>.some(member), contract: Option<ContractRouteId>.none()})
+      at = at + usize.ONE
+    }
+    return result
+  }
+
+  /// Binds one producer-selected capture/input route. Copy/Move/Evaluated transfer existing
+  /// values; only explicit Borrow transport creates a new descriptor source. Its distinct
+  /// referent family carries the original value, using the SAME source evaluation.
+  /// The visitor owns the real borrow event/loan; its ID is required only for that transport.
+  pub effect fn input(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], route: &InputRoute,
+    source: EvalId, target: EvalId, loan: Option<usize>, active: Atom) -> ValueId
+  ! OutOfMemoryError ? &mut Allocator {
+    if route.map.index >= maps.length { CompilerBug.panic(b"producer input has no physical map") }
+    let created = route.transport == Transport.BorrowShared || route.transport == Transport.BorrowMutable
+    let absent = Program.atom(&mut self.rules)
+    if !created {
+      if let Option<MapId>.Some {..} = &route.referent {
+        CompilerBug.panic(b"a value transfer cannot create a second reference")
+      }
+      if let Option<usize>.Some {..} = loan {
+        CompilerBug.panic(b"a value transfer cannot supply a new borrow loan")
+      }
+      return run Self.transfer(self, endpoints, maps, route.map, source, target, active,
+        Directness.Preserve, absent, absent)
+    }
+    let referent = match route.referent {
+      Option<MapId>.Some {value} => value
+      _ => { return CompilerBug.panic(b"producer-created reference has no paired referent map") }
+    }
+    let actualLoan = match loan {
+      Option<usize>.Some {value} => value
+      _ => { return CompilerBug.panic(b"producer-created reference has no actual borrow event") }
+    }
+    validateReferenceMaps(endpoints, maps, route.map, referent)
+    let descriptor = run Self.value(self, target, maps[route.map.index].target)
+    let leaves = Vector<Leaf>.asSlice(&self.leaves)
+    let mut at = usize.ZERO
+    while at < leaves.length {
+      if let SourceLeaf.Borrow {loan: previous, ..} = &leaves[at].kind {
+        if previous == actualLoan { CompilerBug.panic(b"one borrow event was created by two producer routes") }
+      }
+      at = at + usize.ONE
+    }
+    let leaf = run Self.leaf(self, Leaf {kind: SourceLeaf.Borrow {loan: actualLoan, node: Option<NodeId>.none()},
+      origin: maps[route.map.index].origin, endpoint: maps[route.map.index].target})
+    run Vector<Seed>.append(&mut self.seeds, Seed {value: descriptor, leaf: leaf,
+      direct: true, active: active, stored: absent, alternatives: absent})
+    // There is deliberately no Storage -> descriptor transfer of the old C value: that
+    // would claim C is the new &C descriptor. The frozen Value -> Referent map is its lane.
+    drop run Self.transfer(self, endpoints, maps, referent, source, target, active,
+      Directness.Preserve, absent, absent)
+    return descriptor
+  }
+}
+
+// The family is a finite tree of actual inline component maps. Reject malformed cycles or
+// duplicate ownership; do not turn them into a truncated/opaque source route.
+effect fn transferFamily(endpoints: &[Endpoint], maps: &[SelectionMap], root: MapId) -> Vector<MapId>
+! OutOfMemoryError ? &mut Allocator {
+  if root.index >= maps.length { CompilerBug.panic(b"physical transfer has no prepared map") }
+  let mut family = Vector<MapId>.make()
+  run Vector<MapId>.append(&mut family, root)
+  let mut next = usize.ZERO
+  while next < Vector<MapId>.length(&family) {
+    let index = Vector<MapId>.asSlice(&family)[next].index
+    let map = &maps[index]
+    if map.source.index >= endpoints.length || map.target.index >= endpoints.length {
+      CompilerBug.panic(b"physical transfer map has an absent endpoint")
+    }
+    let children = Vector<MapId>.asSlice(&map.children)
+    let mut child = usize.ZERO
+    while child < children.length {
+      let nested = children[child]
+      if nested.index >= maps.length { CompilerBug.panic(b"physical transfer family has an absent child map") }
+      let found = Vector<MapId>.asSlice(&family)
+      let mut previous = usize.ZERO
+      while previous < found.length {
+        if found[previous].index == nested.index { CompilerBug.panic(b"physical transfer family repeats a child map") }
+        previous = previous + usize.ONE
+      }
+      let inner = &maps[nested.index]
+      if inner.source.index >= endpoints.length || inner.target.index >= endpoints.length
+        || inner.site.index != map.site.index || inner.kind != map.kind {
+        CompilerBug.panic(b"physical transfer child belongs to another operation")
+      }
+      let fromParent = match &endpoints[inner.source.index].parent {
+        Option<EndpointId>.Some {value} => value.index == map.source.index
+        _ => false
+      }
+      let toParent = match &endpoints[inner.target.index].parent {
+        Option<EndpointId>.Some {value} => value.index == map.target.index
+        _ => false
+      }
+      if !fromParent || !toParent { CompilerBug.panic(b"physical transfer child is not its paired inline component") }
+      run Vector<MapId>.append(&mut family, nested)
+      child = child + usize.ONE
+    }
+    next = next + usize.ONE
+  }
+  return move family
+}
+
+fn endpointRole(endpoint: &Endpoint) -> Option<EndpointRole> {
+  return match &endpoint.root {
+    Root.Local {role, ..} => Option<EndpointRole>.some(role)
+    Root.Node {role, ..} => Option<EndpointRole>.some(role)
+    _ => Option<EndpointRole>.none()
+  }
+}
+
+fn validateReferenceMaps(endpoints: &[Endpoint], maps: &[SelectionMap], descriptor: MapId, referent: MapId) -> () {
+  if descriptor.index >= maps.length || referent.index >= maps.length {
+    CompilerBug.panic(b"producer-created reference has an absent map")
+  }
+  let created = &maps[descriptor.index]
+  let carried = &maps[referent.index]
+  if created.source.index >= endpoints.length || created.target.index >= endpoints.length
+    || carried.source.index >= endpoints.length || carried.target.index >= endpoints.length {
+    CompilerBug.panic(b"producer-created reference has an absent endpoint")
+  }
+  if created.site.index != carried.site.index || Vector<MapId>.length(&created.children) != usize.ZERO {
+    CompilerBug.panic(b"reference creation and its referent are not one producer operation")
+  }
+  let storage = match move endpointRole(&endpoints[created.source.index]) {
+    Option<EndpointRole>.Some {value} => value == EndpointRole.Storage
+    _ => false
+  }
+  let value = match move endpointRole(&endpoints[carried.source.index]) {
+    Option<EndpointRole>.Some {value} => value == EndpointRole.Value
+    _ => false
+  }
+  let paired = match &endpoints[carried.target.index].parent {
+    Option<EndpointId>.Some {value: parent} => parent.index == created.target.index
+    _ => false
+  }
+  let through = match &endpoints[carried.target.index].selector { Selector.Referent => true _ => false }
+  if !storage || !value || !paired || !through
+    || !sameSourceComponent(endpoints, created.source, carried.source) {
+    CompilerBug.panic(b"reference map must create a descriptor and separately carry its referent")
+  }
+  return ()
+}
+
+// Storage and Value roots for the same authored component differ in role, never in source
+// identity. This validates the supplied pair; it does not search for or construct a map.
+fn sameSourceComponent(endpoints: &[Endpoint], storage: EndpointId, value: EndpointId) -> bool {
+  let mut left = storage
+  let mut right = value
+  let mut remaining = endpoints.length
+  while remaining > usize.ZERO {
+    if left.index >= endpoints.length || right.index >= endpoints.length { return false }
+    let a = &endpoints[left.index]
+    let b = &endpoints[right.index]
+    if !sameSelector(&a.selector, &b.selector) { return false }
+    match &a.parent {
+      Option<EndpointId>.Some {value: parent} => {
+        if let Option<EndpointId>.Some {value: other} = &b.parent {
+          left = parent
+          right = other
+        } else { return false }
+      }
+      Option<EndpointId>.None => {
+        if let Option<EndpointId>.Some {..} = &b.parent { return false }
+        return match &a.root {
+          Root.Node {node, ..} => match &b.root {
+            Root.Node {node: other, ..} => node.index == other.index
+            _ => false
+          }
+          Root.Local {local, ..} => match &b.root {
+            Root.Local {local: other, ..} => local.index == other.index
+            _ => false
+          }
+          _ => false
+        }
+      }
+    }
+    remaining = remaining - usize.ONE
+  }
+  CompilerBug.panic(b"prepared component ancestry is cyclic")
+}
+
+fn sameSelector(left: &Selector, right: &Selector) -> bool {
+  return match &left.* {
+    Selector.Member {declaration, member, payload} => match &right.* {
+      Selector.Member {declaration: other, member: selected, payload: field} =>
+        DeclarationId.equals(&DeclarationId.copyShared(&declaration), &DeclarationId.copyShared(&other))
+          && member == selected && payload == field
+      _ => false
+    }
+    Selector.Field {ordinal} => match &right.* { Selector.Field {ordinal: other} => ordinal == other _ => false }
+    Selector.Variant {ordinal} => match &right.* { Selector.Variant {ordinal: other} => ordinal == other _ => false }
+    Selector.Index {class: IndexClass.Exact {index}} => match &right.* {
+      Selector.Index {class: IndexClass.Exact {index: other}} => index == other
+      _ => false
+    }
+    Selector.Index {class: IndexClass.Remainder} => match &right.* { Selector.Index {class: IndexClass.Remainder} => true _ => false }
+    Selector.Referent => match &right.* { Selector.Referent => true _ => false }
+    Selector.EffectSuccess => match &right.* { Selector.EffectSuccess => true _ => false }
+    Selector.EffectFailure => match &right.* { Selector.EffectFailure => true _ => false }
+    Selector.Identity => match &right.* { Selector.Identity => true _ => false }
+    Selector.Opaque => match &right.* { Selector.Opaque => true _ => false }
   }
 }
 
@@ -1340,7 +1574,7 @@ effect fn sourceTestMap(maps: &mut Vector<SelectionMap>, source: usize, target: 
   run Vector<SelectionMap>.append(maps, SelectionMap {site: NodeId {index: 0},
     origin: Origin {node: 0, location: Location.make(0, 1)}, source: EndpointId {index: source},
     target: EndpointId {index: target}, selector: Selector.Identity, kind: MapKind.Copy,
-    application: Option<ApplicationId>.none()})
+    application: Option<ApplicationId>.none(), children: Vector<MapId>.make()})
   return id
 }
 
@@ -1374,4 +1608,125 @@ fn sourceTestStored(domain: &Domain, solved: &Solution, value: ValueId, leaf: Le
     at = at + usize.ONE
   }
   return result
+}
+
+test effect fn sourceProducerReferencesKeepDescriptorAndReferentSeparate() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run sourceReferenceClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Tests the reservation/rule contract, not a Silk source-program verdict. Two component
+// sources deliberately share the same prepared shape coordinate: only the explicit maps
+// may place them. A same-site map outside the chosen family must not be inferred as a lane.
+effect fn sourceReferenceClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut skeleton = Skeleton.make()
+  let yes = Program.atom(&mut skeleton.rules)
+  let no = Program.atom(&mut skeleton.rules)
+  run Program.fact(&mut skeleton.rules, yes)
+  let start = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let construct = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let copied = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  run Program.fact(&mut skeleton.rules, Flow.reachable(&skeleton.flow, start))
+  run Flow.edge(&mut skeleton.flow, start, construct, yes)
+  run Flow.edge(&mut skeleton.flow, construct, copied, yes)
+  let source = run Skeleton.evaluate(&mut skeleton, NodeId {index: 0}, EvaluationRole.Value, start)
+  let output = run Skeleton.evaluate(&mut skeleton, NodeId {index: 1}, EvaluationRole.Capture, construct)
+  let copy = run Skeleton.evaluate(&mut skeleton, NodeId {index: 2}, EvaluationRole.Value, copied)
+  let mut endpoints = Vector<Endpoint>.make()
+  let origin = Origin {node: 0, location: Location.make(0, 1)}
+  // 0: actual storage C; 1: its value; 2/3: two inline C fields.
+  run sourceTestEndpoint(&mut endpoints, 0, EndpointRole.Storage, usize.MAX, Selector.Identity)
+  run sourceTestEndpoint(&mut endpoints, 0, EndpointRole.Value, usize.MAX, Selector.Identity)
+  run sourceTestEndpoint(&mut endpoints, 0, EndpointRole.Value, 1, Selector.Field {ordinal: 0})
+  run sourceTestEndpoint(&mut endpoints, 0, EndpointRole.Value, 1, Selector.Field {ordinal: 1})
+  // 4: created &C descriptor; 5: C referent; 6/7: its distinct inline fields.
+  run sourceTestEndpoint(&mut endpoints, 1, EndpointRole.Value, usize.MAX, Selector.Identity)
+  run sourceTestEndpoint(&mut endpoints, 1, EndpointRole.Value, 4, Selector.Referent)
+  run sourceTestEndpoint(&mut endpoints, 1, EndpointRole.Value, 5, Selector.Field {ordinal: 0})
+  run sourceTestEndpoint(&mut endpoints, 1, EndpointRole.Value, 5, Selector.Field {ordinal: 1})
+  run sourceTestEndpoint(&mut endpoints, 2, EndpointRole.Value, usize.MAX, Selector.Identity)
+  let mut maps = Vector<SelectionMap>.make()
+  let descriptor = run sourceTestMap(&mut maps, 0, 4)
+  let referent = run sourceTestMap(&mut maps, 1, 5)
+  let first = run sourceTestMap(&mut maps, 2, 6)
+  let second = run sourceTestMap(&mut maps, 3, 7)
+  // This valid standalone map is not in this transfer family.
+  drop run sourceTestMap(&mut maps, 2, 7)
+  let descriptorCopy = run sourceTestMap(&mut maps, 4, 8)
+  let children = Vector<SelectionMap>.asMutSlice(&mut maps)
+  let mut mapIndex = usize.ZERO
+  while mapIndex < children.length {
+    children[mapIndex].site = NodeId {index: 1}
+    mapIndex = mapIndex + usize.ONE
+  }
+  children[descriptorCopy.index].site = NodeId {index: 2}
+  run Vector<MapId>.append(&mut children[referent.index].children, first)
+  run Vector<MapId>.append(&mut children[referent.index].children, second)
+  let held = run Skeleton.value(&mut skeleton, source, EndpointId {index: 2})
+  let plain = run Skeleton.value(&mut skeleton, source, EndpointId {index: 3})
+  let heldLeaf = run Skeleton.leaf(&mut skeleton, Leaf {
+    kind: SourceLeaf.Borrow {loan: 0, node: Option<NodeId>.some(NodeId {index: 0})},
+    origin: origin, endpoint: EndpointId {index: 2}})
+  let plainLeaf = run Skeleton.leaf(&mut skeleton, Leaf {kind: SourceLeaf.LoanFree {node: NodeId {index: 0}},
+    origin: origin, endpoint: EndpointId {index: 3}})
+  run Vector<Seed>.append(&mut skeleton.seeds, Seed {value: held, leaf: heldLeaf,
+    direct: false, active: yes, stored: no, alternatives: no})
+  run Vector<Seed>.append(&mut skeleton.seeds, Seed {value: plain, leaf: plainLeaf,
+    direct: true, active: yes, stored: no, alternatives: no})
+  let route = InputRoute {map: descriptor, referent: Option<MapId>.some(referent),
+    selected: EndpointId {index: 4}, original: EndpointId {index: 4}, transport: Transport.BorrowShared}
+  let made = run Skeleton.input(&mut skeleton, Vector<Endpoint>.asSlice(&endpoints),
+    Vector<SelectionMap>.asSlice(&maps), &route, source, output, Option<usize>.some(1), yes)
+  let createdLeaf = LeafId {index: 2}
+  let copyRoute = InputRoute {map: descriptorCopy, referent: Option<MapId>.none(),
+    selected: EndpointId {index: 8}, original: EndpointId {index: 8}, transport: Transport.Copy}
+  let forwarded = run Skeleton.input(&mut skeleton, Vector<Endpoint>.asSlice(&endpoints),
+    Vector<SelectionMap>.asSlice(&maps), &copyRoute, output, copy, Option<usize>.none(), yes)
+  let one = run Skeleton.value(&mut skeleton, output, EndpointId {index: 6})
+  let two = run Skeleton.value(&mut skeleton, output, EndpointId {index: 7})
+  let reaching = run Flow.emit(move skeleton.flow, &mut skeleton.rules)
+  let domain = run reserveDomain(&mut skeleton.rules, &reaching, Vector<Evaluation>.asSlice(&skeleton.evaluations),
+    Vector<Value>.asSlice(&skeleton.values), Vector<Seed>.asSlice(&skeleton.seeds), Vector<Transfer>.asSlice(&skeleton.transfers))
+  let inputs = run inputPositions(&mut skeleton.rules, one, Vector<Leaf>.length(&skeleton.leaves),
+    Vector<Value>.asSlice(&skeleton.values), Vector<CellKey>.asSlice(&domain.keys), Vector<Cell>.asSlice(&domain.cells),
+    Vector<Witness>.asSlice(&domain.witnesses), Vector<Case>.asSlice(&domain.cases))
+  let solved = run Program.solve(&skeleton.rules)
+  run Testing.expect(sourceTestPresence(&domain, &solved, made, createdLeaf) == Truth.True
+    && sourceTestPresence(&domain, &solved, made, heldLeaf) == Truth.False,
+    "a created reference is one new descriptor source, not a copied C value")
+  run Testing.expect(sourceTestPresence(&domain, &solved, one, heldLeaf) == Truth.True
+    && sourceTestPresence(&domain, &solved, two, heldLeaf) == Truth.False
+    && sourceTestPresence(&domain, &solved, two, plainLeaf) == Truth.True,
+    "only the paired referent family carries C's fields; same-site equal-shape siblings stay distinct")
+  run Testing.expect(sourceTestPresence(&domain, &solved, forwarded, createdLeaf) == Truth.True
+    && sourceTestPresence(&domain, &solved, forwarded, heldLeaf) == Truth.False
+    && Vector<Leaf>.length(&skeleton.leaves) == 3,
+    "copying the descriptor forwards its original borrow rather than creating or flattening another reference")
+  let positions = Vector<Input>.asSlice(&inputs)
+  let mut at = usize.ZERO
+  let mut indirect = false
+  while at < positions.length {
+    if positions[at].leaf.index == heldLeaf.index {
+      let cases = Vector<InputCase>.asSlice(&positions[at].cases)
+      let mut each = usize.ZERO
+      while each < cases.length {
+        if !cases[each].direct { indirect = true }
+        each = each + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  run Testing.expect(indirect, "reference creation does not upgrade the carried referent's indirect history")
+  return ()
+}
+
+effect fn sourceTestEndpoint(endpoints: &mut Vector<Endpoint>, node: usize, role: EndpointRole,
+  parent: usize, selector: Selector) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut ancestor = Option<EndpointId>.none()
+  if parent != usize.MAX { ancestor = Option<EndpointId>.some(EndpointId {index: parent}) }
+  run Vector<Endpoint>.append(endpoints, Endpoint {root: Root.Node {node: NodeId {index: node}, role: role},
+    parent: move ancestor, selector: move selector, shape: ShapeId {index: 0},
+    origin: Origin {node: node, location: Location.make(0, 1)}})
+  return ()
 }
