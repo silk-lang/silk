@@ -13,7 +13,8 @@ Use `verifyIssuedBy` only to check exact issuer linkage and the retained certifi
 
 Inspection is allocation-free, bounded, and retains the original certificate borrow. It admits
 role, key, signature metadata, and supported extension semantics while preserving original SAN
-and NameConstraints DER. Errors own only scalar metadata.
+and NameConstraints DER. Errors own only scalar metadata. P-256/SHA-256, P-384/SHA-384,
+and the bounded RSA/SHA-256 signature profiles are admitted; other combinations fail closed.
 
 ## Gotchas
 
@@ -84,6 +85,16 @@ P256
 ```
 
 An uncompressed validated secp256r1 point.
+
+<a id="CertificateKeyKind.P384"></a>
+
+### `P384`
+
+```silk
+P384
+```
+
+An uncompressed validated secp384r1 point.
 
 <a id="CertificateKeyKind.Rsa"></a>
 

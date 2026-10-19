@@ -1,0 +1,243 @@
+//! Validated single-package manifests with source-preserving version replacement.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.bytes { Bytes }
+import silk.i32
+import silk.option { Option }
+import silk.result { Result }
+import silk.string { String }
+import silk.toml_scanner { TomlError, TomlScanner, TomlSpan, TomlToken }
+import silk.toml_text { TomlText }
+import silk.toml_value { Toml, Value }
+import silk.usize
+import Problem { Problem }
+import Text
+
+/// Owns the original document and the complete quoted package.version token range.
+pub struct Manifest {
+  pub name: String
+  pub version: String
+  pub source: String
+  pub versionStart: usize
+  pub versionEnd: usize
+}
+
+/// Validates the complete TOML document and required package strings before locating
+/// the version token. Quoted/dotted keys and inline tables retain their spelling.
+pub effect fn parse(source: String) -> Manifest ! Problem | TomlError | OutOfMemoryError ? &mut Allocator {
+  let text = String.view(&source)
+  let document = run Toml.parse(String.utf8Bytes(text))
+  let nameText = run packageString(&document, "name")
+  if String.byteLength(nameText) == usize.ZERO {
+    fail Problem { message: "silk.toml package.name must not be empty" }
+  }
+  let versionText = run packageString(&document, "version")
+  let name = run String.copy(nameText)
+  let version = run String.copy(versionText)
+  let span = run locate(text)
+  return Manifest {
+    name: move name,
+    version: move version,
+    source: move source,
+    versionStart: span.offset,
+    versionEnd: span.offset + span.length,
+  }
+}
+
+/// Replaces only the quoted version token. The caller supplies a validated
+/// SemVer spelling; all bytes outside the token, including comments, are preserved.
+pub effect fn replaceVersion(manifest: &Manifest, version: string) -> String ! OutOfMemoryError ? &mut Allocator {
+  let source = String.view(&manifest.source)
+  let prefix = Text.part(source, usize.ZERO, manifest.versionStart)
+  let suffix = Text.part(source, manifest.versionEnd, String.byteLength(source))
+  let mut bytes = Bytes.make()
+  let quotes: usize = 2
+  let length = String.byteLength(prefix) + String.byteLength(version) + String.byteLength(suffix) + quotes
+  run Bytes.reserveExact(&mut bytes, length)
+  run Bytes.append(&mut bytes, String.utf8Bytes(prefix))
+  run Bytes.append(&mut bytes, b"\"")
+  run Bytes.append(&mut bytes, String.utf8Bytes(version))
+  run Bytes.append(&mut bytes, b"\"")
+  run Bytes.append(&mut bytes, String.utf8Bytes(suffix))
+  return unsafe String.fromBytesUnchecked(move bytes)
+}
+
+effect fn packageString<'a>(document: &'a Value, key: string) -> string<'a> ! Problem {
+  let field = Toml.asString(Toml.fieldAt(Toml.field(document, "package"), key))
+  return match move field {
+    Option<string<'a>>.Some { value } => value
+    Option<string<'a>>.None => {
+      if let Option<&Value>.None = move Toml.field(document, "package") {
+        if let Option<&Value>.Some { value: _ } = move Toml.field(document, "workspace") {
+          fail Problem { message: "This is a virtual workspace, not a release package. Select a member with silk changes --dir PATH, or run from a member directory." }
+        }
+      }
+      fail Problem { message: "silk.toml package.name and package.version must be strings" }
+    }
+  }
+}
+
+effect fn next(scanner: &mut TomlScanner) -> TomlToken ! TomlError {
+  return match move TomlScanner.next(&mut scanner.*) {
+    Result<TomlToken, TomlError>.Success { value } => value
+    Result<TomlToken, TomlError>.Failure { error } => { fail error }
+  }
+}
+
+// Only prefixes of package.version can match: 0=root, 1=package,
+// 2=package.version, -1=unrelated. No path storage is needed.
+fn descend(path: i32, name: string) -> i32 {
+  if path == 0 && name == "package" { return 1 }
+  if path == 1 && name == "version" { return 2 }
+  return -1
+}
+
+struct Key {
+  path: i32
+  delimiter: TomlToken
+}
+
+// Bare tokens may contain several dotted key parts, or end in a dot just
+// before a quoted part. A quoted key is decoded as one indivisible part.
+effect fn key(scanner: &mut TomlScanner, first: TomlToken, parent: i32)
+  -> Key ! Problem | TomlError | OutOfMemoryError ? &mut Allocator {
+  let mut token = first
+  let mut path = parent
+  while true {
+    let mut trailingDot = false
+    match token {
+      TomlToken.Text { span } => {
+        let raw = unsafe String.fromUtf8Unchecked(TomlScanner.slice(&scanner.*, span))
+        let mut start = usize.ZERO
+        let mut at = usize.ZERO
+        let length = String.byteLength(raw)
+        while at < length {
+          if Text.byte(raw, at) == 46 {
+            if at == start { fail Problem { message: "cannot safely locate package.version key" } }
+            path = descend(path, Text.part(raw, start, at))
+            start = at + usize.ONE
+          }
+          at = at + usize.ONE
+        }
+        if start < length { path = descend(path, Text.part(raw, start, length)) }
+        else { trailingDot = true }
+      }
+      TomlToken.String { span, literal, multiline } => {
+        if path == 0 || path == 1 {
+          let decoded = run TomlText.decode(TomlScanner.slice(&scanner.*, span), literal, multiline)
+          let name = unsafe String.fromBytesUnchecked(move decoded)
+          path = descend(path, String.view(&name))
+        } else { path = -1 }
+      }
+      _ => { fail Problem { message: "cannot safely locate package.version key" } }
+    }
+    let separator = run next(&mut scanner.*)
+    if trailingDot {
+      token = separator
+      continue
+    }
+    match separator {
+      TomlToken.Dot => { token = run next(&mut scanner.*) }
+      TomlToken.Equals => { return Key { path: path, delimiter: separator } }
+      TomlToken.ArrayEnd => { return Key { path: path, delimiter: separator } }
+      _ => { fail Problem { message: "cannot safely locate package.version key" } }
+    }
+  }
+  fail Problem { message: "cannot safely locate package.version key" }
+}
+
+// The document reader has already validated structure and duplicate definitions.
+// Walk nested values so braces, brackets and version-like text inside strings or
+// arrays never change the current document table or match package.version.
+effect fn value(scanner: &mut TomlScanner, token: TomlToken, path: i32, found: &mut TomlSpan)
+  -> () ! Problem | TomlError | OutOfMemoryError ? &mut Allocator {
+  match token {
+    TomlToken.String { span, literal, multiline } => {
+      if path == 2 {
+        if found.length != usize.ZERO { fail Problem { message: "ambiguous package.version source token" } }
+        found.* = span
+      }
+    }
+    TomlToken.Text { span: _ } => {}
+    TomlToken.ArrayBegin => {
+      while true {
+        let item = run next(&mut scanner.*)
+        match item {
+          TomlToken.ArrayEnd => { return () }
+          TomlToken.Newline => {}
+          TomlToken.Comma => {}
+          _ => { run value(&mut scanner.*, item, -1, &mut found.*) }
+        }
+      }
+    }
+    TomlToken.InlineBegin => {
+      while true {
+        let first = run next(&mut scanner.*)
+        match first {
+          TomlToken.InlineEnd => { return () }
+          TomlToken.Newline => {}
+          TomlToken.Comma => {}
+          _ => {
+            let parsed = run key(&mut scanner.*, first, path)
+            match parsed.delimiter {
+              TomlToken.Equals => {}
+              _ => { fail Problem { message: "cannot safely locate inline package.version" } }
+            }
+            let item = run next(&mut scanner.*)
+            run value(&mut scanner.*, item, parsed.path, &mut found.*)
+          }
+        }
+      }
+    }
+    _ => { fail Problem { message: "cannot safely locate package.version value" } }
+  }
+}
+
+effect fn locate(source: string) -> TomlSpan ! Problem | TomlError | OutOfMemoryError ? &mut Allocator {
+  let mut scanner = TomlScanner.make(String.utf8Bytes(source))
+  let mut table = 0
+  let mut found = TomlSpan { offset: usize.ZERO, length: usize.ZERO }
+  while true {
+    let first = run next(&mut scanner)
+    match first {
+      TomlToken.EndOfInput => { break }
+      TomlToken.Newline => {}
+      TomlToken.ArrayBegin => {
+        let mut firstKey = run next(&mut scanner)
+        let mut array = false
+        match firstKey {
+          TomlToken.ArrayBegin => {
+            array = true
+            firstKey = run next(&mut scanner)
+          }
+          _ => {}
+        }
+        let header = run key(&mut scanner, firstKey, 0)
+        match header.delimiter {
+          TomlToken.ArrayEnd => {}
+          _ => { fail Problem { message: "cannot safely locate manifest table" } }
+        }
+        table = header.path
+        if array {
+          table = -1
+          let close = run next(&mut scanner)
+          match close {
+            TomlToken.ArrayEnd => {}
+            _ => { fail Problem { message: "cannot safely locate manifest table array" } }
+          }
+        }
+      }
+      _ => {
+        let parsed = run key(&mut scanner, first, table)
+        match parsed.delimiter {
+          TomlToken.Equals => {}
+          _ => { fail Problem { message: "cannot safely locate manifest assignment" } }
+        }
+        let item = run next(&mut scanner)
+        run value(&mut scanner, item, parsed.path, &mut found)
+      }
+    }
+  }
+  if found.length == usize.ZERO { fail Problem { message: "cannot locate package.version source token" } }
+  return found
+}

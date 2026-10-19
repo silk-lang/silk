@@ -101,6 +101,33 @@ pub effect fn main() -> ()
 }
 ```
 
+## Changes and releases
+
+The native CLI includes `silk changes`, implemented in the [`changes/`](changes) Silk package.
+From a package directory:
+
+```sh
+silk changes add minor "Reads now return a future." --migration "Await read()."
+silk changes status
+silk changes version --tag beta
+silk changes version
+silk changes since 0.1.0 --json
+```
+
+Each contribution gets its own `.changes/<random>.md`, avoiding shared changelog edits in PRs.
+Migration guidance is optional, but missing guidance is reported as unknown impact. Releases
+consume pending changes, update the package version, and write authoritative
+`.changes/releases/<version>.toml` records. `CHANGELOG.md` is regenerated from those records
+with a warning that manual edits will be overwritten. Commit the records, changelog, manifest,
+and consumed-file deletions together. These commands do not commit, tag, publish, or access Git.
+
+`silk changes since` selects compiler upgrades from the project's `package.silk-version`.
+`since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
+selects a target, and `--source ../candidate` reads a local checkout instead of GitHub.
+Published queries use authenticated native HTTPS and require a GitHub Release whose tag contains
+the complete TOML history. See [`compiler/README.md`](compiler/README.md#native-changes) for
+publication requirements, origin configuration, and trust settings.
+
 ## A short tour
 
 ### Services and providers
@@ -268,13 +295,19 @@ times. It also has to run a shared corpus of 443 programs with exactly the expec
 
 ## Repository
 
-| Path                      | Contents                                                  |
-| ------------------------- | --------------------------------------------------------- |
-| [`compiler/`](compiler)   | The compiler, written in Silk                             |
-| [`stdlib/`](stdlib)       | The standard library                                      |
-| [`reference/`](reference) | The language reference and the generated stdlib reference |
-| [`corpus/`](corpus)       | The shared acceptance corpus                              |
-| [`examples/`](examples)   | Larger example programs                                   |
+| Path                      | Contents                                                   |
+| ------------------------- | ---------------------------------------------------------- |
+| [`compiler/`](compiler)   | The compiler, written in Silk                              |
+| [`changes/`](changes)     | Changes, release versions, migration notes, and changelogs |
+| [`stdlib/`](stdlib)       | The standard library                                       |
+| [`reference/`](reference) | The language reference and the generated stdlib reference  |
+| [`corpus/`](corpus)       | The shared acceptance corpus                               |
+| [`examples/`](examples)   | Larger example programs                                    |
+
+The root `silk.toml` defines a native workspace containing `compiler` and `changes`. Members
+share the root `build/` directory; the root is not itself a package. Select a member explicitly
+from the root, for example `silk build --manifest-path compiler/silk.toml --stdlib stdlib` or
+`silk changes --dir compiler status`. Release operations affect one package at a time.
 
 ## Contributing
 

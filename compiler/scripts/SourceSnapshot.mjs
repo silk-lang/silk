@@ -12,9 +12,22 @@ import * as NativeProcess from './NativeProcess.ts'
 
 export class SourceSnapshotError extends Data.TaggedError('SourceSnapshotError') {}
 const invalid = (message) => Effect.fail(new SourceSnapshotError({ message }))
-export const roots = ['compiler', 'stdlib']
+export const roots = ['changes', 'compiler', 'silk.toml', 'stdlib']
+/** The compiler package, its source dependencies, and their workspace configuration. */
+export const isCompilerInput = (path) =>
+  path === 'silk.toml' || path.startsWith('compiler/') || path.startsWith('changes/')
+const requiredFiles = [
+  'silk.toml',
+  'compiler/silk.toml',
+  'compiler/src/main.silk',
+  'changes/silk.toml',
+  'changes/src/Command.silk',
+]
+const completeClosure = (files) =>
+  requiredFiles.every((required) => files.some(({ path }) => path === required)) &&
+  files.some(({ path }) => path.startsWith('stdlib/'))
 export const InputSnapshotSchema = Schema.Struct({
-  schemaVersion: Schema.Literal(1),
+  schemaVersion: Schema.Literal(2),
   sourceCommit: Schema.String,
   roots: Schema.Array(Schema.String),
   files: Schema.Array(
@@ -83,12 +96,8 @@ export const createSnapshot = Effect.fn('SourceSnapshot.createSnapshot')(
       .toString()
       .trim()
     const entries = yield* committedFiles(repository, sourceCommit)
-    if (
-      !entries.some(({ path }) => path === 'compiler/silk.toml') ||
-      !entries.some(({ path }) => path === 'compiler/src/main.silk') ||
-      !entries.some(({ path }) => path.startsWith('stdlib/'))
-    )
-      return yield* invalid('Incomplete compiler/manifest/stdlib closure')
+    if (!completeClosure(entries))
+      return yield* invalid('Incomplete compiler/dependency/workspace/stdlib closure')
     yield* fs.makeDirectory(directory, { recursive: true })
     if ((yield* fs.readDirectory(directory)).length !== 0)
       return yield* invalid('Snapshot export requires an empty directory')
@@ -115,12 +124,12 @@ export const createSnapshot = Effect.fn('SourceSnapshot.createSnapshot')(
       { cwd: directory, input: Buffer.from(files.map(({ path }) => `${path}\0`).join('')) },
     )
     const receipt = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       sourceCommit,
       roots,
       files,
       normalizedDigest: fileDigest(files),
-      compilerDigest: fileDigest(files.filter(({ path }) => path.startsWith('compiler/'))),
+      compilerDigest: fileDigest(files.filter(({ path }) => isCompilerInput(path))),
       stdlibDigest: fileDigest(files.filter(({ path }) => path.startsWith('stdlib/'))),
       archive: 'authored-inputs.tar',
       archiveSha256: hash(yield* fs.readFile(join(directory, 'authored-inputs.tar'))),
@@ -141,12 +150,12 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
     const receipt =
       supplied ?? (yield* json(yield* fs.readFileString(join(directory, 'input-snapshot.json'))))
     if (
-      receipt.schemaVersion !== 1 ||
+      receipt.schemaVersion !== 2 ||
       receipt.roots.join('\0') !== roots.join('\0') ||
       receipt.archive !== 'authored-inputs.tar' ||
       !/^[a-f0-9]{40}$/.test(receipt.sourceCommit) ||
       !Array.isArray(receipt.files) ||
-      receipt.files.length === 0
+      !completeClosure(receipt.files)
     )
       return yield* invalid('Invalid input snapshot receipt')
     const expected = new Set()
@@ -156,7 +165,7 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
         file.path
           .split('/')
           .some((component) => component === '..' || component === '.' || component === '') ||
-        !roots.some((root) => file.path.startsWith(`${root}/`)) ||
+        !(isCompilerInput(file.path) || file.path.startsWith('stdlib/')) ||
         !['100644', '100755'].includes(file.mode) ||
         !/^[a-f0-9]{64}$/.test(file.sha256) ||
         expected.has(file.path)
@@ -175,8 +184,6 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
     const walk = Effect.fnUntraced(
       /** @param {string} path @returns {import('effect/Effect').fn.Return<void,SourceSnapshotError|import('effect/PlatformError').PlatformError>} */
       function* (path) {
-        // The bootstrap creates only compiler/build; this output is outside the authored input set.
-        if (path === 'compiler/build') return
         const info = yield* fs.stat(join(directory, path))
         if (info.type === 'Directory')
           for (const child of yield* fs.readDirectory(join(directory, path)))
@@ -189,8 +196,7 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
     if (
       ordered.some((file, index) => file !== receipt.files[index]) ||
       fileDigest(ordered) !== receipt.normalizedDigest ||
-      fileDigest(ordered.filter(({ path }) => path.startsWith('compiler/'))) !==
-        receipt.compilerDigest ||
+      fileDigest(ordered.filter(({ path }) => isCompilerInput(path))) !== receipt.compilerDigest ||
       fileDigest(ordered.filter(({ path }) => path.startsWith('stdlib/'))) !==
         receipt.stdlibDigest ||
       hash(yield* fs.readFile(join(directory, receipt.archive))) !== receipt.archiveSha256
@@ -234,16 +240,23 @@ export const restoreSnapshot = Effect.fn('SourceSnapshot.restoreSnapshot')(
 )
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
-  const [command, directory, revision = 'HEAD'] = process.argv.slice(2)
+  const [command, directory, other] = process.argv.slice(2)
   const require = createRequire(new URL('../../package.json', import.meta.url))
   /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
   const { NodeServices } = await import(
     pathToFileURL(require.resolve('@effect/platform-node')).href
   )
-  const program =
-    directory && command === 'create'
-      ? createSnapshot({ directory, revision })
-      : invalid('usage: node SourceSnapshot.mjs create <directory> [revision]')
+  const program = Effect.gen(function* () {
+    if (directory && command === 'create')
+      return yield* createSnapshot({ directory, revision: other ?? 'HEAD' })
+    if (directory && command === 'verify' && other === undefined)
+      return yield* verifySnapshot({ directory })
+    if (directory && command === 'restore' && other)
+      return yield* restoreSnapshot({ artifact: directory, directory: other })
+    return yield* invalid(
+      'usage: node SourceSnapshot.mjs create <directory> [revision] | verify <directory> | restore <artifact> <directory>',
+    )
+  })
   await Effect.runPromise(
     program.pipe(
       Effect.flatMap((receipt) =>

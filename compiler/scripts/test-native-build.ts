@@ -14,6 +14,7 @@ import * as Schema from 'effect/Schema'
 // The ambient search path; tests prepend their own tools to it.
 const ambientPath = Config.String('PATH').pipe(Config.withDefault(''), Effect.orDie)
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
+const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
 
 class VerificationError extends Data.TaggedError('NativeBuildVerificationError')<{
   readonly message: string
@@ -71,6 +72,170 @@ const program = Effect.gen(function* () {
   const helped = yield* invoke(silk, ['--help'], directory)
   assert.equal(helped.status, 0, helped.stderr)
   assert.match(helped.stdout, /usage: silk build/)
+  assert.match(helped.stdout, /silk changes/)
+  // Exercise the linked changes library through the actual native entry point. No compiler,
+  // standalone changes executable, Git, or other tool is available on this subprocess PATH.
+  const releaseWorkspace = join(directory, 'release-workspace')
+  const releaseMember = join(releaseWorkspace, 'compiler')
+  const releaseNested = join(releaseMember, 'src/nested')
+  const changesEnvironment = { ...process.env, PATH: '' }
+  const workspaceManifest = '[workspace]\nmembers = ["compiler", "changes"]\n'
+  yield* fs.makeDirectory(releaseNested, { recursive: true })
+  yield* fs.makeDirectory(join(releaseWorkspace, 'changes'), { recursive: true })
+  yield* fs.writeFileString(join(releaseWorkspace, 'silk.toml'), workspaceManifest)
+  yield* fs.writeFileString(
+    join(releaseMember, 'silk.toml'),
+    '[package]\nname = "native-release"\nversion = "1.0.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(releaseWorkspace, 'changes/silk.toml'),
+    '[package]\nname = "release-consumer"\nversion = "0.1.0"\n\n[dependencies]\nreleased = { path = "../compiler" }\n',
+  )
+  for (const args of [
+    ['changes'],
+    ['changes', '--help'],
+    ['changes', '--dir', 'compiler', '--help'],
+  ]) {
+    const help = yield* invoke(silk, args, releaseWorkspace, changesEnvironment)
+    assert.equal(help.status, 0, help.stderr)
+    assert.match(help.stdout, /silk changes \[--dir PATH\] add/)
+    assert.equal(help.stderr, '')
+  }
+  const missingDirectory = yield* invoke(
+    silk,
+    ['changes', '--dir'],
+    releaseWorkspace,
+    changesEnvironment,
+  )
+  assert.equal(missingDirectory.status, 1)
+  assert.match(missingDirectory.stderr, /silk changes: --dir requires/)
+  for (const args of [
+    ['add', 'patch', 'Must not create a workspace release'],
+    ['status'],
+    ['version'],
+    ['recover'],
+  ]) {
+    const refused = yield* invoke(silk, ['changes', ...args], releaseWorkspace, changesEnvironment)
+    assert.equal(refused.status, 1)
+    assert.match(refused.stderr, /silk changes: .*virtual workspace/)
+    assert.equal(refused.stdout, '')
+  }
+  assert.equal(yield* fs.exists(join(releaseWorkspace, '.changes')), false)
+  assert.equal(yield* fs.readFileString(join(releaseWorkspace, 'silk.toml')), workspaceManifest)
+  const summary = 'Use native release commands'
+  const migration =
+    'Replace "changeset" with "silk changes".\nKeep release records in version control.'
+  const addedChange = yield* invoke(
+    silk,
+    ['changes', 'add', 'minor', summary, '--migration', migration],
+    releaseNested,
+    changesEnvironment,
+  )
+  assert.equal(addedChange.status, 0, addedChange.stderr)
+  const pendingChanges = yield* fs.readDirectory(join(releaseMember, '.changes'))
+  assert.equal(pendingChanges.length, 1)
+  const [pendingChange] = pendingChanges
+  assert.ok(pendingChange)
+  assert.match(pendingChange, /^[0-9a-f]{32}\.md$/)
+  const preview = yield* invoke(
+    silk,
+    ['changes', '--dir', 'compiler', 'status', '--tag', 'beta'],
+    releaseWorkspace,
+    changesEnvironment,
+  )
+  assert.equal(preview.status, 0, preview.stderr)
+  assert.match(preview.stdout, /native-release: 1\.0\.0 -> 1\.1\.0-beta\.1/)
+  assert.match(yield* fs.readFileString(join(releaseMember, 'silk.toml')), /version = "1.0.0"/)
+  const prereleased = yield* invoke(
+    silk,
+    ['changes', '--dir', 'compiler', 'version', '--tag', 'beta'],
+    releaseWorkspace,
+    changesEnvironment,
+  )
+  assert.equal(prereleased.status, 0, prereleased.stderr)
+  const archive = join(releaseMember, '.changes/releases/1.1.0-beta.1.toml')
+  const releaseArchive = yield* fs.readFileString(archive)
+  assert.equal(yield* fs.exists(join(releaseMember, '.changes', pendingChange)), false)
+  assert.match(yield* fs.readFileString(join(releaseMember, 'CHANGELOG.md')), /## 1\.1\.0-beta\.1/)
+  // The release TOML, not hand-edited Markdown, supplies carried promotion notes.
+  const correctedSummary = 'Use corrected native release commands'
+  assert.ok(releaseArchive.includes(summary))
+  yield* fs.writeFileString(archive, releaseArchive.replace(summary, correctedSummary))
+  yield* fs.writeFileString(join(releaseMember, 'CHANGELOG.md'), 'Manual notes must disappear.\n')
+  const promoted = yield* invoke(silk, ['changes', 'version'], releaseNested, changesEnvironment)
+  assert.equal(promoted.status, 0, promoted.stderr)
+  assert.match(yield* fs.readFileString(join(releaseMember, 'silk.toml')), /version = "1.1.0"/)
+  const changelog = yield* fs.readFileString(join(releaseMember, 'CHANGELOG.md'))
+  assert.match(changelog, /## 1\.1\.0\n/)
+  assert.ok(changelog.includes(correctedSummary))
+  assert.ok(changelog.includes(migration))
+  assert.ok(!changelog.includes('Manual notes'))
+  const stableArchive = yield* fs.readFileString(
+    join(releaseMember, '.changes/releases/1.1.0.toml'),
+  )
+  assert.match(stableArchive, /\nfrom = "1\.1\.0-beta\.1"\nversion = "1\.1\.0"\n/)
+  assert.ok(stableArchive.includes(correctedSummary))
+  const expectedHistory = {
+    package: 'native-release',
+    from: '1.0.0',
+    to: '1.1.0',
+    releases: [
+      {
+        format: 1,
+        package: 'native-release',
+        from: '1.1.0-beta.1',
+        version: '1.1.0',
+        base: '1.0.0',
+        changes: [
+          {
+            id: `1.1.0-beta.1/${pendingChange}`,
+            bump: 'minor',
+            summary: correctedSummary,
+            migration,
+          },
+        ],
+      },
+    ],
+  }
+  for (const args of [
+    ['changes', '--dir', 'compiler', 'since', '1.0.0', '--json'],
+    [
+      'changes',
+      '--dir',
+      'changes',
+      'since',
+      'released',
+      '--from',
+      '1.0.0',
+      '--source',
+      '../compiler',
+      '--json',
+    ],
+  ]) {
+    const history = yield* invoke(silk, args, releaseWorkspace, changesEnvironment)
+    assert.equal(history.status, 0, history.stderr)
+    assert.equal(history.stderr, '')
+    assert.deepEqual(yield* decodeJson(history.stdout), expectedHistory)
+  }
+  // A writer interrupted before its ready marker leaves a lock but no applied changes.
+  const releaseLock = join(releaseMember, '.changes/.lock')
+  yield* fs.makeDirectory(releaseLock)
+  const locked = yield* invoke(silk, ['changes', 'status'], releaseNested, changesEnvironment)
+  assert.equal(locked.status, 1)
+  assert.match(locked.stderr, /silk changes .*recover/)
+  const recovered = yield* invoke(
+    silk,
+    ['changes', '--dir', 'compiler', 'recover'],
+    releaseWorkspace,
+    changesEnvironment,
+  )
+  assert.equal(recovered.status, 0, recovered.stderr)
+  assert.equal(yield* fs.exists(releaseLock), false)
+  assert.equal(
+    yield* fs.readFileString(join(releaseMember, '.changes/releases/1.1.0.toml')),
+    stableArchive,
+  )
+  assert.equal(yield* fs.exists(join(releaseWorkspace, 'changes/.changes')), false)
   const ir = yield* invoke(silk, [...argumentsFor('module.ll'), '--emit', 'llvm-ir'], directory, {
     ...process.env,
     SILK_CLANG: sentinel,
@@ -998,7 +1163,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, native changes release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))

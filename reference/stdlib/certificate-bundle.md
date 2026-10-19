@@ -72,6 +72,28 @@ Allocation refusal uses `OutOfMemoryError`. Every failure releases accumulated c
 Only CERTIFICATE labels and SP, HT, CR, and LF whitespace are accepted.
 Explanatory text and malformed later blocks fail the entire document. This operation does not validate trust.
 
+<a id="impl.decodeAnnotatedPem"></a>
+
+### Associated function `decodeAnnotatedPem`
+
+```silk
+pub effect fn decodeAnnotatedPem(input: &[u8], limits: DecodeLimits) -> Result<CertificateBundle, DecodeError>
+  ! OutOfMemoryError ? &mut Allocator
+```
+
+Imports a platform CA document with explanatory text between strict CERTIFICATE blocks.
+
+#### Details
+
+Printable annotation lines outside blocks are ignored. Every block is decoded strictly;
+malformed boundaries, unrelated labels, invalid base64 or DER reject the whole document.
+Order, duplicates, original error offsets, and all inclusive budgets are preserved.
+Annotation bytes count toward the input budget. An annotation-only document is invalid.
+
+#### Gotchas
+
+This operation establishes no authority. Use [`decodePem`](#impl.decodePem) when all non-PEM text must fail.
+
 <a id="impl.length"></a>
 
 ### Method `length`
