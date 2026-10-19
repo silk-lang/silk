@@ -12,8 +12,8 @@ that time, `SemanticCases.silk`, defines `bodyRetainsReceiverPass(body, mode)` a
 `TypedBody.ReceiverPass` scalar-enum values with `value == mode` and `retained == mode`. The
 TypeScript bootstrap accepts the source and reaches native emission, then fails with `RangeError:
 Backend cannot resolve call target bodyRetainsReceiverPass` in `NativeCallOperation.js:193`. A
-previous `Type.equals` scalar-enum comparison produced the same unresolved-target failure (see
-`PAPERCUTS.md`, 2026-09-26).
+previous `Type.equals` scalar-enum comparison produced the same unresolved-target failure on
+2026-09-26.
 
 Reproduce the observed failure on that exact head, where the root still exists, with Node 24 and
 LLVM 22:
