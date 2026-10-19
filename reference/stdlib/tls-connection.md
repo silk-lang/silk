@@ -50,7 +50,7 @@ import silk.trust_anchor { TrustAnchor }
 import silk.trust_snapshot { SnapshotLimits, TrustSnapshot }
 import silk.u64
 import silk.usize
-import silk.vector { Vector }
+import silk.list { List }
 
 struct FixedWall {}
 impl SystemClock for FixedWall {
@@ -84,7 +84,7 @@ fn reference<'a>(host: &'a [u8]) -> ReferenceIdentity<'a> {
 
 fn emptyTrust() -> TrustSnapshot {
   return match move TrustSnapshot.fromAnchors(
-    Vector<TrustAnchor>.make(),
+    List<TrustAnchor>.make(),
     SnapshotLimits {anchors: 0, encodedBytes: 0},
   ) {
     Result.Success {value} => move value
@@ -103,8 +103,8 @@ effect<'env> fn failed<E: 'env, 'env>(error: E) -> i32 { drop error return 1 }
 
 effect fn program() -> i32 ! OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
-  let reads = Vector<MemoryReadEvent>.make()
-  let writes = Vector<MemoryWriteEvent>.make()
+  let reads = List<MemoryReadEvent>.make()
+  let writes = List<MemoryWriteEvent>.make()
   let mut transport = run MemoryByteDuplex.make(
     move reads,
     move writes,

@@ -882,15 +882,15 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="Vector.impl.Serialize"></a>
+<a id="List.impl.Serialize"></a>
 
-## Implementation `Serialize for Vector<T>`
+## Implementation `Serialize for List<T>`
 
 ```silk
-impl<T: Serialize> Serialize for Vector<T>
+impl<T: Serialize> Serialize for List<T>
 ```
 
-<a id="Vector.impl.Serialize.serialize"></a>
+<a id="List.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -899,15 +899,15 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="Vector.impl.Deserialize"></a>
+<a id="List.impl.Deserialize"></a>
 
-## Implementation `Deserialize for Vector<T>`
+## Implementation `Deserialize for List<T>`
 
 ```silk
-impl<T: Deserialize> Deserialize for Vector<T>
+impl<T: Deserialize> Deserialize for List<T>
 ```
 
-<a id="Vector.impl.Deserialize.deserialize"></a>
+<a id="List.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 

@@ -224,10 +224,10 @@ This function borrows the UTF-8 encoding of `name` and delegates to `HostInput.v
 
 ```silk
 pub effect fn arguments(
-  ) -> Vector<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator
+  ) -> List<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator
 ```
 
-Copies all process arguments into an owned vector in host order.
+Copies all process arguments into an owned list in host order.
 
 #### When to use
 
@@ -239,7 +239,7 @@ index without retaining all argument values.
 A host that reports a count it cannot then supply is a broken host, so a missing index below the
 count is `HostInputError` rather than a silently shorter sequence.
 
-Each argument and the result vector own their storage. The operation preserves the program name
+Each argument and the result list own their storage. The operation preserves the program name
 at index zero.
 
 <a id="HostInput.impl.text"></a>

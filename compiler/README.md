@@ -90,8 +90,8 @@ incomplete representation evidence retains the conservative same-body guard. Re-
 generic function within one family with different type arguments is
 `ExpandingSpecialization` unless the arguments descend structurally or along a witness call, or
 the re-entry runs inside a Drop hook's cleanup and every type argument stays within the owned
-structure of the value whose cleanup selected the hook (GEN-006): `Vector<Bytes>` cleanup reaches
-`Vector<u8>` through `Bytes`, while a hook that drops a larger value of its own type still grows.
+structure of the value whose cleanup selected the hook (GEN-006): `List<Bytes>` cleanup reaches
+`List<u8>` through `Bytes`, while a hook that drops a larger value of its own type still grows.
 MIR, layouts and foreign signatures are validated before closure planning, while backend-only
 emission restrictions remain loud gaps on the completed build.
 Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
@@ -531,10 +531,14 @@ silk test --manifest-path changes/silk.toml --root src/tests.silk --no-cache --s
 ```
 
 Native HTTPS conformance runs with `SILK_COMPILER` set to the native binary:
-`node .github/scripts/test-native-https.mjs --live`. Set `SILK_CLANG` if Clang is not on `PATH`.
+`node .github/scripts/test-native-https.mjs`. Set `SILK_CLANG` if Clang is not on `PATH`.
 The harness creates an isolated PKI and explicit OpenSSL request configuration so platform CA
 defaults cannot change the test certificates. Controlled requests exercise history and authentication
-failures; `--live` also checks GitHub with the default platform trust bundle.
+failures. CI runs these controlled checks without external requests. For an optional manual check,
+add `--live` to exercise GitHub with the default platform trust bundle; its unauthenticated API
+quota is shared with other callers on the same public IP and can reject an otherwise valid request.
+Live release-metadata failures print the HTTP status and response body before exiting, so an
+upstream API refusal is distinguishable from transport or certificate failures.
 
 ### One native generation and its smoke receipt
 
@@ -1458,14 +1462,14 @@ debug dump; the output is not a stable format.
 
 ## Representation and recovery
 
-`SyntaxTree` owns the source `Bytes`, the complete token vector (including trivia), a flat node
-vector, the root ID, and syntax diagnostics. A `NodeId` is exactly an index into that node vector.
+`SyntaxTree` owns the source `Bytes`, the complete token list (including trivia), a flat node
+list, the root ID, and syntax diagnostics. A `NodeId` is exactly an index into that node list.
 Children are appended before parents; the source-file root is last. Nodes contain only their
-kind, span, and direct `Element` vector. No child node or token payload is copied into a parent.
+kind, span, and direct `Element` list. No child node or token payload is copied into a parent.
 
-The parser reads significant tokens but retains trivia in the original token vector. Source bytes
+The parser reads significant tokens but retains trivia in the original token list. Source bytes
 allow contextual identifiers such as `where`, `with`, and `operator` to remain ordinary identifiers
-elsewhere. `Parser.parse` takes ownership of both the bytes and their corresponding token vector;
+elsewhere. `Parser.parse` takes ownership of both the bytes and their corresponding token list;
 those inputs must describe the same file.
 
 Missing tokens produce zero-width placeholders and diagnostics. Unexpected source is retained in
@@ -1478,9 +1482,9 @@ its first syntax diagnostic. A future compilation driver can stop on that diagno
 ## Lowered representation
 
 `hir/Hir.silk` defines the target of lowering: a `Module` is one postorder node arena where a
-`HirId` is exactly an index and children precede parents. A node owns no heap vector — single
+`HirId` is exactly an index and children precede parents. A node owns no heap list — single
 children are `HirId`, optional children are `HirRef`, and lists are `Range` runs into one shared
-child vector. Every byte string is interned through `hir/Intern.silk`, so a module holds no source
+child list. Every byte string is interned through `hir/Intern.silk`, so a module holds no source
 bytes and no `SyntaxTree`; `spans` and `nodeCauses` run parallel to `nodes` and keep coordinates
 only. Every tagged record of the bootstrap `AuthoredHir` has a counterpart variant; the module doc
 comment lists each deliberate difference.
@@ -1510,9 +1514,9 @@ library module, which is where an orphan would actually appear.
 
 `hir/Draft.silk` owns the module while it is being built. Every node enters the arena through
 `Draft.append`, which pushes one `nodes`, one `spans`, and one `nodeCauses` entry together, so the
-three parallel vectors cannot drift. Child lists and recovery-cause runs are collected on scratch
-vectors and copied into the module's shared storage when they close. Lexical binders use one flat
-vector with a frame-start stack, so opening and closing a scope truncates rather than allocates.
+three parallel lists cannot drift. Child lists and recovery-cause runs are collected on scratch
+lists and copied into the module's shared storage when they close. Lexical binders use one flat
+list with a frame-start stack, so opening and closing a scope truncates rather than allocates.
 The syntax accessors, the recovery-cause selection, and the name, path, and literal lowerings port
 the bootstrap `AuthoredLowering` helpers of the same names; the literal decoders port
 `internal/IntegerLiteral`, `internal/DurationLiteral`, `LiteralForm`, `StaticText`, and
@@ -1566,7 +1570,7 @@ reordering two declarations or interning extra strings beforehand leaves both en
 written order, which is the one place declaration order does count. The cache itself is out of
 scope; these are its primitives.
 
-CST construction remains postponed. The token vector retains source information, but there is no
+CST construction remains postponed. The token list retains source information, but there is no
 second concrete-syntax tree to maintain.
 
 Recursive rules share a budget of 32 active grammar operations. This counts parser operations,

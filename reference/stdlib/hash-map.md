@@ -6,7 +6,7 @@ Owned key-value storage with deterministic seeded hashing and open-addressed loo
 
 ## When to use
 Use [`HashMap`](#HashMap) for key-based lookup when a key has a [`HashKey`](./hash.md#HashKey) witness. Use
-`silk.vector.Vector` when presentation order should follow insertion, or when indexing rather
+`silk.list.List` when presentation order should follow insertion, or when indexing rather
 than equivalence is the primary operation.
 
 ## Details
