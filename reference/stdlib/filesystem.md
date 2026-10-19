@@ -677,7 +677,7 @@ particular kind, not for this discriminating query.
 ```silk
 effect fn listDirectory(
     path: &Path
-  ) -> Vector<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+  ) -> List<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
 ```
 
 Returns immediate owned children in deterministic complete-path byte order.
@@ -685,7 +685,7 @@ Returns immediate owned children in deterministic complete-path byte order.
 #### Details
 
 The result is not recursive. Each `DirectoryEntry.path` is independently owned and may be
-retained after the listing vector is released.
+retained after the listing list is released.
 
 <a id="FileSystem.createDirectory"></a>
 
@@ -1224,7 +1224,7 @@ pass walks the tree front to back, unlinking every file it meets and recording e
 it meets; the second removes the recorded directories back to front. That order is
 child-before-parent for free: a directory is always recorded before the children found inside
 it, so reversing the record reverses the containment. Neither pass recurses, so depth costs
-vector capacity rather than stack.
+list capacity rather than stack.
 
 This operation is destructive and not transactional. If a provider or allocation failure occurs,
 removals already completed remain completed and the remaining tree is left in place.

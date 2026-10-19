@@ -13,7 +13,7 @@ owner must survive release of its source snapshots.
 ## Details
 
 A snapshot preserves every anchor, restriction, duplicate, and input position. All limits are
-inclusive. Zero permits no corresponding resource. An empty anchor vector is valid explicit
+inclusive. Zero permits no corresponding resource. An empty anchor list is valid explicit
 trust that authenticates no peer.
 
 ## Gotchas
@@ -406,16 +406,16 @@ impl TrustSnapshot
 
 ```silk
 pub fn fromAnchors(
-    anchors: Vector<TrustAnchor>,
+    anchors: List<TrustAnchor>,
     limits: SnapshotLimits,
   ) -> Result<TrustSnapshot, TrustSourceError>
 ```
 
-Consumes a complete anchor vector after allocation-free count and byte-budget validation.
+Consumes a complete anchor list after allocation-free count and byte-budget validation.
 
 #### Details
 
-Success preserves the vector allocation, order, duplicates, and configured restrictions.
+Success preserves the list allocation, order, duplicates, and configured restrictions.
 Failure releases the consumed input and publishes no snapshot. Empty explicit trust is valid.
 
 <a id="impl.fromPem"></a>

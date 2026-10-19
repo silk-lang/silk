@@ -887,7 +887,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 ## Implementation ` Serialize for  `
 
 ```silk
-impl<T: Serialize> Serialize for Vector<T>
+impl<T: Serialize> Serialize for List<T>
 ```
 
 <a id="impl.serialize-17"></a>
@@ -904,7 +904,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 ## Implementation ` Deserialize for  `
 
 ```silk
-impl<T: Deserialize> Deserialize for Vector<T>
+impl<T: Deserialize> Deserialize for List<T>
 ```
 
 <a id="impl.deserialize-16"></a>

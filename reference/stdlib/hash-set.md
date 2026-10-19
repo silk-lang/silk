@@ -6,7 +6,7 @@ Owned unique elements with deterministic seeded hashing and open-addressed membe
 
 ## When to use
 Use [`HashSet`](#HashSet) when equivalence and fast membership are central and an element has a [`HashKey`](./hash.md#HashKey)
-witness. Use `silk.vector.Vector` when order or duplicate values are part of the data.
+witness. Use `silk.list.List` when order or duplicate values are part of the data.
 
 ## Details
 The set starts allocation-free, first allocates eight buckets, and grows before used buckets

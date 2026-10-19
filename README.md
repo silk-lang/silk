@@ -60,7 +60,7 @@ The compiler is written in Silk and builds itself.
 - **Compile-time evaluation.** `static` parameters, `let static` and `static if` run at compile time
   against the selected target, and only the chosen branch reaches the program.
 - **Little compiler magic.** Compiler operations that source can call live in the sealed
-  `Intrinsic` namespace. `Effect`, `Result`, `Vector`, logging and the file system are ordinary Silk
+  `Intrinsic` namespace. `Effect`, `Result`, `List`, logging and the file system are ordinary Silk
   in [`stdlib/`](stdlib), and you can read them like your own code.
 
 ## Install
@@ -280,7 +280,7 @@ so nothing is checked at run time.
 The [standard library](reference/stdlib/index.md) is written in Silk and documented with `silk doc`.
 It includes:
 
-- **Core:** `Effect`, `Result`, `Option`, `Vector`, `HashMap`, `Box`, `Shared`, strings, Unicode,
+- **Core:** `Effect`, `Result`, `Option`, `List`, `HashMap`, `Box`, `Shared`, strings, Unicode,
   formatting, and checked arithmetic for every scalar type.
 - **Systems:** files, child processes, sockets, clocks, randomness, single-threaded fibers and
   schedulers, and WebAssembly start-up.

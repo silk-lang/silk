@@ -1541,7 +1541,7 @@ fn seventh() -> i32 {
 ```
 
 The `Pointer` source API bounds `read` and `write` to a Copy pointee, so `Pointer.read` on a
-`*const Vector<i32>` is rejected at the bound, exactly as `RawBuffer.read` is. MIR verification
+`*const List<i32>` is rejected at the bound, exactly as `RawBuffer.read` is. MIR verification
 applies the same Copy rule to every pointer read and write operation as the backstop for direct
 intrinsic use. Every primitive is available through LLVM on native and WebAssembly targets.
 

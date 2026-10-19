@@ -56,7 +56,7 @@ import silk.option { Option }
 import silk.system_clock { Instant, SystemClock }
 import silk.u64
 import silk.usize
-import silk.vector { Vector }
+import silk.list { List }
 
 struct FixedClock {}
 struct Inspection { minimum: usize }
@@ -99,8 +99,8 @@ effect fn program() -> usize ! BufferError | OutOfMemoryError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let mut clock = FixedClock {}
   let mut transport = run MemoryByteDuplex.make(
-    Vector<MemoryReadEvent>.make(),
-    Vector<MemoryWriteEvent>.make(),
+    List<MemoryReadEvent>.make(),
+    List<MemoryWriteEvent>.make(),
     usize.ONE,
     usize.ONE,
     Option<i32>.none(),
