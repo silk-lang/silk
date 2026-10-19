@@ -23,7 +23,7 @@ interface Generation {
   sha256: string | null
 }
 export interface BuildReceipt {
-  schemaVersion: 1
+  schemaVersion: 2
   status: 'passed' | 'failed'
   failure: { stage: string; message: string } | null
   target: string
@@ -42,6 +42,7 @@ export interface BuildReceipt {
     sourceCommit: string
     normalizedDigest: string
     archiveSha256: string
+    /** Includes path dependencies and the workspace manifest, not just compiler/. */
     compiler: { sha256: string; files: SnapshotReceipt['files'] }
     stdlib: { sha256: string; files: SnapshotReceipt['files'] }
   } | null
@@ -87,15 +88,11 @@ const allowedEnvironment = [
   'LC_ALL',
   'LC_CTYPE',
 ]
-// The variable that names the clang a compiler of `generation` links with. The pinned seed predates
-// SILK_CLANG and reads SILKC_CLANG; that binding goes with the next re-pin.
-const clangVariable = (generation: string) => (generation === 'seed' ? 'SILKC_CLANG' : 'SILK_CLANG')
 const nativeEnvironment = (
   current: Readonly<Record<string, string | undefined>>,
   clang: string,
-  generation: string,
 ): Readonly<Record<string, string>> => {
-  const env: Record<string, string> = { [clangVariable(generation)]: clang }
+  const env: Record<string, string> = { SILK_CLANG: clang }
   for (const name of allowedEnvironment) {
     const value = current[name]
     if (value !== undefined) env[name] = value
@@ -195,7 +192,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   const fs = yield* FileSystem.FileSystem
   producer = resolve(producer)
   clang = resolve(clang)
-  environment = nativeEnvironment(environment, clang, producerGeneration)
+  environment = nativeEnvironment(environment, clang)
   snapshot = resolve(snapshot)
   outputDirectory = resolve(outputDirectory)
   corpusSource = resolve(corpusSource)
@@ -221,7 +218,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   yield* fs.makeDirectory(outputDirectory)
   const receiptPath = join(outputDirectory, 'build-receipt.json')
   const receipt: BuildReceipt = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     status: 'failed',
     failure: null,
     target,
@@ -252,7 +249,9 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       if (receipt.producer.sha256 !== producerSha256)
         return yield* reject(`${producerGeneration} SHA-256 differs from its verified identity`)
       const manifest = yield* SourceSnapshot.verifySnapshot({ directory: snapshot })
-      const compilerFiles = manifest.files.filter((file) => file.path.startsWith('compiler/'))
+      const compilerFiles = manifest.files.filter((file) =>
+        SourceSnapshot.isCompilerInput(file.path),
+      )
       const stdlibFiles = manifest.files.filter((file) => file.path.startsWith('stdlib/'))
       if (compilerFiles.length === 0 || stdlibFiles.length === 0)
         return yield* reject('snapshot must account for compiler and standard-library inputs')
@@ -273,7 +272,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return yield* reject('verified clang target must be a regular executable')
       const sha256 = yield* fileHash(path)
       const result = yield* NativeProcess.execute(path, ['--version'], {
-        env: nativeEnvironment(environment, path, producerGeneration),
+        env: nativeEnvironment(environment, path),
         timeoutMs,
       }).pipe(
         Effect.mapError(
@@ -298,7 +297,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       ...tool,
       environmentPolicy: 'standard-host-with-verified-clang',
     }
-    const environmentFor = (compiler: string) => nativeEnvironment(environment, tool.path, compiler)
+    const childEnvironment = nativeEnvironment(environment, tool.path)
     const program = yield* smokeProgram(corpusSource).pipe(staged('inputs'))
     const smoke = {
       name: 'trivial-features',
@@ -320,8 +319,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       )
         return yield* reject('verified clang changed during native build/smoke')
     })
-    // `compiler` is the generation whose compiler the stage runs, which selects its clang variable.
-    const invoke = (name: string, command: ReadonlyArray<string>, cwd: string, compiler: string) =>
+    const invoke = (name: string, command: ReadonlyArray<string>, cwd: string) =>
       Effect.gen(function* () {
         yield* checkInputs()
         const evidence = yield* NativeProcess.run({
@@ -329,7 +327,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
           cwd,
           resourceFile: join(outputDirectory, `${name}-rss.txt`),
           timeCommand,
-          env: environmentFor(compiler),
+          env: childEnvironment,
           timeoutMs,
         })
         const result = evidence.measurement
@@ -382,14 +380,13 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       '--debug',
       String(debug),
     ]
-    const emitIr = (name: string, compiler: string, compilerGeneration: string) =>
+    const emitIr = (name: string, compiler: string) =>
       Effect.gen(function* () {
         const ir = join(outputDirectory, `${name}.ll`)
         const emitted = yield* invoke(
           name,
           [compiler, ...argumentsFor(compilerRoot, ir, 'llvm-ir')],
           join(snapshot, 'compiler'),
-          compilerGeneration,
         )
         if (!NativeProcess.succeeded(emitted)) return yield* reject(`${name} emission failed`)
         return yield* fileHash(ir)
@@ -399,7 +396,6 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         'native-build',
         [producer, ...argumentsFor(compilerRoot, receipt.output.path, 'executable')],
         join(snapshot, 'compiler'),
-        producerGeneration,
       )
       if (!NativeProcess.succeeded(built))
         return yield* reject(`${producerGeneration} native build failed`)
@@ -412,12 +408,9 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     }).pipe(staged('native-build'))
     const producerIr = `${producerGeneration}-ir`
     if (receipt.fixpoint) {
-      const [, producerIrSha256] = yield* Effect.all(
-        [build, emitIr(producerIr, producer, producerGeneration)],
-        {
-          concurrency: 2,
-        },
-      )
+      const [, producerIrSha256] = yield* Effect.all([build, emitIr(producerIr, producer)], {
+        concurrency: 2,
+      })
       receipt.fixpoint.producerIrSha256 = producerIrSha256
     } else yield* build
     const output = receipt.output.path
@@ -437,7 +430,6 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         'smoke-build',
         [output, ...argumentsFor(smokeSource, smokeBinary, 'executable')],
         smokeDirectory,
-        generation,
       )
       if (!NativeProcess.succeeded(smokeBuilt))
         return yield* reject(`${generation} smoke compilation failed`)
@@ -445,7 +437,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     }).pipe(staged('smoke-build'))
     receipt.smoke = { ...smoke, outputSha256: smokeOutput }
     yield* Effect.gen(function* () {
-      const ran = yield* invoke('smoke-run', [smokeBinary], smokeDirectory, generation)
+      const ran = yield* invoke('smoke-run', [smokeBinary], smokeDirectory)
       if (ran.error !== null || ran.signal !== null || ran.exitCode !== 42 || ran.stdout !== '')
         return yield* reject('trivial-features exit/stdout mismatch')
       if ((yield* executableHash(output, true)) !== outputSha256)
@@ -457,7 +449,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return yield* reject('smoke input/output changed during execution')
     }).pipe(staged('smoke-run'))
     if (receipt.fixpoint) {
-      const outputIrSha256 = yield* emitIr(`${generation}-ir`, output, generation)
+      const outputIrSha256 = yield* emitIr(`${generation}-ir`, output)
       receipt.fixpoint.outputIrSha256 = outputIrSha256
       if (outputIrSha256 !== receipt.fixpoint.producerIrSha256)
         return yield* reject(

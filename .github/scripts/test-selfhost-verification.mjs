@@ -60,7 +60,7 @@ try {
   execFileSync('git', ['add', '.'], { cwd: checkout })
   const gate = join(
     checkout,
-    'compiler/build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
+    'build/llvm/x86_64-unknown-linux-gnu/release-with-debug/silk-format-gate',
   )
   mkdirSync(join(gate, '..'), { recursive: true })
   const verifyingGate = '#!/bin/sh\nprintf "FORMAT_SAFETY checked=1\\n"\n'

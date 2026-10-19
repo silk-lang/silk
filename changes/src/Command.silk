@@ -1,0 +1,345 @@
+//! Native `silk changes` adapter, including compiler/dependency upgrade history from GitHub.
+//!
+//! Author: `silk changes add minor "Change behavior" --migration "Update callers as follows..."`.
+//! Migration notes are optional for every bump kind, but their omission is reported explicitly.
+//! Commit pending .changes/*.md alongside source. `status --tag beta` previews a prerelease;
+//! `version --tag beta` starts/advances it. `version --tag rc` switches channels; `version`
+//! promotes to stable. Pending changes are consumed at each step; earlier prerelease notes carry
+//! forward to promotion. A new larger bump can raise the prerelease's target core version.
+//!
+//! Commit silk.toml, CHANGELOG.md, .changes/releases/*.toml, and removed pending files together.
+//! TOML release records are authoritative. Each release regenerates the Markdown changelog;
+//! manual Markdown edits are overwritten. Edit release records to correct published notes.
+//! `since` starts at package.silk-version and discovers the latest stable compiler release.
+//! `since mylib` starts at that direct dependency's installed version; --to selects a release.
+//! `since 1.2.0` keeps querying this package's local history. --source selects a local checkout,
+//! relative to the consuming project root, and --from overrides compiler/dependency baselines.
+//! --json is structured output for agents. Missing history is an error, never 'no changes'.
+//!
+//! Root discovery: silk changes [--dir PATH] <command>. Select a package, not a virtual workspace.
+//! Recover only after stopping other writers. Library consumers can import changeset.Release
+//! or changeset.History; the native compiler calls runHost with its ambient allocator.
+//! Tests: `silk test --root src/tests.silk --no-cache`.
+import Dependency
+import Dependency { Origin, Target }
+import GitHub
+import History
+import History { Record }
+import Http { Http, HttpError, reportError }
+import HttpNative
+import Problem { Problem }
+import Release
+import Release { Pending }
+import Text
+import Version
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.format { Format }
+import silk.host_input { HostInput, HostInputError }
+import silk.i32
+import silk.json_output { JsonOutput }
+import silk.option { Option }
+import silk.os_filesystem { OsFileSystem }
+import silk.os_random { OsRandom }
+import silk.os_writer { StderrWriter, StdoutWriter }
+import silk.random { Random }
+import silk.result { Result }
+import silk.string { String, InvalidUtf8 }
+import silk.toml_scanner { TomlError }
+import silk.toml_value { Toml, Value }
+import silk.usize
+import silk.vector { Vector }
+import silk.writer { Writer, WriterError }
+
+effect fn argument<'a>(args: &'a [Bytes], index: usize) -> string<'a> ! Problem {
+  return match move String.fromUtf8(Bytes.asSlice(&args[index])) {
+    Result<string, InvalidUtf8>.Success { value } => value
+    Result<string, InvalidUtf8>.Failure { error: _ } => { fail Problem { message: "Arguments must be valid UTF-8." } }
+  }
+}
+
+effect fn optionalArgument<'a>(args: &'a [Bytes], index: usize) -> string<'a> ! Problem {
+  if index == usize.ZERO { return "" }
+  return run argument(args, index)
+}
+
+effect fn help() -> () ! WriterError ? &mut Writer {
+  run Writer.writeAll(b"Usage:\n  silk changes [--dir PATH] add patch|minor|major \"Summary\" [--migration \"Guidance\"]\n  silk changes [--dir PATH] status [--tag beta]\n  silk changes [--dir PATH] version [--tag beta]\n  silk changes [--dir PATH] since [VERSION|DEPENDENCY] [--to VERSION] [--from VERSION] [--source PATH] [--json]\n  silk changes [--dir PATH] recover\n\nEach add creates an independent .changes/<random>.md file.\nMigration notes are optional; omission means unknown impact, not no impact.\nTagged releases use SemVer prereleases (beta.1, beta.2, rc.1).\nVersion without --tag promotes a prerelease to stable. No Git operations.\nTOML records in .changes/releases are authoritative; commit them with the changelog.\nCHANGELOG.md is regenerated on each release; manual edits will be overwritten.\nSince without a selector uses package.silk-version to query compiler upgrades.\nA dependency name uses its installed version; --to selects a release instead of latest stable.\nPublished history is fetched from GitHub. Libraries declare [changes] repository = \"owner/repo\".\nA version selector queries this package's local history; --source selects a local checkout.\n--from overrides compiler/dependency baselines; --source is relative to the project root.\nHTTPS uses SSL_CERT_FILE when set, otherwise the platform PEM certificate bundle.\n--json emits JSON for agents; the stored release records are TOML.\nAt a virtual workspace root select a member with --dir PATH.\nRecover rolls back interrupted writes; stop all other writers first.\n")
+}
+
+effect fn migrationReminder() -> () ! WriterError {
+  let mut stderr = StderrWriter.make()
+  run Writer.writeAll(b"silk changes: no migration notes supplied. Consider --migration for API, behavior, defaults, or data changes; explicitly say when no action is needed.\n")
+    |> Effect.provideMut<Writer>(&mut stderr)
+}
+
+effect fn addCommand(root: &Path, args: &[Bytes], index: usize) -> i32
+! Problem | FileError | TomlError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut Random | &mut Allocator | &mut Writer {
+  let count = args.length - index
+  if count != 3 && count != 5 {
+    fail Problem { message: "Usage: silk changes [--dir PATH] add patch|minor|major \"Summary\" [--migration \"Guidance\"]" }
+  }
+  let label = run argument(args, index + usize.ONE)
+  let kind = run Version.parseBump(label)
+  let summary = run argument(args, index + 2)
+  let mut migration = ""
+  if count == 5 {
+    if (run argument(args, index + 3)) != "--migration" {
+      fail Problem { message: "Unknown add option; use --migration followed by guidance." }
+    }
+    migration = run argument(args, index + 4)
+    if Text.trim(migration) == "" { fail Problem { message: "An explicit --migration value must not be empty." } }
+  }
+  let path = run Release.add(root, kind, summary, migration)
+  run Format.format("Created {path}\n", &.{ path: Option<string>.unwrapOr(Path.view(&path), "<non-UTF-8 path>") })
+  if migration == "" { run migrationReminder() }
+  return 0
+}
+
+effect fn releaseCommand(root: &Path, args: &[Bytes], index: usize, apply: bool) -> i32
+! Problem | FileError | TomlError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut Allocator | &mut Writer {
+  let count = args.length - index
+  let mut tag = ""
+  if count != usize.ONE {
+    if count != 3 { fail Problem { message: "Usage: silk changes [--dir PATH] status|version [--tag beta]" } }
+    if (run argument(args, index + usize.ONE)) != "--tag" { fail Problem { message: "Unknown release option; use --tag." } }
+    tag = run argument(args, index + 2)
+    if tag == "" { fail Problem { message: "--tag requires a nonempty prerelease identifier." } }
+  }
+  if apply {
+    let next = run Release.version(root, tag)
+    run Format.format("Version: {version}\n", &.{ version: String.view(&next) })
+    return 0
+  }
+  let plan = run Release.plan(root, tag)
+  let pending = Vector<Pending>.asSlice(&plan.pending)
+  run Format.format("{name}: {current} -> {next}\n", &.{
+    name: String.view(&plan.manifest.name), current: String.view(&plan.manifest.version), next: String.view(&plan.release.version)
+  })
+  let mut missing = usize.ZERO
+  let mut at = usize.ZERO
+  while at < pending.length {
+    run Format.format("  {bump} {path}\n", &.{
+      bump: Version.label(pending[at].bump),
+      path: Option<string>.unwrapOr(Path.name(&pending[at].path), "<non-UTF-8 path>")
+    })
+    if pending[at].hasMigration == false { missing = missing + usize.ONE }
+    at = at + usize.ONE
+  }
+  if pending.length == usize.ZERO { run Writer.writeAll(b"No pending changes.\n") }
+  if missing > usize.ZERO {
+    run Format.format("{count} pending changes have no migration notes; review API and behavior impact.\n", &.{ count: missing })
+  }
+  return 0
+}
+
+effect fn queryTarget(target: &mut Target) -> Vector<Record>
+! Problem | HttpError | FileError | HostInputError | OutOfMemoryError
+? &mut FileSystem | &mut HostInput | &mut Allocator {
+  return match &target.origin {
+    Origin.Local { directory } => run History.query(&directory, String.view(&target.packageName),
+      String.view(&target.fromVersion), String.view(&target.toVersion))
+    Origin.GitHub { repository, directory } => {
+      let mut http = run HttpNative.make()
+      let publication = run GitHub.resolve(String.view(&repository), String.view(&directory), String.view(&target.toVersion))
+        |> Effect.provideMut<Http>(&mut http)
+      let records = run GitHub.query(&publication, String.view(&target.packageName), String.view(&target.fromVersion))
+        |> Effect.provideMut<Http>(&mut http)
+      target.toVersion = move publication.version
+      return move records
+    }
+  }
+}
+
+effect fn sinceCommand<'a>(root: &Path, args: &'a [Bytes], index: usize) -> i32
+! Problem | HttpError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut HostInput | &mut Allocator | &mut Writer {
+  let mut selectorIndex = usize.ZERO
+  let mut sourceIndex = usize.ZERO
+  let mut fromIndex = usize.ZERO
+  let mut toIndex = usize.ZERO
+  let mut json = false
+  let mut at = index + usize.ONE
+  if at < args.length {
+    let first = run argument(args, at)
+    if first == "" { fail Problem { message: "An explicit since selector must not be empty." } }
+    if Text.byte(first, usize.ZERO) != 45 {
+      selectorIndex = at
+      at = at + usize.ONE
+    }
+  }
+  while at < args.length {
+    let option = run argument(args, at)
+    if option == "--json" {
+      if json { fail Problem { message: "--json was supplied twice." } }
+      json = true
+      at = at + usize.ONE
+    } else {
+      if at + usize.ONE == args.length { fail Problem { message: "since option requires a value." } }
+      let value = run argument(args, at + usize.ONE)
+      if value == "" { fail Problem { message: "since option values must not be empty." } }
+      if option == "--source" {
+        if sourceIndex != usize.ZERO { fail Problem { message: "--source was supplied twice." } }
+        sourceIndex = at + usize.ONE
+      } else if option == "--to" {
+        if toIndex != usize.ZERO { fail Problem { message: "--to was supplied twice." } }
+        toIndex = at + usize.ONE
+      } else {
+        if option != "--from" { fail Problem { message: "Unknown since option; use --to, --from, --source, or --json." } }
+        if fromIndex != usize.ZERO { fail Problem { message: "--from was supplied twice." } }
+        fromIndex = at + usize.ONE
+      }
+      at = at + 2
+    }
+  }
+  let selector = run optionalArgument(args, selectorIndex)
+  let source = run optionalArgument(args, sourceIndex)
+  let from = run optionalArgument(args, fromIndex)
+  let to = run optionalArgument(args, toIndex)
+  let mut target = run Dependency.resolve(root, selector, source, from, to)
+  let records = run queryTarget(&mut target)
+  let releases = Vector<Record>.asSlice(&records)
+  if json {
+    run Writer.writeAll(b"{\"package\":")
+    run JsonOutput.writeString(String.view(&target.packageName))
+    run Writer.writeAll(b",\"from\":")
+    run JsonOutput.writeString(String.view(&target.fromVersion))
+    run Writer.writeAll(b",\"to\":")
+    run JsonOutput.writeString(String.view(&target.toVersion))
+    run Writer.writeAll(b",\"releases\":[")
+    at = usize.ZERO
+    while at < releases.length {
+      if at != usize.ZERO { run Writer.writeAll(b",") }
+      let encoded = run History.encodeJson(&releases[at])
+      run Writer.writeAll(String.ownedUtf8Bytes(&encoded))
+      at = at + usize.ONE
+    }
+    run Writer.writeAll(b"]}\n")
+  } else {
+    run Format.format("# {name}: changes after {from} through {to}\n\n", &.{
+      name: String.view(&target.packageName), from: String.view(&target.fromVersion), to: String.view(&target.toVersion)
+    })
+    if releases.length == usize.ZERO { run Writer.writeAll(b"No new recorded change entries in this range.\n") }
+    at = usize.ZERO
+    while at < releases.length {
+      let rendered = run History.render(&releases[at])
+      run Writer.writeAll(String.ownedUtf8Bytes(&rendered))
+      at = at + usize.ONE
+    }
+  }
+  return 0
+}
+
+effect fn requireRecoveryPackage(root: &Path) -> ()
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let manifest = run Path.join(root, "silk.toml")
+  let source = run FileSystem.readFile(&manifest)
+  let parsed = run Effect.result(Toml.parse(Bytes.asSlice(&source)))
+  let document = match move parsed {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      // Recovery must be able to restore a manifest left partially written.
+      TomlError invalid => { return () }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  if let Option<&Value>.None = move Toml.field(&document, "package") {
+    if let Option<&Value>.Some { value: _ } = move Toml.field(&document, "workspace") {
+      fail Problem { message: "This is a virtual workspace, not a release package. Select a member with silk changes --dir PATH, or run from a member directory." }
+    }
+  }
+}
+
+effect fn command() -> i32
+! Problem | HttpError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut FileSystem | &mut Random | &mut Allocator | &mut Writer {
+  let owned = run HostInput.arguments()
+  let args = Vector<Bytes>.asSlice(&owned)
+  if args.length <= 2 {
+    run help()
+    return 0
+  }
+  let first = run argument(args, 2)
+  if first == "--help" || first == "-h" {
+    run help()
+    return 0
+  }
+  let cwd = run HostInput.workingDirectory()
+  let mut start = run Path.fromBytes(Bytes.asSlice(&cwd))
+  let mut index: usize = 2
+  if first == "--dir" {
+    if args.length < 5 { fail Problem { message: "--dir requires a path followed by a command." } }
+    let selected = run argument(args, 3)
+    if selected == "" { fail Problem { message: "--dir requires a nonempty path." } }
+    let resolved = run Dependency.resolvePath(&start, selected)
+    start = move resolved
+    index = 4
+  }
+  let name = run argument(args, index)
+  if name == "--help" || name == "-h" {
+    run help()
+    return 0
+  }
+  let root = run Release.discover(&start)
+  if name == "recover" { run requireRecoveryPackage(&root) }
+  if name == "add" { return run addCommand(&root, args, index) }
+  if name == "status" { return run releaseCommand(&root, args, index, false) }
+  if name == "version" { return run releaseCommand(&root, args, index, true) }
+  if name == "since" { return run sinceCommand(&root, args, index) }
+  if name == "recover" {
+    if args.length - index != usize.ONE { fail Problem { message: "recover takes no arguments." } }
+    run Release.recover(&root)
+    run Writer.writeAll(b"Recovery complete. Inspect your working tree before trying again.\n")
+    return 0
+  }
+  fail Problem { message: "Unknown command. Use silk changes --help for usage." }
+}
+
+effect fn program() -> i32
+! Problem | HttpError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError
+? &mut HostInput | &mut Allocator {
+  let mut files = run OsFileSystem.make(b"/")
+  let mut random = OsRandom.make()
+  let mut stdout = StdoutWriter.make()
+  return run command()
+    |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<Writer>(&mut stdout)
+}
+
+effect fn report(error: Problem | HttpError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError) -> ()
+! WriterError ? &mut Writer {
+  match move error {
+    Problem problem => { run Format.format("silk changes: {message}\n", &.{ message: problem.message }) }
+    HttpError failure => {
+      run Writer.writeAll(b"silk changes: ")
+      run reportError(&failure)
+    }
+    FileError failure => {
+      run Format.format("silk changes: filesystem operation {operation} failed (reason {reason}).\n", &.{ operation: failure.operation.code, reason: failure.reason.code })
+    }
+    TomlError failure => { run Format.format("silk changes: invalid TOML at byte {offset}.\n", &.{ offset: failure.offset }) }
+    HostInputError failure => { run Writer.writeAll(b"silk changes: could not read process arguments or working directory.\n") }
+    OutOfMemoryError failure => { run Writer.writeAll(b"silk changes: allocation failed.\n") }
+    WriterError failure => { run Writer.writeAll(b"silk changes: could not write command output.\n") }
+  }
+  run Writer.writeAll(b"If .changes/.lock remains after a failed write, stop other writers and run silk changes [--dir PATH] recover for the affected package.\n")
+}
+
+pub effect fn runHost() -> i32 ? &mut HostInput | &mut Allocator {
+  let outcome = run Effect.result(program())
+  return match move outcome {
+    Result<i32, Problem | HttpError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Success { value } => value
+    Result<i32, Problem | HttpError | FileError | TomlError | HostInputError | OutOfMemoryError | WriterError>.Failure { error } => {
+      let mut stderr = StderrWriter.make()
+      let reported = run Effect.result(report(move error) |> Effect.provideMut<Writer>(&mut stderr))
+      drop reported
+      return 1
+    }
+  }
+}
