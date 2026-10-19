@@ -535,6 +535,8 @@ Native HTTPS conformance runs with `SILK_COMPILER` set to the native binary:
 The harness creates an isolated PKI and explicit OpenSSL request configuration so platform CA
 defaults cannot change the test certificates. Controlled requests exercise history and authentication
 failures; `--live` also checks GitHub with the default platform trust bundle.
+Live release-metadata failures print the HTTP status and response body before exiting, so an
+upstream API refusal is distinguishable from transport or certificate failures.
 
 ### One native generation and its smoke receipt
 
