@@ -531,10 +531,12 @@ silk test --manifest-path changes/silk.toml --root src/tests.silk --no-cache --s
 ```
 
 Native HTTPS conformance runs with `SILK_COMPILER` set to the native binary:
-`node .github/scripts/test-native-https.mjs --live`. Set `SILK_CLANG` if Clang is not on `PATH`.
+`node .github/scripts/test-native-https.mjs`. Set `SILK_CLANG` if Clang is not on `PATH`.
 The harness creates an isolated PKI and explicit OpenSSL request configuration so platform CA
 defaults cannot change the test certificates. Controlled requests exercise history and authentication
-failures; `--live` also checks GitHub with the default platform trust bundle.
+failures. CI runs these controlled checks without external requests. For an optional manual check,
+add `--live` to exercise GitHub with the default platform trust bundle; its unauthenticated API
+quota is shared with other callers on the same public IP and can reject an otherwise valid request.
 Live release-metadata failures print the HTTP status and response body before exiting, so an
 upstream API refusal is distinguishable from transport or certificate failures.
 
