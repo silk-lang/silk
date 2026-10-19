@@ -327,6 +327,54 @@ pub union CallableFieldInput {
   Represented {pub parameter: usize, pub slot: usize},
 }
 
+/// Actual source of one field selected by callable staging. These records are emitted beside
+/// the corresponding capture append, never inferred afterward from equal field types.
+pub union StagedSource {
+  Base,
+  BaseField {pub index: usize},
+  Suffix {pub index: usize},
+}
+
+impl Copy for StagedSource {}
+
+pub struct StagedField {
+  pub source: StagedSource
+  pub field: usize
+  pub input: CallableFieldInput
+}
+
+impl Copy for StagedField {}
+
+pub union StagedLayout {
+  Selected {pub fields: Vector<StagedField>},
+  /// The base and suffix are real held values, but representation selection has not chosen a
+  /// physical flatten/nest map. A later semantic recheck rebuilds it; it is never KnownEmpty.
+  Deferred,
+}
+
+impl StagedLayout {
+  pub effect fn copy(self: &Self) -> Self ! OutOfMemoryError ? &mut Allocator {
+    return match &self.* {
+      StagedLayout.Deferred => StagedLayout.Deferred
+      StagedLayout.Selected {fields} => {
+        let mut copied = Vector<StagedField>.make()
+        let previous = Vector<StagedField>.asSlice(&fields)
+        let mut at = usize.ZERO
+        while at < previous.length {
+          run Vector<StagedField>.append(&mut copied, previous[at])
+          at = at + usize.ONE
+        }
+        StagedLayout.Selected {fields: move copied}
+      }
+    }
+  }
+}
+
+pub struct StagedValue {
+  pub ty: Shared<Type>
+  pub layout: StagedLayout
+}
+
 impl Copy for CallableFieldInput {}
 
 impl CallableFieldInput {
@@ -8355,7 +8403,8 @@ effect fn rewriteTypeInside(value: &Shared<Type>, owner: &DeclarationId, argumen
           return run Types.intern(Type.CallableStage {base: move reboundBase, contract: move reboundContract,
             captures: move fields, remaining: remaining, suffixMode: suffixMode})
         }
-        return run Type.stagedCallable(move reboundBase, move reboundContract, move fields, remaining, suffixMode, owner)
+        let staged = run Type.stagedCallable(move reboundBase, move reboundContract, move fields, remaining, suffixMode, owner)
+        return move staged.ty
       }
       Type.Callable {
         mode,
@@ -9386,28 +9435,33 @@ impl Type {
   /// capture record for the original target. Supplied fields stay in capture order; their input
   /// ordinals retain the target's argument order across repeated staging.
   pub effect fn stagedCallable(base: Shared<Type>, contract: Shared<Type>, captures: Vector<Shared<Type>>,
-    remaining: usize, suffixMode: CallableMode, owner: &DeclarationId) -> Shared<Type>
+    remaining: usize, suffixMode: CallableMode, owner: &DeclarationId) -> StagedValue
   ! OutOfMemoryError ? &mut Allocator | &mut Types {
     let copied = run Type.copy(&base)
     if let Type.CallableView {representation, ..} = &copied {
       let staged = run Type.stagedCallable(Shared<Type>.clone(&representation), Shared<Type>.clone(&contract),
         move captures, remaining, suffixMode, owner)
-      return run Type.callableView(move staged, move contract)
+      return StagedValue {ty: run Type.callableView(move staged.ty, move contract), layout: move staged.layout}
     }
     if let Type.CallableValue {isPublic, application, contract: originalContract, captures: originalCaptures, fieldInputs, ..} = move copied {
       let mut fields = Vector<Shared<Type>>.make()
+      let mut routes = Vector<StagedField>.make()
       let mut inputs = Vector<CallableFieldInput>.make()
       let previousInputs = Vector<CallableFieldInput>.asSlice(&fieldInputs)
       let nested = previousInputs.length == usize.ZERO && Shared<Application>.with<bool>(&application, anonymousCallableTarget)
       if nested {
         run Vector<Shared<Type>>.append(&mut fields, Shared<Type>.clone(&base))
         run Vector<CallableFieldInput>.append(&mut inputs, CallableFieldInput.Environment)
+        run Vector<StagedField>.append(&mut routes, StagedField {source: StagedSource.Base,
+          field: usize.ZERO, input: CallableFieldInput.Environment})
       } else {
         let previous = Vector<Shared<Type>>.asSlice(&originalCaptures)
         let mut at = usize.ZERO
         while at < previousInputs.length {
           run Vector<Shared<Type>>.append(&mut fields, Shared<Type>.clone(&previous[at]))
           run Vector<CallableFieldInput>.append(&mut inputs, previousInputs[at])
+          run Vector<StagedField>.append(&mut routes, StagedField {source: StagedSource.BaseField {index: at},
+            field: at, input: previousInputs[at]})
           at = at + usize.ONE
         }
       }
@@ -9417,6 +9471,9 @@ impl Type {
         run Vector<Shared<Type>>.append(&mut fields, Shared<Type>.clone(&supplied[at]))
         run Vector<CallableFieldInput>.append(&mut inputs, CallableFieldInput.Argument {
           parameter: CallableFieldInput.openOrdinal(previousInputs, remaining + at)})
+        run Vector<StagedField>.append(&mut routes, StagedField {source: StagedSource.Suffix {index: at},
+          field: Vector<Shared<Type>>.length(&fields) - usize.ONE,
+          input: CallableFieldInput.Argument {parameter: CallableFieldInput.openOrdinal(previousInputs, remaining + at)}})
         at = at + usize.ONE
       }
       let mut mode = Shared<Type>.with<CallableMode>(&originalContract, callableMode)
@@ -9429,7 +9486,8 @@ impl Type {
         }
         _ => absurd<Type>()
       }
-      return run Type.callableValue(isPublic, move application, run Types.intern(move normalized), move fields, move inputs)
+      let selected = run Type.callableValue(isPublic, move application, run Types.intern(move normalized), move fields, move inputs)
+      return Type.finishStagedValue(move selected, move routes)
     }
     let mut retained = Vector<Shared<Type>>.make()
     run Vector<Shared<Type>>.append(&mut retained, Shared<Type>.clone(&base))
@@ -9440,8 +9498,29 @@ impl Type {
       at = at + usize.ONE
     }
     let contract = run retainedCaptureContract(&contract, owner, Vector<Shared<Type>>.asSlice(&retained))
-    return run Types.intern(Type.CallableStage {base: move base, contract: move contract,
-      captures: move captures, remaining: remaining, suffixMode: suffixMode})
+    return StagedValue {ty: run Types.intern(Type.CallableStage {base: move base, contract: move contract,
+      captures: move captures, remaining: remaining, suffixMode: suffixMode}), layout: StagedLayout.Deferred}
+  }
+
+  /// Pairs the actual append-site routes with the final input mapping selected by callableValue
+  /// or callableSchema. Represented slot identity is read from that result, never recomputed.
+  pub fn finishStagedValue(ty: Shared<Type>, fields: Vector<StagedField>) -> StagedValue {
+    let mut routes = move fields
+    let count = Vector<StagedField>.length(&routes)
+    let mut at = usize.ZERO
+    while at < count {
+      let field = Vector<StagedField>.asSlice(&routes)[at].field
+      let input = Shared<Type>.with<CallableFieldInput>(&ty, fn(value: &Type) -> CallableFieldInput {
+        return match &value.* {
+          Type.CallableValue {fieldInputs, ..} => Vector<CallableFieldInput>.asSlice(&fieldInputs)[field]
+          Type.CallableSchema {fieldInputs, ..} => Vector<CallableFieldInput>.asSlice(&fieldInputs)[field]
+          _ => absurd<CallableFieldInput>()
+        }
+      })
+      Vector<StagedField>.asMutSlice(&mut routes)[at].input = input
+      at = at + usize.ONE
+    }
+    return StagedValue {ty: move ty, layout: StagedLayout.Selected {fields: move routes}}
   }
 
   /// Creates an exact generic named-section environment without selecting an executable target.
