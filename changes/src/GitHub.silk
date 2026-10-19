@@ -1,0 +1,228 @@
+//! Discovers published GitHub releases and reads committed TOML history at one exact release tag.
+import History
+import History { Record, Source }
+import Http { Http }
+import Problem { Problem }
+import Text
+import Version
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.i32
+import silk.json_scanner { JsonError }
+import silk.json_value { Json, Value }
+import silk.option { Option }
+import silk.result { Result }
+import silk.string { String }
+import silk.usize
+import silk.vector { Vector }
+
+/// The exact published version and its tag-pinned, authoritative release-record directory.
+pub struct Publication {
+  pub version: String
+  pub historyBase: String
+}
+
+fn unreserved(value: i32) -> bool {
+  return (value >= 65 && value <= 90) || (value >= 97 && value <= 122)
+    || (value >= 48 && value <= 57) || value == 45 || value == 46 || value == 95 || value == 126
+}
+
+// Encode original UTF-8 bytes exactly once, including literal percent signs and SemVer '+'.
+effect fn appendComponent(output: &mut String, text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut start = usize.ZERO
+  let mut index = usize.ZERO
+  let length = String.byteLength(text)
+  while index < length {
+    let value = Text.byte(text, index)
+    if !unreserved(value) {
+      run String.append(&mut output.*, Text.part(text, start, index))
+      run String.append(&mut output.*, "%")
+      let high = i32.toUsize(value / 16)
+      let low = i32.toUsize(value % 16)
+      run String.append(&mut output.*, Text.part("0123456789ABCDEF", high, high + usize.ONE))
+      run String.append(&mut output.*, Text.part("0123456789ABCDEF", low, low + usize.ONE))
+      start = index + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  run String.append(&mut output.*, Text.part(text, start, length))
+}
+
+effect fn validateComponent(component: string) -> () ! Problem {
+  if component == "" || component == "." || component == ".." {
+    fail Problem { message: "GitHub history paths require nonempty components other than '.' and '..'." }
+  }
+  let mut index = usize.ZERO
+  while index < String.byteLength(component) {
+    let value = Text.byte(component, index)
+    if value < 32 || value == 127 || value == 92 {
+      fail Problem { message: "GitHub history paths must not contain control bytes or backslashes." }
+    }
+    index = index + usize.ONE
+  }
+}
+
+effect fn validateDirectory(directory: string) -> () ! Problem {
+  if directory == "" { return () }
+  let length = String.byteLength(directory)
+  let mut start = usize.ZERO
+  let mut index = usize.ZERO
+  while index < length {
+    if Text.byte(directory, index) == 47 {
+      run validateComponent(Text.part(directory, start, index))
+      start = index + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  run validateComponent(Text.part(directory, start, length))
+}
+
+effect fn validateRepository(repository: string) -> () ! Problem {
+  let length = String.byteLength(repository)
+  let mut separator = length
+  let mut index = usize.ZERO
+  while index < length {
+    let value = Text.byte(repository, index)
+    if value == 47 {
+      if separator != length {
+        fail Problem { message: "GitHub history repository must be an owner/repository pair, not a URL or path." }
+      }
+      separator = index
+    } else {
+      if !unreserved(value) || value == 126 {
+        fail Problem { message: "GitHub history repository permits only ASCII letters, digits, hyphens, underscores, and dots." }
+      }
+    }
+    index = index + usize.ONE
+  }
+  if separator == length {
+    fail Problem { message: "GitHub history repository must declare both owner and repository." }
+  }
+  run validateComponent(Text.part(repository, usize.ZERO, separator))
+  run validateComponent(Text.part(repository, separator + usize.ONE, length))
+}
+
+effect fn appendDirectory(output: &mut String, directory: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  if directory == "" { return () }
+  let length = String.byteLength(directory)
+  let mut start = usize.ZERO
+  let mut index = usize.ZERO
+  while index < length {
+    if Text.byte(directory, index) == 47 {
+      run appendComponent(&mut output.*, Text.part(directory, start, index))
+      run String.append(&mut output.*, "/")
+      start = index + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  run appendComponent(&mut output.*, Text.part(directory, start, length))
+  run String.append(&mut output.*, "/")
+}
+
+effect fn requiredBool(document: &Value, key: string) -> bool ! Problem {
+  return match move Json.field(document, key) {
+    Option<&Value>.Some { value } => match &value.* {
+      Value.Bool { value: flag } => flag
+      _ => { fail Problem { message: "GitHub release metadata requires boolean draft and prerelease fields." } }
+    }
+    Option<&Value>.None => { fail Problem { message: "GitHub release metadata requires boolean draft and prerelease fields." } }
+  }
+}
+
+effect fn releaseDocument(bytes: &Bytes) -> Value ! Problem | OutOfMemoryError ? &mut Allocator {
+  return match move run Effect.result(Json.parse(Bytes.asSlice(bytes))) {
+    Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, JsonError | OutOfMemoryError>.Failure { error } => match move error {
+      JsonError invalid => { fail Problem { message: "GitHub release metadata is not valid JSON (including duplicate keys)." } }
+      OutOfMemoryError allocation => { fail move allocation }
+    }
+  }
+}
+
+/// Empty `to` selects GitHub's latest stable release; an explicit SemVer selects exactly `v<VERSION>`.
+/// No release assets, development fallback, or uncommitted local notes supply authoritative history.
+pub effect fn resolve(repository: string, directory: string, to: string) -> Publication
+! Problem | OutOfMemoryError ? &mut Http | &mut Allocator {
+  run validateRepository(repository)
+  run validateDirectory(directory)
+  if to != "" { run Version.validate(to) }
+  let mut endpoint = run String.copy("https://api.github.com/repos/")
+  run String.append(&mut endpoint, repository)
+  if to == "" {
+    run String.append(&mut endpoint, "/releases/latest")
+  } else {
+    run String.append(&mut endpoint, "/releases/tags/v")
+    run appendComponent(&mut endpoint, to)
+  }
+  let response = run Http.get(String.view(&endpoint))
+  if response.status == 404 {
+    if to == "" { fail Problem { message: "No published stable GitHub release is available for this repository; choose an explicit published --to version." } }
+    fail Problem { message: "The requested GitHub release is unavailable." }
+  }
+  if response.status == 403 || response.status == 429 {
+    fail Problem { message: "GitHub release discovery was denied or rate limited." }
+  }
+  if response.status != 200 { fail Problem { message: "GitHub release discovery failed with an unsuccessful HTTP status." } }
+  let document = run releaseDocument(&response.body)
+  let tag = match move Json.asString(Json.field(&document, "tag_name")) {
+    Option<string>.Some { value } => value
+    Option<string>.None => { fail Problem { message: "GitHub release metadata requires a string tag_name." } }
+  }
+  if !Text.starts(tag, "v") {
+    fail Problem { message: "GitHub release tags must be the complete version prefixed with 'v'." }
+  }
+  let version = Text.part(tag, usize.ONE, String.byteLength(tag))
+  run Version.validate(version)
+  if to != "" && version != to {
+    fail Problem { message: "GitHub returned a release tag different from the exact requested version." }
+  }
+  let draft = run requiredBool(&document, "draft")
+  let prerelease = run requiredBool(&document, "prerelease")
+  if draft { fail Problem { message: "Draft GitHub releases cannot supply published upgrade history." } }
+  if to == "" && (prerelease || Version.isPrerelease(version)) {
+    fail Problem { message: "GitHub latest did not identify a published stable release." }
+  }
+  let mut historyBase = run String.copy("https://raw.githubusercontent.com/")
+  run String.append(&mut historyBase, repository)
+  run String.append(&mut historyBase, "/")
+  run appendComponent(&mut historyBase, tag)
+  run String.append(&mut historyBase, "/")
+  run appendDirectory(&mut historyBase, directory)
+  run String.append(&mut historyBase, ".changes/releases/")
+  return Publication { version: run String.copy(version), historyBase: move historyBase }
+}
+
+struct RemoteSource<'a> {
+  base: string<'a>
+}
+
+impl<'a> Source<Problem | OutOfMemoryError ? &mut Http> for RemoteSource<'a> {
+  effect fn load(self: &mut Self, version: string) -> Record
+  ! Problem | OutOfMemoryError ? &mut Http | &mut Allocator {
+    run Version.validate(version)
+    let mut endpoint = run String.copy(self.base)
+    run appendComponent(&mut endpoint, version)
+    run String.append(&mut endpoint, ".toml")
+    let response = run Http.get(String.view(&endpoint))
+    if response.status == 404 {
+      fail Problem { message: "Incomplete release history: a required TOML archive is not committed at the selected GitHub release tag." }
+    }
+    if response.status == 403 || response.status == 429 {
+      fail Problem { message: "GitHub release history access was denied or rate limited." }
+    }
+    if response.status != 200 {
+      fail Problem { message: "GitHub release history could not be fetched successfully." }
+    }
+    return run History.decode(move response.body, version)
+  }
+}
+
+/// Loads every required predecessor from the selected tag, including any prerelease baseline archive.
+/// Missing records, malformed TOML, and mismatched package/version identities remain errors.
+pub effect fn query(publication: &Publication, packageName: string, from: string) -> Vector<Record>
+! Problem | OutOfMemoryError ? &mut Http | &mut Allocator {
+  let mut source = RemoteSource { base: String.view(&publication.historyBase) }
+  return run History.querySource(&mut source, packageName, from, String.view(&publication.version))
+}

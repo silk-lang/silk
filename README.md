@@ -122,9 +122,12 @@ consume pending changes, update the package version, and write authoritative
 with a warning that manual edits will be overwritten. Commit the records, changelog, manifest,
 and consumed-file deletions together. These commands do not commit, tag, publish, or access Git.
 
-`since <dependency>` uses that direct dependency's installed manifest version as the baseline;
-`--source ../candidate` supplies a newer checkout of the same package. See
-[`compiler/README.md`](compiler/README.md#native-changes) for command details and recovery.
+`silk changes since` selects compiler upgrades from the project's `package.silk-version`.
+`since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
+selects a target, and `--source ../candidate` reads a local checkout instead of GitHub.
+Local queries work, but automatic GitHub queries are currently blocked by native HTTPS trust/TLS
+compatibility. See the [HTTPS handoff](changes/HTTPS_HANDOFF.md) and
+[`compiler/README.md`](compiler/README.md#native-changes) for the interface and current limits.
 
 ## A short tour
 

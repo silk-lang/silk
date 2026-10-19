@@ -395,7 +395,7 @@ spawn a separate tool or require a checkout of that library at runtime.
 silk changes [--dir PATH] add patch|minor|major "Summary" [--migration "Guidance"]
 silk changes [--dir PATH] status [--tag beta]
 silk changes [--dir PATH] version [--tag beta]
-silk changes [--dir PATH] since VERSION|DEPENDENCY [--from VERSION] [--source PATH] [--json]
+silk changes [--dir PATH] since [VERSION|DEPENDENCY] [--to VERSION] [--from VERSION] [--source PATH] [--json]
 silk changes [--dir PATH] recover
 ```
 
@@ -422,12 +422,42 @@ still comes from `release()` in `compiler/src/main.silk`; keep that literal in s
 advance the counter. `--tag rc` changes the channel, and omitting `--tag` promotes the accumulated
 notes to stable. There are no Git tags, commits, network requests, or publication operations.
 
-`since VERSION` returns this package's newer changes and migration guidance. `since DEPENDENCY`
-accepts a direct dependency alias or unambiguous package name and uses its installed manifest
-version as the baseline. `--source` selects a candidate checkout of the same package; `--from`
-overrides a dependency baseline after updating it. `--json` remains JSON for agents, with `null`
-for unspecified migration notes. Queries deduplicate carried prerelease entries and refuse
-incomplete history or an active release lock.
+`since` without a selector uses this project's `[package].silk-version` as the compiler baseline,
+not the running compiler's version. Missing recorded versions require `--from VERSION`.
+`since DEPENDENCY` accepts a direct dependency alias or unambiguous package name and uses its
+installed manifest version as the baseline. `--from` overrides either baseline.
+
+Automatic queries resolve the latest stable GitHub release, or the exact `v<VERSION>` release
+selected by `--to VERSION`. Libraries declare their published history origin in their own manifest:
+
+```toml
+[changes]
+repository = "owner/repository"
+directory = "packages/mylib" # Optional; omitted means the repository root.
+```
+
+The compiler origin is `silk-lang/silk`, directory `compiler`. Release records must be committed
+under that package's `.changes/releases/` at the selected tag, including every required predecessor
+and prerelease baseline. This metadata enables history discovery, not remote dependency installation.
+Queries do not fetch source code for execution or update the project.
+
+**Draft limitation:** native GitHub HTTPS requests currently fail: the macOS annotated CA bundle
+is rejected by the strict PEM loader, and a plain-PEM copy gets past loading but still fails TLS.
+Automatic discovery is not ready for use. See [`changes/HTTPS_HANDOFF.md`](../changes/HTTPS_HANDOFF.md)
+for reproductions, evidence, and the remaining work. No insecure or external-tool fallback is used.
+The adapter selects `SSL_CERT_FILE` when set, otherwise `/etc/ssl/cert.pem` on Darwin or
+`/etc/ssl/certs/ca-certificates.crt` on Linux; it does not consult Darwin Keychain.
+
+`--source PATH` bypasses remote discovery and reads a local checkout of the same package.
+For compiler queries this must be the `silk-compiler` package directory, not a virtual workspace
+root. Without `--to`, that checkout's manifest version supplies the target; an explicit target
+must not exceed it. This local path is exercised and works without network access.
+
+`since VERSION` retains the current package's local-history behavior and also accepts `--to`.
+`--json` emits the resolved package/from/to and release records for agents, with `null` for
+unspecified migration notes. Queries deduplicate carried prerelease entries and refuse incomplete
+history, reversed ranges, or an active local release lock. They do not update `silk-version`;
+update that field only after migrating and verifying the project.
 
 An interrupted write retains `.changes/.lock` and its backups. Stop other writers before
 `recover`; it restores the old manifest, Markdown, and pending changes and removes an uncommitted
