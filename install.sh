@@ -8,6 +8,7 @@
 # SILK_CHANNEL=dev follows published dev snapshots; drafts and bootstrap seeds are excluded.
 # The compiler's SHA-256, reported version and embedded change snapshot are checked before
 # installing `bin/silk` beside `lib/silk/stdlib` into `$SILK_INSTALL` (default `~/.silk`).
+# When minisign is installed, the archive's signature must verify against the release key below.
 # Downloads made by curl carry no macOS quarantine mark, so Gatekeeper lets the compiler run.
 #
 # Environment:
@@ -18,6 +19,8 @@
 set -eu
 
 repo=silk-lang/silk
+# The release signing key, also published as minisign.pub at the repository root.
+minisign_public_key=RWPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDE
 install_dir=${SILK_INSTALL:-$HOME/.silk}
 release=${SILK_RELEASE:-}
 channel=${SILK_CHANNEL:-auto}
@@ -147,6 +150,18 @@ url="https://github.com/$repo/releases/download/$release_path/$encoded_archive"
 
 printf 'Downloading %s from %s\n' "$archive" "$release"
 curl -fSL --progress-bar -o "$tmp/$archive" "$url" || fail "cannot download $url"
+if command -v minisign > /dev/null 2>&1; then
+  # A missing signature fails too: deleting it must not downgrade verification.
+  curl -fsSL -o "$tmp/$archive.minisig" "$url.minisig" ||
+    fail "cannot download the signature of $archive"
+  comment=$(minisign -V -P "$minisign_public_key" -m "$tmp/$archive" -x "$tmp/$archive.minisig" -Q) ||
+    fail "$archive is not signed by the Silk release key"
+  [ "$comment" = "silk $release $archive" ] ||
+    fail "the signature of $archive belongs to a different release or file: $comment"
+  printf 'Verified the minisign signature of %s\n' "$archive"
+else
+  printf 'minisign is not installed; skipping the signature check of %s\n' "$archive"
+fi
 mkdir "$tmp/unpacked"
 tar -xzf "$tmp/$archive" -C "$tmp/unpacked" || fail "cannot unpack $archive"
 [ -f "$tmp/unpacked/$top/bin/silk" ] && [ -d "$tmp/unpacked/$top/lib/silk/stdlib" ] ||
