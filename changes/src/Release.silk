@@ -13,15 +13,18 @@ import Manifest { Manifest }
 import History
 import History { Entry, Record }
 import Problem { Problem }
+import Snapshot
 import Text
 import Version
 import Version { Bump }
+import VersionFile
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.bool
 import silk.bytes { Bytes }
 import silk.effect { Effect }
 import silk.filesystem { DirectoryEntry, FileError, FileSystem, Path }
 import silk.i32
+import silk.json_output { JsonOutput }
 import silk.option { Option }
 import silk.random { Random }
 import silk.result { Result }
@@ -30,6 +33,7 @@ import silk.toml_scanner { TomlError }
 import silk.u8
 import silk.usize
 import silk.vector { Vector }
+import silk.writer { Writer, WriterError }
 
 pub struct Pending {
   pub path: Path
@@ -45,6 +49,7 @@ pub struct Plan {
   pub pending: Vector<Pending>
   pub changelog: String
   pub hadChangelog: bool
+  pub versionSource: Option<String>
 }
 
 /// Finds the closest ancestor containing silk.toml without parsing or mutating it.
@@ -101,6 +106,7 @@ effect fn readPlan(root: &Path, tag: string) -> Plan
   let manifest = run Manifests.parse(move manifestSource)
   let current = String.view(&manifest.version)
   run Version.validate(current)
+  let versionSource = run VersionFile.read(root, String.view(&manifest.versionFile), current, false)
   let mut base = run String.copy(Version.core(current))
   let mut carried = Vector<Entry>.make()
   if Version.isPrerelease(current) {
@@ -138,7 +144,7 @@ effect fn readPlan(root: &Path, tag: string) -> Plan
           hasMigration: String.ownedByteLength(&change.migration) != usize.ZERO
         })
         run Vector<Entry>.append(&mut added, Entry {
-          id: String.make(), bump: change.bump,
+          id: String.make(), bump: change.bump, updated: false,
           summary: move change.summary, migration: move change.migration
         })
       }
@@ -165,11 +171,9 @@ effect fn readPlan(root: &Path, tag: string) -> Plan
   while index > usize.ZERO {
     index = index - usize.ONE
     let entry = Vector<Entry>.remove(&mut added, index)
-    let mut id = run String.copy(String.view(&next))
-    run String.append(&mut id, "/")
-    run String.append(&mut id, pathName(&newPaths[index].path))
+    let id = run String.copy(pathName(&newPaths[index].path))
     run Vector<Entry>.append(&mut carried, Entry {
-      id: move id, bump: entry.bump, summary: move entry.summary, migration: move entry.migration
+      id: move id, bump: entry.bump, summary: move entry.summary, migration: move entry.migration, updated: false
     })
   }
   let changelogPath = run Path.join(root, "CHANGELOG.md")
@@ -183,7 +187,7 @@ effect fn readPlan(root: &Path, tag: string) -> Plan
       entries: move carried
     },
     manifest: move manifest, changed: changed, pending: move pending,
-    changelog: move changelog, hadChangelog: hadChangelog
+    changelog: move changelog, hadChangelog: hadChangelog, versionSource: move versionSource
   }
 }
 
@@ -192,6 +196,145 @@ fn sameTag(current: string, tag: string) -> bool {
   let end = start + String.byteLength(tag)
   if String.byteLength(current) <= end { return false }
   return Text.part(current, start, end) == tag && Text.byte(current, end) == 46
+}
+
+/// Validates the current prepared release without changing files or contacting a publisher.
+/// Coverage begins at the earliest stored predecessor, not an invented 0.0.0 archive.
+pub effect fn prepared(root: &Path) -> Record
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  run unlocked(root)
+  let manifestPath = run Path.join(root, "silk.toml")
+  let source = run textFile(&manifestPath)
+  let manifest = run Manifests.parse(move source)
+  let current = String.view(&manifest.version)
+  run Version.validate(current)
+  let versionSource = run VersionFile.read(root, String.view(&manifest.versionFile), current, true)
+  drop versionSource
+  let currentRecord = run History.load(root, current)
+  if String.view(&currentRecord.packageName) != String.view(&manifest.name) {
+    fail Problem { message: "Release history belongs to a different package." }
+  }
+  let changes = run Path.join(root, ".changes")
+  let pending = run FileSystem.listDirectory(&changes)
+  let entries = Vector<DirectoryEntry>.asSlice(&pending)
+  let mut index = usize.ZERO
+  while index < entries.length {
+    if Text.ends(pathName(&entries[index].path), ".md") {
+      fail Problem { message: "Pending changes must be consumed before exporting a prepared release." }
+    }
+    index = index + usize.ONE
+  }
+  let directory = run Path.join(root, ".changes/releases")
+  let listed = run FileSystem.listDirectory(&directory)
+  let archives = Vector<DirectoryEntry>.asSlice(&listed)
+  let indices = run orderedArchives(archives)
+  let order = Vector<usize>.asSlice(&indices)
+  let mut baseline = run String.copy(String.view(&currentRecord.fromVersion))
+  index = usize.ZERO
+  while index < order.length {
+    let version = archiveVersion(&archives[order[index]])
+    if (run Version.compare(version, current)) > 0 {
+      fail Problem { message: "Release history contains a version newer than the current manifest." }
+    }
+    let record = run History.load(root, version)
+    if String.view(&record.packageName) != String.view(&manifest.name) {
+      fail Problem { message: "Release history belongs to a different package." }
+    }
+    if (run Version.compare(String.view(&record.fromVersion), String.view(&baseline))) < 0 {
+      baseline = run String.copy(String.view(&record.fromVersion))
+    }
+    index = index + usize.ONE
+  }
+  let chain = run History.query(root, String.view(&manifest.name), String.view(&baseline), current)
+  drop chain
+  return move currentRecord
+}
+
+/// Writes read-only publication metadata from the current authoritative TOML record.
+/// JSON has exactly package, version, tag, prerelease, and the same Markdown notes.
+pub effect fn writeRelease(root: &Path, json: bool) -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut Allocator | &mut Writer {
+  let record = run prepared(root)
+  let notes = run History.render(&record)
+  if json == false {
+    run Writer.writeAll(String.ownedUtf8Bytes(&notes))
+    return ()
+  }
+  let mut tag = run String.copy("v")
+  run String.append(&mut tag, String.view(&record.version))
+  run Writer.writeAll(b"{\"package\":")
+  run JsonOutput.writeString(String.view(&record.packageName))
+  run Writer.writeAll(b",\"version\":")
+  run JsonOutput.writeString(String.view(&record.version))
+  run Writer.writeAll(b",\"tag\":")
+  run JsonOutput.writeString(String.view(&tag))
+  run Writer.writeAll(b",\"prerelease\":")
+  if Version.isPrerelease(String.view(&record.version)) { run Writer.writeAll(b"true") }
+  else { run Writer.writeAll(b"false") }
+  run Writer.writeAll(b",\"notes\":")
+  run JsonOutput.writeString(String.view(&notes))
+  run Writer.writeAll(b"}\n")
+}
+
+/// Exports immutable cumulative knowledge and a declared version projection without mutation.
+/// Development counters are externally reserved; Silk owns target/version and note semantics.
+pub effect fn writeSnapshot(root: &Path, commit: string, dev: string, json: bool) -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut Allocator | &mut Writer {
+  run Snapshot.validateCommit(commit)
+  let planned = run plan(root, "")
+  let mut release = move planned.release
+  if dev == "" {
+    if Version.isPrerelease(String.view(&planned.manifest.version)) {
+      fail Problem { message: "A stable snapshot requires a prepared stable release; use release for generic tagged publication metadata." }
+    }
+    release = run prepared(root)
+  } else {
+    let mut target = run String.copy(String.view(&release.version))
+    if planned.changed == false {
+      target = run Version.bump(Version.core(String.view(&planned.manifest.version)), Bump.Patch)
+    }
+    release.version = run Snapshot.devVersion(Version.core(String.view(&target)), dev, commit)
+  }
+  let notes = run History.render(&release)
+  let version = run String.copy(String.view(&release.version))
+  let snapshot = run Snapshot.capture(root, String.view(&planned.manifest.name),
+    String.view(&planned.manifest.version), String.view(&version), commit, move release.entries)
+  let toml = run Snapshot.encode(&snapshot)
+  if json == false {
+    run Writer.writeAll(String.ownedUtf8Bytes(&toml))
+    return ()
+  }
+  let manifest = run Manifests.replaceVersion(&planned.manifest, String.view(&version))
+  let mut versionSource = String.make()
+  if String.view(&planned.manifest.versionFile) != "" {
+    versionSource = run VersionFile.render(String.view(&version))
+  }
+  let mut tag = run String.copy("v")
+  run String.append(&mut tag, String.view(&version))
+  run Writer.writeAll(b"{\"package\":")
+  run JsonOutput.writeString(String.view(&snapshot.packageName))
+  run Writer.writeAll(b",\"version\":")
+  run JsonOutput.writeString(String.view(&version))
+  run Writer.writeAll(b",\"tag\":")
+  run JsonOutput.writeString(String.view(&tag))
+  run Writer.writeAll(b",\"prerelease\":")
+  if Version.isPrerelease(String.view(&version)) { run Writer.writeAll(b"true") }
+  else { run Writer.writeAll(b"false") }
+  run Writer.writeAll(b",\"commit\":")
+  run JsonOutput.writeString(commit)
+  run Writer.writeAll(b",\"notes\":")
+  run JsonOutput.writeString(String.view(&notes))
+  run Writer.writeAll(b",\"toml\":")
+  run JsonOutput.writeString(String.view(&toml))
+  run Writer.writeAll(b",\"manifest\":")
+  run JsonOutput.writeString(String.view(&manifest))
+  run Writer.writeAll(b",\"versionFile\":")
+  run JsonOutput.writeString(String.view(&planned.manifest.versionFile))
+  run Writer.writeAll(b",\"versionSource\":")
+  run JsonOutput.writeString(String.view(&versionSource))
+  run Writer.writeAll(b"}\n")
 }
 
 fn archiveVersion(entry: &DirectoryEntry) -> string {
@@ -221,16 +364,8 @@ effect fn siftArchives(entries: &[DirectoryEntry], order: &mut [usize], start: u
   }
 }
 
-/// Regenerates all notes from authoritative archives, newest SemVer first, plus the planned release.
-pub effect fn renderChangelog(root: &Path, plan: &Plan) -> String
-! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut result = run String.copy("# Changelog\n\nAuto-generated from `.changes/releases/*.toml`. Manual edits are overwritten on the next release; edit the authoritative TOML files instead.\n\n")
-  let planned = run History.render(&plan.release)
-  run String.append(&mut result, String.view(&planned))
-  let directory = run Path.join(root, ".changes/releases")
-  if (run FileSystem.exists(&directory)) == false { return move result }
-  let listed = run FileSystem.listDirectory(&directory)
-  let entries = Vector<DirectoryEntry>.asSlice(&listed)
+effect fn orderedArchives(entries: &[DirectoryEntry]) -> Vector<usize>
+! Problem | OutOfMemoryError ? &mut Allocator {
   let mut indices = Vector<usize>.make()
   let mut index = usize.ZERO
   while index < entries.length {
@@ -238,14 +373,7 @@ pub effect fn renderChangelog(root: &Path, plan: &Plan) -> String
       if entries[index].kind.code != 0 {
         fail Problem { message: "A .changes/releases/*.toml entry must be a regular file." }
       }
-      let version = archiveVersion(&entries[index])
-      run Version.validate(version)
-      if (run Version.compare(version, String.view(&plan.manifest.version))) > 0 {
-        fail Problem { message: "Release history contains a version newer than the current manifest." }
-      }
-      if (run Version.compare(version, String.view(&plan.release.version))) >= 0 {
-        fail Problem { message: "Release history already contains the planned version or a newer release." }
-      }
+      run Version.validate(archiveVersion(&entries[index]))
       run Vector<usize>.append(&mut indices, index)
     }
     index = index + usize.ONE
@@ -266,13 +394,37 @@ pub effect fn renderChangelog(root: &Path, plan: &Plan) -> String
     run siftArchives(entries, move order, usize.ZERO, end)
   }
   let order = Vector<usize>.asSlice(&indices)
-  index = usize.ZERO
+  index = usize.ONE
   while index < count {
+    if (run Version.compare(archiveVersion(&entries[order[index - usize.ONE]]),
+      archiveVersion(&entries[order[index]]))) == 0 {
+      fail Problem { message: "Release history contains duplicate SemVer precedence." }
+    }
+    index = index + usize.ONE
+  }
+  return move indices
+}
+
+/// Regenerates all notes from authoritative archives, newest SemVer first, plus the planned release.
+pub effect fn renderChangelog(root: &Path, plan: &Plan) -> String
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut result = run String.copy("# Changelog\n\nAuto-generated from `.changes/releases/*.toml`. Manual edits are overwritten on the next release; edit the authoritative TOML files instead.\n\n")
+  let planned = run History.render(&plan.release)
+  run String.append(&mut result, String.view(&planned))
+  let directory = run Path.join(root, ".changes/releases")
+  if (run FileSystem.exists(&directory)) == false { return move result }
+  let listed = run FileSystem.listDirectory(&directory)
+  let entries = Vector<DirectoryEntry>.asSlice(&listed)
+  let indices = run orderedArchives(entries)
+  let order = Vector<usize>.asSlice(&indices)
+  let mut index = usize.ZERO
+  while index < order.length {
     let version = archiveVersion(&entries[order[index]])
-    if index > usize.ZERO {
-      if (run Version.compare(archiveVersion(&entries[order[index - usize.ONE]]), version)) == 0 {
-        fail Problem { message: "Release history contains duplicate SemVer precedence." }
-      }
+    if (run Version.compare(version, String.view(&plan.manifest.version))) > 0 {
+      fail Problem { message: "Release history contains a version newer than the current manifest." }
+    }
+    if (run Version.compare(version, String.view(&plan.release.version))) >= 0 {
+      fail Problem { message: "Release history already contains the planned version or a newer release." }
     }
     let record = run History.load(root, version)
     if String.view(&record.packageName) != String.view(&plan.manifest.name) {
@@ -385,6 +537,9 @@ effect fn apply(root: &Path, lock: &Path, tag: string) -> String
   let manifest = run Manifests.replaceVersion(&release.manifest, String.view(&release.release.version))
   let changelog = run renderChangelog(root, &release)
   let record = run History.encode(&release.release)
+  let mut generated = String.make()
+  let relative = String.view(&release.manifest.versionFile)
+  if relative != "" { generated = run VersionFile.render(String.view(&release.release.version)) }
   let recordPath = run History.path(root, String.view(&release.release.version))
   if run FileSystem.exists(&recordPath) {
     fail Problem { message: "This version already has a release record; refusing to overwrite history." }
@@ -410,9 +565,24 @@ effect fn apply(root: &Path, lock: &Path, tag: string) -> String
     run FileSystem.writeFile(&saved, String.ownedUtf8Bytes(&pending[index].source))
     index = index + usize.ONE
   }
+  if relative != "" {
+    let savedPath = run Path.join(lock, "version-path")
+    run FileSystem.writeFile(&savedPath, String.utf8Bytes(relative))
+    match &release.versionSource {
+      Option<String>.Some { value } => {
+        let savedSource = run Path.join(lock, "version-source")
+        run FileSystem.writeFile(&savedSource, String.ownedUtf8Bytes(&value))
+      }
+      Option<String>.None => {}
+    }
+  }
   run FileSystem.writeFile(&ready, b"")
   run FileSystem.writeFile(&recordPath, String.ownedUtf8Bytes(&record))
   run FileSystem.writeFile(&manifestPath, String.ownedUtf8Bytes(&manifest))
+  if relative != "" {
+    let destination = run VersionFile.path(root, relative)
+    run FileSystem.writeFile(&destination, String.ownedUtf8Bytes(&generated))
+  }
   run FileSystem.writeFile(&changelogPath, String.ownedUtf8Bytes(&changelog))
   index = usize.ZERO
   while index < pending.length {
@@ -457,6 +627,18 @@ pub effect fn recover(root: &Path) -> ()
     markerIndex = markerIndex + usize.ONE
   }
   if run FileSystem.exists(&ready) {
+    let savedPath = run Path.join(&lock, "version-path")
+    if run FileSystem.exists(&savedPath) {
+      let relative = run textFile(&savedPath)
+      let destination = run VersionFile.path(root, String.view(&relative))
+      let savedSource = run Path.join(&lock, "version-source")
+      if run FileSystem.exists(&savedSource) {
+        let original = run FileSystem.readFile(&savedSource)
+        run FileSystem.writeFile(&destination, Bytes.asSlice(&original))
+      } else {
+        if run FileSystem.exists(&destination) { run FileSystem.removeFile(&destination) }
+      }
+    }
     let historyJournal = run Path.join(&lock, "history")
     if run FileSystem.exists(&historyJournal) {
       let records = run FileSystem.listDirectory(&historyJournal)

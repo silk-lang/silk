@@ -2,7 +2,8 @@
 //!
 //! Trust configuration is owned once; each request freezes a fresh PEM snapshot. DNS is the
 //! synchronous native resolver, so acquisition has no overall deadline. TLS authentication
-//! retains the native 30-second bound. No redirects, credentials, proxies, retries, or caches.
+//! retains the native 30-second bound. At most five absolute HTTPS redirects; no credentials,
+//! proxies, retries, or caches. Each redirect authenticates its own destination.
 import Http { Http, HttpError, Response }
 import Problem { Problem }
 import silk.allocator { Allocator, OutOfMemoryError }
@@ -29,6 +30,7 @@ import silk.resolver { ResolverError }
 import silk.result { Result }
 import silk.slice { Slice }
 import silk.system_clock { SystemClock }
+import silk.string { String }
 import silk.tls_connection { ConnectionError }
 import silk.trust_snapshot { TrustSourceError }
 import silk.trust_source { TrustSource }
@@ -122,18 +124,69 @@ fn limits() -> Limits {
   return selected
 }
 
+struct Received {
+  response: Response
+  location: String
+}
+
+fn locationHeader(name: string) -> bool {
+  let bytes = String.utf8Bytes(name)
+  let expected = b"location"
+  if bytes.length != expected.length { return false }
+  let mut index = usize.ZERO
+  while index < bytes.length {
+    let mut value = bytes[index]
+    if value >= 65 && value <= 90 { value = value + 32 }
+    if value != expected[index] { return false }
+    index = index + usize.ONE
+  }
+  return true
+}
+
+effect fn redirectLocation(exchange: &Exchange<NativeTransport>) -> String
+! Problem | ClientError | OutOfMemoryError ? &mut Allocator {
+  let head = run Exchange.head(exchange)
+  let mut fields = head.fields()
+  let mut selected = Option<&[u8]>.none()
+  while true {
+    let next = fields.next()
+    match move next {
+      Option.None => { break }
+      Option.Some { value } => {
+        if locationHeader(Header.name(&value)) {
+          if let Option.Some { value: previous } = &selected {
+            fail Problem { message: "HTTPS redirect has duplicate Location headers." }
+          }
+          selected = Option<&[u8]>.some(Header.value(&value))
+        }
+      }
+    }
+  }
+  let bytes = match move selected {
+    Option.Some { value } => value
+    Option.None => { fail Problem { message: "HTTPS redirect has no Location header." } }
+  }
+  if bytes.length == usize.ZERO || bytes.length > 8192 {
+    fail Problem { message: "HTTPS redirect Location must contain at most 8192 bytes." }
+  }
+  return match move run String.copyUtf8(bytes) {
+    Result.Success { value } => move value
+    Result.Failure { error } => { fail Problem { message: "HTTPS redirect Location is not UTF-8." } }
+  }
+}
+
 struct GetHandler {
   request: PreparedRequest
 }
 
-impl ConnectionHandler<NativeTransport, Response, Problem | ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random> for GetHandler {
-  effect<'call> fn handle<'call>(handler: Self, connection: &'call mut Connection<NativeTransport>) -> Response
+impl ConnectionHandler<NativeTransport, Received, Problem | ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random> for GetHandler {
+  effect<'call> fn handle<'call>(handler: Self, connection: &'call mut Connection<NativeTransport>) -> Received
   ! Problem | ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
     return run Client.withExchange(&mut connection.*, &handler.request, RequestOptions.defaults(), receive)
   }
 }
 
-effect<'call> fn receive<'call, 'exchange: 'call>(exchange: &'call mut Exchange<'exchange, NativeTransport>) -> Response
+effect<'call> fn receive<'call, 'exchange: 'call>(exchange: &'call mut Exchange<'exchange, NativeTransport>) -> Received
 ! Problem | ClientError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut Random {
   run Client.send(&mut exchange.*)
   let entries: [Header<'static>; 0] = []
@@ -143,6 +196,11 @@ effect<'call> fn receive<'call, 'exchange: 'call>(exchange: &'call mut Exchange<
   }
   run Client.finishRequest(&mut exchange.*, &trailers)
   let status = run Client.receiveFinal(&mut exchange.*)
+  let code = u16.toI32(status)
+  let mut location = String.make()
+  if code == 301 || code == 302 || code == 303 || code == 307 || code == 308 {
+    location = run redirectLocation(&exchange.*)
+  }
   let mut body = Bytes.make()
   let mut scratch: [u8; 256] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -171,10 +229,10 @@ effect<'call> fn receive<'call, 'exchange: 'call>(exchange: &'call mut Exchange<
     run Bytes.append(&mut body, Slice.view<u8>(&scratch, usize.ZERO, count))
   }
   run Client.finishResponse(&mut exchange.*)
-  return Response { status: u16.toI32(status), body: move body }
+  return Received { response: Response { status: code, body: move body }, location: move location }
 }
 
-effect fn getNative(self: &mut Native, url: string) -> Response
+effect fn getNative(self: &mut Native, url: string) -> Received
 ! Problem | RequestError | ClientError | NativeClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
 ? &mut Allocator {
   let uri = match move Uri.parse(url) {
@@ -212,10 +270,26 @@ effect fn getNative(self: &mut Native, url: string) -> Response
     |> Effect.provideMut<Random>(&mut random)
 }
 
+effect fn follow(self: &mut Native, url: string) -> Response
+! Problem | RequestError | ClientError | NativeClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError
+? &mut Allocator {
+  let mut received = run getNative(&mut self.*, url)
+  let mut hops = usize.ZERO
+  while String.ownedByteLength(&received.location) != usize.ZERO {
+    if hops == 5 { fail Problem { message: "HTTPS redirect limit exceeded." } }
+    // getNative validates the absolute origin, rejects credentials and HTTP downgrades,
+    // and constructs fresh headers without forwarding authorization or cookies.
+    let next = run getNative(&mut self.*, String.view(&received.location))
+    received = move next
+    hops = hops + usize.ONE
+  }
+  return move received.response
+}
+
 impl Http for Native {
   effect fn get(self: &mut Self, url: string) -> Response
   ! Problem | HttpError | OutOfMemoryError ? &mut Allocator {
-    let result = run Effect.result(getNative(&mut self.*, url))
+    let result = run Effect.result(follow(&mut self.*, url))
     return match move result {
       Result.Success { value } => move value
       Result.Failure { error } => match move error {

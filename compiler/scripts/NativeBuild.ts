@@ -42,6 +42,8 @@ export interface BuildReceipt {
     sourceCommit: string
     normalizedDigest: string
     archiveSha256: string
+    /** Explicit native release projection, or null for committed/bootstrap inputs. */
+    projection: SnapshotReceipt['projection'] | null
     /** Includes path dependencies and the workspace manifest, not just compiler/. */
     compiler: { sha256: string; files: SnapshotReceipt['files'] }
     stdlib: { sha256: string; files: SnapshotReceipt['files'] }
@@ -260,6 +262,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         sourceCommit: manifest.sourceCommit,
         normalizedDigest: manifest.normalizedDigest,
         archiveSha256: manifest.archiveSha256,
+        projection: manifest.projection ?? null,
         compiler: { sha256: manifest.compilerDigest, files: compilerFiles },
         stdlib: { sha256: manifest.stdlibDigest, files: stdlibFiles },
       }
