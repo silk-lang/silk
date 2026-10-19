@@ -586,13 +586,13 @@ reads only the syntax index, so a name with a conditional candidate there is the
 
 ## Development and the native seed
 
-`main` is the only integration branch. A pull request merges when `CI result` and `Focused Linux
-Silk` pass on its head. Merge `main` into the branch before its final run, with a merge that retains
+`main` is the only integration branch. A pull request merges when `Focused Linux Silk` passes on
+its head. Merge `main` into the branch before its final run, with a merge that retains
 both parents, so the merge commit reuses that run's verdict.
 
 The frozen TypeScript bootstrap in [`bootstrap/`](../bootstrap) only builds n0, the first native
-compiler, from the commit in `bootstrap/anchor.json`; Bootstrap CI rebuilds n0 from the bootstrap
-every week. Every later compiler is built by the native seed chain, so a compiler or
+compiler, from the commit in `bootstrap/anchor.json`. The bootstrap and n0 are frozen: Bootstrap
+CI rebuilds n0 from the bootstrap only when dispatched by hand, after an emergency change. Every later compiler is built by the native seed chain, so a compiler or
 standard-library change never needs a bootstrap change.
 
 ### Release versions
