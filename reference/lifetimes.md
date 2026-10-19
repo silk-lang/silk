@@ -193,6 +193,33 @@ the operation's environment. So the body never assumes a borrowed first input ou
 environment. A function that returns a view of that input at the environment writes the relation in
 its type, as `cell: &'env Cell`. Owned and generic first inputs remain covered.
 
+For a covered reference `&'access mut Slot<'data>` (or a shared reference), the captured value
+includes the outer access: a written `effect<'data>` requires `'access: 'data`. The referent's
+well-formedness supplies the opposite relation, `'data: 'access`; it does not supply that obligation.
+Consequently, matching the stored-data lifetime alone does not make the call valid. Writing the
+implied outlives bound explicitly does not change the contract. Immediate `run`, a locally staged
+Effect, and a unit success type do not waive it. Finite loan-use proofs cannot establish an unrelated
+relationship between the caller's lifetime parameters or a requirement for `'static`.
+
+A short operation on longer-lived mutable storage can instead name its access environment and
+state the independent storage relationship explicitly:
+
+```silk
+struct Slot<'data> { value: &'data i32 }
+
+effect<'access> fn store<'data, 'input: 'data, 'access>(
+  marker: i32,
+  slot: &'access mut Slot<'data>,
+  value: &'input i32,
+) -> () {
+  slot.value = value
+  return ()
+}
+```
+
+Here the captured inputs owe `'access`, and `'input: 'data` permits the store. The mutable
+referent's `'data` remains invariant. A call cannot shorten it just because execution is local.
+
 An ordinary named function whose result is an `Effect` with an omitted environment elides it from
 the header under LIFE-003. A single borrowed input supplies the environment, and several borrowed
 inputs require it to be written. When no input carries borrowed data, the environment is `'static`, so
