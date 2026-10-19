@@ -6,8 +6,8 @@ Bounded streaming decoding for raw DEFLATE, zlib, and gzip bytes.
 
 ## When to use
 Use [`Decoder`](#Decoder) to decode compressed input into caller-owned output buffers.
-Select [`Format`](#Format) explicitly. Use [`make`](#impl.make) to create state and [`step`](#impl.step) to decode bytes.
-Use [`reset`](#impl.reset) to reuse a decoder for another independent stream.
+Select [`Format`](#Format) explicitly. Use [`make`](#Decoder.impl.make) to create state and [`step`](#Decoder.impl.step) to decode bytes.
+Use [`reset`](#Decoder.impl.reset) to reuse a decoder for another independent stream.
 This module does not detect formats or encode data.
 
 ## Details
@@ -485,9 +485,9 @@ An owned, bounded decoder with no retained input or output borrow.
 
 Drop releases its history and table allocations. A finished decoder returns `Finished` with zero progress on later calls.
 A failed decoder rejects later steps with `InvalidUse`.
-A successful [`reset`](#impl.reset) starts another independent stream with the same owned storage.
+A successful [`reset`](#Decoder.impl.reset) starts another independent stream with the same owned storage.
 
-<a id="impl"></a>
+<a id="Decoder.impl"></a>
 
 ## Implementation `Decoder`
 
@@ -495,7 +495,7 @@ A successful [`reset`](#impl.reset) starts another independent stream with the s
 impl Decoder
 ```
 
-<a id="impl.make"></a>
+<a id="Decoder.impl.make"></a>
 
 ### Associated function `make`
 
@@ -512,7 +512,7 @@ Creates a decoder and acquires bounded history and table storage through the cur
 Construction fails with `MemoryLimit` or `MemberLimit` before allocation if either allowance is insufficient.
 Allocation failure is `OutOfMemoryError`. The first member counts at construction.
 
-<a id="impl.reset"></a>
+<a id="Decoder.impl.reset"></a>
 
 ### Method `reset`
 
@@ -539,7 +539,7 @@ A rejected reset leaves the decoder unchanged. An in-progress stream can continu
 Reset does not validate, reclaim, or erase previous output. Output from failed or abandoned streams remains provisional.
 Reset does not securely erase the decoder storage.
 
-<a id="impl.step"></a>
+<a id="Decoder.impl.step"></a>
 
 ### Method `step`
 
@@ -562,7 +562,7 @@ Raw and zlib leave trailing input unconsumed. Gzip waits for final exhaustion af
 #### Gotchas
 
 Output remains provisional until `Finished`. A failure poisons the decoder; discard all output after failure.
-Limits are cumulative across calls and gzip members until a successful [`reset`](#impl.reset).
+Limits are cumulative across calls and gzip members until a successful [`reset`](#Decoder.impl.reset).
 Checks occur before the excess byte or member is accepted.
 
 

@@ -28,7 +28,7 @@ The scope for StaticText operations.
 This owner carries no data. Select it with `import silk.static_text { StaticText }`
 to access its inherent operations.
 
-<a id="impl"></a>
+<a id="StaticText.impl"></a>
 
 ## Implementation `StaticText`
 
@@ -36,7 +36,7 @@ to access its inherent operations.
 impl StaticText
 ```
 
-<a id="impl.byteLength"></a>
+<a id="StaticText.impl.byteLength"></a>
 
 ### Associated function `byteLength`
 
@@ -46,7 +46,7 @@ pub static fn byteLength(value: string) -> usize
 
 Returns the UTF-8 byte length of `value` during static evaluation.
 
-<a id="impl.byteAt"></a>
+<a id="StaticText.impl.byteAt"></a>
 
 ### Associated function `byteAt`
 
@@ -56,7 +56,7 @@ pub static fn byteAt(value: string, index: usize) -> u8
 
 Returns one UTF-8 byte at `index`, or reports a static phase violation when out of bounds.
 
-<a id="impl.concat"></a>
+<a id="StaticText.impl.concat"></a>
 
 ### Associated function `concat`
 
@@ -66,7 +66,7 @@ pub static fn concat(left: string, right: string) -> string<'static>
 
 Concatenates two static texts and retains `left` as the source anchor for diagnostics.
 
-<a id="impl.slice"></a>
+<a id="StaticText.impl.slice"></a>
 
 ### Associated function `slice`
 

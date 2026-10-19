@@ -5,11 +5,11 @@
 Checked size-and-alignment descriptions used to request storage from an allocator.
 
 ## When to use
-Prefer [`of`](#impl.of) when storage will hold a known Silk type. Use [`make`](#impl.make) only at an untyped boundary
-that already knows a byte size and alignment, and [`repeat`](#impl.repeat) when sizing contiguous elements.
+Prefer [`of`](#Layout.impl.of) when storage will hold a known Silk type. Use [`make`](#Layout.impl.make) only at an untyped boundary
+that already knows a byte size and alignment, and [`repeat`](#Layout.impl.repeat) when sizing contiguous elements.
 
 ## Details
-Alignments are non-zero powers of two. [`repeat`](#impl.repeat) preserves the element alignment and reports
+Alignments are non-zero powers of two. [`repeat`](#Layout.impl.repeat) preserves the element alignment and reports
 [`LayoutOverflow`](#LayoutOverflow) instead of wrapping the aggregate byte size. A [`Layout`](#Layout) describes storage;
 it does not allocate or initialize it.
 
@@ -63,7 +63,7 @@ pub alignment: usize
 
 The required non-zero power-of-two byte alignment.
 
-<a id="impl"></a>
+<a id="Layout.impl"></a>
 
 ## Implementation `Layout`
 
@@ -71,7 +71,7 @@ The required non-zero power-of-two byte alignment.
 impl Layout
 ```
 
-<a id="impl.of"></a>
+<a id="Layout.impl.of"></a>
 
 ### Associated function `of`
 
@@ -81,7 +81,7 @@ pub fn of<T>() -> Layout
 
 Returns the byte size and alignment required to store one value of `T`.
 
-<a id="impl.make"></a>
+<a id="Layout.impl.make"></a>
 
 ### Associated function `make`
 
@@ -95,7 +95,7 @@ Creates a layout from an explicit byte size and alignment.
 
 If `alignment` is zero or is not a power of two, returns `InvalidAlignment` with that value.
 
-<a id="impl.repeat"></a>
+<a id="Layout.impl.repeat"></a>
 
 ### Associated function `repeat`
 
@@ -121,7 +121,7 @@ If the total byte size does not fit in `usize`, returns `LayoutOverflow`.
 pub struct InvalidAlignment
 ```
 
-Reports the rejected alignment supplied to [`make`](#impl.make).
+Reports the rejected alignment supplied to [`make`](#Layout.impl.make).
 
 <a id="InvalidAlignment.alignment"></a>
 
@@ -141,7 +141,7 @@ The zero or non-power-of-two alignment that was rejected.
 pub struct LayoutOverflow
 ```
 
-Reports that [`repeat`](#impl.repeat) could not represent the aggregate byte size as `usize`.
+Reports that [`repeat`](#Layout.impl.repeat) could not represent the aggregate byte size as `usize`.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

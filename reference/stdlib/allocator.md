@@ -78,7 +78,7 @@ effect fn allocate(layout: Layout) -> Intrinsic.Allocation ! OutOfMemoryError ? 
 
 Acquires one allocation for `layout`, or fails without returning partial storage.
 
-<a id="impl"></a>
+<a id="Allocator.impl"></a>
 
 ## Implementation `Allocator`
 
@@ -86,7 +86,7 @@ Acquires one allocation for `layout`, or fails without returning partial storage
 impl Allocator
 ```
 
-<a id="impl.outOfMemory"></a>
+<a id="Allocator.impl.outOfMemory"></a>
 
 ### Associated function `outOfMemory`
 
@@ -100,7 +100,7 @@ Fails immediately with `OutOfMemoryError`.
 
 Use this function to translate a checked size failure into the standard allocation failure.
 
-<a id="impl.systemAllocatorProvider"></a>
+<a id="Allocator.impl.systemAllocatorProvider"></a>
 
 ### Associated function `systemAllocatorProvider`
 
@@ -120,7 +120,7 @@ pub struct SystemAllocator
 
 A process-backed provider for [`Allocator`](#Allocator).
 
-<a id="impl-2"></a>
+<a id="SystemAllocator.impl"></a>
 
 ## Implementation `SystemAllocator`
 
@@ -128,7 +128,7 @@ A process-backed provider for [`Allocator`](#Allocator).
 impl SystemAllocator
 ```
 
-<a id="impl-3"></a>
+<a id="SystemAllocator.impl.Allocator"></a>
 
 ## Implementation `Allocator for SystemAllocator`
 
@@ -136,7 +136,7 @@ impl SystemAllocator
 impl Allocator for SystemAllocator
 ```
 
-<a id="impl.allocate"></a>
+<a id="SystemAllocator.impl.Allocator.allocate"></a>
 
 ### Operation `allocate`
 

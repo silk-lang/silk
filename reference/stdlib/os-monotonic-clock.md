@@ -33,7 +33,7 @@ pub struct OsMonotonicClock
 
 A stateless native provider; construction makes no call and failed operations trap.
 
-<a id="impl"></a>
+<a id="OsMonotonicClock.impl"></a>
 
 ## Implementation `OsMonotonicClock`
 
@@ -41,7 +41,7 @@ A stateless native provider; construction makes no call and failed operations tr
 impl OsMonotonicClock
 ```
 
-<a id="impl.make"></a>
+<a id="OsMonotonicClock.impl.make"></a>
 
 ### Associated function `make`
 
@@ -55,7 +55,7 @@ Creates a native clock provider without reading the clock or installing a defaul
 
 Construction on unsupported or no-libc profiles produces a compile-time error.
 
-<a id="impl-2"></a>
+<a id="OsMonotonicClock.impl.MonotonicClock"></a>
 
 ## Implementation `MonotonicClock for OsMonotonicClock`
 
@@ -63,7 +63,7 @@ Construction on unsupported or no-libc profiles produces a compile-time error.
 impl MonotonicClock for OsMonotonicClock
 ```
 
-<a id="impl.now"></a>
+<a id="OsMonotonicClock.impl.MonotonicClock.now"></a>
 
 ### Operation `now`
 
@@ -71,7 +71,7 @@ impl MonotonicClock for OsMonotonicClock
 effect fn now(self: &mut Self) -> Instant
 ```
 
-<a id="impl.getResolution"></a>
+<a id="OsMonotonicClock.impl.MonotonicClock.getResolution"></a>
 
 ### Operation `getResolution`
 
@@ -79,7 +79,7 @@ effect fn now(self: &mut Self) -> Instant
 effect fn getResolution(self: &mut Self) -> u64
 ```
 
-<a id="impl.waitUntil"></a>
+<a id="OsMonotonicClock.impl.MonotonicClock.waitUntil"></a>
 
 ### Operation `waitUntil`
 
@@ -87,7 +87,7 @@ effect fn getResolution(self: &mut Self) -> u64
 effect fn waitUntil(self: &mut Self, when: Instant) -> ()
 ```
 
-<a id="impl.waitFor"></a>
+<a id="OsMonotonicClock.impl.MonotonicClock.waitFor"></a>
 
 ### Operation `waitFor`
 

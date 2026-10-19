@@ -23,7 +23,7 @@ pub struct BufferedOutput
 
 One fixed-capacity pending output buffer.
 
-<a id="impl"></a>
+<a id="BufferedOutput.impl"></a>
 
 ## Implementation `BufferedOutput`
 
@@ -31,7 +31,7 @@ One fixed-capacity pending output buffer.
 impl BufferedOutput
 ```
 
-<a id="impl.make"></a>
+<a id="BufferedOutput.impl.make"></a>
 
 ### Associated function `make`
 
@@ -43,7 +43,7 @@ pub effect fn make(capacity: usize) -> BufferedOutput
 
 Allocates and initializes one fixed-capacity output buffer.
 
-<a id="impl.capacity"></a>
+<a id="BufferedOutput.impl.capacity"></a>
 
 ### Method `capacity`
 
@@ -53,7 +53,7 @@ pub fn capacity(self: &Self) -> usize
 
 Returns the immutable fixed capacity.
 
-<a id="impl.pending"></a>
+<a id="BufferedOutput.impl.pending"></a>
 
 ### Method `pending`
 
@@ -63,7 +63,7 @@ pub fn pending(self: &Self) -> usize
 
 Returns the retained pending byte count.
 
-<a id="impl.isTerminal"></a>
+<a id="BufferedOutput.impl.isTerminal"></a>
 
 ### Method `isTerminal`
 
@@ -73,7 +73,7 @@ pub fn isTerminal(self: &Self) -> bool
 
 Reports whether a preceding external failure made this output terminal.
 
-<a id="impl.writeSome"></a>
+<a id="BufferedOutput.impl.writeSome"></a>
 
 ### Method `writeSome`
 
@@ -89,7 +89,7 @@ pub effect fn writeSome(
 
 Accepts one positive input prefix, writing pending bytes only when space is needed.
 
-<a id="impl.writeAll"></a>
+<a id="BufferedOutput.impl.writeAll"></a>
 
 ### Method `writeAll`
 
@@ -105,7 +105,7 @@ pub effect fn writeAll(
 
 Accepts the complete finite input or reports its accepted prefix on failure.
 
-<a id="impl.writeVecAll"></a>
+<a id="BufferedOutput.impl.writeVecAll"></a>
 
 ### Method `writeVecAll`
 
@@ -121,7 +121,7 @@ pub effect fn writeVecAll(
 
 Accepts borrowed byte vectors in order after checking aggregate length arithmetic.
 
-<a id="impl.flush"></a>
+<a id="BufferedOutput.impl.flush"></a>
 
 ### Method `flush`
 
@@ -136,7 +136,7 @@ pub effect fn flush(
 
 Writes every pending byte exactly once, then flushes the provider boundary.
 
-<a id="impl.finish"></a>
+<a id="BufferedOutput.impl.finish"></a>
 
 ### Method `finish`
 
@@ -151,7 +151,7 @@ pub effect fn finish(
 
 Explicitly completes pending output; equivalent to flush.
 
-<a id="impl.writeSomeWriter"></a>
+<a id="BufferedOutput.impl.writeSomeWriter"></a>
 
 ### Method `writeSomeWriter`
 
@@ -163,7 +163,7 @@ pub effect fn writeSomeWriter(self: &mut Self, input: &[u8]) -> usize
 
 Accepts one prefix for a Writer-backed adapter without advertising deadlines.
 
-<a id="impl.writeAllWriter"></a>
+<a id="BufferedOutput.impl.writeAllWriter"></a>
 
 ### Method `writeAllWriter`
 
@@ -175,7 +175,7 @@ pub effect fn writeAllWriter(self: &mut Self, input: &[u8]) -> ()
 
 Accepts a complete finite value for a Writer-backed adapter.
 
-<a id="impl.flushWriter"></a>
+<a id="BufferedOutput.impl.flushWriter"></a>
 
 ### Method `flushWriter`
 

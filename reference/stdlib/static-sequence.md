@@ -28,7 +28,7 @@ The scope for StaticSequence operations.
 This owner carries no data. Select it with `import silk.static_sequence { StaticSequence }`
 to access its inherent operations.
 
-<a id="impl"></a>
+<a id="StaticSequence.impl"></a>
 
 ## Implementation `StaticSequence`
 
@@ -36,7 +36,7 @@ to access its inherent operations.
 impl StaticSequence
 ```
 
-<a id="impl.empty"></a>
+<a id="StaticSequence.impl.empty"></a>
 
 ### Associated function `empty`
 
@@ -46,7 +46,7 @@ pub static fn empty<Element>() -> Intrinsic.StaticSequence<Element>
 
 Returns the empty sequence for `Element`.
 
-<a id="impl.append"></a>
+<a id="StaticSequence.impl.append"></a>
 
 ### Method `append`
 
@@ -58,7 +58,7 @@ pub static fn append<Element>(self: Intrinsic.StaticSequence<Element>, value: El
 
 Returns `self` followed by `value` without changing `self`.
 
-<a id="impl.concat"></a>
+<a id="StaticSequence.impl.concat"></a>
 
 ### Associated function `concat`
 
@@ -71,7 +71,7 @@ pub static fn concat<Element>(
 
 Returns every element of `left` followed by every element of `right`.
 
-<a id="impl.length"></a>
+<a id="StaticSequence.impl.length"></a>
 
 ### Method `length`
 
@@ -81,7 +81,7 @@ pub static fn length<Element>(self: Intrinsic.StaticSequence<Element>) -> usize
 
 Returns the finite sequence length.
 
-<a id="impl.at"></a>
+<a id="StaticSequence.impl.at"></a>
 
 ### Method `at`
 

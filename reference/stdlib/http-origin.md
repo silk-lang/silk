@@ -94,7 +94,7 @@ pub struct Origin
 
 An owned HTTP authority and secure-transport selection.
 
-<a id="impl"></a>
+<a id="Origin.impl.Copy"></a>
 
 ## Implementation `Copy for Origin`
 
@@ -102,7 +102,7 @@ An owned HTTP authority and secure-transport selection.
 impl Copy for Origin
 ```
 
-<a id="impl-2"></a>
+<a id="Origin.impl"></a>
 
 ## Implementation `Origin`
 
@@ -110,7 +110,7 @@ impl Copy for Origin
 impl Origin
 ```
 
-<a id="impl.make"></a>
+<a id="Origin.impl.make"></a>
 
 ### Associated function `make`
 
@@ -120,7 +120,7 @@ pub fn make(host: Host, port: Port, secure: bool) -> Result<Origin, OriginError>
 
 Checks a host, a nonzero port, and an explicit transport-security selection.
 
-<a id="impl.fromUri"></a>
+<a id="Origin.impl.fromUri"></a>
 
 ### Associated function `fromUri`
 
@@ -135,7 +135,7 @@ Checks an HTTP or HTTPS URI and copies its host and effective port without alloc
 User information is rejected. Absent ports become 80 for HTTP and 443 for HTTPS.
 The path, query, and fragment do not contribute to this origin.
 
-<a id="impl.host"></a>
+<a id="Origin.impl.host"></a>
 
 ### Method `host`
 
@@ -145,7 +145,7 @@ pub fn host(self: &Self) -> Host
 
 Returns the owned checked identity used for resolution and TLS authentication.
 
-<a id="impl.port"></a>
+<a id="Origin.impl.port"></a>
 
 ### Method `port`
 
@@ -155,7 +155,7 @@ pub fn port(self: &Self) -> Port
 
 Returns the effective checked port, including a scheme default.
 
-<a id="impl.secure"></a>
+<a id="Origin.impl.secure"></a>
 
 ### Method `secure`
 
@@ -165,7 +165,7 @@ pub fn secure(self: &Self) -> bool
 
 Returns whether this origin requires authenticated TLS.
 
-<a id="impl.equals"></a>
+<a id="Origin.impl.equals"></a>
 
 ### Method `equals`
 
@@ -175,7 +175,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Compares transport scheme, effective port, and case-insensitive checked host identity.
 
-<a id="impl.authorityInto"></a>
+<a id="Origin.impl.authorityInto"></a>
 
 ### Method `authorityInto`
 
@@ -185,7 +185,7 @@ pub fn authorityInto(self: &Self, output: &mut [u8]) -> Result<usize, OriginErro
 
 Writes the normalized authority and leaves output unchanged when capacity is insufficient.
 
-<a id="impl.authorityWithPortInto"></a>
+<a id="Origin.impl.authorityWithPortInto"></a>
 
 ### Method `authorityWithPortInto`
 
@@ -199,7 +199,7 @@ Writes the normalized authority with its effective port, including a default por
 
 A capacity failure leaves `output` unchanged.
 
-<a id="impl.matchesAuthority"></a>
+<a id="Origin.impl.matchesAuthority"></a>
 
 ### Method `matchesAuthority`
 

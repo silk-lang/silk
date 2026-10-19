@@ -5,7 +5,7 @@
 Generic helpers for algorithms over primitive integers.
 
 ## When to use
-Call [`Numeric.add`](#impl.add) to add two values of any primitive integer type from generic code. Use the
+Call [`Numeric.add`](#Numeric.impl.add) to add two values of any primitive integer type from generic code. Use the
 concrete integer modules directly when an algorithm also needs width-specific conversion,
 overflow, bitwise, or formatting operations.
 
@@ -47,7 +47,7 @@ The owner of the generic numeric helpers.
 This struct carries no data and is never constructed by the library. The helpers are inherent
 members declared in `impl Numeric`, reached through `import silk.numeric { Numeric }`.
 
-<a id="impl"></a>
+<a id="Numeric.impl"></a>
 
 ## Implementation `Numeric`
 
@@ -55,7 +55,7 @@ members declared in `impl Numeric`, reached through `import silk.numeric { Numer
 impl Numeric
 ```
 
-<a id="impl.add"></a>
+<a id="Numeric.impl.add"></a>
 
 ### Associated function `add`
 

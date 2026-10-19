@@ -6,10 +6,10 @@ Strict standard-padded Base64 operations for caller-provided byte storage.
 
 ## When to use
 Use [`Base64`](#Base64) when a protocol requires the RFC 4648 standard alphabet and required padding.
-Use [`encodedLength`](#impl.encodedLength) or [`decodedLength`](#impl.decodedLength) to calculate exact storage before a write.
+Use [`encodedLength`](#Base64.impl.encodedLength) or [`decodedLength`](#Base64.impl.decodedLength) to calculate exact storage before a write.
 
 ## Details
-[`encodeInto`](#impl.encodeInto) and [`decodeInto`](#impl.decodeInto) write to caller-owned slices without allocation. Decoding
+[`encodeInto`](#Base64.impl.encodeInto) and [`decodeInto`](#Base64.impl.decodeInto) write to caller-owned slices without allocation. Decoding
 rejects whitespace, URL-safe characters, malformed padding, and nonzero unused pad bits. All
 failures occur before destination mutation. A successful write does not change the unused suffix.
 
@@ -155,7 +155,7 @@ pub struct Base64
 
 The owner of strict standard-padded Base64 operations.
 
-<a id="impl"></a>
+<a id="Base64.impl"></a>
 
 ## Implementation `Base64`
 
@@ -163,7 +163,7 @@ The owner of strict standard-padded Base64 operations.
 impl Base64
 ```
 
-<a id="impl.encodedLength"></a>
+<a id="Base64.impl.encodedLength"></a>
 
 ### Associated function `encodedLength`
 
@@ -177,7 +177,7 @@ Returns the exact standard-padded encoded length without allocation.
 Zero returns zero. An unrepresentable result returns `SizeOverflow` without a trap. All
 optional error fields are `None` for `SizeOverflow`.
 
-<a id="impl.decodedLength"></a>
+<a id="Base64.impl.decodedLength"></a>
 
 ### Associated function `decodedLength`
 
@@ -195,7 +195,7 @@ checks bytes from left to right and accepts padding only in the final quantum.
 The function rejects whitespace, URL-safe bytes, malformed padding, and nonzero unused pad
 bits. The returned error identifies the first failure offset.
 
-<a id="impl.encodeInto"></a>
+<a id="Base64.impl.encodeInto"></a>
 
 ### Associated function `encodeInto`
 
@@ -214,7 +214,7 @@ The function returns `SizeOverflow` for an unrepresentable result. It returns `O
 with exact `required` and `available` values for insufficient output. It does not add a NUL
 terminator.
 
-<a id="impl.decodeInto"></a>
+<a id="Base64.impl.decodeInto"></a>
 
 ### Associated function `decodeInto`
 

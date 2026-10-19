@@ -33,7 +33,7 @@ pub struct NativeDiagnostics
 
 An owned native report writer with bounded optional failure context.
 
-<a id="impl"></a>
+<a id="NativeDiagnostics.impl"></a>
 
 ## Implementation `NativeDiagnostics`
 
@@ -41,7 +41,7 @@ An owned native report writer with bounded optional failure context.
 impl NativeDiagnostics
 ```
 
-<a id="impl.make"></a>
+<a id="NativeDiagnostics.impl.make"></a>
 
 ### Associated function `make`
 
@@ -60,7 +60,7 @@ The writer retains the descriptor and output limits supplied by the caller. Cons
 
 Failure identity and origin remain available without optional context. Frames and causes can be omitted when storage is exhausted.
 
-<a id="impl.observe"></a>
+<a id="NativeDiagnostics.impl.observe"></a>
 
 ### Method `observe`
 

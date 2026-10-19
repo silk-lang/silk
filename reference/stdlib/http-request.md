@@ -63,7 +63,7 @@ Chunked
 
 Sends HTTP/1.1 chunks and explicit trailers.
 
-<a id="impl"></a>
+<a id="BodyMode.impl.Copy"></a>
 
 ## Implementation `Copy for BodyMode`
 
@@ -121,9 +121,9 @@ pub value: &'value [u8]
 
 The caller-owned semantic field bytes.
 
-<a id="impl-2"></a>
+<a id="HeaderControl.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for HeaderControl<'value>`
 
 ```silk
 impl<'value> Copy for HeaderControl<'value>
@@ -199,9 +199,9 @@ pub password: &'value [u8]
 
 Password bytes without controls.
 
-<a id="impl-3"></a>
+<a id="Authorization.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Authorization<'value>`
 
 ```silk
 impl<'value> Copy for Authorization<'value>
@@ -307,23 +307,23 @@ pub http10KeepAlive: bool
 
 Permits HTTP/1.0 keep-alive; HTTP/1.1 uses normal persistence.
 
-<a id="impl-4"></a>
+<a id="HeaderPolicy.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for HeaderPolicy<'value>`
 
 ```silk
 impl<'value> Copy for HeaderPolicy<'value>
 ```
 
-<a id="impl-5"></a>
+<a id="HeaderPolicy.impl"></a>
 
-## Implementation ``
+## Implementation `HeaderPolicy<'value>`
 
 ```silk
 impl<'value> HeaderPolicy<'value>
 ```
 
-<a id="impl.defaults"></a>
+<a id="HeaderPolicy.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -513,7 +513,7 @@ pub struct PreparedRequest
 
 One owned, origin-bound, preflighted head with unforgeable framing policy.
 
-<a id="impl-6"></a>
+<a id="PreparedRequest.impl"></a>
 
 ## Implementation `PreparedRequest`
 
@@ -521,7 +521,7 @@ One owned, origin-bound, preflighted head with unforgeable framing policy.
 impl PreparedRequest
 ```
 
-<a id="impl.bytes"></a>
+<a id="PreparedRequest.impl.bytes"></a>
 
 ### Method `bytes`
 
@@ -531,7 +531,7 @@ pub fn bytes<'a>(self: &'a Self) -> &'a [u8]
 
 Borrows the serialized request head until this owner is dropped.
 
-<a id="impl.origin"></a>
+<a id="PreparedRequest.impl.origin"></a>
 
 ### Method `origin`
 
@@ -541,7 +541,7 @@ pub fn origin(self: &Self) -> Origin
 
 Returns the logical request origin used for target, Host, and origin credentials.
 
-<a id="impl.physicalPeer"></a>
+<a id="PreparedRequest.impl.physicalPeer"></a>
 
 ### Method `physicalPeer`
 
@@ -551,7 +551,7 @@ pub fn physicalPeer(self: &Self) -> Origin
 
 Returns the physical peer on whose connection this request is admitted.
 
-<a id="impl.version"></a>
+<a id="PreparedRequest.impl.version"></a>
 
 ### Method `version`
 
@@ -561,7 +561,7 @@ pub fn version(self: &Self) -> Version
 
 Returns the admitted HTTP version.
 
-<a id="impl.bodyMode"></a>
+<a id="PreparedRequest.impl.bodyMode"></a>
 
 ### Method `bodyMode`
 
@@ -571,7 +571,7 @@ pub fn bodyMode(self: &Self) -> BodyMode
 
 Returns the exact selected body delimiter.
 
-<a id="impl.require100"></a>
+<a id="PreparedRequest.impl.require100"></a>
 
 ### Method `require100`
 

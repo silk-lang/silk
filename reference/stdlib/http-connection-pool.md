@@ -116,7 +116,7 @@ pub idleTimeoutNanoseconds: u64
 
 Positive idle lifetime on the pool's monotonic timeline.
 
-<a id="impl"></a>
+<a id="Config.impl.Copy"></a>
 
 ## Implementation `Copy for Config`
 
@@ -124,7 +124,7 @@ Positive idle lifetime on the pool's monotonic timeline.
 impl Copy for Config
 ```
 
-<a id="impl-2"></a>
+<a id="Config.impl"></a>
 
 ## Implementation `Config`
 
@@ -132,7 +132,7 @@ impl Copy for Config
 impl Config
 ```
 
-<a id="impl.defaults"></a>
+<a id="Config.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -262,7 +262,7 @@ OpeningExpired
 
 Opening could not begin or completed at or after its effective acquisition deadline.
 
-<a id="impl-3"></a>
+<a id="PoolError.impl.Copy"></a>
 
 ## Implementation `Copy for PoolError`
 
@@ -330,7 +330,7 @@ pub closed: bool
 
 Whether root ownership has closed the pool.
 
-<a id="impl-4"></a>
+<a id="Counts.impl.Copy"></a>
 
 ## Implementation `Copy for Counts`
 
@@ -358,7 +358,7 @@ pub expired: usize
 
 Number of expired idle owners physically closed by this call.
 
-<a id="impl-5"></a>
+<a id="Collection.impl.Copy"></a>
 
 ## Implementation `Copy for Collection`
 
@@ -606,7 +606,7 @@ Provider representation, HTTP policy, TLS verification/trust/ALPN policy, and co
 belong to the constructor-sealed [`PoolContext`](#PoolContext). This key retains only request-visible route
 identity; direct resolution results never establish equivalence.
 
-<a id="impl-6"></a>
+<a id="ConnectionKey.impl"></a>
 
 ## Implementation `ConnectionKey`
 
@@ -614,7 +614,7 @@ identity; direct resolution results never establish equivalence.
 impl ConnectionKey
 ```
 
-<a id="impl.direct"></a>
+<a id="ConnectionKey.impl.direct"></a>
 
 ### Associated function `direct`
 
@@ -624,7 +624,7 @@ pub fn direct(originalOrigin: Origin) -> ConnectionKey
 
 Creates a direct network key from the normalized original origin without allocation.
 
-<a id="impl.proxy"></a>
+<a id="ConnectionKey.impl.proxy"></a>
 
 ### Associated function `proxy`
 
@@ -634,7 +634,7 @@ pub fn proxy(route: RouteKey) -> ConnectionKey
 
 Creates a proxy-aware key from the sealed JUL-199 route identity.
 
-<a id="impl.unix"></a>
+<a id="ConnectionKey.impl.unix"></a>
 
 ### Associated function `unix`
 
@@ -647,7 +647,7 @@ pub effect fn unix(
 
 Copies one exact Unix pathname into a conservative direct key.
 
-<a id="impl.origin"></a>
+<a id="ConnectionKey.impl.origin"></a>
 
 ### Method `origin`
 
@@ -657,7 +657,7 @@ pub fn origin(self: &Self) -> Origin
 
 Returns the normalized original origin used for per-origin capacity.
 
-<a id="impl.isDirect"></a>
+<a id="ConnectionKey.impl.isDirect"></a>
 
 ### Method `isDirect`
 
@@ -667,7 +667,7 @@ pub fn isDirect(self: &Self) -> bool
 
 Returns whether this key selects direct native contact for its original origin.
 
-<a id="impl.matchesUnixPath"></a>
+<a id="ConnectionKey.impl.matchesUnixPath"></a>
 
 ### Method `matchesUnixPath`
 
@@ -677,15 +677,15 @@ pub fn matchesUnixPath(self: &Self, path: &[u8]) -> bool
 
 Returns whether this key selects the exact supplied Unix path for its original origin.
 
-<a id="impl-7"></a>
+<a id="ConnectionKey.impl.PoolKey"></a>
 
-## Implementation `  for ConnectionKey `
+## Implementation `PoolKey<OutOfMemoryError ? &mut Allocator> for ConnectionKey`
 
 ```silk
 impl PoolKey<OutOfMemoryError ? &mut Allocator> for ConnectionKey
 ```
 
-<a id="impl.copy"></a>
+<a id="ConnectionKey.impl.PoolKey.copy"></a>
 
 ### Operation `copy`
 
@@ -693,7 +693,7 @@ impl PoolKey<OutOfMemoryError ? &mut Allocator> for ConnectionKey
 effect fn copy(key: &Self) -> ConnectionKey ! OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl.equals"></a>
+<a id="ConnectionKey.impl.PoolKey.equals"></a>
 
 ### Operation `equals`
 
@@ -701,7 +701,7 @@ effect fn copy(key: &Self) -> ConnectionKey ! OutOfMemoryError ? &mut Allocator
 fn equals(left: &Self, right: &Self) -> bool
 ```
 
-<a id="impl.sameOrigin"></a>
+<a id="ConnectionKey.impl.PoolKey.sameOrigin"></a>
 
 ### Operation `sameOrigin`
 
@@ -729,15 +729,15 @@ pub struct Handle<K, P, C>
 
 A fallibly copied local handle sharing only preallocated mutable slot state.
 
-<a id="impl-8"></a>
+<a id="Pool.impl"></a>
 
-## Implementation ``
+## Implementation `Pool<K, P, C>`
 
 ```silk
 impl<K, P, C> Pool<K, P, C>
 ```
 
-<a id="impl.handle"></a>
+<a id="Pool.impl.handle"></a>
 
 ### Method `handle`
 

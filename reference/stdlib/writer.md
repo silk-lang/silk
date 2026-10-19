@@ -15,7 +15,7 @@ tests can replace the provider for one lexical operation. Provider failure produ
 [`WriterError`](#WriterError).
 
 ## Gotchas
-Native providers live in `silk.os_writer` and require selected Darwin or GNU libc. [`ignoreError`](#impl.ignoreError) removes the typed
+Native providers live in `silk.os_writer` and require selected Darwin or GNU libc. [`ignoreError`](#Writer.impl.ignoreError) removes the typed
 failure value and returns unit for a failed Effect.
 
 
@@ -63,7 +63,7 @@ effect fn flush() -> () ! WriterError ? &mut Writer
 
 Requests that the active Writer provider commit its buffered output.
 
-<a id="impl"></a>
+<a id="Writer.impl"></a>
 
 ## Implementation `Writer`
 
@@ -71,7 +71,7 @@ Requests that the active Writer provider commit its buffered output.
 impl Writer
 ```
 
-<a id="impl.failure"></a>
+<a id="Writer.impl.failure"></a>
 
 ### Associated function `failure`
 
@@ -81,7 +81,7 @@ pub fn failure() -> WriterError
 
 Creates a failure for a provider that could not complete a write or flush operation.
 
-<a id="impl.ignoreError"></a>
+<a id="Writer.impl.ignoreError"></a>
 
 ### Method `ignoreError`
 
@@ -96,7 +96,7 @@ Runs one Effect and converts its typed failure to unit while it preserves a succ
 This function consumes `self` one time and preserves its provider requirements. It discards the
 error value when the Effect fails.
 
-<a id="impl.writeString"></a>
+<a id="Writer.impl.writeString"></a>
 
 ### Associated function `writeString`
 

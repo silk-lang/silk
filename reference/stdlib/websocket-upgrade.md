@@ -75,7 +75,7 @@ pub maxOwnedBytes: usize
 
 Maximum simultaneous owned payload and index capacities for the response plan.
 
-<a id="impl"></a>
+<a id="Limits.impl.Copy"></a>
 
 ## Implementation `Copy for Limits`
 
@@ -83,7 +83,7 @@ Maximum simultaneous owned payload and index capacities for the response plan.
 impl Copy for Limits
 ```
 
-<a id="impl-2"></a>
+<a id="Limits.impl"></a>
 
 ## Implementation `Limits`
 
@@ -91,7 +91,7 @@ impl Copy for Limits
 impl Limits
 ```
 
-<a id="impl.default"></a>
+<a id="Limits.impl.default"></a>
 
 ### Associated function `default`
 
@@ -475,15 +475,15 @@ pub struct Offer<'head>
 
 Validated metadata that borrows one parsed request and cannot authorize another request.
 
-<a id="impl-3"></a>
+<a id="Offer.impl"></a>
 
-## Implementation ``
+## Implementation `Offer<'head>`
 
 ```silk
 impl<'head> Offer<'head>
 ```
 
-<a id="impl.target"></a>
+<a id="Offer.impl.target"></a>
 
 ### Method `target`
 
@@ -493,7 +493,7 @@ pub fn target(self: &Self) -> RequestTarget<'head>
 
 Returns the request target borrowed from the parsed head.
 
-<a id="impl.host"></a>
+<a id="Offer.impl.host"></a>
 
 ### Method `host`
 
@@ -503,7 +503,7 @@ pub fn host(self: &Self) -> &'head [u8]
 
 Returns the validated Host field bytes.
 
-<a id="impl.origin"></a>
+<a id="Offer.impl.origin"></a>
 
 ### Method `origin`
 
@@ -513,7 +513,7 @@ pub fn origin(self: &Self) -> Option<&'head [u8]>
 
 Returns absent Origin or its exact validated bytes, including literal null.
 
-<a id="impl.protocolCount"></a>
+<a id="Offer.impl.protocolCount"></a>
 
 ### Method `protocolCount`
 
@@ -523,7 +523,7 @@ pub fn protocolCount(self: &Self) -> usize
 
 Returns the number of unique protocols in combined wire order.
 
-<a id="impl.protocolAt"></a>
+<a id="Offer.impl.protocolAt"></a>
 
 ### Method `protocolAt`
 
@@ -533,7 +533,7 @@ pub fn protocolAt(self: &Self, index: usize) -> Option<&'head [u8]>
 
 Returns one protocol by combined wire index, or None for an absent index.
 
-<a id="impl.extensionsPresent"></a>
+<a id="Offer.impl.extensionsPresent"></a>
 
 ### Method `extensionsPresent`
 
@@ -543,7 +543,7 @@ pub fn extensionsPresent(self: &Self) -> bool
 
 Returns whether at least one syntactically valid extension field was supplied.
 
-<a id="impl.acceptInto"></a>
+<a id="Offer.impl.acceptInto"></a>
 
 ### Method `acceptInto`
 

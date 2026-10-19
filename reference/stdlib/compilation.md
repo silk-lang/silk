@@ -5,7 +5,7 @@
 Typed logical build choices fixed before source specialization.
 
 ## When to use
-Use [`artifact`](#impl.artifact), [`safety`](#impl.safety), and [`threading`](#impl.threading) to select source behavior from the build request.
+Use [`artifact`](#Compilation.impl.artifact), [`safety`](#Compilation.impl.safety), and [`threading`](#Compilation.impl.threading) to select source behavior from the build request.
 Use `silk.target` for machine facts such as architecture and pointer width.
 
 ## Details
@@ -431,7 +431,7 @@ The scope for Compilation operations.
 This owner carries no data. Select it with `import silk.compilation { Compilation }`
 to access its inherent operations.
 
-<a id="impl"></a>
+<a id="Compilation.impl"></a>
 
 ## Implementation `Compilation`
 
@@ -439,7 +439,7 @@ to access its inherent operations.
 impl Compilation
 ```
 
-<a id="impl.libc"></a>
+<a id="Compilation.impl.libc"></a>
 
 ### Associated function `libc`
 
@@ -449,7 +449,7 @@ pub static fn libc() -> Libc
 
 Returns the selected C library request during static evaluation.
 
-<a id="impl.artifact"></a>
+<a id="Compilation.impl.artifact"></a>
 
 ### Associated function `artifact`
 
@@ -459,7 +459,7 @@ pub static fn artifact() -> Artifact
 
 Returns the selected artifact request during static evaluation.
 
-<a id="impl.link"></a>
+<a id="Compilation.impl.link"></a>
 
 ### Associated function `link`
 
@@ -469,7 +469,7 @@ pub static fn link() -> Link
 
 Returns the selected link request during static evaluation.
 
-<a id="impl.codeModel"></a>
+<a id="Compilation.impl.codeModel"></a>
 
 ### Associated function `codeModel`
 
@@ -479,7 +479,7 @@ pub static fn codeModel() -> CodeModel
 
 Returns the selected code model during static evaluation.
 
-<a id="impl.relocation"></a>
+<a id="Compilation.impl.relocation"></a>
 
 ### Associated function `relocation`
 
@@ -489,7 +489,7 @@ pub static fn relocation() -> Relocation
 
 Returns the selected relocation model during static evaluation.
 
-<a id="impl.optimization"></a>
+<a id="Compilation.impl.optimization"></a>
 
 ### Associated function `optimization`
 
@@ -499,7 +499,7 @@ pub static fn optimization() -> Optimization
 
 Returns the selected optimization request during static evaluation.
 
-<a id="impl.safety"></a>
+<a id="Compilation.impl.safety"></a>
 
 ### Associated function `safety`
 
@@ -509,7 +509,7 @@ pub static fn safety() -> Safety
 
 Returns the selected library safety policy during static evaluation.
 
-<a id="impl.threading"></a>
+<a id="Compilation.impl.threading"></a>
 
 ### Associated function `threading`
 
@@ -519,7 +519,7 @@ pub static fn threading() -> Threading
 
 Returns the selected library threading policy during static evaluation.
 
-<a id="impl.unwind"></a>
+<a id="Compilation.impl.unwind"></a>
 
 ### Associated function `unwind`
 
@@ -529,7 +529,7 @@ pub static fn unwind() -> Unwind
 
 Returns the selected unwind request during static evaluation.
 
-<a id="impl.entry"></a>
+<a id="Compilation.impl.entry"></a>
 
 ### Associated function `entry`
 
@@ -539,7 +539,7 @@ pub static fn entry() -> Selection
 
 Returns the logical entry request without resolving a startup symbol.
 
-<a id="impl.runtime"></a>
+<a id="Compilation.impl.runtime"></a>
 
 ### Associated function `runtime`
 
@@ -549,7 +549,7 @@ pub static fn runtime() -> Selection
 
 Returns the logical runtime request without loading a runtime package.
 
-<a id="impl.hasSanitizer"></a>
+<a id="Compilation.impl.hasSanitizer"></a>
 
 ### Associated function `hasSanitizer`
 

@@ -40,7 +40,7 @@ pub struct StderrWriter
 
 A Writer provider borrowing process standard error without owning or closing its descriptor.
 
-<a id="impl"></a>
+<a id="StdoutWriter.impl"></a>
 
 ## Implementation `StdoutWriter`
 
@@ -48,7 +48,7 @@ A Writer provider borrowing process standard error without owning or closing its
 impl StdoutWriter
 ```
 
-<a id="impl.make"></a>
+<a id="StdoutWriter.impl.make"></a>
 
 ### Associated function `make`
 
@@ -58,7 +58,7 @@ pub fn make() -> StdoutWriter
 
 Creates a provider borrowing standard output without making a foreign call.
 
-<a id="impl-2"></a>
+<a id="StderrWriter.impl"></a>
 
 ## Implementation `StderrWriter`
 
@@ -66,7 +66,7 @@ Creates a provider borrowing standard output without making a foreign call.
 impl StderrWriter
 ```
 
-<a id="impl.make-2"></a>
+<a id="StderrWriter.impl.make"></a>
 
 ### Associated function `make`
 
@@ -76,7 +76,7 @@ pub fn make() -> StderrWriter
 
 Creates a provider borrowing standard error without making a foreign call.
 
-<a id="impl-3"></a>
+<a id="StdoutWriter.impl.Writer"></a>
 
 ## Implementation `Writer for StdoutWriter`
 
@@ -84,7 +84,7 @@ Creates a provider borrowing standard error without making a foreign call.
 impl Writer for StdoutWriter
 ```
 
-<a id="impl.writeAll"></a>
+<a id="StdoutWriter.impl.Writer.writeAll"></a>
 
 ### Operation `writeAll`
 
@@ -92,7 +92,7 @@ impl Writer for StdoutWriter
 effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl.flush"></a>
+<a id="StdoutWriter.impl.Writer.flush"></a>
 
 ### Operation `flush`
 
@@ -100,7 +100,7 @@ effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Write
 effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-4"></a>
+<a id="StderrWriter.impl.Writer"></a>
 
 ## Implementation `Writer for StderrWriter`
 
@@ -108,7 +108,7 @@ effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
 impl Writer for StderrWriter
 ```
 
-<a id="impl.writeAll-2"></a>
+<a id="StderrWriter.impl.Writer.writeAll"></a>
 
 ### Operation `writeAll`
 
@@ -116,7 +116,7 @@ impl Writer for StderrWriter
 effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl.flush-2"></a>
+<a id="StderrWriter.impl.Writer.flush"></a>
 
 ### Operation `flush`
 

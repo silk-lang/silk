@@ -45,7 +45,7 @@ pub value: u64
 
 The provider-local monotonic identity value.
 
-<a id="impl"></a>
+<a id="TaskId.impl.Copy"></a>
 
 ## Implementation `Copy for TaskId`
 
@@ -53,7 +53,7 @@ The provider-local monotonic identity value.
 impl Copy for TaskId
 ```
 
-<a id="impl-2"></a>
+<a id="TaskId.impl.HashKey"></a>
 
 ## Implementation `HashKey for TaskId`
 
@@ -61,7 +61,7 @@ impl Copy for TaskId
 impl HashKey for TaskId
 ```
 
-<a id="impl.equals"></a>
+<a id="TaskId.impl.HashKey.equals"></a>
 
 ### Operation `equals`
 
@@ -69,7 +69,7 @@ impl HashKey for TaskId
 equals: TaskId.taskIdEquals
 ```
 
-<a id="impl.hash"></a>
+<a id="TaskId.impl.HashKey.hash"></a>
 
 ### Operation `hash`
 
@@ -432,7 +432,7 @@ The child can require only its owned Scheduler and MonotonicClock providers. Pre
 reserves all child endpoints and one task identity before it returns. It does not activate
 the child.
 
-<a id="impl-3"></a>
+<a id="Scheduler.impl"></a>
 
 ## Implementation `Scheduler`
 
@@ -440,7 +440,7 @@ the child.
 impl Scheduler
 ```
 
-<a id="impl.pending"></a>
+<a id="Scheduler.impl.pending"></a>
 
 ### Associated function `pending`
 

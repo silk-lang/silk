@@ -6,7 +6,7 @@ Bounded, resumable Zstandard decoding into caller-owned byte slices.
 
 ## When to use
 Use [`Zstd`](#Zstd) for RFC 8878 files or HTTP zstd content. The decoder accepts all non-dictionary block modes.
-Use `Zstd.make` to allocate state, then [`step`](#impl.step) until the result reports `Finished`.
+Use `Zstd.make` to allocate state, then [`step`](#Zstd.impl.step) until the result reports `Finished`.
 
 ## Details
 Input and output are borrowed only for one call. State owns its history and scratch storage.
@@ -91,7 +91,7 @@ pub workspaceBytes: usize
 
 Maximum non-window workspace, including staging, state, and bounded entropy scratch.
 
-<a id="impl"></a>
+<a id="ZstdLimits.impl"></a>
 
 ## Implementation `ZstdLimits`
 
@@ -99,7 +99,7 @@ Maximum non-window workspace, including staging, state, and bounded entropy scra
 impl ZstdLimits
 ```
 
-<a id="impl.make"></a>
+<a id="ZstdLimits.impl.make"></a>
 
 ### Associated function `make`
 
@@ -459,7 +459,7 @@ An owned, allocation-free-after-construction decoder for one concatenated stream
 The state releases all allocations when dropped. It retains neither input nor output borrows between calls.
 Each regular frame resets its history, entropy tables, and checksum, but cumulative limits do not reset.
 
-<a id="impl-2"></a>
+<a id="Zstd.impl"></a>
 
 ## Implementation `Zstd`
 
@@ -467,7 +467,7 @@ Each regular frame resets its history, entropy tables, and checksum, but cumulat
 impl Zstd
 ```
 
-<a id="impl.make-2"></a>
+<a id="Zstd.impl.make"></a>
 
 ### Associated function `make`
 
@@ -483,7 +483,7 @@ Allocation uses the supplied `Allocator`. No allocation occurs during `step`.
 Storage includes `windowBytes`, three 128 KiB staging buffers, and bounded state and entropy scratch.
 A zero window or unrepresentable total size fails before allocation. Insufficient workspace reports `WorkspaceLimit`.
 
-<a id="impl.step"></a>
+<a id="Zstd.impl.step"></a>
 
 ### Method `step`
 
