@@ -11,7 +11,6 @@
 
 <p align="center">
   <a href="https://github.com/silk-lang/silk/actions/workflows/selfhost.yml"><img src="https://github.com/silk-lang/silk/actions/workflows/selfhost.yml/badge.svg?branch=main" alt="Selfhost"></a>
-  <a href="https://github.com/silk-lang/silk/actions/workflows/ci.yml"><img src="https://github.com/silk-lang/silk/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-c6a678" alt="MIT license"></a>
   <img src="https://img.shields.io/badge/status-pre--alpha-8b5cf6" alt="Pre-alpha">
 </p>
@@ -286,7 +285,7 @@ Node and pnpm:
 
 ```sh
 pnpm install
-pnpm format:check && pnpm lint && pnpm typecheck && pnpm test:scripts
+pnpm test:scripts
 ```
 
 On Debian or Ubuntu, `bash scripts/setup-linux-llvm.sh` installs the verified LLVM 22 toolchain
