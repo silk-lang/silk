@@ -1,9 +1,17 @@
 # Complete sources: B design for independent review
 
-Status: **proposal, no production implementation or Silk acceptance**. This continuation starts
-at approved A `9d0a3157558f9f016d7716115c82547b02c334a2`. It changes no BorrowCheck code, does
-not update PR1984, and imports no unpublished environment or PR1983 change. The decision/effect
-boundary and its state inventory remain in [borrow-policy-staging.md](borrow-policy-staging.md).
+Status: **repair1 proposal for NEW independent design review2; no C implementation or Silk
+acceptance**. Exact reviewed baseline `985eb0ea2d07fecd3cccc08939d07be901d20967` and its models
+are preserved. Accepted main `6c1608657dbdb11efce96ca973213e8cbd809f64` is merged cleanly; its
+PR1983 caller/CFG policy is now the migration baseline. This continuation has no production delta
+against that main, changes no published PR, and imports no unpublished environment/#1957 work.
+
+Read this document with the normative [policy rules](borrow-source-policy-rules.md) and jointly
+agreed [Semantic preparation/API](borrow-source-preparation.md). They form one proposal. The
+rules replace the baseline's missing directness/precision/stop translation; the preparation
+package replaces its unsupplied shape/query boundary. The accepted A extraction and inventory
+remain in [borrow-policy-staging.md](borrow-policy-staging.md). Original baseline model evidence
+is distinct from the new repair1 probes in section 8. Neither is compiler acceptance.
 
 The intended contract is the value actually reaching a queried read. Historical definitions
 which cannot reach it are not operands. This is an intentional correction to eager enumeration,
@@ -113,8 +121,9 @@ IDs and domains:
 | LeafId | Entry(local), Borrow(actual loan site), Expression(real producer), LoanFree(positively nonretaining producer), Unknown(origin/reason) |
 | ComponentId | owner-local typed component or external selector port, described below |
 | FactId | `(DefId or value PortId, ComponentId, LeafId, role)`; role distinguishes real/shadow/inherited |
-| WitnessId | paired `(source DefId/FactId, ReadId, receiving transfer slot)`; never separate unions of read and definition IDs |
-| EffectId | `(EvalId, phase, physical operand/component occurrence, effect kind)` |
+| WitnessId | paired `(source DefId/FactId, ReadId, receiving transfer slot)`; never independent definition/read unions |
+| RouteCaseId | occurrence + paired transfer + typed input/output placement + direct evidence; applicability and source-quality version remain conditional together |
+| EffectId | `(EvalId, phase, occurrence, target LeafId/LoanId, output placement, effect kind, policy reason)` |
 
 Whole-value definition/producer identity and its retained-loan projection have distinct types
 inside this same representation. Original loan policies iterate only actual Borrow facts; Entry,
@@ -131,6 +140,13 @@ not empty successful source vectors. A node not evaluated has MissingEvaluation.
 anonymous recovery preparation never produces a certifying coverage state.
 
 ### Typed components without growing path strings
+
+Semantic first builds the immutable SourcePreparation described in
+[the preparation contract](borrow-source-preparation.md), using the active body's tracked
+Members/MemberShape/Signature/AppliedOperation demands. Types interning and typed Field nodes
+alone cannot supply the inventory. Its complete exact nominal applications, original binder
+correspondences, verified typed maps and finite predicate roots are required inputs. No query
+runs during solving and no solved source selects a new shape demand.
 
 A component is a **slot in a value/storage representation**, not the full history of field
 prefixes through which its contents arrived. For each typed value/definition root reserve its
@@ -169,8 +185,9 @@ component description demanded by the typed body/contracts, L the real leaves an
 selector-trie positions. It is polynomial in these explicit inputs; no claim is made that
 expanding arbitrary recursive types or every array element is polynomial in source text.
 Construction must consume finite typed component descriptions, not recursively instantiate
-unobserved generic fields. Queries outside the typed selector interface are UnknownSelection;
-that is an unsupported query, not a truncation of a supported recursive path.
+unobserved generic fields. Queries outside the prepared typed selector interface fail validated route access. A genuine
+language/proof limitation retains its explicit coverage record; a missing supported selector
+map is a construction blocker, never a new accepted UnknownSelection gap.
 
 Concrete construction order is: (1) reserve evaluation/definition roots and their typed inline
 component descriptors; (2) intern the authored/declared selector tries; (3) reserve external ports
@@ -182,94 +199,45 @@ An index outside the known classes still maps to the existing remainder/may-over
 failed typed component map is an explicit constructor coverage defect, not permission to silently
 fall back to unknown for a previously supported operation.
 
-**API consequence to review:** cyclic source routes cannot always be returned as one Vector of
-steps. Keep SourceQuery(read, finite authored selection), but make the returned selection a
-read-only Analysis-owned `SourceRouteId`, identifying a finite selector graph with start/accept
-ports. A finite ordinary route still has its exact steps; a recursive route represents all its
-paths. Expose finite route vertices/edges and their original typed selection evidence to Semantic.
-Semantic's signature/type obligation evaluation is a product over route vertex and required
-predicate, with explicit unresolved recursive proof, not a private temporal analysis. It must
-prove all admitted route alternatives; choosing one representative path is unsound. The earlier
-Vector-only declaration proposal and environment WIP therefore need an explicit reviewed API
-amendment, not an adapter or silent loss of path information. No schema/API change is made here.
+The agreed API is `prepare(..., SourcePreparation, coverage)`, then immutable
+`sourcesAt(read, SelectionId)` and stamped route/port/edge/case access. SelectionId references
+an already prepared selector; arbitrary new vector paths cannot trigger late graph growth.
+SourceRouteId exposes starts, accepts, typed endpoint/application evidence and paired cases.
+Semantic's finite product uses prepared PredicateIds and checks every possible accepting route;
+visited coverage never proves Contents/outlives. A missing supported map is a construction
+blocker, not a legitimate new UnknownSelection gap. The exact design signatures, original
+application/result/success split, three worked examples, stamp/rebase/recovery lifecycle and
+#1957 metadata constraints are in the jointly agreed preparation document. Archived env WIP is
+preserved and must migrate atomically; it is not an alternate implementation.
 
-## 3. Value transfers, multiplicity and ordering
+## 3. Conditional routes, multiplicity and observation order
 
-One source fact says a leaf may occupy a physical component of this value at this occurrence.
-Multiple reaching definitions supporting that same leaf/component are **alternative witnesses**,
-not extra value components. Store every paired witness. Distinct leaves remain alternatives,
-even when they share regions. Distinct components containing the same leaf remain distinct.
-At the next whole write, these alternatives generate one definition-site fact per component,
-leaf and role; this prevents a copy loop from multiplying provenance records on each traversal.
+[The policy rules](borrow-source-policy-rules.md) define the exact normalization and consumer
+quantifiers. One physical operand/component/leaf observation contains all paired alternative
+RouteCases. Historical definitions are not copies. Directness and typed placement stay together
+with their definition/read witness: declared placement can be Exact yet indirect. Evaluate each
+case against the same incoming state, union conditional effects once, then advance the observation
+version. Genuinely separate components/operands observe earlier effects even for the same loan.
+Target leaf/loan and output placement distinguish EffectIds.
 
-Normalization is at a value boundary, not a global equal-loan dedup. In particular:
+Original operand order (including MAX), structural component order, parent visitation and the
+original branch order remain meaningful. All-case coverage/release needs all possible cases;
+an undefined case cannot supply a positive witness. Conditional effects keep their source and
+policy reason. Entry/LoanFree are genuine definitions but do not inflate Borrow carry counts.
+Exact field writes kill their actual storage components; copies retain their original read;
+referent reads follow current addressed storage, not a stale descriptor value snapshot.
 
-- `appendOperand`: written operand ports remain distinct and ordered, including pipeline input
-  before callee and remaining inputs. Operand indices are labels, not a sort key.
-- `appendCarried`/`rejoin`: join-arm delivery of the same value component/leaf merges alternative
-  witnesses; simultaneous aggregate/operand slots do not merge. Noncompleting arms contribute no
-  value but retain their effects on the paths actually executed.
-- `takeLoan`: one real fresh borrow leaf follows parent-source occurrences as before. No synthetic
-  borrow is added for Entry or a plain shared copy.
-- `hold`: new definition identity is the static write site plus component/leaf/role, with all
-  genuine paired sources; unconditional genuine borrow grounding is separate from an empty list.
-- whole replacement kills previous real definitions of that holder regardless of whether the new
-  value contains loans. Field replacement kills exactly the written known components. Existing
-  shadow history remains a distinct relation for its existing consumers, never an actual value
-  source merely because it is historical. Inherited values copied before overwrite keep their
-  original read witnesses. Move/drop/end remove availability as before.
+## 4. Grounded precision and policy gates
 
-Within an actual value component, alternatives are ordered by static leaf birth ID and then
-source definition ID for diagnostic presentation, not interpreted as simultaneous references.
-Within a containing value, physical component order is the producer's authored construction
-order; for a value with several reaching producers use declared component ordinal order, not
-whichever producer the solver happened to discover first. A declared result path uses declaration
-metadata order. At an opaque whole-result position, genuine operand routes remain alternatives
-and unresolved placement stays explicit; do not manufacture distinct exact fields.
-
-Policy input iteration is the written port order, then component order, then distinct source
-leaf alternatives. One leaf in two real components produces two precision observations. The same
-leaf in one component with two alternative reaching definitions produces one. This deliberately
-removes multiplicity caused only by accumulated historical definitions. It also removes
-source-discovery order as a hidden policy choice. This is a new normalized semantic input contract
-for B/C, not claimed to be bit-for-bit the eager vector in all acyclic cases.
-
-`usize.MAX` remains the unmatched-operand label; it is **not** sorted after regular operands.
-The original naming state machine processes actual ordered ports. `[MAX,0]` and `[0,MAX]`
-remain different. Real repeated same-loan occurrences still see preceding occurrence effects;
-normalization may not merge them merely to make the state order convenient.
-
-## 4. Precision, observation states, and operation gates
-
-Precision describes loss of proven mapping. Its loss lattice is Exact at the best end,
-Stored and Alternatives incomparable, Unknown their join. Existing writes only lose information:
-store adds Stored loss, alternatives adds Alternatives loss, unknown adds both. No exact-retention
-branch restores an earlier loss. This lattice is not the truth/knowledge order used by refinement.
-
-Each source fact transports its mapping precision from its actual producer. A real borrow births
-Exact; an Entry/LoanFree fact has its own non-loan classification, never a loan index. A copy
-transports precision as well as source. This is necessary for a late source whose mapping was
-already lost before the next iteration reads it. The existing loan-global precision effects are
-represented by explicit versions at original observation sites, not a final precision snapshot.
-
-At each operation, join the incoming transported losses into the corresponding loan-global
-pre-operation version, conditional on those source occurrences actually reaching. Then sample
-operation-wide complete/declared/required facts. Iterate physical occurrences in the defined order;
-each decision reads the current loan version and updates it immediately. The output source fact
-carries the resulting precision. Static effect versions run in the original structural evaluation
-order, including prior cleanup/store effects. The join at the input barrier is an explicit new
-backedge dependency, not an optimistic initial-Exact assumption. On identical acyclic inputs it
-is redundant: all transported losses were already recorded by their earlier producer effects.
-For a backedge it prevents a source from reappearing Exact at a lexically earlier consumer.
-
-The global initial Exact metadata for a real loan site is **not a source fact**. It cannot create
-a witness before that borrow's actual creation/transfer reaches the read. A source can carry
-Exact only with a grounded derivation through no-loss transfers. Unknown never becomes LoanFree,
-Absent or Exact. Per-loan state versions and per-source transported quality are two components
-of the one equation system, with the explicit join above; they are not independent proof engines
-or an eager-vs-new compatibility mode. Final loan consumers read final versioned effects; source
-requests read actual value facts. Their different purposes do not authorize either to override
-the other.
+The policy-rules document supplies the missing translation: positive S/A loss bits, actual
+presence, per-source Q and structural per-loan P versions, input barriers, fixed operation
+snapshots and sequential real positions. Loss-free positive cycles derive Exact from presence
+and the proved absence of loss; no quality category or candidate borrow is optimistically seeded.
+Undefined loss is not false. Kept exact branches preserve bits; result alternatives add A;
+unknown result/cleanup add S+A; retained stores add S. Drops preserve earlier state/effects.
+Only an actual value path can bring later loss backward into an earlier read. The saved pre-loop
+snapshot is not overwritten merely by equal LoanId. Full rules, category admission, complete/drop
+feedback and mid-constructor observations are normative there, rather than an unspecified table.
 
 The original gates must be translated literally, not reconstructed from generic graph reachability:
 
@@ -305,10 +273,11 @@ also an edge, including input-quality joins and prior-whole-hold facts.
 
 Compile the finite transfers, gen/kill relations, gate circuits and effect versions into one
 finite normal rule program. The existing CFG reaching equations supply the temporal part; there
-is no second lexical scan and no parallel loan-only flow. A positive rule has one head and a
+is no second lexical scan and no parallel loan-only flow. A normal rule has one head and a
 finite conjunction of positive/negative predicate inputs. Auxiliary gates keep rule size
 polynomial: OR is multiple rules, AND one rule, negation a negative literal; finite-state naming
-and precision transitions use explicit tables. For example:
+uses ordered conditional transitions. Precision uses the grounded S/A loss rules, not a cyclic
+one-hot category join table. For example:
 
 ```
 Witness(a) <- Present(i), ExactAtSnapshot(i), BorrowedEquals(i,a), RecordedOwnAtom(i)
@@ -321,8 +290,8 @@ Active(j)  <- Guard(j), not EarlierGuard(1), ..., not EarlierGuard(j-1)
 Named local atoms a1..ak are fixed typed inputs; no-local-result and unknown-domain cases retain
 their original false guard. `Present` requires a genuine leaf plus an actual transfer/reaching
 witness. A raw member of the candidate universe is never a Present fact. ExactAtSnapshot requires
-both the grounded source quality and the appropriate precision version. AllExact alone cannot
-prove Complete; zero sources or merely possible witnesses are insufficient. Actual-read reaching
+grounded presence and both loss bits proved absent at the appropriate source/loan versions.
+AllExact alone cannot prove Complete; zero sources or merely possible witnesses are insufficient. Actual-read reaching
 uses fixed kills, never an assumption that an absent loan means an absent write.
 
 For a set S of assumed true atoms, define Gamma(S) by discarding rules with a negative literal
@@ -364,8 +333,10 @@ possible and none definite. Therefore neither cross-witness authorizes complete/
 handles the ambiguity explicitly rather than picking the first fixed point visited.
 
 The grounded identity loop is different: Entry/Borrow O reaches q via the zero-iteration edge;
-copy and single-name retention preserve it. Positive closure derives O around the cycle, with no
-negative guard required. K=U on its source slice. A source-free copy cycle produces no source;
+copy and single-name retention preserve presence. No loss operation grounds S/A, so positive
+loss closure is empty, both losses are outside U, and Exact derives. K=U on its source/quality
+slice. A real Stored backedge instead grounds S and transports it to the loop read; no initial
+Exact seed can bypass it. A source-free copy cycle produces no source;
 if its read is reachable it reports uninitialized/ungrounded coverage, not LoanFree. The counter-
 example's nonuniqueness does not force this positive to become unchecked.
 
@@ -378,18 +349,22 @@ policy decision; the implementation must not silently weaken a mandatory proof.
 
 ## 6. Lifecycle and consumers
 
-`prepare` builds the complete structural skeleton once, solves the combined temporal/source/state
-rules, and owns immutable Analysis-local IDs, route graph and effect facts. It is not permitted
-to return an eager prefix as complete. `sourcesAt(actualRead, selection)` projects this same
+Semantic's tracked `prepareSourceInputs` closes the immutable package before reservation.
+`prepare` consumes that package, builds the complete structural skeleton once, solves the combined
+temporal/source/state rules, and owns immutable Analysis-local IDs, route graph and effect facts. It is not permitted
+to return an eager prefix as complete. `sourcesAt(actualRead, stampedSelection)` projects this same
 analysis; multiple EvalIds for a NodeId are returned with their occurrence identities. No side
 cache of temporally scanned assignments exists. Definition/read witnesses remain paired even
 when alternatives are normalized into one component source.
 
 `checkPrepared` materializes each existing effect once, then runs ownership/region consumers with
 Borrow-only source identities and the existing policy. All initialization/release/end/move/drop
-masks are preserved. An incomplete source-request analysis prevents Checked. Real conflict
-precedence and ordered reports must remain intact; the rule solver's worklist order never becomes
-diagnostic order. Foreign/missing/duplicate request ordinals remain Pending; only the Analysis's
+masks are preserved. An incomplete source-request analysis prevents Checked. The explicit terminal
+schedule and runtime-vs-policy-stop translation in the policy rules
+preserve guard/nonreturn/outside/event/storing/imprecision/inherited/region precedence. Source
+enumeration continues past checker stops without treating them as runtime noncompletion. New
+later conflicts cannot leap over an earlier outside gate; worklist order is never report order.
+Foreign/missing/duplicate request ordinals remain Pending; only the Analysis's
 private stamp plus the exact retained obligation can accept Proved. Recovery cannot certify.
 
 Ordinary body, anonymous ClosedBody/CheckedLiteral, derived Effect, clone/rebase/recheck lifecycle
@@ -408,16 +383,18 @@ loan intervals, holding liveness and final region proof consume the same facts, 
 The existing analysis's several bitset passes can remain specialized consumers of the same graph;
 "one analysis" does not require conflating must-initialization with may-reaching sources.
 
-After PR1983 is accepted, its caller-retention classifier must migrate to complete paired source
-facts and actual operation reachability. Creation order, forward-link absence or the first
+Accepted PR1983 at main6c160865 supplies the caller-retention policy. Its classifier must migrate
+to complete paired source facts and actual operation reachability. Creation order, forward-link absence or the first
 parent visited cannot establish Actual/Absent. Preserve independent escape reasons and its exact
-applicability policy. This design imports no unpublished code or loop feasibility rule.
+applicability policy. Accepted literal-Boolean loop feasibility is CFG input. No unpublished policy is imported.
 
 ## 7. Bounds, invariants and explicit review assumptions
 
 Given finite N,C,L,S above, let V=O(N*C+L*S) slots and D=O(N*C) definition sites. Normalized value
 facts number at most O((N+D)*V*L*3) before fixed finite precision/coverage tags. Witness pairs are
-bounded by facts * reads * receiving slots; a conservative polynomial product is sufficient for
+bounded by facts * reads * receiving slots; case count adds finite placement/transfer/direct tags,
+and effect count includes finite target/placement/reason products. Predicate products use the
+prepared obligation/endpoint/application/case IDs, never growing type expressions; a conservative polynomial product is sufficient for
 allocation planning, not a promise that eagerly allocating the Cartesian product is cheap.
 Sparse demand construction may avoid unused facts, but it must be a structural least closure
 which ignores policy selection; deleting a candidate because a tentative policy dropped it is
@@ -436,7 +413,8 @@ Required invariants for C implementation/review:
    safety. Copy-before-reset keeps the earlier read predicate; later backedges reach only reads
    they can actually revisit.
 2. Each actual source mapping has a grounded leaf and paired witness. Normalization merges only
-   same physical component/leaf/role alternatives. Distinct real copies/components survive.
+   same physical component/leaf/role alternatives, preserving each conditional direct/placement
+   case and its source/read pair. Distinct real copies/components survive.
 3. Component routing preserves source/field and owner identity. External selector IDs cannot
    prove distinct storage. All original supported field/reference transformations must fit the
    finite graph; using Unknown merely to avoid representing a recursive route is prohibited.
@@ -452,13 +430,13 @@ Required invariants for C implementation/review:
 component graph; preservation of all supported recursive/opaque precision; full soundness of
 rule compilation for Type/signature predicates; practical cost; actual compiler diagnostics or
 any formerly Checked fixture. These are concrete independent-review/implementation obligations,
-not authorization to fill an uncovered case with guessed semantics. In particular the component
-route API amendment and transported-quality input join are proposed design changes, not part of
-A's approval. Independent design review must accept/reject them before production migration.
+not authorization to fill an uncovered case with guessed semantics. In particular the jointly agreed preparation/route API, conditional-case normalization and
+grounded loss rules are proposed design changes, not part of A's approval. Independent design review must accept/reject them before production migration.
 
 ## 8. Model evidence and acceptance contract
 
-The archived scratch executable is a specification probe, not a compiler test or bootstrap shim.
+The original 985eb0ea archive remains byte-identical. Its executable is a specification probe,
+not a compiler test or bootstrap shim.
 It has independent oracles:
 
 - 1,269 reachable acyclic four-point CFG/write assignments: a path interpreter records the last
@@ -485,7 +463,32 @@ It has independent oracles:
   independently enumerated walks. This verifies finite graph traversal, **not** completeness of
   the compiler-to-component-graph translation.
 
-All model assertions passed. No native invocation, full source fixture execution, compiler build,
+The repair1 archive additionally contains the exact independent review/probes and a separate
+model with these bounded checks:
+
+- 784 graph/action pairs: all 16 specified optional-edge CFGs × 49 action pairs, concrete finite
+  store-state exploration versus positive presence/loss equations. Two cells, L/C leaves, absent
+  or four masks; identity/copy/S-loss/A-loss/caller-kill/weak-call actions. This includes backedges
+  without finite loop unrolling, not arbitrary policy programs.
+- Focused identity Exact, real Stored backedge, saved pre-loop vs in-loop copy, conditional call
+  old+received vs strong kill, explicit Unknown source, undefined/absent/category-invalid admission.
+- Twenty-four precision transitions cover all four initial masks and exact/alternative/unknown/
+  drop/store/cleanup; four complete/drop witness controls preserve presence and loss requirements.
+  Independent Boolean enumeration retains both complete/drop feedback solutions, rejecting the
+  frozen cross-output. Explicit LoanFree replacement is separate from Unknown and absence.
+- Eight direct/indirect/opaque route subsets compared with individual case outcomes; historical
+  duplicate invariance, actual repeated positions 1..5, paired read authentication and four
+  distinct target/placement effect keys.
+- Sixteen prepared recursive route graphs compared with simple-path reachability and independent
+  accepting predicates; a visited cycle cannot prove a false/missing terminal predicate.
+- Small explicit nominal field-kill/copy, original nested-success sibling-binder, checker-stop
+  versus runtime-flow and diagnostic-stage probes. These last probes state narrow contracts;
+  they are not a full result/retention/query/diagnostic oracle.
+
+All recorded model assertions passed. Counts, exact domain, commands, hashes and limitations
+are in `.scratch/source-policy-design-b/repair1/README.md`. They do not establish compiler
+constructor correspondence, full policy correlations, availability, performance, diagnostics or
+Silk acceptance. No native invocation, full source fixture execution, compiler build,
 CI, corpus run or gap update occurred. The model intentionally does not mirror all production
 branches or substitute its outcomes for exact Silk assertions.
 
@@ -498,3 +501,47 @@ cannot advance until earlyStore is a hard refusal and temporal positives are Che
 A controls remain required, including complete-source release, ancestors, declared conflicts,
 static demands, anonymous lifecycle, capture retention and holder release. Design approval alone
 would not close #1944/#1952 or accept new gaps.
+
+## 9. Reported section integration constraint
+
+The #1957 owner supplied read-only candidate evidence on main6c: `storedNamedValid`
+with `p:&'s mut Obj, out:&mut Slot<'s>`, `stage=put3(&mut out.*,&p.n); stage(1)`
+followed by `return out.r.*`. Selected contract metadata removes StoredLoans but leaves
+Regions. Their `t3-0b662c45/.scratch/sections-1957/trial.log` attributes goal14
+Local37->Parameter0 at the second capture: loan0 rootout has parent Parameter1, loan1
+rootp has parent Parameter0, both share Local37. Anonymous/Effect twins reportedly
+have the analogous Local75/41 conflation. This is **owner-reported candidate evidence**,
+not a fresh run or accepted metadata change in this branch. The owner separately reports
+required namedSection/closureSection Checked and placeStored/placeStoredEffect OWN0011;
+the three Regions bodies are extra controls, not failures of those required positives.
+Constructor timing/unresolved-inference gates remain under their audit.
+
+The package must retain actual capture/full-parameter correspondence and paired source
+identity rather than using shared atom membership as source identity. This does not
+authorize dropping the output's own region obligations, changing symbolic region/parent
+proof, or asserting that provenance migration alone fixes these verdicts. Future C must
+assess this exact boundary after #1957's independently accepted metadata integration;
+a further proof-policy change requires explicit attribution/review, not a hidden fallback.
+
+Further exact provenance supplied by the owner: the complete candidate source is
+`t3-0b662c45/.scratch/sections-1957/candidate-probe.silk` at line822 onward. Goal14 is
+SafetyObligation.RegionRelation, relative Location74..81 (`&p.n`), offered the
+construction's fresh Local37, wanted Parameter0 ('s). Goal12 is P1->L37 at62..71
+(`&mut out.*`), goal13 P0->L37 at74..81. Argument/reborrow typing creates these
+before metadata; selected keptArguments does not create or change them. This is
+why replacing all-source quantification merely to obtain P1->P0 is unauthorized.
+
+The metadata candidate's eager keepCarried at construction is **not publishable**
+per the parent's timing audit. Existing construct carries captures without an
+authenticated physical capture-field/full-parameter map. The preparation contract
+requires that map for future C; it does not claim today's route is supported.
+Construction CaptureHold, invocation destination storage and delayed Effect Run
+are distinct operation phases. Package routes must carry the actual selected
+application, capture ordinal/full-parameter map, typed placement and execution
+phase/Eval/read identity. Preparing a possible future invocation route is not
+execution and cannot generate caller storage/escape. Existing constructor opaque/
+universal capture rules remain the accepted policy. Same leaf or region cannot
+stand in for selected capture argument identity. Holder's Type.fieldInputs/schema/
+Carry.path/timing audit owns this dependency; no local escape shuffle or candidate
+behavior is imported. A missing supported map must be resolved before migration,
+not called Unknown or used to weaken an unrelated proof.
