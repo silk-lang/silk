@@ -32,9 +32,12 @@ tag URLs, the fetched predecessor, deduplication against the installed prereleas
 Unicode/newline migration content. It routes the existing HTTP service to loopback; it does not
 replace `HttpNative`, TLS, HTTP framing, metadata parsing, or the history walk.
 
-Linux transport success is not yet claimed. Docker Desktop's local daemon accepted a socket but
-hung on bounded capability probes. The conformance command is wired into the Linux N1 and native
-target CI jobs; inspect their results on the PR's final head before marking it ready.
+Linux x64 CI at `e94cd99237280106b85e38b82062c5e7dc7831cb` also passed the complete
+controlled HTTPS history query, all authentication rejection cases, and live GitHub metadata 200,
+raw manifest 200, and absent history 404. The standard-library root job found a missing generated
+P-384 import; that inventory was regenerated and its local root compile passed. Full CI must
+still pass on the final head before marking the PR ready. Local Docker probes were unavailable
+because the daemon hung; the Linux evidence comes from CI.
 
 ## Diagnosed causes and fixes
 
@@ -84,7 +87,7 @@ reason, location and offset. No temporary debug logging remains.
   invalid/duplicate options, reversed/future targets, undeclared origins, and read-only behavior.
 - Generated standard-library reference pages were regenerated from the source comments.
 - Local formatting, lint, and tooling typecheck pass. A full new-head selfhost/fixpoint run is
-  left to CI. No Linux success or readiness is implied by the Darwin results.
+  left to CI. Linux x64 evidence is recorded separately above; readiness requires the final head.
 
 The measured borrow-gap update was generated with `check-borrow-gap.mjs update` from the
 successful selected corpus log; unselected programs were retained. Its diff is:
@@ -158,7 +161,8 @@ silk changes since 1.2.0 --to 1.4.0
 
 These examples describe the interface; the named target versions must actually exist in the
 selected source. The local workflow has been exercised against real generated release records.
-**Automatic remote queries are implemented but have not succeeded against live GitHub.**
+**Live native HTTPS reaches GitHub successfully; a complete public history query remains blocked
+by missing published TOML history.**
 
 - No selector uses the project's `[package].silk-version`, not its package version or the
   running compiler's version. Missing recorded versions require `--from VERSION`.
