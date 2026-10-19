@@ -2187,9 +2187,9 @@ effect fn sourceReserveBody<'body>(prepared: &PreparedSources.SourcePreparation<
   // Construction inputs are physically activated here exactly once. Implicit references
   // acquire at input.usePoint even if another argument never completes the operation.
   let ownership = run sourceDeclaredLoans(prepared, &mut traversal)
-  run sourceResultUses(prepared, &mut traversal, &ownership, cleanup)
   let results = run SourceResults.reserve(prepared, &traversal)
   let stores = run SourceStores.reserve(prepared, &traversal, &results)
+  run sourceResultUses(prepared, &mut traversal, &ownership, cleanup, &stores)
   run SourceGraph.Skeleton.installStores(&mut traversal.skeleton, prepared, move stores)
   // The graph owns compound result activation and retains empty/incomplete contributors.
   // BC supplies semantic terminal directives; it does not reconstruct contract routes.
@@ -5683,6 +5683,249 @@ effect fn sourceEndLoan<'input, 'body>(input: &SourceRegionInput<'input, 'body>,
   return move result
 }
 
+// A handler gap is an actual execution obligation, distinct from a policy decision to drop
+// a source. It remains visible while the atomic consumer migration is unfinished.
+enum SourceHandlerGap { Handler, HolderUse, ThroughExclusive, BlockLifetime, Projection }
+struct SourcePendingHandler { dispatch: usize, evaluation: SourceGraph.EvalId, reason: SourceHandlerGap, active: SourceAtom }
+struct SourcePolicyRefusal { dispatch: usize, point: SourceControl.PointId, reason: BorrowStatus, active: SourceAtom }
+struct SourceInheritedStatus { status: BorrowStatus, active: SourceAtom }
+struct SourceDispatchProjection {
+  policy: SourcePolicyEffects
+  holders: SourceHolderProjection
+  outputs: List<SourceResultEffect>
+  wholeHolds: List<SourceWholeHold>
+  sealed: List<Location>
+  unheld: List<Location>
+  constructions: List<SourceInheritedStatus>
+  blocks: List<SourceBlockBinding>
+  refusals: List<SourcePolicyRefusal>
+  pending: List<SourcePendingHandler>
+}
+
+effect fn sourceAppendEffects<T>(target: &mut List<T>, source: List<T>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut incoming = move source
+  while List<T>.length(&incoming) != usize.ZERO {
+    run List<T>.append(&mut target.*, List<T>.remove(&mut incoming, usize.ZERO))
+  }
+  return ()
+}
+
+effect fn sourceDispatchMissing(state: &mut SourceDispatchProjection, missing: SourceAtom,
+  rules: &mut SourceProgram) -> () ! OutOfMemoryError ? &mut Allocator {
+  let gaps: [SourceAtom; 2] = [state.policy.missing, missing]
+  state.policy.missing = run SourcePolicy.disjunction(&mut rules.*, &gaps)
+  return ()
+}
+
+effect fn sourcePending(state: &mut SourceDispatchProjection, dispatch: usize, evaluation: SourceGraph.EvalId,
+  reason: SourceHandlerGap, active: SourceAtom, rules: &mut SourceProgram) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<SourcePendingHandler>.append(&mut state.pending,
+    SourcePendingHandler {dispatch: dispatch, evaluation: evaluation, reason: reason, active: active})
+  return run sourceDispatchMissing(&mut state.*, active, &mut rules.*)
+}
+
+effect fn sourceCollectFinish(state: &mut SourceDispatchProjection, finished: SourceFinishEffects,
+  rules: &mut SourceProgram) -> () ! OutOfMemoryError ? &mut Allocator {
+  run sourceDispatchMissing(&mut state.*, finished.missing, &mut rules.*)
+  run sourceAppendEffects<SourceRetentionEffect>(&mut state.policy.retention, move finished.retention)
+  run sourceAppendEffects<SourceEscapeEffect>(&mut state.policy.written, move finished.written)
+  run sourceAppendEffects<SourceIntervalEffect>(&mut state.policy.intervals, move finished.intervals)
+  run sourceAppendEffects<SourcePositionResult>(&mut state.policy.results, move finished.inputResults)
+  run sourceAppendEffects<SourceResultEffect>(&mut state.outputs, move finished.results)
+  run sourceAppendEffects<SourceWholeHold>(&mut state.wholeHolds, move finished.wholeHolds)
+  run sourceAppendEffects<Location>(&mut state.sealed, move finished.sealed)
+  run sourceAppendEffects<Location>(&mut state.unheld, move finished.unheld)
+  return ()
+}
+
+// Immediate execution owns its original call's finish and retention judgment. The
+// construction occurrence remains in the physical graph, with no second policy pass.
+fn sourceInlinedOperation(stores: &SourceStores.Inventory, evaluation: SourceGraph.EvalId) -> bool {
+  let operations = List<SourceStores.Operation>.asSlice(&stores.operations)
+  let mut at = usize.ZERO
+  while at < operations.length {
+    if operations[at].originating.index == evaluation.index && operations[at].evaluation.index != evaluation.index { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Copy immutable directive metadata before mutating its Builder's policy program. This is
+// not a new source/input inventory: all evaluation IDs and original order remain unchanged.
+effect fn sourceDispatchResult<'body>(builder: &SourceGraph.Builder<'body>, evaluation: SourceGraph.EvalId)
+  -> Option<SourceGraph.ResultUse> ! OutOfMemoryError ? &mut Allocator {
+  let directives = SourceGraph.Builder.resultUses(builder)
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < directives.length {
+    if directives[at].evaluation.index == evaluation.index {
+      if found != usize.MAX { return CompilerBug.panic(b"one actual handler has duplicate result directives") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return Option<SourceGraph.ResultUse>.none() }
+  let actual = &directives[found]
+  let mut sources = List<SourceGraph.EvalId>.make()
+  let inputs = List<SourceGraph.EvalId>.asSlice(&actual.sources)
+  at = usize.ZERO
+  while at < inputs.length { run List<SourceGraph.EvalId>.append(&mut sources, inputs[at]) at = at + usize.ONE }
+  return Option<SourceGraph.ResultUse>.some(SourceGraph.ResultUse {
+    evaluation: actual.evaluation, active: actual.active, kind: actual.kind, sources: move sources})
+}
+
+// Dispatch follows the retained visitor trace, never point or Value allocation order. It
+// preserves per-argument precision observations and cleanup between nested occurrences.
+// Unimplemented semantic handlers remain explicit active gaps and leave their policy ports
+// unbound; this internal stage cannot be published as a replacement checker prematurely.
+effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraph.Builder<'body>, visits: &[SourceVisit.Visit],
+  trace: &[SourceVisit.Dispatch], exits: &[SourceVisit.OwnerExit], ownership: &SourceOwnership,
+  cleanup: &[LoanCleanup], context: &RetentionContext, paths: &mut List<List<Step>>,
+  holders: SourceHolderProjection) -> SourceDispatchProjection ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let loans = List<Loan>.asSlice(&ownership.loans)
+  let acquired = List<SourceInputAcquisition>.asSlice(&ownership.acquisitions)
+  let observations = List<SourceOwnerObservation>.asSlice(&ownership.observations)
+  let no = SourceProgram.atom(&mut builder.rules)
+  let mut state = SourceDispatchProjection {
+    policy: SourcePolicyEffects {state: run SourcePolicy.LoanState.make(&mut builder.rules, loans.length),
+      results: List<SourcePositionResult>.make(), crossings: List<SourceCrossingEffect>.make(), written: List<SourceEscapeEffect>.make(),
+      captures: List<SourceCaptureEffect>.make(), retention: List<SourceRetentionEffect>.make(), intervals: List<SourceIntervalEffect>.make(), missing: no},
+    holders: move holders, outputs: List<SourceResultEffect>.make(), wholeHolds: List<SourceWholeHold>.make(),
+    sealed: List<Location>.make(), unheld: List<Location>.make(), constructions: List<SourceInheritedStatus>.make(),
+    blocks: List<SourceBlockBinding>.make(), refusals: List<SourcePolicyRefusal>.make(), pending: List<SourcePendingHandler>.make()}
+  let nodes = SourceGraph.Builder.preparation(&builder.*).body.nodes
+  let mut at = usize.ZERO
+  while at < trace.length {
+    match trace[at] {
+      SourceVisit.Dispatch.Enter {evaluation} => {
+        let actual = sourceVisitAt(visits, evaluation)
+        let active = List<SourceControl.Point>.asSlice(&builder.reaching.points)[actual.entry.index].reachable
+        match move run shapeOf(nodes, actual.node) {
+          Shape.Outside {reason} => run List<SourcePolicyRefusal>.append(&mut state.refusals,
+            SourcePolicyRefusal {dispatch: at, point: actual.entry, reason: reason, active: active})
+          Shape.Recovered {..} => run List<SourcePolicyRefusal>.append(&mut state.refusals,
+            SourcePolicyRefusal {dispatch: at, point: actual.entry, reason: BorrowStatus.Regions, active: active})
+          _ => ()
+        }
+      }
+      SourceVisit.Dispatch.InputComplete {evaluation, input} => {
+        let actual = sourceVisitAt(visits, evaluation)
+        let inputs = List<SourceVisit.Input>.asSlice(&actual.inputs)
+        if input >= inputs.length { return CompilerBug.panic(b"dispatch trace lost an actual input completion") }
+        if !sourceInlinedOperation(SourceGraph.Builder.stores(&builder.*), evaluation) {
+          if let Shape.Defer {..} = move run shapeOf(nodes, actual.node) {
+            let deferred = run sourceDeferInput(&mut builder.*, actual, input, acquired, &mut state.policy.state, loans, &mut paths.*)
+            run sourceDispatchMissing(&mut state, deferred.missing, &mut builder.rules)
+            run sourceAppendEffects<SourceRetentionEffect>(&mut state.policy.retention, move deferred.retention)
+          }
+        }
+      }
+      SourceVisit.Dispatch.Finish {evaluation} => {
+        if sourceInlinedOperation(SourceGraph.Builder.stores(&builder.*), evaluation) { at = at + usize.ONE continue }
+        let actual = sourceVisitAt(visits, evaluation)
+        let active = List<SourceControl.Point>.asSlice(&builder.reaching.points)[actual.execute.index].reachable
+        let directive = run sourceDispatchResult(&builder.*, evaluation)
+        match move run shapeOf(nodes, actual.node) {
+          Shape.Operands {..} | Shape.ShortCircuit {..} => {
+            let directive = match move directive { Option<SourceGraph.ResultUse>.Some {value} => move value
+              _ => { return CompilerBug.panic(b"actual operand handler lost its reserved result directive") } }
+            let finished = run sourceFinishOperands(&mut builder.*, actual, &directive, &mut state.policy.state, loans, &mut paths.*, context)
+            run sourceCollectFinish(&mut state, move finished, &mut builder.rules)
+          }
+          Shape.Call {..} | Shape.Invoke {..} => {
+            let directive = match move directive { Option<SourceGraph.ResultUse>.Some {value} => move value
+              _ => { return CompilerBug.panic(b"actual call handler lost its reserved result directive") } }
+            let called = run sourceCall(&mut builder.*, visits, actual, &directive, acquired, &mut state.policy.state,
+              loans, &mut paths.*, context, &mut state.holders)
+            run sourceCollectFinish(&mut state, move called.finished, &mut builder.rules)
+            run sourceDispatchMissing(&mut state, called.stored.missing, &mut builder.rules)
+            run sourceAppendEffects<SourceIntervalEffect>(&mut state.policy.intervals, move called.stored.intervals)
+            run List<SourcePolicyRefusal>.append(&mut state.refusals, SourcePolicyRefusal {
+              dispatch: at, point: actual.execute, reason: BorrowStatus.StoredLoans, active: called.stored.refusal})
+            // InvocationWrite owns this separate policy family. No KeptSlot can substitute.
+            if called.executing {
+              run sourcePending(&mut state, at, evaluation, SourceHandlerGap.ThroughExclusive, active, &mut builder.rules)
+            }
+          }
+          Shape.Construct {..} => {
+            let constructed = run sourceConstructVisit(&mut builder.*, actual, acquired, &mut state.policy.state, loans, &mut paths.*)
+            run sourceDispatchMissing(&mut state, constructed.missing, &mut builder.rules)
+            let policy = move constructed.policy
+            run sourceAppendEffects<SourceCaptureEffect>(&mut state.policy.captures, move policy.captures)
+            run List<SourceInheritedStatus>.append(&mut state.constructions, SourceInheritedStatus {
+              status: policy.inherited, active: policy.active})
+          }
+          Shape.Binding {..} => {
+            let bound = run sourceBinding(&mut builder.*, actual, &mut state.policy.state, loans, &mut paths.*)
+            run sourceDispatchMissing(&mut state, bound.missing, &mut builder.rules)
+            run sourceAppendEffects<SourceIntervalEffect>(&mut state.policy.intervals, move bound.intervals)
+            run sourceAppendEffects<SourceCrossingEffect>(&mut state.policy.crossings, move bound.crossings)
+            run sourceAppendEffects<SourceEscapeEffect>(&mut state.policy.written, move bound.written)
+            if let Option<SourceBlockBinding>.Some {value} = bound.block {
+              run List<SourceBlockBinding>.append(&mut state.blocks, value)
+              run sourcePending(&mut state, at, evaluation, SourceHandlerGap.BlockLifetime, active, &mut builder.rules)
+            }
+          }
+          Shape.ReadPlace => {
+            if let Option<SourceGraph.ResultUse>.Some {value: directive} = move directive {
+              match directive.kind {
+                SourceGraph.ResultKind.Read {read} => {
+                  let selected = SourceGraph.Builder.evaluation(&builder.*, read)
+                  let node = match selected.site { SourceGraph.EvaluationSite.Node {node} => node
+                    _ => { return CompilerBug.panic(b"read dispatch selected a body-entry value") } }
+                  let root = sourceNodeValueRoot(SourceGraph.Builder.preparation(&builder.*), node)
+                  let output = sourceNodeValueRoot(SourceGraph.Builder.preparation(&builder.*), actual.node)
+                  let prepared = SourceGraph.Builder.preparation(&builder.*)
+                  let owner = prepared.body.owner
+                  let supplied = prepared.body.supplied
+                  let finished = run sourceFinishRead(&mut builder.*, &directive, root, output, actual.execute.index,
+                    &mut state.policy.state, loans, &mut paths.*, nodes, owner, supplied,
+                    List<RetentionEdge>.asSlice(&context.requirements), List<ImpliedGroup>.asSlice(&context.relations), context.settled)
+                  run sourceCollectFinish(&mut state, move finished, &mut builder.rules)
+                }
+                _ => run sourcePending(&mut state, at, evaluation, SourceHandlerGap.Projection, active, &mut builder.rules)
+              }
+            }
+            run sourcePending(&mut state, at, evaluation, SourceHandlerGap.HolderUse, active, &mut builder.rules)
+          }
+          Shape.Leaf | Shape.PassThrough {..} | Shape.Defer {..} | Shape.Outside {..} | Shape.Recovered {..} => ()
+          _ => run sourcePending(&mut state, at, evaluation, SourceHandlerGap.Handler, active, &mut builder.rules)
+        }
+      }
+      SourceVisit.Dispatch.OwnerExit {exit} => {
+        if exit >= exits.length { return CompilerBug.panic(b"dispatch trace lost its exact owner exit") }
+        let actual = &exits[exit]
+        if actual.action == SourceVisit.OwnerAction.Cleanup {
+          let mut found = usize.MAX
+          let mut each = usize.ZERO
+          while each < observations.length {
+            let observed = observations[each]
+            if observed.owner.index == actual.owner.index && observed.point.index == actual.point.index
+              && observed.action == actual.action {
+              if found != usize.MAX { return CompilerBug.panic(b"owner cleanup has duplicate actual observations") }
+              found = each
+            }
+            each = each + usize.ONE
+          }
+          if found == usize.MAX { return CompilerBug.panic(b"owner cleanup lost its reserved current read") }
+          let cleaned = run sourceCleanup(&mut builder.*, observations[found], &mut state.policy.state, loans, &mut paths.*, cleanup)
+          run sourceDispatchMissing(&mut state, cleaned.missing, &mut builder.rules)
+          run sourceAppendEffects<SourceIntervalEffect>(&mut state.policy.intervals, move cleaned.intervals)
+          run List<SourcePolicyRefusal>.append(&mut state.refusals, SourcePolicyRefusal {
+            dispatch: at, point: actual.point, reason: BorrowStatus.StoredLoans, active: cleaned.refusal})
+        } else if actual.action == SourceVisit.OwnerAction.Use {
+          let evaluation = match actual.read { Option<SourceGraph.EvalId>.Some {value} => value
+            _ => { return CompilerBug.panic(b"owner use lost its reserved observation") } }
+          let active = List<SourceControl.Point>.asSlice(&builder.reaching.points)[actual.point.index].reachable
+          run sourcePending(&mut state, at, evaluation, SourceHandlerGap.HolderUse, active, &mut builder.rules)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move state
+}
+
 // Ordered handler effects are complete before this consuming boundary. Source facts and
 // immutable precision versions are sealed together, then the sole graph solve supplies all
 // runtime activity, original definition membership and event applicability.
@@ -8327,7 +8570,7 @@ effect fn sourceEscapeInventory<'body>(prepared: &PreparedSources.SourcePreparat
 // graph never guesses this semantic boundary from a Select, Place or Copy map. In particular,
 // a construction and a match join are physical operations without a finish policy barrier.
 effect fn sourceResultUses<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &mut SourceVisit.Reservation,
-  ownership: &SourceOwnership, cleanup: &[LoanCleanup]) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  ownership: &SourceOwnership, cleanup: &[LoanCleanup], stores: &SourceStores.Inventory) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
   if List<SourceGraph.ResultUse>.length(&reservation.skeleton.results) != usize.ZERO {
     CompilerBug.panic(b"ownership result directives were emitted twice")
   }
@@ -8337,6 +8580,7 @@ effect fn sourceResultUses<'body>(prepared: &PreparedSources.SourcePreparation<'
   let mut at = usize.ZERO
   while at < visits.length {
     let actual = &visits[at]
+    if sourceInlinedOperation(stores, actual.evaluation) { at = at + usize.ONE continue }
     let mut kind = Option<SourceGraph.ResultKind>.none()
     let shape = run shapeOf(nodes, actual.node)
     match move shape {
@@ -9260,6 +9504,7 @@ effect fn sourceCallInput<'body>(builder: &mut SourceGraph.Builder<'body>, actua
 }
 
 struct SourceCallEffects {
+  executing: bool
   finished: SourceFinishEffects
   stored: SourceStoreEffects
   inputs: SourceObservation
@@ -9349,7 +9594,7 @@ effect fn sourceCall<'body>(builder: &mut SourceGraph.Builder<'body>, visits: &[
     stored = run sourceStoreIntoLent(&mut builder.*, storedOperation, &mut state.*, loans, locals, &mut paths.*, owner,
       List<RetentionEdge>.asSlice(&context.requirements), &mut holders.*)
   }
-  return SourceCallEffects {finished: move finished, stored: move stored, inputs: move observation, callee: receiver}
+  return SourceCallEffects {executing: !stores, finished: move finished, stored: move stored, inputs: move observation, callee: receiver}
 }
 
 // One finish operation on the reserved CFG. Retention observes its independent pre-result
