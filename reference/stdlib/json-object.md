@@ -26,7 +26,7 @@ pub struct JsonObject
 
 Owned formatting state for one open JSON object.
 
-<a id="impl"></a>
+<a id="JsonObject.impl"></a>
 
 ## Implementation `JsonObject`
 
@@ -34,7 +34,7 @@ Owned formatting state for one open JSON object.
 impl JsonObject
 ```
 
-<a id="impl.begin"></a>
+<a id="JsonObject.impl.begin"></a>
 
 ### Associated function `begin`
 
@@ -45,7 +45,7 @@ pub effect fn begin(options: &JsonOptions)
 
 Opens an object after checking its depth limit.
 
-<a id="impl.field"></a>
+<a id="JsonObject.impl.field"></a>
 
 ### Method `field`
 
@@ -62,7 +62,7 @@ Writes one named value and returns the open object state.
 #### Details
 The incoming Effect runs once. If it fails, this operation writes nothing.
 
-<a id="impl.fieldIfSome"></a>
+<a id="JsonObject.impl.fieldIfSome"></a>
 
 ### Method `fieldIfSome`
 
@@ -79,7 +79,7 @@ Writes a present named value or leaves an absent member out of the object.
 #### Details
 The incoming Effect runs once. `None` does not write a key or a separator.
 
-<a id="impl.end"></a>
+<a id="JsonObject.impl.end"></a>
 
 ### Method `end`
 

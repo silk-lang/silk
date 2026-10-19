@@ -155,7 +155,7 @@ CloseDelimited
 
 Uses connection closure as the payload delimiter and forbids reuse.
 
-<a id="impl"></a>
+<a id="BodyMode.impl.Copy"></a>
 
 ## Implementation `Copy for BodyMode`
 
@@ -303,7 +303,7 @@ pub shutdownDrainBytes: usize
 
 The maximum input bytes discarded by explicit connection finish.
 
-<a id="impl-2"></a>
+<a id="Limits.impl.Copy"></a>
 
 ## Implementation `Copy for Limits`
 
@@ -621,7 +621,7 @@ pub totalWire: u64
 
 The cumulative framed bytes produced by the response encoder.
 
-<a id="impl-3"></a>
+<a id="WriteProgress.impl.Copy"></a>
 
 ## Implementation `Copy for WriteProgress`
 
@@ -639,15 +639,15 @@ pub struct Connection<'connection, 'transport, P>
 
 One affine serial server connection borrowing its concrete buffered channel.
 
-<a id="impl-4"></a>
+<a id="Connection.impl"></a>
 
-## Implementation ``
+## Implementation `Connection<'connection, 'transport, P>`
 
 ```silk
 impl<'connection, 'transport, P> Connection<'connection, 'transport, P>
 ```
 
-<a id="impl.phase"></a>
+<a id="Connection.impl.phase"></a>
 
 ### Method `phase`
 
@@ -657,7 +657,7 @@ pub fn phase(self: &Self) -> ConnectionPhase
 
 Returns the current connection phase.
 
-<a id="impl.requests"></a>
+<a id="Connection.impl.requests"></a>
 
 ### Method `requests`
 
@@ -667,7 +667,7 @@ pub fn requests(self: &Self) -> usize
 
 Returns the number of request heads admitted by this connection.
 
-<a id="impl.unread"></a>
+<a id="Connection.impl.unread"></a>
 
 ### Method `unread`
 
@@ -687,15 +687,15 @@ pub struct Request<'request, 'connection, 'transport, P>
 
 One callback-scoped active request and its single-message framing decoder.
 
-<a id="impl-5"></a>
+<a id="Request.impl"></a>
 
-## Implementation ``
+## Implementation `Request<'request, 'connection, 'transport, P>`
 
 ```silk
 impl<'request, 'connection, 'transport, P> Request<'request, 'connection, 'transport, P>
 ```
 
-<a id="impl.head"></a>
+<a id="Request.impl.head"></a>
 
 ### Method `head`
 
@@ -705,7 +705,7 @@ pub effect fn head<'head>(self: &'head Self) -> RequestHead<'head> ! ServerError
 
 Borrows the completed parsed head from active request storage.
 
-<a id="impl.bodyComplete"></a>
+<a id="Request.impl.bodyComplete"></a>
 
 ### Method `bodyComplete`
 
@@ -715,7 +715,7 @@ pub effect fn bodyComplete(self: &Self) -> bool ! ServerError
 
 Returns whether request framing completed; fails unless the request remains active.
 
-<a id="impl.expectationRejected"></a>
+<a id="Request.impl.expectationRejected"></a>
 
 ### Method `expectationRejected`
 
@@ -1013,16 +1013,16 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
 
 Completes a successful CONNECT response and lends the exact buffered tunnel suffix.
 
-<a id="impl-6"></a>
+<a id="ResponseWriter.impl"></a>
 
-## Implementation ``
+## Implementation `ResponseWriter<'writer, 'request, 'connection, 'transport, P>`
 
 ```silk
 impl<'writer, 'request, 'connection, 'transport, P>
   ResponseWriter<'writer, 'request, 'connection, 'transport, P>
 ```
 
-<a id="impl.writeSome"></a>
+<a id="ResponseWriter.impl.writeSome"></a>
 
 ### Method `writeSome`
 
@@ -1039,7 +1039,7 @@ pub effect fn writeSome(
 
 Accepts one payload prefix into the shared framing and bounded output owners.
 
-<a id="impl.writeAll"></a>
+<a id="ResponseWriter.impl.writeAll"></a>
 
 ### Method `writeAll`
 
@@ -1056,7 +1056,7 @@ pub effect fn writeAll(
 
 Accepts the complete caller payload in order.
 
-<a id="impl.finish"></a>
+<a id="ResponseWriter.impl.finish"></a>
 
 ### Method `finish`
 

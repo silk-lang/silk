@@ -16,7 +16,7 @@ the caller.
 The accepted profile requires CRLF, exact single-SP start-line separators, and field names
 immediately followed by `:`. It rejects leading blank lines, bare LF, obs-fold, HTTP/0.9, ICY,
 and historical whitespace recovery. Completed heads and their field iterators borrow the parser;
-use [`RequestHead.copy`](#impl.copy) or [`ResponseHead.copy`](#impl.copy-2) for independent ownership.
+use [`RequestHead.copy`](#RequestHead.impl.copy) or [`ResponseHead.copy`](#ResponseHead.impl.copy) for independent ownership.
 
 Construction accounts for the configured head-byte backing plus 32 bytes of portable offset
 metadata per field against `maxOwnedBytes`. Parser scalar and allocator bookkeeping are not part
@@ -86,7 +86,7 @@ pub values: ValueLimits
 
 Shared method, target, name, value, field-count, and aggregate field limits.
 
-<a id="impl"></a>
+<a id="Limits.impl.Copy"></a>
 
 ## Implementation `Copy for Limits`
 
@@ -154,7 +154,7 @@ pub state: ProgressState
 
 Whether one complete head is now available.
 
-<a id="impl-2"></a>
+<a id="Progress.impl.Copy"></a>
 
 ## Implementation `Copy for Progress`
 
@@ -662,7 +662,7 @@ InvalidState
 
 The operation is not valid for the parser's current lifecycle.
 
-<a id="impl-3"></a>
+<a id="ParseReason.impl.Copy"></a>
 
 ## Implementation `Copy for ParseReason`
 
@@ -775,9 +775,9 @@ pub struct RequestHead<'owner>
 
 A completed request head whose values and fields borrow its parser.
 
-<a id="impl-4"></a>
+<a id="RequestHead.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for RequestHead<'owner>`
 
 ```silk
 impl<'owner> Copy for RequestHead<'owner>
@@ -793,9 +793,9 @@ pub struct ResponseHead<'owner>
 
 A completed response head whose values and fields borrow its parser.
 
-<a id="impl-5"></a>
+<a id="ResponseHead.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for ResponseHead<'owner>`
 
 ```silk
 impl<'owner> Copy for ResponseHead<'owner>
@@ -829,7 +829,7 @@ Whole-slice request parsing result, retaining both the parser and exact suffix b
 pub parser: RequestParser
 ```
 
-Completed parser. Borrow it with [`RequestParser.head`](#impl.head).
+Completed parser. Borrow it with [`RequestParser.head`](#RequestParser.impl.head).
 
 <a id="ParsedRequest.progress"></a>
 
@@ -859,7 +859,7 @@ Whole-slice response parsing result, retaining both the parser and exact suffix 
 pub parser: ResponseParser
 ```
 
-Completed parser. Borrow it with [`ResponseParser.head`](#impl.head-2).
+Completed parser. Borrow it with [`ResponseParser.head`](#ResponseParser.impl.head).
 
 <a id="ParsedResponse.progress"></a>
 
@@ -871,7 +871,7 @@ pub progress: Progress
 
 Exact progress through the supplied whole slice.
 
-<a id="impl-6"></a>
+<a id="RequestParser.impl"></a>
 
 ## Implementation `RequestParser`
 
@@ -879,7 +879,7 @@ Exact progress through the supplied whole slice.
 impl RequestParser
 ```
 
-<a id="impl.make"></a>
+<a id="RequestParser.impl.make"></a>
 
 ### Associated function `make`
 
@@ -891,7 +891,7 @@ pub effect fn make(limits: Limits) -> Result<RequestParser, ParseError>
 
 Validates capacity arithmetic and acquires all parser storage before publishing the parser.
 
-<a id="impl.feed"></a>
+<a id="RequestParser.impl.feed"></a>
 
 ### Method `feed`
 
@@ -901,7 +901,7 @@ pub fn feed(self: &mut Self, input: &[u8], final: bool) -> Result<Progress, Pars
 
 Consumes an exact prefix, never crossing the terminating empty line.
 
-<a id="impl.state"></a>
+<a id="RequestParser.impl.state"></a>
 
 ### Method `state`
 
@@ -911,7 +911,7 @@ pub fn state(self: &Self) -> ParserState
 
 Returns the current parser lifecycle.
 
-<a id="impl.failure"></a>
+<a id="RequestParser.impl.failure"></a>
 
 ### Method `failure`
 
@@ -921,7 +921,7 @@ pub fn failure(self: &Self) -> Option<ParseError>
 
 Returns the original poisoning failure, if one exists.
 
-<a id="impl.head"></a>
+<a id="RequestParser.impl.head"></a>
 
 ### Method `head`
 
@@ -931,7 +931,7 @@ pub fn head<'owner>(self: &'owner Self) -> Result<RequestHead<'owner>, ParseErro
 
 Borrows the completed request head and its ordered fields.
 
-<a id="impl.reset"></a>
+<a id="RequestParser.impl.reset"></a>
 
 ### Method `reset`
 
@@ -942,7 +942,7 @@ pub fn reset(self: &mut Self) -> Result<(), ParseError>
 Restores fresh active state while retaining the original allocations.
 A live head borrow statically prevents this exclusive operation.
 
-<a id="impl-7"></a>
+<a id="ResponseParser.impl"></a>
 
 ## Implementation `ResponseParser`
 
@@ -950,7 +950,7 @@ A live head borrow statically prevents this exclusive operation.
 impl ResponseParser
 ```
 
-<a id="impl.make-2"></a>
+<a id="ResponseParser.impl.make"></a>
 
 ### Associated function `make`
 
@@ -962,7 +962,7 @@ pub effect fn make(limits: Limits) -> Result<ResponseParser, ParseError>
 
 Validates capacity arithmetic and acquires all parser storage before publishing the parser.
 
-<a id="impl.feed-2"></a>
+<a id="ResponseParser.impl.feed"></a>
 
 ### Method `feed`
 
@@ -972,7 +972,7 @@ pub fn feed(self: &mut Self, input: &[u8], final: bool) -> Result<Progress, Pars
 
 Consumes an exact prefix, never crossing the terminating empty line.
 
-<a id="impl.state-2"></a>
+<a id="ResponseParser.impl.state"></a>
 
 ### Method `state`
 
@@ -982,7 +982,7 @@ pub fn state(self: &Self) -> ParserState
 
 Returns the current parser lifecycle.
 
-<a id="impl.failure-2"></a>
+<a id="ResponseParser.impl.failure"></a>
 
 ### Method `failure`
 
@@ -992,7 +992,7 @@ pub fn failure(self: &Self) -> Option<ParseError>
 
 Returns the original poisoning failure, if one exists.
 
-<a id="impl.head-2"></a>
+<a id="ResponseParser.impl.head"></a>
 
 ### Method `head`
 
@@ -1002,7 +1002,7 @@ pub fn head<'owner>(self: &'owner Self) -> Result<ResponseHead<'owner>, ParseErr
 
 Borrows the completed response head and its ordered fields.
 
-<a id="impl.reset-2"></a>
+<a id="ResponseParser.impl.reset"></a>
 
 ### Method `reset`
 
@@ -1013,15 +1013,15 @@ pub fn reset(self: &mut Self) -> Result<(), ParseError>
 Restores fresh active state while retaining the original allocations.
 A live head borrow statically prevents this exclusive operation.
 
-<a id="impl-8"></a>
+<a id="RequestHead.impl"></a>
 
-## Implementation ``
+## Implementation `RequestHead<'owner>`
 
 ```silk
 impl<'owner> RequestHead<'owner>
 ```
 
-<a id="impl.version"></a>
+<a id="RequestHead.impl.version"></a>
 
 ### Method `version`
 
@@ -1031,7 +1031,7 @@ pub fn version(self: &Self) -> Version
 
 Returns the parsed protocol version.
 
-<a id="impl.method"></a>
+<a id="RequestHead.impl.method"></a>
 
 ### Method `method`
 
@@ -1041,7 +1041,7 @@ pub fn method(self: &Self) -> Method<'owner>
 
 Returns the validated case-sensitive method token.
 
-<a id="impl.target"></a>
+<a id="RequestHead.impl.target"></a>
 
 ### Method `target`
 
@@ -1051,7 +1051,7 @@ pub fn target(self: &Self) -> RequestTarget<'owner>
 
 Returns the validated request target.
 
-<a id="impl.fieldCount"></a>
+<a id="RequestHead.impl.fieldCount"></a>
 
 ### Method `fieldCount`
 
@@ -1061,7 +1061,7 @@ pub fn fieldCount(self: &Self) -> usize
 
 Returns the number of fields, including duplicates.
 
-<a id="impl.fields"></a>
+<a id="RequestHead.impl.fields"></a>
 
 ### Method `fields`
 
@@ -1071,7 +1071,7 @@ pub fn fields(self: &Self) -> HeaderIterator<'owner>
 
 Iterates fields in original order without combining duplicate names.
 
-<a id="impl.copy"></a>
+<a id="RequestHead.impl.copy"></a>
 
 ### Method `copy`
 
@@ -1084,15 +1084,15 @@ pub effect fn copy(
 
 Copies this head into the shared independently owned HTTP head representation.
 
-<a id="impl-9"></a>
+<a id="ResponseHead.impl"></a>
 
-## Implementation ``
+## Implementation `ResponseHead<'owner>`
 
 ```silk
 impl<'owner> ResponseHead<'owner>
 ```
 
-<a id="impl.version-2"></a>
+<a id="ResponseHead.impl.version"></a>
 
 ### Method `version`
 
@@ -1102,7 +1102,7 @@ pub fn version(self: &Self) -> Version
 
 Returns the parsed protocol version.
 
-<a id="impl.status"></a>
+<a id="ResponseHead.impl.status"></a>
 
 ### Method `status`
 
@@ -1112,7 +1112,7 @@ pub fn status(self: &Self) -> Status
 
 Returns the parsed response status.
 
-<a id="impl.reason"></a>
+<a id="ResponseHead.impl.reason"></a>
 
 ### Method `reason`
 
@@ -1122,7 +1122,7 @@ pub fn reason(self: &Self) -> &'owner [u8]
 
 Borrows the exact reason octets, which may be empty and need not be UTF-8.
 
-<a id="impl.fieldCount-2"></a>
+<a id="ResponseHead.impl.fieldCount"></a>
 
 ### Method `fieldCount`
 
@@ -1132,7 +1132,7 @@ pub fn fieldCount(self: &Self) -> usize
 
 Returns the number of fields, including duplicates.
 
-<a id="impl.fields-2"></a>
+<a id="ResponseHead.impl.fields"></a>
 
 ### Method `fields`
 
@@ -1142,7 +1142,7 @@ pub fn fields(self: &Self) -> HeaderIterator<'owner>
 
 Iterates fields in original order without combining duplicate names.
 
-<a id="impl.copy-2"></a>
+<a id="ResponseHead.impl.copy"></a>
 
 ### Method `copy`
 
@@ -1155,7 +1155,7 @@ pub effect fn copy(
 
 Copies this head into the shared independently owned HTTP head representation.
 
-<a id="impl.copyMatchingHeaders"></a>
+<a id="ResponseHead.impl.copyMatchingHeaders"></a>
 
 ### Method `copyMatchingHeaders`
 
@@ -1175,15 +1175,15 @@ Matching is ASCII case-insensitive. Duplicate matches remain distinct and preser
 The supplied limits apply to the selected fields and complete owned result, not unrelated
 fields retained by the parser.
 
-<a id="impl-10"></a>
+<a id="HeaderIterator.impl"></a>
 
-## Implementation ``
+## Implementation `HeaderIterator<'owner>`
 
 ```silk
 impl<'owner> HeaderIterator<'owner>
 ```
 
-<a id="impl.next"></a>
+<a id="HeaderIterator.impl.next"></a>
 
 ### Method `next`
 
@@ -1193,7 +1193,7 @@ pub fn next(self: &mut Self) -> Option<Header<'owner>>
 
 Returns the next validated field, or `None` after the final field.
 
-<a id="impl.fieldIndex"></a>
+<a id="HeaderIterator.impl.fieldIndex"></a>
 
 ### Method `fieldIndex`
 

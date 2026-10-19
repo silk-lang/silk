@@ -91,7 +91,7 @@ pub struct JsonCodec
 
 Operations that select static JSON witnesses for one value.
 
-<a id="impl"></a>
+<a id="JsonCodec.impl"></a>
 
 ## Implementation `JsonCodec`
 
@@ -99,7 +99,7 @@ Operations that select static JSON witnesses for one value.
 impl JsonCodec
 ```
 
-<a id="impl.decodeOne"></a>
+<a id="JsonCodec.impl.decodeOne"></a>
 
 ### Associated function `decodeOne`
 
@@ -109,7 +109,7 @@ pub fn decodeOne<T: Decode>(scanner: &mut JsonScanner) -> Result<T, JsonError>
 
 Decodes one value without requiring an allocator.
 
-<a id="impl.deserializeOne"></a>
+<a id="JsonCodec.impl.deserializeOne"></a>
 
 ### Associated function `deserializeOne`
 
@@ -120,7 +120,7 @@ pub effect fn deserializeOne<T: Deserialize>(scanner: &mut JsonScanner)
 
 Deserializes one value with its declared allocator upper bound.
 
-<a id="impl.writeOne"></a>
+<a id="JsonCodec.impl.writeOne"></a>
 
 ### Associated function `writeOne`
 
@@ -131,7 +131,7 @@ pub effect fn writeOne<T: Serialize>(value: &T, options: &JsonOptions)
 
 Writes one value through its Serialize witness.
 
-<a id="impl-2"></a>
+<a id="bool.impl.Serialize"></a>
 
 ## Implementation `Serialize for bool`
 
@@ -139,7 +139,7 @@ Writes one value through its Serialize witness.
 impl Serialize for bool
 ```
 
-<a id="impl.serialize"></a>
+<a id="bool.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -148,7 +148,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-3"></a>
+<a id="bool.impl.Decode"></a>
 
 ## Implementation `Decode for bool`
 
@@ -156,7 +156,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for bool
 ```
 
-<a id="impl.decode"></a>
+<a id="bool.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -164,7 +164,7 @@ impl Decode for bool
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-4"></a>
+<a id="bool.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for bool`
 
@@ -172,7 +172,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for bool
 ```
 
-<a id="impl.deserialize"></a>
+<a id="bool.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -181,7 +181,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-5"></a>
+<a id="u8.impl.Serialize"></a>
 
 ## Implementation `Serialize for u8`
 
@@ -189,7 +189,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for u8
 ```
 
-<a id="impl.serialize-2"></a>
+<a id="u8.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -198,7 +198,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-6"></a>
+<a id="u8.impl.Decode"></a>
 
 ## Implementation `Decode for u8`
 
@@ -206,7 +206,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for u8
 ```
 
-<a id="impl.decode-2"></a>
+<a id="u8.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -214,7 +214,7 @@ impl Decode for u8
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-7"></a>
+<a id="u8.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for u8`
 
@@ -222,7 +222,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for u8
 ```
 
-<a id="impl.deserialize-2"></a>
+<a id="u8.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -231,7 +231,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-8"></a>
+<a id="u16.impl.Serialize"></a>
 
 ## Implementation `Serialize for u16`
 
@@ -239,7 +239,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for u16
 ```
 
-<a id="impl.serialize-3"></a>
+<a id="u16.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -248,7 +248,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-9"></a>
+<a id="u16.impl.Decode"></a>
 
 ## Implementation `Decode for u16`
 
@@ -256,7 +256,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for u16
 ```
 
-<a id="impl.decode-3"></a>
+<a id="u16.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -264,7 +264,7 @@ impl Decode for u16
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-10"></a>
+<a id="u16.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for u16`
 
@@ -272,7 +272,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for u16
 ```
 
-<a id="impl.deserialize-3"></a>
+<a id="u16.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -281,7 +281,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-11"></a>
+<a id="u32.impl.Serialize"></a>
 
 ## Implementation `Serialize for u32`
 
@@ -289,7 +289,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for u32
 ```
 
-<a id="impl.serialize-4"></a>
+<a id="u32.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -298,7 +298,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-12"></a>
+<a id="u32.impl.Decode"></a>
 
 ## Implementation `Decode for u32`
 
@@ -306,7 +306,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for u32
 ```
 
-<a id="impl.decode-4"></a>
+<a id="u32.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -314,7 +314,7 @@ impl Decode for u32
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-13"></a>
+<a id="u32.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for u32`
 
@@ -322,7 +322,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for u32
 ```
 
-<a id="impl.deserialize-4"></a>
+<a id="u32.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -331,7 +331,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-14"></a>
+<a id="u64.impl.Serialize"></a>
 
 ## Implementation `Serialize for u64`
 
@@ -339,7 +339,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for u64
 ```
 
-<a id="impl.serialize-5"></a>
+<a id="u64.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -348,7 +348,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-15"></a>
+<a id="u64.impl.Decode"></a>
 
 ## Implementation `Decode for u64`
 
@@ -356,7 +356,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for u64
 ```
 
-<a id="impl.decode-5"></a>
+<a id="u64.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -364,7 +364,7 @@ impl Decode for u64
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-16"></a>
+<a id="u64.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for u64`
 
@@ -372,7 +372,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for u64
 ```
 
-<a id="impl.deserialize-5"></a>
+<a id="u64.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -381,7 +381,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-17"></a>
+<a id="usize.impl.Serialize"></a>
 
 ## Implementation `Serialize for usize`
 
@@ -389,7 +389,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for usize
 ```
 
-<a id="impl.serialize-6"></a>
+<a id="usize.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -398,7 +398,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-18"></a>
+<a id="usize.impl.Decode"></a>
 
 ## Implementation `Decode for usize`
 
@@ -406,7 +406,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for usize
 ```
 
-<a id="impl.decode-6"></a>
+<a id="usize.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -414,7 +414,7 @@ impl Decode for usize
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-19"></a>
+<a id="usize.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for usize`
 
@@ -422,7 +422,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for usize
 ```
 
-<a id="impl.deserialize-6"></a>
+<a id="usize.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -431,7 +431,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-20"></a>
+<a id="i8.impl.Serialize"></a>
 
 ## Implementation `Serialize for i8`
 
@@ -439,7 +439,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for i8
 ```
 
-<a id="impl.serialize-7"></a>
+<a id="i8.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -448,7 +448,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-21"></a>
+<a id="i8.impl.Decode"></a>
 
 ## Implementation `Decode for i8`
 
@@ -456,7 +456,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for i8
 ```
 
-<a id="impl.decode-7"></a>
+<a id="i8.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -464,7 +464,7 @@ impl Decode for i8
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-22"></a>
+<a id="i8.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for i8`
 
@@ -472,7 +472,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for i8
 ```
 
-<a id="impl.deserialize-7"></a>
+<a id="i8.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -481,7 +481,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-23"></a>
+<a id="i16.impl.Serialize"></a>
 
 ## Implementation `Serialize for i16`
 
@@ -489,7 +489,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for i16
 ```
 
-<a id="impl.serialize-8"></a>
+<a id="i16.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -498,7 +498,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-24"></a>
+<a id="i16.impl.Decode"></a>
 
 ## Implementation `Decode for i16`
 
@@ -506,7 +506,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for i16
 ```
 
-<a id="impl.decode-8"></a>
+<a id="i16.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -514,7 +514,7 @@ impl Decode for i16
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-25"></a>
+<a id="i16.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for i16`
 
@@ -522,7 +522,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for i16
 ```
 
-<a id="impl.deserialize-8"></a>
+<a id="i16.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -531,7 +531,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-26"></a>
+<a id="i32.impl.Serialize"></a>
 
 ## Implementation `Serialize for i32`
 
@@ -539,7 +539,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for i32
 ```
 
-<a id="impl.serialize-9"></a>
+<a id="i32.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -548,7 +548,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-27"></a>
+<a id="i32.impl.Decode"></a>
 
 ## Implementation `Decode for i32`
 
@@ -556,7 +556,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for i32
 ```
 
-<a id="impl.decode-9"></a>
+<a id="i32.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -564,7 +564,7 @@ impl Decode for i32
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-28"></a>
+<a id="i32.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for i32`
 
@@ -572,7 +572,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for i32
 ```
 
-<a id="impl.deserialize-9"></a>
+<a id="i32.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -581,7 +581,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-29"></a>
+<a id="i64.impl.Serialize"></a>
 
 ## Implementation `Serialize for i64`
 
@@ -589,7 +589,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for i64
 ```
 
-<a id="impl.serialize-10"></a>
+<a id="i64.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -598,7 +598,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-30"></a>
+<a id="i64.impl.Decode"></a>
 
 ## Implementation `Decode for i64`
 
@@ -606,7 +606,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for i64
 ```
 
-<a id="impl.decode-10"></a>
+<a id="i64.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -614,7 +614,7 @@ impl Decode for i64
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-31"></a>
+<a id="i64.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for i64`
 
@@ -622,7 +622,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for i64
 ```
 
-<a id="impl.deserialize-10"></a>
+<a id="i64.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -631,7 +631,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-32"></a>
+<a id="isize.impl.Serialize"></a>
 
 ## Implementation `Serialize for isize`
 
@@ -639,7 +639,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for isize
 ```
 
-<a id="impl.serialize-11"></a>
+<a id="isize.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -648,7 +648,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-33"></a>
+<a id="isize.impl.Decode"></a>
 
 ## Implementation `Decode for isize`
 
@@ -656,7 +656,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for isize
 ```
 
-<a id="impl.decode-11"></a>
+<a id="isize.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -664,7 +664,7 @@ impl Decode for isize
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-34"></a>
+<a id="isize.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for isize`
 
@@ -672,7 +672,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for isize
 ```
 
-<a id="impl.deserialize-11"></a>
+<a id="isize.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -681,7 +681,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-35"></a>
+<a id="f32.impl.Decode"></a>
 
 ## Implementation `Decode for f32`
 
@@ -689,7 +689,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Decode for f32
 ```
 
-<a id="impl.decode-12"></a>
+<a id="f32.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -697,7 +697,7 @@ impl Decode for f32
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-36"></a>
+<a id="f32.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for f32`
 
@@ -705,7 +705,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for f32
 ```
 
-<a id="impl.deserialize-12"></a>
+<a id="f32.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -714,7 +714,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-37"></a>
+<a id="f32.impl.Serialize"></a>
 
 ## Implementation `Serialize for f32`
 
@@ -722,7 +722,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for f32
 ```
 
-<a id="impl.serialize-12"></a>
+<a id="f32.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -731,7 +731,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-38"></a>
+<a id="f64.impl.Decode"></a>
 
 ## Implementation `Decode for f64`
 
@@ -739,7 +739,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Decode for f64
 ```
 
-<a id="impl.decode-13"></a>
+<a id="f64.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -747,7 +747,7 @@ impl Decode for f64
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-39"></a>
+<a id="f64.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for f64`
 
@@ -755,7 +755,7 @@ fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 impl Deserialize for f64
 ```
 
-<a id="impl.deserialize-13"></a>
+<a id="f64.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -764,7 +764,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-40"></a>
+<a id="f64.impl.Serialize"></a>
 
 ## Implementation `Serialize for f64`
 
@@ -772,7 +772,7 @@ effect fn deserialize(scanner: &mut JsonScanner)
 impl Serialize for f64
 ```
 
-<a id="impl.serialize-13"></a>
+<a id="f64.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -781,15 +781,15 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-41"></a>
+<a id="string.impl.Serialize"></a>
 
-## Implementation ` Serialize for  `
+## Implementation `Serialize for string<'a>`
 
 ```silk
 impl<'a> Serialize for string<'a>
 ```
 
-<a id="impl.serialize-14"></a>
+<a id="string.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -798,7 +798,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-42"></a>
+<a id="String.impl.Serialize"></a>
 
 ## Implementation `Serialize for String`
 
@@ -806,7 +806,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Serialize for String
 ```
 
-<a id="impl.serialize-15"></a>
+<a id="String.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -815,7 +815,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-43"></a>
+<a id="String.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for String`
 
@@ -823,7 +823,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Deserialize for String
 ```
 
-<a id="impl.deserialize-14"></a>
+<a id="String.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -832,15 +832,15 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-44"></a>
+<a id="Option.impl.Serialize"></a>
 
-## Implementation ` Serialize for  `
+## Implementation `Serialize for Option<T>`
 
 ```silk
 impl<T: Serialize> Serialize for Option<T>
 ```
 
-<a id="impl.serialize-16"></a>
+<a id="Option.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -849,15 +849,15 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-45"></a>
+<a id="Option.impl.Decode"></a>
 
-## Implementation ` Decode for  `
+## Implementation `Decode for Option<T>`
 
 ```silk
 impl<T: Decode> Decode for Option<T>
 ```
 
-<a id="impl.decode-14"></a>
+<a id="Option.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -865,15 +865,15 @@ impl<T: Decode> Decode for Option<T>
 fn decode(scanner: &mut JsonScanner) -> Result<Self, JsonError>
 ```
 
-<a id="impl-46"></a>
+<a id="Option.impl.Deserialize"></a>
 
-## Implementation ` Deserialize for  `
+## Implementation `Deserialize for Option<T>`
 
 ```silk
 impl<T: Deserialize> Deserialize for Option<T>
 ```
 
-<a id="impl.deserialize-15"></a>
+<a id="Option.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -882,15 +882,15 @@ effect fn deserialize(scanner: &mut JsonScanner)
     -> Self ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-47"></a>
+<a id="Vector.impl.Serialize"></a>
 
-## Implementation ` Serialize for  `
+## Implementation `Serialize for Vector<T>`
 
 ```silk
 impl<T: Serialize> Serialize for Vector<T>
 ```
 
-<a id="impl.serialize-17"></a>
+<a id="Vector.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -899,15 +899,15 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-48"></a>
+<a id="Vector.impl.Deserialize"></a>
 
-## Implementation ` Deserialize for  `
+## Implementation `Deserialize for Vector<T>`
 
 ```silk
 impl<T: Deserialize> Deserialize for Vector<T>
 ```
 
-<a id="impl.deserialize-16"></a>
+<a id="Vector.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 

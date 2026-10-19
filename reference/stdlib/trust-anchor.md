@@ -35,7 +35,7 @@ pub struct TrustAnchor
 
 One owned trust candidate plus optional locally configured restrictions.
 
-<a id="impl"></a>
+<a id="TrustAnchor.impl"></a>
 
 ## Implementation `TrustAnchor`
 
@@ -43,7 +43,7 @@ One owned trust candidate plus optional locally configured restrictions.
 impl TrustAnchor
 ```
 
-<a id="impl.fromCertificate"></a>
+<a id="TrustAnchor.impl.fromCertificate"></a>
 
 ### Associated function `fromCertificate`
 
@@ -58,7 +58,7 @@ Moves a decoded certificate into an unconstrained explicit trust anchor without 
 All retained certificate bytes and unsupported extension values remain intact for later
 inspection. Authority does not imply that the certificate is supported by a selected profile.
 
-<a id="impl.fromCertificateWithConstraints"></a>
+<a id="TrustAnchor.impl.fromCertificateWithConstraints"></a>
 
 ### Associated function `fromCertificateWithConstraints`
 
@@ -82,7 +82,7 @@ validation. The encoded-byte count includes complete certificate DER and configu
 constraint DER. On semantic failure the consumed certificate is dropped. Allocation refusal
 releases partial owned state through ordinary lexical destruction.
 
-<a id="impl.clone"></a>
+<a id="TrustAnchor.impl.clone"></a>
 
 ### Method `clone`
 
@@ -96,7 +96,7 @@ Produces a byte- and constraint-preserving independent owner.
 
 Allocation refusal releases every partial copy and leaves the original unchanged.
 
-<a id="impl.certificate"></a>
+<a id="TrustAnchor.impl.certificate"></a>
 
 ### Method `certificate`
 
@@ -106,7 +106,7 @@ pub fn certificate(self: &Self) -> &Certificate
 
 Borrows the complete owned decoded certificate.
 
-<a id="impl.configuredPathLength"></a>
+<a id="TrustAnchor.impl.configuredPathLength"></a>
 
 ### Method `configuredPathLength`
 
@@ -116,7 +116,7 @@ pub fn configuredPathLength(self: &Self) -> Option<usize>
 
 Returns the independent configured maximum path length when present.
 
-<a id="impl.configuredNameConstraints"></a>
+<a id="TrustAnchor.impl.configuredNameConstraints"></a>
 
 ### Method `configuredNameConstraints`
 
@@ -126,7 +126,7 @@ pub fn configuredNameConstraints(self: &Self) -> Option<&[u8]>
 
 Borrows exact configured NameConstraints DER when present.
 
-<a id="impl.encodedBytes"></a>
+<a id="TrustAnchor.impl.encodedBytes"></a>
 
 ### Method `encodedBytes`
 

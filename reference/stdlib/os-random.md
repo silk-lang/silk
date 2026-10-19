@@ -35,7 +35,7 @@ A stateless native provider of complete fresh secure bytes in initialized borrow
 ### Gotchas
 Native failure traps, possibly after modifying a prefix. No rollback or typed failure is provided.
 
-<a id="impl"></a>
+<a id="OsRandom.impl"></a>
 
 ## Implementation `OsRandom`
 
@@ -43,7 +43,7 @@ Native failure traps, possibly after modifying a prefix. No rollback or typed fa
 impl OsRandom
 ```
 
-<a id="impl.make"></a>
+<a id="OsRandom.impl.make"></a>
 
 ### Associated function `make`
 
@@ -57,7 +57,7 @@ Creates a native provider without reading entropy or installing an ambient defau
 
 Construction on unsupported or no-libc profiles produces a compile-time error.
 
-<a id="impl-2"></a>
+<a id="OsRandom.impl.Random"></a>
 
 ## Implementation `Random for OsRandom`
 
@@ -65,7 +65,7 @@ Construction on unsupported or no-libc profiles produces a compile-time error.
 impl Random for OsRandom
 ```
 
-<a id="impl.fillBytes"></a>
+<a id="OsRandom.impl.Random.fillBytes"></a>
 
 ### Operation `fillBytes`
 

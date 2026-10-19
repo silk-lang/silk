@@ -8,7 +8,7 @@ One scoped buffered session over an exclusive concrete ByteDuplex provider.
 
 `withBuffered` owns separate fixed input and output state for the callback and terminally closes
 the provider after success, typed failure, or structured cancellation/interruption. Fatal traps
-bypass finalizers and Drop. Release intentionally performs no implicit flush. [`close`](#impl.close) permits
+bypass finalizers and Drop. Release intentionally performs no implicit flush. [`close`](#BufferedDuplex.impl.close) permits
 an earlier terminal close and abandons all buffered bytes without a flush.
 
 Import as `BufferedDuplex` with `import silk.buffered_duplex { BufferedDuplex }`.
@@ -65,15 +65,15 @@ effect<'session> fn use<'session, 'transport: 'session>(
 
 Consumes one owned context while using a temporary buffered session.
 
-<a id="impl"></a>
+<a id="BufferedDuplex.impl"></a>
 
-## Implementation ``
+## Implementation `BufferedDuplex<'transport, P>`
 
 ```silk
 impl<'transport, P> BufferedDuplex<'transport, P>
 ```
 
-<a id="impl.peek"></a>
+<a id="BufferedDuplex.impl.peek"></a>
 
 ### Method `peek`
 
@@ -83,7 +83,7 @@ pub fn peek<'a>(self: &'a Self) -> &'a [u8]
 
 Borrows the initialized unread prefix, or an empty slice after terminal close.
 
-<a id="impl.unread"></a>
+<a id="BufferedDuplex.impl.unread"></a>
 
 ### Method `unread`
 
@@ -93,7 +93,7 @@ pub fn unread(self: &Self) -> usize
 
 Returns the unread input count, or zero after terminal close.
 
-<a id="impl.pending"></a>
+<a id="BufferedDuplex.impl.pending"></a>
 
 ### Method `pending`
 
@@ -103,7 +103,7 @@ pub fn pending(self: &Self) -> usize
 
 Returns the pending output count, or zero after terminal close.
 
-<a id="impl.consume"></a>
+<a id="BufferedDuplex.impl.consume"></a>
 
 ### Method `consume`
 
@@ -113,7 +113,7 @@ pub effect fn consume(self: &mut Self, count: usize) -> () ! BufferError
 
 Consumes exactly an initialized unread prefix.
 
-<a id="impl.fill"></a>
+<a id="BufferedDuplex.impl.fill"></a>
 
 ### Method `fill`
 
@@ -130,7 +130,7 @@ pub effect fn fill(
 
 Retains at least `minimum` input bytes or reports sticky source end.
 
-<a id="impl.readSome"></a>
+<a id="BufferedDuplex.impl.readSome"></a>
 
 ### Method `readSome`
 
@@ -147,7 +147,7 @@ pub effect fn readSome(
 
 Copies one retained or newly read prefix.
 
-<a id="impl.readExact"></a>
+<a id="BufferedDuplex.impl.readExact"></a>
 
 ### Method `readExact`
 
@@ -164,7 +164,7 @@ pub effect fn readExact(
 
 Fills the complete destination or reports its exact copied prefix.
 
-<a id="impl.discardAtMost"></a>
+<a id="BufferedDuplex.impl.discardAtMost"></a>
 
 ### Method `discardAtMost`
 
@@ -181,7 +181,7 @@ pub effect fn discardAtMost(
 
 Discards no more than one finite limit.
 
-<a id="impl.discardExact"></a>
+<a id="BufferedDuplex.impl.discardExact"></a>
 
 ### Method `discardExact`
 
@@ -198,7 +198,7 @@ pub effect fn discardExact(
 
 Discards exactly one finite count.
 
-<a id="impl.writeSome"></a>
+<a id="BufferedDuplex.impl.writeSome"></a>
 
 ### Method `writeSome`
 
@@ -215,7 +215,7 @@ pub effect fn writeSome(
 
 Accepts one positive input prefix into owned pending storage.
 
-<a id="impl.writeAll"></a>
+<a id="BufferedDuplex.impl.writeAll"></a>
 
 ### Method `writeAll`
 
@@ -232,7 +232,7 @@ pub effect fn writeAll(
 
 Accepts one complete finite input in order.
 
-<a id="impl.writeVecAll"></a>
+<a id="BufferedDuplex.impl.writeVecAll"></a>
 
 ### Method `writeVecAll`
 
@@ -249,7 +249,7 @@ pub effect fn writeVecAll(
 
 Accepts borrowed byte vectors in order after checking aggregate length arithmetic.
 
-<a id="impl.flush"></a>
+<a id="BufferedDuplex.impl.flush"></a>
 
 ### Method `flush`
 
@@ -265,7 +265,7 @@ pub effect fn flush(
 
 Writes pending bytes exactly once and then flushes the provider boundary.
 
-<a id="impl.finish"></a>
+<a id="BufferedDuplex.impl.finish"></a>
 
 ### Method `finish`
 
@@ -281,7 +281,7 @@ pub effect fn finish(
 
 Explicitly finishes pending output.
 
-<a id="impl.shutdownWrite"></a>
+<a id="BufferedDuplex.impl.shutdownWrite"></a>
 
 ### Method `shutdownWrite`
 
@@ -303,7 +303,7 @@ A successful shutdown keeps input available but rejects later output operations.
 transport failure terminalizes the complete session. Structured cancellation is handled by
 the enclosing buffered scope, which terminally closes the retained provider.
 
-<a id="impl.close"></a>
+<a id="BufferedDuplex.impl.close"></a>
 
 ### Method `close`
 

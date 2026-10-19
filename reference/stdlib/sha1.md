@@ -9,8 +9,8 @@ Use [`Sha1`](#Sha1) only for legacy interoperability that requires SHA-1. Use SH
 collision-resistant uses. Use `silk/hash` only for collection keys, not cryptographic digests.
 
 ## Details
-[`make`](#impl.make) starts a streaming state. [`update`](#impl.update) absorbs each byte in call order. [`finish`](#impl.finish)
-consumes the state and returns the standard digest byte order. [`hash`](#impl.hash) performs the same
+[`make`](#Sha1.impl.make) starts a streaming state. [`update`](#Sha1.impl.update) absorbs each byte in call order. [`finish`](#Sha1.impl.finish)
+consumes the state and returns the standard digest byte order. [`hash`](#Sha1.impl.hash) performs the same
 lifecycle in one call. These operations do not allocate.
 
 ## Gotchas
@@ -62,14 +62,14 @@ for new collision-resistant uses.
 ### Details
 
 The state is stack-storable and does not allocate. It accepts any message division across
-[`update`](#impl.update) calls. [`finish`](#impl.finish) consumes the state.
+[`update`](#Sha1.impl.update) calls. [`finish`](#Sha1.impl.finish) consumes the state.
 
 ### Gotchas
 
 SHA-1 is cryptographically broken because practical collision attacks exist. Do not use it for
 new signatures, certificates, or content-integrity designs.
 
-<a id="impl"></a>
+<a id="Sha1.impl"></a>
 
 ## Implementation `Sha1`
 
@@ -77,7 +77,7 @@ new signatures, certificates, or content-integrity designs.
 impl Sha1
 ```
 
-<a id="impl.make"></a>
+<a id="Sha1.impl.make"></a>
 
 ### Associated function `make`
 
@@ -87,7 +87,7 @@ pub fn make() -> Self
 
 Creates an empty SHA-1 streaming state without allocation.
 
-<a id="impl.update"></a>
+<a id="Sha1.impl.update"></a>
 
 ### Method `update`
 
@@ -107,7 +107,7 @@ one message across calls produces the same digest.
 If the cumulative message bit length does not fit in `u64`, this operation traps before it
 absorbs bytes from this call.
 
-<a id="impl.finish"></a>
+<a id="Sha1.impl.finish"></a>
 
 ### Method `finish`
 
@@ -122,7 +122,7 @@ Consumes the streaming state and returns its 20-byte SHA-1 digest.
 This operation applies standard SHA-1 padding and returns the digest in standard byte order.
 It does not allocate. The consumed state cannot accept more bytes or produce another digest.
 
-<a id="impl.hash"></a>
+<a id="Sha1.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -134,8 +134,8 @@ Returns the 20-byte SHA-1 digest of `bytes` without allocation.
 
 #### When to use
 
-Use this function when the complete message is available in one slice. Use [`make`](#impl.make) and
-[`update`](#impl.update) when the message arrives in parts.
+Use this function when the complete message is available in one slice. Use [`make`](#Sha1.impl.make) and
+[`update`](#Sha1.impl.update) when the message arrives in parts.
 
 #### Details
 

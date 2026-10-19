@@ -10,7 +10,7 @@ protocols, or any value that must remain unpredictable. Supply an explicit produ
 the application boundary and a scripted provider only in deterministic tests.
 
 ## Details
-The service primitive exactly fills borrowed storage. [`nextU64`](#impl.nextU64), [`nextBool`](#impl.nextBool), and [`below`](#impl.below)
+The service primitive exactly fills borrowed storage. [`nextU64`](#Random.impl.nextU64), [`nextBool`](#Random.impl.nextBool), and [`below`](#Random.impl.below)
 have stable source-defined byte consumption and do not select a concrete provider.
 
 ## Gotchas
@@ -87,7 +87,7 @@ effect fn fillBytes(output: &mut [u8]) -> () ? &mut Random
 
 Fills the complete exclusive byte slice with fresh unpredictable data.
 
-<a id="impl"></a>
+<a id="Random.impl"></a>
 
 ## Implementation `Random`
 
@@ -95,7 +95,7 @@ Fills the complete exclusive byte slice with fresh unpredictable data.
 impl Random
 ```
 
-<a id="impl.nextU64"></a>
+<a id="Random.impl.nextU64"></a>
 
 ### Associated function `nextU64`
 
@@ -105,7 +105,7 @@ pub effect fn nextU64() -> u64 ? &mut Random
 
 Returns one secure `u64` decoded least-significant byte first from exactly eight provider bytes.
 
-<a id="impl.nextBool"></a>
+<a id="Random.impl.nextBool"></a>
 
 ### Associated function `nextBool`
 
@@ -115,7 +115,7 @@ pub effect fn nextBool() -> bool ? &mut Random
 
 Returns whether bit 63 of one secure provider word is set.
 
-<a id="impl.below"></a>
+<a id="Random.impl.below"></a>
 
 ### Associated function `below`
 

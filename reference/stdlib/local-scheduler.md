@@ -5,13 +5,13 @@
 Deterministic single-threaded execution for structured Fibers.
 
 ## When to use
-Use [`execute`](#impl.execute) at an application entry point to run one lazy program that uses the
+Use [`execute`](#LocalScheduler.impl.execute) at an application entry point to run one lazy program that uses the
 `silk.scheduler.Scheduler` and `silk.monotonic_clock.MonotonicClock` services.
 
 ## Details
 Each call creates fresh task storage, a FIFO ready queue, and a private timer source. The root is
 task zero and uses the same `Execution<()>` storage as every child. Task clock waits park only
-their task; the driver uses the parent clock when its event sources need to wait. [`execute`](#impl.execute)
+their task; the driver uses the parent clock when its event sources need to wait. [`execute`](#LocalScheduler.impl.execute)
 returns only after the root terminates.
 
 Import as `LocalScheduler` with `import silk.local_scheduler { LocalScheduler }`.
@@ -30,9 +30,9 @@ A reusable deterministic single-threaded Scheduler provider.
 
 ### Details
 
-Each call to [`execute`](#impl.execute) creates fresh task storage and readiness state.
+Each call to [`execute`](#LocalScheduler.impl.execute) creates fresh task storage and readiness state.
 
-<a id="impl"></a>
+<a id="LocalScheduler.impl"></a>
 
 ## Implementation `LocalScheduler`
 
@@ -40,7 +40,7 @@ Each call to [`execute`](#impl.execute) creates fresh task storage and readiness
 impl LocalScheduler
 ```
 
-<a id="impl.make"></a>
+<a id="LocalScheduler.impl.make"></a>
 
 ### Associated function `make`
 
@@ -50,7 +50,7 @@ pub fn make() -> LocalScheduler
 
 Constructs a reusable local Scheduler value.
 
-<a id="impl.execute"></a>
+<a id="LocalScheduler.impl.execute"></a>
 
 ### Method `execute`
 
@@ -91,7 +91,7 @@ Reports that no task is ready and no event registration remains while the root i
 
 ### Details
 
-[`execute`](#impl.execute) cancels and releases the incomplete task tree before it raises this error.
+[`execute`](#LocalScheduler.impl.execute) cancels and releases the incomplete task tree before it raises this error.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

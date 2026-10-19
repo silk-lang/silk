@@ -26,7 +26,7 @@ pub struct NativeHostInput
 
 An affine snapshot owning every argument and environment byte.
 
-<a id="impl"></a>
+<a id="NativeHostInput.impl"></a>
 
 ## Implementation `NativeHostInput`
 
@@ -34,7 +34,7 @@ An affine snapshot owning every argument and environment byte.
 impl NativeHostInput
 ```
 
-<a id="impl.environmentSnapshot"></a>
+<a id="NativeHostInput.impl.environmentSnapshot"></a>
 
 ### Associated function `environmentSnapshot`
 
@@ -52,7 +52,7 @@ their actual argument vector with capture instead.
 No foreign environment mutation may overlap this operation. Later lookups use owned bytes
 and need no access to libc's environment storage. A null environment means no variables.
 
-<a id="impl.captureProcess"></a>
+<a id="NativeHostInput.impl.captureProcess"></a>
 
 ### Associated function `captureProcess`
 
@@ -67,7 +67,7 @@ argv must remain readable through argc elements, and each element must point to 
 unchanged NUL-terminated string. No foreign environment mutation may overlap capture.
 Failure releases every partially copied argument and environment value.
 
-<a id="impl.capture"></a>
+<a id="NativeHostInput.impl.capture"></a>
 
 ### Associated function `capture`
 
@@ -86,7 +86,7 @@ The caller supplies readable argv elements through argc and environment elements
 its null terminator. Every non-null element identifies a live NUL-terminated byte string.
 No foreign mutation may overlap capture. Failure releases every partially copied value.
 
-<a id="impl.argumentCount"></a>
+<a id="NativeHostInput.impl.argumentCount"></a>
 
 ### Method `argumentCount`
 
@@ -96,7 +96,7 @@ pub fn argumentCount(self: &Self) -> usize
 
 Returns the captured argument count, including the program name when present.
 
-<a id="impl.argument"></a>
+<a id="NativeHostInput.impl.argument"></a>
 
 ### Method `argument`
 
@@ -109,7 +109,7 @@ Copies the fitting argument prefix and returns its full length, or None when abs
 #### Details
 An empty argument is Some(0). Bytes beyond the committed prefix remain unchanged.
 
-<a id="impl.variable"></a>
+<a id="NativeHostInput.impl.variable"></a>
 
 ### Method `variable`
 
@@ -123,7 +123,7 @@ Copies the first matching environment value's prefix and returns its complete by
 Matching is byte-exact. Missing names are None; empty values are Some(0). Names containing
 NUL or equals do not match. Malformed entries without equals are ignored.
 
-<a id="impl.workingDirectory"></a>
+<a id="NativeHostInput.impl.workingDirectory"></a>
 
 ### Associated function `workingDirectory`
 
@@ -137,7 +137,7 @@ Reads the current working directory into independently owned bytes.
 Grows from 256 bytes through 1 MiB only on ERANGE. Every attempt owns and releases its
 buffer. Allocation failure is OutOfMemoryError; other failures are HostInputError.
 
-<a id="impl.workingDirectoryCopy"></a>
+<a id="NativeHostInput.impl.workingDirectoryCopy"></a>
 
 ### Associated function `workingDirectoryCopy`
 

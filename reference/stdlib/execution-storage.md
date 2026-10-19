@@ -28,7 +28,7 @@ pub struct ExecutionStorage
 
 An affine state that owns its private-frame reservations and capacity limit.
 
-<a id="impl"></a>
+<a id="ExecutionStorage.impl.Drop"></a>
 
 ## Implementation `Drop for ExecutionStorage`
 
@@ -36,7 +36,7 @@ An affine state that owns its private-frame reservations and capacity limit.
 impl Drop for ExecutionStorage
 ```
 
-<a id="impl.drop"></a>
+<a id="ExecutionStorage.impl.Drop.drop"></a>
 
 ### Operation `drop`
 
@@ -44,7 +44,7 @@ impl Drop for ExecutionStorage
 fn drop(self: &mut ExecutionStorage) -> ()
 ```
 
-<a id="impl-2"></a>
+<a id="ExecutionStorage.impl"></a>
 
 ## Implementation `ExecutionStorage`
 
@@ -52,7 +52,7 @@ fn drop(self: &mut ExecutionStorage) -> ()
 impl ExecutionStorage
 ```
 
-<a id="impl.make"></a>
+<a id="ExecutionStorage.impl.make"></a>
 
 ### Associated function `make`
 
@@ -67,7 +67,7 @@ Creates an independent state whose frame reservations can charge at most `limit`
 Charges include each reservation header and alignment padding. The fixed state allocation
 is excluded. Refusal acquires no state and reports OutOfMemoryError.
 
-<a id="impl.used"></a>
+<a id="ExecutionStorage.impl.used"></a>
 
 ### Method `used`
 
@@ -77,7 +77,7 @@ pub fn used(self: &ExecutionStorage) -> usize
 
 Returns the bytes charged to this state's current frame reservations.
 
-<a id="impl.acquire"></a>
+<a id="ExecutionStorage.impl.acquire"></a>
 
 ### Method `acquire`
 
@@ -92,7 +92,7 @@ Acquires a fixed-address frame or returns null without retaining a partial reser
 The caller must initialize bytes before reading, obey the requested extent, and stop using
 the pointer before release or state destruction. A zero size or invalid alignment returns null.
 
-<a id="impl.release"></a>
+<a id="ExecutionStorage.impl.release"></a>
 
 ### Method `release`
 

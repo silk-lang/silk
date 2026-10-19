@@ -6,7 +6,7 @@ Completed success-or-failure values that can be inspected and transformed as ord
 
 ## When to use
 Use [`Result`](#Result) after an effectful computation has been reified, or whenever both outcome arms
-belong in a value. Use [`map`](#impl.map) for success, [`mapError`](#impl.mapError) for failure, and [`flatMap`](#impl.flatMap) for a
+belong in a value. Use [`map`](#Result.impl.map) for success, [`mapError`](#Result.impl.mapError) for failure, and [`flatMap`](#Result.impl.flatMap) for a
 success continuation that already returns a result.
 
 ## Details
@@ -103,15 +103,15 @@ pub error: F
 
 The produced failure value.
 
-<a id="impl"></a>
+<a id="Result.impl"></a>
 
-## Implementation ``
+## Implementation `Result<A, F>`
 
 ```silk
 impl<A, F> Result<A, F>
 ```
 
-<a id="impl.succeed"></a>
+<a id="Result.impl.succeed"></a>
 
 ### Associated function `succeed`
 
@@ -121,7 +121,7 @@ pub fn succeed(value: A) -> Result<A, F>
 
 Constructs a completed success by moving `value` into the success arm.
 
-<a id="impl.failResult"></a>
+<a id="Result.impl.failResult"></a>
 
 ### Associated function `failResult`
 
@@ -131,7 +131,7 @@ pub fn failResult(error: F) -> Result<A, F>
 
 Constructs a completed failure by moving `error` into the failure arm.
 
-<a id="impl.map"></a>
+<a id="Result.impl.map"></a>
 
 ### Method `map`
 
@@ -144,9 +144,9 @@ Applies `transform` once to a success value and carries a failure through unchan
 #### Details
 
 The callback is never called for [`Failure`](#Result.Failure). This consumes the result and may change only its
-success type; use [`mapError`](#impl.mapError) to change the failure type instead.
+success type; use [`mapError`](#Result.impl.mapError) to change the failure type instead.
 
-<a id="impl.mapError"></a>
+<a id="Result.impl.mapError"></a>
 
 ### Method `mapError`
 
@@ -161,7 +161,7 @@ Applies `transform` once to a failure value and carries a success through unchan
 The callback is never called for [`Success`](#Result.Success). This consumes the result and may change only its
 failure type.
 
-<a id="impl.flatMap"></a>
+<a id="Result.impl.flatMap"></a>
 
 ### Method `flatMap`
 
@@ -175,9 +175,9 @@ stays one Result deep instead of nesting.
 #### Details
 
 A failure bypasses the callback unchanged. The callback must use the same failure type `F`, so
-use [`mapError`](#impl.mapError) before or after this operation when the steps use different error types.
+use [`mapError`](#Result.impl.mapError) before or after this operation when the steps use different error types.
 
-<a id="impl.unwrapOr"></a>
+<a id="Result.impl.unwrapOr"></a>
 
 ### Method `unwrapOr`
 
@@ -197,7 +197,7 @@ Only the failure arm consumes the fallback. The success arm releases it, and the
 releases the error, so exactly one owned value leaves this call and the other drops.
 Use `match` instead when the failure payload affects recovery or must be retained.
 
-<a id="impl.unwrapOr.fallback"></a>
+<a id="Result.impl.unwrapOr.fallback"></a>
 
 #### Parameter `fallback`
 

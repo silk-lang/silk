@@ -313,7 +313,7 @@ pub maxDiscardWireBytes: u64
 
 Maximum wire bytes consumed by one explicit discard or drain operation; at most 1048576.
 
-<a id="impl"></a>
+<a id="Limits.impl.Copy"></a>
 
 ## Implementation `Copy for Limits`
 
@@ -321,7 +321,7 @@ Maximum wire bytes consumed by one explicit discard or drain operation; at most 
 impl Copy for Limits
 ```
 
-<a id="impl-2"></a>
+<a id="Limits.impl"></a>
 
 ## Implementation `Limits`
 
@@ -329,7 +329,7 @@ impl Copy for Limits
 impl Limits
 ```
 
-<a id="impl.defaults"></a>
+<a id="Limits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -339,7 +339,7 @@ pub fn defaults() -> Limits
 
 Returns finite standard limits, including 16 informational heads and 65536 informational wire bytes.
 
-<a id="impl-3"></a>
+<a id="RequestOptions.impl"></a>
 
 ## Implementation `RequestOptions`
 
@@ -347,7 +347,7 @@ Returns finite standard limits, including 16 informational heads and 65536 infor
 impl RequestOptions
 ```
 
-<a id="impl.defaults-2"></a>
+<a id="RequestOptions.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -723,7 +723,7 @@ pub bytes: usize
 
 The exact retained byte count.
 
-<a id="impl-4"></a>
+<a id="ReuseEligibility.impl.Copy"></a>
 
 ## Implementation `Copy for ReuseEligibility`
 
@@ -781,7 +781,7 @@ pub totalWire: u64
 
 Cumulative encoded wire bytes.
 
-<a id="impl-5"></a>
+<a id="WriteProgress.impl.Copy"></a>
 
 ## Implementation `Copy for WriteProgress`
 
@@ -799,15 +799,15 @@ pub struct Connection<P>
 
 An affine owned connection retaining the transport, bounded storage, and next input suffix.
 
-<a id="impl-6"></a>
+<a id="Connection.impl"></a>
 
-## Implementation ``
+## Implementation `Connection<P>`
 
 ```silk
 impl<P> Connection<P>
 ```
 
-<a id="impl.phase"></a>
+<a id="Connection.impl.phase"></a>
 
 ### Method `phase`
 
@@ -817,7 +817,7 @@ pub fn phase(self: &Self) -> ConnectionPhase
 
 Returns the current logical connection phase.
 
-<a id="impl.unread"></a>
+<a id="Connection.impl.unread"></a>
 
 ### Method `unread`
 
@@ -862,15 +862,15 @@ pub transport: &'view P
 
 The immutable exact provider retained by the owned connection.
 
-<a id="impl-7"></a>
+<a id="Connection.impl-2"></a>
 
-## Implementation ``
+## Implementation `Connection<P>`
 
 ```silk
 impl<P> Connection<P>
 ```
 
-<a id="impl.transportContext"></a>
+<a id="Connection.impl.transportContext"></a>
 
 ### Method `transportContext`
 
@@ -890,15 +890,15 @@ pub struct Exchange<'exchange, P>
 
 One exclusive callback-scoped request and response lifecycle.
 
-<a id="impl-8"></a>
+<a id="Exchange.impl"></a>
 
-## Implementation ``
+## Implementation `Exchange<'exchange, P>`
 
 ```silk
 impl<'exchange, P> Exchange<'exchange, P>
 ```
 
-<a id="impl.phase-2"></a>
+<a id="Exchange.impl.phase"></a>
 
 ### Method `phase`
 
@@ -908,7 +908,7 @@ pub fn phase(self: &Self) -> ExchangePhase
 
 Returns the next permitted stage.
 
-<a id="impl.head"></a>
+<a id="Exchange.impl.head"></a>
 
 ### Method `head`
 
@@ -1061,7 +1061,7 @@ pub handshakeDurationNanoseconds: u64
 
 Finite TLS handshake duration in nanoseconds.
 
-<a id="impl-9"></a>
+<a id="RouteSettings.impl.Copy"></a>
 
 ## Implementation `Copy for RouteSettings`
 
@@ -1168,9 +1168,9 @@ effect<'call> fn handle<'call, 'transport: 'call, 'provider: 'transport, 'tunnel
 
 Runs after route acquisition and required origin authentication complete.
 
-<a id="impl-10"></a>
+<a id="RouteTransport.impl"></a>
 
-## Implementation ``
+## Implementation `RouteTransport<'transport, 'provider, 'tunnel, P>`
 
 ```silk
 impl<'transport, 'provider: 'transport, 'tunnel: 'provider, P> RouteTransport<
@@ -1181,9 +1181,9 @@ impl<'transport, 'provider: 'transport, 'tunnel: 'provider, P> RouteTransport<
 >
 ```
 
-<a id="impl-11"></a>
+<a id="RouteTransport.impl.HttpTransport"></a>
 
-## Implementation ` HttpTransport for  `
+## Implementation `HttpTransport for RouteTransport<'transport, 'provider, 'tunnel, P>`
 
 ```silk
 impl<'transport, 'provider: 'transport, 'tunnel: 'provider, P> HttpTransport for RouteTransport<
@@ -1199,7 +1199,7 @@ where
   &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
-<a id="impl.readSomeRaw"></a>
+<a id="RouteTransport.impl.HttpTransport.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -1207,7 +1207,7 @@ where
 readSomeRaw: RouteTransport.read
 ```
 
-<a id="impl.writeSomeRaw"></a>
+<a id="RouteTransport.impl.HttpTransport.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -1215,7 +1215,7 @@ readSomeRaw: RouteTransport.read
 writeSomeRaw: RouteTransport.write
 ```
 
-<a id="impl.flush"></a>
+<a id="RouteTransport.impl.HttpTransport.flush"></a>
 
 ### Operation `flush`
 
@@ -1223,7 +1223,7 @@ writeSomeRaw: RouteTransport.write
 flush: RouteTransport.flushOutput
 ```
 
-<a id="impl.close"></a>
+<a id="RouteTransport.impl.HttpTransport.close"></a>
 
 ### Operation `close`
 
@@ -1610,15 +1610,15 @@ pub effect fn withTunnel<'tunnel, 'exchange: 'tunnel, 'callback, P, A, E, ?R>(
 
 Hands successful CONNECT to one scoped tunnel callback and permanently consumes HTTP reuse authority.
 
-<a id="impl-12"></a>
+<a id="Tunnel.impl"></a>
 
-## Implementation ``
+## Implementation `Tunnel<'tunnel, P>`
 
 ```silk
 impl<'tunnel, P> Tunnel<'tunnel, P>
 ```
 
-<a id="impl.transferByteDuplex"></a>
+<a id="Tunnel.impl.transferByteDuplex"></a>
 
 ### Method `transferByteDuplex`
 
@@ -1649,7 +1649,7 @@ Cleanup closes the duplex after success, typed failure, or structured cancellati
 After scoped finalization, a repeated transfer returns `InvalidState` and leaves the existing
 Closed authority unchanged.
 
-<a id="impl.readSome"></a>
+<a id="Tunnel.impl.readSome"></a>
 
 ### Method `readSome`
 
@@ -1663,7 +1663,7 @@ pub effect fn readSome(self: &mut Self, output: &mut [u8], requestedDeadline: Op
 
 Reads the retained tunnel suffix before asking the underlying transport for more input.
 
-<a id="impl.writeSome"></a>
+<a id="Tunnel.impl.writeSome"></a>
 
 ### Method `writeSome`
 
@@ -1677,17 +1677,17 @@ pub effect fn writeSome(self: &mut Self, input: &[u8], requestedDeadline: Option
 
 Writes one tunnel prefix under the caller's absolute deadline.
 
-<a id="impl-13"></a>
+<a id="TransferredTunnel.impl"></a>
 
-## Implementation ``
+## Implementation `TransferredTunnel<'tunnel, P>`
 
 ```silk
 impl<'tunnel, P> TransferredTunnel<'tunnel, P>
 ```
 
-<a id="impl-14"></a>
+<a id="TransferredTunnel.impl.ByteDuplex"></a>
 
-## Implementation ` ByteDuplex for  `
+## Implementation `ByteDuplex for TransferredTunnel<'tunnel, P>`
 
 ```silk
 impl<'tunnel, P> ByteDuplex for TransferredTunnel<'tunnel, P>
@@ -1696,7 +1696,7 @@ where
   &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
-<a id="impl.readSomeRaw-2"></a>
+<a id="TransferredTunnel.impl.ByteDuplex.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -1704,7 +1704,7 @@ where
 readSomeRaw: TransferredTunnel.read
 ```
 
-<a id="impl.writeSomeRaw-2"></a>
+<a id="TransferredTunnel.impl.ByteDuplex.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -1712,7 +1712,7 @@ readSomeRaw: TransferredTunnel.read
 writeSomeRaw: TransferredTunnel.write
 ```
 
-<a id="impl.flushRaw"></a>
+<a id="TransferredTunnel.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`
 
@@ -1720,7 +1720,7 @@ writeSomeRaw: TransferredTunnel.write
 flushRaw: TransferredTunnel.flushOutput
 ```
 
-<a id="impl.shutdownWriteRaw"></a>
+<a id="TransferredTunnel.impl.ByteDuplex.shutdownWriteRaw"></a>
 
 ### Operation `shutdownWriteRaw`
 
@@ -1728,7 +1728,7 @@ flushRaw: TransferredTunnel.flushOutput
 shutdownWriteRaw: TransferredTunnel.shutdownOutput
 ```
 
-<a id="impl.closeRaw"></a>
+<a id="TransferredTunnel.impl.ByteDuplex.closeRaw"></a>
 
 ### Operation `closeRaw`
 

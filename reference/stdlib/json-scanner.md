@@ -82,7 +82,7 @@ pub length: usize
 
 The number of bytes in the range.
 
-<a id="impl"></a>
+<a id="JsonSpan.impl.Copy"></a>
 
 ## Implementation `Copy for JsonSpan`
 
@@ -310,7 +310,7 @@ pub available: Option<usize>
 
 Capacity available to a future consumer, if applicable.
 
-<a id="impl-2"></a>
+<a id="JsonError.impl"></a>
 
 ## Implementation `JsonError`
 
@@ -318,7 +318,7 @@ Capacity available to a future consumer, if applicable.
 impl JsonError
 ```
 
-<a id="impl.at"></a>
+<a id="JsonError.impl.at"></a>
 
 ### Associated function `at`
 
@@ -488,7 +488,7 @@ EndOfInput
 
 The complete root value and trailing whitespace have ended.
 
-<a id="impl-3"></a>
+<a id="JsonToken.impl.Copy"></a>
 
 ## Implementation `Copy for JsonToken`
 
@@ -610,7 +610,7 @@ pub struct JsonScanner<'input>
 
 A slice-backed convenience adapter over the resumable scanner.
 
-<a id="impl-4"></a>
+<a id="JsonScanState.impl"></a>
 
 ## Implementation `JsonScanState`
 
@@ -618,7 +618,7 @@ A slice-backed convenience adapter over the resumable scanner.
 impl JsonScanState
 ```
 
-<a id="impl.make"></a>
+<a id="JsonScanState.impl.make"></a>
 
 ### Associated function `make`
 
@@ -628,7 +628,7 @@ pub fn make() -> JsonScanState
 
 Creates an empty, allocation-free state for exactly one root JSON value.
 
-<a id="impl.step"></a>
+<a id="JsonScanState.impl.step"></a>
 
 ### Method `step`
 
@@ -646,15 +646,15 @@ final chunk, including an empty one. No input slice survives this call.
 `NeedMore` consumes the entire chunk. A number at a nonfinal boundary remains pending;
 its lookahead delimiter is left for the following call. Errors make this state terminal.
 
-<a id="impl-5"></a>
+<a id="JsonScanner.impl"></a>
 
-## Implementation ``
+## Implementation `JsonScanner<'input>`
 
 ```silk
 impl<'input> JsonScanner<'input>
 ```
 
-<a id="impl.make-2"></a>
+<a id="JsonScanner.impl.make"></a>
 
 ### Associated function `make`
 
@@ -664,7 +664,7 @@ pub fn make(input: &'input [u8]) -> JsonScanner<'input>
 
 Borrows a complete input slice and starts a single-document scan.
 
-<a id="impl.next"></a>
+<a id="JsonScanner.impl.next"></a>
 
 ### Method `next`
 
@@ -674,7 +674,7 @@ pub fn next(self: &mut JsonScanner<'input>) -> Result<JsonToken, JsonError>
 
 Returns the next token or sticky `EndOfInput` after trailing whitespace.
 
-<a id="impl.peek"></a>
+<a id="JsonScanner.impl.peek"></a>
 
 ### Method `peek`
 
@@ -684,7 +684,7 @@ pub fn peek(self: &mut JsonScanner<'input>) -> Result<JsonToken, JsonError>
 
 Returns the next token without consuming it.
 
-<a id="impl.offset"></a>
+<a id="JsonScanner.impl.offset"></a>
 
 ### Method `offset`
 
@@ -694,7 +694,7 @@ pub fn offset(self: &JsonScanner<'input>) -> usize
 
 Returns the absolute byte offset of the last token returned by `next` or `peek`.
 
-<a id="impl.length"></a>
+<a id="JsonScanner.impl.length"></a>
 
 ### Method `length`
 
@@ -704,7 +704,7 @@ pub fn length(self: &JsonScanner<'input>) -> usize
 
 Returns the length of the complete input slice.
 
-<a id="impl.slice"></a>
+<a id="JsonScanner.impl.slice"></a>
 
 ### Method `slice`
 

@@ -32,7 +32,7 @@ pub struct MemoryTrustSource
 
 A mutable provider that owns one complete current trust snapshot.
 
-<a id="impl"></a>
+<a id="MemoryTrustSource.impl"></a>
 
 ## Implementation `MemoryTrustSource`
 
@@ -40,7 +40,7 @@ A mutable provider that owns one complete current trust snapshot.
 impl MemoryTrustSource
 ```
 
-<a id="impl.make"></a>
+<a id="MemoryTrustSource.impl.make"></a>
 
 ### Associated function `make`
 
@@ -50,7 +50,7 @@ pub fn make(snapshot: TrustSnapshot) -> MemoryTrustSource
 
 Consumes a snapshot and creates a provider without allocation or validation.
 
-<a id="impl.replace"></a>
+<a id="MemoryTrustSource.impl.replace"></a>
 
 ### Method `replace`
 
@@ -65,7 +65,7 @@ Atomically replaces current trust and returns the complete old snapshot.
 This operation allocates nothing and cannot fail. The new snapshot affects only later loads.
 Existing loaded snapshots remain independent owners.
 
-<a id="impl-2"></a>
+<a id="MemoryTrustSource.impl.TrustSource"></a>
 
 ## Implementation `TrustSource for MemoryTrustSource`
 
@@ -73,7 +73,7 @@ Existing loaded snapshots remain independent owners.
 impl TrustSource for MemoryTrustSource
 ```
 
-<a id="impl.load"></a>
+<a id="MemoryTrustSource.impl.TrustSource.load"></a>
 
 ### Operation `load`
 

@@ -9,13 +9,13 @@ Use these operations with `silk.raw-buffer` while implementing a container. Appl
 should prefer an initialized collection, which maintains the slot state on the caller's behalf.
 
 ## Details
-[`write`](#impl.write) changes an uninitialized slot to initialized. [`take`](#impl.take) and [`dropValue`](#impl.dropValue) change it
-back to uninitialized, while [`copy`](#impl.copy) leaves an initialized `Copy` value in place. Consuming a
+[`write`](#Slot.impl.write) changes an uninitialized slot to initialized. [`take`](#Slot.impl.take) and [`dropValue`](#Slot.impl.dropValue) change it
+back to uninitialized, while [`copy`](#Slot.impl.copy) leaves an initialized `Copy` value in place. Consuming a
 `Slot<'storage, T>` prevents reusing the same selection accidentally, but the container must still keep
 its own initialization map.
 
 ## Gotchas
-[`take`](#impl.take), [`copy`](#impl.copy), and [`dropValue`](#impl.dropValue) are `unsafe`: the caller must prove that the slot is
+[`take`](#Slot.impl.take), [`copy`](#Slot.impl.copy), and [`dropValue`](#Slot.impl.dropValue) are `unsafe`: the caller must prove that the slot is
 initialized. Writing twice without a state transition overwrites the earlier value without
 dropping it. Selecting an out-of-bounds slot traps.
 
@@ -77,7 +77,7 @@ This struct carries no data and is never constructed by the library. Every opera
 inherent member declared in `impl Slot`, so `import silk.slot { Slot }` is the one import that
 reaches `Slot.write(...)` and the rest. It is unrelated to the builtin `Slot<'storage, T>` place type.
 
-<a id="impl"></a>
+<a id="Slot.impl"></a>
 
 ## Implementation `Slot`
 
@@ -85,7 +85,7 @@ reaches `Slot.write(...)` and the rest. It is unrelated to the builtin `Slot<'st
 impl Slot
 ```
 
-<a id="impl.address"></a>
+<a id="Slot.impl.address"></a>
 
 ### Associated function `address`
 
@@ -100,7 +100,7 @@ Forms a non-null writable address without reading or initializing the selected s
 This operation consumes the slot selection. The pointer holds no loan and keeps no storage alive.
 A later memory access must prove its own lifetime, initialization, and access requirements.
 
-<a id="impl.write"></a>
+<a id="Slot.impl.write"></a>
 
 ### Associated function `write`
 
@@ -115,7 +115,7 @@ Moves one value into a selected uninitialized raw slot.
 The slot must be in bounds and uninitialized. A second write without a state transition is
 invalid. The value must satisfy the unchanged slot type, including every payload lifetime.
 
-<a id="impl.take"></a>
+<a id="Slot.impl.take"></a>
 
 ### Associated function `take`
 
@@ -133,7 +133,7 @@ The result retains every lifetime inside `T`. It does not retain the slot select
 
 The caller must prove that the slot is initialized.
 
-<a id="impl.copy"></a>
+<a id="Slot.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -147,7 +147,7 @@ Copies a `Copy` value from a selected initialized raw slot without changing its 
 
 The caller must prove that the slot is initialized.
 
-<a id="impl.dropValue"></a>
+<a id="Slot.impl.dropValue"></a>
 
 ### Associated function `dropValue`
 

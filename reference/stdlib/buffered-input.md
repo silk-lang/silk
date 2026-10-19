@@ -403,7 +403,7 @@ pub struct BufferedInput
 
 One fixed-capacity retained input buffer.
 
-<a id="impl"></a>
+<a id="BufferedInput.impl"></a>
 
 ## Implementation `BufferedInput`
 
@@ -411,7 +411,7 @@ One fixed-capacity retained input buffer.
 impl BufferedInput
 ```
 
-<a id="impl.make"></a>
+<a id="BufferedInput.impl.make"></a>
 
 ### Associated function `make`
 
@@ -423,7 +423,7 @@ pub effect fn make(capacity: usize) -> BufferedInput
 
 Allocates and initializes one fixed-capacity input buffer.
 
-<a id="impl.capacity"></a>
+<a id="BufferedInput.impl.capacity"></a>
 
 ### Method `capacity`
 
@@ -433,7 +433,7 @@ pub fn capacity(self: &Self) -> usize
 
 Returns the immutable fixed capacity.
 
-<a id="impl.unread"></a>
+<a id="BufferedInput.impl.unread"></a>
 
 ### Method `unread`
 
@@ -443,7 +443,7 @@ pub fn unread(self: &Self) -> usize
 
 Returns the initialized unread count.
 
-<a id="impl.isEnded"></a>
+<a id="BufferedInput.impl.isEnded"></a>
 
 ### Method `isEnded`
 
@@ -453,7 +453,7 @@ pub fn isEnded(self: &Self) -> bool
 
 Reports whether the source has reached sticky end.
 
-<a id="impl.isTerminal"></a>
+<a id="BufferedInput.impl.isTerminal"></a>
 
 ### Method `isTerminal`
 
@@ -463,7 +463,7 @@ pub fn isTerminal(self: &Self) -> bool
 
 Reports whether an external failure made this input terminal.
 
-<a id="impl.peek"></a>
+<a id="BufferedInput.impl.peek"></a>
 
 ### Method `peek`
 
@@ -473,7 +473,7 @@ pub fn peek<'a>(self: &'a Self) -> &'a [u8]
 
 Borrows exactly the initialized unread slice.
 
-<a id="impl.consume"></a>
+<a id="BufferedInput.impl.consume"></a>
 
 ### Method `consume`
 
@@ -483,7 +483,7 @@ pub effect fn consume(self: &mut Self, count: usize) -> () ! BufferError
 
 Advances by `count` initialized bytes, preserving state on overrun.
 
-<a id="impl.fill"></a>
+<a id="BufferedInput.impl.fill"></a>
 
 ### Method `fill`
 
@@ -499,7 +499,7 @@ pub effect fn fill(
 
 Retains at least `minimum` bytes or reports sticky source end.
 
-<a id="impl.fillStandard"></a>
+<a id="BufferedInput.impl.fillStandard"></a>
 
 ### Method `fillStandard`
 
@@ -511,7 +511,7 @@ pub effect fn fillStandard(self: &mut Self, minimum: usize) -> FillOutcome
 
 Retains through StandardInput without advertising a deadline.
 
-<a id="impl.readSome"></a>
+<a id="BufferedInput.impl.readSome"></a>
 
 ### Method `readSome`
 
@@ -527,7 +527,7 @@ pub effect fn readSome(
 
 Copies one positive prefix or reports sticky end.
 
-<a id="impl.readSomeStandard"></a>
+<a id="BufferedInput.impl.readSomeStandard"></a>
 
 ### Method `readSomeStandard`
 
@@ -539,7 +539,7 @@ pub effect fn readSomeStandard(self: &mut Self, output: &mut [u8]) -> ReadTransf
 
 Copies one positive prefix through StandardInput or reports sticky end.
 
-<a id="impl.readExact"></a>
+<a id="BufferedInput.impl.readExact"></a>
 
 ### Method `readExact`
 
@@ -555,7 +555,7 @@ pub effect fn readExact(
 
 Fills the complete destination or reports its precisely copied prefix.
 
-<a id="impl.discardAtMost"></a>
+<a id="BufferedInput.impl.discardAtMost"></a>
 
 ### Method `discardAtMost`
 
@@ -571,7 +571,7 @@ pub effect fn discardAtMost(
 
 Discards no more than `limit` and reports whether end was actually observed.
 
-<a id="impl.discardExact"></a>
+<a id="BufferedInput.impl.discardExact"></a>
 
 ### Method `discardExact`
 

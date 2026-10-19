@@ -9,11 +9,11 @@ Use [`Utf8Decoder`](#Utf8Decoder) when bytes arrive in chunks and a sequence can
 Use `String.fromUtf8` when all bytes are available in one complete slice.
 
 ## Details
-Feed bytes in order with [`step`](#impl.step). A complete scalar resets the decoder for the next byte.
+Feed bytes in order with [`step`](#Utf8Decoder.impl.step). A complete scalar resets the decoder for the next byte.
 The caller supplies each byte's offset so an invalid result identifies that byte.
 
 ## Gotchas
-If input ends while [`pending`](#impl.pending) returns true, the caller must report incomplete input.
+If input ends while [`pending`](#Utf8Decoder.impl.pending) returns true, the caller must report incomplete input.
 After an invalid result, create a new decoder before processing more bytes.
 
 Import as `Utf8Decoder` with `import silk.utf8_decoder { Utf8Decoder }`.
@@ -94,7 +94,7 @@ Allocation-free state for one UTF-8 scalar at a time across byte chunks.
 A completed scalar leaves this state ready for the next sequence. An incomplete sequence
 remains available for the next chunk. This state does not retain a byte slice.
 
-<a id="impl"></a>
+<a id="Utf8Decoder.impl"></a>
 
 ## Implementation `Utf8Decoder`
 
@@ -102,7 +102,7 @@ remains available for the next chunk. This state does not retain a byte slice.
 impl Utf8Decoder
 ```
 
-<a id="impl.make"></a>
+<a id="Utf8Decoder.impl.make"></a>
 
 ### Associated function `make`
 
@@ -112,7 +112,7 @@ pub fn make() -> Utf8Decoder
 
 Creates a decoder ready for the first byte of a UTF-8 sequence.
 
-<a id="impl.pending"></a>
+<a id="Utf8Decoder.impl.pending"></a>
 
 ### Method `pending`
 
@@ -122,7 +122,7 @@ pub fn pending(self: &Utf8Decoder) -> bool
 
 Returns true if the current scalar still needs continuation bytes.
 
-<a id="impl.step"></a>
+<a id="Utf8Decoder.impl.step"></a>
 
 ### Method `step`
 
@@ -138,7 +138,7 @@ absolute position of `byte` in the caller's input. A complete scalar resets the 
 
 #### Gotchas
 Overlong sequences, surrogate values, and values above `0x10FFFF` are invalid. If input
-ends while [`pending`](#impl.pending) is true, the caller must report incomplete input.
+ends while [`pending`](#Utf8Decoder.impl.pending) is true, the caller must report incomplete input.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -9,14 +9,14 @@ Use the built-in `string` type for borrowed text and [`String`](#String) when te
 Use [`Bytes`](./bytes.md#Bytes) when arbitrary octets must survive without UTF-8 validation.
 
 ## Details
-[`fromUtf8`](#impl.fromUtf8) validates and borrows existing bytes without allocating; [`copyUtf8`](#impl.copyUtf8) validates and
-owns a copy. [`fromBytes`](#impl.fromBytes) adopts owned bytes without copying; [`intoBytes`](#impl.intoBytes) transfers them back.
-[`append`](#impl.append) and [`appendOwned`](#impl.appendOwned) leave the original value unchanged if growth cannot
+[`fromUtf8`](#String.impl.fromUtf8) validates and borrows existing bytes without allocating; [`copyUtf8`](#String.impl.copyUtf8) validates and
+owns a copy. [`fromBytes`](#String.impl.fromBytes) adopts owned bytes without copying; [`intoBytes`](#String.impl.intoBytes) transfers them back.
+[`append`](#String.impl.append) and [`appendOwned`](#String.impl.appendOwned) leave the original value unchanged if growth cannot
 allocate. Scalar cursors expose Unicode scalar values and byte offsets, not grapheme clusters.
 
 ## Gotchas
 A [`ScalarCursor`](#ScalarCursor) is meaningful only for the same unchanged string from which its traversal
-began. Start with [`scalarCursor`](#impl.scalarCursor) and advance only with [`nextCursor`](#impl.nextCursor).
+began. Start with [`scalarCursor`](#String.impl.scalarCursor) and advance only with [`nextCursor`](#String.impl.nextCursor).
 
 ## Examples
 ### Validate borrowed UTF-8 bytes
@@ -98,7 +98,7 @@ pub struct String
 
 An owned sequence of valid UTF-8 bytes that releases its storage on drop.
 
-<a id="impl"></a>
+<a id="String.impl"></a>
 
 ## Implementation `String`
 
@@ -106,7 +106,7 @@ An owned sequence of valid UTF-8 bytes that releases its storage on drop.
 impl String
 ```
 
-<a id="impl.fromUtf8Unchecked"></a>
+<a id="String.impl.fromUtf8Unchecked"></a>
 
 ### Associated function `fromUtf8Unchecked`
 
@@ -119,14 +119,14 @@ Borrows caller-validated UTF-8 bytes as text without runtime validation.
 #### When to use
 
 Use this function only when an earlier operation proves that the complete byte view is UTF-8.
-Use [`fromUtf8`](#impl.fromUtf8) when the bytes have not been validated.
+Use [`fromUtf8`](#String.impl.fromUtf8) when the bytes have not been validated.
 
 #### Gotchas
 
 The caller must guarantee that the complete byte view is valid UTF-8 for the lifetime of the
 returned string view. Invalid bytes violate the safety contract.
 
-<a id="impl.fromUtf8"></a>
+<a id="String.impl.fromUtf8"></a>
 
 ### Associated function `fromUtf8`
 
@@ -141,7 +141,7 @@ Validates a complete byte view and borrows it as text without allocating.
 Success returns a `string` view with the same lexical lifetime as `values`. Failure returns the
 first invalid byte offset in [`InvalidUtf8`](#InvalidUtf8).
 
-<a id="impl.make"></a>
+<a id="String.impl.make"></a>
 
 ### Associated function `make`
 
@@ -151,7 +151,7 @@ pub fn make() -> String
 
 Constructs an empty owned String without allocating.
 
-<a id="impl.fromBytes"></a>
+<a id="String.impl.fromBytes"></a>
 
 ### Associated function `fromBytes`
 
@@ -163,14 +163,14 @@ Validates owned bytes and transfers their storage into a String without allocati
 
 #### When to use
 
-Use when a byte buffer must become owned text. Use [`fromUtf8`](#impl.fromUtf8) to borrow bytes without consuming them.
+Use when a byte buffer must become owned text. Use [`fromUtf8`](#String.impl.fromUtf8) to borrow bytes without consuming them.
 
 #### Details
 
 This function consumes `values`. Invalid UTF-8 returns the first invalid byte offset and releases
 the input storage. Success preserves the input allocation and its capacity.
 
-<a id="impl.fromBytesUnchecked"></a>
+<a id="String.impl.fromBytesUnchecked"></a>
 
 ### Associated function `fromBytesUnchecked`
 
@@ -183,14 +183,14 @@ Transfers caller-validated UTF-8 storage into a String without validation, alloc
 #### When to use
 
 Use when an earlier operation proves that every initialized byte forms valid UTF-8.
-Use [`fromBytes`](#impl.fromBytes) when that guarantee is not available.
+Use [`fromBytes`](#String.impl.fromBytes) when that guarantee is not available.
 
 #### Gotchas
 
 The complete initialized contents of `values` must be valid UTF-8. Invalid bytes violate the safety contract.
 This function consumes `values` and preserves its allocation and capacity.
 
-<a id="impl.intoBytes"></a>
+<a id="String.impl.intoBytes"></a>
 
 ### Method `intoBytes`
 
@@ -205,7 +205,7 @@ Consumes the String and returns its bytes without allocation or copying.
 The returned bytes retain the allocation, capacity, and complete UTF-8 contents.
 They can be modified as arbitrary bytes after this conversion.
 
-<a id="impl.copy"></a>
+<a id="String.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -215,7 +215,7 @@ pub effect fn copy(value: string) -> String ! OutOfMemoryError ? &mut Allocator
 
 Copies valid borrowed text into independently owned storage.
 
-<a id="impl.copyUtf8"></a>
+<a id="String.impl.copyUtf8"></a>
 
 ### Associated function `copyUtf8`
 
@@ -227,7 +227,7 @@ Validates complete UTF-8 bytes and copies them into independently owned storage.
 
 #### When to use
 
-Use this function when the bytes must outlive their current buffer. Use [`fromUtf8`](#impl.fromUtf8) for a
+Use this function when the bytes must outlive their current buffer. Use [`fromUtf8`](#String.impl.fromUtf8) for a
 borrowed result without allocation.
 
 #### Details
@@ -235,7 +235,7 @@ borrowed result without allocation.
 Invalid input returns [`InvalidUtf8`](#InvalidUtf8) as ordinary result data. Allocation failure remains in the
 Effect failure channel. No owned string is returned in either failure case.
 
-<a id="impl.append"></a>
+<a id="String.impl.append"></a>
 
 ### Method `append`
 
@@ -247,13 +247,13 @@ Appends complete valid text atomically with respect to allocation failure.
 
 #### When to use
 
-Use this function for borrowed text. Use [`appendOwned`](#impl.appendOwned) when the suffix is an owned [`String`](#String).
+Use this function for borrowed text. Use [`appendOwned`](#String.impl.appendOwned) when the suffix is an owned [`String`](#String).
 
 #### Details
 
 If growth fails, `self` keeps its prior contents and byte length.
 
-<a id="impl.appendOwned"></a>
+<a id="String.impl.appendOwned"></a>
 
 ### Method `appendOwned`
 
@@ -265,13 +265,13 @@ Appends another owned String atomically with respect to allocation failure.
 
 #### When to use
 
-Use this function to consume an owned suffix. Use [`append`](#impl.append) when the suffix is borrowed text.
+Use this function to consume an owned suffix. Use [`append`](#String.impl.append) when the suffix is borrowed text.
 
 #### Details
 
 This function consumes `value`. If growth fails, `self` keeps its prior contents and byte length.
 
-<a id="impl.view"></a>
+<a id="String.impl.view"></a>
 
 ### Method `view`
 
@@ -281,7 +281,7 @@ pub fn view(self: &Self) -> string
 
 Borrows the complete owned contents as valid text without allocating or copying.
 
-<a id="impl.utf8Bytes"></a>
+<a id="String.impl.utf8Bytes"></a>
 
 ### Associated function `utf8Bytes`
 
@@ -291,7 +291,7 @@ pub fn utf8Bytes(value: string) -> &[u8]
 
 Borrows a string's immutable UTF-8 encoding.
 
-<a id="impl.byteLength"></a>
+<a id="String.impl.byteLength"></a>
 
 ### Associated function `byteLength`
 
@@ -301,7 +301,7 @@ pub fn byteLength(value: string) -> usize
 
 Returns a string's UTF-8 byte length.
 
-<a id="impl.ownedUtf8Bytes"></a>
+<a id="String.impl.ownedUtf8Bytes"></a>
 
 ### Method `ownedUtf8Bytes`
 
@@ -311,7 +311,7 @@ pub fn ownedUtf8Bytes(self: &Self) -> &[u8]
 
 Borrows an owned String's immutable UTF-8 encoding.
 
-<a id="impl.ownedByteLength"></a>
+<a id="String.impl.ownedByteLength"></a>
 
 ### Method `ownedByteLength`
 
@@ -321,7 +321,7 @@ pub fn ownedByteLength(self: &Self) -> usize
 
 Returns an owned String's initialized UTF-8 byte length.
 
-<a id="impl.scalarCursor"></a>
+<a id="String.impl.scalarCursor"></a>
 
 ### Associated function `scalarCursor`
 
@@ -331,7 +331,7 @@ pub fn scalarCursor() -> ScalarCursor
 
 Creates a cursor at UTF-8 byte offset zero, before the first Unicode scalar.
 
-<a id="impl.cursorByteOffset"></a>
+<a id="String.impl.cursorByteOffset"></a>
 
 ### Associated function `cursorByteOffset`
 
@@ -341,7 +341,7 @@ pub fn cursorByteOffset(cursor: &ScalarCursor) -> usize
 
 Returns a cursor's explicit UTF-8 byte offset.
 
-<a id="impl.scalarValue"></a>
+<a id="String.impl.scalarValue"></a>
 
 ### Associated function `scalarValue`
 
@@ -351,7 +351,7 @@ pub fn scalarValue(step: &ScalarStep) -> char
 
 Returns the decoded Unicode scalar value without consuming the step.
 
-<a id="impl.scalarByteOffset"></a>
+<a id="String.impl.scalarByteOffset"></a>
 
 ### Associated function `scalarByteOffset`
 
@@ -361,7 +361,7 @@ pub fn scalarByteOffset(step: &ScalarStep) -> usize
 
 Returns the UTF-8 byte offset at which one step begins.
 
-<a id="impl.nextCursor"></a>
+<a id="String.impl.nextCursor"></a>
 
 ### Associated function `nextCursor`
 
@@ -371,7 +371,7 @@ pub fn nextCursor(step: ScalarStep) -> ScalarCursor
 
 Consumes one scalar step and returns the cursor immediately after that scalar.
 
-<a id="impl.nextScalar"></a>
+<a id="String.impl.nextScalar"></a>
 
 ### Associated function `nextScalar`
 
@@ -388,7 +388,7 @@ does not allocate.
 
 #### Gotchas
 
-The cursor must come from [`scalarCursor`](#impl.scalarCursor) or [`nextCursor`](#impl.nextCursor) for the same unchanged string.
+The cursor must come from [`scalarCursor`](#String.impl.scalarCursor) or [`nextCursor`](#String.impl.nextCursor) for the same unchanged string.
 
 <a id="InvalidUtf8"></a>
 

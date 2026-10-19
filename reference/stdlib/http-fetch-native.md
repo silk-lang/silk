@@ -33,19 +33,19 @@ An immutable native route/acquisition context and optional compatible direct-poo
 
 ### Details
 
-[`make`](#impl.make) consumes all fresh-acquisition settings without allocation. [`makeWithPool`](#impl.makeWithPool) first
+[`make`](#Context.impl.make) consumes all fresh-acquisition settings without allocation. [`makeWithPool`](#Context.impl.makeWithPool) first
 constructs that exact fresh context, then fallibly copies the supplied pool handle. A failed
 copy publishes no partially initialized context and leaves the source handle valid.
 
-<a id="impl"></a>
+<a id="Context.impl"></a>
 
-## Implementation ``
+## Implementation `Context<'configuration>`
 
 ```silk
 impl<'configuration> Context<'configuration>
 ```
 
-<a id="impl.make"></a>
+<a id="Context.impl.make"></a>
 
 ### Associated function `make`
 
@@ -59,7 +59,7 @@ pub fn make(
 
 Owns one native fresh-acquisition context without a connection pool.
 
-<a id="impl.makeWithPool"></a>
+<a id="Context.impl.makeWithPool"></a>
 
 ### Associated function `makeWithPool`
 
@@ -81,7 +81,7 @@ Owns one native fresh-acquisition context and a copied direct-pool capability.
 The copied handle retains the pool's already bounded immutable transport, HTTP, TLS, ALPN,
 and trust context. Route compatibility remains a per-attempt pre-contact admission check.
 
-<a id="impl.hasPool"></a>
+<a id="Context.impl.hasPool"></a>
 
 ### Method `hasPool`
 
@@ -91,9 +91,9 @@ pub fn hasPool(self: &Self) -> bool
 
 Returns whether this context owns an explicit direct native pool capability.
 
-<a id="impl-2"></a>
+<a id="Context.impl.FetchClient"></a>
 
-## Implementation `  for  `
+## Implementation `FetchClient<'policy, NativeRouteProvider, NativeTransport, A, HandlerError, ProxyError | RequestError | ValueError | OriginError | ClientError | NativeClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError | PoolError, HandlerRequirements, &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource> for Context<'configuration>`
 
 ```silk
 impl<
@@ -130,7 +130,7 @@ impl<
   > for Context<'configuration>
 ```
 
-<a id="impl.withAttempt"></a>
+<a id="Context.impl.FetchClient.withAttempt"></a>
 
 ### Operation `withAttempt`
 

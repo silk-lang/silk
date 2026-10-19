@@ -190,7 +190,7 @@ pub struct UriPercent
 
 The owner of byte percent encoding and decoding operations for URI components.
 
-<a id="impl"></a>
+<a id="UriPercent.impl"></a>
 
 ## Implementation `UriPercent`
 
@@ -198,7 +198,7 @@ The owner of byte percent encoding and decoding operations for URI components.
 impl UriPercent
 ```
 
-<a id="impl.encodeOwned"></a>
+<a id="UriPercent.impl.encodeOwned"></a>
 
 ### Associated function `encodeOwned`
 
@@ -218,7 +218,7 @@ Allocation or size overflow fails with `OutOfMemoryError`.
 Supply raw data, not already escaped text. Whole-path encoding retains slash and colon;
 use `FirstPathSegment` for data that must not become a relative reference's scheme.
 
-<a id="impl.encodeInto"></a>
+<a id="UriPercent.impl.encodeInto"></a>
 
 ### Associated function `encodeInto`
 
@@ -234,7 +234,7 @@ Replaces a reusable byte buffer with percent-encoded ASCII component data.
 Computes the size and reserves exact required capacity before changing the contents.
 Existing sufficient capacity requires no allocation. Failure leaves the original contents intact.
 
-<a id="impl.encodedLength"></a>
+<a id="UriPercent.impl.encodedLength"></a>
 
 ### Associated function `encodedLength`
 
@@ -248,7 +248,7 @@ Returns the encoded byte count without allocating, or `None` when the size excee
 Counts raw data under the selected grammar context, including three bytes for each escape.
 Use this to reserve a combined serialization before appending its individual components.
 
-<a id="impl.appendEncoded"></a>
+<a id="UriPercent.impl.appendEncoded"></a>
 
 ### Associated function `appendEncoded`
 
@@ -264,7 +264,7 @@ Appends encoded component data while retaining all existing destination bytes.
 Computes the additional byte count and reserves exact capacity before mutation. Sufficient
 capacity requires no allocation. Size overflow or allocation failure leaves the output intact.
 
-<a id="impl.encodeToWriter"></a>
+<a id="UriPercent.impl.encodeToWriter"></a>
 
 ### Associated function `encodeToWriter`
 
@@ -283,7 +283,7 @@ The Writer provider may allocate independently.
 #### Gotchas
 Writer failure may leave partial output. This operation does not flush the provider.
 
-<a id="impl.decodeOwned"></a>
+<a id="UriPercent.impl.decodeOwned"></a>
 
 ### Associated function `decodeOwned`
 
@@ -299,7 +299,7 @@ Decodes percent escapes into owned arbitrary bytes with one exact backing alloca
 Malformed escapes fail before allocation. Empty output does not allocate. No bytes are
 zero-filled before being overwritten, and plus signs remain literal bytes.
 
-<a id="impl.decodeInto"></a>
+<a id="UriPercent.impl.decodeInto"></a>
 
 ### Associated function `decodeInto`
 
@@ -315,7 +315,7 @@ Replaces reusable byte storage with strictly decoded bytes, preserving literal p
 Validates all escapes and reserves exact capacity before mutation. Malformed input and allocation
 failure leave existing contents intact. Sufficient capacity requires no allocation.
 
-<a id="impl.decodeInPlace"></a>
+<a id="UriPercent.impl.decodeInPlace"></a>
 
 ### Associated function `decodeInPlace`
 
@@ -332,7 +332,7 @@ The operation allocates nothing. Output may contain arbitrary bytes, including i
 #### Gotchas
 Bytes after the returned prefix are unspecified; the slice's physical length does not change.
 
-<a id="impl.decodeOrBorrow"></a>
+<a id="UriPercent.impl.decodeOrBorrow"></a>
 
 ### Associated function `decodeOrBorrow`
 

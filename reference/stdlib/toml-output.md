@@ -5,7 +5,7 @@
 TOML document and value output through the ambient Writer.
 
 ## When to use
-Use [`TomlOutput.write`](#impl.write) for an owned TOML document. Unsupported scalar spellings and
+Use [`TomlOutput.write`](#TomlOutput.impl.write) for an owned TOML document. Unsupported scalar spellings and
 container shapes fail before the first write. Writer failures may leave an accepted prefix.
 
 ## Examples
@@ -73,7 +73,7 @@ pub struct TomlOutput
 
 Output operations for an owned document or a value inside an assignment.
 
-<a id="impl"></a>
+<a id="TomlOutput.impl"></a>
 
 ## Implementation `TomlOutput`
 
@@ -81,7 +81,7 @@ Output operations for an owned document or a value inside an assignment.
 impl TomlOutput
 ```
 
-<a id="impl.write"></a>
+<a id="TomlOutput.impl.write"></a>
 
 ### Associated function `write`
 
@@ -96,7 +96,7 @@ Writes a complete document, preserving table and array-of-tables structure.
 Invalid scalar text or container structure fails before the first write.
 Writer failure can leave an accepted prefix. This operation does not flush the Writer.
 
-<a id="impl.writeString"></a>
+<a id="TomlOutput.impl.writeString"></a>
 
 ### Associated function `writeString`
 
@@ -106,7 +106,7 @@ pub effect fn writeString(value: string) -> () ! WriterError ? &mut Writer
 
 Writes a quoted TOML basic string.
 
-<a id="impl.writeKey"></a>
+<a id="TomlOutput.impl.writeKey"></a>
 
 ### Associated function `writeKey`
 

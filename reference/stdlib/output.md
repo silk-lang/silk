@@ -43,15 +43,15 @@ pub struct Initialized<T: Copy>
 
 Owns storage for one initialized `Copy` value that can be extracted once.
 
-<a id="impl"></a>
+<a id="Uninitialized.impl"></a>
 
-## Implementation ``
+## Implementation `Uninitialized<T>`
 
 ```silk
 impl<T> Uninitialized<T>
 ```
 
-<a id="impl.make"></a>
+<a id="Uninitialized.impl.make"></a>
 
 ### Associated function `make`
 
@@ -65,7 +65,7 @@ Allocates storage without constructing or reading a value.
 
 Allocation failure returns `OutOfMemoryError` without an output state.
 
-<a id="impl.address"></a>
+<a id="Uninitialized.impl.address"></a>
 
 ### Method `address`
 
@@ -79,7 +79,7 @@ Returns the output address without reading or initializing the storage.
 
 The address keeps no storage alive. Foreign code must finish its access before the owner is consumed or dropped.
 
-<a id="impl.initialize"></a>
+<a id="Uninitialized.impl.initialize"></a>
 
 ### Method `initialize`
 
@@ -89,7 +89,7 @@ pub fn initialize<T: Copy>(self: Self, value: T) -> Initialized<T>
 
 Writes a value and transfers the allocation into the initialized state.
 
-<a id="impl.assumeInitialized"></a>
+<a id="Uninitialized.impl.assumeInitialized"></a>
 
 ### Method `assumeInitialized`
 
@@ -104,15 +104,15 @@ Transfers the allocation after the caller proves that foreign code initialized t
 The storage must contain a valid `T`. Partial writes, untouched bytes that belong to the value,
 and invalid scalar or pointer representations do not satisfy this requirement.
 
-<a id="impl-2"></a>
+<a id="Initialized.impl"></a>
 
-## Implementation ``
+## Implementation `Initialized<T>`
 
 ```silk
 impl<T> Initialized<T>
 ```
 
-<a id="impl.into"></a>
+<a id="Initialized.impl.into"></a>
 
 ### Method `into`
 
