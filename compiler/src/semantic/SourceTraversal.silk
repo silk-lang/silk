@@ -5,10 +5,10 @@
 //! transport and ownership actions to these actual occurrences before that same graph is solved.
 
 import hir.Hir {InfixOperator}
-import semantic.SourceAnalysis {Skeleton, EvalId, EvaluationRole}
-import semantic.SourceFlow {Flow, PointId}
+import semantic.SourceAnalysis {Skeleton, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, sameSelector}
+import semantic.SourceFlow {Flow, PointId, Write}
 import semantic.SourceRules {Atom, Program}
-import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState}
+import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, MapId, SelectionMap, MapKind}
 import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace}
 import semantic.Type {Type}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -124,6 +124,7 @@ pub effect fn reserve<'body>(prepared: &SourcePreparation<'body>) -> Reservation
   let body = run visit(prepared, &mut walk, prepared.body.root, Access.Value, entry)
   let ended = run closeScopes(&mut walk, usize.ZERO, body.next, prepared.body.root, ExitKind.Normal)
   run edge(&mut walk, ended, exit)
+  run activateLocalStorage(prepared, &mut walk.reservation, yes)
   return move walk.reservation
 }
 
@@ -541,4 +542,175 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
       return joined
     }
   }
+}
+
+// Canonical whole-value storage does not depend on whether any source is a Loan. This stage
+// installs entry definitions and every authored local read/replacement in the same skeleton;
+// operation and boundary activation add their transfers before Builder.reserve emits equations.
+effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reservation: &mut Reservation, yes: Atom) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+  let absent = Program.atom(&mut reservation.skeleton.rules)
+  let count = Vector<Evaluation>.length(&reservation.skeleton.evaluations)
+  let mut at = usize.ZERO
+  while at < count {
+    let evaluation = Vector<Evaluation>.asSlice(&reservation.skeleton.evaluations)[at]
+    if let EvaluationSite.Entry {local} = evaluation.site {
+      let root = localRoot(endpoints, local)
+      let mut component = usize.ZERO
+      while component < endpoints.length {
+        if inlineComponent(prepared, root, EndpointId {index: component}) {
+          let endpoint = EndpointId {index: component}
+          let value = run Skeleton.value(&mut reservation.skeleton, EvalId {index: at}, endpoint)
+          let leaf = run Skeleton.leaf(&mut reservation.skeleton, Leaf {kind: SourceLeaf.Entry {local: local},
+            origin: prepared.body.locals[local.index].origin, endpoint: endpoint})
+          run Vector<Seed>.append(&mut reservation.skeleton.seeds, Seed {value: value, leaf: leaf,
+            direct: false, active: yes, stored: absent, alternatives: absent})
+          drop run Skeleton.define(&mut reservation.skeleton, evaluation.point, endpoint, value, yes, Write.Strong)
+        }
+        component = component + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let visits = Vector<Visit>.asSlice(&reservation.visits)
+  at = usize.ZERO
+  while at < visits.length {
+    let occurrence = &visits[at]
+    let inputs = Vector<Input>.asSlice(&occurrence.inputs)
+    match &prepared.body.nodes[occurrence.node.index].kind {
+      NodeKind.Expression {form: Expression.Local {local}, ..} => {
+        let source = localRoot(endpoints, local)
+        let target = nodeRoot(endpoints, occurrence.node, EndpointRole.Value)
+        let map = exactMap(maps, occurrence.node, source, target, MapKind.Copy)
+        // Place access needs the actual stored sources for a subsequent borrow/projection,
+        // but it is not thereby an ownership Read event; that distinction stays in Visit.
+        drop run Skeleton.readLocal(&mut reservation.skeleton, endpoints, maps, map, occurrence.evaluation, local)
+      }
+      NodeKind.LocalBinding {local, initializer} => {
+        run localReplacement(prepared, &mut reservation.skeleton, occurrence, inputs, local, initializer, yes)
+      }
+      NodeKind.MutableBinding {local, initializer} => {
+        run localReplacement(prepared, &mut reservation.skeleton, occurrence, inputs, local, initializer, yes)
+      }
+      NodeKind.Assignment {local, value} => {
+        run localReplacement(prepared, &mut reservation.skeleton, occurrence, inputs, local, value, yes)
+      }
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn localReplacement<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton, occurrence: &Visit,
+  inputs: &[Input], local: LocalId, operand: NodeId, yes: Atom) -> () ! OutOfMemoryError ? &mut Allocator {
+  if inputs.length != usize.ONE || inputs[0].node.index != operand.index {
+    CompilerBug.panic(b"local source replacement lost its actual initializer occurrence")
+  }
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+  let source = nodeRoot(endpoints, operand, EndpointRole.Value)
+  let target = localRoot(endpoints, local)
+  let map = exactMap(maps, occurrence.node, source, target, MapKind.Place)
+  drop run Skeleton.writeLocal(skeleton, endpoints, maps, map, inputs[0].evaluation, occurrence.evaluation, local, yes)
+  return ()
+}
+
+fn localRoot(endpoints: &[Endpoint], local: LocalId) -> EndpointId {
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    let matches = match &endpoints[at].root {
+      Root.Local {local: actual, role} => actual.index == local.index && role == EndpointRole.Storage
+      _ => false
+    }
+    let root = match endpoints[at].parent { Option<EndpointId>.None => true _ => false }
+    if matches && root {
+      if found != usize.MAX { return CompilerBug.panic(b"canonical local storage has duplicate prepared roots") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return CompilerBug.panic(b"local storage has no canonical prepared root") }
+  return EndpointId {index: found}
+}
+
+fn nodeRoot(endpoints: &[Endpoint], node: NodeId, role: EndpointRole) -> EndpointId {
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    let matches = match &endpoints[at].root {
+      Root.Node {node: actual, role: actualRole} => actual.index == node.index && actualRole == role
+      _ => false
+    }
+    let root = match endpoints[at].parent { Option<EndpointId>.None => true _ => false }
+    if matches && root {
+      if found != usize.MAX { return CompilerBug.panic(b"source node has duplicate prepared component roots") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return CompilerBug.panic(b"source node has no prepared component root") }
+  return EndpointId {index: found}
+}
+
+// Identity is the actual typed site AND both physical endpoints/kind. Matching a shared site,
+// type, or lifetime alone cannot select a transfer; duplicate exact evidence is also a defect.
+fn exactMap(maps: &[SelectionMap], site: NodeId, source: EndpointId, target: EndpointId, kind: MapKind) -> MapId {
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < maps.length {
+    if maps[at].site.index == site.index && maps[at].source.index == source.index
+      && maps[at].target.index == target.index && maps[at].kind == kind {
+      if found != usize.MAX { return CompilerBug.panic(b"physical source transfer has duplicate exact map identities") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return CompilerBug.panic(b"supported physical source transfer has no prepared map") }
+  return MapId {index: found}
+}
+
+// Entry owns only the finite inline frontier. A demanded Referent/EffectSuccess boundary is
+// not another initialized local field; later selection must compose its actual source route.
+fn inlineComponent<'body>(prepared: &SourcePreparation<'body>, root: EndpointId, candidate: EndpointId) -> bool {
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let shapes = Vector<Shape>.asSlice(&prepared.shapes)
+  let mut current = candidate
+  let mut remaining = endpoints.length
+  while remaining > usize.ZERO {
+    if current.index == root.index { return true }
+    if current.index >= endpoints.length { return CompilerBug.panic(b"prepared entry component is absent") }
+    let endpoint = &endpoints[current.index]
+    let parent = match endpoint.parent { Option<EndpointId>.Some {value} => value _ => { return false } }
+    if parent.index >= endpoints.length || endpoints[parent.index].shape.index >= shapes.length {
+      return CompilerBug.panic(b"prepared entry component has no parent shape")
+    }
+    // Inline coordinates are fields, variant payloads, or authored array partitions. Reference,
+    // pointer and Effect semantic channels always stop the owned frontier.
+    let boundary = match &endpoint.selector {
+      Selector.Referent => true
+      Selector.EffectSuccess => true
+      Selector.EffectFailure => true
+      Selector.Opaque => true
+      _ => false
+    }
+    if boundary { return false }
+    let components = Vector<Component>.asSlice(&shapes[endpoints[parent.index].shape.index].components)
+    let mut found = false
+    let mut component = usize.ZERO
+    while component < components.length {
+      if sameSelector(&components[component].selector, &endpoint.selector) {
+        if !components[component].inline { return false }
+        found = true
+      }
+      component = component + usize.ONE
+    }
+    if !found { return CompilerBug.panic(b"prepared entry child is absent from its exact inline shape") }
+    current = parent
+    remaining = remaining - usize.ONE
+  }
+  return CompilerBug.panic(b"prepared inline source component ancestry is cyclic")
 }
