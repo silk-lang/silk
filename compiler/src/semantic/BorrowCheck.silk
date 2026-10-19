@@ -2051,9 +2051,15 @@ struct SourceAccessRefusal {
   point: SourceControl.PointId
   reason: BorrowStatus
 }
+struct SourceGuardConsumption {
+  subject: SourceGraph.EvalId
+  point: SourceControl.PointId
+  span: Location
+}
 struct SourceAccessProjection {
   events: Vector<SourceAccessEvent>
   refusals: Vector<SourceAccessRefusal>
+  guardConsumed: Vector<SourceGuardConsumption>
 }
 
 effect fn sourceAccessEvent(events: &mut Vector<SourceAccessEvent>, evaluation: SourceGraph.EvalId,
@@ -2126,13 +2132,84 @@ fn sourceConsumedTarget(events: &mut Vector<SourceAccessEvent>, written: usize, 
   return ()
 }
 
-// Project ordinary authored accesses onto reserved runtime points. Loan acquisition, match
-// subject access and owner exits have their own semantic handlers. Holding/cleanup effects,
-// guarded consumption and store-policy refusals are also separate consumers of these events;
-// this inventory alone is not a completed ownership proof.
+// A consuming guard sees the provisional owner acquired by THIS match occurrence. Neither
+// a repeated guard NodeId nor a binding's retained subject dependency executes another guard.
+// Keep the actual access point so the final diagnostic pass uses the one CFG's applicability.
+effect fn sourceGuardConsumptions<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  events: &[SourceAccessEvent]) -> Vector<SourceGuardConsumption> ! OutOfMemoryError ? &mut Allocator {
+  let mut consumed = Vector<SourceGuardConsumption>.make()
+  let visits = Vector<SourceVisit.Visit>.asSlice(&reservation.visits)
+  let subjects = Vector<SourceVisit.Subject>.asSlice(&reservation.subjects)
+  let mut at = usize.ZERO
+  while at < visits.length {
+    let actual = &visits[at]
+    if let NodeKind.Expression {form: Expression.Match {subject, access, arms, ..}, ..} = &prepared.body.nodes[actual.node.index].kind {
+      let owning = match &access { SubjectAccess.Place {..} => false _ => true }
+      if owning {
+        let source = sourceAccessInput(actual, usize.ZERO, subject)
+        let mut retained = Option<SourceGraph.EvalId>.none()
+        let mut each = usize.ZERO
+        while each < subjects.length {
+          if subjects[each].site.index == actual.node.index && subjects[each].source.index == source.evaluation.index {
+            if let Option<SourceGraph.EvalId>.Some {..} = retained {
+              return CompilerBug.panic(b"consuming guard has duplicate actual subject acquisitions")
+            }
+            if !subjects[each].owned { return CompilerBug.panic(b"consuming guard lost its subject owner") }
+            retained = Option<SourceGraph.EvalId>.some(subjects[each].evaluation)
+          }
+          each = each + usize.ONE
+        }
+        let evaluation = match retained {
+          Option<SourceGraph.EvalId>.Some {value} => value
+          _ => { return CompilerBug.panic(b"consuming guard has no actual subject acquisition") }
+        }
+        let root = sourceTemporaryRoot(prepared, reservation, evaluation)
+        let written = Vector<MatchArm>.asSlice(&arms)
+        let selected = Vector<SourceVisit.ArmResult>.asSlice(&actual.armInputs)
+        if selected.length != written.length { return CompilerBug.panic(b"consuming guard lost its actual arm coordinates") }
+        let inputs = Vector<SourceVisit.Input>.asSlice(&actual.inputs)
+        each = usize.ZERO
+        while each < selected.length {
+          if let Option<usize>.Some {value: guard} = selected[each].guard {
+            let node = match written[each].guard {
+              Option<NodeId>.Some {value} => value
+              _ => { return CompilerBug.panic(b"actual guard coordinate has no written guard") }
+            }
+            if guard >= inputs.length || inputs[guard].node.index != node.index {
+              return CompilerBug.panic(b"consuming guard names another actual input occurrence")
+            }
+            let subtree = run sourceAccessSubtree(prepared, reservation, inputs[guard].evaluation)
+            let contained = Vector<bool>.asSlice(&subtree)
+            let mut event = usize.ZERO
+            while event < events.length {
+              let use = &events[event]
+              if contained[use.evaluation.index] && use.event.place.root == root
+                && (use.event.kind == Kind.Move || use.event.kind == Kind.Drop) {
+                run Vector<SourceGuardConsumption>.append(&mut consumed, SourceGuardConsumption {
+                  subject: evaluation, point: SourceControl.PointId {index: use.event.point}, span: use.event.span})
+              }
+              event = event + usize.ONE
+            }
+          } else if let Option<NodeId>.Some {..} = written[each].guard {
+            return CompilerBug.panic(b"written guard has no actual arm input coordinate")
+          }
+          each = each + usize.ONE
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move consumed
+}
+
+// Project authored accesses onto reserved runtime points, including a match's subject use
+// before its guards and arms. Loan acquisition and owner exits have their own semantic
+// handlers. Holding/cleanup effects and store-policy refusals are separate consumers of
+// these events; this inventory alone is not a completed ownership proof.
 effect fn sourceAccessEvents<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
   cleanup: &[LoanCleanup]) -> SourceAccessProjection ! OutOfMemoryError ? &mut Allocator | &mut Types {
-  let mut projection = SourceAccessProjection {events: Vector<SourceAccessEvent>.make(), refusals: Vector<SourceAccessRefusal>.make()}
+  let mut projection = SourceAccessProjection {events: Vector<SourceAccessEvent>.make(), refusals: Vector<SourceAccessRefusal>.make(),
+    guardConsumed: Vector<SourceGuardConsumption>.make()}
   let nodes = prepared.body.nodes
   let visits = Vector<SourceVisit.Visit>.asSlice(&reservation.visits)
   let mut at = usize.ZERO
@@ -2230,10 +2307,32 @@ effect fn sourceAccessEvents<'body>(prepared: &PreparedSources.SourcePreparation
           }
         }
       }
+      Shape.Match {subject, access, ..} => {
+        let input = sourceAccessInput(actual, usize.ZERO, subject)
+        let written = run pathOf(nodes, subject)
+        if access == Scrutinee.Moved && (written.root == usize.MAX || written.through) {
+          run Vector<SourceAccessRefusal>.append(&mut projection.refusals,
+            SourceAccessRefusal {point: input.usePoint, reason: BorrowStatus.StoredLoans})
+        } else if access != Scrutinee.Value && written.root != usize.MAX {
+          let kind = match access {
+            Scrutinee.Moved => Kind.Move
+            Scrutinee.Exclusive => Kind.Update
+            Scrutinee.Place => Kind.Inspect
+            _ => Kind.Read
+          }
+          let path = run sourceAuthoredPath(prepared, reservation, input)
+          let subjectSpan = nodes[subject.index].origin.location
+          // The subject is inspected/moved before any guard or arm, even when no arm
+          // completes. Borrowed-view acquisition still requires its producer authority.
+          run sourceAccessEvent(&mut projection.events, actual.evaluation, input.usePoint,
+            &path, kind, subjectSpan, subjectSpan)
+        }
+      }
       _ => ()
     }
     at = at + usize.ONE
   }
+  projection.guardConsumed = run sourceGuardConsumptions(prepared, reservation, Vector<SourceAccessEvent>.asSlice(&projection.events))
   return move projection
 }
 
