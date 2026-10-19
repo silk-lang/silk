@@ -76,6 +76,7 @@ import semantic.SourcePreparation {RegionBound}
 import semantic.SourcePreparation as PreparedSources
 import semantic.SourceAnalysis as SourceGraph
 import semantic.SourceTraversal as SourceVisit
+import semantic.SourceFlow as SourceControl
 import semantic.SourceRules {Atom as SourceAtom, Program as SourceProgram, Solution as SourceSolution, Truth as SourceTruth}
 import semantic.SourcePolicy
 import CompilerBug
@@ -2029,6 +2030,454 @@ fn loanReferent(value: &Type) -> Option<Shared<Type>> {
 struct SourceOwnership {
   loans: Vector<Loan>
   events: Vector<Event>
+}
+
+// Written operand order is supplied by the operation, never recovered by sorting ValueIds.
+// A root denotes the actual physical value family (including an implicit reference input),
+// not its selected/original contract parameter coordinate.
+struct SourceOperand {
+  evaluation: SourceGraph.EvalId
+  root: PreparedSources.EndpointId
+  ordinal: usize
+}
+impl Copy for SourceOperand {}
+
+struct SourceCarryCase {
+  source: SourceGraph.InputCase
+  field: usize
+}
+
+// One actual component/leaf observation. Histories remain cases of that observation. The
+// second written use of the same value gets another position, even for the same loan.
+struct SourceCarryPosition {
+  value: SourceGraph.ValueId
+  leaf: SourceGraph.LeafId
+  loan: usize
+  operand: usize
+  since: usize
+  quality: SourceQuality
+  cases: Vector<SourceCarryCase>
+}
+
+struct SourceObservation {
+  positions: Vector<SourceCarryPosition>
+  // Entry, Expression, LoanFree and Unknown remain actual inputs. None is a fake Loan, nor
+  // can an empty Borrow projection stand for complete source coverage.
+  other: Vector<SourceGraph.Input>
+  unknown: SourceAtom
+}
+
+// Every effect retains its actual source history and operation applicability. Definition and
+// read identities belong to SourceFlow; they must never index the old eager Holding table.
+struct SourceEffectSource {
+  value: SourceGraph.ValueId
+  leaf: SourceGraph.LeafId
+  loan: usize
+  definition: Option<SourceControl.DefinitionId>
+  read: Option<SourceControl.ReadId>
+}
+impl Copy for SourceEffectSource {}
+
+struct SourceRetentionEffect {
+  source: SourceEffectSource
+  point: usize
+  caller: SourceAtom
+  independent: SourceAtom
+  storing: SourceAtom
+}
+
+struct SourceIntervalEffect {
+  source: SourceEffectSource
+  from: usize
+  to: usize
+  cleanup: bool
+  active: SourceAtom
+}
+
+fn sourceQuality(cell: SourceGraph.Cell) -> SourceQuality {
+  return SourceQuality {present: cell.present, stored: cell.stored, alternatives: cell.alternatives}
+}
+
+fn sourceEffectSource(position: &SourceCarryPosition, actual: &SourceCarryCase) -> SourceEffectSource {
+  return SourceEffectSource {value: position.value, leaf: position.leaf, loan: position.loan,
+    definition: actual.source.definition, read: actual.source.read}
+}
+
+// This conversion is only for immutable place/type predicates such as keptSink. It deliberately
+// carries no legacy Holding identity: source effects retain the typed pair above instead.
+fn sourcePredicateCarry(position: &SourceCarryPosition, actual: &SourceCarryCase) -> Carry {
+  return Carry {loan: position.loan, since: position.since, operand: position.operand,
+    definition: usize.MAX, read: usize.MAX, field: actual.field, direct: actual.source.direct}
+}
+
+// Shape component order, not endpoint allocation order, determines a physical scan. Only
+// frozen inline children participate; following a reference would invent captured contents.
+effect fn sourceComponents<'body>(prepared: &PreparedSources.SourcePreparation<'body>,
+  root: PreparedSources.EndpointId) -> Vector<PreparedSources.EndpointId>
+! OutOfMemoryError ? &mut Allocator {
+  let endpoints = Vector<PreparedSources.Endpoint>.asSlice(&prepared.endpoints)
+  let shapes = Vector<PreparedSources.Shape>.asSlice(&prepared.shapes)
+  let mut pending = Vector<PreparedSources.EndpointId>.make()
+  let mut ordered = Vector<PreparedSources.EndpointId>.make()
+  run Vector<PreparedSources.EndpointId>.append(&mut pending, root)
+  while Vector<PreparedSources.EndpointId>.length(&pending) > usize.ZERO {
+    let endpoint = Vector<PreparedSources.EndpointId>.remove(&mut pending,
+      Vector<PreparedSources.EndpointId>.length(&pending) - usize.ONE)
+    if endpoint.index >= endpoints.length { CompilerBug.panic(b"source observation names an absent component") }
+    let prior = Vector<PreparedSources.EndpointId>.asSlice(&ordered)
+    let mut at = usize.ZERO
+    while at < prior.length {
+      if prior[at].index == endpoint.index { CompilerBug.panic(b"source observation repeats an inline component") }
+      at = at + usize.ONE
+    }
+    run Vector<PreparedSources.EndpointId>.append(&mut ordered, endpoint)
+    if endpoints[endpoint.index].shape.index >= shapes.length { CompilerBug.panic(b"source observation has no prepared shape") }
+    let components = Vector<PreparedSources.Component>.asSlice(&shapes[endpoints[endpoint.index].shape.index].components)
+    at = components.length
+    while at > usize.ZERO {
+      at = at - usize.ONE
+      if components[at].inline {
+        let mut found = usize.MAX
+        let mut each = usize.ZERO
+        while each < endpoints.length {
+          let child = match endpoints[each].parent { Option<PreparedSources.EndpointId>.Some {value} => value.index == endpoint.index _ => false }
+          if child && SourceGraph.sameSelector(&endpoints[each].selector, &components[at].selector) {
+            if found != usize.MAX { CompilerBug.panic(b"source observation has duplicate prepared children") }
+            found = each
+          }
+          each = each + usize.ONE
+        }
+        if found == usize.MAX { CompilerBug.panic(b"source observation lost a prepared inline child") }
+        run Vector<PreparedSources.EndpointId>.append(&mut pending, PreparedSources.EndpointId {index: found})
+      }
+    }
+  }
+  return move ordered
+}
+
+// Translate a *physical* placement into the existing slot classifier's path vocabulary.
+// Unknown placement stays MAX. A contract channel never becomes an owned field by ordinal.
+effect fn sourceField(endpoints: &[PreparedSources.Endpoint], root: PreparedSources.EndpointId,
+  child: PreparedSources.EndpointId, paths: &mut Vector<Vector<Step>>) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let mut reverse = Vector<PreparedSources.EndpointId>.make()
+  let mut current = child
+  let mut remaining = endpoints.length
+  while current.index != root.index && remaining > usize.ZERO {
+    if current.index >= endpoints.length { CompilerBug.panic(b"source carry names an absent placement") }
+    run Vector<PreparedSources.EndpointId>.append(&mut reverse, current)
+    match endpoints[current.index].parent {
+      Option<PreparedSources.EndpointId>.Some {value} => { current = value }
+      _ => { CompilerBug.panic(b"source carry placement does not belong to its physical operand") }
+    }
+    remaining = remaining - usize.ONE
+  }
+  if remaining == usize.ZERO { CompilerBug.panic(b"source carry has cyclic placement ancestry") }
+  let ancestry = Vector<PreparedSources.EndpointId>.asSlice(&reverse)
+  let mut steps = Vector<Step>.make()
+  let mut at = ancestry.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    match &endpoints[ancestry[at].index].selector {
+      PreparedSources.Selector.Field {ordinal} => run Vector<Step>.append(&mut steps, fieldStep(ordinal))
+      PreparedSources.Selector.Member {declaration, member, payload} => {
+        if DeclarationId.kind(&declaration) == OwnerKind.Union {
+          run Vector<Step>.append(&mut steps, memberStep(member))
+          run Vector<Step>.append(&mut steps, fieldStep(payload))
+        } else {
+          if payload != usize.ZERO { CompilerBug.panic(b"record carry has a union payload coordinate") }
+          run Vector<Step>.append(&mut steps, fieldStep(member))
+        }
+      }
+      PreparedSources.Selector.Variant {ordinal} => run Vector<Step>.append(&mut steps, memberStep(ordinal))
+      PreparedSources.Selector.Index {class} => {
+        let step = match &class {
+          PreparedSources.IndexClass.Exact {index} => elementStep(index)
+          PreparedSources.IndexClass.Remainder => anyElement()
+        }
+        run Vector<Step>.append(&mut steps, step)
+      }
+      PreparedSources.Selector.Identity => ()
+      _ => { return usize.MAX }
+    }
+  }
+  if Vector<Step>.length(&steps) == usize.ZERO { return usize.ZERO }
+  let field = Vector<Vector<Step>>.length(&paths.*)
+  run Vector<Vector<Step>>.append(&mut paths.*, move steps)
+  return field
+}
+
+// Collect without solving or sampling Truth. Each supplied operand is scanned in prepared
+// component order, then stable leaf order; case alternatives do not multiply scan positions.
+effect fn sourceObserve<'body>(builder: &mut SourceGraph.Builder<'body>, operands: &[SourceOperand],
+  paths: &mut Vector<Vector<Step>>, loans: usize) -> SourceObservation
+! OutOfMemoryError ? &mut Allocator {
+  let unknown = SourceProgram.atom(&mut builder.rules)
+  let mut observed = SourceObservation {positions: Vector<SourceCarryPosition>.make(),
+    other: Vector<SourceGraph.Input>.make(), unknown: unknown}
+  let mut operand = usize.ZERO
+  while operand < operands.length {
+    let actual = operands[operand]
+    let components = run sourceComponents(SourceGraph.Builder.preparation(&builder.*), actual.root)
+    let ordered = Vector<PreparedSources.EndpointId>.asSlice(&components)
+    let mut component = usize.ZERO
+    while component < ordered.length {
+      let endpoint = ordered[component]
+      {
+        let values = SourceGraph.Builder.values(&builder.*)
+        let mut value = usize.ZERO
+        while value < values.length && !(values[value].evaluation.index == actual.evaluation.index
+          && values[value].endpoint.index == endpoint.index) { value = value + usize.ONE }
+        if value < values.length {
+          let id = SourceGraph.ValueId {index: value}
+          let mut inputs = run SourceGraph.Builder.inputs(&mut builder.*, id)
+          while Vector<SourceGraph.Input>.length(&inputs) > usize.ZERO {
+            let input = Vector<SourceGraph.Input>.remove(&mut inputs, usize.ZERO)
+            let mut loan = usize.MAX
+            let mut unresolved = false
+            match &SourceGraph.Builder.leaf(&builder.*, input.leaf).kind {
+              SourceGraph.SourceLeaf.Borrow {loan: index, ..} => { loan = index }
+              SourceGraph.SourceLeaf.Unknown {..} => { unresolved = true }
+              _ => ()
+            }
+            if loan == usize.MAX {
+              if unresolved {
+                let present: [SourceAtom; 1] = [input.quality.present]
+                let empty = Vector<SourceAtom>.make()
+                run SourceProgram.rule(&mut builder.rules, unknown, &present, Vector<SourceAtom>.asSlice(&empty))
+              }
+              run Vector<SourceGraph.Input>.append(&mut observed.other, move input)
+            } else {
+              if loan >= loans { CompilerBug.panic(b"source carry names an absent actual loan") }
+              let mut cases = Vector<SourceCarryCase>.make()
+              let mut histories = move input.cases
+              while Vector<SourceGraph.InputCase>.length(&histories) > usize.ZERO {
+                let history = Vector<SourceGraph.InputCase>.remove(&mut histories, usize.ZERO)
+                let field = run sourceField(Vector<PreparedSources.Endpoint>.asSlice(
+                  &SourceGraph.Builder.preparation(&builder.*).endpoints), actual.root, history.placement, &mut paths.*)
+                run Vector<SourceCarryCase>.append(&mut cases, SourceCarryCase {source: move history, field: field})
+              }
+              let evaluation = SourceGraph.Builder.evaluation(&builder.*, actual.evaluation)
+              run Vector<SourceCarryPosition>.append(&mut observed.positions, SourceCarryPosition {
+                value: id, leaf: input.leaf, loan: loan, operand: actual.ordinal, since: evaluation.point.index,
+                quality: sourceQuality(input.quality), cases: move cases})
+            }
+          }
+        }
+      }
+      component = component + usize.ONE
+    }
+    operand = operand + usize.ONE
+  }
+  return move observed
+}
+
+effect fn sourceBarrier(observation: &SourceObservation, state: &mut SourcePolicy.LoanState,
+  rules: &mut SourceProgram) -> Vector<SourceQuality> ! OutOfMemoryError ? &mut Allocator {
+  let positions = Vector<SourceCarryPosition>.asSlice(&observation.positions)
+  let mut inputs = Vector<SourcePolicy.LoanInput>.make()
+  let mut at = usize.ZERO
+  while at < positions.length {
+    run Vector<SourcePolicy.LoanInput>.append(&mut inputs,
+      SourcePolicy.LoanInput {loan: positions[at].loan, quality: positions[at].quality})
+    at = at + usize.ONE
+  }
+  return run SourcePolicy.LoanState.barrier(&mut state.*, &mut rules.*, Vector<SourcePolicy.LoanInput>.asSlice(&inputs))
+}
+
+// The operation guard is the exact reserved execute/use/cleanup point. A never-returning
+// operation can consume an input even though its result evaluation has no reachable output.
+effect fn sourceConsume(observation: &SourceObservation, point: usize, active: SourceAtom,
+  rules: &mut SourceProgram, intervals: &mut Vector<SourceIntervalEffect>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let positions = Vector<SourceCarryPosition>.asSlice(&observation.positions)
+  let empty = Vector<SourceAtom>.make()
+  let mut at = usize.ZERO
+  while at < positions.length {
+    let cases = Vector<SourceCarryCase>.asSlice(&positions[at].cases)
+    let mut each = usize.ZERO
+    while each < cases.length {
+      let guards: [SourceAtom; 2] = [active, cases[each].source.quality.present]
+      let present = run SourcePolicy.conjunction(&mut rules.*, &guards, Vector<SourceAtom>.asSlice(&empty))
+      run Vector<SourceIntervalEffect>.append(&mut intervals.*, SourceIntervalEffect {
+        source: sourceEffectSource(&positions[at], &cases[each]), from: positions[at].since, to: point,
+        cleanup: false, active: present})
+      each = each + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Classify each paired history before completing parent closure. The unchanged keptSink
+// predicate preserves Same/Unknown slot behavior and never manufactures located evidence.
+effect fn sourceKeepCarried(observation: &SourceObservation, snapshot: &[SourceQuality], loans: &[Loan],
+  paths: &[Vector<Step>], owner: &DeclarationId, sinks: &[OperandSink], only: usize,
+  point: usize, active: SourceAtom, rules: &mut SourceProgram) -> Vector<SourceRetentionEffect>
+! OutOfMemoryError ? &mut Allocator {
+  let positions = Vector<SourceCarryPosition>.asSlice(&observation.positions)
+  if snapshot.length != positions.length { CompilerBug.panic(b"retention lost its input observation version") }
+  let empty = Vector<SourceAtom>.make()
+  let none = Vector<SourceAtom>.asSlice(&empty)
+  let yes = run sourceBoolean(&mut rules.*, true)
+  let mut inputs = Vector<SourcePolicy.RetentionInput>.make()
+  let mut carries = Vector<Carry>.make()
+  let mut sources = Vector<SourceEffectSource>.make()
+  let mut at = usize.ZERO
+  while at < positions.length {
+    let position = &positions[at]
+    let cases = Vector<SourceCarryCase>.asSlice(&position.cases)
+    let mut each = usize.ZERO
+    while each < cases.length {
+      let carry = sourcePredicateCarry(position, &cases[each])
+      let mut operand = only
+      if operand == usize.MAX { operand = position.operand }
+      let mut located = false
+      let mut initial = CallSink.Local
+      if operand < sinks.length { initial = keptSink(paths, &loans[position.loan], owner, carry, &sinks[operand], &mut located) }
+      let sink = match initial {
+        CallSink.Local => SourcePolicy.Sink.Local
+        CallSink.Universal => SourcePolicy.Sink.Universal
+        CallSink.Unknown => SourcePolicy.Sink.Unknown
+      }
+      let guards: [SourceAtom; 2] = [active, cases[each].source.quality.present]
+      let present = run SourcePolicy.conjunction(&mut rules.*, &guards, none)
+      let quality = SourceQuality {present: present, stored: snapshot[at].stored, alternatives: snapshot[at].alternatives}
+      run Vector<SourcePolicy.RetentionInput>.append(&mut inputs, SourcePolicy.RetentionInput {
+        quality: quality, initial: sink, local: loans[position.loan].local, located: located,
+        knownField: carry.field != usize.MAX, actualPoint: point != usize.MAX})
+      run Vector<Carry>.append(&mut carries, carry)
+      run Vector<SourceEffectSource>.append(&mut sources, sourceEffectSource(position, &cases[each]))
+      each = each + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let actual = Vector<Carry>.asSlice(&carries)
+  let mut parents = Vector<SourceParentEdge>.make()
+  at = usize.ZERO
+  while at < actual.length {
+    if let Option<Shared<Lifetime>>.Some {value: parent} = &loans[actual[at].loan].parent {
+      let mut candidate = usize.ZERO
+      while candidate < actual.length {
+        if only != usize.MAX || actual[at].operand == actual[candidate].operand {
+          if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loans[actual[candidate].loan].borrowed {
+            if meetMember(&parent, &borrowed) {
+              run Vector<SourceParentEdge>.append(&mut parents,
+                SourceParentEdge {child: at, parent: candidate, applicable: yes})
+            }
+          }
+        }
+        candidate = candidate + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let decisions = run SourcePolicy.retention(&mut rules.*, Vector<SourcePolicy.RetentionInput>.asSlice(&inputs),
+    Vector<SourceParentEdge>.asSlice(&parents))
+  let decisions = Vector<SourcePolicy.RetentionOutput>.asSlice(&decisions)
+  let mut effects = Vector<SourceRetentionEffect>.make()
+  at = usize.ZERO
+  while at < decisions.length {
+    run Vector<SourceRetentionEffect>.append(&mut effects, SourceRetentionEffect {
+      source: Vector<SourceEffectSource>.asSlice(&sources)[at], point: point, caller: decisions[at].caller,
+      independent: decisions[at].independentEscape, storing: decisions[at].storing})
+    at = at + usize.ONE
+  }
+  return move effects
+}
+
+struct SourceCleanupEffects {
+  intervals: Vector<SourceIntervalEffect>
+  refusal: SourceAtom
+}
+
+// Cleanup observes the source graph's actual read of initialized storage at this exit. It
+// never scans definitions created at unrelated points or uses a Loan ID as an owner witness.
+// The caller separately records the original loop-cleanup marker and refusal frontier.
+effect fn sourceObserveCleanup<'body>(builder: &mut SourceGraph.Builder<'body>, observation: &SourceObservation,
+  state: &mut SourcePolicy.LoanState, loans: &[Loan], cleanup: &[LoanCleanup], holder: usize,
+  storage: SourceGraph.Storage, hidden: bool, point: usize, active: SourceAtom) -> SourceCleanupEffects
+! OutOfMemoryError ? &mut Allocator {
+  let refusal = SourceProgram.atom(&mut builder.rules)
+  let mut effects = SourceCleanupEffects {intervals: Vector<SourceIntervalEffect>.make(), refusal: refusal}
+  if holder >= cleanup.length { return move effects }
+  let descriptor = &cleanup[holder]
+  let observed = Vector<Shared<Lifetime>>.asSlice(&descriptor.regions)
+  if !descriptor.unknown && observed.length == usize.ZERO { return move effects }
+  let empty = Vector<SourceAtom>.make()
+  let none = Vector<SourceAtom>.asSlice(&empty)
+  let yes = run sourceBoolean(&mut builder.rules, true)
+  let everything = run sourceBoolean(&mut builder.rules, descriptor.unknown && hidden)
+  let components = run sourceComponents(SourceGraph.Builder.preparation(&builder.*), storage.endpoint)
+  let owned = Vector<PreparedSources.EndpointId>.asSlice(&components)
+  let positions = Vector<SourceCarryPosition>.asSlice(&observation.positions)
+  // The barrier is common to all real definitions observed at this exit. Alternative paired
+  // histories do not sequentially contaminate one another's incoming precision version.
+  drop run sourceBarrier(observation, &mut state.*, &mut builder.rules)
+  let mut at = usize.ZERO
+  while at < positions.length {
+    let position = &positions[at]
+    let named = Vector<Shared<Lifetime>>.asSlice(&loans[position.loan].regions)
+    let namedEmpty = run sourceBoolean(&mut builder.rules, named.length == usize.ZERO)
+    let shares = run sourceBoolean(&mut builder.rules, sharesAtom(named, observed))
+    let cases = Vector<SourceCarryCase>.asSlice(&position.cases)
+    let mut losses = Vector<SourcePolicy.Precision>.make()
+    let mut each = usize.ZERO
+    while each < cases.length {
+      let actual = &cases[each]
+      let guards: [SourceAtom; 2] = [active, actual.source.quality.present]
+      let present = run SourcePolicy.conjunction(&mut builder.rules, &guards, none)
+      if descriptor.unknown && !hidden {
+        let held: [SourceAtom; 1] = [present]
+        run SourceProgram.rule(&mut builder.rules, refusal, &held, none)
+      } else {
+        let definition = match actual.source.definition {
+          Option<SourceControl.DefinitionId>.Some {value} => SourceGraph.Builder.definition(&builder.*, value)
+          _ => { return CompilerBug.panic(b"cleanup source has no actual storage definition") }
+        }
+        let read = match actual.source.read {
+          Option<SourceControl.ReadId>.Some {value} => SourceGraph.Builder.read(&builder.*, value)
+          _ => { return CompilerBug.panic(b"cleanup source has no paired storage read") }
+        }
+        let sameOwner = match definition.storage.temporary {
+          Option<SourceGraph.EvalId>.Some {value} => match read.storage.temporary {
+            Option<SourceGraph.EvalId>.Some {value: other} => value.index == other.index
+            _ => false
+          }
+          _ => match read.storage.temporary { Option<SourceGraph.EvalId>.None => true _ => false }
+        }
+        let expectedOwner = match storage.temporary {
+          Option<SourceGraph.EvalId>.Some {value} => match read.storage.temporary {
+            Option<SourceGraph.EvalId>.Some {value: other} => value.index == other.index
+            _ => false
+          }
+          _ => match read.storage.temporary { Option<SourceGraph.EvalId>.None => true _ => false }
+        }
+        let mut matching = false
+        let mut component = usize.ZERO
+        while component < owned.length {
+          if owned[component].index == read.storage.endpoint.index { matching = true }
+          component = component + usize.ONE
+        }
+        if read.point.index != point || definition.storage.endpoint.index != read.storage.endpoint.index
+          || !sameOwner || !expectedOwner || !matching {
+          CompilerBug.panic(b"cleanup cross-paired a definition and another storage read")
+        }
+        let decision = run SourcePolicy.cleanup(&mut builder.rules, &SourcePolicy.CleanupInput {
+          observed: present, matchingHolder: yes, everything: everything, namedEmpty: namedEmpty, shares: shares})
+        run Vector<SourceIntervalEffect>.append(&mut effects.intervals, SourceIntervalEffect {
+          source: sourceEffectSource(position, actual), from: definition.point.index, to: point,
+          cleanup: true, active: decision.interval})
+        run Vector<SourcePolicy.Precision>.append(&mut losses,
+          SourcePolicy.Precision {stored: decision.addStored, alternatives: decision.addAlternatives})
+      }
+      each = each + usize.ONE
+    }
+    drop run SourcePolicy.LoanState.finishPosition(&mut state.*, &mut builder.rules, position.loan,
+      Vector<SourcePolicy.Precision>.asSlice(&losses))
+    at = at + usize.ONE
+  }
+  return move effects
 }
 
 // Hidden owners use one dense identity per actual owner acquisition. A reused typed NodeId
@@ -10655,5 +11104,87 @@ effect fn sourceSnapshotClaims() -> ()
     && SourceSolution.truth(&solved, retained[1].addAlternatives) == SourceTruth.False
     && SourceSolution.truth(&solved, retained[2].kept) == SourceTruth.Undefined,
     "the result policy consumes actual required-source evidence without preserving a killed source or downgrading its proved placement")
+  return ()
+}
+
+test effect fn sourceRetentionUsesPairedCasesAndOperationPoint() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run sourceRetentionClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sourceRetentionClaims() -> ()
+! InvalidModulePath | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let owner = run capturedTestOwner(b"source-retention.silk", 0)
+  let region = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&owner), ordinal: 0})
+  let parent = run Shared<Lifetime>.make(Lifetime.Static)
+  let mut loans = Vector<Loan>.make()
+  run Vector<Loan>.append(&mut loans, run symbolicTestLoan(&region, &parent, true))
+  let mut rules = SourceProgram.make()
+  let yes = run sourceBoolean(&mut rules, true)
+  let no = SourceProgram.atom(&mut rules)
+  let quality = SourceQuality {present: yes, stored: no, alternatives: no}
+  let mut cases = Vector<SourceCarryCase>.make()
+  let mut each = usize.ZERO
+  while each < 2 {
+    run Vector<SourceCarryCase>.append(&mut cases, SourceCarryCase {field: 0,
+      source: SourceGraph.InputCase {source: Option<SourceGraph.ValueId>.none(),
+        placement: PreparedSources.EndpointId {index: 0}, direct: each == usize.ZERO,
+        definition: Option<SourceControl.DefinitionId>.some(SourceControl.DefinitionId {index: 3 + each}),
+        read: Option<SourceControl.ReadId>.some(SourceControl.ReadId {index: 5}),
+        map: Option<PreparedSources.MapId>.none(), direction: SourceGraph.MapDirection.Forward,
+        address: Option<SourceGraph.EvalId>.none(), contract: Option<PreparedSources.ContractRouteId>.none(),
+        quality: SourceGraph.Cell {present: yes, stored: no, alternatives: no}}})
+    each = each + usize.ONE
+  }
+  let mut positions = Vector<SourceCarryPosition>.make()
+  run Vector<SourceCarryPosition>.append(&mut positions, SourceCarryPosition {
+    value: SourceGraph.ValueId {index: 2}, leaf: SourceGraph.LeafId {index: 0}, loan: 0,
+    operand: 0, since: 8, quality: quality, cases: move cases})
+  let observation = SourceObservation {positions: move positions, other: Vector<SourceGraph.Input>.make(), unknown: no}
+  let mut paths = Vector<Vector<Step>>.make()
+  run Vector<Vector<Step>>.append(&mut paths, Vector<Step>.make())
+  let mut slots = Vector<SlotSink>.make()
+  run Vector<SlotSink>.append(&mut slots, SlotSink {path: Vector<KeptStep>.make(), view: true,
+    referent: run Shared<Type>.make(Type.Unit), exclusive: false, kept: CallSink.Universal, approximate: CallSink.Local})
+  let mut sinks = Vector<OperandSink>.make()
+  run Vector<OperandSink>.append(&mut sinks, OperandSink {outer: CallSink.Local, whole: CallSink.Unknown,
+    outerApproximate: CallSink.Local, wholeApproximate: CallSink.Local, span: Location.make(10, 11),
+    holds: true, view: Option<Shared<Lifetime>>.none(), slots: move slots, undescribed: false})
+  let mut state = run SourcePolicy.LoanState.make(&mut rules, 1)
+  let snapshot = run sourceBarrier(&observation, &mut state, &mut rules)
+  let kept = run sourceKeepCarried(&observation, Vector<SourceQuality>.asSlice(&snapshot), Vector<Loan>.asSlice(&loans),
+    Vector<Vector<Step>>.asSlice(&paths), &owner, Vector<OperandSink>.asSlice(&sinks), usize.MAX, 9, yes, &mut rules)
+  let absent = run sourceKeepCarried(&observation, Vector<SourceQuality>.asSlice(&snapshot), Vector<Loan>.asSlice(&loans),
+    Vector<Vector<Step>>.asSlice(&paths), &owner, Vector<OperandSink>.asSlice(&sinks), usize.MAX, 9, no, &mut rules)
+  let mut intervals = Vector<SourceIntervalEffect>.make()
+  run sourceConsume(&observation, 9, yes, &mut rules, &mut intervals)
+  let solved = run SourceProgram.solve(&rules)
+  let actual = Vector<SourceRetentionEffect>.asSlice(&kept)
+  let inactive = Vector<SourceRetentionEffect>.asSlice(&absent)
+  let flights = Vector<SourceIntervalEffect>.asSlice(&intervals)
+  run Testing.expect(actual.length == 2 && inactive.length == 2 && flights.length == 2,
+    "two paired histories keep their own evidence without becoming two physical policy inputs")
+  each = usize.ZERO
+  while each < actual.length {
+    run Testing.expect(SourceSolution.truth(&solved, actual[each].caller) == SourceTruth.True
+      && SourceSolution.truth(&solved, actual[each].independent) == SourceTruth.False
+      && SourceSolution.truth(&solved, actual[each].storing) == SourceTruth.False,
+      "Same view slots locate both direct and indirect sources before caller-retention effects")
+    run Testing.expect(SourceSolution.truth(&solved, inactive[each].caller) == SourceTruth.False
+      && SourceSolution.truth(&solved, inactive[each].independent) == SourceTruth.False
+      && SourceSolution.truth(&solved, inactive[each].storing) == SourceTruth.False,
+      "an inactive actual operation cannot publish retention from an otherwise present source")
+    let paired = match actual[each].source.definition {
+      Option<SourceControl.DefinitionId>.Some {value} => value.index == 3 + each
+      _ => false
+    }
+    let read = match actual[each].source.read { Option<SourceControl.ReadId>.Some {value} => value.index == 5 _ => false }
+    run Testing.expect(paired && read && actual[each].point == 9
+      && flights[each].from == 8 && flights[each].to == 9
+      && SourceSolution.truth(&solved, flights[each].active) == SourceTruth.True,
+      "retention and consumption preserve their exact definition/read and execution coordinates")
+    each = each + usize.ONE
+  }
   return ()
 }
