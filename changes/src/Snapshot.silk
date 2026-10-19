@@ -1,0 +1,311 @@
+//! Immutable cumulative published change knowledge, separate from committed release history.
+//! Local assets live at .changes/snapshots/<exact-version>.toml; explicit source files may
+//! instead sit beside baseline <exact-version>.toml files. Removed entries are not reverts.
+import History
+import History { Entry }
+import Problem { Problem }
+import Text
+import Version
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { DirectoryEntry, FileError, FileSystem, Path }
+import silk.i32
+import silk.option { Option }
+import silk.result { Result }
+import silk.string { String, InvalidUtf8 }
+import silk.toml_codec { TomlCodec }
+import silk.toml_scanner { TomlError }
+import silk.toml_value { Toml, Value }
+import silk.usize
+import silk.vector { Vector }
+
+pub struct Record {
+  pub packageName: String
+  pub version: String
+  pub kind: String
+  pub commit: String
+  pub floor: String
+  pub entries: Vector<Entry>
+}
+
+pub fn isDev(version: string) -> bool {
+  let start = String.byteLength(Version.core(version))
+  return Text.starts(Text.part(version, start, String.byteLength(version)), "-dev.")
+}
+
+pub effect fn validateCommit(commit: string) -> () ! Problem {
+  if String.byteLength(commit) != 40 { fail Problem { message: "Snapshot commit must be exactly 40 lowercase hexadecimal characters." } }
+  let mut index = usize.ZERO
+  while index < 40 {
+    let byte = Text.byte(commit, index)
+    if !((byte >= 48 && byte <= 57) || (byte >= 97 && byte <= 102)) {
+      fail Problem { message: "Snapshot commit must be exactly 40 lowercase hexadecimal characters." }
+    }
+    index = index + usize.ONE
+  }
+}
+
+/// Uses decimal text without machine-sized counter arithmetic or truncation.
+pub effect fn devVersion(core: string, counter: string, commit: string) -> String
+! Problem | OutOfMemoryError ? &mut Allocator {
+  run Version.validate(core)
+  run validateCommit(commit)
+  if core != Version.core(core) { fail Problem { message: "Development snapshots require a stable target core." } }
+  if counter == "" || Text.byte(counter, usize.ZERO) == 48 {
+    fail Problem { message: "--dev requires a positive decimal counter without leading zeroes." }
+  }
+  let mut index = usize.ZERO
+  while index < String.byteLength(counter) {
+    let byte = Text.byte(counter, index)
+    if byte < 48 || byte > 57 { fail Problem { message: "--dev requires a positive decimal counter without leading zeroes." } }
+    index = index + usize.ONE
+  }
+  let mut version = run String.copy(core)
+  run String.append(&mut version, "-dev.")
+  run String.append(&mut version, counter)
+  run String.append(&mut version, "+")
+  run String.append(&mut version, Text.part(commit, usize.ZERO, 12))
+  return move version
+}
+
+effect fn validate(record: &Record) -> () ! Problem | OutOfMemoryError ? &mut Allocator {
+  if Text.trim(String.view(&record.packageName)) == "" { fail Problem { message: "Snapshot package must not be empty." } }
+  let version = String.view(&record.version)
+  let floor = String.view(&record.floor)
+  run Version.validate(version)
+  run Version.validate(floor)
+  run validateCommit(String.view(&record.commit))
+  if (run Version.compare(version, floor)) <= 0 { fail Problem { message: "Snapshot version must be newer than its coverage floor." } }
+  let kind = String.view(&record.kind)
+  if isDev(version) {
+    if kind != "dev" { fail Problem { message: "Snapshot kind does not match its development version." } }
+    let start = String.byteLength(Version.core(version)) + 5
+    if String.byteLength(version) <= start + 13 { fail Problem { message: "Development snapshot must identify its counter and commit." } }
+    let end = String.byteLength(version) - 13
+    let expected = run devVersion(Version.core(version), Text.part(version, start, end), String.view(&record.commit))
+    if String.view(&expected) != version { fail Problem { message: "Development snapshot version does not match its full source commit." } }
+  } else {
+    if Version.isPrerelease(version) {
+      if kind != "prerelease" { fail Problem { message: "Snapshot kind does not match its prerelease version." } }
+    } else {
+      if kind != "stable" { fail Problem { message: "Snapshot kind does not match its stable version." } }
+    }
+  }
+  run History.validateEntries(&record.entries)
+}
+
+effect fn required<'a>(value: &'a Value, key: string) -> string<'a> ! Problem {
+  return match move Toml.asString(Toml.field(value, key)) {
+    Option<string<'a>>.Some { value: text } => text
+    Option<string<'a>>.None => { fail Problem { message: "Snapshot requires string schema, package, version, kind, commit, and floor fields." } }
+  }
+}
+
+pub effect fn parse(text: string) -> Record ! Problem | OutOfMemoryError ? &mut Allocator {
+  let value = match move run Effect.result(Toml.parse(String.utf8Bytes(text))) {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      TomlError invalid => { fail Problem { message: "Snapshot must be valid TOML without duplicate keys." } }
+      OutOfMemoryError allocation => { fail move allocation }
+    }
+  }
+  let format = match move Toml.field(&value, "format") {
+    Option<&Value>.Some { value: field } => match move TomlCodec.decodeOne<i32>(field) {
+      Result<i32, TomlError>.Success { value: number } => number
+      Result<i32, TomlError>.Failure { error } => 0
+    }
+    Option<&Value>.None => 0
+  }
+  if format != 1 || (run required(&value, "schema")) != "silk.changes.snapshot" {
+    fail Problem { message: "Unsupported immutable changes snapshot schema or format." }
+  }
+  let record = Record {
+    packageName: run String.copy(run required(&value, "package")),
+    version: run String.copy(run required(&value, "version")),
+    kind: run String.copy(run required(&value, "kind")),
+    commit: run String.copy(run required(&value, "commit")),
+    floor: run String.copy(run required(&value, "floor")),
+    entries: run History.parseEntries(&value),
+  }
+  run validate(&record)
+  return move record
+}
+
+pub effect fn encode(record: &Record) -> String ! Problem | OutOfMemoryError ? &mut Allocator {
+  run validate(record)
+  let mut output = run String.copy("format = 1\nschema = \"silk.changes.snapshot\"\npackage = ")
+  run History.quoted(&mut output, String.view(&record.packageName))
+  run String.append(&mut output, "\nversion = ")
+  run History.quoted(&mut output, String.view(&record.version))
+  run String.append(&mut output, "\nkind = ")
+  run History.quoted(&mut output, String.view(&record.kind))
+  run String.append(&mut output, "\ncommit = ")
+  run History.quoted(&mut output, String.view(&record.commit))
+  run String.append(&mut output, "\nfloor = ")
+  run History.quoted(&mut output, String.view(&record.floor))
+  run String.append(&mut output, "\n")
+  run History.encodeEntries(&mut output, &record.entries)
+  return move output
+}
+
+pub effect fn decode(bytes: Bytes, version: string) -> Record ! Problem | OutOfMemoryError ? &mut Allocator {
+  let text = match move String.fromBytes(move bytes) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { error } => { fail Problem { message: "Snapshot must contain UTF-8 TOML." } }
+  }
+  let record = run parse(String.view(&text))
+  if version != "" && String.view(&record.version) != version {
+    fail Problem { message: "Snapshot version does not match the exact requested release." }
+  }
+  return move record
+}
+
+pub effect fn read(path: &Path) -> Record
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if (run FileSystem.exists(path)) == false { fail Problem { message: "A required immutable release snapshot is missing." } }
+  let bytes = run FileSystem.readFile(path)
+  return run decode(move bytes, "")
+}
+
+pub effect fn load(root: &Path, version: string) -> Record
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  run Version.validate(version)
+  let mut relative = run String.copy(".changes/snapshots/")
+  run String.append(&mut relative, version)
+  run String.append(&mut relative, ".toml")
+  let path = run Path.join(root, String.view(&relative))
+  let record = run read(&path)
+  if String.view(&record.version) != version { fail Problem { message: "Snapshot filename does not match its exact recorded version." } }
+  return move record
+}
+
+fn indexOf(entries: &Vector<Entry>, id: string) -> usize {
+  let items = Vector<Entry>.asSlice(entries)
+  let mut index = usize.ZERO
+  while index < items.length {
+    if String.view(&items[index].id) == id { return index }
+    index = index + usize.ONE
+  }
+  return items.length
+}
+
+/// Newest knowledge wins when prerelease series repeat IDs. Takes entry ownership.
+pub effect fn merge(entries: &mut Vector<Entry>, older: Vector<Entry>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut pending = move older
+  while Vector<Entry>.length(&pending) > usize.ZERO {
+    let last = Vector<Entry>.length(&pending) - usize.ONE
+    let entry = Vector<Entry>.remove(&mut pending, last)
+    if indexOf(&entries.*, String.view(&entry.id)) == Vector<Entry>.length(&entries.*) {
+      run Vector<Entry>.append(&mut entries.*, move entry)
+    }
+  }
+}
+
+/// Complete committed predecessor coverage plus current pending knowledge; never writes a file.
+pub effect fn capture(root: &Path, packageName: string, current: string, version: string,
+  commit: string, entries: Vector<Entry>) -> Record
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut floor = run String.copy(current)
+  let directory = run Path.join(root, ".changes/releases")
+  if run FileSystem.exists(&directory) {
+    let listed = run FileSystem.listDirectory(&directory)
+    let files = Vector<DirectoryEntry>.asSlice(&listed)
+    let mut index = usize.ZERO
+    while index < files.length {
+      let name = Option<string>.unwrapOr(Path.name(&files[index].path), "")
+      if Text.ends(name, ".toml") {
+        if files[index].kind.code != 0 { fail Problem { message: "Release archives must be regular files." } }
+        let storedVersion = Text.part(name, usize.ZERO, String.byteLength(name) - 5)
+        let record = run History.load(root, storedVersion)
+        if String.view(&record.packageName) != packageName { fail Problem { message: "Release history belongs to a different package." } }
+        if (run Version.compare(storedVersion, current)) > 0 { fail Problem { message: "Release history is newer than the committed manifest." } }
+        if (run Version.compare(String.view(&record.fromVersion), String.view(&floor))) < 0 {
+          floor = run String.copy(String.view(&record.fromVersion))
+        }
+      }
+      index = index + usize.ONE
+    }
+  }
+  let mut cumulative = move entries
+  let mut history = run History.query(root, packageName, String.view(&floor), current)
+  while Vector<History.Record>.length(&history) > usize.ZERO {
+    let last = Vector<History.Record>.length(&history) - usize.ONE
+    let record = Vector<History.Record>.remove(&mut history, last)
+    run merge(&mut cumulative, move record.entries)
+  }
+  let mut kind = "stable"
+  if Version.isPrerelease(version) { kind = "prerelease" }
+  if isDev(version) { kind = "dev" }
+  let record = Record { packageName: run String.copy(packageName), version: run String.copy(version),
+    kind: run String.copy(kind), commit: run String.copy(commit), floor: move floor, entries: move cumulative }
+  run validate(&record)
+  return move record
+}
+
+effect fn results(target: Record) -> Vector<History.Record> ! OutOfMemoryError ? &mut Allocator {
+  let mut records = Vector<History.Record>.make()
+  if Vector<Entry>.length(&target.entries) != usize.ZERO {
+    let base = run String.copy(Version.core(String.view(&target.floor)))
+    run Vector<History.Record>.append(&mut records, History.Record {
+      packageName: move target.packageName, fromVersion: move target.floor, version: move target.version,
+      baseVersion: move base, entries: move target.entries,
+    })
+  }
+  return move records
+}
+
+/// The coverage floor is a supported empty baseline, not an imaginary published release.
+pub effect fn fromFloor(target: Record, packageName: string, from: string) -> Vector<History.Record>
+! Problem | OutOfMemoryError ? &mut Allocator {
+  run validate(&target)
+  if String.view(&target.packageName) != packageName { fail Problem { message: "Snapshot belongs to a different package." } }
+  if String.view(&target.floor) != from { fail Problem { message: "A required exact baseline snapshot is missing or outside supported coverage." } }
+  return run results(move target)
+}
+
+/// Compare stable identity AND content. Missing target IDs convey no code-revert claim.
+pub effect fn compare(baseline: &Record, target: Record, packageName: string) -> Vector<History.Record>
+! Problem | OutOfMemoryError ? &mut Allocator {
+  run validate(baseline)
+  run validate(&target)
+  if String.view(&baseline.packageName) != packageName || String.view(&target.packageName) != packageName {
+    fail Problem { message: "Snapshot belongs to a different package." }
+  }
+  if String.view(&baseline.floor) != String.view(&target.floor) {
+    fail Problem { message: "Snapshot coverage floors differ; this comparison has unsupported history gaps." }
+  }
+  if (run Version.compare(String.view(&baseline.version), String.view(&target.version))) > 0 {
+    fail Problem { message: "Snapshot baseline must not be newer than its target." }
+  }
+  if String.view(&baseline.version) == String.view(&target.version) && String.view(&baseline.commit) != String.view(&target.commit) {
+    fail Problem { message: "An immutable release version identifies conflicting source commits." }
+  }
+  let sameVersion = String.view(&baseline.version) == String.view(&target.version)
+  let originalCount = Vector<Entry>.length(&target.entries)
+  let mut compared = move target
+  let old = Vector<Entry>.asSlice(&baseline.entries)
+  let mut index = Vector<Entry>.length(&compared.entries)
+  while index > usize.ZERO {
+    index = index - usize.ONE
+    let entry = &Vector<Entry>.asSlice(&compared.entries)[index]
+    let found = indexOf(&baseline.entries, String.view(&entry.id))
+    if found < old.length {
+      let unchanged = Version.rank(entry.bump) == Version.rank(old[found].bump)
+        && String.view(&entry.summary) == String.view(&old[found].summary)
+        && String.view(&entry.migration) == String.view(&old[found].migration)
+      if unchanged {
+        let removed = Vector<Entry>.remove(&mut compared.entries, index)
+        drop removed
+      } else {
+        let entries = Vector<Entry>.asMutSlice(&mut compared.entries)
+        entries[index].updated = true
+      }
+    }
+  }
+  if sameVersion && (originalCount != old.length || Vector<Entry>.length(&compared.entries) != usize.ZERO) {
+    fail Problem { message: "An immutable release version identifies conflicting change content." }
+  }
+  return run results(move compared)
+}
