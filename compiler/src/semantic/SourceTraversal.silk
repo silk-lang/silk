@@ -127,8 +127,8 @@ struct Frame {
   scopeDepth: usize
 }
 impl Copy for Frame {}
-/// A match captures its subject once. Owned subjects have a distinct snapshot occurrence;
-/// borrowed/place subjects keep the actual scoped address, never an extra copied owner.
+/// A match or zero-count repeat captures its operand once. Owned subjects have a distinct
+/// snapshot occurrence; borrowed/place subjects keep the actual scoped address.
 pub struct Subject {
   pub site: NodeId
   pub node: NodeId
@@ -700,6 +700,28 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
     Expression.ArraySlice {value, ..} => run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
     Expression.SliceLength {value} => run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
     Expression.ArrayLength {value, ..} => run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
+    Expression.ArrayRepeat {value, count} => {
+      if count != usize.ZERO {
+        return run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
+      }
+      // Even an empty repeat evaluates and disposes its operand. Capture the owned value
+      // separately from a local/projection's address: ending this copy must not end its source.
+      let depth = List<ScopeId>.length(&walk.active)
+      run openScope(&mut walk.*, id, ScopeKind.Statement)
+      let saved = walk.retention
+      walk.retention = Retention.None
+      let used = run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
+      walk.retention = saved
+      let actual = List<Input>.asSlice(&inputs.*)[usize.ZERO]
+      let snapshot = run Skeleton.evaluate(&mut walk.reservation.skeleton, value, EvaluationRole.Binding, used)
+      let scope = List<ScopeId>.asSlice(&walk.active)[depth]
+      drop run registerOwner(&mut walk.*, OwnerRoot.Subject {node: value, evaluation: snapshot}, used, false)
+      run List<Subject>.append(&mut walk.reservation.subjects, Subject {site: id, node: value,
+        source: actual.evaluation, evaluation: snapshot, scope: scope, owned: true, consumes: false})
+      let ended = run closeScopes(&mut walk.*, depth, used, id, ExitKind.Normal)
+      List<ScopeId>.truncate(&mut walk.active, depth)
+      return ended
+    }
     Expression.EnumValue {value} => run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
     Expression.UnionInject {value, ..} => run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
     Expression.UnionWiden {value} => run input(prepared, &mut walk.*, &mut inputs.*, value, Access.Value, previous)
@@ -947,6 +969,7 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
         Expression.VariantConstruct {..} => true
         Expression.Callable {..} => true
         Expression.StagedCallable {..} => true
+        Expression.ArrayRepeat {..} => true
         _ => false
       }
       if !empty && constructed {
@@ -1016,6 +1039,9 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
         }
         run Skeleton.arraySlice(&mut reservation.skeleton, prepared, &rows[selected], inputs[usize.ZERO].evaluation,
           occurrence.evaluation, yes)
+      }
+      NodeKind.Expression {form: Expression.ArrayRepeat {value, count}, ..} => {
+        run repeatValues(prepared, &mut reservation.skeleton, occurrence, value, count, yes)
       }
       NodeKind.Expression {form: Expression.StorageCall {operation: StorageOperation.Replace, ..}, ..} => {
         let rows = List<Replacement>.asSlice(&prepared.replacements)
@@ -1278,6 +1304,102 @@ effect fn aggregateValues<'body>(prepared: &SourcePreparation<'body>, skeleton: 
     drop run Skeleton.transfer(&mut skeleton.*, endpoints, maps, map, inputs[actual].evaluation,
       occurrence.evaluation, active, Directness.Preserve, absent, absent, TransferPolicy.Physical)
     field = field + usize.ONE
+  }
+  return ()
+}
+
+// Repeat cardinality is not evaluation multiplicity. Each frozen partition holds the same
+// actual operand result at its own physical endpoint; Remainder is one finite partition.
+effect fn repeatValues<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
+  occurrence: &Visit, operand: NodeId, count: usize, active: Atom) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let inputs = List<Input>.asSlice(&occurrence.inputs)
+  if inputs.length != usize.ONE || inputs[0].node.index != operand.index || inputs[0].access != Access.Value {
+    CompilerBug.panic(b"array repeat lost its single actual value operand")
+  }
+  let endpoints = List<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = List<SelectionMap>.asSlice(&prepared.maps)
+  let source = nodeRoot(endpoints, operand, EndpointRole.Value)
+  let output = nodeRoot(endpoints, occurrence.node, EndpointRole.Value)
+  let shape = &List<Shape>.asSlice(&prepared.shapes)[endpoints[output.index].shape.index]
+  let correct = match &shape.state { ShapeState.Array {length} => length == count _ => false }
+  if !correct { CompilerBug.panic(b"array repeat has no exact frozen array extent") }
+  let components = List<Component>.asSlice(&shape.components)
+  let mut exact = usize.ZERO
+  let mut remainder = false
+  let mut partitions = List<EndpointId>.make()
+  let mut at = usize.ZERO
+  while at < components.length {
+    if !components[at].inline { CompilerBug.panic(b"array repeat partition is not owned inline storage") }
+    match &components[at].selector {
+      Selector.Index {class: IndexClass.Exact {index}} => {
+        if index >= count { CompilerBug.panic(b"array repeat has an out-of-bounds exact partition") }
+        exact = exact + usize.ONE
+      }
+      Selector.Index {class: IndexClass.Remainder} => { remainder = true }
+      _ => { CompilerBug.panic(b"array repeat has a non-index output partition") }
+    }
+    let mut previous = usize.ZERO
+    while previous < at {
+      if sameSelector(&components[previous].selector, &components[at].selector) {
+        CompilerBug.panic(b"array repeat has a duplicate frozen partition")
+      }
+      previous = previous + usize.ONE
+    }
+    run List<EndpointId>.append(&mut partitions, exactChild(endpoints, output, &components[at].selector))
+    at = at + usize.ONE
+  }
+  if (exact < count) != remainder || (count == usize.ONE && exact != usize.ONE) {
+    CompilerBug.panic(b"array repeat frozen partitions do not cover its exact extent")
+  }
+  let partitions = List<EndpointId>.asSlice(&partitions)
+  // Every actual direct child must belong to the shape, and every root family must name
+  // exactly this operand and one such child. Descendant maps remain owned by children IDs.
+  at = usize.ZERO
+  while at < endpoints.length {
+    let child = match endpoints[at].parent { Option<EndpointId>.Some {value} => value.index == output.index _ => false }
+    if child {
+      let mut found = false
+      let mut part = usize.ZERO
+      while part < partitions.length {
+        found = found || partitions[part].index == at
+        part = part + usize.ONE
+      }
+      let root = match &endpoints[at].root {
+        Root.Node {node, role} => node.index == occurrence.node.index && role == EndpointRole.Value
+        _ => false
+      }
+      if !found || !root { CompilerBug.panic(b"array repeat has an extraneous output component") }
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < maps.length {
+    // Whole-value selection also has maps into these components. Those select an existing
+    // output; only transport families can purport to place the repeated operand there.
+    if maps[at].site.index == occurrence.node.index && maps[at].kind != MapKind.Select {
+      let mut target = false
+      let mut part = usize.ZERO
+      while part < partitions.length {
+        target = target || maps[at].target.index == partitions[part].index
+        part = part + usize.ONE
+      }
+      if maps[at].source.index == source.index || target || maps[at].target.index == output.index {
+        if maps[at].source.index != source.index || !target || maps[at].kind != MapKind.Place
+          || !maps[at].componentTransport || !sameSelector(&maps[at].selector, &Selector.Identity) {
+          CompilerBug.panic(b"array repeat has an extraneous or unauthenticated placement family")
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  let absent = Program.atom(&mut skeleton.rules)
+  at = usize.ZERO
+  while at < partitions.length {
+    let map = exactMap(maps, occurrence.node, source, partitions[at], MapKind.Place)
+    drop run Skeleton.transfer(&mut skeleton.*, endpoints, maps, map, inputs[0].evaluation,
+      occurrence.evaluation, active, Directness.Preserve, absent, absent, TransferPolicy.Physical)
+    at = at + usize.ONE
   }
   return ()
 }
