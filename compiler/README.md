@@ -707,10 +707,11 @@ gh workflow run selfhost.yml --ref main -f release=dev
 
 Dev publication does not run `changes version`, consume pending files, commit a version bump,
 or regenerate the committed changelog. It reserves a repository-global counter in
-`compiler-dev-reservation/N`, generates the native snapshot from the exact source commit, and
-creates a fresh build projection containing only the generated manifest/version-module changes
+`refs/silk/compiler-dev-reservation/N`, generates the native snapshot from the exact source commit,
+and creates a fresh build projection containing only the generated manifest/version-module changes
 and snapshot. N1, N2, and target builds consume that same verified projection. Base and projected
-input digests remain in receipts; source snapshots are never edited in place.
+input digests remain in receipts; source snapshots are never edited in place. Reservations are
+internal Git refs, not tags or releases; a failed build can leave a reservation without publishing.
 
 The publication queue serializes main-branch runs without cancelling pending releases. A commit
 already published is not released again as dev; stable release merges are also excluded.
@@ -737,9 +738,12 @@ snapshot. No historical migration coverage is invented.
 
 The frozen bootstrap bundle remains `bootstrap-v0.0.0`. Future n0 publications use the separate
 `bootstrap-native-v<binary-version>` namespace and remain prereleases, not normal compiler releases.
-The original n0 release, `v0.1.0-dev.8624+5081812`, is retained for pinned builds and the frozen
-reproducibility check. Do not delete it while either depends on it. Bootstrap publication checks
-the original compiler hashes as well as any existing namespaced n0 release.
+The original n0 release is retained at `v0.1.0-dev.1+5081812` for pinned builds and the frozen
+reproducibility check. Its tag and downloadable archive names were renamed from `dev.8624`;
+the compiler bytes, hashes, and receipts are unchanged, and the historical binary reports
+`silk v0.1.0`. Its corrected `native-seed.json` names the renamed release. Do not delete or rename
+it while pinned builds depend on it. Bootstrap publication checks the original compiler hashes
+as well as any existing namespaced n0 release.
 
 ### The native seed pin
 

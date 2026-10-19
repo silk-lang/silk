@@ -22,13 +22,6 @@ behavior, data format, build artifact, or internal representation is a compatibi
   may be gated on whether the build can be revised: one code path whose recorder returns early in a
   one-shot build. It must not change what the compiler computes, and both modes need a test.
 
-## Papercuts
-
-Maintain PAPERCUTS.md, a global log shared by all agent sessions of anything that slowed down
-development. When you lose time to one, append date · symptom · fix · project at the end of the file
-on one physical line. Do not reorder or reformat existing entries. Check it first when tooling fails
-mysteriously.
-
 ## Repository workflow
 
 - The Node tooling in `compiler/scripts` uses pnpm and Vitest; `pnpm test:scripts` tests it, and
