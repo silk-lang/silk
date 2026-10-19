@@ -8,7 +8,7 @@ import hir.Hir {InfixOperator}
 import semantic.SourceAnalysis {Skeleton, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, Storage, sameSelector, inputOperand, sameInputRead}
 import semantic.SourceFlow {Flow, PointId, Write}
 import semantic.SourceRules {Atom, Program}
-import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, MapId, SelectionMap, MapKind, InputRead, InputRoute}
+import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, MapId, SelectionMap, MapKind, InputRead, InputRoute, Construction, Operation, Transport}
 import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace}
 import semantic.Type {Type}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -24,6 +24,24 @@ import CompilerBug
 pub enum Access { Value, Place }
 pub enum ScopeKind { Body, Block, Statement, Arm }
 pub enum ExitKind { Normal, Return, Failure, Break, Continue, RunFailure }
+pub enum Retention { None, Arrays, Storage }
+pub struct OwnerId { pub index: usize }
+impl Copy for OwnerId {}
+pub union OwnerRoot { Local { pub local: LocalId }, Temporary { pub evaluation: EvalId } }
+impl Copy for OwnerRoot {}
+pub struct Owner {
+  pub root: OwnerRoot
+  pub scope: ScopeId
+  pub initialized: PointId
+}
+pub enum OwnerAction { Use, Cleanup, End, Expire }
+pub struct OwnerExit {
+  pub owner: OwnerId
+  pub action: OwnerAction
+  pub point: PointId
+  pub cause: NodeId
+}
+
 pub struct ScopeId { pub index: usize }
 impl Copy for ScopeId {}
 
@@ -31,6 +49,8 @@ pub struct Scope {
   pub node: NodeId
   pub kind: ScopeKind
   pub parent: Option<ScopeId>
+  pub owners: Vector<OwnerId>
+  pub expiring: Vector<OwnerId>
 }
 
 pub struct ScopeExit {
@@ -76,6 +96,8 @@ pub struct Reservation {
   pub scopes: Vector<Scope>
   pub exits: Vector<ScopeExit>
   pub loops: Vector<Loop>
+  pub owners: Vector<Owner>
+  pub ownerExits: Vector<OwnerExit>
 }
 
 struct Frame {
@@ -95,6 +117,7 @@ struct Walk {
   frames: Vector<Frame>
   subjects: Vector<Subject>
   yes: Atom
+  retention: Retention
 }
 struct Completed {
   evaluation: EvalId
@@ -111,8 +134,9 @@ pub effect fn reserve<'body>(prepared: &SourcePreparation<'body>) -> Reservation
   let exit = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
   run Program.fact(&mut skeleton.rules, Flow.reachable(&skeleton.flow, entry))
   let mut walk = Walk {reservation: Reservation {skeleton: move skeleton, entry: entry, exit: exit,
-    visits: Vector<Visit>.make(), scopes: Vector<Scope>.make(), exits: Vector<ScopeExit>.make(), loops: Vector<Loop>.make()},
-    active: Vector<ScopeId>.make(), frames: Vector<Frame>.make(), subjects: Vector<Subject>.make(), yes: yes}
+    visits: Vector<Visit>.make(), scopes: Vector<Scope>.make(), exits: Vector<ScopeExit>.make(), loops: Vector<Loop>.make(),
+    owners: Vector<Owner>.make(), ownerExits: Vector<OwnerExit>.make()},
+    active: Vector<ScopeId>.make(), frames: Vector<Frame>.make(), subjects: Vector<Subject>.make(), yes: yes, retention: Retention.None}
   run openScope(&mut walk, prepared.body.root, ScopeKind.Body)
   // The same entry eligibility as accepted ownership initialization: actual bindings acquire
   // definitions at their nodes, never at entry. No invented RHS stands for a parameter/capture.
@@ -133,6 +157,7 @@ pub effect fn reserve<'body>(prepared: &SourcePreparation<'body>) -> Reservation
     if !bound {
       initialized = run after(&mut walk, initialized)
       drop run Skeleton.entry(&mut walk.reservation.skeleton, LocalId {index: local}, initialized)
+      drop run registerOwner(&mut walk, OwnerRoot.Local {local: LocalId {index: local}}, initialized, true)
     }
     local = local + usize.ONE
   }
@@ -160,12 +185,39 @@ effect fn openScope(walk: &mut Walk, node: NodeId, kind: ScopeKind) -> () ! OutO
   let mut parent = Option<ScopeId>.none()
   if active.length > usize.ZERO { parent = Option<ScopeId>.some(active[active.length - usize.ONE]) }
   let id = ScopeId {index: Vector<Scope>.length(&walk.reservation.scopes)}
-  run Vector<Scope>.append(&mut walk.reservation.scopes, Scope {node: node, kind: kind, parent: move parent})
+  run Vector<Scope>.append(&mut walk.reservation.scopes, Scope {node: node, kind: kind, parent: move parent, owners: Vector<OwnerId>.make(), expiring: Vector<OwnerId>.make()})
   run Vector<ScopeId>.append(&mut walk.active, id)
   return ()
 }
-// This emits a distinct point per scope exit. Ownership cleanup/end actions attach to that
-// point; a transfer exit does not mutate the lexical stack used to reserve sibling paths.
+// Registers physical owners in acquisition order. A retained initializer temporary lives in
+// the nearest non-statement scope; its validity may still expire in the creating statement.
+effect fn registerOwner(walk: &mut Walk, root: OwnerRoot, initialized: PointId, lexical: bool) -> OwnerId
+! OutOfMemoryError ? &mut Allocator {
+  let active = Vector<ScopeId>.asSlice(&walk.active)
+  let mut at = active.length
+  if at == usize.ZERO { return CompilerBug.panic(b"source owner has no active lexical scope") }
+  at = at - usize.ONE
+  while lexical && at > usize.ZERO && Vector<Scope>.asSlice(&walk.reservation.scopes)[active[at].index].kind == ScopeKind.Statement {
+    at = at - usize.ONE
+  }
+  let scope = active[at]
+  let id = OwnerId {index: Vector<Owner>.length(&walk.reservation.owners)}
+  run Vector<Owner>.append(&mut walk.reservation.owners, Owner {root: root, scope: scope, initialized: initialized})
+  let scopes = Vector<Scope>.asMutSlice(&mut walk.reservation.scopes)
+  run Vector<OwnerId>.append(&mut scopes[scope.index].owners, id)
+  return id
+}
+
+effect fn ownerAction(walk: &mut Walk, owner: OwnerId, action: OwnerAction, previous: PointId, cause: NodeId) -> PointId
+! OutOfMemoryError ? &mut Allocator {
+  let current = run after(&mut walk.*, previous)
+  run Vector<OwnerExit>.append(&mut walk.reservation.ownerExits, OwnerExit {owner: owner, action: action, point: current, cause: cause})
+  return current
+}
+
+// Conditional owner-use/cleanup actions get immutable points before solving. Their effects
+// are gated by the real held sources and cleanup contract; their reservation is not a use.
+// A transfer exit replays release order without mutating sibling lexical acquisition state.
 effect fn closeScopes(walk: &mut Walk, depth: usize, from: PointId, cause: NodeId, kind: ExitKind) -> PointId
 ! OutOfMemoryError ? &mut Allocator {
   let mut at = Vector<ScopeId>.length(&walk.active)
@@ -173,6 +225,35 @@ effect fn closeScopes(walk: &mut Walk, depth: usize, from: PointId, cause: NodeI
   while at > depth {
     at = at - usize.ONE
     let scope = Vector<ScopeId>.asSlice(&walk.active)[at]
+    let mut expiring = Vector<OwnerId>.make()
+    let mut owners = Vector<OwnerId>.make()
+    let scopes = Vector<Scope>.asSlice(&walk.reservation.scopes)
+    let expires = Vector<OwnerId>.asSlice(&scopes[scope.index].expiring)
+    let roots = Vector<OwnerId>.asSlice(&scopes[scope.index].owners)
+    let mut each = expires.length
+    while each > usize.ZERO {
+      each = each - usize.ONE
+      run Vector<OwnerId>.append(&mut expiring, expires[each])
+    }
+    each = roots.length
+    while each > usize.ZERO {
+      each = each - usize.ONE
+      run Vector<OwnerId>.append(&mut owners, roots[each])
+    }
+    let ended = Vector<OwnerId>.asSlice(&expiring)
+    each = usize.ZERO
+    while each < ended.length {
+      current = run ownerAction(&mut walk.*, ended[each], OwnerAction.Expire, current, cause)
+      each = each + usize.ONE
+    }
+    let released = Vector<OwnerId>.asSlice(&owners)
+    each = usize.ZERO
+    while each < released.length {
+      current = run ownerAction(&mut walk.*, released[each], OwnerAction.Use, current, cause)
+      current = run ownerAction(&mut walk.*, released[each], OwnerAction.Cleanup, current, cause)
+      current = run ownerAction(&mut walk.*, released[each], OwnerAction.End, current, cause)
+      each = each + usize.ONE
+    }
     current = run after(&mut walk.*, current)
     run Vector<ScopeExit>.append(&mut walk.reservation.exits, ScopeExit {scope: scope, point: current, cause: cause, kind: kind})
   }
@@ -188,11 +269,42 @@ effect fn input<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inp
 
 // Record the actual vector coordinate before evaluation order can permute it (pipeline calls).
 effect fn selectedInput<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inputs: &mut Vector<Input>,
-  node: NodeId, read: InputRead, previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
-  let result = run visit(prepared, &mut walk.*, node, Access.Value, previous)
+  site: NodeId, node: NodeId, read: InputRead, previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  let mut access = Access.Value
+  if referenceInput(prepared, site, read) { access = Access.Place }
+  let result = run visit(prepared, &mut walk.*, node, access, previous)
   run Vector<Input>.append(&mut inputs.*, Input {node: node, evaluation: result.evaluation,
-    access: Access.Value, read: Option<InputRead>.some(read)})
+    access: access, read: Option<InputRead>.some(read)})
   return result.next
+}
+
+// The producer explicitly requests a reference to this actual operand. This only selects
+// place evaluation/temporary lifetime; the real Borrow leaf/event is still created once by
+// that InputRoute's transport. Shared same-map PrepareEffect metadata adds no second action.
+fn referenceInput<'body>(prepared: &SourcePreparation<'body>, site: NodeId, read: InputRead) -> bool {
+  let constructions = Vector<Construction>.asSlice(&prepared.constructions)
+  let operations = Vector<Operation>.asSlice(&prepared.operations)
+  let mut at = usize.ZERO
+  while at < constructions.length {
+    if constructions[at].site.index == site.index && borrowedInput(Vector<InputRoute>.asSlice(&constructions[at].inputs), read) { return true }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < operations.length {
+    if operations[at].site.index == site.index && borrowedInput(Vector<InputRoute>.asSlice(&operations[at].inputs), read) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn borrowedInput(inputs: &[InputRoute], read: InputRead) -> bool {
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    if sameInputRead(inputs[at].read, read)
+      && (inputs[at].transport == Transport.BorrowShared || inputs[at].transport == Transport.BorrowMutable) { return true }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 /// Resolve a route only within this physical operation's actual inputs. Repeated NodeIds at
@@ -219,22 +331,22 @@ pub fn routeInput<'body>(prepared: &SourcePreparation<'body>, visit: &Visit, rou
 }
 
 effect fn operands<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inputs: &mut Vector<Input>,
-  nodes: &[NodeId], previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  site: NodeId, nodes: &[NodeId], previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
   let mut current = previous
   let mut at = usize.ZERO
   while at < nodes.length {
-    current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, nodes[at], InputRead.Argument {ordinal: at}, current)
+    current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, site, nodes[at], InputRead.Argument {ordinal: at}, current)
     at = at + usize.ONE
   }
   return current
 }
 
 effect fn fields<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inputs: &mut Vector<Input>,
-  values: &[AggregateField], previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  site: NodeId, values: &[AggregateField], previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
   let mut current = previous
   let mut at = usize.ZERO
   while at < values.length {
-    current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, values[at].value, InputRead.Field {ordinal: at}, current)
+    current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, site, values[at].value, InputRead.Field {ordinal: at}, current)
     at = at + usize.ONE
   }
   return current
@@ -245,7 +357,10 @@ effect fn settled<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, i
   node: NodeId, previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
   let depth = Vector<ScopeId>.length(&walk.active)
   run openScope(&mut walk.*, node, ScopeKind.Statement)
+  let saved = walk.retention
+  walk.retention = Retention.None
   let current = run input(prepared, &mut walk.*, &mut inputs.*, node, Access.Value, previous)
+  walk.retention = saved
   let ended = run closeScopes(&mut walk.*, depth, current, node, ExitKind.Normal)
   Vector<ScopeId>.truncate(&mut walk.active, depth)
   return ended
@@ -266,11 +381,15 @@ effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id:
       current = run expression(prepared, &mut walk.*, id, &form, access, &mut inputs, previous)
       if let Expression.CompileError {..} = &form { terminates = true }
     }
-    NodeKind.LocalBinding {initializer, ..} => {
+    NodeKind.LocalBinding {local, initializer} => {
+      walk.retention = bindingRetention(prepared, local)
       current = run input(prepared, &mut walk.*, &mut inputs, initializer, Access.Value, current)
+      walk.retention = Retention.None
     }
-    NodeKind.MutableBinding {initializer, ..} => {
+    NodeKind.MutableBinding {local, initializer} => {
+      walk.retention = bindingRetention(prepared, local)
       current = run input(prepared, &mut walk.*, &mut inputs, initializer, Access.Value, current)
+      walk.retention = Retention.None
     }
     NodeKind.Assignment {value, ..} => {
       current = run input(prepared, &mut walk.*, &mut inputs, value, Access.Value, current)
@@ -375,6 +494,30 @@ effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id:
   let mut successful = execute
   if neverValue(node) || impossibleIndex(prepared, id) { successful = run point(&mut walk.*) }
   let evaluation = run Skeleton.evaluate(&mut walk.reservation.skeleton, id, EvaluationRole.Value, successful)
+  match &node.kind {
+    NodeKind.LocalBinding {local, ..} => { drop run registerOwner(&mut walk.*, OwnerRoot.Local {local: local}, execute, true) }
+    NodeKind.MutableBinding {local, ..} => { drop run registerOwner(&mut walk.*, OwnerRoot.Local {local: local}, execute, true) }
+    _ => ()
+  }
+  if access == Access.Place && needsTemporary(&node.kind) {
+    let owner = run registerOwner(&mut walk.*, OwnerRoot.Temporary {evaluation: evaluation}, successful, walk.retention != Retention.None)
+    let mut expires = walk.retention == Retention.Storage
+    if walk.retention == Retention.Arrays {
+      let array = match &node.kind {
+        NodeKind.Expression {ty, ..} => Shared<Type>.with<bool>(&ty, fn(value: &Type) -> bool {
+          return match &value.* { Type.Array {..} => true _ => false }
+        })
+        _ => false
+      }
+      expires = !array
+    }
+    if expires {
+      let active = Vector<ScopeId>.asSlice(&walk.active)
+      let scope = active[active.length - usize.ONE]
+      let scopes = Vector<Scope>.asMutSlice(&mut walk.reservation.scopes)
+      run Vector<OwnerId>.append(&mut scopes[scope.index].expiring, owner)
+    }
+  }
   let active = Vector<ScopeId>.asSlice(&walk.active)
   if active.length == usize.ZERO { return CompilerBug.panic(b"source occurrence has no lexical scope") }
   run Vector<Visit>.append(&mut walk.reservation.visits, Visit {node: id, evaluation: evaluation,
@@ -397,6 +540,14 @@ effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id:
     return Completed {evaluation: evaluation, next: run point(&mut walk.*)}
   }
   return Completed {evaluation: evaluation, next: successful}
+}
+
+fn bindingRetention<'body>(prepared: &SourcePreparation<'body>, local: LocalId) -> Retention {
+  if local.index >= prepared.body.locals.length { return CompilerBug.panic(b"source binding has no declared local type") }
+  let ty = &prepared.body.locals[local.index].ty
+  if Shared<Type>.with<bool>(ty, Type.holdsView) { return Retention.Arrays }
+  if Type.hasOpenRuntimeParameters(ty) { return Retention.Storage }
+  return Retention.None
 }
 
 fn neverValue(node: &Node) -> bool {
@@ -501,33 +652,33 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
       }
       return run input(prepared, &mut walk.*, &mut inputs.*, right, Access.Value, first)
     }
-    Expression.Aggregate {fields: values, ..} => run fields(prepared, &mut walk.*, &mut inputs.*, Vector<AggregateField>.asSlice(&values), previous)
-    Expression.VariantConstruct {fields: values, ..} => run fields(prepared, &mut walk.*, &mut inputs.*, Vector<AggregateField>.asSlice(&values), previous)
-    Expression.Callable {fields: values, ..} => run fields(prepared, &mut walk.*, &mut inputs.*, Vector<AggregateField>.asSlice(&values), previous)
+    Expression.Aggregate {fields: values, ..} => run fields(prepared, &mut walk.*, &mut inputs.*, id, Vector<AggregateField>.asSlice(&values), previous)
+    Expression.VariantConstruct {fields: values, ..} => run fields(prepared, &mut walk.*, &mut inputs.*, id, Vector<AggregateField>.asSlice(&values), previous)
+    Expression.Callable {fields: values, ..} => run fields(prepared, &mut walk.*, &mut inputs.*, id, Vector<AggregateField>.asSlice(&values), previous)
     Expression.StagedCallable {callee, arguments, ..} => {
-      let first = run selectedInput(prepared, &mut walk.*, &mut inputs.*, callee, InputRead.Receiver, previous)
-      return run operands(prepared, &mut walk.*, &mut inputs.*, Vector<NodeId>.asSlice(&arguments), first)
+      let first = run selectedInput(prepared, &mut walk.*, &mut inputs.*, id, callee, InputRead.Receiver, previous)
+      return run operands(prepared, &mut walk.*, &mut inputs.*, id, Vector<NodeId>.asSlice(&arguments), first)
     }
     Expression.CallableCall {callee, arguments, pipeline, ..} => {
       let supplied = Vector<NodeId>.asSlice(&arguments)
       let mut current = previous
       let mut first = usize.ZERO
       if pipeline && supplied.length > usize.ZERO {
-        current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, supplied[0], InputRead.Argument {ordinal: usize.ZERO}, current)
+        current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, id, supplied[0], InputRead.Argument {ordinal: usize.ZERO}, current)
         first = usize.ONE
       }
-      current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, callee, InputRead.Receiver, current)
+      current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, id, callee, InputRead.Receiver, current)
       while first < supplied.length {
-        current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, supplied[first], InputRead.Argument {ordinal: first}, current)
+        current = run selectedInput(prepared, &mut walk.*, &mut inputs.*, id, supplied[first], InputRead.Argument {ordinal: first}, current)
         first = first + usize.ONE
       }
       return current
     }
-    Expression.DirectCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, Vector<NodeId>.asSlice(&arguments), previous)
-    Expression.InterfaceCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, Vector<NodeId>.asSlice(&arguments), previous)
-    Expression.ForeignCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, Vector<NodeId>.asSlice(&arguments), previous)
-    Expression.IntrinsicCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, Vector<NodeId>.asSlice(&arguments), previous)
-    Expression.StorageCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.DirectCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, id, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.InterfaceCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, id, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.ForeignCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, id, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.IntrinsicCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, id, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.StorageCall {arguments, ..} => run operands(prepared, &mut walk.*, &mut inputs.*, id, Vector<NodeId>.asSlice(&arguments), previous)
     Expression.Run {value, access: mode} => {
       let mut receiver = Access.Value
       if mode == RunAccess.Shared || mode == RunAccess.Exclusive { receiver = Access.Place }
