@@ -8,7 +8,7 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Schema from 'effect/Schema'
 import * as Console from 'effect/Console'
 import * as NativeProcess from './NativeProcess.ts'
-import { verifySnapshot } from './SourceSnapshot.mjs'
+import { hash, verifySnapshot } from './SourceSnapshot.mjs'
 
 export class CompilerReleaseError extends Data.TaggedError('CompilerReleaseError') {}
 const invalid = (message) => Effect.fail(new CompilerReleaseError({ reason: 'Conflict', message }))
@@ -38,6 +38,15 @@ const pages = Effect.fnUntraced(function* (repository, path) {
 })
 
 const headMarker = (head) => `<!-- silk-managed-head: ${head} -->`
+const sealDescription = (title, body) =>
+  `<!-- silk-managed-description: ${hash(JSON.stringify([title, body]))} -->\n${body}`
+const ownedDescription = (pull) => {
+  if (typeof pull.title !== 'string' || typeof pull.body !== 'string') return undefined
+  const seal = /^<!-- silk-managed-description: ([0-9a-f]{64}) -->\n/.exec(pull.body)
+  if (!seal) return undefined
+  const body = pull.body.slice(seal[0].length)
+  return seal[1] === hash(JSON.stringify([pull.title, body])) ? body : undefined
+}
 export const isManagedMerge = (pull, commit, repository) =>
   typeof pull.merged_at === 'string' &&
   pull.merge_commit_sha === commit &&
@@ -123,6 +132,7 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
   )
   if (pulls.length > 1) return yield* invalid('Multiple managed release PRs')
   const pull = pulls[0]
+  const previousDescription = pull && ownedDescription(pull)
   if (pending.length === 0 && !pull) return
   const remote = yield* command('git', [
     'ls-remote',
@@ -132,10 +142,12 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
   ])
   const oldHead = remote.split(/\s/)[0]
   if (pull && !oldHead) return yield* invalid('Managed release PR branch was removed')
+  let preparedHead
   if (oldHead) {
     if (
       pull &&
       (pull.user.login !== 'github-actions[bot]' ||
+        previousDescription === undefined ||
         !pull.body?.includes(managedMarker) ||
         !pull.body.includes(headMarker(oldHead)) ||
         pull.head.sha !== oldHead)
@@ -172,19 +184,7 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
       if (pull) yield* api(repository, `pulls/${pull.number}`, 'PATCH', { state: 'closed' })
       return
     }
-    if (parents[0] === base) {
-      // Also repairs a token-suppressed dispatch after an otherwise successful refresh.
-      yield* command('gh', [
-        'workflow',
-        'run',
-        'selfhost.yml',
-        '--repo',
-        repository,
-        '--ref',
-        managedBranch,
-      ])
-      if (pull) return
-    }
+    if (parents[0] === base) preparedHead = oldHead
   }
   yield* command(compiler, ['changes', '--dir', 'compiler', 'version'])
   const release = yield* json(
@@ -198,39 +198,52 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
     'compiler/CHANGELOG.md',
     'compiler/.changes',
   ])
-  yield* command('git', [
-    '-c',
-    'user.name=github-actions[bot]',
-    '-c',
-    'user.email=41898282+github-actions[bot]@users.noreply.github.com',
-    'commit',
-    '-m',
-    `Release Silk ${release.version}`,
-    '-m',
-    `Silk-Managed-Release: ${base}`,
-  ])
-  const head = yield* command('git', ['rev-parse', 'HEAD'])
-  // Authorize both exact bot heads before moving the branch. A merge racing the refresh
-  // still identifies the head it actually merged; a failed lease never overwrites a human edit.
+  let head = preparedHead
+  if (head) {
+    // A push may have succeeded before its metadata PATCH failed. Reproduce the native
+    // preparation, prove it is the same tree, then repair metadata without another commit.
+    const tree = yield* command('git', ['write-tree'])
+    if (tree !== (yield* command('git', ['rev-parse', `${head}^{tree}`])))
+      return yield* invalid('Existing managed release tree differs from native preparation')
+  } else {
+    yield* command('git', [
+      '-c',
+      'user.name=github-actions[bot]',
+      '-c',
+      'user.email=41898282+github-actions[bot]@users.noreply.github.com',
+      'commit',
+      '-m',
+      `Release Silk ${release.version}`,
+      '-m',
+      `Silk-Managed-Release: ${base}`,
+    ])
+    head = yield* command('git', ['rev-parse', 'HEAD'])
+    // Authorize both exact bot heads before moving the branch. A merge racing the refresh
+    // still identifies its head; resealing retains human-edit detection on interrupted retries.
+    if (pull)
+      yield* api(repository, `pulls/${pull.number}`, 'PATCH', {
+        body: sealDescription(pull.title, `${previousDescription}\n${headMarker(head)}`),
+      })
+    yield* command('git', [
+      'push',
+      `--force-with-lease=refs/heads/${managedBranch}:${oldHead}`,
+      'origin',
+      `HEAD:refs/heads/${managedBranch}`,
+    ])
+  }
+  const title = `Release Silk ${release.version}`
+  const body = sealDescription(
+    title,
+    `${managedMarker}\n${headMarker(head)}\n${oldHead && oldHead !== head ? headMarker(oldHead) : ''}\nPrepare Silk ${release.version}.\n\nThis PR is refreshed from main while pending changes exist. Review and explicitly merge when ready to announce; merging automatically publishes this exact stable release after all native gates. No release is published by preparing this PR. Do not edit the managed branch, title, or description; add review comments instead.\n\n${release.notes}`,
+  )
   if (pull)
     yield* api(repository, `pulls/${pull.number}`, 'PATCH', {
-      body: `${pull.body}\n${headMarker(head)}`,
-    })
-  yield* command('git', [
-    'push',
-    `--force-with-lease=refs/heads/${managedBranch}:${oldHead}`,
-    'origin',
-    `HEAD:refs/heads/${managedBranch}`,
-  ])
-  const body = `${managedMarker}\n${headMarker(head)}\n${oldHead ? headMarker(oldHead) : ''}\nPrepare Silk ${release.version}.\n\nThis PR is refreshed from main while pending changes exist. Review and explicitly merge when ready to announce; merging automatically publishes this exact stable release after all native gates. No release is published by preparing this PR. Do not edit the managed branch.\n\n${release.notes}`
-  if (pull)
-    yield* api(repository, `pulls/${pull.number}`, 'PATCH', {
-      title: `Release Silk ${release.version}`,
+      title,
       body,
     })
   else
     yield* api(repository, 'pulls', 'POST', {
-      title: `Release Silk ${release.version}`,
+      title,
       body,
       head: managedBranch,
       base: 'main',

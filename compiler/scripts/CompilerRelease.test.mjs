@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -27,13 +28,21 @@ const ref = (counter, sha) => ({
   ref: `refs/tags/compiler-dev-reservation/${counter}`,
   object: { type: 'commit', sha },
 })
+const sealedDescription = (title, body) =>
+  `<!-- silk-managed-description: ${createHash('sha256')
+    .update(JSON.stringify([title, body]))
+    .digest('hex')} -->\n${body}`
 const pull = {
   merged_at: '2026-10-19T06:00:00Z',
   merge_commit_sha: commit,
   base: { ref: 'main' },
   head: { ref: managedBranch, sha: other, repo: { full_name: repository } },
   user: { login: 'github-actions[bot]' },
-  body: `${managedMarker}\n<!-- silk-managed-head: ${other} -->`,
+  title: 'Release Silk 0.1.0',
+  body: sealedDescription(
+    'Release Silk 0.1.0',
+    `${managedMarker}\n<!-- silk-managed-head: ${other} -->\nOld release notes.`,
+  ),
 }
 const outcome = (value) => ({
   stdout: Buffer.from(typeof value === 'string' ? value : JSON.stringify(value)),
@@ -232,6 +241,113 @@ it.effect('refresh refuses a human-edited managed head before changing the branc
     assert.isTrue(Result.isFailure(result))
     if (Result.isFailure(result)) assert.strictEqual(result.failure.reason, 'Conflict')
     assert.deepEqual(mutations, [])
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
+const maintenanceFixture = Effect.fnUntraced(function* () {
+  const fs = yield* FileSystem.FileSystem
+  const state = {
+    head: commit,
+    remote: other,
+    parent: 'd'.repeat(40),
+    commits: 0,
+    pull: { ...pull, number: 1, merged_at: null },
+    failMetadata: false,
+  }
+  yield* transport((file, args, options) =>
+    Effect.sync(() => {
+      if (file === '/native-compiler') {
+        if (args.includes('release'))
+          return outcome({
+            version: '0.2.0',
+            prerelease: false,
+            notes: 'New behavior and migration guidance.',
+          })
+        return outcome('')
+      }
+      if (file === 'git') {
+        if (args[0] === 'rev-parse')
+          return outcome(args[1] === 'HEAD' ? state.head : 'prepared-tree')
+        if (args[0] === 'ls-remote')
+          return outcome(
+            `${args.at(-1) === 'refs/heads/main' ? commit : state.remote}\t${args.at(-1)}`,
+          )
+        if (args[0] === 'show') {
+          if (args.includes('--format=%P')) return outcome(state.parent)
+          if (args.includes('--format=%B'))
+            return outcome(`Release Silk\n\nSilk-Managed-Release: ${state.parent}`)
+          return outcome('41898282+github-actions[bot]@users.noreply.github.com')
+        }
+        if (args[0] === 'diff') return outcome('compiler/silk.toml')
+        if (args[0] === 'write-tree') return outcome('prepared-tree')
+        if (args.includes('commit')) {
+          state.head = 'c'.repeat(40)
+          state.commits++
+        }
+        if (args[0] === 'push') {
+          state.remote = state.head
+          state.parent = commit
+        }
+        if (['fetch', 'merge-base', 'add', 'push'].includes(args[0]) || args.includes('commit'))
+          return outcome('')
+        throw new Error(`Unexpected git operation: ${args}`)
+      }
+      if (file === 'gh' && args.includes('--paginate'))
+        return outcome([[{ ...state.pull, head: { ...pull.head, sha: state.remote } }]])
+      if (file === 'gh' && args.includes('PATCH')) {
+        const patch = JSON.parse(Buffer.from(options.input).toString())
+        if (state.failMetadata && patch.title) {
+          state.failMetadata = false
+          return {
+            ...outcome(''),
+            status: 1,
+            stderr: Buffer.from('interrupted metadata publication'),
+          }
+        }
+        state.pull = { ...state.pull, ...patch }
+        return outcome(state.pull)
+      }
+      if (file === 'gh' && args[0] === 'workflow') return outcome('')
+      throw new Error(`Unexpected process: ${file} ${args}`)
+    }),
+  )
+  const refresh = () =>
+    maintain({ repository, compiler: '/native-compiler' }).pipe(
+      Effect.provideService(FileSystem.FileSystem, {
+        ...fs,
+        readDirectory: () => Effect.succeed(['pending.md']),
+      }),
+    )
+  return { state, refresh }
+})
+
+it.effect('refresh preserves human-edited PR descriptions by refusing the update', () =>
+  Effect.gen(function* () {
+    const { state, refresh } = yield* maintenanceFixture()
+    state.pull.body += '\nHuman release instructions.'
+    const description = state.pull.body
+    const result = yield* Effect.result(refresh())
+    assert.isTrue(Result.isFailure(result))
+    assert.strictEqual(state.pull.body, description)
+    assert.strictEqual(state.remote, other)
+    assert.strictEqual(state.commits, 0)
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
+it.effect('same-head retry repairs interrupted PR metadata without another release commit', () =>
+  Effect.gen(function* () {
+    const { state, refresh } = yield* maintenanceFixture()
+    state.failMetadata = true
+    assert.isTrue(Result.isFailure(yield* Effect.result(refresh())))
+    const publishedHead = state.remote
+    assert.notStrictEqual(publishedHead, other)
+    assert.strictEqual(state.pull.title, 'Release Silk 0.1.0')
+    state.head = commit
+    yield* refresh()
+    assert.strictEqual(state.pull.title, 'Release Silk 0.2.0')
+    assert.include(state.pull.body, 'New behavior and migration guidance.')
+    assert.strictEqual(state.remote, publishedHead)
+    assert.strictEqual(state.commits, 1)
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 

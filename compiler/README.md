@@ -473,7 +473,9 @@ installed manifest version as the baseline. `--from` overrides either baseline.
 Automatic queries from a stable baseline select the latest stable GitHub Release, falling back
 to dev only when no stable release exists. A dev baseline selects the highest eligible dev or
 stable version, so it can advance to stable. Discovery searches all release pages and excludes
-drafts and bootstrap seeds. `--to VERSION` always selects an exact `v<VERSION>` release.
+drafts and bootstrap seeds. Eligible dev tags require a positive decimal counter and exactly
+12 lowercase hexadecimal metadata characters; older bootstrap counters do not compete with
+new dev releases. `--to VERSION` always selects an exact `v<VERSION>` release.
 Libraries declare their publication origin in their own manifest:
 
 ```toml
@@ -681,8 +683,10 @@ silk changes --dir compiler add minor "Describe the user-visible change." \
 The workflow builds the release tool from that exact commit, collects pending compiler changes
 with `silk changes version`, and updates the manifest, generated version module, TOML history,
 changelog, and pending-file deletions together. It verifies bot ownership and uses a guarded
-branch update; human edits are refused rather than overwritten. Selfhost verification is
-explicitly dispatched because `GITHUB_TOKEN` updates do not trigger normal PR workflows.
+branch update. Edits to the managed branch, PR title, or description are refused rather than
+overwritten; add review comments instead. An interrupted metadata update is repaired on retry
+without another release commit. Selfhost verification is explicitly dispatched because
+`GITHUB_TOKEN` updates do not trigger normal PR workflows.
 To request a refresh manually:
 
 ```sh
