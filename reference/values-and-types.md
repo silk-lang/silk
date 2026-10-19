@@ -1339,8 +1339,9 @@ reports `SEM0030` at that element; a contextual length mismatch reports `SEM0031
 **Status:** Confirmed
 
 `[value; count]` constructs a fixed array. `count` is a compile-time integer expression subject to
-the same non-negative length bound as `[T; N]`: at most 2147483647. Static locals and the current
-`static for` binder may determine the count. With an expected `[T; N]`, `value` is checked in
+the same non-negative length bound as `[T; N]`: at most 2147483647. Static locals, selected static
+parameters, and the current `static for` binder may determine the count, including inside static
+initializers. With an expected `[T; N]`, `value` is checked in
 immediate `T` context and `count` must equal `N`; otherwise the operand determines the element type.
 
 ```silk
