@@ -25,7 +25,7 @@ const commit = 'a'.repeat(40)
 const other = 'b'.repeat(40)
 const repository = 'silk-lang/silk'
 const ref = (counter, sha) => ({
-  ref: `refs/tags/compiler-dev-reservation/${counter}`,
+  ref: `refs/silk/compiler-dev-reservation/${counter}`,
   object: { type: 'commit', sha },
 })
 const sealedDescription = (title, body) =>
@@ -151,26 +151,35 @@ it.effect('published commits are deduplicated, while drafts reuse their durable 
   }).pipe(Effect.scoped),
 )
 
-it.effect('persists the next counter before returning build authorization', () =>
+it.effect('reserves and resumes counters without creating public release tags', () =>
   Effect.gen(function* () {
-    const writes = []
+    const refs = [ref(12, other)]
     yield* transport((file, args, options) =>
       Effect.sync(() => {
         assert.strictEqual(file, 'gh')
         const path = args.find((value) => value.startsWith('repos/'))
         if (args.includes('POST')) {
-          writes.push(JSON.parse(Buffer.from(options.input).toString()))
-          return outcome({})
+          const value = JSON.parse(Buffer.from(options.input).toString())
+          assert.isFalse(refs.some((entry) => entry.ref === value.ref))
+          refs.push({ ref: value.ref, object: { type: 'commit', sha: value.sha } })
+          return outcome(refs.at(-1))
         }
-        if (path.includes('/git/matching-refs/')) return outcome([[ref(12, other)]])
+        if (path.includes('/git/matching-refs/')) {
+          const prefix = `refs/${path.split('/git/matching-refs/')[1].split('?')[0]}`
+          return outcome([refs.filter((entry) => entry.ref.startsWith(prefix))])
+        }
         return outcome([[]])
       }),
     )
-    assert.deepEqual(yield* plan({ repository, commit, mode: 'dev', event: 'schedule' }), {
+    const request = { repository, commit, mode: 'dev', event: 'workflow_dispatch' }
+    assert.deepEqual(yield* plan(request), { mode: 'dev', counter: 13 })
+    assert.deepEqual(yield* plan(request), { mode: 'dev', counter: 13 })
+    assert.deepEqual(yield* plan({ ...request, commit: 'c'.repeat(40) }), {
       mode: 'dev',
-      counter: 13,
+      counter: 14,
     })
-    assert.deepEqual(writes, [{ ref: 'refs/tags/compiler-dev-reservation/13', sha: commit }])
+    assert.deepEqual(refs.filter((entry) => entry.ref.startsWith('refs/tags/')), [])
+    assert.deepEqual(refs, [ref(12, other), ref(13, commit), ref(14, 'c'.repeat(40))])
   }).pipe(Effect.scoped),
 )
 
