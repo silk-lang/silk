@@ -124,9 +124,9 @@ and consumed-file deletions together. These commands do not commit, tag, publish
 `silk changes since` selects compiler upgrades from the project's `package.silk-version`.
 `since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
 selects a target, and `--source ../candidate` reads a local checkout instead of GitHub.
-Local queries work, but automatic GitHub queries are currently blocked by native HTTPS trust/TLS
-compatibility. See the [HTTPS handoff](changes/HTTPS_HANDOFF.md) and
-[`compiler/README.md`](compiler/README.md#native-changes) for the interface and current limits.
+Published queries use authenticated native HTTPS and require a GitHub Release whose tag contains
+the complete TOML history. See [`compiler/README.md`](compiler/README.md#native-changes) for
+publication requirements, origin configuration, and trust settings.
 
 ## A short tour
 

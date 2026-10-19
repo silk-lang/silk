@@ -436,17 +436,21 @@ repository = "owner/repository"
 directory = "packages/mylib" # Optional; omitted means the repository root.
 ```
 
-The compiler origin is `silk-lang/silk`, directory `compiler`. Release records must be committed
-under that package's `.changes/releases/` at the selected tag, including every required predecessor
-and prerelease baseline. This metadata enables history discovery, not remote dependency installation.
-Queries do not fetch source code for execution or update the project.
+The compiler origin is `silk-lang/silk`, directory `compiler`. Before publishing a GitHub Release
+with a `v<VERSION>` tag, commit that package's `.changes/releases/` records, including every required
+predecessor and prerelease baseline. All records are read from the selected tag, never the default
+branch. Automatic latest-version discovery requires a stable GitHub Release, not just a Git tag or
+prerelease. Existing releases without these records cannot supply upgrade history: missing releases
+and incomplete archives are errors, never an empty list of changes.
 
-**Draft limitation:** native GitHub HTTPS requests currently fail: the macOS annotated CA bundle
-is rejected by the strict PEM loader, and a plain-PEM copy gets past loading but still fails TLS.
-Automatic discovery is not ready for use. See [`changes/HTTPS_HANDOFF.md`](../changes/HTTPS_HANDOFF.md)
-for reproductions, evidence, and the remaining work. No insecure or external-tool fallback is used.
-The adapter selects `SSL_CERT_FILE` when set, otherwise `/etc/ssl/cert.pem` on Darwin or
-`/etc/ssl/certs/ca-certificates.crt` on Linux; it does not consult Darwin Keychain.
+This metadata enables history discovery, not remote dependency installation. Queries do not fetch
+source code for execution or update the project.
+
+Requests use native authenticated HTTPS, with no insecure or external-tool fallback. The adapter
+selects `SSL_CERT_FILE` when set, otherwise `/etc/ssl/cert.pem` on Darwin or
+`/etc/ssl/certs/ca-certificates.crt` on Linux; it does not consult Darwin Keychain. Platform bundles
+may contain annotations between certificates, but every certificate must decode successfully.
+Private repositories, redirects, proxies, retries, and decompression are not supported.
 
 `--source PATH` bypasses remote discovery and reads a local checkout of the same package.
 For compiler queries this must be the `silk-compiler` package directory, not a virtual workspace
