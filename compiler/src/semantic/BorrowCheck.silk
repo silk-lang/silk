@@ -2053,7 +2053,26 @@ struct SourceOwnership {
   loans: List<Loan>
   events: List<Event>
   acquisitions: List<SourceInputAcquisition>
+  views: List<SourceViewAcquisition>
 }
+
+// An actual borrowed match view owns a loan, but produces no reference value. Its prepared
+// authority and runtime subject remain separate from later canonical address proofs.
+struct SourceViewAcquisition {
+  loan: usize
+  record: usize
+  result: SourceGraph.EvalId
+  source: SourceGraph.EvalId
+  scope: SourceVisit.ScopeId
+  point: SourceControl.PointId
+  extents: List<SourceViewExtent>
+}
+
+struct SourceViewExtent {
+  from: SourceControl.PointId
+  to: SourceControl.PointId
+}
+impl Copy for SourceViewExtent {}
 
 struct SourceInputAcquisition {
   result: SourceGraph.EvalId
@@ -5039,6 +5058,7 @@ union SourceBorrowKind {
   Authored {record: usize},
   Construction {record: usize, route: usize},
   Invocation {record: usize, route: usize},
+  MatchView {record: usize},
 }
 impl Copy for SourceBorrowKind {}
 struct SourceBorrowSite {
@@ -5071,6 +5091,26 @@ fn sourceCreatesReference(route: &PreparedSources.InputRoute) -> bool {
     || route.transport == PreparedSources.Transport.BorrowMutable
 }
 
+// Bindings refer to an already evaluated subject. Rebase binder markers through those
+// exact inputs so two executions of the same typed match never lend through one another.
+effect fn sourcePathBinders<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  input: SourceVisit.Input, binders: &mut List<usize>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let base = sourcePlaceBase(prepared, reservation, input)
+  if let NodeKind.Expression {form: Expression.PatternBinding {subject, access, ..}, ..} = &prepared.body.nodes[base.node.index].kind {
+    if access == BindingAccess.Place || access == BindingAccess.Shared || access == BindingAccess.Exclusive {
+      let actual = SourceVisit.occurrence(reservation, base.evaluation)
+      let inputs = List<SourceVisit.Input>.asSlice(&actual.inputs)
+      if inputs.length != usize.ONE || inputs[0].node.index != subject.index {
+        return CompilerBug.panic(b"view binding lost its actual subject input")
+      }
+      let source = run pathOf(prepared.body.nodes, subject)
+      if source.root != usize.MAX { run sourcePathBinders(prepared, reservation, inputs[0], &mut binders.*) }
+      if access != BindingAccess.Place { run List<usize>.append(&mut binders.*, inputs[0].evaluation.index) }
+    }
+  }
+  return ()
+}
+
 // Authored address syntax retains its actual hidden/subject owner occurrence. This does not
 // resolve a descriptor to the storage it addresses; referent steps remain explicit.
 effect fn sourceAuthoredPath<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
@@ -5093,6 +5133,8 @@ effect fn sourceAuthoredPath<'body>(prepared: &PreparedSources.SourcePreparation
       path.root = sourceTemporaryRoot(prepared, reservation, inputs[0].evaluation)
     }
   }
+  path.binders = List<usize>.make()
+  run sourcePathBinders(prepared, reservation, input, &mut path.binders)
   return move path
 }
 
@@ -5296,14 +5338,111 @@ effect fn sourceOwnerEnds<'body>(prepared: &PreparedSources.SourcePreparation<'b
   return ()
 }
 
+// The authored MatchView licenses this acquisition only. There is no source-value seed:
+// later binding uses keep the real loan alive without making their values carry that loan.
+effect fn sourceMatchViewLoan<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  actual: &SourceVisit.Visit, record: usize, ownership: &mut SourceOwnership) -> () ! OutOfMemoryError ? &mut Allocator {
+  let views = List<PreparedSources.MatchView>.asSlice(&prepared.matchViews)
+  if record >= views.length || views[record].site.index != actual.node.index {
+    return CompilerBug.panic(b"match loan has no matching prepared view")
+  }
+  let view = &views[record]
+  let endpoints = List<PreparedSources.Endpoint>.asSlice(&prepared.endpoints)
+  let selections = List<PreparedSources.Selection>.asSlice(&prepared.selections)
+  if view.source.index >= endpoints.length || view.selection.index >= selections.length {
+    return CompilerBug.panic(b"match view names an absent source selection")
+  }
+  let selected = &selections[view.selection.index]
+  let accepts = List<PreparedSources.EndpointId>.asSlice(&selected.accepts)
+  if selected.site.index != actual.node.index || selected.root.index != view.source.index
+    || accepts.length != usize.ONE || accepts[0].index != view.source.index
+    || List<PreparedSources.MapId>.length(&selected.maps) != usize.ZERO {
+    return CompilerBug.panic(b"match view is not its exact singleton subject selection")
+  }
+  if let NodeKind.Expression {form: Expression.Match {subject, access, arms, syntax, ..}, ..} = &prepared.body.nodes[actual.node.index].kind {
+    let mode = scrutineeOf(&access)
+    if mode != Scrutinee.Shared && mode != Scrutinee.Exclusive {
+      return CompilerBug.panic(b"nonborrowed match attempted a view acquisition")
+    }
+    let authentic = match &endpoints[view.source.index].root {
+      PreparedSources.Root.Node {node, role} => node.index == subject.index && role == PreparedSources.EndpointRole.Storage
+      _ => false
+    }
+    if !authentic { return CompilerBug.panic(b"match view is not its original subject storage") }
+    if let Option<PreparedSources.EndpointId>.Some {..} = endpoints[view.source.index].parent {
+      return CompilerBug.panic(b"match view source is not the original whole subject")
+    }
+    let input = sourceAccessInput(actual, usize.ZERO, subject)
+    let subjects = List<SourceVisit.Subject>.asSlice(&reservation.subjects)
+    let mut scoped = usize.MAX
+    let mut at = usize.ZERO
+    while at < subjects.length {
+      if subjects[at].site.index == actual.node.index && subjects[at].source.index == input.evaluation.index {
+        if scoped != usize.MAX { return CompilerBug.panic(b"match view has duplicate actual subject occurrences") }
+        scoped = at
+      }
+      at = at + usize.ONE
+    }
+    if scoped == usize.MAX || subjects[scoped].owned || subjects[scoped].evaluation.index != input.evaluation.index {
+      return CompilerBug.panic(b"match view lost its actual borrowed subject")
+    }
+    let written = run pathOf(prepared.body.nodes, subject)
+    if written.root == usize.MAX { return CompilerBug.panic(b"rvalue match attempted a new loan") }
+    let path = run sourceInputPath(prepared, reservation, input, view.source)
+    let exclusive = mode == Scrutinee.Exclusive && (syntax != MatchSyntax.Match || armLoanMatchesAccess())
+    let parent = run borrowedPlaceLifetime(prepared.body.nodes, subject)
+    let span = prepared.body.nodes[subject.index].origin.location
+    let loan = List<Loan>.length(&ownership.loans)
+    let mut acquired = run loanTyped(prepared.body.owner, &path, exclusive, span,
+      Option<Shared<Type>>.none(), move parent, input.usePoint.index)
+    acquired.binder = input.evaluation.index
+    run List<Loan>.append(&mut ownership.loans, move acquired)
+    let mut kind = Kind.SharedBorrow
+    if exclusive { kind = Kind.ExclusiveBorrow }
+    run List<Event>.append(&mut ownership.events, Event {point: input.usePoint.index,
+      place: Place {root: path.root, steps: run copySteps(List<Step>.asSlice(&path.steps))}, kind: kind,
+      span: span, target: span, loan: loan, consumesTarget: usize.ZERO, refiner: path.refiner,
+      refinedDepth: path.refinedDepth, binders: run copyBinders(List<usize>.asSlice(&path.binders))})
+    let mut extents = List<SourceViewExtent>.make()
+    let declared = List<MatchArm>.asSlice(&arms)
+    let intervals = List<SourceVisit.ArmResult>.asSlice(&actual.armInputs)
+    if intervals.length != declared.length { return CompilerBug.panic(b"match view lost its actual arm intervals") }
+    at = usize.ZERO
+    while at < declared.length {
+      let binds = List<NodeId>.length(&declared[at].bindings) != usize.ZERO
+      if (syntax == MatchSyntax.Match && armLoanSpansArm()) || (syntax == MatchSyntax.IfLet && binds) {
+        run List<SourceViewExtent>.append(&mut extents,
+          SourceViewExtent {from: intervals[at].entry, to: intervals[at].completed})
+      }
+      at = at + usize.ONE
+    }
+    if syntax == MatchSyntax.Let && declared.length > usize.ZERO && List<NodeId>.length(&declared[0].bindings) != usize.ZERO {
+      let exits = List<SourceVisit.ScopeExit>.asSlice(&reservation.exits)
+      at = usize.ZERO
+      while at < exits.length {
+        if exits[at].scope.index == subjects[scoped].scope.index {
+          run List<SourceViewExtent>.append(&mut extents, SourceViewExtent {from: input.usePoint, to: exits[at].point})
+        }
+        at = at + usize.ONE
+      }
+    }
+    run List<SourceViewAcquisition>.append(&mut ownership.views, SourceViewAcquisition {
+      loan: loan, record: record, result: actual.evaluation, source: input.evaluation,
+      scope: subjects[scoped].scope, point: input.usePoint, extents: move extents})
+    return ()
+  }
+  return CompilerBug.panic(b"prepared match view belongs to another expression")
+}
+
 // Reserve all real reference creations first, without observing any policy-selected source.
 // Activating each Construction once also avoids executing future invocation destination writes.
 effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &mut SourceVisit.Reservation)
   -> SourceOwnership ! OutOfMemoryError ? &mut Allocator {
   let mut ownership = SourceOwnership {loans: List<Loan>.make(), events: List<Event>.make(),
-    acquisitions: List<SourceInputAcquisition>.make()}
+    acquisitions: List<SourceInputAcquisition>.make(), views: List<SourceViewAcquisition>.make()}
   let nodes = prepared.body.nodes
   let authored = List<PreparedSources.Borrow>.asSlice(&prepared.borrows)
+  let views = List<PreparedSources.MatchView>.asSlice(&prepared.matchViews)
   let constructions = List<PreparedSources.Construction>.asSlice(&prepared.constructions)
   let operations = List<PreparedSources.Operation>.asSlice(&prepared.operations)
   let maps = List<PreparedSources.SelectionMap>.asSlice(&prepared.maps)
@@ -5329,6 +5468,29 @@ effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparatio
       if found == usize.MAX { CompilerBug.panic(b"authored source borrow has no prepared reference maps") }
       run sourceBorrowOrder(&mut sites, SourceBorrowSite {visit: at, point: actual.execute.index,
         kind: SourceBorrowKind.Authored {record: found}})
+    }
+    if let NodeKind.Expression {form: Expression.Match {subject, access, ..}, ..} = &nodes[actual.node.index].kind {
+      let mode = scrutineeOf(&access)
+      if mode == Scrutinee.Shared || mode == Scrutinee.Exclusive {
+        let mut record = usize.MAX
+        let mut each = usize.ZERO
+        while each < views.length {
+          if views[each].site.index == actual.node.index {
+            if record != usize.MAX { return CompilerBug.panic(b"match view has duplicate prepared acquisitions") }
+            record = each
+          }
+          each = each + usize.ONE
+        }
+        if record == usize.MAX { return CompilerBug.panic(b"borrowed match has no prepared view authority") }
+        // A returned reference with no authored place carries existing loans. Do not turn
+        // the view record into a temporary owner or acquire a fabricated descriptor loan.
+        let path = run pathOf(nodes, subject)
+        if path.root != usize.MAX {
+          let input = sourceAccessInput(actual, usize.ZERO, subject)
+          run sourceBorrowOrder(&mut sites, SourceBorrowSite {visit: at, point: input.usePoint.index,
+            kind: SourceBorrowKind.MatchView {record: record}})
+        }
+      }
     }
     let mut each = usize.ZERO
     while each < constructions.length {
@@ -5370,10 +5532,16 @@ effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparatio
     let site = ordered[at]
     let actual = &List<SourceVisit.Visit>.asSlice(&reservation.visits)[site.visit]
     let evaluation = actual.evaluation
+    if let SourceBorrowKind.MatchView {record} = site.kind {
+      run sourceMatchViewLoan(prepared, &reservation.*, actual, record, &mut ownership)
+      at = at + usize.ONE
+      continue
+    }
     let mut input = Option<SourceVisit.Input>.none()
     let mut route = Option<&PreparedSources.InputRoute>.none()
     let mut map = PreparedSources.MapId {index: usize.MAX}
     match site.kind {
+      SourceBorrowKind.MatchView {..} => { return CompilerBug.panic(b"match view entered descriptor acquisition") }
       SourceBorrowKind.Authored {record} => {
         let operands = List<SourceVisit.Input>.asSlice(&actual.inputs)
         if operands.length != usize.ONE { CompilerBug.panic(b"authored borrow lost its actual operand") }
