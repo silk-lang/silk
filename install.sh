@@ -20,7 +20,7 @@ set -eu
 
 repo=silk-lang/silk
 # The release signing key, also published as minisign.pub at the repository root.
-minisign_public_key=RWPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDERPLACEHOLDE
+minisign_public_key=RWQefAo9Dbb8LrlLPaqWdRNlX5th2l7r+4WYhxRNbe5K5URDUht1XUDs
 install_dir=${SILK_INSTALL:-$HOME/.silk}
 release=${SILK_RELEASE:-}
 channel=${SILK_CHANNEL:-auto}
