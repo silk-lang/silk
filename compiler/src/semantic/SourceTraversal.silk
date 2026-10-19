@@ -22,12 +22,12 @@ import CompilerBug
 /// Addressing a place does not copy its stored value. Dereferencing it still evaluates the
 /// reference descriptor, and an index expression still executes in source order.
 pub enum Access { Value, Place }
-pub enum ScopeKind { Body, Block, Statement, Arm }
+pub enum ScopeKind { Body, Block, Statement, Match, Arm }
 pub enum ExitKind { Normal, Return, Failure, Break, Continue, RunFailure }
 pub enum Retention { None, Arrays, Storage }
 pub struct OwnerId { pub index: usize }
 impl Copy for OwnerId {}
-pub union OwnerRoot { Local { pub local: LocalId }, Temporary { pub evaluation: EvalId } }
+pub union OwnerRoot { Local { pub local: LocalId }, Temporary { pub evaluation: EvalId }, Subject { pub node: NodeId, pub evaluation: EvalId } }
 impl Copy for OwnerRoot {}
 pub struct Owner {
   pub root: OwnerRoot
@@ -101,6 +101,7 @@ pub struct Reservation {
   pub loops: Vector<Loop>
   pub owners: Vector<Owner>
   pub ownerExits: Vector<OwnerExit>
+  pub subjects: Vector<Subject>
 }
 
 struct Frame {
@@ -108,17 +109,20 @@ struct Frame {
   scopeDepth: usize
 }
 impl Copy for Frame {}
-struct Subject {
-  node: NodeId
-  evaluation: EvalId
-  scope: ScopeId
+/// A match captures its subject once. Owned subjects have a distinct snapshot occurrence;
+/// borrowed/place subjects keep the actual scoped address, never an extra copied owner.
+pub struct Subject {
+  pub node: NodeId
+  pub source: EvalId
+  pub evaluation: EvalId
+  pub scope: ScopeId
+  pub owned: bool
 }
 impl Copy for Subject {}
 struct Walk {
   reservation: Reservation
   active: Vector<ScopeId>
   frames: Vector<Frame>
-  subjects: Vector<Subject>
   yes: Atom
   retention: Retention
 }
@@ -138,8 +142,8 @@ pub effect fn reserve<'body>(prepared: &SourcePreparation<'body>) -> Reservation
   run Program.fact(&mut skeleton.rules, Flow.reachable(&skeleton.flow, entry))
   let mut walk = Walk {reservation: Reservation {skeleton: move skeleton, entry: entry, exit: exit,
     visits: Vector<Visit>.make(), scopes: Vector<Scope>.make(), exits: Vector<ScopeExit>.make(), loops: Vector<Loop>.make(),
-    owners: Vector<Owner>.make(), ownerExits: Vector<OwnerExit>.make()},
-    active: Vector<ScopeId>.make(), frames: Vector<Frame>.make(), subjects: Vector<Subject>.make(), yes: yes, retention: Retention.None}
+    owners: Vector<Owner>.make(), ownerExits: Vector<OwnerExit>.make(), subjects: Vector<Subject>.make()},
+    active: Vector<ScopeId>.make(), frames: Vector<Frame>.make(), yes: yes, retention: Retention.None}
   run openScope(&mut walk, prepared.body.root, ScopeKind.Body)
   // The same entry eligibility as accepted ownership initialization: actual bindings acquire
   // definitions at their nodes, never at entry. No invented RHS stands for a parameter/capture.
@@ -621,7 +625,7 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
     Expression.PatternBinding {subject, ..} => {
       // A use/definition addresses the previously evaluated subject; it must not reevaluate
       // the subject expression (and cannot infer its identity from a type or region).
-      let subjects = Vector<Subject>.asSlice(&walk.subjects)
+      let subjects = Vector<Subject>.asSlice(&walk.reservation.subjects)
       let active = Vector<ScopeId>.asSlice(&walk.active)
       let mut at = subjects.length
       while at > usize.ZERO {
@@ -711,6 +715,8 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
       let tested = run after(&mut walk.*, evaluated.next)
       run Vector<Input>.append(&mut inputs.*, Input {node: subject, evaluation: evaluated.evaluation,
         usePoint: tested, access: subjectMode, read: Option<InputRead>.none()})
+      let enclosing = Vector<ScopeId>.length(&walk.active)
+      if syntax != MatchSyntax.Let { run openScope(&mut walk.*, id, ScopeKind.Match) }
       let active = Vector<ScopeId>.asSlice(&walk.active)
       let mut subjectScope = active[active.length - usize.ONE]
       if syntax == MatchSyntax.Let {
@@ -726,7 +732,16 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
           }
         }
       }
-      run Vector<Subject>.append(&mut walk.subjects, Subject {node: subject, evaluation: evaluated.evaluation, scope: subjectScope})
+      let owned = match &mode { SubjectAccess.Place {..} => false _ => true }
+      let mut retained = evaluated.evaluation
+      if owned {
+        // A copied/moved subject has distinct storage, even when the source is a local.
+        // Its identity is this acquisition, not the shared typed subject NodeId.
+        retained = run Skeleton.evaluate(&mut walk.reservation.skeleton, subject, EvaluationRole.Binding, tested)
+        drop run registerOwner(&mut walk.*, OwnerRoot.Subject {node: subject, evaluation: retained}, tested, syntax == MatchSyntax.Let)
+      }
+      run Vector<Subject>.append(&mut walk.reservation.subjects, Subject {node: subject,
+        source: evaluated.evaluation, evaluation: retained, scope: subjectScope, owned: owned})
       let joined = run point(&mut walk.*)
       let mut rejected = tested
       let values = Vector<MatchArm>.asSlice(&arms)
@@ -753,11 +768,12 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
           rejected = next
         }
         let result = run input(prepared, &mut walk.*, &mut inputs.*, values[arm].result, Access.Value, selected)
-        let ended = run closeScopes(&mut walk.*, depth, result, id, ExitKind.Normal)
+        let ended = run closeScopes(&mut walk.*, enclosing, result, id, ExitKind.Normal)
         run edge(&mut walk.*, ended, joined)
         Vector<ScopeId>.truncate(&mut walk.active, depth)
         arm = arm + usize.ONE
       }
+      Vector<ScopeId>.truncate(&mut walk.active, enclosing)
       return joined
     }
   }
@@ -808,6 +824,20 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
   let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
   let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
   let absent = Program.atom(&mut reservation.skeleton.rules)
+  // All subjects are structurally reserved already. Materialize each owned snapshot once;
+  // later source/definition closure supplies its RHS, including loop-carried sources.
+  let subjects = Vector<Subject>.asSlice(&reservation.subjects)
+  let mut subject = usize.ZERO
+  while subject < subjects.length {
+    if subjects[subject].owned {
+      let from = nodeRoot(endpoints, subjects[subject].node, EndpointRole.Value)
+      let into = nodeRoot(endpoints, subjects[subject].node, EndpointRole.Storage)
+      let placement = exactMap(maps, subjects[subject].node, from, into, MapKind.Place)
+      run Skeleton.materialize(&mut reservation.skeleton, endpoints, maps, placement,
+        subjects[subject].source, subjects[subject].evaluation, yes)
+    }
+    subject = subject + usize.ONE
+  }
   let count = Vector<Evaluation>.length(&reservation.skeleton.evaluations)
   let mut at = usize.ZERO
   while at < count {
@@ -876,7 +906,7 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
       let from = nodeRoot(endpoints, occurrence.node, EndpointRole.Value)
       let into = nodeRoot(endpoints, occurrence.node, EndpointRole.Storage)
       let placement = exactMap(maps, occurrence.node, from, into, MapKind.Place)
-      run Skeleton.materialize(&mut reservation.skeleton, endpoints, maps, placement, occurrence.evaluation, yes)
+      run Skeleton.materialize(&mut reservation.skeleton, endpoints, maps, placement, occurrence.evaluation, occurrence.evaluation, yes)
     }
     match &prepared.body.nodes[occurrence.node.index].kind {
       NodeKind.Expression {form: Expression.Local {local}, ..} => {
