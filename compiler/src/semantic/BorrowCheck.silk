@@ -2090,6 +2090,52 @@ struct SourceRuntimeEvents {
   unresolved: bool
 }
 
+enum MoveAccess { None, Unknown, Conflict }
+
+// Geometry of a genuinely reaching move. The caller retains diagnostic ordering and the
+// exact source event; this classifier neither chooses a reaching source nor assumes ID order.
+fn movedAccess(event: &Event, source: &Event) -> MoveAccess {
+  let shared = overlap(&source.place, &event.place)
+  if shared == usize.ZERO { return MoveAccess.None }
+  let ends = event.kind == Kind.Drop && covers(&event.place, &source.place)
+    && List<Step>.length(&event.place.steps) < List<Step>.length(&source.place.steps)
+  if ends || (event.kind == Kind.Write && covers(&event.place, &source.place)) { return MoveAccess.None }
+  // Inspecting an owner's tag does not read its moved payload. A write behind a moved
+  // descriptor still uses that descriptor, and a dynamic index can hit an exact moved slot.
+  let partial = event.kind == Kind.Inspect && !covers(&source.place, &event.place)
+  let used = shared == usize.ONE && (event.kind != Kind.Write || behind(&source.place, &event.place)) && !partial
+  if used || (shared == 2 && !partial && determined(&source.place)) { return MoveAccess.Conflict }
+  if !partial { return MoveAccess.Unknown }
+  return MoveAccess.None
+}
+
+struct LoanAccessOverlap {
+  overlap: usize
+  indexed: bool
+}
+impl Copy for LoanAccessOverlap {}
+
+fn loanAccessOverlap(locals: &[Local], loan: &Loan, event: &Event) -> LoanAccessOverlap {
+  let mut shared = overlap(&loan.place, &event.place)
+  let mut indexed = shared == 2
+  if shared != usize.ZERO && behind(&event.place, &loan.place) {
+    // Replacing a descriptor leaves its referent untouched. Consuming a known shared
+    // descriptor does too; the exact same local dereference boundary is still mandatory.
+    indexed = false
+    if event.kind == Kind.Write { shared = usize.ZERO }
+    else if event.kind == Kind.Move || event.kind == Kind.Drop {
+      shared = 2
+      if loan.precision == LoanPrecision.Exact && sharedLocalDescriptor(locals, &event.place) { shared = usize.ZERO }
+    }
+  }
+  return LoanAccessOverlap {overlap: shared, indexed: indexed}
+}
+
+fn preciseLoanConflict(loan: &Loan, selected: LoanAccessOverlap, caller: CallerSource) -> bool {
+  return (selected.overlap == usize.ONE || selected.indexed) && (loan.precision == LoanPrecision.Exact
+    || (loan.precision == LoanPrecision.Stored && caller == CallerSource.Actual))
+}
+
 // Runtime applicability belongs to the event's own point. For example, an argument borrow
 // occurs before a later never argument even when the enclosing result cannot complete.
 // Stable point ordering preserves the caller's ordering of coincident actual events.
@@ -4099,6 +4145,43 @@ effect fn sourceReleasedLoanPoints<'body>(graph: &SourceGraph.Graph<'body>, cont
   }
   return run releasedInstancePoints(points, control.entry, loan.created,
     List<bool>.asSlice(&occupied), List<bool>.asSlice(&ends))
+}
+
+// Flight classification retains the accepted strict interval endpoints. Cleanup and storage
+// ends additionally require paths on the same CFG; a source case is authenticated independently
+// of whether the source's old owner still contains it at the consuming event.
+effect fn sourceFlight<'body>(graph: &SourceGraph.Graph<'body>, control: &SourceControlProjection,
+  intervals: &[SourceIntervalProjection], loan: usize, point: usize, storageEnd: bool) -> CallerSource
+! OutOfMemoryError ? &mut Allocator {
+  let points = List<Point>.asSlice(&control.points)
+  if point >= points.length { return CallerSource.Unknown }
+  let reachable = SourceGraph.Graph.truth(graph,
+    List<SourceControl.Point>.asSlice(&SourceGraph.Graph.control(graph).points)[point].reachable)
+  if reachable == SourceTruth.False { return CallerSource.Absent }
+  let mut result = CallerSource.Absent
+  let mut at = usize.ZERO
+  while at < intervals.length {
+    let interval = &intervals[at]
+    if interval.source.loan == loan && interval.from < point && point < interval.to {
+      let present = sourceTruthAnd(reachable, SourceGraph.Graph.truth(graph, interval.evidence.present))
+      if SourceGraph.Graph.truth(graph, interval.evidence.missing) != SourceTruth.False { result = CallerSource.Unknown }
+      if present != SourceTruth.False {
+        if interval.from >= points.length || interval.to >= points.length { result = CallerSource.Unknown }
+        else if storageEnd || interval.cleanup {
+          let before = run pathReaches(points, interval.from, point)
+          if before && run pathReaches(points, point, interval.to) {
+            if present == SourceTruth.True && !control.unresolved { return CallerSource.Actual }
+            result = CallerSource.Unknown
+          }
+        } else {
+          if present == SourceTruth.True { return CallerSource.Actual }
+          result = CallerSource.Unknown
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return result
 }
 
 // Bind the accepted region solver to actual graph-backed loan requirements and validity.
@@ -9579,8 +9662,8 @@ effect fn inFlight(walker: &Walker, loan: &Loan, point: usize, definitions: &[u6
     if interval.from < point && point < interval.to
       && (interval.definition == usize.MAX || reaches(definitions, width, interval.read, interval.definition)) {
       if !interval.cleanup { return true }
-      let before = run pathReaches(walker, interval.from, point)
-      if before && run pathReaches(walker, point, interval.to) { return true }
+      let before = run pathReaches(List<Point>.asSlice(&walker.points), interval.from, point)
+      if before && run pathReaches(List<Point>.asSlice(&walker.points), point, interval.to) { return true }
     }
     at = at + usize.ONE
   }
@@ -9773,13 +9856,12 @@ effect fn reachingHoldings(walker: &Walker, width: usize) -> Reach
 
 // Graph reachability, used at storage ends rather than treating sibling arms as one numeric
 // interval. The ordinary conflict walk keeps its compact interval test.
-effect fn pathReaches(walker: &Walker, from: usize, to: usize) -> bool
+effect fn pathReaches(points: &[Point], from: usize, to: usize) -> bool
   ! OutOfMemoryError
   ? &mut Allocator {
   if from == usize.MAX || to == usize.MAX {
     return false
   }
-  let points = List<Point>.asSlice(&walker.points)
   let mut seen = List<bool>.make()
   let mut at = usize.ZERO
   while at < points.length {
@@ -9828,8 +9910,8 @@ effect fn flightEnds(
     if interval.to != point && interval.from < point && point < interval.to
       && (interval.definition == usize.MAX
       || reaches(definitions, width, interval.read, interval.definition)) {
-      let arrived = run pathReaches(walker, interval.from, point)
-      if arrived && run pathReaches(walker, point, interval.to) {
+      let arrived = run pathReaches(List<Point>.asSlice(&walker.points), interval.from, point)
+      if arrived && run pathReaches(List<Point>.asSlice(&walker.points), point, interval.to) {
         return true
       }
     }
@@ -9864,7 +9946,7 @@ effect fn expiredUse(
         && pathsOverlap(walker, points[point].read, all[at].field)
         && !overwrites(walker, points[point].written, all[at].field)
         && reaches(definitions, definitionWidth, point, at)
-        && run pathReaches(walker, event.point, point) {
+        && run pathReaches(List<Point>.asSlice(&walker.points), event.point, point) {
         return points[point].span
       }
       at = at + usize.ONE
@@ -9943,7 +10025,7 @@ effect fn holdingUse(walker: &Walker, holding: usize, fallback: Location, defini
   while step < points.length {
     let point = (held.point + step) % points.length
     if points[point].uses == held.holder && pathsOverlap(walker, points[point].read, held.field)
-      && reaches(definitions, width, point, holding) && run pathReaches(walker, held.point, point) {
+      && reaches(definitions, width, point, holding) && run pathReaches(List<Point>.asSlice(&walker.points), held.point, point) {
       return points[point].span
     }
     step = step + usize.ONE
@@ -10381,32 +10463,16 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
     while event.kind != Kind.End && event.kind != Kind.Expire && bit < moved.length {
       let source = &events[moved[bit]]
       if reaches(List<u64>.asSlice(&reach.entering), moveWidth, event.point, bit) {
-        let shared = overlap(&source.place, &event.place)
-        if shared != usize.ZERO {
-          // A replacement of the whole moved place reinitializes it, and a drop of an owner ends
-          // the parts that remain after a part was moved out.
-          let ends = event.kind == Kind.Drop && covers(&event.place, &source.place)
-            && List<Step>.length(&event.place.steps) < List<Step>.length(&source.place.steps)
-          if !ends && (event.kind != Kind.Write || !covers(&event.place, &source.place)) {
-            // Inspecting the tag of an owner reads none of its moved parts.
-            let partial = event.kind == Kind.Inspect && !covers(&source.place, &event.place)
-            // A write behind a moved reference uses the reference to reach its referent.
-            // A runtime index may name the moved element itself, so reading or writing through it
-            // uses the moved place, as the bootstrap reports (OWN0001).
-            let used = shared == usize.ONE && (event.kind != Kind.Write || behind(&source.place, &event.place)) && !partial
-            if used || (shared == 2 && !partial && determined(&source.place)) {
-              if List<Report>.length(&reports) == usize.ZERO {
-                return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UseAfterMove, access: event.span, earlier: Option<Location>.some(source.span), reports: List<Report>.make()}
-              }
-              stopped = true
-              break
-            }
-            // A partial replacement of a moved place, or an overlap decided by an unknown index.
-            if !partial {
-              unknown = true
-            }
+        let classification = movedAccess(event, source)
+        if classification == MoveAccess.Conflict {
+          if List<Report>.length(&reports) == usize.ZERO {
+            return Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions, code: RejectionCode.UseAfterMove, access: event.span,
+              earlier: Option<Location>.some(source.span), reports: List<Report>.make()}
           }
+          stopped = true
+          break
         }
+        if classification == MoveAccess.Unknown { unknown = true }
       }
       bit = bit + usize.ONE
     }
@@ -10472,24 +10538,8 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
       } else if index != event.loan && !deferred && !lentTo(&loans[index], &event.binders) {
         let code = conflictCode(event.kind, loans[index].exclusive)
         if let Option<RejectionCode>.Some {value} = move code {
-          let mut shared = overlap(&loans[index].place, &event.place)
-          // A runtime index may name the lent element itself, so the access conflicts with the
-          // loan as the bootstrap reports it (OWN0011).
-          let mut indexed = shared == 2
-          if shared != usize.ZERO && behind(&event.place, &loans[index].place) {
-            // Replacing a reference leaves the referent it lent untouched. Consuming a known
-            // shared descriptor does too: `behind` authenticates this same local's dereference
-            // boundary. The referent's own loans and source obligations remain independently live.
-            indexed = false
-            if event.kind == Kind.Write {
-              shared = usize.ZERO
-            } else if event.kind == Kind.Move || event.kind == Kind.Drop {
-              shared = 2
-              if loans[index].precision == LoanPrecision.Exact && sharedLocalDescriptor(locals, &event.place) {
-                shared = usize.ZERO
-              }
-            }
-          }
+          let selected = loanAccessOverlap(locals, &loans[index], event)
+          let shared = selected.overlap
           if shared != usize.ZERO {
             let mut live = run inFlight(&walker, &loans[index], event.point, List<u64>.asSlice(&definitions.entering), definitionWidth)
             if !live && definitionWidth > usize.ZERO {
@@ -10524,8 +10574,7 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
             if live {
               // An approximate loan's conflict is not a proof either way: the body answers
               // `imprecise`, which is unchecked, never `Checked`.
-              if (shared == usize.ONE || indexed) && (loans[index].precision == LoanPrecision.Exact
-                || (loans[index].precision == LoanPrecision.Stored && caller == CallerSource.Actual)) {
+              if preciseLoanConflict(&loans[index], selected, caller) {
                 run addReport(&mut reports, Report {code: value, access: event.target, related: true, earlier: loans[index].origin})
                 // A write, move or drop of body storage leaves a view its borrow made expired, which
                 // the view's next use reports (OWN0019), as the bootstrap's lifetime analysis
