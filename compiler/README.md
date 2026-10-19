@@ -211,6 +211,15 @@ Borrow checking remains step 14: successful builds print a `SILK_GAP borrow-chec
 emitted bodies and a `SILK_GAP borrow-check root-package` summary of the concrete root-package
 bodies, each with a per-reason breakdown, then one `SILK_GAP borrow-check body` line naming each
 unchecked concrete root-package body by its block.
+Direct calls retain authenticated finite source loans through shared views, slices and stored
+inputs. Their declared lifetime bounds identify the possible source of each complete owned record
+field path, including nested fields, before inference coalesces lifetime arguments. An immediate
+Effect run uses the same success-result mapping. Reference and element boundaries keep their
+conservative treatment. A projected sibling does not inherit the other field's loans. A shared reference supplies
+its authenticated outer loan even when its generic referent is unknown; this proves nothing about
+loans inside that referent. Other unknown or multi-region input provenance keeps its conservative
+treatment, and an assignment temporary still ends with
+its statement, reporting `OWN0019` at a later retained use before MIR verification.
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
 referent, an array element and a covariant nominal lifetime argument may differ: a `'static`
