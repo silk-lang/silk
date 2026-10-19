@@ -2041,6 +2041,221 @@ struct SourceInputAcquisition {
 }
 impl Copy for SourceInputAcquisition {}
 
+// Access syntax is independent of the source histories a read later attributes. In particular,
+// these paths do not assert that a call-returned descriptor addresses its loan's original place.
+struct SourceAccessEvent {
+  evaluation: SourceGraph.EvalId
+  event: Event
+}
+struct SourceAccessRefusal {
+  point: SourceControl.PointId
+  reason: BorrowStatus
+}
+struct SourceAccessProjection {
+  events: Vector<SourceAccessEvent>
+  refusals: Vector<SourceAccessRefusal>
+}
+
+effect fn sourceAccessEvent(events: &mut Vector<SourceAccessEvent>, evaluation: SourceGraph.EvalId,
+  point: SourceControl.PointId, path: &Path, kind: Kind, span: Location, target: Location) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if path.root == usize.MAX { CompilerBug.panic(b"ownership access has no actual place root") }
+  run Vector<SourceAccessEvent>.append(&mut events.*, SourceAccessEvent {evaluation: evaluation,
+    event: Event {point: point.index, place: Place {root: path.root, steps: run copySteps(Vector<Step>.asSlice(&path.steps))},
+      kind: kind, span: span, target: target, loan: usize.MAX, consumesTarget: usize.ZERO,
+      refiner: path.refiner, refinedDepth: path.refinedDepth, binders: run copyBinders(Vector<usize>.asSlice(&path.binders))}})
+  return ()
+}
+
+fn sourceAccessInput(actual: &SourceVisit.Visit, ordinal: usize, node: NodeId) -> SourceVisit.Input {
+  let inputs = Vector<SourceVisit.Input>.asSlice(&actual.inputs)
+  if ordinal >= inputs.length || inputs[ordinal].node.index != node.index {
+    return CompilerBug.panic(b"ownership access lost its actual ordered input")
+  }
+  return inputs[ordinal]
+}
+
+// The moves in a replacement's RHS belong to that actual evaluation subtree, not to every
+// earlier event or every evaluation of the same typed NodeId. A pattern binding's retained
+// subject is an address dependency; reading it does not execute the subject expression again.
+effect fn sourceAccessSubtree<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  root: SourceGraph.EvalId) -> Vector<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut selected = Vector<bool>.make()
+  let mut at = usize.ZERO
+  while at < Vector<SourceGraph.Evaluation>.length(&reservation.skeleton.evaluations) {
+    run Vector<bool>.append(&mut selected, false)
+    at = at + usize.ONE
+  }
+  let mut pending = Vector<SourceGraph.EvalId>.make()
+  run Vector<SourceGraph.EvalId>.append(&mut pending, root)
+  while Vector<SourceGraph.EvalId>.length(&pending) != usize.ZERO {
+    let current = match move Vector<SourceGraph.EvalId>.pop(&mut pending) {
+      Option<SourceGraph.EvalId>.Some {value} => value
+      _ => { return CompilerBug.panic(b"ownership access subtree lost its pending occurrence") }
+    }
+    if Vector<bool>.asSlice(&selected)[current.index] { continue }
+    Vector<bool>.asMutSlice(&mut selected)[current.index] = true
+    let actual = SourceVisit.occurrence(reservation, current)
+    if let NodeKind.Expression {form: Expression.PatternBinding {..}, ..} = &prepared.body.nodes[actual.node.index].kind {
+      continue
+    }
+    let inputs = Vector<SourceVisit.Input>.asSlice(&actual.inputs)
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      run Vector<SourceGraph.EvalId>.append(&mut pending, inputs[at].evaluation)
+      at = at + usize.ONE
+    }
+  }
+  return move selected
+}
+
+fn sourceConsumedTarget(events: &mut Vector<SourceAccessEvent>, written: usize, rhs: &[bool], statement: Location) -> () {
+  let all = Vector<SourceAccessEvent>.asMutSlice(&mut events.*)
+  let mut at = usize.ZERO
+  while at < all.length {
+    if rhs[all[at].evaluation.index] && (all[at].event.kind == Kind.Move || all[at].event.kind == Kind.Drop) {
+      let shared = overlap(&all[at].event.place, &all[written].event.place)
+      if shared == usize.ONE || (shared != usize.ZERO && all[written].event.consumesTarget == usize.ZERO) {
+        all[written].event.consumesTarget = shared
+        all[written].event.span = statement
+        all[written].event.target = statement
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Project ordinary authored accesses onto reserved runtime points. Loan acquisition, match
+// subject access and owner exits have their own semantic handlers. Holding/cleanup effects,
+// guarded consumption and store-policy refusals are also separate consumers of these events;
+// this inventory alone is not a completed ownership proof.
+effect fn sourceAccessEvents<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  cleanup: &[LoanCleanup]) -> SourceAccessProjection ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut projection = SourceAccessProjection {events: Vector<SourceAccessEvent>.make(), refusals: Vector<SourceAccessRefusal>.make()}
+  let nodes = prepared.body.nodes
+  let visits = Vector<SourceVisit.Visit>.asSlice(&reservation.visits)
+  let mut at = usize.ZERO
+  while at < visits.length {
+    let actual = &visits[at]
+    let span = nodes[actual.node.index].origin.location
+    let shape = run shapeOf(nodes, actual.node)
+    match move shape {
+      Shape.ReadPlace => {
+        if actual.access == SourceVisit.Access.Value {
+          let written = run pathOf(nodes, actual.node)
+          let mut owned = written.root != usize.MAX
+          if !owned {
+            let base = projectedBase(nodes, actual.node)
+            let descriptor = prepared.body.locals.length + nodes.length + base.index
+            owned = descriptor < cleanup.length
+              && (cleanup[descriptor].unknown || Vector<Shared<Lifetime>>.length(&cleanup[descriptor].regions) != usize.ZERO)
+          }
+          if owned {
+            let path = run sourceAuthoredPath(prepared, reservation, SourceVisit.Input {node: actual.node,
+              evaluation: actual.evaluation, usePoint: actual.execute, access: actual.access, read: Option<PreparedSources.InputRead>.none()})
+            run sourceAccessEvent(&mut projection.events, actual.evaluation, actual.execute, &path, Kind.Read, span, span)
+          }
+        }
+      }
+      Shape.Move {value, consumed} => {
+        if consumed {
+          let written = run pathOf(nodes, value)
+          if written.root == usize.MAX || written.through {
+            run Vector<SourceAccessRefusal>.append(&mut projection.refusals,
+              SourceAccessRefusal {point: actual.execute, reason: BorrowStatus.StoredLoans})
+          } else {
+            let path = run sourceAuthoredPath(prepared, reservation, sourceAccessInput(actual, usize.ZERO, value))
+            run sourceAccessEvent(&mut projection.events, actual.evaluation, actual.execute, &path, Kind.Move, span, nodes[value.index].origin.location)
+          }
+        }
+      }
+      Shape.Drop {value, consumed} => {
+        if consumed {
+          let written = run pathOf(nodes, value)
+          if written.root == usize.MAX || written.through {
+            run Vector<SourceAccessRefusal>.append(&mut projection.refusals,
+              SourceAccessRefusal {point: actual.execute, reason: BorrowStatus.StoredLoans})
+          } else {
+            let path = run sourceAuthoredPath(prepared, reservation, sourceAccessInput(actual, usize.ZERO, value))
+            run sourceAccessEvent(&mut projection.events, actual.evaluation, actual.execute, &path, Kind.Drop, span, span)
+          }
+        }
+      }
+      Shape.Assignment {local, value} => {
+        let path = Path {root: local, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make(),
+          refiner: usize.MAX, refinedDepth: usize.ZERO, binders: Vector<usize>.make()}
+        let target = Location {start: span.start, end: span.start + usize.ONE}
+        let event = Vector<SourceAccessEvent>.length(&projection.events)
+        run sourceAccessEvent(&mut projection.events, actual.evaluation, actual.execute, &path, Kind.Write, target, target)
+        let rhs = run sourceAccessSubtree(prepared, reservation, sourceAccessInput(actual, usize.ZERO, value).evaluation)
+        sourceConsumedTarget(&mut projection.events, event, Vector<bool>.asSlice(&rhs), span)
+      }
+      Shape.PlaceAssignment {target, value} => {
+        let written = run pathOf(nodes, target)
+        if written.root == usize.MAX {
+          run Vector<SourceAccessRefusal>.append(&mut projection.refusals,
+            SourceAccessRefusal {point: actual.execute, reason: BorrowStatus.StoredLoans})
+        } else {
+          let path = run sourceAuthoredPath(prepared, reservation, sourceAccessInput(actual, usize.ZERO, target))
+          let mut targetSpan = writtenSpan(nodes, target)
+          if !path.through && Vector<Step>.length(&path.steps) == usize.ZERO { targetSpan = nodes[target.index].origin.location }
+          let event = Vector<SourceAccessEvent>.length(&projection.events)
+          run sourceAccessEvent(&mut projection.events, actual.evaluation, actual.execute, &path, Kind.Write, targetSpan, targetSpan)
+          if !path.through {
+            let rhs = run sourceAccessSubtree(prepared, reservation, sourceAccessInput(actual, usize.ONE, value).evaluation)
+            sourceConsumedTarget(&mut projection.events, event, Vector<bool>.asSlice(&rhs), span)
+          }
+        }
+      }
+      Shape.Displace {target, value} => {
+        let written = run pathOf(nodes, target)
+        if written.root == usize.MAX || (!written.through && run nodeRetains(nodes, target, prepared.body.owner)) {
+          run Vector<SourceAccessRefusal>.append(&mut projection.refusals,
+            SourceAccessRefusal {point: actual.execute, reason: BorrowStatus.StoredLoans})
+        } else {
+          let path = run sourceAuthoredPath(prepared, reservation, sourceAccessInput(actual, usize.ZERO, target))
+          let read = match actual.displaced {
+            Option<SourceGraph.EvalId>.Some {value} => value
+            _ => { return CompilerBug.panic(b"replacement access has no actual displaced read") }
+          }
+          let evaluations = Vector<SourceGraph.Evaluation>.asSlice(&reservation.skeleton.evaluations)
+          let targetSpan = writtenSpan(nodes, target)
+          run sourceAccessEvent(&mut projection.events, actual.evaluation, evaluations[read.index].point, &path, Kind.Read, targetSpan, targetSpan)
+          let event = Vector<SourceAccessEvent>.length(&projection.events)
+          run sourceAccessEvent(&mut projection.events, actual.evaluation, evaluations[actual.evaluation.index].point, &path, Kind.Write, targetSpan, targetSpan)
+          if !path.through {
+            let rhs = run sourceAccessSubtree(prepared, reservation, sourceAccessInput(actual, usize.ONE, value).evaluation)
+            sourceConsumedTarget(&mut projection.events, event, Vector<bool>.asSlice(&rhs), span)
+          }
+        }
+      }
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  return move projection
+}
+
+// Event numbering is not point numbering: several actual input acquisitions may occur at
+// one use point. The eventual conflict/region consumers must inspect the entire point row.
+effect fn sourceEventsAt(events: &[Event], pointCount: usize) -> Vector<Vector<usize>>
+! OutOfMemoryError ? &mut Allocator {
+  let mut rows = Vector<Vector<usize>>.make()
+  let mut at = usize.ZERO
+  while at < pointCount {
+    run Vector<Vector<usize>>.append(&mut rows, Vector<usize>.make())
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < events.length {
+    if events[at].point >= pointCount { return CompilerBug.panic(b"ownership event names a foreign CFG point") }
+    run Vector<usize>.append(&mut Vector<Vector<usize>>.asMutSlice(&mut rows)[events[at].point], at)
+    at = at + usize.ONE
+  }
+  return move rows
+}
+
 // Written operand order is supplied by the operation, never recovered by sorting ValueIds.
 // A root denotes the actual physical value family (including an implicit reference input),
 // not its selected/original contract parameter coordinate.
@@ -3336,10 +3551,10 @@ fn sourceCreatesReference(route: &PreparedSources.InputRoute) -> bool {
     || route.transport == PreparedSources.Transport.BorrowMutable
 }
 
-// Extends the actual written operand by its producer-selected physical component path. This
-// never uses selected/original parameter coordinates to infer the storage being borrowed.
-effect fn sourceInputPath<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
-  input: SourceVisit.Input, endpoint: PreparedSources.EndpointId) -> Path ! OutOfMemoryError ? &mut Allocator {
+// Authored address syntax retains its actual hidden/subject owner occurrence. This does not
+// resolve a descriptor to the storage it addresses; referent steps remain explicit.
+effect fn sourceAuthoredPath<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  input: SourceVisit.Input) -> Path ! OutOfMemoryError ? &mut Allocator {
   let nodes = prepared.body.nodes
   let mut path = run pathOf(nodes, input.node)
   if path.root == usize.MAX {
@@ -3358,6 +3573,14 @@ effect fn sourceInputPath<'body>(prepared: &PreparedSources.SourcePreparation<'b
       path.root = sourceTemporaryRoot(prepared, reservation, inputs[0].evaluation)
     }
   }
+  return move path
+}
+
+// Extends the actual written operand by its producer-selected physical component path. This
+// never uses selected/original parameter coordinates to infer the storage being borrowed.
+effect fn sourceInputPath<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &SourceVisit.Reservation,
+  input: SourceVisit.Input, endpoint: PreparedSources.EndpointId) -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut path = run sourceAuthoredPath(prepared, reservation, input)
   let endpoints = Vector<PreparedSources.Endpoint>.asSlice(&prepared.endpoints)
   let mut ancestry = Vector<PreparedSources.EndpointId>.make()
   let mut current = endpoint
@@ -12581,6 +12804,58 @@ effect fn regionChoiceClaims() -> ()
   run Vector<SafetyObligation>.append(&mut obligations, retentionTestRelation(&choice, &universal, false))
   run Testing.expect(!run choiceRelationsProved(&walker, &owner, Vector<SafetyObligation>.asSlice(&obligations)),
     "a body-scoped choice is never a universal premise")
+  return ()
+}
+
+test effect fn accessProjectionKeepsSharedPointsAndActualReplacementOperands() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run sourceAccessClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sourceAccessClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut events = Vector<SourceAccessEvent>.make()
+  let mut path = Path {root: 0, through: false, steps: Vector<Step>.make(), indexes: Vector<NodeId>.make(),
+    refiner: usize.MAX, refinedDepth: 0, binders: Vector<usize>.make()}
+  run Vector<Step>.append(&mut path.steps, anyElement())
+  let target = Location.make(8, 9)
+  let statement = Location.make(8, 15)
+  run sourceAccessEvent(&mut events, SourceGraph.EvalId {index: 0}, SourceControl.PointId {index: 0},
+    &path, Kind.Move, Location.make(2, 4), Location.make(3, 4))
+  Vector<Step>.asMutSlice(&mut path.steps)[0] = elementStep(4)
+  run sourceAccessEvent(&mut events, SourceGraph.EvalId {index: 1}, SourceControl.PointId {index: 0},
+    &path, Kind.Drop, Location.make(5, 7), Location.make(5, 7))
+  run sourceAccessEvent(&mut events, SourceGraph.EvalId {index: 2}, SourceControl.PointId {index: 1},
+    &path, Kind.Write, target, target)
+  let mut rhs = Vector<bool>.make()
+  run Vector<bool>.append(&mut rhs, false)
+  run Vector<bool>.append(&mut rhs, false)
+  run Vector<bool>.append(&mut rhs, false)
+  sourceConsumedTarget(&mut events, 2, Vector<bool>.asSlice(&rhs), statement)
+  run Testing.expect(Vector<SourceAccessEvent>.asSlice(&events)[2].event.consumesTarget == 0
+    && Vector<SourceAccessEvent>.asSlice(&events)[2].event.span.end == 9,
+    "an earlier overlapping move outside this actual RHS cannot widen the replacement diagnostic")
+  Vector<bool>.asMutSlice(&mut rhs)[0] = true
+  sourceConsumedTarget(&mut events, 2, Vector<bool>.asSlice(&rhs), statement)
+  run Testing.expect(Vector<SourceAccessEvent>.asSlice(&events)[2].event.consumesTarget == 2
+    && Vector<SourceAccessEvent>.asSlice(&events)[2].event.target.end == 15,
+    "an actual RHS move through an unknown index preserves the uncertain overlapping-assignment gate and statement span")
+  Vector<bool>.asMutSlice(&mut rhs)[1] = true
+  sourceConsumedTarget(&mut events, 2, Vector<bool>.asSlice(&rhs), statement)
+  run Testing.expect(Vector<SourceAccessEvent>.asSlice(&events)[2].event.consumesTarget == 1,
+    "a definite RHS overlap dominates an uncertain one")
+  let mut projected = Vector<Event>.make()
+  while Vector<SourceAccessEvent>.length(&events) != usize.ZERO {
+    if let Option<SourceAccessEvent>.Some {value} = move Vector<SourceAccessEvent>.pop(&mut events) {
+      run Vector<Event>.insert(&mut projected, 0, move value.event)
+    }
+  }
+  let rows = run sourceEventsAt(Vector<Event>.asSlice(&projected), 3)
+  let all = Vector<Vector<usize>>.asSlice(&rows)
+  run Testing.expect(Vector<usize>.length(&all[0]) == 2 && Vector<usize>.asSlice(&all[0])[0] == 0
+    && Vector<usize>.asSlice(&all[0])[1] == 1 && Vector<usize>.asSlice(&all[1])[0] == 2
+    && Vector<usize>.length(&all[2]) == 0,
+    "all events at one actual CFG point survive indexing, while an empty point gains no event")
   return ()
 }
 
