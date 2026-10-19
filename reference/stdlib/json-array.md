@@ -25,7 +25,7 @@ pub struct JsonArray
 
 Owned formatting state for one open JSON array.
 
-<a id="impl"></a>
+<a id="JsonArray.impl"></a>
 
 ## Implementation `JsonArray`
 
@@ -33,7 +33,7 @@ Owned formatting state for one open JSON array.
 impl JsonArray
 ```
 
-<a id="impl.begin"></a>
+<a id="JsonArray.impl.begin"></a>
 
 ### Associated function `begin`
 
@@ -44,7 +44,7 @@ pub effect fn begin(options: &JsonOptions)
 
 Opens an array after checking its depth limit.
 
-<a id="impl.items"></a>
+<a id="JsonArray.impl.items"></a>
 
 ### Method `items`
 
@@ -60,7 +60,7 @@ Writes all values in source order and returns the open array state.
 #### Details
 The incoming Effect runs once. If it fails, this operation writes nothing.
 
-<a id="impl.end"></a>
+<a id="JsonArray.impl.end"></a>
 
 ### Method `end`
 

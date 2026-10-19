@@ -9,7 +9,7 @@ Use [`JsonReader`](#JsonReader) when a JSON document does not fit in one input s
 `silk.json_scanner.JsonScanner` when the complete document is available.
 
 ## Details
-Each call to [`next`](#impl.next) returns one validated token. Raw string, number, and literal bytes use
+Each call to [`next`](#JsonReader.impl.next) returns one validated token. Raw string, number, and literal bytes use
 caller-owned scratch storage. The reader keeps no input or scratch view between calls.
 
 ## Gotchas
@@ -68,7 +68,7 @@ Owned state for one JSON document read from `BufferedInput`.
 This state keeps no input or scratch reference. It retains scanner progress across input
 fills. A completed document returns sticky end-of-input.
 
-<a id="impl"></a>
+<a id="JsonReader.impl"></a>
 
 ## Implementation `JsonReader`
 
@@ -76,7 +76,7 @@ fills. A completed document returns sticky end-of-input.
 impl JsonReader
 ```
 
-<a id="impl.make"></a>
+<a id="JsonReader.impl.make"></a>
 
 ### Associated function `make`
 
@@ -86,7 +86,7 @@ pub fn make() -> JsonReader
 
 Creates an empty reader for one JSON document without allocation.
 
-<a id="impl.next"></a>
+<a id="JsonReader.impl.next"></a>
 
 ### Method `next`
 

@@ -1111,15 +1111,15 @@ pub struct FetchRequest<'uri, 'method, 'headers, 'policy>
 
 A semantic request whose body authority is supplied by one source-specific operation.
 
-<a id="impl"></a>
+<a id="FetchRequest.impl"></a>
 
-## Implementation ``
+## Implementation `FetchRequest<'uri, 'method, 'headers, 'policy>`
 
 ```silk
 impl<'uri, 'method, 'headers, 'policy> FetchRequest<'uri, 'method, 'headers, 'policy>
 ```
 
-<a id="impl.make"></a>
+<a id="FetchRequest.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1139,7 +1139,7 @@ pub fn make(
 
 Constructs a semantic request while preserving its explicit method and ordered headers.
 
-<a id="impl.get"></a>
+<a id="FetchRequest.impl.get"></a>
 
 ### Associated function `get`
 
@@ -1269,7 +1269,7 @@ pub maxBufferedBytes: usize
 
 Positive per-read response delivery scratch capacity.
 
-<a id="impl-2"></a>
+<a id="FetchOptions.impl"></a>
 
 ## Implementation `FetchOptions`
 
@@ -1277,7 +1277,7 @@ Positive per-read response delivery scratch capacity.
 impl FetchOptions
 ```
 
-<a id="impl.defaults"></a>
+<a id="FetchOptions.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -1287,7 +1287,7 @@ pub fn defaults() -> FetchOptions
 
 Returns Manual, Raw, context-pool, inherited-route policy with finite standard limits.
 
-<a id="impl.validate"></a>
+<a id="FetchOptions.impl.validate"></a>
 
 ### Method `validate`
 
@@ -1307,15 +1307,15 @@ pub struct Fetch<C>
 
 An owned target-neutral facade around one explicit acquisition context.
 
-<a id="impl-3"></a>
+<a id="Fetch.impl"></a>
 
-## Implementation ``
+## Implementation `Fetch<C>`
 
 ```silk
 impl<C> Fetch<C>
 ```
 
-<a id="impl.make-2"></a>
+<a id="Fetch.impl.make"></a>
 
 ### Associated function `make`
 

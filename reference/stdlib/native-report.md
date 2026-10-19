@@ -26,7 +26,7 @@ pub struct NativeReport
 
 Per-report output limits and success state, with no process-global storage.
 
-<a id="impl"></a>
+<a id="NativeReport.impl"></a>
 
 ## Implementation `NativeReport`
 
@@ -34,7 +34,7 @@ Per-report output limits and success state, with no process-global storage.
 impl NativeReport
 ```
 
-<a id="impl.make"></a>
+<a id="NativeReport.impl.make"></a>
 
 ### Associated function `make`
 
@@ -47,7 +47,7 @@ Creates an independent writer borrowing fd, with explicit byte and caller-frame 
 #### Details
 Construction allocates nothing. Limits apply across the primary report and its causes.
 
-<a id="impl.unhandled"></a>
+<a id="NativeReport.impl.unhandled"></a>
 
 ### Method `unhandled`
 
@@ -60,7 +60,7 @@ Writes the primary typed-failure classification, canonical identity and known so
 #### Gotchas
 The selected runtime must complete failure-payload cleanup before calling this operation.
 
-<a id="impl.fatal"></a>
+<a id="NativeReport.impl.fatal"></a>
 
 ### Method `fatal`
 
@@ -73,7 +73,7 @@ Writes a distinct best-effort fatal classification, reason and known origin.
 #### Gotchas
 Returning from this formatter grants neither trap recovery nor structured cleanup.
 
-<a id="impl.frame"></a>
+<a id="NativeReport.impl.frame"></a>
 
 ### Method `frame`
 
@@ -87,7 +87,7 @@ Appends an outward logical caller frame, excluding the already written origin.
 Exhausting the frame limit writes one truncation marker if the byte budget permits it,
 then marks the report incomplete. Later calls commit no additional output.
 
-<a id="impl.truncate"></a>
+<a id="NativeReport.impl.truncate"></a>
 
 ### Method `truncate`
 
@@ -101,7 +101,7 @@ Marks missing diagnostic context with one bounded marker and stops later output.
 Use when source context storage cannot retain a frame or cause. An earlier output failure
 suppresses the marker; repeating this operation writes nothing further.
 
-<a id="impl.cause"></a>
+<a id="NativeReport.impl.cause"></a>
 
 ### Method `cause`
 
@@ -111,7 +111,7 @@ pub effect fn cause(self: &mut Self, identity: string, source: string) -> bool
 
 Appends a retained recovery cause after the primary failure and its logical callers.
 
-<a id="impl.succeeded"></a>
+<a id="NativeReport.impl.succeeded"></a>
 
 ### Method `succeeded`
 

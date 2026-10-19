@@ -6,7 +6,7 @@ Deterministic bounded TLS-server certificate paths to explicit trust authority.
 
 ## When to use
 
-Use [`CertificatePath.validate`](#impl.validate) after certificate decoding and before HTTPS identity and TLS
+Use [`CertificatePath.validate`](#CertificatePath.impl.validate) after certificate decoding and before HTTPS identity and TLS
 CertificateVerify checks. Supply every trust candidate explicitly as a [`TrustAnchor`](./trust-anchor.md#TrustAnchor).
 
 ## Details
@@ -145,7 +145,7 @@ pub profile: ProfileLimits
 
 Bounds for each semantic certificate-profile inspection.
 
-<a id="impl"></a>
+<a id="ValidationLimits.impl.Copy"></a>
 
 ## Implementation `Copy for ValidationLimits`
 
@@ -153,7 +153,7 @@ Bounds for each semantic certificate-profile inspection.
 impl Copy for ValidationLimits
 ```
 
-<a id="impl-2"></a>
+<a id="ValidationLimits.impl"></a>
 
 ## Implementation `ValidationLimits`
 
@@ -161,7 +161,7 @@ impl Copy for ValidationLimits
 impl ValidationLimits
 ```
 
-<a id="impl.defaults"></a>
+<a id="ValidationLimits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -501,7 +501,7 @@ Call
 
 The validation call rather than one certificate.
 
-<a id="impl-3"></a>
+<a id="ValidationLocation.impl.Copy"></a>
 
 ## Implementation `Copy for ValidationLocation`
 
@@ -799,15 +799,15 @@ pub struct ValidatedPath<'a>
 
 One borrowed selected path plus owned caller-order intermediate indices.
 
-<a id="impl-4"></a>
+<a id="ValidatedPath.impl"></a>
 
-## Implementation ``
+## Implementation `ValidatedPath<'a>`
 
 ```silk
 impl<'a> ValidatedPath<'a>
 ```
 
-<a id="impl.leaf"></a>
+<a id="ValidatedPath.impl.leaf"></a>
 
 ### Method `leaf`
 
@@ -817,7 +817,7 @@ pub fn leaf(self: &Self) -> &'a Certificate
 
 Borrows the exact caller-supplied leaf certificate.
 
-<a id="impl.anchorIndex"></a>
+<a id="ValidatedPath.impl.anchorIndex"></a>
 
 ### Method `anchorIndex`
 
@@ -827,7 +827,7 @@ pub fn anchorIndex(self: &Self) -> usize
 
 Returns the selected trust anchor's original caller index.
 
-<a id="impl.intermediateCount"></a>
+<a id="ValidatedPath.impl.intermediateCount"></a>
 
 ### Method `intermediateCount`
 
@@ -837,7 +837,7 @@ pub fn intermediateCount(self: &Self) -> usize
 
 Returns the number of selected peer intermediate certificates.
 
-<a id="impl.intermediateIndex"></a>
+<a id="ValidatedPath.impl.intermediateIndex"></a>
 
 ### Method `intermediateIndex`
 
@@ -847,7 +847,7 @@ pub fn intermediateIndex(self: &Self, index: usize) -> Option<usize>
 
 Returns one selected intermediate's original caller index, in leaf-to-anchor order.
 
-<a id="impl.validationTime"></a>
+<a id="ValidatedPath.impl.validationTime"></a>
 
 ### Method `validationTime`
 
@@ -857,7 +857,7 @@ pub fn validationTime(self: &Self) -> Instant
 
 Returns the copied caller-supplied validation instant.
 
-<a id="impl.revocationStatus"></a>
+<a id="ValidatedPath.impl.revocationStatus"></a>
 
 ### Method `revocationStatus`
 
@@ -877,7 +877,7 @@ pub struct CertificatePath
 
 The namespace for bounded deterministic certificate-path validation.
 
-<a id="impl-5"></a>
+<a id="CertificatePath.impl"></a>
 
 ## Implementation `CertificatePath`
 
@@ -885,7 +885,7 @@ The namespace for bounded deterministic certificate-path validation.
 impl CertificatePath
 ```
 
-<a id="impl.validate"></a>
+<a id="CertificatePath.impl.validate"></a>
 
 ### Associated function `validate`
 

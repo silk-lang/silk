@@ -60,7 +60,7 @@ An allocation-free streaming SHA3-224 state with a 28-byte fixed digest.
 Call `update` zero or more times, then call `finish` one time. Use `hash` for one complete
 borrowed byte sequence. Finalization consumes the state.
 
-<a id="impl"></a>
+<a id="Sha3_224.impl"></a>
 
 ## Implementation `Sha3_224`
 
@@ -68,7 +68,7 @@ borrowed byte sequence. Finalization consumes the state.
 impl Sha3_224
 ```
 
-<a id="impl.make"></a>
+<a id="Sha3_224.impl.make"></a>
 
 ### Associated function `make`
 
@@ -78,7 +78,7 @@ pub fn make() -> Sha3_224
 
 Creates an empty SHA3-224 streaming state without allocation.
 
-<a id="impl.update"></a>
+<a id="Sha3_224.impl.update"></a>
 
 ### Method `update`
 
@@ -93,7 +93,7 @@ Absorbs `bytes` in order into this SHA3-224 state.
 An empty slice does not change the digest. Any chunking of the same byte sequence gives the
 same digest.
 
-<a id="impl.finish"></a>
+<a id="Sha3_224.impl.finish"></a>
 
 ### Method `finish`
 
@@ -103,7 +103,7 @@ pub fn finish(self: Self) -> [u8; 28]
 
 Consumes this state and returns its standardized 28-byte SHA3-224 digest.
 
-<a id="impl.hash"></a>
+<a id="Sha3_224.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -133,7 +133,7 @@ An allocation-free streaming SHA3-256 state with a 32-byte fixed digest.
 Call `update` zero or more times, then call `finish` one time. Use `hash` for one complete
 borrowed byte sequence. Finalization consumes the state.
 
-<a id="impl-2"></a>
+<a id="Sha3_256.impl"></a>
 
 ## Implementation `Sha3_256`
 
@@ -141,7 +141,7 @@ borrowed byte sequence. Finalization consumes the state.
 impl Sha3_256
 ```
 
-<a id="impl.make-2"></a>
+<a id="Sha3_256.impl.make"></a>
 
 ### Associated function `make`
 
@@ -151,7 +151,7 @@ pub fn make() -> Sha3_256
 
 Creates an empty SHA3-256 streaming state without allocation.
 
-<a id="impl.update-2"></a>
+<a id="Sha3_256.impl.update"></a>
 
 ### Method `update`
 
@@ -166,7 +166,7 @@ Absorbs `bytes` in order into this SHA3-256 state.
 An empty slice does not change the digest. Any chunking of the same byte sequence gives the
 same digest.
 
-<a id="impl.finish-2"></a>
+<a id="Sha3_256.impl.finish"></a>
 
 ### Method `finish`
 
@@ -176,7 +176,7 @@ pub fn finish(self: Self) -> [u8; 32]
 
 Consumes this state and returns its standardized 32-byte SHA3-256 digest.
 
-<a id="impl.hash-2"></a>
+<a id="Sha3_256.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -206,7 +206,7 @@ An allocation-free streaming SHA3-384 state with a 48-byte fixed digest.
 Call `update` zero or more times, then call `finish` one time. Use `hash` for one complete
 borrowed byte sequence. Finalization consumes the state.
 
-<a id="impl-3"></a>
+<a id="Sha3_384.impl"></a>
 
 ## Implementation `Sha3_384`
 
@@ -214,7 +214,7 @@ borrowed byte sequence. Finalization consumes the state.
 impl Sha3_384
 ```
 
-<a id="impl.make-3"></a>
+<a id="Sha3_384.impl.make"></a>
 
 ### Associated function `make`
 
@@ -224,7 +224,7 @@ pub fn make() -> Sha3_384
 
 Creates an empty SHA3-384 streaming state without allocation.
 
-<a id="impl.update-3"></a>
+<a id="Sha3_384.impl.update"></a>
 
 ### Method `update`
 
@@ -239,7 +239,7 @@ Absorbs `bytes` in order into this SHA3-384 state.
 An empty slice does not change the digest. Any chunking of the same byte sequence gives the
 same digest.
 
-<a id="impl.finish-3"></a>
+<a id="Sha3_384.impl.finish"></a>
 
 ### Method `finish`
 
@@ -249,7 +249,7 @@ pub fn finish(self: Self) -> [u8; 48]
 
 Consumes this state and returns its standardized 48-byte SHA3-384 digest.
 
-<a id="impl.hash-3"></a>
+<a id="Sha3_384.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -279,7 +279,7 @@ An allocation-free streaming SHA3-512 state with a 64-byte fixed digest.
 Call `update` zero or more times, then call `finish` one time. Use `hash` for one complete
 borrowed byte sequence. Finalization consumes the state.
 
-<a id="impl-4"></a>
+<a id="Sha3_512.impl"></a>
 
 ## Implementation `Sha3_512`
 
@@ -287,7 +287,7 @@ borrowed byte sequence. Finalization consumes the state.
 impl Sha3_512
 ```
 
-<a id="impl.make-4"></a>
+<a id="Sha3_512.impl.make"></a>
 
 ### Associated function `make`
 
@@ -297,7 +297,7 @@ pub fn make() -> Sha3_512
 
 Creates an empty SHA3-512 streaming state without allocation.
 
-<a id="impl.update-4"></a>
+<a id="Sha3_512.impl.update"></a>
 
 ### Method `update`
 
@@ -312,7 +312,7 @@ Absorbs `bytes` in order into this SHA3-512 state.
 An empty slice does not change the digest. Any chunking of the same byte sequence gives the
 same digest.
 
-<a id="impl.finish-4"></a>
+<a id="Sha3_512.impl.finish"></a>
 
 ### Method `finish`
 
@@ -322,7 +322,7 @@ pub fn finish(self: Self) -> [u8; 64]
 
 Consumes this state and returns its standardized 64-byte SHA3-512 digest.
 
-<a id="impl.hash-4"></a>
+<a id="Sha3_512.impl.hash"></a>
 
 ### Associated function `hash`
 

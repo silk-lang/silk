@@ -5,8 +5,8 @@
 Optional owned values that distinguish presence from absence without a failure channel.
 
 ## When to use
-Use [`Option`](#Option) when absence is an expected answer and needs no error payload. Use [`map`](#impl.map) for a
-pure transform, [`flatMap`](#impl.flatMap) when the transform may also return absence, and [`unwrapOr`](#impl.unwrapOr) only
+Use [`Option`](#Option) when absence is an expected answer and needs no error payload. Use [`map`](#Option.impl.map) for a
+pure transform, [`flatMap`](#Option.impl.flatMap) when the transform may also return absence, and [`unwrapOr`](#Option.impl.unwrapOr) only
 when the caller is ready to consume the option.
 
 ## Details
@@ -57,8 +57,8 @@ An owned value that is either [`Some`](#Option.Some) or [`None`](#Option.None).
 
 ### Details
 
-Match on an `Option` when both arms need custom behavior. Prefer [`map`](#impl.map), [`flatMap`](#impl.flatMap), or
-[`unwrapOr`](#impl.unwrapOr) for the common transform, continue, and default cases.
+Match on an `Option` when both arms need custom behavior. Prefer [`map`](#Option.impl.map), [`flatMap`](#Option.impl.flatMap), or
+[`unwrapOr`](#Option.impl.unwrapOr) for the common transform, continue, and default cases.
 
 <a id="Option.None"></a>
 
@@ -90,15 +90,15 @@ pub value: T
 
 The value moved through present-only combinator branches.
 
-<a id="impl"></a>
+<a id="Option.impl"></a>
 
-## Implementation ``
+## Implementation `Option<T>`
 
 ```silk
 impl<T> Option<T>
 ```
 
-<a id="impl.none"></a>
+<a id="Option.impl.none"></a>
 
 ### Associated function `none`
 
@@ -108,7 +108,7 @@ pub fn none() -> Option<T>
 
 Constructs an absent optional value of the requested element type.
 
-<a id="impl.some"></a>
+<a id="Option.impl.some"></a>
 
 ### Associated function `some`
 
@@ -118,7 +118,7 @@ pub fn some(value: T) -> Option<T>
 
 Constructs a present option by moving `value` into it.
 
-<a id="impl.map"></a>
+<a id="Option.impl.map"></a>
 
 ### Method `map`
 
@@ -133,7 +133,7 @@ Applies `transform` once to a present value and keeps an absent value absent.
 The callback is not called for [`None`](#Option.None). This operation consumes `self`; use a shared borrow and
 `match` instead when the original option must remain available.
 
-<a id="impl.flatMap"></a>
+<a id="Option.impl.flatMap"></a>
 
 ### Method `flatMap`
 
@@ -149,7 +149,7 @@ outcome stays one Option deep instead of nesting.
 The callback runs once for [`Some`](#Option.Some) and not at all for [`None`](#Option.None). Use this when the next step may
 reject the value without needing to explain why; use a `Result` when rejection needs an error.
 
-<a id="impl.unwrapOr"></a>
+<a id="Option.impl.unwrapOr"></a>
 
 ### Method `unwrapOr`
 
@@ -186,7 +186,7 @@ pub fn main() -> i32 {
 }
 ```
 
-<a id="impl.unwrapOr.fallback"></a>
+<a id="Option.impl.unwrapOr.fallback"></a>
 
 #### Parameter `fallback`
 

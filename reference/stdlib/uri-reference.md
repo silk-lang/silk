@@ -6,11 +6,11 @@ Borrowed RFC 3986 URI references, explicit owned storage, and lossless component
 
 ## When to use
 
-Use [`parse`](#impl.parse) for a URI or a relative reference. Use `silk.uri` when a scheme is required.
+Use [`parse`](#UriReference.impl.parse) for a URI or a relative reference. Use `silk.uri` when a scheme is required.
 
 ## Details
 
-[`parse`](#impl.parse) borrows its input without allocation. [`OwnedUriReference`](#OwnedUriReference) provides explicit owned storage.
+[`parse`](#UriReference.impl.parse) borrows its input without allocation. [`OwnedUriReference`](#OwnedUriReference) provides explicit owned storage.
 Empty components remain distinct from absent components. Parsing does not decode percent escapes.
 
 ## Gotchas
@@ -272,7 +272,7 @@ pub offset: usize
 
 The zero-based offending byte offset, or the end offset when required syntax is missing.
 
-<a id="impl"></a>
+<a id="ParseError.impl.Copy"></a>
 
 ## Implementation `Copy for ParseError`
 
@@ -293,25 +293,25 @@ An immutable parsed reference borrowing its original serialization.
 ### Details
 
 Parsing allocates nothing. The result and its component views cannot outlive the input.
-Use [`copy`](#impl.copy) to retain the value independently, or [`OwnedUriReference.fromString`](#impl.fromString) to adopt text.
+Use [`copy`](#UriReference.impl.copy) to retain the value independently, or [`OwnedUriReference.fromString`](#OwnedUriReference.impl.fromString) to adopt text.
 
-<a id="impl-2"></a>
+<a id="UriReference.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for UriReference<'text>`
 
 ```silk
 impl<'text> Copy for UriReference<'text>
 ```
 
-<a id="impl-3"></a>
+<a id="UriReference.impl"></a>
 
-## Implementation ``
+## Implementation `UriReference<'text>`
 
 ```silk
 impl<'text> UriReference<'text>
 ```
 
-<a id="impl.parse"></a>
+<a id="UriReference.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -326,7 +326,7 @@ Validates and borrows a URI reference without allocating or normalizing.
 Syntax errors identify the failed component and byte. Valid dotted decimal hosts take
 precedence over registered names. The result retains the lifetime of `text`.
 
-<a id="impl.validateComponent"></a>
+<a id="UriReference.impl.validateComponent"></a>
 
 ### Associated function `validateComponent`
 
@@ -342,7 +342,7 @@ Errors are relative to the supplied component text. Path checks its allowed byte
 must additionally check path form against the presence of scheme and authority. Host accepts
 bracketed literals or reg-names, never userinfo or a port. Empty ports and hosts are valid.
 
-<a id="impl.copy"></a>
+<a id="UriReference.impl.copy"></a>
 
 ### Method `copy`
 
@@ -352,7 +352,7 @@ pub effect fn copy(self: &Self) -> OwnedUriReference ! OutOfMemoryError ? &mut A
 
 Copies a parsed reference into independent owned storage with one allocation for nonempty input.
 
-<a id="impl.parseOwned"></a>
+<a id="UriReference.impl.parseOwned"></a>
 
 ### Associated function `parseOwned`
 
@@ -364,7 +364,7 @@ pub effect fn parseOwned(text: string<'text>) -> Result<OwnedUriReference, Parse
 
 Validates input and explicitly copies it into owned storage; invalid input does not allocate.
 
-<a id="impl.format"></a>
+<a id="UriReference.impl.format"></a>
 
 ### Method `format`
 
@@ -374,7 +374,7 @@ pub fn format(self: &Self) -> string<'text>
 
 Returns the original borrowed serialization, preserving all delimiters and escape spelling.
 
-<a id="impl.scheme"></a>
+<a id="UriReference.impl.scheme"></a>
 
 ### Method `scheme`
 
@@ -384,7 +384,7 @@ pub fn scheme(self: &Self) -> Option<string<'text>>
 
 Borrows the scheme without its colon, or returns `None` for a relative reference.
 
-<a id="impl.authority"></a>
+<a id="UriReference.impl.authority"></a>
 
 ### Method `authority`
 
@@ -394,7 +394,7 @@ pub fn authority(self: &Self) -> Option<string<'text>>
 
 Borrows the authority without its two slashes, including a present empty authority.
 
-<a id="impl.userinfo"></a>
+<a id="UriReference.impl.userinfo"></a>
 
 ### Method `userinfo`
 
@@ -408,7 +408,7 @@ Borrows user information without its at sign, or returns `None` when absent.
 
 An empty value is present. Colons remain part of the value; no username or password split occurs.
 
-<a id="impl.host"></a>
+<a id="UriReference.impl.host"></a>
 
 ### Method `host`
 
@@ -422,7 +422,7 @@ Borrows the host with IP-literal brackets intact, or returns `None` when authori
 
 An empty authority has a present empty host. The view borrows from the input without allocation.
 
-<a id="impl.port"></a>
+<a id="UriReference.impl.port"></a>
 
 ### Method `port`
 
@@ -436,7 +436,7 @@ Borrows the decimal port without its colon, or returns `None` when the colon is 
 
 An empty port is present. This operation does not convert the port to a number or impose a limit.
 
-<a id="impl.path"></a>
+<a id="UriReference.impl.path"></a>
 
 ### Method `path`
 
@@ -446,7 +446,7 @@ pub fn path(self: &Self) -> string<'text>
 
 Borrows the path from the input without allocation; an empty path returns an empty string.
 
-<a id="impl.query"></a>
+<a id="UriReference.impl.query"></a>
 
 ### Method `query`
 
@@ -456,7 +456,7 @@ pub fn query(self: &Self) -> Option<string<'text>>
 
 Borrows the query without its question mark, including a present empty query.
 
-<a id="impl.fragment"></a>
+<a id="UriReference.impl.fragment"></a>
 
 ### Method `fragment`
 
@@ -466,7 +466,7 @@ pub fn fragment(self: &Self) -> Option<string<'text>>
 
 Borrows the fragment without its number sign, including a present empty fragment.
 
-<a id="impl.hostKind"></a>
+<a id="UriReference.impl.hostKind"></a>
 
 ### Method `hostKind`
 
@@ -488,10 +488,10 @@ An immutable owner of validated URI-reference text and scalar component ranges.
 
 ### Details
 
-Owns no references into itself. [`view`](#impl.view) borrows existing storage without reparsing or allocating.
-Use [`fromString`](#impl.fromString) to transfer existing storage, or [`UriReference.parseOwned`](#impl.parseOwned) to copy input.
+Owns no references into itself. [`view`](#OwnedUriReference.impl.view) borrows existing storage without reparsing or allocating.
+Use [`fromString`](#OwnedUriReference.impl.fromString) to transfer existing storage, or [`UriReference.parseOwned`](#UriReference.impl.parseOwned) to copy input.
 
-<a id="impl-4"></a>
+<a id="OwnedUriReference.impl"></a>
 
 ## Implementation `OwnedUriReference`
 
@@ -499,7 +499,7 @@ Use [`fromString`](#impl.fromString) to transfer existing storage, or [`UriRefer
 impl OwnedUriReference
 ```
 
-<a id="impl.fromString"></a>
+<a id="OwnedUriReference.impl.fromString"></a>
 
 ### Associated function `fromString`
 
@@ -513,7 +513,7 @@ Validates and adopts an existing String without copying or allocating.
 
 This operation consumes the String on both success and syntax failure.
 
-<a id="impl.view"></a>
+<a id="OwnedUriReference.impl.view"></a>
 
 ### Method `view`
 
@@ -523,7 +523,7 @@ pub fn view(self: &Self) -> UriReference
 
 Borrows a parsed reference from this owner's stored ranges without validation or allocation.
 
-<a id="impl.intoString"></a>
+<a id="OwnedUriReference.impl.intoString"></a>
 
 ### Method `intoString`
 

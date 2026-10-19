@@ -6,17 +6,17 @@ One owned heap indirection for recursive data and values whose storage must have
 
 ## When to use
 Use [`Box`](#Box) to break an inline layout cycle, such as a tree node that owns more tree nodes. Use
-[`make`](#impl.make) to allocate, [`get`](#impl.get) or [`getMut`](#impl.getMut) to borrow the element, and [`into`](#impl.into) to recover it.
+[`make`](#Box.impl.make) to allocate, [`get`](#Box.impl.get) or [`getMut`](#Box.impl.getMut) to borrow the element, and [`into`](#Box.impl.into) to recover it.
 
 ## Details
 A box owns exactly one allocation and one value. Borrowing exposes a one-element slice because
 Silk can return a slice tied to a parameter but cannot return a bare borrowed value. Dropping
-the box recursively drops its element; consuming it with [`into`](#impl.into) transfers the element and
+the box recursively drops its element; consuming it with [`into`](#Box.impl.into) transfers the element and
 still releases the allocation exactly once.
 
 ## Gotchas
 Ordinary recursive destruction uses the call stack. For a very deep chain, consume links with
-[`into`](#impl.into) in an iterative loop when stack depth matters.
+[`into`](#Box.impl.into) in an iterative loop when stack depth matters.
 
 ## Examples
 ### Store and recover one owned value
@@ -83,15 +83,15 @@ pub struct Box<T>
 
 Owns one heap-allocated `T` and releases both the value and its allocation on drop.
 
-<a id="impl"></a>
+<a id="Box.impl"></a>
 
-## Implementation ``
+## Implementation `Box<T>`
 
 ```silk
 impl<T> Box<T>
 ```
 
-<a id="impl.make"></a>
+<a id="Box.impl.make"></a>
 
 ### Associated function `make`
 
@@ -106,7 +106,7 @@ Moves one value into a new box with storage for exactly one element.
 The returned box owns the value and the allocation. Allocation failure produces
 `OutOfMemoryError` and does not produce a partial box.
 
-<a id="impl.get"></a>
+<a id="Box.impl.get"></a>
 
 ### Method `get`
 
@@ -120,7 +120,7 @@ Borrows the held value as a shared slice of length one.
 
 The slice borrows the box and remains valid only for the lexical borrow.
 
-<a id="impl.getMut"></a>
+<a id="Box.impl.getMut"></a>
 
 ### Method `getMut`
 
@@ -134,7 +134,7 @@ Borrows the held value as an exclusive slice of length one.
 
 The slice permits mutation of the element and remains valid only for the lexical borrow.
 
-<a id="impl.into"></a>
+<a id="Box.impl.into"></a>
 
 ### Method `into`
 
@@ -144,15 +144,15 @@ pub fn into(self: Self) -> T
 
 Consumes the box, returns its owned value, and releases its allocation.
 
-<a id="impl-2"></a>
+<a id="Box.impl.Drop"></a>
 
-## Implementation ` Drop for  `
+## Implementation `Drop for Box<T>`
 
 ```silk
 impl<T> Drop for Box<T>
 ```
 
-<a id="impl.drop"></a>
+<a id="Box.impl.Drop.drop"></a>
 
 ### Operation `drop`
 

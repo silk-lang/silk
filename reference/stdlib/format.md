@@ -6,9 +6,9 @@ Writer-backed value presentation, statically validated templates, and complete d
 
 ## When to use
 
-Use [`display`](#impl.display) for one value. Use [`format`](#impl.format) for a static template and a borrowed argument
-pack. Use [`displayWith`](#impl.displayWith) when presentation needs explicit options. Integer `parse` operations
-and [`f64Value`](#impl.f64Value)/[`f32Value`](#impl.f32Value) are allocation-free inverses of their default presentation.
+Use [`display`](#Format.impl.display) for one value. Use [`format`](#Format.impl.format) for a static template and a borrowed argument
+pack. Use [`displayWith`](#Format.impl.displayWith) when presentation needs explicit options. Integer `parse` operations
+and [`f64Value`](#Format.impl.f64Value)/[`f32Value`](#Format.impl.f32Value) are allocation-free inverses of their default presentation.
 
 ## Details
 
@@ -102,7 +102,7 @@ The owner of the parsing and rendering operations.
 This struct carries no data and is never constructed by the library. Every operation is an
 inherent member declared in `impl Format`, reached through `import silk.format { Format }`.
 
-<a id="impl"></a>
+<a id="Format.impl"></a>
 
 ## Implementation `Format`
 
@@ -110,7 +110,7 @@ inherent member declared in `impl Format`, reached through `import silk.format {
 impl Format
 ```
 
-<a id="impl.defaultOptions"></a>
+<a id="Format.impl.defaultOptions"></a>
 
 ### Associated function `defaultOptions`
 
@@ -125,7 +125,7 @@ Returns the canonical formatting defaults.
 The result has no width, default alignment, a space fill, negative-only signs, no alternate
 form, no zero padding, no precision, and no color permission.
 
-<a id="impl.make"></a>
+<a id="Format.impl.make"></a>
 
 ### Associated function `make`
 
@@ -135,7 +135,7 @@ pub fn make(options: FormatOptions) -> Formatter
 
 Starts a Formatter session with explicit options.
 
-<a id="impl.makeDefault"></a>
+<a id="Format.impl.makeDefault"></a>
 
 ### Associated function `makeDefault`
 
@@ -143,9 +143,9 @@ Starts a Formatter session with explicit options.
 pub fn makeDefault() -> Formatter
 ```
 
-Starts a Formatter session with [`defaultOptions`](#impl.defaultOptions).
+Starts a Formatter session with [`defaultOptions`](#Format.impl.defaultOptions).
 
-<a id="impl.hasWidth"></a>
+<a id="Format.impl.hasWidth"></a>
 
 ### Method `hasWidth`
 
@@ -155,7 +155,7 @@ pub fn hasWidth(self: &Formatter) -> bool
 
 Reports whether a minimum width was supplied.
 
-<a id="impl.width"></a>
+<a id="Format.impl.width"></a>
 
 ### Method `width`
 
@@ -166,7 +166,7 @@ pub fn width(self: &Formatter) -> usize
 Returns the requested minimum width in Unicode scalars, not UTF-8 bytes or terminal cells, or
 zero when no width was supplied.
 
-<a id="impl.alignment"></a>
+<a id="Format.impl.alignment"></a>
 
 ### Method `alignment`
 
@@ -176,7 +176,7 @@ pub fn alignment(self: &Formatter) -> Alignment
 
 Returns the requested alignment.
 
-<a id="impl.fill"></a>
+<a id="Format.impl.fill"></a>
 
 ### Method `fill`
 
@@ -186,7 +186,7 @@ pub fn fill(self: &Formatter) -> char
 
 Returns the requested fill scalar.
 
-<a id="impl.sign"></a>
+<a id="Format.impl.sign"></a>
 
 ### Method `sign`
 
@@ -196,7 +196,7 @@ pub fn sign(self: &Formatter) -> Sign
 
 Returns the requested sign policy.
 
-<a id="impl.alternate"></a>
+<a id="Format.impl.alternate"></a>
 
 ### Method `alternate`
 
@@ -206,7 +206,7 @@ pub fn alternate(self: &Formatter) -> bool
 
 Reports whether alternate presentation is requested.
 
-<a id="impl.zeroPad"></a>
+<a id="Format.impl.zeroPad"></a>
 
 ### Method `zeroPad`
 
@@ -221,7 +221,7 @@ Reports whether integer width padding with zeroes is requested.
 A supplied precision disables this padding for integers. Float presentations use the fill
 scalar for width padding and never use zeroes.
 
-<a id="impl.hasPrecision"></a>
+<a id="Format.impl.hasPrecision"></a>
 
 ### Method `hasPrecision`
 
@@ -231,7 +231,7 @@ pub fn hasPrecision(self: &Formatter) -> bool
 
 Reports whether a numeric precision was supplied.
 
-<a id="impl.precision"></a>
+<a id="Format.impl.precision"></a>
 
 ### Method `precision`
 
@@ -246,7 +246,7 @@ Returns the requested digit count, or zero when no numeric precision was supplie
 For integers this is a minimum digit count and disables width-driven zero padding. For floats
 it is the exact number of fractional digits.
 
-<a id="impl.color"></a>
+<a id="Format.impl.color"></a>
 
 ### Method `color`
 
@@ -256,7 +256,7 @@ pub fn color(self: &Formatter) -> bool
 
 Reports whether a presentation may emit balanced ANSI styling.
 
-<a id="impl.write"></a>
+<a id="Format.impl.write"></a>
 
 ### Method `write`
 
@@ -274,7 +274,7 @@ Writes one byte sequence through the ambient Writer.
 If Writer fails, this returns the original `WriterError`; any prefix accepted before the failure
 remains written.
 
-<a id="impl.writeText"></a>
+<a id="Format.impl.writeText"></a>
 
 ### Method `writeText`
 
@@ -292,7 +292,7 @@ Writes valid UTF-8 content without applying width policy.
 If Writer fails, this returns the original `WriterError`; any prefix accepted before the failure
 remains written.
 
-<a id="impl.writePadding"></a>
+<a id="Format.impl.writePadding"></a>
 
 ### Method `writePadding`
 
@@ -310,7 +310,7 @@ Writes `count` copies of the session's fill scalar in bounded chunks.
 If Writer fails, this returns the original `WriterError`; any fill accepted before the failure
 remains written.
 
-<a id="impl.leadingPadding"></a>
+<a id="Format.impl.leadingPadding"></a>
 
 ### Method `leadingPadding`
 
@@ -322,14 +322,14 @@ Returns the number of fill scalars before content with this visible width.
 
 #### Details
 
-A user-defined Display can use this together with [`writeLeadingPadding`](#impl.writeLeadingPadding) and
-[`writeTrailingPadding`](#impl.writeTrailingPadding) so ANSI control bytes never count toward the visible content width.
+A user-defined Display can use this together with [`writeLeadingPadding`](#Format.impl.writeLeadingPadding) and
+[`writeTrailingPadding`](#Format.impl.writeTrailingPadding) so ANSI control bytes never count toward the visible content width.
 `Alignment.Default` and `Alignment.Right` put all extra fill before the content;
 `Alignment.Left` puts Option.none there. `Alignment.Center` puts half there, rounding an odd extra
 scalar down so the trailing side receives the remainder. No padding is returned when the
 requested width does not exceed `contentWidth`.
 
-<a id="impl.trailingPadding"></a>
+<a id="Format.impl.trailingPadding"></a>
 
 ### Method `trailingPadding`
 
@@ -346,7 +346,7 @@ Returns the number of fill scalars after content with this visible width.
 extra scalar up. No padding is returned when the requested width does not exceed
 `contentWidth`.
 
-<a id="impl.writeLeadingPadding"></a>
+<a id="Format.impl.writeLeadingPadding"></a>
 
 ### Method `writeLeadingPadding`
 
@@ -365,7 +365,7 @@ byte or terminal-cell count.
 If Writer fails, this returns the original `WriterError`; any leading fill accepted before the
 failure remains written.
 
-<a id="impl.writeTrailingPadding"></a>
+<a id="Format.impl.writeTrailingPadding"></a>
 
 ### Method `writeTrailingPadding`
 
@@ -384,7 +384,7 @@ byte or terminal-cell count.
 If Writer fails, this returns the original `WriterError`; any trailing fill accepted before the
 failure remains written.
 
-<a id="impl.display"></a>
+<a id="Format.impl.display"></a>
 
 ### Associated function `display`
 
@@ -396,10 +396,10 @@ Displays one value with canonical defaults through the ambient mutable Writer.
 
 #### Details
 
-This operation uses [`defaultOptions`](#impl.defaultOptions) and does not require Allocator. If Writer fails, an
+This operation uses [`defaultOptions`](#Format.impl.defaultOptions) and does not require Allocator. If Writer fails, an
 accepted prefix remains written and the original `WriterError` is preserved.
 
-<a id="impl.displayWith"></a>
+<a id="Format.impl.displayWith"></a>
 
 ### Associated function `displayWith`
 
@@ -421,7 +421,7 @@ uses the fill scalar. Alternate form and color do not change numeric output. Thi
 does not require Allocator. If Writer fails, an accepted prefix remains written and the
 original `WriterError` is preserved.
 
-<a id="impl.format"></a>
+<a id="Format.impl.format"></a>
 
 ### Associated function `format`
 
@@ -494,7 +494,7 @@ pub fn main() -> i32 {
 }
 ```
 
-<a id="impl.unsignedValue"></a>
+<a id="Format.impl.unsignedValue"></a>
 
 ### Associated function `unsignedValue`
 
@@ -510,7 +510,7 @@ Empty text, a leading sign, and any byte outside `0`–`9` are `NotANumber` at t
 stopped the read. A value above `u64.MAX` is `OutOfRange`, detected before the overflow rather
 than after it.
 
-<a id="impl.signedValue"></a>
+<a id="Format.impl.signedValue"></a>
 
 ### Associated function `signedValue`
 
@@ -525,7 +525,7 @@ Reads complete decimal text as a signed value, accepting one leading `-`.
 Digits accumulate negatively, so text naming `i64.MIN` reads like any other value. A leading `+`
 is not accepted. A value outside `i64.MIN`–`i64.MAX` is `OutOfRange`.
 
-<a id="impl.f64Value"></a>
+<a id="Format.impl.f64Value"></a>
 
 ### Associated function `f64Value`
 
@@ -542,7 +542,7 @@ rejected. Overflow rounds to infinity and underflow rounds to signed zero. The f
 compares exact decimal values with binary64 rounding boundaries, including subnormals and
 ties to even; no intermediate floating-point multiplication decides the result.
 
-<a id="impl.f32Value"></a>
+<a id="Format.impl.f32Value"></a>
 
 ### Associated function `f32Value`
 
@@ -557,7 +557,7 @@ Reads a complete finite decimal spelling, rounding directly to IEEE binary32.
 The decimal is never rounded through binary64, avoiding double rounding. Overflow produces
 infinity and underflow preserves the sign of zero.
 
-<a id="impl.u8Value"></a>
+<a id="Format.impl.u8Value"></a>
 
 ### Associated function `u8Value`
 
@@ -567,7 +567,7 @@ pub fn u8Value(text: string) -> Result<u8, ParseError>
 
 Reads complete decimal text as a `u8`, rejecting a value above `u8.MAX`.
 
-<a id="impl.u16Value"></a>
+<a id="Format.impl.u16Value"></a>
 
 ### Associated function `u16Value`
 
@@ -577,7 +577,7 @@ pub fn u16Value(text: string) -> Result<u16, ParseError>
 
 Reads complete decimal text as a `u16`, rejecting a value above `u16.MAX`.
 
-<a id="impl.u32Value"></a>
+<a id="Format.impl.u32Value"></a>
 
 ### Associated function `u32Value`
 
@@ -587,7 +587,7 @@ pub fn u32Value(text: string) -> Result<u32, ParseError>
 
 Reads complete decimal text as a `u32`, rejecting a value above `u32.MAX`.
 
-<a id="impl.u64Value"></a>
+<a id="Format.impl.u64Value"></a>
 
 ### Associated function `u64Value`
 
@@ -597,7 +597,7 @@ pub fn u64Value(text: string) -> Result<u64, ParseError>
 
 Reads complete decimal text as a `u64`, rejecting a value above `u64.MAX`.
 
-<a id="impl.usizeValue"></a>
+<a id="Format.impl.usizeValue"></a>
 
 ### Associated function `usizeValue`
 
@@ -608,7 +608,7 @@ pub fn usizeValue(text: string) -> Result<usize, ParseError>
 Reads complete decimal text as a `usize`, rejecting a value the target's pointer width cannot
 hold.
 
-<a id="impl.i8Value"></a>
+<a id="Format.impl.i8Value"></a>
 
 ### Associated function `i8Value`
 
@@ -618,7 +618,7 @@ pub fn i8Value(text: string) -> Result<i8, ParseError>
 
 Reads complete decimal text as an `i8`, rejecting a value outside `i8.MIN`–`i8.MAX`.
 
-<a id="impl.i16Value"></a>
+<a id="Format.impl.i16Value"></a>
 
 ### Associated function `i16Value`
 
@@ -628,7 +628,7 @@ pub fn i16Value(text: string) -> Result<i16, ParseError>
 
 Reads complete decimal text as an `i16`, rejecting a value outside `i16.MIN`–`i16.MAX`.
 
-<a id="impl.i32Value"></a>
+<a id="Format.impl.i32Value"></a>
 
 ### Associated function `i32Value`
 
@@ -638,7 +638,7 @@ pub fn i32Value(text: string) -> Result<i32, ParseError>
 
 Reads complete decimal text as an `i32`, rejecting a value outside `i32.MIN`–`i32.MAX`.
 
-<a id="impl.i64Value"></a>
+<a id="Format.impl.i64Value"></a>
 
 ### Associated function `i64Value`
 
@@ -648,7 +648,7 @@ pub fn i64Value(text: string) -> Result<i64, ParseError>
 
 Reads complete decimal text as an `i64`, rejecting a value outside `i64.MIN`–`i64.MAX`.
 
-<a id="impl.isizeValue"></a>
+<a id="Format.impl.isizeValue"></a>
 
 ### Associated function `isizeValue`
 
@@ -761,7 +761,7 @@ Explicit policy for one formatting session.
 
 ### Details
 
-[`defaultOptions`](#impl.defaultOptions) uses no width, default alignment, a space fill, negative-only signs, no
+[`defaultOptions`](#Format.impl.defaultOptions) uses no width, default alignment, a space fill, negative-only signs, no
 alternate form, no zero padding, no precision, and no color. Width counts Unicode scalars.
 For integers, precision disables width-driven zero padding. For floats, precision selects
 fixed fractional digits instead of the shortest round-tripping form. Alternate form and color
@@ -950,7 +950,7 @@ pub reason: NotANumber | OutOfRange
 
 The reason the text was rejected.
 
-<a id="impl-2"></a>
+<a id="u8.impl.Display"></a>
 
 ## Implementation `Display for u8`
 
@@ -958,7 +958,7 @@ The reason the text was rejected.
 impl Display for u8
 ```
 
-<a id="impl.display-2"></a>
+<a id="u8.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -966,7 +966,7 @@ impl Display for u8
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-3"></a>
+<a id="u16.impl.Display"></a>
 
 ## Implementation `Display for u16`
 
@@ -974,7 +974,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for u16
 ```
 
-<a id="impl.display-3"></a>
+<a id="u16.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -982,7 +982,7 @@ impl Display for u16
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-4"></a>
+<a id="u32.impl.Display"></a>
 
 ## Implementation `Display for u32`
 
@@ -990,7 +990,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for u32
 ```
 
-<a id="impl.display-4"></a>
+<a id="u32.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -998,7 +998,7 @@ impl Display for u32
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-5"></a>
+<a id="u64.impl.Display"></a>
 
 ## Implementation `Display for u64`
 
@@ -1006,7 +1006,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for u64
 ```
 
-<a id="impl.display-5"></a>
+<a id="u64.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1014,7 +1014,7 @@ impl Display for u64
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-6"></a>
+<a id="usize.impl.Display"></a>
 
 ## Implementation `Display for usize`
 
@@ -1022,7 +1022,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for usize
 ```
 
-<a id="impl.display-6"></a>
+<a id="usize.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1030,7 +1030,7 @@ impl Display for usize
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-7"></a>
+<a id="i8.impl.Display"></a>
 
 ## Implementation `Display for i8`
 
@@ -1038,7 +1038,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for i8
 ```
 
-<a id="impl.display-7"></a>
+<a id="i8.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1046,7 +1046,7 @@ impl Display for i8
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-8"></a>
+<a id="i16.impl.Display"></a>
 
 ## Implementation `Display for i16`
 
@@ -1054,7 +1054,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for i16
 ```
 
-<a id="impl.display-8"></a>
+<a id="i16.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1062,7 +1062,7 @@ impl Display for i16
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-9"></a>
+<a id="i32.impl.Display"></a>
 
 ## Implementation `Display for i32`
 
@@ -1070,7 +1070,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for i32
 ```
 
-<a id="impl.display-9"></a>
+<a id="i32.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1078,7 +1078,7 @@ impl Display for i32
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-10"></a>
+<a id="i64.impl.Display"></a>
 
 ## Implementation `Display for i64`
 
@@ -1086,7 +1086,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for i64
 ```
 
-<a id="impl.display-10"></a>
+<a id="i64.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1094,7 +1094,7 @@ impl Display for i64
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-11"></a>
+<a id="isize.impl.Display"></a>
 
 ## Implementation `Display for isize`
 
@@ -1102,7 +1102,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for isize
 ```
 
-<a id="impl.display-11"></a>
+<a id="isize.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1110,7 +1110,7 @@ impl Display for isize
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-12"></a>
+<a id="f64.impl.Display"></a>
 
 ## Implementation `Display for f64`
 
@@ -1118,7 +1118,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for f64
 ```
 
-<a id="impl.display-12"></a>
+<a id="f64.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1141,7 +1141,7 @@ against the value's exact decimal expansion, which is not required to round-trip
 `NaN` and `Infinity` ignore precision and width-driven zero padding; only the sign policy
 applies, and it applies to `Infinity` alone. Float padding always uses the fill scalar.
 
-<a id="impl-13"></a>
+<a id="f32.impl.Display"></a>
 
 ## Implementation `Display for f32`
 
@@ -1149,7 +1149,7 @@ applies, and it applies to `Infinity` alone. Float padding always uses the fill 
 impl Display for f32
 ```
 
-<a id="impl.display-13"></a>
+<a id="f32.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1171,15 +1171,15 @@ many fractional digits, rounded ties-to-even, which is not required to round-tri
 `NaN` and `Infinity` ignore precision and width-driven zero padding; only the sign policy
 applies, and it applies to `Infinity` alone. Float padding always uses the fill scalar.
 
-<a id="impl-14"></a>
+<a id="string.impl.Display"></a>
 
-## Implementation ` Display for  `
+## Implementation `Display for string<'text>`
 
 ```silk
 impl<'text> Display for string<'text>
 ```
 
-<a id="impl.display-14"></a>
+<a id="string.impl.Display.display"></a>
 
 ### Operation `display`
 

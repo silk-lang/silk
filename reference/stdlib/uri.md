@@ -5,8 +5,8 @@
 Borrowed RFC 3986 URIs, explicit ownership, and reusable relative-reference resolution.
 
 ## When to use
-Use [`parse`](#impl.parse) when a scheme is required. Use `silk.uri_reference` for relative references.
-Use [`resolveInto`](#impl.resolveInto) to reuse output storage, or [`resolveOwned`](#impl.resolveOwned) for an independent owner.
+Use [`parse`](#Uri.impl.parse) when a scheme is required. Use `silk.uri_reference` for relative references.
+Use [`resolveInto`](#Uri.impl.resolveInto) to reuse output storage, or [`resolveOwned`](#Uri.impl.resolveOwned) for an independent owner.
 
 ## Details
 [`Uri`](#Uri) accepts the RFC `URI` production, including fragments. Parsing allocates nothing.
@@ -30,23 +30,23 @@ A parsed URI borrowing input text, with a required scheme and an optional fragme
 ### Details
 Parsing and component access allocate nothing. The value cannot outlive its input.
 
-<a id="impl"></a>
+<a id="Uri.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Uri<'text>`
 
 ```silk
 impl<'text> Copy for Uri<'text>
 ```
 
-<a id="impl-2"></a>
+<a id="Uri.impl"></a>
 
-## Implementation ``
+## Implementation `Uri<'text>`
 
 ```silk
 impl<'text> Uri<'text>
 ```
 
-<a id="impl.parse"></a>
+<a id="Uri.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -60,7 +60,7 @@ Validates and borrows a scheme-bearing URI without allocating or normalizing.
 A missing scheme returns `MissingScheme` at byte zero. Other syntax errors identify their
 component and byte. The returned view retains the input lifetime.
 
-<a id="impl.copy"></a>
+<a id="Uri.impl.copy"></a>
 
 ### Method `copy`
 
@@ -70,7 +70,7 @@ pub effect fn copy(self: &Self) -> OwnedUri ! OutOfMemoryError ? &mut Allocator
 
 Copies this parsed URI into independently owned storage with one allocation for its text.
 
-<a id="impl.parseOwned"></a>
+<a id="Uri.impl.parseOwned"></a>
 
 ### Associated function `parseOwned`
 
@@ -82,7 +82,7 @@ pub effect fn parseOwned(text: string<'text>) -> Result<OwnedUri, ParseError>
 
 Validates input and explicitly copies it into owned storage; invalid input does not allocate.
 
-<a id="impl.format"></a>
+<a id="Uri.impl.format"></a>
 
 ### Method `format`
 
@@ -92,7 +92,7 @@ pub fn format(self: &Self) -> string<'text>
 
 Borrows the original URI text with delimiters, letter case, and escape spelling unchanged.
 
-<a id="impl.asReference"></a>
+<a id="Uri.impl.asReference"></a>
 
 ### Method `asReference`
 
@@ -102,7 +102,7 @@ pub fn asReference(self: &Self) -> UriReference<'text>
 
 Returns this scheme-bearing URI as a borrowed generic reference without validation or allocation.
 
-<a id="impl.scheme"></a>
+<a id="Uri.impl.scheme"></a>
 
 ### Method `scheme`
 
@@ -112,7 +112,7 @@ pub fn scheme(self: &Self) -> string<'text>
 
 Borrows the required scheme without its colon and preserves its letter case.
 
-<a id="impl.authority"></a>
+<a id="Uri.impl.authority"></a>
 
 ### Method `authority`
 
@@ -122,7 +122,7 @@ pub fn authority(self: &Self) -> Option<string<'text>>
 
 Borrows the authority without `//`, or returns `None` when absent. An empty authority remains present.
 
-<a id="impl.userinfo"></a>
+<a id="Uri.impl.userinfo"></a>
 
 ### Method `userinfo`
 
@@ -132,7 +132,7 @@ pub fn userinfo(self: &Self) -> Option<string<'text>>
 
 Borrows userinfo without `@`, or returns `None` when absent. An empty userinfo remains present.
 
-<a id="impl.host"></a>
+<a id="Uri.impl.host"></a>
 
 ### Method `host`
 
@@ -142,7 +142,7 @@ pub fn host(self: &Self) -> Option<string<'text>>
 
 Borrows the host, including IP-literal brackets, or returns `None` without authority. An empty host remains present.
 
-<a id="impl.hostKind"></a>
+<a id="Uri.impl.hostKind"></a>
 
 ### Method `hostKind`
 
@@ -152,7 +152,7 @@ pub fn hostKind(self: &Self) -> Option<HostKind>
 
 Returns the parsed host classification, or `None` when authority is absent.
 
-<a id="impl.port"></a>
+<a id="Uri.impl.port"></a>
 
 ### Method `port`
 
@@ -162,7 +162,7 @@ pub fn port(self: &Self) -> Option<string<'text>>
 
 Borrows the port digits without the colon, or returns `None` when absent. An empty port remains present.
 
-<a id="impl.path"></a>
+<a id="Uri.impl.path"></a>
 
 ### Method `path`
 
@@ -172,7 +172,7 @@ pub fn path(self: &Self) -> string<'text>
 
 Borrows the path with its escape spelling unchanged. The path can be empty.
 
-<a id="impl.query"></a>
+<a id="Uri.impl.query"></a>
 
 ### Method `query`
 
@@ -182,7 +182,7 @@ pub fn query(self: &Self) -> Option<string<'text>>
 
 Borrows the query without `?`, or returns `None` when absent. An empty query remains present.
 
-<a id="impl.fragment"></a>
+<a id="Uri.impl.fragment"></a>
 
 ### Method `fragment`
 
@@ -192,7 +192,7 @@ pub fn fragment(self: &Self) -> Option<string<'text>>
 
 Borrows the fragment without `#`, or returns `None` when absent. An empty fragment remains present.
 
-<a id="impl.resolveInto"></a>
+<a id="Uri.impl.resolveInto"></a>
 
 ### Associated function `resolveInto`
 
@@ -209,13 +209,13 @@ Resolves into reusable byte storage with strict RFC 3986 section 5.2 semantics.
 Replaces output after reserving sufficient capacity. A single backing buffer holds the selected
 components and the path is compacted directly in it. Existing sufficient capacity allocates
 nothing. Allocation failure leaves the destination unchanged. Success returns unit; parse
-its ASCII byte view with [`parse`](#impl.parse) to obtain a borrowed URI without allocating.
+its ASCII byte view with [`parse`](#Uri.impl.parse) to obtain a borrowed URI without allocating.
 
 #### Gotchas
 Output cannot overlap the borrowed inputs. Dot removal may expose `//` as authority syntax;
 invalid recomposition returns a syntax error and leaves the attempted serialization in output.
 
-<a id="impl.resolveOwned"></a>
+<a id="Uri.impl.resolveOwned"></a>
 
 ### Associated function `resolveOwned`
 
@@ -229,7 +229,7 @@ Resolves with one owned backing allocation and adopts the completed serializatio
 
 #### Details
 Reserves a calculated upper bound once. The final allocation may have spare capacity after
-dot removal. Use [`resolveInto`](#impl.resolveInto) when the caller already has reusable storage.
+dot removal. Use [`resolveInto`](#Uri.impl.resolveInto) when the caller already has reusable storage.
 Recomposition validation and its syntax-failure behavior are the same as `resolveInto`.
 
 <a id="OwnedUri"></a>
@@ -242,7 +242,7 @@ pub struct OwnedUri
 
 An immutable owned URI whose borrowed views cannot outlive its storage.
 
-<a id="impl-3"></a>
+<a id="OwnedUri.impl"></a>
 
 ## Implementation `OwnedUri`
 
@@ -250,7 +250,7 @@ An immutable owned URI whose borrowed views cannot outlive its storage.
 impl OwnedUri
 ```
 
-<a id="impl.fromString"></a>
+<a id="OwnedUri.impl.fromString"></a>
 
 ### Associated function `fromString`
 
@@ -263,7 +263,7 @@ Validates and adopts existing owned text without allocation or copying.
 #### Gotchas
 Consumes the supplied String on success and failure. A scheme is required.
 
-<a id="impl.view"></a>
+<a id="OwnedUri.impl.view"></a>
 
 ### Method `view`
 
@@ -273,7 +273,7 @@ pub fn view(self: &Self) -> Uri
 
 Borrows a parsed URI directly from the stored ranges without reparsing or allocating.
 
-<a id="impl.intoString"></a>
+<a id="OwnedUri.impl.intoString"></a>
 
 ### Method `intoString`
 

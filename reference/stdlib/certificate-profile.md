@@ -176,7 +176,7 @@ pub depth: usize
 
 Maximum traversed extension-value TLV depth; a value root has depth one.
 
-<a id="impl"></a>
+<a id="ProfileLimits.impl.Copy"></a>
 
 ## Implementation `Copy for ProfileLimits`
 
@@ -184,7 +184,7 @@ Maximum traversed extension-value TLV depth; a value root has depth one.
 impl Copy for ProfileLimits
 ```
 
-<a id="impl-2"></a>
+<a id="ProfileLimits.impl"></a>
 
 ## Implementation `ProfileLimits`
 
@@ -192,7 +192,7 @@ impl Copy for ProfileLimits
 impl ProfileLimits
 ```
 
-<a id="impl.defaults"></a>
+<a id="ProfileLimits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -783,7 +783,7 @@ pub decipherOnly: bool
 
 decipherOnly bit.
 
-<a id="impl-3"></a>
+<a id="KeyUsage.impl.Copy"></a>
 
 ## Implementation `Copy for KeyUsage`
 
@@ -831,7 +831,7 @@ pub purposeCount: usize
 
 Number of key-purpose identifiers in the original extension.
 
-<a id="impl-4"></a>
+<a id="ExtendedKeyUsage.impl.Copy"></a>
 
 ## Implementation `Copy for ExtendedKeyUsage`
 
@@ -849,23 +849,23 @@ pub struct CertificateProfile<'a>
 
 One immutable borrowed semantic view over a complete decoded certificate.
 
-<a id="impl-5"></a>
+<a id="CertificateProfile.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for CertificateProfile<'a>`
 
 ```silk
 impl<'a> Copy for CertificateProfile<'a>
 ```
 
-<a id="impl-6"></a>
+<a id="CertificateProfile.impl"></a>
 
-## Implementation ``
+## Implementation `CertificateProfile<'a>`
 
 ```silk
 impl<'a> CertificateProfile<'a>
 ```
 
-<a id="impl.inspect"></a>
+<a id="CertificateProfile.impl.inspect"></a>
 
 ### Associated function `inspect`
 
@@ -891,7 +891,7 @@ self-signature are deliberately ignored.
 Success does not establish trust, current validity, a complete path, service identity, or an
 actual signature. An anchor must be supplied through `silk.trust_anchor` as explicit authority.
 
-<a id="impl.certificate"></a>
+<a id="CertificateProfile.impl.certificate"></a>
 
 ### Method `certificate`
 
@@ -901,7 +901,7 @@ pub fn certificate(self: &Self) -> &'a Certificate
 
 Borrows the structurally decoded certificate retained by this view.
 
-<a id="impl.certificateRole"></a>
+<a id="CertificateProfile.impl.certificateRole"></a>
 
 ### Method `certificateRole`
 
@@ -911,7 +911,7 @@ pub fn certificateRole(self: &Self) -> CertificateRole
 
 Returns the role under which this certificate was inspected.
 
-<a id="impl.keyKind"></a>
+<a id="CertificateProfile.impl.keyKind"></a>
 
 ### Method `keyKind`
 
@@ -921,7 +921,7 @@ pub fn keyKind(self: &Self) -> CertificateKeyKind
 
 Returns the admitted public-key profile.
 
-<a id="impl.ca"></a>
+<a id="CertificateProfile.impl.ca"></a>
 
 ### Method `ca`
 
@@ -931,7 +931,7 @@ pub fn ca(self: &Self) -> bool
 
 Returns the admitted BasicConstraints CA value, or false when absent.
 
-<a id="impl.pathLength"></a>
+<a id="CertificateProfile.impl.pathLength"></a>
 
 ### Method `pathLength`
 
@@ -941,7 +941,7 @@ pub fn pathLength(self: &Self) -> Option<usize>
 
 Returns the admitted BasicConstraints path length when present.
 
-<a id="impl.keyUsage"></a>
+<a id="CertificateProfile.impl.keyUsage"></a>
 
 ### Method `keyUsage`
 
@@ -951,7 +951,7 @@ pub fn keyUsage(self: &Self) -> Option<KeyUsage>
 
 Returns admitted KeyUsage facts when the extension was present.
 
-<a id="impl.extendedKeyUsage"></a>
+<a id="CertificateProfile.impl.extendedKeyUsage"></a>
 
 ### Method `extendedKeyUsage`
 
@@ -961,7 +961,7 @@ pub fn extendedKeyUsage(self: &Self) -> Option<ExtendedKeyUsage>
 
 Returns admitted ExtendedKeyUsage facts when the extension was present.
 
-<a id="impl.subjectAltNamesDer"></a>
+<a id="CertificateProfile.impl.subjectAltNamesDer"></a>
 
 ### Method `subjectAltNamesDer`
 
@@ -971,7 +971,7 @@ pub fn subjectAltNamesDer(self: &Self) -> Option<&'a [u8]>
 
 Borrows the exact subjectAltName extension-value DER when present.
 
-<a id="impl.nameConstraintsDer"></a>
+<a id="CertificateProfile.impl.nameConstraintsDer"></a>
 
 ### Method `nameConstraintsDer`
 
@@ -981,7 +981,7 @@ pub fn nameConstraintsDer(self: &Self) -> Option<&'a [u8]>
 
 Borrows the exact embedded NameConstraints extension-value DER when present.
 
-<a id="impl.validateConfiguredNameConstraints"></a>
+<a id="CertificateProfile.impl.validateConfiguredNameConstraints"></a>
 
 ### Associated function `validateConfiguredNameConstraints`
 
@@ -994,7 +994,7 @@ pub fn validateConfiguredNameConstraints(
 
 Validates strict configured DNS/IP NameConstraints without allocating or retaining input.
 
-<a id="impl.checkNameConstraints"></a>
+<a id="CertificateProfile.impl.checkNameConstraints"></a>
 
 ### Associated function `checkNameConstraints`
 
@@ -1018,10 +1018,10 @@ identifies the coordinate system used by any returned constraint error.
 
 #### Gotchas
 
-The constraint value must first pass [`validateConfiguredNameConstraints`](#impl.validateConfiguredNameConstraints) or profile
+The constraint value must first pass [`validateConfiguredNameConstraints`](#CertificateProfile.impl.validateConfiguredNameConstraints) or profile
 inspection. The operation checks only one constraint source; callers must apply all sources.
 
-<a id="impl.verifyIssuedBy"></a>
+<a id="CertificateProfile.impl.verifyIssuedBy"></a>
 
 ### Associated function `verifyIssuedBy`
 

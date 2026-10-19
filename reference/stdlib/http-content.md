@@ -167,7 +167,7 @@ pub offset: usize
 
 The byte offset of the coding token or invalid byte within the field value.
 
-<a id="impl"></a>
+<a id="CodingPosition.impl.Copy"></a>
 
 ## Implementation `Copy for CodingPosition`
 
@@ -875,7 +875,7 @@ pub reuse: ReuseDisposition
 
 The reuse disposition established by the plan or completion.
 
-<a id="impl-2"></a>
+<a id="AppliedPlan.impl.Copy"></a>
 
 ## Implementation `Copy for AppliedPlan`
 
@@ -893,15 +893,15 @@ pub struct RepresentationView<'owner, 'head>
 
 Borrowed effective representation metadata that never rewrites wire headers.
 
-<a id="impl-3"></a>
+<a id="RepresentationView.impl"></a>
 
-## Implementation ``
+## Implementation `RepresentationView<'owner, 'head>`
 
 ```silk
 impl<'owner, 'head> RepresentationView<'owner, 'head>
 ```
 
-<a id="impl.originalHead"></a>
+<a id="RepresentationView.impl.originalHead"></a>
 
 ### Method `originalHead`
 
@@ -911,7 +911,7 @@ pub fn originalHead(self: &Self) -> ResponseHead<'head>
 
 Returns the untouched response head with its original coding and length headers.
 
-<a id="impl.appliedPlan"></a>
+<a id="RepresentationView.impl.appliedPlan"></a>
 
 ### Method `appliedPlan`
 
@@ -921,7 +921,7 @@ pub fn appliedPlan(self: &Self) -> AppliedPlan
 
 Returns the effective coding counts, mode, and reuse disposition.
 
-<a id="impl.anomaly"></a>
+<a id="RepresentationView.impl.anomaly"></a>
 
 ### Method `anomaly`
 
@@ -931,7 +931,7 @@ pub fn anomaly(self: &Self) -> Anomaly
 
 Returns the exact framing anomaly selected from the original response.
 
-<a id="impl.decodingApplied"></a>
+<a id="RepresentationView.impl.decodingApplied"></a>
 
 ### Method `decodingApplied`
 
@@ -941,7 +941,7 @@ pub fn decodingApplied(self: &Self) -> bool
 
 Returns whether at least one nonidentity content decoder was selected.
 
-<a id="impl.decodedLength"></a>
+<a id="RepresentationView.impl.decodedLength"></a>
 
 ### Method `decodedLength`
 
@@ -961,15 +961,15 @@ pub struct ContentCompletion<'owner>
 
 Opaque positive evidence that framing and every selected codec completed.
 
-<a id="impl-4"></a>
+<a id="ContentCompletion.impl"></a>
 
-## Implementation ``
+## Implementation `ContentCompletion<'owner>`
 
 ```silk
 impl<'owner> ContentCompletion<'owner>
 ```
 
-<a id="impl.bodyKind"></a>
+<a id="ContentCompletion.impl.bodyKind"></a>
 
 ### Method `bodyKind`
 
@@ -979,7 +979,7 @@ pub fn bodyKind(self: &Self) -> BodyCompletionKind
 
 Returns whether the completed body was delimited or ended at transport closure.
 
-<a id="impl.decodedBytes"></a>
+<a id="ContentCompletion.impl.decodedBytes"></a>
 
 ### Method `decodedBytes`
 
@@ -989,7 +989,7 @@ pub fn decodedBytes(self: &Self) -> u64
 
 Returns the final validated representation byte count.
 
-<a id="impl.anomaly-2"></a>
+<a id="ContentCompletion.impl.anomaly"></a>
 
 ### Method `anomaly`
 
@@ -999,7 +999,7 @@ pub fn anomaly(self: &Self) -> Anomaly
 
 Returns the exact framing anomaly selected from the original response.
 
-<a id="impl.reuse"></a>
+<a id="ContentCompletion.impl.reuse"></a>
 
 ### Method `reuse`
 
@@ -1019,15 +1019,15 @@ pub struct ResponseContext<'head, 'method, 'names>
 
 Atomic response-selection provenance. Its fields are intentionally private.
 
-<a id="impl-5"></a>
+<a id="ResponseContext.impl"></a>
 
-## Implementation ``
+## Implementation `ResponseContext<'head, 'method, 'names>`
 
 ```silk
 impl<'head, 'method, 'names> ResponseContext<'head, 'method, 'names>
 ```
 
-<a id="impl.make"></a>
+<a id="ResponseContext.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1051,15 +1051,15 @@ pub struct CodingPlan<'head, 'method, 'names>
 
 A validated single-use response plan. Construction consumes its complete context.
 
-<a id="impl-6"></a>
+<a id="CodingPlan.impl"></a>
 
-## Implementation ``
+## Implementation `CodingPlan<'head, 'method, 'names>`
 
 ```silk
 impl<'head, 'method, 'names> CodingPlan<'head, 'method, 'names>
 ```
 
-<a id="impl.make-2"></a>
+<a id="CodingPlan.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1074,7 +1074,7 @@ pub fn make(
 
 Validates all policy and storage requirements without allocation or body I/O.
 
-<a id="impl.originalHead-2"></a>
+<a id="CodingPlan.impl.originalHead"></a>
 
 ### Method `originalHead`
 
@@ -1084,7 +1084,7 @@ pub fn originalHead(self: &Self) -> ResponseHead<'head>
 
 Returns the untouched response head with its original coding and length headers.
 
-<a id="impl.selectionAnomaly"></a>
+<a id="CodingPlan.impl.selectionAnomaly"></a>
 
 ### Method `selectionAnomaly`
 
@@ -1094,7 +1094,7 @@ pub fn selectionAnomaly(self: &Self) -> Anomaly
 
 Returns the selected framing anomaly exactly.
 
-<a id="impl.selectedFraming"></a>
+<a id="CodingPlan.impl.selectedFraming"></a>
 
 ### Method `selectedFraming`
 
@@ -1104,7 +1104,7 @@ pub fn selectedFraming(self: &Self) -> Framing
 
 Returns the framing retained by atomic selection.
 
-<a id="impl.applied"></a>
+<a id="CodingPlan.impl.applied"></a>
 
 ### Method `applied`
 
@@ -1114,7 +1114,7 @@ pub fn applied(self: &Self) -> AppliedPlan
 
 Returns the effective plan metadata.
 
-<a id="impl.ownedBytes"></a>
+<a id="CodingPlan.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 
@@ -1164,7 +1164,7 @@ pub zstd: bool
 
 Enables zstd in automatic Accept-Encoding output.
 
-<a id="impl-7"></a>
+<a id="EnabledCodings.impl.Copy"></a>
 
 ## Implementation `Copy for EnabledCodings`
 
@@ -1387,7 +1387,7 @@ pub error: ContentError<'static>
 
 The original content, framing, or codec failure and output coordinates.
 
-<a id="impl-8"></a>
+<a id="Decoder.impl"></a>
 
 ## Implementation `Decoder`
 
@@ -1395,7 +1395,7 @@ The original content, framing, or codec failure and output coordinates.
 impl Decoder
 ```
 
-<a id="impl.make-3"></a>
+<a id="Decoder.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1407,7 +1407,7 @@ pub effect fn make<'head, 'method, 'names>(plan: CodingPlan<'head, 'method, 'nam
 
 Acquires the existing bounded framing and codec stack from one validated plan.
 
-<a id="impl.step"></a>
+<a id="Decoder.impl.step"></a>
 
 ### Method `step`
 
@@ -1425,7 +1425,7 @@ Advances without I/O, retaining exact consumed and written prefixes on failure.
 remain provisional until `completion` confirms framing, checksums and pending output.
 Empty output completes locally without consuming input or changing a live decoder.
 
-<a id="impl.progress"></a>
+<a id="Decoder.impl.progress"></a>
 
 ### Method `progress`
 
@@ -1435,7 +1435,7 @@ pub fn progress(self: &Self) -> ContentProgress
 
 Reports the current cumulative representation coordinates without advancing input.
 
-<a id="impl.completion"></a>
+<a id="Decoder.impl.completion"></a>
 
 ### Method `completion`
 
@@ -1448,7 +1448,7 @@ pub fn completion<'owner>(self: &'owner Self) -> Result<
 
 Borrows successful framing and content completion from this owner.
 
-<a id="impl.trailers"></a>
+<a id="Decoder.impl.trailers"></a>
 
 ### Method `trailers`
 
@@ -1461,7 +1461,7 @@ pub fn trailers<'owner>(self: &'owner Self) -> Result<
 
 Borrows trailers only after successful content and body completion.
 
-<a id="impl.abandon"></a>
+<a id="Decoder.impl.abandon"></a>
 
 ### Method `abandon`
 
@@ -1481,15 +1481,15 @@ pub struct ContentReader<'reader, 'transport, 'head, P>
 
 One callback-scoped exclusive content reader.
 
-<a id="impl-9"></a>
+<a id="ContentReader.impl"></a>
 
-## Implementation ``
+## Implementation `ContentReader<'reader, 'transport, 'head, P>`
 
 ```silk
 impl<'reader, 'transport, 'head, P> ContentReader<'reader, 'transport, 'head, P>
 ```
 
-<a id="impl.representation"></a>
+<a id="ContentReader.impl.representation"></a>
 
 ### Method `representation`
 
@@ -1501,7 +1501,7 @@ pub fn representation<'owner>(
 
 Borrows untouched wire metadata and the effective applied plan.
 
-<a id="impl.completion-2"></a>
+<a id="ContentReader.impl.completion"></a>
 
 ### Method `completion`
 
@@ -1513,7 +1513,7 @@ pub fn completion<'owner>(
 
 Returns positive completion only after framing, codecs, and pending output finish.
 
-<a id="impl.trailers-2"></a>
+<a id="ContentReader.impl.trailers"></a>
 
 ### Method `trailers`
 
@@ -1525,7 +1525,7 @@ pub fn trailers<'owner>(
 
 Borrows trailers only through successful content and body completion.
 
-<a id="impl.readSome"></a>
+<a id="ContentReader.impl.readSome"></a>
 
 ### Method `readSome`
 

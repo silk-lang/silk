@@ -28,7 +28,7 @@ pub struct ProcessInputs
 
 Borrowed argument/environment words and a validated runtime page size.
 
-<a id="impl"></a>
+<a id="ProcessInputs.impl"></a>
 
 ## Implementation `ProcessInputs`
 
@@ -36,7 +36,7 @@ Borrowed argument/environment words and a validated runtime page size.
 impl ProcessInputs
 ```
 
-<a id="impl.decode"></a>
+<a id="ProcessInputs.impl.decode"></a>
 
 ### Associated function `decode`
 
@@ -56,7 +56,7 @@ Unknown auxiliary-vector keys are ignored. No input is copied or changed.
 The caller must provide aligned readable words through both pointer-vector terminators and
 AT_NULL. Each nonzero argument/environment address must identify a live NUL-terminated string.
 
-<a id="impl.pageSize"></a>
+<a id="ProcessInputs.impl.pageSize"></a>
 
 ### Method `pageSize`
 
@@ -66,7 +66,7 @@ pub fn pageSize(self: &ProcessInputs) -> usize
 
 Returns the validated runtime AT_PAGESZ value.
 
-<a id="impl.argc"></a>
+<a id="ProcessInputs.impl.argc"></a>
 
 ### Method `argc`
 
@@ -76,7 +76,7 @@ pub fn argc(self: &ProcessInputs) -> usize
 
 Returns the number of argument strings, including the program name.
 
-<a id="impl.envc"></a>
+<a id="ProcessInputs.impl.envc"></a>
 
 ### Method `envc`
 
@@ -86,7 +86,7 @@ pub fn envc(self: &ProcessInputs) -> usize
 
 Returns the number of environment strings.
 
-<a id="impl.argument"></a>
+<a id="ProcessInputs.impl.argument"></a>
 
 ### Method `argument`
 
@@ -100,7 +100,7 @@ Returns an argument's NUL-terminated byte pointer, or null for an absent index.
 
 The decoder's original stack and string storage must remain live. The pointer owns no storage.
 
-<a id="impl.variable"></a>
+<a id="ProcessInputs.impl.variable"></a>
 
 ### Method `variable`
 

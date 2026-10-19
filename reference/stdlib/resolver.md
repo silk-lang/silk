@@ -424,7 +424,7 @@ Duplicate
 
 An equal endpoint was already present.
 
-<a id="impl"></a>
+<a id="ResolveRequest.impl"></a>
 
 ## Implementation `ResolveRequest`
 
@@ -432,7 +432,7 @@ An equal endpoint was already present.
 impl ResolveRequest
 ```
 
-<a id="impl.make"></a>
+<a id="ResolveRequest.impl.make"></a>
 
 ### Associated function `make`
 
@@ -448,7 +448,7 @@ pub fn make(
 
 Admits an owned host, checked port, finite capacity, family, and optional absolute deadline.
 
-<a id="impl.host"></a>
+<a id="ResolveRequest.impl.host"></a>
 
 ### Method `host`
 
@@ -458,7 +458,7 @@ pub fn host(self: &Self) -> Host
 
 Returns the owned host by value.
 
-<a id="impl.port"></a>
+<a id="ResolveRequest.impl.port"></a>
 
 ### Method `port`
 
@@ -468,7 +468,7 @@ pub fn port(self: &Self) -> Port
 
 Returns the checked port by value.
 
-<a id="impl.family"></a>
+<a id="ResolveRequest.impl.family"></a>
 
 ### Method `family`
 
@@ -478,7 +478,7 @@ pub fn family(self: &Self) -> FamilySelection
 
 Returns the selected address family.
 
-<a id="impl.maxResults"></a>
+<a id="ResolveRequest.impl.maxResults"></a>
 
 ### Method `maxResults`
 
@@ -488,7 +488,7 @@ pub fn maxResults(self: &Self) -> usize
 
 Returns the finite result capacity.
 
-<a id="impl.hasDeadline"></a>
+<a id="ResolveRequest.impl.hasDeadline"></a>
 
 ### Method `hasDeadline`
 
@@ -498,7 +498,7 @@ pub fn hasDeadline(self: &Self) -> bool
 
 Reports whether the request carries an absolute deadline.
 
-<a id="impl.deadline"></a>
+<a id="ResolveRequest.impl.deadline"></a>
 
 ### Method `deadline`
 
@@ -508,7 +508,7 @@ pub fn deadline(self: &Self) -> Option<Instant>
 
 Returns the optional absolute deadline for a provider that can enforce it.
 
-<a id="impl-2"></a>
+<a id="ResolvedEndpoints.impl"></a>
 
 ## Implementation `ResolvedEndpoints`
 
@@ -516,7 +516,7 @@ Returns the optional absolute deadline for a provider that can enforce it.
 impl ResolvedEndpoints
 ```
 
-<a id="impl.make-2"></a>
+<a id="ResolvedEndpoints.impl.make"></a>
 
 ### Associated function `make`
 
@@ -526,7 +526,7 @@ pub fn make(maximum: usize) -> Result<ResolvedEndpoints, ResolverError>
 
 Creates an empty finite builder after validating its capacity.
 
-<a id="impl.length"></a>
+<a id="ResolvedEndpoints.impl.length"></a>
 
 ### Method `length`
 
@@ -536,7 +536,7 @@ pub fn length(self: &Self) -> usize
 
 Returns the number of admitted endpoints.
 
-<a id="impl.get"></a>
+<a id="ResolvedEndpoints.impl.get"></a>
 
 ### Method `get`
 
@@ -546,7 +546,7 @@ pub fn get(self: &Self, index: usize) -> Endpoint
 
 Returns a copied endpoint at a valid index.
 
-<a id="impl.asSlice"></a>
+<a id="ResolvedEndpoints.impl.asSlice"></a>
 
 ### Method `asSlice`
 
@@ -556,7 +556,7 @@ pub fn asSlice(self: &Self) -> &[Endpoint]
 
 Borrows the admitted endpoint prefix.
 
-<a id="impl.admit"></a>
+<a id="ResolvedEndpoints.impl.admit"></a>
 
 ### Method `admit`
 
@@ -593,7 +593,7 @@ effect fn resolveDomain(
 
 Resolves one admitted domain request and owns all returned endpoint storage.
 
-<a id="impl-3"></a>
+<a id="Resolver.impl"></a>
 
 ## Implementation `Resolver`
 
@@ -601,7 +601,7 @@ Resolves one admitted domain request and owns all returned endpoint storage.
 impl Resolver
 ```
 
-<a id="impl.resolve"></a>
+<a id="Resolver.impl.resolve"></a>
 
 ### Associated function `resolve`
 
