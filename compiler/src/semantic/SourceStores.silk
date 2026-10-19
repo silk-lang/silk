@@ -1,0 +1,539 @@
+//! Actual executing retained-slot occurrences and their frozen physical selector paths.
+//! Coverage and parameter-stage metadata remain in Prepared.Retention. This inventory
+//! creates no writes or source facts and never decides which slot pairs are eligible.
+
+import semantic.SourceAnalysis {EvalId, sameInputRead, sameSelector}
+import semantic.SourceFlow {PointId}
+import semantic.SourcePreparation as Prepared
+import semantic.SourcePreparation {EndpointId, InputRead, MapId, MapKind, OperationPhase,
+  RetentionId, SelectionId, SourcePreparation}
+import semantic.SourceResults as Results
+import semantic.SourceTraversal as Traversal
+import semantic.TypedBody {Expression, NodeId, NodeKind, RunAccess, SourceRetention, SourceRetentionCoverage}
+import semantic.Type {KeptRegions, KeptSlot, Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.list {List}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import CompilerBug
+
+pub struct Path {
+  pub endpoint: EndpointId
+  /// Exact root-to-accepted-endpoint order. Empty names the actual selection root.
+  pub selectors: List<MapId>
+}
+pub struct Slot {
+  pub slot: usize
+  pub original: SelectionId
+  pub physical: SelectionId
+  /// Every physical accepted frontier member, including an opaque prefix.
+  /// No paths for EmptyArray; the owning RetentionSlot retains why it is empty.
+  pub paths: List<Path>
+}
+pub struct Input {
+  pub operand: usize
+  pub route: usize
+  pub position: usize
+  pub actual: Traversal.Input
+  pub slots: List<Slot>
+}
+pub struct Operation {
+  pub prepared: usize
+  pub evaluation: EvalId
+  pub execute: PointId
+  pub retention: RetentionId
+  /// The actual call occurrence whose arguments supplied the retained stage.
+  /// An Immediate Run keeps its own execute/evaluation while naming this earlier Eval.
+  pub originating: EvalId
+  pub inputs: List<Input>
+}
+pub struct Inventory { pub operations: List<Operation> }
+
+fn sameActual(left: Traversal.Input, right: Traversal.Input) -> bool {
+  let read = match left.read {
+    Option<InputRead>.Some {value} => match right.read {
+      Option<InputRead>.Some {value: other} => sameInputRead(value, other)
+      _ => false
+    }
+    Option<InputRead>.None => match right.read { Option<InputRead>.None => true _ => false }
+  }
+  return read && left.node.index == right.node.index && left.evaluation.index == right.evaluation.index
+    && left.usePoint.index == right.usePoint.index && left.access == right.access
+}
+
+fn actualOperation<'body>(prepared: &SourcePreparation<'body>, reservation: &Traversal.Reservation,
+  results: &Results.Inventory, evaluation: EvalId) -> usize {
+  let operations = List<Results.Operation>.asSlice(&results.operations)
+  let rows = List<Prepared.Operation>.asSlice(&prepared.operations)
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < operations.length {
+    if operations[at].evaluation.index == evaluation.index {
+      if found != usize.MAX { return CompilerBug.panic(b"store occurrence has duplicate actual operations") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return CompilerBug.panic(b"store occurrence has no actual operation") }
+  let operation = &operations[found]
+  if operation.prepared >= rows.length { return CompilerBug.panic(b"store occurrence has no prepared operation") }
+  let visit = Traversal.occurrence(reservation, evaluation)
+  if rows[operation.prepared].site.index != visit.node.index || operation.execute.index != visit.execute.index {
+    return CompilerBug.panic(b"store occurrence changed its typed site or execution point")
+  }
+  return found
+}
+
+// Follow actual receiver EvalIds, not a same-node search or a type-derived implementation.
+// The finite operation bound rejects a cyclic/malformed occurrence chain.
+fn originating<'body>(prepared: &SourcePreparation<'body>, reservation: &Traversal.Reservation,
+  results: &Results.Inventory, executing: EvalId, retention: RetentionId) -> usize {
+  let retained = List<Prepared.Retention>.asSlice(&prepared.retentions)
+  if retention.index >= retained.length { return CompilerBug.panic(b"store occurrence lost its retained record") }
+  let record = &retained[retention.index]
+  let rows = List<Prepared.Operation>.asSlice(&prepared.operations)
+  let operations = List<Results.Operation>.asSlice(&results.operations)
+  let mut evaluation = executing
+  let mut remaining = operations.length
+  while remaining > usize.ZERO {
+    remaining = remaining - usize.ONE
+    let index = actualOperation(prepared, reservation, results, evaluation)
+    let actual = &operations[index]
+    let row = &rows[actual.prepared]
+    let same = match row.retention { Option<RetentionId>.Some {value} => value.index == retention.index _ => false }
+    if !same { return CompilerBug.panic(b"immediate store execution changed its original retained stage") }
+    let visit = Traversal.occurrence(reservation, evaluation)
+    if row.site.index >= prepared.body.nodes.length { return CompilerBug.panic(b"store execution has no typed site") }
+    if row.site.index == record.site.index {
+      let call = match &prepared.body.nodes[row.site.index].kind {
+        NodeKind.Expression {form: Expression.DirectCall {..}, ..} => true
+        NodeKind.Expression {form: Expression.InterfaceCall {..}, ..} => true
+        NodeKind.Expression {form: Expression.CallableCall {..}, ..} => true
+        _ => false
+      }
+      let application = match row.application {
+        Option<Prepared.ApplicationId>.Some {value} => value.index == record.application.index _ => false
+      }
+      if !call || !application || row.phase == OperationPhase.ExecuteEffect {
+        return CompilerBug.panic(b"retained store stage is not its original call application")
+      }
+      return index
+    }
+    let operand = match &prepared.body.nodes[row.site.index].kind {
+      NodeKind.Expression {form: Expression.Run {value, access: RunAccess.Immediate}, ..} => value
+      _ => { return CompilerBug.panic(b"retained execution crossed a non-immediate receiver") }
+    }
+    if row.phase != OperationPhase.ExecuteEffect { return CompilerBug.panic(b"immediate store receiver is not executing") }
+    let receiver = match actual.receiver {
+      Option<Results.Receiver>.Some {value} => value
+      _ => { return CompilerBug.panic(b"immediate store execution has no actual receiver read") }
+    }
+    let inputs = List<Traversal.Input>.asSlice(&visit.inputs)
+    let endpoint = match row.receiver {
+      Option<EndpointId>.Some {value} => value
+      _ => { return CompilerBug.panic(b"immediate store execution lost its prepared receiver") }
+    }
+    let endpoints = List<Prepared.Endpoint>.asSlice(&prepared.endpoints)
+    if endpoint.index >= endpoints.length { return CompilerBug.panic(b"immediate store receiver has no physical endpoint") }
+    let receiverRoot = &endpoints[endpoint.index]
+    let physical = match &receiverRoot.root {
+      Prepared.Root.Node {node, role: Prepared.EndpointRole.Value} => node.index == operand.index
+      _ => false
+    }
+    let root = match receiverRoot.parent { Option<EndpointId>.None => true _ => false }
+    let read = match receiver.actual.read { Option<InputRead>.Some {value: InputRead.Receiver} => true _ => false }
+    if receiver.position >= inputs.length || !sameActual(inputs[receiver.position], receiver.actual)
+      || !read || !physical || !root || receiver.actual.node.index != operand.index || receiver.endpoint.index != endpoint.index {
+      return CompilerBug.panic(b"immediate store execution substituted another receiver occurrence")
+    }
+    let mut count = usize.ZERO
+    let mut at = usize.ZERO
+    while at < inputs.length {
+      if let Option<InputRead>.Some {value: InputRead.Receiver} = inputs[at].read { count = count + usize.ONE }
+      at = at + usize.ONE
+    }
+    if count != usize.ONE { return CompilerBug.panic(b"immediate store execution repeated its receiver coordinate") }
+    evaluation = receiver.actual.evaluation
+    if Traversal.occurrence(reservation, evaluation).node.index != operand.index {
+      return CompilerBug.panic(b"immediate store receiver Eval is not its typed operand")
+    }
+  }
+  return CompilerBug.panic(b"retained execution has a cyclic actual receiver chain")
+}
+
+fn actualInput<'body>(prepared: &SourcePreparation<'body>, reservation: &Traversal.Reservation,
+  operation: &Results.Operation, route: usize) -> Results.Input {
+  let rows = List<Prepared.Operation>.asSlice(&prepared.operations)
+  let routes = List<Prepared.InputRoute>.asSlice(&rows[operation.prepared].inputs)
+  if route >= routes.length { return CompilerBug.panic(b"retained operand lost its original input route") }
+  let visit = Traversal.occurrence(reservation, operation.evaluation)
+  let actual = Traversal.routeInput(prepared, visit, &routes[route])
+  let inputs = List<Results.Input>.asSlice(&operation.inputs)
+  let positions = List<Traversal.Input>.asSlice(&visit.inputs)
+  let mut found = Option<Results.Input>.none()
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    let input = inputs[at]
+    if input.route == route {
+      if let Option<Results.Input>.Some {..} = found { return CompilerBug.panic(b"retained route repeated its actual occurrence") }
+      if input.position >= positions.length || !sameActual(input.actual, actual)
+        || !sameActual(positions[input.position], actual) {
+        return CompilerBug.panic(b"retained input changed its actual position, Eval or use point")
+      }
+      if Traversal.occurrence(reservation, actual.evaluation).node.index != actual.node.index {
+        return CompilerBug.panic(b"retained input Eval changed its actual operand")
+      }
+      found = Option<Results.Input>.some(input)
+    }
+    at = at + usize.ONE
+  }
+  return match found {
+    Option<Results.Input>.Some {value} => value
+    _ => CompilerBug.panic(b"retained route has no actual result-inventory input")
+  }
+}
+
+fn incoming<'body>(prepared: &SourcePreparation<'body>, selection: &Prepared.Selection, endpoint: EndpointId) -> MapId {
+  let maps = List<Prepared.SelectionMap>.asSlice(&prepared.maps)
+  let listed = List<MapId>.asSlice(&selection.maps)
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if maps[listed[at].index].target.index == endpoint.index {
+      if found != usize.MAX { return CompilerBug.panic(b"retained selector endpoint has duplicate incoming maps") }
+      found = listed[at].index
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return CompilerBug.panic(b"retained selector path omitted its exact parent map") }
+  return MapId {index: found}
+}
+
+fn validateConnected<'body>(prepared: &SourcePreparation<'body>, selection: &Prepared.Selection, endpoint: EndpointId) -> () {
+  let maps = List<Prepared.SelectionMap>.asSlice(&prepared.maps)
+  let mut current = endpoint
+  let mut remaining = List<MapId>.length(&selection.maps)
+  while current.index != selection.root.index {
+    if remaining == usize.ZERO { return CompilerBug.panic(b"retained selection has a cycle or disconnected frontier") }
+    remaining = remaining - usize.ONE
+    current = maps[incoming(prepared, selection, current).index].source
+  }
+  return ()
+}
+
+fn validateSelection<'body>(prepared: &SourcePreparation<'body>, site: NodeId, slot: &Prepared.SlotSelection) -> () {
+  let selections = List<Prepared.Selection>.asSlice(&prepared.selections)
+  let maps = List<Prepared.SelectionMap>.asSlice(&prepared.maps)
+  let endpoints = List<Prepared.Endpoint>.asSlice(&prepared.endpoints)
+  if slot.selection.index >= selections.length { return CompilerBug.panic(b"retained slot has no frozen selection") }
+  let selection = &selections[slot.selection.index]
+  if selection.site.index != site.index || selection.root.index >= endpoints.length {
+    return CompilerBug.panic(b"retained selection changed its original call site or root")
+  }
+  let listed = List<MapId>.asSlice(&selection.maps)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].index >= maps.length { return CompilerBug.panic(b"retained selection names an absent map") }
+    let map = &maps[listed[at].index]
+    if map.source.index >= endpoints.length || map.target.index >= endpoints.length {
+      return CompilerBug.panic(b"retained selection names an absent endpoint")
+    }
+    let parent = match endpoints[map.target.index].parent {
+      Option<EndpointId>.Some {value} => value.index == map.source.index _ => false
+    }
+    if map.kind != MapKind.Select || map.site.index != site.index || !parent
+      || map.target.index == selection.root.index || !sameSelector(&map.selector, &endpoints[map.target.index].selector) {
+      return CompilerBug.panic(b"retained selection substituted another physical selector edge")
+    }
+    let mut earlier = usize.ZERO
+    while earlier < at {
+      if listed[earlier].index == listed[at].index || maps[listed[earlier].index].target.index == map.target.index {
+        return CompilerBug.panic(b"retained selection repeated a map or physical child")
+      }
+      earlier = earlier + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < listed.length {
+    validateConnected(prepared, selection, maps[listed[at].index].target)
+    at = at + usize.ONE
+  }
+  let accepts = List<EndpointId>.asSlice(&selection.accepts)
+  at = usize.ZERO
+  while at < accepts.length {
+    if accepts[at].index >= endpoints.length { return CompilerBug.panic(b"retained selection accepts an absent endpoint") }
+    let mut earlier = usize.ZERO
+    while earlier < at {
+      if accepts[earlier].index == accepts[at].index { return CompilerBug.panic(b"retained selection repeated an accepted endpoint") }
+      earlier = earlier + usize.ONE
+    }
+    validateConnected(prepared, selection, accepts[at])
+    at = at + usize.ONE
+  }
+  if let Prepared.SlotCoverage.EmptyArray {endpoint} = &slot.coverage {
+    if endpoint.index >= endpoints.length || accepts.length != usize.ZERO {
+      return CompilerBug.panic(b"empty retained array invented an accepted source frontier")
+    }
+    validateConnected(prepared, selection, endpoint)
+    let shapes = List<Prepared.Shape>.asSlice(&prepared.shapes)
+    let empty = match &shapes[endpoints[endpoint.index].shape.index].state {
+      Prepared.ShapeState.Array {length} => length == usize.ZERO _ => false
+    }
+    if !empty { CompilerBug.panic(b"empty retained selection does not name its actual zero-length array") }
+  }
+  return ()
+}
+
+effect fn physicalPaths<'body>(prepared: &SourcePreparation<'body>, selection: SelectionId) -> List<Path>
+! OutOfMemoryError ? &mut Allocator {
+  let row = &List<Prepared.Selection>.asSlice(&prepared.selections)[selection.index]
+  let maps = List<Prepared.SelectionMap>.asSlice(&prepared.maps)
+  let accepts = List<EndpointId>.asSlice(&row.accepts)
+  let mut paths = List<Path>.make()
+  let mut at = usize.ZERO
+  while at < accepts.length {
+    let mut current = accepts[at]
+    let mut reverse = List<MapId>.make()
+    while current.index != row.root.index {
+      let map = incoming(prepared, row, current)
+      run List<MapId>.append(&mut reverse, map)
+      current = maps[map.index].source
+    }
+    let mut selectors = List<MapId>.make()
+    let backwards = List<MapId>.asSlice(&reverse)
+    let mut each = backwards.length
+    while each > usize.ZERO {
+      each = each - usize.ONE
+      run List<MapId>.append(&mut selectors, backwards[each])
+    }
+    run List<Path>.append(&mut paths, Path {endpoint: accepts[at], selectors: move selectors})
+    at = at + usize.ONE
+  }
+  return move paths
+}
+
+fn validateRecord<'body>(prepared: &SourcePreparation<'body>, id: RetentionId, operation: &Prepared.Operation) -> () {
+  let record = &List<Prepared.Retention>.asSlice(&prepared.retentions)[id.index]
+  let operands = List<Prepared.RetentionOperand>.asSlice(&record.operands)
+  let complete = Shared<SourceRetention>.with<bool>(&record.source, fn(source: &SourceRetention) -> bool {
+    return match source.coverage { SourceRetentionCoverage.Complete => true _ => false }
+  })
+  if !complete {
+    if operands.length != usize.ZERO || (prepared.body.coverage != Prepared.Coverage.Recovery && !prepared.body.pending) {
+      CompilerBug.panic(b"unmatched retained stage invented exact runtime operands")
+    }
+    return ()
+  }
+  let count = Shared<List<KeptRegions>>.with<usize>(&record.recorded, fn(values: &List<KeptRegions>) -> usize {
+    return List<KeptRegions>.length(values)
+  })
+  let domain = Shared<SourceRetention>.with<usize>(&record.source, fn(source: &SourceRetention) -> usize {
+    return List<usize>.length(&source.operands)
+  })
+  if operands.length != count || domain != count { CompilerBug.panic(b"retained stage omitted an original runtime operand") }
+  let routes = List<Prepared.InputRoute>.asSlice(&operation.inputs)
+  let maps = List<Prepared.SelectionMap>.asSlice(&prepared.maps)
+  let selections = List<Prepared.Selection>.asSlice(&prepared.selections)
+  let endpoints = List<Prepared.Endpoint>.asSlice(&prepared.endpoints)
+  let mut at = usize.ZERO
+  while at < operands.length {
+    let operand = &operands[at]
+    let parameter = Shared<SourceRetention>.with<usize>(&record.source, fn(source: &SourceRetention) -> usize {
+      return List<usize>.asSlice(&source.operands)[at]
+    })
+    let parameters = Shared<SourceRetention>.with<usize>(&record.source, fn(source: &SourceRetention) -> usize {
+      return List<Shared<Type>>.length(&source.parameters)
+    })
+    if operand.operand != at || operand.parameter != parameter || parameter >= parameters || operand.input >= routes.length {
+      CompilerBug.panic(b"retained operand changed its full parameter-stage coordinate")
+    }
+    let route = &routes[operand.input]
+    let argument = match route.read { InputRead.Argument {ordinal} => ordinal == at _ => false }
+    if !argument || route.map.index >= maps.length { CompilerBug.panic(b"retained operand changed its originating argument route") }
+    let mut matching = usize.ZERO
+    let mut each = usize.ZERO
+    while each < routes.length {
+      if sameInputRead(routes[each].read, route.read) { matching = matching + usize.ONE }
+      each = each + usize.ONE
+    }
+    if matching != usize.ONE || maps[route.map.index].site.index != record.site.index {
+      CompilerBug.panic(b"retained operand has ambiguous routes or a different call-site map")
+    }
+    let physical = maps[route.map.index].source
+    if physical.index >= endpoints.length { CompilerBug.panic(b"retained input map has no actual source endpoint") }
+    let count = Shared<List<KeptRegions>>.with<usize>(&record.recorded, fn(values: &List<KeptRegions>) -> usize {
+      return List<KeptSlot>.length(&List<KeptRegions>.asSlice(values)[at].slots)
+    })
+    let slots = List<Prepared.RetentionSlot>.asSlice(&operand.slots)
+    if slots.length != count { CompilerBug.panic(b"retained operand omitted an original slot") }
+    let mut slot = usize.ZERO
+    while slot < slots.length {
+      let value = &slots[slot]
+      if value.slot != slot { CompilerBug.panic(b"retained slot changed its original ordinal") }
+      validateSelection(prepared, record.site, &value.original)
+      validateSelection(prepared, record.site, &value.physical)
+      let original = selections[value.original.selection.index].root
+      let root = &endpoints[original.index]
+      let exact = match &root.root {
+        Prepared.Root.Retention {retention, operand: selected} => retention.index == id.index && selected == at
+        _ => false
+      }
+      let parent = match root.parent { Option<EndpointId>.None => true _ => false }
+      if !exact || !parent || selections[value.physical.selection.index].root.index != physical.index {
+        CompilerBug.panic(b"retained slot cross-paired original parameter and physical argument roots")
+      }
+      slot = slot + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Revalidate actual occurrence binding and every retained slot/path against the same
+/// immutable preparation and reservation. No policy or source-presence interpretation.
+pub fn validateOperation<'body>(prepared: &SourcePreparation<'body>, reservation: &Traversal.Reservation,
+  results: &Results.Inventory, operation: &Operation) -> () {
+  let operations = List<Results.Operation>.asSlice(&results.operations)
+  let executing = actualOperation(prepared, reservation, results, operation.evaluation)
+  let actual = &operations[executing]
+  let rows = List<Prepared.Operation>.asSlice(&prepared.operations)
+  let row = &rows[actual.prepared]
+  if operation.prepared != actual.prepared || operation.execute.index != actual.execute.index
+    || row.phase == OperationPhase.PrepareEffect {
+    CompilerBug.panic(b"store reservation changed its actual executing operation")
+  }
+  let origin = originating(prepared, reservation, results, operation.evaluation, operation.retention)
+  let source = &operations[origin]
+  if source.evaluation.index != operation.originating.index {
+    CompilerBug.panic(b"store reservation changed its actual originating call")
+  }
+  if row.phase == OperationPhase.Invoke && origin != executing {
+    CompilerBug.panic(b"direct invocation acquired another operation's retained inputs")
+  }
+  let retained = &List<Prepared.Retention>.asSlice(&prepared.retentions)[operation.retention.index]
+  validateRecord(prepared, operation.retention, &rows[source.prepared])
+  let operands = List<Prepared.RetentionOperand>.asSlice(&retained.operands)
+  let inputs = List<Input>.asSlice(&operation.inputs)
+  if inputs.length != operands.length { CompilerBug.panic(b"store inventory omitted an original retained operand") }
+  let maps = List<Prepared.SelectionMap>.asSlice(&prepared.maps)
+  let endpoints = List<Prepared.Endpoint>.asSlice(&prepared.endpoints)
+  let selections = List<Prepared.Selection>.asSlice(&prepared.selections)
+  let routes = List<Prepared.InputRoute>.asSlice(&rows[source.prepared].inputs)
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    let input = &inputs[at]
+    let operand = &operands[at]
+    let original = actualInput(prepared, reservation, source, operand.input)
+    if input.operand != operand.operand || input.route != operand.input || input.position != original.position
+      || !sameActual(input.actual, original.actual) {
+      CompilerBug.panic(b"store input changed its actual retained operand occurrence")
+    }
+    let endpoint = &endpoints[maps[routes[input.route].map.index].source.index]
+    let physical = match &endpoint.root {
+      Prepared.Root.Node {node, role: Prepared.EndpointRole.Value} => node.index == input.actual.node.index
+      _ => false
+    }
+    if !physical { CompilerBug.panic(b"store input selector root is not its actual argument value") }
+    let slots = List<Slot>.asSlice(&input.slots)
+    let retainedSlots = List<Prepared.RetentionSlot>.asSlice(&operand.slots)
+    if slots.length != retainedSlots.length { CompilerBug.panic(b"store inventory omitted an original retained slot") }
+    let mut slot = usize.ZERO
+    while slot < slots.length {
+      let value = &slots[slot]
+      if value.slot != retainedSlots[slot].slot || value.original.index != retainedSlots[slot].original.selection.index
+        || value.physical.index != retainedSlots[slot].physical.selection.index {
+        CompilerBug.panic(b"store slot substituted another original or physical selection")
+      }
+      let selection = &selections[value.physical.index]
+      let accepts = List<EndpointId>.asSlice(&selection.accepts)
+      let paths = List<Path>.asSlice(&value.paths)
+      if paths.length != accepts.length { CompilerBug.panic(b"store slot lost a physical accepted frontier member") }
+      let mut path = usize.ZERO
+      while path < paths.length {
+        let selected = &paths[path]
+        if selected.endpoint.index != accepts[path].index { CompilerBug.panic(b"store path changed its accepted endpoint order") }
+        let selectors = List<MapId>.asSlice(&selected.selectors)
+        let mut current = selected.endpoint
+        let mut step = selectors.length
+        while current.index != selection.root.index {
+          if step == usize.ZERO { CompilerBug.panic(b"store path omitted an original physical selector") }
+          step = step - usize.ONE
+          let map = incoming(prepared, selection, current)
+          if selectors[step].index != map.index { CompilerBug.panic(b"store path substituted or reordered a physical selector") }
+          current = maps[map.index].source
+        }
+        if step != usize.ZERO { CompilerBug.panic(b"store path invented a prefix before the selection root") }
+        path = path + usize.ONE
+      }
+      slot = slot + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Reserve only actual Invoke/ExecuteEffect occurrences with retained metadata. Preparation
+/// records remain metadata; stored Run cannot inherit writes from a same-typed descriptor.
+/// Structurally present but unreachable operations remain present at their real execute point.
+pub effect fn reserve<'body>(prepared: &SourcePreparation<'body>, reservation: &Traversal.Reservation,
+  results: &Results.Inventory) -> Inventory ! OutOfMemoryError ? &mut Allocator {
+  let operations = List<Results.Operation>.asSlice(&results.operations)
+  let rows = List<Prepared.Operation>.asSlice(&prepared.operations)
+  let mut inventory = Inventory {operations: List<Operation>.make()}
+  let mut at = usize.ZERO
+  while at < operations.length {
+    let actual = &operations[at]
+    if actualOperation(prepared, reservation, results, actual.evaluation) != at {
+      CompilerBug.panic(b"store reservation changed operation occurrence order")
+    }
+    let row = &rows[actual.prepared]
+    if row.phase != OperationPhase.PrepareEffect {
+      match row.retention {
+        Option<RetentionId>.Some {value: id} => {
+          let origin = originating(prepared, reservation, results, actual.evaluation, id)
+          let source = &operations[origin]
+          validateRecord(prepared, id, &rows[source.prepared])
+          let retained = &List<Prepared.Retention>.asSlice(&prepared.retentions)[id.index]
+          let operands = List<Prepared.RetentionOperand>.asSlice(&retained.operands)
+          let mut inputs = List<Input>.make()
+          let mut each = usize.ZERO
+          while each < operands.length {
+            let operand = &operands[each]
+            let read = actualInput(prepared, reservation, source, operand.input)
+            let original = List<Prepared.RetentionSlot>.asSlice(&operand.slots)
+            let mut slots = List<Slot>.make()
+            let mut slot = usize.ZERO
+            while slot < original.length {
+              let value = &original[slot]
+              let paths = run physicalPaths(prepared, value.physical.selection)
+              run List<Slot>.append(&mut slots, Slot {slot: value.slot, original: value.original.selection,
+                physical: value.physical.selection, paths: move paths})
+              slot = slot + usize.ONE
+            }
+            run List<Input>.append(&mut inputs, Input {operand: operand.operand, route: operand.input,
+              position: read.position, actual: read.actual, slots: move slots})
+            each = each + usize.ONE
+          }
+          let operation = Operation {prepared: actual.prepared, evaluation: actual.evaluation, execute: actual.execute,
+            retention: id, originating: source.evaluation, inputs: move inputs}
+          validateOperation(prepared, reservation, results, &operation)
+          run List<Operation>.append(&mut inventory.operations, move operation)
+        }
+        Option<RetentionId>.None => {
+          let required = match &prepared.body.nodes[row.site.index].kind {
+            NodeKind.Expression {form: Expression.DirectCall {..}, ..} => true
+            NodeKind.Expression {form: Expression.InterfaceCall {..}, ..} => true
+            NodeKind.Expression {form: Expression.CallableCall {..}, ..} => true
+            NodeKind.Expression {form: Expression.Run {access: RunAccess.Immediate, ..}, ..} => true
+            _ => false
+          }
+          if required { CompilerBug.panic(b"executing call omitted its original retained stage") }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move inventory
+}
