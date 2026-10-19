@@ -2569,6 +2569,33 @@ struct SourceLoanAvailability {
   unresolved: bool
 }
 
+struct SourceHolderRequest {
+  owner: Option<SourceVisit.OwnerId>
+  evaluation: SourceGraph.EvalId
+  root: PreparedSources.EndpointId
+  point: SourceControl.PointId
+  active: SourceAtom
+}
+impl Copy for SourceHolderRequest {}
+
+struct SourceHolderUse {
+  request: usize
+  storage: SourceGraph.Storage
+  active: SourceAtom
+}
+impl Copy for SourceHolderUse {}
+
+struct SourceHolderProjection {
+  requests: List<SourceHolderRequest>
+  uses: List<SourceHolderUse>
+  missing: SourceAtom
+}
+
+struct SourceHolderLiveness {
+  liveOut: List<u64>
+  unresolved: bool
+}
+
 // Inputs to the existing availability propagation: real carriers and paired copy reads.
 // `preserves` is a projection of kills, not an independently solved reaching relation.
 struct AvailabilitySource {
@@ -3293,6 +3320,166 @@ fn sourceSameStorage(left: SourceGraph.Storage, right: SourceGraph.Storage) -> b
   }
 }
 
+// Canonical whole-owner ancestry stops at every address/channel boundary. Keeping a holder
+// through a field use does not turn a returned reference's provenance into its storage owner.
+fn sourceStorageRoot(endpoints: &[PreparedSources.Endpoint], storage: SourceGraph.Storage) -> Option<SourceGraph.Storage> {
+  let mut current = storage.endpoint
+  let mut remaining = endpoints.length
+  while current.index < endpoints.length && remaining > usize.ZERO {
+    let endpoint = &endpoints[current.index]
+    match endpoint.parent {
+      Option<PreparedSources.EndpointId>.Some {value} => {
+        match &endpoint.selector {
+          PreparedSources.Selector.Field {..} | PreparedSources.Selector.Member {..}
+            | PreparedSources.Selector.Variant {..} | PreparedSources.Selector.Index {..} => { current = value }
+          _ => { return Option<SourceGraph.Storage>.none() }
+        }
+      }
+      _ => {
+        let valid = match &endpoint.root {
+          PreparedSources.Root.Local {role, ..} => role == PreparedSources.EndpointRole.Storage
+            && match storage.temporary { Option<SourceGraph.EvalId>.None => true _ => false }
+          PreparedSources.Root.Node {role, ..} => role == PreparedSources.EndpointRole.Storage
+            && match storage.temporary { Option<SourceGraph.EvalId>.Some {..} => true _ => false }
+          _ => false
+        }
+        if valid { return Option<SourceGraph.Storage>.some(SourceGraph.Storage {endpoint: current, temporary: storage.temporary}) }
+        return Option<SourceGraph.Storage>.none()
+      }
+    }
+    remaining = remaining - usize.ONE
+  }
+  return Option<SourceGraph.Storage>.none()
+}
+
+fn sourceOwnerStorage<'body>(builder: &SourceGraph.Builder<'body>, owner: &SourceVisit.Owner,
+  storage: SourceGraph.Storage) -> bool {
+  let endpoints = List<PreparedSources.Endpoint>.asSlice(&SourceGraph.Builder.preparation(builder).endpoints)
+  let endpoint = &endpoints[storage.endpoint.index]
+  return match owner.root {
+    SourceVisit.OwnerRoot.Local {local} => match &endpoint.root {
+      PreparedSources.Root.Local {local: actual, role} => actual.index == local.index && role == PreparedSources.EndpointRole.Storage
+        && match storage.temporary { Option<SourceGraph.EvalId>.None => true _ => false }
+      _ => false
+    }
+    SourceVisit.OwnerRoot.Temporary {evaluation} | SourceVisit.OwnerRoot.Subject {evaluation, ..} => {
+      let same = match storage.temporary { Option<SourceGraph.EvalId>.Some {value} => value.index == evaluation.index _ => false }
+      if !same { return false }
+      let actual = SourceGraph.Builder.evaluation(builder, evaluation)
+      return match actual.site {
+        SourceGraph.EvaluationSite.Node {node} => match &endpoint.root {
+          PreparedSources.Root.Node {node: stored, role} => stored.index == node.index && role == PreparedSources.EndpointRole.Storage
+          _ => false
+        }
+        _ => false
+      }
+    }
+  }
+}
+
+// Retain requests even when no canonical address exists. Whole-holder demand is independent
+// of which loans the selected output carries, including a LoanFree selected field. Exact alias
+// nodes license address-only uses; existing reads license only their actual Copy placement.
+effect fn sourceHolderProjection<'body>(builder: &mut SourceGraph.Builder<'body>, reservation: &SourceVisit.Reservation,
+  storage: &SourceStorageProjection, requests: List<SourceHolderRequest>) -> SourceHolderProjection
+! OutOfMemoryError ? &mut Allocator {
+  let mut result = SourceHolderProjection {requests: move requests, uses: List<SourceHolderUse>.make(), missing: SourceProgram.atom(&mut builder.rules)}
+  let all = List<SourceHolderRequest>.asSlice(&result.requests)
+  let definitions = List<SourceStorageDefinition>.asSlice(&storage.definitions)
+  let reads = List<SourceGraph.ReadView>.asSlice(&storage.reads)
+  let empty = List<SourceAtom>.make()
+  let none = List<SourceAtom>.asSlice(&empty)
+  let mut gaps = List<SourceAtom>.make()
+  let mut at = usize.ZERO
+  while at < all.length {
+    let request = all[at]
+    let reachable = List<SourceControl.Point>.asSlice(&builder.reaching.points)[request.point.index].reachable
+    let guards: [SourceAtom; 2] = [request.active, reachable]
+    let active = run SourcePolicy.conjunction(&mut builder.rules, &guards, none)
+    let mut covered = List<SourceAtom>.make()
+    if let Option<SourceVisit.OwnerId>.Some {value: owner} = request.owner {
+      let owners = List<SourceVisit.Owner>.asSlice(&reservation.owners)
+      if owner.index >= owners.length { CompilerBug.panic(b"whole-holder use lost its actual owner") }
+      let mut each = usize.ZERO
+      while each < definitions.length {
+        if let Option<SourceGraph.Storage>.Some {value: root} = sourceStorageRoot(
+          List<PreparedSources.Endpoint>.asSlice(&SourceGraph.Builder.preparation(&builder.*).endpoints), definitions[each].definition.storage) {
+          if sourceOwnerStorage(&builder.*, &owners[owner.index], root) {
+            run List<SourceHolderUse>.append(&mut result.uses, SourceHolderUse {request: at, storage: root, active: active})
+            run List<SourceAtom>.append(&mut covered, active)
+          }
+        }
+        each = each + usize.ONE
+      }
+    } else {
+      let mut alias = usize.ZERO
+      while alias < SourceGraph.Builder.aliases(&builder.*).length {
+        let aliases = SourceGraph.Builder.aliases(&builder.*)
+        if aliases[alias].evaluation.index == request.evaluation.index && aliases[alias].endpoint.index == request.root.index {
+          if let Option<SourceGraph.Storage>.Some {value: root} = sourceStorageRoot(
+            List<PreparedSources.Endpoint>.asSlice(&SourceGraph.Builder.preparation(&builder.*).endpoints), aliases[alias].storage) {
+            let guards: [SourceAtom; 2] = [active, aliases[alias].active]
+            let present = run SourcePolicy.conjunction(&mut builder.rules, &guards, none)
+            run List<SourceHolderUse>.append(&mut result.uses, SourceHolderUse {request: at, storage: root, active: present})
+            // Positive address proofs supply uses, but this inventory does not certify that
+            // every possible address history has been enumerated. Read/owner coverage below
+            // remains necessary until the graph exposes the demand's completeness evidence.
+          }
+        }
+        alias = alias + usize.ONE
+      }
+      let components = run sourceComponents(SourceGraph.Builder.preparation(&builder.*), request.root)
+      let parts = List<PreparedSources.EndpointId>.asSlice(&components)
+      let mut readCoverage = List<SourceAtom>.make()
+      let mut component = usize.ZERO
+      while component < parts.length {
+        let mut componentCoverage = List<SourceAtom>.make()
+        let mut value = usize.ZERO
+        while value < SourceGraph.Builder.values(&builder.*).length {
+          let actual = SourceGraph.Builder.value(&builder.*, SourceGraph.ValueId {index: value})
+          let physical = match actual.subject { Option<SourceGraph.ResidualSubject>.None => true _ => false }
+          if physical && actual.endpoint.index == parts[component].index && actual.phase == SourceGraph.ValuePhase.Input && actual.evaluation.index == request.evaluation.index {
+            let mut read = usize.ZERO
+            while read < reads.length {
+              if reads[read].point.index == SourceGraph.Builder.evaluation(&builder.*, request.evaluation).point.index {
+                let placements = run SourceGraph.Builder.readPlacements(&builder.*, SourceGraph.ValueId {index: value}, reads[read].id)
+                let candidates = List<SourceGraph.ReadPlacement>.asSlice(&placements)
+                let mut each = usize.ZERO
+                while each < candidates.length {
+                  if let Option<SourceGraph.Storage>.Some {value: root} = sourceStorageRoot(
+                    List<PreparedSources.Endpoint>.asSlice(&SourceGraph.Builder.preparation(&builder.*).endpoints), candidates[each].storage) {
+                    let guards: [SourceAtom; 2] = [active, candidates[each].active]
+                    let present = run SourcePolicy.conjunction(&mut builder.rules, &guards, none)
+                    run List<SourceHolderUse>.append(&mut result.uses, SourceHolderUse {request: at, storage: root, active: present})
+                    run List<SourceAtom>.append(&mut componentCoverage, present)
+                  }
+                  each = each + usize.ONE
+                }
+              }
+              read = read + usize.ONE
+            }
+          }
+          value = value + usize.ONE
+        }
+        run List<SourceAtom>.append(&mut readCoverage,
+          run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&componentCoverage)))
+        component = component + usize.ONE
+      }
+      if parts.length > usize.ZERO {
+        run List<SourceAtom>.append(&mut covered,
+          run SourcePolicy.conjunction(&mut builder.rules, List<SourceAtom>.asSlice(&readCoverage), none))
+      }
+    }
+    let present = run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&covered))
+    let included: [SourceAtom; 1] = [active]
+    let excluded: [SourceAtom; 1] = [present]
+    run List<SourceAtom>.append(&mut gaps, run SourcePolicy.conjunction(&mut builder.rules, &included, &excluded))
+    at = at + usize.ONE
+  }
+  result.missing = run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&gaps))
+  return move result
+}
+
 // Capture symbolic source membership only after structural reservation has closed. This
 // does not emit a definition, choose a reaching predecessor, or turn a Borrow leaf into a
 // storage owner. Availability later uses this record's real ID with Graph.control().
@@ -3554,30 +3741,14 @@ effect fn sourceControlProjection<'body>(graph: &SourceGraph.Graph<'body>, entry
 // Field-sensitive needs use the original paired read. A copied value can remain in flight
 // after its old owner is overwritten; that interval does not keep the old storage occupied.
 // Whole-holder conflict uses are a separate canonical-owner demand, not output source facts.
-effect fn sourceLoanNeeds<'body>(graph: &SourceGraph.Graph<'body>, control: &SourceControlProjection,
-  storage: &SourceStorageProjection, occupancy: &SourceLoanOccupancy, intervals: &[SourceIntervalProjection],
-  created: usize, flow: &mut IntervalFlow) -> SourceLoanNeeds ! OutOfMemoryError ? &mut Allocator {
-  let points = List<Point>.asSlice(&control.points)
+effect fn sourceLivenessBounds<'body>(graph: &SourceGraph.Graph<'body>, storage: &SourceStorageProjection,
+  occupancy: &SourceLoanOccupancy) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let points = List<SourceControl.Point>.asSlice(&SourceGraph.Graph.control(graph).points)
   let definitions = List<SourceStorageDefinition>.asSlice(&storage.definitions)
-  let mut used = List<u64>.make()
-  let mut bound = List<u64>.make()
-  let mut required = List<u64>.make()
-  let mut unresolved = control.unresolved || occupancy.unresolved
   let width = occupancy.width
+  let mut bound = List<u64>.make()
   let mut at = usize.ZERO
-  while at < points.length * width {
-    run List<u64>.append(&mut used, 0)
-    run List<u64>.append(&mut bound, 0)
-    at = at + usize.ONE
-  }
-  at = usize.ZERO
-  while at < (points.length + 63) / 64 { run List<u64>.append(&mut required, 0) at = at + usize.ONE }
-  if created < points.length {
-    let active = SourceGraph.Graph.truth(graph,
-      List<SourceControl.Point>.asSlice(&SourceGraph.Graph.control(graph).points)[created].reachable)
-    if active != SourceTruth.False { drop includeRegionPoint(&mut required, created) }
-    if active == SourceTruth.Undefined { unresolved = true }
-  } else { unresolved = true }
+  while at < points.length * width { run List<u64>.append(&mut bound, 0) at = at + usize.ONE }
   at = usize.ZERO
   while at < points.length {
     let mut each = usize.ZERO
@@ -3594,6 +3765,32 @@ effect fn sourceLoanNeeds<'body>(graph: &SourceGraph.Graph<'body>, control: &Sou
     }
     at = at + usize.ONE
   }
+  return move bound
+}
+
+effect fn sourceLoanNeeds<'body>(graph: &SourceGraph.Graph<'body>, control: &SourceControlProjection,
+  storage: &SourceStorageProjection, occupancy: &SourceLoanOccupancy, intervals: &[SourceIntervalProjection],
+  created: usize, flow: &mut IntervalFlow) -> SourceLoanNeeds ! OutOfMemoryError ? &mut Allocator {
+  let points = List<Point>.asSlice(&control.points)
+  let definitions = List<SourceStorageDefinition>.asSlice(&storage.definitions)
+  let mut used = List<u64>.make()
+  let mut required = List<u64>.make()
+  let mut unresolved = control.unresolved || occupancy.unresolved
+  let width = occupancy.width
+  let mut at = usize.ZERO
+  while at < points.length * width {
+    run List<u64>.append(&mut used, 0)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < (points.length + 63) / 64 { run List<u64>.append(&mut required, 0) at = at + usize.ONE }
+  if created < points.length {
+    let active = SourceGraph.Graph.truth(graph,
+      List<SourceControl.Point>.asSlice(&SourceGraph.Graph.control(graph).points)[created].reachable)
+    if active != SourceTruth.False { drop includeRegionPoint(&mut required, created) }
+    if active == SourceTruth.Undefined { unresolved = true }
+  } else { unresolved = true }
+  let bound = run sourceLivenessBounds(graph, storage, occupancy)
   at = usize.ZERO
   while at < intervals.length {
     let interval = &intervals[at]
@@ -3641,6 +3838,47 @@ effect fn sourceLoanNeeds<'body>(graph: &SourceGraph.Graph<'body>, control: &Sou
     at = at + usize.ONE
   }
   return SourceLoanNeeds {required: move required, liveOut: move liveOut, unresolved: unresolved}
+}
+
+// Whole-holder uses retain every reaching definition of that canonical owner for conflicts.
+// They do not add source cases to the selected result or field-sensitive region requirements.
+effect fn sourceHolderLiveness<'body>(graph: &SourceGraph.Graph<'body>, control: &SourceControlProjection,
+  storage: &SourceStorageProjection, occupancy: &SourceLoanOccupancy, holders: &SourceHolderProjection)
+  -> SourceHolderLiveness ! OutOfMemoryError ? &mut Allocator {
+  let points = List<Point>.asSlice(&control.points)
+  let definitions = List<SourceStorageDefinition>.asSlice(&storage.definitions)
+  let requests = List<SourceHolderRequest>.asSlice(&holders.requests)
+  let uses = List<SourceHolderUse>.asSlice(&holders.uses)
+  let endpoints = List<PreparedSources.Endpoint>.asSlice(&SourceGraph.Graph.preparation(graph).endpoints)
+  let mut unresolved = control.unresolved || occupancy.unresolved
+    || SourceGraph.Graph.truth(graph, holders.missing) != SourceTruth.False
+  let mut used = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < points.length * occupancy.width { run List<u64>.append(&mut used, 0) at = at + usize.ONE }
+  at = usize.ZERO
+  while at < uses.length {
+    let demand = uses[at]
+    if demand.request >= requests.length { return CompilerBug.panic(b"holder liveness lost its actual use") }
+    let point = requests[demand.request].point.index
+    let active = SourceGraph.Graph.truth(graph, demand.active)
+    if active == SourceTruth.Undefined { unresolved = true }
+    if active != SourceTruth.False {
+      let mut each = usize.ZERO
+      while each < definitions.length {
+        if let Option<SourceGraph.Storage>.Some {value: root} = sourceStorageRoot(endpoints, definitions[each].definition.storage) {
+          if sourceSameStorage(root, demand.storage)
+            && reaches(List<u64>.asSlice(&occupancy.entering), occupancy.width, point, each) {
+            sourceIncludeDefinition(&mut used, occupancy.width, point, definitions[each].definition.id)
+          }
+        }
+        each = each + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  let bound = run sourceLivenessBounds(graph, storage, occupancy)
+  return SourceHolderLiveness {liveOut: run solveLiveness(points, occupancy.width,
+    List<u64>.asSlice(&used), List<u64>.asSlice(&bound)), unresolved: unresolved}
 }
 
 // Build the existing availability solver's inputs from original definitions and paired source
@@ -13826,6 +14064,32 @@ effect fn sourceAccessClaims() -> () ! OutOfMemoryError | AssertionError<'static
   let joined = run releasedInstancePoints(List<Point>.asSlice(&points), 0, 0, &occupied, &explicitEnds)
   run Testing.expect(u64.bitAnd(List<u64>.asSlice(&joined)[0], maskOf(3)) == 0,
     "a creating path bypassing the end prevents release at the join")
+  let mut endpoints = List<PreparedSources.Endpoint>.make()
+  let origin = Origin {node: 0, location: target}
+  run List<PreparedSources.Endpoint>.append(&mut endpoints, PreparedSources.Endpoint {
+    root: PreparedSources.Root.Node {node: NodeId {index: 0}, role: PreparedSources.EndpointRole.Storage},
+    parent: Option<PreparedSources.EndpointId>.none(), selector: PreparedSources.Selector.Identity,
+    shape: PreparedSources.ShapeId {index: 0}, origin: origin})
+  run List<PreparedSources.Endpoint>.append(&mut endpoints, PreparedSources.Endpoint {
+    root: PreparedSources.Root.Node {node: NodeId {index: 0}, role: PreparedSources.EndpointRole.Storage},
+    parent: Option<PreparedSources.EndpointId>.some(PreparedSources.EndpointId {index: 0}),
+    selector: PreparedSources.Selector.Field {ordinal: 0}, shape: PreparedSources.ShapeId {index: 0}, origin: origin})
+  run List<PreparedSources.Endpoint>.append(&mut endpoints, PreparedSources.Endpoint {
+    root: PreparedSources.Root.Node {node: NodeId {index: 0}, role: PreparedSources.EndpointRole.Storage},
+    parent: Option<PreparedSources.EndpointId>.some(PreparedSources.EndpointId {index: 1}),
+    selector: PreparedSources.Selector.Referent, shape: PreparedSources.ShapeId {index: 0}, origin: origin})
+  let owned = sourceStorageRoot(List<PreparedSources.Endpoint>.asSlice(&endpoints), SourceGraph.Storage {
+    endpoint: PreparedSources.EndpointId {index: 1}, temporary: Option<SourceGraph.EvalId>.some(SourceGraph.EvalId {index: 7})})
+  let canonical = match owned {
+    Option<SourceGraph.Storage>.Some {value} => sourceSameStorage(value, SourceGraph.Storage {
+      endpoint: PreparedSources.EndpointId {index: 0}, temporary: Option<SourceGraph.EvalId>.some(SourceGraph.EvalId {index: 7})})
+    _ => false
+  }
+  let crossed = sourceStorageRoot(List<PreparedSources.Endpoint>.asSlice(&endpoints), SourceGraph.Storage {
+    endpoint: PreparedSources.EndpointId {index: 2}, temporary: Option<SourceGraph.EvalId>.some(SourceGraph.EvalId {index: 7})})
+  let refused = match crossed { Option<SourceGraph.Storage>.None => true _ => false }
+  run Testing.expect(canonical && refused,
+    "whole-holder ancestry preserves the actual acquisition and cannot cross a referent into its descriptor owner")
   return ()
 }
 
