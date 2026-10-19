@@ -6,17 +6,20 @@
 
 import semantic.SourcePreparation {
   ApplicationId, ContractRouteId, Coverage, EndpointId, MapId, SelectionId as PreparedSelectionId,
-  SourcePreparation, Selection, SelectionMap, ContractRoute, Root, Endpoint,
+  SourcePreparation, Selection, SelectionMap, ContractRoute, Root, Endpoint, Selector, MapKind,
 }
 import semantic.SourceFlow {ComponentId, Definition, DefinitionId, Flow, PointId, Read, ReadId, Reaching, Point, Pair, Write}
 import semantic.SourceRules {Atom, Program, Solution, Truth}
 import semantic.TypedBody {LocalId, NodeId, NodeKind, Origin}
+import semantic.SourceLocations {Location}
 import silk.allocator {Allocator, OutOfMemoryError}
+import silk.effect {Effect}
 import silk.option {Option}
 import silk.ownership {Copy}
 import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.shared {Shared}
+import silk.testing {AssertionError, Testing}
 import silk.usize
 import silk.vector {Vector}
 import CompilerBug
@@ -122,6 +125,29 @@ pub struct Cell {
   pub alternatives: Atom
 }
 impl Copy for Cell {}
+
+/// One policy scan position for a physical value component and one source leaf. Reaching
+/// histories belong to cases, not additional positions; genuinely repeated operands have
+/// distinct ValueIds. Entry/loan-free/unknown inputs remain visible but are not Borrow counts.
+pub struct Input {
+  pub value: ValueId
+  pub leaf: LeafId
+  pub quality: Cell
+  pub cases: Vector<InputCase>
+}
+
+/// All case attributes come from one paired route. Policy guards cannot combine one history's
+/// directness or placement with another history's definition/read or quality.
+pub struct InputCase {
+  pub source: Option<ValueId>
+  pub placement: EndpointId
+  pub direct: bool
+  pub definition: Option<DefinitionId>
+  pub read: Option<ReadId>
+  pub map: Option<MapId>
+  pub contract: Option<ContractRouteId>
+  pub quality: Cell
+}
 
 struct CellKey {
   value: ValueId
@@ -351,12 +377,11 @@ fn findCell(keys: &[CellKey], value: ValueId, leaf: LeafId, witness: usize, dire
 /// Complete physical storage transfers are created from the same relation used by ownership
 /// projection. No creation-order source classifier or historical loan list participates here.
 /// The definition/read numbers index explicit records, not inferred source ordering.
-effect fn storageTransfers<'body>(preparation: &SourcePreparation<'body>, reaching: &Reaching,
+effect fn storageTransfers(maps: &[SelectionMap], reaching: &Reaching,
   stored: &[DefinedValue], readValues: &[ReadValue], values: &[Value], evaluations: &[Evaluation],
   transfers: &mut Vector<Transfer>, rules: &mut Program) -> () ! OutOfMemoryError ? &mut Allocator {
   let definitions = Vector<Definition>.asSlice(&reaching.definitions)
   let reads = Vector<Read>.asSlice(&reaching.reads)
-  let maps = Vector<SelectionMap>.asSlice(&preparation.maps)
   if stored.length != definitions.length || readValues.length != reads.length {
     CompilerBug.panic(b"source storage reservation omitted a definition or read value")
   }
@@ -528,6 +553,133 @@ effect fn reserveCell(keys: &mut Vector<CellKey>, cells: &mut Vector<Cell>, rule
   return at
 }
 
+struct Domain {
+  cells: Vector<Cell>
+  keys: Vector<CellKey>
+  witnesses: Vector<Witness>
+  cases: Vector<Case>
+}
+
+// Emits the finite paired value domain into the one program. This is independent of query
+// stamping and TypedBody publication; it cannot solve or extend prepared physical endpoints.
+effect fn reserveDomain(rules: &mut Program, reaching: &Reaching, evaluations: &[Evaluation],
+  values: &[Value], seeds: &[Seed], transfers: &[Transfer]) -> Domain
+! OutOfMemoryError ? &mut Allocator {
+  let mut witnesses = Vector<Witness>.make()
+  let seedCount = seeds.length
+  let mut seedWitness = usize.ZERO
+  while seedWitness < seedCount {
+    run Vector<Witness>.append(&mut witnesses, Witness {definition: Option<DefinitionId>.none(), read: Option<ReadId>.none()})
+    seedWitness = seedWitness + usize.ONE
+  }
+  let pairs = Vector<Pair>.asSlice(&reaching.pairs)
+  let mut pair = usize.ZERO
+  while pair < pairs.length {
+    run Vector<Witness>.append(&mut witnesses, Witness {definition: Option<DefinitionId>.some(pairs[pair].definition),
+      read: Option<ReadId>.some(pairs[pair].read)})
+    pair = pair + usize.ONE
+  }
+  let mut cells = Vector<Cell>.make()
+  let mut keys = Vector<CellKey>.make()
+  let mut index = usize.ZERO
+  let mut cases = Vector<Case>.make()
+  let empty = Vector<Atom>.make()
+  let none = Vector<Atom>.asSlice(&empty)
+  let points = Vector<Point>.asSlice(&reaching.points)
+  index = usize.ZERO
+  while index < seeds.length {
+    let seed = seeds[index]
+    let target = run reserveCell(&mut keys, &mut cells, rules,
+      CellKey {value: seed.value, leaf: seed.leaf, witness: index, direct: seed.direct})
+    let cell = Vector<Cell>.asSlice(&cells)[target]
+    let active = Program.atom(rules)
+    let reach = points[evaluations[values[seed.value.index].evaluation.index].point.index].reachable
+    let admitted: [Atom; 2] = [seed.active, reach]
+    run Program.rule(rules, active, &admitted, none)
+    let present: [Atom; 1] = [active]
+    run Program.rule(rules, cell.present, &present, none)
+    let stored: [Atom; 2] = [active, seed.stored]
+    run Program.rule(rules, cell.stored, &stored, none)
+    let alternatives: [Atom; 2] = [active, seed.alternatives]
+    run Program.rule(rules, cell.alternatives, &alternatives, none)
+    run Vector<Case>.append(&mut cases, Case {source: Option<usize>.none(), target: target, active: active, quality: cell,
+      definition: Option<DefinitionId>.none(), read: Option<ReadId>.none(), map: Option<MapId>.none(),
+      contract: Option<ContractRouteId>.none()})
+    index = index + usize.ONE
+  }
+  // Candidate closure follows physical topology only. It reads no Truth and ignores every
+  // policy/CFG gate, including late backedges. It reserves cells, not source witnesses.
+  // Each (value, leaf, paired witness, directness) key is processed exactly once.
+  index = usize.ZERO
+  while index < Vector<CellKey>.length(&keys) {
+    let key = Vector<CellKey>.asSlice(&keys)[index]
+    let mut transferIndex = usize.ZERO
+    while transferIndex < transfers.length {
+      let transfer = &transfers[transferIndex]
+      if transfer.source.index == key.value.index {
+        let direct = match transfer.directness {
+          Directness.Preserve => key.direct
+          Directness.Direct => true
+          Directness.Indirect => false
+        }
+        let mut targetWitness = key.witness
+        let mut paired = Option<Atom>.none()
+        if let Option<DefinitionId>.Some {value: definition} = transfer.definition {
+          if let Option<ReadId>.Some {value: read} = transfer.read {
+            let mut pairIndex = usize.ZERO
+            while pairIndex < pairs.length {
+              if pairs[pairIndex].definition.index == definition.index && pairs[pairIndex].read.index == read.index {
+                targetWitness = seedCount + pairIndex
+                paired = Option<Atom>.some(pairs[pairIndex].active)
+                break
+              }
+              pairIndex = pairIndex + usize.ONE
+            }
+            if let Option<Atom>.None = paired { CompilerBug.panic(b"source transfer has no matching definition/read pair") }
+          } else { CompilerBug.panic(b"source transfer omits its paired read") }
+        } else {
+          if let Option<ReadId>.Some {value: ignored} = transfer.read { CompilerBug.panic(b"source transfer omits its paired definition") }
+        }
+        let target = run reserveCell(&mut keys, &mut cells, rules,
+          CellKey {value: transfer.target, leaf: key.leaf, witness: targetWitness, direct: direct})
+        let input = Vector<Cell>.asSlice(&cells)[index]
+        let output = Vector<Cell>.asSlice(&cells)[target]
+        let active = Program.atom(rules)
+        let reach = points[evaluations[values[transfer.target.index].evaluation.index].point.index].reachable
+        if let Option<Atom>.Some {value: pairGate} = paired {
+          let admitted: [Atom; 4] = [input.present, transfer.active, reach, pairGate]
+          run Program.rule(rules, active, &admitted, none)
+        } else {
+          let admitted: [Atom; 3] = [input.present, transfer.active, reach]
+          run Program.rule(rules, active, &admitted, none)
+        }
+        let present: [Atom; 1] = [active]
+        run Program.rule(rules, output.present, &present, none)
+        let caseStored = Program.atom(rules)
+        let caseAlternatives = Program.atom(rules)
+        let stored: [Atom; 2] = [active, input.stored]
+        run Program.rule(rules, caseStored, &stored, none)
+        let newStored: [Atom; 2] = [active, transfer.stored]
+        run Program.rule(rules, caseStored, &newStored, none)
+        let alternatives: [Atom; 2] = [active, input.alternatives]
+        run Program.rule(rules, caseAlternatives, &alternatives, none)
+        let newAlternatives: [Atom; 2] = [active, transfer.alternatives]
+        run Program.rule(rules, caseAlternatives, &newAlternatives, none)
+        let storedOutput: [Atom; 1] = [caseStored]
+        let alternativesOutput: [Atom; 1] = [caseAlternatives]
+        run Program.rule(rules, output.stored, &storedOutput, none)
+        run Program.rule(rules, output.alternatives, &alternativesOutput, none)
+        run Vector<Case>.append(&mut cases, Case {source: Option<usize>.some(index), target: target, active: active,
+          quality: Cell {present: active, stored: caseStored, alternatives: caseAlternatives},
+          definition: transfer.definition, read: transfer.read, map: transfer.map, contract: transfer.contract})
+      }
+      transferIndex = transferIndex + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  return Domain {cells: move cells, keys: move keys, witnesses: move witnesses, cases: move cases}
+}
+
 impl<'body> Builder<'body> {
   /// Reserves the finite typed-topology value/leaf/witness/directness domain and emits source rules.
   /// Cases retain each paired edge; their alternatives do not multiply physical operands.
@@ -536,137 +688,41 @@ impl<'body> Builder<'body> {
     let mut rules = move skeleton.rules
     let reaching = run Flow.emit(move skeleton.flow, &mut rules)
     let mut transfers = move skeleton.transfers
-    run storageTransfers(&preparation, &reaching, Vector<DefinedValue>.asSlice(&skeleton.definitions),
+    run storageTransfers(Vector<SelectionMap>.asSlice(&preparation.maps), &reaching, Vector<DefinedValue>.asSlice(&skeleton.definitions),
       Vector<ReadValue>.asSlice(&skeleton.reads), Vector<Value>.asSlice(&skeleton.values),
       Vector<Evaluation>.asSlice(&skeleton.evaluations), &mut transfers, &mut rules)
     validateReservation(&preparation, &reaching, Vector<Evaluation>.asSlice(&skeleton.evaluations),
       Vector<Value>.asSlice(&skeleton.values), Vector<Leaf>.asSlice(&skeleton.leaves),
       Vector<Seed>.asSlice(&skeleton.seeds), Vector<Transfer>.asSlice(&transfers))
-    let mut witnesses = Vector<Witness>.make()
-    let seedCount = Vector<Seed>.length(&skeleton.seeds)
-    let mut seedWitness = usize.ZERO
-    while seedWitness < seedCount {
-      run Vector<Witness>.append(&mut witnesses, Witness {definition: Option<DefinitionId>.none(), read: Option<ReadId>.none()})
-      seedWitness = seedWitness + usize.ONE
-    }
-    let pairs = Vector<Pair>.asSlice(&reaching.pairs)
-    let mut pair = usize.ZERO
-    while pair < pairs.length {
-      run Vector<Witness>.append(&mut witnesses, Witness {definition: Option<DefinitionId>.some(pairs[pair].definition),
-        read: Option<ReadId>.some(pairs[pair].read)})
-      pair = pair + usize.ONE
-    }
-    let mut cells = Vector<Cell>.make()
-    let mut keys = Vector<CellKey>.make()
-    let mut index = usize.ZERO
-    let mut cases = Vector<Case>.make()
-    let empty = Vector<Atom>.make()
-    let none = Vector<Atom>.asSlice(&empty)
-    let seeds = Vector<Seed>.asSlice(&skeleton.seeds)
-    let values = Vector<Value>.asSlice(&skeleton.values)
-    let evaluations = Vector<Evaluation>.asSlice(&skeleton.evaluations)
-    let points = Vector<Point>.asSlice(&reaching.points)
-    index = usize.ZERO
-    while index < seeds.length {
-      let seed = seeds[index]
-      let target = run reserveCell(&mut keys, &mut cells, &mut rules,
-        CellKey {value: seed.value, leaf: seed.leaf, witness: index, direct: seed.direct})
-      let cell = Vector<Cell>.asSlice(&cells)[target]
-      let active = Program.atom(&mut rules)
-      let reach = points[evaluations[values[seed.value.index].evaluation.index].point.index].reachable
-      let admitted: [Atom; 2] = [seed.active, reach]
-      run Program.rule(&mut rules, active, &admitted, none)
-      let present: [Atom; 1] = [active]
-      run Program.rule(&mut rules, cell.present, &present, none)
-      let stored: [Atom; 2] = [active, seed.stored]
-      run Program.rule(&mut rules, cell.stored, &stored, none)
-      let alternatives: [Atom; 2] = [active, seed.alternatives]
-      run Program.rule(&mut rules, cell.alternatives, &alternatives, none)
-      run Vector<Case>.append(&mut cases, Case {source: Option<usize>.none(), target: target, active: active, quality: cell,
-        definition: Option<DefinitionId>.none(), read: Option<ReadId>.none(), map: Option<MapId>.none(),
-        contract: Option<ContractRouteId>.none()})
-      index = index + usize.ONE
-    }
-    let transfers = Vector<Transfer>.asSlice(&transfers)
-    // Candidate closure follows physical topology only. It reads no Truth and ignores every
-    // policy/CFG gate, including late backedges. It reserves cells, not source witnesses.
-    // Each (value, leaf, paired witness, directness) key is processed exactly once.
-    index = usize.ZERO
-    while index < Vector<CellKey>.length(&keys) {
-      let key = Vector<CellKey>.asSlice(&keys)[index]
-      let mut transferIndex = usize.ZERO
-      while transferIndex < transfers.length {
-        let transfer = &transfers[transferIndex]
-        if transfer.source.index == key.value.index {
-          let direct = match transfer.directness {
-            Directness.Preserve => key.direct
-            Directness.Direct => true
-            Directness.Indirect => false
-          }
-          let mut targetWitness = key.witness
-          let mut paired = Option<Atom>.none()
-          if let Option<DefinitionId>.Some {value: definition} = transfer.definition {
-            if let Option<ReadId>.Some {value: read} = transfer.read {
-              let mut pairIndex = usize.ZERO
-              while pairIndex < pairs.length {
-                if pairs[pairIndex].definition.index == definition.index && pairs[pairIndex].read.index == read.index {
-                  targetWitness = seedCount + pairIndex
-                  paired = Option<Atom>.some(pairs[pairIndex].active)
-                  break
-                }
-                pairIndex = pairIndex + usize.ONE
-              }
-              if let Option<Atom>.None = paired { CompilerBug.panic(b"source transfer has no matching definition/read pair") }
-            } else { CompilerBug.panic(b"source transfer omits its paired read") }
-          } else {
-            if let Option<ReadId>.Some {value: ignored} = transfer.read { CompilerBug.panic(b"source transfer omits its paired definition") }
-          }
-          let target = run reserveCell(&mut keys, &mut cells, &mut rules,
-            CellKey {value: transfer.target, leaf: key.leaf, witness: targetWitness, direct: direct})
-          let input = Vector<Cell>.asSlice(&cells)[index]
-          let output = Vector<Cell>.asSlice(&cells)[target]
-          let active = Program.atom(&mut rules)
-          let reach = points[evaluations[values[transfer.target.index].evaluation.index].point.index].reachable
-          if let Option<Atom>.Some {value: pairGate} = paired {
-            let admitted: [Atom; 4] = [input.present, transfer.active, reach, pairGate]
-            run Program.rule(&mut rules, active, &admitted, none)
-          } else {
-            let admitted: [Atom; 3] = [input.present, transfer.active, reach]
-            run Program.rule(&mut rules, active, &admitted, none)
-          }
-          let present: [Atom; 1] = [active]
-          run Program.rule(&mut rules, output.present, &present, none)
-          let caseStored = Program.atom(&mut rules)
-          let caseAlternatives = Program.atom(&mut rules)
-          let stored: [Atom; 2] = [active, input.stored]
-          run Program.rule(&mut rules, caseStored, &stored, none)
-          let newStored: [Atom; 2] = [active, transfer.stored]
-          run Program.rule(&mut rules, caseStored, &newStored, none)
-          let alternatives: [Atom; 2] = [active, input.alternatives]
-          run Program.rule(&mut rules, caseAlternatives, &alternatives, none)
-          let newAlternatives: [Atom; 2] = [active, transfer.alternatives]
-          run Program.rule(&mut rules, caseAlternatives, &newAlternatives, none)
-          let storedOutput: [Atom; 1] = [caseStored]
-          let alternativesOutput: [Atom; 1] = [caseAlternatives]
-          run Program.rule(&mut rules, output.stored, &storedOutput, none)
-          run Program.rule(&mut rules, output.alternatives, &alternativesOutput, none)
-          run Vector<Case>.append(&mut cases, Case {source: Option<usize>.some(index), target: target, active: active,
-            quality: Cell {present: active, stored: caseStored, alternatives: caseAlternatives},
-            definition: transfer.definition, read: transfer.read, map: transfer.map, contract: transfer.contract})
-        }
-        transferIndex = transferIndex + usize.ONE
-      }
-      index = index + usize.ONE
-    }
+    let domain = run reserveDomain(&mut rules, &reaching, Vector<Evaluation>.asSlice(&skeleton.evaluations),
+      Vector<Value>.asSlice(&skeleton.values), Vector<Seed>.asSlice(&skeleton.seeds), Vector<Transfer>.asSlice(&transfers))
     return Builder<'body> {rules: move rules, reaching: move reaching, preparation: move preparation,
       evaluations: move skeleton.evaluations, values: move skeleton.values, leaves: move skeleton.leaves,
-      cells: move cells, keys: move keys, witnesses: move witnesses, cases: move cases}
+      cells: move domain.cells, keys: move domain.keys, witnesses: move domain.witnesses, cases: move domain.cases}
   }
 
   pub fn cell(self: &Self, value: ValueId, leaf: LeafId, witness: usize, direct: bool) -> Option<Cell> {
     let index = findCell(Vector<CellKey>.asSlice(&self.keys), value, leaf, witness, direct)
     if index == usize.MAX { return Option<Cell>.none() }
     return Option<Cell>.some(Vector<Cell>.asSlice(&self.cells)[index])
+  }
+
+  pub fn leaf(self: &Self, leaf: LeafId) -> &Leaf {
+    let leaves = Vector<Leaf>.asSlice(&self.leaves)
+    if leaf.index >= leaves.length { CompilerBug.panic(b"policy input names an unreserved source leaf") }
+    return &leaves[leaf.index]
+  }
+
+  /// Called once at each operation's input barrier. The caller supplies written operand and
+  /// structural component order; this returns stable leaf order within that physical position.
+  /// No candidate Truth is inspected and none of the inputs can depend on a selected output.
+  pub effect fn inputs(self: &mut Self, value: ValueId) -> Vector<Input>
+  ! OutOfMemoryError ? &mut Allocator {
+    let values = Vector<Value>.asSlice(&self.values)
+    if value.index >= values.length { CompilerBug.panic(b"policy input names an unreserved physical value") }
+    return run inputPositions(&mut self.rules, value, Vector<Leaf>.length(&self.leaves), values,
+      Vector<CellKey>.asSlice(&self.keys), Vector<Cell>.asSlice(&self.cells),
+      Vector<Witness>.asSlice(&self.witnesses), Vector<Case>.asSlice(&self.cases))
   }
 
   pub effect fn solve(self: Self) -> Graph<'body> ! OutOfMemoryError ? &mut Allocator {
@@ -676,6 +732,58 @@ impl<'body> Builder<'body> {
       reaching: move self.reaching, evaluations: move self.evaluations, values: move self.values,
       leaves: move self.leaves, cells: move self.cells, keys: move self.keys, witnesses: move self.witnesses, cases: move self.cases}
   }
+}
+
+effect fn inputPositions(rules: &mut Program, value: ValueId, leafCount: usize, values: &[Value],
+  keys: &[CellKey], cells: &[Cell], witnesses: &[Witness], cases: &[Case]) -> Vector<Input>
+! OutOfMemoryError ? &mut Allocator {
+  let mut result = Vector<Input>.make()
+  let empty = Vector<Atom>.make()
+  let none = Vector<Atom>.asSlice(&empty)
+  let mut leaf = usize.ZERO
+  while leaf < leafCount {
+    let mut found = false
+    let mut key = usize.ZERO
+    while key < keys.length {
+      if keys[key].value.index == value.index && keys[key].leaf.index == leaf { found = true }
+      key = key + usize.ONE
+    }
+    if found {
+      let quality = Cell {present: Program.atom(rules), stored: Program.atom(rules), alternatives: Program.atom(rules)}
+      let mut alternatives = Vector<InputCase>.make()
+      key = usize.ZERO
+      while key < keys.length {
+        if keys[key].value.index == value.index && keys[key].leaf.index == leaf {
+          let present: [Atom; 1] = [cells[key].present]
+          let stored: [Atom; 1] = [cells[key].stored]
+          let lost: [Atom; 1] = [cells[key].alternatives]
+          run Program.rule(rules, quality.present, &present, none)
+          run Program.rule(rules, quality.stored, &stored, none)
+          run Program.rule(rules, quality.alternatives, &lost, none)
+          let witness = &witnesses[keys[key].witness]
+          let mut each = usize.ZERO
+          while each < cases.length {
+            if cases[each].target == key {
+              let mut source = Option<ValueId>.none()
+              if let Option<usize>.Some {value: previous} = cases[each].source {
+                source = Option<ValueId>.some(keys[previous].value)
+              }
+              run Vector<InputCase>.append(&mut alternatives, InputCase {source: source,
+                placement: values[value.index].endpoint, direct: keys[key].direct,
+                definition: witness.definition, read: witness.read, map: cases[each].map,
+                contract: cases[each].contract, quality: cases[each].quality})
+            }
+            each = each + usize.ONE
+          }
+        }
+        key = key + usize.ONE
+      }
+      run Vector<Input>.append(&mut result, Input {value: value, leaf: LeafId {index: leaf},
+        quality: quality, cases: move alternatives})
+    }
+    leaf = leaf + usize.ONE
+  }
+  return move result
 }
 
 impl<'body> Graph<'body> {
@@ -1059,4 +1167,211 @@ impl SourceReadId {
   pub fn equals(self: &Self, other: &Self) -> bool {
     return sameStamp(&self.stamp, &other.stamp) && self.index == other.index
   }
+}
+
+// Reservation-level source semantics, not acceptance of a manually assembled typed body.
+// The graph supplies independently observable read results: a saved copy, a backedge alias,
+// an explicit unknown entry and a loan-free replacement all need distinct source identities.
+test effect fn sourceCopiesKeepEarlierReadsAndAcquireBackedgeDefinitions() -> ()
+! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run sourceCopyClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn sourceCopyClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut skeleton = Skeleton.make()
+  let yes = Program.atom(&mut skeleton.rules)
+  let no = Program.atom(&mut skeleton.rules)
+  run Program.fact(&mut skeleton.rules, yes)
+  let entry = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let before = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let save = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let header = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let alias = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let replacement = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let exit = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let reset = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let finalRead = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let savedRead = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let aliasRead = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let otherAlias = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  run Program.fact(&mut skeleton.rules, Flow.reachable(&skeleton.flow, entry))
+  run Flow.edge(&mut skeleton.flow, entry, before, yes)
+  run Flow.edge(&mut skeleton.flow, before, save, yes)
+  run Flow.edge(&mut skeleton.flow, save, header, yes)
+  run Flow.edge(&mut skeleton.flow, header, alias, yes)
+  run Flow.edge(&mut skeleton.flow, alias, replacement, yes)
+  run Flow.edge(&mut skeleton.flow, header, otherAlias, yes)
+  run Flow.edge(&mut skeleton.flow, otherAlias, replacement, yes)
+  run Flow.edge(&mut skeleton.flow, replacement, header, yes)
+  run Flow.edge(&mut skeleton.flow, header, exit, yes)
+  run Flow.edge(&mut skeleton.flow, exit, reset, yes)
+  run Flow.edge(&mut skeleton.flow, reset, finalRead, yes)
+  run Flow.edge(&mut skeleton.flow, finalRead, savedRead, yes)
+  run Flow.edge(&mut skeleton.flow, savedRead, aliasRead, yes)
+
+  // Storage component coordinates 0=r, 1=saved, 2=alias. The initial alias is explicitly
+  // unknown; reaching no loan at entry must not make the zero-iteration case loan-free.
+  let initial = run sourceTestValue(&mut skeleton, entry, 0)
+  let initialAlias = run sourceTestValue(&mut skeleton, entry, 2)
+  let early = run sourceTestValue(&mut skeleton, before, 3)
+  let saved = run sourceTestValue(&mut skeleton, save, 1)
+  let current = run sourceTestValue(&mut skeleton, header, 4)
+  let copied = run sourceTestValue(&mut skeleton, alias, 2)
+  let copiedIndirectly = run sourceTestValue(&mut skeleton, otherAlias, 2)
+  let later = run sourceTestValue(&mut skeleton, replacement, 0)
+  let cleared = run sourceTestValue(&mut skeleton, reset, 0)
+  let finalValue = run sourceTestValue(&mut skeleton, finalRead, 5)
+  let savedValue = run sourceTestValue(&mut skeleton, savedRead, 6)
+  let aliasValue = run sourceTestValue(&mut skeleton, aliasRead, 7)
+  let caller = LeafId {index: 0}
+  let storedSource = LeafId {index: 1}
+  let unknown = LeafId {index: 2}
+  let loanFree = LeafId {index: 3}
+  run Vector<Seed>.append(&mut skeleton.seeds,
+    Seed {value: initial, leaf: caller, direct: true, active: yes, stored: no, alternatives: no})
+  run Vector<Seed>.append(&mut skeleton.seeds,
+    Seed {value: initialAlias, leaf: unknown, direct: false, active: yes, stored: no, alternatives: no})
+  run Vector<Seed>.append(&mut skeleton.seeds,
+    Seed {value: later, leaf: storedSource, direct: true, active: yes, stored: yes, alternatives: no})
+  run Vector<Seed>.append(&mut skeleton.seeds,
+    Seed {value: cleared, leaf: loanFree, direct: false, active: yes, stored: no, alternatives: no})
+  let initialDefinition = run Skeleton.define(&mut skeleton, entry, EndpointId {index: 0}, initial, yes, Write.Strong)
+  let unknownDefinition = run Skeleton.define(&mut skeleton, entry, EndpointId {index: 2}, initialAlias, yes, Write.Strong)
+  let savedDefinition = run Skeleton.define(&mut skeleton, save, EndpointId {index: 1}, saved, yes, Write.Strong)
+  let aliasDefinition = run Skeleton.define(&mut skeleton, alias, EndpointId {index: 2}, copied, yes, Write.Strong)
+  let otherAliasDefinition = run Skeleton.define(&mut skeleton, otherAlias, EndpointId {index: 2}, copiedIndirectly, yes, Write.Strong)
+  // Deliberately register the read before the later replacement definition. The result must
+  // depend on CFG reachability, not on this constructor order.
+  let mut maps = Vector<SelectionMap>.make()
+  let earlyMap = run sourceTestMap(&mut maps, 0, 3)
+  let currentMap = run sourceTestMap(&mut maps, 0, 4)
+  let savedMap = run sourceTestMap(&mut maps, 1, 6)
+  let aliasMap = run sourceTestMap(&mut maps, 2, 7)
+  let finalMap = run sourceTestMap(&mut maps, 0, 5)
+  let earlyRead = run Skeleton.read(&mut skeleton, before, EndpointId {index: 0}, early, earlyMap)
+  let currentRead = run Skeleton.read(&mut skeleton, header, EndpointId {index: 0}, current, currentMap)
+  let laterDefinition = run Skeleton.define(&mut skeleton, replacement, EndpointId {index: 0}, later, yes, Write.Strong)
+  let clearedDefinition = run Skeleton.define(&mut skeleton, reset, EndpointId {index: 0}, cleared, yes, Write.Strong)
+  let finalStorageRead = run Skeleton.read(&mut skeleton, finalRead, EndpointId {index: 0}, finalValue, finalMap)
+  let savedStorageRead = run Skeleton.read(&mut skeleton, savedRead, EndpointId {index: 1}, savedValue, savedMap)
+  let aliasStorageRead = run Skeleton.read(&mut skeleton, aliasRead, EndpointId {index: 2}, aliasValue, aliasMap)
+  let savingMap = run sourceTestMap(&mut maps, 3, 1)
+  let copyingMap = run sourceTestMap(&mut maps, 4, 2)
+  run Vector<Transfer>.append(&mut skeleton.transfers, Transfer {source: early, target: saved,
+    active: yes, directness: Directness.Preserve, stored: no, alternatives: no,
+    definition: Option<DefinitionId>.none(), read: Option<ReadId>.none(),
+    map: Option<MapId>.some(savingMap), contract: Option<ContractRouteId>.none()})
+  run Vector<Transfer>.append(&mut skeleton.transfers, Transfer {source: current, target: copied,
+    active: yes, directness: Directness.Preserve, stored: no, alternatives: no,
+    definition: Option<DefinitionId>.none(), read: Option<ReadId>.none(),
+    map: Option<MapId>.some(copyingMap), contract: Option<ContractRouteId>.none()})
+  run Vector<Transfer>.append(&mut skeleton.transfers, Transfer {source: current, target: copiedIndirectly,
+    active: yes, directness: Directness.Indirect, stored: no, alternatives: no,
+    definition: Option<DefinitionId>.none(), read: Option<ReadId>.none(),
+    map: Option<MapId>.some(copyingMap), contract: Option<ContractRouteId>.none()})
+  let mut rules = move skeleton.rules
+  let reaching = run Flow.emit(move skeleton.flow, &mut rules)
+  let mut transfers = move skeleton.transfers
+  run storageTransfers(Vector<SelectionMap>.asSlice(&maps), &reaching,
+    Vector<DefinedValue>.asSlice(&skeleton.definitions), Vector<ReadValue>.asSlice(&skeleton.reads),
+    Vector<Value>.asSlice(&skeleton.values), Vector<Evaluation>.asSlice(&skeleton.evaluations), &mut transfers, &mut rules)
+  let domain = run reserveDomain(&mut rules, &reaching, Vector<Evaluation>.asSlice(&skeleton.evaluations),
+    Vector<Value>.asSlice(&skeleton.values), Vector<Seed>.asSlice(&skeleton.seeds), Vector<Transfer>.asSlice(&transfers))
+  let inputs = run inputPositions(&mut rules, aliasValue, 4, Vector<Value>.asSlice(&skeleton.values),
+    Vector<CellKey>.asSlice(&domain.keys), Vector<Cell>.asSlice(&domain.cells),
+    Vector<Witness>.asSlice(&domain.witnesses), Vector<Case>.asSlice(&domain.cases))
+  let solved = run Program.solve(&rules)
+  run Testing.expect(sourceTestPresence(&domain, &solved, savedValue, caller) == Truth.True
+    && sourceTestPresence(&domain, &solved, savedValue, storedSource) == Truth.False,
+    "the pre-loop saved copy keeps its actual caller source and excludes the later replacement")
+  run Testing.expect(sourceTestPresence(&domain, &solved, current, caller) == Truth.True
+    && sourceTestPresence(&domain, &solved, current, storedSource) == Truth.True,
+    "the loop read includes entry and replacement sources even when the read was reserved first")
+  run Testing.expect(sourceTestPresence(&domain, &solved, aliasValue, caller) == Truth.True
+    && sourceTestPresence(&domain, &solved, aliasValue, storedSource) == Truth.True
+    && sourceTestPresence(&domain, &solved, aliasValue, unknown) == Truth.True,
+    "an earlier loop copy acquires later backedge sources while preserving explicit zero-iteration unknown")
+  run Testing.expect(sourceTestPresence(&domain, &solved, finalValue, loanFree) == Truth.True
+    && sourceTestPresence(&domain, &solved, finalValue, caller) == Truth.False
+    && sourceTestPresence(&domain, &solved, finalValue, storedSource) == Truth.False,
+    "a loan-free overwrite is a real definition that kills the old reaching sources")
+  run Testing.expect(sourceTestStored(&domain, &solved, savedValue, caller) == Truth.False
+    && sourceTestStored(&domain, &solved, aliasValue, storedSource) == Truth.True,
+    "stored loss follows the actual loop copy and cannot travel backward into the saved value")
+  let positions = Vector<Input>.asSlice(&inputs)
+  let mut position = usize.ZERO
+  let mut present = usize.ZERO
+  let mut callerPositions = usize.ZERO
+  let mut direct = false
+  let mut indirect = false
+  while position < positions.length {
+    if Solution.truth(&solved, positions[position].quality.present) == Truth.True {
+      present = present + usize.ONE
+      if positions[position].leaf.index == caller.index {
+        callerPositions = callerPositions + usize.ONE
+        let histories = Vector<InputCase>.asSlice(&positions[position].cases)
+        let mut history = usize.ZERO
+        while history < histories.length {
+          if Solution.truth(&solved, histories[history].quality.present) == Truth.True {
+            if histories[history].direct { direct = true } else { indirect = true }
+          }
+          history = history + usize.ONE
+        }
+      }
+    }
+    position = position + usize.ONE
+  }
+  run Testing.expect(present == 3 && callerPositions == usize.ONE && direct && indirect,
+    "branch histories keep paired directness but do not multiply one physical read into duplicate inputs")
+  return ()
+}
+
+effect fn sourceTestValue(skeleton: &mut Skeleton, point: PointId, endpoint: usize) -> ValueId
+! OutOfMemoryError ? &mut Allocator {
+  let node = NodeId {index: Vector<Evaluation>.length(&skeleton.evaluations)}
+  let evaluation = run Skeleton.evaluate(skeleton, node, EvaluationRole.Value, point)
+  return run Skeleton.value(skeleton, evaluation, EndpointId {index: endpoint})
+}
+
+effect fn sourceTestMap(maps: &mut Vector<SelectionMap>, source: usize, target: usize) -> MapId
+! OutOfMemoryError ? &mut Allocator {
+  let id = MapId {index: Vector<SelectionMap>.length(maps)}
+  run Vector<SelectionMap>.append(maps, SelectionMap {site: NodeId {index: 0},
+    origin: Origin {node: 0, location: Location.make(0, 1)}, source: EndpointId {index: source},
+    target: EndpointId {index: target}, selector: Selector.Identity, kind: MapKind.Copy,
+    application: Option<ApplicationId>.none()})
+  return id
+}
+
+fn sourceTestPresence(domain: &Domain, solved: &Solution, value: ValueId, leaf: LeafId) -> Truth {
+  let keys = Vector<CellKey>.asSlice(&domain.keys)
+  let cells = Vector<Cell>.asSlice(&domain.cells)
+  let mut result = Truth.False
+  let mut at = usize.ZERO
+  while at < keys.length {
+    if keys[at].value.index == value.index && keys[at].leaf.index == leaf.index {
+      let present = Solution.truth(solved, cells[at].present)
+      if present == Truth.True { return Truth.True }
+      if present == Truth.Undefined { result = Truth.Undefined }
+    }
+    at = at + usize.ONE
+  }
+  return result
+}
+
+fn sourceTestStored(domain: &Domain, solved: &Solution, value: ValueId, leaf: LeafId) -> Truth {
+  let keys = Vector<CellKey>.asSlice(&domain.keys)
+  let cells = Vector<Cell>.asSlice(&domain.cells)
+  let mut result = Truth.False
+  let mut at = usize.ZERO
+  while at < keys.length {
+    if keys[at].value.index == value.index && keys[at].leaf.index == leaf.index {
+      let stored = Solution.truth(solved, cells[at].stored)
+      if stored == Truth.True { return Truth.True }
+      if stored == Truth.Undefined { result = Truth.Undefined }
+    }
+    at = at + usize.ONE
+  }
+  return result
 }
