@@ -445,7 +445,7 @@ protected sequence only after complete encoding. Pending bytes remain stable unt
 The later authenticated client owns epoch installation and reserves its final send record for
 KeyUpdate. Standalone users must replace an exhausted sender; no sequence reset is exposed.
 
-<a id="impl"></a>
+<a id="TlsRecordSender.impl"></a>
 
 ## Implementation `TlsRecordSender`
 
@@ -453,7 +453,7 @@ KeyUpdate. Standalone users must replace an exhausted sender; no sequence reset 
 impl TlsRecordSender
 ```
 
-<a id="impl.make"></a>
+<a id="TlsRecordSender.impl.make"></a>
 
 ### Associated function `make`
 
@@ -476,7 +476,7 @@ storage once; later operations allocate nothing.
 
 A traffic secret proves no peer identity. Install it only after authenticated key agreement.
 
-<a id="impl.makePlaintext"></a>
+<a id="TlsRecordSender.impl.makePlaintext"></a>
 
 ### Associated function `makePlaintext`
 
@@ -486,7 +486,7 @@ pub effect fn makePlaintext() -> TlsRecordSender ! OutOfMemoryError ? &mut Alloc
 
 Creates plaintext TLS record framing without a traffic secret or protected epoch.
 
-<a id="impl.replaceEpoch"></a>
+<a id="TlsRecordSender.impl.replaceEpoch"></a>
 
 ### Method `replaceEpoch`
 
@@ -510,7 +510,7 @@ traffic secret must have the selected suite hash width.
 Pending output makes the replacement invalid. Every failure leaves the complete old epoch
 unchanged. A successful replacement is allowed after the old epoch exhausts its record budget.
 
-<a id="impl.queueRecord"></a>
+<a id="TlsRecordSender.impl.queueRecord"></a>
 
 ### Method `queueRecord`
 
@@ -531,7 +531,7 @@ content must be nonempty, alerts exactly two bytes, and application content may 
 Inputs longer than 16384 bytes queue one exact prefix. A protected record adds its inner type,
 no padding, an authenticated outer header, and one sequence reservation.
 
-<a id="impl.pendingOutput"></a>
+<a id="TlsRecordSender.impl.pendingOutput"></a>
 
 ### Method `pendingOutput`
 
@@ -542,7 +542,7 @@ pub fn pendingOutput<'owner>(self: &'owner Self) -> &'owner [u8]
 Borrows the exact unacknowledged output suffix.
 Repeated inspection and inspection before any queued record are idempotent.
 
-<a id="impl.cancelPending"></a>
+<a id="TlsRecordSender.impl.cancelPending"></a>
 
 ### Method `cancelPending`
 
@@ -557,7 +557,7 @@ Cancels the complete pending suffix without changing the traffic-key epoch.
 Callers must close a transport after canceling a partially written record; its already-written
 prefix cannot be completed or reused. Authenticated protocols use this only on terminal failure.
 
-<a id="impl.recordsRemaining"></a>
+<a id="TlsRecordSender.impl.recordsRemaining"></a>
 
 ### Method `recordsRemaining`
 
@@ -568,7 +568,7 @@ pub fn recordsRemaining(self: &Self) -> u64
 Returns the number of records that this protected epoch can still encode.
 Plaintext framing returns zero because it has no traffic-key epoch.
 
-<a id="impl.ackWritten"></a>
+<a id="TlsRecordSender.impl.ackWritten"></a>
 
 ### Method `ackWritten`
 
@@ -599,7 +599,7 @@ remains ready until consumed, and its view structurally borrows this owner.
 Every peer-record failure is terminal for this receiver. Construct a fresh epoch after a valid
 TLS key transition; never attempt to reuse a failed or exhausted receiver.
 
-<a id="impl-2"></a>
+<a id="TlsRecordReceiver.impl"></a>
 
 ## Implementation `TlsRecordReceiver`
 
@@ -607,7 +607,7 @@ TLS key transition; never attempt to reuse a failed or exhausted receiver.
 impl TlsRecordReceiver
 ```
 
-<a id="impl.make-2"></a>
+<a id="TlsRecordReceiver.impl.make"></a>
 
 ### Associated function `make`
 
@@ -620,7 +620,7 @@ pub effect fn make(
 
 Creates a protected receive epoch from one exact-width traffic secret.
 
-<a id="impl.makePlaintext-2"></a>
+<a id="TlsRecordReceiver.impl.makePlaintext"></a>
 
 ### Associated function `makePlaintext`
 
@@ -630,7 +630,7 @@ pub effect fn makePlaintext() -> TlsRecordReceiver ! OutOfMemoryError ? &mut All
 
 Creates plaintext TLS record framing without a traffic secret or protected epoch.
 
-<a id="impl.replaceEpoch-2"></a>
+<a id="TlsRecordReceiver.impl.replaceEpoch"></a>
 
 ### Method `replaceEpoch`
 
@@ -654,7 +654,7 @@ traffic secret must have the selected suite hash width.
 A partial, ready, or terminal receiver makes the replacement invalid. Every failure leaves
 the complete old epoch unchanged. A successful replacement is allowed after exhaustion.
 
-<a id="impl.feedInput"></a>
+<a id="TlsRecordReceiver.impl.feedInput"></a>
 
 ### Method `feedInput`
 
@@ -668,15 +668,15 @@ Copies a prefix for the current record and reports the exact next receive action
 
 Empty input reports zero-consumption `NeedInput`. Header admission occurs after exactly five
 bytes and before any body byte is copied. Completion stops before a coalesced following record.
-A ready record causes zero-consumption `NeedRecordConsumption` until [`consumeRecord`](#impl.consumeRecord) or
-[`consumeRecordInto`](#impl.consumeRecordInto) succeeds. During a protected epoch, exact plaintext compatibility CCS
+A ready record causes zero-consumption `NeedRecordConsumption` until [`consumeRecord`](#TlsRecordReceiver.impl.consumeRecord) or
+[`consumeRecordInto`](#TlsRecordReceiver.impl.consumeRecordInto) succeeds. During a protected epoch, exact plaintext compatibility CCS
 `{1}` is admitted without consuming a protected sequence; every other record remains protected.
 
 #### Gotchas
 
 Header, authentication, content, and key-use failures terminally invalidate this receiver.
 
-<a id="impl.record"></a>
+<a id="TlsRecordReceiver.impl.record"></a>
 
 ### Method `record`
 
@@ -686,7 +686,7 @@ pub fn record<'owner>(self: &'owner Self) -> Option<RecordView<'owner>>
 
 Borrows the complete current record, or returns `None` while more input is needed.
 
-<a id="impl.readyContentType"></a>
+<a id="TlsRecordReceiver.impl.readyContentType"></a>
 
 ### Method `readyContentType`
 
@@ -696,7 +696,7 @@ pub fn readyContentType(self: &Self) -> Option<ContentType>
 
 Returns the ready record's authenticated content type without borrowing its content.
 
-<a id="impl.readyLength"></a>
+<a id="TlsRecordReceiver.impl.readyLength"></a>
 
 ### Method `readyLength`
 
@@ -706,7 +706,7 @@ pub fn readyLength(self: &Self) -> usize
 
 Returns the ready record's authenticated content length, or zero when no record is ready.
 
-<a id="impl.consumeRecordInto"></a>
+<a id="TlsRecordReceiver.impl.consumeRecordInto"></a>
 
 ### Method `consumeRecordInto`
 
@@ -724,7 +724,7 @@ Copies and consumes one complete authenticated record without retaining an owner
 A destination smaller than the ready content returns `RecordOverflow` and leaves the record
 ready and unchanged. No ready record returns `InvalidState`.
 
-<a id="impl.consumeRecord"></a>
+<a id="TlsRecordReceiver.impl.consumeRecord"></a>
 
 ### Method `consumeRecord`
 

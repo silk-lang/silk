@@ -6,13 +6,13 @@ Explicit Unicode canonical normalization backed by the pinned Unicode 17.0.0 dat
 
 ## When to use
 Normalize text at a boundary where canonically equivalent spellings must compare alike. Use
-[`normalizeNfc`](#impl.normalizeNfc) for ordinary storage and comparison, or [`normalizeNfd`](#impl.normalizeNfd) when a decomposed,
+[`normalizeNfc`](#Unicode.impl.normalizeNfc) for ordinary storage and comparison, or [`normalizeNfd`](#Unicode.impl.normalizeNfd) when a decomposed,
 canonically ordered sequence is the desired representation.
 
 ## Details
 Normalization is opt-in: `string` equality continues to compare exact UTF-8 bytes. Both forms
 allocate a fresh owned [`String`](./string.md#String), handle Hangul composition algorithmically, and use the same
-generated tables on every target. [`dataVersion`](#impl.dataVersion) reports which Unicode database defines those
+generated tables on every target. [`dataVersion`](#Unicode.impl.dataVersion) reports which Unicode database defines those
 results.
 
 ## Gotchas
@@ -76,7 +76,7 @@ The owner of the normalization and Unicode-data operations.
 This struct carries no data and is never constructed by the library. Every operation is an
 inherent member declared in `impl Unicode`, reached through `import silk.unicode { Unicode }`.
 
-<a id="impl"></a>
+<a id="Unicode.impl"></a>
 
 ## Implementation `Unicode`
 
@@ -84,7 +84,7 @@ inherent member declared in `impl Unicode`, reached through `import silk.unicode
 impl Unicode
 ```
 
-<a id="impl.dataVersion"></a>
+<a id="Unicode.impl.dataVersion"></a>
 
 ### Associated function `dataVersion`
 
@@ -99,7 +99,7 @@ Returns the Unicode version that defines this module's normalization results.
 The version is data, not identity: a later database changes what this returns and what the
 tables contain, and changes neither a compiler type nor a target ABI.
 
-<a id="impl.longestDecomposition"></a>
+<a id="Unicode.impl.longestDecomposition"></a>
 
 ### Associated function `longestDecomposition`
 
@@ -109,7 +109,7 @@ pub fn longestDecomposition() -> usize
 
 Returns the longest full canonical decomposition of one scalar in the active Unicode data.
 
-<a id="impl.canonicalCombiningClass"></a>
+<a id="Unicode.impl.canonicalCombiningClass"></a>
 
 ### Associated function `canonicalCombiningClass`
 
@@ -122,7 +122,7 @@ pub fn canonicalCombiningClass(
 
 Returns a Unicode scalar's canonical combining class, or zero for a starter or unknown value.
 
-<a id="impl.canonicalCombiningClass.scalar"></a>
+<a id="Unicode.impl.canonicalCombiningClass.scalar"></a>
 
 #### Parameter `scalar`
 
@@ -132,7 +132,7 @@ scalar: u32
 
 Unicode scalar value represented as its unsigned code point.
 
-<a id="impl.normalizeNfd"></a>
+<a id="Unicode.impl.normalizeNfd"></a>
 
 ### Associated function `normalizeNfd`
 
@@ -145,14 +145,14 @@ Returns the Normalization Form D of text: fully decomposed, in canonical order.
 #### When to use
 
 Use this function when consumers require decomposed scalars in canonical combining-class order.
-Use [`normalizeNfc`](#impl.normalizeNfc) for ordinary normalized storage and comparison.
+Use [`normalizeNfc`](#Unicode.impl.normalizeNfc) for ordinary normalized storage and comparison.
 
 #### Details
 
 The function does not change `value`. It returns freshly owned UTF-8 text and can allocate.
 Canonically equivalent inputs produce equal NFD text under the same Unicode data version.
 
-<a id="impl.normalizeNfc"></a>
+<a id="Unicode.impl.normalizeNfc"></a>
 
 ### Associated function `normalizeNfc`
 
@@ -165,7 +165,7 @@ Returns the Normalization Form C of text: decomposed, canonically ordered, then 
 #### When to use
 
 Use this function for ordinary normalized storage and canonical-equivalence comparison. Use
-[`normalizeNfd`](#impl.normalizeNfd) when a consumer requires decomposed scalars.
+[`normalizeNfd`](#Unicode.impl.normalizeNfd) when a consumer requires decomposed scalars.
 
 #### Details
 

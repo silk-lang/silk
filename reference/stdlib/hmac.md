@@ -34,7 +34,7 @@ An incremental HMAC-SHA-256 state that returns a 32-byte authentication tag.
 
 The state owns fixed storage. `finish` consumes the state. Secret state is not guaranteed to be erased.
 
-<a id="impl"></a>
+<a id="HmacSha256.impl"></a>
 
 ## Implementation `HmacSha256`
 
@@ -42,7 +42,7 @@ The state owns fixed storage. `finish` consumes the state. Secret state is not g
 impl HmacSha256
 ```
 
-<a id="impl.make"></a>
+<a id="HmacSha256.impl.make"></a>
 
 ### Associated function `make`
 
@@ -60,7 +60,7 @@ Keys longer than 64 bytes are hashed before use. The state does not retain the i
 
 If the key exceeds the SHA-256 64-bit bit-length domain, the program traps.
 
-<a id="impl.update"></a>
+<a id="HmacSha256.impl.update"></a>
 
 ### Method `update`
 
@@ -78,7 +78,7 @@ Any segmentation of the same message produces the same tag.
 
 If the message plus the 64-byte key pad exceeds the 64-bit bit-length domain, the program traps.
 
-<a id="impl.finish"></a>
+<a id="HmacSha256.impl.finish"></a>
 
 ### Method `finish`
 
@@ -88,7 +88,7 @@ pub fn finish(self: Self) -> [u8; 32]
 
 Consumes the HMAC-SHA-256 state and returns its complete 32-byte authentication tag.
 
-<a id="impl.authenticate"></a>
+<a id="HmacSha256.impl.authenticate"></a>
 
 ### Associated function `authenticate`
 
@@ -121,7 +121,7 @@ An incremental HMAC-SHA-384 state that returns a 48-byte authentication tag.
 
 The state owns fixed storage. `finish` consumes the state. Secret state is not guaranteed to be erased.
 
-<a id="impl-2"></a>
+<a id="HmacSha384.impl"></a>
 
 ## Implementation `HmacSha384`
 
@@ -129,7 +129,7 @@ The state owns fixed storage. `finish` consumes the state. Secret state is not g
 impl HmacSha384
 ```
 
-<a id="impl.make-2"></a>
+<a id="HmacSha384.impl.make"></a>
 
 ### Associated function `make`
 
@@ -147,7 +147,7 @@ Keys longer than 128 bytes are hashed before use. The state does not retain the 
 
 If the key exceeds the SHA-384 128-bit bit-length domain, the program traps.
 
-<a id="impl.update-2"></a>
+<a id="HmacSha384.impl.update"></a>
 
 ### Method `update`
 
@@ -165,7 +165,7 @@ Any segmentation of the same message produces the same tag.
 
 If the message plus the 128-byte key pad exceeds the 128-bit bit-length domain, the program traps.
 
-<a id="impl.finish-2"></a>
+<a id="HmacSha384.impl.finish"></a>
 
 ### Method `finish`
 
@@ -175,7 +175,7 @@ pub fn finish(self: Self) -> [u8; 48]
 
 Consumes the HMAC-SHA-384 state and returns its complete 48-byte authentication tag.
 
-<a id="impl.authenticate-2"></a>
+<a id="HmacSha384.impl.authenticate"></a>
 
 ### Associated function `authenticate`
 

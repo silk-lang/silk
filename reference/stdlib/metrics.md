@@ -10,9 +10,9 @@ acquisition, release, current-live, or peak-live counts. Code that never imports
 pays no instrumentation cost.
 
 ## Details
-The compiler does not collect these metrics. A provider calls [`recordAcquire`](#impl.recordAcquire) and
-[`recordRelease`](#impl.recordRelease) at its own allocation boundary, then exposes an independent snapshot with
-[`copy`](#impl.copy). Counts belong to that provider instance rather than to the process globally.
+The compiler does not collect these metrics. A provider calls [`recordAcquire`](#Metrics.impl.recordAcquire) and
+[`recordRelease`](#Metrics.impl.recordRelease) at its own allocation boundary, then exposes an independent snapshot with
+[`copy`](#Metrics.impl.copy). Counts belong to that provider instance rather than to the process globally.
 
 ## Gotchas
 Recording is intentionally minimal and assumes every release corresponds to an earlier acquire.
@@ -68,7 +68,7 @@ This struct carries no data and is never constructed by the library. Ledger cons
 updates, and snapshots are inherent members declared in `impl Metrics`, reached through
 `import silk.metrics { Metrics }`.
 
-<a id="impl"></a>
+<a id="Metrics.impl"></a>
 
 ## Implementation `Metrics`
 
@@ -76,7 +76,7 @@ updates, and snapshots are inherent members declared in `impl Metrics`, reached 
 impl Metrics
 ```
 
-<a id="impl.make"></a>
+<a id="Metrics.impl.make"></a>
 
 ### Associated function `make`
 
@@ -86,7 +86,7 @@ pub fn make() -> AllocationMetrics
 
 Creates a ledger with zero acquisitions, zero releases, and a zero peak.
 
-<a id="impl.copy"></a>
+<a id="Metrics.impl.copy"></a>
 
 ### Method `copy`
 
@@ -100,7 +100,7 @@ Copies the current counters without moving or changing the provider's ledger.
 
 Use this function when a provider must publish metrics while it keeps the mutable ledger.
 
-<a id="impl.live"></a>
+<a id="Metrics.impl.live"></a>
 
 ### Method `live`
 
@@ -115,7 +115,7 @@ Returns `acquired - released`, which is the number of recorded live allocations.
 If `released` is greater than `acquired`, the unsigned subtraction traps. Record each release
 only after its matching successful acquisition.
 
-<a id="impl.recordAcquire"></a>
+<a id="Metrics.impl.recordAcquire"></a>
 
 ### Method `recordAcquire`
 
@@ -135,7 +135,7 @@ not change the counters.
 The operation traps if `acquired` overflows `usize`. An unbalanced prior release can also make
 the live-count subtraction trap.
 
-<a id="impl.recordRelease"></a>
+<a id="Metrics.impl.recordRelease"></a>
 
 ### Method `recordRelease`
 
@@ -152,7 +152,7 @@ Call this function after the provider releases one allocation that it previously
 #### Gotchas
 
 This function does not check that a matching acquisition exists. If releases become greater
-than acquisitions, [`live`](#impl.live) traps.
+than acquisitions, [`live`](#Metrics.impl.live) traps.
 
 <a id="AllocationMetrics"></a>
 
@@ -167,7 +167,7 @@ Copyable counters for one provider's successful allocation acquisitions and rele
 ### Details
 
 `acquired` and `released` are cumulative. `peakLive` is the greatest value of
-`acquired - released` observed by [`recordAcquire`](#impl.recordAcquire). Use [`live`](#impl.live) for the current difference.
+`acquired - released` observed by [`recordAcquire`](#Metrics.impl.recordAcquire). Use [`live`](#Metrics.impl.live) for the current difference.
 
 <a id="AllocationMetrics.acquired"></a>
 
@@ -199,7 +199,7 @@ pub peakLive: usize
 
 The greatest live-allocation count observed after an acquisition.
 
-<a id="impl-2"></a>
+<a id="AllocationMetrics.impl.Copy"></a>
 
 ## Implementation `Copy for AllocationMetrics`
 

@@ -84,7 +84,7 @@ pub struct NativeDescriptor
 
 Byte-transfer policy for borrowed native descriptors with no resource ownership.
 
-<a id="impl"></a>
+<a id="NativeDescriptor.impl"></a>
 
 ## Implementation `NativeDescriptor`
 
@@ -92,7 +92,7 @@ Byte-transfer policy for borrowed native descriptors with no resource ownership.
 impl NativeDescriptor
 ```
 
-<a id="impl.read"></a>
+<a id="NativeDescriptor.impl.read"></a>
 
 ### Associated function `read`
 
@@ -108,7 +108,7 @@ Success stores the exact prefix length in `count`; zero capacity succeeds with z
 Failure stores zero in `count` and captures a native error in `error`, or zero for an invalid
 transfer count. Bytes beyond a successful prefix retain their initial values.
 
-<a id="impl.writeAll"></a>
+<a id="NativeDescriptor.impl.writeAll"></a>
 
 ### Associated function `writeAll`
 

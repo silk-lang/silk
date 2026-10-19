@@ -27,7 +27,7 @@ pub struct Mapping
 
 One affine, zero-initialized anonymous mapping and its aligned usable range.
 
-<a id="impl"></a>
+<a id="Mapping.impl.Drop"></a>
 
 ## Implementation `Drop for Mapping`
 
@@ -35,7 +35,7 @@ One affine, zero-initialized anonymous mapping and its aligned usable range.
 impl Drop for Mapping
 ```
 
-<a id="impl.drop"></a>
+<a id="Mapping.impl.Drop.drop"></a>
 
 ### Operation `drop`
 
@@ -43,7 +43,7 @@ impl Drop for Mapping
 fn drop(self: &mut Mapping) -> ()
 ```
 
-<a id="impl-2"></a>
+<a id="Mapping.impl"></a>
 
 ## Implementation `Mapping`
 
@@ -51,7 +51,7 @@ fn drop(self: &mut Mapping) -> ()
 impl Mapping
 ```
 
-<a id="impl.allocate"></a>
+<a id="Mapping.impl.allocate"></a>
 
 ### Associated function `allocate`
 
@@ -67,7 +67,7 @@ The caller supplies the process page size from validated AT_PAGESZ. Size must be
 page size and alignment must be powers of two. Invalid values and arithmetic overflow return
 error 22. Mapping failure returns the kernel error. Success owns one complete mapping.
 
-<a id="impl.length"></a>
+<a id="Mapping.impl.length"></a>
 
 ### Method `length`
 
@@ -77,7 +77,7 @@ pub fn length(self: &Mapping) -> usize
 
 Returns the requested usable byte count, excluding alignment padding.
 
-<a id="impl.pointer"></a>
+<a id="Mapping.impl.pointer"></a>
 
 ### Method `pointer`
 
@@ -92,7 +92,7 @@ Returns the aligned address of the mapping's usable range.
 The pointer grants no ownership. Keep the mapping alive and limit accesses to `length` bytes.
 The initial bytes are zero; subsequent reads require the caller to preserve initialization.
 
-<a id="impl.release"></a>
+<a id="Mapping.impl.release"></a>
 
 ### Associated function `release`
 

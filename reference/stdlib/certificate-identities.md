@@ -81,7 +81,7 @@ pub depth: usize
 
 Maximum DER depth. The implementation also enforces a ceiling of 32.
 
-<a id="impl"></a>
+<a id="SanDecodeLimits.impl.Copy"></a>
 
 ## Implementation `Copy for SanDecodeLimits`
 
@@ -89,7 +89,7 @@ Maximum DER depth. The implementation also enforces a ceiling of 32.
 impl Copy for SanDecodeLimits
 ```
 
-<a id="impl-2"></a>
+<a id="SanDecodeLimits.impl"></a>
 
 ## Implementation `SanDecodeLimits`
 
@@ -97,7 +97,7 @@ impl Copy for SanDecodeLimits
 impl SanDecodeLimits
 ```
 
-<a id="impl.standard"></a>
+<a id="SanDecodeLimits.impl.standard"></a>
 
 ### Associated function `standard`
 
@@ -327,7 +327,7 @@ pub struct CertificateSan
 
 Operations that decode complete SAN values without allocation or identity matching.
 
-<a id="impl-3"></a>
+<a id="CertificateSan.impl"></a>
 
 ## Implementation `CertificateSan`
 
@@ -335,7 +335,7 @@ Operations that decode complete SAN values without allocation or identity matchi
 impl CertificateSan
 ```
 
-<a id="impl.validateValue"></a>
+<a id="CertificateSan.impl.validateValue"></a>
 
 ### Associated function `validateValue`
 
@@ -354,7 +354,7 @@ This performs the same complete framing and GeneralName schema checks as `decode
 enforces the supplied input, identity, node, and depth budgets, and returns the name count.
 Payload syntax such as DNS label policy and IP address width remains the consumer's job.
 
-<a id="impl.decodeValue"></a>
+<a id="CertificateSan.impl.decodeValue"></a>
 
 ### Associated function `decodeValue`
 
@@ -384,7 +384,7 @@ Schema-dependent SET ordering, default values, and implicit content rules requir
 An error can leave partial descriptors. Never consume them after failure.
 DNS syntax and IP lengths require `HttpsIdentity.verify`; this operation does not establish trust.
 
-<a id="impl.decode"></a>
+<a id="CertificateSan.impl.decode"></a>
 
 ### Associated function `decode`
 

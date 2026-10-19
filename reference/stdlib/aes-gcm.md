@@ -5,7 +5,7 @@
 Detached AES-128-GCM and AES-256-GCM authenticated encryption.
 
 ## When to use
-Use [`AesGcm`](#AesGcm) to encrypt with an explicit nonce and associated data. Use [`open`](#impl.open) to verify and decrypt.
+Use [`AesGcm`](#AesGcm) to encrypt with an explicit nonce and associated data. Use [`open`](#AesGcm.impl.open) to verify and decrypt.
 
 ## Details
 Operations borrow inputs and write separate caller-owned destinations. They allocate no memory and require no provider.
@@ -101,7 +101,7 @@ pub struct AesGcm
 
 The owner of allocation-free AES-128/256-GCM seal and open operations.
 
-<a id="impl"></a>
+<a id="AesGcm.impl"></a>
 
 ## Implementation `AesGcm`
 
@@ -109,7 +109,7 @@ The owner of allocation-free AES-128/256-GCM seal and open operations.
 impl AesGcm
 ```
 
-<a id="impl.seal"></a>
+<a id="AesGcm.impl.seal"></a>
 
 ### Associated function `seal`
 
@@ -139,7 +139,7 @@ Inputs and exclusive destinations must not alias. No input is retained and no al
 The caller must use a unique nonce for each encryption under one key and enforce per-key usage limits.
 The operation does not generate a nonce or guarantee physical erasure of secret copies.
 
-<a id="impl.open"></a>
+<a id="AesGcm.impl.open"></a>
 
 ### Associated function `open`
 

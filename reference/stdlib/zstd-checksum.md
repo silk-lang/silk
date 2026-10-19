@@ -22,7 +22,7 @@ pub struct Xxh64
 
 An allocation-free seed-zero checksum state with a 32-byte partial stripe.
 
-<a id="impl"></a>
+<a id="Xxh64.impl"></a>
 
 ## Implementation `Xxh64`
 
@@ -30,7 +30,7 @@ An allocation-free seed-zero checksum state with a 32-byte partial stripe.
 impl Xxh64
 ```
 
-<a id="impl.make"></a>
+<a id="Xxh64.impl.make"></a>
 
 ### Associated function `make`
 
@@ -40,7 +40,7 @@ pub fn make() -> Xxh64
 
 Creates an empty seed-zero checksum state without allocating storage.
 
-<a id="impl.updateByte"></a>
+<a id="Xxh64.impl.updateByte"></a>
 
 ### Method `updateByte`
 
@@ -54,7 +54,7 @@ Adds one decoded byte without allocating storage.
 
 The caller must reject input that would make the total byte count exceed `u64.MAX`.
 
-<a id="impl.finish"></a>
+<a id="Xxh64.impl.finish"></a>
 
 ### Method `finish`
 

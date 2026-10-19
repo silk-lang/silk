@@ -5,7 +5,7 @@
 Owned TOML documents with ordered tables and distinct scalar kinds.
 
 ## When to use
-Use [`Toml.parse`](#impl.parse) to validate and own a complete TOML document, then borrow fields from
+Use [`Toml.parse`](#Toml.impl.parse) to validate and own a complete TOML document, then borrow fields from
 its root table. Every allocation uses the ambient Allocator and partial trees drop on failure.
 
 ## Details
@@ -427,7 +427,7 @@ pub struct Toml
 
 Operations on complete owned TOML documents.
 
-<a id="impl"></a>
+<a id="Toml.impl"></a>
 
 ## Implementation `Toml`
 
@@ -435,7 +435,7 @@ Operations on complete owned TOML documents.
 impl Toml
 ```
 
-<a id="impl.parse"></a>
+<a id="Toml.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -449,7 +449,7 @@ Parses one complete UTF-8 document into an owned root table.
 All allocations use the ambient allocator. Syntax errors include a reason and byte offset.
 If parsing fails, the partial tree is released.
 
-<a id="impl.field"></a>
+<a id="Toml.impl.field"></a>
 
 ### Method `field`
 
@@ -459,7 +459,7 @@ pub fn field<'a>(self: &'a Value, name: string) -> Option<&'a Value>
 
 Borrows a table member by decoded key, or returns `None` for absence or another value kind.
 
-<a id="impl.fieldAt"></a>
+<a id="Toml.impl.fieldAt"></a>
 
 ### Method `fieldAt`
 
@@ -469,7 +469,7 @@ pub fn fieldAt<'a>(self: Option<&'a Value>, name: string) -> Option<&'a Value>
 
 Borrows a nested table member through an optional value, or returns `None`.
 
-<a id="impl.item"></a>
+<a id="Toml.impl.item"></a>
 
 ### Method `item`
 
@@ -479,7 +479,7 @@ pub fn item<'a>(self: &'a Value, index: usize) -> Option<&'a Value>
 
 Borrows an array element, or returns None for an absent index or another value kind.
 
-<a id="impl.asString"></a>
+<a id="Toml.impl.asString"></a>
 
 ### Method `asString`
 

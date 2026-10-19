@@ -6,7 +6,7 @@ HTTP request-target forms, authority validation, URI conversion, and Host select
 
 ## When to use
 
-Use [`RequestTarget.parse`](#impl.parse-2) for received or already serialized targets and [`RequestTarget.fromUri`](#impl.fromUri)
+Use [`RequestTarget.parse`](#RequestTarget.impl.parse) for received or already serialized targets and [`RequestTarget.fromUri`](#RequestTarget.impl.fromUri)
 for outgoing origin- or absolute-form bytes. Use [`validateRequestHost`](#validateRequestHost) before server routing.
 
 ## Details
@@ -58,23 +58,23 @@ pub struct HttpAuthority<'text>
 
 A validated HTTP authority retaining lexical host and optional port spelling.
 
-<a id="impl"></a>
+<a id="HttpAuthority.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for HttpAuthority<'text>`
 
 ```silk
 impl<'text> Copy for HttpAuthority<'text>
 ```
 
-<a id="impl-2"></a>
+<a id="HttpAuthority.impl"></a>
 
-## Implementation ``
+## Implementation `HttpAuthority<'text>`
 
 ```silk
 impl<'text> HttpAuthority<'text>
 ```
 
-<a id="impl.parse"></a>
+<a id="HttpAuthority.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -84,7 +84,7 @@ pub fn parse(text: string<'text>) -> Result<HttpAuthority<'text>, ValueError>
 
 Validates an authority without userinfo, preserving bracketed IP literals.
 
-<a id="impl.format"></a>
+<a id="HttpAuthority.impl.format"></a>
 
 ### Method `format`
 
@@ -94,7 +94,7 @@ pub fn format(self: &Self) -> string<'text>
 
 Borrows the complete authority serialization.
 
-<a id="impl.host"></a>
+<a id="HttpAuthority.impl.host"></a>
 
 ### Method `host`
 
@@ -104,7 +104,7 @@ pub fn host(self: &Self) -> string<'text>
 
 Borrows the host, retaining brackets around an IP literal.
 
-<a id="impl.portText"></a>
+<a id="HttpAuthority.impl.portText"></a>
 
 ### Method `portText`
 
@@ -114,7 +114,7 @@ pub fn portText(self: &Self) -> Option<string<'text>>
 
 Borrows optional port digits without the colon.
 
-<a id="impl.port"></a>
+<a id="HttpAuthority.impl.port"></a>
 
 ### Method `port`
 
@@ -174,23 +174,23 @@ Asterisk
 
 Server-wide OPTIONS asterisk-form.
 
-<a id="impl-3"></a>
+<a id="RequestTarget.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for RequestTarget<'text>`
 
 ```silk
 impl<'text> Copy for RequestTarget<'text>
 ```
 
-<a id="impl-4"></a>
+<a id="RequestTarget.impl"></a>
 
-## Implementation ``
+## Implementation `RequestTarget<'text>`
 
 ```silk
 impl<'text> RequestTarget<'text>
 ```
 
-<a id="impl.parse-2"></a>
+<a id="RequestTarget.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -204,7 +204,7 @@ pub fn parse(
 
 Parses one exact target form using method-specific admission rules.
 
-<a id="impl.validateForMethod"></a>
+<a id="RequestTarget.impl.validateForMethod"></a>
 
 ### Associated function `validateForMethod`
 
@@ -217,7 +217,7 @@ pub fn validateForMethod(
 
 Rejects a validated target form that does not match `method`.
 
-<a id="impl.format-2"></a>
+<a id="RequestTarget.impl.format"></a>
 
 ### Method `format`
 
@@ -227,7 +227,7 @@ pub fn format(self: Self) -> string<'text>
 
 Borrows the accepted lexical request target.
 
-<a id="impl.isAbsolute"></a>
+<a id="RequestTarget.impl.isAbsolute"></a>
 
 ### Method `isAbsolute`
 
@@ -237,7 +237,7 @@ pub fn isAbsolute(self: &Self) -> bool
 
 Reports whether this target is absolute-form.
 
-<a id="impl.isAuthority"></a>
+<a id="RequestTarget.impl.isAuthority"></a>
 
 ### Method `isAuthority`
 
@@ -247,7 +247,7 @@ pub fn isAuthority(self: &Self) -> bool
 
 Reports whether this target is authority-form.
 
-<a id="impl.fromUri"></a>
+<a id="RequestTarget.impl.fromUri"></a>
 
 ### Associated function `fromUri`
 

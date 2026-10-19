@@ -9,19 +9,19 @@ Use [`Vector`](#Vector) when a sequence must grow or own a runtime-determined nu
 fixed array when the length is part of the type, and `silk.bytes.Bytes` for bulk byte storage.
 
 ## Details
-[`make`](#impl.make) is allocation-free. The first growth reserves four elements and later growth doubles
-capacity; [`reserve`](#impl.reserve) can move that cost ahead of mutation. Growth completes in replacement
-storage before committing, so [`append`](#impl.append) and [`reserve`](#impl.reserve) leave the vector unchanged on
+[`make`](#Vector.impl.make) is allocation-free. The first growth reserves four elements and later growth doubles
+capacity; [`reserve`](#Vector.impl.reserve) can move that cost ahead of mutation. Growth completes in replacement
+storage before committing, so [`append`](#Vector.impl.append) and [`reserve`](#Vector.impl.reserve) leave the vector unchanged on
 [`OutOfMemoryError`](./allocator.md#OutOfMemoryError). Removing, clearing, and truncating drop exactly the elements they discard
 while retaining capacity.
 
-[`sort`](#impl.sort) is stable, deterministic, and supports move-only elements, but allocates scratch space.
-[`binarySearch`](#impl.binarySearch) requires an already sorted vector and returns the lowest index among equal
+[`sort`](#Vector.impl.sort) is stable, deterministic, and supports move-only elements, but allocates scratch space.
+[`binarySearch`](#Vector.impl.binarySearch) requires an already sorted vector and returns the lowest index among equal
 matches.
 
 ## Gotchas
-[`get`](#impl.get), [`set`](#impl.set), and [`remove`](#impl.remove) trap on an out-of-range index. An [`insert`](#impl.insert) position must be at
-or before the current length. Use [`asSlice`](#impl.asSlice) to borrow move-only elements because [`get`](#impl.get)
+[`get`](#Vector.impl.get), [`set`](#Vector.impl.set), and [`remove`](#Vector.impl.remove) trap on an out-of-range index. An [`insert`](#Vector.impl.insert) position must be at
+or before the current length. Use [`asSlice`](#Vector.impl.asSlice) to borrow move-only elements because [`get`](#Vector.impl.get)
 produces a copied value.
 
 ## Examples
@@ -140,15 +140,15 @@ elements. Capacity counts elements that fit without growth. Borrowed elements re
 referent lifetimes through replacement, extraction, and required cleanup. An allocation does
 not make its payload detached.
 
-<a id="impl"></a>
+<a id="Vector.impl"></a>
 
-## Implementation ``
+## Implementation `Vector<T>`
 
 ```silk
 impl<T> Vector<T>
 ```
 
-<a id="impl.make"></a>
+<a id="Vector.impl.make"></a>
 
 ### Associated function `make`
 
@@ -158,7 +158,7 @@ pub fn make() -> Vector<T>
 
 Creates an empty vector with zero capacity and no allocation.
 
-<a id="impl.length"></a>
+<a id="Vector.impl.length"></a>
 
 ### Method `length`
 
@@ -168,7 +168,7 @@ pub fn length(self: &Self) -> usize
 
 Returns the number of initialized elements.
 
-<a id="impl.capacity"></a>
+<a id="Vector.impl.capacity"></a>
 
 ### Method `capacity`
 
@@ -178,7 +178,7 @@ pub fn capacity(self: &Self) -> usize
 
 Returns the total number of elements that fit without another growth allocation.
 
-<a id="impl.asSlice"></a>
+<a id="Vector.impl.asSlice"></a>
 
 ### Method `asSlice`
 
@@ -192,7 +192,7 @@ Borrows the initialized elements as one shared lexical slice.
 
 Do not retain this slice across an operation that can grow the vector.
 
-<a id="impl.asMutSlice"></a>
+<a id="Vector.impl.asMutSlice"></a>
 
 ### Method `asMutSlice`
 
@@ -206,7 +206,7 @@ Borrows all initialized elements as one exclusive lexical slice.
 
 Do not retain this slice across an operation that can grow the vector.
 
-<a id="impl.append"></a>
+<a id="Vector.impl.append"></a>
 
 ### Method `append`
 
@@ -221,7 +221,7 @@ Appends one owned value, growing geometrically when capacity is exhausted.
 The vector takes ownership of `value`. If growth fails, the vector keeps its prior contents,
 length, and capacity.
 
-<a id="impl.insert"></a>
+<a id="Vector.impl.insert"></a>
 
 ### Method `insert`
 
@@ -240,9 +240,9 @@ vector keeps its prior contents, length, and capacity.
 
 #### Gotchas
 
-`index` must be less than or equal to [`length`](#impl.length).
+`index` must be less than or equal to [`length`](#Vector.impl.length).
 
-<a id="impl.get"></a>
+<a id="Vector.impl.get"></a>
 
 ### Method `get`
 
@@ -254,9 +254,9 @@ Copies the element at one index and traps when the index is out of range.
 
 #### When to use
 
-Use this function for a `Copy` element. Use [`asSlice`](#impl.asSlice) to borrow a move-only element.
+Use this function for a `Copy` element. Use [`asSlice`](#Vector.impl.asSlice) to borrow a move-only element.
 
-<a id="impl.pop"></a>
+<a id="Vector.impl.pop"></a>
 
 ### Method `pop`
 
@@ -270,7 +270,7 @@ Removes the last element and returns it. Returns an absent value for an empty ve
 
 A present result transfers ownership of the removed element. Capacity does not change.
 
-<a id="impl.remove"></a>
+<a id="Vector.impl.remove"></a>
 
 ### Method `remove`
 
@@ -284,7 +284,7 @@ Removes the element at one index, shifting the later elements down. Traps out of
 
 Ownership of the removed element passes to the caller. Capacity does not change.
 
-<a id="impl.clear"></a>
+<a id="Vector.impl.clear"></a>
 
 ### Method `clear`
 
@@ -294,7 +294,7 @@ pub fn clear(self: &mut Self) -> ()
 
 Drops every initialized element and sets the length to zero, keeping the capacity.
 
-<a id="impl.truncate"></a>
+<a id="Vector.impl.truncate"></a>
 
 ### Method `truncate`
 
@@ -308,7 +308,7 @@ Drops every element past one length, keeping the capacity. Shorter lengths are l
 
 If `length` is not less than the current length, this function does nothing.
 
-<a id="impl.set"></a>
+<a id="Vector.impl.set"></a>
 
 ### Method `set`
 
@@ -318,7 +318,7 @@ pub fn set(self: &mut Self, index: usize, value: T) -> ()
 
 Overwrites the element at one index, dropping the old element first. Traps out of range.
 
-<a id="impl.reserve"></a>
+<a id="Vector.impl.reserve"></a>
 
 ### Method `reserve`
 
@@ -335,7 +335,7 @@ Grows capacity to hold at least `additional` more elements without another alloc
 This function does not change the length. If allocation fails, contents, length, and capacity
 remain unchanged.
 
-<a id="impl.reserveExact"></a>
+<a id="Vector.impl.reserveExact"></a>
 
 ### Method `reserveExact`
 
@@ -349,7 +349,7 @@ Reserves space for `additional` elements without geometric capacity growth.
 
 #### When to use
 
-Use when the complete output length is known. Use [`reserve`](#impl.reserve) for repeated growth.
+Use when the complete output length is known. Use [`reserve`](#Vector.impl.reserve) for repeated growth.
 
 #### Details
 
@@ -357,7 +357,7 @@ If the current capacity is sufficient, this function does not allocate or shrink
 Otherwise, one allocation sets capacity to the current length plus `additional`.
 The length stays unchanged. Size overflow or allocation failure leaves all existing state unchanged.
 
-<a id="impl.sort"></a>
+<a id="Vector.impl.sort"></a>
 
 ### Method `sort`
 
@@ -372,7 +372,7 @@ Orders the elements in place. Equal elements keep their input order.
 The sort is stable and deterministic. It supports move-only elements and allocates scratch
 storage. If allocation fails, the vector remains unchanged.
 
-<a id="impl.binarySearch"></a>
+<a id="Vector.impl.binarySearch"></a>
 
 ### Method `binarySearch`
 
@@ -392,15 +392,15 @@ This function consumes `target` and does not change the vector.
 
 The vector must already be ordered by the same `Order` witness.
 
-<a id="impl-2"></a>
+<a id="Vector.impl.Drop"></a>
 
-## Implementation ` Drop for  `
+## Implementation `Drop for Vector<T>`
 
 ```silk
 impl<T> Drop for Vector<T>
 ```
 
-<a id="impl.drop"></a>
+<a id="Vector.impl.Drop.drop"></a>
 
 ### Operation `drop`
 
@@ -408,15 +408,15 @@ impl<T> Drop for Vector<T>
 fn drop(self: &mut Vector<T>) -> ()
 ```
 
-<a id="impl-3"></a>
+<a id="Vector.impl-2"></a>
 
-## Implementation ``
+## Implementation `Vector<T>`
 
 ```silk
 impl<T> Vector<T>
 ```
 
-<a id="impl.appendBytes"></a>
+<a id="Vector.impl.appendBytes"></a>
 
 ### Method `appendBytes`
 
@@ -432,7 +432,7 @@ Appends every byte of one borrowed sequence in source order with one bulk copy.
 
 If growth fails, the vector keeps its prior contents, length, and capacity.
 
-<a id="impl.appendRepeated"></a>
+<a id="Vector.impl.appendRepeated"></a>
 
 ### Method `appendRepeated`
 

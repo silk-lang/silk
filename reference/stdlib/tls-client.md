@@ -6,7 +6,7 @@ An authenticated bounded TLS 1.3 client for caller-driven byte transports.
 
 ## When to use
 
-Use [`Client.make`](#impl.make) when an application has an explicit HTTPS identity, trust snapshot,
+Use [`Client.make`](#Client.impl.make) when an application has an explicit HTTPS identity, trust snapshot,
 validation instant, cryptographic random provider, allocator, and byte transport. Use the
 driver operations to move exact input and output prefixes without retaining caller buffers.
 
@@ -162,7 +162,7 @@ The nonempty protocol bytes, without a length prefix.
 pub union AlpnConfig<'a>
 ```
 
-Borrowed ALPN policy copied by [`Client.make`](#impl.make).
+Borrowed ALPN policy copied by [`Client.make`](#Client.impl.make).
 
 <a id="AlpnConfig.Disabled"></a>
 
@@ -204,31 +204,31 @@ pub required: bool
 
 Whether absence of a server selection is a failure.
 
-<a id="impl"></a>
+<a id="AlpnProtocol.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for AlpnProtocol<'a>`
 
 ```silk
 impl<'a> Copy for AlpnProtocol<'a>
 ```
 
-<a id="impl-2"></a>
+<a id="AlpnConfig.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for AlpnConfig<'a>`
 
 ```silk
 impl<'a> Copy for AlpnConfig<'a>
 ```
 
-<a id="impl-3"></a>
+<a id="AlpnConfig.impl"></a>
 
-## Implementation ``
+## Implementation `AlpnConfig<'a>`
 
 ```silk
 impl<'a> AlpnConfig<'a>
 ```
 
-<a id="impl.defaults"></a>
+<a id="AlpnConfig.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -408,7 +408,7 @@ pub path: ValidationLimits
 
 Certificate-path policy.
 
-<a id="impl-4"></a>
+<a id="ClientLimits.impl.Copy"></a>
 
 ## Implementation `Copy for ClientLimits`
 
@@ -416,7 +416,7 @@ Certificate-path policy.
 impl Copy for ClientLimits
 ```
 
-<a id="impl-5"></a>
+<a id="ClientLimits.impl"></a>
 
 ## Implementation `ClientLimits`
 
@@ -424,7 +424,7 @@ impl Copy for ClientLimits
 impl ClientLimits
 ```
 
-<a id="impl.defaults-2"></a>
+<a id="ClientLimits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -1344,7 +1344,7 @@ NoApplicationProtocol
 
 The server omits a required ALPN selection or selects a protocol that was not offered.
 
-<a id="impl-6"></a>
+<a id="CertificateVerifyFailure.impl.Copy"></a>
 
 ## Implementation `Copy for CertificateVerifyFailure`
 
@@ -1362,15 +1362,15 @@ pub struct Authentication<'a>
 
 Authenticated result metadata borrowed from one client owner.
 
-<a id="impl-7"></a>
+<a id="Authentication.impl"></a>
 
-## Implementation ``
+## Implementation `Authentication<'a>`
 
 ```silk
 impl<'a> Authentication<'a>
 ```
 
-<a id="impl.suite"></a>
+<a id="Authentication.impl.suite"></a>
 
 ### Method `suite`
 
@@ -1380,7 +1380,7 @@ pub fn suite(self: &Self) -> CipherSuite
 
 Returns the negotiated TLS 1.3 cipher suite.
 
-<a id="impl.group"></a>
+<a id="Authentication.impl.group"></a>
 
 ### Method `group`
 
@@ -1390,7 +1390,7 @@ pub fn group(self: &Self) -> NamedGroup
 
 Returns the negotiated ephemeral key-exchange group.
 
-<a id="impl.selectedAlpn"></a>
+<a id="Authentication.impl.selectedAlpn"></a>
 
 ### Method `selectedAlpn`
 
@@ -1400,7 +1400,7 @@ pub fn selectedAlpn(self: &Self) -> Option<&'a [u8]>
 
 Returns the selected offered ALPN protocol, or `None` when ALPN was disabled or optional.
 
-<a id="impl.leafDer"></a>
+<a id="Authentication.impl.leafDer"></a>
 
 ### Method `leafDer`
 
@@ -1410,7 +1410,7 @@ pub fn leafDer(self: &Self) -> &'a [u8]
 
 Borrows the exact DER of the leaf used for path, identity, and signature authentication.
 
-<a id="impl.intermediateIndices"></a>
+<a id="Authentication.impl.intermediateIndices"></a>
 
 ### Method `intermediateIndices`
 
@@ -1420,7 +1420,7 @@ pub fn intermediateIndices(self: &Self) -> &'a [usize]
 
 Borrows selected intermediate indices in leaf-to-anchor order.
 
-<a id="impl.anchorIndex"></a>
+<a id="Authentication.impl.anchorIndex"></a>
 
 ### Method `anchorIndex`
 
@@ -1430,7 +1430,7 @@ pub fn anchorIndex(self: &Self) -> usize
 
 Returns the selected explicit trust-anchor index.
 
-<a id="impl.validationTime"></a>
+<a id="Authentication.impl.validationTime"></a>
 
 ### Method `validationTime`
 
@@ -1440,7 +1440,7 @@ pub fn validationTime(self: &Self) -> Instant
 
 Returns the exact caller-supplied validation instant, including nanoseconds.
 
-<a id="impl.revocationStatus"></a>
+<a id="Authentication.impl.revocationStatus"></a>
 
 ### Method `revocationStatus`
 
@@ -1450,7 +1450,7 @@ pub fn revocationStatus(self: &Self) -> RevocationStatus
 
 Returns the revocation evidence produced by certificate-path validation.
 
-<a id="impl.sanIndex"></a>
+<a id="Authentication.impl.sanIndex"></a>
 
 ### Method `sanIndex`
 
@@ -1470,7 +1470,7 @@ pub struct Client
 
 One affine authenticated TLS 1.3 client state machine.
 
-<a id="impl-8"></a>
+<a id="Client.impl"></a>
 
 ## Implementation `Client`
 
@@ -1478,7 +1478,7 @@ One affine authenticated TLS 1.3 client state machine.
 impl Client
 ```
 
-<a id="impl.make"></a>
+<a id="Client.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1505,7 +1505,7 @@ A-label used for both SNI and certificate identity. IP references send no SNI.
 The caller must supply a trustworthy validation instant and providers. Random-provider
 failure remains fatal. Allocation refusal is an `OutOfMemoryError` Effect failure.
 
-<a id="impl.pendingOutput"></a>
+<a id="Client.impl.pendingOutput"></a>
 
 ### Method `pendingOutput`
 
@@ -1515,7 +1515,7 @@ pub fn pendingOutput<'a>(self: &'a Self) -> &'a [u8]
 
 Borrows the exact unacknowledged TLS output suffix.
 
-<a id="impl.authentication"></a>
+<a id="Client.impl.authentication"></a>
 
 ### Method `authentication`
 
@@ -1525,7 +1525,7 @@ pub fn authentication<'a>(self: &'a Self) -> Option<Authentication<'a>>
 
 Returns authenticated metadata only after the one-shot authentication event becomes visible.
 
-<a id="impl.feedInput"></a>
+<a id="Client.impl.feedInput"></a>
 
 ### Method `feedInput`
 
@@ -1547,7 +1547,7 @@ consumes and ignores all later transport bytes as required by TLS 1.3. Before re
 more input, the client drains every complete handshake message exposed by the accepted
 record and schedules mandatory response output.
 
-<a id="impl.progress"></a>
+<a id="Client.impl.progress"></a>
 
 ### Method `progress`
 
@@ -1559,7 +1559,7 @@ pub effect fn progress(self: &mut Self) -> Result<Progress, TlsError>
 
 Drains complete buffered handshake work and schedules mandatory control output without input.
 
-<a id="impl.ackWritten"></a>
+<a id="Client.impl.ackWritten"></a>
 
 ### Method `ackWritten`
 
@@ -1569,7 +1569,7 @@ pub fn ackWritten(self: &mut Self, count: usize) -> Result<Progress, TlsError>
 
 Acknowledges one transmitted prefix without acknowledging bytes implicitly.
 
-<a id="impl.readPlaintext"></a>
+<a id="Client.impl.readPlaintext"></a>
 
 ### Method `readPlaintext`
 
@@ -1586,7 +1586,7 @@ Copies authenticated application plaintext or reports pending input, closure, or
 
 A zero-length destination returns `EmptyBuffer`; it is never clean EOF.
 
-<a id="impl.writePlaintext"></a>
+<a id="Client.impl.writePlaintext"></a>
 
 ### Method `writePlaintext`
 
@@ -1601,7 +1601,7 @@ Accepts at most one 16384-byte application fragment after authentication.
 Mandatory control output has priority and accepts no plaintext. A positive accepted prefix
 is encrypted once and must not be resubmitted after partial transport writes.
 
-<a id="impl.requestKeyUpdate"></a>
+<a id="Client.impl.requestKeyUpdate"></a>
 
 ### Method `requestKeyUpdate`
 
@@ -1611,7 +1611,7 @@ pub fn requestKeyUpdate(self: &mut Self) -> Result<Progress, TlsError>
 
 Schedules one coalesced local KeyUpdate before the next application write.
 
-<a id="impl.closeWrite"></a>
+<a id="Client.impl.closeWrite"></a>
 
 ### Method `closeWrite`
 
@@ -1621,7 +1621,7 @@ pub fn closeWrite(self: &mut Self) -> Result<Progress, TlsError>
 
 Idempotently schedules one local `close_notify` after accepted output.
 
-<a id="impl.endInput"></a>
+<a id="Client.impl.endInput"></a>
 
 ### Method `endInput`
 

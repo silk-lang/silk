@@ -5,8 +5,8 @@
 Minimal source-defined test assertions and runtime selection predicates.
 
 ## When to use
-Mark a parameterless unit function with `test`, then use [`expect`](#impl.expect) for a boolean condition.
-Custom runners may reuse [`matches`](#impl.matches) to apply the builtin runner's file and name policy.
+Mark a parameterless unit function with `test`, then use [`expect`](#Testing.impl.expect) for a boolean condition.
+Custom runners may reuse [`matches`](#Testing.impl.matches) to apply the builtin runner's file and name policy.
 
 ## Details
 Assertions are ordinary typed failures. They require no service and carry the caller's borrowed
@@ -37,7 +37,7 @@ pub struct Testing
 
 Source-defined test helpers with no compiler-known behavior.
 
-<a id="impl"></a>
+<a id="Testing.impl"></a>
 
 ## Implementation `Testing`
 
@@ -45,7 +45,7 @@ Source-defined test helpers with no compiler-known behavior.
 impl Testing
 ```
 
-<a id="impl.expect"></a>
+<a id="Testing.impl.expect"></a>
 
 ### Associated function `expect`
 
@@ -58,7 +58,7 @@ pub effect fn expect<'message>(
 
 Fails with `message` when `condition` is false.
 
-<a id="impl.assertionMessage"></a>
+<a id="Testing.impl.assertionMessage"></a>
 
 ### Associated function `assertionMessage`
 
@@ -68,7 +68,7 @@ pub fn assertionMessage<'message>(error: &'message AssertionError<'message>) -> 
 
 Returns the diagnostic message retained by one assertion failure.
 
-<a id="impl.matches"></a>
+<a id="Testing.impl.matches"></a>
 
 ### Associated function `matches`
 

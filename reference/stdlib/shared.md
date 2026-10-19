@@ -7,20 +7,20 @@ Explicitly allocated, single-threaded shared ownership Shared.with callback-scop
 ## When to use
 Use [`Shared`](#Shared) when several independently owned local values or dormant computations must retain
 one mutable state without retaining a lexical borrow for their whole lifetimes. Construction is
-the only implicit storage boundary: [`Shared.make`](#impl.make) allocates once, while [`Shared.clone`](#impl.clone), [`Shared.with`](#impl.with), and
-[`Shared.withMut`](#impl.withMut) allocate nothing themselves.
+the only implicit storage boundary: [`Shared.make`](#Shared.impl.make) allocates once, while [`Shared.clone`](#Shared.impl.clone), [`Shared.with`](#Shared.impl.with), and
+[`Shared.withMut`](#Shared.impl.withMut) allocate nothing themselves.
 
 ## Details
 Every handle is affine and local to one execution thread. Cloning adds one strong obligation;
 dropping a non-last handle preserves the value and allocation, while dropping the last handle
 cleans the value and then releases the allocation. Access is callback-scoped and exclusive even
-through [`Shared.with`](#impl.with): nesting `Shared.with` under `Shared.with`, `Shared.withMut` under `Shared.with`, `Shared.with` under `Shared.withMut`, or
+through [`Shared.with`](#Shared.impl.with): nesting `Shared.with` under `Shared.with`, `Shared.withMut` under `Shared.with`, `Shared.with` under `Shared.withMut`, or
 `Shared.withMut` under `Shared.withMut` through an alias traps before the nested callback receives a reference.
 
 ## Gotchas
 Strong-reference cycles leak until ordinary source breaks them. This module does not expose weak
 handles, allocation identity, raw addresses, thread transfer, or post-trap cleanup guarantees.
-Extract work under [`Shared.withMut`](#impl.withMut) and invoke external callbacks only after the access call returns.
+Extract work under [`Shared.withMut`](#Shared.impl.withMut) and invoke external callbacks only after the access call returns.
 
 ## Examples
 ### Share and update one local value
@@ -79,15 +79,15 @@ An affine, non-thread-transferable strong handle to one local value.
 The opaque core is the sole field and supplies recursively derived cleanup and local execution
 affinity. `Shared` declares no source Drop hook.
 
-<a id="impl"></a>
+<a id="Shared.impl"></a>
 
-## Implementation ``
+## Implementation `Shared<T>`
 
 ```silk
 impl<T> Shared<T>
 ```
 
-<a id="impl.make"></a>
+<a id="Shared.impl.make"></a>
 
 ### Associated function `make`
 
@@ -102,7 +102,7 @@ Allocates one control block and transfers `value` into a new strong handle.
 Allocation failure leaves `value` under ordinary Effect-frame cleanup and produces no handle.
 The returned handle carries no allocator requirement after construction completes.
 
-<a id="impl.clone"></a>
+<a id="Shared.impl.clone"></a>
 
 ### Method `clone`
 
@@ -116,7 +116,7 @@ Adds one strong handle without allocating or touching the stored value.
 
 Count exhaustion traps before mutation and does not produce a partial handle.
 
-<a id="impl.withMut"></a>
+<a id="Shared.impl.withMut"></a>
 
 ### Method `withMut`
 
@@ -131,7 +131,7 @@ Runs one take-once callback Shared.with exclusive access to the stored value.
 The borrow cannot escape the callback or remain live across suspension. Reentrant access through
 any alias traps before the nested callback receives a reference.
 
-<a id="impl.with"></a>
+<a id="Shared.impl.with"></a>
 
 ### Method `with`
 
@@ -143,7 +143,7 @@ Runs one take-once callback Shared.with shared access to the stored value.
 
 #### Details
 
-Inspection delegates through [`Shared.withMut`](#impl.withMut), so it has the same exclusive runtime access state and
+Inspection delegates through [`Shared.withMut`](#Shared.impl.withMut), so it has the same exclusive runtime access state and
 the same four-way reentrant conflict policy. The callback cannot mutate through its `&T`.
 
 

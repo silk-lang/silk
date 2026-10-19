@@ -14,7 +14,7 @@ selected one regular PEM bundle file. Provide it lexically as
 
 Construction copies an absolute native root and an existing normalized portable [`Path`](./filesystem.md#Path)
 without performing I/O. Each load opens the file anew, reads no more than the caller's input
-budget, closes it, then decodes the complete bytes through [`TrustSnapshot.fromAnnotatedPem`](./trust-snapshot.md#impl.fromAnnotatedPem). Returned
+budget, closes it, then decodes the complete bytes through [`TrustSnapshot.fromAnnotatedPem`](./trust-snapshot.md#TrustSnapshot.impl.fromAnnotatedPem). Returned
 Printable annotations outside certificate blocks are accepted; malformed blocks fail the load.
 Snapshots own their anchors independently of this provider and every later load.
 
@@ -96,7 +96,7 @@ A mutable native provider that owns one explicit root and portable PEM-file path
 The provider contains configuration only. It opens the configured path for every load and
 never caches, installs, or replaces caller-owned snapshots.
 
-<a id="impl"></a>
+<a id="NativeFileTrustSource.impl"></a>
 
 ## Implementation `NativeFileTrustSource`
 
@@ -104,7 +104,7 @@ never caches, installs, or replaces caller-owned snapshots.
 impl NativeFileTrustSource
 ```
 
-<a id="impl.make"></a>
+<a id="NativeFileTrustSource.impl.make"></a>
 
 ### Associated function `make`
 
@@ -126,7 +126,7 @@ path length must not exceed 4096 bytes. Each accepted input is copied into indep
 storage. Invalid configuration fails with [`TrustSourceError`](./trust-snapshot.md#TrustSourceError); caller
 allocation refusal remains [`OutOfMemoryError`](./allocator.md#OutOfMemoryError).
 
-<a id="impl-2"></a>
+<a id="NativeFileTrustSource.impl.TrustSource"></a>
 
 ## Implementation `TrustSource for NativeFileTrustSource`
 
@@ -134,7 +134,7 @@ allocation refusal remains [`OutOfMemoryError`](./allocator.md#OutOfMemoryError)
 impl TrustSource for NativeFileTrustSource
 ```
 
-<a id="impl.load"></a>
+<a id="NativeFileTrustSource.impl.TrustSource.load"></a>
 
 ### Operation `load`
 

@@ -5,7 +5,7 @@
 Decoding validated JSON string tokens into owned UTF-8 bytes.
 
 ## When to use
-Use [`JsonText.decode`](#impl.decode) after `JsonScanner` has validated a string token. The returned bytes
+Use [`JsonText.decode`](#JsonText.impl.decode) after `JsonScanner` has validated a string token. The returned bytes
 are valid UTF-8 and can be adopted by `String` without another copy.
 
 Import as `JsonText` with `import silk.json_text { JsonText }`.
@@ -22,7 +22,7 @@ pub struct JsonText
 
 Operations on validated JSON string token text.
 
-<a id="impl"></a>
+<a id="JsonText.impl"></a>
 
 ## Implementation `JsonText`
 
@@ -30,7 +30,7 @@ Operations on validated JSON string token text.
 impl JsonText
 ```
 
-<a id="impl.copy"></a>
+<a id="JsonText.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -40,7 +40,7 @@ pub effect fn copy(raw: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator
 
 Copies scanner-validated UTF-8 or ASCII bytes into owned storage.
 
-<a id="impl.decode"></a>
+<a id="JsonText.impl.decode"></a>
 
 ### Associated function `decode`
 

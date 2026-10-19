@@ -48,7 +48,7 @@ pub struct BufferedTransfer
 
 The owner of bounded exact-prefix transfer operations.
 
-<a id="impl"></a>
+<a id="BufferedTransfer.impl"></a>
 
 ## Implementation `BufferedTransfer`
 
@@ -56,7 +56,7 @@ The owner of bounded exact-prefix transfer operations.
 impl BufferedTransfer
 ```
 
-<a id="impl.transferAtMost"></a>
+<a id="BufferedTransfer.impl.transferAtMost"></a>
 
 ### Associated function `transferAtMost`
 
@@ -75,7 +75,7 @@ where &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock,
 
 Transfers no more than `limit`, consuming only destination-accepted bytes.
 
-<a id="impl.transferExact"></a>
+<a id="BufferedTransfer.impl.transferExact"></a>
 
 ### Associated function `transferExact`
 
