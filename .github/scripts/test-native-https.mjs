@@ -72,10 +72,14 @@ try {
   ])
   assert.equal(build.status, 0, JSON.stringify(build))
 
+  // Own request defaults: LibreSSL can append -addext to the host's CA extensions.
+  writeFileSync(join(directory, 'request.cnf'), '[req]\ndistinguished_name = subject\n[subject]\n')
   // Match the compatibility gap: P-256 leaf and intermediate, P-384 authority, SHA-384 CA signature.
   openssl('ecparam', '-name', 'secp384r1', '-genkey', '-noout', '-out', 'root.key')
   openssl(
     'req',
+    '-config',
+    'request.cnf',
     '-new',
     '-x509',
     '-key',
@@ -94,6 +98,8 @@ try {
   )
   openssl(
     'req',
+    '-config',
+    'request.cnf',
     '-new',
     '-x509',
     '-key',
@@ -127,6 +133,8 @@ try {
     openssl('ecparam', '-name', curve, '-genkey', '-noout', '-out', `${name}.key`)
     openssl(
       'req',
+      '-config',
+      'request.cnf',
       '-new',
       '-key',
       `${name}.key`,

@@ -473,6 +473,12 @@ Run the library's package-owned tests from the repository root:
 silk test --manifest-path changes/silk.toml --root src/tests.silk --no-cache --stdlib stdlib
 ```
 
+Native HTTPS conformance runs with `SILK_COMPILER` set to the native binary:
+`node .github/scripts/test-native-https.mjs --live`. Set `SILK_CLANG` if Clang is not on `PATH`.
+The harness creates an isolated PKI and explicit OpenSSL request configuration so platform CA
+defaults cannot change the test certificates. Controlled requests exercise history and authentication
+failures; `--live` also checks GitHub with the default platform trust bundle.
+
 ### One native generation and its smoke receipt
 
 `NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored
