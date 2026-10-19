@@ -898,11 +898,19 @@ new source position.
 
 Semantic units record consumed source inputs and other units' results. Presence, complete name
 buckets, selected import syntax and targets, and nominal identity are separate source inputs.
-Changing an unrelated field or function does not invalidate a nominal identity or an unchanged
-selective import. Readers that have not been partitioned still record the source's exact bytes;
-this includes the current body, storage-shape and operation-signature readers. There is no general
-semantic-result cutoff: changed inputs invalidate their consumers and transitive result dependers.
-Unchanged inputs keep completed answers available for an ordinary cache hit.
+Storage and callable readers additionally observe the actual declaration header, selected member,
+source-only omitted-lifetime scan, original operation, or owning body they consume. A primitive
+change to another field does not invalidate a selected member shape; whole-record consumers still
+observe all required members. Operation-name catalogs exclude result types, while the selected
+operation's signature retains them. Empty implementation catalogs remain positive absence inputs,
+so inserting or deleting an implementation invalidates their consumers. Anonymous syntax belongs
+to its real enclosing named body.
+
+Changing an unrelated field or function does not invalidate these unchanged observations. Readers
+that have not been partitioned still record the source's exact bytes, including location-bearing
+implementation-head and backend readers. There is no general semantic-result cutoff: changed inputs
+invalidate their consumers and transitive result dependers. Unchanged inputs keep completed answers
+available for an ordinary cache hit.
 
 Successful selected imports retain declaration handles, not parse positions. Retained diagnostic
 locations have explicit guarded token-coordinate observations; recovery positions that are not token
