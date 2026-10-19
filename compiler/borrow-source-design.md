@@ -1,6 +1,6 @@
 # Complete sources: B design for independent review
 
-Status: **repair1 proposal for NEW independent design review2; no C implementation or Silk
+Status: **repair2 proposal for NEW independent design review3; no C implementation or Silk
 acceptance**. Exact reviewed baseline `985eb0ea2d07fecd3cccc08939d07be901d20967` and its models
 are preserved. Accepted main `6c1608657dbdb11efce96ca973213e8cbd809f64` is merged cleanly; its
 PR1983 caller/CFG policy is now the migration baseline. This continuation has no production delta
@@ -10,8 +10,8 @@ Read this document with the normative [policy rules](borrow-source-policy-rules.
 agreed [Semantic preparation/API](borrow-source-preparation.md). They form one proposal. The
 rules replace the baseline's missing directness/precision/stop translation; the preparation
 package replaces its unsupplied shape/query boundary. The accepted A extraction and inventory
-remain in [borrow-policy-staging.md](borrow-policy-staging.md). Original baseline model evidence
-is distinct from the new repair1 probes in section 8. Neither is compiler acceptance.
+remain in [borrow-policy-staging.md](borrow-policy-staging.md). Original baseline/repair1 model evidence
+is distinct from the repair2 correspondence probes in section 8. Neither is compiler acceptance.
 
 The intended contract is the value actually reaching a queried read. Historical definitions
 which cannot reach it are not operands. This is an intentional correction to eager enumeration,
@@ -234,7 +234,9 @@ presence, per-source Q and structural per-loan P versions, input barriers, fixed
 snapshots and sequential real positions. Loss-free positive cycles derive Exact from presence
 and the proved absence of loss; no quality category or candidate borrow is optimistically seeded.
 Undefined loss is not false. Kept exact branches preserve bits; result alternatives add A;
-unknown result/cleanup add S+A; retained stores add S. Drops preserve earlier state/effects.
+unknown results and eligible cleanup of empty named regions add S+A; retained stores add S.
+Nonempty cleanup observations add intervals without loss, even with everything=true.
+Drops preserve earlier state/effects.
 Only an actual value path can bring later loss backward into an earlier read. The saved pre-loop
 snapshot is not overwritten merely by equal LoanId. Full rules, category admission, complete/drop
 feedback and mid-constructor observations are normative there, rather than an unspecified table.
@@ -252,7 +254,7 @@ The original gates must be translated literally, not reconstructed from generic 
 | resultDecision | unchanged stores/excluded/known/outside-forward/outside-bound/outside-drop/declared/complete/several/unique/implied precedence; mapped versus original field distinction |
 | whole hold | kept, not declared, mapped whole position, forwarding not Matched; described only ordinary typed call, as A |
 | unreachableField | actual qualifying field read; Exact body source, required-source exclusion, **at least one prior whole hold** for this loan, every prior relevant hold described and its implied facts known, then mayOutlive exclusion |
-| retainedSinks | original initial sinks; same operand/only selector; queue closure through nonlocal parents without promotion, promote actual local ancestors; final effects after closure |
+| retainedSinks | Same view path narrows regardless of direct; Unknown uses direct/referent fallback; keep located separate; same operand/only selector and parent closure complete before effects, replacing promoted provisional sinks |
 | defer | keepCarried immediately after each original argument visit, before appending it; correct direct caller is defer, not invoke |
 | invoke | pipeline/callee/arguments order; finish, storeIntoLent, then storeThroughExclusive; original callee-loan exclusion |
 | construct | original opaque pass before universal stored-region pass; CaptureHold gates, storable/inherited effects and reference-capture loans preserved |
@@ -260,7 +262,7 @@ The original gates must be translated literally, not reconstructed from generic 
 | ReadPlace / attributeRead | original place-through/steps gate, nonempty loan carries or through-holder condition, nodeRetains; scalar excludes real shadow definitions, retaining read keeps its original field filtering/reborrow/declared gates |
 | replace / hold | callable replacement with carried loans remains unsupported; retains gate uses the actual loan projection; every write still defines whole-value state; loopCleanup and mutable/callable gates remain conditional predicates |
 | PlaceAssignment / Displace | original path-through/local-source/retaining predicates, exact write/shadow rules and unsupported displaced-view boundary; no general direct-caller-store allowance in C |
-| cleanup / storage | original precision changes, loop-cleanup boundary, must-init, real/shadow/inherited policy; no availability relaxation |
+| cleanup / storage | preserve outer observation/refusal gates; interval on everything OR named.empty OR shares; S+A loss only for interval AND named.empty; loop-cleanup/must-init/real-shadow-inherited unchanged |
 
 WholeHold, unretained, intervals, escape, storable and storing are conditional EffectIds, emitted
 once after solving, in structural/occurrence order. A solver revisit never appends again. The
@@ -485,8 +487,22 @@ model with these bounded checks:
   versus runtime-flow and diagnostic-stage probes. These last probes state narrow contracts;
   they are not a full result/retention/query/diagnostic oracle.
 
-All recorded model assertions passed. Counts, exact domain, commands, hashes and limitations
-are in `.scratch/source-policy-design-b/repair1/README.md`. They do not establish compiler
+Repair1's route-subset classifier used a stale direct-and-field0 rule; its historical PASS
+is **not** correspondence evidence for accepted main6c. Its 24 transitions test already-selected
+loss events, not the cleanup eligibility/subgate. Review2 resolved the three architecture
+blockers but required these two bounded corrections. Repair2's separate archive tests the
+current Same/Different/Unknown classifier with located evidence, mixed indirect/direct histories,
+parent-closure-before-effects, Exact/Stored adapter gates and cleanup interval/loss subgates.
+Repair2 retains six slot-path/directness boundary answers plus exact indirect/mixed and
+Unknown-path controls, 16 parent-closure graphs, 128 adapter/applicability/reason combinations
+and 192 cleanup combinations over four qualities and actual named/observed sets. Helpers are
+identified accepted-main specializations checked against boundary tables and a separate parent
+reachability characterization, not independent whole-compiler oracles. Historical models and
+both independent reviewer probes are replayed from temporary copies. The preparation contribution
+and prior construction arguments are unchanged.
+
+All recorded model assertions passed within their stated models. Counts, exact domain, commands,
+hashes and limitations are in the repair1 and repair2 archive READMEs. They do not establish compiler
 constructor correspondence, full policy correlations, availability, performance, diagnostics or
 Silk acceptance. No native invocation, full source fixture execution, compiler build,
 CI, corpus run or gap update occurred. The model intentionally does not mirror all production

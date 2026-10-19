@@ -1,7 +1,8 @@
-# Repair1: conditional routes and grounded precision
+# Conditional routes and grounded precision — repair2
 
-Design only, based on 985eb0ea2. This replaces the missing rules in B sections 3–5;
-it is not source acceptance. The baseline model files remain byte-for-byte unchanged.
+Design only, correcting two accepted-main6c policy correspondences after review2
+of b1e21c5. The prior architecture remains unchanged. All baseline/repair1 models
+and results are historical, byte-for-byte preserved; this is not Silk acceptance.
 
 ## One occurrence, conditional routes
 
@@ -48,11 +49,15 @@ Consumer quantifiers:
 
 * A source exists only with an active paired route; universe membership is not
   existence. Required safety/coverage quantifies over **all possible** cases.
-* `keptSink` evaluates the original branch order separately for each case. Local
-  narrowing is a release certificate only when every applicable case allows it;
-  a possible Unknown/Universal case retains its storing/escape effect. For the
-  review example direct-only is Local, indirect-only Unknown, and their union
-  has both conditional results (hence no unconditional Local certificate).
+* `keptSink` evaluates the accepted main6c branch order separately for each case,
+  returning both sink and located evidence. A Same view-slot path can narrow an
+  **indirect** carry: exact field0 direct and indirect histories both yield
+  Local/located=true for the review's fixed inputs. Their union has only that
+  result, not an extra Unknown/storing outcome. On Unknown paths, directness and
+  actual referent compatibility still govern fallback, without located evidence.
+  Local release requires every applicable case's **completed** classification to
+  allow it; parent closure below precedes effects. No provisional Unknown becomes
+  a storing effect if that same case is promoted to Universal.
 * `keptIn`, `destinationSlot`, `destinationField`, `excludedTransferRead` are
   case predicates. Source/destination joins require the original operand and
   paired definition/read relationship. A direct case cannot lend its evidence
@@ -76,6 +81,63 @@ coverage/witnesses plus `not BadRelease(o)`. Undefined Drop is not evidence of i
 Same-target same-placement same-reason effects intern and union their supports.
 Different loan targets or placements cannot collide. A later materializer neither
 replays alternatives as copies nor discards an effect because another case narrows.
+
+### Accepted slot classifier and final retention effects (R2-1)
+
+Each case supplies its own field/path, direct flag, referent/exclusivity and paired
+source definition/read to the existing transferSlotPath/type predicates. Preserve
+keptSink's holds/static early return, own-origin/own-view selection, locally typed
+Universal downgrade and approximate-channel corrections. In the non-own narrowing
+path, undescribed or empty slot inventory leaves the whole judgment unchanged.
+Otherwise scan slots in their existing order:
+
+| Path match | Fit and position evidence |
+| --- | --- |
+| Same | fits regardless of directness; a view slot sets positioned; non-view uses whole/wholeApproximate and sets uncertain |
+| Different | does not fit; contributes no narrowing or position |
+| Unknown | indirect aborts narrowing without publishing partial slot accumulators; direct consults the actual optional referent and Type.mayHoldLoan; fitting Unknown sets uncertain, never positioned |
+
+Join kept/approximate for fitting slots only. With no occupied slot, keep the
+original whole judgment. With occupied slots and no abort, publish the joined
+judgments even if position remains uncertain; positioned is true only when a Same
+view exists and no fitting Unknown/non-view contributes uncertainty. Finally
+`located = positioned || (own && direct && field==whole)`. No parent or sink join
+manufactures this witness. Directness remains necessary in its other consumers.
+
+For holds=true, own=false, typedLocally=true, whole=Universal, wholeApproximate=Local,
+one described compatible Local view slot, the boundary table is:
+
+| Match | direct | sink | located |
+| --- | --- | --- | --- |
+| Same | true or false | Local | true |
+| Different | true or false | Unknown | false |
+| Unknown | true, compatible actual referent | Local | false |
+| Unknown | false, or absent/incompatible referent | Unknown | false |
+
+Classifications are provisional until retainedSinks completes its same-operand
+(or explicit only-operand) parent closure. Seed the queue with Universal cases;
+traverse authenticated parent/borrowed links in the existing order, including
+nonlocal ancestors without promoting their own sink. Promote actual local ancestors
+to Universal; **leave their located flag unchanged**. Thus Unknown/located=false
+can become Universal/located=false. The earlier Unknown is replaced for that case,
+not unioned with the final classification. Alternative cases retain separate final
+results, so one case's promotion cannot erase another case's actual Unknown.
+
+Only then produce effects from the final sink:
+
+* Universal + located + known carry field + real operation point + Exact/Stored
+  records CallerRetention with the same definition/read/point. Alternatives and
+  Unknown quality cannot acquire this actual-slot evidence.
+* Other Universal classifications produce the existing independent escape reason.
+* Unknown produces storing; Local produces neither retention effect.
+
+CallerRetention's later source authentication and operation-to-event reachability
+remain mandatory; recording it is not unconditional applicability. Existing capture,
+return and written-operand escape reasons remain independent. A qualified retention
+cannot clear those reasons; a parent promotion cannot forge located or a read pair.
+Effect identity/normalization above applies to these **final** outcomes, not queue
+intermediates. This corrects repair1's stale direct-and-field0 example; it changes
+neither accepted policy nor the all-case representation.
 
 ## Precision is the absence of grounded loss, not a seeded category
 
@@ -125,8 +187,29 @@ Positive generators, with the original ordered branch guards:
 | resultDecision kept+not exact+not alternatives | add S and A |
 | resultDecision not kept | no result Has/Q; preserve all prior global P; bound/unretained effects remain ordered as before |
 | accepted retained PlaceAssignment store | add S; Alternatives becomes Unknown |
-| observeCleanup original matched definition gate | add S and A at its exact observation version |
+| observeCleanup eligible matching definition; everything OR named.empty OR shares(named,observed) | add the cleanup interval with its original definition/read; no loss merely from this gate |
+| observeCleanup interval gate AND named.empty | add S and A at its exact observation version |
 | construct, keepCarried, consume, rejoin | no invented quality generator; retain original escape/storing/bound/interval effects and transport existing Q |
+
+Cleanup has two subgates, not one loss event (R2-2). Preserve the cleanup-descriptor bounds check,
+loop-cleanup recording, unknownHeld&&!hidden refusal, and the early return when
+!everything && observed.empty before testing individual definitions. At an eligible
+cleanup point:
+
+```
+Interval(d) <- EligibleCleanup, HolderMatches(d), Everything
+Interval(d) <- EligibleCleanup, HolderMatches(d), NamedEmpty(d)
+Interval(d) <- EligibleCleanup, HolderMatches(d), SharesNamedObserved(d)
+LossS(d) <- Interval(d), NamedEmpty(d)
+LossA(d) <- Interval(d), NamedEmpty(d)
+```
+
+Every interval retains `(definition.point, cleanup.point, definition.id,
+read=cleanup.point, cleanup=true)`. Nonempty matching names add the interval and
+preserve Exact/Stored/Alternatives/Unknown, **even with everything=true**. Empty
+names add both loss bits only after the outer eligible-cleanup and holder gates;
+no observing point means no interval or loss. These loss facts target the existing
+loan's proper observation version. Loop markers and refusal behavior do not change.
 
 Every generator includes active target/input evidence. Unknown quality is produced
 by a real loss operation, not by an unsupported cyclic lookup. Loss propagates
@@ -190,7 +273,7 @@ closure are checked in addition to the normal-program mathematical enclosure.
 
 ---
 
-# Concrete translation and terminal precedence (repair1)
+# Concrete translation and terminal precedence
 
 These rules specify proposed C obligations; they do not change production or claim
 Silk acceptance. Preserve every A guard in the gate table, now with accepted #1983
@@ -276,7 +359,9 @@ leaf entries, not history cases. The nonempty prior whole-hold guard remains.
 For resultDecision encode ordered guards as `Chosen_j <- Guard_j, not Guard_0,
 ... not Guard_(j-1)` (include the original else grouping). Its direct immutable
 inputs come from case + snapshot + P_i. Exact output decisions never erase loss.
-Store adds S; alternatives result adds A; unknown result/cleanup adds both.
+Store adds S; alternatives result adds A; unknown result adds both. Cleanup adds
+both only under its eligible interval AND named.empty subgate; nonempty cleanup
+intervals preserve quality even when everything=true.
 Drop removes that output only, not earlier effects or its input certificate.
 Complete/declared/implied predicates use the exact snapshot/source identities,
 not a current approximation cached across refinement. An undefined earlier guard
