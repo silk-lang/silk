@@ -794,3 +794,5 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-19 · Native CLI reproducer probes require check --manifest-path; file-root build requires -o immediately after the source and a parent silk.toml, so bare scratch files yielded usage or no-manifest errors · Put each reproducer in a minimal package and use the documented argument order · silk retained result provenance
 
 2026-10-19 · Native source-test compilation rejected nested scalar enum field patterns such as Type.Reference {access: Access.Shared, ..} with SEM0042 · Bind the field and compare access == Access.Shared explicitly · silk retained result provenance
+
+2026-10-19 · Reusing a native test runner with relative --silk-test-plan/--silk-test-result paths exited 2 without output because the runner filesystem is rooted at / · Pass absolute plan and receipt paths when reusing the generated executable · silk source tests
