@@ -87,6 +87,8 @@ import semantic.SourcePolicy {
 }
 import semantic.Type {Argument, Binding, KeptRegions, KeptSlot, KeptStep, KeptStepKind, Type}
 import semantic.TypedBody {
+  SourceRetention,
+  SourceRetentionCoverage,
   SectionRetention,
   AggregateField,
   ResultBorrow,
@@ -2566,6 +2568,30 @@ struct SourceRetentionCases {
   decisions: List<SourcePolicy.RetentionOutput>
 }
 
+// Coordinates in the exact producer-stage kept record. These do not identify a physical
+// source or canonical destination; the graph's reserved candidate supplies those separately.
+struct SourceKeptSlot {
+  operand: usize
+  slot: usize
+}
+impl Copy for SourceKeptSlot {}
+
+struct SourceReadExclusion {
+  excluded: SourceAtom
+  missing: SourceAtom
+}
+impl Copy for SourceReadExclusion {}
+
+struct SourceStoreDecision {
+  eligible: SourceAtom
+  missing: SourceAtom
+}
+
+struct KeptOrigins {
+  regions: List<Shared<Lifetime>>
+  reached: List<usize>
+}
+
 // Caller retention starts at an actual operation, while independent escape reasons retain
 // their original global constraint. Neither table is indexed by historical Holding order.
 struct SourceCallerRetention {
@@ -3394,6 +3420,146 @@ effect fn sourceKeepCarried(observation: &SourceObservation, snapshot: &[SourceQ
     at = at + usize.ONE
   }
   return move effects
+}
+
+// Only executing call arms may activate kept-slot destination writes. An immediate Run
+// keeps the originating call's exact producer-stage record; a stored Run has no such record.
+// Construction/classification records are never substituted for invocation authority.
+fn sourceExecutingRetention<'body>(prepared: &PreparedSources.SourcePreparation<'body>,
+  operation: &PreparedSources.Operation) -> Option<PreparedSources.RetentionId> {
+  if operation.phase == PreparedSources.OperationPhase.PrepareEffect { return Option<PreparedSources.RetentionId>.none() }
+  let mut site = operation.site
+  let mut remaining = prepared.body.nodes.length
+  while remaining > usize.ZERO {
+    if let NodeKind.Expression {form: Expression.Run {value, access}, ..} = &prepared.body.nodes[site.index].kind {
+      if access != RunAccess.Immediate {
+        if let Option<PreparedSources.RetentionId>.Some {..} = operation.retention {
+          return CompilerBug.panic(b"stored invocation substituted a declared kept-slot stage")
+        }
+        return Option<PreparedSources.RetentionId>.none()
+      }
+      site = value
+      remaining = remaining - usize.ONE
+    } else { break }
+  }
+  if remaining == usize.ZERO { return CompilerBug.panic(b"retained invocation origin is cyclic") }
+  let call = match &prepared.body.nodes[site.index].kind {
+    NodeKind.Expression {form: Expression.DirectCall {..}, ..} => true
+    NodeKind.Expression {form: Expression.InterfaceCall {..}, ..} => true
+    NodeKind.Expression {form: Expression.CallableCall {..}, ..} => true
+    _ => false
+  }
+  if !call {
+    if let Option<PreparedSources.RetentionId>.Some {..} = operation.retention {
+      return CompilerBug.panic(b"noncall operation acquired declared destination writes")
+    }
+    return Option<PreparedSources.RetentionId>.none()
+  }
+  let id = match operation.retention {
+    Option<PreparedSources.RetentionId>.Some {value} => value
+    _ => { return CompilerBug.panic(b"executing call lost its recorded kept-slot stage") }
+  }
+  let recorded = List<PreparedSources.Retention>.asSlice(&prepared.retentions)
+  if id.index >= recorded.length || recorded[id.index].site.index != site.index {
+    return CompilerBug.panic(b"executing call substituted another producer's kept slots")
+  }
+  let application = match operation.application {
+    Option<PreparedSources.ApplicationId>.Some {value} => value
+    _ => { return CompilerBug.panic(b"retained invocation lost its actual application") }
+  }
+  if recorded[id.index].application.index != application.index {
+    return CompilerBug.panic(b"retained invocation substituted another application stage")
+  }
+  return Option<PreparedSources.RetentionId>.some(id)
+}
+
+enum SourceSlotCoverage { Complete, Empty, Missing }
+
+fn sourceSlotCoverage(slot: &PreparedSources.SlotSelection) -> SourceSlotCoverage {
+  return match &slot.coverage {
+    PreparedSources.SlotCoverage.Exact => SourceSlotCoverage.Complete
+    PreparedSources.SlotCoverage.EmptyArray {..} => SourceSlotCoverage.Empty
+    _ => SourceSlotCoverage.Missing
+  }
+}
+
+// Original and physical paths are frozen separately. A complete opaque original can have
+// a concrete physical inline frontier; an unfinished prefix in either coordinate stays a gap.
+fn sourceKeptCoverage(retention: &PreparedSources.Retention, coordinate: SourceKeptSlot) -> SourceSlotCoverage {
+  let operands = List<PreparedSources.RetentionOperand>.asSlice(&retention.operands)
+  let mut found = false
+  let mut result = SourceSlotCoverage.Missing
+  let mut at = usize.ZERO
+  while at < operands.length {
+    if operands[at].operand == coordinate.operand {
+      let slots = List<PreparedSources.RetentionSlot>.asSlice(&operands[at].slots)
+      let mut each = usize.ZERO
+      while each < slots.length {
+        if slots[each].slot == coordinate.slot {
+          if found { return CompilerBug.panic(b"retained slot has duplicate original coordinates") }
+          found = true
+          let original = sourceSlotCoverage(&slots[each].original)
+          let physical = sourceSlotCoverage(&slots[each].physical)
+          if original == SourceSlotCoverage.Empty || physical == SourceSlotCoverage.Empty { result = SourceSlotCoverage.Empty }
+          else if original == SourceSlotCoverage.Complete && physical == SourceSlotCoverage.Complete { result = SourceSlotCoverage.Complete }
+        }
+        each = each + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return result
+}
+
+// The selected source and destination slots are the actual recorded KeptSlots, not inferred
+// contract/result routes. This is semantic pair eligibility only: the caller must separately
+// bind the reserved canonical write, original source history and selected address authority.
+// Incomplete structural/read evidence stays visible even when an eligibility test says drop.
+effect fn sourceKeptSlotDecision(retention: &PreparedSources.Retention, sourceSlot: SourceKeptSlot,
+  targetSlot: SourceKeptSlot, position: &SourceCarryPosition, history: &SourceCarryCase,
+  destination: &SourceCarryPosition, targetHistory: &SourceCarryCase, loans: &[Loan], paths: &[List<Step>],
+  owner: &DeclarationId, edges: &[RetentionEdge], named: &[Shared<Lifetime>], active: SourceAtom,
+  exclusion: SourceReadExclusion, rules: &mut SourceProgram) -> SourceStoreDecision ! OutOfMemoryError ? &mut Allocator {
+  if position.loan >= loans.length || destination.loan >= loans.length || position.operand != sourceSlot.operand
+    || destination.operand != targetSlot.operand { return CompilerBug.panic(b"kept-slot decision lost its actual operand or loan") }
+  let complete = Shared<SourceRetention>.with<bool>(&retention.source, fn(source: &SourceRetention) -> bool {
+    return match source.coverage { SourceRetentionCoverage.Complete => true _ => false }
+  })
+  let original = sourceKeptCoverage(retention, sourceSlot)
+  let target = sourceKeptCoverage(retention, targetSlot)
+  let carry = sourcePredicateCarry(position, history)
+  let lent = sourcePredicateCarry(destination, targetHistory)
+  let origins = run keptOrigins(&loans[position.loan], owner, edges)
+  let permitted = Shared<List<KeptRegions>>.with<bool>(&retention.recorded, fn(values: &List<KeptRegions>) -> bool {
+    let entries = List<KeptRegions>.asSlice(values)
+    if sourceSlot.operand >= entries.length || targetSlot.operand >= entries.length {
+      return CompilerBug.panic(b"selected retained operand is absent from its original record")
+    }
+    let sources = List<KeptSlot>.asSlice(&entries[sourceSlot.operand].slots)
+    let destinations = List<KeptSlot>.asSlice(&entries[targetSlot.operand].slots)
+    if sourceSlot.slot >= sources.length || targetSlot.slot >= destinations.length {
+      return CompilerBug.panic(b"selected retained slot is absent from its original record")
+    }
+    return keptSlotIn(&sources[sourceSlot.slot], &loans[position.loan], carry, paths, owner,
+      List<Shared<Lifetime>>.asSlice(&origins.regions), List<usize>.asSlice(&origins.reached), named)
+      && destinationSlotKeeps(&sources[sourceSlot.slot], &destinations[targetSlot.slot], paths, lent, named)
+  })
+  let empty = List<SourceAtom>.make()
+  let none = List<SourceAtom>.asSlice(&empty)
+  let actual: [SourceAtom; 3] = [active, history.source.quality.present, targetHistory.source.quality.present]
+  let present = run SourcePolicy.conjunction(&mut rules.*, &actual, none)
+  let no = SourceProgram.atom(&mut rules.*)
+  let mut eligible = no
+  if permitted && original != SourceSlotCoverage.Empty && target != SourceSlotCoverage.Empty {
+    let positive: [SourceAtom; 1] = [present]
+    let excluded: [SourceAtom; 1] = [exclusion.excluded]
+    eligible = run SourcePolicy.conjunction(&mut rules.*, &positive, &excluded)
+  }
+  let mut missing = no
+  if !complete || original == SourceSlotCoverage.Missing || target == SourceSlotCoverage.Missing { missing = present }
+  let unknownRead: [SourceAtom; 2] = [present, exclusion.missing]
+  let gaps: [SourceAtom; 2] = [missing, run SourcePolicy.conjunction(&mut rules.*, &unknownRead, none)]
+  return SourceStoreDecision {eligible: eligible, missing: run SourcePolicy.disjunction(&mut rules.*, &gaps)}
 }
 
 // This lookup reads the sole emitted reaching relation. A missing pair is not a proof of
@@ -8440,6 +8606,26 @@ effect fn keptIn(recorded: &Shared<List<KeptRegions>>, operand: usize, loan: &Lo
   excluded: bool, owner: &DeclarationId,
   edges: &[RetentionEdge], named: &[Shared<Lifetime>], destination: Carry, target: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
   if excluded { return false }
+  let origins = run keptOrigins(loan, owner, edges)
+  return Shared<List<KeptRegions>>.with<bool>(recorded, fn(values: &List<KeptRegions>) -> bool {
+    let entries = List<KeptRegions>.asSlice(values)
+    if operand >= entries.length { return false }
+    let slots = List<KeptSlot>.asSlice(&entries[operand].slots)
+    let mut at = usize.ZERO
+    while at < slots.length {
+      if keptSlotIn(&slots[at], loan, carry, paths, owner, List<Shared<Lifetime>>.asSlice(&origins.regions),
+        List<usize>.asSlice(&origins.reached), named)
+        && destinationKeeps(entries, &slots[at], paths, destination, target, named) { return true }
+      at = at + usize.ONE
+    }
+    return false
+  })
+}
+
+// Immutable source-to-extent closure shared by eager classification and a selected C slot.
+// These regions decide eligibility only; they never pair sources or establish an address.
+effect fn keptOrigins(loan: &Loan, owner: &DeclarationId, edges: &[RetentionEdge]) -> KeptOrigins
+! OutOfMemoryError ? &mut Allocator {
   let mut source = List<Shared<Lifetime>>.make()
   if let Option<Shared<Lifetime>>.Some {value} = &loan.borrowed {
     run List<Shared<Lifetime>>.append(&mut source, Shared<Lifetime>.clone(&value))
@@ -8470,18 +8656,7 @@ effect fn keptIn(recorded: &Shared<List<KeptRegions>>, operand: usize, loan: &Lo
     }
     at = at + usize.ONE
   }
-  return Shared<List<KeptRegions>>.with<bool>(recorded, fn(values: &List<KeptRegions>) -> bool {
-    let entries = List<KeptRegions>.asSlice(values)
-    if operand >= entries.length { return false }
-    let slots = List<KeptSlot>.asSlice(&entries[operand].slots)
-    let mut at = usize.ZERO
-    while at < slots.length {
-      if keptSlotIn(&slots[at], loan, carry, paths, owner, List<Shared<Lifetime>>.asSlice(&source), List<usize>.asSlice(&reached), named)
-        && destinationKeeps(entries, &slots[at], paths, destination, target, named) { return true }
-      at = at + usize.ONE
-    }
-    return false
-  })
+  return KeptOrigins {regions: move source, reached: move reached}
 }
 
 // One explicitly selected original KeptSlot. Preparation only freezes this coordinate;
@@ -8515,6 +8690,11 @@ fn destinationKeeps(entries: &[KeptRegions], source: &KeptSlot, paths: &[List<St
   named: &[Shared<Lifetime>]) -> bool {
   let slots = List<KeptSlot>.asSlice(&entries[destination.operand].slots)
   let target = &slots[targetIndex]
+  return destinationSlotKeeps(source, target, paths, destination, named)
+}
+
+fn destinationSlotKeeps(source: &KeptSlot, target: &KeptSlot, paths: &[List<Step>], destination: Carry,
+  named: &[Shared<Lifetime>]) -> bool {
   return destinationSlot(paths, destination, target)
     && sharesAtom(List<Shared<Lifetime>>.asSlice(&target.source), named)
     && sharesAtom(List<Shared<Lifetime>>.asSlice(&source.kept), List<Shared<Lifetime>>.asSlice(&target.source))
