@@ -5,11 +5,11 @@
 //! transport and ownership actions to these actual occurrences before that same graph is solved.
 
 import hir.Hir {InfixOperator}
-import semantic.SourceAnalysis {Skeleton, Directness, TransferPolicy, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, Storage, sameSelector, inputOperand, sameInputRead}
+import semantic.SourceAnalysis {Skeleton, SelectionUse, Directness, TransferPolicy, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, Storage, sameSelector, inputOperand, sameInputRead}
 import semantic.SourceFlow {Flow, PointId, Write}
 import semantic.SourceRules {Atom, Program}
-import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, IndexClass, MapId, SelectionMap, MapKind, InputRead, InputRoute, Construction, Operation, Transport, Replacement, ArraySlice}
-import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace, SourceConstruction}
+import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, IndexClass, MapId, SelectionId, Selection, SelectionMap, MapKind, InputRead, InputRoute, Construction, Operation, Transport, Replacement, ArraySlice}
+import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace, SourceConstruction, PlaceStep}
 import semantic.Type {Type}
 import semantic.StorageOperation {StorageOperation}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -41,6 +41,9 @@ pub struct OwnerExit {
   pub action: OwnerAction
   pub point: PointId
   pub cause: NodeId
+  /// Use/Cleanup observes this owner's current value here, separately from acquisition.
+  /// The source root comes from owner, never from the exit's diagnostic cause node.
+  pub read: Option<EvalId>
 }
 
 pub struct ScopeId { pub index: usize }
@@ -231,7 +234,12 @@ effect fn registerOwner(walk: &mut Walk, root: OwnerRoot, initialized: PointId, 
 effect fn ownerAction(walk: &mut Walk, owner: OwnerId, action: OwnerAction, previous: PointId, cause: NodeId) -> PointId
 ! OutOfMemoryError ? &mut Allocator {
   let current = run after(&mut walk.*, previous)
-  run Vector<OwnerExit>.append(&mut walk.reservation.ownerExits, OwnerExit {owner: owner, action: action, point: current, cause: cause})
+  let mut read = Option<EvalId>.none()
+  if action == OwnerAction.Use || action == OwnerAction.Cleanup {
+    read = Option<EvalId>.some(run Skeleton.evaluate(&mut walk.reservation.skeleton, cause, EvaluationRole.Cleanup, current))
+  }
+  run Vector<OwnerExit>.append(&mut walk.reservation.ownerExits, OwnerExit {owner: owner, action: action, point: current,
+    cause: cause, read: move read})
   return current
 }
 
@@ -743,7 +751,7 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
     Expression.Run {value, access: mode} => {
       let mut receiver = Access.Value
       if mode == RunAccess.Shared || mode == RunAccess.Exclusive { receiver = Access.Place }
-      return run input(prepared, &mut walk.*, &mut inputs.*, value, receiver, previous)
+      return run selectedAccess(prepared, &mut walk.*, &mut inputs.*, value, InputRead.Receiver, receiver, previous)
     }
     Expression.Match {subject, arms, access: mode, syntax, ..} => {
       let mut subjectMode = Access.Value
@@ -1042,20 +1050,27 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
           Vector<AggregateField>.asSlice(&fields), tag, yes)
       }
       NodeKind.Expression {form: Expression.Callable {fields, ..}, ..} => {
-        run aggregateValues(prepared, &mut reservation.skeleton, occurrence,
-          Vector<AggregateField>.asSlice(&fields), usize.MAX, yes)
+        // A prepared construction owns its exact Copy/Move/Borrow route, including the
+        // paired referent of an implicit capture borrow. Do not also copy its plain fields.
+        if !preparedConstruction(prepared, occurrence.node) {
+          run aggregateValues(prepared, &mut reservation.skeleton, occurrence,
+            Vector<AggregateField>.asSlice(&fields), usize.MAX, yes)
+        }
       }
       NodeKind.Expression {form: Expression.Match {arms, ..}, ..} => {
         run matchValues(prepared, &mut reservation.skeleton, occurrence, Vector<MatchArm>.asSlice(&arms), yes)
       }
       NodeKind.Expression {form: Expression.PatternBinding {..}, ..} => {
-        run ownedProjection(prepared, &mut reservation.skeleton, occurrence, yes)
+        run projection(prepared, &mut reservation.skeleton, occurrence, yes)
       }
       NodeKind.Expression {form: Expression.Field {..}, ..} => {
-        run ownedProjection(prepared, &mut reservation.skeleton, occurrence, yes)
+        run projection(prepared, &mut reservation.skeleton, occurrence, yes)
       }
       NodeKind.Expression {form: Expression.Index {..}, ..} => {
-        run ownedProjection(prepared, &mut reservation.skeleton, occurrence, yes)
+        run projection(prepared, &mut reservation.skeleton, occurrence, yes)
+      }
+      NodeKind.Expression {form: Expression.Dereference {..}, ..} => {
+        run projection(prepared, &mut reservation.skeleton, occurrence, yes)
       }
       NodeKind.Drop {value, consumed} => {
         if let Option<ConsumedPlace>.Some {..} = &consumed {
@@ -1272,39 +1287,244 @@ fn exactChild(endpoints: &[Endpoint], parent: EndpointId, selector: &Selector) -
   return EndpointId {index: found}
 }
 
-// Inline Field/Index projections read canonical storage at the projection occurrence. Slice
-// and reference boundary maps have Value sources and are handled by the separate route product;
-// they cannot be mistaken for owned storage merely because their element types match.
-effect fn ownedProjection<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
+// Reserve actual selector uses before address/source closure. Inline and boundary selections
+// share this path: a field below a dereference cannot eagerly see its eventual canonical alias.
+// The operand is the recorded visit input (or retained pattern subject), never a NodeId lookup.
+effect fn projection<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
   occurrence: &Visit, active: Atom) -> () ! OutOfMemoryError ? &mut Allocator {
   let inputs = Vector<Input>.asSlice(&occurrence.inputs)
   if inputs.length == usize.ZERO { CompilerBug.panic(b"typed projection lost its actual base evaluation") }
   let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
-  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
-  let output = nodeRoot(endpoints, occurrence.node, EndpointRole.Value)
+  let mut root = nodeRoot(endpoints, inputs[0].node, EndpointRole.Storage)
+  let mut path = Vector<EndpointId>.make()
   let mut strength = Write.Strong
-  if let NodeKind.Expression {form: Expression.Index {element, ..}, ..} = &prepared.body.nodes[occurrence.node.index].kind {
-    // An unknown index reaches each finite partition but does not overwrite every candidate.
-    if element == usize.MAX { strength = Write.Weak }
-  }
-  let storage = nodeRoot(endpoints, occurrence.node, EndpointRole.Storage)
-  let mut at = usize.ZERO
-  while at < maps.length {
-    let physical = &maps[at]
-    if physical.site.index == occurrence.node.index && physical.kind == MapKind.Copy && physical.target.index == output.index {
-      let owned = match &endpoints[physical.source.index].root {
-        Root.Node {node, role} => node.index == inputs[0].node.index && role == EndpointRole.Storage
-        _ => false
+  match &prepared.body.nodes[occurrence.node.index].kind {
+    NodeKind.Expression {form: Expression.Field {value, index, ..}, ..} => {
+      if inputs.length != usize.ONE || inputs[0].node.index != value.index {
+        CompilerBug.panic(b"field selection lost its actual typed operand")
       }
-      if owned {
-        let alias = exactMap(maps, occurrence.node, physical.source, storage, MapKind.Select)
-        run Skeleton.projectAliases(&mut skeleton.*, endpoints, maps, alias, inputs[0].evaluation, occurrence.evaluation, strength)
-        run Skeleton.readAliases(&mut skeleton.*, endpoints, maps, MapId {index: at}, inputs[0].evaluation, occurrence.evaluation, active)
+      run Vector<EndpointId>.append(&mut path, projectionField(endpoints, root, index, usize.MAX))
+    }
+    NodeKind.Expression {form: Expression.Dereference {value}, ..} => {
+      if inputs.length != usize.ONE || inputs[0].node.index != value.index {
+        CompilerBug.panic(b"dereference selection lost its actual descriptor operand")
+      }
+      root = nodeRoot(endpoints, value, EndpointRole.Value)
+      run Vector<EndpointId>.append(&mut path, exactChild(endpoints, root, &Selector.Referent))
+    }
+    NodeKind.Expression {form: Expression.Index {value, index, element}, ..} => {
+      if inputs.length != 2 || inputs[0].node.index != value.index || inputs[1].node.index != index.index {
+        CompilerBug.panic(b"index selection lost its base/index operand order")
+      }
+      if element == usize.MAX { strength = Write.Weak }
+      let shape = &Vector<Shape>.asSlice(&prepared.shapes)[endpoints[root.index].shape.index]
+      let slice = match &shape.state { ShapeState.Slice => true _ => false }
+      if slice { root = nodeRoot(endpoints, value, EndpointRole.Value) }
+      let components = Vector<Component>.asSlice(&shape.components)
+      let mut selected = usize.ZERO
+      let mut at = usize.ZERO
+      while at < components.length {
+        let matches = match &components[at].selector {
+          Selector.Index {class: IndexClass.Exact {index: ordinal}} => element == usize.MAX || element == ordinal
+          Selector.Index {class: IndexClass.Remainder} => slice || element == usize.MAX
+          _ => false
+        }
+        if matches {
+          let mut part = Vector<EndpointId>.make()
+          run Vector<EndpointId>.append(&mut part, exactChild(endpoints, root, &components[at].selector))
+          run selectionUse(prepared, &mut skeleton.*, occurrence, root, Vector<EndpointId>.asSlice(&part), strength, active)
+          selected = selected + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      // Only an actual Array(0) has no successful partition. A Count0 conversion is one
+      // reaching slice case, and cannot suppress this use's other possible descriptor cases.
+      if selected == usize.ZERO && !impossibleIndex(prepared, occurrence.node) {
+        CompilerBug.panic(b"index selection has no exact prepared partition")
+      }
+      return ()
+    }
+    NodeKind.Expression {form: Expression.PatternBinding {subject, path: steps, ..}, ..} => {
+      if inputs.length != usize.ONE || inputs[0].node.index != subject.index {
+        CompilerBug.panic(b"pattern selection lost its retained subject occurrence")
+      }
+      let steps = Vector<PlaceStep>.asSlice(&steps)
+      let mut parent = root
+      let mut at = usize.ZERO
+      while at < steps.length {
+        let child = match &steps[at] {
+          PlaceStep.Member {tag, ..} => exactChild(endpoints, parent, &Selector.Variant {ordinal: tag})
+          PlaceStep.VariantField {tag, field} => projectionField(endpoints, parent, field, tag)
+          PlaceStep.Field {index} => projectionField(endpoints, parent, index, usize.MAX)
+          PlaceStep.Element {index} => exactChild(endpoints, parent, &Selector.Index {class: IndexClass.Exact {index: index}})
+        }
+        run Vector<EndpointId>.append(&mut path, child)
+        parent = child
+        at = at + usize.ONE
+      }
+    }
+    _ => { CompilerBug.panic(b"source selection is not a typed projection") }
+  }
+  run selectionUse(prepared, &mut skeleton.*, occurrence, root, Vector<EndpointId>.asSlice(&path), strength, active)
+  return ()
+}
+
+fn projectionField(endpoints: &[Endpoint], parent: EndpointId, field: usize, variant: usize) -> EndpointId {
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    let child = match endpoints[at].parent { Option<EndpointId>.Some {value} => value.index == parent.index _ => false }
+    let matches = match &endpoints[at].selector {
+      Selector.Member {member, payload, ..} =>
+        (variant == usize.MAX && member == field && payload == usize.ZERO)
+        || (variant != usize.MAX && member == variant && payload == field)
+      Selector.Field {ordinal} => variant == usize.MAX && ordinal == field
+      _ => false
+    }
+    if child && matches {
+      if found != usize.MAX { return CompilerBug.panic(b"field selection has duplicate prepared coordinates") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return CompilerBug.panic(b"field selection has no exact prepared coordinate") }
+  return EndpointId {index: found}
+}
+
+// Site, path and terminal inline frontier identify the prepared selection. Empty pattern
+// paths can have no maps at all, so map.site alone cannot authenticate their distinct uses.
+effect fn selectionUse<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
+  occurrence: &Visit, root: EndpointId, path: &[EndpointId], strength: Write, active: Atom) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+  let selections = Vector<Selection>.asSlice(&prepared.selections)
+  let mut terminal = root
+  if path.length > usize.ZERO { terminal = path[path.length - usize.ONE] }
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < selections.length {
+    if selections[at].site.index == occurrence.node.index && selections[at].root.index == root.index
+      && projectionSelection(prepared, &selections[at], occurrence.node, root, path, terminal) {
+      if found != usize.MAX { CompilerBug.panic(b"projection has duplicate exact prepared selections") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { CompilerBug.panic(b"projection has no exact prepared selection") }
+  let mut selectors = Vector<MapId>.make()
+  let members = Vector<MapId>.asSlice(&selections[found].maps)
+  let mut parent = root
+  at = usize.ZERO
+  while at < path.length {
+    // The selection matcher proved there is exactly one map for each authored step.
+    let mut each = usize.ZERO
+    while each < members.length {
+      let map = &maps[members[each].index]
+      if map.source.index == parent.index && map.target.index == path[at].index {
+        run Vector<MapId>.append(&mut selectors, members[each])
+      }
+      each = each + usize.ONE
+    }
+    parent = path[at]
+    at = at + usize.ONE
+  }
+  let value = exactMap(maps, occurrence.node, terminal,
+    nodeRoot(endpoints, occurrence.node, EndpointRole.Value), MapKind.Copy)
+  let place = exactMap(maps, occurrence.node, terminal,
+    nodeRoot(endpoints, occurrence.node, EndpointRole.Storage), MapKind.Select)
+  let inputs = Vector<Input>.asSlice(&occurrence.inputs)
+  run Vector<SelectionUse>.append(&mut skeleton.selections, SelectionUse {operand: inputs[0].evaluation,
+    result: occurrence.evaluation, selection: SelectionId {index: found}, selectors: move selectors,
+    value: Option<MapId>.some(value), place: Option<MapId>.some(place), strength: strength, active: active})
+  return ()
+}
+
+fn projectionSelection<'body>(prepared: &SourcePreparation<'body>, selection: &Selection,
+  site: NodeId, root: EndpointId, path: &[EndpointId], terminal: EndpointId) -> bool {
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+  let members = Vector<MapId>.asSlice(&selection.maps)
+  let accepts = Vector<EndpointId>.asSlice(&selection.accepts)
+  let mut expectedMaps = path.length
+  let mut expectedAccepts = usize.ZERO
+  let mut at = usize.ZERO
+  while at < members.length {
+    if members[at].index >= maps.length { return CompilerBug.panic(b"prepared selection names an absent map") }
+    let map = &maps[members[at].index]
+    if map.site.index != site.index || map.kind != MapKind.Select { return false }
+    let child = match endpoints[map.target.index].parent { Option<EndpointId>.Some {value} => value.index == map.source.index _ => false }
+    if !child || !sameSelector(&map.selector, &endpoints[map.target.index].selector) { return false }
+    at = at + usize.ONE
+  }
+  let mut parent = root
+  at = usize.ZERO
+  while at < path.length {
+    if selectionEdgeCount(maps, members, parent, path[at]) != usize.ONE { return false }
+    parent = path[at]
+    at = at + usize.ONE
+  }
+  // Exactly the terminal's inline frontier, not a sibling with an equal type and not an
+  // additional Referent/Effect channel that happens to be present in the endpoint table.
+  at = usize.ZERO
+  while at < endpoints.length {
+    let endpoint = EndpointId {index: at}
+    if inlineComponent(prepared, terminal, endpoint) {
+      if at != terminal.index {
+        let parent = match endpoints[at].parent {
+          Option<EndpointId>.Some {value} => value
+          _ => { return CompilerBug.panic(b"selected inline child has no parent") }
+        }
+        if selectionEdgeCount(maps, members, parent, endpoint) != usize.ONE { return false }
+        expectedMaps = expectedMaps + usize.ONE
+      }
+      let mut children = false
+      let mut child = usize.ZERO
+      while child < endpoints.length {
+        let immediate = match endpoints[child].parent { Option<EndpointId>.Some {value} => value.index == at _ => false }
+        if immediate && inlineComponent(prepared, endpoint, EndpointId {index: child}) { children = true }
+        child = child + usize.ONE
+      }
+      if !children {
+        let mut matches = usize.ZERO
+        let mut accept = usize.ZERO
+        while accept < accepts.length {
+          if accepts[accept].index == at { matches = matches + usize.ONE }
+          accept = accept + usize.ONE
+        }
+        if matches != usize.ONE { return false }
+        expectedAccepts = expectedAccepts + usize.ONE
       }
     }
     at = at + usize.ONE
   }
-  return ()
+  return members.length == expectedMaps && accepts.length == expectedAccepts
+}
+
+fn selectionEdgeCount(maps: &[SelectionMap], members: &[MapId], parent: EndpointId, child: EndpointId) -> usize {
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < members.length {
+    if maps[members[at].index].source.index == parent.index && maps[members[at].index].target.index == child.index {
+      count = count + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return count
+}
+
+fn preparedConstruction<'body>(prepared: &SourcePreparation<'body>, site: NodeId) -> bool {
+  let rows = Vector<Construction>.asSlice(&prepared.constructions)
+  let mut found = false
+  let mut at = usize.ZERO
+  while at < rows.length {
+    if rows[at].site.index == site.index {
+      if found { return CompilerBug.panic(b"source producer has duplicate physical constructions") }
+      found = true
+    }
+    at = at + usize.ONE
+  }
+  return found
 }
 
 effect fn localReplacement<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton, occurrence: &Visit,
