@@ -31,10 +31,11 @@ mysteriously.
 
 ## Repository workflow
 
-- The workspace uses pnpm, Oxfmt, Oxlint, and Vitest. `pnpm format:check`, `pnpm lint`,
-  `pnpm typecheck`, and `pnpm test:scripts` are the fast local checks.
+- The Node tooling in `compiler/scripts` uses pnpm and Vitest; `pnpm test:scripts` tests it, and
+  Selfhost CI runs it too. `pnpm format` and `pnpm lint` (Oxfmt, Oxlint) are optional local
+  helpers that CI no longer runs.
 - `main` is the only integration branch. A pull request merges when its required checks pass on its
-  exact head: `CI result` and `Focused Linux Silk`. Merge `main` into the branch before its final
+  exact head: `Focused Linux Silk`. Merge `main` into the branch before its final
   run. If a check fails, fix the cause and push the new head; report the exact failure and whether
   it predates the change.
 - Open a draft PR as soon as there is a coherent commit, and reuse the task's PR. Run the cheapest
