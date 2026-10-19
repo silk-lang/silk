@@ -214,8 +214,10 @@ unchecked concrete root-package body by its block.
 Direct calls retain authenticated finite source loans through shared views, slices and stored
 inputs. Their declared lifetime bounds identify the possible source of each record result field
 before inference coalesces lifetime arguments; an immediate Effect run uses the same success-result
-mapping. A projected sibling does not inherit the other field's loans. Unknown or multi-region
-input provenance keeps its conservative treatment, and an assignment temporary still ends with
+mapping. A projected sibling does not inherit the other field's loans. A shared reference supplies
+its authenticated outer loan even when its generic referent is unknown; this proves nothing about
+loans inside that referent. Other unknown or multi-region input provenance keeps its conservative
+treatment, and an assignment temporary still ends with
 its statement, reporting `OWN0019` at a later retained use before MIR verification.
 Typing therefore admits covariant region subtyping without the borrow checker. At an expected
 value (a return, an annotated binding, a field) a reference, slice or `string` region, a shared
