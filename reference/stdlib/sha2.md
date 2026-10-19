@@ -13,7 +13,7 @@ Use `silk.hash` only for collection keys. It is not a cryptographic hash.
 Each actor supports incremental input through `update`, consuming finalization through
 `finish`, and one-shot input through `hash`. The states use only inline storage and allocate no
 memory. Each digest uses the standardized big-endian byte order.
-[`Sha256.checkpoint`](#impl.checkpoint) and [`Sha384.checkpoint`](#impl.checkpoint-2) also return a digest without consuming the
+[`Sha256.checkpoint`](#Sha256.impl.checkpoint) and [`Sha384.checkpoint`](#Sha384.impl.checkpoint) also return a digest without consuming the
 streaming state. Use these operations for exact protocol transcript boundaries.
 
 ## Gotchas
@@ -52,7 +52,7 @@ pub struct Sha224
 
 An allocation-free incremental SHA-224 state that returns a 28-byte digest.
 
-<a id="impl"></a>
+<a id="Sha224.impl"></a>
 
 ## Implementation `Sha224`
 
@@ -60,7 +60,7 @@ An allocation-free incremental SHA-224 state that returns a 28-byte digest.
 impl Sha224
 ```
 
-<a id="impl.make"></a>
+<a id="Sha224.impl.make"></a>
 
 ### Associated function `make`
 
@@ -70,7 +70,7 @@ pub fn make() -> Sha224
 
 Creates an empty SHA-224 state.
 
-<a id="impl.update"></a>
+<a id="Sha224.impl.update"></a>
 
 ### Method `update`
 
@@ -81,7 +81,7 @@ pub fn update(self: &mut Self, bytes: &[u8]) -> ()
 Adds `bytes` to this SHA-224 state in source order. An empty slice does not change the state.
 If the complete message exceeds the 64-bit bit-length domain, the program traps.
 
-<a id="impl.finish"></a>
+<a id="Sha224.impl.finish"></a>
 
 ### Method `finish`
 
@@ -91,7 +91,7 @@ pub fn finish(self: Self) -> [u8; 28]
 
 Consumes this SHA-224 state and returns its 28-byte digest in big-endian byte order.
 
-<a id="impl.hash"></a>
+<a id="Sha224.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -111,7 +111,7 @@ pub struct Sha256
 
 An allocation-free incremental SHA-256 state that returns a 32-byte digest.
 
-<a id="impl-2"></a>
+<a id="Sha256.impl"></a>
 
 ## Implementation `Sha256`
 
@@ -119,7 +119,7 @@ An allocation-free incremental SHA-256 state that returns a 32-byte digest.
 impl Sha256
 ```
 
-<a id="impl.make-2"></a>
+<a id="Sha256.impl.make"></a>
 
 ### Associated function `make`
 
@@ -129,7 +129,7 @@ pub fn make() -> Sha256
 
 Creates an empty SHA-256 state.
 
-<a id="impl.update-2"></a>
+<a id="Sha256.impl.update"></a>
 
 ### Method `update`
 
@@ -140,7 +140,7 @@ pub fn update(self: &mut Self, bytes: &[u8]) -> ()
 Adds `bytes` to this SHA-256 state in source order. An empty slice does not change the state.
 If the complete message exceeds the 64-bit bit-length domain, the program traps.
 
-<a id="impl.checkpoint"></a>
+<a id="Sha256.impl.checkpoint"></a>
 
 ### Method `checkpoint`
 
@@ -155,7 +155,7 @@ Returns the SHA-256 digest of all bytes supplied so far without consuming this s
 The operation copies the fixed inline state. A later `update` or `checkpoint` continues from
 the same original byte sequence.
 
-<a id="impl.finish-2"></a>
+<a id="Sha256.impl.finish"></a>
 
 ### Method `finish`
 
@@ -165,7 +165,7 @@ pub fn finish(self: Self) -> [u8; 32]
 
 Consumes this SHA-256 state and returns its 32-byte digest in big-endian byte order.
 
-<a id="impl.hash-2"></a>
+<a id="Sha256.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -185,7 +185,7 @@ pub struct Sha384
 
 An allocation-free incremental SHA-384 state that returns a 48-byte digest.
 
-<a id="impl-3"></a>
+<a id="Sha384.impl"></a>
 
 ## Implementation `Sha384`
 
@@ -193,7 +193,7 @@ An allocation-free incremental SHA-384 state that returns a 48-byte digest.
 impl Sha384
 ```
 
-<a id="impl.make-3"></a>
+<a id="Sha384.impl.make"></a>
 
 ### Associated function `make`
 
@@ -203,7 +203,7 @@ pub fn make() -> Sha384
 
 Creates an empty SHA-384 state.
 
-<a id="impl.update-3"></a>
+<a id="Sha384.impl.update"></a>
 
 ### Method `update`
 
@@ -214,7 +214,7 @@ pub fn update(self: &mut Self, bytes: &[u8]) -> ()
 Adds `bytes` to this SHA-384 state in source order. An empty slice does not change the state.
 If the complete message exceeds the 128-bit bit-length domain, the program traps.
 
-<a id="impl.checkpoint-2"></a>
+<a id="Sha384.impl.checkpoint"></a>
 
 ### Method `checkpoint`
 
@@ -229,7 +229,7 @@ Returns the SHA-384 digest of all bytes supplied so far without consuming this s
 The operation copies the fixed inline state. A later `update` or `checkpoint` continues from
 the same original byte sequence.
 
-<a id="impl.finish-3"></a>
+<a id="Sha384.impl.finish"></a>
 
 ### Method `finish`
 
@@ -239,7 +239,7 @@ pub fn finish(self: Self) -> [u8; 48]
 
 Consumes this SHA-384 state and returns its 48-byte digest in big-endian byte order.
 
-<a id="impl.hash-3"></a>
+<a id="Sha384.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -259,7 +259,7 @@ pub struct Sha512
 
 An allocation-free incremental SHA-512 state that returns a 64-byte digest.
 
-<a id="impl-4"></a>
+<a id="Sha512.impl"></a>
 
 ## Implementation `Sha512`
 
@@ -267,7 +267,7 @@ An allocation-free incremental SHA-512 state that returns a 64-byte digest.
 impl Sha512
 ```
 
-<a id="impl.make-4"></a>
+<a id="Sha512.impl.make"></a>
 
 ### Associated function `make`
 
@@ -277,7 +277,7 @@ pub fn make() -> Sha512
 
 Creates an empty SHA-512 state.
 
-<a id="impl.update-4"></a>
+<a id="Sha512.impl.update"></a>
 
 ### Method `update`
 
@@ -288,7 +288,7 @@ pub fn update(self: &mut Self, bytes: &[u8]) -> ()
 Adds `bytes` to this SHA-512 state in source order. An empty slice does not change the state.
 If the complete message exceeds the 128-bit bit-length domain, the program traps.
 
-<a id="impl.finish-4"></a>
+<a id="Sha512.impl.finish"></a>
 
 ### Method `finish`
 
@@ -298,7 +298,7 @@ pub fn finish(self: Self) -> [u8; 64]
 
 Consumes this SHA-512 state and returns its 64-byte digest in big-endian byte order.
 
-<a id="impl.hash-4"></a>
+<a id="Sha512.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -318,7 +318,7 @@ pub struct Sha512_224
 
 An allocation-free incremental SHA-512/224 state that returns a 28-byte digest.
 
-<a id="impl-5"></a>
+<a id="Sha512_224.impl"></a>
 
 ## Implementation `Sha512_224`
 
@@ -326,7 +326,7 @@ An allocation-free incremental SHA-512/224 state that returns a 28-byte digest.
 impl Sha512_224
 ```
 
-<a id="impl.make-5"></a>
+<a id="Sha512_224.impl.make"></a>
 
 ### Associated function `make`
 
@@ -336,7 +336,7 @@ pub fn make() -> Sha512_224
 
 Creates an empty SHA-512/224 state.
 
-<a id="impl.update-5"></a>
+<a id="Sha512_224.impl.update"></a>
 
 ### Method `update`
 
@@ -347,7 +347,7 @@ pub fn update(self: &mut Self, bytes: &[u8]) -> ()
 Adds `bytes` to this SHA-512/224 state in source order. An empty slice does not change the
 state. If the complete message exceeds the 128-bit bit-length domain, the program traps.
 
-<a id="impl.finish-5"></a>
+<a id="Sha512_224.impl.finish"></a>
 
 ### Method `finish`
 
@@ -357,7 +357,7 @@ pub fn finish(self: Self) -> [u8; 28]
 
 Consumes this SHA-512/224 state and returns its 28-byte digest in big-endian byte order.
 
-<a id="impl.hash-5"></a>
+<a id="Sha512_224.impl.hash"></a>
 
 ### Associated function `hash`
 
@@ -378,7 +378,7 @@ pub struct Sha512_256
 
 An allocation-free incremental SHA-512/256 state that returns a 32-byte digest.
 
-<a id="impl-6"></a>
+<a id="Sha512_256.impl"></a>
 
 ## Implementation `Sha512_256`
 
@@ -386,7 +386,7 @@ An allocation-free incremental SHA-512/256 state that returns a 32-byte digest.
 impl Sha512_256
 ```
 
-<a id="impl.make-6"></a>
+<a id="Sha512_256.impl.make"></a>
 
 ### Associated function `make`
 
@@ -396,7 +396,7 @@ pub fn make() -> Sha512_256
 
 Creates an empty SHA-512/256 state.
 
-<a id="impl.update-6"></a>
+<a id="Sha512_256.impl.update"></a>
 
 ### Method `update`
 
@@ -407,7 +407,7 @@ pub fn update(self: &mut Self, bytes: &[u8]) -> ()
 Adds `bytes` to this SHA-512/256 state in source order. An empty slice does not change the
 state. If the complete message exceeds the 128-bit bit-length domain, the program traps.
 
-<a id="impl.finish-6"></a>
+<a id="Sha512_256.impl.finish"></a>
 
 ### Method `finish`
 
@@ -417,7 +417,7 @@ pub fn finish(self: Self) -> [u8; 32]
 
 Consumes this SHA-512/256 state and returns its 32-byte digest in big-endian byte order.
 
-<a id="impl.hash-6"></a>
+<a id="Sha512_256.impl.hash"></a>
 
 ### Associated function `hash`
 

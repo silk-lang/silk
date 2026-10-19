@@ -60,7 +60,7 @@ pub struct HkdfSha256
 
 HKDF-SHA-256 extraction and expansion with a 32-byte pseudorandom key.
 
-<a id="impl"></a>
+<a id="HkdfSha256.impl"></a>
 
 ## Implementation `HkdfSha256`
 
@@ -68,7 +68,7 @@ HKDF-SHA-256 extraction and expansion with a 32-byte pseudorandom key.
 impl HkdfSha256
 ```
 
-<a id="impl.extract"></a>
+<a id="HkdfSha256.impl.extract"></a>
 
 ### Associated function `extract`
 
@@ -88,7 +88,7 @@ Use the result with `HkdfSha256.expand` and protocol-specific context bytes.
 If the salt exceeds the 64-bit bit-length domain, the program traps.
 If the input plus the 64-byte HMAC pad exceeds that domain, the program traps.
 
-<a id="impl.expand"></a>
+<a id="HkdfSha256.impl.expand"></a>
 
 ### Associated function `expand`
 
@@ -119,7 +119,7 @@ pub struct HkdfSha384
 
 HKDF-SHA-384 extraction and expansion with a 48-byte pseudorandom key.
 
-<a id="impl-2"></a>
+<a id="HkdfSha384.impl"></a>
 
 ## Implementation `HkdfSha384`
 
@@ -127,7 +127,7 @@ HKDF-SHA-384 extraction and expansion with a 48-byte pseudorandom key.
 impl HkdfSha384
 ```
 
-<a id="impl.extract-2"></a>
+<a id="HkdfSha384.impl.extract"></a>
 
 ### Associated function `extract`
 
@@ -147,7 +147,7 @@ Use the result with `HkdfSha384.expand` and protocol-specific context bytes.
 If the salt exceeds the 128-bit bit-length domain, the program traps.
 If the input plus the 128-byte HMAC pad exceeds that domain, the program traps.
 
-<a id="impl.expand-2"></a>
+<a id="HkdfSha384.impl.expand"></a>
 
 ### Associated function `expand`
 

@@ -31,7 +31,7 @@ pub struct NativeClock
 
 Source-owned validation and blocking wait operations for selected native clocks.
 
-<a id="impl"></a>
+<a id="NativeClock.impl"></a>
 
 ## Implementation `NativeClock`
 
@@ -39,7 +39,7 @@ Source-owned validation and blocking wait operations for selected native clocks.
 impl NativeClock
 ```
 
-<a id="impl.now"></a>
+<a id="NativeClock.impl.now"></a>
 
 ### Associated function `now`
 
@@ -53,7 +53,7 @@ Reads canonical civil time, or a nonnegative mark on the native monotonic timeli
 A failed call or malformed result traps. `monotonic` selects the clock domain.
 Calls on unsupported or no-libc profiles produce a compile-time error.
 
-<a id="impl.resolution"></a>
+<a id="NativeClock.impl.resolution"></a>
 
 ### Associated function `resolution`
 
@@ -67,7 +67,7 @@ Returns the positive nominal resolution of the selected clock in whole nanosecon
 Failed calls, noncanonical fields, zero resolution and checked overflow trap.
 Calls on unsupported or no-libc profiles produce a compile-time error.
 
-<a id="impl.waitUntil"></a>
+<a id="NativeClock.impl.waitUntil"></a>
 
 ### Associated function `waitUntil`
 

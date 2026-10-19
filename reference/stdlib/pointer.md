@@ -33,7 +33,7 @@ pub struct Pointer
 
 The operations for data pointers, which hold no ownership or loan.
 
-<a id="impl"></a>
+<a id="Pointer.impl"></a>
 
 ## Implementation `Pointer`
 
@@ -41,7 +41,7 @@ The operations for data pointers, which hold no ownership or loan.
 impl Pointer
 ```
 
-<a id="impl.bytes"></a>
+<a id="Pointer.impl.bytes"></a>
 
 ### Associated function `bytes`
 
@@ -58,7 +58,7 @@ Every later access must independently address initialized readable bytes. This p
 inspection of a valid prefix of a variable-sized external record without loading the
 nominal record. It does not keep the allocation alive.
 
-<a id="impl.address"></a>
+<a id="Pointer.impl.address"></a>
 
 ### Associated function `address`
 
@@ -73,7 +73,7 @@ Returns the unsigned numeric address of a raw data pointer.
 Null has address zero. Observation does not read memory or keep storage alive.
 The result has the selected target's pointer width and cannot reconstruct a pointer.
 
-<a id="impl.addressMany"></a>
+<a id="Pointer.impl.addressMany"></a>
 
 ### Associated function `addressMany`
 
@@ -88,7 +88,7 @@ Returns the unsigned numeric address of a many-element data pointer.
 Null has address zero. Observation does not read memory or keep storage alive.
 The result has the selected target's pointer width and cannot reconstruct a pointer.
 
-<a id="impl.null"></a>
+<a id="Pointer.impl.null"></a>
 
 ### Associated function `null`
 
@@ -98,7 +98,7 @@ pub fn null<T>() -> ?*mut T
 
 Returns a null single-element pointer.
 
-<a id="impl.isNull"></a>
+<a id="Pointer.impl.isNull"></a>
 
 ### Associated function `isNull`
 
@@ -108,7 +108,7 @@ pub fn isNull<T>(pointer: ?*const T) -> bool
 
 Reports whether a nullable single-element pointer is null.
 
-<a id="impl.isNullMany"></a>
+<a id="Pointer.impl.isNullMany"></a>
 
 ### Associated function `isNullMany`
 
@@ -118,7 +118,7 @@ pub fn isNullMany<T>(pointer: ?[*]const T) -> bool
 
 Reports whether a nullable many-element pointer is null.
 
-<a id="impl.nonNull"></a>
+<a id="Pointer.impl.nonNull"></a>
 
 ### Associated function `nonNull`
 
@@ -132,7 +132,7 @@ Returns a non-null shared pointer when the address is not zero.
 
 A present result does not prove that the addressed storage is live or initialized.
 
-<a id="impl.nonNullMut"></a>
+<a id="Pointer.impl.nonNullMut"></a>
 
 ### Associated function `nonNullMut`
 
@@ -146,7 +146,7 @@ Returns a non-null writable pointer when the address is not zero.
 
 A present result does not prove that the addressed storage is live or initialized.
 
-<a id="impl.nonNullMany"></a>
+<a id="Pointer.impl.nonNullMany"></a>
 
 ### Associated function `nonNullMany`
 
@@ -160,7 +160,7 @@ Returns a non-null shared many-element pointer when the address is not zero.
 
 The result carries no length and proves no storage validity.
 
-<a id="impl.nonNullManyMut"></a>
+<a id="Pointer.impl.nonNullManyMut"></a>
 
 ### Associated function `nonNullManyMut`
 
@@ -174,7 +174,7 @@ Returns a non-null writable many-element pointer when the address is not zero.
 
 The result carries no length and proves no storage validity.
 
-<a id="impl.fromRef"></a>
+<a id="Pointer.impl.fromRef"></a>
 
 ### Associated function `fromRef`
 
@@ -188,7 +188,7 @@ Forms a non-null shared pointer without extending the reference's loan.
 
 The pointer keeps no storage alive. A later access must prove that the storage remains live.
 
-<a id="impl.fromMutRef"></a>
+<a id="Pointer.impl.fromMutRef"></a>
 
 ### Associated function `fromMutRef`
 
@@ -202,7 +202,7 @@ Forms a non-null writable pointer without extending the reference's loan.
 
 The pointer keeps no storage alive. A later access must prove that the storage remains live.
 
-<a id="impl.fromSlice"></a>
+<a id="Pointer.impl.fromSlice"></a>
 
 ### Associated function `fromSlice`
 
@@ -216,7 +216,7 @@ Forms a nullable shared many-element pointer from a slice address.
 
 The pointer carries no length or loan. Pass the length separately and keep the storage live.
 
-<a id="impl.fromMutSlice"></a>
+<a id="Pointer.impl.fromMutSlice"></a>
 
 ### Associated function `fromMutSlice`
 
@@ -230,7 +230,7 @@ Forms a nullable writable many-element pointer from a slice address.
 
 The pointer carries no length or loan. Pass the length separately and keep the storage live.
 
-<a id="impl.at"></a>
+<a id="Pointer.impl.at"></a>
 
 ### Associated function `at`
 
@@ -244,7 +244,7 @@ Returns a shared pointer to one element of a many-element pointer.
 
 The caller must prove that `index` selects an element within the same live allocation.
 
-<a id="impl.atMut"></a>
+<a id="Pointer.impl.atMut"></a>
 
 ### Associated function `atMut`
 
@@ -258,7 +258,7 @@ Returns a writable pointer to one element of a many-element pointer.
 
 The caller must prove that `index` selects an element within the same live writable allocation.
 
-<a id="impl.read"></a>
+<a id="Pointer.impl.read"></a>
 
 ### Associated function `read`
 
@@ -272,7 +272,7 @@ Copies one initialized value from naturally aligned storage.
 
 The caller must prove that the pointer addresses a live, readable, initialized `T`.
 
-<a id="impl.write"></a>
+<a id="Pointer.impl.write"></a>
 
 ### Associated function `write`
 
@@ -286,7 +286,7 @@ Writes one value into naturally aligned storage.
 
 The caller must prove that the pointer addresses live writable storage for `T`.
 
-<a id="impl.readUnaligned"></a>
+<a id="Pointer.impl.readUnaligned"></a>
 
 ### Associated function `readUnaligned`
 
@@ -300,7 +300,7 @@ Copies one initialized value from storage with byte alignment.
 
 The caller must prove that the pointer addresses a live, readable, initialized `T`.
 
-<a id="impl.writeUnaligned"></a>
+<a id="Pointer.impl.writeUnaligned"></a>
 
 ### Associated function `writeUnaligned`
 
@@ -314,7 +314,7 @@ Writes one value into storage with byte alignment.
 
 The caller must prove that the pointer addresses live writable storage for `T`.
 
-<a id="impl.assumeAligned"></a>
+<a id="Pointer.impl.assumeAligned"></a>
 
 ### Associated function `assumeAligned`
 
@@ -329,7 +329,7 @@ Returns a pointer with the natural alignment of its pointee.
 The caller must prove that the address satisfies the target alignment of `T`.
 The result holds no loan and keeps no storage alive.
 
-<a id="impl.assumeMany"></a>
+<a id="Pointer.impl.assumeMany"></a>
 
 ### Associated function `assumeMany`
 
@@ -344,7 +344,7 @@ Returns a many-element pointer without a length.
 The caller must prove the element range separately before each indexed access.
 The result holds no loan and keeps no storage alive.
 
-<a id="impl.assumeAlignedMut"></a>
+<a id="Pointer.impl.assumeAlignedMut"></a>
 
 ### Associated function `assumeAlignedMut`
 
@@ -359,7 +359,7 @@ Returns a pointer with the natural alignment of its pointee.
 The caller must prove that the address satisfies the target alignment of `T`.
 The result holds no loan and keeps no storage alive.
 
-<a id="impl.assumeManyMut"></a>
+<a id="Pointer.impl.assumeManyMut"></a>
 
 ### Associated function `assumeManyMut`
 

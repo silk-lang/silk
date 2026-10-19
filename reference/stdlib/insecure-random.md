@@ -6,10 +6,10 @@ Provider-replaceable deterministic words, booleans, bounded values, and byte fil
 
 ## When to use
 Require [`InsecureRandom`](#InsecureRandom) when a reproducible pseudorandom stream is needed. Use
-[`Xoshiro256StarStar`](#Xoshiro256StarStar) with [`seeded`](#impl.seeded) for one stable supported-target sequence.
+[`Xoshiro256StarStar`](#Xoshiro256StarStar) with [`seeded`](#InsecureRandom.impl.seeded) for one stable supported-target sequence.
 
 ## Details
-`InsecureRandom.nextU64` obtains one word from the active provider. [`nextBool`](#impl.nextBool), [`below`](#impl.below), and [`fillBytes`](#impl.fillBytes)
+`InsecureRandom.nextU64` obtains one word from the active provider. [`nextBool`](#InsecureRandom.impl.nextBool), [`below`](#InsecureRandom.impl.below), and [`fillBytes`](#InsecureRandom.impl.fillBytes)
 define one stable mapping from provider words to their results. Seed expansion uses SplitMix64.
 
 ## Gotchas
@@ -63,7 +63,7 @@ effect fn nextU64() -> u64 ? &mut InsecureRandom
 
 Returns the next deterministic word and advances the active provider once.
 
-<a id="impl"></a>
+<a id="InsecureRandom.impl"></a>
 
 ## Implementation `InsecureRandom`
 
@@ -71,7 +71,7 @@ Returns the next deterministic word and advances the active provider once.
 impl InsecureRandom
 ```
 
-<a id="impl.seeded"></a>
+<a id="InsecureRandom.impl.seeded"></a>
 
 ### Associated function `seeded`
 
@@ -85,7 +85,7 @@ Creates a reproducible [`Xoshiro256StarStar`](#Xoshiro256StarStar) provider from
 
 Every seed, including zero, expands through four successive SplitMix64 steps.
 
-<a id="impl.nextBool"></a>
+<a id="InsecureRandom.impl.nextBool"></a>
 
 ### Associated function `nextBool`
 
@@ -95,7 +95,7 @@ pub effect fn nextBool() -> bool ? &mut InsecureRandom
 
 Returns whether bit 63 of the next deterministic provider word is set.
 
-<a id="impl.below"></a>
+<a id="InsecureRandom.impl.below"></a>
 
 ### Associated function `below`
 
@@ -109,7 +109,7 @@ Returns a deterministic value below `upperExclusive`, or `None` when the bound i
 
 Positive bounds use complete-word rejection sampling. Progress requires eventual acceptance.
 
-<a id="impl.fillBytes"></a>
+<a id="InsecureRandom.impl.fillBytes"></a>
 
 ### Associated function `fillBytes`
 
@@ -137,7 +137,7 @@ A deterministic xoshiro256** provider with four private `u64` state words.
 
 The sequence is stable on every Silk engine and is not cryptographically secure.
 
-<a id="impl-2"></a>
+<a id="Xoshiro256StarStar.impl.InsecureRandom"></a>
 
 ## Implementation `InsecureRandom for Xoshiro256StarStar`
 
@@ -145,7 +145,7 @@ The sequence is stable on every Silk engine and is not cryptographically secure.
 impl InsecureRandom for Xoshiro256StarStar
 ```
 
-<a id="impl.nextU64"></a>
+<a id="Xoshiro256StarStar.impl.InsecureRandom.nextU64"></a>
 
 ### Operation `nextU64`
 

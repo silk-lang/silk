@@ -103,7 +103,7 @@ pub struct RsaPublicKey
 
 An admitted RSA public key with bounded owned storage and exponent 65537.
 
-<a id="impl"></a>
+<a id="RsaPublicKey.impl"></a>
 
 ## Implementation `RsaPublicKey`
 
@@ -111,7 +111,7 @@ An admitted RSA public key with bounded owned storage and exponent 65537.
 impl RsaPublicKey
 ```
 
-<a id="impl.fromComponents"></a>
+<a id="RsaPublicKey.impl.fromComponents"></a>
 
 ### Associated function `fromComponents`
 
@@ -126,7 +126,7 @@ Admits canonical unsigned modulus bytes and exponent 65537 into an owned public 
 The modulus must be odd and contain 2048 through 4096 significant bits. Leading zero bytes are rejected.
 The exponent must be exactly the three bytes 01 00 01. Rejection returns InvalidKey without retaining input.
 
-<a id="impl.verifyPss"></a>
+<a id="RsaPublicKey.impl.verifyPss"></a>
 
 ### Method `verifyPss`
 
@@ -146,7 +146,7 @@ InvalidLength, MessageTooLong or InvalidSignature identifies rejection; no input
 
 This operation does not establish certificate trust or service identity. It requires no entropy provider.
 
-<a id="impl-2"></a>
+<a id="RsaPublicKey.impl-2"></a>
 
 ## Implementation `RsaPublicKey`
 
@@ -154,7 +154,7 @@ This operation does not establish certificate trust or service identity. It requ
 impl RsaPublicKey
 ```
 
-<a id="impl.fromCertificateKey"></a>
+<a id="RsaPublicKey.impl.fromCertificateKey"></a>
 
 ### Associated function `fromCertificateKey`
 
@@ -175,7 +175,7 @@ The modulus and exponent then pass the same bounded profile as fromComponents.
 Malformed DER returns InvalidEncoding; wrong algorithm parameters return InvalidParameters.
 Nonzero unused bits return InvalidLength. No borrowed bytes are retained.
 
-<a id="impl.verifyCertificate"></a>
+<a id="RsaPublicKey.impl.verifyCertificate"></a>
 
 ### Method `verifyCertificate`
 

@@ -320,7 +320,7 @@ unsafe effect fn closeRaw() -> () ! ByteIoError ? &mut ByteDuplex with Intrinsic
 
 Closes the complete transport lease. Implementations must remain terminal and idempotent.
 
-<a id="impl"></a>
+<a id="ByteDuplex.impl"></a>
 
 ## Implementation `ByteDuplex`
 
@@ -328,7 +328,7 @@ Closes the complete transport lease. Implementations must remain terminal and id
 impl ByteDuplex
 ```
 
-<a id="impl.readSome"></a>
+<a id="ByteDuplex.impl.readSome"></a>
 
 ### Associated function `readSome`
 
@@ -346,7 +346,7 @@ Reads one positive prefix or reports orderly transport end.
 Empty output completes without calling the provider. An impossible provider count terminally
 closes the lease and returns `InvalidTransferCount`, even if that close itself fails.
 
-<a id="impl.writeSome"></a>
+<a id="ByteDuplex.impl.writeSome"></a>
 
 ### Associated function `writeSome`
 
@@ -364,7 +364,7 @@ Writes one positive prefix and returns its exact length.
 Empty input completes without calling the provider. An impossible provider count terminally
 closes the lease and returns `InvalidTransferCount`, even if that close itself fails.
 
-<a id="impl.flush"></a>
+<a id="ByteDuplex.impl.flush"></a>
 
 ### Associated function `flush`
 
@@ -376,7 +376,7 @@ pub effect fn flush(
 
 Flushes accepted output to the provider's documented transport boundary.
 
-<a id="impl.shutdownWrite"></a>
+<a id="ByteDuplex.impl.shutdownWrite"></a>
 
 ### Associated function `shutdownWrite`
 
@@ -388,7 +388,7 @@ pub effect fn shutdownWrite(
 
 Flushes accepted output and then closes only the write direction.
 
-<a id="impl.close"></a>
+<a id="ByteDuplex.impl.close"></a>
 
 ### Associated function `close`
 
@@ -398,7 +398,7 @@ pub effect fn close() -> () ! ByteIoError ? &mut ByteDuplex
 
 Closes the complete transport lease. Repeated calls remain terminal.
 
-<a id="impl.timeout"></a>
+<a id="ByteDuplex.impl.timeout"></a>
 
 ### Associated function `timeout`
 
@@ -408,7 +408,7 @@ pub fn timeout(operation: ByteIoOperation) -> ByteIoError
 
 Constructs a timeout failure for `operation`.
 
-<a id="impl.invalidTransferCount"></a>
+<a id="ByteDuplex.impl.invalidTransferCount"></a>
 
 ### Associated function `invalidTransferCount`
 
@@ -422,7 +422,7 @@ pub fn invalidTransferCount(
 
 Constructs an invalid-count failure with the observed and permitted counts.
 
-<a id="impl.closed"></a>
+<a id="ByteDuplex.impl.closed"></a>
 
 ### Associated function `closed`
 
@@ -432,7 +432,7 @@ pub fn closed(operation: ByteIoOperation) -> ByteIoError
 
 Constructs a closed-direction failure for `operation`.
 
-<a id="impl.provider"></a>
+<a id="ByteDuplex.impl.provider"></a>
 
 ### Associated function `provider`
 

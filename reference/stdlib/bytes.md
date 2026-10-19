@@ -9,7 +9,7 @@ Use [`Bytes`](#Bytes) when every octet must round-trip unchanged. Use `silk.stri
 the value is known to be valid UTF-8 and callers need text operations.
 
 ## Details
-[`make`](#impl.make) creates an empty value without allocating, while [`zeroed`](#impl.zeroed), [`copy`](#impl.copy), and [`append`](#impl.append)
+[`make`](#Bytes.impl.make) creates an empty value without allocating, while [`zeroed`](#Bytes.impl.zeroed), [`copy`](#Bytes.impl.copy), and [`append`](#Bytes.impl.append)
 may require an [`Allocator`](./allocator.md#Allocator). Shared and exclusive views borrow only the initialized prefix;
 later appends can reallocate, so do not retain a view across a mutation.
 
@@ -67,9 +67,9 @@ An owned encoding-neutral sequence of arbitrary octets.
 ### Details
 
 A value owns its initialized bytes and releases their storage on drop. Its length can grow with
-[`append`](#impl.append), and its capacity is not part of the public contract.
+[`append`](#Bytes.impl.append), and its capacity is not part of the public contract.
 
-<a id="impl"></a>
+<a id="Bytes.impl"></a>
 
 ## Implementation `Bytes`
 
@@ -77,7 +77,7 @@ A value owns its initialized bytes and releases their storage on drop. Its lengt
 impl Bytes
 ```
 
-<a id="impl.make"></a>
+<a id="Bytes.impl.make"></a>
 
 ### Associated function `make`
 
@@ -87,7 +87,7 @@ pub fn make() -> Bytes
 
 Creates an empty `Bytes` value without allocating storage.
 
-<a id="impl.zeroed"></a>
+<a id="Bytes.impl.zeroed"></a>
 
 ### Associated function `zeroed`
 
@@ -101,7 +101,7 @@ Allocates an owned initialized byte buffer of exactly `length` zero octets.
 
 A zero length returns an empty value without an allocation.
 
-<a id="impl.length"></a>
+<a id="Bytes.impl.length"></a>
 
 ### Method `length`
 
@@ -111,7 +111,7 @@ pub fn length(self: &Self) -> usize
 
 Returns the initialized byte count.
 
-<a id="impl.copy"></a>
+<a id="Bytes.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -125,7 +125,7 @@ Copies a complete borrowed byte sequence into independently owned storage.
 
 Empty input does not allocate. Nonempty input uses one allocation sized to its byte length.
 
-<a id="impl.reserveExact"></a>
+<a id="Bytes.impl.reserveExact"></a>
 
 ### Method `reserveExact`
 
@@ -142,7 +142,7 @@ Reserves storage for `additional` bytes without changing the initialized length.
 Sufficient capacity is reused. Otherwise, one allocation provides the current length plus
 `additional` bytes of capacity. Size overflow or allocation failure leaves the value unchanged.
 
-<a id="impl.clear"></a>
+<a id="Bytes.impl.clear"></a>
 
 ### Method `clear`
 
@@ -152,7 +152,7 @@ pub fn clear(self: &mut Self) -> ()
 
 Removes all initialized bytes and keeps the allocation for reuse.
 
-<a id="impl.truncate"></a>
+<a id="Bytes.impl.truncate"></a>
 
 ### Method `truncate`
 
@@ -166,7 +166,7 @@ Removes bytes after `length` and keeps the allocation for reuse.
 
 A length greater than or equal to the current length leaves the value unchanged.
 
-<a id="impl.append"></a>
+<a id="Bytes.impl.append"></a>
 
 ### Method `append`
 
@@ -180,7 +180,7 @@ Appends a complete borrowed byte sequence in source order.
 
 If growth fails, the original bytes and their length remain unchanged.
 
-<a id="impl.asSlice"></a>
+<a id="Bytes.impl.asSlice"></a>
 
 ### Method `asSlice`
 
@@ -190,7 +190,7 @@ pub fn asSlice(self: &Self) -> &[u8]
 
 Borrows all initialized octets as one shared lexical slice.
 
-<a id="impl.asMutSlice"></a>
+<a id="Bytes.impl.asMutSlice"></a>
 
 ### Method `asMutSlice`
 
@@ -202,7 +202,7 @@ Borrows all initialized octets as one exclusive lexical slice.
 
 #### Gotchas
 
-Do not retain this slice across [`append`](#impl.append), because an append can replace the allocation.
+Do not retain this slice across [`append`](#Bytes.impl.append), because an append can replace the allocation.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

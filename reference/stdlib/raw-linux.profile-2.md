@@ -27,7 +27,7 @@ pub struct RawLinux
 
 The scope for raw Linux kernel operations on the selected target.
 
-<a id="impl"></a>
+<a id="RawLinux.impl"></a>
 
 ## Implementation `RawLinux`
 
@@ -35,7 +35,7 @@ The scope for raw Linux kernel operations on the selected target.
 impl RawLinux
 ```
 
-<a id="impl.syscall0"></a>
+<a id="RawLinux.impl.syscall0"></a>
 
 ### Associated function `syscall0`
 
@@ -50,7 +50,7 @@ Issues a Linux syscall with 0 arguments and returns its raw result.
 The caller must prove the syscall's memory, lifetime and resource obligations.
 Kernel errors remain encoded in the result; no libc error state is read.
 
-<a id="impl.syscall1"></a>
+<a id="RawLinux.impl.syscall1"></a>
 
 ### Associated function `syscall1`
 
@@ -65,7 +65,7 @@ Issues a Linux syscall with 1 argument and returns its raw result.
 The caller must prove the syscall's memory, lifetime and resource obligations.
 Kernel errors remain encoded in the result; no libc error state is read.
 
-<a id="impl.syscall2"></a>
+<a id="RawLinux.impl.syscall2"></a>
 
 ### Associated function `syscall2`
 
@@ -80,7 +80,7 @@ Issues a Linux syscall with 2 arguments and returns its raw result.
 The caller must prove the syscall's memory, lifetime and resource obligations.
 Kernel errors remain encoded in the result; no libc error state is read.
 
-<a id="impl.syscall3"></a>
+<a id="RawLinux.impl.syscall3"></a>
 
 ### Associated function `syscall3`
 
@@ -95,7 +95,7 @@ Issues a Linux syscall with 3 arguments and returns its raw result.
 The caller must prove the syscall's memory, lifetime and resource obligations.
 Kernel errors remain encoded in the result; no libc error state is read.
 
-<a id="impl.syscall4"></a>
+<a id="RawLinux.impl.syscall4"></a>
 
 ### Associated function `syscall4`
 
@@ -110,7 +110,7 @@ Issues a Linux syscall with 4 arguments and returns its raw result.
 The caller must prove the syscall's memory, lifetime and resource obligations.
 Kernel errors remain encoded in the result; no libc error state is read.
 
-<a id="impl.syscall5"></a>
+<a id="RawLinux.impl.syscall5"></a>
 
 ### Associated function `syscall5`
 
@@ -125,7 +125,7 @@ Issues a Linux syscall with 5 arguments and returns its raw result.
 The caller must prove the syscall's memory, lifetime and resource obligations.
 Kernel errors remain encoded in the result; no libc error state is read.
 
-<a id="impl.syscall6"></a>
+<a id="RawLinux.impl.syscall6"></a>
 
 ### Associated function `syscall6`
 
@@ -148,7 +148,7 @@ Issues a Linux syscall with 6 arguments and returns its raw result.
 The caller must prove the syscall's memory, lifetime and resource obligations.
 Kernel errors remain encoded in the result; no libc error state is read.
 
-<a id="impl.syscallNoReturn"></a>
+<a id="RawLinux.impl.syscallNoReturn"></a>
 
 ### Associated function `syscallNoReturn`
 
@@ -162,7 +162,7 @@ Issues a terminal Linux syscall with one argument.
 
 The caller must select a syscall that cannot return. No structured cleanup follows this call.
 
-<a id="impl.pointer"></a>
+<a id="RawLinux.impl.pointer"></a>
 
 ### Associated function `pointer`
 
@@ -226,7 +226,7 @@ pub const EXIT_GROUP: usize
 
 The selected Linux exit_group syscall number.
 
-<a id="impl-2"></a>
+<a id="RawLinux.impl-2"></a>
 
 ## Implementation `RawLinux`
 
@@ -234,7 +234,7 @@ The selected Linux exit_group syscall number.
 impl RawLinux
 ```
 
-<a id="impl.error"></a>
+<a id="RawLinux.impl.error"></a>
 
 ### Associated function `error`
 
@@ -244,7 +244,7 @@ pub fn error(result: usize) -> usize
 
 Returns zero for success or the positive kernel error number.
 
-<a id="impl.read"></a>
+<a id="RawLinux.impl.read"></a>
 
 ### Associated function `read`
 
@@ -259,7 +259,7 @@ Reads one initialized prefix from a borrowed Linux descriptor.
 Returns the raw kernel result: a byte count, zero at EOF, or an encoded error. Interrupted reads
 are returned to the caller. Bytes beyond a successful prefix retain their previous values.
 
-<a id="impl.write"></a>
+<a id="RawLinux.impl.write"></a>
 
 ### Associated function `write`
 

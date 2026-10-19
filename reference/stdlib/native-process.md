@@ -27,7 +27,7 @@ pub struct NativeProcess
 
 Blocking native process execution with per-call owned resources and captures.
 
-<a id="impl"></a>
+<a id="NativeProcess.impl"></a>
 
 ## Implementation `NativeProcess`
 
@@ -35,7 +35,7 @@ Blocking native process execution with per-call owned resources and captures.
 impl NativeProcess
 ```
 
-<a id="impl.execute"></a>
+<a id="NativeProcess.impl.execute"></a>
 
 ### Associated function `execute`
 

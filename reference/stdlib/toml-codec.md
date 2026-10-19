@@ -5,9 +5,9 @@
 Static contracts for converting common Silk values to and from TOML values.
 
 ## When to use
-Use [`TomlCodec.writeOne`](#impl.writeOne) to write a typed value after a key and separator. Use
-[`TomlCodec.decodeOne`](#impl.decodeOne) on a parsed value for allocation-free types, or
-[`TomlCodec.deserializeOne`](#impl.deserializeOne) for an owned string.
+Use [`TomlCodec.writeOne`](#TomlCodec.impl.writeOne) to write a typed value after a key and separator. Use
+[`TomlCodec.decodeOne`](#TomlCodec.impl.decodeOne) on a parsed value for allocation-free types, or
+[`TomlCodec.deserializeOne`](#TomlCodec.impl.deserializeOne) for an owned string.
 
 Import as `TomlCodec` with `import silk.toml_codec { TomlCodec }`.
 
@@ -83,7 +83,7 @@ pub struct TomlCodec
 
 Selects static TOML conversion witnesses.
 
-<a id="impl"></a>
+<a id="TomlCodec.impl"></a>
 
 ## Implementation `TomlCodec`
 
@@ -91,7 +91,7 @@ Selects static TOML conversion witnesses.
 impl TomlCodec
 ```
 
-<a id="impl.writeOne"></a>
+<a id="TomlCodec.impl.writeOne"></a>
 
 ### Associated function `writeOne`
 
@@ -104,7 +104,7 @@ Writes a typed value in value position through the ambient Writer.
 #### Gotchas
 Write the key and ` = ` before this call when writing a document.
 
-<a id="impl.decodeOne"></a>
+<a id="TomlCodec.impl.decodeOne"></a>
 
 ### Associated function `decodeOne`
 
@@ -114,7 +114,7 @@ pub fn decodeOne<T: Decode>(value: &Value) -> Result<T, TomlError>
 
 Decodes an allocation-free type from one owned value, or returns a typed failure.
 
-<a id="impl.deserializeOne"></a>
+<a id="TomlCodec.impl.deserializeOne"></a>
 
 ### Associated function `deserializeOne`
 
@@ -125,7 +125,7 @@ pub effect fn deserializeOne<T: Deserialize>(value: &Value)
 
 Deserializes an allocating type from one owned value with the ambient allocator.
 
-<a id="impl-2"></a>
+<a id="bool.impl.Serialize"></a>
 
 ## Implementation `Serialize for bool`
 
@@ -133,7 +133,7 @@ Deserializes an allocating type from one owned value with the ambient allocator.
 impl Serialize for bool
 ```
 
-<a id="impl.serialize"></a>
+<a id="bool.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -141,7 +141,7 @@ impl Serialize for bool
 effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
-<a id="impl-3"></a>
+<a id="bool.impl.Decode"></a>
 
 ## Implementation `Decode for bool`
 
@@ -149,7 +149,7 @@ effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 impl Decode for bool
 ```
 
-<a id="impl.decode"></a>
+<a id="bool.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -157,7 +157,7 @@ impl Decode for bool
 fn decode(value: &Value) -> Result<Self, TomlError>
 ```
 
-<a id="impl-4"></a>
+<a id="i64.impl.Serialize"></a>
 
 ## Implementation `Serialize for i64`
 
@@ -165,7 +165,7 @@ fn decode(value: &Value) -> Result<Self, TomlError>
 impl Serialize for i64
 ```
 
-<a id="impl.serialize-2"></a>
+<a id="i64.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -173,7 +173,7 @@ impl Serialize for i64
 effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
-<a id="impl-5"></a>
+<a id="i64.impl.Decode"></a>
 
 ## Implementation `Decode for i64`
 
@@ -181,7 +181,7 @@ effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 impl Decode for i64
 ```
 
-<a id="impl.decode-2"></a>
+<a id="i64.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -189,7 +189,7 @@ impl Decode for i64
 fn decode(value: &Value) -> Result<Self, TomlError>
 ```
 
-<a id="impl-6"></a>
+<a id="i32.impl.Serialize"></a>
 
 ## Implementation `Serialize for i32`
 
@@ -197,7 +197,7 @@ fn decode(value: &Value) -> Result<Self, TomlError>
 impl Serialize for i32
 ```
 
-<a id="impl.serialize-3"></a>
+<a id="i32.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -205,7 +205,7 @@ impl Serialize for i32
 effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
-<a id="impl-7"></a>
+<a id="i32.impl.Decode"></a>
 
 ## Implementation `Decode for i32`
 
@@ -213,7 +213,7 @@ effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 impl Decode for i32
 ```
 
-<a id="impl.decode-3"></a>
+<a id="i32.impl.Decode.decode"></a>
 
 ### Operation `decode`
 
@@ -221,7 +221,7 @@ impl Decode for i32
 fn decode(value: &Value) -> Result<Self, TomlError>
 ```
 
-<a id="impl-8"></a>
+<a id="f64.impl.Serialize"></a>
 
 ## Implementation `Serialize for f64`
 
@@ -229,7 +229,7 @@ fn decode(value: &Value) -> Result<Self, TomlError>
 impl Serialize for f64
 ```
 
-<a id="impl.serialize-4"></a>
+<a id="f64.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -237,7 +237,7 @@ impl Serialize for f64
 effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
-<a id="impl-9"></a>
+<a id="f64.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for f64`
 
@@ -245,7 +245,7 @@ effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 impl Deserialize for f64
 ```
 
-<a id="impl.deserialize"></a>
+<a id="f64.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 
@@ -253,15 +253,15 @@ impl Deserialize for f64
 effect fn deserialize(value: &Value) -> Self ! TomlError | OutOfMemoryError ? &mut Allocator
 ```
 
-<a id="impl-10"></a>
+<a id="string.impl.Serialize"></a>
 
-## Implementation ` Serialize for  `
+## Implementation `Serialize for string<'a>`
 
 ```silk
 impl<'a> Serialize for string<'a>
 ```
 
-<a id="impl.serialize-5"></a>
+<a id="string.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -269,7 +269,7 @@ impl<'a> Serialize for string<'a>
 effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
-<a id="impl-11"></a>
+<a id="String.impl.Serialize"></a>
 
 ## Implementation `Serialize for String`
 
@@ -277,7 +277,7 @@ effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 impl Serialize for String
 ```
 
-<a id="impl.serialize-6"></a>
+<a id="String.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -285,7 +285,7 @@ impl Serialize for String
 effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 ```
 
-<a id="impl-12"></a>
+<a id="String.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for String`
 
@@ -293,7 +293,7 @@ effect fn serialize(self: &Self) -> () ! TomlError | WriterError ? &mut Writer
 impl Deserialize for String
 ```
 
-<a id="impl.deserialize-2"></a>
+<a id="String.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 

@@ -111,7 +111,7 @@ pub struct BlockState
 
 Retained entropy tables and repeat offsets for one zstd frame.
 
-<a id="impl"></a>
+<a id="BlockState.impl"></a>
 
 ## Implementation `BlockState`
 
@@ -119,7 +119,7 @@ Retained entropy tables and repeat offsets for one zstd frame.
 impl BlockState
 ```
 
-<a id="impl.make"></a>
+<a id="BlockState.impl.make"></a>
 
 ### Associated function `make`
 
@@ -132,7 +132,7 @@ Allocates fresh entropy tables and sets the initial repeat offsets for one frame
 #### Details
 The state owns five exact allocations and releases them when dropped. Decode and reset do not allocate.
 
-<a id="impl.reset"></a>
+<a id="BlockState.impl.reset"></a>
 
 ### Method `reset`
 
@@ -142,7 +142,7 @@ pub fn reset(self: &mut Self) -> ()
 
 Restores fresh entropy tables and repeat offsets before a new frame.
 
-<a id="impl.workspaceBytes"></a>
+<a id="BlockState.impl.workspaceBytes"></a>
 
 ### Associated function `workspaceBytes`
 
@@ -155,7 +155,7 @@ Returns a conservative byte bound for tables and transient algorithm scratch on 
 #### Details
 This bound excludes caller-owned compressed, literal, output, and history storage.
 
-<a id="impl.decode"></a>
+<a id="BlockState.impl.decode"></a>
 
 ### Method `decode`
 

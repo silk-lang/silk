@@ -6,7 +6,7 @@ Explicit access to process arguments, environment values, and the working direct
 
 ## When to use
 Require [`HostInput`](#HostInput) when code needs launch-time process data but should remain replaceable in
-tests. Use [`text`](#impl.text) only when the caller wants a checked UTF-8 view; keep the original bytes for
+tests. Use [`text`](#HostInput.impl.text) only when the caller wants a checked UTF-8 view; keep the original bytes for
 lossless pass-through.
 
 ## Details
@@ -183,7 +183,7 @@ Copies the process working directory as raw bytes.
 This operation does not change the directory. An unavailable host value produces
 `HostInputError`; ownership allocation produces `OutOfMemoryError`.
 
-<a id="impl"></a>
+<a id="HostInput.impl"></a>
 
 ## Implementation `HostInput`
 
@@ -191,7 +191,7 @@ This operation does not change the directory. An unavailable host value produces
 impl HostInput
 ```
 
-<a id="impl.inputFailure"></a>
+<a id="HostInput.impl.inputFailure"></a>
 
 ### Associated function `inputFailure`
 
@@ -201,7 +201,7 @@ pub fn inputFailure() -> HostInputError
 
 Creates a host-input failure for a provider that cannot complete a lookup.
 
-<a id="impl.variableNamed"></a>
+<a id="HostInput.impl.variableNamed"></a>
 
 ### Associated function `variableNamed`
 
@@ -218,16 +218,16 @@ Copies one environment value selected by a valid UTF-8 name.
 This function borrows the UTF-8 encoding of `name` and delegates to `HostInput.variable`. It returns
 `None` when the name is unset and independently owns a present value.
 
-<a id="impl.arguments"></a>
+<a id="HostInput.impl.arguments"></a>
 
 ### Associated function `arguments`
 
 ```silk
 pub effect fn arguments(
-  ) -> Vector<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator
+  ) -> List<Bytes> ! HostInputError | OutOfMemoryError ? &mut HostInput | &mut Allocator
 ```
 
-Copies all process arguments into an owned vector in host order.
+Copies all process arguments into an owned list in host order.
 
 #### When to use
 
@@ -239,10 +239,10 @@ index without retaining all argument values.
 A host that reports a count it cannot then supply is a broken host, so a missing index below the
 count is `HostInputError` rather than a silently shorter sequence.
 
-Each argument and the result vector own their storage. The operation preserves the program name
+Each argument and the result list own their storage. The operation preserves the program name
 at index zero.
 
-<a id="impl.text"></a>
+<a id="HostInput.impl.text"></a>
 
 ### Associated function `text`
 

@@ -84,7 +84,7 @@ Tunnel
 
 The bytes belong to a tunnel rather than an HTTP body.
 
-<a id="impl"></a>
+<a id="Framing.impl.Copy"></a>
 
 ## Implementation `Copy for Framing`
 
@@ -142,15 +142,15 @@ pub struct Selection<'head>
 
 A borrowed framing selection.
 
-<a id="impl-2"></a>
+<a id="Selection.impl"></a>
 
-## Implementation ``
+## Implementation `Selection<'head>`
 
 ```silk
 impl<'head> Selection<'head>
 ```
 
-<a id="impl.framing"></a>
+<a id="Selection.impl.framing"></a>
 
 ### Method `framing`
 
@@ -160,7 +160,7 @@ pub fn framing(self: &Self) -> Framing
 
 Returns the selected payload delimiter.
 
-<a id="impl.anomaly"></a>
+<a id="Selection.impl.anomaly"></a>
 
 ### Method `anomaly`
 
@@ -280,7 +280,7 @@ pub trailerValues: ValueLimits
 
 Admission limits for each retained trailer name and value.
 
-<a id="impl-3"></a>
+<a id="Limits.impl.Copy"></a>
 
 ## Implementation `Copy for Limits`
 
@@ -448,15 +448,15 @@ pub struct Completion<'owner>
 
 Opaque positive evidence borrowed from a completed owner.
 
-<a id="impl-4"></a>
+<a id="Completion.impl"></a>
 
-## Implementation ``
+## Implementation `Completion<'owner>`
 
 ```silk
 impl<'owner> Completion<'owner>
 ```
 
-<a id="impl.kind"></a>
+<a id="Completion.impl.kind"></a>
 
 ### Method `kind`
 
@@ -946,7 +946,7 @@ InvalidState
 
 The operation is not permitted in the current state.
 
-<a id="impl-5"></a>
+<a id="BodyReason.impl.Copy"></a>
 
 ## Implementation `Copy for BodyReason`
 
@@ -1074,23 +1074,23 @@ Explicit
 
 Restricts trailers to the supplied admitted field names.
 
-<a id="impl-6"></a>
+<a id="TrailerPolicy.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for TrailerPolicy<'names>`
 
 ```silk
 impl<'names> Copy for TrailerPolicy<'names>
 ```
 
-<a id="impl-7"></a>
+<a id="TrailerPolicy.impl"></a>
 
-## Implementation ``
+## Implementation `TrailerPolicy<'names>`
 
 ```silk
 impl<'names> TrailerPolicy<'names>
 ```
 
-<a id="impl.defaultPolicy"></a>
+<a id="TrailerPolicy.impl.defaultPolicy"></a>
 
 ### Associated function `defaultPolicy`
 
@@ -1100,7 +1100,7 @@ pub fn defaultPolicy() -> TrailerPolicy<'names>
 
 Returns the default forbidden-trailer policy.
 
-<a id="impl.fromNames"></a>
+<a id="TrailerPolicy.impl.fromNames"></a>
 
 ### Associated function `fromNames`
 
@@ -1176,7 +1176,7 @@ pub struct Decoder
 
 Affine allocation-free incremental body decoder.
 
-<a id="impl-8"></a>
+<a id="Decoder.impl"></a>
 
 ## Implementation `Decoder`
 
@@ -1184,7 +1184,7 @@ Affine allocation-free incremental body decoder.
 impl Decoder
 ```
 
-<a id="impl.make"></a>
+<a id="Decoder.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1198,7 +1198,7 @@ pub effect fn make<'head>(
 
 Acquires every decoder buffer and copies trailer policy and Connection exclusions.
 
-<a id="impl.step"></a>
+<a id="Decoder.impl.step"></a>
 
 ### Method `step`
 
@@ -1213,7 +1213,7 @@ pub fn step(
 
 Decodes into caller output without consuming unwritten payload.
 
-<a id="impl.discard"></a>
+<a id="Decoder.impl.discard"></a>
 
 ### Method `discard`
 
@@ -1228,7 +1228,7 @@ pub fn discard(
 
 Discards wire bytes under an explicit cumulative framing-byte budget.
 
-<a id="impl.completion"></a>
+<a id="Decoder.impl.completion"></a>
 
 ### Method `completion`
 
@@ -1238,7 +1238,7 @@ pub fn completion<'owner>(self: &'owner Self) -> Option<Completion<'owner>>
 
 Returns positive evidence only after a successful terminal boundary.
 
-<a id="impl.trailers"></a>
+<a id="Decoder.impl.trailers"></a>
 
 ### Method `trailers`
 
@@ -1248,7 +1248,7 @@ pub fn trailers<'owner>(self: &'owner Self) -> Option<Trailers<'owner>>
 
 Returns completed chunk trailers without merging them into initial fields.
 
-<a id="impl.abandon"></a>
+<a id="Decoder.impl.abandon"></a>
 
 ### Method `abandon`
 
@@ -1268,15 +1268,15 @@ pub struct Trailers<'owner>
 
 A decoder-borrowed trailer section.
 
-<a id="impl-9"></a>
+<a id="Trailers.impl"></a>
 
-## Implementation ``
+## Implementation `Trailers<'owner>`
 
 ```silk
 impl<'owner> Trailers<'owner>
 ```
 
-<a id="impl.count"></a>
+<a id="Trailers.impl.count"></a>
 
 ### Method `count`
 
@@ -1286,7 +1286,7 @@ pub fn count(self: &Self) -> usize
 
 Returns the number of retained trailer fields.
 
-<a id="impl.requiredOwnedBytes"></a>
+<a id="Trailers.impl.requiredOwnedBytes"></a>
 
 ### Method `requiredOwnedBytes`
 
@@ -1296,7 +1296,7 @@ pub fn requiredOwnedBytes(self: &Self) -> Result<usize, BodyError>
 
 Returns the exact payload-plus-index bytes required by an independent owned copy.
 
-<a id="impl.fields"></a>
+<a id="Trailers.impl.fields"></a>
 
 ### Method `fields`
 
@@ -1306,7 +1306,7 @@ pub fn fields(self: &'owner Self) -> TrailerIterator<'owner>
 
 Borrows an iterator over trailer fields in their retained order.
 
-<a id="impl.copy"></a>
+<a id="Trailers.impl.copy"></a>
 
 ### Method `copy`
 
@@ -1329,7 +1329,7 @@ pub struct OwnedTrailers
 
 An independently owned trailer section.
 
-<a id="impl-10"></a>
+<a id="OwnedTrailers.impl"></a>
 
 ## Implementation `OwnedTrailers`
 
@@ -1337,7 +1337,7 @@ An independently owned trailer section.
 impl OwnedTrailers
 ```
 
-<a id="impl.ownedBytes"></a>
+<a id="OwnedTrailers.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 
@@ -1347,7 +1347,7 @@ pub fn ownedBytes(self: &Self) -> usize
 
 Returns the exact retained trailer payload-plus-index byte count.
 
-<a id="impl.view"></a>
+<a id="OwnedTrailers.impl.view"></a>
 
 ### Method `view`
 
@@ -1367,15 +1367,15 @@ pub struct TrailerIterator<'owner>
 
 An ordered iterator borrowing one retained trailer section.
 
-<a id="impl-11"></a>
+<a id="TrailerIterator.impl"></a>
 
-## Implementation ``
+## Implementation `TrailerIterator<'owner>`
 
 ```silk
 impl<'owner> TrailerIterator<'owner>
 ```
 
-<a id="impl.next"></a>
+<a id="TrailerIterator.impl.next"></a>
 
 ### Method `next`
 
@@ -1395,7 +1395,7 @@ pub struct Encoder
 
 Affine allocation-free incremental body encoder.
 
-<a id="impl-12"></a>
+<a id="Encoder.impl"></a>
 
 ## Implementation `Encoder`
 
@@ -1403,7 +1403,7 @@ Affine allocation-free incremental body encoder.
 impl Encoder
 ```
 
-<a id="impl.make-2"></a>
+<a id="Encoder.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1417,7 +1417,7 @@ pub effect fn make<'head>(
 
 Acquires bounded chunk and finish-snapshot storage.
 
-<a id="impl.step-2"></a>
+<a id="Encoder.impl.step"></a>
 
 ### Method `step`
 
@@ -1427,7 +1427,7 @@ pub fn step(self: &mut Self, input: &[u8], output: &mut [u8]) -> Result<Progress
 
 Accepts payload and emits as much framed output as fits.
 
-<a id="impl.beginFinish"></a>
+<a id="Encoder.impl.beginFinish"></a>
 
 ### Method `beginFinish`
 
@@ -1440,7 +1440,7 @@ pub fn beginFinish<'value>(
 
 Validates and snapshots all finish trailers before any finish byte is emitted.
 
-<a id="impl.continueFinish"></a>
+<a id="Encoder.impl.continueFinish"></a>
 
 ### Method `continueFinish`
 
@@ -1450,7 +1450,7 @@ pub fn continueFinish(self: &mut Self, output: &mut [u8]) -> Result<Progress, Bo
 
 Drains the immutable finish snapshot.
 
-<a id="impl.completion-2"></a>
+<a id="Encoder.impl.completion"></a>
 
 ### Method `completion`
 
@@ -1460,7 +1460,7 @@ pub fn completion<'owner>(self: &'owner Self) -> Option<Completion<'owner>>
 
 Borrows positive completion evidence only after successful encoder finalization.
 
-<a id="impl.abandon-2"></a>
+<a id="Encoder.impl.abandon"></a>
 
 ### Method `abandon`
 

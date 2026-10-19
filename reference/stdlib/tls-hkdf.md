@@ -161,7 +161,7 @@ pub struct TlsHkdfSha256
 
 TLS label operations with SHA-256 and 32-byte secrets and transcript hashes.
 
-<a id="impl"></a>
+<a id="TlsHkdfSha256.impl"></a>
 
 ## Implementation `TlsHkdfSha256`
 
@@ -169,7 +169,7 @@ TLS label operations with SHA-256 and 32-byte secrets and transcript hashes.
 impl TlsHkdfSha256
 ```
 
-<a id="impl.expandLabel"></a>
+<a id="TlsHkdfSha256.impl.expandLabel"></a>
 
 ### Associated function `expandLabel`
 
@@ -194,7 +194,7 @@ LabelLength, ContextLength, and OutputLength identify rejected lengths in that o
 The fixed `tls13 ` prefix is always added, even when the raw label already starts with those bytes.
 No normalization or zero-byte termination occurs. The caller must select the correct protocol label and a strong secret.
 
-<a id="impl.deriveSecret"></a>
+<a id="TlsHkdfSha256.impl.deriveSecret"></a>
 
 ### Associated function `deriveSecret`
 
@@ -219,7 +219,7 @@ A message longer than 2^61 minus 1 bytes returns MessageTooLong before hashing.
 The caller supplies the exact serialized handshake messages. This operation does not apply transcript rewriting.
 Use `deriveSecretFromHash` for a previously computed transcript hash; this operation would hash those bytes again.
 
-<a id="impl.deriveSecretFromHash"></a>
+<a id="TlsHkdfSha256.impl.deriveSecretFromHash"></a>
 
 ### Associated function `deriveSecretFromHash`
 
@@ -252,7 +252,7 @@ pub struct TlsHkdfSha384
 
 TLS label operations with SHA-384 and 48-byte secrets and transcript hashes.
 
-<a id="impl-2"></a>
+<a id="TlsHkdfSha384.impl"></a>
 
 ## Implementation `TlsHkdfSha384`
 
@@ -260,7 +260,7 @@ TLS label operations with SHA-384 and 48-byte secrets and transcript hashes.
 impl TlsHkdfSha384
 ```
 
-<a id="impl.expandLabel-2"></a>
+<a id="TlsHkdfSha384.impl.expandLabel"></a>
 
 ### Associated function `expandLabel`
 
@@ -285,7 +285,7 @@ LabelLength, ContextLength, and OutputLength identify rejected lengths in that o
 The fixed `tls13 ` prefix is always added, even when the raw label already starts with those bytes.
 No normalization or zero-byte termination occurs. The caller must select the correct protocol label and a strong secret.
 
-<a id="impl.deriveSecret-2"></a>
+<a id="TlsHkdfSha384.impl.deriveSecret"></a>
 
 ### Associated function `deriveSecret`
 
@@ -309,7 +309,7 @@ Empty messages use SHA-384 of the empty byte sequence, not an empty context.
 The caller supplies the exact serialized handshake messages. This operation does not apply transcript rewriting.
 Use `deriveSecretFromHash` for a previously computed transcript hash; this operation would hash those bytes again.
 
-<a id="impl.deriveSecretFromHash-2"></a>
+<a id="TlsHkdfSha384.impl.deriveSecretFromHash"></a>
 
 ### Associated function `deriveSecretFromHash`
 

@@ -90,8 +90,8 @@ incomplete representation evidence retains the conservative same-body guard. Re-
 generic function within one family with different type arguments is
 `ExpandingSpecialization` unless the arguments descend structurally or along a witness call, or
 the re-entry runs inside a Drop hook's cleanup and every type argument stays within the owned
-structure of the value whose cleanup selected the hook (GEN-006): `Vector<Bytes>` cleanup reaches
-`Vector<u8>` through `Bytes`, while a hook that drops a larger value of its own type still grows.
+structure of the value whose cleanup selected the hook (GEN-006): `List<Bytes>` cleanup reaches
+`List<u8>` through `Bytes`, while a hook that drops a larger value of its own type still grows.
 MIR, layouts and foreign signatures are validated before closure planning, while backend-only
 emission restrictions remain loud gaps on the completed build.
 Typing records the owned place each consuming site transfers: `move`, `drop`, `match move` and a
@@ -531,10 +531,14 @@ silk test --manifest-path changes/silk.toml --root src/tests.silk --no-cache --s
 ```
 
 Native HTTPS conformance runs with `SILK_COMPILER` set to the native binary:
-`node .github/scripts/test-native-https.mjs --live`. Set `SILK_CLANG` if Clang is not on `PATH`.
+`node .github/scripts/test-native-https.mjs`. Set `SILK_CLANG` if Clang is not on `PATH`.
 The harness creates an isolated PKI and explicit OpenSSL request configuration so platform CA
 defaults cannot change the test certificates. Controlled requests exercise history and authentication
-failures; `--live` also checks GitHub with the default platform trust bundle.
+failures. CI runs these controlled checks without external requests. For an optional manual check,
+add `--live` to exercise GitHub with the default platform trust bundle; its unauthenticated API
+quota is shared with other callers on the same public IP and can reject an otherwise valid request.
+Live release-metadata failures print the HTTP status and response body before exiting, so an
+upstream API refusal is distinguishable from transport or certificate failures.
 
 ### One native generation and its smoke receipt
 
@@ -886,24 +890,32 @@ facts to the new request without rerunning its nested providers. Replayed discov
 new request ledger; the event log records only queries actually started or hit. Source bytes belong
 to the held revision, with no host file snapshot or mutable filesystem provider in this API.
 
-`Semantic.revise` selects another immutable revision. The next demand validates retained source
-bytes and absent paths before reuse, so changed imported headers or newly present paths recompute
-affected facts and diagnostics against the new source. Unrelated source changes leave completed
-facts reusable. The source index retains completed presence or absence queries when their exact
-content observation agrees, including parsed syntax, authored HIR, and name indexes for unchanged
-files. Each parsed declaration also owns a lazy shared `BodyInput`: its exact source span and
-canonical header/body bytes are captured once for typed bodies, selected static roots, and reuse
-checks. Changed content releases its parsed unit and declaration inputs; a same-path edit never
-reuses different bytes.
-Previously issued authored cursors expire on every revision selection. A body can also retain its
-checked payload after a same-file or imported callee body edit when its own declaration and the semantic results it consumed still match. That
-validation starts a real query and records `Reuse`; it does not count as a `Hit`. Header and source
-queries can run again. A store opened with `Semantic.traced` keeps `Semantic.eventLog`, the queries
-actually run or hit; `Semantic.make` records no events, so a build keeps no per-demand log. Replaying a completed
-answer's evidence does not create synthetic nested hit events. `Semantic.sourceEvents` records source
-reads and name observations. The focused source-written M1 checks use these records to prove
-avoided provider reads and semantic demands; they do not measure speed. The native `build`
-mode consumes these demanded facts for its documented closed-body subset.
+`Semantic.update` selects another immutable revision. Before the next demand can choose a
+key, project a retained declaration handle, or reuse an answer, it reconciles every changed module
+already observed by that session. Intermediate deletion or module absence ends a handle even if the
+same declaration is restored before any demand. Surviving declarations keep their handle at their
+new source position.
+
+Semantic units record consumed source inputs and other units' results. Presence, complete name
+buckets, selected import syntax and targets, and nominal identity are separate source inputs.
+Changing an unrelated field or function does not invalidate a nominal identity or an unchanged
+selective import. Readers that have not been partitioned still record the source's exact bytes;
+this includes the current body, storage-shape and operation-signature readers. There is no general
+semantic-result cutoff: changed inputs invalidate their consumers and transitive result dependers.
+Unchanged inputs keep completed answers available for an ordinary cache hit.
+
+Successful selected imports retain declaration handles, not parse positions. Retained diagnostic
+locations have explicit guarded token-coordinate observations; recovery positions that are not token
+aligned retain a source-prefix observation. Successful relative typed-body origins continue to use
+the existing declaration anchors. Previously issued authored cursors expire on revision selection.
+A failed reconciliation prevents cache reuse and leaves pending history retryable.
+
+A store opened with `Semantic.traced` keeps `Semantic.eventLog`: actual query `Start`, `Hit`, and
+`Finish` events. `Semantic.make` records no per-demand events. Replaying a completed answer's
+source/dependency evidence does not synthesize nested query hits. `Semantic.sourceEvents` records
+source reads and name observations. A oneShot store computes the same semantic facts without
+revision-observation bookkeeping. The focused source tests assert reuse through event intervals,
+not timing; the native build consumes the demanded facts for its documented closed-body subset.
 
 The current semantic subset resolves local names, ordinary namespace imports, selective imports,
 explicit aliases, and a hybrid namespace alias with selected members. Qualified type names have
@@ -1450,14 +1462,14 @@ debug dump; the output is not a stable format.
 
 ## Representation and recovery
 
-`SyntaxTree` owns the source `Bytes`, the complete token vector (including trivia), a flat node
-vector, the root ID, and syntax diagnostics. A `NodeId` is exactly an index into that node vector.
+`SyntaxTree` owns the source `Bytes`, the complete token list (including trivia), a flat node
+list, the root ID, and syntax diagnostics. A `NodeId` is exactly an index into that node list.
 Children are appended before parents; the source-file root is last. Nodes contain only their
-kind, span, and direct `Element` vector. No child node or token payload is copied into a parent.
+kind, span, and direct `Element` list. No child node or token payload is copied into a parent.
 
-The parser reads significant tokens but retains trivia in the original token vector. Source bytes
+The parser reads significant tokens but retains trivia in the original token list. Source bytes
 allow contextual identifiers such as `where`, `with`, and `operator` to remain ordinary identifiers
-elsewhere. `Parser.parse` takes ownership of both the bytes and their corresponding token vector;
+elsewhere. `Parser.parse` takes ownership of both the bytes and their corresponding token list;
 those inputs must describe the same file.
 
 Missing tokens produce zero-width placeholders and diagnostics. Unexpected source is retained in
@@ -1470,9 +1482,9 @@ its first syntax diagnostic. A future compilation driver can stop on that diagno
 ## Lowered representation
 
 `hir/Hir.silk` defines the target of lowering: a `Module` is one postorder node arena where a
-`HirId` is exactly an index and children precede parents. A node owns no heap vector — single
+`HirId` is exactly an index and children precede parents. A node owns no heap list — single
 children are `HirId`, optional children are `HirRef`, and lists are `Range` runs into one shared
-child vector. Every byte string is interned through `hir/Intern.silk`, so a module holds no source
+child list. Every byte string is interned through `hir/Intern.silk`, so a module holds no source
 bytes and no `SyntaxTree`; `spans` and `nodeCauses` run parallel to `nodes` and keep coordinates
 only. Every tagged record of the bootstrap `AuthoredHir` has a counterpart variant; the module doc
 comment lists each deliberate difference.
@@ -1502,9 +1514,9 @@ library module, which is where an orphan would actually appear.
 
 `hir/Draft.silk` owns the module while it is being built. Every node enters the arena through
 `Draft.append`, which pushes one `nodes`, one `spans`, and one `nodeCauses` entry together, so the
-three parallel vectors cannot drift. Child lists and recovery-cause runs are collected on scratch
-vectors and copied into the module's shared storage when they close. Lexical binders use one flat
-vector with a frame-start stack, so opening and closing a scope truncates rather than allocates.
+three parallel lists cannot drift. Child lists and recovery-cause runs are collected on scratch
+lists and copied into the module's shared storage when they close. Lexical binders use one flat
+list with a frame-start stack, so opening and closing a scope truncates rather than allocates.
 The syntax accessors, the recovery-cause selection, and the name, path, and literal lowerings port
 the bootstrap `AuthoredLowering` helpers of the same names; the literal decoders port
 `internal/IntegerLiteral`, `internal/DurationLiteral`, `LiteralForm`, `StaticText`, and
@@ -1558,7 +1570,7 @@ reordering two declarations or interning extra strings beforehand leaves both en
 written order, which is the one place declaration order does count. The cache itself is out of
 scope; these are its primitives.
 
-CST construction remains postponed. The token vector retains source information, but there is no
+CST construction remains postponed. The token list retains source information, but there is no
 second concrete-syntax tree to maintain.
 
 Recursive rules share a budget of 32 active grammar operations. This counts parser operations,

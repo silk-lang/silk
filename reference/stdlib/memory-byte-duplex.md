@@ -325,7 +325,7 @@ pub count: usize
 
 The exact successful transfer prefix, or zero for lifecycle operations and failures.
 
-<a id="impl"></a>
+<a id="MemoryWriteAction.impl.Copy"></a>
 
 ## Implementation `Copy for MemoryWriteAction`
 
@@ -333,7 +333,7 @@ The exact successful transfer prefix, or zero for lifecycle operations and failu
 impl Copy for MemoryWriteAction
 ```
 
-<a id="impl-2"></a>
+<a id="MemoryByteDuplexAudit.impl.Copy"></a>
 
 ## Implementation `Copy for MemoryByteDuplexAudit`
 
@@ -351,7 +351,7 @@ pub struct MemoryByteDuplex
 
 A bounded scripted provider with owned input, output, and audit storage.
 
-<a id="impl-3"></a>
+<a id="MemoryByteDuplex.impl"></a>
 
 ## Implementation `MemoryByteDuplex`
 
@@ -359,14 +359,14 @@ A bounded scripted provider with owned input, output, and audit storage.
 impl MemoryByteDuplex
 ```
 
-<a id="impl.make"></a>
+<a id="MemoryByteDuplex.impl.make"></a>
 
 ### Associated function `make`
 
 ```silk
 pub effect fn make(
-    reads: Vector<MemoryReadEvent>,
-    writes: Vector<MemoryWriteEvent>,
+    reads: List<MemoryReadEvent>,
+    writes: List<MemoryWriteEvent>,
     outboundCapacity: usize,
     auditCapacity: usize,
     closeFailure: Option<i32>,
@@ -375,7 +375,7 @@ pub effect fn make(
 
 Constructs a bounded provider and preallocates every byte and audit slot used by operations.
 
-<a id="impl.outbound"></a>
+<a id="MemoryByteDuplex.impl.outbound"></a>
 
 ### Method `outbound`
 
@@ -385,7 +385,7 @@ pub fn outbound<'a>(self: &'a Self) -> &'a [u8]
 
 Returns the exact accepted output prefix in write order.
 
-<a id="impl.audit"></a>
+<a id="MemoryByteDuplex.impl.audit"></a>
 
 ### Method `audit`
 
@@ -395,7 +395,7 @@ pub fn audit<'a>(self: &'a Self) -> &'a [MemoryByteDuplexAudit]
 
 Returns the initialized audit prefix in operation order.
 
-<a id="impl.phase"></a>
+<a id="MemoryByteDuplex.impl.phase"></a>
 
 ### Method `phase`
 
@@ -405,7 +405,7 @@ pub fn phase(self: &Self) -> MemoryByteDuplexPhase
 
 Returns the current directional or terminal phase.
 
-<a id="impl.closeAttempts"></a>
+<a id="MemoryByteDuplex.impl.closeAttempts"></a>
 
 ### Method `closeAttempts`
 
@@ -415,7 +415,7 @@ pub fn closeAttempts(self: &Self) -> usize
 
 Returns the number of first and repeated terminal close calls.
 
-<a id="impl-4"></a>
+<a id="MemoryByteDuplex.impl.ByteDuplex"></a>
 
 ## Implementation `ByteDuplex for MemoryByteDuplex`
 
@@ -423,7 +423,7 @@ Returns the number of first and repeated terminal close calls.
 impl ByteDuplex for MemoryByteDuplex
 ```
 
-<a id="impl.readSomeRaw"></a>
+<a id="MemoryByteDuplex.impl.ByteDuplex.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -431,7 +431,7 @@ impl ByteDuplex for MemoryByteDuplex
 readSomeRaw: MemoryByteDuplex.read
 ```
 
-<a id="impl.writeSomeRaw"></a>
+<a id="MemoryByteDuplex.impl.ByteDuplex.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -439,7 +439,7 @@ readSomeRaw: MemoryByteDuplex.read
 writeSomeRaw: MemoryByteDuplex.write
 ```
 
-<a id="impl.flushRaw"></a>
+<a id="MemoryByteDuplex.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`
 
@@ -447,7 +447,7 @@ writeSomeRaw: MemoryByteDuplex.write
 flushRaw: MemoryByteDuplex.flushOutput
 ```
 
-<a id="impl.shutdownWriteRaw"></a>
+<a id="MemoryByteDuplex.impl.ByteDuplex.shutdownWriteRaw"></a>
 
 ### Operation `shutdownWriteRaw`
 
@@ -455,7 +455,7 @@ flushRaw: MemoryByteDuplex.flushOutput
 shutdownWriteRaw: MemoryByteDuplex.shutdownOutput
 ```
 
-<a id="impl.closeRaw"></a>
+<a id="MemoryByteDuplex.impl.ByteDuplex.closeRaw"></a>
 
 ### Operation `closeRaw`
 

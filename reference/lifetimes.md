@@ -287,10 +287,10 @@ allocation fits that count. Taking an initialized element transfers `T`, includi
 copying one requires `T: Copy` and retains those same lifetimes. Neither operation extends a
 reference into the buffer's own allocation beyond that allocation's lifetime.
 
-`Vector<T>` uses these operations in ordinary Silk source. Its empty constructor, ordinary
+`List<T>` uses these operations in ordinary Silk source. Its empty constructor, ordinary
 replacement and extraction operations, and insertion Effects with unit outcomes admit shared
 references and affine elements containing exclusive references. Extracted external references may
-survive the Vector while their backing owners remain valid. A Vector's Drop cleans its initialized
+survive the List while their backing owners remain valid. A List's Drop cleans its initialized
 elements before releasing storage, including after growth failure.
 
 A user Drop hook conservatively retains every component its declared receiver could observe.
@@ -310,4 +310,4 @@ reports `OWN0019`. Invalid replacement uses the ordinary type and lifetime diagn
 
 **Evidence:** owned-allocation requirements,
 dependent ownership tests,
-Vector tests.
+List tests.

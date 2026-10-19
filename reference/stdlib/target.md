@@ -5,7 +5,7 @@
 Typed compile-time facts for the selected compilation profile.
 
 ## When to use
-Use [`arch`](#impl.arch) and [`operatingSystem`](#impl.operatingSystem) to select source behavior for a machine. Use [`pointerBits`](#pointerBits)
+Use [`arch`](#Target.impl.arch) and [`operatingSystem`](#Target.impl.operatingSystem) to select source behavior for a machine. Use [`pointerBits`](#pointerBits)
 for pointer-sized arithmetic. Read logical artifact and runtime requests through `silk.compilation`.
 
 ## Details
@@ -260,7 +260,7 @@ The scope for Target operations.
 This owner carries no data. Select it with `import silk.target { Target }`
 to access its inherent operations.
 
-<a id="impl"></a>
+<a id="Target.impl"></a>
 
 ## Implementation `Target`
 
@@ -268,7 +268,7 @@ to access its inherent operations.
 impl Target
 ```
 
-<a id="impl.arch"></a>
+<a id="Target.impl.arch"></a>
 
 ### Associated function `arch`
 
@@ -278,7 +278,7 @@ pub static fn arch() -> Arch
 
 Returns the selected Arch during static evaluation.
 
-<a id="impl.operatingSystem"></a>
+<a id="Target.impl.operatingSystem"></a>
 
 ### Associated function `operatingSystem`
 
@@ -288,7 +288,7 @@ pub static fn operatingSystem() -> OperatingSystem
 
 Returns the selected OperatingSystem during static evaluation.
 
-<a id="impl.abi"></a>
+<a id="Target.impl.abi"></a>
 
 ### Associated function `abi`
 
@@ -298,7 +298,7 @@ pub static fn abi() -> Abi
 
 Returns the selected Abi during static evaluation.
 
-<a id="impl.objectFormat"></a>
+<a id="Target.impl.objectFormat"></a>
 
 ### Associated function `objectFormat`
 
@@ -308,7 +308,7 @@ pub static fn objectFormat() -> ObjectFormat
 
 Returns the selected ObjectFormat during static evaluation.
 
-<a id="impl.endianness"></a>
+<a id="Target.impl.endianness"></a>
 
 ### Associated function `endianness`
 
@@ -318,7 +318,7 @@ pub static fn endianness() -> Endianness
 
 Returns the selected Endianness during static evaluation.
 
-<a id="impl.cpu"></a>
+<a id="Target.impl.cpu"></a>
 
 ### Associated function `cpu`
 
@@ -328,7 +328,7 @@ pub static fn cpu() -> string<'static>
 
 Returns the logical cpu selection.
 
-<a id="impl.deployment"></a>
+<a id="Target.impl.deployment"></a>
 
 ### Associated function `deployment`
 
@@ -338,7 +338,7 @@ pub static fn deployment() -> string<'static>
 
 Returns the logical deployment selection.
 
-<a id="impl.hasCpuFeature"></a>
+<a id="Target.impl.hasCpuFeature"></a>
 
 ### Associated function `hasCpuFeature`
 

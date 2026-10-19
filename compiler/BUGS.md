@@ -359,7 +359,7 @@ descends through reference types, so a cleanup root holding `&mut Semantic` reac
 size. Even on `cb31280d`, the `Query.Entry ⊂ Semantic` question already holds about 1.2 million
 memo entries.
 
-Selfhost `c871c5ea` removed the borrowed field from the draft: the draft owns only its vectors,
+Selfhost `c871c5ea` removed the borrowed field from the draft: the draft owns only its lists,
 and `Semantic` reaches the walk separately.
 
 The overflow itself was in the memo key. Stopping the search at reference types was rejected: the

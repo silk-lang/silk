@@ -18,7 +18,7 @@ pub struct TomlText
 
 Operations on validated TOML string spellings.
 
-<a id="impl"></a>
+<a id="TomlText.impl"></a>
 
 ## Implementation `TomlText`
 
@@ -26,7 +26,7 @@ Operations on validated TOML string spellings.
 impl TomlText
 ```
 
-<a id="impl.copy"></a>
+<a id="TomlText.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -36,7 +36,7 @@ pub effect fn copy(raw: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator
 
 Copies validated bytes into owned storage.
 
-<a id="impl.decode"></a>
+<a id="TomlText.impl.decode"></a>
 
 ### Associated function `decode`
 

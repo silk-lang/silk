@@ -53,7 +53,7 @@ pub struct Pem
 
 Internal strict certificate PEM operations.
 
-<a id="impl"></a>
+<a id="Pem.impl"></a>
 
 ## Implementation `Pem`
 
@@ -61,7 +61,7 @@ Internal strict certificate PEM operations.
 impl Pem
 ```
 
-<a id="impl.skipAnnotations"></a>
+<a id="Pem.impl.skipAnnotations"></a>
 
 ### Associated function `skipAnnotations`
 
@@ -77,7 +77,7 @@ ASCII text and whitespace are annotations only between complete blocks. A line c
 a hyphen boundary, BEGIN or END is always sent to the strict block decoder, even when
 malformed or indented. Non-text control bytes are never discarded.
 
-<a id="impl.skipWhitespace"></a>
+<a id="Pem.impl.skipWhitespace"></a>
 
 ### Associated function `skipWhitespace`
 
@@ -91,7 +91,7 @@ Returns the first offset without a space, tab, CR, or LF byte.
 
 An offset at or beyond the input end returns the input length. This operation allocates nothing.
 
-<a id="impl.decodeNext"></a>
+<a id="Pem.impl.decodeNext"></a>
 
 ### Associated function `decodeNext`
 

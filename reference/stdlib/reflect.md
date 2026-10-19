@@ -88,7 +88,7 @@ The scope for Reflect operations.
 This owner carries no data. Select it with `import silk.reflect { Reflect }`
 to access its inherent operations.
 
-<a id="impl"></a>
+<a id="Reflect.impl"></a>
 
 ## Implementation `Reflect`
 
@@ -96,7 +96,7 @@ to access its inherent operations.
 impl Reflect
 ```
 
-<a id="impl.typeOf"></a>
+<a id="Reflect.impl.typeOf"></a>
 
 ### Associated function `typeOf`
 
@@ -106,7 +106,7 @@ pub static fn typeOf<Owner>() -> Intrinsic.Type<Owner>
 
 Returns the canonical aggregate type descriptor for `Owner`.
 
-<a id="impl.fields"></a>
+<a id="Reflect.impl.fields"></a>
 
 ### Associated function `fields`
 
@@ -116,7 +116,7 @@ pub static fn fields<Owner>() -> Intrinsic.Fields<Owner>
 
 Returns declaration-ordered descriptors for fields visible from this wrapper.
 
-<a id="impl.typeKind"></a>
+<a id="Reflect.impl.typeKind"></a>
 
 ### Associated function `typeKind`
 
@@ -126,7 +126,7 @@ pub static fn typeKind<Owner>(descriptor: Intrinsic.Type<Owner>) -> u8
 
 Returns the stable aggregate-kind code for `descriptor`.
 
-<a id="impl.fieldKind"></a>
+<a id="Reflect.impl.fieldKind"></a>
 
 ### Associated function `fieldKind`
 
@@ -136,7 +136,7 @@ pub static fn fieldKind<Owner, Value>(field: Intrinsic.Field<Owner, Value>) -> u
 
 Returns whether `field` carries a label or a position.
 
-<a id="impl.fieldLabel"></a>
+<a id="Reflect.impl.fieldLabel"></a>
 
 ### Associated function `fieldLabel`
 
@@ -146,7 +146,7 @@ pub static fn fieldLabel<Owner, Value>(field: Intrinsic.Field<Owner, Value>) -> 
 
 Returns the source label of a labeled field.
 
-<a id="impl.fieldOrdinal"></a>
+<a id="Reflect.impl.fieldOrdinal"></a>
 
 ### Associated function `fieldOrdinal`
 
@@ -156,7 +156,7 @@ pub static fn fieldOrdinal<Owner, Value>(field: Intrinsic.Field<Owner, Value>) -
 
 Returns the source position of a positional field.
 
-<a id="impl.borrowField"></a>
+<a id="Reflect.impl.borrowField"></a>
 
 ### Associated function `borrowField`
 

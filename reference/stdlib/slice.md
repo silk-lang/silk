@@ -5,7 +5,7 @@
 Allocation-free views of contiguous initialized elements.
 
 ## When to use
-Use [`view`](#impl.view) to borrow a subrange of an existing slice without copying its elements.
+Use [`view`](#Slice.impl.view) to borrow a subrange of an existing slice without copying its elements.
 
 ## Details
 Views retain the input lifetime. Bounds follow indexing: an invalid range traps.
@@ -25,7 +25,7 @@ pub struct Slice
 
 The owner of operations that borrow ranges of existing slices.
 
-<a id="impl"></a>
+<a id="Slice.impl"></a>
 
 ## Implementation `Slice`
 
@@ -33,7 +33,7 @@ The owner of operations that borrow ranges of existing slices.
 impl Slice
 ```
 
-<a id="impl.view"></a>
+<a id="Slice.impl.view"></a>
 
 ### Associated function `view`
 

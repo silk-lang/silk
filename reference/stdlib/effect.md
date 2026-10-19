@@ -7,14 +7,14 @@ and controlling sequencing and cleanup.
 
 ## When to use
 An `Effect<A ! E ? R>` describes a computation with three visible channels: it can Result.succeed with
-`A`, fail with typed value `E`, and require providers `R`. Use [`map`](#impl.map) and [`flatMap`](#impl.flatMap) to continue
-success, [`mapError`](#impl.mapError), [`catch`](#impl.catch), or [`catchAll`](#impl.catchAll) for typed failures, [`provide`](#impl.provide) or [`provideMut`](#impl.provideMut)
-for lexical services, and [`ensuring`](#impl.ensuring) for typed-outcome cleanup. Direct `run` remains clearest
+`A`, fail with typed value `E`, and require providers `R`. Use [`map`](#Effect.impl.map) and [`flatMap`](#Effect.impl.flatMap) to continue
+success, [`mapError`](#Effect.impl.mapError), [`catch`](#Effect.impl.catch), or [`catchAll`](#Effect.impl.catchAll) for typed failures, [`provide`](#Effect.impl.provide) or [`provideMut`](#Effect.impl.provideMut)
+for lexical services, and [`ensuring`](#Effect.impl.ensuring) for typed-outcome cleanup. Direct `run` remains clearest
 for straightforward sequential code.
 
 ## Details
 Combinators are lazy: passing an Effect does not run it. Most accept a `once Effect`, so that
-particular value can execute at most once; [`retry`](#impl.retry) explicitly accepts a reusable Effect.
+particular value can execute at most once; [`retry`](#Effect.impl.retry) explicitly accepts a reusable Effect.
 Sequential combinators stop at the first typed failure unless a recovery operation handles it.
 Their signatures show how failure and requirement rows combine, so composing two steps normally
 produces the unions `! E | F` and `? R | S`.
@@ -26,7 +26,7 @@ owned provider bindings have distinct borrowing and capture behavior.
 
 ## Gotchas
 Typed failures are outcomes that combinators can materialize and recover. Traps are not: they bypass
-[`catchAll`](#impl.catchAll), [`ensuring`](#impl.ensuring), and Drop hooks. [`suspend`](#impl.suspend) crosses the stack-safe execution boundary
+[`catchAll`](#Effect.impl.catchAll), [`ensuring`](#Effect.impl.ensuring), and Drop hooks. [`suspend`](#Effect.impl.suspend) crosses the stack-safe execution boundary
 while preserving all three channels exactly; frame exhaustion is fatal.
 
 ## Examples
@@ -141,7 +141,7 @@ inherent member declared in `impl Effect`, so `import silk.effect { Effect }` is
 that reaches `Effect.map(...)`, `Effect.catchAll(...)`, and the rest. It is unrelated to the
 builtin `Effect<A ! E ? R>` type, which needs no import.
 
-<a id="impl"></a>
+<a id="Effect.impl"></a>
 
 ## Implementation `Effect`
 
@@ -149,7 +149,7 @@ builtin `Effect<A ! E ? R>` type, which needs no import.
 impl Effect
 ```
 
-<a id="impl.log"></a>
+<a id="Effect.impl.log"></a>
 
 ### Associated function `log`
 
@@ -165,9 +165,9 @@ Sends one complete message at `LogLevel.Info` through the required mutable [`Log
 #### Details
 
 The logger decides where the message goes. Logging may fail with [`LogError`](./logger.md#LogError), and this wrapper
-neither buffers nor recovers that failure. Use [`logAt`](#impl.logAt) when the level is not Info.
+neither buffers nor recovers that failure. Use [`logAt`](#Effect.impl.logAt) when the level is not Info.
 
-<a id="impl.logAt"></a>
+<a id="Effect.impl.logAt"></a>
 
 ### Associated function `logAt`
 
@@ -186,7 +186,7 @@ Sends one complete message at `level` through the required mutable [`Logger`](./
 The message is one logging event rather than a fragment. The provider controls formatting and
 destination; its [`LogError`](./logger.md#LogError) propagates unchanged.
 
-<a id="impl.logTrace"></a>
+<a id="Effect.impl.logTrace"></a>
 
 ### Associated function `logTrace`
 
@@ -199,7 +199,7 @@ pub effect fn logTrace<Args>(
 
 Sends one complete message at `LogLevel.Trace` through the required mutable [`Logger`](./logger.md#Logger).
 
-<a id="impl.logDebug"></a>
+<a id="Effect.impl.logDebug"></a>
 
 ### Associated function `logDebug`
 
@@ -212,7 +212,7 @@ pub effect fn logDebug<Args>(
 
 Sends one complete message at `LogLevel.Debug` through the required mutable [`Logger`](./logger.md#Logger).
 
-<a id="impl.logInfo"></a>
+<a id="Effect.impl.logInfo"></a>
 
 ### Associated function `logInfo`
 
@@ -225,7 +225,7 @@ pub effect fn logInfo<Args>(
 
 Sends one complete message at `LogLevel.Info` through the required mutable [`Logger`](./logger.md#Logger).
 
-<a id="impl.logWarning"></a>
+<a id="Effect.impl.logWarning"></a>
 
 ### Associated function `logWarning`
 
@@ -238,7 +238,7 @@ pub effect fn logWarning<Args>(
 
 Sends one complete message at `LogLevel.Warning` through the required mutable [`Logger`](./logger.md#Logger).
 
-<a id="impl.logError"></a>
+<a id="Effect.impl.logError"></a>
 
 ### Associated function `logError`
 
@@ -251,7 +251,7 @@ pub effect fn logError<Args>(
 
 Sends one complete message at `LogLevel.Error` through the required mutable [`Logger`](./logger.md#Logger).
 
-<a id="impl.result"></a>
+<a id="Effect.impl.result"></a>
 
 ### Associated function `result`
 
@@ -294,7 +294,7 @@ pub fn main() -> i32 {
 }
 ```
 
-<a id="impl.mapBoth"></a>
+<a id="Effect.impl.mapBoth"></a>
 
 ### Method `mapBoth`
 
@@ -314,7 +314,7 @@ Exactly one callback runs after `self`: `onSuccess` changes `A` to `B`, while `o
 `E` to `F` and re-raises it. Requirements are preserved, and traps bypass both callbacks.
 When diagnostic observation is active, the mapped failure retains the original selected cause.
 
-<a id="impl.map"></a>
+<a id="Effect.impl.map"></a>
 
 ### Method `map`
 
@@ -330,9 +330,9 @@ Applies a pure callback to success while preserving typed failure and requiremen
 #### Details
 
 `onSuccess` runs once only after `self` succeeds. A typed failure propagates without invoking the
-callback. Use [`flatMap`](#impl.flatMap) when the callback itself needs an Effect.
+callback. Use [`flatMap`](#Effect.impl.flatMap) when the callback itself needs an Effect.
 
-<a id="impl.mapError"></a>
+<a id="Effect.impl.mapError"></a>
 
 ### Method `mapError`
 
@@ -348,10 +348,10 @@ Applies a pure callback to typed failure while preserving success and requiremen
 #### Details
 
 `onFailure` runs once only when `self` fails, and its returned `F` becomes the new typed failure.
-Success bypasses the callback. This changes an error value; use [`catchAll`](#impl.catchAll) to recover to success.
+Success bypasses the callback. This changes an error value; use [`catchAll`](#Effect.impl.catchAll) to recover to success.
 Mapping runs inside selected recovery, preserving the original failure as its diagnostic cause.
 
-<a id="impl.flatMap"></a>
+<a id="Effect.impl.flatMap"></a>
 
 ### Method `flatMap`
 
@@ -372,7 +372,7 @@ use direct `run` statements when named intermediate values are clearer.
 The success input remains valid through the returned Effect's execution and cleanup, including suspension and cancellation.
 The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
-<a id="impl.flatten"></a>
+<a id="Effect.impl.flatten"></a>
 
 ### Method `flatten`
 
@@ -387,9 +387,9 @@ Runs an outer Effect and then the inner Effect it produces.
 #### Details
 
 If the outer Effect fails, no inner Effect is available or run. The two failure rows and the two
-requirement rows are joined. `Effect.flatten(nested)` is the nested-Effect form of [`flatMap`](#impl.flatMap).
+requirement rows are joined. `Effect.flatten(nested)` is the nested-Effect form of [`flatMap`](#Effect.impl.flatMap).
 
-<a id="impl.zip"></a>
+<a id="Effect.impl.zip"></a>
 
 ### Method `zip`
 
@@ -408,7 +408,7 @@ Runs two Effects in declaration order and collects both success values.
 the second step. Both failure and requirement rows are joined. Use the public `Pair.first` and
 `Pair.second` fields to read the results; this is sequencing, not parallel execution.
 
-<a id="impl.zip3"></a>
+<a id="Effect.impl.zip3"></a>
 
 ### Method `zip3`
 
@@ -428,7 +428,7 @@ The operands run from left to right. Each later operand is skipped if an earlier
 all three failure and requirement rows are joined. Use this fixed-arity operation when all three
 successful values are needed together; it does not run them concurrently.
 
-<a id="impl.tap"></a>
+<a id="Effect.impl.tap"></a>
 
 ### Method `tap`
 
@@ -450,7 +450,7 @@ callback is skipped when `self` fails.
 The success input remains valid through the returned Effect's execution and cleanup, including suspension and cancellation.
 The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
-<a id="impl.catchAll"></a>
+<a id="Effect.impl.catchAll"></a>
 
 ### Method `catchAll`
 
@@ -467,13 +467,13 @@ Recovers every typed failure in the protected row with another Effect.
 
 The handler receives the complete failure value and runs only on typed failure. The protected
 failure row is removed in full; only the handler's own `F` can fail afterwards. Success bypasses
-the handler, requirements from both paths remain, and traps are not recovered. Use [`catch`](#impl.catch) to
+the handler, requirements from both paths remain, and traps are not recovered. Use [`catch`](#Effect.impl.catch) to
 handle one selected member while leaving the other failures in the row.
 The handler's returned Effect runs once and can consume captured values.
 The failure input remains valid through execution, suspension, cancellation, and cleanup.
 The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
-<a id="impl.catch"></a>
+<a id="Effect.impl.catch"></a>
 
 ### Method `catch`
 
@@ -495,12 +495,12 @@ the protected row propagates unchanged as the residual. Success bypasses the han
 
 A success bypasses the handler. A matching `S` invokes it once; nonmatching typed failures
 propagate in `Without<E, S>`, and the handler's failures join as `F`. Requirements from either
-path remain. Traps are not selected or recovered. Use [`catchAll`](#impl.catchAll) when the handler should receive
+path remain. Traps are not selected or recovered. Use [`catchAll`](#Effect.impl.catchAll) when the handler should receive
 the entire failure value regardless of its union member.
 The selected failure input remains valid through execution, suspension, cancellation, and cleanup.
 The returned Effect cannot escape that invocation scope. Captured values retain their separate lifetime requirements.
 
-<a id="impl.ensuring"></a>
+<a id="Effect.impl.ensuring"></a>
 
 ### Method `ensuring`
 
@@ -534,7 +534,7 @@ remaining captures exactly once; it does not resume or finish the finalizer.
 A trap is not an outcome. It bypasses the finalizer exactly as it bypasses `Effect.catch` and
 every Drop hook.
 
-<a id="impl.ensuringNonParking"></a>
+<a id="Effect.impl.ensuringNonParking"></a>
 
 ### Method `ensuringNonParking`
 
@@ -557,7 +557,7 @@ Runs a nonparking finalizer on every structured Effect exit and preserves the or
 #### When to use
 
 Use this operation when structured cancellation must release a scoped resource before it
-destroys the protected execution. Use [`ensuring`](#impl.ensuring) when the finalizer can suspend.
+destroys the protected execution. Use [`ensuring`](#Effect.impl.ensuring) when the finalizer can suspend.
 
 #### Details
 
@@ -570,7 +570,7 @@ Nested scopes finalize in reverse order. The original outcome remains unchanged.
 The finalizer must satisfy `Intrinsic.NonParking`. Fatal traps bypass this finalizer and all
 Drop hooks. Recover a fallible release before you pass it to this operation.
 
-<a id="impl.useReleaseNonParking"></a>
+<a id="Effect.impl.useReleaseNonParking"></a>
 
 ### Associated function `useReleaseNonParking`
 
@@ -613,7 +613,7 @@ preserved. The release Effect must satisfy `Intrinsic.NonParking`.
 Fatal traps bypass release and all Drop hooks. Recover a fallible release to `! never` before
 returning it from the callback.
 
-<a id="impl.ifThenElse"></a>
+<a id="Effect.impl.ifThenElse"></a>
 
 ### Associated function `ifThenElse`
 
@@ -647,7 +647,7 @@ arms must agree on the success type.
 The name is `ifThenElse` rather than `if` because `if` is a keyword and Silk has no
 raw-identifier form, so the declaration itself could not be spelled `if`.
 
-<a id="impl.retry"></a>
+<a id="Effect.impl.retry"></a>
 
 ### Method `retry`
 
@@ -667,7 +667,7 @@ Earlier failure payloads are released before the next attempt; the last failure 
 `retries == 0` means one initial attempt. Traps are not retried, and `self` must be reusable
 (`mut Effect`) because the same computation may execute more than once.
 
-<a id="impl.bindRequirement"></a>
+<a id="Effect.impl.bindRequirement"></a>
 
 ### Method `bindRequirement`
 
@@ -688,7 +688,7 @@ or one unique service-conformance witness, but a shared provider selects only a 
 requirement. Subtraction removes that exact stored capability-role-access member. The borrow is
 lexical: the provider remains owned by the caller after the Effect completes.
 
-<a id="impl.bindRequirementMut"></a>
+<a id="Effect.impl.bindRequirementMut"></a>
 
 ### Method `bindRequirementMut`
 
@@ -708,7 +708,7 @@ An exclusive provider may satisfy a stored shared or exclusive requirement. The 
 still the exact stored member, so providing `&mut P` for a shared `&Logger` removes `&Logger`, not
 a synthesized `&mut Logger`. The caller regains exclusive access after the Effect completes.
 
-<a id="impl.bindRequirementOwned"></a>
+<a id="Effect.impl.bindRequirementOwned"></a>
 
 ### Method `bindRequirementOwned`
 
@@ -728,7 +728,7 @@ Owned selection accepts shared or exclusive stored requirements. Moving an affin
 the resulting Effect take-once; an ordinary Copy provider is captured by snapshot and remains
 repeatable. The provider is released with the Effect's lexical scope; it is not returned.
 
-<a id="impl.provide"></a>
+<a id="Effect.impl.provide"></a>
 
 ### Method `provide`
 
@@ -744,10 +744,10 @@ Provides a shared service for one lexical Effect execution.
 
 #### Details
 
-This is the user-facing alias of [`bindRequirement`](#impl.bindRequirement). The provider is borrowed, the exact selected
+This is the user-facing alias of [`bindRequirement`](#Effect.impl.bindRequirement). The provider is borrowed, the exact selected
 shared row member is removed, and every unrelated requirement remains visible in the return type.
 
-<a id="impl.provideMut"></a>
+<a id="Effect.impl.provideMut"></a>
 
 ### Method `provideMut`
 
@@ -803,7 +803,7 @@ pub fn main() -> i32 {
 }
 ```
 
-<a id="impl.provideEffect"></a>
+<a id="Effect.impl.provideEffect"></a>
 
 ### Method `provideEffect`
 
@@ -825,7 +825,7 @@ successful provider is borrowed exclusively while `self` runs and is released be
 therefore acquires a fresh provider for each attempt. The result keeps acquisition requirements
 `Q` and every requirement in `R` except the selected entry `S`.
 
-<a id="impl.suspend"></a>
+<a id="Effect.impl.suspend"></a>
 
 ### Associated function `suspend`
 
@@ -844,7 +844,7 @@ belong to the compiler-owned execution stack, whose exhaustion is a fatal trap. 
 recursive or deeply chained boundary that must yield through the stack-safe Effect executor;
 ordinary laziness alone does not require suspension.
 
-<a id="impl.of"></a>
+<a id="Effect.impl.of"></a>
 
 ### Associated function `of`
 
@@ -861,7 +861,7 @@ the returned Effect does not produce that value until execution. The Effect has 
 or requirement channels. For an affine value, constructing the Effect transfers ownership into
 it, so that Effect can be consumed only once.
 
-<a id="impl.sleep"></a>
+<a id="Effect.impl.sleep"></a>
 
 ### Associated function `sleep`
 
@@ -887,7 +887,7 @@ A zero duration needs no positive timeline advance. An unrepresentable absolute 
 pub struct Pair<A, B>
 ```
 
-Two success values collected in operand order by [`zip`](#impl.zip).
+Two success values collected in operand order by [`zip`](#Effect.impl.zip).
 
 <a id="Pair.first"></a>
 
@@ -917,7 +917,7 @@ The second Effect's success value.
 pub struct Triple<A, B, C>
 ```
 
-Three success values collected in operand order by [`zip3`](#impl.zip3).
+Three success values collected in operand order by [`zip3`](#Effect.impl.zip3).
 
 <a id="Triple.first"></a>
 

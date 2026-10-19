@@ -121,7 +121,7 @@ ordinary source analysis, explicit imports, and source navigation.
 **Status:** Confirmed
 
 Only closed language bindings exist without source imports. Standard-library actors—including
-`Option`, `Result`, `Effect`, scalar operation actors, `Vector`, `String`, services, and provider
+`Option`, `Result`, `Effect`, scalar operation actors, `List`, `String`, services, and provider
 types—enter a module scope only through explicit imports.
 
 ```silk
@@ -269,10 +269,10 @@ resource.
 
 ```silk,ignore
 import silk.allocator { Allocator, OutOfMemoryError }
-import silk.vector { Vector }
+import silk.list { List }
 
-effect fn copyValues(values: &[i32]) -> Vector<i32> ! OutOfMemoryError ? &mut Allocator {
-  let mut result = Vector<i32>.make()
+effect fn copyValues(values: &[i32]) -> List<i32> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<i32>.make()
   // append operations state their allocation contract
   return move result
 }
@@ -1140,7 +1140,7 @@ offline importer.
 
 `silk.trust_snapshot { TrustSnapshot, SnapshotLimits, TrustLoadLimits, TrustSourceError }`
 represents one opaque, immutable owner of an ordered sequence of explicit `TrustAnchor` values.
-`fromAnchors` consumes an existing vector without allocation after checking its complete count and
+`fromAnchors` consumes an existing list without allocation after checking its complete count and
 aggregate retained byte size. Empty explicit trust is valid and authenticates no peer. `fromPem`
 strictly decodes one or more certificates, transfers their owners into unconstrained anchors, and
 rejects empty or whitespace-only input. Both constructors preserve every input position and
