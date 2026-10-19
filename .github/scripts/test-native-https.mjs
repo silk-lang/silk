@@ -72,9 +72,21 @@ try {
   ])
   assert.equal(build.status, 0, JSON.stringify(build))
 
-  // Own request defaults: LibreSSL can append -addext to the host's CA extensions.
-  writeFileSync(join(directory, 'request.cnf'), '[req]\ndistinguished_name = subject\n[subject]\n')
   // Match the compatibility gap: P-256 leaf and intermediate, P-384 authority, SHA-384 CA signature.
+  // Host req defaults can already contain CA extensions. LibreSSL appends -addext values to
+  // those defaults, producing duplicate extensions. Keep the test PKI in one explicit config.
+  writeFileSync(
+    join(directory, 'request.cnf'),
+    `[req]
+distinguished_name = dn
+[dn]
+[root]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+[unrelated]
+basicConstraints = critical,CA:TRUE
+`,
+  )
   openssl('ecparam', '-name', 'secp384r1', '-genkey', '-noout', '-out', 'root.key')
   openssl(
     'req',
@@ -89,10 +101,8 @@ try {
     '2',
     '-subj',
     '/CN=Silk HTTPS Test Root',
-    '-addext',
-    'basicConstraints=critical,CA:TRUE',
-    '-addext',
-    'keyUsage=critical,keyCertSign,cRLSign',
+    '-extensions',
+    'root',
     '-out',
     'root.pem',
   )
@@ -109,8 +119,8 @@ try {
     '2',
     '-subj',
     '/CN=Unrelated Test Root',
-    '-addext',
-    'basicConstraints=critical,CA:TRUE',
+    '-extensions',
+    'unrelated',
     '-out',
     'unrelated.pem',
   )
