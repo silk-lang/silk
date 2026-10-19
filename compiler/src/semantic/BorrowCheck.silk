@@ -4640,6 +4640,126 @@ effect fn sourceStaleDefinition<'body>(graph: &SourceGraph.Graph<'body>, control
   return result
 }
 
+// A stale definition reports its actual defining operation before looking for a later use.
+// The stored Value can have been evaluated earlier; it never supplies the writer's span.
+effect fn sourceDefinitionUse<'body>(graph: &SourceGraph.Graph<'body>, control: &SourceControlProjection,
+  storage: &SourceStorageProjection, id: SourceControl.DefinitionId, fallback: Location)
+  -> SourceRequiredUse ! OutOfMemoryError ? &mut Allocator {
+  let definition = SourceGraph.Graph.definition(graph, id)
+  let prepared = SourceGraph.Graph.preparation(graph)
+  if let Option<SourceGraph.EvalId>.Some {value: writer} = definition.writer {
+    let actual = SourceGraph.Graph.evaluation(graph, writer)
+    if actual.point.index != definition.point.index { return CompilerBug.panic(b"stale definition lost its actual writer point") }
+    if let SourceGraph.EvaluationSite.Node {node} = actual.site {
+      let span = prepared.body.nodes[node.index].origin.location
+      if span.end > span.start { return SourceRequiredUse {evidence: CallerSource.Actual, span: span} }
+    } else { return CompilerBug.panic(b"body-entry definition acquired a node writer") }
+  }
+  let points = List<Point>.asSlice(&control.points)
+  let reads = List<SourceGraph.ReadView>.asSlice(&storage.reads)
+  let maps = List<PreparedSources.SelectionMap>.asSlice(&prepared.maps)
+  let actualPoints = List<SourceControl.Point>.asSlice(&SourceGraph.Graph.control(graph).points)
+  let mut result = SourceRequiredUse {evidence: CallerSource.Absent, span: fallback}
+  let mut step = usize.ONE
+  while step < points.length {
+    let point = (definition.point.index + step) % points.length
+    if run pathReaches(points, definition.point.index, point) {
+      let mut at = usize.ZERO
+      while at < reads.length {
+        let read = reads[at]
+        if read.point.index == point && sourceSameStorage(definition.storage, read.storage) {
+          if let Option<SourceAtom>.Some {value: pair} = sourceFlowPair(SourceGraph.Graph.control(graph), id, read.id) {
+            let paired = sourceTruthAnd(SourceGraph.Graph.truth(graph, pair), SourceGraph.Graph.truth(graph, actualPoints[point].reachable))
+            if paired != SourceTruth.False {
+              let placements = run SourceGraph.Graph.readPlacementsByRead(graph, read.id)
+              let placements = List<SourceGraph.ReadPlacement>.asSlice(&placements)
+              let mut each = usize.ZERO
+              while each < placements.length {
+                let placement = placements[each]
+                let consumer = SourceGraph.Graph.value(graph, placement.consumer)
+                let evaluation = SourceGraph.Graph.evaluation(graph, consumer.evaluation)
+                if placement.read.index != read.id.index || consumer.phase != SourceGraph.ValuePhase.Input
+                  || consumer.evaluation.index != placement.result.index || evaluation.point.index != point
+                  || placement.map.index >= maps.length || maps[placement.map.index].kind != PreparedSources.MapKind.Copy
+                  || maps[placement.map.index].target.index != consumer.endpoint.index {
+                  return CompilerBug.panic(b"stale definition use lost its original read consumer")
+                }
+                if sourceSameStorage(definition.storage, placement.storage) {
+                  let active = sourceTruthAnd(paired, SourceGraph.Graph.truth(graph, placement.active))
+                  if active != SourceTruth.False {
+                    if active == SourceTruth.Undefined || control.unresolved { result.evidence = CallerSource.Unknown }
+                    else if let SourceGraph.EvaluationSite.Node {node} = evaluation.site {
+                      return SourceRequiredUse {evidence: CallerSource.Actual, span: prepared.body.nodes[node.index].origin.location}
+                    } else { result.evidence = CallerSource.Unknown }
+                  }
+                }
+                each = each + usize.ONE
+              }
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+    step = step + usize.ONE
+  }
+  return result
+}
+
+fn sourceTemporaryOwner(owners: &[SourceVisit.Owner], locals: usize, root: usize) -> bool {
+  if root < locals || root - locals >= owners.length { return false }
+  return match owners[root - locals].root { SourceVisit.OwnerRoot.Temporary {..} => true _ => false }
+}
+
+// A storage end retains field-sensitive needs, current flight and copied stale histories.
+// Unknown acquisition/control evidence cannot become a concrete expiration diagnostic.
+effect fn sourceEndLoan<'input, 'body>(input: &SourceRegionInput<'input, 'body>, settled: &SourceSettledLoans,
+  callers: &SourceCallerProjection, occupancy: &SourceLoanOccupancy, needs: &SourceLoanNeeds,
+  holders: &SourceHolderLiveness, event: &Event, uncertain: bool, returnedEscape: bool,
+  paths: &mut List<ReplacementReach>, reports: &mut List<Report>) -> SourceAccessDecision
+! OutOfMemoryError ? &mut Allocator {
+  let loans = List<Loan>.asSlice(&settled.loans)
+  let activities = List<SourceTruth>.asSlice(&settled.activity)
+  let index = occupancy.loan
+  if index >= loans.length || activities.length != loans.length { return CompilerBug.panic(b"storage end lost its actual loan") }
+  if event.kind != Kind.End && event.kind != Kind.Expire { return CompilerBug.panic(b"storage-end classifier received an ordinary access") }
+  let loan = &loans[index]
+  let mut result = SourceAccessDecision {reported: false, unresolved: false}
+  if !loan.local || (loan.bound && returnedEscape) || !covers(&event.place, &loan.place)
+    || activities[index] == SourceTruth.False { return result }
+  let live = run sourceLoanLiveAt(input.graph, input.control, settled, callers, occupancy, needs, holders,
+    input.intervals, input.views, input.viewMissing, event.point, true, &mut paths.*)
+  let evidence = sourceLiveEvidence(&live)
+  let mut stale = SourceStaleDefinition {evidence: CallerSource.Absent, definition: Option<SourceControl.DefinitionId>.none()}
+  if evidence != CallerSource.Actual {
+    stale = run sourceStaleDefinition(input.graph, input.control, input.storage, occupancy, needs, loan, event.point)
+  }
+  if evidence != CallerSource.Actual && stale.evidence != CallerSource.Actual {
+    result.unresolved = evidence == CallerSource.Unknown || stale.evidence == CallerSource.Unknown
+    return result
+  }
+  if uncertain || activities[index] != SourceTruth.True
+    || loan.precision == LoanPrecision.Alternatives || loan.precision == LoanPrecision.Unknown {
+    result.unresolved = true
+    return result
+  }
+  let mut required = SourceRequiredUse {evidence: CallerSource.Absent, span: event.span}
+  if stale.evidence == CallerSource.Actual {
+    let definition = match stale.definition {
+      Option<SourceControl.DefinitionId>.Some {value} => value
+      _ => { return CompilerBug.panic(b"actual stale source has no physical definition") }
+    }
+    required = run sourceDefinitionUse(input.graph, input.control, input.storage, definition, event.span)
+  } else if live.flight != CallerSource.Actual || sourceTemporaryOwner(input.owners,
+    SourceGraph.Graph.preparation(input.graph).body.locals.length, loan.place.root) {
+    required = run sourceExpiredUse(input.graph, input.control, input.storage, index, event, false)
+  }
+  result.unresolved = required.evidence == CallerSource.Unknown
+  run addReport(&mut reports.*, Report {code: expiredCode(), access: required.span, related: true, earlier: loan.origin})
+  result.reported = true
+  return result
+}
+
 // Build the existing availability solver's inputs from original definitions and paired source
 // cases. A copy is licensed by its actual input history; occupying the same region or appearing
 // earlier in the definition inventory supplies no copy edge.
