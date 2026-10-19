@@ -1,0 +1,544 @@
+//! Complete structural evaluation order for source and ownership analysis.
+//!
+//! Reservation emits one SourceFlow CFG into SourceAnalysis.Skeleton. It never inspects a
+//! solved source, loan precision, policy result or checker-outside flag. Consumers attach source
+//! transport and ownership actions to these actual occurrences before that same graph is solved.
+
+import hir.Hir {InfixOperator}
+import semantic.SourceAnalysis {Skeleton, EvalId, EvaluationRole}
+import semantic.SourceFlow {Flow, PointId}
+import semantic.SourceRules {Atom, Program}
+import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState}
+import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace}
+import semantic.Type {Type}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.shared {Shared}
+import silk.usize
+import silk.vector {Vector}
+import CompilerBug
+
+/// Addressing a place does not copy its stored value. Dereferencing it still evaluates the
+/// reference descriptor, and an index expression still executes in source order.
+pub enum Access { Value, Place }
+pub enum ScopeKind { Body, Block, Statement, Arm }
+pub enum ExitKind { Normal, Return, Failure, Break, Continue, RunFailure }
+pub struct ScopeId { pub index: usize }
+impl Copy for ScopeId {}
+
+pub struct Scope {
+  pub node: NodeId
+  pub kind: ScopeKind
+  pub parent: Option<ScopeId>
+}
+
+pub struct ScopeExit {
+  pub scope: ScopeId
+  pub point: PointId
+  pub cause: NodeId
+  pub kind: ExitKind
+}
+
+pub struct Input {
+  pub node: NodeId
+  pub evaluation: EvalId
+  pub access: Access
+}
+impl Copy for Input {}
+
+/// A single actual evaluation, separate from its enclosing operation's use of the result.
+/// `execute` is reached even for a never-returning call. Its successful output evaluation can
+/// instead be unreachable; this distinction must survive into operation effects and queries.
+pub struct Visit {
+  pub node: NodeId
+  pub evaluation: EvalId
+  pub execute: PointId
+  pub access: Access
+  pub scope: ScopeId
+  pub inputs: Vector<Input>
+}
+
+pub struct Loop {
+  pub node: NodeId
+  pub before: PointId
+  pub header: PointId
+  pub exit: PointId
+  pub backedges: Vector<PointId>
+}
+
+pub struct Reservation {
+  pub skeleton: Skeleton
+  pub entry: PointId
+  pub exit: PointId
+  pub visits: Vector<Visit>
+  pub scopes: Vector<Scope>
+  pub exits: Vector<ScopeExit>
+  pub loops: Vector<Loop>
+}
+
+struct Frame { repeat: usize, scopeDepth: usize }
+impl Copy for Frame {}
+struct Subject { node: NodeId, evaluation: EvalId, scope: ScopeId }
+impl Copy for Subject {}
+struct Walk {
+  reservation: Reservation
+  active: Vector<ScopeId>
+  frames: Vector<Frame>
+  subjects: Vector<Subject>
+  yes: Atom
+}
+struct Completed { evaluation: EvalId, next: PointId }
+impl Copy for Completed {}
+
+pub effect fn reserve<'body>(prepared: &SourcePreparation<'body>) -> Reservation
+! OutOfMemoryError ? &mut Allocator {
+  let mut skeleton = Skeleton.make()
+  let yes = Program.atom(&mut skeleton.rules)
+  run Program.fact(&mut skeleton.rules, yes)
+  let entry = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  let exit = run Flow.point(&mut skeleton.flow, &mut skeleton.rules)
+  run Program.fact(&mut skeleton.rules, Flow.reachable(&skeleton.flow, entry))
+  let mut walk = Walk {reservation: Reservation {skeleton: move skeleton, entry: entry, exit: exit,
+    visits: Vector<Visit>.make(), scopes: Vector<Scope>.make(), exits: Vector<ScopeExit>.make(), loops: Vector<Loop>.make()},
+    active: Vector<ScopeId>.make(), frames: Vector<Frame>.make(), subjects: Vector<Subject>.make(), yes: yes}
+  run openScope(&mut walk, prepared.body.root, ScopeKind.Body)
+  // The same entry eligibility as accepted ownership initialization: actual bindings acquire
+  // definitions at their nodes, never at entry. No invented RHS stands for a parameter/capture.
+  let mut local = usize.ZERO
+  while local < prepared.body.locals.length {
+    let mut bound = false
+    let mut node = usize.ZERO
+    while node < prepared.body.nodes.length {
+      let binding = match &prepared.body.nodes[node].kind {
+        NodeKind.LocalBinding {local: found, ..} => found.index == local
+        NodeKind.MutableBinding {local: found, ..} => found.index == local
+        _ => false
+      }
+      bound = bound || binding
+      node = node + usize.ONE
+    }
+    if !bound { drop run Skeleton.entry(&mut walk.reservation.skeleton, LocalId {index: local}, entry) }
+    local = local + usize.ONE
+  }
+  let body = run visit(prepared, &mut walk, prepared.body.root, Access.Value, entry)
+  let ended = run closeScopes(&mut walk, usize.ZERO, body.next, prepared.body.root, ExitKind.Normal)
+  run edge(&mut walk, ended, exit)
+  return move walk.reservation
+}
+
+effect fn point(walk: &mut Walk) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  return run Flow.point(&mut walk.reservation.skeleton.flow, &mut walk.reservation.skeleton.rules)
+}
+effect fn edge(walk: &mut Walk, from: PointId, to: PointId) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Flow.edge(&mut walk.reservation.skeleton.flow, from, to, walk.yes)
+  return ()
+}
+effect fn after(walk: &mut Walk, previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  let next = run point(&mut walk.*)
+  run edge(&mut walk.*, previous, next)
+  return next
+}
+effect fn openScope(walk: &mut Walk, node: NodeId, kind: ScopeKind) -> () ! OutOfMemoryError ? &mut Allocator {
+  let active = Vector<ScopeId>.asSlice(&walk.active)
+  let mut parent = Option<ScopeId>.none()
+  if active.length > usize.ZERO { parent = Option<ScopeId>.some(active[active.length - usize.ONE]) }
+  let id = ScopeId {index: Vector<Scope>.length(&walk.reservation.scopes)}
+  run Vector<Scope>.append(&mut walk.reservation.scopes, Scope {node: node, kind: kind, parent: move parent})
+  run Vector<ScopeId>.append(&mut walk.active, id)
+  return ()
+}
+// This emits a distinct point per scope exit. Ownership cleanup/end actions attach to that
+// point; a transfer exit does not mutate the lexical stack used to reserve sibling paths.
+effect fn closeScopes(walk: &mut Walk, depth: usize, from: PointId, cause: NodeId, kind: ExitKind) -> PointId
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = Vector<ScopeId>.length(&walk.active)
+  let mut current = from
+  while at > depth {
+    at = at - usize.ONE
+    let scope = Vector<ScopeId>.asSlice(&walk.active)[at]
+    current = run after(&mut walk.*, current)
+    run Vector<ScopeExit>.append(&mut walk.reservation.exits, ScopeExit {scope: scope, point: current, cause: cause, kind: kind})
+  }
+  return current
+}
+
+effect fn input<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inputs: &mut Vector<Input>,
+  node: NodeId, access: Access, previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  let result = run visit(prepared, &mut walk.*, node, access, previous)
+  run Vector<Input>.append(inputs, Input {node: node, evaluation: result.evaluation, access: access})
+  return result.next
+}
+
+effect fn operands<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inputs: &mut Vector<Input>,
+  nodes: &[NodeId], previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  let mut current = previous
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    current = run input(prepared, &mut walk.*, inputs, nodes[at], Access.Value, current)
+    at = at + usize.ONE
+  }
+  return current
+}
+
+effect fn fields<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inputs: &mut Vector<Input>,
+  values: &[AggregateField], previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  let mut current = previous
+  let mut at = usize.ZERO
+  while at < values.length {
+    current = run input(prepared, &mut walk.*, inputs, values[at].value, Access.Value, current)
+    at = at + usize.ONE
+  }
+  return current
+}
+
+// Conditions/guards own statement temporaries even outside an enclosing ordinary statement.
+effect fn settled<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, inputs: &mut Vector<Input>,
+  node: NodeId, previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  let depth = Vector<ScopeId>.length(&walk.active)
+  run openScope(&mut walk.*, node, ScopeKind.Statement)
+  let current = run input(prepared, &mut walk.*, inputs, node, Access.Value, previous)
+  let ended = run closeScopes(&mut walk.*, depth, current, node, ExitKind.Normal)
+  Vector<ScopeId>.truncate(&mut walk.active, depth)
+  return ended
+}
+
+effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id: NodeId, access: Access,
+  previous: PointId) -> Completed ! OutOfMemoryError ? &mut Allocator {
+  if id.index >= prepared.body.nodes.length { return CompilerBug.panic(b"source traversal names an absent body node") }
+  let node = &prepared.body.nodes[id.index]
+  let mut inputs = Vector<Input>.make()
+  let mut current = previous
+  let mut terminates = false
+  let mut exitKind = ExitKind.Normal
+  let mut jump = Option<PointId>.none()
+  let mut exitDepth = usize.ZERO
+  match &node.kind {
+    NodeKind.Expression {form, ..} => {
+      current = run expression(prepared, &mut walk.*, id, &form, access, &mut inputs, previous)
+      if let Expression.CompileError {..} = &form { terminates = true }
+    }
+    NodeKind.LocalBinding {initializer, ..} => {
+      current = run input(prepared, &mut walk.*, &mut inputs, initializer, Access.Value, current)
+    }
+    NodeKind.MutableBinding {initializer, ..} => {
+      current = run input(prepared, &mut walk.*, &mut inputs, initializer, Access.Value, current)
+    }
+    NodeKind.Assignment {value, ..} => {
+      current = run input(prepared, &mut walk.*, &mut inputs, value, Access.Value, current)
+    }
+    NodeKind.PlaceAssignment {target, value} => {
+      current = run input(prepared, &mut walk.*, &mut inputs, target, Access.Place, current)
+      current = run input(prepared, &mut walk.*, &mut inputs, value, Access.Value, current)
+    }
+    NodeKind.Drop {value, consumed} => {
+      let mut mode = Access.Value
+      if let Option<ConsumedPlace>.Some {..} = &consumed { mode = Access.Place }
+      current = run input(prepared, &mut walk.*, &mut inputs, value, mode, current)
+    }
+    NodeKind.Return {value} => {
+      if let Option<NodeId>.Some {value: operand} = &value {
+        current = run input(prepared, &mut walk.*, &mut inputs, operand, Access.Value, current)
+      }
+      terminates = true
+      exitKind = ExitKind.Return
+      jump = Option<PointId>.some(walk.reservation.exit)
+    }
+    NodeKind.Fail {value} => {
+      current = run input(prepared, &mut walk.*, &mut inputs, value, Access.Value, current)
+      terminates = true
+      exitKind = ExitKind.Failure
+      jump = Option<PointId>.some(walk.reservation.exit)
+    }
+    NodeKind.Branch {condition, thenBranch, elseBranch, ..} => {
+      let split = run settled(prepared, &mut walk.*, &mut inputs, condition, current)
+      let taken = run input(prepared, &mut walk.*, &mut inputs, thenBranch, Access.Value, split)
+      let mut other = split
+      if let Option<NodeId>.Some {value} = &elseBranch {
+        other = run input(prepared, &mut walk.*, &mut inputs, value, Access.Value, split)
+      }
+      current = run after(&mut walk.*, taken)
+      run edge(&mut walk.*, other, current)
+    }
+    NodeKind.While {condition, body} => {
+      let header = run after(&mut walk.*, current)
+      let exit = run point(&mut walk.*)
+      let repeat = Vector<Loop>.length(&walk.reservation.loops)
+      run Vector<Loop>.append(&mut walk.reservation.loops, Loop {node: id, before: current,
+        header: header, exit: exit, backedges: Vector<PointId>.make()})
+      // Preserve TRANSFER-001: a transfer in the condition addresses the enclosing frame.
+      let split = run settled(prepared, &mut walk.*, &mut inputs, condition, header)
+      let mut enters = true
+      let mut skips = true
+      if let NodeKind.Expression {form: Expression.Boolean {value}, ..} = &prepared.body.nodes[condition.index].kind {
+        enters = value
+        skips = !value
+      }
+      if skips { run edge(&mut walk.*, split, exit) }
+      let start = run point(&mut walk.*)
+      if enters { run edge(&mut walk.*, split, start) }
+      run Vector<Frame>.append(&mut walk.frames, Frame {repeat: repeat, scopeDepth: Vector<ScopeId>.length(&walk.active)})
+      // Even an impossible body is structurally reserved. It receives no runtime entry edge.
+      let repeated = run input(prepared, &mut walk.*, &mut inputs, body, Access.Value, start)
+      run edge(&mut walk.*, repeated, header)
+      let loops = Vector<Loop>.asMutSlice(&mut walk.reservation.loops)
+      run Vector<PointId>.append(&mut loops[repeat].backedges, repeated)
+      drop Vector<Frame>.pop(&mut walk.frames)
+      current = exit
+    }
+    NodeKind.Break => {
+      let frames = Vector<Frame>.asSlice(&walk.frames)
+      if frames.length == usize.ZERO { return CompilerBug.panic(b"typed source break has no loop frame") }
+      let frame = frames[frames.length - usize.ONE]
+      jump = Option<PointId>.some(Vector<Loop>.asSlice(&walk.reservation.loops)[frame.repeat].exit)
+      exitDepth = frame.scopeDepth
+      exitKind = ExitKind.Break
+      terminates = true
+    }
+    NodeKind.Continue => {
+      let frames = Vector<Frame>.asSlice(&walk.frames)
+      if frames.length == usize.ZERO { return CompilerBug.panic(b"typed source continue has no loop frame") }
+      let frame = frames[frames.length - usize.ONE]
+      jump = Option<PointId>.some(Vector<Loop>.asSlice(&walk.reservation.loops)[frame.repeat].header)
+      exitDepth = frame.scopeDepth
+      exitKind = ExitKind.Continue
+      terminates = true
+    }
+    NodeKind.Recovered {resumes} => {
+      // Recovery never certifies. Its isolated suffix still gets ownership diagnostics exactly
+      // as the accepted checker does; no failed statement transports prior source definitions.
+      current = run point(&mut walk.*)
+      if resumes { run edge(&mut walk.*, walk.reservation.entry, current) }
+    }
+    NodeKind.Block {statements, ..} => {
+      let enclosing = Vector<ScopeId>.length(&walk.active)
+      run openScope(&mut walk.*, id, ScopeKind.Block)
+      let values = Vector<NodeId>.asSlice(&statements)
+      let mut at = usize.ZERO
+      while at < values.length {
+        current = run settled(prepared, &mut walk.*, &mut inputs, values[at], current)
+        at = at + usize.ONE
+      }
+      current = run closeScopes(&mut walk.*, enclosing, current, id, ExitKind.Normal)
+      Vector<ScopeId>.truncate(&mut walk.active, enclosing)
+    }
+  }
+  let execute = run after(&mut walk.*, current)
+  let mut successful = execute
+  if neverValue(node) || impossibleIndex(prepared, id) { successful = run point(&mut walk.*) }
+  let evaluation = run Skeleton.evaluate(&mut walk.reservation.skeleton, id, EvaluationRole.Value, successful)
+  let active = Vector<ScopeId>.asSlice(&walk.active)
+  if active.length == usize.ZERO { return CompilerBug.panic(b"source occurrence has no lexical scope") }
+  run Vector<Visit>.append(&mut walk.reservation.visits, Visit {node: id, evaluation: evaluation,
+    execute: execute, access: access, scope: active[active.length - usize.ONE], inputs: move inputs})
+  if let NodeKind.Expression {form: Expression.Run {..}, ..} = &node.kind {
+    let failed = run closeScopes(&mut walk.*, usize.ZERO, execute, id, ExitKind.RunFailure)
+    run edge(&mut walk.*, failed, walk.reservation.exit)
+  }
+  if terminates {
+    let cleaned = run closeScopes(&mut walk.*, exitDepth, execute, id, exitKind)
+    if let Option<PointId>.Some {value} = jump {
+      run edge(&mut walk.*, cleaned, value)
+      if exitKind == ExitKind.Continue {
+        let frames = Vector<Frame>.asSlice(&walk.frames)
+        let repeat = frames[frames.length - usize.ONE].repeat
+        let loops = Vector<Loop>.asMutSlice(&mut walk.reservation.loops)
+        run Vector<PointId>.append(&mut loops[repeat].backedges, cleaned)
+      }
+    }
+    return Completed {evaluation: evaluation, next: run point(&mut walk.*)}
+  }
+  return Completed {evaluation: evaluation, next: successful}
+}
+
+fn neverValue(node: &Node) -> bool {
+  return match &node.kind {
+    NodeKind.Expression {ty, ..} => Shared<Type>.with<bool>(&ty, fn(ty: &Type) -> bool {
+      return match &ty.* { Type.Union {members} => Vector<Shared<Type>>.length(&members) == usize.ZERO _ => false }
+    })
+    _ => false
+  }
+}
+
+// Positive frozen layout evidence only. A raw pointer or unknown-length slice is not Array(0).
+fn impossibleIndex<'body>(prepared: &SourcePreparation<'body>, node: NodeId) -> bool {
+  let base = match &prepared.body.nodes[node.index].kind {
+    NodeKind.Expression {form: Expression.Index {value, ..}, ..} => value.index
+    _ => usize.MAX
+  }
+  if base == usize.MAX { return false }
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let shapes = Vector<Shape>.asSlice(&prepared.shapes)
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    let actual = match &endpoints[at].root {
+      Root.Node {node: found, role} => found.index == base && role == EndpointRole.Value
+      _ => false
+    }
+    let root = match endpoints[at].parent { Option<EndpointId>.None => true _ => false }
+    if actual && root {
+      if endpoints[at].shape.index >= shapes.length { return CompilerBug.panic(b"source index has no prepared shape") }
+      return match &shapes[endpoints[at].shape.index].state { ShapeState.Array {length} => length == usize.ZERO _ => false }
+    }
+    at = at + usize.ONE
+  }
+  return CompilerBug.panic(b"source index has no prepared operand root")
+}
+
+// Exhaustive typed expression traversal. Descriptor recipes and selected contracts are metadata,
+// not extra operand executions; pattern uses refer to the one earlier subject occurrence.
+effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id: NodeId, form: &Expression,
+  access: Access, inputs: &mut Vector<Input>, previous: PointId) -> PointId ! OutOfMemoryError ? &mut Allocator {
+  return match &form.* {
+    Expression.Integer {..} => previous
+    Expression.Float {..} => previous
+    Expression.Text {..} => previous
+    Expression.Boolean {..} => previous
+    Expression.Unit => previous
+    Expression.Local {..} => previous
+    Expression.Embedded {..} => previous
+    Expression.Constant {..} => previous
+    Expression.ForeignStatic {..} => previous
+    Expression.ForeignAddress {..} => previous
+    Expression.EnumMember {..} => previous
+    Expression.PatternBinding {subject, ..} => {
+      // A use/definition addresses the previously evaluated subject; it must not reevaluate
+      // the subject expression (and cannot infer its identity from a type or region).
+      let subjects = Vector<Subject>.asSlice(&walk.subjects)
+      let active = Vector<ScopeId>.asSlice(&walk.active)
+      let mut at = subjects.length
+      while at > usize.ZERO {
+        at = at - usize.ONE
+        if subjects[at].node.index == subject.index {
+          let mut scope = usize.ZERO
+          while scope < active.length {
+            if subjects[at].scope.index == active[scope].index {
+              run Vector<Input>.append(inputs, Input {node: subject, evaluation: subjects[at].evaluation, access: Access.Place})
+              return previous
+            }
+            scope = scope + usize.ONE
+          }
+        }
+      }
+      return CompilerBug.panic(b"pattern source has no actual evaluated subject in its scope")
+    }
+    Expression.Borrow {value, ..} => run input(prepared, &mut walk.*, inputs, value, Access.Place, previous)
+    Expression.Field {value, ..} => run input(prepared, &mut walk.*, inputs, value, Access.Place, previous)
+    Expression.Index {value, index, ..} => {
+      let base = run input(prepared, &mut walk.*, inputs, value, Access.Place, previous)
+      return run input(prepared, &mut walk.*, inputs, index, Access.Value, base)
+    }
+    Expression.Dereference {value} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.Move {value, consumed} => {
+      let mut mode = Access.Value
+      if let Option<ConsumedPlace>.Some {..} = &consumed { mode = Access.Place }
+      return run input(prepared, &mut walk.*, inputs, value, mode, previous)
+    }
+    Expression.PointerWeaken {value} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.ArraySlice {value, ..} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.SliceLength {value} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.ArrayLength {value, ..} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.EnumValue {value} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.UnionInject {value, ..} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.UnionWiden {value} => run input(prepared, &mut walk.*, inputs, value, Access.Value, previous)
+    Expression.CompileError {message} => run input(prepared, &mut walk.*, inputs, message, Access.Value, previous)
+    Expression.ConcretePrefix {operand, ..} => run input(prepared, &mut walk.*, inputs, operand, Access.Value, previous)
+    Expression.ConcreteInfix {operator, left, right} => {
+      let first = run input(prepared, &mut walk.*, inputs, left, Access.Value, previous)
+      if operator == InfixOperator.And || operator == InfixOperator.Or {
+        let second = run settled(prepared, &mut walk.*, inputs, right, first)
+        let joined = run after(&mut walk.*, second)
+        run edge(&mut walk.*, first, joined)
+        return joined
+      }
+      return run input(prepared, &mut walk.*, inputs, right, Access.Value, first)
+    }
+    Expression.Aggregate {fields: values, ..} => run fields(prepared, &mut walk.*, inputs, Vector<AggregateField>.asSlice(&values), previous)
+    Expression.VariantConstruct {fields: values, ..} => run fields(prepared, &mut walk.*, inputs, Vector<AggregateField>.asSlice(&values), previous)
+    Expression.Callable {fields: values, ..} => run fields(prepared, &mut walk.*, inputs, Vector<AggregateField>.asSlice(&values), previous)
+    Expression.StagedCallable {callee, arguments, ..} => {
+      let first = run input(prepared, &mut walk.*, inputs, callee, Access.Value, previous)
+      return run operands(prepared, &mut walk.*, inputs, Vector<NodeId>.asSlice(&arguments), first)
+    }
+    Expression.CallableCall {callee, arguments, pipeline, ..} => {
+      let supplied = Vector<NodeId>.asSlice(&arguments)
+      let mut current = previous
+      let mut first = usize.ZERO
+      if pipeline && supplied.length > usize.ZERO {
+        current = run input(prepared, &mut walk.*, inputs, supplied[0], Access.Value, current)
+        first = usize.ONE
+      }
+      current = run input(prepared, &mut walk.*, inputs, callee, Access.Value, current)
+      while first < supplied.length {
+        current = run input(prepared, &mut walk.*, inputs, supplied[first], Access.Value, current)
+        first = first + usize.ONE
+      }
+      return current
+    }
+    Expression.DirectCall {arguments, ..} => run operands(prepared, &mut walk.*, inputs, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.InterfaceCall {arguments, ..} => run operands(prepared, &mut walk.*, inputs, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.ForeignCall {arguments, ..} => run operands(prepared, &mut walk.*, inputs, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.IntrinsicCall {arguments, ..} => run operands(prepared, &mut walk.*, inputs, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.StorageCall {arguments, ..} => run operands(prepared, &mut walk.*, inputs, Vector<NodeId>.asSlice(&arguments), previous)
+    Expression.Run {value, access: mode} => {
+      let mut receiver = Access.Value
+      if mode == RunAccess.Shared || mode == RunAccess.Exclusive { receiver = Access.Place }
+      return run input(prepared, &mut walk.*, inputs, value, receiver, previous)
+    }
+    Expression.Match {subject, arms, access: mode, syntax, ..} => {
+      let mut subjectMode = Access.Value
+      if let SubjectAccess.Place {..} = &mode { subjectMode = Access.Place }
+      let evaluated = run visit(prepared, &mut walk.*, subject, subjectMode, previous)
+      run Vector<Input>.append(inputs, Input {node: subject, evaluation: evaluated.evaluation, access: subjectMode})
+      let tested = evaluated.next
+      let active = Vector<ScopeId>.asSlice(&walk.active)
+      let mut subjectScope = active[active.length - usize.ONE]
+      if syntax == MatchSyntax.Let {
+        // Destructuring-let subjects remain available to uses after this statement, in the
+        // nearest enclosing ordinary scope; arm scopes never extend their owner's lifetime.
+        let scopes = Vector<Scope>.asSlice(&walk.reservation.scopes)
+        let mut enclosing = active.length
+        while enclosing > usize.ZERO {
+          enclosing = enclosing - usize.ONE
+          if scopes[active[enclosing].index].kind != ScopeKind.Statement {
+            subjectScope = active[enclosing]
+            break
+          }
+        }
+      }
+      run Vector<Subject>.append(&mut walk.subjects, Subject {node: subject, evaluation: evaluated.evaluation, scope: subjectScope})
+      let joined = run point(&mut walk.*)
+      let mut rejected = tested
+      let values = Vector<MatchArm>.asSlice(&arms)
+      let mut arm = usize.ZERO
+      while arm < values.length {
+        let depth = Vector<ScopeId>.length(&walk.active)
+        if syntax != MatchSyntax.Let { run openScope(&mut walk.*, id, ScopeKind.Arm) }
+        let entry = run after(&mut walk.*, rejected)
+        let mut selected = entry
+        let bindings = Vector<NodeId>.asSlice(&values[arm].bindings)
+        let mut binding = usize.ZERO
+        while binding < bindings.length {
+          selected = run input(prepared, &mut walk.*, inputs, bindings[binding], Access.Place, selected)
+          binding = binding + usize.ONE
+        }
+        // Existing ownership coverage admits pattern failure independently of guard failure.
+        // Pattern/case predicates remain paired source applicability, not guessed runtime tags.
+        rejected = entry
+        if let Option<NodeId>.Some {value: guard} = &values[arm].guard {
+          selected = run settled(prepared, &mut walk.*, inputs, guard, selected)
+          let failed = run closeScopes(&mut walk.*, depth, selected, id, ExitKind.Normal)
+          let next = run after(&mut walk.*, rejected)
+          run edge(&mut walk.*, failed, next)
+          rejected = next
+        }
+        let result = run input(prepared, &mut walk.*, inputs, values[arm].result, Access.Value, selected)
+        let ended = run closeScopes(&mut walk.*, depth, result, id, ExitKind.Normal)
+        run edge(&mut walk.*, ended, joined)
+        Vector<ScopeId>.truncate(&mut walk.active, depth)
+        arm = arm + usize.ONE
+      }
+      return joined
+    }
+  }
+}
