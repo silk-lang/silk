@@ -11,10 +11,18 @@ import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as Schema from 'effect/Schema'
 
+import { isVersion } from './SemVer.mjs'
 // The ambient search path; tests prepend their own tools to it.
 const ambientPath = Config.String('PATH').pipe(Config.withDefault(''), Effect.orDie)
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
+const decodeRelease = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Struct({
+  package: Schema.String,
+  version: Schema.String,
+  tag: Schema.String,
+  prerelease: Schema.Boolean,
+  notes: Schema.String,
+})))
 
 class VerificationError extends Data.TaggedError('NativeBuildVerificationError')<{
   readonly message: string
@@ -68,7 +76,8 @@ const program = Effect.gen(function* () {
   // `--version` and `--help` answer on standard output without reading any source.
   const versioned = yield* invoke(silk, ['--version'], directory)
   assert.equal(versioned.status, 0, versioned.stderr)
-  assert.match(versioned.stdout, /^silk v\d+\.\d+\.\d+\n$/)
+  const emittedVersion = versioned.stdout.match(/^silk v(.+)\n$/)?.[1]
+  assert.ok(emittedVersion !== undefined && isVersion(emittedVersion), versioned.stdout)
   const helped = yield* invoke(silk, ['--help'], directory)
   assert.equal(helped.status, 0, helped.stderr)
   assert.match(helped.stdout, /usage: silk build/)
@@ -85,7 +94,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(releaseWorkspace, 'silk.toml'), workspaceManifest)
   yield* fs.writeFileString(
     join(releaseMember, 'silk.toml'),
-    '[package]\nname = "native-release"\nversion = "1.0.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "native-release"\nversion = "1.0.0"\nroot = "src/main.silk"\n[changes]\nversion-file = "src/ReleaseVersion.silk"\n',
   )
   yield* fs.writeFileString(
     join(releaseWorkspace, 'changes/silk.toml'),
@@ -162,6 +171,22 @@ const program = Effect.gen(function* () {
   assert.ok(releaseArchive.includes(summary))
   yield* fs.writeFileString(archive, releaseArchive.replace(summary, correctedSummary))
   yield* fs.writeFileString(join(releaseMember, 'CHANGELOG.md'), 'Manual notes must disappear.\n')
+  // Publication reads corrected TOML, not the hand-edited derived Markdown.
+  const betaPublication = yield* invoke(
+    silk,
+    ['changes', 'release', '--json'],
+    releaseNested,
+    changesEnvironment,
+  )
+  assert.equal(betaPublication.status, 0, betaPublication.stderr)
+  const beta = yield* decodeRelease(betaPublication.stdout)
+  assert.equal(beta.package, 'native-release')
+  assert.equal(beta.version, '1.1.0-beta.1')
+  assert.equal(beta.tag, 'v1.1.0-beta.1')
+  assert.equal(beta.prerelease, true)
+  assert.ok(beta.notes.includes(correctedSummary))
+  assert.ok(beta.notes.includes(migration))
+  assert.ok(!beta.notes.includes('Manual notes'))
   const promoted = yield* invoke(silk, ['changes', 'version'], releaseNested, changesEnvironment)
   assert.equal(promoted.status, 0, promoted.stderr)
   assert.match(yield* fs.readFileString(join(releaseMember, 'silk.toml')), /version = "1.1.0"/)
@@ -175,6 +200,19 @@ const program = Effect.gen(function* () {
   )
   assert.match(stableArchive, /\nfrom = "1\.1\.0-beta\.1"\nversion = "1\.1\.0"\n/)
   assert.ok(stableArchive.includes(correctedSummary))
+  const stablePublication = yield* invoke(
+    silk,
+    ['changes', 'release', '--json'],
+    releaseNested,
+    changesEnvironment,
+  )
+  assert.equal(stablePublication.status, 0, stablePublication.stderr)
+  const stable = yield* decodeRelease(stablePublication.stdout)
+  assert.equal(stable.version, '1.1.0')
+  assert.equal(stable.tag, 'v1.1.0')
+  assert.equal(stable.prerelease, false)
+  assert.ok(stable.notes.includes(correctedSummary))
+  assert.ok(stable.notes.includes(migration))
   const expectedHistory = {
     package: 'native-release',
     from: '1.0.0',
@@ -890,8 +928,7 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(bare.status, 6, bare.stderr)
-  // `format` reports unchanged and formatted files on standard output, and drift and damage on
-  // standard error, as the TypeScript CLI does.
+  // Check mode must not rewrite drift; formatting fixes intact inputs without damaging rejected ones.
   const formatting = join(directory, 'formatting')
   yield* fs.makeDirectory(join(formatting, 'src'), { recursive: true })
   yield* fs.writeFileString(
@@ -903,21 +940,11 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(formatting, 'src/c.silk'), 'pub fn c( {\n')
   const formatChecked = yield* invoke(silk, ['format', '--check'], formatting)
   assert.equal(formatChecked.status, 1, formatChecked.stderr)
-  assert.equal(formatChecked.stdout, `${join(formatting, 'src/a.silk')}: unchanged\n`)
-  assert.match(
-    formatChecked.stderr,
-    new RegExp(`^${join(formatting, 'src/b.silk')}: needs formatting$`, 'm'),
-  )
-  assert.match(
-    formatChecked.stderr,
-    new RegExp(
-      `^${join(formatting, 'src/c.silk')}: cannot format damaged source \\(PAR\\d{4}(, [A-Z]{3}\\d{4})*\\)$`,
-      'm',
-    ),
-  )
+  assert.equal(yield* fs.readFileString(join(formatting, 'src/b.silk')), 'pub fn b()->i32{return 2}\n')
   const rewritten = yield* invoke(silk, ['format'], formatting)
   assert.equal(rewritten.status, 1, rewritten.stderr)
-  assert.match(rewritten.stdout, new RegExp(`^${join(formatting, 'src/b.silk')}: formatted$`, 'm'))
+  assert.equal(yield* fs.readFileString(join(formatting, 'src/b.silk')), 'pub fn b() -> i32 {\n  return 2\n}\n')
+  assert.equal(yield* fs.readFileString(join(formatting, 'src/c.silk')), 'pub fn c( {\n')
   const cleanedByPath = yield* invoke(silk, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)

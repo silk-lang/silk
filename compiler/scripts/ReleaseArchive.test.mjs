@@ -3,10 +3,12 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync }
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
+import * as Result from 'effect/Result'
+import * as NativeProcess from './NativeProcess.ts'
 const require = createRequire(new URL('../../package.json', import.meta.url))
 /** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
@@ -39,17 +41,17 @@ it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibl
       compiler: join(root, 'compiler'),
       standardLibrary: join(root, 'stdlib'),
       target: 'x86_64-unknown-linux-gnu',
-      version: '0.1.0',
+      version: '1.2.3-rc.2+release.build',
     }
     const first = yield* ReleaseArchive.write({ ...options, outputDirectory: join(root, 'first') })
     const second = yield* ReleaseArchive.write({
       ...options,
       outputDirectory: join(root, 'second'),
     })
-    assert.strictEqual(first, join(root, 'first/silk-0.1.0-x86_64-unknown-linux-gnu.tar.gz'))
+    assert.strictEqual(first, join(root, 'first/silk-1.2.3-rc.2-x86_64-unknown-linux-gnu.tar.gz'))
     assert.deepStrictEqual(readFileSync(first), readFileSync(second))
     execFileSync('tar', ['-xzf', first, '-C', root])
-    const top = join(root, 'silk-0.1.0-x86_64-unknown-linux-gnu')
+    const top = join(root, 'silk-1.2.3-rc.2-x86_64-unknown-linux-gnu')
     assert.deepStrictEqual((yield* fs.readDirectory(top)).sort(), ['bin', 'lib'])
     assert.deepStrictEqual(yield* fs.readDirectory(join(top, 'lib/silk')), ['stdlib'])
     assert.strictEqual(readFileSync(join(top, 'bin/silk'), 'utf8'), '#!/bin/sh\necho silk\n')
@@ -72,6 +74,85 @@ it('names an archive by its version without build metadata', () => {
     'silk-0.1.0-x86_64-unknown-linux-gnu',
   )
 })
+
+it.effect('rejects malformed versions before reading inputs or writing archive paths', () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-archive-version-' })
+    for (const version of [
+      '',
+      'v1.2.3',
+      '01.2.3',
+      '1.02.3',
+      '1.2.03',
+      '1.2.3-01',
+      '1.2.3-beta.01',
+      '1.2',
+      '1.2.3-',
+      '1.2.3+',
+      '1.2.3-beta..1',
+      '1.2.3+build..1',
+      '1.2.3+build+other',
+      '../../escape',
+      '1.2.3/../../escape',
+      '1.2.3\\escape',
+      '1.2.3\n',
+    ]) {
+      const result = yield* Effect.result(
+        ReleaseArchive.write({
+          compiler: join(root, 'missing-compiler'),
+          standardLibrary: join(root, 'missing-stdlib'),
+          target: 'aarch64-apple-darwin',
+          version,
+          outputDirectory: root,
+        }),
+      )
+      assert.isTrue(Result.isFailure(result), version)
+      if (Result.isFailure(result)) assert.strictEqual(result.failure._tag, 'ReleaseArchiveError')
+    }
+    assert.deepEqual(yield* fs.readDirectory(root), [])
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
+it.effect('requires an explicit CLI version and packages it without executing the compiler', () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-archive-cli-' })
+    const compiler = join(root, 'foreign-compiler')
+    const standardLibrary = join(root, 'stdlib')
+    const output = join(root, 'output')
+    yield* fs.writeFileString(compiler, 'foreign executable bytes, not a host program')
+    yield* fs.makeDirectory(standardLibrary)
+    yield* fs.writeFileString(join(standardLibrary, 'i32.silk'), 'pub let ZERO = 0\n')
+    yield* fs.makeDirectory(output)
+    const args = [
+      fileURLToPath(new URL('./ReleaseArchive.ts', import.meta.url)),
+      '--compiler', compiler,
+      '--stdlib', standardLibrary,
+      '--target', 'aarch64-apple-darwin',
+      '--output', output,
+    ]
+    const missing = yield* NativeProcess.execute(process.execPath, args)
+    assert.strictEqual(missing.status, 1)
+    assert.match(missing.stderr.toString(), /--version <version>/)
+    assert.strictEqual(missing.stdout.toString(), '')
+    assert.deepEqual(yield* fs.readDirectory(output), [])
+    const invalid = yield* NativeProcess.execute(process.execPath, [...args, '--version', '1.2.3-01'])
+    assert.strictEqual(invalid.status, 1)
+    assert.match(invalid.stderr.toString(), /valid SemVer/)
+    assert.deepEqual(yield* fs.readDirectory(output), [])
+    for (const [version, basename] of [
+      ['2.3.4', 'silk-2.3.4-aarch64-apple-darwin.tar.gz'],
+      ['2.3.5-beta.0+build.007', 'silk-2.3.5-beta.0-aarch64-apple-darwin.tar.gz'],
+      ['2.3.6+metadata', 'silk-2.3.6-aarch64-apple-darwin.tar.gz'],
+    ]) {
+      const result = yield* NativeProcess.execute(process.execPath, [...args, '--version', version])
+      assert.strictEqual(result.status, 0, result.stderr.toString())
+      assert.strictEqual(result.stdout.toString(), `${join(output, basename)}\n`)
+      assert.isTrue(yield* fs.exists(join(output, basename)))
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
 
 it('refuses a member path that fits no ustar prefix and name split', () => {
   const unsplittable = `${'a'.repeat(160)}/${'b'.repeat(101)}`

@@ -1,8 +1,6 @@
 // The native seed chain's pin and its verified seed. Every seed is an earlier published native
 // compiler, and the first, n0, is the bootstrap anchor's compiler built by the bootstrap; recovery
 // from a broken chain pins an older published release.
-import { execFileSync } from 'node:child_process'
-import { readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -12,6 +10,7 @@ import * as FileSystem from 'effect/FileSystem'
 import * as Schema from 'effect/Schema'
 import * as Console from 'effect/Console'
 import { hash } from './SourceSnapshot.mjs'
+import { isVersion } from './SemVer.mjs'
 
 export class NativeSeedError extends Data.TaggedError('NativeSeedError') {}
 const invalid = (message) => Effect.fail(new NativeSeedError({ message }))
@@ -23,19 +22,11 @@ export const targets = [
 export const TargetSchema = Schema.Literals(targets)
 export const seedAsset = (target) => `silk-compiler-${target}`
 const Hex = (length) => Schema.String.check(Schema.isPattern(new RegExp(`^[a-f0-9]{${length}}$`)))
-/**
- * A release tag: `v<version>`, where a build of main between releases is
- * `<next>-dev.<commits since the last release>+<7-hex commit>` and a release is plain `<x.y.z>`.
- */
-const releaseTag = /^v(\d+\.\d+\.\d+)(?:-dev\.(\d+)\+([a-f0-9]{7}))?$/
-// Seeds published before release versions; accepted until the pin names a versioned release.
-const legacyTag = /^native-seed-([a-f0-9]{40})$/
-const tagNamesCommit = (tag, commit) => {
-  const legacy = legacyTag.exec(tag)
-  if (legacy) return legacy[1] === commit
-  const release = releaseTag.exec(tag)
-  return release !== null && (release[3] === undefined || commit.startsWith(release[3]))
-}
+// Compiler releases and frozen-bootstrap native seeds have distinct publication namespaces.
+const isSeedTag = (tag) =>
+  tag.startsWith('bootstrap-native-v')
+    ? isVersion(tag.slice('bootstrap-native-v'.length))
+    : tag.startsWith('v') && isVersion(tag.slice(1))
 /**
  * `compiler/native-seed.json`: the only authority for the compiler that builds N1. Every published
  * candidate carries this pin as its `native-seed.json`, so recovery commits an older one verbatim.
@@ -62,8 +53,8 @@ const validatePin = Effect.fnUntraced(
       if (target !== seed.target) return yield* invalid('Native seed key must match its target')
       if (seed.asset !== seedAsset(seed.target))
         return yield* invalid('Native seed asset must name its target')
-      if (!tagNamesCommit(seed.tag, seed.sourceCommit))
-        return yield* invalid('Native seed tag must be a release version naming its source commit')
+      if (!isSeedTag(seed.tag))
+        return yield* invalid('Native seed tag must be v<semver> or bootstrap-native-v<semver>')
     }
     return pin
   },
@@ -134,31 +125,6 @@ export const candidate = Effect.fn('NativeSeed.candidate')(
   },
 )
 
-/**
- * The release version of `commit`: `[package].version` of `compiler/silk.toml` is the next release,
- * and `-dev.<n>+<commit>` counts the commits since the newest plain `v<x.y.z>` tag before it (all
- * of its history when there is none). Needs the full history and tags, as a `fetch-depth: 0`
- * checkout has.
- */
-export const releaseVersion = (commit, repository = '.') => {
-  const git = (...args) =>
-    execFileSync('git', ['-C', repository, ...args], { encoding: 'utf8' }).trim()
-  const manifest = readFileSync(new URL('../silk.toml', import.meta.url), 'utf8')
-  const next = manifest.match(/^version = "(\d+\.\d+\.\d+)"$/m)?.[1]
-  if (next === undefined) throw new Error('compiler/silk.toml states no x.y.z version')
-  const full = git('rev-parse', '--verify', `${commit}^{commit}`)
-  const released = git('tag', '--merged', full, '--list', 'v*')
-    .split('\n')
-    .map((tag) => releaseTag.exec(tag))
-    .filter((match) => match !== null && match[2] === undefined)
-    .map((match) => match[1].split('.').map(Number))
-    .sort((a, b) => b[0] - a[0] || b[1] - a[1] || b[2] - a[2])[0]
-  if (released !== undefined && released.join('.') === next)
-    throw new Error(`v${next} is released; raise compiler/silk.toml to the next version`)
-  const count = git('rev-list', '--count', released ? `v${released.join('.')}..${full}` : full)
-  return `${next}-dev.${count}+${full.slice(0, 7)}`
-}
-
 const BuildReceiptSchema = Schema.Struct({
   status: Schema.Literal('passed'),
   target: TargetSchema,
@@ -192,15 +158,6 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       }),
       printPin,
     )
-  // The release version of a commit, without the tag's `v`.
-  else if (command === 'version' && first && !second)
-    program = Effect.flatMap(
-      Effect.try({
-        try: () => releaseVersion(first),
-        catch: (cause) => new NativeSeedError({ message: String(cause) }),
-      }),
-      Console.log,
-    )
   else if (command === 'candidate' && first && second && third && !fourth)
     program = Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem
@@ -221,7 +178,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
     })
   else
     program = invalid(
-      'usage: node NativeSeed.mjs outputs <pin> <target> | verify <pin> <target> <download> <destination> | candidate <fixpoint-build-receipt> <run-id> <tag> | version <commit>',
+      'usage: node NativeSeed.mjs outputs <pin> <target> | verify <pin> <target> <download> <destination> | candidate <fixpoint-build-receipt> <run-id> <tag>',
     )
   await Effect.runPromise(program.pipe(Effect.provide(NodeServices.layer)))
 }

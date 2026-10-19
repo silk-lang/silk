@@ -8,6 +8,7 @@ import { gzipSync } from 'node:zlib'
 import * as Data from 'effect/Data'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
+import { isVersion } from './SemVer.mjs'
 
 export class ReleaseArchiveError extends Data.TaggedError('ReleaseArchiveError')<{
   readonly message: string
@@ -126,13 +127,15 @@ const tree = Effect.fnUntraced(function* (root: string, base: string) {
 
 /**
  * The archive's file name and top-level directory: `silk-<version>-<target>`, without the
- * version's `+<commit>` build metadata, since GitHub renames release assets that contain `+`.
+ * version's build metadata, since GitHub renames release assets that contain `+`.
  */
 export const name = (version: string, target: string) =>
   `silk-${version.replace(/\+.*$/, '')}-${target}`
 
 /** Writes the target's gzip-compressed release archive and answers its path. */
 export const write = Effect.fn('ReleaseArchive.write')(function* (options: ArchiveOptions) {
+  if (!isVersion(options.version))
+    return yield* new ReleaseArchiveError({ message: 'Release version must be valid SemVer' })
   const fs = yield* FileSystem.FileSystem
   const top = name(options.version, options.target)
   const library = yield* tree(options.standardLibrary, `${top}/lib/silk/stdlib`)
@@ -161,19 +164,9 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
   return path
 })
 
-// The compiler's release version, `[package].version` of `compiler/silk.toml`.
-const compilerVersion = Effect.fnUntraced(function* () {
-  const fs = yield* FileSystem.FileSystem
-  const manifest = yield* fs.readFileString(new URL('../silk.toml', import.meta.url).pathname)
-  const version = manifest.match(/^version = "([^"]+)"$/m)?.[1]
-  if (version === undefined)
-    return yield* new ReleaseArchiveError({ message: 'compiler/silk.toml states no version' })
-  return version
-})
-
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const usage =
-    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> --stdlib <directory> --target <triple> --output <directory> [--version <version>]'
+    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> --stdlib <directory> --target <triple> --output <directory> --version <version>'
   const cli = Effect.gen(function* () {
     const { values } = yield* Effect.try({
       try: () =>
@@ -188,13 +181,13 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         }),
       catch: (cause) => new ReleaseArchiveError({ message: usage, cause }),
     })
-    if (!values.compiler || !values.stdlib || !values.target || !values.output)
+    if (!values.compiler || !values.stdlib || !values.target || !values.output || !values.version)
       return yield* new ReleaseArchiveError({ message: usage })
     const path = yield* write({
       compiler: resolve(values.compiler),
       standardLibrary: resolve(values.stdlib),
       target: values.target,
-      version: values.version ?? (yield* compilerVersion()),
+      version: values.version,
       outputDirectory: resolve(values.output),
     })
     yield* Effect.sync(() => process.stdout.write(`${path}\n`))

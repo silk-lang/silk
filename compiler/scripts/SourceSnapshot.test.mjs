@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
@@ -11,7 +11,6 @@ import { historicalSeeds } from '../../.github/scripts/native-seed-history.mjs'
 import {
   candidate,
   readPin,
-  releaseVersion,
   selectSeed,
   targets,
   verifySeed,
@@ -162,7 +161,7 @@ it.effect('installs only downloaded bytes that match a Release pin', () =>
     const f = yield* fixture()
     const seed = '#!/bin/sh\nexit 42\n'
     const target = 'x86_64-unknown-linux-gnu'
-    const tag = `v0.1.0-dev.1+${f.revision.slice(0, 7)}`
+    const tag = 'v1.2.3-rc.1+release.build'
     const pin = yield* candidate({
       target,
       tag,
@@ -193,27 +192,59 @@ it.effect('installs only downloaded bytes that match a Release pin', () =>
       /differs from pinned/,
     )
     assert.isFalse(yield* f.fs.exists(replaced))
-    yield* f.fs.writeFileString(
-      pinPath,
-      yield* encodeJson({
-        ...pin,
-        seeds: { [target]: { ...pin.seeds[target], tag: 'v0.1.0-dev.1+0000000' } },
-      }),
-    )
-    yield* failure(readPin(pinPath), /tag must be a release version naming its source commit/)
-    for (const accepted of ['v0.1.0', `native-seed-${f.revision}`]) {
+    for (const accepted of [
+      'v0.0.0',
+      'v1.2.3',
+      'v1.2.3-beta.0',
+      'v1.2.3-rc.2+build.007',
+      'v1.2.3+metadata',
+      'v1.2.3-01alpha.a-b',
+      'v0.1.0-dev.8624+5081812',
+      `v1.2.3+${'0'.repeat(40)}`,
+      'bootstrap-native-v0.0.0',
+      'bootstrap-native-v1.2.3-rc.1+build.007',
+    ]) {
       const seeds = { [target]: { ...pin.seeds[target], tag: accepted } }
       yield* f.fs.writeFileString(pinPath, yield* encodeJson({ ...pin, seeds }))
       assert.strictEqual((yield* readPin(pinPath)).seeds[target].tag, accepted)
     }
     for (const rejected of [
-      `native-seed-${'0'.repeat(40)}`,
-      `v0.1.0-dev.1+${f.revision}`,
+      `native-seed-${f.revision}`,
+      'bootstrap-v1.2.3',
+      'bootstrap-native-v01.2.3',
+      'bootstrap-native-v1.2.3-01',
       '0.1.0',
+      'v01.2.3',
+      'v1.02.3',
+      'v1.2.03',
+      'v1.2.3-01',
+      'v1.2.3-beta.01',
+      'v1.2',
+      'v1.2.3-',
+      'v1.2.3+',
+      'v1.2.3-beta..1',
+      'v1.2.3+build..1',
+      'v1.2.3+build+other',
+      'v1.2.3/../../escape',
+      'v1.2.3\\escape',
+      'v1.2.3\n',
+      ' v1.2.3',
     ]) {
       const seeds = { [target]: { ...pin.seeds[target], tag: rejected } }
       yield* f.fs.writeFileString(pinPath, yield* encodeJson({ ...pin, seeds }))
-      yield* failure(readPin(pinPath), /tag must be a release version/)
+      yield* failure(readPin(pinPath), /tag must be v<semver>/)
+    }
+    for (const invalid of [
+      { sourceCommit: f.revision.slice(0, 7) },
+      { sourceCommit: 'g'.repeat(40) },
+      { sha256: 'a'.repeat(63) },
+      { sha256: 'g'.repeat(64) },
+      { runId: '' },
+      { runId: 'not-a-run' },
+    ]) {
+      const seeds = { [target]: { ...pin.seeds[target], ...invalid } }
+      yield* f.fs.writeFileString(pinPath, yield* encodeJson({ ...pin, seeds }))
+      yield* failure(readPin(pinPath), /./)
     }
     yield* f.fs.writeFileString(
       pinPath,
@@ -237,7 +268,7 @@ it.effect(
       for (const target of targets) {
         const pin = yield* candidate({
           target,
-          tag: `v0.1.0-dev.1+${f.revision.slice(0, 7)}`,
+          tag: 'v1.2.3',
           sha256: hash(target),
           sourceCommit: f.revision,
           runId: '1',
@@ -288,40 +319,56 @@ it.effect(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
-it.effect('counts dev versions from the newest plain release tag', () =>
+it.effect('publishes candidates only from passed receipts with matching IR fixpoints', () =>
   Effect.gen(function* () {
-    const f = yield* fixture()
-    const commit = Effect.fnUntraced(function* () {
-      yield* f.git(
-        '-c',
-        'user.name=Snapshot Test',
-        '-c',
-        'user.email=snapshot@example.invalid',
-        'commit',
-        '-q',
-        '--allow-empty',
-        '-m',
-        'next',
-      )
-      return yield* f.git('rev-parse', 'HEAD')
-    })
-    const next = /^version = "([^"]+)"$/m.exec(
-      yield* f.fs.readFileString(new URL('../silk.toml', import.meta.url).pathname),
-    )[1]
-    assert.strictEqual(
-      releaseVersion(f.revision, f.repository),
-      `${next}-dev.1+${f.revision.slice(0, 7)}`,
+    const fs = yield* FileSystem.FileSystem
+    const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-seed-receipt-' })
+    const receiptPath = join(root, 'receipt.json')
+    const receipt = {
+      status: 'passed',
+      target: 'aarch64-apple-darwin',
+      output: { generation: 'N2', sha256: 'a'.repeat(64) },
+      inputs: { sourceCommit: 'b'.repeat(40) },
+      fixpoint: { producerIrSha256: 'c'.repeat(64), outputIrSha256: 'c'.repeat(64) },
+    }
+    const args = [
+      fileURLToPath(new URL('./NativeSeed.mjs', import.meta.url)),
+      'candidate',
+      receiptPath,
+      '123',
+      'v1.2.3-beta.1+independent',
+    ]
+    yield* fs.writeFileString(receiptPath, yield* encodeJson(receipt))
+    const accepted = yield* NativeProcess.execute(process.execPath, args)
+    assert.strictEqual(accepted.status, 0, accepted.stderr.toString())
+    const pin = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))(
+      accepted.stdout.toString(),
     )
-    const second = yield* commit()
-    // Dev builds and other tags do not restart the count.
-    yield* f.git('tag', `v${next}-dev.2+${second.slice(0, 7)}`)
-    yield* f.git('tag', 'bootstrap-v0.0.0')
-    assert.strictEqual(releaseVersion(second, f.repository), `${next}-dev.2+${second.slice(0, 7)}`)
-    yield* f.git('tag', 'v0.0.1')
-    const third = yield* commit()
-    assert.strictEqual(releaseVersion(third, f.repository), `${next}-dev.1+${third.slice(0, 7)}`)
-    yield* f.git('tag', `v${next}`)
-    assert.throws(() => releaseVersion(third, f.repository), /raise compiler\/silk.toml/)
+    assert.deepEqual(pin, {
+      schemaVersion: 2,
+      seeds: {
+        'aarch64-apple-darwin': {
+          _tag: 'Release',
+          target: 'aarch64-apple-darwin',
+          tag: 'v1.2.3-beta.1+independent',
+          asset: 'silk-compiler-aarch64-apple-darwin',
+          sha256: 'a'.repeat(64),
+          sourceCommit: 'b'.repeat(40),
+          runId: '123',
+        },
+      },
+    })
+    for (const invalid of [
+      { ...receipt, status: 'failed' },
+      { ...receipt, fixpoint: { ...receipt.fixpoint, outputIrSha256: 'd'.repeat(64) } },
+      { ...receipt, inputs: { sourceCommit: 'b'.repeat(7) } },
+      { ...receipt, output: { ...receipt.output, sha256: 'a'.repeat(63) } },
+    ]) {
+      yield* fs.writeFileString(receiptPath, yield* encodeJson(invalid))
+      const rejected = yield* NativeProcess.execute(process.execPath, args)
+      assert.strictEqual(rejected.status, 1)
+      assert.strictEqual(rejected.stdout.toString(), '')
+    }
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 

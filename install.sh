@@ -1,18 +1,18 @@
 #!/bin/sh
-# Installs the Silk compiler from the newest published build of main.
+# Installs the newest stable Silk compiler release, or an explicitly selected prerelease.
 #
 #   curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 #
-# A manually published build of main is a `v<version>` release, such as `v0.1.0-dev.8796+440201f`,
-# holding one `silk-<version>-<target>.tar.gz` archive per target. This script picks the newest one
-# for the running host, checks its compiler against the release's `native-seed.json`, and unpacks
-# it into `$SILK_INSTALL` (default `~/.silk`): `bin/silk` beside the standard library in
-# `lib/silk/stdlib`.
+# Compiler releases are tagged `v<version>`, with one `silk-<version>-<target>.tar.gz` per target.
+# The default matches `silk changes since`: GitHub's latest stable release, never a bootstrap
+# seed or an automatically selected beta/rc. The compiler's SHA-256 and reported version are
+# checked before installing into `$SILK_INSTALL` (default `~/.silk`):
+# `bin/silk` beside its standard library in `lib/silk/stdlib`.
 # Downloads made by curl carry no macOS quarantine mark, so Gatekeeper lets the compiler run.
 #
 # Environment:
 #   SILK_INSTALL   install directory (default: ~/.silk)
-#   SILK_RELEASE   a release tag to install instead of the newest build of main, such as v0.1.0
+#   SILK_RELEASE   explicit release tag, such as v0.1.0 or v0.2.0-beta.1
 #   GITHUB_TOKEN   optional; raises the GitHub API rate limit
 set -eu
 
@@ -69,33 +69,27 @@ case "$os" in
   *) fail "Silk has no build for $os yet" ;;
 esac
 
-# The most recently published `v*` release. The releases API does not list them by date,
-# so read every page and compare `published_at` (ISO 8601, so it sorts as text). Each release's
-# `tag_name` precedes its `published_at`; a draft's `published_at` is null and never matches.
+# GitHub's latest release excludes drafts and prereleases.
 if [ -z "$release" ]; then
-  page=1
-  found=
-  while [ "$page" -le 20 ]; do
-    tags=$(api "releases?per_page=100&page=$page") || fail "cannot list releases from GitHub"
-    tags=$(printf '%s\n' "$tags" |
-      grep -o '"tag_name": *"[^"]*"\|"published_at": *"[^"]*"' |
-      awk -F'"' '$2 == "tag_name" { tag = $4; next } tag ~ /^v[0-9]/ { print $4, tag } { tag = "" }') || true
-    [ -n "$tags" ] || break
-    found=$(printf '%s\n%s\n' "$found" "$tags")
-    page=$((page + 1))
-  done
-  release=$(printf '%s\n' "$found" | grep . | sort -r | head -n 1 | cut -d' ' -f2) || true
-  [ -n "$release" ] || fail "no published build of main found"
+  metadata=$(api releases/latest) || fail "cannot find a stable compiler release; select a published prerelease with SILK_RELEASE"
+  release=$(printf '%s\n' "$metadata" | grep -o '"tag_name": *"v[^"]*"' | cut -d'"' -f4) || true
+  [ -n "$release" ] || fail "the latest release is not a v<version> compiler release"
+else
+  release_path=$(printf '%s' "$release" | sed 's/+/%2B/g')
+  metadata=$(api "releases/tags/$release_path") || fail "cannot find release $release"
 fi
 
-# A dev version's `+<commit>` must reach GitHub as `%2B` in a URL path.
+# Preserve SemVer build metadata in a URL path.
 release_path=$(printf '%s' "$release" | sed 's/+/%2B/g')
-url=$(api "releases/tags/$release_path" 2> /dev/null |
+url=$(printf '%s\n' "$metadata" |
   grep -o "\"browser_download_url\": *\"[^\"]*/silk-[^/\"]*-$target\\.tar\\.gz\"" |
   head -n 1 | cut -d'"' -f4) || true
 [ -n "$url" ] || fail "release $release has no archive for $target"
 archive=${url##*/}
 top=${archive%.tar.gz}
+version=${release#v}
+[ "$archive" = "silk-${version%%+*}-$target.tar.gz" ] ||
+  fail "archive $archive does not match release $release"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
@@ -107,15 +101,17 @@ tar -xzf "$tmp/$archive" -C "$tmp/unpacked" || fail "cannot unpack $archive"
 [ -f "$tmp/unpacked/$top/bin/silk" ] && [ -d "$tmp/unpacked/$top/lib/silk/stdlib" ] ||
   fail "$archive does not hold bin/silk and lib/silk/stdlib"
 
-# A seed release names each target compiler's SHA-256; release archives without one skip the check.
-if curl -fsSL -o "$tmp/native-seed.json" \
-  "https://github.com/$repo/releases/download/$release_path/native-seed.json" 2> /dev/null; then
-  expected=$(tr -d ' \t\r\n' < "$tmp/native-seed.json" | grep -o "\"$target\":{[^}]*}" |
-    grep -o '"sha256":"[0-9a-f]*"' | cut -d'"' -f4) || true
-  [ -n "$expected" ] || fail "native-seed.json of $release names no compiler for $target"
-  actual=$(sha256 "$tmp/unpacked/$top/bin/silk")
-  [ "$actual" = "$expected" ] || fail "bin/silk has SHA-256 $actual, but $release names $expected"
-fi
+# Every compiler release publishes a verified per-target pin; never silently skip verification.
+curl -fsSL -o "$tmp/native-seed.json" \
+  "https://github.com/$repo/releases/download/$release_path/native-seed.json" ||
+  fail "cannot download native-seed.json for $release"
+expected=$(tr -d ' \t\r\n' < "$tmp/native-seed.json" | grep -o "\"$target\":{[^}]*}" |
+  grep -o '"sha256":"[0-9a-f]*"' | cut -d'"' -f4) || true
+[ -n "$expected" ] || fail "native-seed.json of $release names no compiler for $target"
+actual=$(sha256 "$tmp/unpacked/$top/bin/silk")
+[ "$actual" = "$expected" ] || fail "bin/silk has SHA-256 $actual, but $release names $expected"
+[ "$("$tmp/unpacked/$top/bin/silk" --version)" = "silk v$version" ] ||
+  fail "the compiler does not report the requested version $version"
 
 # Replace only what an earlier install put there, so stale standard-library files go away.
 mkdir -p "$install_dir/bin" "$install_dir/lib"

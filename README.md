@@ -71,9 +71,10 @@ On macOS (Apple Silicon) or Linux (x86-64 or ARM64):
 curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 ```
 
-The script puts `silk` in `~/.silk/bin` (set `SILK_INSTALL` to change it), with its standard
-library beside it, and checks the compiler's SHA-256 against the release. Building programs needs
-Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
+The script installs the latest stable release into `~/.silk/bin` (set `SILK_INSTALL` to change it),
+with its standard library beside it, and verifies the compiler's SHA-256 and reported version.
+Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Building programs
+needs Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
 
 ## Quick start
 
@@ -111,6 +112,7 @@ silk changes add minor "Reads now return a future." --migration "Await read()."
 silk changes status
 silk changes version --tag beta
 silk changes version
+silk changes release --json
 silk changes since 0.1.0 --json
 ```
 
@@ -118,8 +120,11 @@ Each contribution gets its own `.changes/<random>.md`, avoiding shared changelog
 Migration guidance is optional, but missing guidance is reported as unknown impact. Releases
 consume pending changes, update the package version, and write authoritative
 `.changes/releases/<version>.toml` records. `CHANGELOG.md` is regenerated from those records
-with a warning that manual edits will be overwritten. Commit the records, changelog, manifest,
-and consumed-file deletions together. These commands do not commit, tag, publish, or access Git.
+with a warning that manual edits will be overwritten. An optional `[changes].version-file`
+generates a Silk module exposing the package's version in the same recovery transaction.
+Commit the records, changelog, manifest, generated module, and consumed-file deletions together.
+`release` checks the prepared release and exports its notes and metadata for a publisher.
+These commands do not commit, tag, publish, or access Git.
 
 `silk changes since` selects compiler upgrades from the project's `package.silk-version`.
 `since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
@@ -127,6 +132,11 @@ selects a target, and `--source ../candidate` reads a local checkout instead of 
 Published queries use authenticated native HTTPS and require a GitHub Release whose tag contains
 the complete TOML history. See [`compiler/README.md`](compiler/README.md#native-changes) for
 publication requirements, origin configuration, and trust settings.
+
+The compiler uses this flow itself. **Prepare compiler release** opens a version PR; after it
+is merged, **Selfhost Silk** publishes the exact prepared version with GitHub notes from TOML.
+Stable and explicit beta/rc releases share this path. See the
+[compiler release procedure](compiler/README.md#release-versions).
 
 ## A short tour
 

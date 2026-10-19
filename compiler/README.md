@@ -275,11 +275,12 @@ root contains `silk/`. `--stdlib` names it explicitly; without the flag, every c
 library an installation keeps at `<prefix>/lib/silk/stdlib` beside `<prefix>/bin/silk`. The
 compiler finds its executable from argument zero (a path, or a bare name searched in `PATH`) and
 resolves symbolic links with `realpath`, so a link to it in another directory finds the same
-library. `compiler/scripts/ReleaseArchive.ts` packages that installation per target as
-`silk-<version>-<target>.tar.gz`: `bin/silk` and `lib/silk/stdlib` below one
+library. `compiler/scripts/ReleaseArchive.ts --version <version>` packages that installation per
+target as `silk-<version>-<target>.tar.gz`: `bin/silk` and `lib/silk/stdlib` below one
 `silk-<version>-<target>/` directory, with zero owners and times so equal inputs give equal
-bytes. The selfhost workflow packages every target's N2 this way, runs a new `init` project from
-the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
+bytes. The version is explicit, never inferred from the working checkout. The selfhost workflow
+packages every target's N2 this way, checks its version and the version recorded by `init`, runs
+a new project from the unpacked archive with the clang on `PATH`, and uploads the archive as `silk-release-<target>`. An executable package without a `[build].composition` takes its runtime from the
 library's `compositions.json` for the target and libc, so such a build needs the library root even
 without standard-library imports; no listed runtime is a refusal. The profile's `runtime` request
 chooses among them: `{ kind = "named", name = "<name>" }` selects the composition or catalog runtime
@@ -404,6 +405,7 @@ spawn a separate tool or require a checkout of that library at runtime.
 silk changes [--dir PATH] add patch|minor|major "Summary" [--migration "Guidance"]
 silk changes [--dir PATH] status [--tag beta]
 silk changes [--dir PATH] version [--tag beta]
+silk changes [--dir PATH] release [--json]
 silk changes [--dir PATH] since [VERSION|DEPENDENCY] [--to VERSION] [--from VERSION] [--source PATH] [--json]
 silk changes [--dir PATH] recover
 ```
@@ -422,10 +424,30 @@ changes at any bump level.
 release at `.changes/releases/<version>.toml`. These TOML records are authoritative.
 `CHANGELOG.md` is regenerated, newest release first, with a visible warning that manual edits
 will be overwritten on the next release. Correct notes in the TOML records instead. Commit the
-manifest, records, generated changelog, and pending-file deletions together.
+manifest, records, generated changelog, any configured version module, and pending-file deletions
+together.
 
-For compiler releases, this updates `compiler/silk.toml`. The native compiler's reported version
-still comes from `release()` in `compiler/src/main.silk`; keep that literal in sync before publishing.
+An executable package can opt into a generated version module:
+
+```toml
+[changes]
+version-file = "src/ReleaseVersion.silk"
+```
+
+`version` generates `pub fn value() -> &'static [u8]` returning the exact package version.
+The path must be normalized, package-relative, outside `.changes`, and end in `.silk`; its parent
+directory must already exist. An absent module is created on the first release. An existing file
+must match the generated current version: manual or stale source is refused, not overwritten.
+`status` detects this drift too. Commit the module before building; no build step mutates an
+immutable source snapshot. The compiler uses this configuration for both `--version` and `init`.
+
+`release` is a read-only publication check and export, not a Git or network operation. It prints
+the current release's Markdown notes from TOML; `--json` emits `package`, `version`, `tag`,
+`prerelease`, and `notes`. It refuses pending changes, an interrupted transaction, inconsistent
+package/version records, incomplete supported predecessor history, or a missing/stale configured
+version module. Coverage begins at the earliest stored predecessor, so an existing library need
+not invent archives back to `0.0.0`. Publishers should consume this output rather than parse the
+generated changelog or invent another version.
 
 `--tag beta` produces SemVer prereleases such as `1.2.0-beta.1`; subsequent pending changes
 advance the counter. `--tag rc` changes the channel, and omitting `--tag` promotes the accumulated
@@ -473,8 +495,9 @@ history, reversed ranges, or an active local release lock. They do not update `s
 update that field only after migrating and verifying the project.
 
 An interrupted write retains `.changes/.lock` and its backups. Stop other writers before
-`recover`; it restores the old manifest, Markdown, and pending changes and removes an uncommitted
-TOML record. This is process-failure recovery, not a power-loss durability guarantee.
+`recover`; it restores the old manifest, Markdown, pending changes and configured version module,
+or removes a module created by the interrupted release, and removes the uncommitted TOML record.
+This is process-failure recovery, not a power-loss durability guarantee.
 
 Run the library's package-owned tests from the repository root:
 
@@ -616,20 +639,76 @@ standard-library change never needs a bootstrap change.
 
 ### Release versions
 
-Every published compiler is a GitHub prerelease tagged `v<version>`. Between releases, a build of
-`main` is `<next>-dev.<n>+<commit>`, as in `v0.1.0-dev.8796+440201f`: `<next>` is
-`[package].version` of `compiler/silk.toml`, `<n>` counts the commits since the newest plain
-`v<x.y.z>` tag (all of history before the first release), and `<commit>` is the 7-hex commit.
-`node compiler/scripts/NativeSeed.mjs version <commit>` prints it. Archives are named without the
-`+<commit>`, because GitHub renames release assets that contain `+`. After tagging a plain
-release, raise `compiler/silk.toml` to the next version; the version script refuses until then.
-n0 is `v0.1.0-dev.8624+5081812`, and the bootstrap bundle is `bootstrap-v0.0.0`.
+The compiler is the reference consumer of `silk changes`. Its package version, generated
+`compiler/src/ReleaseVersion.silk`, executable `--version`, `init`'s `package.silk-version`, release
+tag and archive version agree. Versions are ordinary SemVer: `0.1.0`, `0.2.0-beta.1`,
+`0.2.0-rc.1`, then `0.2.0`. Unreleased checkouts retain their last prepared package version;
+commit identity belongs in build receipts, not an invented commit-count release number.
+
+Include a change file in each compiler or standard-library feature/fix PR, including changes to
+the linked changes CLI:
+
+```sh
+silk changes --dir compiler add minor "Describe the user-visible change." \
+  --migration "Explain changed APIs, behavior, defaults, or required project edits."
+```
+
+After those PRs reach `main`, run **Prepare compiler release** with `stable`, `beta`, or `rc`:
+
+```sh
+gh workflow run prepare-release.yml --ref main -f channel=stable
+```
+
+It verifies the pinned seed, builds the release tool from the exact checkout, consumes pending
+compiler changes with `silk changes version`, and opens a draft PR containing the manifest,
+generated version module, TOML records, changelog and consumed-file deletions. It explicitly
+dispatches Selfhost verification for that branch; it does not force-push an existing release PR.
+Review and merge the PR before publication.
+
+For local preparation, use a native compiler built from this checkout:
+
+```sh
+silk changes --dir compiler status
+silk changes --dir compiler version # Add --tag beta or --tag rc for a prerelease.
+silk changes --dir compiler release --json
+git add compiler/silk.toml compiler/src/ReleaseVersion.silk compiler/CHANGELOG.md compiler/.changes
+git commit -m "Prepare compiler release"
+```
+
+Once the prepared commit is on `main`, run **Selfhost Silk** with `publish` enabled:
+
+```sh
+gh workflow run selfhost.yml --ref main -f publish=true
+```
+
+Publication requires every native gate, validates the committed history and source snapshot,
+checks the executable's identity, and publishes the already-built archives without relabeling
+them. The `v<VERSION>` tag points at that exact commit, including every required TOML record.
+GitHub release notes come from `silk changes release`; stable versions become the latest stable
+release, while beta/rc versions are marked prerelease. Reruns verify existing notes and assets;
+they never replace a published release. Prepare a new version for a new publication.
+
+The installer and `silk changes since` both default to the latest stable release. Select a
+prerelease explicitly with `SILK_RELEASE=v0.2.0-beta.1` when installing or `--to 0.2.0-beta.1`
+when querying history. Archive basenames omit `+build` metadata because GitHub renames assets
+containing `+`; the binary, manifest and tag retain the complete version.
+
+`0.1.0` is the first authoritative compiler history, with an initial baseline of `0.0.0`.
+Older development executables reported `0.1.0` without identifying their source revision;
+their recorded version is not a reliable upgrade baseline. Use `silk changes since --from 0.0.0`
+to review the initial release explicitly. No historical migration coverage is invented.
+
+The frozen bootstrap bundle remains `bootstrap-v0.0.0`. Future n0 publications use the separate
+`bootstrap-native-v<binary-version>` namespace and remain prereleases, not normal compiler releases.
+The original n0 release, `v0.1.0-dev.8624+5081812`, is retained for pinned builds and the frozen
+reproducibility check. Do not delete it while either depends on it. Bootstrap publication checks
+the original compiler hashes as well as any existing namespaced n0 release.
 
 ### The native seed pin
 
-`compiler/native-seed.json` names the published native compiler that builds N1. Seeds are
-published on demand by running Selfhost Silk on `main` with publish ticked, as `v<version>`
-releases. Advance the pin weekly,
+`compiler/native-seed.json` names the published native compiler that builds N1. Each prepared
+compiler release published by Selfhost Silk includes a ready-to-commit per-target pin alongside
+its binaries and receipts. Advance the pin weekly,
 and immediately after any soundness or code generation fix that N1 must not be built without. Pin
 only a candidate whose publishing run summary says **Full gate**; never pin a candidate published
 from a run that reused a pull request verdict. Copy that run's `native-seed.json` verbatim in a
