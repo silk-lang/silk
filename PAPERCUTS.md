@@ -796,3 +796,4 @@ Append entries at the end, with one physical line per entry. Entry order has no 
 2026-10-19 · Native source-test compilation rejected nested scalar enum field patterns such as Type.Reference {access: Access.Shared, ..} with SEM0042 · Bind the field and compare access == Access.Shared explicitly · silk retained result provenance
 
 2026-10-19 · Reusing a native test runner with relative --silk-test-plan/--silk-test-result paths exited 2 without output because the runner filesystem is rooted at / · Pass absolute plan and receipt paths when reusing the generated executable · silk source tests
+2026-10-19 · A new source test used an unsafe block as an expression and failed PAR0001 before any assertion ran · Decode fixture bytes with String.fromBytes and propagate InvalidUtf8; unsafe is a statement boundary · holder-transfer regressions
