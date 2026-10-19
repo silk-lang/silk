@@ -56,7 +56,7 @@ loan. No batching, deduplication or sorting of effects is introduced.
 
 Other retention policies are **unchanged**, not moved into the new helper: capture construction,
 written-operand escape, return escape, stores, cleanup, field filtering and solver consumption.
-`keepCarried` invocation sites in `finish` and `invoke` are unchanged. `construct`, `consume`,
+`keepCarried` invocation sites in `finish` and `defer` are unchanged. `construct`, `consume`,
 `rejoin` and `storeIntoLent` still execute their existing work at their existing positions. This
 is a pure boundary for result selection and call retention, not a claim that the entire Walker
 has become a pure operation graph.
@@ -259,3 +259,10 @@ unique-name branch keeps O without changing precision on every pass. Copy/reachi
 writes remain separate mandatory checks. A stores=true operation likewise preserves already
 proved precision; it cannot turn Unknown into Exact. These are falsifiable acceptance shapes for
 C, not new tests or evidence claimed by A.
+
+## Continuation after independent A review
+
+A is unchanged. The concrete B continuation is in [borrow-source-design.md](borrow-source-design.md).
+It replaces unconditional acyclic-equivalence with equivalence on identical valid ordered inputs
+and observation states; killed historical inputs are an intentional enumeration correction.
+No source graph or API implementation accompanies that proposal.
