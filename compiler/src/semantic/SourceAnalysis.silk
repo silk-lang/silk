@@ -6,11 +6,11 @@
 
 import semantic.SourcePreparation {
   ApplicationId, ContractRouteId, Coverage, EndpointId, MapId, SelectionId as PreparedSelectionId,
-  SourcePreparation, Selection, Root, Endpoint,
+  SourcePreparation, Selection, SelectionMap, ContractRoute, Root, Endpoint,
 }
-import semantic.SourceFlow {DefinitionId, Flow, PointId, ReadId, Reaching, Point, Pair}
+import semantic.SourceFlow {ComponentId, Definition, DefinitionId, Flow, PointId, Read, ReadId, Reaching, Point, Pair, Write}
 import semantic.SourceRules {Atom, Program, Solution, Truth}
-import semantic.TypedBody {LocalId, NodeId, Origin}
+import semantic.TypedBody {LocalId, NodeId, NodeKind, Origin}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.option {Option}
 import silk.ownership {Copy}
@@ -19,9 +19,10 @@ import silk.result {Result}
 import silk.shared {Shared}
 import silk.usize
 import silk.vector {Vector}
+import CompilerBug
 
 /// A static evaluation role. Repeated evaluations of the same NodeId have separate EvalIds.
-pub enum EvaluationRole { Value, Receiver, Argument, Capture, Cleanup, Run, Binding, Replacement }
+pub enum EvaluationRole { Entry, Value, Receiver, Argument, Capture, Cleanup, Run, Binding, Replacement }
 pub struct EvalId { pub index: usize }
 impl Copy for EvalId {}
 pub struct ValueId { pub index: usize }
@@ -44,8 +45,11 @@ pub struct Leaf {
   pub endpoint: EndpointId
 }
 
+pub union EvaluationSite { Entry { pub local: LocalId }, Node { pub node: NodeId } }
+impl Copy for EvaluationSite {}
+
 pub struct Evaluation {
-  pub node: NodeId
+  pub site: EvaluationSite
   pub role: EvaluationRole
   pub point: PointId
 }
@@ -60,7 +64,6 @@ pub struct Value {
 impl Copy for Value {}
 
 pub enum Directness { Preserve, Direct, Indirect }
-pub enum ReservationError { InvalidPair, InvalidEndpoint, InvalidEvaluation, InvalidLeaf, InvalidTransfer }
 
 /// Actual source/read/definition evidence travels together on each transfer. Placement is the
 /// target value's prepared endpoint; source and target are never recovered from region equality.
@@ -87,6 +90,16 @@ pub struct Seed {
 }
 impl Copy for Seed {}
 
+/// A definition's value is the actual stored component, after its RHS placement. Entries,
+/// loan-free replacements and opaque/unknown values use the same definition representation.
+struct DefinedValue { definition: DefinitionId, value: ValueId }
+impl Copy for DefinedValue {}
+
+/// A read supplies its actual storage-to-value map once. Complete definition/read pairing is
+/// reserved later, including definitions not yet visited when the read was encountered.
+struct ReadValue { read: ReadId, value: ValueId, map: MapId }
+impl Copy for ReadValue {}
+
 /// Structural producer; no source alternative is selected during reservation. The BorrowCheck
 /// visitor records actual roots, evaluations, storage and typed transfers into this one skeleton.
 pub struct Skeleton {
@@ -97,6 +110,8 @@ pub struct Skeleton {
   pub leaves: Vector<Leaf>
   pub transfers: Vector<Transfer>
   pub seeds: Vector<Seed>
+  definitions: Vector<DefinedValue>
+  reads: Vector<ReadValue>
 }
 
 /// A source-quality observation. Presence is separate from positive loss bits: an absent cell
@@ -259,13 +274,24 @@ pub struct Graph<'body> {
 impl Skeleton {
   pub fn make() -> Self {
     return Skeleton {rules: Program.make(), flow: Flow.make(), evaluations: Vector<Evaluation>.make(),
-      values: Vector<Value>.make(), leaves: Vector<Leaf>.make(), transfers: Vector<Transfer>.make(), seeds: Vector<Seed>.make()}
+      values: Vector<Value>.make(), leaves: Vector<Leaf>.make(), transfers: Vector<Transfer>.make(), seeds: Vector<Seed>.make(),
+      definitions: Vector<DefinedValue>.make(), reads: Vector<ReadValue>.make()}
   }
 
   pub effect fn evaluate(self: &mut Self, node: NodeId, role: EvaluationRole, point: PointId) -> EvalId
   ! OutOfMemoryError ? &mut Allocator {
     let id = EvalId {index: Vector<Evaluation>.length(&self.evaluations)}
-    run Vector<Evaluation>.append(&mut self.evaluations, Evaluation {node: node, role: role, point: point})
+    run Vector<Evaluation>.append(&mut self.evaluations, Evaluation {site: EvaluationSite.Node {node: node}, role: role, point: point})
+    return id
+  }
+
+  /// Only the owning visitor may create entry storage, for actual parameters/capture aliases.
+  /// Locals with a binding node obtain their definitions at that binding, never here.
+  pub effect fn entry(self: &mut Self, local: LocalId, point: PointId) -> EvalId
+  ! OutOfMemoryError ? &mut Allocator {
+    let id = EvalId {index: Vector<Evaluation>.length(&self.evaluations)}
+    run Vector<Evaluation>.append(&mut self.evaluations,
+      Evaluation {site: EvaluationSite.Entry {local: local}, role: EvaluationRole.Entry, point: point})
     return id
   }
 
@@ -290,6 +316,26 @@ impl Skeleton {
     run Vector<Leaf>.append(&mut self.leaves, move leaf)
     return id
   }
+
+  /// The prepared storage endpoint is the component identity. The value must already occupy
+  /// that exact endpoint; a distinct RHS->storage map records physical placement separately.
+  pub effect fn define(self: &mut Self, point: PointId, storage: EndpointId, value: ValueId,
+    active: Atom, write: Write) -> DefinitionId ! OutOfMemoryError ? &mut Allocator {
+    let values = Vector<Value>.asSlice(&self.values)
+    if value.index >= values.length || values[value.index].endpoint.index != storage.index {
+      CompilerBug.panic(b"source definition does not name its stored component")
+    }
+    let definition = run Flow.define(&mut self.flow, point, ComponentId {index: storage.index}, active, write)
+    run Vector<DefinedValue>.append(&mut self.definitions, DefinedValue {definition: definition, value: value})
+    return definition
+  }
+
+  pub effect fn read(self: &mut Self, point: PointId, storage: EndpointId, value: ValueId, map: MapId) -> ReadId
+  ! OutOfMemoryError ? &mut Allocator {
+    let read = run Flow.read(&mut self.flow, point, ComponentId {index: storage.index})
+    run Vector<ReadValue>.append(&mut self.reads, ReadValue {read: read, value: value, map: map})
+    return read
+  }
 }
 
 fn findCell(keys: &[CellKey], value: ValueId, leaf: LeafId, witness: usize, direct: bool) -> usize {
@@ -300,6 +346,173 @@ fn findCell(keys: &[CellKey], value: ValueId, leaf: LeafId, witness: usize, dire
     at = at + usize.ONE
   }
   return usize.MAX
+}
+
+/// Complete physical storage transfers are created from the same relation used by ownership
+/// projection. No creation-order source classifier or historical loan list participates here.
+/// The definition/read numbers index explicit records, not inferred source ordering.
+effect fn storageTransfers<'body>(preparation: &SourcePreparation<'body>, reaching: &Reaching,
+  stored: &[DefinedValue], readValues: &[ReadValue], values: &[Value], evaluations: &[Evaluation],
+  transfers: &mut Vector<Transfer>, rules: &mut Program) -> () ! OutOfMemoryError ? &mut Allocator {
+  let definitions = Vector<Definition>.asSlice(&reaching.definitions)
+  let reads = Vector<Read>.asSlice(&reaching.reads)
+  let maps = Vector<SelectionMap>.asSlice(&preparation.maps)
+  if stored.length != definitions.length || readValues.length != reads.length {
+    CompilerBug.panic(b"source storage reservation omitted a definition or read value")
+  }
+  let mut at = usize.ZERO
+  while at < stored.length {
+    let actual = stored[at]
+    if actual.definition.index != at || actual.value.index >= values.length {
+      CompilerBug.panic(b"source storage definition identity is invalid")
+    }
+    let value = values[actual.value.index]
+    if value.evaluation.index >= evaluations.length || value.endpoint.index != definitions[at].component.index {
+      CompilerBug.panic(b"source storage definition value has a different component")
+    }
+    if evaluations[value.evaluation.index].point.index != definitions[at].point.index {
+      CompilerBug.panic(b"source storage definition value has a different evaluation point")
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < readValues.length {
+    let actual = readValues[at]
+    if actual.read.index != at || actual.value.index >= values.length || actual.map.index >= maps.length {
+      CompilerBug.panic(b"source storage read identity is invalid")
+    }
+    let value = values[actual.value.index]
+    let map = &maps[actual.map.index]
+    if value.evaluation.index >= evaluations.length || map.source.index != reads[at].component.index
+      || map.target.index != value.endpoint.index {
+      CompilerBug.panic(b"source storage read map does not name its actual endpoints")
+    }
+    if evaluations[value.evaluation.index].point.index != reads[at].point.index {
+      CompilerBug.panic(b"source storage read value has a different evaluation point")
+    }
+    at = at + usize.ONE
+  }
+  // Copying a descriptor adds no loss itself. Loss already present at the definition travels
+  // along the value path; observation of a later loan-wide loss does not rewrite this copy.
+  let noLoss = Program.atom(rules)
+  let pairs = Vector<Pair>.asSlice(&reaching.pairs)
+  at = usize.ZERO
+  while at < pairs.length {
+    let pair = pairs[at]
+    let source = stored[pair.definition.index]
+    let target = readValues[pair.read.index]
+    run Vector<Transfer>.append(transfers, Transfer {source: source.value, target: target.value,
+      active: pair.active, directness: Directness.Preserve, stored: noLoss, alternatives: noLoss,
+      definition: Option<DefinitionId>.some(pair.definition), read: Option<ReadId>.some(pair.read),
+      map: Option<MapId>.some(target.map), contract: Option<ContractRouteId>.none()})
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Missing supported routes are internal construction failures even when their inputs happen
+/// to be absent in this solution. Validate before source closure, never by selected outcomes.
+fn validateReservation<'body>(preparation: &SourcePreparation<'body>, reaching: &Reaching,
+  evaluations: &[Evaluation], values: &[Value], leaves: &[Leaf], seeds: &[Seed], transfers: &[Transfer]) -> () {
+  let endpoints = Vector<Endpoint>.asSlice(&preparation.endpoints)
+  let points = Vector<Point>.asSlice(&reaching.points)
+  let nodes = preparation.body.nodes
+  let mut at = usize.ZERO
+  while at < evaluations.length {
+    let evaluation = evaluations[at]
+    if evaluation.point.index >= points.length { CompilerBug.panic(b"source evaluation has no reserved CFG point") }
+    match evaluation.site {
+      EvaluationSite.Node {node} => {
+        if node.index >= nodes.length || evaluation.role == EvaluationRole.Entry {
+          CompilerBug.panic(b"source evaluation does not name its actual body node")
+        }
+      }
+      EvaluationSite.Entry {local} => {
+        if local.index >= preparation.body.locals.length || evaluation.role != EvaluationRole.Entry {
+          CompilerBug.panic(b"source entry does not name actual initialized storage")
+        }
+        let mut node = usize.ZERO
+        while node < nodes.length {
+          let binding = match &nodes[node].kind {
+            NodeKind.LocalBinding {local: bound, ..} => bound.index == local.index
+            NodeKind.MutableBinding {local: bound, ..} => bound.index == local.index
+            _ => false
+          }
+          if binding { CompilerBug.panic(b"a later local binding was fabricated as source entry storage") }
+          node = node + usize.ONE
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < values.length {
+    if values[at].evaluation.index >= evaluations.length || values[at].endpoint.index >= endpoints.length {
+      CompilerBug.panic(b"source value has no actual evaluation or prepared endpoint")
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < leaves.length {
+    if leaves[at].endpoint.index >= endpoints.length { CompilerBug.panic(b"source leaf has no prepared endpoint") }
+    let valid = match &leaves[at].kind {
+      SourceLeaf.Entry {local} => local.index < preparation.body.locals.length
+      SourceLeaf.Borrow {node: Option<NodeId>.Some {value}, ..} => value.index < nodes.length
+      SourceLeaf.Borrow {node: Option<NodeId>.None, ..} => true
+      SourceLeaf.Expression {node} => node.index < nodes.length
+      SourceLeaf.LoanFree {node} => node.index < nodes.length
+      SourceLeaf.Unknown {node: Option<NodeId>.Some {value}, ..} => value.index < nodes.length
+      SourceLeaf.Unknown {node: Option<NodeId>.None, ..} => true
+    }
+    if !valid { CompilerBug.panic(b"source leaf names an absent body origin") }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < seeds.length {
+    let seed = seeds[at]
+    if seed.value.index >= values.length || seed.leaf.index >= leaves.length {
+      CompilerBug.panic(b"source seed has no reserved value or leaf")
+    }
+    if values[seed.value.index].endpoint.index != leaves[seed.leaf.index].endpoint.index {
+      CompilerBug.panic(b"source seed bypasses its physical placement map")
+    }
+    if let SourceLeaf.Entry {local} = &leaves[seed.leaf.index].kind {
+      let actual = evaluations[values[seed.value.index].evaluation.index]
+      let valid = match actual.site {
+        EvaluationSite.Entry {local: bound} => bound.index == local.index
+        _ => false
+      }
+      if !valid { CompilerBug.panic(b"caller source seed did not originate in actual entry storage") }
+    }
+    at = at + usize.ONE
+  }
+  let maps = Vector<SelectionMap>.asSlice(&preparation.maps)
+  let routes = Vector<ContractRoute>.asSlice(&preparation.routes)
+  at = usize.ZERO
+  while at < transfers.length {
+    let transfer = &transfers[at]
+    if transfer.source.index >= values.length || transfer.target.index >= values.length {
+      CompilerBug.panic(b"source transfer has no reserved physical value")
+    }
+    let source = values[transfer.source.index].endpoint
+    let target = values[transfer.target.index].endpoint
+    match transfer.map {
+      Option<MapId>.Some {value} => {
+        if value.index >= maps.length { CompilerBug.panic(b"source transfer has no prepared physical map") }
+        if maps[value.index].source.index != source.index || maps[value.index].target.index != target.index {
+          CompilerBug.panic(b"source transfer does not follow its prepared physical endpoints")
+        }
+      }
+      Option<MapId>.None => {
+        if source.index != target.index { CompilerBug.panic(b"distinct source endpoints require a prepared map") }
+      }
+    }
+    if let Option<ContractRouteId>.Some {value} = transfer.contract {
+      if value.index >= routes.length { CompilerBug.panic(b"source transfer has no original contract route") }
+    }
+    at = at + usize.ONE
+  }
+  return ()
 }
 
 effect fn reserveCell(keys: &mut Vector<CellKey>, cells: &mut Vector<Cell>, rules: &mut Program, key: CellKey) -> usize
@@ -319,9 +532,16 @@ impl<'body> Builder<'body> {
   /// Reserves the finite typed-topology value/leaf/witness/directness domain and emits source rules.
   /// Cases retain each paired edge; their alternatives do not multiply physical operands.
   pub effect fn reserve(preparation: SourcePreparation<'body>, skeleton: Skeleton) -> Self
-  ! OutOfMemoryError | ReservationError ? &mut Allocator {
+  ! OutOfMemoryError ? &mut Allocator {
     let mut rules = move skeleton.rules
     let reaching = run Flow.emit(move skeleton.flow, &mut rules)
+    let mut transfers = move skeleton.transfers
+    run storageTransfers(&preparation, &reaching, Vector<DefinedValue>.asSlice(&skeleton.definitions),
+      Vector<ReadValue>.asSlice(&skeleton.reads), Vector<Value>.asSlice(&skeleton.values),
+      Vector<Evaluation>.asSlice(&skeleton.evaluations), &mut transfers, &mut rules)
+    validateReservation(&preparation, &reaching, Vector<Evaluation>.asSlice(&skeleton.evaluations),
+      Vector<Value>.asSlice(&skeleton.values), Vector<Leaf>.asSlice(&skeleton.leaves),
+      Vector<Seed>.asSlice(&skeleton.seeds), Vector<Transfer>.asSlice(&transfers))
     let mut witnesses = Vector<Witness>.make()
     let seedCount = Vector<Seed>.length(&skeleton.seeds)
     let mut seedWitness = usize.ZERO
@@ -367,7 +587,7 @@ impl<'body> Builder<'body> {
         contract: Option<ContractRouteId>.none()})
       index = index + usize.ONE
     }
-    let transfers = Vector<Transfer>.asSlice(&skeleton.transfers)
+    let transfers = Vector<Transfer>.asSlice(&transfers)
     // Candidate closure follows physical topology only. It reads no Truth and ignores every
     // policy/CFG gate, including late backedges. It reserves cells, not source witnesses.
     // Each (value, leaf, paired witness, directness) key is processed exactly once.
@@ -396,10 +616,10 @@ impl<'body> Builder<'body> {
                 }
                 pairIndex = pairIndex + usize.ONE
               }
-              if let Option<Atom>.None = paired { fail ReservationError.InvalidPair }
-            } else { fail ReservationError.InvalidPair }
+              if let Option<Atom>.None = paired { CompilerBug.panic(b"source transfer has no matching definition/read pair") }
+            } else { CompilerBug.panic(b"source transfer omits its paired read") }
           } else {
-            if let Option<ReadId>.Some {value: ignored} = transfer.read { fail ReservationError.InvalidPair }
+            if let Option<ReadId>.Some {value: ignored} = transfer.read { CompilerBug.panic(b"source transfer omits its paired definition") }
           }
           let target = run reserveCell(&mut keys, &mut cells, &mut rules,
             CellKey {value: transfer.target, leaf: key.leaf, witness: targetWitness, direct: direct})
@@ -553,7 +773,11 @@ impl<'body> Graph<'body> {
     let mut value = usize.ZERO
     while value < values.length {
       let evaluation = values[value].evaluation.index
-      if evaluations[evaluation].node.index == query.read.index {
+      let atRead = match evaluations[evaluation].site {
+        EvaluationSite.Node {node} => node.index == query.read.index
+        EvaluationSite.Entry {..} => false
+      }
+      if atRead {
         let mut selected = false
         let mut accept = usize.ZERO
         while accept < accepts.length {
@@ -584,6 +808,10 @@ impl<'body> Graph<'body> {
                 let mut routeCase = usize.ZERO
                 while routeCase < cases.length {
                   if cases[routeCase].target == cell && Solution.truth(&self.solution, cases[routeCase].active) != Truth.False {
+                    if Solution.truth(&self.solution, cases[routeCase].active) == Truth.Undefined {
+                      complete = false
+                      run Vector<SourceGap>.append(&mut gaps, SourceGap.UnresolvedApplicability)
+                    }
                     run Vector<SourceAlternative>.append(&mut alternatives, SourceAlternative {
                       leaf: SourceLeafId {stamp: Shared<Stamp>.clone(&self.stamp), index: leaf}, origin: leaves[leaf].origin,
                       occurrence: OccurrenceId {stamp: Shared<Stamp>.clone(&self.stamp), index: evaluation},
