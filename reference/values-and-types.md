@@ -1334,6 +1334,53 @@ reports `SEM0030` at that element; a contextual length mismatch reports `SEM0031
 **Evidence:** fixed-array specification,
 [array elaboration](../bootstrap/packages/compiler/src/Elaboration.ts).
 
+### ARRAY-003 — A repeated array evaluates one value and repeats its storage
+
+**Status:** Confirmed
+
+`[value; count]` constructs a fixed array. `count` is a compile-time integer expression subject to
+the same non-negative length bound as `[T; N]`: at most 2147483647. Static locals and the current
+`static for` binder may determine the count. With an expected `[T; N]`, `value` is checked in
+immediate `T` context and `count` must equal `N`; otherwise the operand determines the element type.
+
+```silk
+fn lanes() -> [u64; 25] {
+  return [0; 25]
+}
+
+static fn padding() -> [u8; 32] {
+  return [255; 32]
+}
+
+fn matrix() -> [[u8; 4]; 3] {
+  return [[0; 4]; 3]
+}
+```
+
+The operand is evaluated exactly once, including when `count` is zero. A zero-count operand is
+discarded with its ordinary cleanup; a count of one transfers it into the sole element.
+Counts above one require the operand's type to satisfy `Copy`. Repetition never implicitly clones
+an affine value. Each array element has independent storage; repeated reference values still refer
+to the same borrowed storage and retain its ordinary lifetime and access restrictions.
+
+Repetition is available during static evaluation when its operand is a valid static value.
+Compile-time evaluation does not grant static storage duration to a runtime local.
+The result is an array, not a slice; explicit borrowing supplies a slice view as usual.
+An empty repetition can infer its element type from its operand, unlike `[]`.
+
+**Boundary:** The count is not a runtime allocation size. Repetition copies one evaluated value;
+it does not invoke a factory once per element. Array repetition remains compact through runtime
+lowering, while static values remain subject to the static evaluator's resource bounds.
+
+**Diagnostics:** Malformed repetition receives a parser diagnostic. Out-of-range literal counts
+report `SEM0002`; other invalid constant counts use the existing fixed-array constant diagnostics.
+An incompatible operand reports `SEM0030`, a contextual length mismatch reports `SEM0031`, and
+repeating a non-`Copy` operand more than once reports missing conformance at the operand.
+
+**Evidence:** [static execution and admission](../compiler/src/semantic/SemanticStaticCases.silk),
+[lowering and retained loans](../compiler/src/semantic/SemanticLoweringCases.silk),
+[native repetition and cleanup](../corpus/native/array-repeat/main.silk).
+
 ### INDEX-001 — Array and slice indexing uses checked `usize`
 
 **Status:** Confirmed
