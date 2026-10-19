@@ -2782,6 +2782,18 @@ struct SourceAccessDecision {
   unresolved: bool
 }
 
+struct SourceLoanFlow {
+  occupancy: SourceLoanOccupancy
+  needs: SourceLoanNeeds
+  holders: SourceHolderLiveness
+}
+
+struct SourceConflictProjection {
+  conflict: Option<Verdict>
+  contested: List<Shared<Lifetime>>
+  unresolved: bool
+}
+
 struct SourceRequiredUse {
   evidence: CallerSource
   span: Location
@@ -4876,6 +4888,150 @@ effect fn sourceEndLoan<'input, 'body>(input: &SourceRegionInput<'input, 'body>,
   run addReport(&mut reports.*, Report {code: expiredCode(), access: required.span, related: true, earlier: loan.origin})
   result.reported = true
   return result
+}
+
+// Freeze the diagnostic walk's per-loan views from the solved graph. Every occupancy bit
+// still names a real Flow definition, and every liveness query uses the shared actual CFG.
+effect fn sourceLoanFlows<'input, 'body>(input: &SourceRegionInput<'input, 'body>, settled: &SourceSettledLoans,
+  holders: &SourceHolderProjection, intervals: &mut IntervalFlow) -> List<SourceLoanFlow>
+! OutOfMemoryError ? &mut Allocator {
+  let loans = List<Loan>.asSlice(&settled.loans)
+  let mut result = List<SourceLoanFlow>.make()
+  let mut at = usize.ZERO
+  while at < loans.length {
+    let occupancy = run sourceLoanOccupancy(input.graph, input.storage, at)
+    let needs = run sourceLoanNeeds(input.graph, input.control, input.storage, &occupancy,
+      input.intervals, input.views, loans[at].created, &mut intervals.*)
+    let kept = run sourceHolderLiveness(input.graph, input.control, input.storage, &occupancy, holders)
+    run List<SourceLoanFlow>.append(&mut result, SourceLoanFlow {occupancy: move occupancy, needs: move needs, holders: move kept})
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+// The complete access-order classifier, after guard/escape/outside precedence has been
+// decided by the body owner. It reports genuine conflicts and unresolved evidence only;
+// absence of a conflict never discharges source coverage or retained region obligations.
+effect fn sourceConflicts<'input, 'body, 'proof>(input: &SourceRegionInput<'input, 'body>,
+  settled: &SourceSettledLoans, callers: &SourceCallerProjection, flow: &[SourceLoanFlow],
+  moves: &SourceMoveProjection, refinements: &[Refinement], regions: &RegionSources<'proof>,
+  chains: &[UnretainedChain], returnedEscape: bool) -> SourceConflictProjection
+! OutOfMemoryError ? &mut Allocator {
+  let events = List<Event>.asSlice(&input.events.events)
+  let uncertain = List<bool>.asSlice(&input.events.uncertain)
+  let loans = List<Loan>.asSlice(&settled.loans)
+  if uncertain.length != events.length || flow.length != loans.length {
+    return CompilerBug.panic(b"source conflict projection lost its actual event or loan inventory")
+  }
+  let mut result = SourceConflictProjection {conflict: Option<Verdict>.none(), contested: List<Shared<Lifetime>>.make(),
+    unresolved: settled.unresolved || input.events.unresolved || input.control.unresolved || moves.unresolved}
+  let points = List<Point>.asSlice(&input.control.points)
+  let loops = List<Loop>.asSlice(&moves.loops)
+  let initialized = List<MoveInitialization>.asSlice(&moves.initialized)
+  let moved = List<usize>.asSlice(&moves.moves)
+  let mut reports = List<Report>.make()
+  let mut paths = List<ReplacementReach>.make()
+  let mut checkedLoops = usize.ZERO
+  let mut stopped = false
+  let mut at = usize.ZERO
+  while at <= events.length {
+    while checkedLoops < loops.length && (at == events.length || loops[checkedLoops].header < events[at].point) {
+      let repeat = &loops[checkedLoops]
+      let repeats = run refinementRepeats(points, refinements, events, repeat, &mut paths)
+      let compatible = moves.width == usize.ZERO || compatibleHeader(initialized, events, moved, &moves.reach, moves.width, repeat)
+      if !compatible || !repeats {
+        if moves.unresolved { result.unresolved = true }
+        else {
+          if List<Report>.length(&reports) == usize.ZERO {
+            result.conflict = Option<Verdict>.some(Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions,
+              code: RejectionCode.IncompatibleLoopHeader, access: repeat.span, earlier: Option<Location>.none(), reports: List<Report>.make()})
+          }
+          stopped = true
+          break
+        }
+      }
+      checkedLoops = checkedLoops + usize.ONE
+    }
+    if stopped || at == events.length { break }
+    let event = &events[at]
+    if event.consumesTarget == usize.ONE && !uncertain[at] {
+      if List<Report>.length(&reports) == usize.ZERO {
+        result.conflict = Option<Verdict>.some(Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions,
+          code: RejectionCode.OverlappingAssignment, access: event.span, earlier: Option<Location>.none(), reports: List<Report>.make()})
+      }
+      break
+    }
+    if event.consumesTarget != usize.ZERO { result.unresolved = true }
+    let mut bit = usize.ZERO
+    while event.kind != Kind.End && event.kind != Kind.Expire && bit < moved.length {
+      if moveReachesEvent(events, initialized, moved, &moves.reach, moves.width, bit, at) {
+        let classification = movedAccess(event, &events[moved[bit]])
+        if classification == MoveAccess.Conflict {
+          if moves.unresolved || uncertain[at] || uncertain[moved[bit]] { result.unresolved = true }
+          else {
+            if List<Report>.length(&reports) == usize.ZERO {
+              result.conflict = Option<Verdict>.some(Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions,
+                code: RejectionCode.UseAfterMove, access: event.span, earlier: Option<Location>.some(events[moved[bit]].span),
+                reports: List<Report>.make()})
+            }
+            stopped = true
+            break
+          }
+        }
+        if classification == MoveAccess.Unknown { result.unresolved = true }
+      }
+      bit = bit + usize.ONE
+    }
+    if stopped { break }
+    if event.refiner != usize.MAX && event.kind != Kind.End && event.kind != Kind.Expire {
+      let test = refinementTest(refinements, event.refiner)
+      if test == usize.MAX { result.unresolved = true }
+      let mut source = usize.ZERO
+      while test != usize.MAX && source < events.length {
+        let written = &events[source]
+        if replaces(written.kind) && coversRefined(&written.place, &event.place, event.refinedDepth)
+          && run reachesAvoiding(points, &mut paths, written.point, event.point, test) {
+          if input.control.unresolved || uncertain[at] || uncertain[source] { result.unresolved = true }
+          else {
+            if List<Report>.length(&reports) == usize.ZERO {
+              run List<Report>.append(&mut reports, Report {code: RejectionCode.ExtractionBoundary, access: event.span,
+                related: true, earlier: written.span})
+            }
+            break
+          }
+        }
+        source = source + usize.ONE
+      }
+    }
+    let mut loan = usize.ZERO
+    while loan < loans.length {
+      let actual = &flow[loan]
+      if actual.occupancy.loan != loan { return CompilerBug.panic(b"source conflict projection reordered loan identities") }
+      let ended = event.kind == Kind.End || event.kind == Kind.Expire
+      let mut decision = SourceAccessDecision {reported: false, unresolved: false}
+      if ended {
+        decision = run sourceEndLoan(input, settled, callers, &actual.occupancy, &actual.needs, &actual.holders,
+          event, uncertain[at], returnedEscape, &mut paths, &mut reports)
+      } else {
+        decision = run sourceAccessLoan(input, settled, callers, &actual.occupancy, &actual.needs, &actual.holders,
+          regions, chains, event, uncertain[at], returnedEscape, &mut paths, &mut result.contested, &mut reports)
+      }
+      if decision.unresolved { result.unresolved = true }
+      if decision.reported && !ended { break }
+      loan = loan + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if List<Report>.length(&reports) != usize.ZERO {
+    let first = List<Report>.asSlice(&reports)[usize.ZERO]
+    let mut listed = List<Report>.make()
+    if List<Report>.length(&reports) > usize.ONE { listed = run bySpan(List<Report>.asSlice(&reports)) }
+    let mut earlier = Option<Location>.none()
+    if first.related { earlier = Option<Location>.some(first.earlier) }
+    result.conflict = Option<Verdict>.some(Verdict {outcome: Outcome.Conflict, status: BorrowStatus.Regions,
+      code: first.code, access: first.access, earlier: move earlier, reports: move listed})
+  }
+  return move result
 }
 
 // Build the existing availability solver's inputs from original definitions and paired source
@@ -12061,6 +12217,27 @@ fn movedIn(events: &[Event], moves: &[usize], state: &[u64], width: usize, point
   return false
 }
 
+// A point may contain several ordered ownership events. Start with its incoming move
+// state, then apply only the preceding events at that point; later writes cannot clear a
+// move before this access, and an earlier move cannot disappear behind the shared point.
+fn moveReachesEvent(events: &[Event], initialized: &[MoveInitialization], moves: &[usize], reach: &Reach,
+  width: usize, bit: usize, at: usize) -> bool {
+  let point = events[at].point
+  let source = moves[bit]
+  let place = &events[source].place
+  let mut present = reaches(List<u64>.asSlice(&reach.entering), width, point, bit)
+  if moveInitialized(initialized, point, place.root) { present = false }
+  let mut before = usize.ZERO
+  while before < at {
+    if events[before].point == point {
+      if events[before].kind == Kind.Write && covers(&events[before].place, place) { present = false }
+      if before == source { present = true }
+    }
+    before = before + usize.ONE
+  }
+  return present
+}
+
 fn samePlace(left: &Place, right: &Place) -> bool {
   return left.root == right.root && overlap(left, right) == usize.ONE
     && List<Step>.length(&left.steps) == List<Step>.length(&right.steps)
@@ -16383,6 +16560,25 @@ effect fn sourceAccessClaims() -> () ! OutOfMemoryError | AssertionError<'static
   run Testing.expect(!reaches(List<u64>.asSlice(&together.leaving), 1, 3, 0)
     && !reaches(List<u64>.asSlice(&together.leaving), 1, 3, 1),
     "all actual owners initialized at one CFG point clear their own moves")
+  run Testing.expect(moveReachesEvent(List<Event>.asSlice(&projected), List<MoveInitialization>.asSlice(&initialized),
+      &moves, &together, 1, 0, 1)
+    && !moveReachesEvent(List<Event>.asSlice(&projected), List<MoveInitialization>.asSlice(&initialized),
+      &moves, &together, 1, 1, 0),
+    "a coincident access sees a preceding move but cannot see a later move at that same point")
+  List<Event>.asMutSlice(&mut projected)[2].point = 0
+  List<Event>.asMutSlice(&mut projected)[2].place.root = 1
+  path.root = 1
+  let mut afterWrite = List<SourceAccessEvent>.make()
+  run sourceAccessEvent(&mut afterWrite, SourceGraph.EvalId {index: 3}, SourceControl.PointId {index: 0},
+    &path, Kind.Read, target, target)
+  if let Option<SourceAccessEvent>.Some {value} = move List<SourceAccessEvent>.pop(&mut afterWrite) {
+    run List<Event>.append(&mut projected, move value.event)
+  }
+  run Testing.expect(moveReachesEvent(List<Event>.asSlice(&projected), List<MoveInitialization>.asSlice(&initialized),
+      &moves, &together, 1, 1, 2)
+    && !moveReachesEvent(List<Event>.asSlice(&projected), List<MoveInitialization>.asSlice(&initialized),
+      &moves, &together, 1, 1, 3),
+    "a coincident write clears a move only for the access that follows the write")
   return run sourceViewClaims()
 }
 
