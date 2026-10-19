@@ -123,7 +123,7 @@ The returned certificate cannot outlive this bundle. This operation allocates no
 ### Method `intoCertificates`
 
 ```silk
-pub fn intoCertificates(self: Self) -> Vector<Certificate>
+pub fn intoCertificates(self: Self) -> List<Certificate>
 ```
 
 Consumes the bundle and returns every owned certificate without allocating or copying DER.
@@ -135,7 +135,7 @@ inspect one certificate without consuming the bundle.
 
 #### Details
 
-The returned vector preserves input order, duplicate entries, allocation, and capacity. This
+The returned list preserves input order, duplicate entries, allocation, and capacity. This
 operation assigns no trust and performs no certificate validation.
 
 

@@ -518,7 +518,7 @@ argument. Argument evaluation order does not shorten an earlier loan to the end 
 evaluation; the callee receives all arguments together.
 
 Reading `.length` of any place while an exclusive loan of it is live is an access, whether the
-place is a fixed-size array, a slice or a `Vector`, even though a fixed array's length is part of
+place is a fixed-size array, a slice or a `List`, even though a fixed array's length is part of
 its type. For `values: [i32; 2]`, `replace(&mut values, values.length - 1)` reports `OWN0011` at
 the length read and relates the first argument's loan. Bind the length before the call instead:
 `let last = values.length - 1` and then `replace(&mut values, last)`.
@@ -583,7 +583,7 @@ Borrowing an owned temporary creates a hidden owner, which is live for every vie
 borrow within the statement that evaluates it and is then cleaned under the ordinary ownership
 rules. Only a borrowed array keeps its hidden owner past that statement, for the views a binding
 holds, as described below. The hidden owner of any other temporary, such as a struct value, a call
-result or a `Vector`, ends with its statement, so a view of it used after that statement has expired.
+result or a `List`, ends with its statement, so a view of it used after that statement has expired.
 
 ```silk
 fn read(values: &[i32]) -> i32 { return 1 }

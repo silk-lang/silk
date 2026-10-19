@@ -84,7 +84,7 @@ One owned child: an array item or an object member with its decoded key.
 
 ### Details
 Both container kinds use this one recursive storage shape, so cleanup follows one finite
-`Box<Vector<JsonChild>>` specialization even when arrays and objects nest in each other.
+`Box<List<JsonChild>>` specialization even when arrays and objects nest in each other.
 
 <a id="JsonChild.Item"></a>
 
@@ -221,7 +221,7 @@ Values in source order.
 #### Field `values`
 
 ```silk
-pub values: Box<Vector<JsonChild>>
+pub values: Box<List<JsonChild>>
 ```
 
 The array elements in source order.
@@ -241,7 +241,7 @@ Members in source order.
 #### Field `entries`
 
 ```silk
-pub entries: Box<Vector<JsonChild>>
+pub entries: Box<List<JsonChild>>
 ```
 
 The object members in source order.

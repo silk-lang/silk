@@ -43,7 +43,7 @@ import silk.trust_anchor as TrustAnchors {TrustAnchor}
 import silk.trust_snapshot as TrustSnapshots {SnapshotLimits, TrustSnapshot, TrustSourceError}
 import silk.u8
 import silk.usize
-import silk.vector as Vectors {Vector}
+import silk.list as Lists {List}
 
 struct ExampleRandom { next: usize }
 
@@ -66,7 +66,7 @@ effect fn program<'name>(name: &'name [u8]) -> i32 ! OutOfMemoryError {
     Result<ReferenceIdentity<'name>, IdentityError>.Failure {error} => { return 0 }
   }
   let snapshot = TrustSnapshot.fromAnchors(
-    Vector<TrustAnchor>.make(),
+    List<TrustAnchor>.make(),
     SnapshotLimits {anchors: 0, encodedBytes: 0},
   )
   let trust = match move snapshot {

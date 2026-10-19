@@ -365,8 +365,8 @@ impl MemoryByteDuplex
 
 ```silk
 pub effect fn make(
-    reads: Vector<MemoryReadEvent>,
-    writes: Vector<MemoryWriteEvent>,
+    reads: List<MemoryReadEvent>,
+    writes: List<MemoryWriteEvent>,
     outboundCapacity: usize,
     auditCapacity: usize,
     closeFailure: Option<i32>,

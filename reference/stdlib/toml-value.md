@@ -372,7 +372,7 @@ Ordered values or an array of tables.
 #### Field `values`
 
 ```silk
-pub values: Box<Vector<TomlChild>>
+pub values: Box<List<TomlChild>>
 ```
 
 The owned elements in source order.
@@ -402,7 +402,7 @@ Ordered key/value members.
 #### Field `entries`
 
 ```silk
-pub entries: Box<Vector<TomlChild>>
+pub entries: Box<List<TomlChild>>
 ```
 
 The owned members in source order.

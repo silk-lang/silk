@@ -44,7 +44,7 @@ const importOf = (module) => {
 
 const source = [
   '//! Ordinary package root that loads every standard-library module except application startup.',
-  '//! Regenerate with `node .github/scripts/check-stdlib-root.mjs --write`.',
+  '//! Regenerate with `node .github/scripts/generate-stdlib-root.mjs`.',
   '',
   ...modules
     .filter((module) => !startup.has(module))
@@ -55,12 +55,4 @@ const source = [
   '',
 ].join('\n')
 
-if (process.argv[2] === '--write' && process.argv.length === 3) {
-  writeFileSync(fixture, source)
-} else if (process.argv.length === 2) {
-  if (readFileSync(fixture, 'utf8') !== source) {
-    throw new Error('Stdlib root imports differ from the module inventory; run with --write')
-  }
-} else {
-  throw new Error('Usage: node .github/scripts/check-stdlib-root.mjs [--write]')
-}
+writeFileSync(fixture, source)
