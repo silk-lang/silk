@@ -2596,6 +2596,15 @@ struct SourceHolderLiveness {
   unresolved: bool
 }
 
+struct SourceRegionInput<'input, 'body> {
+  graph: &'input SourceGraph.Graph<'body>
+  control: &'input SourceControlProjection
+  owners: &'input [SourceVisit.Owner]
+  storage: &'input SourceStorageProjection
+  events: &'input SourceRuntimeEvents
+  intervals: &'input [SourceIntervalProjection]
+}
+
 // Inputs to the existing availability propagation: real carriers and paired copy reads.
 // `preserves` is a projection of kills, not an independently solved reaching relation.
 struct AvailabilitySource {
@@ -4018,11 +4027,10 @@ effect fn sourceLoanAvailable(control: &SourceControlProjection, events: &Source
 // Owner identity, not a region match or a source leaf's creation order, selects initialization.
 // Several owners may initialize at one point; the old singleton Point.initializes slot is not
 // used by this projection. Repeated initialization of a local keeps the existing refusal.
-effect fn sourceInitializedOwnedRegion(control: &SourceControlProjection, reservation: &SourceVisit.Reservation,
+effect fn sourceInitializedOwnedRegion(control: &SourceControlProjection, owners: &[SourceVisit.Owner],
   localCount: usize, loan: &Loan, region: &Shared<Lifetime>, storage: &mut RegionAvailability,
   flow: &mut IntervalFlow) -> usize ! OutOfMemoryError ? &mut Allocator {
   if control.unresolved || !initializedOwnedSource(loan, region) { return usize.MAX }
-  let owners = List<SourceVisit.Owner>.asSlice(&reservation.owners)
   let mut initialized = usize.MAX
   let mut at = usize.ZERO
   while at < owners.length {
@@ -4091,6 +4099,79 @@ effect fn sourceReleasedLoanPoints<'body>(graph: &SourceGraph.Graph<'body>, cont
   }
   return run releasedInstancePoints(points, control.entry, loan.created,
     List<bool>.asSlice(&occupied), List<bool>.asSlice(&ends))
+}
+
+// Bind the accepted region solver to actual graph-backed loan requirements and validity.
+// Every loan is checked against its own availability before release or region intersection;
+// universal domains keep their universal requirements and do not gain a finite-source proof.
+effect fn sourceRegionPoints<'input, 'body, 'proof>(input: &SourceRegionInput<'input, 'body>,
+  sources: &RegionSources<'proof>, owner: &DeclarationId, region: &Shared<Lifetime>,
+  regions: &mut List<RegionPoints>, premises: &[RegionBound], symbolic: &mut List<SymbolicRegion>,
+  flow: &mut IntervalFlow, storage: &mut RegionAvailability) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if input.control.unresolved || input.events.unresolved { return usize.MAX }
+  let existing = List<RegionPoints>.asSlice(&regions.*)
+  let mut at = usize.ZERO
+  while at < existing.length {
+    if Lifetime.equalsShared(&existing[at].region, region) { return at }
+    at = at + usize.ONE
+  }
+  let domain = regionDomain(region, owner, sources.supplied)
+  if domain == RegionDomain.Unknown { return usize.MAX }
+  let mut selected = List<usize>.make()
+  if domain == RegionDomain.Local {
+    at = usize.ZERO
+    while at < sources.loans.length {
+      if regionsCarry(List<Shared<Lifetime>>.asSlice(&sources.loans[at].regions), region, owner, sources.supplied) {
+        if !provable(sources.loans[at].precision) { return usize.MAX }
+        run List<usize>.append(&mut selected, at)
+      }
+      at = at + usize.ONE
+    }
+    if List<usize>.length(&selected) == usize.ZERO
+      && !proofContains(List<Shared<Lifetime>>.asSlice(&storage.choices), region) { return usize.MAX }
+  }
+  let pointCount = List<Point>.length(&input.control.points)
+  let words = (pointCount + 63) / 64
+  let mut required = List<u64>.make()
+  let mut available = List<u64>.make()
+  let mut incoming = List<u64>.make()
+  at = usize.ZERO
+  while at < words {
+    let mut initial: u64 = 0
+    if domain == RegionDomain.Universal { initial = u64.bitNot(0) }
+    run List<u64>.append(&mut required, initial)
+    run List<u64>.append(&mut available, u64.bitNot(0))
+    run List<u64>.append(&mut incoming, 0)
+    at = at + usize.ONE
+  }
+  let chosen = List<usize>.asSlice(&selected)
+  at = usize.ZERO
+  while at < chosen.length {
+    let index = chosen[at]
+    let loan = &sources.loans[index]
+    if loan.created >= pointCount { return usize.MAX }
+    let occupancy = run sourceLoanOccupancy(input.graph, input.storage, index)
+    let needs = run sourceLoanNeeds(input.graph, input.control, input.storage, &occupancy, input.intervals, loan.created, &mut flow.*)
+    let carriers = run sourceAvailabilityProjection(input.graph, input.storage, &occupancy, input.intervals)
+    let universalBound = run loanParentBoundProved(sources, owner, loan, premises, &mut symbolic.*)
+    let finiteBound = !loan.local && proofContains(List<Shared<Lifetime>>.asSlice(&storage.finiteParents), region)
+    let initialized = run sourceInitializedOwnedRegion(input.control, input.owners,
+      SourceGraph.Graph.preparation(input.graph).body.locals.length, loan, region, &mut storage.*, &mut flow.*)
+    let own = run sourceLoanAvailable(input.control, input.events, &carriers, &occupancy, loan,
+      universalBound || finiteBound, initialized, &storage.*)
+    if needs.unresolved || own.unresolved { return usize.MAX }
+    let ownWords = List<u64>.asSlice(&own.points)
+    let neededWords = List<u64>.asSlice(&needs.required)
+    if !regionSourceFits(neededWords, ownWords) { return usize.MAX }
+    let released = run sourceReleasedLoanPoints(input.graph, input.control, &occupancy, &needs,
+      input.intervals, sources.loans, ownWords)
+    mergeRegionSource(&mut required, &mut available, neededWords, ownWords, List<u64>.asSlice(&released))
+    at = at + usize.ONE
+  }
+  let index = List<RegionPoints>.length(&regions.*)
+  run List<RegionPoints>.append(&mut regions.*, RegionPoints {region: Shared<Lifetime>.clone(region),
+    required: move required, available: move available, incoming: move incoming})
+  return index
 }
 
 // Operation applicability is an ownership effect on the existing CFG. It is emitted into
@@ -10489,7 +10570,7 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
   }
   walker.contested = move contested
   let mut symbolic = List<SymbolicRegion>.make()
-  let crossingsProved = run crossedRegionsProved(&walker, owner, premises, &mut symbolic)
+  let crossingsProved = run crossedRegionsProved(&regionSources(&walker), owner, premises, &mut symbolic)
   let mut relationsProved = !pending && crossingsProved
   if !relationsProved {
     relationsProved = run localRelationsProved(&walker, owner, obligations, premises, &mut symbolic,
@@ -10613,6 +10694,23 @@ fn refutedOr(walker: &Walker, escaping: usize, otherwise: Verdict) -> Verdict {
 // the points propagated from other regions. A local region's own requirement was checked loan by
 // loan against that loan's validity; propagated points must lie where every loan of the region is
 // valid.
+// Immutable source/provenance inputs to the accepted universal and parent predicates.
+// The source consumer supplies its projected loans and policy effects directly; no Walker or
+// historical Holding identity is required by these proofs.
+struct RegionSources<'proof> {
+  loans: &'proof [Loan]
+  supplied: &'proof [Shared<Lifetime>]
+  contested: &'proof [Shared<Lifetime>]
+  openContents: &'proof [Shared<Lifetime>]
+  retentionRelations: &'proof [ImpliedGroup]
+}
+
+fn regionSources<'proof>(walker: &'proof Walker) -> RegionSources<'proof> {
+  return RegionSources {loans: List<Loan>.asSlice(&walker.loans), supplied: List<Shared<Lifetime>>.asSlice(&walker.supplied),
+    contested: List<Shared<Lifetime>>.asSlice(&walker.contested), openContents: List<Shared<Lifetime>>.asSlice(&walker.openContents),
+    retentionRelations: List<ImpliedGroup>.asSlice(&walker.retentionRelations)}
+}
+
 struct RegionPoints {
   region: Shared<Lifetime>
   required: List<u64>
@@ -10861,20 +10959,20 @@ effect fn symbolicRootIndex(roots: &mut List<SymbolicRoot>, region: &Shared<Life
 // universal. Each reachable component must also reach a real root; a root elsewhere in the graph
 // cannot justify an ungrounded sibling cycle. Static cycles from reassigning a reborrow may be
 // grounded by the original reference, without assuming the cycle itself is a source of validity.
-effect fn symbolicParentsProved(walker: &Walker, owner: &DeclarationId, offered: &Shared<Lifetime>,
+effect fn symbolicParentsProved<'proof>(sources: &RegionSources<'proof>, owner: &DeclarationId, offered: &Shared<Lifetime>,
   wanted: &Shared<Lifetime>, premises: &[RegionBound], cache: &mut List<SymbolicRegion>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   let mut roots = List<SymbolicRoot>.make()
   drop run symbolicRootIndex(&mut roots, offered)
-  let loans = List<Loan>.asSlice(&walker.loans)
+  let loans = sources.loans
   let mut next = usize.ZERO
   while next < List<SymbolicRoot>.length(&roots) {
     let entries = List<SymbolicRoot>.asSlice(&roots)
     let region = Shared<Lifetime>.clone(&entries[next].region)
     // A contested region is used past the body by a loan the walk dropped, after a conflicting
     // access: it outlives no universal region.
-    if regionDomain(wanted, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied)) == RegionDomain.Universal
-      && proofContains(List<Shared<Lifetime>>.asSlice(&walker.contested), &region) { return false }
+    if regionDomain(wanted, owner, sources.supplied) == RegionDomain.Universal
+      && proofContains(sources.contested, &region) { return false }
     let mut parents = List<usize>.make()
     let mut grounded = false
     let mut found = false
@@ -10895,10 +10993,10 @@ effect fn symbolicParentsProved(walker: &Walker, owner: &DeclarationId, offered:
           let mut atom = usize.ZERO
           while atom < count {
             let parent = Lifetime.atomAt(&bound, atom)
-            let domain = regionDomain(&parent, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied))
+            let domain = regionDomain(&parent, owner, sources.supplied)
             if domain == RegionDomain.Universal {
-              if regionDomain(wanted, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied)) == RegionDomain.Universal
-                && !run universalRegionProved(owner, List<Shared<Lifetime>>.asSlice(&walker.supplied), &parent, wanted, premises) { return false }
+              if regionDomain(wanted, owner, sources.supplied) == RegionDomain.Universal
+                && !run universalRegionProved(owner, sources.supplied, &parent, wanted, premises) { return false }
               grounded = true
             } else if domain == RegionDomain.Local {
               let known = cachedSymbolicRegion(owner, &parent, wanted, List<SymbolicRegion>.asSlice(&cache.*))
@@ -10918,11 +11016,11 @@ effect fn symbolicParentsProved(walker: &Walker, owner: &DeclarationId, offered:
     }
     if !found { return false }
     // An open contents bound lets values of unknown regions into this region.
-    if proofContains(List<Shared<Lifetime>>.asSlice(&walker.openContents), &region) { return false }
+    if proofContains(sources.openContents, &region) { return false }
     // A value can also enter this region without a loan, through a region relation such as a
     // passed reference meeting a fresh borrow in one call region. Each such source must itself
     // reach the target; it never grounds this region, so its own loans must still be found.
-    let relations = List<ImpliedGroup>.asSlice(&walker.retentionRelations)
+    let relations = sources.retentionRelations
     let mut relation = usize.ZERO
     while relation < relations.length {
       if proofContains(List<Shared<Lifetime>>.asSlice(&relations[relation].container), &region) {
@@ -10931,10 +11029,10 @@ effect fn symbolicParentsProved(walker: &Walker, owner: &DeclarationId, offered:
         while member < members.length {
           let source = &members[member]
           if !Lifetime.equalsShared(source, &region) {
-            let domain = regionDomain(source, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied))
+            let domain = regionDomain(source, owner, sources.supplied)
             if domain == RegionDomain.Universal {
-              if regionDomain(wanted, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied)) == RegionDomain.Universal
-                && !run universalRegionProved(owner, List<Shared<Lifetime>>.asSlice(&walker.supplied), source, wanted, premises) { return false }
+              if regionDomain(wanted, owner, sources.supplied) == RegionDomain.Universal
+                && !run universalRegionProved(owner, sources.supplied, source, wanted, premises) { return false }
             } else if domain == RegionDomain.Local {
               let known = cachedSymbolicRegion(owner, source, wanted, List<SymbolicRegion>.asSlice(&cache.*))
               if let Option<bool>.Some {value} = move known {
@@ -11001,20 +11099,20 @@ fn groundRegionParents(roots: &mut List<SymbolicRoot>) -> bool {
 
 // A local target asks only for a source valid throughout the finite body. A universal target
 // retains its exact identity. Inner retained atoms never stand in for outer storage provenance.
-effect fn symbolicRegionProved(walker: &Walker, owner: &DeclarationId,
+effect fn symbolicRegionProved<'proof>(sources: &RegionSources<'proof>, owner: &DeclarationId,
   offered: &Shared<Lifetime>, wanted: &Shared<Lifetime>, premises: &[RegionBound], cache: &mut List<SymbolicRegion>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
-  let longer = regionDomain(offered, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied))
-  let shorter = regionDomain(wanted, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied))
+  let longer = regionDomain(offered, owner, sources.supplied)
+  let shorter = regionDomain(wanted, owner, sources.supplied)
   if longer == RegionDomain.Unknown || shorter == RegionDomain.Unknown { return false }
   if longer == RegionDomain.Universal {
     if shorter == RegionDomain.Local { return true }
-    return run universalRegionProved(owner, List<Shared<Lifetime>>.asSlice(&walker.supplied), offered, wanted, premises)
+    return run universalRegionProved(owner, sources.supplied, offered, wanted, premises)
   }
   if let Option<bool>.Some {value} = move cachedSymbolicRegion(owner, offered, wanted, List<SymbolicRegion>.asSlice(&cache.*)) {
     return value
   }
-  let proved = run symbolicParentsProved(walker, owner, offered, wanted, premises, &mut cache.*)
+  let proved = run symbolicParentsProved(sources, owner, offered, wanted, premises, &mut cache.*)
   if !proved {
     run List<SymbolicRegion>.append(&mut cache.*, SymbolicRegion {
       offered: Shared<Lifetime>.clone(offered), wanted: Shared<Lifetime>.clone(wanted), proved: false,
@@ -11025,7 +11123,7 @@ effect fn symbolicRegionProved(walker: &Walker, owner: &DeclarationId,
 
 // The actual parent bounds this loan's chosen outer lifetime. Such an external source is
 // valid throughout the body independently of when its descriptor or this loan was created.
-effect fn loanParentBoundProved(walker: &Walker, owner: &DeclarationId, loan: &Loan,
+effect fn loanParentBoundProved<'proof>(sources: &RegionSources<'proof>, owner: &DeclarationId, loan: &Loan,
   premises: &[RegionBound], cache: &mut List<SymbolicRegion>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   if loan.local || !provable(loan.precision) { return false }
@@ -11037,7 +11135,7 @@ effect fn loanParentBoundProved(walker: &Walker, owner: &DeclarationId, loan: &L
       let mut atom = usize.ZERO
       while atom < count {
         let member = Lifetime.atomAt(&parent, atom)
-        if !run symbolicRegionProved(walker, owner, &member, &borrowed, premises, &mut cache.*) { return false }
+        if !run symbolicRegionProved(sources, owner, &member, &borrowed, premises, &mut cache.*) { return false }
         atom = atom + usize.ONE
       }
       return true
@@ -11046,13 +11144,13 @@ effect fn loanParentBoundProved(walker: &Walker, owner: &DeclarationId, loan: &L
   return false
 }
 
-effect fn crossedRegionsProved(walker: &Walker, owner: &DeclarationId, premises: &[RegionBound],
+effect fn crossedRegionsProved<'proof>(sources: &RegionSources<'proof>, owner: &DeclarationId, premises: &[RegionBound],
   cache: &mut List<SymbolicRegion>) -> bool ! OutOfMemoryError ? &mut Allocator {
-  let loans = List<Loan>.asSlice(&walker.loans)
+  let loans = sources.loans
   let mut at = usize.ZERO
   while at < loans.length {
     let loan = &loans[at]
-    if loan.crossed && !run loanParentBoundProved(walker, owner, loan, premises, &mut cache.*) { return false }
+    if loan.crossed && !run loanParentBoundProved(sources, owner, loan, premises, &mut cache.*) { return false }
     at = at + usize.ONE
   }
   return true
@@ -11120,7 +11218,7 @@ effect fn finiteCrossingsProved(walker: &Walker, owner: &DeclarationId, premises
   let mut at = usize.ZERO
   while at < loans.length {
     let loan = &loans[at]
-    if loan.crossed && !run loanParentBoundProved(walker, owner, loan, premises, &mut symbolic.*) {
+    if loan.crossed && !run loanParentBoundProved(&regionSources(walker), owner, loan, premises, &mut symbolic.*) {
       if let Option<Shared<Lifetime>>.Some {value: borrowed} = &loan.borrowed {
         if localMeet(&borrowed, owner, List<Shared<Lifetime>>.asSlice(&walker.supplied)) {
           // The meet's local constituents carry its finite requirements; its universal ones
@@ -11836,7 +11934,7 @@ effect fn regionPoints(walker: &Walker, owner: &DeclarationId, region: &Shared<L
       run List<u64>.append(&mut needed, 0)
       at = at + usize.ONE
     }
-    let universalBound = run loanParentBoundProved(walker, owner, loan, premises, &mut symbolic.*)
+    let universalBound = run loanParentBoundProved(&regionSources(walker), owner, loan, premises, &mut symbolic.*)
     // Each nonlocal member of this graph has authenticated outer provenance. Its finite
     // parent edges constrain all incoming and own requirements to the actual source storage.
     let finiteBound = !loan.local && proofContains(List<Shared<Lifetime>>.asSlice(&storage.finiteParents), region)
@@ -11884,26 +11982,14 @@ effect fn regionPoints(walker: &Walker, owner: &DeclarationId, region: &Shared<L
     run unreachableAvailable(List<Point>.asSlice(&walker.points), loan.created, &mut own)
     let ownWords = List<u64>.asSlice(&own)
     let neededWords = List<u64>.asSlice(&needed)
-    let mut word = usize.ZERO
-    while word < words {
-      if u64.bitAnd(neededWords[word], u64.bitNot(ownWords[word])) != 0 { return usize.MAX }
-      word = word + usize.ONE
-    }
+    if !regionSourceFits(neededWords, ownWords) { return usize.MAX }
     // Incoming graph requirements can outlast this particular source instance. They constrain
     // its storage only while that instance can still inhabit a value; concrete release on every
     // creating path makes the source irrelevant there. Own uses were checked above, and the
     // release mask excludes their points, surviving holdings, parents and open-ended retention.
     // Keep every relation edge and requirement: other live sources still restrict the intersection.
     let released = run releasedLoanPoints(walker, chosen[index], definitions, definitionWidth, neededWords)
-    let releasedWords = List<u64>.asSlice(&released)
-    let mut all = List<u64>.asMutSlice(&mut available)
-    let mut gathered = List<u64>.asMutSlice(&mut required)
-    word = usize.ZERO
-    while word < words {
-      all[word] = u64.bitAnd(all[word], u64.bitOr(ownWords[word], releasedWords[word]))
-      gathered[word] = u64.bitOr(gathered[word], neededWords[word])
-      word = word + usize.ONE
-    }
+    mergeRegionSource(&mut required, &mut available, neededWords, ownWords, List<u64>.asSlice(&released))
     index = index + usize.ONE
   }
   let mut propagated = List<u64>.make()
@@ -11916,6 +12002,30 @@ effect fn regionPoints(walker: &Walker, owner: &DeclarationId, region: &Shared<L
   run List<RegionPoints>.append(&mut regions.*, RegionPoints {region: Shared<Lifetime>.clone(region),
     required: move required, incoming: move propagated, available: move available})
   return position
+}
+
+// Own-source inclusion always precedes release: another loan's validity cannot satisfy it.
+fn regionSourceFits(required: &[u64], available: &[u64]) -> bool {
+  if required.length != available.length { return false }
+  let mut word = usize.ZERO
+  while word < required.length {
+    if u64.bitAnd(required[word], u64.bitNot(available[word])) != 0 { return false }
+    word = word + usize.ONE
+  }
+  return true
+}
+
+fn mergeRegionSource(required: &mut List<u64>, available: &mut List<u64>, needed: &[u64], own: &[u64], released: &[u64]) -> () {
+  let mut all = List<u64>.asMutSlice(&available.*)
+  let mut gathered = List<u64>.asMutSlice(&required.*)
+  if all.length != gathered.length || needed.length != all.length || own.length != all.length || released.length != all.length
+    || !regionSourceFits(needed, own) { CompilerBug.panic(b"region source must satisfy its own needs before release") }
+  let mut word = usize.ZERO
+  while word < all.length {
+    all[word] = u64.bitAnd(all[word], u64.bitOr(own[word], released[word]))
+    gathered[word] = u64.bitOr(gathered[word], needed[word])
+    word = word + usize.ONE
+  }
 }
 
 // Whether `loan` is an exact loan of storage the body owns: rooted in a local or a temporary's
@@ -12156,7 +12266,7 @@ effect fn localRelationsProved(walker: &Walker, owner: &DeclarationId, obligatio
           // A caller boundary needs real storage provenance, not the identical finite point sets
           // of two distinct universal lifetimes. Every outer loan must reach a sufficient parent.
           if longer == RegionDomain.Local && shorter == RegionDomain.Universal {
-            if !run symbolicRegionProved(walker, owner, &member, &wanted, premises, &mut symbolic.*) { return false }
+            if !run symbolicRegionProved(&regionSources(walker), owner, &member, &wanted, premises, &mut symbolic.*) { return false }
           } else if shorter == RegionDomain.Local
             && (longer == RegionDomain.Universal
               || (longer == RegionDomain.Unknown && capturedFiniteSource(&member, owner))) {
@@ -13006,40 +13116,40 @@ effect fn symbolicRootClaims() -> ()
   run List<Loan>.append(&mut walker.loans, run symbolicTestLoan(&first, &second, false))
   run List<Loan>.append(&mut walker.loans, run symbolicTestLoan(&second, &first, false))
   let mut cache = List<SymbolicRegion>.make()
-  run Testing.expect(!run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(!run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "an ungrounded reborrow cycle cannot establish a caller lifetime")
   run List<Loan>.append(&mut walker.loans, run symbolicTestLoan(&second, &a, false))
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "a reborrow cycle is proved when every branch stays grounded in the matching universal parent")
   let mut alternatives = List<Loan>.asMutSlice(&mut walker.loans)
   alternatives[2].precision = LoanPrecision.Alternatives
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "a complete possible-source union proves a bound only through all of its roots")
   let mut unresolved = List<Loan>.asMutSlice(&mut walker.loans)
   unresolved[2].precision = LoanPrecision.Unknown
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(!run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(!run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "unknown retention cannot acquire a proof from another complete branch")
   let mut exact = List<Loan>.asMutSlice(&mut walker.loans)
   exact[2].precision = LoanPrecision.Exact
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(!run symbolicRegionProved(&walker, &owner, &first, &b, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(!run symbolicRegionProved(&regionSources(&walker), &owner, &first, &b, List<RegionBound>.asSlice(&premises), &mut cache),
     "a cached proof for one universal does not prove another universal")
   run List<Loan>.append(&mut walker.loans, run symbolicTestLoan(&first, &b, false))
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(!run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(!run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "every loan sharing an inference region must have a sufficient parent")
   let mut changed = List<Loan>.asMutSlice(&mut walker.loans)
   changed[3].parent = Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&a))
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "a shared region is proved when every one of its parents reaches the requested universal")
   let mut owned = List<Loan>.asMutSlice(&mut walker.loans)
   owned[3].local = true
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(!run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(!run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "owned storage cannot acquire a universal validity bound from a named parent")
   let mut restored = List<Loan>.asMutSlice(&mut walker.loans)
   restored[3].local = false
@@ -13047,7 +13157,7 @@ effect fn symbolicRootClaims() -> ()
   run List<Loan>.append(&mut walker.loans, run symbolicTestLoan(&first, &third, false))
   run List<Loan>.append(&mut walker.loans, run symbolicTestLoan(&third, &third, false))
   cache = List<SymbolicRegion>.make()
-  run Testing.expect(!run symbolicRegionProved(&walker, &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
+  run Testing.expect(!run symbolicRegionProved(&regionSources(&walker), &owner, &first, &a, List<RegionBound>.asSlice(&premises), &mut cache),
     "a grounded branch cannot justify another branch that ends in an ungrounded cycle")
   return ()
 }
@@ -13406,7 +13516,7 @@ effect fn finiteParentClaims() -> ()
     List<RegionBound>.asSlice(&premises), &mut symbolic,  List<u64>.asSlice(&words),
     List<u64>.asSlice(&words), 0, true),
     "the finite crossing is proved when the actual owned parent remains valid")
-  run Testing.expect(!run symbolicRegionProved(&walker, &owner, &second, &universal,
+  run Testing.expect(!run symbolicRegionProved(&regionSources(&walker), &owner, &second, &universal,
     List<RegionBound>.asSlice(&premises), &mut symbolic),
     "finite success never installs a universal-source proof for owned storage")
   let mut shared = List<Loan>.asMutSlice(&mut walker.loans)
