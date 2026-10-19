@@ -5,7 +5,7 @@ the first native compiler, the commit named in [`anchor.json`](anchor.json), fro
 there the native compiler in [`compiler/`](../compiler) builds itself from its pinned seed.
 
 Change it only when that build breaks. [Bootstrap CI](../.github/workflows/bootstrap.yml) runs
-when this directory or what builds it changes, and weekly. It bundles the compiler into one
+only when dispatched by hand, so run it after any such emergency change. It bundles the compiler into one
 `silk.mjs`, smoke-tests the bundle with Node 24 and Bun, and builds n0: the bundle builds the
 anchor's compiler (T1), T1 emits that compiler's LLVM IR for each target, each target links the IR
 into N1, and N1 builds n0. N1 and n0 must emit T1's IR byte for byte, n0 must build the current
