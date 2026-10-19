@@ -17,7 +17,7 @@ and 64 message bytes, and exposes attempted calls separately from successful com
 
 ## Gotchas
 Logger failures are typed [`LogError`](#LogError) values and do not guarantee that a message committed.
-In-memory accessors require an event index less than [`length`](#impl.length) and a valid message-byte index.
+In-memory accessors require an event index less than [`length`](#Logger.impl.length) and a valid message-byte index.
 
 ## Examples
 ### Record and inspect one warning
@@ -172,11 +172,11 @@ Formats and submits one complete UTF-8 message at one severity to the active pro
 
 #### Details
 
-Template validation and Display selection match [`Format.format`](./format.md#impl.format). The call does not add a
+Template validation and Display selection match [`Format.format`](./format.md#Format.impl.format). The call does not add a
 newline, severity label, timestamp, or provider-independent decoration. A provider failure
 produces [`LogError`](#LogError).
 
-<a id="impl"></a>
+<a id="Logger.impl"></a>
 
 ## Implementation `Logger`
 
@@ -184,7 +184,7 @@ produces [`LogError`](#LogError).
 impl Logger
 ```
 
-<a id="impl.failure"></a>
+<a id="Logger.impl.failure"></a>
 
 ### Associated function `failure`
 
@@ -194,7 +194,7 @@ pub fn failure(code: i32) -> LogError
 
 Creates a logging failure with a provider-defined code.
 
-<a id="impl.errorCode"></a>
+<a id="Logger.impl.errorCode"></a>
 
 ### Associated function `errorCode`
 
@@ -209,7 +209,7 @@ Returns the provider-defined failure code for diagnostics.
 Interpret this code only with knowledge of the selected provider. Different providers can use
 the same code for different failures.
 
-<a id="impl.inMemoryProvider"></a>
+<a id="Logger.impl.inMemoryProvider"></a>
 
 ### Associated function `inMemoryProvider`
 
@@ -224,7 +224,7 @@ Creates an empty in-memory logger with capacity for eight events and 64 message 
 A call fails when eight events are already committed. A call also fails when its bytes exceed
 the remaining 64-byte total. Neither failure commits the event.
 
-<a id="impl.inMemoryProviderFailAt"></a>
+<a id="Logger.impl.inMemoryProviderFailAt"></a>
 
 ### Associated function `inMemoryProviderFailAt`
 
@@ -236,11 +236,11 @@ Creates an in-memory logger that rejects one zero-based attempted-call ordinal.
 
 #### Details
 
-The configured attempt increases [`attempts`](#impl.attempts) but does not increase [`length`](#impl.length) or consume
+The configured attempt increases [`attempts`](#Logger.impl.attempts) but does not increase [`length`](#Logger.impl.length) or consume
 message capacity. Other attempts retain the eight-event and 64-byte limits of
-[`inMemoryProvider`](#impl.inMemoryProvider).
+[`inMemoryProvider`](#Logger.impl.inMemoryProvider).
 
-<a id="impl.length"></a>
+<a id="Logger.impl.length"></a>
 
 ### Method `length`
 
@@ -252,10 +252,10 @@ Returns the number of events that the in-memory logger committed.
 
 #### Details
 
-Failed attempts do not increase this count. Use [`attempts`](#impl.attempts) when rejected calls must also be
+Failed attempts do not increase this count. Use [`attempts`](#Logger.impl.attempts) when rejected calls must also be
 observed.
 
-<a id="impl.levelAt"></a>
+<a id="Logger.impl.levelAt"></a>
 
 ### Method `levelAt`
 
@@ -267,10 +267,10 @@ Returns the severity of one committed event.
 
 #### Gotchas
 
-`index` must be less than [`length`](#impl.length). An unused index below eight returns the initial Trace
+`index` must be less than [`length`](#Logger.impl.length). An unused index below eight returns the initial Trace
 value instead of trapping. An index of eight or more traps.
 
-<a id="impl.messageLengthAt"></a>
+<a id="Logger.impl.messageLengthAt"></a>
 
 ### Method `messageLengthAt`
 
@@ -282,10 +282,10 @@ Returns the UTF-8 byte length of one committed message.
 
 #### Gotchas
 
-`index` must be less than [`length`](#impl.length). An unused index below eight returns zero instead of
+`index` must be less than [`length`](#Logger.impl.length). An unused index below eight returns zero instead of
 trapping. An index of eight or more traps.
 
-<a id="impl.messageByteAt"></a>
+<a id="Logger.impl.messageByteAt"></a>
 
 ### Method `messageByteAt`
 
@@ -301,11 +301,11 @@ Returns one UTF-8 byte from a committed message.
 
 #### Gotchas
 
-`eventIndex` must be less than [`length`](#impl.length). `byteIndex` must be less than
-[`messageLengthAt`](#impl.messageLengthAt) for that event. An unused event or invalid byte index traps. An event index
+`eventIndex` must be less than [`length`](#Logger.impl.length). `byteIndex` must be less than
+[`messageLengthAt`](#Logger.impl.messageLengthAt) for that event. An unused event or invalid byte index traps. An event index
 of eight or more also traps.
 
-<a id="impl.attempts"></a>
+<a id="Logger.impl.attempts"></a>
 
 ### Method `attempts`
 
@@ -336,7 +336,7 @@ The provider copies each committed message into fixed internal storage. It recor
 calls separately from committed events. Capacity failure and configured failure do not commit an
 event.
 
-<a id="impl-2"></a>
+<a id="InMemoryLogger.impl"></a>
 
 ## Implementation `InMemoryLogger`
 
@@ -344,7 +344,7 @@ event.
 impl InMemoryLogger
 ```
 
-<a id="impl-3"></a>
+<a id="InMemoryLogger.impl.Logger"></a>
 
 ## Implementation `Logger for InMemoryLogger`
 
@@ -352,7 +352,7 @@ impl InMemoryLogger
 impl Logger for InMemoryLogger
 ```
 
-<a id="impl.log"></a>
+<a id="InMemoryLogger.impl.Logger.log"></a>
 
 ### Operation `log`
 

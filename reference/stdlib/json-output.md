@@ -68,7 +68,7 @@ pub depthLimit: usize
 
 The greatest permitted container depth.
 
-<a id="impl"></a>
+<a id="JsonOptions.impl.Copy"></a>
 
 ## Implementation `Copy for JsonOptions`
 
@@ -86,7 +86,7 @@ pub struct JsonOutput
 
 Low-level JSON output operations shared by tree and typed serializers.
 
-<a id="impl-2"></a>
+<a id="JsonOptions.impl"></a>
 
 ## Implementation `JsonOptions`
 
@@ -94,7 +94,7 @@ Low-level JSON output operations shared by tree and typed serializers.
 impl JsonOptions
 ```
 
-<a id="impl.compact"></a>
+<a id="JsonOptions.impl.compact"></a>
 
 ### Associated function `compact`
 
@@ -104,7 +104,7 @@ pub fn compact() -> JsonOptions
 
 Selects compact output with the scanner's nesting limit.
 
-<a id="impl.indented"></a>
+<a id="JsonOptions.impl.indented"></a>
 
 ### Associated function `indented`
 
@@ -114,7 +114,7 @@ pub fn indented(width: usize) -> JsonOptions
 
 Selects indentation width while retaining the default nesting limit.
 
-<a id="impl.child"></a>
+<a id="JsonOptions.impl.child"></a>
 
 ### Method `child`
 
@@ -124,7 +124,7 @@ pub effect fn child(self: &JsonOptions) -> JsonOptions ! JsonError
 
 Returns policy for one nested container or fails before its opening delimiter.
 
-<a id="impl-3"></a>
+<a id="JsonOutput.impl"></a>
 
 ## Implementation `JsonOutput`
 
@@ -132,7 +132,7 @@ Returns policy for one nested container or fails before its opening delimiter.
 impl JsonOutput
 ```
 
-<a id="impl.writeString"></a>
+<a id="JsonOutput.impl.writeString"></a>
 
 ### Associated function `writeString`
 
@@ -142,7 +142,7 @@ pub effect fn writeString(value: string) -> () ! WriterError ? &mut Writer
 
 Writes one UTF-8 string with RFC 8259 quoting and control-byte escapes.
 
-<a id="impl.writeNumber"></a>
+<a id="JsonOutput.impl.writeNumber"></a>
 
 ### Associated function `writeNumber`
 
@@ -152,7 +152,7 @@ pub effect fn writeNumber(value: string) -> () ! JsonError | WriterError ? &mut 
 
 Validates and writes one complete JSON number lexeme without reformatting it.
 
-<a id="impl.separator"></a>
+<a id="JsonOutput.impl.separator"></a>
 
 ### Associated function `separator`
 
@@ -162,7 +162,7 @@ pub effect fn separator(options: &JsonOptions, first: bool) -> () ! WriterError 
 
 Writes a comma before a later member or item and its optional indentation.
 
-<a id="impl.line"></a>
+<a id="JsonOutput.impl.line"></a>
 
 ### Associated function `line`
 
@@ -172,7 +172,7 @@ pub effect fn line(options: &JsonOptions) -> () ! WriterError ? &mut Writer
 
 Writes a newline and spaces for the current depth when indentation is enabled.
 
-<a id="impl.colon"></a>
+<a id="JsonOutput.impl.colon"></a>
 
 ### Associated function `colon`
 

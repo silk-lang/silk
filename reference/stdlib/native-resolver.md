@@ -35,7 +35,7 @@ pub struct NativeSystemResolver
 
 The selected synchronous system Resolver provider.
 
-<a id="impl"></a>
+<a id="NativeSystemResolver.impl"></a>
 
 ## Implementation `NativeSystemResolver`
 
@@ -43,7 +43,7 @@ The selected synchronous system Resolver provider.
 impl NativeSystemResolver
 ```
 
-<a id="impl.make"></a>
+<a id="NativeSystemResolver.impl.make"></a>
 
 ### Associated function `make`
 
@@ -57,7 +57,7 @@ Creates a stateless synchronous native provider.
 
 On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
 
-<a id="impl-2"></a>
+<a id="NativeSystemResolver.impl.Resolver"></a>
 
 ## Implementation `Resolver for NativeSystemResolver`
 
@@ -65,7 +65,7 @@ On unsupported targets or no-libc profiles, a reached call produces a compile-ti
 impl Resolver for NativeSystemResolver
 ```
 
-<a id="impl.resolveDomain"></a>
+<a id="NativeSystemResolver.impl.Resolver.resolveDomain"></a>
 
 ### Operation `resolveDomain`
 

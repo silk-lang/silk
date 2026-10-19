@@ -356,7 +356,7 @@ or another fact that is not clear from syntax alone.
 Do not use pseudocode, `...`, incomplete expressions, hidden imports, placeholder APIs, or bare API
 call inventories. Do not assume that the reader can open other documentation.
 
-Prefer titles such as “Use an absent fallback” or “Get the second vector element”.
+Prefer titles such as “Use an absent fallback” or “Get the second list element”.
 Do not use “Example”, “Basic usage”, or “Syntax”.
 
 Use prose before code only when it explains a decision that the code cannot show. Do not describe
@@ -377,11 +377,11 @@ Preferred:
 ```silk
 import silk.usize
 
-import silk.vector { Vector }
+import silk.list { List }
 
 pub fn main() -> i32 {
-  let values = Vector<i32>.make()
-  let count = Vector<i32>.length(&values)
+  let values = List<i32>.make()
+  let count = List<i32>.length(&values)
   return count
     |> usize.toI32
 }
@@ -392,7 +392,7 @@ primitive modules. A namespace binding exposes only root declarations and never 
 Do not import root operations as unqualified names when that removes useful context; an inherent
 member such as `make`, `append`, `get`, or `length` cannot be selected on its own.
 
-`Vector.length` gives context that `length` does not give. This rule is mandatory in official
+`List.length` gives context that `length` does not give. This rule is mandatory in official
 documentation examples.
 
 ### Pipe operator
@@ -438,7 +438,7 @@ Do not use “sometimes”, “usually”, or “may” for deterministic behavi
 Do not describe an API as “fast”, “safe”, or “lightweight” without a precise guarantee.
 
 Format identifiers, values, and short expressions as code. Examples include `Option.none`,
-`usize.ZERO`, and `Vector.get`.
+`usize.ZERO`, and `List.get`.
 
 ## API families
 
@@ -465,7 +465,7 @@ complete program.
 /// Returns the number of initialized elements in `self`.
 ```
 
-This comment documents `Vector.length`. The signature gives the remaining information.
+This comment documents `List.length`. The signature gives the remaining information.
 
 ### Details explain ownership
 
@@ -517,7 +517,7 @@ an owned value pipeline.
 ///
 /// # Details
 ///
-/// This function copies the element. It does not change the vector.
+/// This function copies the element. It does not change the list.
 ///
 /// # Gotchas
 ///
@@ -526,7 +526,7 @@ an owned value pipeline.
 ///
 /// # Examples
 ///
-/// ## Get the second vector element
+/// ## Get the second list element
 ///
 /// ```silk
 /// import silk.allocator { Allocator, OutOfMemoryError }
@@ -535,17 +535,17 @@ an owned value pipeline.
 ///
 /// import silk.usize
 ///
-/// import silk.vector { Vector }
+/// import silk.list { List }
 ///
 /// pub effect fn main() -> ()
 /// ! OutOfMemoryError {
 ///   let mut allocator = Allocator.systemAllocatorProvider()
-///   let mut values = Vector<i32>.make()
-///   let first = run Vector<i32>.append(&mut values, 10)
+///   let mut values = List<i32>.make()
+///   let first = run List<i32>.append(&mut values, 10)
 ///     |> Effect.provideMut<Allocator>(&mut allocator)
-///   let second = run Vector<i32>.append(&mut values, 20)
+///   let second = run List<i32>.append(&mut values, 20)
 ///     |> Effect.provideMut<Allocator>(&mut allocator)
-///   let value = Vector<i32>.get(&values, usize.ONE)
+///   let value = List<i32>.get(&values, usize.ONE)
 ///   if value != 20 {
 ///     let mismatch = 1 / 0
 ///   }
@@ -554,7 +554,7 @@ an owned value pipeline.
 /// ```
 ````
 
-This comment documents `Vector.get`. The borrow uses a direct call. The Effect values use a pipe.
+This comment documents `List.get`. The borrow uses a direct call. The Effect values use a pipe.
 
 ## Common failures
 
@@ -619,7 +619,7 @@ publication.
 - [ ] Each example has a specific title and observable result.
 - [ ] Each example is a complete program or a legal statement sequence with defined context.
 - [ ] Complete programs are preferred and contain all imports and setup.
-- [ ] Each operation name has useful context, such as `Vector.get`.
+- [ ] Each operation name has useful context, such as `List.get`.
 - [ ] Examples use `|>` when the resulting Silk is valid and clear.
 - [ ] Each example passes `silk check` and `silk format --check`.
 - [ ] Each executable example runs successfully.

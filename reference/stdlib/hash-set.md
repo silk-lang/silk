@@ -6,7 +6,7 @@ Owned unique elements with deterministic seeded hashing and open-addressed membe
 
 ## When to use
 Use [`HashSet`](#HashSet) when equivalence and fast membership are central and an element has a [`HashKey`](./hash.md#HashKey)
-witness. Use `silk.vector.Vector` when order or duplicate values are part of the data.
+witness. Use `silk.list.List` when order or duplicate values are part of the data.
 
 ## Details
 The set starts allocation-free, first allocates eight buckets, and grows before used buckets
@@ -15,13 +15,13 @@ table, moves every live element, and discards those markers. Allocation complete
 so failed growth leaves prior membership, length, and bucket count unchanged.
 
 One [`HashSeed`](./hash.md#HashSeed) plus the same operation sequence fixes bucket presentation order on every
-engine. Iterate deterministically by scanning `0..bucketCount`, testing [`occupiedAt`](#impl.occupiedAt), and then
-calling [`elementAt`](#impl.elementAt). This is bucket order, not insertion order.
+engine. Iterate deterministically by scanning `0..bucketCount`, testing [`occupiedAt`](#HashSet.impl.occupiedAt), and then
+calling [`elementAt`](#HashSet.impl.elementAt). This is bucket order, not insertion order.
 
 ## Gotchas
 Probes are consumed. Inserting an equivalent element keeps the element already stored and drops
-the arrival; [`remove`](#impl.remove) instead transfers the stored element to the caller. [`elementAt`](#impl.elementAt) copies
-and therefore requires a `Copy` element; [`contains`](#impl.contains) and [`indexOf`](#impl.indexOf) can inspect membership for
+the arrival; [`remove`](#HashSet.impl.remove) instead transfers the stored element to the caller. [`elementAt`](#HashSet.impl.elementAt) copies
+and therefore requires a `Copy` element; [`contains`](#HashSet.impl.contains) and [`indexOf`](#HashSet.impl.indexOf) can inspect membership for
 move-only elements without taking them out.
 
 ## Examples
@@ -77,9 +77,9 @@ pub struct Member<T>
 
 Internal hashed element record exposed by the current table representation.
 
-<a id="impl"></a>
+<a id="Member.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Member<T>`
 
 ```silk
 impl<T: Copy> Copy for Member<T>
@@ -120,15 +120,15 @@ Owns one representative of each equivalence class under one hash witness and see
 An equivalent insertion keeps the representative already stored. The seed and operation
 sequence determine bucket presentation order, which is not insertion order.
 
-<a id="impl-2"></a>
+<a id="HashSet.impl"></a>
 
-## Implementation ``
+## Implementation `HashSet<T>`
 
 ```silk
 impl<T> HashSet<T>
 ```
 
-<a id="impl.make"></a>
+<a id="HashSet.impl.make"></a>
 
 ### Associated function `make`
 
@@ -142,7 +142,7 @@ Creates an empty set whose every hash is computed under one seed.
 
 An empty set allocates no storage. The seed fixes bucket order for the same operation sequence.
 
-<a id="impl.length"></a>
+<a id="HashSet.impl.length"></a>
 
 ### Method `length`
 
@@ -152,7 +152,7 @@ pub fn length(self: &Self) -> usize
 
 Returns the number of elements the set holds.
 
-<a id="impl.bucketCount"></a>
+<a id="HashSet.impl.bucketCount"></a>
 
 ### Method `bucketCount`
 
@@ -162,7 +162,7 @@ pub fn bucketCount(self: &Self) -> usize
 
 Returns the number of buckets the set presents, which is the range `occupiedAt` accepts.
 
-<a id="impl.occupiedAt"></a>
+<a id="HashSet.impl.occupiedAt"></a>
 
 ### Method `occupiedAt`
 
@@ -172,7 +172,7 @@ pub fn occupiedAt(self: &Self, index: usize) -> bool
 
 Reports whether one bucket holds an element. Out-of-range buckets hold nothing.
 
-<a id="impl.insert"></a>
+<a id="HashSet.impl.insert"></a>
 
 ### Method `insert`
 
@@ -193,7 +193,7 @@ arriving element is released, so the element that survives is the one the set al
 Fails only with `OutOfMemoryError`, and only from the growth this insert needed. A failed insert
 leaves every prior element present, and leaves the length and the bucket count unchanged.
 
-<a id="impl.contains"></a>
+<a id="HashSet.impl.contains"></a>
 
 ### Method `contains`
 
@@ -207,7 +207,7 @@ Reports whether the set holds an element equivalent to one probe element.
 
 This function consumes the probe element. It does not change the set or move a stored element.
 
-<a id="impl.indexOf"></a>
+<a id="HashSet.impl.indexOf"></a>
 
 ### Method `indexOf`
 
@@ -222,7 +222,7 @@ Returns the bucket holding an element equivalent to one probe element, or an abs
 This is the membership question a set of move-only elements answers without moving anything.
 This function consumes the probe element.
 
-<a id="impl.remove"></a>
+<a id="HashSet.impl.remove"></a>
 
 ### Method `remove`
 
@@ -236,7 +236,7 @@ Removes the element equivalent to one probe element and answers with it.
 
 Ownership passes to the caller; the set does not also release it. The probe element is released.
 
-<a id="impl.elementAt"></a>
+<a id="HashSet.impl.elementAt"></a>
 
 ### Method `elementAt`
 
@@ -252,17 +252,17 @@ Reads a copy out of the set, so it answers for a set whose element type is `Copy
 
 #### Gotchas
 
-If `index` is out of range or [`occupiedAt`](#impl.occupiedAt) returns `false`, the program traps.
+If `index` is out of range or [`occupiedAt`](#HashSet.impl.occupiedAt) returns `false`, the program traps.
 
-<a id="impl-3"></a>
+<a id="HashSet.impl.Drop"></a>
 
-## Implementation ` Drop for  `
+## Implementation `Drop for HashSet<T>`
 
 ```silk
 impl<T> Drop for HashSet<T>
 ```
 
-<a id="impl.drop"></a>
+<a id="HashSet.impl.Drop.drop"></a>
 
 ### Operation `drop`
 

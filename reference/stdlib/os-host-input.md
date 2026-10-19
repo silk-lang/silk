@@ -30,7 +30,7 @@ pub struct OsHostInput
 
 An affine HostInput provider owning its argument and environment snapshot.
 
-<a id="impl"></a>
+<a id="OsHostInput.impl"></a>
 
 ## Implementation `OsHostInput`
 
@@ -38,7 +38,7 @@ An affine HostInput provider owning its argument and environment snapshot.
 impl OsHostInput
 ```
 
-<a id="impl.make"></a>
+<a id="OsHostInput.impl.make"></a>
 
 ### Associated function `make`
 
@@ -51,7 +51,7 @@ Moves an already captured snapshot into the portable service provider.
 #### Details
 Construction reads no foreign state and performs no allocation.
 
-<a id="impl-2"></a>
+<a id="OsHostInput.impl.HostInput"></a>
 
 ## Implementation `HostInput for OsHostInput`
 
@@ -59,7 +59,7 @@ Construction reads no foreign state and performs no allocation.
 impl HostInput for OsHostInput
 ```
 
-<a id="impl.argumentCount"></a>
+<a id="OsHostInput.impl.HostInput.argumentCount"></a>
 
 ### Operation `argumentCount`
 
@@ -67,7 +67,7 @@ impl HostInput for OsHostInput
 argumentCount: OsHostInput.argumentCount
 ```
 
-<a id="impl.argument"></a>
+<a id="OsHostInput.impl.HostInput.argument"></a>
 
 ### Operation `argument`
 
@@ -75,7 +75,7 @@ argumentCount: OsHostInput.argumentCount
 argument: OsHostInput.argument
 ```
 
-<a id="impl.variable"></a>
+<a id="OsHostInput.impl.HostInput.variable"></a>
 
 ### Operation `variable`
 
@@ -83,7 +83,7 @@ argument: OsHostInput.argument
 variable: OsHostInput.variable
 ```
 
-<a id="impl.workingDirectory"></a>
+<a id="OsHostInput.impl.HostInput.workingDirectory"></a>
 
 ### Operation `workingDirectory`
 

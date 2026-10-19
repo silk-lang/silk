@@ -5,9 +5,9 @@
 Affine Fiber handles, typed outcomes, and one-observer completion.
 
 ## When to use
-Use [`forkChild`](#impl.forkChild) to create structured child work. Use [`await`](#impl.await) to inspect success, failure, or
-cancellation as data. Use [`join`](#impl.join) to propagate a Fiber failure through the current Effect. Use
-[`yieldNow`](#impl.yieldNow) to let tasks that are already ready run first under a FIFO provider.
+Use [`forkChild`](#Fiber.impl.forkChild) to create structured child work. Use [`await`](#Fiber.impl.await) to inspect success, failure, or
+cancellation as data. Use [`join`](#Fiber.impl.join) to propagate a Fiber failure through the current Effect. Use
+[`yieldNow`](#Fiber.impl.yieldNow) to let tasks that are already ready run first under a FIFO provider.
 
 ## Details
 A [`Fiber`](#Fiber) owns one completion observer. Observation consumes the Fiber, so one Fiber has at
@@ -33,8 +33,8 @@ The producer endpoint for one Fiber result.
 
 ### Details
 
-A Scheduler provider owns this endpoint until it calls [`completeSuccess`](#impl.completeSuccess) or
-[`completeFailure`](#impl.completeFailure). Both operations consume the endpoint and notify one parked observer.
+A Scheduler provider owns this endpoint until it calls [`completeSuccess`](#Fiber.impl.completeSuccess) or
+[`completeFailure`](#Fiber.impl.completeFailure). Both operations consume the endpoint and notify one parked observer.
 
 <a id="CompletionCanceller"></a>
 
@@ -49,7 +49,7 @@ The type-erased cancellation endpoint for one Fiber result.
 ### Details
 
 A task store can retain this endpoint without storing the Fiber success or failure types.
-[`cancel`](#impl.cancel) consumes the endpoint and notifies one parked observer.
+[`cancel`](#Fiber.impl.cancel) consumes the endpoint and notifies one parked observer.
 
 <a id="Fiber"></a>
 
@@ -63,17 +63,17 @@ An affine handle that observes one task result or cancellation.
 
 ### Details
 
-[`await`](#impl.await) and [`join`](#impl.join) consume the handle. Dropping the handle does not cancel its task.
+[`await`](#Fiber.impl.await) and [`join`](#Fiber.impl.join) consume the handle. Dropping the handle does not cancel its task.
 
-<a id="impl"></a>
+<a id="Fiber.impl"></a>
 
-## Implementation ``
+## Implementation `Fiber<A, E>`
 
 ```silk
 impl<A, E> Fiber<A, E>
 ```
 
-<a id="impl.prepare"></a>
+<a id="Fiber.impl.prepare"></a>
 
 ### Associated function `prepare`
 
@@ -94,7 +94,7 @@ Use this provider operation before a Scheduler constructs and publishes a task.
 No endpoint becomes visible until both Shared completion cells exist. Observation and
 notification allocate no further storage.
 
-<a id="impl.completeSuccess"></a>
+<a id="Fiber.impl.completeSuccess"></a>
 
 ### Associated function `completeSuccess`
 
@@ -109,7 +109,7 @@ Completes one Fiber with `value` and notifies its observer.
 This operation stores `value` before it publishes readiness. It consumes the producer endpoint
 and allocates no storage.
 
-<a id="impl.completeFailure"></a>
+<a id="Fiber.impl.completeFailure"></a>
 
 ### Associated function `completeFailure`
 
@@ -124,7 +124,7 @@ Completes one Fiber with `error` and notifies its observer.
 This operation stores `error` before it publishes readiness. It consumes the producer endpoint
 and allocates no storage.
 
-<a id="impl.cancel"></a>
+<a id="Fiber.impl.cancel"></a>
 
 ### Associated function `cancel`
 
@@ -139,7 +139,7 @@ Publishes cancellation and notifies one parked Fiber observer.
 This operation is independent of the Fiber success and failure types. It consumes the
 cancellation endpoint and allocates no storage.
 
-<a id="impl.await"></a>
+<a id="Fiber.impl.await"></a>
 
 ### Method `await`
 
@@ -154,7 +154,7 @@ Consumes a Fiber and returns its success, typed failure, or cancellation as data
 A terminal Fiber returns immediately. A pending Fiber parks the current Execution and installs
 exactly one Wake. Observation and resumption allocate no storage.
 
-<a id="impl.join"></a>
+<a id="Fiber.impl.join"></a>
 
 ### Method `join`
 
@@ -168,9 +168,9 @@ Consumes a Fiber, returns its success value, and propagates failure or cancellat
 #### Details
 
 A typed task failure is raised unchanged. Cancellation raises [`Cancelled`](#Cancelled). A pending Fiber
-parks with the same allocation-free one-observer protocol as [`await`](#impl.await).
+parks with the same allocation-free one-observer protocol as [`await`](#Fiber.impl.await).
 
-<a id="impl.yieldNow"></a>
+<a id="Fiber.impl.yieldNow"></a>
 
 ### Associated function `yieldNow`
 
@@ -305,15 +305,15 @@ pub fiber: Fiber<A, E>
 
 The affine result handle returned after task publication succeeds.
 
-<a id="impl-2"></a>
+<a id="Fiber.impl-2"></a>
 
-## Implementation ``
+## Implementation `Fiber<A, E>`
 
 ```silk
 impl<A: 'static, E: 'static> Fiber<A, E>
 ```
 
-<a id="impl.forkChild"></a>
+<a id="Fiber.impl.forkChild"></a>
 
 ### Associated function `forkChild`
 

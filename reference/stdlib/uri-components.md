@@ -264,15 +264,15 @@ pub fragment: Option<ComponentValue<'text>>
 
 An optional raw or encoded fragment without its number sign.
 
-<a id="impl"></a>
+<a id="UriComponents.impl"></a>
 
-## Implementation ``
+## Implementation `UriComponents<'text>`
 
 ```silk
 impl<'text> UriComponents<'text>
 ```
 
-<a id="impl.make"></a>
+<a id="UriComponents.impl.make"></a>
 
 ### Associated function `make`
 
@@ -282,7 +282,7 @@ pub fn make() -> UriComponents<'text>
 
 Creates an empty relative reference without allocating.
 
-<a id="impl.fromReference"></a>
+<a id="UriComponents.impl.fromReference"></a>
 
 ### Associated function `fromReference`
 
@@ -296,7 +296,7 @@ Borrows every parsed component as encoded text for inspection or modification wi
 
 Serialization with `Full` preserves the original text when no fields have changed.
 
-<a id="impl.serializeInto"></a>
+<a id="UriComponents.impl.serializeInto"></a>
 
 ### Associated function `serializeInto`
 
@@ -321,7 +321,7 @@ Raw first-relative-segment colons are escaped so they cannot introduce a scheme.
 A recomposition error leaves the attempted serialization in output. `PathAndQuery` can produce
 text that is not a complete URI reference. Omitted components are still validated.
 
-<a id="impl.serializeOwned"></a>
+<a id="UriComponents.impl.serializeOwned"></a>
 
 ### Method `serializeOwned`
 
@@ -337,7 +337,7 @@ Serializes selected components into independent text with one exact allocation f
 
 Validation errors return ordinary result data. Allocation and size overflow use `OutOfMemoryError`.
 
-<a id="impl.buildOwned"></a>
+<a id="UriComponents.impl.buildOwned"></a>
 
 ### Method `buildOwned`
 

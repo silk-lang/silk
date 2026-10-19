@@ -190,7 +190,7 @@ Bytes after a [`Filled`](#Filled) count keep their previous values. For a valid 
 
 An empty `buffer` returns Filled(0) without reading, including after end-of-input.
 
-<a id="impl"></a>
+<a id="StandardInput.impl"></a>
 
 ## Implementation `StandardInput`
 
@@ -198,7 +198,7 @@ An empty `buffer` returns Filled(0) without reading, including after end-of-inpu
 impl StandardInput
 ```
 
-<a id="impl.readFailure"></a>
+<a id="StandardInput.impl.readFailure"></a>
 
 ### Associated function `readFailure`
 
@@ -208,7 +208,7 @@ pub fn readFailure() -> StreamReadError
 
 Creates a standard-input failure for a provider that cannot complete one read.
 
-<a id="impl.filled"></a>
+<a id="StandardInput.impl.filled"></a>
 
 ### Associated function `filled`
 
@@ -222,7 +222,7 @@ Creates an outcome for a read that committed exactly `count` leading bytes.
 
 A provider must not use a count greater than the buffer length passed to its read operation.
 
-<a id="impl.endOfInput"></a>
+<a id="StandardInput.impl.endOfInput"></a>
 
 ### Associated function `endOfInput`
 
@@ -232,7 +232,7 @@ pub fn endOfInput() -> ReadOutcome
 
 Creates an outcome that reports permanent end-of-input after a valid non-empty read.
 
-<a id="impl.count"></a>
+<a id="StandardInput.impl.count"></a>
 
 ### Associated function `count`
 
@@ -244,10 +244,10 @@ Returns the committed byte count, or zero for end-of-input.
 
 #### Gotchas
 
-A zero count does not by itself identify end-of-input. Use [`isEndOfInput`](#impl.isEndOfInput) when that
+A zero count does not by itself identify end-of-input. Use [`isEndOfInput`](#StandardInput.impl.isEndOfInput) when that
 distinction controls another read.
 
-<a id="impl.isEndOfInput"></a>
+<a id="StandardInput.impl.isEndOfInput"></a>
 
 ### Associated function `isEndOfInput`
 
@@ -257,7 +257,7 @@ pub fn isEndOfInput(outcome: &ReadOutcome) -> bool
 
 Reports whether the outcome guarantees that no later read produces bytes.
 
-<a id="impl.receive"></a>
+<a id="StandardInput.impl.receive"></a>
 
 ### Associated function `receive`
 
@@ -272,7 +272,7 @@ Reads through the active [`StandardInput`](#StandardInput) provider into a mutab
 #### Details
 
 This wrapper preserves partial-read behavior and the exclusive provider requirement. Inspect
-[`count`](#impl.count) before reading buffer bytes. Use [`isEndOfInput`](#impl.isEndOfInput) to decide when draining is complete.
+[`count`](#StandardInput.impl.count) before reading buffer bytes. Use [`isEndOfInput`](#StandardInput.impl.isEndOfInput) to decide when draining is complete.
 
 #### Gotchas
 

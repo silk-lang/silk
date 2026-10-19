@@ -841,7 +841,7 @@ pub fn main() -> i32 {
 The type spelling `i32` needs no import because it is part of the language. `Option.some` needs the
 explicit `Option` binding because `Option` is an ordinary standard-library union and `some` is one
 of its inherent members, reached through the type under NAME-005. The same rule applies to
-`Effect`, `Vector`, `Result`, filesystem services, target providers, and the primitive namespaces:
+`Effect`, `List`, `Result`, filesystem services, target providers, and the primitive namespaces:
 
 ```silk
 import silk.effect { Effect }

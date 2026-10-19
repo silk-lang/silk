@@ -12,8 +12,8 @@ that time, `SemanticCases.silk`, defines `bodyRetainsReceiverPass(body, mode)` a
 `TypedBody.ReceiverPass` scalar-enum values with `value == mode` and `retained == mode`. The
 TypeScript bootstrap accepts the source and reaches native emission, then fails with `RangeError:
 Backend cannot resolve call target bodyRetainsReceiverPass` in `NativeCallOperation.js:193`. A
-previous `Type.equals` scalar-enum comparison produced the same unresolved-target failure (see
-`PAPERCUTS.md`, 2026-09-26).
+previous `Type.equals` scalar-enum comparison produced the same unresolved-target failure on
+2026-09-26.
 
 Reproduce the observed failure on that exact head, where the root still exists, with Node 24 and
 LLVM 22:
@@ -359,7 +359,7 @@ descends through reference types, so a cleanup root holding `&mut Semantic` reac
 size. Even on `cb31280d`, the `Query.Entry ⊂ Semantic` question already holds about 1.2 million
 memo entries.
 
-Selfhost `c871c5ea` removed the borrowed field from the draft: the draft owns only its vectors,
+Selfhost `c871c5ea` removed the borrowed field from the draft: the draft owns only its lists,
 and `Semantic` reaches the walk separately.
 
 The overflow itself was in the memo key. Stopping the search at reference types was rejected: the

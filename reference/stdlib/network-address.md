@@ -633,7 +633,7 @@ pub struct NetworkAddress
 
 Operations shared across the network address value family.
 
-<a id="impl"></a>
+<a id="AddressError.impl.Copy"></a>
 
 ## Implementation `Copy for AddressError`
 
@@ -641,7 +641,7 @@ Operations shared across the network address value family.
 impl Copy for AddressError
 ```
 
-<a id="impl-2"></a>
+<a id="Ipv4Address.impl.Copy"></a>
 
 ## Implementation `Copy for Ipv4Address`
 
@@ -649,7 +649,7 @@ impl Copy for AddressError
 impl Copy for Ipv4Address
 ```
 
-<a id="impl-3"></a>
+<a id="Ipv6Address.impl.Copy"></a>
 
 ## Implementation `Copy for Ipv6Address`
 
@@ -657,7 +657,7 @@ impl Copy for Ipv4Address
 impl Copy for Ipv6Address
 ```
 
-<a id="impl-4"></a>
+<a id="IpAddress.impl.Copy"></a>
 
 ## Implementation `Copy for IpAddress`
 
@@ -665,7 +665,7 @@ impl Copy for Ipv6Address
 impl Copy for IpAddress
 ```
 
-<a id="impl-5"></a>
+<a id="Port.impl.Copy"></a>
 
 ## Implementation `Copy for Port`
 
@@ -673,7 +673,7 @@ impl Copy for IpAddress
 impl Copy for Port
 ```
 
-<a id="impl-6"></a>
+<a id="Endpoint.impl.Copy"></a>
 
 ## Implementation `Copy for Endpoint`
 
@@ -681,7 +681,7 @@ impl Copy for Port
 impl Copy for Endpoint
 ```
 
-<a id="impl-7"></a>
+<a id="DomainHost.impl.Copy"></a>
 
 ## Implementation `Copy for DomainHost`
 
@@ -689,7 +689,7 @@ impl Copy for Endpoint
 impl Copy for DomainHost
 ```
 
-<a id="impl-8"></a>
+<a id="Host.impl.Copy"></a>
 
 ## Implementation `Copy for Host`
 
@@ -697,7 +697,7 @@ impl Copy for DomainHost
 impl Copy for Host
 ```
 
-<a id="impl-9"></a>
+<a id="Ipv4Address.impl"></a>
 
 ## Implementation `Ipv4Address`
 
@@ -705,7 +705,7 @@ impl Copy for Host
 impl Ipv4Address
 ```
 
-<a id="impl.fromOctets"></a>
+<a id="Ipv4Address.impl.fromOctets"></a>
 
 ### Associated function `fromOctets`
 
@@ -715,7 +715,7 @@ pub fn fromOctets(octets: [u8; 4]) -> Ipv4Address
 
 Constructs an IPv4 address from exact network-order octets.
 
-<a id="impl.parse"></a>
+<a id="Ipv4Address.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -725,7 +725,7 @@ pub fn parse(bytes: &[u8]) -> Result<Ipv4Address, AddressError>
 
 Parses a strict RFC 3986 decimal dotted quad.
 
-<a id="impl.octets"></a>
+<a id="Ipv4Address.impl.octets"></a>
 
 ### Method `octets`
 
@@ -735,7 +735,7 @@ pub fn octets(self: &Self) -> [u8; 4]
 
 Returns the owned network-order octets by value.
 
-<a id="impl.equals"></a>
+<a id="Ipv4Address.impl.equals"></a>
 
 ### Method `equals`
 
@@ -745,7 +745,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Reports exact binary equality.
 
-<a id="impl.formatInto"></a>
+<a id="Ipv4Address.impl.formatInto"></a>
 
 ### Method `formatInto`
 
@@ -755,7 +755,7 @@ pub fn formatInto(self: &Self, output: &mut [u8]) -> Result<usize, AddressError>
 
 Formats canonical decimal dotted-quad text without partial output.
 
-<a id="impl-10"></a>
+<a id="Ipv6Address.impl"></a>
 
 ## Implementation `Ipv6Address`
 
@@ -763,7 +763,7 @@ Formats canonical decimal dotted-quad text without partial output.
 impl Ipv6Address
 ```
 
-<a id="impl.fromOctets-2"></a>
+<a id="Ipv6Address.impl.fromOctets"></a>
 
 ### Associated function `fromOctets`
 
@@ -773,7 +773,7 @@ pub fn fromOctets(octets: [u8; 16]) -> Ipv6Address
 
 Constructs an IPv6 address from exact network-order octets.
 
-<a id="impl.parse-2"></a>
+<a id="Ipv6Address.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -783,7 +783,7 @@ pub fn parse(bytes: &[u8]) -> Result<Ipv6Address, AddressError>
 
 Parses RFC 4291 IPv6 text without zones or IPvFuture.
 
-<a id="impl.octets-2"></a>
+<a id="Ipv6Address.impl.octets"></a>
 
 ### Method `octets`
 
@@ -793,7 +793,7 @@ pub fn octets(self: &Self) -> [u8; 16]
 
 Returns the owned network-order octets by value.
 
-<a id="impl.equals-2"></a>
+<a id="Ipv6Address.impl.equals"></a>
 
 ### Method `equals`
 
@@ -803,7 +803,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Reports exact binary equality.
 
-<a id="impl.formatInto-2"></a>
+<a id="Ipv6Address.impl.formatInto"></a>
 
 ### Method `formatInto`
 
@@ -813,7 +813,7 @@ pub fn formatInto(self: &Self, output: &mut [u8]) -> Result<usize, AddressError>
 
 Formats canonical RFC 5952 lowercase text without partial output.
 
-<a id="impl-11"></a>
+<a id="IpAddress.impl"></a>
 
 ## Implementation `IpAddress`
 
@@ -821,7 +821,7 @@ Formats canonical RFC 5952 lowercase text without partial output.
 impl IpAddress
 ```
 
-<a id="impl.isV4"></a>
+<a id="IpAddress.impl.isV4"></a>
 
 ### Method `isV4`
 
@@ -831,7 +831,7 @@ pub fn isV4(self: &Self) -> bool
 
 Reports whether this address is IPv4.
 
-<a id="impl.equals-3"></a>
+<a id="IpAddress.impl.equals"></a>
 
 ### Method `equals`
 
@@ -841,7 +841,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Reports family-sensitive exact equality.
 
-<a id="impl.formatInto-3"></a>
+<a id="IpAddress.impl.formatInto"></a>
 
 ### Method `formatInto`
 
@@ -851,7 +851,7 @@ pub fn formatInto(self: &Self, output: &mut [u8]) -> Result<usize, AddressError>
 
 Formats the selected canonical address form.
 
-<a id="impl-12"></a>
+<a id="Port.impl"></a>
 
 ## Implementation `Port`
 
@@ -859,7 +859,7 @@ Formats the selected canonical address form.
 impl Port
 ```
 
-<a id="impl.make"></a>
+<a id="Port.impl.make"></a>
 
 ### Associated function `make`
 
@@ -869,7 +869,7 @@ pub fn make(value: usize) -> Result<Port, AddressError>
 
 Checks a pointer-width integer as an inclusive u16 transport port.
 
-<a id="impl.fromU16"></a>
+<a id="Port.impl.fromU16"></a>
 
 ### Associated function `fromU16`
 
@@ -879,7 +879,7 @@ pub fn fromU16(value: u16) -> Port
 
 Constructs a port from an already checked u16.
 
-<a id="impl.value"></a>
+<a id="Port.impl.value"></a>
 
 ### Method `value`
 
@@ -889,7 +889,7 @@ pub fn value(self: &Self) -> u16
 
 Returns the underlying checked u16.
 
-<a id="impl-13"></a>
+<a id="Endpoint.impl"></a>
 
 ## Implementation `Endpoint`
 
@@ -897,7 +897,7 @@ Returns the underlying checked u16.
 impl Endpoint
 ```
 
-<a id="impl.make-2"></a>
+<a id="Endpoint.impl.make"></a>
 
 ### Associated function `make`
 
@@ -907,7 +907,7 @@ pub fn make(address: IpAddress, port: Port) -> Endpoint
 
 Owns one numeric address and checked port.
 
-<a id="impl.address"></a>
+<a id="Endpoint.impl.address"></a>
 
 ### Method `address`
 
@@ -917,7 +917,7 @@ pub fn address(self: &Self) -> IpAddress
 
 Returns the owned address by value.
 
-<a id="impl.port"></a>
+<a id="Endpoint.impl.port"></a>
 
 ### Method `port`
 
@@ -927,7 +927,7 @@ pub fn port(self: &Self) -> Port
 
 Returns the checked port by value.
 
-<a id="impl.equals-4"></a>
+<a id="Endpoint.impl.equals"></a>
 
 ### Method `equals`
 
@@ -937,7 +937,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Reports exact address-and-port equality.
 
-<a id="impl-14"></a>
+<a id="DomainHost.impl"></a>
 
 ## Implementation `DomainHost`
 
@@ -945,7 +945,7 @@ Reports exact address-and-port equality.
 impl DomainHost
 ```
 
-<a id="impl.make-3"></a>
+<a id="DomainHost.impl.make"></a>
 
 ### Associated function `make`
 
@@ -955,7 +955,7 @@ pub fn make(bytes: &[u8]) -> Result<DomainHost, AddressError>
 
 Copies and validates an absolute unrooted ASCII LDH/A-label domain.
 
-<a id="impl.bytes"></a>
+<a id="DomainHost.impl.bytes"></a>
 
 ### Method `bytes`
 
@@ -965,7 +965,7 @@ pub fn bytes<'a>(self: &'a Self) -> &'a [u8]
 
 Borrows the preserved source-spelling bytes.
 
-<a id="impl.length"></a>
+<a id="DomainHost.impl.length"></a>
 
 ### Method `length`
 
@@ -975,7 +975,7 @@ pub fn length(self: &Self) -> usize
 
 Returns the stored byte length.
 
-<a id="impl.equals-5"></a>
+<a id="DomainHost.impl.equals"></a>
 
 ### Method `equals`
 
@@ -985,7 +985,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Reports ASCII case-insensitive equality.
 
-<a id="impl-15"></a>
+<a id="Host.impl"></a>
 
 ## Implementation `Host`
 
@@ -993,7 +993,7 @@ Reports ASCII case-insensitive equality.
 impl Host
 ```
 
-<a id="impl.parse-3"></a>
+<a id="Host.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -1003,7 +1003,7 @@ pub fn parse(bytes: &[u8]) -> Result<Host, AddressError>
 
 Classifies an RFC 3986 URI host into owned numeric or domain identity.
 
-<a id="impl.numeric"></a>
+<a id="Host.impl.numeric"></a>
 
 ### Method `numeric`
 
@@ -1013,7 +1013,7 @@ pub fn numeric(self: &Self) -> IpAddress | ()
 
 Returns the numeric address when this host is numeric.
 
-<a id="impl-16"></a>
+<a id="Ipv4Address.impl.Display"></a>
 
 ## Implementation `Display for Ipv4Address`
 
@@ -1021,7 +1021,7 @@ Returns the numeric address when this host is numeric.
 impl Display for Ipv4Address
 ```
 
-<a id="impl.display"></a>
+<a id="Ipv4Address.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1029,7 +1029,7 @@ impl Display for Ipv4Address
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-17"></a>
+<a id="Ipv6Address.impl.Display"></a>
 
 ## Implementation `Display for Ipv6Address`
 
@@ -1037,7 +1037,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for Ipv6Address
 ```
 
-<a id="impl.display-2"></a>
+<a id="Ipv6Address.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1045,7 +1045,7 @@ impl Display for Ipv6Address
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-18"></a>
+<a id="IpAddress.impl.Display"></a>
 
 ## Implementation `Display for IpAddress`
 
@@ -1053,7 +1053,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for IpAddress
 ```
 
-<a id="impl.display-3"></a>
+<a id="IpAddress.impl.Display.display"></a>
 
 ### Operation `display`
 
@@ -1061,7 +1061,7 @@ impl Display for IpAddress
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-<a id="impl-19"></a>
+<a id="DomainHost.impl.Display"></a>
 
 ## Implementation `Display for DomainHost`
 
@@ -1069,7 +1069,7 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 impl Display for DomainHost
 ```
 
-<a id="impl.display-4"></a>
+<a id="DomainHost.impl.Display.display"></a>
 
 ### Operation `display`
 

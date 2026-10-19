@@ -105,7 +105,7 @@ Keys are 32 bytes, nonces 12 bytes, and detached tags 16 bytes. Payloads may con
 274877906880 bytes; AAD lengths must fit `u64`, as all addressable Silk slices do.
 Output capacity may exceed the payload length; the unused suffix is preserved.
 
-<a id="impl"></a>
+<a id="ChaCha20Poly1305.impl"></a>
 
 ## Implementation `ChaCha20Poly1305`
 
@@ -113,7 +113,7 @@ Output capacity may exceed the payload length; the unused suffix is preserved.
 impl ChaCha20Poly1305
 ```
 
-<a id="impl.seal"></a>
+<a id="ChaCha20Poly1305.impl.seal"></a>
 
 ### Associated function `seal`
 
@@ -130,7 +130,7 @@ Returns the first [`AeadError`](#AeadError) on rejection and preserves both dest
 #### Gotchas
 The caller must provide a unique nonce for each encryption under the same key.
 
-<a id="impl.open"></a>
+<a id="ChaCha20Poly1305.impl.open"></a>
 
 ### Associated function `open`
 

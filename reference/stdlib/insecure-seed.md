@@ -6,10 +6,10 @@ One provider-stable 128-bit value for initialization-time hash-flood hardening.
 
 ## When to use
 Read [`InsecureSeed`](#InsecureSeed) once while initializing a language runtime or application data structure.
-Use [`fixed`](#impl.fixed) in deterministic environments or [`fromRandom`](#impl.fromRandom) when secure randomness is present.
+Use [`fixed`](#InsecureSeed.impl.fixed) in deterministic environments or [`fromRandom`](#InsecureSeed.impl.fromRandom) when secure randomness is present.
 
 ## Details
-A provider returns the same copyable [`Seed`](#Seed) on every shared read. [`fromRandom`](#impl.fromRandom) consumes two
+A provider returns the same copyable [`Seed`](#Seed) on every shared read. [`fromRandom`](#InsecureSeed.impl.fromRandom) consumes two
 secure words exactly once and stores them in an immutable provider.
 
 ## Gotchas
@@ -45,7 +45,7 @@ pub struct Seed
 
 A copyable pair of initialization seed words with private representation.
 
-<a id="impl"></a>
+<a id="Seed.impl.Copy"></a>
 
 ## Implementation `Copy for Seed`
 
@@ -73,7 +73,7 @@ effect fn get() -> Seed ? &InsecureSeed
 
 Returns a copy of the provider's stable seed.
 
-<a id="impl-2"></a>
+<a id="InsecureSeed.impl"></a>
 
 ## Implementation `InsecureSeed`
 
@@ -81,7 +81,7 @@ Returns a copy of the provider's stable seed.
 impl InsecureSeed
 ```
 
-<a id="impl.first"></a>
+<a id="InsecureSeed.impl.first"></a>
 
 ### Associated function `first`
 
@@ -91,7 +91,7 @@ pub fn first(seed: &Seed) -> u64
 
 Returns the first word of `seed`.
 
-<a id="impl.second"></a>
+<a id="InsecureSeed.impl.second"></a>
 
 ### Associated function `second`
 
@@ -101,7 +101,7 @@ pub fn second(seed: &Seed) -> u64
 
 Returns the second word of `seed`.
 
-<a id="impl.fixed"></a>
+<a id="InsecureSeed.impl.fixed"></a>
 
 ### Associated function `fixed`
 
@@ -111,7 +111,7 @@ pub fn fixed(first: u64, second: u64) -> FixedInsecureSeed
 
 Creates a deterministic provider from two explicit words without requiring secure randomness.
 
-<a id="impl.fromRandom"></a>
+<a id="InsecureSeed.impl.fromRandom"></a>
 
 ### Associated function `fromRandom`
 
@@ -131,7 +131,7 @@ pub struct FixedInsecureSeed
 
 An immutable provider containing one fixed seed.
 
-<a id="impl-3"></a>
+<a id="FixedInsecureSeed.impl"></a>
 
 ## Implementation `FixedInsecureSeed`
 
@@ -139,7 +139,7 @@ An immutable provider containing one fixed seed.
 impl FixedInsecureSeed
 ```
 
-<a id="impl-4"></a>
+<a id="FixedInsecureSeed.impl.InsecureSeed"></a>
 
 ## Implementation `InsecureSeed for FixedInsecureSeed`
 
@@ -147,7 +147,7 @@ impl FixedInsecureSeed
 impl InsecureSeed for FixedInsecureSeed
 ```
 
-<a id="impl.get"></a>
+<a id="FixedInsecureSeed.impl.InsecureSeed.get"></a>
 
 ### Operation `get`
 

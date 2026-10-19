@@ -544,7 +544,7 @@ pub struct RouteKey
 
 Stable route identity for later pooling and redirect recomputation.
 
-<a id="impl"></a>
+<a id="ProxyReason.impl.Copy"></a>
 
 ## Implementation `Copy for ProxyReason`
 
@@ -552,7 +552,7 @@ Stable route identity for later pooling and redirect recomputation.
 impl Copy for ProxyReason
 ```
 
-<a id="impl-2"></a>
+<a id="ProxyAdmissionError.impl.Copy"></a>
 
 ## Implementation `Copy for ProxyAdmissionError`
 
@@ -560,7 +560,7 @@ impl Copy for ProxyReason
 impl Copy for ProxyAdmissionError
 ```
 
-<a id="impl-3"></a>
+<a id="ProxyConfigId.impl.Copy"></a>
 
 ## Implementation `Copy for ProxyConfigId`
 
@@ -568,7 +568,7 @@ impl Copy for ProxyAdmissionError
 impl Copy for ProxyConfigId
 ```
 
-<a id="impl-4"></a>
+<a id="ProxyAuthContextId.impl.Copy"></a>
 
 ## Implementation `Copy for ProxyAuthContextId`
 
@@ -576,15 +576,15 @@ impl Copy for ProxyConfigId
 impl Copy for ProxyAuthContextId
 ```
 
-<a id="impl-5"></a>
+<a id="Route.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Route<'configuration>`
 
 ```silk
 impl<'configuration> Copy for Route<'configuration>
 ```
 
-<a id="impl-6"></a>
+<a id="RouteKey.impl.Copy"></a>
 
 ## Implementation `Copy for RouteKey`
 
@@ -592,7 +592,7 @@ impl<'configuration> Copy for Route<'configuration>
 impl Copy for RouteKey
 ```
 
-<a id="impl-7"></a>
+<a id="ProxyError.impl"></a>
 
 ## Implementation `ProxyError`
 
@@ -600,7 +600,7 @@ impl Copy for RouteKey
 impl ProxyError
 ```
 
-<a id="impl.invalidRoute"></a>
+<a id="ProxyError.impl.invalidRoute"></a>
 
 ### Associated function `invalidRoute`
 
@@ -610,7 +610,7 @@ pub fn invalidRoute() -> ProxyError
 
 Returns the credential-free failure for an incompatible sealed route.
 
-<a id="impl-8"></a>
+<a id="ProxyConfigId.impl"></a>
 
 ## Implementation `ProxyConfigId`
 
@@ -618,7 +618,7 @@ Returns the credential-free failure for an incompatible sealed route.
 impl ProxyConfigId
 ```
 
-<a id="impl.make"></a>
+<a id="ProxyConfigId.impl.make"></a>
 
 ### Associated function `make`
 
@@ -628,7 +628,7 @@ pub fn make(value: u64) -> ProxyConfigId
 
 Preserves a caller-supplied nonsecret identity payload opaquely.
 
-<a id="impl.equals"></a>
+<a id="ProxyConfigId.impl.equals"></a>
 
 ### Method `equals`
 
@@ -638,7 +638,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Reports exact caller-payload equality without exposing the payload.
 
-<a id="impl-9"></a>
+<a id="ProxyAuthContextId.impl"></a>
 
 ## Implementation `ProxyAuthContextId`
 
@@ -646,7 +646,7 @@ Reports exact caller-payload equality without exposing the payload.
 impl ProxyAuthContextId
 ```
 
-<a id="impl.make-2"></a>
+<a id="ProxyAuthContextId.impl.make"></a>
 
 ### Associated function `make`
 
@@ -656,7 +656,7 @@ pub fn make(value: u64) -> ProxyAuthContextId
 
 Preserves a caller-supplied nonsecret identity payload opaquely.
 
-<a id="impl.equals-2"></a>
+<a id="ProxyAuthContextId.impl.equals"></a>
 
 ### Method `equals`
 
@@ -666,7 +666,7 @@ pub fn equals(self: &Self, other: &Self) -> bool
 
 Reports exact caller-payload equality without exposing the payload.
 
-<a id="impl-10"></a>
+<a id="ProxyAuth.impl"></a>
 
 ## Implementation `ProxyAuth`
 
@@ -674,7 +674,7 @@ Reports exact caller-payload equality without exposing the payload.
 impl ProxyAuth
 ```
 
-<a id="impl.none"></a>
+<a id="ProxyAuth.impl.none"></a>
 
 ### Associated function `none`
 
@@ -684,7 +684,7 @@ pub fn none(contextId: ProxyAuthContextId) -> ProxyAuth
 
 Creates an authentication context with no credential bytes.
 
-<a id="impl.preparedBasic"></a>
+<a id="ProxyAuth.impl.preparedBasic"></a>
 
 ### Associated function `preparedBasic`
 
@@ -697,7 +697,7 @@ pub effect fn preparedBasic(
 
 Strictly validates and copies one nonempty prepared Basic token.
 
-<a id="impl.contextId"></a>
+<a id="ProxyAuth.impl.contextId"></a>
 
 ### Method `contextId`
 
@@ -707,7 +707,7 @@ pub fn contextId(self: &Self) -> ProxyAuthContextId
 
 Returns the caller-supplied authentication-context identity.
 
-<a id="impl.ownedBytes"></a>
+<a id="ProxyAuth.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 
@@ -717,7 +717,7 @@ pub fn ownedBytes(self: &Self) -> usize
 
 Returns retained credential bytes without exposing them.
 
-<a id="impl-11"></a>
+<a id="BypassPolicy.impl"></a>
 
 ## Implementation `BypassPolicy`
 
@@ -725,7 +725,7 @@ Returns retained credential bytes without exposing them.
 impl BypassPolicy
 ```
 
-<a id="impl.copy"></a>
+<a id="BypassPolicy.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -737,7 +737,7 @@ pub effect fn copy(origins: &[Origin]) -> Result<BypassPolicy, ProxyError>
 
 Copies at most 64 exact normalized HTTP origins into immutable owned policy.
 
-<a id="impl.contains"></a>
+<a id="BypassPolicy.impl.contains"></a>
 
 ### Method `contains`
 
@@ -747,7 +747,7 @@ pub fn contains(self: &Self, origin: &Origin) -> bool
 
 Reports exact scheme, normalized-host, and effective-port membership.
 
-<a id="impl.ownedBytes-2"></a>
+<a id="BypassPolicy.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 
@@ -757,7 +757,7 @@ pub fn ownedBytes(self: &Self) -> usize
 
 Returns copied bypass-entry storage size.
 
-<a id="impl-12"></a>
+<a id="ProxyConfig.impl"></a>
 
 ## Implementation `ProxyConfig`
 
@@ -765,7 +765,7 @@ Returns copied bypass-entry storage size.
 impl ProxyConfig
 ```
 
-<a id="impl.make-3"></a>
+<a id="ProxyConfig.impl.make"></a>
 
 ### Associated function `make`
 
@@ -782,7 +782,7 @@ pub fn make(
 
 Admits a plain programmatic proxy endpoint under a total owned-byte budget.
 
-<a id="impl.fromUri"></a>
+<a id="ProxyConfig.impl.fromUri"></a>
 
 ### Associated function `fromUri`
 
@@ -798,7 +798,7 @@ pub fn fromUri<'text>(
 
 Parses only a plain `http` authority with no userinfo, path, query, or fragment.
 
-<a id="impl.id"></a>
+<a id="ProxyConfig.impl.id"></a>
 
 ### Method `id`
 
@@ -808,7 +808,7 @@ pub fn id(self: &Self) -> ProxyConfigId
 
 Returns the caller-supplied configuration identity.
 
-<a id="impl.authContextId"></a>
+<a id="ProxyConfig.impl.authContextId"></a>
 
 ### Method `authContextId`
 
@@ -818,7 +818,7 @@ pub fn authContextId(self: &Self) -> ProxyAuthContextId
 
 Returns the caller-supplied authentication-context identity.
 
-<a id="impl.proxyHost"></a>
+<a id="ProxyConfig.impl.proxyHost"></a>
 
 ### Method `proxyHost`
 
@@ -828,7 +828,7 @@ pub fn proxyHost(self: &Self) -> Host
 
 Returns the checked proxy host.
 
-<a id="impl.proxyPort"></a>
+<a id="ProxyConfig.impl.proxyPort"></a>
 
 ### Method `proxyPort`
 
@@ -838,7 +838,7 @@ pub fn proxyPort(self: &Self) -> Port
 
 Returns the checked nonzero proxy port.
 
-<a id="impl.ownedBytes-3"></a>
+<a id="ProxyConfig.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 
@@ -880,15 +880,15 @@ Any 2xx response is accepted. A 407 retains status, reason, and ordered duplicat
 Complete-head copy failures map to `ProxyMetadataLimit`, while allocation failure remains
 `OutOfMemoryError`. Call this only after the shared client's parser has returned a final head.
 
-<a id="impl-13"></a>
+<a id="Route.impl"></a>
 
-## Implementation ``
+## Implementation `Route<'configuration>`
 
 ```silk
 impl<'configuration> Route<'configuration>
 ```
 
-<a id="impl.mode"></a>
+<a id="Route.impl.mode"></a>
 
 ### Method `mode`
 
@@ -898,7 +898,7 @@ pub fn mode(self: &Self) -> RouteMode
 
 Returns the selected route mode.
 
-<a id="impl.originalOrigin"></a>
+<a id="Route.impl.originalOrigin"></a>
 
 ### Method `originalOrigin`
 
@@ -908,7 +908,7 @@ pub fn originalOrigin(self: &Self) -> Origin
 
 Returns the original origin that policy evaluated.
 
-<a id="impl.proxyHost-2"></a>
+<a id="Route.impl.proxyHost"></a>
 
 ### Method `proxyHost`
 
@@ -918,7 +918,7 @@ pub fn proxyHost(self: &Self) -> Host
 
 Returns the proxy host retained when policy selected the route.
 
-<a id="impl.proxyPort-2"></a>
+<a id="Route.impl.proxyPort"></a>
 
 ### Method `proxyPort`
 
@@ -928,7 +928,7 @@ pub fn proxyPort(self: &Self) -> Port
 
 Returns the proxy port retained when policy selected the route.
 
-<a id="impl.physicalPeer"></a>
+<a id="Route.impl.physicalPeer"></a>
 
 ### Method `physicalPeer`
 
@@ -938,7 +938,7 @@ pub fn physicalPeer(self: &Self) -> Result<Origin, OriginError>
 
 Returns the plaintext proxy peer retained by the sealed route.
 
-<a id="impl.proxyAuthorizationLength"></a>
+<a id="Route.impl.proxyAuthorizationLength"></a>
 
 ### Method `proxyAuthorizationLength`
 
@@ -953,7 +953,7 @@ Returns the complete configured `Proxy-Authorization` value length, or zero when
 The prepared token remains private; possessing a policy-selected route is the capability to
 request its bounded wire representation.
 
-<a id="impl.writeProxyAuthorizationInto"></a>
+<a id="Route.impl.writeProxyAuthorizationInto"></a>
 
 ### Method `writeProxyAuthorizationInto`
 
@@ -964,7 +964,7 @@ pub fn writeProxyAuthorizationInto(self: &Self, output: &mut [u8]) -> Option<usi
 Writes the complete configured `Proxy-Authorization` value without exposing token storage.
 Returns `None` without changing `output` when it is too small.
 
-<a id="impl.configId"></a>
+<a id="Route.impl.configId"></a>
 
 ### Method `configId`
 
@@ -974,7 +974,7 @@ pub fn configId(self: &Self) -> ProxyConfigId
 
 Returns the configuration identity retained when policy selected the route.
 
-<a id="impl.authContextId-2"></a>
+<a id="Route.impl.authContextId"></a>
 
 ### Method `authContextId`
 
@@ -984,7 +984,7 @@ pub fn authContextId(self: &Self) -> ProxyAuthContextId
 
 Returns the authentication-context identity retained when policy selected the route.
 
-<a id="impl.key"></a>
+<a id="Route.impl.key"></a>
 
 ### Method `key`
 
@@ -994,7 +994,7 @@ pub fn key(self: &Self) -> RouteKey
 
 Returns a stable key without reading or formatting authentication bytes.
 
-<a id="impl.recompute"></a>
+<a id="Route.impl.recompute"></a>
 
 ### Method `recompute`
 
@@ -1004,7 +1004,7 @@ pub fn recompute(self: &Self, origin: Origin) -> Route<'configuration>
 
 Recomputes policy for a new origin under the current immutable configuration.
 
-<a id="impl-14"></a>
+<a id="RouteKey.impl"></a>
 
 ## Implementation `RouteKey`
 
@@ -1012,7 +1012,7 @@ Recomputes policy for a new origin under the current immutable configuration.
 impl RouteKey
 ```
 
-<a id="impl.originalOrigin-2"></a>
+<a id="RouteKey.impl.originalOrigin"></a>
 
 ### Method `originalOrigin`
 
@@ -1022,7 +1022,7 @@ pub fn originalOrigin(self: &Self) -> Origin
 
 Returns the normalized original origin retained by this sealed route identity.
 
-<a id="impl.mode-2"></a>
+<a id="RouteKey.impl.mode"></a>
 
 ### Method `mode`
 
@@ -1032,7 +1032,7 @@ pub fn mode(self: &Self) -> RouteMode
 
 Returns the selected route mode without exposing proxy configuration or credential bytes.
 
-<a id="impl.equals-3"></a>
+<a id="RouteKey.impl.equals"></a>
 
 ### Method `equals`
 

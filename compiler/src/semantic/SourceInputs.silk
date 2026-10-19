@@ -1,0 +1,219 @@
+//! Source-only observations consumed by semantic units. These are graph inputs, not queries.
+//! Loading syntax does not imply consuming all of its bytes. Each selector retains exactly the
+//! authored facts read by its consumer; unconverted readers keep explicit SourceFile edges.
+
+import hir.Hir as Hir {Module, Node}
+import hir.Fingerprint
+import semantic.DeclarationId {DeclarationId}
+import semantic.ModuleIndex {ModuleIndex, NameObservation, CandidateKind, Arm}
+import semantic.SourceIndex {IndexedSource}
+import semantic.Anchor {Anchor}
+import semantic.SourceLocations {Location}
+import lexer.Span {Span}
+import semantic.SourceUnit {SourceUnit}
+import silk.slice {Slice}
+import silk.string {String}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.list {List}
+import silk.usize
+import semantic.RuntimeEncoding as Encoding
+
+pub enum Facet {
+  /// A declaration handle still denotes its original owner. Position is not content.
+  Alive,
+  /// Header node category and visibility, without fields or binders.
+  Identity,
+  /// Canonical innermost static-arm identity and polarity.
+  Arm,
+  /// One authored import declaration. Other declarations are excluded.
+  Import,
+}
+
+pub union Selector {
+  Presence,
+  Name {pub spelling: Bytes},
+  /// The complete bucket plus the arm/import facts actually read by selection.
+  Selection {pub spelling: Bytes},
+  Declaration {pub handle: usize, pub facet: Facet},
+  Location {pub handle: usize, pub location: Location},
+  /// A source prefix used only when a published absolute diagnostic cannot be represented by
+  /// an authored token selector. Appending unrelated bytes after the site does not change it.
+  Prefix {pub end: usize},
+}
+
+pub struct Input {
+  pub module: usize
+  pub selector: Selector
+  pub value: Bytes
+}
+
+pub struct SourceInputs { pub inputs: List<Input> }
+
+pub fn make() -> SourceInputs { return SourceInputs {inputs: List<Input>.make()} }
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length { if left[at] != right[at] { return false } at = at + usize.ONE }
+  return true
+}
+
+fn sameSelector(left: &Selector, right: &Selector) -> bool {
+  return match &left.* {
+    Selector.Presence => match &right.* { Selector.Presence => true _ => false }
+    Selector.Name {spelling} => match &right.* {
+      Selector.Name {spelling: other} => sameBytes(Bytes.asSlice(&spelling), Bytes.asSlice(&other)) _ => false
+    }
+    Selector.Selection {spelling} => match &right.* {
+      Selector.Selection {spelling: other} => sameBytes(Bytes.asSlice(&spelling), Bytes.asSlice(&other)) _ => false
+    }
+    Selector.Declaration {handle, facet} => match &right.* {
+      Selector.Declaration {handle: other, facet: otherFacet} => handle == other && facet == otherFacet _ => false
+    }
+    Selector.Location {handle, location} => match &right.* {
+      Selector.Location {handle: other, location: compared} => handle == other && location.start == compared.start && location.end == compared.end
+      _ => false
+    }
+    Selector.Prefix {end} => match &right.* { Selector.Prefix {end: other} => end == other _ => false }
+  }
+}
+
+pub effect fn intern(self: &mut SourceInputs, module: usize, selector: Selector, value: Bytes) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let inputs = List<Input>.asSlice(&self.inputs)
+  let mut at = usize.ZERO
+  while at < inputs.length {
+    if inputs[at].module == module && sameSelector(&inputs[at].selector, &selector) { return at }
+    at = at + usize.ONE
+  }
+  run List<Input>.append(&mut self.inputs, Input {module: module, selector: move selector, value: move value})
+  return at
+}
+
+pub fn unchanged(input: &Input, value: &Bytes) -> bool { return sameBytes(Bytes.asSlice(&input.value), Bytes.asSlice(value)) }
+
+// Canonical arm coordinates, never an ordinal from a previous parse.
+effect fn arm(output: &mut Bytes, source: &IndexedSource, position: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(source))
+  if let Option<Arm>.Some {value} = &declarations[position].arm {
+    run Encoding.field(&mut output.*, b"arm")
+    let mut identity = Bytes.make()
+    run DeclarationId.appendContent(&declarations[value.conditional].identity, &mut identity)
+    run Encoding.field(&mut output.*, Bytes.asSlice(&identity))
+    if value.holds { run Encoding.field(&mut output.*, b"true") }
+    else { run Encoding.field(&mut output.*, b"false") }
+  } else { run Encoding.field(&mut output.*, b"unconditional") }
+  return ()
+}
+
+// The caller provides the current live position of the stable handle, or MAX if it was lost.
+pub effect fn capture(selector: &Selector, source: Option<&IndexedSource>, position: usize) -> Bytes
+! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  let indexed = match move source {
+    Option<&IndexedSource>.Some {value} => value
+    Option<&IndexedSource>.None => { return run Bytes.copy(b"absent") }
+  }
+  run Encoding.field(&mut output, b"present")
+  let index = IndexedSource.moduleIndex(indexed)
+  let declarations = ModuleIndex.listDeclarations(index)
+  let hir = IndexedSource.authored(indexed)
+  match &selector.* {
+    Selector.Presence => {}
+    Selector.Name {spelling} => { run name(&mut output, indexed, Bytes.asSlice(&spelling), false) }
+    Selector.Selection {spelling} => { run name(&mut output, indexed, Bytes.asSlice(&spelling), true) }
+    Selector.Location {location, ..} => {
+      if position < declarations.length {
+        // A token ordinal is meaningful only under its retained authored header structure.
+        let guarded = run Fingerprint.header(hir, declarations[position].header)
+        run Encoding.field(&mut output, List<u8>.asSlice(&guarded))
+        if let Option<Anchor>.Some {value: anchor} = move IndexedSource.anchorOf(indexed, position) {
+          if let Option<Span>.Some {value: span} = move Anchor.retainedSpan(&anchor, location) {
+            run Encoding.word(&mut output, usize.toU64(span.start))
+            run Encoding.word(&mut output, usize.toU64(span.end))
+            return move output
+          }
+        }
+      }
+      return run Bytes.copy(b"missing-location")
+    }
+    Selector.Prefix {end} => {
+      let bytes = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
+      let limit = end
+      if limit > bytes.length { return run Bytes.copy(b"missing-prefix") }
+      run Encoding.field(&mut output, Slice.view<u8>(bytes, usize.ZERO, limit))
+    }
+    Selector.Declaration {facet, ..} => {
+      if position >= declarations.length { return run Bytes.copy(b"lost-handle") }
+      run Encoding.field(&mut output, b"live")
+      if facet == Facet.Arm { run arm(&mut output, indexed, position) }
+      if facet == Facet.Identity {
+        let header = Module.node(hir, declarations[position].header)
+        run Encoding.field(&mut output, String.utf8Bytes(Hir.nodeKindName(header)))
+        let visible = match header {
+          Node.StructHeader {isPublic, ..} => isPublic
+          Node.TupleHeader {isPublic, ..} => isPublic
+          Node.EnumHeader {isPublic, ..} => isPublic
+          Node.UnionHeader {isPublic, ..} => isPublic
+          Node.ServiceHeader {isPublic, ..} => isPublic
+          Node.InterfaceHeader {isPublic, ..} => isPublic
+          Node.RoleHeader {isPublic, ..} => isPublic
+          _ => false
+        }
+        if visible { run Encoding.field(&mut output, b"public") }
+      }
+      if facet == Facet.Import {
+        let encoded = run Fingerprint.header(hir, declarations[position].header)
+        run Encoding.field(&mut output, List<u8>.asSlice(&encoded))
+      }
+    }
+  }
+  return move output
+}
+
+effect fn name(output: &mut Bytes, source: &IndexedSource, spelling: &[u8], selected: bool) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let index = IndexedSource.moduleIndex(source)
+  let observation = run ModuleIndex.observeName(index, spelling)
+  let members = NameObservation.listMembers(&observation)
+  run Encoding.word(&mut output.*, usize.toU64(members.length))
+  let mut at = usize.ZERO
+  while at < members.length {
+    let item = &members[at]
+    let mut identity = Bytes.make()
+    run DeclarationId.appendContent(&item.declaration, &mut identity)
+    run Encoding.field(&mut output.*, Bytes.asSlice(&identity))
+    run Encoding.field(&mut output.*, match item.kind {
+      CandidateKind.Declaration => b"declaration"
+      CandidateKind.ImportModule => b"namespace"
+      CandidateKind.ImportMember => b"member"
+    })
+    run Encoding.word(&mut output.*, usize.toU64(item.ordinal))
+    if item.isPublic { run Encoding.field(&mut output.*, b"public") }
+    else { run Encoding.field(&mut output.*, b"private") }
+    if selected {
+      if let Option<usize>.Some {value: position} = move ModuleIndex.ordinalOf(index, &item.declaration) {
+        run arm(&mut output.*, source, position)
+        if item.kind != CandidateKind.Declaration {
+          let declarations = ModuleIndex.listDeclarations(index)
+          let encoded = run Fingerprint.header(IndexedSource.authored(source), declarations[position].header)
+          run Encoding.field(&mut output.*, List<u8>.asSlice(&encoded))
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Handle carried by a declaration or retained-location selector, if any.
+pub fn handle(selector: &Selector) -> usize {
+  return match &selector.* {
+    Selector.Declaration {handle, ..} => handle
+    Selector.Location {handle, ..} => handle
+    _ => usize.MAX
+  }
+}

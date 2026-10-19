@@ -52,7 +52,7 @@ This struct carries no data and is never constructed by the library. Every gener
 an inherent member declared in `impl UnicodeTables`, reached through
 `import silk.unicode_tables { UnicodeTables }`.
 
-<a id="impl"></a>
+<a id="UnicodeTables.impl"></a>
 
 ## Implementation `UnicodeTables`
 
@@ -60,7 +60,7 @@ an inherent member declared in `impl UnicodeTables`, reached through
 impl UnicodeTables
 ```
 
-<a id="impl.dataVersion"></a>
+<a id="UnicodeTables.impl.dataVersion"></a>
 
 ### Associated function `dataVersion`
 
@@ -70,7 +70,7 @@ pub fn dataVersion() -> string<'static>
 
 Returns the Unicode data version that defines all lookup results in this module.
 
-<a id="impl.maximumDecompositionLength"></a>
+<a id="UnicodeTables.impl.maximumDecompositionLength"></a>
 
 ### Associated function `maximumDecompositionLength`
 
@@ -80,7 +80,7 @@ pub fn maximumDecompositionLength() -> usize
 
 Returns the longest full canonical decomposition of one scalar in these tables.
 
-<a id="impl.combiningClass"></a>
+<a id="UnicodeTables.impl.combiningClass"></a>
 
 ### Associated function `combiningClass`
 
@@ -90,7 +90,7 @@ pub fn combiningClass(scalar: u32) -> u32
 
 Returns a scalar's canonical combining class, or zero for a starter or unknown value.
 
-<a id="impl.canonicalDecomposition"></a>
+<a id="UnicodeTables.impl.canonicalDecomposition"></a>
 
 ### Associated function `canonicalDecomposition`
 
@@ -101,7 +101,7 @@ pub fn canonicalDecomposition(scalar: u32) -> Decomposition
 Returns the canonical decomposition of a scalar, or both components zero when it has none.
 Hangul syllables decompose algorithmically and are absent from this table by design.
 
-<a id="impl.canonicalComposition"></a>
+<a id="UnicodeTables.impl.canonicalComposition"></a>
 
 ### Associated function `canonicalComposition`
 

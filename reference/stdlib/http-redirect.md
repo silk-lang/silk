@@ -231,7 +231,7 @@ pub maxOwnedBytes: usize
 
 Maximum aggregate name payload plus owned index storage.
 
-<a id="impl"></a>
+<a id="NameListLimits.impl.Copy"></a>
 
 ## Implementation `Copy for NameListLimits`
 
@@ -289,7 +289,7 @@ pub maxHistoryBytes: usize
 
 Maximum serialized key bytes in the preallocated history arena.
 
-<a id="impl-2"></a>
+<a id="HistoryLimits.impl.Copy"></a>
 
 ## Implementation `Copy for HistoryLimits`
 
@@ -627,7 +627,7 @@ ReplayContractMismatch
 
 A producer's framing or observed length violates its declared contract.
 
-<a id="impl-3"></a>
+<a id="RedirectReason.impl.Copy"></a>
 
 ## Implementation `Copy for RedirectReason`
 
@@ -990,7 +990,7 @@ pub end: bool
 
 Whether no later pull may produce bytes.
 
-<a id="impl-4"></a>
+<a id="BodyChunk.impl.Copy"></a>
 
 ## Implementation `Copy for BodyChunk`
 
@@ -2163,15 +2163,15 @@ pub body: BodyDecision
 
 Whether content remains part of the next attempt.
 
-<a id="impl-5"></a>
+<a id="Transition.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Transition<'method>`
 
 ```silk
 impl<'method> Copy for Transition<'method>
 ```
 
-<a id="impl-6"></a>
+<a id="NameList.impl"></a>
 
 ## Implementation `NameList`
 
@@ -2179,7 +2179,7 @@ impl<'method> Copy for Transition<'method>
 impl NameList
 ```
 
-<a id="impl.empty"></a>
+<a id="NameList.impl.empty"></a>
 
 ### Associated function `empty`
 
@@ -2189,7 +2189,7 @@ pub fn empty() -> NameList
 
 Creates an empty admitted list without allocating.
 
-<a id="impl.copy"></a>
+<a id="NameList.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -2201,7 +2201,7 @@ pub effect fn copy(names: &[string], limits: NameListLimits) -> Result<NameList,
 
 Validates and copies field names under exact count, per-name, and owned-byte boundaries.
 
-<a id="impl.contains"></a>
+<a id="NameList.impl.contains"></a>
 
 ### Method `contains`
 
@@ -2211,7 +2211,7 @@ pub fn contains(self: &Self, name: string) -> bool
 
 Reports ASCII case-insensitive membership without allocating.
 
-<a id="impl.count"></a>
+<a id="NameList.impl.count"></a>
 
 ### Method `count`
 
@@ -2221,7 +2221,7 @@ pub fn count(self: &Self) -> usize
 
 Returns the number of owned names.
 
-<a id="impl.ownedBytes"></a>
+<a id="NameList.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 
@@ -2231,7 +2231,7 @@ pub fn ownedBytes(self: &Self) -> usize
 
 Returns accounted payload plus index storage bytes.
 
-<a id="impl-7"></a>
+<a id="Policy.impl"></a>
 
 ## Implementation `Policy`
 
@@ -2239,7 +2239,7 @@ Returns accounted payload plus index storage bytes.
 impl Policy
 ```
 
-<a id="impl.defaults"></a>
+<a id="Policy.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -2255,7 +2255,7 @@ The result permits 10 hops, 8192 URI bytes, and 90112 history bytes. It denies o
 and downgrades, preserves POST for 301 and 302, and closes intermediate responses. Both owned
 name lists are empty.
 
-<a id="impl.make"></a>
+<a id="Policy.impl.make"></a>
 
 ### Associated function `make`
 
@@ -2274,7 +2274,7 @@ pub fn make(
 
 Admits an immutable policy, rejecting list overlap and hop-count overflow before I/O.
 
-<a id="impl.mode"></a>
+<a id="Policy.impl.mode"></a>
 
 ### Method `mode`
 
@@ -2284,7 +2284,7 @@ pub fn mode(self: &Self) -> Mode
 
 Returns whether responses are returned manually or followed.
 
-<a id="impl.historyLimits"></a>
+<a id="Policy.impl.historyLimits"></a>
 
 ### Method `historyLimits`
 
@@ -2294,7 +2294,7 @@ pub fn historyLimits(self: &Self) -> HistoryLimits
 
 Returns admitted URI, history, and hop capacities.
 
-<a id="impl.crossOrigin"></a>
+<a id="Policy.impl.crossOrigin"></a>
 
 ### Method `crossOrigin`
 
@@ -2304,7 +2304,7 @@ pub fn crossOrigin(self: &Self) -> CrossOriginPolicy
 
 Returns cross-origin admission policy.
 
-<a id="impl.downgrade"></a>
+<a id="Policy.impl.downgrade"></a>
 
 ### Method `downgrade`
 
@@ -2314,7 +2314,7 @@ pub fn downgrade(self: &Self) -> DowngradePolicy
 
 Returns HTTPS-to-HTTP downgrade policy.
 
-<a id="impl.post301302"></a>
+<a id="Policy.impl.post301302"></a>
 
 ### Method `post301302`
 
@@ -2324,7 +2324,7 @@ pub fn post301302(self: &Self) -> Post301302Policy
 
 Returns exact POST behavior for 301 and 302.
 
-<a id="impl.previousResponse"></a>
+<a id="Policy.impl.previousResponse"></a>
 
 ### Method `previousResponse`
 
@@ -2334,7 +2334,7 @@ pub fn previousResponse(self: &Self) -> &PreviousResponsePolicy
 
 Borrows intermediate-response cleanup policy.
 
-<a id="impl.safeCustom"></a>
+<a id="Policy.impl.safeCustom"></a>
 
 ### Method `safeCustom`
 
@@ -2344,7 +2344,7 @@ pub fn safeCustom(self: &Self) -> &NameList
 
 Borrows the admitted cross-origin safe-custom field names.
 
-<a id="impl.sensitive"></a>
+<a id="Policy.impl.sensitive"></a>
 
 ### Method `sensitive`
 
@@ -2433,7 +2433,7 @@ pub struct History
 
 Bounded method-aware redirect-loop history in one preallocated byte arena.
 
-<a id="impl-8"></a>
+<a id="History.impl"></a>
 
 ## Implementation `History`
 
@@ -2441,7 +2441,7 @@ Bounded method-aware redirect-loop history in one preallocated byte arena.
 impl History
 ```
 
-<a id="impl.make-2"></a>
+<a id="History.impl.make"></a>
 
 ### Associated function `make`
 
@@ -2458,7 +2458,7 @@ Checks `maxHops + 1` and reserves the complete history-byte budget before networ
 All later inserts use one arena. An insert can fail its exact byte limit without another
 history allocation.
 
-<a id="impl.insert"></a>
+<a id="History.impl.insert"></a>
 
 ### Method `insert`
 
@@ -2471,7 +2471,7 @@ pub effect fn insert<'method>(self: &mut Self, method: Method<'method>, origin: 
 
 Checks and inserts one transformed method, normalized origin, and exact path/query key.
 
-<a id="impl.count-2"></a>
+<a id="History.impl.count"></a>
 
 ### Method `count`
 
@@ -2481,7 +2481,7 @@ pub fn count(self: &Self) -> usize
 
 Returns the number of stored method-aware keys.
 
-<a id="impl.ownedBytes-2"></a>
+<a id="History.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 

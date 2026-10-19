@@ -11,7 +11,7 @@ syntax.
 
 ## Details
 Requests preserve NUL-free argument and environment-entry bytes in insertion order. The
-environment begins empty, and the working directory is inherited unless [`requestWithin`](#impl.requestWithin)
+environment begins empty, and the working directory is inherited unless [`requestWithin`](#ChildProcess.impl.requestWithin)
 selects one. Child standard input is closed. `ChildProcess.execute` blocks until termination and
 owns complete stdout and stderr captures in [`ProcessOutcome`](#ProcessOutcome). A nonzero exit is outcome data.
 
@@ -134,7 +134,7 @@ A typed failure to start, wait for, or capture one child process.
 ### Details
 
 `operation` identifies the provider-reported stage. `reason` gives a portable recovery category.
-Use [`providerCode`](#impl.providerCode) when diagnostics also need a provider-defined numeric code.
+Use [`providerCode`](#ChildProcess.impl.providerCode) when diagnostics also need a provider-defined numeric code.
 
 A child that exits with a nonzero code produces [`ProcessOutcome`](#ProcessOutcome) data instead of this error.
 
@@ -320,7 +320,7 @@ Runs one request to termination and returns owned captures of both output stream
 This operation blocks and closes the child's standard input. A nonzero exit code returns on
 the success channel. Start, wait, and capture failures produce `ProcessError`.
 
-<a id="impl"></a>
+<a id="ChildProcess.impl"></a>
 
 ## Implementation `ChildProcess`
 
@@ -328,7 +328,7 @@ the success channel. Start, wait, and capture failures produce `ProcessError`.
 impl ChildProcess
 ```
 
-<a id="impl.spawnOperation"></a>
+<a id="ChildProcess.impl.spawnOperation"></a>
 
 ### Associated function `spawnOperation`
 
@@ -338,7 +338,7 @@ pub fn spawnOperation() -> ProcessOperation
 
 Returns the stage for preparing and starting the child process.
 
-<a id="impl.waitOperation"></a>
+<a id="ChildProcess.impl.waitOperation"></a>
 
 ### Associated function `waitOperation`
 
@@ -348,7 +348,7 @@ pub fn waitOperation() -> ProcessOperation
 
 Returns the stage for waiting until the child process terminates.
 
-<a id="impl.captureOperation"></a>
+<a id="ChildProcess.impl.captureOperation"></a>
 
 ### Associated function `captureOperation`
 
@@ -358,7 +358,7 @@ pub fn captureOperation() -> ProcessOperation
 
 Returns the stage for copying the completed output and error streams.
 
-<a id="impl.operationCode"></a>
+<a id="ChildProcess.impl.operationCode"></a>
 
 ### Associated function `operationCode`
 
@@ -368,7 +368,7 @@ pub fn operationCode(operation: ProcessOperation) -> i32
 
 Returns the stable numeric code for an execution stage.
 
-<a id="impl.notFound"></a>
+<a id="ChildProcess.impl.notFound"></a>
 
 ### Associated function `notFound`
 
@@ -378,7 +378,7 @@ pub fn notFound() -> ProcessReason
 
 Returns the reason used when no executable exists at the requested path.
 
-<a id="impl.permissionDenied"></a>
+<a id="ChildProcess.impl.permissionDenied"></a>
 
 ### Associated function `permissionDenied`
 
@@ -388,7 +388,7 @@ pub fn permissionDenied() -> ProcessReason
 
 Returns the reason used when the provider denies access to the requested executable.
 
-<a id="impl.invalidRequest"></a>
+<a id="ChildProcess.impl.invalidRequest"></a>
 
 ### Associated function `invalidRequest`
 
@@ -398,7 +398,7 @@ pub fn invalidRequest() -> ProcessReason
 
 Returns the reason used when the provider cannot present the request to its process boundary.
 
-<a id="impl.noSpace"></a>
+<a id="ChildProcess.impl.noSpace"></a>
 
 ### Associated function `noSpace`
 
@@ -408,7 +408,7 @@ pub fn noSpace() -> ProcessReason
 
 Returns the reason used when process setup or captured output exhausts provider storage.
 
-<a id="impl.unsupported"></a>
+<a id="ChildProcess.impl.unsupported"></a>
 
 ### Associated function `unsupported`
 
@@ -418,7 +418,7 @@ pub fn unsupported() -> ProcessReason
 
 Returns the reason used when the provider does not support the requested process operation.
 
-<a id="impl.other"></a>
+<a id="ChildProcess.impl.other"></a>
 
 ### Associated function `other`
 
@@ -428,7 +428,7 @@ pub fn other() -> ProcessReason
 
 Returns the reason used when no other portable recovery category applies.
 
-<a id="impl.reasonCode"></a>
+<a id="ChildProcess.impl.reasonCode"></a>
 
 ### Associated function `reasonCode`
 
@@ -438,7 +438,7 @@ pub fn reasonCode(reason: ProcessReason) -> i32
 
 Returns the stable numeric code for a portable recovery category.
 
-<a id="impl.failure"></a>
+<a id="ChildProcess.impl.failure"></a>
 
 ### Associated function `failure`
 
@@ -448,7 +448,7 @@ pub fn failure(operation: ProcessOperation, reason: ProcessReason) -> ProcessErr
 
 Creates a process failure without a provider-defined numeric code.
 
-<a id="impl.failureWithCode"></a>
+<a id="ChildProcess.impl.failureWithCode"></a>
 
 ### Associated function `failureWithCode`
 
@@ -462,7 +462,7 @@ pub fn failureWithCode(
 
 Creates a process failure with a provider-defined numeric code for diagnostics.
 
-<a id="impl.providerCode"></a>
+<a id="ChildProcess.impl.providerCode"></a>
 
 ### Associated function `providerCode`
 
@@ -472,7 +472,7 @@ pub fn providerCode(error: &ProcessError) -> Option<i32>
 
 Returns the provider-defined numeric code, or `None` when the failure has no such code.
 
-<a id="impl.request"></a>
+<a id="ChildProcess.impl.request"></a>
 
 ### Associated function `request`
 
@@ -483,7 +483,7 @@ pub effect fn request(program: &Path) -> ProcessRequest ! OutOfMemoryError ? &mu
 Creates a request for `program` with no arguments, an empty environment, and the caller's
 own working directory.
 
-<a id="impl.requestWithin"></a>
+<a id="ChildProcess.impl.requestWithin"></a>
 
 ### Associated function `requestWithin`
 
@@ -497,7 +497,7 @@ pub effect fn requestWithin(
 Creates a request that runs `program` in `directory` instead of the caller's
 working directory.
 
-<a id="impl.addArgument"></a>
+<a id="ChildProcess.impl.addArgument"></a>
 
 ### Method `addArgument`
 
@@ -519,7 +519,7 @@ The request copies `value` and preserves argument order.
 `value` must not contain NUL. NUL is the entry separator used by process providers.
 If allocation fails, do not reuse `self`; it can contain an incomplete argument entry.
 
-<a id="impl.setVariable"></a>
+<a id="ChildProcess.impl.setVariable"></a>
 
 ### Method `setVariable`
 
@@ -544,7 +544,7 @@ not read or merge the caller's environment.
 grammar beyond this provider-format requirement.
 If allocation fails, do not reuse `self`; it can contain an incomplete environment entry.
 
-<a id="impl.program"></a>
+<a id="ChildProcess.impl.program"></a>
 
 ### Method `program`
 
@@ -554,7 +554,7 @@ pub fn program(self: &ProcessRequest) -> &[u8]
 
 Borrows the executable path bytes for the lifetime of the request borrow.
 
-<a id="impl.arguments"></a>
+<a id="ChildProcess.impl.arguments"></a>
 
 ### Method `arguments`
 
@@ -564,7 +564,7 @@ pub fn arguments(self: &ProcessRequest) -> &[u8]
 
 Borrows all ordered arguments as one block of NUL-terminated entries.
 
-<a id="impl.argumentCount"></a>
+<a id="ChildProcess.impl.argumentCount"></a>
 
 ### Method `argumentCount`
 
@@ -572,9 +572,9 @@ Borrows all ordered arguments as one block of NUL-terminated entries.
 pub fn argumentCount(self: &ProcessRequest) -> usize
 ```
 
-Returns the number of calls to [`addArgument`](#impl.addArgument) that completed successfully.
+Returns the number of calls to [`addArgument`](#ChildProcess.impl.addArgument) that completed successfully.
 
-<a id="impl.environment"></a>
+<a id="ChildProcess.impl.environment"></a>
 
 ### Method `environment`
 
@@ -584,7 +584,7 @@ pub fn environment(self: &ProcessRequest) -> &[u8]
 
 Borrows the explicit environment as one block of NUL-terminated `name=value` entries.
 
-<a id="impl.environmentCount"></a>
+<a id="ChildProcess.impl.environmentCount"></a>
 
 ### Method `environmentCount`
 
@@ -592,9 +592,9 @@ Borrows the explicit environment as one block of NUL-terminated `name=value` ent
 pub fn environmentCount(self: &ProcessRequest) -> usize
 ```
 
-Returns the number of calls to [`setVariable`](#impl.setVariable) that completed successfully.
+Returns the number of calls to [`setVariable`](#ChildProcess.impl.setVariable) that completed successfully.
 
-<a id="impl.workingDirectory"></a>
+<a id="ChildProcess.impl.workingDirectory"></a>
 
 ### Method `workingDirectory`
 
@@ -604,7 +604,7 @@ pub fn workingDirectory(self: &ProcessRequest) -> &[u8]
 
 Borrows the selected working-directory bytes, or an empty view when the child inherits one.
 
-<a id="impl.hasWorkingDirectory"></a>
+<a id="ChildProcess.impl.hasWorkingDirectory"></a>
 
 ### Method `hasWorkingDirectory`
 
@@ -614,7 +614,7 @@ pub fn hasWorkingDirectory(self: &ProcessRequest) -> bool
 
 Reports whether the request selects a working directory instead of inheriting one.
 
-<a id="impl.exited"></a>
+<a id="ChildProcess.impl.exited"></a>
 
 ### Associated function `exited`
 
@@ -624,7 +624,7 @@ pub fn exited(code: i32, output: Bytes, errors: Bytes) -> ProcessOutcome
 
 Creates an exited outcome that owns `output` and `errors`.
 
-<a id="impl.signaled"></a>
+<a id="ChildProcess.impl.signaled"></a>
 
 ### Associated function `signaled`
 
@@ -634,7 +634,7 @@ pub fn signaled(signal: i32, output: Bytes, errors: Bytes) -> ProcessOutcome
 
 Creates a signaled outcome that owns `output` and `errors`.
 
-<a id="impl.isSignaled"></a>
+<a id="ChildProcess.impl.isSignaled"></a>
 
 ### Associated function `isSignaled`
 
@@ -644,7 +644,7 @@ pub fn isSignaled(outcome: &ProcessOutcome) -> bool
 
 Reports whether a signal terminated the child instead of an exit code.
 
-<a id="impl.exitCode"></a>
+<a id="ChildProcess.impl.exitCode"></a>
 
 ### Associated function `exitCode`
 
@@ -654,7 +654,7 @@ pub fn exitCode(outcome: &ProcessOutcome) -> Option<i32>
 
 Returns the exit code, or `None` when a signal terminated the child.
 
-<a id="impl.terminatingSignal"></a>
+<a id="ChildProcess.impl.terminatingSignal"></a>
 
 ### Associated function `terminatingSignal`
 
@@ -664,7 +664,7 @@ pub fn terminatingSignal(outcome: &ProcessOutcome) -> Option<i32>
 
 Returns the terminating signal number, or `None` when the child returned an exit code.
 
-<a id="impl.outputBytes"></a>
+<a id="ChildProcess.impl.outputBytes"></a>
 
 ### Associated function `outputBytes`
 
@@ -674,7 +674,7 @@ pub fn outputBytes(outcome: &ProcessOutcome) -> &[u8]
 
 Borrows the complete captured standard output without consuming the outcome.
 
-<a id="impl.errorBytes"></a>
+<a id="ChildProcess.impl.errorBytes"></a>
 
 ### Associated function `errorBytes`
 
@@ -684,7 +684,7 @@ pub fn errorBytes(outcome: &ProcessOutcome) -> &[u8]
 
 Borrows the complete captured standard error without consuming the outcome.
 
-<a id="impl.submit"></a>
+<a id="ChildProcess.impl.submit"></a>
 
 ### Associated function `submit`
 

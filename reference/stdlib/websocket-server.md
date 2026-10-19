@@ -65,7 +65,7 @@ pub maxCloseBytes: usize
 
 The maximum aggregate peer frame bytes accepted by one [`finishClose`](#finishClose) call.
 
-<a id="impl"></a>
+<a id="Limits.impl.Copy"></a>
 
 ## Implementation `Copy for Limits`
 
@@ -73,7 +73,7 @@ The maximum aggregate peer frame bytes accepted by one [`finishClose`](#finishCl
 impl Copy for Limits
 ```
 
-<a id="impl-2"></a>
+<a id="Limits.impl"></a>
 
 ## Implementation `Limits`
 
@@ -81,7 +81,7 @@ impl Copy for Limits
 impl Limits
 ```
 
-<a id="impl.defaults"></a>
+<a id="Limits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -91,7 +91,7 @@ pub fn defaults() -> Limits
 
 Returns limits for 65,536-byte messages, 32 close frames, and 65,536 close bytes.
 
-<a id="impl.make"></a>
+<a id="Limits.impl.make"></a>
 
 ### Associated function `make`
 
@@ -895,7 +895,7 @@ pub struct ControlPayload
 
 An owned Ping or Pong payload with at most 125 bytes.
 
-<a id="impl-3"></a>
+<a id="ControlPayload.impl"></a>
 
 ## Implementation `ControlPayload`
 
@@ -903,7 +903,7 @@ An owned Ping or Pong payload with at most 125 bytes.
 impl ControlPayload
 ```
 
-<a id="impl.asSlice"></a>
+<a id="ControlPayload.impl.asSlice"></a>
 
 ### Method `asSlice`
 
@@ -923,7 +923,7 @@ pub struct CloseReason
 
 An owned validated Close reason with at most 123 UTF-8 bytes.
 
-<a id="impl-4"></a>
+<a id="CloseReason.impl"></a>
 
 ## Implementation `CloseReason`
 
@@ -931,7 +931,7 @@ An owned validated Close reason with at most 123 UTF-8 bytes.
 impl CloseReason
 ```
 
-<a id="impl.asSlice-2"></a>
+<a id="CloseReason.impl.asSlice"></a>
 
 ### Method `asSlice`
 
@@ -951,7 +951,7 @@ pub struct CloseData
 
 Owned validated status and reason data for one server Close frame.
 
-<a id="impl-5"></a>
+<a id="CloseData.impl"></a>
 
 ## Implementation `CloseData`
 
@@ -959,7 +959,7 @@ Owned validated status and reason data for one server Close frame.
 impl CloseData
 ```
 
-<a id="impl.make-2"></a>
+<a id="CloseData.impl.make"></a>
 
 ### Associated function `make`
 
@@ -974,7 +974,7 @@ Validates and copies one server Close status and UTF-8 reason.
 The operation rejects client-only code `1010`, other disallowed codes, reasons above 123
 bytes, and invalid UTF-8 before it publishes owned data.
 
-<a id="impl.code"></a>
+<a id="CloseData.impl.code"></a>
 
 ### Method `code`
 
@@ -984,7 +984,7 @@ pub fn code(self: &Self) -> u16
 
 Returns the validated status code.
 
-<a id="impl.reason"></a>
+<a id="CloseData.impl.reason"></a>
 
 ### Method `reason`
 

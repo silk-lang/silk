@@ -139,7 +139,7 @@ Waits for at least `howLong` nanoseconds on the provider's logical timeline.
 A zero duration requires no positive timeline advance. An implementation traps rather than
 wrapping when the derived absolute deadline cannot be represented.
 
-<a id="impl"></a>
+<a id="MonotonicClock.impl"></a>
 
 ## Implementation `MonotonicClock`
 
@@ -147,7 +147,7 @@ wrapping when the derived absolute deadline cannot be represented.
 impl MonotonicClock
 ```
 
-<a id="impl.deadlineAfter"></a>
+<a id="MonotonicClock.impl.deadlineAfter"></a>
 
 ### Associated function `deadlineAfter`
 

@@ -14,7 +14,7 @@ export class CompilerReleaseError extends Data.TaggedError('CompilerReleaseError
 const invalid = (message) => Effect.fail(new CompilerReleaseError({ reason: 'Conflict', message }))
 export const managedBranch = 'release/compiler-stable'
 export const managedMarker = '<!-- silk-managed-stable-release -->'
-const reservationPrefix = 'refs/tags/compiler-dev-reservation/'
+const reservationPrefix = 'refs/silk/compiler-dev-reservation/'
 const json = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))
 const command = Effect.fnUntraced(function* (executable, args, options = {}) {
   const result = yield* NativeProcess.execute(executable, args, options)
@@ -57,7 +57,7 @@ export const isManagedMerge = (pull, commit, repository) =>
   pull.body?.includes(managedMarker) &&
   pull.body.includes(headMarker(pull.head.sha))
 
-/** Reservations never disappear when a draft is deleted; counters are repository-global. */
+/** Internal refs survive deleted drafts without appearing as tags/releases; counters are global. */
 export const reservation = Effect.fn('CompilerRelease.reservation')(function* (refs, commit) {
   let maximum = 0
   let existing
@@ -102,7 +102,7 @@ export const plan = Effect.fn('CompilerRelease.plan')(function* ({
   if (mode === 'stable') return { mode }
   const refs = yield* pages(
     repository,
-    'git/matching-refs/tags/compiler-dev-reservation/?per_page=100',
+    `git/matching-refs/${reservationPrefix.slice('refs/'.length)}?per_page=100`,
   )
   const selected = yield* reservation(refs, commit)
   if (!selected.exists)

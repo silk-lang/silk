@@ -5,8 +5,8 @@
 Deterministic seeded hashing contracts for hash maps, hash sets, and user-defined key types.
 
 ## When to use
-Implement [`HashKey`](#HashKey) when a type will be stored as a hashed key. Use [`mix`](#impl.mix) for the first
-integer field and [`combine`](#impl.combine) for further fields, feeding every field that participates in
+Implement [`HashKey`](#HashKey) when a type will be stored as a hashed key. Use [`mix`](#Hash.impl.mix) for the first
+integer field and [`combine`](#Hash.impl.combine) for further fields, feeding every field that participates in
 equality. [`Word`](#Word) is the ready-made key for one `u64`.
 
 ## Details
@@ -58,7 +58,7 @@ The owner of the seed, mixing, and ready-made key operations.
 This struct carries no data and is never constructed by the library. Every operation is an
 inherent member declared in `impl Hash`, reached through `import silk.hash { Hash }`.
 
-<a id="impl"></a>
+<a id="Hash.impl"></a>
 
 ## Implementation `Hash`
 
@@ -66,7 +66,7 @@ inherent member declared in `impl Hash`, reached through `import silk.hash { Has
 impl Hash
 ```
 
-<a id="impl.seed"></a>
+<a id="Hash.impl.seed"></a>
 
 ### Associated function `seed`
 
@@ -76,7 +76,7 @@ pub fn seed(value: u64) -> HashSeed
 
 Creates a deterministic hash seed from one `u64` value.
 
-<a id="impl.mix"></a>
+<a id="Hash.impl.mix"></a>
 
 ### Associated function `mix`
 
@@ -92,10 +92,10 @@ Use this function to start a hash for an integer key or the first integer field 
 
 #### Details
 
-The same seed and value return the same result on all supported targets. Use [`combine`](#impl.combine) for each
+The same seed and value return the same result on all supported targets. Use [`combine`](#Hash.impl.combine) for each
 additional field that participates in equality.
 
-<a id="impl.combine"></a>
+<a id="Hash.impl.combine"></a>
 
 ### Associated function `combine`
 
@@ -107,9 +107,9 @@ Continues a hash with one further value, so a key of several fields folds into o
 
 #### When to use
 
-Use this function after [`mix`](#impl.mix) for each additional integer field that participates in equality.
+Use this function after [`mix`](#Hash.impl.mix) for each additional integer field that participates in equality.
 
-<a id="impl.word"></a>
+<a id="Hash.impl.word"></a>
 
 ### Associated function `word`
 
@@ -144,7 +144,7 @@ pub value: u64
 
 The seed value handed to every hash the collection computes.
 
-<a id="impl-2"></a>
+<a id="HashSeed.impl.Copy"></a>
 
 ## Implementation `Copy for HashSeed`
 
@@ -219,7 +219,7 @@ pub value: u64
 
 The integer this key stands for.
 
-<a id="impl-3"></a>
+<a id="Word.impl.Copy"></a>
 
 ## Implementation `Copy for Word`
 
@@ -227,7 +227,7 @@ The integer this key stands for.
 impl Copy for Word
 ```
 
-<a id="impl-4"></a>
+<a id="Word.impl.HashKey"></a>
 
 ## Implementation `HashKey for Word`
 
@@ -235,7 +235,7 @@ impl Copy for Word
 impl HashKey for Word
 ```
 
-<a id="impl.equals"></a>
+<a id="Word.impl.HashKey.equals"></a>
 
 ### Operation `equals`
 
@@ -243,7 +243,7 @@ impl HashKey for Word
 equals: Word.wordEquals
 ```
 
-<a id="impl.hash"></a>
+<a id="Word.impl.HashKey.hash"></a>
 
 ### Operation `hash`
 

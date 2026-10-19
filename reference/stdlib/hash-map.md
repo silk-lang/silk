@@ -6,7 +6,7 @@ Owned key-value storage with deterministic seeded hashing and open-addressed loo
 
 ## When to use
 Use [`HashMap`](#HashMap) for key-based lookup when a key has a [`HashKey`](./hash.md#HashKey) witness. Use
-`silk.vector.Vector` when presentation order should follow insertion, or when indexing rather
+`silk.list.List` when presentation order should follow insertion, or when indexing rather
 than equivalence is the primary operation.
 
 ## Details
@@ -17,13 +17,13 @@ commits, so failed growth leaves existing entries, length, and bucket count unch
 
 One [`HashSeed`](./hash.md#HashSeed) plus the same operation sequence fixes bucket presentation order across the
 native code and WebAssembly. Iterate deterministically by scanning
-`0..bucketCount`, testing [`occupiedAt`](#impl.occupiedAt), then reading [`keyAt`](#impl.keyAt) and [`valueAt`](#impl.valueAt). This is bucket
+`0..bucketCount`, testing [`occupiedAt`](#HashMap.impl.occupiedAt), then reading [`keyAt`](#HashMap.impl.keyAt) and [`valueAt`](#HashMap.impl.valueAt). This is bucket
 order, not insertion order.
 
 ## Gotchas
-Lookup and removal consume the probe key. [`get`](#impl.get), [`keyAt`](#impl.keyAt), and [`valueAt`](#impl.valueAt) copy a complete
-stored entry and therefore require both stored key and value to be `Copy`; use [`withMut`](#impl.withMut) to
-update a move-only value in place or [`remove`](#impl.remove) to transfer it out. Equivalent keys must also
+Lookup and removal consume the probe key. [`get`](#HashMap.impl.get), [`keyAt`](#HashMap.impl.keyAt), and [`valueAt`](#HashMap.impl.valueAt) copy a complete
+stored entry and therefore require both stored key and value to be `Copy`; use [`withMut`](#HashMap.impl.withMut) to
+update a move-only value in place or [`remove`](#HashMap.impl.remove) to transfer it out. Equivalent keys must also
 obey the [`HashKey`](./hash.md#HashKey) hash contract.
 
 ## Examples
@@ -80,9 +80,9 @@ pub struct Entry<K, V>
 
 Internal key-value record exposed by the current table representation.
 
-<a id="impl"></a>
+<a id="Entry.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Entry<K, V>`
 
 ```silk
 impl<K: Copy, V: Copy> Copy for Entry<K, V>
@@ -123,15 +123,15 @@ Owns unique keys and their values under one equivalence, hash witness, and seed.
 An equivalent insertion replaces the stored value instead of adding another entry. The seed
 and operation sequence determine bucket presentation order, which is not insertion order.
 
-<a id="impl-2"></a>
+<a id="HashMap.impl"></a>
 
-## Implementation ``
+## Implementation `HashMap<K, V>`
 
 ```silk
 impl<K, V> HashMap<K, V>
 ```
 
-<a id="impl.make"></a>
+<a id="HashMap.impl.make"></a>
 
 ### Associated function `make`
 
@@ -146,7 +146,7 @@ Constructs an empty map whose every hash is computed under one seed.
 An empty map allocates nothing. The seed fixes the order the map will present its entries in,
 and is the only thing besides the sequence of operations that decides it.
 
-<a id="impl.length"></a>
+<a id="HashMap.impl.length"></a>
 
 ### Method `length`
 
@@ -156,7 +156,7 @@ pub fn length(self: &Self) -> usize
 
 Returns the number of entries the map holds.
 
-<a id="impl.bucketCount"></a>
+<a id="HashMap.impl.bucketCount"></a>
 
 ### Method `bucketCount`
 
@@ -166,7 +166,7 @@ pub fn bucketCount(self: &Self) -> usize
 
 Returns the number of buckets the map presents, which is the range `occupiedAt` accepts.
 
-<a id="impl.occupiedAt"></a>
+<a id="HashMap.impl.occupiedAt"></a>
 
 ### Method `occupiedAt`
 
@@ -176,7 +176,7 @@ pub fn occupiedAt(self: &Self, index: usize) -> bool
 
 Reports whether one bucket holds an entry. Out-of-range buckets hold nothing.
 
-<a id="impl.insert"></a>
+<a id="HashMap.impl.insert"></a>
 
 ### Method `insert`
 
@@ -198,7 +198,7 @@ not change, the replaced value travels to the caller, and the key the map held i
 Fails only with `OutOfMemoryError`, and only from the growth this insert needed. A failed insert
 leaves every prior entry at its own key, and leaves the length and the bucket count unchanged.
 
-<a id="impl.contains"></a>
+<a id="HashMap.impl.contains"></a>
 
 ### Method `contains`
 
@@ -212,7 +212,7 @@ Reports whether the map holds an entry under a key equivalent to one probe key.
 
 This function consumes the probe key. It does not change the map or move a stored entry.
 
-<a id="impl.indexOf"></a>
+<a id="HashMap.impl.indexOf"></a>
 
 ### Method `indexOf`
 
@@ -225,10 +225,10 @@ Returns the bucket holding an entry under a key equivalent to one probe key, or 
 #### Details
 
 This is the lookup a map with move-only values answers: the bucket names the entry without
-moving anything out of the map. A move-only value can then be transferred with [`remove`](#impl.remove).
+moving anything out of the map. A move-only value can then be transferred with [`remove`](#HashMap.impl.remove).
 This function consumes the probe key.
 
-<a id="impl.get"></a>
+<a id="HashMap.impl.get"></a>
 
 ### Method `get`
 
@@ -241,10 +241,10 @@ Returns the value held under a key equivalent to one probe key, or an absent val
 #### Details
 
 Reads a complete entry copy, so it answers only when both stored key and value types are `Copy`.
-Use [`indexOf`](#impl.indexOf) for a non-moving presence check and [`remove`](#impl.remove) to transfer a move-only value.
+Use [`indexOf`](#HashMap.impl.indexOf) for a non-moving presence check and [`remove`](#HashMap.impl.remove) to transfer a move-only value.
 This function consumes the probe key and does not change the map.
 
-<a id="impl.withMut"></a>
+<a id="HashMap.impl.withMut"></a>
 
 ### Method `withMut`
 
@@ -265,7 +265,7 @@ rejected.
 This function consumes the probe key but leaves the stored key, length, used count, and bucket
 count unchanged.
 
-<a id="impl.remove"></a>
+<a id="HashMap.impl.remove"></a>
 
 ### Method `remove`
 
@@ -280,7 +280,7 @@ Removes the entry under a key equivalent to one probe key and answers with its v
 Ownership of the value passes to the caller; the map does not also release it. The key the map
 held is released, and the probe key is released as well.
 
-<a id="impl.keyAt"></a>
+<a id="HashMap.impl.keyAt"></a>
 
 ### Method `keyAt`
 
@@ -296,9 +296,9 @@ Reads a complete entry copy, so both stored key and value types must be `Copy`.
 
 #### Gotchas
 
-If `index` is out of range or [`occupiedAt`](#impl.occupiedAt) returns `false`, the program traps.
+If `index` is out of range or [`occupiedAt`](#HashMap.impl.occupiedAt) returns `false`, the program traps.
 
-<a id="impl.valueAt"></a>
+<a id="HashMap.impl.valueAt"></a>
 
 ### Method `valueAt`
 
@@ -314,17 +314,17 @@ Reads a complete entry copy, so both stored key and value types must be `Copy`.
 
 #### Gotchas
 
-If `index` is out of range or [`occupiedAt`](#impl.occupiedAt) returns `false`, the program traps.
+If `index` is out of range or [`occupiedAt`](#HashMap.impl.occupiedAt) returns `false`, the program traps.
 
-<a id="impl-3"></a>
+<a id="HashMap.impl.Drop"></a>
 
-## Implementation ` Drop for  `
+## Implementation `Drop for HashMap<K, V>`
 
 ```silk
 impl<K, V> Drop for HashMap<K, V>
 ```
 
-<a id="impl.drop"></a>
+<a id="HashMap.impl.Drop.drop"></a>
 
 ### Operation `drop`
 

@@ -5,8 +5,8 @@
 TOML 1.1.0 lexical scanning and document syntax validation.
 
 ## When to use
-Validate a complete UTF-8 document with [`TomlScanner.validate`](#impl.validate), then use
-[`TomlScanner.next`](#impl.next) to inspect its source tokens and byte spans.
+Validate a complete UTF-8 document with [`TomlScanner.validate`](#TomlScanner.impl.validate), then use
+[`TomlScanner.next`](#TomlScanner.impl.next) to inspect its source tokens and byte spans.
 
 ## Details
 Tokens retain their source spelling. Validation checks keys, scalar forms, strings,
@@ -57,7 +57,7 @@ pub length: usize
 
 Number of source bytes.
 
-<a id="impl"></a>
+<a id="TomlSpan.impl.Copy"></a>
 
 ## Implementation `Copy for TomlSpan`
 
@@ -65,7 +65,7 @@ Number of source bytes.
 impl Copy for TomlSpan
 ```
 
-<a id="impl-2"></a>
+<a id="TomlError.impl.Copy"></a>
 
 ## Implementation `Copy for TomlError`
 
@@ -321,7 +321,7 @@ A clock time without a date.
 pub union TomlToken
 ```
 
-Source-level token. `Text` is classified by [`TomlScanner.scalarKind`](#impl.scalarKind) in value position.
+Source-level token. `Text` is classified by [`TomlScanner.scalarKind`](#TomlScanner.impl.scalarKind) in value position.
 
 <a id="TomlToken.Text"></a>
 
@@ -473,7 +473,7 @@ EndOfInput
 
 The end of the complete input.
 
-<a id="impl-3"></a>
+<a id="TomlToken.impl.Copy"></a>
 
 ## Implementation `Copy for TomlToken`
 
@@ -491,15 +491,15 @@ pub struct TomlScanner<'input>
 
 A complete-input scanner. `validate` starts from the beginning and does not consume tokens.
 
-<a id="impl-4"></a>
+<a id="TomlScanner.impl"></a>
 
-## Implementation ``
+## Implementation `TomlScanner<'input>`
 
 ```silk
 impl<'input> TomlScanner<'input>
 ```
 
-<a id="impl.make"></a>
+<a id="TomlScanner.impl.make"></a>
 
 ### Associated function `make`
 
@@ -509,7 +509,7 @@ pub fn make(input: &'input [u8]) -> TomlScanner<'input>
 
 Creates a scanner borrowing a complete TOML source.
 
-<a id="impl.validate"></a>
+<a id="TomlScanner.impl.validate"></a>
 
 ### Method `validate`
 
@@ -519,7 +519,7 @@ pub fn validate(self: &mut TomlScanner) -> Result<bool, TomlError>
 
 Validates the complete document; key equality is handled by the document reader.
 
-<a id="impl.next"></a>
+<a id="TomlScanner.impl.next"></a>
 
 ### Method `next`
 
@@ -529,7 +529,7 @@ pub fn next(self: &mut TomlScanner) -> Result<TomlToken, TomlError>
 
 Returns the next lexical source token.
 
-<a id="impl.scalarKind"></a>
+<a id="TomlScanner.impl.scalarKind"></a>
 
 ### Method `scalarKind`
 
@@ -539,7 +539,7 @@ pub fn scalarKind(self: &TomlScanner, span: TomlSpan) -> Option<TomlScalarKind>
 
 Classifies an unquoted scalar spelling.
 
-<a id="impl.slice"></a>
+<a id="TomlScanner.impl.slice"></a>
 
 ### Method `slice`
 
@@ -549,7 +549,7 @@ pub fn slice(self: &TomlScanner<'input>, span: TomlSpan) -> &'input [u8]
 
 Borrows the raw source bytes of a token span.
 
-<a id="impl.offset"></a>
+<a id="TomlScanner.impl.offset"></a>
 
 ### Method `offset`
 

@@ -112,7 +112,7 @@ effect fn getResolution() -> u64 ? &mut SystemClock
 Returns the provider-reported positive nominal resolution in whole nanoseconds.
 The value may be a lower bound on actual observable precision.
 
-<a id="impl"></a>
+<a id="SystemClock.impl"></a>
 
 ## Implementation `SystemClock`
 
@@ -120,7 +120,7 @@ The value may be a lower bound on actual observable precision.
 impl SystemClock
 ```
 
-<a id="impl.make"></a>
+<a id="SystemClock.impl.make"></a>
 
 ### Associated function `make`
 
@@ -135,7 +135,7 @@ Creates a canonical split-second instant.
 `nanoseconds` must be non-negative and less than one billion. A noncanonical fraction traps
 instead of being normalized into another field pair.
 
-<a id="impl.seconds"></a>
+<a id="SystemClock.impl.seconds"></a>
 
 ### Method `seconds`
 
@@ -145,7 +145,7 @@ pub fn seconds(self: &Instant) -> i64
 
 Returns the signed whole-second component of an instant.
 
-<a id="impl.nanoseconds"></a>
+<a id="SystemClock.impl.nanoseconds"></a>
 
 ### Method `nanoseconds`
 

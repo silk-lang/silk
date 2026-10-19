@@ -35,7 +35,7 @@ A [`Logger`](./logger.md#Logger) provider that formats each complete message to 
 The provider ignores the severity for physical formatting and writes only the formatted UTF-8
 message bytes. It adds no newline and performs no message allocation.
 
-<a id="impl"></a>
+<a id="StdoutLogger.impl"></a>
 
 ## Implementation `StdoutLogger`
 
@@ -43,7 +43,7 @@ message bytes. It adds no newline and performs no message allocation.
 impl StdoutLogger
 ```
 
-<a id="impl.make"></a>
+<a id="StdoutLogger.impl.make"></a>
 
 ### Associated function `make`
 
@@ -53,7 +53,7 @@ pub fn make() -> StdoutLogger
 
 Creates a native stdout logger without writing or acquiring a descriptor.
 
-<a id="impl-2"></a>
+<a id="StdoutLogger.impl.Logger"></a>
 
 ## Implementation `Logger for StdoutLogger`
 
@@ -61,7 +61,7 @@ Creates a native stdout logger without writing or acquiring a descriptor.
 impl Logger for StdoutLogger
 ```
 
-<a id="impl.log"></a>
+<a id="StdoutLogger.impl.Logger.log"></a>
 
 ### Operation `log`
 

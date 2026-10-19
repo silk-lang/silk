@@ -6,7 +6,7 @@ Ordered, bounded HTTP fields with borrowed iteration and explicit owned copies.
 
 ## When to use
 
-Use [`Headers.make`](#impl.make) over validated borrowed fields, or [`Headers.copy`](#impl.copy) when the collection must
+Use [`Headers.make`](#Headers.impl.make) over validated borrowed fields, or [`Headers.copy`](#Headers.impl.copy) when the collection must
 outlive its source. Lookup is ASCII case-insensitive and never combines repeated values.
 
 ## Details
@@ -98,7 +98,7 @@ pub maxOwnedBytes: usize
 
 Maximum owned payload capacities plus index storage bytes.
 
-<a id="impl"></a>
+<a id="Limits.impl.Copy"></a>
 
 ## Implementation `Copy for Limits`
 
@@ -116,23 +116,23 @@ pub struct Headers<'value>
 
 An ordered borrowed collection of validated HTTP fields.
 
-<a id="impl-2"></a>
+<a id="Headers.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Headers<'value>`
 
 ```silk
 impl<'value> Copy for Headers<'value>
 ```
 
-<a id="impl-3"></a>
+<a id="Headers.impl"></a>
 
-## Implementation ``
+## Implementation `Headers<'value>`
 
 ```silk
 impl<'value> Headers<'value>
 ```
 
-<a id="impl.make"></a>
+<a id="Headers.impl.make"></a>
 
 ### Associated function `make`
 
@@ -145,7 +145,7 @@ pub fn make(
 
 Validates collection budgets and borrows an existing field slice without allocating.
 
-<a id="impl.count"></a>
+<a id="Headers.impl.count"></a>
 
 ### Method `count`
 
@@ -155,7 +155,7 @@ pub fn count(self: &Self) -> usize
 
 Returns the number of fields, including duplicates.
 
-<a id="impl.fieldBytes"></a>
+<a id="Headers.impl.fieldBytes"></a>
 
 ### Method `fieldBytes`
 
@@ -165,7 +165,7 @@ pub fn fieldBytes(self: &Self) -> usize
 
 Returns aggregate field-name plus field-value bytes.
 
-<a id="impl.iter"></a>
+<a id="Headers.impl.iter"></a>
 
 ### Method `iter`
 
@@ -175,7 +175,7 @@ pub fn iter(self: &Self) -> HeaderIterator<'value>
 
 Iterates every field in insertion order.
 
-<a id="impl.getAll"></a>
+<a id="Headers.impl.getAll"></a>
 
 ### Method `getAll`
 
@@ -185,7 +185,7 @@ pub fn getAll(self: &Self, name: string<'value>) -> HeaderIterator<'value>
 
 Iterates every field whose name matches `name` ASCII case-insensitively.
 
-<a id="impl.getFirst"></a>
+<a id="Headers.impl.getFirst"></a>
 
 ### Method `getFirst`
 
@@ -195,7 +195,7 @@ pub fn getFirst(self: &Self, name: string) -> Option<Header<'value>>
 
 Returns the first matching field without combining duplicates.
 
-<a id="impl.getUnique"></a>
+<a id="Headers.impl.getUnique"></a>
 
 ### Method `getUnique`
 
@@ -205,7 +205,7 @@ pub fn getUnique(self: &Self, name: string) -> Result<Option<Header<'value>>, Va
 
 Returns an absent or unique matching field and rejects a second match.
 
-<a id="impl.copy"></a>
+<a id="Headers.impl.copy"></a>
 
 ### Method `copy`
 
@@ -218,7 +218,7 @@ pub effect fn copy(
 
 Copies fields into independent byte and index storage under `maxOwnedBytes`.
 
-<a id="impl.copyMatching"></a>
+<a id="Headers.impl.copyMatching"></a>
 
 ### Method `copyMatching`
 
@@ -237,7 +237,7 @@ Copies only case-insensitively matching fields in their original order.
 All selected-field and owned-capacity limits are checked before allocation. Duplicate fields
 remain distinct and retain their original relative order.
 
-<a id="impl.requiredOwnedBytes"></a>
+<a id="Headers.impl.requiredOwnedBytes"></a>
 
 ### Method `requiredOwnedBytes`
 
@@ -247,7 +247,7 @@ pub fn requiredOwnedBytes(self: &Self) -> Result<usize, ValueError>
 
 Computes the payload-plus-index bytes required by an owned copy without allocating.
 
-<a id="impl.formatInto"></a>
+<a id="Headers.impl.formatInto"></a>
 
 ### Method `formatInto`
 
@@ -257,7 +257,7 @@ pub fn formatInto(self: &Self, output: &mut [u8]) -> Result<usize, ValueError>
 
 Formats only ordered field lines into caller storage after a complete sizing pass.
 
-<a id="impl.connectionTokens"></a>
+<a id="Headers.impl.connectionTokens"></a>
 
 ### Method `connectionTokens`
 
@@ -267,7 +267,7 @@ pub fn connectionTokens(self: &Self) -> MetadataIterator<'value>
 
 Iterates Connection field tokens while retaining extension spelling.
 
-<a id="impl.contentCodings"></a>
+<a id="Headers.impl.contentCodings"></a>
 
 ### Method `contentCodings`
 
@@ -277,7 +277,7 @@ pub fn contentCodings(self: &Self) -> MetadataIterator<'value>
 
 Iterates Content-Encoding codings while retaining extensions.
 
-<a id="impl.transferCodings"></a>
+<a id="Headers.impl.transferCodings"></a>
 
 ### Method `transferCodings`
 
@@ -297,7 +297,7 @@ pub struct OwnedHeaders
 
 Independently owned HTTP field payloads and offset records.
 
-<a id="impl-4"></a>
+<a id="OwnedHeaders.impl"></a>
 
 ## Implementation `OwnedHeaders`
 
@@ -305,7 +305,7 @@ Independently owned HTTP field payloads and offset records.
 impl OwnedHeaders
 ```
 
-<a id="impl.view"></a>
+<a id="OwnedHeaders.impl.view"></a>
 
 ### Method `view`
 
@@ -315,7 +315,7 @@ pub fn view<'value>(self: &'value Self) -> Headers<'value>
 
 Borrows an ordered collection view tied to this owner.
 
-<a id="impl.ownedBytes"></a>
+<a id="OwnedHeaders.impl.ownedBytes"></a>
 
 ### Method `ownedBytes`
 
@@ -335,15 +335,15 @@ pub struct HeaderIterator<'value>
 
 An insertion-order iterator over all fields or one case-insensitive name.
 
-<a id="impl-5"></a>
+<a id="HeaderIterator.impl"></a>
 
-## Implementation ``
+## Implementation `HeaderIterator<'value>`
 
 ```silk
 impl<'value> HeaderIterator<'value>
 ```
 
-<a id="impl.next"></a>
+<a id="HeaderIterator.impl.next"></a>
 
 ### Method `next`
 
@@ -353,7 +353,7 @@ pub fn next(self: &mut Self) -> Option<Header<'value>>
 
 Returns the next matching field, preserving original name and value bytes.
 
-<a id="impl.fieldIndex"></a>
+<a id="HeaderIterator.impl.fieldIndex"></a>
 
 ### Method `fieldIndex`
 
@@ -373,23 +373,23 @@ pub struct MetadataToken<'value>
 
 One parsed metadata token borrowed from its source field.
 
-<a id="impl-6"></a>
+<a id="MetadataToken.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for MetadataToken<'value>`
 
 ```silk
 impl<'value> Copy for MetadataToken<'value>
 ```
 
-<a id="impl-7"></a>
+<a id="MetadataToken.impl"></a>
 
-## Implementation ``
+## Implementation `MetadataToken<'value>`
 
 ```silk
 impl<'value> MetadataToken<'value>
 ```
 
-<a id="impl.token"></a>
+<a id="MetadataToken.impl.token"></a>
 
 ### Method `token`
 
@@ -399,7 +399,7 @@ pub fn token(self: &Self) -> &'value [u8]
 
 Borrows the coding or connection-option token without parameters.
 
-<a id="impl.raw"></a>
+<a id="MetadataToken.impl.raw"></a>
 
 ### Method `raw`
 
@@ -409,7 +409,7 @@ pub fn raw(self: &Self) -> &'value [u8]
 
 Borrows the complete list member, including validated transfer parameters.
 
-<a id="impl.fieldIndex-2"></a>
+<a id="MetadataToken.impl.fieldIndex"></a>
 
 ### Method `fieldIndex`
 
@@ -419,7 +419,7 @@ pub fn fieldIndex(self: &Self) -> usize
 
 Returns the source collection field index.
 
-<a id="impl.offset"></a>
+<a id="MetadataToken.impl.offset"></a>
 
 ### Method `offset`
 
@@ -429,7 +429,7 @@ pub fn offset(self: &Self) -> usize
 
 Returns the token's byte offset within the source field value.
 
-<a id="impl.matches"></a>
+<a id="MetadataToken.impl.matches"></a>
 
 ### Method `matches`
 
@@ -449,15 +449,15 @@ pub struct MetadataIterator<'value>
 
 A lazy ordered iterator over selected HTTP metadata fields.
 
-<a id="impl-8"></a>
+<a id="MetadataIterator.impl"></a>
 
-## Implementation ``
+## Implementation `MetadataIterator<'value>`
 
 ```silk
 impl<'value> MetadataIterator<'value>
 ```
 
-<a id="impl.next-2"></a>
+<a id="MetadataIterator.impl.next"></a>
 
 ### Method `next`
 

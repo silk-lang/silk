@@ -5,9 +5,9 @@
 Portable normalized paths, whole-file operations, directory traversal, and explicit temp scopes.
 
 ## When to use
-Build provider-absolute [`Path`](#Path) values with [`make`](#impl.make) or [`fromBytes`](#impl.fromBytes), then run operations
-through a supplied [`FileSystem`](#FileSystem). Use [`rawBytes`](#impl.rawBytes) for platform values that must round-trip even
-when they are not UTF-8, and [`resolve`](#impl.resolve) for lexical relative-path resolution.
+Build provider-absolute [`Path`](#Path) values with [`make`](#Path.impl.make) or [`fromBytes`](#Path.impl.fromBytes), then run operations
+through a supplied [`FileSystem`](#FileSystem). Use [`rawBytes`](#Path.impl.rawBytes) for platform values that must round-trip even
+when they are not UTF-8, and [`resolve`](#Path.impl.resolve) for lexical relative-path resolution.
 
 ## Details
 Paths are absolute and normalized: they reject NUL, empty components, trailing separators, and
@@ -17,12 +17,12 @@ Portable [`FileError`](#FileError) data names both the operation and a closed re
 optional provider code for diagnostics.
 
 Temporary directories have an explicit lifecycle because removal can fail and needs services.
-Use [`release`](#impl.release) when cleanup failure matters, or [`releaseIgnored`](#impl.releaseIgnored) as an infallible finalizer
+Use [`release`](#FileSystem.impl.release) when cleanup failure matters, or [`releaseIgnored`](#FileSystem.impl.releaseIgnored) as an infallible finalizer
 only after deliberately accepting that loss.
 
 ## Gotchas
-A path created from arbitrary bytes may not have a valid text view. Keep using [`rawBytes`](#impl.rawBytes) unless
-the bytes were validated as UTF-8; [`view`](#impl.view) and [`name`](#impl.name) rely on that caller knowledge.
+A path created from arbitrary bytes may not have a valid text view. Keep using [`rawBytes`](#Path.impl.rawBytes) unless
+the bytes were validated as UTF-8; [`view`](#Path.impl.view) and [`name`](#Path.impl.name) rely on that caller knowledge.
 
 ## Examples
 ### Construct and inspect a portable path
@@ -72,10 +72,10 @@ An owned, normalized absolute path in a [`FileSystem`](#FileSystem) provider's p
 ### Details
 
 Portable `/` means the selected provider's root, not necessarily the host operating system's
-root. Construct paths through [`make`](#impl.make), [`fromBytes`](#impl.fromBytes), [`root`](#impl.root), [`join`](#impl.join), or [`resolve`](#impl.resolve); the
+root. Construct paths through [`make`](#Path.impl.make), [`fromBytes`](#Path.impl.fromBytes), [`root`](#Path.impl.root), [`join`](#Path.impl.join), or [`resolve`](#Path.impl.resolve); the
 representation is private so every `Path` satisfies the normalization rules.
 
-<a id="impl"></a>
+<a id="Path.impl"></a>
 
 ## Implementation `Path`
 
@@ -83,7 +83,7 @@ representation is private so every `Path` satisfies the normalization rules.
 impl Path
 ```
 
-<a id="impl.make"></a>
+<a id="Path.impl.make"></a>
 
 ### Associated function `make`
 
@@ -99,7 +99,7 @@ The text must begin with `/`. Root is valid; every other path must have nonempty
 no trailing slash, NUL, `.` component, or `..` component. Invalid input fails with
 `FileError(FileSystem.pathOperation(), FileSystem.invalidPath())`; copying can fail with [`OutOfMemoryError`](./allocator.md#OutOfMemoryError).
 
-<a id="impl.fromBytes"></a>
+<a id="Path.impl.fromBytes"></a>
 
 ### Associated function `fromBytes`
 
@@ -117,7 +117,7 @@ The same normalization applies as for textual construction: the value is absolut
 and rejects `.`, `..`, empty components, and trailing separators. Well-formed text is not
 required, so a Path built this way may have no `string` view.
 
-<a id="impl.root"></a>
+<a id="Path.impl.root"></a>
 
 ### Associated function `root`
 
@@ -127,7 +127,7 @@ pub effect fn root() -> Path ! OutOfMemoryError ? &mut Allocator
 
 Allocates the portable root path `/` in the selected allocator.
 
-<a id="impl.rawBytes"></a>
+<a id="Path.impl.rawBytes"></a>
 
 ### Method `rawBytes`
 
@@ -142,7 +142,7 @@ Borrows the complete normalized path as exact platform bytes.
 This is the lossless view. It round-trips a Path built from platform bytes even when those
 bytes are not well-formed text, which the `string` view cannot promise.
 
-<a id="impl.view"></a>
+<a id="Path.impl.view"></a>
 
 ### Method `view`
 
@@ -154,10 +154,10 @@ Borrows the complete path as text, or answers `None` when its bytes are not vali
 
 #### Details
 
-Paths from [`make`](#impl.make), [`join`](#impl.join), [`joinUtf8`](#impl.joinUtf8), and [`resolve`](#impl.resolve) are always valid UTF-8. A path
-created with [`fromBytes`](#impl.fromBytes) or [`joinBytes`](#impl.joinBytes) may not be; [`rawBytes`](#impl.rawBytes) is the lossless view.
+Paths from [`make`](#Path.impl.make), [`join`](#Path.impl.join), [`joinUtf8`](#Path.impl.joinUtf8), and [`resolve`](#Path.impl.resolve) are always valid UTF-8. A path
+created with [`fromBytes`](#Path.impl.fromBytes) or [`joinBytes`](#Path.impl.joinBytes) may not be; [`rawBytes`](#Path.impl.rawBytes) is the lossless view.
 
-<a id="impl.isRoot"></a>
+<a id="Path.impl.isRoot"></a>
 
 ### Method `isRoot`
 
@@ -167,7 +167,7 @@ pub fn isRoot(self: &Self) -> bool
 
 Returns `true` exactly when this path is the portable root `/`.
 
-<a id="impl.name"></a>
+<a id="Path.impl.name"></a>
 
 ### Method `name`
 
@@ -182,7 +182,7 @@ Borrows the final component as text, or answers `None` when its bytes are not va
 Root answers empty text. The component never includes a separator, and borrowing it does not
 allocate.
 
-<a id="impl.join"></a>
+<a id="Path.impl.join"></a>
 
 ### Associated function `join`
 
@@ -198,9 +198,9 @@ Appends one normalized relative text fragment to an absolute base path.
 #### Details
 
 `fragment` must be nonempty and relative, with no NUL, empty, `.`, or `..` component and no
-trailing slash. Use [`resolve`](#impl.resolve) when dot components should be interpreted instead of rejected.
+trailing slash. Use [`resolve`](#Path.impl.resolve) when dot components should be interpreted instead of rejected.
 
-<a id="impl.joinUtf8"></a>
+<a id="Path.impl.joinUtf8"></a>
 
 ### Associated function `joinUtf8`
 
@@ -216,9 +216,9 @@ Validates UTF-8 bytes as one normalized relative fragment and appends them to `b
 #### Details
 
 This is useful for a child name returned as bytes by another portable API. Invalid UTF-8 and the
-same malformed components rejected by [`join`](#impl.join) fail with the `InvalidPath` reason.
+same malformed components rejected by [`join`](#Path.impl.join) fail with the `InvalidPath` reason.
 
-<a id="impl.joinBytes"></a>
+<a id="Path.impl.joinBytes"></a>
 
 ### Associated function `joinBytes`
 
@@ -234,10 +234,10 @@ Appends one normalized relative byte fragment while preserving non-UTF-8 names.
 #### Details
 
 The fragment must be nonempty and contain no NUL, empty, dot or dot-dot component.
-This is the byte-preserving operation for native directory names; use [`joinUtf8`](#impl.joinUtf8)
+This is the byte-preserving operation for native directory names; use [`joinUtf8`](#Path.impl.joinUtf8)
 when the caller also requires valid UTF-8.
 
-<a id="impl.resolve"></a>
+<a id="Path.impl.resolve"></a>
 
 ### Associated function `resolve`
 
@@ -256,7 +256,7 @@ Empty text and `.` keep the base; `..` removes components; ordinary components a
 absolute relative value, an empty interior component, NUL, or any attempt to escape above root
 fails with the `InvalidPath` reason. Resolution is lexical and never accesses the filesystem.
 
-<a id="impl.parent"></a>
+<a id="Path.impl.parent"></a>
 
 ### Method `parent`
 
@@ -320,7 +320,7 @@ The closed portable kind of one directory entry.
 pub code: i32
 ```
 
-Stable portable kind code selected by [`file`](#impl.file) or [`directory`](#impl.directory).
+Stable portable kind code selected by [`file`](#FileSystem.impl.file) or [`directory`](#FileSystem.impl.directory).
 
 <a id="DirectoryEntry"></a>
 
@@ -404,7 +404,7 @@ An allocation-free portable failure naming the attempted operation and recovery 
 
 ### Details
 
-Match or compare [`operationCode`](#impl.operationCode) and [`reasonCode`](#impl.reasonCode) for portable recovery. [`providerCode`](#impl.providerCode)
+Match or compare [`operationCode`](#FileSystem.impl.operationCode) and [`reasonCode`](#FileSystem.impl.reasonCode) for portable recovery. [`providerCode`](#FileSystem.impl.providerCode)
 may retain an OS or provider-specific numeric detail for diagnostics, but portable decisions
 must not depend on it.
 
@@ -440,7 +440,7 @@ Destination policy for atomic whole-file publication.
 
 ### Details
 
-Construct with [`FileSystem.replaceExisting`](#impl.replaceExisting) or [`FileSystem.createNew`](#impl.createNew).
+Construct with [`FileSystem.replaceExisting`](#FileSystem.impl.replaceExisting) or [`FileSystem.createNew`](#FileSystem.impl.createNew).
 
 <a id="PublicationPolicy.code"></a>
 
@@ -464,7 +464,7 @@ Explicit synchronization policy for atomic publication.
 
 ### Details
 
-Construct with [`FileSystem.buffered`](#impl.buffered) or [`FileSystem.synchronized`](#impl.synchronized).
+Construct with [`FileSystem.buffered`](#FileSystem.impl.buffered) or [`FileSystem.synchronized`](#FileSystem.impl.synchronized).
 
 <a id="Durability.code"></a>
 
@@ -549,7 +549,7 @@ this service in memory, while native applications can use `silk.os_filesystem`. 
 platform policy, but every implementation must preserve the portable error categories,
 create-or-truncate writes, and deterministic listing order described here.
 
-[`writeFileWithParents`](#impl.writeFileWithParents) composes parent creation and the final write using the same lexical
+[`writeFileWithParents`](#FileSystem.impl.writeFileWithParents) composes parent creation and the final write using the same lexical
 provider. Supply both `&mut FileSystem` and `&mut Allocator` for this operation. Its directory
 creation is not transactional: a failed final write may leave newly created parents behind.
 
@@ -583,7 +583,7 @@ Writes one complete byte view with create-or-truncate semantics.
 #### Details
 
 A missing file is created; an existing regular file is replaced by exactly `bytes`. The call
-does not create missing parent directories—use [`writeFileWithParents`](#impl.writeFileWithParents) for that workflow.
+does not create missing parent directories—use [`writeFileWithParents`](#FileSystem.impl.writeFileWithParents) for that workflow.
 
 <a id="FileSystem.createFile"></a>
 
@@ -600,7 +600,7 @@ Exclusively creates a regular file and writes its contents without replacing any
 Existing files, directories, and symlink entries fail with `AlreadyExists`, without following
 or modifying them. The claim is atomic, but readers can observe incomplete contents while the
 write proceeds. A write or close failure after creation leaves the new, possibly partial file
-in place. Use `FileSystem.writeFileAtomic` with [`createNew`](#impl.createNew) for complete-content publication instead.
+in place. Use `FileSystem.writeFileAtomic` with [`createNew`](#FileSystem.impl.createNew) for complete-content publication instead.
 
 <a id="FileSystem.writeFileAtomic"></a>
 
@@ -677,7 +677,7 @@ particular kind, not for this discriminating query.
 ```silk
 effect fn listDirectory(
     path: &Path
-  ) -> Vector<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
+  ) -> List<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator
 ```
 
 Returns immediate owned children in deterministic complete-path byte order.
@@ -685,7 +685,7 @@ Returns immediate owned children in deterministic complete-path byte order.
 #### Details
 
 The result is not recursive. Each `DirectoryEntry.path` is independently owned and may be
-retained after the listing vector is released.
+retained after the listing list is released.
 
 <a id="FileSystem.createDirectory"></a>
 
@@ -699,7 +699,7 @@ Creates exactly one missing directory whose parent already exists.
 
 #### Details
 
-Existing paths fail with `AlreadyExists`; use [`createDirectoriesRecursively`](#impl.createDirectoriesRecursively) to ensure every
+Existing paths fail with `AlreadyExists`; use [`createDirectoriesRecursively`](#FileSystem.impl.createDirectoriesRecursively) to ensure every
 missing component.
 
 <a id="FileSystem.removeFile"></a>
@@ -724,7 +724,7 @@ Removes exactly one empty directory.
 
 #### Details
 
-A nonempty directory fails with `NotEmpty`; use [`removeDirectoryRecursively`](#impl.removeDirectoryRecursively) only when all
+A nonempty directory fails with `NotEmpty`; use [`removeDirectoryRecursively`](#FileSystem.impl.removeDirectoryRecursively) only when all
 descendants are intentionally in scope for removal.
 
 <a id="FileSystem.createTemporaryDirectory"></a>
@@ -748,7 +748,7 @@ to check-then-create, and the gap between those two is exactly the race this avo
 `prefix` is a byte prefix for the provider-chosen child name, not a complete path. The returned
 directory already exists and is an immediate child of `parent`.
 
-<a id="impl-2"></a>
+<a id="FileSystem.impl"></a>
 
 ## Implementation `FileSystem`
 
@@ -756,7 +756,7 @@ directory already exists and is an immediate child of `parent`.
 impl FileSystem
 ```
 
-<a id="impl.replaceExisting"></a>
+<a id="FileSystem.impl.replaceExisting"></a>
 
 ### Associated function `replaceExisting`
 
@@ -766,7 +766,7 @@ pub fn replaceExisting() -> PublicationPolicy
 
 Selects atomic replacement or creation of an absent destination.
 
-<a id="impl.createNew"></a>
+<a id="FileSystem.impl.createNew"></a>
 
 ### Associated function `createNew`
 
@@ -776,7 +776,7 @@ pub fn createNew() -> PublicationPolicy
 
 Selects atomic publication only when no destination entry exists.
 
-<a id="impl.buffered"></a>
+<a id="FileSystem.impl.buffered"></a>
 
 ### Associated function `buffered`
 
@@ -786,7 +786,7 @@ pub fn buffered() -> Durability
 
 Requests atomic visibility without explicit filesystem synchronization.
 
-<a id="impl.synchronized"></a>
+<a id="FileSystem.impl.synchronized"></a>
 
 ### Associated function `synchronized`
 
@@ -796,7 +796,7 @@ pub fn synchronized() -> Durability
 
 Requests file synchronization before publication and parent synchronization afterward.
 
-<a id="impl.file"></a>
+<a id="FileSystem.impl.file"></a>
 
 ### Associated function `file`
 
@@ -806,7 +806,7 @@ pub fn file() -> DirectoryEntryKind
 
 Constructs the regular-file [`DirectoryEntryKind`](#DirectoryEntryKind).
 
-<a id="impl.directory"></a>
+<a id="FileSystem.impl.directory"></a>
 
 ### Associated function `directory`
 
@@ -816,7 +816,7 @@ pub fn directory() -> DirectoryEntryKind
 
 Constructs the directory [`DirectoryEntryKind`](#DirectoryEntryKind).
 
-<a id="impl.entryKindCode"></a>
+<a id="FileSystem.impl.entryKindCode"></a>
 
 ### Associated function `entryKindCode`
 
@@ -826,7 +826,7 @@ pub fn entryKindCode(kind: DirectoryEntryKind) -> i32
 
 Returns the stable code for a consumed [`DirectoryEntryKind`](#DirectoryEntryKind): `0` for file, `1` for directory.
 
-<a id="impl.fileInfo"></a>
+<a id="FileSystem.impl.fileInfo"></a>
 
 ### Associated function `fileInfo`
 
@@ -836,7 +836,7 @@ pub fn fileInfo(byteLength: usize) -> FileInfo
 
 Constructs regular-file metadata with the complete length in bytes.
 
-<a id="impl.directoryInfo"></a>
+<a id="FileSystem.impl.directoryInfo"></a>
 
 ### Associated function `directoryInfo`
 
@@ -846,7 +846,7 @@ pub fn directoryInfo() -> DirectoryInfo
 
 Constructs the fieldless portable directory metadata value.
 
-<a id="impl.directoryEntry"></a>
+<a id="FileSystem.impl.directoryEntry"></a>
 
 ### Associated function `directoryEntry`
 
@@ -856,7 +856,7 @@ pub fn directoryEntry(path: Path, kind: DirectoryEntryKind) -> DirectoryEntry
 
 Constructs a directory entry by taking ownership of its complete child `path` and `kind`.
 
-<a id="impl.readFileOperation"></a>
+<a id="FileSystem.impl.readFileOperation"></a>
 
 ### Associated function `readFileOperation`
 
@@ -866,7 +866,7 @@ pub fn readFileOperation() -> FileOperation
 
 Selects the read-file operation.
 
-<a id="impl.writeFileOperation"></a>
+<a id="FileSystem.impl.writeFileOperation"></a>
 
 ### Associated function `writeFileOperation`
 
@@ -876,7 +876,7 @@ pub fn writeFileOperation() -> FileOperation
 
 Selects the write-file operation.
 
-<a id="impl.statOperation"></a>
+<a id="FileSystem.impl.statOperation"></a>
 
 ### Associated function `statOperation`
 
@@ -886,7 +886,7 @@ pub fn statOperation() -> FileOperation
 
 Selects the stat operation.
 
-<a id="impl.listDirectoryOperation"></a>
+<a id="FileSystem.impl.listDirectoryOperation"></a>
 
 ### Associated function `listDirectoryOperation`
 
@@ -896,7 +896,7 @@ pub fn listDirectoryOperation() -> FileOperation
 
 Selects the list-directory operation.
 
-<a id="impl.createDirectoryOperation"></a>
+<a id="FileSystem.impl.createDirectoryOperation"></a>
 
 ### Associated function `createDirectoryOperation`
 
@@ -906,7 +906,7 @@ pub fn createDirectoryOperation() -> FileOperation
 
 Selects the create-directory operation.
 
-<a id="impl.removeFileOperation"></a>
+<a id="FileSystem.impl.removeFileOperation"></a>
 
 ### Associated function `removeFileOperation`
 
@@ -916,7 +916,7 @@ pub fn removeFileOperation() -> FileOperation
 
 Selects the remove-file operation.
 
-<a id="impl.removeDirectoryOperation"></a>
+<a id="FileSystem.impl.removeDirectoryOperation"></a>
 
 ### Associated function `removeDirectoryOperation`
 
@@ -926,7 +926,7 @@ pub fn removeDirectoryOperation() -> FileOperation
 
 Selects the remove-directory operation.
 
-<a id="impl.pathOperation"></a>
+<a id="FileSystem.impl.pathOperation"></a>
 
 ### Associated function `pathOperation`
 
@@ -936,7 +936,7 @@ pub fn pathOperation() -> FileOperation
 
 Selects path construction and resolution.
 
-<a id="impl.createTemporaryDirectoryOperation"></a>
+<a id="FileSystem.impl.createTemporaryDirectoryOperation"></a>
 
 ### Associated function `createTemporaryDirectoryOperation`
 
@@ -946,7 +946,7 @@ pub fn createTemporaryDirectoryOperation() -> FileOperation
 
 Selects the create-temporary-directory operation.
 
-<a id="impl.createFileOperation"></a>
+<a id="FileSystem.impl.createFileOperation"></a>
 
 ### Associated function `createFileOperation`
 
@@ -956,7 +956,7 @@ pub fn createFileOperation() -> FileOperation
 
 Selects exclusive regular-file creation.
 
-<a id="impl.writeFileAtomicOperation"></a>
+<a id="FileSystem.impl.writeFileAtomicOperation"></a>
 
 ### Associated function `writeFileAtomicOperation`
 
@@ -966,7 +966,7 @@ pub fn writeFileAtomicOperation() -> FileOperation
 
 Selects atomic whole-file publication.
 
-<a id="impl.syncFileOperation"></a>
+<a id="FileSystem.impl.syncFileOperation"></a>
 
 ### Associated function `syncFileOperation`
 
@@ -976,7 +976,7 @@ pub fn syncFileOperation() -> FileOperation
 
 Selects synchronization of an owned file descriptor.
 
-<a id="impl.syncDirectoryOperation"></a>
+<a id="FileSystem.impl.syncDirectoryOperation"></a>
 
 ### Associated function `syncDirectoryOperation`
 
@@ -986,7 +986,7 @@ pub fn syncDirectoryOperation() -> FileOperation
 
 Selects directory synchronization.
 
-<a id="impl.operationCode"></a>
+<a id="FileSystem.impl.operationCode"></a>
 
 ### Associated function `operationCode`
 
@@ -996,7 +996,7 @@ pub fn operationCode(operation: FileOperation) -> i32
 
 Returns the stable numeric code of a consumed [`FileOperation`](#FileOperation).
 
-<a id="impl.notFound"></a>
+<a id="FileSystem.impl.notFound"></a>
 
 ### Associated function `notFound`
 
@@ -1006,7 +1006,7 @@ pub fn notFound() -> FileReason
 
 Constructs the `NotFound` recovery reason.
 
-<a id="impl.alreadyExists"></a>
+<a id="FileSystem.impl.alreadyExists"></a>
 
 ### Associated function `alreadyExists`
 
@@ -1016,7 +1016,7 @@ pub fn alreadyExists() -> FileReason
 
 Constructs the `AlreadyExists` recovery reason.
 
-<a id="impl.permissionDenied"></a>
+<a id="FileSystem.impl.permissionDenied"></a>
 
 ### Associated function `permissionDenied`
 
@@ -1026,7 +1026,7 @@ pub fn permissionDenied() -> FileReason
 
 Constructs the `PermissionDenied` recovery reason.
 
-<a id="impl.invalidPath"></a>
+<a id="FileSystem.impl.invalidPath"></a>
 
 ### Associated function `invalidPath`
 
@@ -1036,7 +1036,7 @@ pub fn invalidPath() -> FileReason
 
 Constructs the `InvalidPath` recovery reason.
 
-<a id="impl.wrongType"></a>
+<a id="FileSystem.impl.wrongType"></a>
 
 ### Associated function `wrongType`
 
@@ -1046,7 +1046,7 @@ pub fn wrongType() -> FileReason
 
 Constructs the `WrongType` recovery reason.
 
-<a id="impl.notEmpty"></a>
+<a id="FileSystem.impl.notEmpty"></a>
 
 ### Associated function `notEmpty`
 
@@ -1056,7 +1056,7 @@ pub fn notEmpty() -> FileReason
 
 Constructs the `NotEmpty` recovery reason.
 
-<a id="impl.noSpace"></a>
+<a id="FileSystem.impl.noSpace"></a>
 
 ### Associated function `noSpace`
 
@@ -1066,7 +1066,7 @@ pub fn noSpace() -> FileReason
 
 Constructs the `NoSpace` recovery reason.
 
-<a id="impl.tooLarge"></a>
+<a id="FileSystem.impl.tooLarge"></a>
 
 ### Associated function `tooLarge`
 
@@ -1076,7 +1076,7 @@ pub fn tooLarge() -> FileReason
 
 Constructs the `TooLarge` recovery reason.
 
-<a id="impl.unsupported"></a>
+<a id="FileSystem.impl.unsupported"></a>
 
 ### Associated function `unsupported`
 
@@ -1086,7 +1086,7 @@ pub fn unsupported() -> FileReason
 
 Constructs the `Unsupported` recovery reason.
 
-<a id="impl.other"></a>
+<a id="FileSystem.impl.other"></a>
 
 ### Associated function `other`
 
@@ -1096,7 +1096,7 @@ pub fn other() -> FileReason
 
 Constructs the catch-all `Other` recovery reason.
 
-<a id="impl.reasonCode"></a>
+<a id="FileSystem.impl.reasonCode"></a>
 
 ### Associated function `reasonCode`
 
@@ -1106,7 +1106,7 @@ pub fn reasonCode(reason: FileReason) -> i32
 
 Returns the stable numeric code of a consumed [`FileReason`](#FileReason).
 
-<a id="impl.error"></a>
+<a id="FileSystem.impl.error"></a>
 
 ### Associated function `error`
 
@@ -1116,7 +1116,7 @@ pub fn error(operation: FileOperation, reason: FileReason) -> FileError
 
 Constructs a portable [`FileError`](#FileError) without a provider-specific numeric detail.
 
-<a id="impl.errorWithCode"></a>
+<a id="FileSystem.impl.errorWithCode"></a>
 
 ### Associated function `errorWithCode`
 
@@ -1131,7 +1131,7 @@ Constructs a portable [`FileError`](#FileError) while retaining one provider-spe
 The numeric `code` is opaque outside that provider. The portable `operation` and `reason` remain
 the fields callers should use for recovery.
 
-<a id="impl.providerCode"></a>
+<a id="FileSystem.impl.providerCode"></a>
 
 ### Associated function `providerCode`
 
@@ -1141,7 +1141,7 @@ pub fn providerCode(error: &FileError) -> Option<i32>
 
 Borrows an error and returns its provider-specific numeric detail, if one was retained.
 
-<a id="impl.temporaryDirectory"></a>
+<a id="FileSystem.impl.temporaryDirectory"></a>
 
 ### Associated function `temporaryDirectory`
 
@@ -1156,11 +1156,11 @@ Creates an explicitly owned temporary directory under `parent` with a name begin
 
 #### Details
 
-The result is owned. Nothing removes it until a caller runs [`release`](#impl.release) or [`releaseIgnored`](#impl.releaseIgnored).
+The result is owned. Nothing removes it until a caller runs [`release`](#FileSystem.impl.release) or [`releaseIgnored`](#FileSystem.impl.releaseIgnored).
 The prefix is encoded as UTF-8 and the provider chooses and claims the remaining unique name in
 one operation.
 
-<a id="impl.release"></a>
+<a id="FileSystem.impl.release"></a>
 
 ### Method `release`
 
@@ -1179,7 +1179,7 @@ tree to find what to remove allocates, so it can exhaust memory. A caller that m
 failed cleanup uses this operation and handles the failure. The owner is consumed even when
 removal fails, so copy any diagnostic path information needed before calling.
 
-<a id="impl.releaseIgnored"></a>
+<a id="FileSystem.impl.releaseIgnored"></a>
 
 ### Method `releaseIgnored`
 
@@ -1205,7 +1205,7 @@ A caller who needs the failure uses `release` instead and does not compose it wi
 The finalizer consumes the directory. The protected Effect cannot borrow it when the finalizer
 starts. Derive the required paths before you give the owner to the finalizer.
 
-<a id="impl.removeDirectoryRecursively"></a>
+<a id="FileSystem.impl.removeDirectoryRecursively"></a>
 
 ### Associated function `removeDirectoryRecursively`
 
@@ -1224,12 +1224,12 @@ pass walks the tree front to back, unlinking every file it meets and recording e
 it meets; the second removes the recorded directories back to front. That order is
 child-before-parent for free: a directory is always recorded before the children found inside
 it, so reversing the record reverses the containment. Neither pass recurses, so depth costs
-vector capacity rather than stack.
+list capacity rather than stack.
 
 This operation is destructive and not transactional. If a provider or allocation failure occurs,
 removals already completed remain completed and the remaining tree is left in place.
 
-<a id="impl.createDirectoriesRecursively"></a>
+<a id="FileSystem.impl.createDirectoriesRecursively"></a>
 
 ### Associated function `createDirectoriesRecursively`
 
@@ -1247,7 +1247,7 @@ Existing directories are kept. An existing regular file at any component fails w
 `WrongType`; failures other than `NotFound` propagate. This is ordinary stat-then-create
 composition, so concurrent namespace changes may still race according to provider policy.
 
-<a id="impl.writeFileWithParents"></a>
+<a id="FileSystem.impl.writeFileWithParents"></a>
 
 ### Associated function `writeFileWithParents`
 
@@ -1266,7 +1266,7 @@ The final write uses `FileSystem.writeFile` create-or-truncate semantics. Passin
 directly to the provider and normally fails with `WrongType`. Directory creation and writing are
 not transactional, so a later failure may leave newly created parents behind.
 
-<a id="impl.exists"></a>
+<a id="FileSystem.impl.exists"></a>
 
 ### Associated function `exists`
 

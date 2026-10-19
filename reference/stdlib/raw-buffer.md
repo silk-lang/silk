@@ -5,18 +5,18 @@
 Low-level typed views over owned allocations for implementing collections and storage actors.
 
 ## When to use
-Prefer `silk.vector.Vector`, `silk.bytes.Bytes`, or `silk.box.Box` in application code. Use
+Prefer `silk.list.List`, `silk.bytes.Bytes`, or `silk.box.Box` in application code. Use
 these operations only when building a container that explicitly tracks capacity and which
 slots are initialized.
 
 ## Details
-[`copy`](#impl.copy) supports overlapping ranges and behaves as though the moved elements passed through
-temporary storage. [`fill`](#impl.fill) writes raw bytes and therefore operates only on `RawBuffer<u8>`.
+[`copy`](#RawBuffer.impl.copy) supports overlapping ranges and behaves as though the moved elements passed through
+temporary storage. [`fill`](#RawBuffer.impl.fill) writes raw bytes and therefore operates only on `RawBuffer<u8>`.
 
 ## Gotchas
-[`from`](#impl.from), [`read`](#impl.read), [`copy`](#impl.copy), [`view`](#impl.view), and [`viewMut`](#impl.viewMut) are `unsafe`: the caller must prove
+[`from`](#RawBuffer.impl.from), [`read`](#RawBuffer.impl.read), [`copy`](#RawBuffer.impl.copy), [`view`](#RawBuffer.impl.view), and [`viewMut`](#RawBuffer.impl.viewMut) are `unsafe`: the caller must prove
 that an allocation fits the recorded element count, every selected range is in bounds, and
-every read or view covers initialized elements. [`slot`](#impl.slot) and [`fill`](#impl.fill) check the recorded count
+every read or view covers initialized elements. [`slot`](#RawBuffer.impl.slot) and [`fill`](#RawBuffer.impl.fill) check the recorded count
 and trap outside it. Releasing a raw buffer releases its allocation but does not discover and
 drop values still stored in it; a container must clear initialized `Slot` values before release.
 
@@ -78,7 +78,7 @@ inherent member declared in `impl RawBuffer`, so `import silk.raw_buffer { RawBu
 one import that reaches `RawBuffer.from(...)` and the rest. It is unrelated to the builtin
 `RawBuffer<T>` type.
 
-<a id="impl"></a>
+<a id="RawBuffer.impl"></a>
 
 ## Implementation `RawBuffer`
 
@@ -86,7 +86,7 @@ one import that reaches `RawBuffer.from(...)` and the rest. It is unrelated to t
 impl RawBuffer
 ```
 
-<a id="impl.from"></a>
+<a id="RawBuffer.impl.from"></a>
 
 ### Associated function `from`
 
@@ -100,7 +100,7 @@ Adopts an allocation as typed raw storage with the specified element capacity.
 
 The caller must prove that the allocation has the size and alignment for `count` values of `T`.
 
-<a id="impl.slot"></a>
+<a id="RawBuffer.impl.slot"></a>
 
 ### Associated function `slot`
 
@@ -112,11 +112,11 @@ Selects one raw storage slot after checking the buffer's recorded element count.
 
 #### Gotchas
 
-An `index` outside [`count`](#impl.count) traps. The slot operations that read or drop require the caller to
+An `index` outside [`count`](#RawBuffer.impl.count) traps. The slot operations that read or drop require the caller to
 track whether the slot is initialized. The result retains exclusive access to the buffer until
 the slot is consumed. Lifetimes inside `T` remain separate from this storage access.
 
-<a id="impl.count"></a>
+<a id="RawBuffer.impl.count"></a>
 
 ### Associated function `count`
 
@@ -126,7 +126,7 @@ pub fn count<T>(buffer: &Intrinsic.RawBuffer<T>) -> usize
 
 Returns the element capacity recorded by a raw buffer.
 
-<a id="impl.read"></a>
+<a id="RawBuffer.impl.read"></a>
 
 ### Associated function `read`
 
@@ -138,11 +138,11 @@ Copies one initialized element without changing its slot state.
 
 #### Gotchas
 
-The caller must prove that `index` is less than [`count`](#impl.count) and that the selected slot contains
+The caller must prove that `index` is less than [`count`](#RawBuffer.impl.count) and that the selected slot contains
 an initialized `T`. A copied reference retains its original referent lifetime after the buffer
 is released.
 
-<a id="impl.copy"></a>
+<a id="RawBuffer.impl.copy"></a>
 
 ### Associated function `copy`
 
@@ -162,7 +162,7 @@ intermediate buffer.
 The caller must prove that both selected ranges are in bounds. The source range must be
 initialized.
 
-<a id="impl.fill"></a>
+<a id="RawBuffer.impl.fill"></a>
 
 ### Associated function `fill`
 
@@ -174,9 +174,9 @@ Initializes a selected byte range with one repeated byte value.
 
 #### Gotchas
 
-A range beyond [`count`](#impl.count) traps.
+A range beyond [`count`](#RawBuffer.impl.count) traps.
 
-<a id="impl.view"></a>
+<a id="RawBuffer.impl.view"></a>
 
 ### Associated function `view`
 
@@ -191,7 +191,7 @@ Borrows a shared view of an initialized element range.
 The caller must prove that the selected range is in bounds and that each selected slot is
 initialized.
 
-<a id="impl.viewMut"></a>
+<a id="RawBuffer.impl.viewMut"></a>
 
 ### Associated function `viewMut`
 
