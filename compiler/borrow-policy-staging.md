@@ -6,9 +6,11 @@ The cyclic design below requires independent review before implementation.
 
 ## A: implemented boundary and observation order
 
-`retainedSinks` accepts immutable loans, carries, operand sinks, owner and the optional operand
-selector. Its result is one `CallSink` per carry, in the original order. `keepCarried` applies
-Universal as `Loan.escapes = true`, Unknown as `Walker.storing = true`, and Local as no effect.
+`retainedSinks` accepts immutable loans, structural paths, carries, operand sinks, owner and the
+optional operand selector. Its result contains one `CallSink` and actual-slot witness per carry,
+in the original order. `keepCarried` records located Exact/Stored universal retention as a
+`CallerRetention` at the operation point for later operand-read source validation. Other Universal
+reasons set `Loan.escapes = true`; Unknown sets `Walker.storing = true`; Local has no effect.
 Neither classification nor parent closure reads either of these output flags. No decision is
 recomputed after application. The initial queue is seeded in carry order. Each dequeued child
 scans candidate parents in carry order, marking/enqueuing once; same-operand restrictions,
@@ -19,8 +21,10 @@ are unchanged. A nonlocal parent may be traversed without being promoted.
 and exclusive (the last two through `narrowSlots`). Parent closure additionally reads parent,
 borrowed and local. It does not read precision, escapes, bound, unretained or wholeHolds.
 Sink inputs include holds, whole/outer classification and approximation, span/view identity,
-undescribed, and the slot types/access/classifications. Owner identity classifies region atoms.
-Removing the Walker argument removes no dependency.
+undescribed, and the slot paths/types/access/classifications. Carry field/direct and immutable
+Walker paths supply structural correspondence. Parent promotion changes only the sink, never the
+actual-slot witness. Owner identity classifies region atoms. Removing the Walker argument removes
+no dependency; paths are passed explicitly. The adapter alone reads precision and records effects.
 
 `resultDecision` accepts an immutable loan, the actual carry, immutable `ResultFacts`, owner,
 named and required regions, retention relations and implied signature facts, plus mapped field
@@ -52,11 +56,13 @@ changes previously occurred after the last fallible decision and still do. Appen
 carries/whole holds/unretained remains fallible in the same order. `declaredResultCarries` still
 executes at the original site after precision application. All original branch precedence is
 preserved, including a declared-result placement when an earlier outside-result branch kept a
-loan. No batching, deduplication or sorting of effects is introduced.
+loan. The integrated caller-slot repair keeps authenticated declared-source exactness after the
+owned/outlives-result gates and immediately before coarse outside-drop. No source authentication
+is added here. No batching, deduplication or sorting of effects is introduced.
 
 Other retention policies are **unchanged**, not moved into the new helper: capture construction,
 written-operand escape, return escape, stores, cleanup, field filtering and solver consumption.
-`keepCarried` invocation sites in `finish` and `invoke` are unchanged. `construct`, `consume`,
+`keepCarried` invocation sites in `finish` and `defer` are unchanged. `construct`, `consume`,
 `rejoin` and `storeIntoLent` still execute their existing work at their existing positions. This
 is a pure boundary for result selection and call retention, not a claim that the entire Walker
 has become a pure operation graph.
@@ -92,6 +98,14 @@ The result/call extraction preserves the old observation points rather than maki
 order independent. In particular `wholeHolds` records created by an earlier operation can change
 a later field decision; later precision degradation can affect a later operation-wide complete
 or declared-source certificate. B must model these dependencies explicitly.
+
+The integrated caller-slot repair additionally initializes/appends `Walker.callerRetentions` and
+validates each paired definition/read source after reaching holdings are computed. Before that
+finalization, `independentEscapes` snapshots the existing written/capture/opaque/result reasons.
+Access and End conflicts use those independent reasons or operation-to-event-qualified caller
+retention; availability and release still see the conservative aggregate escape bits. These
+observation points are unchanged by the extraction. The inventory above remains the explicitly
+pinned pre-extraction record, not a claim that it lists these later additions.
 
 ## B: concrete information-order design, not implemented
 
@@ -180,7 +194,7 @@ implies kept=false for **all** remaining branches. Unknown kept retains a possib
 it cannot justify either an Exact source or an unrelated-owner release.
 
 For example the complete/unneeded drop does not override declared retention: its active mask
-also requires outside-forward, outside-bound, outside-drop and declared branches false. The
+also requires outside-forward, outside-bound, declared and outside-drop branches false. The
 implied drop additionally requires all preceding exact/complete branches false. The bound effect
 is present only on its own active outside-bound branch. The unretained effect is present only on
 the outside-drop branch. `declared` result placement is separately computed from metadata after

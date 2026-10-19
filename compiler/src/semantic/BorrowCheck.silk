@@ -649,7 +649,19 @@ struct WholeHold {
   described: bool
 }
 
+// A signature-retained source after a concrete call/construction point. The source predicate is
+// the actual paired definition/read of that carry, not a union of unrelated reaching alternatives.
+enum CallerSource { Absent, Actual, Unknown }
+
+struct CallerRetention {
+  loan: usize
+  point: usize
+  definition: usize
+  read: usize
+}
+
 struct Walker {
+  callerRetentions: Vector<CallerRetention>
   // The Supplied atoms this body's own selected application binds its region parameters to.
   // They name caller regions valid for the whole invocation; every other Supplied atom stays open.
   supplied: Vector<Shared<Lifetime>>
@@ -2566,11 +2578,13 @@ effect fn resultDecision(loan: &Loan, carry: Carry, facts: &ResultFacts, owner: 
       // part the loan does not reach.
       exact = true
       bound = true
+    } else if facts.declared {
+      // An authenticated declared source survives filtering by instantiated result atoms.
+      // Owned-storage escape and bound diagnostics above retain their original precedence.
+      exact = true
     } else if facts.outside && (loan.local || bodyRegions(regionsOf, owner)) {
       kept = false
       dropped = true
-    } else if facts.declared {
-      exact = true
     } else if facts.complete && unneededOwnedLoan(loan, owner, named, requiredSources, facts.ancestor) {
       kept = false
     } else if facts.several && facts.forwarding == Forwarding.Operands && carry.operand < facts.placedCount
@@ -2659,7 +2673,7 @@ effect fn finish(nodes: &[Node], owner: &DeclarationId, walker: &mut Walker, res
   run recordUnheld(nodes, &mut walker.*, result)
   // A loan a call can keep in a universal region must outlive the body; one that reaches a call this
   // walk cannot describe leaves the body unchecked.
-  run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(carried), sinks, usize.MAX)
+  run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(carried), sinks, usize.MAX, point)
   if Vector<Carry>.length(carried) > usize.ZERO {
     run consume(&mut walker.*, Vector<Carry>.asSlice(carried), point)
     let retained = run nodeRetains(nodes, result, owner)
@@ -3783,7 +3797,7 @@ effect fn defer(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
   let kept = Vector<OperandSink>.asSlice(&sinks)
   if pipeline && arguments.length > usize.ZERO {
     let input = run visit(nodes, locals, owner, &mut walker.*, arguments[0], current)
-    run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(&input.carried), kept, usize.ZERO)
+    run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(&input.carried), kept, usize.ZERO, input.at)
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&input.carried))
     current = input.at
     first = usize.ONE
@@ -3794,7 +3808,7 @@ effect fn defer(nodes: &[Node], locals: &[Local], owner: &DeclarationId, walker:
   let mut index = first
   while index < arguments.length {
     let flow = run visit(nodes, locals, owner, &mut walker.*, arguments[index], current)
-    run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(&flow.carried), kept, index)
+    run keepCarried(&mut walker.*, owner, Vector<Carry>.asSlice(&flow.carried), kept, index, flow.at)
     run appendCarried(&mut carried, Vector<Carry>.asSlice(&flow.carried))
     current = flow.at
     index = index + usize.ONE
@@ -4893,11 +4907,25 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       // lowering evaluates the condition before it enters this loop's targets, so the condition is
       // walked before this loop's frame is pushed.
       let tested = run settled(nodes, locals, owner, &mut walker.*, condition, header)
+      if tested.at == usize.MAX {
+        let mut loops = Vector<Loop>.asMutSlice(&mut walker.loops)
+        loops[repeat].end = Vector<Point>.length(&walker.points)
+        return flowAt(usize.MAX)
+      }
+      // Only the checked literal supplies a feasible-edge fact. Evaluate the condition normally;
+      // calls, local reads and other runtime expressions retain both alternatives.
+      let mut enters = true
+      let mut skips = true
+      if let NodeKind.Expression {form: Expression.Boolean {value}, ..} = &nodes[condition.index].kind {
+        enters = value
+        skips = !value
+      }
       run Vector<Frame>.append(&mut walker.frames, Frame {exit: exit, repeat: repeat, scopes: Vector<Scope>.length(&walker.scopes)})
       let split = run newPoint(&mut walker.*, tested.at)
       run consume(&mut walker.*, Vector<Carry>.asSlice(&tested.carried), split)
-      run edge(&mut walker.*, split, exit)
-      let repeated = run visit(nodes, locals, owner, &mut walker.*, body, split)
+      if skips { run edge(&mut walker.*, split, exit) }
+      let mut repeated = flowAt(usize.MAX)
+      if enters { repeated = run visit(nodes, locals, owner, &mut walker.*, body, split) }
       run backEdge(&mut walker.*, repeat, repeated.at)
       let mut loops = Vector<Loop>.asMutSlice(&mut walker.loops)
       loops[repeat].end = Vector<Point>.length(&walker.points)
@@ -4905,6 +4933,12 @@ effect fn visitNode(nodes: &[Node], locals: &[Local], owner: &DeclarationId, wal
       Vector<Frame>.truncate(&mut walker.frames, enclosing)
       if Vector<Carry>.length(&repeated.carried) > usize.ZERO {
         leave(&mut walker.*, BorrowStatus.StoredLoans)
+      }
+      if !skips {
+        // A literal-true loop completes only through an actual break path. Do not revive code
+        // after a returning or endlessly repeating body through its unattached exit point.
+        let mut paths = Vector<ReplacementReach>.make()
+        if !run reachesAvoiding(&walker.*, &mut paths, split, exit, usize.MAX) { return flowAt(usize.MAX) }
       }
       return flowAt(exit)
     }
@@ -6028,6 +6062,7 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
     declared = declared + usize.ONE
   }
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: move unrun,
     points: Vector<Point>.make(),
     loans: Vector<Loan>.make(),
@@ -6137,6 +6172,9 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
     liveOut = run liveness(&walker, definitionWidth, true)
     keptOut = run liveness(&walker, definitionWidth, false)
   }
+  let callerSources = run callerHoldingSources(&walker, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
+  let independentEscapes = run retainCallerSources(&mut walker, Vector<CallerSource>.asSlice(&callerSources),
+    Vector<u64>.asSlice(&definitions.entering), definitionWidth)
   let events = Vector<Event>.asSlice(&walker.events)
   let loans = Vector<Loan>.asSlice(&walker.loans)
   let mut moves = Vector<usize>.make()
@@ -6265,9 +6303,12 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
         let carried = run flightEnds(&walker, &loans[index], event.point, Vector<u64>.asSlice(&definitions.entering), definitionWidth)
         let mut held = definitionWidth > usize.ZERO
           && heldLive(&walker, index, Vector<u64>.asSlice(&liveOut), Vector<u64>.asSlice(&definitions.entering), definitionWidth, event.point)
-        if !held && loans[index].escapes {
+        if !held && Vector<bool>.asSlice(&independentEscapes)[index] {
           held = run reachesAvoiding(&walker, &mut replacementReaches, loans[index].created, event.point, usize.MAX)
         }
+        let caller = run callerRetentionAt(&walker, index, event.point, Vector<CallerSource>.asSlice(&callerSources),
+          Vector<u64>.asSlice(&definitions.entering), definitionWidth, &mut replacementReaches)
+        if caller == CallerSource.Actual { held = true }
         if !held && loans[index].until != usize.MAX {
           held = run liveUntil(&walker, &mut replacementReaches, &loans[index], event.point)
         }
@@ -6275,6 +6316,7 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
         if !carried && !held && definitionWidth > usize.ZERO {
           stale = run staleHolding(&walker, index, event.point, Vector<u64>.asSlice(&liveOut), Vector<u64>.asSlice(&definitions.entering), definitionWidth)
         }
+        if !carried && !held && stale == usize.MAX && caller == CallerSource.Unknown { unknown = true }
         if carried || held || stale != usize.MAX {
           if loans[index].precision == LoanPrecision.Alternatives || loans[index].precision == LoanPrecision.Unknown { unknown = true } else {
             // A temporary's view carried past its owner is reported where it is first used after
@@ -6314,11 +6356,15 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
             if !live && definitionWidth > usize.ZERO {
               live = heldLive(&walker, index, Vector<u64>.asSlice(&keptOut), Vector<u64>.asSlice(&definitions.entering), definitionWidth, event.point)
             }
-            // A universal loan a call can keep past the body outlives it, so it is live wherever its
-            // creation reaches, whether or not a holder still uses it here.
-            if !live && loans[index].escapes {
+            // Written/capture/opaque escape reasons retain their original global constraint.
+            // A new concrete caller retention instead starts at the operation that retains it;
+            // a sibling or returned arm cannot extend it onto an unrelated access path.
+            if !live && Vector<bool>.asSlice(&independentEscapes)[index] {
               live = run reachesAvoiding(&walker, &mut replacementReaches, loans[index].created, event.point, usize.MAX)
             }
+            let caller = run callerRetentionAt(&walker, index, event.point, Vector<CallerSource>.asSlice(&callerSources),
+              Vector<u64>.asSlice(&definitions.entering), definitionWidth, &mut replacementReaches)
+            if caller == CallerSource.Actual { live = true }
             // An unrun `effect` block's own capture is live from where it is taken to the block's
             // scope end.
             if !live && loans[index].until != usize.MAX {
@@ -6335,10 +6381,12 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
               }
               chain = chain + usize.ONE
             }
+            if !live && caller == CallerSource.Unknown { unknown = true }
             if live {
               // An approximate loan's conflict is not a proof either way: the body answers
               // `imprecise`, which is unchecked, never `Checked`.
-              if (shared == usize.ONE || indexed) && loans[index].precision == LoanPrecision.Exact {
+              if (shared == usize.ONE || indexed) && (loans[index].precision == LoanPrecision.Exact
+                || (loans[index].precision == LoanPrecision.Stored && caller == CallerSource.Actual)) {
                 run addReport(&mut reports, Report {code: value, access: event.target, related: true, earlier: loans[index].origin})
                 // A write, move or drop of body storage leaves a view its borrow made expired, which
                 // the view's next use reports (OWN0019), as the bootstrap's lifetime analysis
@@ -6393,6 +6441,100 @@ pub effect fn check(owner: &DeclarationId, supplied: &[Shared<Lifetime>], locals
     return refutedOr(&walker, returnedEscape, verdict(Outcome.Clear, BorrowStatus.Checked))
   }
   return refutedOr(&walker, returnedEscape, verdict(Outcome.Clear, BorrowStatus.Regions))
+}
+
+// A caller retains the value read into its operand, not its holder's historical type. Shadow
+// definitions remain in the region proof, but cannot supply that value. A copied alias follows
+// each paired source/read; a read before replacement therefore survives replacement of its source.
+// Holdings only refer to previously recorded definitions. Unknown or unavailable provenance stays
+// Unknown rather than becoming evidence that the loan is absent.
+effect fn callerHoldingSources(walker: &Walker, definitions: &[u64], width: usize) -> Vector<CallerSource>
+! OutOfMemoryError ? &mut Allocator {
+  let holdings = Vector<Holding>.asSlice(&walker.definitions)
+  let sources = Vector<HoldingSource>.asSlice(&walker.holdingSources)
+  let mut states = Vector<CallerSource>.make()
+  if Vector<CallerRetention>.length(&walker.callerRetentions) == usize.ZERO { return move states }
+  let mut at = usize.ZERO
+  while at < holdings.length {
+    let holding = holdings[at]
+    let mut state = CallerSource.Unknown
+    if holding.field != usize.MAX {
+      if holding.shadowed { state = CallerSource.Absent }
+      else if holding.sourceCount == usize.ZERO { state = CallerSource.Actual }
+      else if holding.sources <= sources.length && holding.sourceCount <= sources.length - holding.sources {
+        state = CallerSource.Absent
+        let mut each = holding.sources
+        while each < holding.sources + holding.sourceCount {
+          let source = sources[each]
+          let selected = callerSource(walker, Vector<CallerSource>.asSlice(&states), definitions, width, source.definition, source.read)
+          if selected == CallerSource.Actual { state = CallerSource.Actual }
+          else if selected == CallerSource.Unknown && state != CallerSource.Actual { state = CallerSource.Unknown }
+          each = each + usize.ONE
+        }
+      }
+    }
+    run Vector<CallerSource>.append(&mut states, state)
+    at = at + usize.ONE
+  }
+  return move states
+}
+
+fn callerSource(walker: &Walker, sources: &[CallerSource], definitions: &[u64], width: usize,
+  definition: usize, read: usize) -> CallerSource {
+  // Only a fresh borrow introduces this unconditional pair; every copy/transform preserves it
+  // or replaces it with a recorded Holding/read pair.
+  if definition == usize.MAX && read == usize.MAX { return CallerSource.Actual }
+  if definition >= sources.length || width == usize.ZERO || read >= Vector<Point>.length(&walker.points) {
+    return CallerSource.Unknown
+  }
+  if !reaches(definitions, width, read, definition) { return CallerSource.Absent }
+  return sources[definition]
+}
+
+// Preserve independent escape reasons separately from location-qualified caller retention.
+// The aggregate flag remains conservative for region availability/release proofs. Event conflicts
+// use the returned independent reasons or callerRetentionAt, never that aggregate flag alone.
+// No later overwrite can cancel a call that already retained a real source.
+effect fn retainCallerSources(walker: &mut Walker, sources: &[CallerSource], definitions: &[u64], width: usize) -> Vector<bool>
+! OutOfMemoryError ? &mut Allocator {
+  let mut independent = Vector<bool>.make()
+  let original = Vector<Loan>.asSlice(&walker.loans)
+  let mut at = usize.ZERO
+  while at < original.length {
+    run Vector<bool>.append(&mut independent, original[at].escapes)
+    at = at + usize.ONE
+  }
+  let retained = Vector<CallerRetention>.asSlice(&walker.callerRetentions)
+  at = usize.ZERO
+  while at < retained.length {
+    let source = &retained[at]
+    if callerSource(&walker.*, sources, definitions, width, source.definition, source.read) != CallerSource.Absent {
+      let mut loans = Vector<Loan>.asMutSlice(&mut walker.loans)
+      loans[source.loan].escapes = true
+    }
+    at = at + usize.ONE
+  }
+  return move independent
+}
+
+// Both Exact and Stored caller-retained conflicts need the operation to reach the access. The
+// source definition is authenticated at the operand read: Move may consume it before the call.
+// Unknown source evidence can require an unchecked result, never a concrete conflict by itself.
+effect fn callerRetentionAt(walker: &Walker, loan: usize, point: usize, sources: &[CallerSource], definitions: &[u64], width: usize,
+  replacements: &mut Vector<ReplacementReach>) -> CallerSource ! OutOfMemoryError ? &mut Allocator {
+  let retained = Vector<CallerRetention>.asSlice(&walker.callerRetentions)
+  let mut result = CallerSource.Absent
+  let mut at = usize.ZERO
+  while at < retained.length {
+    let source = &retained[at]
+    if source.loan == loan && run reachesAvoiding(walker, &mut replacements.*, source.point, point, usize.MAX) {
+      let selected = callerSource(walker, sources, definitions, width, source.definition, source.read)
+      if selected == CallerSource.Actual { return CallerSource.Actual }
+      if selected == CallerSource.Unknown { result = CallerSource.Unknown }
+    }
+    at = at + usize.ONE
+  }
+  return result
 }
 
 // The SEM0212 refutation of the loan at `escaping` (`escapingOwnedLoan`), or `otherwise` when
@@ -8043,7 +8185,7 @@ fn namedEnclosing(declaration: &DeclarationId, owner: &DeclarationId) -> bool {
 }
 
 // Where a call can keep a loan one operand carries: `Local` also when the operand holds none of it.
-fn keptSink(loan: &Loan, owner: &DeclarationId, direct: bool, sink: &OperandSink) -> CallSink {
+fn keptSink(paths: &[Vector<Step>], loan: &Loan, owner: &DeclarationId, carry: Carry, sink: &OperandSink, located: &mut bool) -> CallSink {
   let origin = loan.origin
   // An operand whose type names only `'static` holds no loan of the body unless typing gave that
   // loan a `'static` region; one the walk carries into it otherwise is not part of its value.
@@ -8060,16 +8202,16 @@ fn keptSink(loan: &Loan, owner: &DeclarationId, direct: bool, sink: &OperandSink
       at = at + usize.ONE
     }
   }
+  let mut positioned = false
   if own {
     kept = sink.outer
     approximate = sink.outerApproximate
-  } else if direct {
-    narrowSlots(loan, sink, &mut kept, &mut approximate)
+  } else {
+    positioned = narrowSlots(paths, carry, loan, sink, &mut kept, &mut approximate)
   }
-  // A loan the operand carries, rather than its own borrow, lies where typing placed it: one typed
-  // only at regions within the body cannot be at a universal position unless typing related
-  // regions natively unsolved, so it leaves the body unchecked rather than escaping.
-  if !own && kept == CallSink.Universal && typedLocally(&loan.regions, owner) { kept = CallSink.Unknown }
+  // A structural slot is the actual destination of this carried value after coercion. Without
+  // that correspondence, local region names alone cannot establish a universal retention path.
+  if !own && !positioned && kept == CallSink.Universal && typedLocally(&loan.regions, owner) { kept = CallSink.Unknown }
   // An approximate channel's universal region may be longer than any binding needs: only a loan
   // typing gave a universal region is held to it, and any other leaves the body unchecked.
   if kept != CallSink.Universal && approximate == CallSink.Universal {
@@ -8081,28 +8223,38 @@ fn keptSink(loan: &Loan, owner: &DeclarationId, direct: bool, sink: &OperandSink
   } else if kept == CallSink.Local && approximate == CallSink.Unknown {
     kept = CallSink.Unknown
   }
+  located.* = positioned || (own && carry.direct && carry.field == usize.ZERO)
   return kept
 }
 
-// Decides which loans the operands carry into a call that can keep them in a universal region.
-// The returned sinks describe escape/storing effects without mutating the loans. A reborrow keeps
-// its parent's storage borrowed while it lives, so a loan of body storage
+// Completed classifications and their actual-slot witnesses share carry order. Parent
+// closure may promote a sink, but never manufactures a structural-slot witness.
+struct RetainedSinks {
+  sinks: Vector<CallSink>
+  located: Vector<bool>
+}
+
+// Classifies operand retention without mutating loans. A reborrow keeps its parent's storage
+// borrowed while it lives, so a loan of body storage
 // that the parent regions of an escaping loan reach among those its operand carries escapes with
 // it, wherever typing placed it. Any other loan that reaches a call this walk cannot describe keeps
 // the body from being Checked; the walk goes on, so a definite conflict among exact loans, such as
 // an escaping loan of body storage that ends, still rejects it. Each carry is judged by
 // `sinks[only]`, or by its own operand's sink when `only` is `usize.MAX`; a carry with no sink is
 // kept nowhere.
-effect fn retainedSinks(loans: &[Loan], owner: &DeclarationId, carries: &[Carry], sinks: &[OperandSink], only: usize) -> Vector<CallSink>
+effect fn retainedSinks(loans: &[Loan], paths: &[Vector<Step>], owner: &DeclarationId, carries: &[Carry], sinks: &[OperandSink], only: usize) -> RetainedSinks
 ! OutOfMemoryError ? &mut Allocator {
   let mut kept = Vector<CallSink>.make()
   let mut escaping = Vector<usize>.make()
+  let mut located = Vector<bool>.make()
   let mut at = usize.ZERO
   while at < carries.length {
     let mut operand = only
     if operand == usize.MAX { operand = carries[at].operand }
     let mut decided = CallSink.Local
-    if operand < sinks.length { decided = keptSink(&loans[carries[at].loan], owner, carries[at].direct, &sinks[operand]) }
+    let mut exactSlot = false
+    if operand < sinks.length { decided = keptSink(paths, &loans[carries[at].loan], owner, carries[at], &sinks[operand], &mut exactSlot) }
+    run Vector<bool>.append(&mut located, exactSlot)
     run Vector<CallSink>.append(&mut kept, decided)
     if decided == CallSink.Universal { run Vector<usize>.append(&mut escaping, at) }
     at = at + usize.ONE
@@ -8140,20 +8292,29 @@ effect fn retainedSinks(loans: &[Loan], owner: &DeclarationId, carries: &[Carry]
     }
     next = next + usize.ONE
   }
-  return move kept
+  return RetainedSinks {sinks: move kept, located: move located}
 }
 
 // Apply the completed retention decision at the original call point, before result
-// consumption/classification. Parent closure observes the pre-effect loan state.
-effect fn keepCarried(walker: &mut Walker, owner: &DeclarationId, carries: &[Carry], sinks: &[OperandSink], only: usize) -> ()
+// consumption/classification. Parent closure observes the pre-effect loan state; precise
+// caller sources are validated later against the operand read's reaching definitions.
+effect fn keepCarried(walker: &mut Walker, owner: &DeclarationId, carries: &[Carry], sinks: &[OperandSink], only: usize, point: usize) -> ()
 ! OutOfMemoryError ? &mut Allocator {
-  let kept = run retainedSinks(Vector<Loan>.asSlice(&walker.loans), owner, carries, sinks, only)
-  let decisions = Vector<CallSink>.asSlice(&kept)
+  let kept = run retainedSinks(Vector<Loan>.asSlice(&walker.loans), Vector<Vector<Step>>.asSlice(&walker.paths), owner, carries, sinks, only)
+  let decisions = Vector<CallSink>.asSlice(&kept.sinks)
   let mut at = usize.ZERO
   while at < carries.length {
     if decisions[at] == CallSink.Universal {
       let mut all = Vector<Loan>.asMutSlice(&mut walker.loans)
-      all[carries[at].loan].escapes = true
+      // Stored preserves exact source flow, but only a known actual signature slot authenticates
+      // its retention beyond this point. Alternatives and Unknown never gain this evidence.
+      if Vector<bool>.asSlice(&kept.located)[at] && carries[at].field != usize.MAX && point != usize.MAX
+        && (all[carries[at].loan].precision == LoanPrecision.Exact || all[carries[at].loan].precision == LoanPrecision.Stored) {
+        run Vector<CallerRetention>.append(&mut walker.callerRetentions, CallerRetention {
+          loan: carries[at].loan, point: point, definition: carries[at].definition, read: carries[at].read})
+      } else {
+        all[carries[at].loan].escapes = true
+      }
     } else if decisions[at] == CallSink.Unknown {
       walker.storing = true
     }
@@ -8162,25 +8323,34 @@ effect fn keepCarried(walker: &mut Walker, owner: &DeclarationId, carries: &[Car
   return ()
 }
 
-// Narrows where a call keeps a loan an operand carries to the slots its value can lie in
-// (`Type.mayHoldLoan`): an opaque slot keeps it wherever the whole operand does. Only a loan the
-// operand carries as its own reference (`Carry.direct`) is narrowed: a projection or call result
-// carries it in a value of another type, which may lie in any slot. A loan typed as no reference, an
-// operand the call could not describe, or a loan no slot can hold stays judged by the whole operand.
-fn narrowSlots(loan: &Loan, sink: &OperandSink, kept: &mut CallSink, approximate: &mut CallSink) -> () {
-  let referent = match &loan.referent {
-    Option<Shared<Type>>.Some {value} => Shared<Type>.clone(&value)
-    Option<Shared<Type>>.None => { return () }
-  }
+// A known value path identifies the slot carrying a loan even after region shortening or
+// projection changes its referent type. Unknown paths retain the whole-operand judgment unless
+// the reference's own type rules out a slot; opaque contents never establish an exact position.
+fn narrowSlots(paths: &[Vector<Step>], carry: Carry, loan: &Loan, sink: &OperandSink, kept: &mut CallSink, approximate: &mut CallSink) -> bool {
   let slots = Vector<SlotSink>.asSlice(&sink.slots)
-  if sink.undescribed || slots.length == usize.ZERO { return () }
+  if sink.undescribed || slots.length == usize.ZERO { return false }
   let mut occupied = false
+  let mut positioned = false
+  let mut uncertain = false
   let mut precise = CallSink.Local
   let mut wider = CallSink.Local
   let mut at = usize.ZERO
   while at < slots.length {
-    if Type.mayHoldLoan(slots[at].view, &slots[at].referent, slots[at].exclusive, &referent, loan.exclusive) {
+    let mut matched = SlotPath.Unknown
+    if carry.field != usize.MAX {
+      matched = transferSlotPath(Vector<Step>.asSlice(&paths[carry.field]), Vector<KeptStep>.asSlice(&slots[at].path), slots[at].view)
+    }
+    let mut fits = matched == SlotPath.Same
+    if matched == SlotPath.Unknown {
+      if !carry.direct { return false }
+      if let Option<Shared<Type>>.Some {value: referent} = &loan.referent {
+        fits = Type.mayHoldLoan(slots[at].view, &slots[at].referent, slots[at].exclusive, &referent, loan.exclusive)
+      }
+    }
+    if fits {
       occupied = true
+      if matched == SlotPath.Same && slots[at].view { positioned = true }
+      if matched == SlotPath.Unknown || !slots[at].view { uncertain = true }
       let mut slotKept = slots[at].kept
       let mut slotApproximate = slots[at].approximate
       if !slots[at].view {
@@ -8192,10 +8362,10 @@ fn narrowSlots(loan: &Loan, sink: &OperandSink, kept: &mut CallSink, approximate
     }
     at = at + usize.ONE
   }
-  if !occupied { return () }
+  if !occupied { return false }
   kept.* = precise
   approximate.* = wider
-  return ()
+  return positioned && !uncertain
 }
 
 // The longer of two sinks: unknown over universal over local.
@@ -8289,6 +8459,7 @@ struct OperandSink {
 // One `KeptSlot` of an operand: whether a loan can lie there and where the callee keeps it then. An
 // opaque slot keeps a loan wherever the whole operand does.
 struct SlotSink {
+  path: Vector<KeptStep>
   view: bool
   referent: Shared<Type>
   exclusive: bool
@@ -8373,12 +8544,23 @@ effect fn operandSinks(nodes: &[Node], call: NodeId, arguments: &[NodeId], owner
         })
         let mut index = usize.ZERO
         while index < count {
-          let slot = Shared<Vector<KeptRegions>>.with<SlotSink>(&kept, fn(values: &Vector<KeptRegions>) -> SlotSink {
+          let mut slot = Shared<Vector<KeptRegions>>.with<SlotSink>(&kept, fn(values: &Vector<KeptRegions>) -> SlotSink {
             let entries = Vector<KeptRegions>.asSlice(values)
             let listed = Vector<KeptSlot>.asSlice(&entries[at].slots)
-            return SlotSink {view: listed[index].view, referent: Shared<Type>.clone(&listed[index].referent), exclusive: listed[index].exclusive,
+            return SlotSink {path: Vector<KeptStep>.make(), view: listed[index].view, referent: Shared<Type>.clone(&listed[index].referent), exclusive: listed[index].exclusive,
               kept: regionSink(&listed[index].kept, owner), approximate: approximateSink(&listed[index].keptApproximate, entries[at].undescribed, owner)}
           })
+          let length = Shared<Vector<KeptRegions>>.with<usize>(&kept, fn(values: &Vector<KeptRegions>) -> usize {
+            return Vector<KeptStep>.length(&Vector<KeptSlot>.asSlice(&Vector<KeptRegions>.asSlice(values)[at].slots)[index].path)
+          })
+          let mut step = usize.ZERO
+          while step < length {
+            let value = Shared<Vector<KeptRegions>>.with<KeptStep>(&kept, fn(values: &Vector<KeptRegions>) -> KeptStep {
+              return Vector<KeptStep>.asSlice(&Vector<KeptSlot>.asSlice(&Vector<KeptRegions>.asSlice(values)[at].slots)[index].path)[step]
+            })
+            run Vector<KeptStep>.append(&mut slot.path, value)
+            step = step + usize.ONE
+          }
           run Vector<SlotSink>.append(&mut sink.slots, move slot)
           index = index + usize.ONE
         }
@@ -8544,6 +8726,7 @@ effect fn wrappedRegionClaims() -> ()
   let owner = run DeclarationId.fromParts(move module, Vector<OwnerStep>.make())
   let region = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: Vector<bool>.make(), points: Vector<Point>.make(), loans: Vector<Loan>.make(), events: Vector<Event>.make(),
     frames: Vector<Frame>.make(), loops: Vector<Loop>.make(), held: Vector<Vector<usize>>.make(),
     definitions: Vector<Holding>.make(), holdingSources: Vector<HoldingSource>.make(), scopes: Vector<Scope>.make(), localCount: 1,
@@ -8638,6 +8821,7 @@ effect fn symbolicRootClaims() -> ()
   let a = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let b = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: 1})
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: Vector<bool>.make(), points: Vector<Point>.make(), loans: Vector<Loan>.make(), events: Vector<Event>.make(),
     frames: Vector<Frame>.make(), loops: Vector<Loop>.make(), held: Vector<Vector<usize>>.make(),
     definitions: Vector<Holding>.make(), holdingSources: Vector<HoldingSource>.make(), scopes: Vector<Scope>.make(), localCount: 1,
@@ -8997,6 +9181,7 @@ effect fn finiteParentClaims() -> ()
   let foreign = run Shared<Lifetime>.make(Lifetime.Local {declaration: move foreignOwner, ordinal: 0})
   let universal = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: Vector<bool>.make(), points: Vector<Point>.make(), loans: Vector<Loan>.make(), events: Vector<Event>.make(),
     frames: Vector<Frame>.make(), loops: Vector<Loop>.make(), held: Vector<Vector<usize>>.make(),
     definitions: Vector<Holding>.make(), holdingSources: Vector<HoldingSource>.make(), scopes: Vector<Scope>.make(), localCount: 2,
@@ -9145,6 +9330,7 @@ effect fn intervalRequirementClaims() -> ()
   let region = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let universal = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: Vector<bool>.make(), points: Vector<Point>.make(), loans: Vector<Loan>.make(), events: Vector<Event>.make(),
     frames: Vector<Frame>.make(), loops: Vector<Loop>.make(), held: Vector<Vector<usize>>.make(),
     definitions: Vector<Holding>.make(), holdingSources: Vector<HoldingSource>.make(), scopes: Vector<Scope>.make(), localCount: 1,
@@ -9231,6 +9417,7 @@ effect fn ownedInitializationClaims() -> ()
   let shorter = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let longer = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&owner), ordinal: 1})
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: Vector<bool>.make(), points: Vector<Point>.make(), loans: Vector<Loan>.make(), events: Vector<Event>.make(),
     frames: Vector<Frame>.make(), loops: Vector<Loop>.make(), held: Vector<Vector<usize>>.make(),
     definitions: Vector<Holding>.make(), holdingSources: Vector<HoldingSource>.make(), scopes: Vector<Scope>.make(), localCount: 2,
@@ -9434,6 +9621,7 @@ effect fn offeredMeetClaims() -> ()
   let wanted = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&owner), ordinal: 2})
   let universal = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: Vector<bool>.make(), points: Vector<Point>.make(), loans: Vector<Loan>.make(), events: Vector<Event>.make(),
     frames: Vector<Frame>.make(), loops: Vector<Loop>.make(), held: Vector<Vector<usize>>.make(),
     definitions: Vector<Holding>.make(), holdingSources: Vector<HoldingSource>.make(), scopes: Vector<Scope>.make(), localCount: 3,
@@ -9523,6 +9711,7 @@ effect fn regionChoiceClaims() -> ()
   let useRegion = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(&owner), ordinal: 2})
   let universal = run Shared<Lifetime>.make(Lifetime.Parameter {declaration: DeclarationId.copy(&owner), ordinal: 0})
   let mut walker = Walker {
+    callerRetentions: Vector<CallerRetention>.make(),
     unrun: Vector<bool>.make(), points: Vector<Point>.make(), loans: Vector<Loan>.make(), events: Vector<Event>.make(),
     frames: Vector<Frame>.make(), loops: Vector<Loop>.make(), held: Vector<Vector<usize>>.make(),
     definitions: Vector<Holding>.make(), holdingSources: Vector<HoldingSource>.make(), scopes: Vector<Scope>.make(), localCount: 3,
