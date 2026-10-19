@@ -406,6 +406,7 @@ silk changes [--dir PATH] add patch|minor|major "Summary" [--migration "Guidance
 silk changes [--dir PATH] status [--tag beta]
 silk changes [--dir PATH] version [--tag beta]
 silk changes [--dir PATH] release [--json]
+silk changes [--dir PATH] snapshot --commit FULL_SHA [--dev COUNTER] [--json]
 silk changes [--dir PATH] since [VERSION|DEPENDENCY] [--to VERSION] [--from VERSION] [--source PATH] [--json]
 silk changes [--dir PATH] recover
 ```
@@ -438,8 +439,9 @@ version-file = "src/ReleaseVersion.silk"
 The path must be normalized, package-relative, outside `.changes`, and end in `.silk`; its parent
 directory must already exist. An absent module is created on the first release. An existing file
 must match the generated current version: manual or stale source is refused, not overwritten.
-`status` detects this drift too. Commit the module before building; no build step mutates an
-immutable source snapshot. The compiler uses this configuration for both `--version` and `init`.
+`status` detects this drift too. Commit the module before an ordinary build. Dev publication
+instead creates a separate, verified build projection; it never mutates the committed source
+snapshot. The compiler uses the generated module for both `--version` and `init`.
 
 `release` is a read-only publication check and export, not a Git or network operation. It prints
 the current release's Markdown notes from TOML; `--json` emits `package`, `version`, `tag`,
@@ -448,6 +450,16 @@ package/version records, incomplete supported predecessor history, or a missing/
 version module. Coverage begins at the earliest stored predecessor, so an existing library need
 not invent archives back to `0.0.0`. Publishers should consume this output rather than parse the
 generated changelog or invent another version.
+
+`snapshot --commit FULL_SHA` exports an immutable, cumulative TOML publication snapshot for a
+prepared release. `--dev COUNTER` instead includes the pending changes without consuming them,
+selects the next stable core, and produces `<core>-dev.<counter>+<first-12-commit-characters>`.
+With no pending notes, the dev core is the next patch after the committed stable version.
+Counters must be positive integers; the publisher owns their durable reservation.
+The full lowercase 40-character commit is required. Neither form changes any files.
+`--json` includes `package`, `version`, `tag`, `prerelease`, `commit`, `notes`, `toml`, `manifest`,
+`versionFile`, and `versionSource`; the last three describe the exact native-generated build
+projection. Pending filenames are permanent change IDs, including after promotion to stable.
 
 `--tag beta` produces SemVer prereleases such as `1.2.0-beta.1`; subsequent pending changes
 advance the counter. `--tag rc` changes the channel, and omitting `--tag` promotes the accumulated
@@ -458,8 +470,11 @@ not the running compiler's version. Missing recorded versions require `--from VE
 `since DEPENDENCY` accepts a direct dependency alias or unambiguous package name and uses its
 installed manifest version as the baseline. `--from` overrides either baseline.
 
-Automatic queries resolve the latest stable GitHub release, or the exact `v<VERSION>` release
-selected by `--to VERSION`. Libraries declare their published history origin in their own manifest:
+Automatic queries from a stable baseline select the latest stable GitHub Release, falling back
+to dev only when no stable release exists. A dev baseline selects the highest eligible dev or
+stable version, so it can advance to stable. Discovery searches all release pages and excludes
+drafts and bootstrap seeds. `--to VERSION` always selects an exact `v<VERSION>` release.
+Libraries declare their publication origin in their own manifest:
 
 ```toml
 [changes]
@@ -467,12 +482,13 @@ repository = "owner/repository"
 directory = "packages/mylib" # Optional; omitted means the repository root.
 ```
 
-The compiler origin is `silk-lang/silk`, directory `compiler`. Before publishing a GitHub Release
-with a `v<VERSION>` tag, commit that package's `.changes/releases/` records, including every required
-predecessor and prerelease baseline. All records are read from the selected tag, never the default
-branch. Automatic latest-version discovery requires a stable GitHub Release, not just a Git tag or
-prerelease. Existing releases without these records cannot supply upgrade history: missing releases
-and incomplete archives are errors, never an empty list of changes.
+The compiler origin is `silk-lang/silk`, directory `compiler`. Every published release must attach
+the native-generated `changes-snapshot.toml` asset. It contains the exact package, version, full
+source commit, coverage floor, and cumulative changes. Both the baseline and target are read
+from their own immutable assets, never from the default branch or another release's tag.
+Only an exact match with the target's declared coverage floor needs no baseline asset.
+Missing releases, missing snapshots, mismatched identities, and incomplete coverage are errors,
+never an empty list of changes. This remains a single-package publication format.
 
 This metadata enables history discovery, not remote dependency installation. Queries do not fetch
 source code for execution or update the project.
@@ -481,18 +497,25 @@ Requests use native authenticated HTTPS, with no insecure or external-tool fallb
 selects `SSL_CERT_FILE` when set, otherwise `/etc/ssl/cert.pem` on Darwin or
 `/etc/ssl/certs/ca-certificates.crt` on Linux; it does not consult Darwin Keychain. Platform bundles
 may contain annotations between certificates, but every certificate must decode successfully.
-Private repositories, redirects, proxies, retries, and decompression are not supported.
+Up to five absolute HTTPS redirects are supported for release assets. Each destination is
+authenticated independently; HTTP downgrades, credentials, duplicate/missing locations, and
+invalid destination certificates are rejected. No authorization or cookies are forwarded.
+Private repositories, proxies, retries, and decompression are not supported.
 
-`--source PATH` bypasses remote discovery and reads a local checkout of the same package.
-For compiler queries this must be the `silk-compiler` package directory, not a virtual workspace
-root. Without `--to`, that checkout's manifest version supplies the target; an explicit target
-must not exceed it. This local path is exercised and works without network access.
+`--source PATH` bypasses remote discovery. A checkout of the same package supplies committed
+stable history; compiler queries require the `silk-compiler` package directory, not a virtual
+workspace root. Exact published snapshots can be stored at `.changes/snapshots/<version>.toml`.
+Alternatively, point `--source` directly at a target snapshot TOML file; its baseline must be a
+sibling `<exact-baseline-version>.toml`, unless the baseline equals the coverage floor.
+Dev queries require snapshots: a live checkout's pending files are never substituted.
 
 `since VERSION` retains the current package's local-history behavior and also accepts `--to`.
 `--json` emits the resolved package/from/to and release records for agents, with `null` for
-unspecified migration notes. Queries deduplicate carried prerelease entries and refuse incomplete
-history, reversed ranges, or an active local release lock. They do not update `silk-version`;
-update that field only after migrating and verifying the project.
+unspecified migration notes and an `updated` boolean on each entry. Unchanged IDs are omitted
+even when promoted from dev to stable; a changed summary, bump, or migration for an existing ID
+is shown as updated guidance. Queries refuse incomplete history, ambiguous metadata identities,
+reversed ranges, or an active local release lock. They do not update `silk-version`; update that
+field only after migrating and verifying the project.
 
 An interrupted write retains `.changes/.lock` and its backups. Stop other writers before
 `recover`; it restores the old manifest, Markdown, pending changes and configured version module,
@@ -639,11 +662,12 @@ standard-library change never needs a bootstrap change.
 
 ### Release versions
 
-The compiler is the reference consumer of `silk changes`. Its package version, generated
-`compiler/src/ReleaseVersion.silk`, executable `--version`, `init`'s `package.silk-version`, release
-tag and archive version agree. Versions are ordinary SemVer: `0.1.0`, `0.2.0-beta.1`,
-`0.2.0-rc.1`, then `0.2.0`. Unreleased checkouts retain their last prepared package version;
-commit identity belongs in build receipts, not an invented commit-count release number.
+The compiler is the reference consumer of `silk changes`. Stable versions are ordinary SemVer;
+dev versions are `<next-stable-core>-dev.N+<12-character-commit>`, for example
+`0.1.0-dev.2+a1b2c3d4e5f6`. The numeric counter orders dev releases; the hash is SemVer build
+metadata, not a precedence component. Snapshots and receipts retain the full 40-character SHA.
+The projected manifest, generated version module, executable `--version`, `init`'s
+`package.silk-version`, release tag, and archive version agree.
 
 Include a change file in each compiler or standard-library feature/fix PR, including changes to
 the linked changes CLI:
@@ -653,50 +677,59 @@ silk changes --dir compiler add minor "Describe the user-visible change." \
   --migration "Explain changed APIs, behavior, defaults, or required project edits."
 ```
 
-After those PRs reach `main`, run **Prepare compiler release** with `stable`, `beta`, or `rc`:
+**Stable releases.** Every push to `main` refreshes the draft PR on `release/compiler-stable`.
+The workflow builds the release tool from that exact commit, collects pending compiler changes
+with `silk changes version`, and updates the manifest, generated version module, TOML history,
+changelog, and pending-file deletions together. It verifies bot ownership and uses a guarded
+branch update; human edits are refused rather than overwritten. Selfhost verification is
+explicitly dispatched because `GITHUB_TOKEN` updates do not trigger normal PR workflows.
+To request a refresh manually:
 
 ```sh
-gh workflow run prepare-release.yml --ref main -f channel=stable
+gh workflow run prepare-release.yml --ref main
 ```
 
-It verifies the pinned seed, builds the release tool from the exact checkout, consumes pending
-compiler changes with `silk changes version`, and opens a draft PR containing the manifest,
-generated version module, TOML records, changelog and consumed-file deletions. It explicitly
-dispatches Selfhost verification for that branch; it does not force-push an existing release PR.
-Review and merge the PR before publication.
+Review the release PR, mark it ready, and merge only when ready to announce. Its exact merge
+commit automatically publishes stable after every native gate passes. Preparing or refreshing
+the PR publishes nothing. Keep it unmerged until the first `0.1.0` announcement; the unreleased
+checkout remains `0.0.0` until then. A manual stable retry is allowed only for that managed merge,
+not an arbitrary commit containing a plausible version.
 
-For local preparation, use a native compiler built from this checkout:
+**Dev releases.** Selfhost runs daily at 06:00 UTC, or on demand:
 
 ```sh
-silk changes --dir compiler status
-silk changes --dir compiler version # Add --tag beta or --tag rc for a prerelease.
-silk changes --dir compiler release --json
-git add compiler/silk.toml compiler/src/ReleaseVersion.silk compiler/CHANGELOG.md compiler/.changes
-git commit -m "Prepare compiler release"
+gh workflow run selfhost.yml --ref main -f release=dev
 ```
 
-Once the prepared commit is on `main`, run **Selfhost Silk** with `publish` enabled:
+Dev publication does not run `changes version`, consume pending files, commit a version bump,
+or regenerate the committed changelog. It reserves a repository-global counter in
+`compiler-dev-reservation/N`, generates the native snapshot from the exact source commit, and
+creates a fresh build projection containing only the generated manifest/version-module changes
+and snapshot. N1, N2, and target builds consume that same verified projection. Base and projected
+input digests remain in receipts; source snapshots are never edited in place.
 
-```sh
-gh workflow run selfhost.yml --ref main -f publish=true
-```
+The publication queue serializes main-branch runs without cancelling pending releases. A commit
+already published is not released again as dev; stable release merges are also excluded.
+An interrupted run reuses its reservation and draft. Rerun the original failed workflow to retry
+that exact source. Uploaded assets must match their immutable identities, missing draft assets
+may be added, and published releases are never overwritten or repaired in place.
 
-Publication requires every native gate, validates the committed history and source snapshot,
-checks the executable's identity, and publishes the already-built archives without relabeling
-them. The `v<VERSION>` tag points at that exact commit, including every required TOML record.
-GitHub release notes come from `silk changes release`; stable versions become the latest stable
-release, while beta/rc versions are marked prerelease. Reruns verify existing notes and assets;
-they never replace a published release. Prepare a new version for a new publication.
+Both channels publish `v<VERSION>` at the exact source commit after all native gates. GitHub notes
+come from the native snapshot export. Each archive includes the same `lib/silk/changes-snapshot.toml`
+that is attached separately to the release. Dev snapshots include only pending notes present in
+that source commit. Later edits on `main` cannot change what `since` reports for that release.
+Stable promotion preserves IDs, avoiding repeated guidance unless its content changed.
 
-The installer and `silk changes since` both default to the latest stable release. Select a
-prerelease explicitly with `SILK_RELEASE=v0.2.0-beta.1` when installing or `--to 0.2.0-beta.1`
-when querying history. Archive basenames omit `+build` metadata because GitHub renames assets
-containing `+`; the binary, manifest and tag retain the complete version.
+The installer defaults to stable, using dev only before a stable release exists.
+`SILK_CHANNEL=dev` follows dev; `SILK_CHANNEL=stable` requires stable; `SILK_RELEASE=v<VERSION>`
+selects an exact release. Archives retain the complete version, including literal `+commit`
+metadata; download URLs percent-encode `+`. Installation checks the binary hash, reported
+version, and equality of embedded and standalone snapshots before replacing an installation.
 
-`0.1.0` is the first authoritative compiler history, with an initial baseline of `0.0.0`.
-Older development executables reported `0.1.0` without identifying their source revision;
-their recorded version is not a reliable upgrade baseline. Use `silk changes since --from 0.0.0`
-to review the initial release explicitly. No historical migration coverage is invented.
+`0.0.0` is the initial coverage floor, not a published release. Older development executables
+reported `0.1.0` without reliable source identity or snapshot coverage. Use
+`silk changes since --from 0.0.0` to review the initial changes explicitly against a new published
+snapshot. No historical migration coverage is invented.
 
 The frozen bootstrap bundle remains `bootstrap-v0.0.0`. Future n0 publications use the separate
 `bootstrap-native-v<binary-version>` namespace and remain prereleases, not normal compiler releases.

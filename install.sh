@@ -1,41 +1,85 @@
 #!/bin/sh
-# Installs the newest stable Silk compiler release, or an explicitly selected prerelease.
+# Installs a stable or dev Silk compiler release, or an explicitly selected version.
 #
 #   curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 #
 # Compiler releases are tagged `v<version>`, with one `silk-<version>-<target>.tar.gz` per target.
-# The default matches `silk changes since`: GitHub's latest stable release, never a bootstrap
-# seed or an automatically selected beta/rc. The compiler's SHA-256 and reported version are
-# checked before installing into `$SILK_INSTALL` (default `~/.silk`):
-# `bin/silk` beside its standard library in `lib/silk/stdlib`.
+# Auto selection prefers stable and uses dev only before a stable release exists.
+# SILK_CHANNEL=dev follows published dev snapshots; drafts and bootstrap seeds are excluded.
+# The compiler's SHA-256, reported version and embedded change snapshot are checked before
+# installing `bin/silk` beside `lib/silk/stdlib` into `$SILK_INSTALL` (default `~/.silk`).
 # Downloads made by curl carry no macOS quarantine mark, so Gatekeeper lets the compiler run.
 #
 # Environment:
 #   SILK_INSTALL   install directory (default: ~/.silk)
-#   SILK_RELEASE   explicit release tag, such as v0.1.0 or v0.2.0-beta.1
+#   SILK_RELEASE   exact release tag, such as v0.1.0-dev.2+a1b2c3d4e5f6
+#   SILK_CHANNEL   auto (default), stable, or dev; SILK_RELEASE selects an exact version
 #   GITHUB_TOKEN   optional; raises the GitHub API rate limit
 set -eu
 
 repo=silk-lang/silk
 install_dir=${SILK_INSTALL:-$HOME/.silk}
 release=${SILK_RELEASE:-}
+channel=${SILK_CHANNEL:-auto}
 
 fail() {
   printf 'silk-install: %s\n' "$*" >&2
   exit 1
 }
 
-for tool in curl tar uname mktemp; do
+for tool in curl tar uname mktemp cmp; do
   command -v "$tool" > /dev/null 2>&1 || fail "this installer needs $tool"
 done
 
+case "$channel" in
+  auto | stable | dev) ;;
+  *) fail "SILK_CHANNEL must be auto, stable, or dev" ;;
+esac
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT INT TERM
+
+# Keep 404 distinct: authorization failures and network errors must not switch channels.
 api() {
   if [ -n "${GITHUB_TOKEN:-}" ]; then
-    curl -fsSL -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
-      "https://api.github.com/repos/$repo/$1"
+    status=$(curl -sS -o "$tmp/response.json" -w '%{http_code}' \
+      -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+      "https://api.github.com/repos/$repo/$1") || fail "cannot reach the GitHub release API"
   else
-    curl -fsSL -H 'Accept: application/vnd.github+json' "https://api.github.com/repos/$repo/$1"
+    status=$(curl -sS -o "$tmp/response.json" -w '%{http_code}' \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/$repo/$1") || fail "cannot reach the GitHub release API"
   fi
+  case "$status" in
+    200) cat "$tmp/response.json" ;;
+    404) return 4 ;;
+    *) fail "GitHub release API returned HTTP $status" ;;
+  esac
+}
+
+select_dev() {
+  : > "$tmp/dev-tags"
+  page=1
+  while :; do
+    listing=$(api "releases?per_page=100&page=$page") || fail "cannot discover dev releases"
+    printf '%s\n' "$listing" |
+      grep -Eo '"tag_name"[[:space:]]*:[[:space:]]*"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-dev\.[1-9][0-9]*\+[a-f0-9]{12}"' |
+      cut -d'"' -f4 | cut -c2- >> "$tmp/dev-tags" || true
+    count=$(printf '%s\n' "$listing" | grep -o '"tag_name"' | wc -l | tr -d ' ')
+    [ "$count" -ge 100 ] || break
+    page=$((page + 1))
+  done
+  # POSIX numeric keys order core and dev counter; no platform-specific sort -V.
+  LC_ALL=C sort -t. -k1,1nr -k2,2nr -k3,3nr -k4,4nr "$tmp/dev-tags" > "$tmp/sorted-dev-tags"
+  while IFS= read -r candidate; do
+    encoded=$(printf '%s' "$candidate" | sed 's/+/%2B/g')
+    metadata=$(api "releases/tags/v$encoded") || fail "cannot inspect dev release v$candidate"
+    if printf '%s\n' "$metadata" | grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' &&
+      printf '%s\n' "$metadata" | grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*true'; then
+      release="v$candidate"
+      return 0
+    fi
+  done < "$tmp/sorted-dev-tags"
+  fail "no published dev compiler release is available"
 }
 
 sha256() {
@@ -69,30 +113,37 @@ case "$os" in
   *) fail "Silk has no build for $os yet" ;;
 esac
 
-# GitHub's latest release excludes drafts and prereleases.
-if [ -z "$release" ]; then
-  metadata=$(api releases/latest) || fail "cannot find a stable compiler release; select a published prerelease with SILK_RELEASE"
-  release=$(printf '%s\n' "$metadata" | grep -o '"tag_name": *"v[^"]*"' | cut -d'"' -f4) || true
-  [ -n "$release" ] || fail "the latest release is not a v<version> compiler release"
-else
+if [ -n "$release" ]; then
   release_path=$(printf '%s' "$release" | sed 's/+/%2B/g')
   metadata=$(api "releases/tags/$release_path") || fail "cannot find release $release"
+elif [ "$channel" = dev ]; then
+  select_dev
+elif metadata=$(api releases/latest); then
+  release=$(printf '%s\n' "$metadata" | grep -o '"tag_name": *"v[^"]*"' | cut -d'"' -f4) || true
+  [ -n "$release" ] || fail "the latest release is not a v<version> compiler release"
+  printf '%s\n' "$metadata" | grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*false' ||
+    fail "the latest release is not stable"
+  core=${release%%+*}
+  case "$core" in *-*) fail "the latest release is not stable" ;; esac
+else
+  status=$?
+  [ "$status" = 4 ] && [ "$channel" = auto ] ||
+    fail "cannot find a stable compiler release; use SILK_CHANNEL=dev or SILK_RELEASE"
+  select_dev
 fi
+printf '%s\n' "$metadata" | grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' ||
+  fail "draft releases cannot be installed"
+case "$release" in v[0-9]*) ;; *) fail "not a compiler release tag: $release" ;; esac
+reported_tag=$(printf '%s\n' "$metadata" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4) || true
+[ "$reported_tag" = "$release" ] || fail "GitHub returned a different release tag"
 
-# Preserve SemVer build metadata in a URL path.
+# The full version, including +commit metadata, names the archive and its top directory.
 release_path=$(printf '%s' "$release" | sed 's/+/%2B/g')
-url=$(printf '%s\n' "$metadata" |
-  grep -o "\"browser_download_url\": *\"[^\"]*/silk-[^/\"]*-$target\\.tar\\.gz\"" |
-  head -n 1 | cut -d'"' -f4) || true
-[ -n "$url" ] || fail "release $release has no archive for $target"
-archive=${url##*/}
-top=${archive%.tar.gz}
 version=${release#v}
-[ "$archive" = "silk-${version%%+*}-$target.tar.gz" ] ||
-  fail "archive $archive does not match release $release"
-
-tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT INT TERM
+archive="silk-$version-$target.tar.gz"
+encoded_archive=$(printf '%s' "$archive" | sed 's/+/%2B/g')
+top=${archive%.tar.gz}
+url="https://github.com/$repo/releases/download/$release_path/$encoded_archive"
 
 printf 'Downloading %s from %s\n' "$archive" "$release"
 curl -fSL --progress-bar -o "$tmp/$archive" "$url" || fail "cannot download $url"
@@ -112,6 +163,13 @@ actual=$(sha256 "$tmp/unpacked/$top/bin/silk")
 [ "$actual" = "$expected" ] || fail "bin/silk has SHA-256 $actual, but $release names $expected"
 [ "$("$tmp/unpacked/$top/bin/silk" --version)" = "silk v$version" ] ||
   fail "the compiler does not report the requested version $version"
+[ -f "$tmp/unpacked/$top/lib/silk/changes-snapshot.toml" ] ||
+  fail "the compiler archive has no published change snapshot"
+curl -fsSL -o "$tmp/changes-snapshot.toml" \
+  "https://github.com/$repo/releases/download/$release_path/changes-snapshot.toml" ||
+  fail "cannot download the published change snapshot for $release"
+cmp -s "$tmp/changes-snapshot.toml" "$tmp/unpacked/$top/lib/silk/changes-snapshot.toml" ||
+  fail "the embedded change snapshot differs from the published release"
 
 # Replace only what an earlier install put there, so stale standard-library files go away.
 mkdir -p "$install_dir/bin" "$install_dir/lib"

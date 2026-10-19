@@ -36,6 +36,8 @@ export interface ArchiveOptions {
   readonly version: string
   /** An existing directory that receives `silk-<version>-<target>.tar.gz`. */
   readonly outputDirectory: string
+  /** Immutable native release metadata, embedded verbatim without executing the compiler. */
+  readonly snapshot?: string | undefined
 }
 
 const encoder = new TextEncoder()
@@ -125,12 +127,8 @@ const tree = Effect.fnUntraced(function* (root: string, base: string) {
   return entries
 })
 
-/**
- * The archive's file name and top-level directory: `silk-<version>-<target>`, without the
- * version's build metadata, since GitHub renames release assets that contain `+`.
- */
-export const name = (version: string, target: string) =>
-  `silk-${version.replace(/\+.*$/, '')}-${target}`
+/** The archive's file name and top-level directory retain the exact release version. */
+export const name = (version: string, target: string) => `silk-${version}-${target}`
 
 /** Writes the target's gzip-compressed release archive and answers its path. */
 export const write = Effect.fn('ReleaseArchive.write')(function* (options: ArchiveOptions) {
@@ -152,6 +150,13 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
     { _tag: 'Directory', path: `${top}/lib/silk` },
     ...library,
   ]
+  if (options.snapshot !== undefined)
+    entries.push({
+      _tag: 'File',
+      path: `${top}/lib/silk/changes-snapshot.toml`,
+      bytes: yield* fs.readFile(options.snapshot),
+      executable: false,
+    })
   const archive = tar(entries)
   if (archive === undefined)
     return yield* new ReleaseArchiveError({ message: 'An archive member path is too long' })
@@ -166,7 +171,7 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const usage =
-    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> --stdlib <directory> --target <triple> --output <directory> --version <version>'
+    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> --stdlib <directory> --target <triple> --output <directory> --version <version> [--snapshot <TOML-file>]'
   const cli = Effect.gen(function* () {
     const { values } = yield* Effect.try({
       try: () =>
@@ -177,6 +182,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
             target: { type: 'string' },
             output: { type: 'string' },
             version: { type: 'string' },
+            snapshot: { type: 'string' },
           },
         }),
       catch: (cause) => new ReleaseArchiveError({ message: usage, cause }),
@@ -189,6 +195,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       target: values.target,
       version: values.version,
       outputDirectory: resolve(values.output),
+      snapshot: values.snapshot === undefined ? undefined : resolve(values.snapshot),
     })
     yield* Effect.sync(() => process.stdout.write(`${path}\n`))
   })

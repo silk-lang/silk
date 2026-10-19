@@ -128,14 +128,16 @@ These commands do not commit, tag, publish, or access Git.
 
 `silk changes since` selects compiler upgrades from the project's `package.silk-version`.
 `since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
-selects a target, and `--source ../candidate` reads a local checkout instead of GitHub.
-Published queries use authenticated native HTTPS and require a GitHub Release whose tag contains
-the complete TOML history. See [`compiler/README.md`](compiler/README.md#native-changes) for
-publication requirements, origin configuration, and trust settings.
+selects an exact target. Published queries compare immutable `changes-snapshot.toml` release
+assets, including pending notes that actually shipped in a dev release—not today's open changes.
+Unchanged notes are deduplicated across dev-to-stable promotion; edited migration guidance is
+shown again as updated. `--source PATH` supports offline checkouts and snapshot files.
+See [`compiler/README.md`](compiler/README.md#native-changes) for discovery and trust settings.
 
-The compiler uses this flow itself. **Prepare compiler release** opens a version PR; after it
-is merged, **Selfhost Silk** publishes the exact prepared version with GitHub notes from TOML.
-Stable and explicit beta/rc releases share this path. See the
+The compiler uses this flow itself. A maintained draft release PR collects pending changes;
+merging it publishes stable after the native gates pass. Daily or manually triggered dev releases
+use `0.1.0-dev.N+<commit>` versions without consuming pending notes or changing the committed
+changelog. `0.1.0` remains reserved for the first announcement. See the
 [compiler release procedure](compiler/README.md#release-versions).
 
 ## A short tour

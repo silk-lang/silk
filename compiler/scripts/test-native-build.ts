@@ -16,13 +16,17 @@ import { isVersion } from './SemVer.mjs'
 const ambientPath = Config.String('PATH').pipe(Config.withDefault(''), Effect.orDie)
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown))
 const decodeJson = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))
-const decodeRelease = Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Struct({
-  package: Schema.String,
-  version: Schema.String,
-  tag: Schema.String,
-  prerelease: Schema.Boolean,
-  notes: Schema.String,
-})))
+const decodeRelease = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      package: Schema.String,
+      version: Schema.String,
+      tag: Schema.String,
+      prerelease: Schema.Boolean,
+      notes: Schema.String,
+    }),
+  ),
+)
 
 class VerificationError extends Data.TaggedError('NativeBuildVerificationError')<{
   readonly message: string
@@ -226,10 +230,11 @@ const program = Effect.gen(function* () {
         base: '1.0.0',
         changes: [
           {
-            id: `1.1.0-beta.1/${pendingChange}`,
+            id: pendingChange,
             bump: 'minor',
             summary: correctedSummary,
             migration,
+            updated: false,
           },
         ],
       },
@@ -940,10 +945,16 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(formatting, 'src/c.silk'), 'pub fn c( {\n')
   const formatChecked = yield* invoke(silk, ['format', '--check'], formatting)
   assert.equal(formatChecked.status, 1, formatChecked.stderr)
-  assert.equal(yield* fs.readFileString(join(formatting, 'src/b.silk')), 'pub fn b()->i32{return 2}\n')
+  assert.equal(
+    yield* fs.readFileString(join(formatting, 'src/b.silk')),
+    'pub fn b()->i32{return 2}\n',
+  )
   const rewritten = yield* invoke(silk, ['format'], formatting)
   assert.equal(rewritten.status, 1, rewritten.stderr)
-  assert.equal(yield* fs.readFileString(join(formatting, 'src/b.silk')), 'pub fn b() -> i32 {\n  return 2\n}\n')
+  assert.equal(
+    yield* fs.readFileString(join(formatting, 'src/b.silk')),
+    'pub fn b() -> i32 {\n  return 2\n}\n',
+  )
   assert.equal(yield* fs.readFileString(join(formatting, 'src/c.silk')), 'pub fn c( {\n')
   const cleanedByPath = yield* invoke(silk, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
