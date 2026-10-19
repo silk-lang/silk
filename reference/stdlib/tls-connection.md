@@ -21,8 +21,8 @@ final deadline check.
 ## Gotchas
 
 Direct owned I/O is guarded: typed failure or structured cancellation closes the owner and its
-provider before an ambiguous buffer can be offered again. [`OwnedConnection.shutdownWrite`](#impl.shutdownWrite)
-performs TLS grace for the write direction; [`OwnedConnection.close`](#impl.close) immediately invalidates
+provider before an ambiguous buffer can be offered again. [`OwnedConnection.shutdownWrite`](#OwnedConnection.impl.shutdownWrite)
+performs TLS grace for the write direction; [`OwnedConnection.close`](#OwnedConnection.impl.close) immediately invalidates
 and terminally closes the provider. Scoped close failures are suppressed so they cannot replace
 the protected result. Fatal traps remain outside structured finalization guarantees.
 
@@ -293,7 +293,7 @@ pub externalDeadline: Option<Instant>
 
 Optional caller-owned absolute deadline clamped against the handshake duration.
 
-<a id="impl"></a>
+<a id="ConnectionOptions.impl"></a>
 
 ## Implementation `ConnectionOptions`
 
@@ -301,7 +301,7 @@ Optional caller-owned absolute deadline clamped against the handshake duration.
 impl ConnectionOptions
 ```
 
-<a id="impl.defaults"></a>
+<a id="ConnectionOptions.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -321,15 +321,15 @@ pub struct OwnedConnection<P>
 
 One affine authenticated TLS client owning its exact byte provider.
 
-<a id="impl-2"></a>
+<a id="OwnedConnection.impl"></a>
 
-## Implementation ``
+## Implementation `OwnedConnection<P>`
 
 ```silk
 impl<P> OwnedConnection<P>
 ```
 
-<a id="impl.phase"></a>
+<a id="OwnedConnection.impl.phase"></a>
 
 ### Method `phase`
 
@@ -339,7 +339,7 @@ pub fn phase(self: &Self) -> ConnectionPhase
 
 Returns the current directional, invalid, or terminal phase.
 
-<a id="impl.authentication"></a>
+<a id="OwnedConnection.impl.authentication"></a>
 
 ### Method `authentication`
 
@@ -349,7 +349,7 @@ pub fn authentication<'a>(self: &'a Self) -> Option<Authentication<'a>>
 
 Borrows the authenticated session evidence retained by this connection.
 
-<a id="impl.readSome"></a>
+<a id="OwnedConnection.impl.readSome"></a>
 
 ### Method `readSome`
 
@@ -372,7 +372,7 @@ Reads one verified plaintext prefix or clean authenticated peer end.
 
 Mandatory TLS output is sent first. Underlying end without `close_notify` is truncation.
 
-<a id="impl.writeSome"></a>
+<a id="OwnedConnection.impl.writeSome"></a>
 
 ### Method `writeSome`
 
@@ -391,7 +391,7 @@ pub effect fn writeSome<'connection>(
 
 Encrypts and transmits one positive application prefix.
 
-<a id="impl.flush"></a>
+<a id="OwnedConnection.impl.flush"></a>
 
 ### Method `flush`
 
@@ -406,7 +406,7 @@ pub effect fn flush<'connection>(self: &'connection mut Self, deadline: Option<I
 
 Drains mandatory TLS output and flushes the underlying byte boundary.
 
-<a id="impl.shutdownWrite"></a>
+<a id="OwnedConnection.impl.shutdownWrite"></a>
 
 ### Method `shutdownWrite`
 
@@ -421,7 +421,7 @@ pub effect fn shutdownWrite<'connection>(self: &'connection mut Self, deadline: 
 
 Sends and flushes TLS `close_notify`, then closes only the transport write direction.
 
-<a id="impl.close"></a>
+<a id="OwnedConnection.impl.close"></a>
 
 ### Method `close`
 

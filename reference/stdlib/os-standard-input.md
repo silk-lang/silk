@@ -11,7 +11,7 @@ code. Use a scripted provider in tests to control partial reads, end-of-input, a
 ## Details
 The provider remembers observed end-of-input and commits each libc read directly into the caller's
 buffer. For a non-empty buffer, a zero-length host transfer becomes the outcome selected by
-[`StandardInput.endOfInput`](./standard-input.md#impl.endOfInput). Only a host read error becomes [`StreamReadError`](./standard-input.md#StreamReadError). Partial transfer counts are
+[`StandardInput.endOfInput`](./standard-input.md#StandardInput.impl.endOfInput). Only a host read error becomes [`StreamReadError`](./standard-input.md#StreamReadError). Partial transfer counts are
 preserved exactly.
 
 Constructing the provider performs no read. Portable code reads after the application supplies
@@ -55,7 +55,7 @@ A native [`StandardInput`](./standard-input.md#StandardInput) provider for the p
 The process owns the descriptor. Each read changes only the committed prefix of the caller's
 buffer and preserves the host transfer count.
 
-<a id="impl"></a>
+<a id="OsStandardInput.impl"></a>
 
 ## Implementation `OsStandardInput`
 
@@ -63,7 +63,7 @@ buffer and preserves the host transfer count.
 impl OsStandardInput
 ```
 
-<a id="impl-2"></a>
+<a id="OsStandardInput.impl-2"></a>
 
 ## Implementation `OsStandardInput`
 
@@ -71,7 +71,7 @@ impl OsStandardInput
 impl OsStandardInput
 ```
 
-<a id="impl.make"></a>
+<a id="OsStandardInput.impl.make"></a>
 
 ### Associated function `make`
 
@@ -91,7 +91,7 @@ portable code that calls `silk.standard_input.receive`.
 Construction initializes only the EOF flag and cannot fail. For a non-empty read buffer, a zero-byte
 host transfer becomes end-of-input data. A host read error becomes [`StreamReadError`](./standard-input.md#StreamReadError).
 
-<a id="impl-3"></a>
+<a id="OsStandardInput.impl.StandardInput"></a>
 
 ## Implementation `StandardInput for OsStandardInput`
 
@@ -99,7 +99,7 @@ host transfer becomes end-of-input data. A host read error becomes [`StreamReadE
 impl StandardInput for OsStandardInput
 ```
 
-<a id="impl.read"></a>
+<a id="OsStandardInput.impl.StandardInput.read"></a>
 
 ### Operation `read`
 

@@ -113,7 +113,7 @@ pub nodes: usize
 
 Maximum traversed TLV count per certificate; opaque payloads do not add nodes.
 
-<a id="impl"></a>
+<a id="DecodeLimits.impl.Copy"></a>
 
 ## Implementation `Copy for DecodeLimits`
 
@@ -121,7 +121,7 @@ Maximum traversed TLV count per certificate; opaque payloads do not add nodes.
 impl Copy for DecodeLimits
 ```
 
-<a id="impl-2"></a>
+<a id="DecodeLimits.impl"></a>
 
 ## Implementation `DecodeLimits`
 
@@ -129,7 +129,7 @@ impl Copy for DecodeLimits
 impl DecodeLimits
 ```
 
-<a id="impl.defaults"></a>
+<a id="DecodeLimits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -593,7 +593,7 @@ pub offset: usize
 
 The offending byte, TLV tag, or end offset when required input is missing.
 
-<a id="impl-3"></a>
+<a id="DecodeError.impl.Copy"></a>
 
 ## Implementation `Copy for DecodeError`
 
@@ -671,7 +671,7 @@ pub second: u8
 
 The second, from 0 through 59.
 
-<a id="impl-4"></a>
+<a id="CertificateTime.impl.Copy"></a>
 
 ## Implementation `Copy for CertificateTime`
 
@@ -964,7 +964,7 @@ An immutable owned certificate that preserves its original DER and all raw exten
 Accessors borrow this owner. Dropping the certificate releases all owned storage.
 Unknown algorithms, duplicate extensions, and policy-invalid serials remain available to independent validators.
 
-<a id="impl-5"></a>
+<a id="Certificate.impl"></a>
 
 ## Implementation `Certificate`
 
@@ -972,7 +972,7 @@ Unknown algorithms, duplicate extensions, and policy-invalid serials remain avai
 impl Certificate
 ```
 
-<a id="impl.copy"></a>
+<a id="Certificate.impl.copy"></a>
 
 ### Method `copy`
 
@@ -988,7 +988,7 @@ The copy preserves every original DER byte, checked field offset, algorithm spel
 extension in source order. Allocation refusal releases partial storage and returns
 `OutOfMemoryError`; no semantic validation is performed.
 
-<a id="impl.decodeDer"></a>
+<a id="Certificate.impl.decodeDer"></a>
 
 ### Associated function `decodeDer`
 
@@ -1009,7 +1009,7 @@ No partial result escapes. The result retains no input borrow. Trailing bytes, i
 
 Success does not verify signatures, trust, names, or current validity. Extensions remain opaque.
 
-<a id="impl.decodePem"></a>
+<a id="Certificate.impl.decodePem"></a>
 
 ### Associated function `decodePem`
 
@@ -1032,7 +1032,7 @@ Allocation refusal uses `OutOfMemoryError`; no partial certificate escapes.
 This strict profile rejects explanatory text and VT/FF that permissive RFC 7468 readers can ignore.
 Success does not establish trust or validate a signature.
 
-<a id="impl.tbsDer"></a>
+<a id="Certificate.impl.tbsDer"></a>
 
 ### Method `tbsDer`
 
@@ -1042,7 +1042,7 @@ pub fn tbsDer(self: &Self) -> &[u8]
 
 Borrows the complete original signed TBSCertificate TLV; the view cannot outlive this owner.
 
-<a id="impl.issuerDer"></a>
+<a id="Certificate.impl.issuerDer"></a>
 
 ### Method `issuerDer`
 
@@ -1052,7 +1052,7 @@ pub fn issuerDer(self: &Self) -> &[u8]
 
 Borrows the complete issuer Name TLV, without normalization; the view cannot outlive this owner.
 
-<a id="impl.subjectDer"></a>
+<a id="Certificate.impl.subjectDer"></a>
 
 ### Method `subjectDer`
 
@@ -1062,7 +1062,7 @@ pub fn subjectDer(self: &Self) -> &[u8]
 
 Borrows the complete subject Name TLV, without normalization; the view cannot outlive this owner.
 
-<a id="impl.validityDer"></a>
+<a id="Certificate.impl.validityDer"></a>
 
 ### Method `validityDer`
 
@@ -1072,7 +1072,7 @@ pub fn validityDer(self: &Self) -> &[u8]
 
 Borrows the complete original Validity TLV; the view cannot outlive this owner.
 
-<a id="impl.spkiDer"></a>
+<a id="Certificate.impl.spkiDer"></a>
 
 ### Method `spkiDer`
 
@@ -1082,7 +1082,7 @@ pub fn spkiDer(self: &Self) -> &[u8]
 
 Borrows the complete original SubjectPublicKeyInfo TLV; the view cannot outlive this owner.
 
-<a id="impl.der"></a>
+<a id="Certificate.impl.der"></a>
 
 ### Method `der`
 
@@ -1092,7 +1092,7 @@ pub fn der(self: &Self) -> &[u8]
 
 Borrows all original DER bytes; the view cannot outlive this owner.
 
-<a id="impl.version"></a>
+<a id="Certificate.impl.version"></a>
 
 ### Method `version`
 
@@ -1102,7 +1102,7 @@ pub fn version(self: &Self) -> CertificateVersion
 
 Returns the structural certificate version without imposing validation policy.
 
-<a id="impl.offsets"></a>
+<a id="Certificate.impl.offsets"></a>
 
 ### Method `offsets`
 
@@ -1112,7 +1112,7 @@ pub fn offsets(self: &Self) -> CertificateOffsets
 
 Returns stable byte offsets for semantic diagnostics over the retained DER.
 
-<a id="impl.serial"></a>
+<a id="Certificate.impl.serial"></a>
 
 ### Method `serial`
 
@@ -1122,7 +1122,7 @@ pub fn serial(self: &Self) -> &[u8]
 
 Borrows minimal signed INTEGER content, including a required sign octet; the view borrows this owner.
 
-<a id="impl.notBefore"></a>
+<a id="Certificate.impl.notBefore"></a>
 
 ### Method `notBefore`
 
@@ -1132,7 +1132,7 @@ pub fn notBefore(self: &Self) -> CertificateTime
 
 Returns the decoded UTC lower validity boundary without consulting a clock.
 
-<a id="impl.notAfter"></a>
+<a id="Certificate.impl.notAfter"></a>
 
 ### Method `notAfter`
 
@@ -1142,7 +1142,7 @@ pub fn notAfter(self: &Self) -> CertificateTime
 
 Returns the decoded UTC upper validity boundary without checking interval order.
 
-<a id="impl.publicKey"></a>
+<a id="Certificate.impl.publicKey"></a>
 
 ### Method `publicKey`
 
@@ -1152,7 +1152,7 @@ pub fn publicKey<'a>(self: &'a Self) -> BitStringView<'a>
 
 Borrows the original subjectPublicKey payload and unused-bit count; the view borrows this owner.
 
-<a id="impl.signature"></a>
+<a id="Certificate.impl.signature"></a>
 
 ### Method `signature`
 
@@ -1162,7 +1162,7 @@ pub fn signature<'a>(self: &'a Self) -> BitStringView<'a>
 
 Borrows the original signatureValue payload and unused-bit count; the view borrows this owner.
 
-<a id="impl.publicKeyAlgorithm"></a>
+<a id="Certificate.impl.publicKeyAlgorithm"></a>
 
 ### Method `publicKeyAlgorithm`
 
@@ -1172,7 +1172,7 @@ pub fn publicKeyAlgorithm<'a>(self: &'a Self) -> AlgorithmView<'a>
 
 Borrows the SPKI AlgorithmIdentifier, preserving parameter absence and original encoding.
 
-<a id="impl.tbsSignatureAlgorithm"></a>
+<a id="Certificate.impl.tbsSignatureAlgorithm"></a>
 
 ### Method `tbsSignatureAlgorithm`
 
@@ -1182,7 +1182,7 @@ pub fn tbsSignatureAlgorithm<'a>(self: &'a Self) -> AlgorithmView<'a>
 
 Borrows the TBSCertificate signature AlgorithmIdentifier, preserving parameter absence and original encoding.
 
-<a id="impl.signatureAlgorithm"></a>
+<a id="Certificate.impl.signatureAlgorithm"></a>
 
 ### Method `signatureAlgorithm`
 
@@ -1192,7 +1192,7 @@ pub fn signatureAlgorithm<'a>(self: &'a Self) -> AlgorithmView<'a>
 
 Borrows the outer signature AlgorithmIdentifier, preserving parameter absence and original encoding.
 
-<a id="impl.issuerUniqueId"></a>
+<a id="Certificate.impl.issuerUniqueId"></a>
 
 ### Method `issuerUniqueId`
 
@@ -1202,7 +1202,7 @@ pub fn issuerUniqueId<'a>(self: &'a Self) -> Option<BitStringView<'a>>
 
 Borrows the optional unique ID and unused-bit count; absence returns `None`. The view borrows this owner.
 
-<a id="impl.subjectUniqueId"></a>
+<a id="Certificate.impl.subjectUniqueId"></a>
 
 ### Method `subjectUniqueId`
 
@@ -1212,7 +1212,7 @@ pub fn subjectUniqueId<'a>(self: &'a Self) -> Option<BitStringView<'a>>
 
 Borrows the optional unique ID and unused-bit count; absence returns `None`. The view borrows this owner.
 
-<a id="impl.extensionCount"></a>
+<a id="Certificate.impl.extensionCount"></a>
 
 ### Method `extensionCount`
 
@@ -1222,7 +1222,7 @@ pub fn extensionCount(self: &Self) -> usize
 
 Returns the extension count, including duplicates and unknown OIDs.
 
-<a id="impl.extension"></a>
+<a id="Certificate.impl.extension"></a>
 
 ### Method `extension`
 

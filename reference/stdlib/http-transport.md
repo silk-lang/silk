@@ -113,7 +113,7 @@ effect fn close() -> () ! TransportError ? &mut HttpTransport with Intrinsic.non
 
 Closes the logical lease without parking; repeated calls complete locally.
 
-<a id="impl"></a>
+<a id="HttpTransport.impl"></a>
 
 ## Implementation `HttpTransport`
 
@@ -121,7 +121,7 @@ Closes the logical lease without parking; repeated calls complete locally.
 impl HttpTransport
 ```
 
-<a id="impl.readSome"></a>
+<a id="HttpTransport.impl.readSome"></a>
 
 ### Associated function `readSome`
 
@@ -133,7 +133,7 @@ pub effect fn readSome(output: &mut [u8], deadline: Option<Instant>) -> ReadTran
 
 Reads one validated positive prefix or transport end; empty output completes locally.
 
-<a id="impl.writeSome"></a>
+<a id="HttpTransport.impl.writeSome"></a>
 
 ### Associated function `writeSome`
 
@@ -185,17 +185,17 @@ pub fn secured<'provider, P>(provider: &'provider mut OwnedConnection<P>) -> Sec
 
 Borrows one exact authenticated connection without allocation or I/O.
 
-<a id="impl-2"></a>
+<a id="Plain.impl"></a>
 
-## Implementation ``
+## Implementation `Plain<'provider, P>`
 
 ```silk
 impl<'provider, P> Plain<'provider, P>
 ```
 
-<a id="impl-3"></a>
+<a id="Plain.impl.HttpTransport"></a>
 
-## Implementation ` HttpTransport for  `
+## Implementation `HttpTransport for Plain<'provider, P>`
 
 ```silk
 impl<'provider, P> HttpTransport for Plain<'provider, P>
@@ -205,7 +205,7 @@ where
   &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
-<a id="impl.readSomeRaw"></a>
+<a id="Plain.impl.HttpTransport.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -213,7 +213,7 @@ where
 readSomeRaw: Plain.read
 ```
 
-<a id="impl.writeSomeRaw"></a>
+<a id="Plain.impl.HttpTransport.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -221,7 +221,7 @@ readSomeRaw: Plain.read
 writeSomeRaw: Plain.write
 ```
 
-<a id="impl.flush"></a>
+<a id="Plain.impl.HttpTransport.flush"></a>
 
 ### Operation `flush`
 
@@ -229,7 +229,7 @@ writeSomeRaw: Plain.write
 flush: Plain.flushOutput
 ```
 
-<a id="impl.close"></a>
+<a id="Plain.impl.HttpTransport.close"></a>
 
 ### Operation `close`
 
@@ -237,17 +237,17 @@ flush: Plain.flushOutput
 close: Plain.closeLease
 ```
 
-<a id="impl-4"></a>
+<a id="Secured.impl"></a>
 
-## Implementation ``
+## Implementation `Secured<'provider, P>`
 
 ```silk
 impl<'provider, P> Secured<'provider, P>
 ```
 
-<a id="impl-5"></a>
+<a id="Secured.impl.HttpTransport"></a>
 
-## Implementation ` HttpTransport for  `
+## Implementation `HttpTransport for Secured<'provider, P>`
 
 ```silk
 impl<'provider, P> HttpTransport for Secured<'provider, P>
@@ -257,7 +257,7 @@ where
   &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
-<a id="impl.readSomeRaw-2"></a>
+<a id="Secured.impl.HttpTransport.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -265,7 +265,7 @@ where
 readSomeRaw: Secured.read
 ```
 
-<a id="impl.writeSomeRaw-2"></a>
+<a id="Secured.impl.HttpTransport.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -273,7 +273,7 @@ readSomeRaw: Secured.read
 writeSomeRaw: Secured.write
 ```
 
-<a id="impl.flush-2"></a>
+<a id="Secured.impl.HttpTransport.flush"></a>
 
 ### Operation `flush`
 
@@ -281,7 +281,7 @@ writeSomeRaw: Secured.write
 flush: Secured.flushOutput
 ```
 
-<a id="impl.close-2"></a>
+<a id="Secured.impl.HttpTransport.close"></a>
 
 ### Operation `close`
 
@@ -309,17 +309,17 @@ pub fn borrow<'provider, P>(provider: &'provider mut P) -> Loan<'provider, P>
 
 Borrows one HTTP provider for a scoped owned client session without allocation.
 
-<a id="impl-6"></a>
+<a id="Loan.impl"></a>
 
-## Implementation ``
+## Implementation `Loan<'provider, P>`
 
 ```silk
 impl<'provider, P> Loan<'provider, P>
 ```
 
-<a id="impl-7"></a>
+<a id="Loan.impl.HttpTransport"></a>
 
-## Implementation ` HttpTransport for  `
+## Implementation `HttpTransport for Loan<'provider, P>`
 
 ```silk
 impl<'provider, P> HttpTransport for Loan<'provider, P>
@@ -328,7 +328,7 @@ where
   &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
 ```
 
-<a id="impl.readSomeRaw-3"></a>
+<a id="Loan.impl.HttpTransport.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -336,7 +336,7 @@ where
 readSomeRaw: Loan.read
 ```
 
-<a id="impl.writeSomeRaw-3"></a>
+<a id="Loan.impl.HttpTransport.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -344,7 +344,7 @@ readSomeRaw: Loan.read
 writeSomeRaw: Loan.write
 ```
 
-<a id="impl.flush-3"></a>
+<a id="Loan.impl.HttpTransport.flush"></a>
 
 ### Operation `flush`
 
@@ -352,7 +352,7 @@ writeSomeRaw: Loan.write
 flush: Loan.flushOutput
 ```
 
-<a id="impl.close-3"></a>
+<a id="Loan.impl.HttpTransport.close"></a>
 
 ### Operation `close`
 
@@ -360,9 +360,9 @@ flush: Loan.flushOutput
 close: Loan.closeLease
 ```
 
-<a id="impl-8"></a>
+<a id="Loan.impl.ByteDuplex"></a>
 
-## Implementation ` ByteDuplex for  `
+## Implementation `ByteDuplex for Loan<'provider, P>`
 
 ```silk
 impl<'provider, P> ByteDuplex for Loan<'provider, P>
@@ -371,7 +371,7 @@ where
   &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
-<a id="impl.readSomeRaw-4"></a>
+<a id="Loan.impl.ByteDuplex.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -379,7 +379,7 @@ where
 readSomeRaw: Loan.readBytes
 ```
 
-<a id="impl.writeSomeRaw-4"></a>
+<a id="Loan.impl.ByteDuplex.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -387,7 +387,7 @@ readSomeRaw: Loan.readBytes
 writeSomeRaw: Loan.writeBytes
 ```
 
-<a id="impl.flushRaw"></a>
+<a id="Loan.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`
 
@@ -395,7 +395,7 @@ writeSomeRaw: Loan.writeBytes
 flushRaw: Loan.flushBytes
 ```
 
-<a id="impl.shutdownWriteRaw"></a>
+<a id="Loan.impl.ByteDuplex.shutdownWriteRaw"></a>
 
 ### Operation `shutdownWriteRaw`
 
@@ -403,7 +403,7 @@ flushRaw: Loan.flushBytes
 shutdownWriteRaw: Loan.shutdownBytes
 ```
 
-<a id="impl.closeRaw"></a>
+<a id="Loan.impl.ByteDuplex.closeRaw"></a>
 
 ### Operation `closeRaw`
 

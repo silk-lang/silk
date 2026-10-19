@@ -5,7 +5,7 @@
 Explicit JSON serialization of visible named aggregate fields.
 
 ## When to use
-Use [`JsonReflect.write`](#impl.write) for a struct whose visible fields each implement `Serialize`.
+Use [`JsonReflect.write`](#JsonReflect.impl.write) for a struct whose visible fields each implement `Serialize`.
 Call it directly or from the struct's hand-written `Serialize` witness.
 
 ## Details
@@ -31,7 +31,7 @@ pub struct JsonReflect
 
 Operations for writing the visible projection of a named aggregate.
 
-<a id="impl"></a>
+<a id="JsonReflect.impl"></a>
 
 ## Implementation `JsonReflect`
 
@@ -39,7 +39,7 @@ Operations for writing the visible projection of a named aggregate.
 impl JsonReflect
 ```
 
-<a id="impl.write"></a>
+<a id="JsonReflect.impl.write"></a>
 
 ### Associated function `write`
 

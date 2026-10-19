@@ -32,7 +32,7 @@ pub struct OsSystemClock
 
 A stateless native provider; construction makes no call and failed operations trap.
 
-<a id="impl"></a>
+<a id="OsSystemClock.impl"></a>
 
 ## Implementation `OsSystemClock`
 
@@ -40,7 +40,7 @@ A stateless native provider; construction makes no call and failed operations tr
 impl OsSystemClock
 ```
 
-<a id="impl.make"></a>
+<a id="OsSystemClock.impl.make"></a>
 
 ### Associated function `make`
 
@@ -50,7 +50,7 @@ pub fn make() -> OsSystemClock
 
 Creates a native clock provider without reading the clock or installing a default.
 
-<a id="impl-2"></a>
+<a id="OsSystemClock.impl.SystemClock"></a>
 
 ## Implementation `SystemClock for OsSystemClock`
 
@@ -58,7 +58,7 @@ Creates a native clock provider without reading the clock or installing a defaul
 impl SystemClock for OsSystemClock
 ```
 
-<a id="impl.now"></a>
+<a id="OsSystemClock.impl.SystemClock.now"></a>
 
 ### Operation `now`
 
@@ -66,7 +66,7 @@ impl SystemClock for OsSystemClock
 effect fn now(self: &mut Self) -> Instant
 ```
 
-<a id="impl.getResolution"></a>
+<a id="OsSystemClock.impl.SystemClock.getResolution"></a>
 
 ### Operation `getResolution`
 

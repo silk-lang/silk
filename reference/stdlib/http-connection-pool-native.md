@@ -50,7 +50,7 @@ pub fn limitsEqual(left: &Limits, right: &Limits) -> bool
 
 Compares every HTTP connection, parser, framing, capacity, and discard limit.
 
-<a id="impl"></a>
+<a id="Context.impl"></a>
 
 ## Implementation `Context`
 
@@ -58,9 +58,9 @@ Compares every HTTP connection, parser, framing, capacity, and discard limit.
 impl Context
 ```
 
-<a id="impl-2"></a>
+<a id="Context.impl.PoolContextCopy"></a>
 
-## Implementation `  for Context `
+## Implementation `PoolContextCopy<TrustSourceError | OutOfMemoryError ? &mut Allocator> for Context`
 
 ```silk
 impl PoolContextCopy<
@@ -68,7 +68,7 @@ impl PoolContextCopy<
 > for Context
 ```
 
-<a id="impl.copy"></a>
+<a id="Context.impl.PoolContextCopy.copy"></a>
 
 ### Operation `copy`
 
@@ -76,9 +76,9 @@ impl PoolContextCopy<
 copy: Context.copyContext
 ```
 
-<a id="impl-3"></a>
+<a id="Context.impl.PoolContext"></a>
 
-## Implementation `  for Context `
+## Implementation `PoolContext<ConnectionKey, NativeTransport, NativeClientError | ClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random> for Context`
 
 ```silk
 impl PoolContext<
@@ -96,7 +96,7 @@ impl PoolContext<
 > for Context
 ```
 
-<a id="impl.accepts"></a>
+<a id="Context.impl.PoolContext.accepts"></a>
 
 ### Operation `accepts`
 
@@ -104,7 +104,7 @@ impl PoolContext<
 accepts: Context.acceptsKey
 ```
 
-<a id="impl.acquire"></a>
+<a id="Context.impl.PoolContext.acquire"></a>
 
 ### Operation `acquire`
 

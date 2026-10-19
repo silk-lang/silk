@@ -44,7 +44,7 @@ pub struct DirectoryHandle
 
 An affine directory stream retaining an owned name across an insufficient-buffer retry.
 
-<a id="impl"></a>
+<a id="DirectoryHandle.impl.Drop"></a>
 
 ## Implementation `Drop for DirectoryHandle`
 
@@ -52,7 +52,7 @@ An affine directory stream retaining an owned name across an insufficient-buffer
 impl Drop for DirectoryHandle
 ```
 
-<a id="impl.drop"></a>
+<a id="DirectoryHandle.impl.Drop.drop"></a>
 
 ### Operation `drop`
 
@@ -70,7 +70,7 @@ pub struct NativeFileSystem
 
 Descriptor-relative filesystem operations with source-owned error and lifetime policy.
 
-<a id="impl-2"></a>
+<a id="NativeFileSystem.impl"></a>
 
 ## Implementation `NativeFileSystem`
 
@@ -78,7 +78,7 @@ Descriptor-relative filesystem operations with source-owned error and lifetime p
 impl NativeFileSystem
 ```
 
-<a id="impl.openFile"></a>
+<a id="NativeFileSystem.impl.openFile"></a>
 
 ### Associated function `openFile`
 
@@ -88,7 +88,7 @@ pub effect fn openFile(root: &[u8], path: &[u8], writing: bool, operation: i32) 
 
 Opens and validates a regular file; writes truncate only after successful kind inspection.
 
-<a id="impl.createFile"></a>
+<a id="NativeFileSystem.impl.createFile"></a>
 
 ### Associated function `createFile`
 
@@ -104,7 +104,7 @@ Existing files, directories and final symlinks report AlreadyExists. A successfu
 mode 0666 filtered by umask. Readers may see a prefix while writing; a later write or close
 failure leaves the newly created, possibly partial file in place. This does not synchronize.
 
-<a id="impl.writeFileAtomic"></a>
+<a id="NativeFileSystem.impl.writeFileAtomic"></a>
 
 ### Associated function `writeFileAtomic`
 
@@ -133,7 +133,7 @@ Newly published inodes use 0666 filtered by umask and normal filesystem inherita
 metadata is copied and old hard links retain the old inode. Callers must not concurrently
 remove or replace provider-owned staging entries; this is not a hostile-directory sandbox.
 
-<a id="impl.syncDirectory"></a>
+<a id="NativeFileSystem.impl.syncDirectory"></a>
 
 ### Associated function `syncDirectory`
 
@@ -148,7 +148,7 @@ Synchronizes an owned no-follow directory descriptor and reports sync or one-sho
 Darwin and GNU/Linux use ordinary fsync, not a stronger hardware-cache flush. EINVAL,
 ENOTSUP/EOPNOTSUPP and ENOSYS from synchronization report Unsupported with the native code.
 
-<a id="impl.openDirectory"></a>
+<a id="NativeFileSystem.impl.openDirectory"></a>
 
 ### Associated function `openDirectory`
 
@@ -158,7 +158,7 @@ pub effect fn openDirectory(root: &[u8], path: &[u8], operation: i32) -> Directo
 
 Opens a directory and transfers its descriptor to a stream only after fdopendir succeeds.
 
-<a id="impl.inspect"></a>
+<a id="NativeFileSystem.impl.inspect"></a>
 
 ### Associated function `inspect`
 
@@ -168,7 +168,7 @@ pub effect fn inspect(root: &[u8], path: &[u8], outputKind: &mut i32, length: &m
 
 Inspects a no-follow child and returns regular-file or directory metadata.
 
-<a id="impl.command"></a>
+<a id="NativeFileSystem.impl.command"></a>
 
 ### Associated function `command`
 
@@ -178,7 +178,7 @@ pub effect fn command(root: &[u8], path: &[u8], command: i32, operation: i32) ->
 
 Creates or removes one normalized child, rejecting replacement through symlinks.
 
-<a id="impl.readFile"></a>
+<a id="NativeFileSystem.impl.readFile"></a>
 
 ### Associated function `readFile`
 
@@ -188,7 +188,7 @@ pub effect fn readFile(handle: &mut FileHandle, output: &mut [u8], operation: i3
 
 Reads one checked prefix, retrying EINTR and leaving the remaining initialized tail unchanged.
 
-<a id="impl.writeFile"></a>
+<a id="NativeFileSystem.impl.writeFile"></a>
 
 ### Associated function `writeFile`
 
@@ -198,7 +198,7 @@ pub effect fn writeFile(handle: &mut FileHandle, input: &[u8], operation: i32) -
 
 Completes initialized bytes, advancing after positive counts and preserving failure prefixes.
 
-<a id="impl.next"></a>
+<a id="NativeFileSystem.impl.next"></a>
 
 ### Associated function `next`
 
@@ -211,7 +211,7 @@ Copies the next owned byte name, retaining it when output capacity is insufficie
 #### Details
 False reports required capacity without advancing; true with zero count is latched EOF.
 
-<a id="impl.createUnique"></a>
+<a id="NativeFileSystem.impl.createUnique"></a>
 
 ### Associated function `createUnique`
 
@@ -221,7 +221,7 @@ pub effect fn createUnique(root: &[u8], path: &[u8], prefix: &[u8], counter: &mu
 
 Exclusively creates one predictable counter name, retrying at most 128 collisions.
 
-<a id="impl.closeFile"></a>
+<a id="NativeFileSystem.impl.closeFile"></a>
 
 ### Associated function `closeFile`
 
@@ -231,7 +231,7 @@ pub effect fn closeFile(value: FileHandle, operation: FileOperation) -> () ! Fil
 
 Consumes a file and reports its one close attempt, without retrying EINTR.
 
-<a id="impl.closeDirectory"></a>
+<a id="NativeFileSystem.impl.closeDirectory"></a>
 
 ### Associated function `closeDirectory`
 

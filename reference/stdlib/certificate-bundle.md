@@ -39,7 +39,7 @@ An immutable owned sequence that preserves every decoded certificate in input or
 The bundle releases all certificate storage on drop. Borrowed certificates cannot outlive the bundle.
 Duplicate certificates remain separate entries. Decoding does not assign trust or chain order.
 
-<a id="impl"></a>
+<a id="CertificateBundle.impl"></a>
 
 ## Implementation `CertificateBundle`
 
@@ -47,7 +47,7 @@ Duplicate certificates remain separate entries. Decoding does not assign trust o
 impl CertificateBundle
 ```
 
-<a id="impl.decodePem"></a>
+<a id="CertificateBundle.impl.decodePem"></a>
 
 ### Associated function `decodePem`
 
@@ -72,7 +72,7 @@ Allocation refusal uses `OutOfMemoryError`. Every failure releases accumulated c
 Only CERTIFICATE labels and SP, HT, CR, and LF whitespace are accepted.
 Explanatory text and malformed later blocks fail the entire document. This operation does not validate trust.
 
-<a id="impl.decodeAnnotatedPem"></a>
+<a id="CertificateBundle.impl.decodeAnnotatedPem"></a>
 
 ### Associated function `decodeAnnotatedPem`
 
@@ -92,9 +92,9 @@ Annotation bytes count toward the input budget. An annotation-only document is i
 
 #### Gotchas
 
-This operation establishes no authority. Use [`decodePem`](#impl.decodePem) when all non-PEM text must fail.
+This operation establishes no authority. Use [`decodePem`](#CertificateBundle.impl.decodePem) when all non-PEM text must fail.
 
-<a id="impl.length"></a>
+<a id="CertificateBundle.impl.length"></a>
 
 ### Method `length`
 
@@ -104,7 +104,7 @@ pub fn length(self: &Self) -> usize
 
 Returns the number of certificates, including duplicate entries.
 
-<a id="impl.get"></a>
+<a id="CertificateBundle.impl.get"></a>
 
 ### Method `get`
 
@@ -118,7 +118,7 @@ Borrows the certificate at `index`, or returns `None` when the index is outside 
 
 The returned certificate cannot outlive this bundle. This operation allocates nothing and preserves input order.
 
-<a id="impl.intoCertificates"></a>
+<a id="CertificateBundle.impl.intoCertificates"></a>
 
 ### Method `intoCertificates`
 
@@ -130,7 +130,7 @@ Consumes the bundle and returns every owned certificate without allocating or co
 
 #### When to use
 
-Use this function when another owner must take the complete decoded sequence. Use [`get`](#impl.get) to
+Use this function when another owner must take the complete decoded sequence. Use [`get`](#CertificateBundle.impl.get) to
 inspect one certificate without consuming the bundle.
 
 #### Details

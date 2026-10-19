@@ -5,8 +5,8 @@
 Owned dynamic JSON values parsed from a byte slice and written through the ambient Writer.
 
 ## When to use
-Use [`Json.parse`](#impl.parse) when a document needs borrowed field access after parsing. Use
-[`Json.write`](#impl.write) or [`Json.writeWith`](#impl.writeWith) to serialize an owned tree. Token-only consumers can use
+Use [`Json.parse`](#Json.impl.parse) when a document needs borrowed field access after parsing. Use
+[`Json.write`](#Json.impl.write) or [`Json.writeWith`](#Json.impl.writeWith) to serialize an owned tree. Token-only consumers can use
 `silk.json_scanner` without an allocator.
 
 ## Details
@@ -256,7 +256,7 @@ pub struct Json
 
 Operations on owned JSON values.
 
-<a id="impl"></a>
+<a id="Json.impl"></a>
 
 ## Implementation `Json`
 
@@ -264,7 +264,7 @@ Operations on owned JSON values.
 impl Json
 ```
 
-<a id="impl.parse"></a>
+<a id="Json.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -278,7 +278,7 @@ Parses one complete strict JSON document into an owned value tree.
 Every allocation is charged to the ambient allocator. On syntax, duplicate-key, or
 allocation failure, the partially built tree is dropped.
 
-<a id="impl.decode"></a>
+<a id="Json.impl.decode"></a>
 
 ### Associated function `decode`
 
@@ -288,7 +288,7 @@ pub fn decode<T: Decode>(bytes: &[u8]) -> Result<T, JsonError>
 
 Decodes one complete JSON document without an allocator requirement.
 
-<a id="impl.deserialize"></a>
+<a id="Json.impl.deserialize"></a>
 
 ### Associated function `deserialize`
 
@@ -299,7 +299,7 @@ pub effect fn deserialize<T: Deserialize>(bytes: &[u8])
 
 Deserializes one complete JSON document, with allocation charged to the ambient allocator.
 
-<a id="impl.serialize"></a>
+<a id="Json.impl.serialize"></a>
 
 ### Associated function `serialize`
 
@@ -310,7 +310,7 @@ pub effect fn serialize<T: Serialize>(value: &T, options: &JsonOptions)
 
 Serializes one value through its static witness and the ambient Writer.
 
-<a id="impl.write"></a>
+<a id="Json.impl.write"></a>
 
 ### Associated function `write`
 
@@ -320,7 +320,7 @@ pub effect fn write(document: &Value) -> () ! JsonError | WriterError ? &mut Wri
 
 Writes a tree compactly through the ambient Writer.
 
-<a id="impl.writeWith"></a>
+<a id="Json.impl.writeWith"></a>
 
 ### Associated function `writeWith`
 
@@ -331,7 +331,7 @@ pub effect fn writeWith(document: &Value, options: &JsonOptions)
 
 Writes a tree with explicit indentation and depth policy.
 
-<a id="impl.field"></a>
+<a id="Json.impl.field"></a>
 
 ### Method `field`
 
@@ -341,7 +341,7 @@ pub fn field<'a>(self: &'a Value, key: string) -> Option<&'a Value>
 
 Borrows a member of an object, or returns `None` for an absent key or other value kind.
 
-<a id="impl.fieldAt"></a>
+<a id="Json.impl.fieldAt"></a>
 
 ### Method `fieldAt`
 
@@ -351,7 +351,7 @@ pub fn fieldAt<'a>(self: Option<&'a Value>, key: string) -> Option<&'a Value>
 
 Chains an object lookup while preserving an absent value.
 
-<a id="impl.asI32"></a>
+<a id="Json.impl.asI32"></a>
 
 ### Method `asI32`
 
@@ -361,7 +361,7 @@ pub fn asI32(self: Option<&Value>) -> Option<i32>
 
 Decodes an integer number into `i32`, returning `None` for absence or overflow.
 
-<a id="impl.asI64"></a>
+<a id="Json.impl.asI64"></a>
 
 ### Method `asI64`
 
@@ -371,7 +371,7 @@ pub fn asI64(self: Option<&Value>) -> Option<i64>
 
 Decodes an integer number into `i64`, returning `None` for absence or overflow.
 
-<a id="impl.asU64"></a>
+<a id="Json.impl.asU64"></a>
 
 ### Method `asU64`
 
@@ -381,7 +381,7 @@ pub fn asU64(self: Option<&Value>) -> Option<u64>
 
 Decodes an integer number into `u64`, returning `None` for absence or overflow.
 
-<a id="impl.asF64"></a>
+<a id="Json.impl.asF64"></a>
 
 ### Method `asF64`
 
@@ -391,7 +391,7 @@ pub fn asF64(self: Option<&Value>) -> Option<f64>
 
 Decodes a finite `f64`, or returns `None` for absence, wrong type, invalid text, or overflow.
 
-<a id="impl.asF32"></a>
+<a id="Json.impl.asF32"></a>
 
 ### Method `asF32`
 
@@ -401,7 +401,7 @@ pub fn asF32(self: Option<&Value>) -> Option<f32>
 
 Decodes a finite `f32`, or returns `None` for absence, wrong type, invalid text, or overflow.
 
-<a id="impl.asString"></a>
+<a id="Json.impl.asString"></a>
 
 ### Method `asString`
 
@@ -411,7 +411,7 @@ pub fn asString<'a>(self: Option<&'a Value>) -> Option<string<'a>>
 
 Borrows decoded string text while its owning tree remains alive.
 
-<a id="impl-2"></a>
+<a id="Value.impl.Serialize"></a>
 
 ## Implementation `Serialize for Value`
 
@@ -419,7 +419,7 @@ Borrows decoded string text while its owning tree remains alive.
 impl Serialize for Value
 ```
 
-<a id="impl.serialize-2"></a>
+<a id="Value.impl.Serialize.serialize"></a>
 
 ### Operation `serialize`
 
@@ -428,7 +428,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
     -> () ! JsonError | WriterError ? &mut Writer
 ```
 
-<a id="impl-3"></a>
+<a id="Value.impl.Deserialize"></a>
 
 ## Implementation `Deserialize for Value`
 
@@ -436,7 +436,7 @@ effect fn serialize(self: &Self, options: &JsonOptions)
 impl Deserialize for Value
 ```
 
-<a id="impl.deserialize-2"></a>
+<a id="Value.impl.Deserialize.deserialize"></a>
 
 ### Operation `deserialize`
 

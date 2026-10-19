@@ -46,7 +46,7 @@ pub struct OsChildProcess
 
 A stateless provider whose executions each own their native resources and captures.
 
-<a id="impl"></a>
+<a id="OsChildProcess.impl"></a>
 
 ## Implementation `OsChildProcess`
 
@@ -54,7 +54,7 @@ A stateless provider whose executions each own their native resources and captur
 impl OsChildProcess
 ```
 
-<a id="impl.make"></a>
+<a id="OsChildProcess.impl.make"></a>
 
 ### Associated function `make`
 
@@ -64,7 +64,7 @@ pub fn make() -> OsChildProcess
 
 Creates a provider without allocating storage or starting a child.
 
-<a id="impl-2"></a>
+<a id="OsChildProcess.impl.ChildProcess"></a>
 
 ## Implementation `ChildProcess for OsChildProcess`
 
@@ -72,7 +72,7 @@ Creates a provider without allocating storage or starting a child.
 impl ChildProcess for OsChildProcess
 ```
 
-<a id="impl.execute"></a>
+<a id="OsChildProcess.impl.ChildProcess.execute"></a>
 
 ### Operation `execute`
 

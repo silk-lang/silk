@@ -5,23 +5,23 @@
 Independently owned, caller-funded lazy computations with explicit external parking.
 
 ## When to use
-Use [`make`](#impl.make) when a lazy Effect must outlive the caller which constructs it and be resumed by a
-later owner. Use [`park`](#impl.park) inside the body when readiness comes from an external registration.
-Use [`drive`](#impl.drive) for the initial activation and each later eligible activation.
+Use [`make`](#Execution.impl.make) when a lazy Effect must outlive the caller which constructs it and be resumed by a
+later owner. Use [`park`](#Execution.impl.park) inside the body when readiness comes from an external registration.
+Use [`drive`](#Execution.impl.drive) for the initial activation and each later eligible activation.
 
 ## Details
 Construction obtains one combined package from the selected `Allocator`
 and does not start the Effect. The body representation, continuation, and fixed readiness
 endpoint remain private. A nested `Effect.suspend` transfers execution
-immediately. In contrast, [`park`](#impl.park) relinquishes the Execution until one [`Wake`](#Wake) makes it
+immediately. In contrast, [`park`](#Execution.impl.park) relinquishes the Execution until one [`Wake`](#Wake) makes it
 eligible. The readiness phase and the park generation are ordinary source policy kept in two
 package control words; the compiler only stores them.
 
 ## Gotchas
-`Execution` is affine. The readiness callback must be detached and non-parking. [`make`](#impl.make) can
+`Execution` is affine. The readiness callback must be detached and non-parking. [`make`](#Execution.impl.make) can
 report package allocation refusal. Later private execution-stack growth is a fatal trap.
 Dropping a dormant Execution cancels it. A retained Wake keeps the complete inert package alive
-until the Wake is consumed or dropped. [`drive`](#impl.drive) returns continued ownership only to
+until the Wake is consumed or dropped. [`drive`](#Execution.impl.drive) returns continued ownership only to
 `onSuspend`.
 
 Import as `Execution` with `import silk.execution { Execution }`.
@@ -40,8 +40,8 @@ The affine readiness authority for one parked generation of one Execution.
 
 ### Details
 
-[`Execution.park`](#impl.park) passes the generation's only Wake to its registration callback.
-[`Execution.wake`](#impl.wake) consumes it and makes that generation eligible at most once.
+[`Execution.park`](#Execution.impl.park) passes the generation's only Wake to its registration callback.
+[`Execution.wake`](#Execution.impl.wake) consumes it and makes that generation eligible at most once.
 
 ### Gotchas
 
@@ -65,7 +65,7 @@ inherent member declared in `impl Execution`, so `import silk.execution { Execut
 one import that reaches `Execution.make(...)` and the rest. It is unrelated to the builtin
 `Intrinsic.Execution<A>` type.
 
-<a id="impl"></a>
+<a id="Execution.impl"></a>
 
 ## Implementation `Execution`
 
@@ -73,7 +73,7 @@ one import that reaches `Execution.make(...)` and the rest. It is unrelated to t
 impl Execution
 ```
 
-<a id="impl.make"></a>
+<a id="Execution.impl.make"></a>
 
 ### Associated function `make`
 
@@ -96,7 +96,7 @@ The returned Execution is `Initial`. The body does not start during this call. A
 produces no Execution and leaves every input under ordinary Effect cleanup. Later private stack
 growth is a fatal trap and is not a `OutOfMemoryError`.
 
-<a id="impl.drive"></a>
+<a id="Execution.impl.drive"></a>
 
 ### Associated function `drive`
 
@@ -129,7 +129,7 @@ retain it across parking. Outcome callbacks run in the driving caller's diagnost
 
 Driving a dormant, notifying, completed, or destroyed Execution is a fatal state trap.
 
-<a id="impl.notifyInitial"></a>
+<a id="Execution.impl.notifyInitial"></a>
 
 ### Associated function `notifyInitial`
 
@@ -142,14 +142,14 @@ Notifies the fixed readiness endpoint for one `Initial` Execution exactly once.
 #### Details
 
 This operation changes the package to `InitialReady` before it invokes the endpoint. It is
-synchronous, does not park, and does not run the body. A later [`drive`](#impl.drive) starts the body.
+synchronous, does not park, and does not run the body. A later [`drive`](#Execution.impl.drive) starts the body.
 
 #### Gotchas
 
 The Execution must still be `Initial`. Calling this operation again, or calling it after the
 Execution has been driven, parked, completed, or destroyed, is a fatal state trap.
 
-<a id="impl.park"></a>
+<a id="Execution.impl.park"></a>
 
 ### Associated function `park`
 
@@ -167,7 +167,7 @@ Relinquishes the currently Running Execution until one external readiness signal
 
 The registration callback receives the generation's sole affine [`Wake`](#Wake). Its returned guard
 is retained while dormant and dropped immediately before source continues after this call.
-A Wake signaled during registration is latched until [`drive`](#impl.drive) returns this Execution to its
+A Wake signaled during registration is latched until [`drive`](#Execution.impl.drive) returns this Execution to its
 owner, which then notifies. The Wake invokes the fixed readiness endpoint at most one time.
 
 #### Gotchas
@@ -175,7 +175,7 @@ owner, which then notifies. The Wake invokes the fixed readiness endpoint at mos
 A caller that keeps a cancelled Wake also keeps the complete inert Execution package alive.
 Consuming or dropping that Wake releases the final package authority.
 
-<a id="impl.wake"></a>
+<a id="Execution.impl.wake"></a>
 
 ### Associated function `wake`
 
@@ -188,7 +188,7 @@ Consumes one Wake and makes its parked generation eligible.
 #### Details
 
 A Wake signaled while its generation is still registering is latched until the owner receives
-the Execution back from [`drive`](#impl.drive). A Wake signaled while its generation is dormant makes the
+the Execution back from [`drive`](#Execution.impl.drive). A Wake signaled while its generation is dormant makes the
 Execution eligible and synchronously invokes its fixed readiness endpoint. Signaling never
 drives the Execution.
 

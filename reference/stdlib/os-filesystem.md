@@ -29,7 +29,7 @@ On Darwin and GNU/Linux these are ordinary filesystem synchronization, not F_FUL
 guarantees about hardware caches or physical power-loss recovery. Unsupported synchronization
 fails explicitly rather than silently downgrading.
 
-[`make`](#impl.make) copies its root. The root must be an absolute, non-empty, NUL-free native path. A root
+[`make`](#OsFileSystem.impl.make) copies its root. The root must be an absolute, non-empty, NUL-free native path. A root
 that violates this precondition traps. Open handles close on success and failure; close is never
 retried after EINTR. An earlier failure takes precedence over close failure. [`AtomicWriteError`](./filesystem.md#AtomicWriteError)
 distinguishes failure before publication from failure after complete new contents became visible,
@@ -92,7 +92,7 @@ A native [`FileSystem`](./filesystem.md#FileSystem) provider confined beneath on
 Portable absolute paths resolve inside this root. The provider never exposes the root as a
 [`Path`](./filesystem.md#Path), and operations reject lexical or symbolic-link escape from the root.
 
-<a id="impl"></a>
+<a id="OsFileSystem.impl"></a>
 
 ## Implementation `OsFileSystem`
 
@@ -100,7 +100,7 @@ Portable absolute paths resolve inside this root. The provider never exposes the
 impl OsFileSystem
 ```
 
-<a id="impl-2"></a>
+<a id="OsFileSystem.impl-2"></a>
 
 ## Implementation `OsFileSystem`
 
@@ -108,7 +108,7 @@ impl OsFileSystem
 impl OsFileSystem
 ```
 
-<a id="impl.make"></a>
+<a id="OsFileSystem.impl.make"></a>
 
 ### Associated function `make`
 
@@ -133,7 +133,7 @@ this provider root instead of the host filesystem root.
 `root` must be non-empty, absolute, and NUL-free. A value that violates this precondition traps.
 Allocation failure leaves no provider value.
 
-<a id="impl-3"></a>
+<a id="OsFileSystem.impl.FileSystem"></a>
 
 ## Implementation `FileSystem for OsFileSystem`
 
@@ -141,7 +141,7 @@ Allocation failure leaves no provider value.
 impl FileSystem for OsFileSystem
 ```
 
-<a id="impl.readFile"></a>
+<a id="OsFileSystem.impl.FileSystem.readFile"></a>
 
 ### Operation `readFile`
 
@@ -149,7 +149,7 @@ impl FileSystem for OsFileSystem
 readFile: OsFileSystem.readFile
 ```
 
-<a id="impl.writeFile"></a>
+<a id="OsFileSystem.impl.FileSystem.writeFile"></a>
 
 ### Operation `writeFile`
 
@@ -157,7 +157,7 @@ readFile: OsFileSystem.readFile
 writeFile: OsFileSystem.writeFile
 ```
 
-<a id="impl.createFile"></a>
+<a id="OsFileSystem.impl.FileSystem.createFile"></a>
 
 ### Operation `createFile`
 
@@ -165,7 +165,7 @@ writeFile: OsFileSystem.writeFile
 createFile: OsFileSystem.createFile
 ```
 
-<a id="impl.writeFileAtomic"></a>
+<a id="OsFileSystem.impl.FileSystem.writeFileAtomic"></a>
 
 ### Operation `writeFileAtomic`
 
@@ -173,7 +173,7 @@ createFile: OsFileSystem.createFile
 writeFileAtomic: OsFileSystem.writeFileAtomic
 ```
 
-<a id="impl.syncDirectory"></a>
+<a id="OsFileSystem.impl.FileSystem.syncDirectory"></a>
 
 ### Operation `syncDirectory`
 
@@ -181,7 +181,7 @@ writeFileAtomic: OsFileSystem.writeFileAtomic
 syncDirectory: OsFileSystem.syncDirectory
 ```
 
-<a id="impl.stat"></a>
+<a id="OsFileSystem.impl.FileSystem.stat"></a>
 
 ### Operation `stat`
 
@@ -189,7 +189,7 @@ syncDirectory: OsFileSystem.syncDirectory
 stat: OsFileSystem.stat
 ```
 
-<a id="impl.listDirectory"></a>
+<a id="OsFileSystem.impl.FileSystem.listDirectory"></a>
 
 ### Operation `listDirectory`
 
@@ -197,7 +197,7 @@ stat: OsFileSystem.stat
 listDirectory: OsFileSystem.listDirectory
 ```
 
-<a id="impl.createDirectory"></a>
+<a id="OsFileSystem.impl.FileSystem.createDirectory"></a>
 
 ### Operation `createDirectory`
 
@@ -205,7 +205,7 @@ listDirectory: OsFileSystem.listDirectory
 createDirectory: OsFileSystem.createDirectory
 ```
 
-<a id="impl.removeFile"></a>
+<a id="OsFileSystem.impl.FileSystem.removeFile"></a>
 
 ### Operation `removeFile`
 
@@ -213,7 +213,7 @@ createDirectory: OsFileSystem.createDirectory
 removeFile: OsFileSystem.removeFile
 ```
 
-<a id="impl.removeDirectory"></a>
+<a id="OsFileSystem.impl.FileSystem.removeDirectory"></a>
 
 ### Operation `removeDirectory`
 
@@ -221,7 +221,7 @@ removeFile: OsFileSystem.removeFile
 removeDirectory: OsFileSystem.removeDirectory
 ```
 
-<a id="impl.createTemporaryDirectory"></a>
+<a id="OsFileSystem.impl.FileSystem.createTemporaryDirectory"></a>
 
 ### Operation `createTemporaryDirectory`
 

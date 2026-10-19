@@ -29,7 +29,7 @@ pub struct NativeRoute
 
 The immutable transport route retained independently of the HTTP origin.
 
-<a id="impl"></a>
+<a id="NativeRoute.impl.Copy"></a>
 
 ## Implementation `Copy for NativeRoute`
 
@@ -37,7 +37,7 @@ The immutable transport route retained independently of the HTTP origin.
 impl Copy for NativeRoute
 ```
 
-<a id="impl-2"></a>
+<a id="NativeRoute.impl"></a>
 
 ## Implementation `NativeRoute`
 
@@ -45,7 +45,7 @@ impl Copy for NativeRoute
 impl NativeRoute
 ```
 
-<a id="impl.isUnix"></a>
+<a id="NativeRoute.impl.isUnix"></a>
 
 ### Method `isUnix`
 
@@ -55,7 +55,7 @@ pub fn isUnix(self: &Self) -> bool
 
 Returns whether this route uses an explicit Unix socket path.
 
-<a id="impl.path"></a>
+<a id="NativeRoute.impl.path"></a>
 
 ### Method `path`
 
@@ -275,7 +275,7 @@ pub alpn: AlpnPolicy
 
 HTTP-only application protocol negotiation policy.
 
-<a id="impl-3"></a>
+<a id="Options.impl"></a>
 
 ## Implementation `Options`
 
@@ -283,7 +283,7 @@ HTTP-only application protocol negotiation policy.
 impl Options
 ```
 
-<a id="impl.defaults"></a>
+<a id="Options.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -318,7 +318,7 @@ One affine plain native provider owned by a routed HTTP scope.
 The provider retains the exact socket selected for the route's physical peer. HTTP and raw
 byte authority share one terminal state so CONNECT transfer cannot duplicate ownership.
 
-<a id="impl-4"></a>
+<a id="NativeRouteProvider.impl"></a>
 
 ## Implementation `NativeRouteProvider`
 
@@ -326,7 +326,7 @@ byte authority share one terminal state so CONNECT transfer cannot duplicate own
 impl NativeRouteProvider
 ```
 
-<a id="impl-5"></a>
+<a id="NativeRouteProvider.impl.HttpTransport"></a>
 
 ## Implementation `HttpTransport for NativeRouteProvider`
 
@@ -334,7 +334,7 @@ impl NativeRouteProvider
 impl HttpTransport for NativeRouteProvider
 ```
 
-<a id="impl.readSomeRaw"></a>
+<a id="NativeRouteProvider.impl.HttpTransport.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -342,7 +342,7 @@ impl HttpTransport for NativeRouteProvider
 readSomeRaw: NativeRouteProvider.readHttp
 ```
 
-<a id="impl.writeSomeRaw"></a>
+<a id="NativeRouteProvider.impl.HttpTransport.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -350,7 +350,7 @@ readSomeRaw: NativeRouteProvider.readHttp
 writeSomeRaw: NativeRouteProvider.writeHttp
 ```
 
-<a id="impl.flush"></a>
+<a id="NativeRouteProvider.impl.HttpTransport.flush"></a>
 
 ### Operation `flush`
 
@@ -358,7 +358,7 @@ writeSomeRaw: NativeRouteProvider.writeHttp
 flush: NativeRouteProvider.flushHttp
 ```
 
-<a id="impl.close"></a>
+<a id="NativeRouteProvider.impl.HttpTransport.close"></a>
 
 ### Operation `close`
 
@@ -366,7 +366,7 @@ flush: NativeRouteProvider.flushHttp
 close: NativeRouteProvider.closeHttp
 ```
 
-<a id="impl-6"></a>
+<a id="NativeRouteProvider.impl.ByteDuplex"></a>
 
 ## Implementation `ByteDuplex for NativeRouteProvider`
 
@@ -374,7 +374,7 @@ close: NativeRouteProvider.closeHttp
 impl ByteDuplex for NativeRouteProvider
 ```
 
-<a id="impl.readSomeRaw-2"></a>
+<a id="NativeRouteProvider.impl.ByteDuplex.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -382,7 +382,7 @@ impl ByteDuplex for NativeRouteProvider
 readSomeRaw: NativeRouteProvider.readBytes
 ```
 
-<a id="impl.writeSomeRaw-2"></a>
+<a id="NativeRouteProvider.impl.ByteDuplex.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -390,7 +390,7 @@ readSomeRaw: NativeRouteProvider.readBytes
 writeSomeRaw: NativeRouteProvider.writeBytes
 ```
 
-<a id="impl.flushRaw"></a>
+<a id="NativeRouteProvider.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`
 
@@ -398,7 +398,7 @@ writeSomeRaw: NativeRouteProvider.writeBytes
 flushRaw: NativeRouteProvider.flushBytes
 ```
 
-<a id="impl.shutdownWriteRaw"></a>
+<a id="NativeRouteProvider.impl.ByteDuplex.shutdownWriteRaw"></a>
 
 ### Operation `shutdownWriteRaw`
 
@@ -406,7 +406,7 @@ flushRaw: NativeRouteProvider.flushBytes
 shutdownWriteRaw: NativeRouteProvider.shutdownBytes
 ```
 
-<a id="impl.closeRaw"></a>
+<a id="NativeRouteProvider.impl.ByteDuplex.closeRaw"></a>
 
 ### Operation `closeRaw`
 
@@ -580,7 +580,7 @@ routes consume caller-prepared trust; no resolver fallback or alternate endpoint
 
 On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
 
-<a id="impl-7"></a>
+<a id="NativeTransport.impl"></a>
 
 ## Implementation `NativeTransport`
 
@@ -588,7 +588,7 @@ On unsupported targets or no-libc profiles, a reached call produces a compile-ti
 impl NativeTransport
 ```
 
-<a id="impl.route"></a>
+<a id="NativeTransport.impl.route"></a>
 
 ### Method `route`
 
@@ -598,7 +598,7 @@ pub fn route(self: &Self) -> NativeRoute
 
 Returns owned immutable route metadata while leaving the transport exclusively inside its session.
 
-<a id="impl-8"></a>
+<a id="NativeTransport.impl.HttpTransport"></a>
 
 ## Implementation `HttpTransport for NativeTransport`
 
@@ -606,7 +606,7 @@ Returns owned immutable route metadata while leaving the transport exclusively i
 impl HttpTransport for NativeTransport
 ```
 
-<a id="impl.readSomeRaw-3"></a>
+<a id="NativeTransport.impl.HttpTransport.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -614,7 +614,7 @@ impl HttpTransport for NativeTransport
 readSomeRaw: NativeTransport.read
 ```
 
-<a id="impl.writeSomeRaw-3"></a>
+<a id="NativeTransport.impl.HttpTransport.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -622,7 +622,7 @@ readSomeRaw: NativeTransport.read
 writeSomeRaw: NativeTransport.write
 ```
 
-<a id="impl.flush-2"></a>
+<a id="NativeTransport.impl.HttpTransport.flush"></a>
 
 ### Operation `flush`
 
@@ -630,7 +630,7 @@ writeSomeRaw: NativeTransport.write
 flush: NativeTransport.flushOutput
 ```
 
-<a id="impl.close-2"></a>
+<a id="NativeTransport.impl.HttpTransport.close"></a>
 
 ### Operation `close`
 
@@ -694,9 +694,9 @@ before acquisition; tunneled TLS continues to authenticate the original origin t
 [`withProxyRoute`](#withProxyRoute). On unsupported targets or no-libc profiles, reached acquisition produces a
 compile-time error.
 
-<a id="impl-9"></a>
+<a id="NativeRedirectClient.impl"></a>
 
-## Implementation ``
+## Implementation `NativeRedirectClient<'configuration, 'policy, A, HandlerError, HandlerRequirements>`
 
 ```silk
 impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> NativeRedirectClient<
@@ -708,7 +708,7 @@ impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> NativeRedir
 >
 ```
 
-<a id="impl.make"></a>
+<a id="NativeRedirectClient.impl.make"></a>
 
 ### Associated function `make`
 
@@ -728,9 +728,9 @@ Creates a reusable redirect attempt client from one policy-selected route.
 
 Construction on unsupported targets or no-libc profiles produces a compile-time error.
 
-<a id="impl-10"></a>
+<a id="NativeRedirectClient.impl-2"></a>
 
-## Implementation ``
+## Implementation `NativeRedirectClient<'configuration, 'policy, A, HandlerError, HandlerRequirements>`
 
 ```silk
 impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> NativeRedirectClient<
@@ -742,9 +742,9 @@ impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> NativeRedir
 >
 ```
 
-<a id="impl-11"></a>
+<a id="NativeRedirectClient.impl.AttemptClient"></a>
 
-## Implementation `  for  `
+## Implementation `AttemptClient<'policy, NativeRouteProvider, A, HandlerError, ProxyError | RequestError | ValueError | OriginError | ClientError | NativeClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError, &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource, HandlerRequirements> for NativeRedirectClient<'configuration, 'policy, A, HandlerError, HandlerRequirements>`
 
 ```silk
 impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> AttemptClient<
@@ -758,7 +758,7 @@ impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> AttemptClie
 > for NativeRedirectClient<'configuration, 'policy, A, HandlerError, HandlerRequirements>
 ```
 
-<a id="impl.withAttempt"></a>
+<a id="NativeRedirectClient.impl.AttemptClient.withAttempt"></a>
 
 ### Operation `withAttempt`
 

@@ -437,7 +437,7 @@ pub available: usize
 
 Available caller output bytes.
 
-<a id="impl"></a>
+<a id="ValueReason.impl.Copy"></a>
 
 ## Implementation `Copy for ValueReason`
 
@@ -525,7 +525,7 @@ Http11
 
 HTTP/1.1.
 
-<a id="impl-2"></a>
+<a id="Version.impl"></a>
 
 ## Implementation `Version`
 
@@ -533,7 +533,7 @@ HTTP/1.1.
 impl Version
 ```
 
-<a id="impl.parse"></a>
+<a id="Version.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -543,7 +543,7 @@ pub fn parse(text: string) -> Result<Version, ValueError>
 
 Parses exactly `HTTP/1.0` or `HTTP/1.1`.
 
-<a id="impl.format"></a>
+<a id="Version.impl.format"></a>
 
 ### Method `format`
 
@@ -563,23 +563,23 @@ pub struct Method<'text>
 
 A borrowed open HTTP method token with preserved spelling.
 
-<a id="impl-3"></a>
+<a id="Method.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Method<'text>`
 
 ```silk
 impl<'text> Copy for Method<'text>
 ```
 
-<a id="impl-4"></a>
+<a id="Method.impl"></a>
 
-## Implementation ``
+## Implementation `Method<'text>`
 
 ```silk
 impl<'text> Method<'text>
 ```
 
-<a id="impl.parse-2"></a>
+<a id="Method.impl.parse"></a>
 
 ### Associated function `parse`
 
@@ -589,7 +589,7 @@ pub fn parse(text: string<'text>, maxBytes: usize) -> Result<Method<'text>, Valu
 
 Validates a nonempty `tchar` token within `maxBytes` and borrows it unchanged.
 
-<a id="impl.format-2"></a>
+<a id="Method.impl.format"></a>
 
 ### Method `format`
 
@@ -599,7 +599,7 @@ pub fn format(self: &Self) -> string<'text>
 
 Borrows the original method spelling.
 
-<a id="impl.equals"></a>
+<a id="Method.impl.equals"></a>
 
 ### Method `equals`
 
@@ -609,7 +609,7 @@ pub fn equals(self: &Self, other: &Method) -> bool
 
 Compares method spelling case-sensitively.
 
-<a id="impl.get"></a>
+<a id="Method.impl.get"></a>
 
 ### Associated function `get`
 
@@ -619,7 +619,7 @@ pub fn get() -> Method<'static>
 
 Returns the standard GET method value.
 
-<a id="impl.head"></a>
+<a id="Method.impl.head"></a>
 
 ### Associated function `head`
 
@@ -629,7 +629,7 @@ pub fn head() -> Method<'static>
 
 Returns the standard HEAD method value.
 
-<a id="impl.post"></a>
+<a id="Method.impl.post"></a>
 
 ### Associated function `post`
 
@@ -639,7 +639,7 @@ pub fn post() -> Method<'static>
 
 Returns the standard POST method value.
 
-<a id="impl.put"></a>
+<a id="Method.impl.put"></a>
 
 ### Associated function `put`
 
@@ -649,7 +649,7 @@ pub fn put() -> Method<'static>
 
 Returns the standard PUT method value.
 
-<a id="impl.delete"></a>
+<a id="Method.impl.delete"></a>
 
 ### Associated function `delete`
 
@@ -659,7 +659,7 @@ pub fn delete() -> Method<'static>
 
 Returns the standard DELETE method value.
 
-<a id="impl.connect"></a>
+<a id="Method.impl.connect"></a>
 
 ### Associated function `connect`
 
@@ -669,7 +669,7 @@ pub fn connect() -> Method<'static>
 
 Returns the standard CONNECT method value.
 
-<a id="impl.options"></a>
+<a id="Method.impl.options"></a>
 
 ### Associated function `options`
 
@@ -679,7 +679,7 @@ pub fn options() -> Method<'static>
 
 Returns the standard OPTIONS method value.
 
-<a id="impl.trace"></a>
+<a id="Method.impl.trace"></a>
 
 ### Associated function `trace`
 
@@ -689,7 +689,7 @@ pub fn trace() -> Method<'static>
 
 Returns the standard TRACE method value.
 
-<a id="impl.patch"></a>
+<a id="Method.impl.patch"></a>
 
 ### Associated function `patch`
 
@@ -769,7 +769,7 @@ pub struct Status
 
 A response status retaining registered and unregistered valid codes.
 
-<a id="impl-5"></a>
+<a id="Status.impl.Copy"></a>
 
 ## Implementation `Copy for Status`
 
@@ -777,7 +777,7 @@ A response status retaining registered and unregistered valid codes.
 impl Copy for Status
 ```
 
-<a id="impl-6"></a>
+<a id="Status.impl"></a>
 
 ## Implementation `Status`
 
@@ -785,7 +785,7 @@ impl Copy for Status
 impl Status
 ```
 
-<a id="impl.fromCode"></a>
+<a id="Status.impl.fromCode"></a>
 
 ### Associated function `fromCode`
 
@@ -795,7 +795,7 @@ pub fn fromCode(code: u16) -> Result<Status, ValueError>
 
 Constructs a status from any code in the inclusive 100 through 599 range.
 
-<a id="impl.code"></a>
+<a id="Status.impl.code"></a>
 
 ### Method `code`
 
@@ -805,7 +805,7 @@ pub fn code(self: &Self) -> u16
 
 Returns the preserved numeric status code.
 
-<a id="impl.class"></a>
+<a id="Status.impl.class"></a>
 
 ### Method `class`
 
@@ -825,23 +825,23 @@ pub struct Header<'value>
 
 A validated header field borrowing its exact name spelling and raw value octets.
 
-<a id="impl-7"></a>
+<a id="Header.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for Header<'value>`
 
 ```silk
 impl<'value> Copy for Header<'value>
 ```
 
-<a id="impl-8"></a>
+<a id="Header.impl"></a>
 
-## Implementation ``
+## Implementation `Header<'value>`
 
 ```silk
 impl<'value> Header<'value>
 ```
 
-<a id="impl.make"></a>
+<a id="Header.impl.make"></a>
 
 ### Associated function `make`
 
@@ -855,7 +855,7 @@ pub fn make(
 
 Validates one semantic field after wire OWS removal and borrows it unchanged.
 
-<a id="impl.name"></a>
+<a id="Header.impl.name"></a>
 
 ### Method `name`
 
@@ -865,7 +865,7 @@ pub fn name(self: &Self) -> string<'value>
 
 Borrows the original field-name spelling.
 
-<a id="impl.value-3"></a>
+<a id="Header.impl.value-2"></a>
 
 ### Method `value`
 
@@ -885,23 +885,23 @@ pub struct RequestHead<'value>
 
 A validated request head without body, framing, connection, or exchange state.
 
-<a id="impl-9"></a>
+<a id="RequestHead.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for RequestHead<'value>`
 
 ```silk
 impl<'value> Copy for RequestHead<'value>
 ```
 
-<a id="impl-10"></a>
+<a id="RequestHead.impl"></a>
 
-## Implementation ``
+## Implementation `RequestHead<'value>`
 
 ```silk
 impl<'value> RequestHead<'value>
 ```
 
-<a id="impl.make-2"></a>
+<a id="RequestHead.impl.make"></a>
 
 ### Associated function `make`
 
@@ -916,7 +916,7 @@ pub fn make(
 
 Combines validated request components and enforces the HTTP/1.1 Host requirement.
 
-<a id="impl.version"></a>
+<a id="RequestHead.impl.version"></a>
 
 ### Method `version`
 
@@ -926,7 +926,7 @@ pub fn version(self: &Self) -> Version
 
 Returns the request version.
 
-<a id="impl.method"></a>
+<a id="RequestHead.impl.method"></a>
 
 ### Method `method`
 
@@ -936,7 +936,7 @@ pub fn method(self: &Self) -> Method<'value>
 
 Returns the borrowed request method.
 
-<a id="impl.target"></a>
+<a id="RequestHead.impl.target"></a>
 
 ### Method `target`
 
@@ -946,7 +946,7 @@ pub fn target(self: &Self) -> RequestTarget<'value>
 
 Returns the borrowed request target.
 
-<a id="impl.headers"></a>
+<a id="RequestHead.impl.headers"></a>
 
 ### Method `headers`
 
@@ -956,7 +956,7 @@ pub fn headers(self: &Self) -> Headers<'value>
 
 Returns the borrowed ordered fields.
 
-<a id="impl.copy"></a>
+<a id="RequestHead.impl.copy"></a>
 
 ### Method `copy`
 
@@ -979,7 +979,7 @@ pub struct OwnedRequestHead
 
 An independently owned request head whose views borrow only this value.
 
-<a id="impl-11"></a>
+<a id="OwnedRequestHead.impl"></a>
 
 ## Implementation `OwnedRequestHead`
 
@@ -987,7 +987,7 @@ An independently owned request head whose views borrow only this value.
 impl OwnedRequestHead
 ```
 
-<a id="impl.view"></a>
+<a id="OwnedRequestHead.impl.view"></a>
 
 ### Method `view`
 
@@ -1007,15 +1007,15 @@ pub struct ResponseHead<'value>
 
 A validated response head without body, framing, connection, or exchange state.
 
-<a id="impl-12"></a>
+<a id="ResponseHead.impl"></a>
 
-## Implementation ``
+## Implementation `ResponseHead<'value>`
 
 ```silk
 impl<'value> ResponseHead<'value>
 ```
 
-<a id="impl.make-3"></a>
+<a id="ResponseHead.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1031,7 +1031,7 @@ pub fn make(
 
 Validates an optional reason phrase and combines response metadata.
 
-<a id="impl.version-2"></a>
+<a id="ResponseHead.impl.version"></a>
 
 ### Method `version`
 
@@ -1041,7 +1041,7 @@ pub fn version(self: &Self) -> Version
 
 Returns the response version.
 
-<a id="impl.status"></a>
+<a id="ResponseHead.impl.status"></a>
 
 ### Method `status`
 
@@ -1051,7 +1051,7 @@ pub fn status(self: &Self) -> Status
 
 Returns the response status.
 
-<a id="impl.reason"></a>
+<a id="ResponseHead.impl.reason"></a>
 
 ### Method `reason`
 
@@ -1061,7 +1061,7 @@ pub fn reason(self: &Self) -> Option<&'value [u8]>
 
 Returns the exact optional reason-phrase bytes.
 
-<a id="impl.headers-2"></a>
+<a id="ResponseHead.impl.headers"></a>
 
 ### Method `headers`
 
@@ -1071,7 +1071,7 @@ pub fn headers(self: &Self) -> Headers<'value>
 
 Returns the borrowed ordered fields.
 
-<a id="impl.copy-2"></a>
+<a id="ResponseHead.impl.copy"></a>
 
 ### Method `copy`
 
@@ -1084,7 +1084,7 @@ pub effect fn copy(
 
 Copies the complete response head into independent bounded storage.
 
-<a id="impl.copyMatchingHeaders"></a>
+<a id="ResponseHead.impl.copyMatchingHeaders"></a>
 
 ### Method `copyMatchingHeaders`
 
@@ -1113,7 +1113,7 @@ pub struct OwnedResponseHead
 
 An independently owned response head whose views borrow only this value.
 
-<a id="impl-13"></a>
+<a id="OwnedResponseHead.impl"></a>
 
 ## Implementation `OwnedResponseHead`
 
@@ -1121,7 +1121,7 @@ An independently owned response head whose views borrow only this value.
 impl OwnedResponseHead
 ```
 
-<a id="impl.view-2"></a>
+<a id="OwnedResponseHead.impl.view"></a>
 
 ### Method `view`
 

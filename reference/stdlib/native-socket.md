@@ -1139,7 +1139,7 @@ pub peer: UnixPeerAddress
 
 The accepted peer identity.
 
-<a id="impl"></a>
+<a id="ConnectOptionsError.impl.Copy"></a>
 
 ## Implementation `Copy for ConnectOptionsError`
 
@@ -1147,7 +1147,7 @@ The accepted peer identity.
 impl Copy for ConnectOptionsError
 ```
 
-<a id="impl-2"></a>
+<a id="AttemptFailure.impl.Copy"></a>
 
 ## Implementation `Copy for AttemptFailure`
 
@@ -1155,7 +1155,7 @@ impl Copy for ConnectOptionsError
 impl Copy for AttemptFailure
 ```
 
-<a id="impl-3"></a>
+<a id="NativeSocketError.impl.Copy"></a>
 
 ## Implementation `Copy for NativeSocketError`
 
@@ -1163,7 +1163,7 @@ impl Copy for AttemptFailure
 impl Copy for NativeSocketError
 ```
 
-<a id="impl-4"></a>
+<a id="ConnectOptions.impl.Copy"></a>
 
 ## Implementation `Copy for ConnectOptions`
 
@@ -1171,7 +1171,7 @@ impl Copy for NativeSocketError
 impl Copy for ConnectOptions
 ```
 
-<a id="impl-5"></a>
+<a id="ListenOptionsError.impl.Copy"></a>
 
 ## Implementation `Copy for ListenOptionsError`
 
@@ -1179,7 +1179,7 @@ impl Copy for ConnectOptions
 impl Copy for ListenOptionsError
 ```
 
-<a id="impl-6"></a>
+<a id="ListenOptions.impl.Copy"></a>
 
 ## Implementation `Copy for ListenOptions`
 
@@ -1187,7 +1187,7 @@ impl Copy for ListenOptionsError
 impl Copy for ListenOptions
 ```
 
-<a id="impl-7"></a>
+<a id="UnixSocketPath.impl.Copy"></a>
 
 ## Implementation `Copy for UnixSocketPath`
 
@@ -1195,7 +1195,7 @@ impl Copy for ListenOptions
 impl Copy for UnixSocketPath
 ```
 
-<a id="impl-8"></a>
+<a id="BoundAddress.impl.Copy"></a>
 
 ## Implementation `Copy for BoundAddress`
 
@@ -1203,7 +1203,7 @@ impl Copy for UnixSocketPath
 impl Copy for BoundAddress
 ```
 
-<a id="impl-9"></a>
+<a id="UnixPeerAddress.impl.Copy"></a>
 
 ## Implementation `Copy for UnixPeerAddress`
 
@@ -1211,7 +1211,7 @@ impl Copy for BoundAddress
 impl Copy for UnixPeerAddress
 ```
 
-<a id="impl-10"></a>
+<a id="PeerAddress.impl.Copy"></a>
 
 ## Implementation `Copy for PeerAddress`
 
@@ -1219,7 +1219,7 @@ impl Copy for UnixPeerAddress
 impl Copy for PeerAddress
 ```
 
-<a id="impl-11"></a>
+<a id="ConnectOptions.impl"></a>
 
 ## Implementation `ConnectOptions`
 
@@ -1227,7 +1227,7 @@ impl Copy for PeerAddress
 impl ConnectOptions
 ```
 
-<a id="impl.make"></a>
+<a id="ConnectOptions.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1241,7 +1241,7 @@ pub fn make(
 
 Admits a 1..1,000,000,000ns interval and 1..1024 native attempts.
 
-<a id="impl.defaults"></a>
+<a id="ConnectOptions.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -1251,7 +1251,7 @@ pub fn defaults() -> ConnectOptions
 
 Selects Nagle, a one-millisecond readiness interval, and 64 attempts.
 
-<a id="impl.noDelay"></a>
+<a id="ConnectOptions.impl.noDelay"></a>
 
 ### Method `noDelay`
 
@@ -1261,7 +1261,7 @@ pub fn noDelay(self: &Self) -> bool
 
 Reports whether outbound TCP disables Nagle buffering.
 
-<a id="impl.pollInterval"></a>
+<a id="ConnectOptions.impl.pollInterval"></a>
 
 ### Method `pollInterval`
 
@@ -1271,7 +1271,7 @@ pub fn pollInterval(self: &Self) -> u64
 
 Returns the positive polling interval in nanoseconds.
 
-<a id="impl.maxAttempts"></a>
+<a id="ConnectOptions.impl.maxAttempts"></a>
 
 ### Method `maxAttempts`
 
@@ -1281,7 +1281,7 @@ pub fn maxAttempts(self: &Self) -> usize
 
 Returns the maximum number of native connection attempts.
 
-<a id="impl-12"></a>
+<a id="ListenOptions.impl"></a>
 
 ## Implementation `ListenOptions`
 
@@ -1289,7 +1289,7 @@ Returns the maximum number of native connection attempts.
 impl ListenOptions
 ```
 
-<a id="impl.make-2"></a>
+<a id="ListenOptions.impl.make"></a>
 
 ### Associated function `make`
 
@@ -1303,7 +1303,7 @@ pub fn make(
 
 Admits backlog 1..65535 and a 1..1,000,000,000ns polling interval.
 
-<a id="impl.defaults-2"></a>
+<a id="ListenOptions.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -1313,7 +1313,7 @@ pub fn defaults() -> ListenOptions
 
 Selects backlog 128, no address reuse, and a one-millisecond polling interval.
 
-<a id="impl.kernelBacklog"></a>
+<a id="ListenOptions.impl.kernelBacklog"></a>
 
 ### Method `kernelBacklog`
 
@@ -1323,7 +1323,7 @@ pub fn kernelBacklog(self: &Self) -> usize
 
 Returns the requested kernel backlog limit.
 
-<a id="impl.reuseAddress"></a>
+<a id="ListenOptions.impl.reuseAddress"></a>
 
 ### Method `reuseAddress`
 
@@ -1333,7 +1333,7 @@ pub fn reuseAddress(self: &Self) -> bool
 
 Reports whether listener creation enables SO_REUSEADDR.
 
-<a id="impl.pollInterval-2"></a>
+<a id="ListenOptions.impl.pollInterval"></a>
 
 ### Method `pollInterval`
 
@@ -1343,7 +1343,7 @@ pub fn pollInterval(self: &Self) -> u64
 
 Returns the positive polling interval in nanoseconds.
 
-<a id="impl-13"></a>
+<a id="UnixSocketPath.impl"></a>
 
 ## Implementation `UnixSocketPath`
 
@@ -1351,7 +1351,7 @@ Returns the positive polling interval in nanoseconds.
 impl UnixSocketPath
 ```
 
-<a id="impl.bytes"></a>
+<a id="UnixSocketPath.impl.bytes"></a>
 
 ### Method `bytes`
 
@@ -1451,7 +1451,7 @@ effect<'call> fn use<'call>(
 
 Consumes one owned context while using temporary accepted-connection loans.
 
-<a id="impl-14"></a>
+<a id="Connection.impl"></a>
 
 ## Implementation `Connection`
 
@@ -1459,7 +1459,7 @@ Consumes one owned context while using temporary accepted-connection loans.
 impl Connection
 ```
 
-<a id="impl.phase"></a>
+<a id="Connection.impl.phase"></a>
 
 ### Method `phase`
 
@@ -1469,7 +1469,7 @@ pub fn phase(self: &Self) -> ConnectionPhase
 
 Returns the current descriptor lifecycle phase.
 
-<a id="impl.close"></a>
+<a id="Connection.impl.close"></a>
 
 ### Method `close`
 
@@ -1483,7 +1483,7 @@ Explicitly closes this connection once. Scoped cleanup recovers this error.
 
 On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
 
-<a id="impl-15"></a>
+<a id="Listener.impl"></a>
 
 ## Implementation `Listener`
 
@@ -1491,7 +1491,7 @@ On unsupported targets or no-libc profiles, a reached call produces a compile-ti
 impl Listener
 ```
 
-<a id="impl.phase-2"></a>
+<a id="Listener.impl.phase"></a>
 
 ### Method `phase`
 
@@ -1501,7 +1501,7 @@ pub fn phase(self: &Self) -> ListenerPhase
 
 Returns the current descriptor lifecycle phase.
 
-<a id="impl.boundAddress"></a>
+<a id="Listener.impl.boundAddress"></a>
 
 ### Method `boundAddress`
 
@@ -1511,7 +1511,7 @@ pub fn boundAddress(self: &Self) -> BoundAddress
 
 Returns a copy of the actual local address recorded after listener creation.
 
-<a id="impl.close-2"></a>
+<a id="Listener.impl.close"></a>
 
 ### Method `close`
 
@@ -1525,7 +1525,7 @@ Explicitly closes this listener once without unlinking a Unix pathname.
 
 On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
 
-<a id="impl-16"></a>
+<a id="Accepted.impl"></a>
 
 ## Implementation `Accepted`
 
@@ -1533,7 +1533,7 @@ On unsupported targets or no-libc profiles, a reached call produces a compile-ti
 impl Accepted
 ```
 
-<a id="impl.peer"></a>
+<a id="Accepted.impl.peer"></a>
 
 ### Method `peer`
 
@@ -1543,7 +1543,7 @@ pub fn peer(self: &Self) -> PeerAddress
 
 Returns a copy of the independently owned accepted peer identity.
 
-<a id="impl.connectionPhase"></a>
+<a id="Accepted.impl.connectionPhase"></a>
 
 ### Method `connectionPhase`
 
@@ -1737,7 +1737,7 @@ Connects one absolute pathname Unix socket and lends the owned provider in one s
 
 On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
 
-<a id="impl-17"></a>
+<a id="Connection.impl-2"></a>
 
 ## Implementation `Connection`
 
@@ -1745,7 +1745,7 @@ On unsupported targets or no-libc profiles, a reached call produces a compile-ti
 impl Connection
 ```
 
-<a id="impl-18"></a>
+<a id="Connection.impl.ByteDuplex"></a>
 
 ## Implementation `ByteDuplex for Connection`
 
@@ -1753,7 +1753,7 @@ impl Connection
 impl ByteDuplex for Connection
 ```
 
-<a id="impl.readSomeRaw"></a>
+<a id="Connection.impl.ByteDuplex.readSomeRaw"></a>
 
 ### Operation `readSomeRaw`
 
@@ -1761,7 +1761,7 @@ impl ByteDuplex for Connection
 readSomeRaw: Connection.readConnection
 ```
 
-<a id="impl.writeSomeRaw"></a>
+<a id="Connection.impl.ByteDuplex.writeSomeRaw"></a>
 
 ### Operation `writeSomeRaw`
 
@@ -1769,7 +1769,7 @@ readSomeRaw: Connection.readConnection
 writeSomeRaw: Connection.writeConnection
 ```
 
-<a id="impl.flushRaw"></a>
+<a id="Connection.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`
 
@@ -1777,7 +1777,7 @@ writeSomeRaw: Connection.writeConnection
 flushRaw: Connection.flushConnection
 ```
 
-<a id="impl.shutdownWriteRaw"></a>
+<a id="Connection.impl.ByteDuplex.shutdownWriteRaw"></a>
 
 ### Operation `shutdownWriteRaw`
 
@@ -1785,7 +1785,7 @@ flushRaw: Connection.flushConnection
 shutdownWriteRaw: Connection.shutdownConnection
 ```
 
-<a id="impl.closeRaw"></a>
+<a id="Connection.impl.ByteDuplex.closeRaw"></a>
 
 ### Operation `closeRaw`
 

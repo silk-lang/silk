@@ -835,39 +835,39 @@ pub struct HttpsIdentity
 
 Pure HTTPS DNS-ID and IP-ID reference construction and verification.
 
-<a id="impl"></a>
+<a id="OriginHost.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for OriginHost<'a>`
 
 ```silk
 impl<'a> Copy for OriginHost<'a>
 ```
 
-<a id="impl-2"></a>
+<a id="ReferenceIdentity.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for ReferenceIdentity<'a>`
 
 ```silk
 impl<'a> Copy for ReferenceIdentity<'a>
 ```
 
-<a id="impl-3"></a>
+<a id="PresentedIdentity.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for PresentedIdentity<'a>`
 
 ```silk
 impl<'a> Copy for PresentedIdentity<'a>
 ```
 
-<a id="impl-4"></a>
+<a id="CertificateIdentities.impl.Copy"></a>
 
-## Implementation ` Copy for  `
+## Implementation `Copy for CertificateIdentities<'a>`
 
 ```silk
 impl<'a> Copy for CertificateIdentities<'a>
 ```
 
-<a id="impl-5"></a>
+<a id="IdentityError.impl.Copy"></a>
 
 ## Implementation `Copy for IdentityError`
 
@@ -875,7 +875,7 @@ impl<'a> Copy for CertificateIdentities<'a>
 impl Copy for IdentityError
 ```
 
-<a id="impl-6"></a>
+<a id="IdentityLimits.impl.Copy"></a>
 
 ## Implementation `Copy for IdentityLimits`
 
@@ -883,7 +883,7 @@ impl Copy for IdentityError
 impl Copy for IdentityLimits
 ```
 
-<a id="impl-7"></a>
+<a id="IdentityMatch.impl.Copy"></a>
 
 ## Implementation `Copy for IdentityMatch`
 
@@ -891,7 +891,7 @@ impl Copy for IdentityLimits
 impl Copy for IdentityMatch
 ```
 
-<a id="impl-8"></a>
+<a id="IdentityLimits.impl"></a>
 
 ## Implementation `IdentityLimits`
 
@@ -899,7 +899,7 @@ impl Copy for IdentityMatch
 impl IdentityLimits
 ```
 
-<a id="impl.standard"></a>
+<a id="IdentityLimits.impl.standard"></a>
 
 ### Associated function `standard`
 
@@ -909,7 +909,7 @@ pub fn standard() -> IdentityLimits
 
 Returns inclusive limits of 256 SAN descriptors and 65536 payload octets.
 
-<a id="impl-9"></a>
+<a id="HttpsIdentity.impl"></a>
 
 ## Implementation `HttpsIdentity`
 
@@ -917,7 +917,7 @@ Returns inclusive limits of 256 SAN descriptors and 65536 payload octets.
 impl HttpsIdentity
 ```
 
-<a id="impl.exactDnsNameError"></a>
+<a id="HttpsIdentity.impl.exactDnsNameError"></a>
 
 ### Associated function `exactDnsNameError`
 
@@ -932,7 +932,7 @@ Returns the shared HTTPS-profile admission error for one exact DNS name, when in
 This applies the canonical 253-octet, LDH-label, edge-hyphen, wildcard-free, and
 nonnumeric-final-label grammar used by HTTPS reference identities.
 
-<a id="impl.presentedDnsNameError"></a>
+<a id="HttpsIdentity.impl.presentedDnsNameError"></a>
 
 ### Associated function `presentedDnsNameError`
 
@@ -947,7 +947,7 @@ Returns the shared HTTPS-profile admission error for one presented DNS name, whe
 A wildcard is admitted only as the complete leftmost `*.` label and remains included in the
 253-octet total-name bound. All other label policy is identical to exact DNS names.
 
-<a id="impl-10"></a>
+<a id="HttpsIdentity.impl-2"></a>
 
 ## Implementation `HttpsIdentity`
 
@@ -955,7 +955,7 @@ A wildcard is admitted only as the complete leftmost `*.` label and remains incl
 impl HttpsIdentity
 ```
 
-<a id="impl.reference"></a>
+<a id="HttpsIdentity.impl.reference"></a>
 
 ### Associated function `reference`
 
@@ -981,7 +981,7 @@ Supply the original origin host before resolution, never an alias, peer name, or
 The caller checks HTTPS and converts IP literals. DNS input rejects brackets, ports, escapes, underscores and Unicode.
 A-label grammar does not validate Punycode. Explicit IPvFuture, zones, URI-ID and SRV-ID return `Unsupported`.
 
-<a id="impl.verify"></a>
+<a id="HttpsIdentity.impl.verify"></a>
 
 ### Associated function `verify`
 

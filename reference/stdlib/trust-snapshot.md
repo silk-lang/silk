@@ -6,8 +6,8 @@ Bounded immutable owners for explicit trust-anchor sequences.
 
 ## When to use
 
-Use [`fromAnchors`](#impl.fromAnchors) when the application already owns explicit authorities. Use [`fromPem`](#impl.fromPem) to
-import strict certificate PEM as unconstrained anchors. Use [`copy`](#impl.copy) or [`combine`](#impl.combine) when a new
+Use [`fromAnchors`](#TrustSnapshot.impl.fromAnchors) when the application already owns explicit authorities. Use [`fromPem`](#TrustSnapshot.impl.fromPem) to
+import strict certificate PEM as unconstrained anchors. Use [`copy`](#TrustSnapshot.impl.copy) or [`combine`](#TrustSnapshot.impl.combine) when a new
 owner must survive release of its source snapshots.
 
 ## Details
@@ -55,7 +55,7 @@ pub encodedBytes: usize
 
 Maximum aggregate certificate and configured-constraint bytes.
 
-<a id="impl"></a>
+<a id="SnapshotLimits.impl.Copy"></a>
 
 ## Implementation `Copy for SnapshotLimits`
 
@@ -63,7 +63,7 @@ Maximum aggregate certificate and configured-constraint bytes.
 impl Copy for SnapshotLimits
 ```
 
-<a id="impl-2"></a>
+<a id="SnapshotLimits.impl"></a>
 
 ## Implementation `SnapshotLimits`
 
@@ -71,7 +71,7 @@ impl Copy for SnapshotLimits
 impl SnapshotLimits
 ```
 
-<a id="impl.defaults"></a>
+<a id="SnapshotLimits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -111,7 +111,7 @@ pub snapshot: SnapshotLimits
 
 Bounds used by the complete returned snapshot.
 
-<a id="impl-3"></a>
+<a id="TrustLoadLimits.impl.Copy"></a>
 
 ## Implementation `Copy for TrustLoadLimits`
 
@@ -119,7 +119,7 @@ Bounds used by the complete returned snapshot.
 impl Copy for TrustLoadLimits
 ```
 
-<a id="impl-4"></a>
+<a id="TrustLoadLimits.impl"></a>
 
 ## Implementation `TrustLoadLimits`
 
@@ -127,7 +127,7 @@ impl Copy for TrustLoadLimits
 impl TrustLoadLimits
 ```
 
-<a id="impl.defaults-2"></a>
+<a id="TrustLoadLimits.impl.defaults"></a>
 
 ### Associated function `defaults`
 
@@ -392,7 +392,7 @@ One immutable independently owned sequence of explicit trust authorities.
 The snapshot preserves input order and duplicates. Each borrowed anchor remains valid only
 while this snapshot remains valid. Construction does not inspect certificate semantics.
 
-<a id="impl-5"></a>
+<a id="TrustSnapshot.impl"></a>
 
 ## Implementation `TrustSnapshot`
 
@@ -400,7 +400,7 @@ while this snapshot remains valid. Construction does not inspect certificate sem
 impl TrustSnapshot
 ```
 
-<a id="impl.fromAnchors"></a>
+<a id="TrustSnapshot.impl.fromAnchors"></a>
 
 ### Associated function `fromAnchors`
 
@@ -418,7 +418,7 @@ Consumes a complete anchor list after allocation-free count and byte-budget vali
 Success preserves the list allocation, order, duplicates, and configured restrictions.
 Failure releases the consumed input and publishes no snapshot. Empty explicit trust is valid.
 
-<a id="impl.fromPem"></a>
+<a id="TrustSnapshot.impl.fromPem"></a>
 
 ### Associated function `fromPem`
 
@@ -444,7 +444,7 @@ decoding. Decoder failures retain their structured locations. Allocation refusal
 Empty or whitespace-only PEM is invalid. Import assigns explicit authority but does not
 authenticate a path or reproduce OS trust policy.
 
-<a id="impl.fromAnnotatedPem"></a>
+<a id="TrustSnapshot.impl.fromAnnotatedPem"></a>
 
 ### Associated function `fromAnnotatedPem`
 
@@ -457,15 +457,15 @@ Imports configured platform authorities from an annotated certificate PEM docume
 
 #### Details
 
-Uses [`CertificateBundle.decodeAnnotatedPem`](./certificate-bundle.md#impl.decodeAnnotatedPem), retaining all certificates, duplicates, limits,
+Uses [`CertificateBundle.decodeAnnotatedPem`](./certificate-bundle.md#CertificateBundle.impl.decodeAnnotatedPem), retaining all certificates, duplicates, limits,
 and rejection locations. Malformed certificates fail atomically; none are skipped.
 
 #### Gotchas
 
 Call only with explicitly trusted configuration, never peer-supplied authority. This does
-not import keychain settings or validate a certificate path. [`fromPem`](#impl.fromPem) remains strict.
+not import keychain settings or validate a certificate path. [`fromPem`](#TrustSnapshot.impl.fromPem) remains strict.
 
-<a id="impl.anchors"></a>
+<a id="TrustSnapshot.impl.anchors"></a>
 
 ### Method `anchors`
 
@@ -475,7 +475,7 @@ pub fn anchors(self: &Self) -> &[TrustAnchor]
 
 Borrows all anchors in their original order, including every duplicate.
 
-<a id="impl.copy"></a>
+<a id="TrustSnapshot.impl.copy"></a>
 
 ### Method `copy`
 
@@ -495,7 +495,7 @@ Creates an independently owned copy under the supplied inclusive limits.
 Every certificate and configured constraint is copied. Allocation refusal releases partial
 output and leaves this snapshot unchanged.
 
-<a id="impl.combine"></a>
+<a id="TrustSnapshot.impl.combine"></a>
 
 ### Associated function `combine`
 
