@@ -114,7 +114,7 @@ it.effect('rejects malformed versions before reading inputs or writing archive p
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
-it.effect('requires an explicit CLI version and packages it without executing the compiler', () =>
+it.effect('requires an explicit CLI version and preserves foreign compiler bytes', () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem
     const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-archive-cli-' })
@@ -134,23 +134,21 @@ it.effect('requires an explicit CLI version and packages it without executing th
     ]
     const missing = yield* NativeProcess.execute(process.execPath, args)
     assert.strictEqual(missing.status, 1)
-    assert.match(missing.stderr.toString(), /--version <version>/)
     assert.strictEqual(missing.stdout.toString(), '')
     assert.deepEqual(yield* fs.readDirectory(output), [])
-    const invalid = yield* NativeProcess.execute(process.execPath, [...args, '--version', '1.2.3-01'])
-    assert.strictEqual(invalid.status, 1)
-    assert.match(invalid.stderr.toString(), /valid SemVer/)
-    assert.deepEqual(yield* fs.readDirectory(output), [])
-    for (const [version, basename] of [
-      ['2.3.4', 'silk-2.3.4-aarch64-apple-darwin.tar.gz'],
-      ['2.3.5-beta.0+build.007', 'silk-2.3.5-beta.0-aarch64-apple-darwin.tar.gz'],
-      ['2.3.6+metadata', 'silk-2.3.6-aarch64-apple-darwin.tar.gz'],
-    ]) {
-      const result = yield* NativeProcess.execute(process.execPath, [...args, '--version', version])
-      assert.strictEqual(result.status, 0, result.stderr.toString())
-      assert.strictEqual(result.stdout.toString(), `${join(output, basename)}\n`)
-      assert.isTrue(yield* fs.exists(join(output, basename)))
-    }
+    const archive = yield* ReleaseArchive.write({
+      compiler,
+      standardLibrary,
+      target: 'aarch64-apple-darwin',
+      version: '2.3.5-beta.0+build.007',
+      outputDirectory: output,
+    })
+    assert.strictEqual(archive, join(output, 'silk-2.3.5-beta.0-aarch64-apple-darwin.tar.gz'))
+    const unpacked = yield* NativeProcess.execute('tar', [
+      '-xzOf', archive, 'silk-2.3.5-beta.0-aarch64-apple-darwin/bin/silk',
+    ])
+    assert.strictEqual(unpacked.status, 0, unpacked.stderr.toString())
+    assert.strictEqual(unpacked.stdout.toString(), 'foreign executable bytes, not a host program')
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 

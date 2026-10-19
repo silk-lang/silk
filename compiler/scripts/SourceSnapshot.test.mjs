@@ -1,6 +1,6 @@
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { pathToFileURL } from 'node:url'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
@@ -10,6 +10,7 @@ import * as NativeProcess from './NativeProcess.ts'
 import { historicalSeeds } from '../../.github/scripts/native-seed-history.mjs'
 import {
   candidate,
+  readCandidate,
   readPin,
   selectSeed,
   targets,
@@ -18,7 +19,6 @@ import {
 import { createSnapshot, hash, restoreSnapshot, verifySnapshot } from './SourceSnapshot.mjs'
 
 const require = createRequire(new URL('../../package.json', import.meta.url))
-/** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
 /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))
@@ -331,19 +331,13 @@ it.effect('publishes candidates only from passed receipts with matching IR fixpo
       inputs: { sourceCommit: 'b'.repeat(40) },
       fixpoint: { producerIrSha256: 'c'.repeat(64), outputIrSha256: 'c'.repeat(64) },
     }
-    const args = [
-      fileURLToPath(new URL('./NativeSeed.mjs', import.meta.url)),
-      'candidate',
-      receiptPath,
-      '123',
-      'v1.2.3-beta.1+independent',
-    ]
+    const options = {
+      receipt: receiptPath,
+      runId: '123',
+      tag: 'v1.2.3-beta.1+independent',
+    }
     yield* fs.writeFileString(receiptPath, yield* encodeJson(receipt))
-    const accepted = yield* NativeProcess.execute(process.execPath, args)
-    assert.strictEqual(accepted.status, 0, accepted.stderr.toString())
-    const pin = yield* Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))(
-      accepted.stdout.toString(),
-    )
+    const pin = yield* readCandidate(options)
     assert.deepEqual(pin, {
       schemaVersion: 2,
       seeds: {
@@ -365,9 +359,8 @@ it.effect('publishes candidates only from passed receipts with matching IR fixpo
       { ...receipt, output: { ...receipt.output, sha256: 'a'.repeat(63) } },
     ]) {
       yield* fs.writeFileString(receiptPath, yield* encodeJson(invalid))
-      const rejected = yield* NativeProcess.execute(process.execPath, args)
-      assert.strictEqual(rejected.status, 1)
-      assert.strictEqual(rejected.stdout.toString(), '')
+      const rejected = yield* Effect.result(readCandidate(options))
+      assert.isTrue(Result.isFailure(rejected))
     }
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )

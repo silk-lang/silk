@@ -133,6 +133,26 @@ const BuildReceiptSchema = Schema.Struct({
   fixpoint: Schema.Struct({ producerIrSha256: Hex(64), outputIrSha256: Hex(64) }),
 })
 
+/** Reads a passed fixpoint receipt before producing its ready-to-publish seed coordinates. */
+export const readCandidate = Effect.fn('NativeSeed.readCandidate')(
+  /** @param {{receipt:string,runId:string,tag:string}} options */
+  function* ({ receipt: receiptPath, runId, tag }) {
+    const fs = yield* FileSystem.FileSystem
+    const receipt = yield* Schema.decodeEffect(Schema.fromJsonString(BuildReceiptSchema))(
+      yield* fs.readFileString(receiptPath),
+    )
+    if (receipt.fixpoint.producerIrSha256 !== receipt.fixpoint.outputIrSha256)
+      return yield* invalid('A seed candidate requires an IR fixpoint')
+    return yield* candidate({
+      target: receipt.target,
+      tag,
+      sha256: receipt.output.sha256,
+      sourceCommit: receipt.inputs.sourceCommit,
+      runId,
+    })
+  },
+)
+
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const [command, first, second, third, fourth, ...extra] = process.argv.slice(2)
   const require = createRequire(new URL('../../package.json', import.meta.url))
@@ -159,23 +179,10 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       printPin,
     )
   else if (command === 'candidate' && first && second && third && !fourth)
-    program = Effect.gen(function* () {
-      const fs = yield* FileSystem.FileSystem
-      const receipt = yield* Schema.decodeEffect(Schema.fromJsonString(BuildReceiptSchema))(
-        yield* fs.readFileString(resolve(first)),
-      )
-      if (receipt.fixpoint.producerIrSha256 !== receipt.fixpoint.outputIrSha256)
-        return yield* invalid('A seed candidate requires an IR fixpoint')
-      yield* printPin(
-        yield* candidate({
-          target: receipt.target,
-          tag: third,
-          sha256: receipt.output.sha256,
-          sourceCommit: receipt.inputs.sourceCommit,
-          runId: second,
-        }),
-      )
-    })
+    program = Effect.flatMap(
+      readCandidate({ receipt: resolve(first), runId: second, tag: third }),
+      printPin,
+    )
   else
     program = invalid(
       'usage: node NativeSeed.mjs outputs <pin> <target> | verify <pin> <target> <download> <destination> | candidate <fixpoint-build-receipt> <run-id> <tag>',
