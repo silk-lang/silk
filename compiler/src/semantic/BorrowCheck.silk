@@ -2062,6 +2062,39 @@ struct SourceAccessProjection {
   guardConsumed: Vector<SourceGuardConsumption>
 }
 
+struct SourceRuntimeEvents {
+  events: Vector<Event>
+  uncertain: Vector<bool>
+  unresolved: bool
+}
+
+// Runtime applicability belongs to the event's own point. For example, an argument borrow
+// occurs before a later never argument even when the enclosing result cannot complete.
+// Stable point ordering preserves the caller's ordering of coincident actual events.
+effect fn sourceRuntimeEvents<'body>(graph: &SourceGraph.Graph<'body>, events: Vector<Event>)
+  -> SourceRuntimeEvents ! OutOfMemoryError ? &mut Allocator {
+  let mut pending = move events
+  let mut result = SourceRuntimeEvents {events: Vector<Event>.make(), uncertain: Vector<bool>.make(), unresolved: false}
+  let points = Vector<SourceControl.Point>.asSlice(&SourceGraph.Graph.control(graph).points)
+  while Vector<Event>.length(&pending) != usize.ZERO {
+    let event = match move Vector<Event>.pop(&mut pending) {
+      Option<Event>.Some {value} => move value
+      _ => { return CompilerBug.panic(b"runtime event projection lost an actual event") }
+    }
+    if event.point >= points.length { return CompilerBug.panic(b"runtime event has no actual CFG point") }
+    let active = SourceGraph.Graph.truth(graph, points[event.point].reachable)
+    if active == SourceTruth.False { continue }
+    let uncertain = active == SourceTruth.Undefined
+    if uncertain { result.unresolved = true }
+    let existing = Vector<Event>.asSlice(&result.events)
+    let mut at = usize.ZERO
+    while at < existing.length && existing[at].point < event.point { at = at + usize.ONE }
+    run Vector<Event>.insert(&mut result.events, at, move event)
+    run Vector<bool>.insert(&mut result.uncertain, at, uncertain)
+  }
+  return move result
+}
+
 effect fn sourceAccessEvent(events: &mut Vector<SourceAccessEvent>, evaluation: SourceGraph.EvalId,
   point: SourceControl.PointId, path: &Path, kind: Kind, span: Location, target: Location) -> ()
 ! OutOfMemoryError ? &mut Allocator {
@@ -2506,6 +2539,33 @@ struct SourceControlProjection {
 struct SourceLoanNeeds {
   required: Vector<u64>
   liveOut: Vector<u64>
+  unresolved: bool
+}
+
+struct SourceLoanAvailability {
+  points: Vector<u64>
+  unresolved: bool
+}
+
+// Inputs to the existing availability propagation: real carriers and paired copy reads.
+// `preserves` is a projection of kills, not an independently solved reaching relation.
+struct AvailabilitySource {
+  definition: usize
+  read: usize
+}
+impl Copy for AvailabilitySource {}
+
+struct AvailabilityCarrier {
+  point: usize
+  selected: bool
+  unpaired: bool
+  sources: Vector<AvailabilitySource>
+}
+
+struct AvailabilityProjection {
+  carriers: Vector<AvailabilityCarrier>
+  preserves: Vector<u64>
+  flight: Vector<bool>
   unresolved: bool
 }
 
@@ -3559,6 +3619,140 @@ effect fn sourceLoanNeeds<'body>(graph: &SourceGraph.Graph<'body>, control: &Sou
     at = at + usize.ONE
   }
   return SourceLoanNeeds {required: move required, liveOut: move liveOut, unresolved: unresolved}
+}
+
+// Build the existing availability solver's inputs from original definitions and paired source
+// cases. A copy is licensed by its actual input history; occupying the same region or appearing
+// earlier in the definition inventory supplies no copy edge.
+effect fn sourceAvailabilityProjection<'body>(graph: &SourceGraph.Graph<'body>, storage: &SourceStorageProjection,
+  occupancy: &SourceLoanOccupancy, intervals: &[SourceIntervalProjection]) -> AvailabilityProjection
+! OutOfMemoryError ? &mut Allocator {
+  let control = SourceGraph.Graph.control(graph)
+  let pointCount = Vector<SourceControl.Point>.length(&control.points)
+  let definitions = Vector<SourceStorageDefinition>.asSlice(&storage.definitions)
+  let mut projection = AvailabilityProjection {carriers: Vector<AvailabilityCarrier>.make(),
+    preserves: Vector<u64>.make(), flight: Vector<bool>.make(), unresolved: occupancy.unresolved}
+  let leaving = Vector<u64>.asSlice(&occupancy.leaving)
+  let mut at = usize.ZERO
+  while at < leaving.length {
+    run Vector<u64>.append(&mut projection.preserves, leaving[at])
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < pointCount { run Vector<bool>.append(&mut projection.flight, false) at = at + usize.ONE }
+  at = usize.ZERO
+  while at < intervals.length {
+    let interval = &intervals[at]
+    if interval.source.loan == occupancy.loan {
+      let active = SourceGraph.Graph.truth(graph, interval.evidence.present)
+      if active == SourceTruth.Undefined || SourceGraph.Graph.truth(graph, interval.evidence.missing) != SourceTruth.False {
+        projection.unresolved = true
+      }
+      if active != SourceTruth.False {
+        if interval.from >= pointCount || interval.to >= pointCount { projection.unresolved = true }
+        else {
+          let mut point = interval.from
+          while point <= interval.to {
+            Vector<bool>.asMutSlice(&mut projection.flight)[point] = true
+            point = point + usize.ONE
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < definitions.length {
+    let definition = &definitions[at]
+    let mut carrier = AvailabilityCarrier {point: definition.definition.point.index,
+      selected: sourceStoredMembership(graph, definition, occupancy.loan) != SourceTruth.False,
+      unpaired: false, sources: Vector<AvailabilitySource>.make()}
+    let inputs = Vector<SourceGraph.Input>.asSlice(&definition.inputs)
+    let members = Vector<SourceStoredLoan>.asSlice(&definition.loans)
+    let mut each = usize.ZERO
+    while each < inputs.length {
+      let mut membership = SourceTruth.False
+      let mut member = usize.ZERO
+      while member < members.length {
+        if members[member].loan == occupancy.loan && members[member].leaf.index == inputs[each].leaf.index {
+          let active = SourceGraph.Graph.truth(graph, members[member].active)
+          if active == SourceTruth.True || (active == SourceTruth.Undefined && membership == SourceTruth.False) { membership = active }
+        }
+        member = member + usize.ONE
+      }
+      let cases = Vector<SourceGraph.InputCase>.asSlice(&inputs[each].cases)
+      let mut history = usize.ZERO
+      while history < cases.length {
+        let source = &cases[history]
+        let active = sourceTruthAnd(membership, SourceGraph.Graph.truth(graph, source.quality.present))
+        if active == SourceTruth.Undefined { projection.unresolved = true }
+        if active != SourceTruth.False {
+          match source.definition {
+            Option<SourceControl.DefinitionId>.Some {value: origin} => {
+              if let Option<SourceControl.ReadId>.Some {value: read} = source.read {
+                if origin.index >= definitions.length || read.index >= SourceGraph.Graph.readCount(graph) {
+                  projection.unresolved = true
+                } else {
+                  let written = SourceGraph.Graph.definition(graph, origin)
+                  let observed = SourceGraph.Graph.read(graph, read)
+                  if !sourceSameStorage(written.storage, observed.storage) { projection.unresolved = true }
+                  else if let Option<SourceAtom>.Some {value: pair} = sourceFlowPair(control, origin, read) {
+                    let paired = sourceTruthAnd(active, SourceGraph.Graph.truth(graph, pair))
+                    if paired == SourceTruth.Undefined { projection.unresolved = true }
+                    if paired != SourceTruth.False {
+                      run Vector<AvailabilitySource>.append(&mut carrier.sources,
+                        AvailabilitySource {definition: origin.index, read: observed.point.index})
+                    }
+                  } else { projection.unresolved = true }
+                }
+              } else { projection.unresolved = true }
+            }
+            _ => match source.read {
+              Option<SourceControl.ReadId>.None => { carrier.unpaired = true }
+              _ => { projection.unresolved = true }
+            }
+          }
+        }
+        history = history + usize.ONE
+      }
+      each = each + usize.ONE
+    }
+    run Vector<AvailabilityCarrier>.append(&mut projection.carriers, move carrier)
+    at = at + usize.ONE
+  }
+  return move projection
+}
+
+// The source path supplies actual events and the projected carrier histories to the one
+// accepted availability algorithm. Initialization and unreachable points retain their separate
+// must-mask and creation proofs; neither is inferred from current loan occupancy.
+effect fn sourceLoanAvailable(control: &SourceControlProjection, events: &SourceRuntimeEvents,
+  projection: &AvailabilityProjection, occupancy: &SourceLoanOccupancy, loan: &Loan,
+  sourceBound: bool, initialized: usize, storage: &RegionAvailability) -> SourceLoanAvailability
+! OutOfMemoryError ? &mut Allocator {
+  let points = Vector<Point>.asSlice(&control.points)
+  let mut result = SourceLoanAvailability {points: Vector<u64>.make(), unresolved:
+    control.unresolved || events.unresolved || projection.unresolved || occupancy.unresolved}
+  let words = (points.length + 63) / 64
+  let mut at = usize.ZERO
+  while at < words { run Vector<u64>.append(&mut result.points, u64.bitNot(0)) at = at + usize.ONE }
+  if loan.created >= points.length {
+    result.unresolved = true
+    return move result
+  }
+  run propagateAvailability(points, Vector<Event>.asSlice(&events.events), control.entry, loan, sourceBound,
+    initialized != usize.MAX, Vector<u64>.asSlice(&occupancy.entering), occupancy.width, projection, &mut result.points)
+  if initialized != usize.MAX {
+    let masks = Vector<Vector<u64>>.asSlice(&storage.masks)
+    if initialized >= masks.length { return CompilerBug.panic(b"source availability lost its actual initialization mask") }
+    let valid = Vector<u64>.asSlice(&masks[initialized])
+    if valid.length != words { return CompilerBug.panic(b"initialization mask belongs to another CFG") }
+    let mut own = Vector<u64>.asMutSlice(&mut result.points)
+    at = usize.ZERO
+    while at < words { own[at] = u64.bitAnd(own[at], valid[at]) at = at + usize.ONE }
+  }
+  run unreachableAvailable(points, loan.created, &mut result.points)
+  return move result
 }
 
 // Owner identity, not a region match or a source leaf's creation order, selects initialization.
@@ -10749,10 +10943,61 @@ fn excludeRegionPoint(bits: &mut Vector<u64>, point: usize) -> bool {
 // every path from entry; a point no path from creation reaches is available (`unreachableAvailable`).
 // Real referent ends, writes, moves and drops still propagate exclusions along the CFG; neither
 // the symbolic escape proof nor the Walker's conflict/liveness checks are bypassed.
+// The eager caller supplies the same carrier contract while the atomic source migration is
+// staged. The propagation below is shared; the source caller never runs reachingHoldings.
 effect fn localAvailable(walker: &Walker, entry: usize, index: usize, loan: &Loan, sourceBound: bool, ownedStart: bool,
   definitions: &[u64], definitionWidth: usize, available: &mut Vector<u64>) -> ()
 ! OutOfMemoryError ? &mut Allocator {
   let points = Vector<Point>.asSlice(&walker.points)
+  let held = Vector<Holding>.asSlice(&walker.definitions)
+  let histories = Vector<HoldingSource>.asSlice(&walker.holdingSources)
+  let mut projection = AvailabilityProjection {carriers: Vector<AvailabilityCarrier>.make(),
+    preserves: Vector<u64>.make(), flight: Vector<bool>.make(), unresolved: false}
+  let mut at = usize.ZERO
+  while at < points.length {
+    run Vector<bool>.append(&mut projection.flight, withinInterval(loan, at))
+    at = at + usize.ONE
+  }
+  if definitionWidth == usize.ZERO {
+    return run propagateAvailability(points, Vector<Event>.asSlice(&walker.events), entry, loan, sourceBound,
+      ownedStart, definitions, definitionWidth, &projection, &mut available.*)
+  }
+  at = usize.ZERO
+  while at < points.length * definitionWidth {
+    run Vector<u64>.append(&mut projection.preserves, 0)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < held.length {
+    let mut sources = Vector<AvailabilitySource>.make()
+    let mut each = held[at].sources
+    while each < held[at].sources + held[at].sourceCount {
+      run Vector<AvailabilitySource>.append(&mut sources, AvailabilitySource {
+        definition: histories[each].definition, read: histories[each].read})
+      each = each + usize.ONE
+    }
+    run Vector<AvailabilityCarrier>.append(&mut projection.carriers, AvailabilityCarrier {
+      point: held[at].point, selected: held[at].loan == index, unpaired: held[at].sourceCount == usize.ZERO,
+      sources: move sources})
+    let mut point = usize.ZERO
+    while point < points.length {
+      if points[point].defines != held[at].holder || held[at].point == point {
+        sourceIncludeDefinition(&mut projection.preserves, definitionWidth, point, SourceControl.DefinitionId {index: at})
+      }
+      point = point + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return run propagateAvailability(points, Vector<Event>.asSlice(&walker.events), entry, loan, sourceBound,
+    ownedStart, definitions, definitionWidth, &projection, &mut available.*)
+}
+
+// Accepted availability algorithm, parameterized only by its actual carrier/kill/history
+// inventory. The caller supplies the same CFG and keeps the source-bound and own-loan gates.
+effect fn propagateAvailability(points: &[Point], events: &[Event], entry: usize, loan: &Loan,
+  sourceBound: bool, ownedStart: bool, definitions: &[u64], definitionWidth: usize,
+  projection: &AvailabilityProjection, available: &mut Vector<u64>) -> ()
+! OutOfMemoryError ? &mut Allocator {
   let mut entered = Vector<usize>.make()
   // The entry belongs to the supplied CFG; its numeric ID is not an availability fact.
   if !sourceBound && !ownedStart && loan.created != entry && excludeRegionPoint(&mut available.*, entry) {
@@ -10772,7 +11017,6 @@ effect fn localAvailable(walker: &Walker, entry: usize, index: usize, loan: &Loa
     at = at + usize.ONE
   }
   let mut queue = Vector<usize>.make()
-  let events = Vector<Event>.asSlice(&walker.events)
   at = usize.ZERO
   while at < events.length {
     let event = &events[at]
@@ -10813,7 +11057,7 @@ effect fn localAvailable(walker: &Walker, entry: usize, index: usize, loan: &Loa
     }
     return ()
   }
-  let all = Vector<Holding>.asSlice(&walker.definitions)
+  let all = Vector<AvailabilityCarrier>.asSlice(&projection.carriers)
   let mut carried = Vector<u64>.make()
   at = usize.ZERO
   while at < points.length * width { run Vector<u64>.append(&mut carried, 0) at = at + usize.ONE }
@@ -10823,7 +11067,7 @@ effect fn localAvailable(walker: &Walker, entry: usize, index: usize, loan: &Loa
     let point = Vector<usize>.asSlice(&queue)[at]
     let mut held = usize.ZERO
     while held < all.length {
-      if all[held].loan == index && reaches(definitions, width, point, held) {
+      if all[held].selected && reaches(definitions, width, point, held) {
         let mut words = Vector<u64>.asMutSlice(&mut carried)
         let slot = point * width + wordOf(held)
         words[slot] = u64.bitOr(words[slot], maskOf(held))
@@ -10836,24 +11080,24 @@ effect fn localAvailable(walker: &Walker, entry: usize, index: usize, loan: &Loa
   while at < Vector<usize>.length(&queue) {
     let point = Vector<usize>.asSlice(&queue)[at]
     let next = Vector<usize>.asSlice(&points[point].next)
-    let flowing = withinInterval(loan, point)
+    let flowing = Vector<bool>.asSlice(&projection.flight)[point]
     let mut edge = usize.ZERO
     while edge < next.length {
       let target = next[edge]
       if target != loan.created {
-        let landing = withinInterval(loan, target)
+        let landing = Vector<bool>.asSlice(&projection.flight)[target]
         let mut grew = false
         let mut holds = false
         let mut held = usize.ZERO
         while held < all.length {
           let incoming = u64.bitAnd(Vector<u64>.asSlice(&carried)[point * width + wordOf(held)], maskOf(held)) != 0
-          let rebound = points[target].defines == all[held].holder && all[held].point != target
+          let rebound = !reaches(Vector<u64>.asSlice(&projection.preserves), width, target, held)
           let mut copied = false
-          if all[held].loan == index && all[held].point == target {
-            copied = all[held].sourceCount == usize.ZERO && (flowing || landing)
-            let sources = Vector<HoldingSource>.asSlice(&walker.holdingSources)
-            let mut source = all[held].sources
-            while source < all[held].sources + all[held].sourceCount {
+          if all[held].selected && all[held].point == target {
+            copied = all[held].unpaired && (flowing || landing)
+            let sources = Vector<AvailabilitySource>.asSlice(&all[held].sources)
+            let mut source = usize.ZERO
+            while source < sources.length {
               let origin = sources[source].definition
               if reaches(definitions, width, sources[source].read, origin)
                 && u64.bitAnd(Vector<u64>.asSlice(&carried)[point * width + wordOf(origin)], maskOf(origin)) != 0 { copied = true }
