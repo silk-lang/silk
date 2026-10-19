@@ -5,11 +5,11 @@
 //! transport and ownership actions to these actual occurrences before that same graph is solved.
 
 import hir.Hir {InfixOperator}
-import semantic.SourceAnalysis {Skeleton, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, Storage, sameSelector, inputOperand, sameInputRead}
+import semantic.SourceAnalysis {Skeleton, Directness, TransferPolicy, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, Storage, sameSelector, inputOperand, sameInputRead}
 import semantic.SourceFlow {Flow, PointId, Write}
 import semantic.SourceRules {Atom, Program}
-import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, MapId, SelectionMap, MapKind, InputRead, InputRoute, Construction, Operation, Transport}
-import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace}
+import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, IndexClass, MapId, SelectionMap, MapKind, InputRead, InputRoute, Construction, Operation, Transport}
+import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace, SourceConstruction}
 import semantic.Type {Type}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.option {Option}
@@ -863,6 +863,38 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
         let alias = exactMap(maps, occurrence.node, source, storage, MapKind.Select)
         run Skeleton.localAliases(&mut reservation.skeleton, endpoints, maps, alias, occurrence.evaluation, local)
       }
+      NodeKind.Expression {form: Expression.Move {value, consumed}, ..} => {
+        let mut storage = false
+        if let Option<ConsumedPlace>.Some {..} = &consumed { storage = true }
+        run forwardedValue(prepared, &mut reservation.skeleton, occurrence, value, storage,
+          Option<usize>.none(), yes)
+      }
+      NodeKind.Expression {form: Expression.PointerWeaken {value}, ..} => {
+        run forwardedValue(prepared, &mut reservation.skeleton, occurrence, value, false,
+          Option<usize>.none(), yes)
+      }
+      NodeKind.Expression {form: Expression.EnumValue {value}, ..} => {
+        run forwardedValue(prepared, &mut reservation.skeleton, occurrence, value, false,
+          Option<usize>.none(), yes)
+      }
+      NodeKind.Expression {form: Expression.UnionInject {value, tag}, ..} => {
+        run forwardedValue(prepared, &mut reservation.skeleton, occurrence, value, false,
+          Option<usize>.some(tag), yes)
+      }
+      NodeKind.Expression {form: Expression.Aggregate {fields, construction, ..}, ..} => {
+        if let Option<SourceConstruction>.None = &construction {
+          run aggregateValues(prepared, &mut reservation.skeleton, occurrence,
+            Vector<AggregateField>.asSlice(&fields), usize.MAX, yes)
+        }
+      }
+      NodeKind.Expression {form: Expression.VariantConstruct {fields, tag}, ..} => {
+        run aggregateValues(prepared, &mut reservation.skeleton, occurrence,
+          Vector<AggregateField>.asSlice(&fields), tag, yes)
+      }
+      NodeKind.Expression {form: Expression.Callable {fields, ..}, ..} => {
+        run aggregateValues(prepared, &mut reservation.skeleton, occurrence,
+          Vector<AggregateField>.asSlice(&fields), usize.MAX, yes)
+      }
       NodeKind.Expression {form: Expression.Field {..}, ..} => {
         run ownedProjection(prepared, &mut reservation.skeleton, occurrence, yes)
       }
@@ -893,6 +925,114 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
     at = at + usize.ONE
   }
   return ()
+}
+
+// Representation-preserving unary transfers retain their actual predecessor, including
+// LoanFree and Unknown. A consumed place reads at this operation before its destructive
+// ownership action; it does not reuse an earlier cached contents snapshot of the address.
+effect fn forwardedValue<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
+  occurrence: &Visit, operand: NodeId, storage: bool, variant: Option<usize>, active: Atom) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let inputs = Vector<Input>.asSlice(&occurrence.inputs)
+  if inputs.length != usize.ONE || inputs[0].node.index != operand.index {
+    CompilerBug.panic(b"forwarded value lost its actual operand occurrence")
+  }
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+  let mut role = EndpointRole.Value
+  if storage { role = EndpointRole.Storage }
+  let source = nodeRoot(endpoints, operand, role)
+  let mut target = nodeRoot(endpoints, occurrence.node, EndpointRole.Value)
+  let mut kind = MapKind.Copy
+  if let Option<usize>.Some {value: tag} = variant {
+    target = exactChild(endpoints, target, &Selector.Variant {ordinal: tag})
+    kind = MapKind.Place
+  }
+  let map = exactMap(maps, occurrence.node, source, target, kind)
+  if storage {
+    run Skeleton.readAliases(&mut skeleton.*, endpoints, maps, map,
+      inputs[0].evaluation, occurrence.evaluation, active)
+  } else {
+    let absent = Program.atom(&mut skeleton.rules)
+    drop run Skeleton.transfer(&mut skeleton.*, endpoints, maps, map, inputs[0].evaluation,
+      occurrence.evaluation, active, Directness.Preserve, absent, absent, TransferPolicy.Physical)
+  }
+  return ()
+}
+
+// The written fields vector supplies occurrence multiplicity; its destination coordinate
+// selects one frozen map. Two fields evaluating the same NodeId remain two physical reads.
+// This is construction holding only. Invocation result/storage policy is a separate consumer.
+effect fn aggregateValues<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
+  occurrence: &Visit, fields: &[AggregateField], variant: usize, active: Atom) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+  let inputs = Vector<Input>.asSlice(&occurrence.inputs)
+  let output = nodeRoot(endpoints, occurrence.node, EndpointRole.Value)
+  let shape = &Vector<Shape>.asSlice(&prepared.shapes)[endpoints[output.index].shape.index]
+  let array = match &shape.state { ShapeState.Array {..} => true _ => false }
+  let absent = Program.atom(&mut skeleton.rules)
+  let mut field = usize.ZERO
+  while field < fields.length {
+    let mut actual = usize.MAX
+    let mut input = usize.ZERO
+    while input < inputs.length {
+      if let Option<InputRead>.Some {value: InputRead.Field {ordinal}} = inputs[input].read {
+        if ordinal == field {
+          if actual != usize.MAX || inputs[input].node.index != fields[field].value.index {
+            CompilerBug.panic(b"aggregate field has no unique actual operand occurrence")
+          }
+          actual = input
+        }
+      }
+      input = input + usize.ONE
+    }
+    if actual == usize.MAX { CompilerBug.panic(b"aggregate field lost its written evaluation") }
+    let source = nodeRoot(endpoints, fields[field].value, EndpointRole.Value)
+    let mut selected = usize.MAX
+    let mut endpoint = usize.ZERO
+    while endpoint < endpoints.length {
+      let child = match endpoints[endpoint].parent {
+        Option<EndpointId>.Some {value} => value.index == output.index
+        _ => false
+      }
+      let placed = match &endpoints[endpoint].selector {
+        Selector.Member {member, payload, ..} =>
+          (variant != usize.MAX && member == variant && payload == fields[field].index)
+          || (variant == usize.MAX && !array && member == fields[field].index && payload == usize.ZERO)
+        Selector.Field {ordinal} => !array && variant == usize.MAX && ordinal == fields[field].index
+        Selector.Index {class: IndexClass.Exact {index}} => array && index == fields[field].index
+        _ => false
+      }
+      if child && placed {
+        if selected != usize.MAX { CompilerBug.panic(b"aggregate placement has duplicate prepared components") }
+        selected = endpoint
+      }
+      endpoint = endpoint + usize.ONE
+    }
+    if selected == usize.MAX { CompilerBug.panic(b"aggregate placement has no exact prepared component") }
+    let map = exactMap(maps, occurrence.node, source, EndpointId {index: selected}, MapKind.Place)
+    drop run Skeleton.transfer(&mut skeleton.*, endpoints, maps, map, inputs[actual].evaluation,
+      occurrence.evaluation, active, Directness.Preserve, absent, absent, TransferPolicy.Physical)
+    field = field + usize.ONE
+  }
+  return ()
+}
+
+fn exactChild(endpoints: &[Endpoint], parent: EndpointId, selector: &Selector) -> EndpointId {
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    let child = match endpoints[at].parent { Option<EndpointId>.Some {value} => value.index == parent.index _ => false }
+    if child && sameSelector(&endpoints[at].selector, selector) {
+      if found != usize.MAX { return CompilerBug.panic(b"source component has duplicate exact prepared identities") }
+      found = at
+    }
+    at = at + usize.ONE
+  }
+  if found == usize.MAX { return CompilerBug.panic(b"source component has no prepared identity") }
+  return EndpointId {index: found}
 }
 
 // Inline Field/Index projections read canonical storage at the projection occurrence. Slice
