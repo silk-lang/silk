@@ -162,10 +162,26 @@ pub struct StorageAlias {
   pub route: Vector<MapId>
 }
 
-struct AliasDestination {
+/// Deferred address consumers are recorded at their actual execution points. Candidate
+/// closure may discover another address history later; it extends this same operation's
+/// destination gate instead of creating a second store or rereading a prior snapshot.
+union AliasOperationKind {
+  Project { map: MapId, source: EvalId, target: EvalId, write: Write },
+  Read { map: MapId, source: EvalId, target: EvalId, active: Atom },
+  Write { map: MapId, source: EvalId, address: EvalId, target: EvalId, active: Atom },
+  Invalidate { address: EvalId, root: EndpointId, target: EvalId, origin: Origin, active: Atom },
+}
+impl Copy for AliasOperationKind {}
+struct AliasOperation {
+  kind: AliasOperationKind
+  closed: usize
+}
+impl Copy for AliasOperation {}
+struct AliasDefinition {
+  operation: usize
   storage: Storage
   active: Atom
-  write: Write
+  definition: DefinitionId
 }
 
 /// A real reference descriptor remembers its actual address formation, not a copy of the
@@ -227,6 +243,8 @@ pub struct Skeleton {
   pub storage: Vector<Storage>
   pub aliases: Vector<StorageAlias>
   pub selections: Vector<SelectionUse>
+  aliasOperations: Vector<AliasOperation>
+  aliasDefinitions: Vector<AliasDefinition>
   references: Vector<ReferenceOrigin>
   definitions: Vector<DefinedValue>
   reads: Vector<ReadValue>
@@ -493,7 +511,7 @@ impl Skeleton {
   pub fn make() -> Self {
     return Skeleton {rules: Program.make(), flow: Flow.make(), evaluations: Vector<Evaluation>.make(),
       values: Vector<Value>.make(), leaves: Vector<Leaf>.make(), transfers: Vector<Transfer>.make(), seeds: Vector<Seed>.make(),
-      storage: Vector<Storage>.make(), aliases: Vector<StorageAlias>.make(), selections: Vector<SelectionUse>.make(), references: Vector<ReferenceOrigin>.make(), definitions: Vector<DefinedValue>.make(), reads: Vector<ReadValue>.make(), closedPairs: usize.ZERO}
+      storage: Vector<Storage>.make(), aliases: Vector<StorageAlias>.make(), selections: Vector<SelectionUse>.make(), aliasOperations: Vector<AliasOperation>.make(), aliasDefinitions: Vector<AliasDefinition>.make(), references: Vector<ReferenceOrigin>.make(), definitions: Vector<DefinedValue>.make(), reads: Vector<ReadValue>.make(), closedPairs: usize.ZERO}
   }
 
   pub effect fn evaluate(self: &mut Self, node: NodeId, role: EvaluationRole, point: PointId) -> EvalId
@@ -579,6 +597,177 @@ impl Skeleton {
     let read = run Flow.read(&mut self.flow, point, component)
     run Vector<ReadValue>.append(&mut self.reads, ReadValue {read: read, storage: storage, value: value, map: move map})
     return read
+  }
+
+  effect fn aliasDefinition(self: &mut Self, operation: usize, storage: Storage, target: EvalId,
+    active: Atom, write: Write, unavailable: Option<Origin>) -> () ! OutOfMemoryError ? &mut Allocator {
+    let existing = Vector<AliasDefinition>.asSlice(&self.aliasDefinitions)
+    let mut index = usize.ZERO
+    let mut found = usize.MAX
+    while index < existing.length {
+      if existing[index].operation == operation && sameStorage(existing[index].storage, storage) { found = index }
+      index = index + usize.ONE
+    }
+    let mut joined = active
+    if found == usize.MAX {
+      joined = Program.atom(&mut self.rules)
+      let actual = Skeleton.evaluation(&self.*, target)
+      let mut definition = DefinitionId {index: usize.MAX}
+      match unavailable {
+        Option<Origin>.Some {value: origin} => {
+          definition = run Skeleton.uninitialize(&mut self.*, storage, target, origin, joined, write)
+        }
+        Option<Origin>.None => {
+          let value = run Skeleton.value(&mut self.*, target, storage.endpoint)
+          definition = run Skeleton.define(&mut self.*, actual.point, storage, value, joined, write)
+        }
+      }
+      run Vector<AliasDefinition>.append(&mut self.aliasDefinitions, AliasDefinition {
+        operation: operation, storage: storage, active: joined, definition: definition})
+    } else {
+      let previous = &Vector<AliasDefinition>.asSlice(&self.aliasDefinitions)[found]
+      joined = previous.active
+      if write == Write.Weak { Flow.weaken(&mut self.flow, previous.definition) }
+    }
+    let input: [Atom; 1] = [active]
+    let none = Vector<Atom>.make()
+    run Program.rule(&mut self.rules, joined, &input, Vector<Atom>.asSlice(&none))
+    return ()
+  }
+
+  effect fn activateSelections<'body>(self: &mut Self, prepared: &SourcePreparation<'body>) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+    let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+    let length = Vector<SelectionUse>.length(&self.selections)
+    let mut index = usize.ZERO
+    while index < length {
+      let request = &Vector<SelectionUse>.asSlice(&self.selections)[index]
+      run validateSelectionUse(prepared, request, Vector<Evaluation>.asSlice(&self.evaluations))
+      let operand = request.operand
+      let result = request.result
+      let active = request.active
+      let strength = request.strength
+      let value = request.value
+      let place = request.place
+      // These families are also the exact output side of a later boundary composition.
+      // Ordinary inline storage already has matching aliases; a reference/slice boundary
+      // supplies them only through its occurrence-sensitive product, never by this map alone.
+      if let Option<MapId>.Some {value: map} = place {
+        run Skeleton.projectAliases(&mut self.*, endpoints, maps, map, operand, result, strength)
+      }
+      if let Option<MapId>.Some {value: map} = value {
+        run Skeleton.readAliases(&mut self.*, endpoints, maps, map, operand, result, active)
+      }
+      index = index + usize.ONE
+    }
+    return ()
+  }
+
+  /// Extends operations only for newly discovered actual aliases. Destination definitions and
+  /// their gates keep stable identities across rounds; no solved fact or policy is sampled.
+  effect fn activateAliasOperations(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap]) -> bool
+  ! OutOfMemoryError ? &mut Allocator {
+    let count = Vector<StorageAlias>.length(&self.aliases)
+    let length = Vector<AliasOperation>.length(&self.aliasOperations)
+    let mut changed = false
+    let mut operation = usize.ZERO
+    while operation < length {
+      let request = Vector<AliasOperation>.asSlice(&self.aliasOperations)[operation]
+      if request.closed > count { CompilerBug.panic(b"actual source alias inventory shrank") }
+      if request.closed < count {
+        match request.kind {
+          AliasOperationKind.Project {map, source, target, write} => {
+            run Skeleton.emitAliasProjection(&mut self.*, endpoints, maps, map, source, target, write, request.closed, count)
+          }
+          AliasOperationKind.Read {map, source, target, active} => {
+            run Skeleton.emitAliasRead(&mut self.*, endpoints, maps, map, source, target, active, request.closed, count)
+          }
+          AliasOperationKind.Write {map, address, target, active, ..} => {
+            run Skeleton.emitAliasWrite(&mut self.*, endpoints, maps, map, address, target, active, operation, request.closed, count)
+          }
+          AliasOperationKind.Invalidate {address, root, target, origin, active} => {
+            let mut alias = request.closed
+            while alias < count {
+              let actual = &Vector<StorageAlias>.asSlice(&self.aliases)[alias]
+              if actual.evaluation.index == address.index && componentWithin(endpoints, actual.endpoint, root) {
+                let storage = actual.storage
+                let write = actual.write
+                let applicable = run addressApplies(&mut self.rules, active, actual.active)
+                run Skeleton.aliasDefinition(&mut self.*, operation, storage, target, applicable, write, Option<Origin>.some(origin))
+              }
+              alias = alias + usize.ONE
+            }
+          }
+        }
+        Vector<AliasOperation>.asMutSlice(&mut self.aliasOperations)[operation].closed = count
+        changed = true
+      }
+      operation = operation + usize.ONE
+    }
+    return changed
+  }
+
+  /// Observe an actual owner at its cleanup/use point. The cause node names the action,
+  /// not the storage being read. Only canonical inline storage is observed; reference
+  /// referents and Effect channels are not owned fields and cannot be read by this walk.
+  pub effect fn observeStorage<'body>(self: &mut Self, prepared: &SourcePreparation<'body>,
+    storage: Storage, evaluation: EvalId) -> ValueId ! OutOfMemoryError ? &mut Allocator {
+    let actual = Skeleton.evaluation(&self.*, evaluation)
+    let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+    let shapes = Vector<Prepared.Shape>.asSlice(&prepared.shapes)
+    if actual.role != EvaluationRole.Cleanup || storage.endpoint.index >= endpoints.length {
+      return CompilerBug.panic(b"owner observation has no actual cleanup occurrence or storage")
+    }
+    let root = &endpoints[storage.endpoint.index]
+    let whole = match root.parent { Option<EndpointId>.None => true _ => false }
+    let identity = match &root.root {
+      Root.Local {local, role} => local.index < prepared.body.locals.length && role == EndpointRole.Storage
+        && match storage.temporary { Option<EvalId>.None => true _ => false }
+      Root.Node {node, role} => role == EndpointRole.Storage && match storage.temporary {
+        Option<EvalId>.Some {value} => match Skeleton.evaluation(&self.*, value).site {
+          EvaluationSite.Node {node: owner} => owner.index == node.index
+          _ => false
+        }
+        _ => false
+      }
+      _ => false
+    }
+    if !whole || !identity { return CompilerBug.panic(b"cleanup observation changed its canonical owner identity") }
+    let mut pending = Vector<EndpointId>.make()
+    run Vector<EndpointId>.append(&mut pending, storage.endpoint)
+    let result = run Skeleton.value(&mut self.*, evaluation, storage.endpoint)
+    let mut at = usize.ZERO
+    while at < Vector<EndpointId>.length(&pending) {
+      let endpoint = Vector<EndpointId>.asSlice(&pending)[at]
+      let value = run Skeleton.value(&mut self.*, evaluation, endpoint)
+      drop run Skeleton.read(&mut self.*, actual.point,
+        Storage {endpoint: endpoint, temporary: storage.temporary}, value, Option<MapId>.none())
+      let components = Vector<Prepared.Component>.asSlice(&shapes[endpoints[endpoint.index].shape.index].components)
+      let mut component = usize.ZERO
+      while component < components.length {
+        if components[component].inline {
+          let mut found = usize.MAX
+          let mut child = usize.ZERO
+          while child < endpoints.length {
+            let parent = match endpoints[child].parent {
+              Option<EndpointId>.Some {value} => value.index == endpoint.index
+              _ => false
+            }
+            if parent && sameSelector(&endpoints[child].selector, &components[component].selector) {
+              if found != usize.MAX { CompilerBug.panic(b"owned storage repeats a prepared inline component") }
+              found = child
+            }
+            child = child + usize.ONE
+          }
+          if found == usize.MAX { CompilerBug.panic(b"owned storage omitted a prepared inline component") }
+          run Vector<EndpointId>.append(&mut pending, EndpointId {index: found})
+        }
+        component = component + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    return result
   }
 
   /// Close only the newly reserved storage pairs into the SAME transfer graph. Boundary
@@ -702,17 +891,28 @@ impl Skeleton {
   /// stored value or turn an unknown reference selector into an owned-storage alias.
   pub effect fn projectAliases(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], map: MapId,
     source: EvalId, target: EvalId, write: Write) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run transferFamily(endpoints, maps, map)
+    // Address formation composes an already evaluated operand with its later projection.
+    // Runtime loop cycles are source-flow edges, not recursively expanding address paths.
+    if source.index >= target.index { CompilerBug.panic(b"source address projection does not follow operand evaluation") }
+    run Vector<AliasOperation>.append(&mut self.aliasOperations, AliasOperation {
+      kind: AliasOperationKind.Project {map: map, source: source, target: target, write: write}, closed: usize.ZERO})
+    return ()
+  }
+
+  effect fn emitAliasProjection(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], map: MapId,
+    source: EvalId, target: EvalId, write: Write, first: usize, limit: usize) -> () ! OutOfMemoryError ? &mut Allocator {
     let family = run transferFamily(endpoints, maps, map)
     let actual = Skeleton.evaluation(&self.*, target)
     let matches = match actual.site { EvaluationSite.Node {node} => node.index == maps[map.index].site.index _ => false }
     if !matches { CompilerBug.panic(b"projected address map has a different actual occurrence") }
     let members = Vector<MapId>.asSlice(&family)
-    let previous = Vector<StorageAlias>.length(&self.aliases)
+    let previous = limit
     let mut member = usize.ZERO
     while member < members.length {
       let physical = &maps[members[member].index]
       if physical.kind != MapKind.Select { CompilerBug.panic(b"projected storage identity requires a Select map") }
-      let mut at = usize.ZERO
+      let mut at = first
       while at < previous {
         let alias = &Vector<StorageAlias>.asSlice(&self.aliases)[at]
         if alias.evaluation.index == source.index && alias.endpoint.index == physical.source.index {
@@ -738,6 +938,14 @@ impl Skeleton {
   /// address formation, so the proof exposes both facts without inventing another evaluation.
   pub effect fn readAliases(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], map: MapId,
     source: EvalId, target: EvalId, active: Atom) -> () ! OutOfMemoryError ? &mut Allocator {
+    drop run transferFamily(endpoints, maps, map)
+    run Vector<AliasOperation>.append(&mut self.aliasOperations, AliasOperation {
+      kind: AliasOperationKind.Read {map: map, source: source, target: target, active: active}, closed: usize.ZERO})
+    return ()
+  }
+
+  effect fn emitAliasRead(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], map: MapId,
+    source: EvalId, target: EvalId, active: Atom, first: usize, limit: usize) -> () ! OutOfMemoryError ? &mut Allocator {
     let family = run transferFamily(endpoints, maps, map)
     let members = Vector<MapId>.asSlice(&family)
     let actual = Skeleton.evaluation(&self.*, target)
@@ -748,8 +956,8 @@ impl Skeleton {
     while member < members.length {
       let physical = &maps[members[member].index]
       if physical.kind != MapKind.Copy { CompilerBug.panic(b"projected value read requires a prepared Copy map") }
-      let count = Vector<StorageAlias>.length(&self.aliases)
-      let mut at = usize.ZERO
+      let count = limit
+      let mut at = first
       while at < count {
         let alias = &Vector<StorageAlias>.asSlice(&self.aliases)[at]
         if alias.evaluation.index == source.index && alias.endpoint.index == physical.source.index {
@@ -820,19 +1028,26 @@ impl Skeleton {
   pub effect fn writeAliases(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], map: MapId,
     source: EvalId, address: EvalId, target: EvalId, active: Atom) -> ()
   ! OutOfMemoryError ? &mut Allocator {
-    let actual = Skeleton.evaluation(&self.*, target)
     let absent = Program.atom(&mut self.rules)
     drop run Skeleton.transfer(&mut self.*, endpoints, maps, map, source, target, active,
       Directness.Preserve, absent, absent, TransferPolicy.Physical)
+    run Vector<AliasOperation>.append(&mut self.aliasOperations, AliasOperation {
+      kind: AliasOperationKind.Write {map: map, source: source, address: address, target: target, active: active}, closed: usize.ZERO})
+    return ()
+  }
+
+  effect fn emitAliasWrite(self: &mut Self, endpoints: &[Endpoint], maps: &[SelectionMap], map: MapId,
+    address: EvalId, target: EvalId, active: Atom, operation: usize, first: usize, limit: usize) -> ()
+  ! OutOfMemoryError ? &mut Allocator {
+    let absent = Program.atom(&mut self.rules)
     let family = run transferFamily(endpoints, maps, map)
     let members = Vector<MapId>.asSlice(&family)
-    let mut defined = Vector<AliasDestination>.make()
     let mut member = usize.ZERO
     while member < members.length {
       let physical = &maps[members[member].index]
       if physical.kind != MapKind.Place { CompilerBug.panic(b"projected replacement has no prepared Place map") }
-      let count = Vector<StorageAlias>.length(&self.aliases)
-      let mut at = usize.ZERO
+      let count = limit
+      let mut at = first
       while at < count {
         let alias = &Vector<StorageAlias>.asSlice(&self.aliases)[at]
         if alias.evaluation.index == address.index && alias.endpoint.index == physical.target.index {
@@ -868,21 +1083,11 @@ impl Skeleton {
               map: Option<MapId>.some(edge), contract: Option<ContractRouteId>.none(), policy: TransferPolicy.Physical})
             before = onward
           }
-          run aliasDestination(&mut defined, &mut self.rules, storage, applicable, write)
+          run Skeleton.aliasDefinition(&mut self.*, operation, storage, target, applicable, write, Option<Origin>.none())
         }
         at = at + usize.ONE
       }
       member = member + usize.ONE
-    }
-    // Histories are not extra writes. Join their applicability BEFORE making the one
-    // definition, so discovery order cannot choose which conditional destination survives.
-    let destinations = Vector<AliasDestination>.asSlice(&defined)
-    let mut at = usize.ZERO
-    while at < destinations.length {
-      let destination = &destinations[at]
-      let stored = run Skeleton.value(&mut self.*, target, destination.storage.endpoint)
-      drop run Skeleton.define(&mut self.*, actual.point, destination.storage, stored, destination.active, destination.write)
-      at = at + usize.ONE
     }
     return ()
   }
@@ -946,36 +1151,16 @@ impl Skeleton {
   pub effect fn invalidateAliases(self: &mut Self, endpoints: &[Endpoint], address: EvalId,
     root: EndpointId, target: EvalId, origin: Origin, active: Atom) -> ()
   ! OutOfMemoryError ? &mut Allocator {
-    let mut covered = Vector<AliasDestination>.make()
-    let count = Vector<StorageAlias>.length(&self.aliases)
-    let mut at = usize.ZERO
-    while at < count {
-      let alias = &Vector<StorageAlias>.asSlice(&self.aliases)[at]
-      if alias.evaluation.index == address.index && componentWithin(endpoints, alias.endpoint, root) {
-        let storage = alias.storage
-        let write = alias.write
-        let applicable = run addressApplies(&mut self.rules, active, alias.active)
-        run aliasDestination(&mut covered, &mut self.rules, storage, applicable, write)
-      }
-      at = at + usize.ONE
-    }
-    let destinations = Vector<AliasDestination>.asSlice(&covered)
-    if destinations.length == usize.ZERO {
-      CompilerBug.panic(b"consumed owned place has no actual canonical storage components")
-    }
-    at = usize.ZERO
-    while at < destinations.length {
-      let destination = &destinations[at]
-      run Skeleton.uninitialize(&mut self.*, destination.storage, target, origin, destination.active, destination.write)
-      at = at + usize.ONE
-    }
+    if root.index >= endpoints.length { CompilerBug.panic(b"consumed source address has no prepared root") }
+    run Vector<AliasOperation>.append(&mut self.aliasOperations, AliasOperation {
+      kind: AliasOperationKind.Invalidate {address: address, root: root, target: target, origin: origin, active: active}, closed: usize.ZERO})
     return ()
   }
 
   // Unavailable is an explicit source definition. It is neither a synthetic RHS nor a
   // LoanFree value, and it cannot make a later mandatory source obligation disappear.
   effect fn uninitialize(self: &mut Self, storage: Storage, evaluation: EvalId, origin: Origin,
-    active: Atom, write: Write) -> () ! OutOfMemoryError ? &mut Allocator {
+    active: Atom, write: Write) -> DefinitionId ! OutOfMemoryError ? &mut Allocator {
     let actual = Skeleton.evaluation(&self.*, evaluation)
     let node = match actual.site { EvaluationSite.Node {node} => node _ => { return CompilerBug.panic(b"entry is not a consuming operation") } }
     let absent = Program.atom(&mut self.rules)
@@ -984,8 +1169,7 @@ impl Skeleton {
       node: Option<NodeId>.some(node), reason: UnknownReason.Uninitialized}, origin: origin, endpoint: storage.endpoint})
     run Vector<Seed>.append(&mut self.seeds, Seed {value: value, leaf: leaf,
       direct: false, active: active, stored: absent, alternatives: absent})
-    drop run Skeleton.define(&mut self.*, actual.point, storage, value, active, write)
-    return ()
+    return run Skeleton.define(&mut self.*, actual.point, storage, value, active, write)
   }
 
   /// A real owner end kills its own reserved storage components. Reference descriptors which
@@ -1024,7 +1208,7 @@ impl Skeleton {
           remaining = remaining - usize.ONE
         }
         if remaining == usize.ZERO { CompilerBug.panic(b"source owner component ancestry is cyclic") }
-        run Skeleton.uninitialize(&mut self.*, storage, evaluation, origin, active, Write.Strong)
+        drop run Skeleton.uninitialize(&mut self.*, storage, evaluation, origin, active, Write.Strong)
       }
       at = at + usize.ONE
     }
@@ -1178,6 +1362,100 @@ impl Skeleton {
   }
 }
 
+// The consumer site is independent of the subject root: two empty-path pattern bindings
+// may select precisely the same subject but still perform different actual reads.
+effect fn validateSelectionUse<'body>(prepared: &SourcePreparation<'body>, request: &SelectionUse,
+  evaluations: &[Evaluation]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let selections = Vector<Selection>.asSlice(&prepared.selections)
+  let endpoints = Vector<Endpoint>.asSlice(&prepared.endpoints)
+  let maps = Vector<SelectionMap>.asSlice(&prepared.maps)
+  if request.operand.index >= evaluations.length || request.result.index >= evaluations.length
+    || request.selection.index >= selections.length {
+    CompilerBug.panic(b"source selection has an absent actual occurrence or prepared selection")
+  }
+  let selected = &selections[request.selection.index]
+  let site = match evaluations[request.result.index].site {
+    EvaluationSite.Node {node} => node
+    _ => { return CompilerBug.panic(b"source projection result is not an actual node evaluation") }
+  }
+  if selected.site.index != site.index || selected.root.index >= endpoints.length {
+    CompilerBug.panic(b"source selection belongs to another consumer site")
+  }
+  let actual = match &endpoints[selected.root.index].root {
+    Root.Node {node, ..} => match evaluations[request.operand.index].site {
+      EvaluationSite.Node {node: operand} => operand.index == node.index
+      _ => false
+    }
+    _ => false
+  }
+  if !actual { CompilerBug.panic(b"source selection lost its retained subject occurrence") }
+  let listed = Vector<MapId>.asSlice(&selected.maps)
+  let selectors = Vector<MapId>.asSlice(&request.selectors)
+  let mut terminal = selected.root
+  let mut at = usize.ZERO
+  while at < selectors.length {
+    let id = selectors[at]
+    if id.index >= maps.length { CompilerBug.panic(b"source selection names an absent selector") }
+    let map = &maps[id.index]
+    if map.site.index != site.index || map.kind != MapKind.Select || map.source.index != terminal.index {
+      CompilerBug.panic(b"source selection lost its ordered authored selector path")
+    }
+    let mut found = usize.ZERO
+    let mut each = usize.ZERO
+    while each < listed.length {
+      if listed[each].index == id.index { found = found + usize.ONE }
+      each = each + usize.ONE
+    }
+    if found != usize.ONE { CompilerBug.panic(b"source selector is not a unique member of its prepared selection") }
+    terminal = map.target
+    at = at + usize.ONE
+  }
+  let accepted = Vector<EndpointId>.asSlice(&selected.accepts)
+  if accepted.length == usize.ZERO { CompilerBug.panic(b"source selection has no explicit accepting frontier") }
+  let families: [Option<MapId>; 2] = [request.value, request.place]
+  let mut family = usize.ZERO
+  while family < families.length {
+    if let Option<MapId>.Some {value: root} = families[family] {
+      let members = run transferFamily(endpoints, maps, root)
+      let map = &maps[root.index]
+      let mut expectedKind = MapKind.Copy
+      let mut expectedRole = EndpointRole.Value
+      if family == usize.ONE {
+        expectedKind = MapKind.Select
+        expectedRole = EndpointRole.Storage
+      }
+      let output = match &endpoints[map.target.index].root {
+        Root.Node {node, role} => node.index == site.index && role == expectedRole
+        _ => false
+      }
+      if map.site.index != site.index || map.source.index != terminal.index
+        || map.kind != expectedKind || !output {
+        CompilerBug.panic(b"source projection output family is not its exact consumer placement")
+      }
+      let children = Vector<MapId>.asSlice(&members)
+      let mut leafCount = usize.ZERO
+      at = usize.ZERO
+      while at < children.length {
+        let child = &maps[children[at].index]
+        if Vector<MapId>.length(&child.children) == usize.ZERO {
+          let mut matches = usize.ZERO
+          let mut each = usize.ZERO
+          while each < accepted.length {
+            if accepted[each].index == child.source.index { matches = matches + usize.ONE }
+            each = each + usize.ONE
+          }
+          if matches != usize.ONE { CompilerBug.panic(b"source projection changed its accepting component frontier") }
+          leafCount = leafCount + usize.ONE
+        }
+        at = at + usize.ONE
+      }
+      if leafCount != accepted.length { CompilerBug.panic(b"source projection omitted an accepting component") }
+    }
+    family = family + usize.ONE
+  }
+  return ()
+}
+
 // The family is a finite tree of actual inline component maps. Reject malformed cycles or
 // duplicate ownership; do not turn them into a truncated/opaque source route.
 effect fn transferFamily(endpoints: &[Endpoint], maps: &[SelectionMap], root: MapId) -> Vector<MapId>
@@ -1232,30 +1510,6 @@ effect fn addressApplies(rules: &mut Program, operation: Atom, address: Atom) ->
   let absent = Vector<Atom>.make()
   run Program.rule(&mut rules.*, result, &both, Vector<Atom>.asSlice(&absent))
   return result
-}
-
-// One physical destination can have several reaching address histories. Their positive
-// gates are alternatives of one write; uncertain/weak address strength never becomes Strong.
-effect fn aliasDestination(destinations: &mut Vector<AliasDestination>, rules: &mut Program,
-  storage: Storage, active: Atom, write: Write) -> () ! OutOfMemoryError ? &mut Allocator {
-  let mut found = usize.MAX
-  let current = Vector<AliasDestination>.asSlice(&destinations.*)
-  let mut at = usize.ZERO
-  while at < current.length {
-    if sameStorage(current[at].storage, storage) { found = at }
-    at = at + usize.ONE
-  }
-  if found == usize.MAX {
-    found = Vector<AliasDestination>.length(&destinations.*)
-    let gate = Program.atom(&mut rules.*)
-    run Vector<AliasDestination>.append(&mut destinations.*, AliasDestination {storage: storage, active: gate, write: write})
-  }
-  let pending = Vector<AliasDestination>.asMutSlice(&mut destinations.*)
-  if write == Write.Weak { pending[found].write = Write.Weak }
-  let selected: [Atom; 1] = [active]
-  let absent = Vector<Atom>.make()
-  run Program.rule(&mut rules.*, pending[found].active, &selected, Vector<Atom>.asSlice(&absent))
-  return ()
 }
 
 effect fn copyMapRoute(maps: &[MapId]) -> Vector<MapId> ! OutOfMemoryError ? &mut Allocator {
@@ -3065,6 +3319,12 @@ impl<'body> Builder<'body> {
     validateResiduals(&preparation)
     validateContractProducts(&preparation)
     let mut closed = move skeleton
+    run Skeleton.activateSelections(&mut closed, &preparation)
+    let mut addresses = true
+    while addresses {
+      addresses = run Skeleton.activateAliasOperations(&mut closed, Vector<Endpoint>.asSlice(&preparation.endpoints),
+        Vector<SelectionMap>.asSlice(&preparation.maps))
+    }
     drop run Skeleton.closeStorage(&mut closed)
     let mut domain = Domain.make()
     run extendDomain(&mut domain, &mut closed.rules, Flow.reservedPoints(&closed.flow), Flow.reservedPairs(&closed.flow),
@@ -4146,7 +4406,7 @@ effect fn sourceQueryPreparation<'body>(body: Prepared.Body<'body>, ty: &Shared<
     run sourceTestEndpoint(&mut endpoints, at, EndpointRole.Value, usize.MAX, Selector.Identity)
     let mut accepts = Vector<EndpointId>.make()
     run Vector<EndpointId>.append(&mut accepts, EndpointId {index: at})
-    run Vector<Selection>.append(&mut selections, Selection {root: EndpointId {index: at},
+    run Vector<Selection>.append(&mut selections, Selection {site: NodeId {index: at}, root: EndpointId {index: at},
       accepts: move accepts, maps: Vector<MapId>.make()})
     at = at + usize.ONE
   }
