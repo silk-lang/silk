@@ -219,6 +219,9 @@ effect<'access> fn store<'data, 'input: 'data, 'access>(
 
 Here the captured inputs owe `'access`, and `'input: 'data` permits the store. The mutable
 referent's `'data` remains invariant. A call cannot shorten it just because execution is local.
+The implied captured-input bounds participate in inference just like explicit bounds: an unfixed
+covariant environment can be chosen as a meet of the input regions. That choice changes the
+operation's instantiation; it does not prove a missing relationship between fixed lifetimes.
 
 An ordinary named function whose result is an `Effect` with an omitted environment elides it from
 the header under LIFE-003. A single borrowed input supplies the environment, and several borrowed
