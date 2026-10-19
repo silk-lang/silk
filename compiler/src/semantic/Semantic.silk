@@ -68,6 +68,7 @@ import backend.Layout {
   TypeLayout,
 }
 import backend.LlvmText
+import backend.LlvmText {ObjectConstant}
 import semantic.CallableWitness
 import semantic.CallableWitness {CallableWitness as WitnessRecipe, OperandLoan as WitnessLoan}
 import semantic.Specialization {
@@ -2155,6 +2156,8 @@ struct Resolver {
   layoutValues: List<Shared<BackendLayout>>
   // The instance-text content of each layout value, encoded on first supply; empty until then.
   layoutContents: List<Bytes>
+  // The C objects the current artifact build defines for its exported statics (FFI-005).
+  exportedObjects: List<ExportedObject>
   emissionInputs: List<EmissionInputs>
   llvmInputs: List<LlvmInput>
   llvmValues: List<InstanceDefinition>
@@ -12200,6 +12203,47 @@ fn argumentKind(argument: &Argument) -> GenericKind {
   }
 }
 
+// STRUCT-006: whether `ty` is in the closed C object subset a C-layout record field may hold: a C
+// integer or floating scalar, a raw pointer, an admitted C function address, a fixed array of such
+// objects, another C-layout record, or a scalar enum with a written representation.
+effect fn cObjectField(resolver: &mut Resolver, ty: &Shared<Type>) -> bool
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let element = Shared<Type>.with<Option<Shared<Type>>>(ty, fn(value: &Type) -> Option<Shared<Type>> {
+    return match &value.* {
+      Type.Array {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+      _ => Option<Shared<Type>>.none()
+    }
+  })
+  if let Option<Shared<Type>>.Some {value: inner} = move element { return run cObjectField(&mut resolver.*, &inner) }
+  let nominal = Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* { Type.Nominal {..} => true _ => false }
+  })
+  if !nominal {
+    return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+      return match &value.* {
+        Type.Unit => false
+        _ => CAbi.admit(value)
+      }
+    })
+  }
+  let moduleOrdinal = declaringModuleOrdinal(&resolver.*, ty)
+  if moduleOrdinal == usize.MAX { return false }
+  let declaredModule = resolvedModule(&resolver.*, moduleOrdinal)
+  let ordinal = match move run ordinalOfProvider(&mut resolver.*, &declaredModule, ty) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return false }
+  }
+  let written = run header(&mut resolver.*, &declaredModule, ordinal)
+  if let Option<HeaderSyntax>.Some {value} = move written {
+    return match value.header {
+      Node.StructHeader {abi, ..} => abi.present
+      Node.EnumHeader {representation, ..} => representation.present
+      _ => false
+    }
+  }
+  return false
+}
+
 effect fn resolveMemberShape(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -12450,6 +12494,10 @@ effect fn resolveMemberShape(
       assumptions: Option<List<Constraint>>.some(move assumptions),
       deferred: Option<List<DeferredBounds>>.none(),
     }
+    let cLayout = match value.header {
+      Node.StructHeader {abi, ..} => abi.present
+      _ => false
+    }
     let mut types = List<Shared<Type>>.make()
     let writtenTypes = List<HirId>.asSlice(&annotations)
     let mut typeAt = usize.ZERO
@@ -12477,6 +12525,16 @@ effect fn resolveMemberShape(
           )
           if let Option<Shared<Rejection>>.Some {value: diagnostic} = move existential {
             return run memberRejected(move diagnostic, move dependencies)
+          }
+          // STRUCT-006: a C-layout record field stays inside the closed C object subset.
+          if cLayout && !run cObjectField(&mut resolver.*, &ty) {
+            let mut fieldSpan = value.span
+            let annotation = run typeNode(&mut resolver.*, &module, writtenTypes[typeAt])
+            if let Option<HeaderSyntax>.Some {value: syntax} = move annotation { fieldSpan = syntax.span }
+            return run memberRejected(
+              run reject(&resolver.*, &module, RejectionCode.UnsupportedCLayoutField, fieldSpan),
+              move dependencies,
+            )
           }
           run List<Shared<Type>>.append(&mut types, move ty)
         }
@@ -12990,6 +13048,15 @@ effect fn resolveContract(
       _ => {
         return run memberRejected(
           run reject(&resolver.*, &module, RejectionCode.NotType, value.span),
+          move dependencies,
+        )
+      }
+    }
+    // STRUCT-006: a C-layout record has one fixed C layout, so it declares no type parameters.
+    if let Node.StructHeader {generics, abi, ..} = value.header {
+      if abi.present && generics.length > usize.ZERO {
+        return run memberRejected(
+          run reject(&resolver.*, &module, RejectionCode.GenericCLayoutRecord, value.span),
           move dependencies,
         )
       }
@@ -27774,8 +27841,8 @@ effect fn callConstantTarget(
   )
 }
 
-// The declared type of one imported C static. Its scalar or pointer type is read by copy; an
-// exported definition, a non-C ABI and linkage properties stay deferred.
+// The declared type of one C static, imported or exported. Its scalar or pointer type is read by
+// copy; a non-C ABI and linkage properties stay deferred.
 effect fn foreignStaticType(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -27792,7 +27859,8 @@ effect fn foreignStaticType(
     Option<GapCode>.Some {..} => true
     Option<GapCode>.None => false
   }
-  if written.exported || deferred {
+  // An exported static's own C object is read through its symbol like an imported one.
+  if deferred {
     return Result<Shared<Type>, Shared<Rejection>>.failResult(
       run reject(&resolver.*, &module, RejectionCode.ForeignStaticUnavailable, span),
     )
@@ -66589,7 +66657,7 @@ effect fn foreignSignature(
   let module = resolvedModule(&resolver.*, location.module)
   let written = run foreignHeader(&mut resolver.*, &module, location.declaration)
   // A Silk call to an exported definition is not a C import; it keeps a named gap.
-  if written.exported { fail BackendGap.make(GapCode.ForeignExport, declaration, written.span) }
+  if written.exported && !written.global { fail BackendGap.make(GapCode.ForeignExport, declaration, written.span) }
   return run cSignature(&mut resolver.*, &mut owner.*, &mut dependencies.*, declaration, location, move written)
 }
 
@@ -75000,6 +75068,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       mirValues: List<MirFunction>.make(),
       layoutValues: List<Shared<BackendLayout>>.make(),
       layoutContents: List<Bytes>.make(),
+      exportedObjects: List<ExportedObject>.make(),
       emissionInputs: List<EmissionInputs>.make(),
       llvmInputs: List<LlvmInput>.make(),
       llvmValues: List<InstanceDefinition>.make(),
@@ -75453,7 +75522,8 @@ impl Semantic {
   pub effect fn checkDeclarations(
     self: &mut Self,
     request: &mut Request,
-    rootPackage: &[ModuleId]
+    rootPackage: &[ModuleId],
+    runtime: &Option<ModuleId>,
   ) -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
@@ -75685,6 +75755,22 @@ impl Semantic {
             )
             if let Result<Shared<Type>, Shared<Rejection>>.Failure { error } = move checked {
               run appendDeclarationRejection(&mut rejections, move error)
+            } else {
+              // An exported static defines its C object from a statically evaluated initializer.
+              let linked = run foreignHeader(&mut self.resolver, &module, declaration.ordinal)
+              if linked.exported {
+                let valued = run exportedStaticValue(
+                  &mut self.resolver,
+                  &mut self.query,
+                  &mut dependencies,
+                  moduleOrdinal,
+                  declaration.ordinal,
+                  declaration.span
+                )
+                if let Result<Shared<StaticData>, Shared<Rejection>>.Failure { error } = move valued {
+                  run appendDeclarationRejection(&mut rejections, move error)
+                }
+              }
             }
           }
           OwnerKind.Import => {
@@ -75844,6 +75930,7 @@ impl Semantic {
         }
       }
     }
+    run Semantic.checkForeignClaims(&mut self.*, List<usize>.asSlice(&modules), runtime, &mut rejections)
     let safety = run Semantic.declarationEscapes(
       &mut self.*,
       &mut request.*,
@@ -77840,7 +77927,12 @@ impl Semantic {
   ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
   ? &mut Allocator | &mut Types {
     run selectRequest(&mut self.resolver, &request.*)
-    let mut checked = run Semantic.checkDeclarations(&mut self.*, &mut request.*, rootPackage)
+    self.resolver.exportedObjects = List<ExportedObject>.make()
+    let exempt = match move runtime {
+      Option<&ModuleId>.Some {value} => Option<ModuleId>.some(ModuleId.copy(value))
+      Option<&ModuleId>.None => Option<ModuleId>.none()
+    }
+    let mut checked = run Semantic.checkDeclarations(&mut self.*, &mut request.*, rootPackage, &exempt)
     if List<Shared<Rejection>>.length(&checked.rejections) > usize.ZERO {
       let first = List<Shared<Rejection>>.remove(&mut checked.rejections, usize.ZERO)
       return BackendBuild.Rejected {
@@ -77856,7 +77948,9 @@ impl Semantic {
     let mut roots = List<BuildRoot>.make()
     let mut gaps = List<Shared<BackendGap>>.make()
     let mut rootModule = Option<ModuleId>.none()
-    if let Option<&ModuleId>.Some {value: selected} = move runtime {
+    if let Option<ModuleId>.Some {value: selectedRuntime} = &exempt {
+      let selectedModule = ModuleId.copy(&selectedRuntime)
+      let selected = &selectedModule
       let listed = match move run exportCandidates(&mut self.resolver, selected) {
         Option<List<ExportCandidate>>.Some {value} => move value
         Option<List<ExportCandidate>>.None => {
@@ -77865,6 +77959,10 @@ impl Semantic {
       }
       let refused = run Semantic.rootExports(&mut self.*, &mut request.*, selected, &listed, &mut roots, &mut gaps)
       if let Option<Shared<Rejection>>.Some {value} = move refused {
+        return refusedBuild(move value)
+      }
+      let refusedObject = run Semantic.rootObjects(&mut self.*, selected, &mut gaps)
+      if let Option<Shared<Rejection>>.Some {value} = move refusedObject {
         return refusedBuild(move value)
       }
       if List<Shared<BackendGap>>.length(&gaps) > usize.ZERO {
@@ -77886,6 +77984,10 @@ impl Semantic {
       if let Option<List<ExportCandidate>>.Some {value: exported} = move candidates {
         let refusedExport = run Semantic.rootExports(&mut self.*, &mut request.*, &applicationModule, &exported, &mut roots, &mut gaps)
         if let Option<Shared<Rejection>>.Some {value} = move refusedExport {
+          return refusedBuild(move value)
+        }
+        let refusedObject = run Semantic.rootObjects(&mut self.*, &applicationModule, &mut gaps)
+        if let Option<Shared<Rejection>>.Some {value} = move refusedObject {
           return refusedBuild(move value)
         }
         if List<Shared<BackendGap>>.length(&gaps) > usize.ZERO {
@@ -77972,6 +78074,163 @@ impl Semantic {
       }
       let symbol = run Shared<Bytes>.make(run Bytes.copy(Bytes.asSlice(&candidate.symbol)))
       run List<BuildRoot>.append(&mut roots.*, BuildRoot {key: InstanceKey.Export {function: move function, symbol: move symbol}, span: candidate.span, retained: false})
+    }
+    return Option<Shared<Rejection>>.none()
+  }
+  // FFI-005: every linked declaration of the root package spells its native symbol as an ASCII
+  // identifier the compiler does not reserve, and its active claims agree. The selected runtime and
+  // the standard library own the entry and runtime symbols. A definition shares its symbol with no
+  // other definition and binds only imports of its own kind and exact C types.
+  effect fn checkForeignClaims(self: &mut Self, modules: &[usize], runtime: &Option<ModuleId>,
+    rejections: &mut List<Shared<Rejection>>) -> ()
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let mut active = List<ForeignClaim>.make()
+    let mut moduleAt = usize.ZERO
+    while moduleAt < modules.length {
+      let moduleOrdinal = modules[moduleAt]
+      moduleAt = moduleAt + usize.ONE
+      let module = resolvedModule(&self.resolver, moduleOrdinal)
+      let exempt = runtimeOwned(&module, runtime)
+      let mut claims = run foreignClaims(&mut self.resolver, moduleOrdinal)
+      while List<ForeignClaim>.length(&claims) > usize.ZERO {
+        let claim = List<ForeignClaim>.remove(&mut claims, usize.ZERO)
+        let mut conditions = List<Dependency>.make()
+        let present = run available(&mut self.resolver, &mut self.query, &mut conditions, &module, claim.declaration, claim.header)
+        let selected = match move present {
+          Result<bool, Shared<Rejection>>.Success {value} => value
+          Result<bool, Shared<Rejection>>.Failure {error: _} => false
+        }
+        if !selected { continue }
+        let valid = NativeForeign.validSymbol(Bytes.asSlice(&claim.symbol))
+        let reserved = NativeForeign.reservedSymbol(Bytes.asSlice(&claim.symbol))
+        if !valid {
+          run appendDeclarationRejection(&mut rejections.*, run reject(&self.resolver, &module, RejectionCode.InvalidForeignSymbol, claim.span))
+          continue
+        }
+        if reserved && !exempt {
+          run appendDeclarationRejection(&mut rejections.*, run reject(&self.resolver, &module, RejectionCode.ReservedForeignSymbol, claim.span))
+          continue
+        }
+        run List<ForeignClaim>.append(&mut active, move claim)
+      }
+    }
+    let claimed = List<ForeignClaim>.asSlice(&active)
+    let mut later = usize.ONE
+    while later < claimed.length {
+      let mut earlier = usize.ZERO
+      while earlier < later {
+        if same(Bytes.asSlice(&claimed[earlier].symbol), Bytes.asSlice(&claimed[later].symbol)) {
+          if !run claimsAgree(&mut self.resolver, &mut self.query, &claimed[earlier], &claimed[later]) {
+            let module = resolvedModule(&self.resolver, claimed[later].module)
+            let related = RelatedSite {module: resolvedModule(&self.resolver, claimed[earlier].module), span: claimed[earlier].span}
+            run appendDeclarationRejection(&mut rejections.*, run rejectWithRelated(&self.resolver, &module,
+              RejectionCode.ForeignSymbolConflict, claimed[later].span, Option<RelatedSite>.some(move related)))
+            break
+          }
+        }
+        earlier = earlier + usize.ONE
+      }
+      later = later + usize.ONE
+    }
+    return ()
+  }
+  // Defines the C object of each active `export "C" static` of `module`: its initializer evaluates
+  // statically to one C scalar emitted under the static's symbol beside the instance definitions.
+  // Gaps are collected; any other refusal is returned.
+  effect fn rootObjects(self: &mut Self, module: &ModuleId, gaps: &mut List<Shared<BackendGap>>) -> Option<Shared<Rejection>>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+    let moduleOrdinal = run internModule(&mut self.resolver, module)
+    let mut claims = run foreignClaims(&mut self.resolver, moduleOrdinal)
+    while List<ForeignClaim>.length(&claims) > usize.ZERO {
+      let claim = List<ForeignClaim>.remove(&mut claims, usize.ZERO)
+      if !claim.global || !claim.exported { continue }
+      let mut conditions = List<Dependency>.make()
+      let present = run available(&mut self.resolver, &mut self.query, &mut conditions, module, claim.declaration, claim.header)
+      let selected = match move present {
+        Result<bool, Shared<Rejection>>.Success {value} => value
+        Result<bool, Shared<Rejection>>.Failure {error} => { return Option<Shared<Rejection>>.some(move error) }
+      }
+      if !selected { continue }
+      let declared = run declarationAt(&mut self.resolver, module, claim.declaration)
+      let identity = match move declared {
+        Option<DeclarationId>.Some {value} => run Shared<DeclarationId>.make(move value)
+        Option<DeclarationId>.None => {
+          return Option<Shared<Rejection>>.some(run reject(&self.resolver, module, RejectionCode.UnknownName, claim.header))
+        }
+      }
+      let mut dependencies = List<Dependency>.make()
+      let valued = run exportedStaticValue(&mut self.resolver, &mut self.query, &mut dependencies, moduleOrdinal, claim.declaration, claim.header)
+      let value = match move valued {
+        Result<Shared<StaticData>, Shared<Rejection>>.Success {value} => move value
+        Result<Shared<StaticData>, Shared<Rejection>>.Failure {error} => {
+          let code = Shared<Rejection>.with<RejectionCode>(&error, fn(rejection: &Rejection) -> RejectionCode {
+            return rejection.code
+          })
+          let deferral = BackendGap.forRejection(code)
+          if let Option<GapCode>.Some {value: gapCode} = move deferral {
+            run List<Shared<BackendGap>>.append(&mut gaps.*, run Shared<BackendGap>.make(BackendGap.fromRejection(gapCode, &identity, &error)))
+            continue
+          }
+          return Option<Shared<Rejection>>.some(move error)
+        }
+      }
+      let scalarOption = Shared<StaticData>.with<Option<ObjectConstant>>(&value, objectConstant)
+      let constant = match move scalarOption {
+        Option<ObjectConstant>.Some {value: scalar} => move scalar
+        Option<ObjectConstant>.None => {
+          run List<Shared<BackendGap>>.append(&mut gaps.*, run Shared<BackendGap>.make(BackendGap.make(GapCode.ForeignStatic, &identity, claim.header)))
+          continue
+        }
+      }
+      let written = run foreignHeader(&mut self.resolver, module, claim.declaration)
+      let location = InstanceLocation {module: moduleOrdinal, declaration: claim.declaration}
+      let classified = run Effect.result(cSignature(&mut self.resolver, &mut self.query, &mut dependencies, &identity, location, move written))
+      let signature = match move classified {
+        Result<CAbi.Signature, BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value: classifiedSignature} => move classifiedSignature
+        Result<CAbi.Signature, BackendGap | Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+          BackendGap {code, owner: gapOwner, source} => {
+            run List<Shared<BackendGap>>.append(&mut gaps.*, run Shared<BackendGap>.make(BackendGap {code: code, owner: move gapOwner, source: move source}))
+            continue
+          }
+          Cycle {} => { fail Cycle {} }
+          InvalidModulePath {} => { fail InvalidModulePath {} }
+          RevisionMismatch {} => { fail RevisionMismatch {} }
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        }
+      }
+      let defined = run Effect.result(LlvmText.exportedObject(&signature, &constant))
+      let definition = match move defined {
+        Result<Bytes, BackendGap | OutOfMemoryError>.Success {value: objectText} => move objectText
+        Result<Bytes, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+          BackendGap {code, owner: gapOwner, source} => {
+            run List<Shared<BackendGap>>.append(&mut gaps.*, run Shared<BackendGap>.make(BackendGap {code: code, owner: move gapOwner, source: move source}))
+            continue
+          }
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        }
+      }
+      let symbol = run Bytes.copy(Bytes.asSlice(&signature.symbol))
+      let mut signatures = List<CAbi.Signature>.make()
+      run List<CAbi.Signature>.append(&mut signatures, move signature)
+      let printed = run Effect.result(LlvmText.foreignDeclarations(List<CAbi.Signature>.asSlice(&signatures)))
+      let mut external = Bytes.make()
+      match move printed {
+        Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Success {value: listed} => {
+          let entries = List<LlvmText.Declaration>.asSlice(&listed)
+          if entries.length > usize.ZERO { external = run Bytes.copy(Bytes.asSlice(&entries[usize.ZERO].text)) }
+        }
+        Result<List<LlvmText.Declaration>, BackendGap | OutOfMemoryError>.Failure {error} => match move error {
+          BackendGap {code, owner: gapOwner, source} => {
+            run List<Shared<BackendGap>>.append(&mut gaps.*, run Shared<BackendGap>.make(BackendGap {code: code, owner: move gapOwner, source: move source}))
+            continue
+          }
+          OutOfMemoryError {} => { fail OutOfMemoryError {} }
+        }
+      }
+      run List<ExportedObject>.append(&mut self.resolver.exportedObjects,
+        ExportedObject {symbol: move symbol, definition: move definition, external: move external})
     }
     return Option<Shared<Rejection>>.none()
   }
@@ -78911,6 +79170,49 @@ effect fn assembleEmission(
   }
 }
 
+// Binds each collected import to the definition this artifact emits under its symbol: an exported
+// function's definition replaces a function declaration, and an exported object replaces an import
+// of exactly its C type. Absent when an import claims a definition of another kind or C type.
+effect fn boundDeclarations(resolver: &Resolver, plan: &EmissionPlan, foreign: &List<LlvmText.Declaration>)
+  -> Option<List<LlvmText.Declaration>> ! OutOfMemoryError ? &mut Allocator {
+  let entries = List<LlvmText.Declaration>.asSlice(foreign)
+  let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
+  let identities = List<EmissionIdentity>.asSlice(&plan.identities)
+  let mut kept = List<LlvmText.Declaration>.make()
+  let mut at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at]
+    at = at + usize.ONE
+    let symbol = Bytes.asSlice(&entry.symbol)
+    let text = Bytes.asSlice(&entry.text)
+    let global = text.length > usize.ZERO && text[usize.ZERO] == 64
+    let mut bound = false
+    let mut object = usize.ZERO
+    while object < objects.length {
+      if same(Bytes.asSlice(&objects[object].symbol), symbol) {
+        if !same(Bytes.asSlice(&objects[object].external), text) { return Option<List<LlvmText.Declaration>>.none() }
+        bound = true
+      }
+      object = object + usize.ONE
+    }
+    let mut identity = usize.ZERO
+    while identity < identities.length {
+      if same(Bytes.asSlice(&identities[identity].symbol), symbol) {
+        if global { return Option<List<LlvmText.Declaration>>.none() }
+        bound = true
+      }
+      identity = identity + usize.ONE
+    }
+    if bound { continue }
+    run List<LlvmText.Declaration>.append(&mut kept, LlvmText.Declaration {
+      contract: run Bytes.copy(Bytes.asSlice(&entry.contract)),
+      symbol: run Bytes.copy(symbol),
+      text: run Bytes.copy(text),
+    })
+  }
+  return Option<List<LlvmText.Declaration>>.some(move kept)
+}
+
 effect fn assembleEmissionChecked(
   resolver: &Resolver,
   reached: &[CollectedText],
@@ -78941,8 +79243,20 @@ effect fn assembleEmissionChecked(
       return refusedBuild(run reject(resolver, module, RejectionCode.ForeignSymbolConflict, span))
     }
   }
+  let bound = match move run boundDeclarations(resolver, &plan, &foreign) {
+    Option<List<LlvmText.Declaration>>.Some {value} => move value
+    Option<List<LlvmText.Declaration>>.None => {
+      return refusedBuild(run reject(resolver, module, RejectionCode.ForeignSymbolConflict, span))
+    }
+  }
   let mut text = run LlvmText.declarations(&resolver.target)
-  run appendEmissionDeclarations(&mut text, &foreign)
+  run appendEmissionDeclarations(&mut text, &bound)
+  let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
+  let mut object = usize.ZERO
+  while object < objects.length {
+    run Bytes.append(&mut text, Bytes.asSlice(&objects[object].definition))
+    object = object + usize.ONE
+  }
   let order = run emissionOrder(&plan)
   let unchecked = run appendResolvedDefinitions(
     resolver,
@@ -80064,6 +80378,208 @@ effect fn exportCandidates(resolver: &mut Resolver, module: &ModuleId) -> Option
     return Option<List<ExportCandidate>>.some(move found)
   }
   return Option<List<ExportCandidate>>.none()
+}
+
+// One authored native symbol claim: a linked C function or object, imported or exported (FFI-005).
+struct ForeignClaim {
+  module: usize
+  declaration: usize
+  symbol: Bytes
+  /// The written symbol literal, or the declaration's name when the symbol is implied.
+  span: Span
+  header: Span
+  exported: bool
+  global: bool
+}
+
+// The C object an exported static defines, and the import declaration that binds to it.
+struct ExportedObject {
+  symbol: Bytes
+  definition: Bytes
+  external: Bytes
+}
+
+effect fn appendForeignClaim(found: &mut List<ForeignClaim>, hir: &Module, module: usize, declaration: usize,
+  header: Span, name: HirId, clause: HirId, global: bool) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if let Node.Linkage {direction, symbol, ..} = Module.node(hir, clause) {
+    let mut spelled = Bytes.make()
+    let mut span = Module.span(hir, name)
+    if let Node.Name {text} = Module.node(hir, name) { spelled = run Bytes.copy(Module.text(hir, text)) }
+    if symbol.present {
+      if let Node.TextLiteral {value: text} = Module.node(hir, symbol.id) {
+        spelled = run Bytes.copy(Module.text(hir, text))
+        span = Module.span(hir, symbol.id)
+      }
+    }
+    run List<ForeignClaim>.append(&mut found.*, ForeignClaim {
+      module: module, declaration: declaration, symbol: move spelled, span: span, header: header,
+      exported: direction == LinkageDirection.Export, global: global,
+    })
+  }
+  return ()
+}
+
+// Lists every linked function and static one module declares, in declaration order, including
+// those inside `static if` arms.
+effect fn foreignClaims(resolver: &mut Resolver, moduleOrdinal: usize) -> List<ForeignClaim>
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let module = resolvedModule(&resolver.*, moduleOrdinal)
+  let mut found = List<ForeignClaim>.make()
+  let answer = run source(&mut resolver.*, &module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, &module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    let hir = IndexedSource.authored(value)
+    let mut at = usize.ZERO
+    while at < declarations.length {
+      let header = Module.span(hir, declarations[at].header)
+      let written = Module.node(hir, declarations[at].header)
+      if let Node.FunctionHeader {name, linkage, ..} = written {
+        if linkage.present { run appendForeignClaim(&mut found, hir, moduleOrdinal, at, header, name, linkage.id, false) }
+      } else if let Node.StaticHeader {name, linkage, ..} = written {
+        run appendForeignClaim(&mut found, hir, moduleOrdinal, at, header, name, linkage, true)
+      }
+      at = at + usize.ONE
+    }
+  }
+  return move found
+}
+
+fn libraryPath(path: &[u8]) -> bool {
+  let prefix = b"silk/"
+  if path.length <= prefix.length { return false }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if path[at] != prefix[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `module` owns the compiler's runtime and entry symbols: the selected runtime, or a
+// standard-library module that defines the entry, raw start or execution-storage hooks.
+fn runtimeOwned(module: &ModuleId, runtime: &Option<ModuleId>) -> bool {
+  if let Option<ModuleId>.Some {value} = &runtime.* {
+    if ModuleId.equals(&value, module) { return true }
+  }
+  return ModuleId.withPath<bool>(module, libraryPath)
+}
+
+// The C scalar of one statically evaluated exported-object initializer.
+fn objectConstant(value: &StaticData) -> Option<ObjectConstant> {
+  return match &value.* {
+    StaticData.Integer {sign, magnitude, ..} => Option<ObjectConstant>.some(
+      ObjectConstant.Integer {negative: sign == StaticSign.Negative, magnitude: magnitude})
+    StaticData.Float {ty, bits} => Option<ObjectConstant>.some(
+      ObjectConstant.Float {bits: bits, single: ty == StaticFloatType.F32})
+    _ => Option<ObjectConstant>.none()
+  }
+}
+
+// The value an exported static's initializer evaluates to at its declared C object type.
+effect fn exportedStaticValue(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  moduleOrdinal: usize,
+  ordinal: usize,
+  span: Span,
+) -> Result<Shared<StaticData>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let declared = run declaredStaticType(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, ordinal, span)
+  let ty = match move declared {
+    Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
+    Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+      return Result<Shared<StaticData>, Shared<Rejection>>.failResult(move error)
+    }
+  }
+  let module = resolvedModule(&resolver.*, moduleOrdinal)
+  let written = run initializerSyntax(&mut resolver.*, &module, ordinal, span)
+  let initializerSpan = written.span
+  let expression = match move written.expression {
+    Option<HirId>.Some {value} => value
+    Option<HirId>.None => {
+      return Result<Shared<StaticData>, Shared<Rejection>>.failResult(
+        run reject(&resolver.*, &module, RejectionCode.InvalidConstant, initializerSpan))
+    }
+  }
+  return run staticExpression(
+    &mut resolver.*, &mut owner.*, &mut dependencies.*,
+    &module, Option<usize>.some(ordinal), expression,
+    StaticRootExpectation.Resolved {ty: move ty, mismatchCode: RejectionCode.InvalidConstant},
+    &[], &[],
+  )
+}
+
+// The C parameter and result types one foreign function or object claims: an object's value type,
+// or a function's result followed by its parameters. Absent when its signature is itself rejected.
+effect fn claimShape(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, claim: &ForeignClaim)
+  -> Option<List<Shared<Type>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let mut shape = List<Shared<Type>>.make()
+  let mut dependencies = List<Dependency>.make()
+  if claim.global {
+    let declared = run declaredStaticType(&mut resolver.*, &mut owner.*, &mut dependencies, claim.module, claim.declaration, claim.header)
+    if let Result<Shared<Type>, Shared<Rejection>>.Success {value} = move declared {
+      run List<Shared<Type>>.append(&mut shape, move value)
+      return Option<List<Shared<Type>>>.some(move shape)
+    }
+    return Option<List<Shared<Type>>>.none()
+  }
+  let request = Key {family: Family.Signature, module: claim.module, name: usize.ZERO, declaration: claim.declaration,
+    member: usize.ZERO, external: false}
+  let key = run internDeclaration(&mut resolver.*, request)
+  let signature = run demandRaw(&mut resolver.*, &mut owner.*, key, claim.header)
+  let facts = Shared<Result<Answer, NoRejection>>.with<Option<SignatureFacts>>(&signature, signatureFacts)
+  let summary = match move facts {
+    Option<SignatureFacts>.Some {value} => move value
+    Option<SignatureFacts>.None => { return Option<List<Shared<Type>>>.none() }
+  }
+  // A variadic import never shares its symbol with a fixed export.
+  if summary.isVariadic { return Option<List<Shared<Type>>>.none() }
+  run List<Shared<Type>>.append(&mut shape, Shared<Type>.clone(&summary.result))
+  let mut at = usize.ZERO
+  while at < summary.parameters {
+    let parameter = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameterAt(answer, at) })
+    match move parameter {
+      Option<Shared<Type>>.Some {value} => { run List<Shared<Type>>.append(&mut shape, move value) }
+      Option<Shared<Type>>.None => { return Option<List<Shared<Type>>>.none() }
+    }
+    at = at + usize.ONE
+  }
+  return Option<List<Shared<Type>>>.some(move shape)
+}
+
+// Whether two active claims of one native symbol may coexist: only an import may share a symbol
+// with a definition, and then only as the same kind of claim with exactly the definition's C types.
+// Two imports are joined by the emission plan. A claim whose own types are rejected is reported there.
+effect fn claimsAgree(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, first: &ForeignClaim,
+  second: &ForeignClaim) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  if !first.exported && !second.exported { return true }
+  if first.exported && second.exported { return false }
+  if first.global != second.global { return false }
+  let left = match move run claimShape(&mut resolver.*, &mut owner.*, first) {
+    Option<List<Shared<Type>>>.Some {value} => move value
+    Option<List<Shared<Type>>>.None => { return true }
+  }
+  let right = match move run claimShape(&mut resolver.*, &mut owner.*, second) {
+    Option<List<Shared<Type>>>.Some {value} => move value
+    Option<List<Shared<Type>>>.None => { return true }
+  }
+  let lefts = List<Shared<Type>>.asSlice(&left)
+  let rights = List<Shared<Type>>.asSlice(&right)
+  if lefts.length != rights.length { return false }
+  let mut at = usize.ZERO
+  while at < lefts.length {
+    if !run Type.equalsShared(&lefts[at], &rights[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
 }
 
 struct BackendRequest {
