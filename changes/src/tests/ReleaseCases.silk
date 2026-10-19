@@ -1,0 +1,519 @@
+import History
+import Text
+import Problem { Problem }
+import Release
+import Release { Plan }
+import Version { Bump }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { AtomicWriteError, DirectoryEntry, DirectoryInfo, Durability, FileError, FileInfo, FileSystem, Path, PublicationPolicy }
+import silk.i32
+import silk.option { Option }
+import silk.os_filesystem { OsFileSystem }
+import silk.os_random { OsRandom }
+import silk.random { Random }
+import silk.result { Result }
+import silk.string { String }
+import silk.testing { AssertionError, Testing }
+import silk.toml_scanner { TomlError }
+import silk.u8
+import silk.usize
+import silk.vector { Vector }
+
+enum FailureBoundary {
+  ChangelogPrefix,
+  PendingUnlink,
+}
+
+union ReleaseCase {
+  Recovery {
+    boundary: FailureBoundary,
+    hadChangelog: bool
+  },
+  Regeneration,
+}
+
+// OsFileSystem rejects a symlink even at its configured root; macOS /tmp is a symlink.
+fn temporaryRoot() -> &'static [u8] {
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return b"/private/tmp"
+  } else {
+    return b"/tmp"
+  }
+}
+
+// Only the selected operation is faulted. All storage, including the mutation before
+// the error, belongs to the real provider; recovery uses a separate normal provider.
+struct InterruptedFileSystem {
+  files: OsFileSystem
+  boundary: FailureBoundary
+  armed: bool
+}
+
+impl FileSystem for InterruptedFileSystem {
+  effect fn readFile(self: &mut Self, path: &Path) -> Bytes
+  ! FileError | OutOfMemoryError ? &mut Allocator {
+    return run FileSystem.readFile(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn writeFile(self: &mut Self, path: &Path, bytes: &[u8]) -> () ! FileError {
+    let name = Option<string>.unwrapOr(Path.name(path), "")
+    if self.armed && name == "CHANGELOG.md" {
+      match self.boundary {
+        FailureBoundary.ChangelogPrefix => {
+          self.armed = false
+          let prefix = [bytes[0], bytes[1], bytes[2], bytes[3]]
+          run FileSystem.writeFile(path, &prefix) |> Effect.provideMut<FileSystem>(&mut self.files)
+          fail FileSystem.errorWithCode(FileSystem.writeFileOperation(), FileSystem.noSpace(), 8127)
+        }
+        FailureBoundary.PendingUnlink => {}
+      }
+    }
+    return run FileSystem.writeFile(path, bytes) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn createFile(self: &mut Self, path: &Path, bytes: &[u8]) -> () ! FileError {
+    return run FileSystem.createFile(path, bytes) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn writeFileAtomic(
+    self: &mut Self,
+    path: &Path,
+    bytes: &[u8],
+    policy: PublicationPolicy,
+    durability: Durability,
+  ) -> () ! AtomicWriteError {
+    return run FileSystem.writeFileAtomic(path, bytes, move policy, move durability)
+      |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn syncDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.syncDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn stat(self: &mut Self, path: &Path) -> FileInfo | DirectoryInfo ! FileError {
+    return run FileSystem.stat(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn listDirectory(self: &mut Self, path: &Path) -> Vector<DirectoryEntry>
+  ! FileError | OutOfMemoryError ? &mut Allocator {
+    return run FileSystem.listDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn createDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.createDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn removeFile(self: &mut Self, path: &Path) -> () ! FileError {
+    let name = Option<string>.unwrapOr(Path.name(path), "")
+    if self.armed && name == "a.md" {
+      match self.boundary {
+        FailureBoundary.PendingUnlink => {
+          self.armed = false
+          run FileSystem.removeFile(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+          fail FileSystem.errorWithCode(FileSystem.removeFileOperation(), FileSystem.other(), 8127)
+        }
+        FailureBoundary.ChangelogPrefix => {}
+      }
+    }
+    return run FileSystem.removeFile(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn removeDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.removeDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+
+  effect fn createTemporaryDirectory(self: &mut Self, parent: &Path, prefix: &[u8]) -> Path
+  ! FileError | OutOfMemoryError ? &mut Allocator {
+    return run FileSystem.createTemporaryDirectory(parent, prefix)
+      |> Effect.provideMut<FileSystem>(&mut self.files)
+  }
+}
+
+fn originalManifest() -> string<'static> {
+  return "# retain this comment\r\n[package]\r\nname = \"recovery-case\"\r\nversion = \"1.2.3\" # release\r\n\r\n[dependencies]\r\n"
+}
+
+fn releasedManifest() -> string<'static> {
+  return "# retain this comment\r\n[package]\r\nname = \"recovery-case\"\r\nversion = \"1.3.0\" # release\r\n\r\n[dependencies]\r\n"
+}
+
+fn originalChangelog() -> string<'static> {
+  return "# History\r\n\r\n## 1.2.3\r\n\r\nOld release: retain spacing.  \r\n"
+}
+
+fn firstChange() -> string<'static> {
+  return "---\r\nbump: patch\r\n---\r\n\r\n- Repair the edge.\r\n"
+}
+
+fn secondChange() -> string<'static> {
+  return "---\nbump: minor\n---\n\n- Add the capability.\n"
+}
+
+fn contains(text: string, wanted: string) -> bool {
+  let length = String.byteLength(text)
+  let count = String.byteLength(wanted)
+  if count > length { return false }
+  let mut at = usize.ZERO
+  while at <= length - count {
+    if Text.part(text, at, at + count) == wanted { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn expectPublishedChangelog(path: &Path) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let bytes = run FileSystem.readFile(path)
+  let text = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&bytes))
+  run Testing.expect(Text.starts(text, "# Changelog\n"), "published notes identify the generated changelog")
+  run Testing.expect(contains(text, "Auto-generated") && contains(text, ".changes/releases/*.toml"),
+    "the visible warning identifies the authoritative source")
+  run Testing.expect(contains(text, "## 1.3.0\n"), "published notes identify the release")
+  run Testing.expect(contains(text, "- Add the capability."), "minor summary must reach the changelog")
+  run Testing.expect(contains(text, "- Repair the edge."), "patch summary must reach the changelog")
+  run Testing.expect(contains(text, originalChangelog()) == false, "manual Markdown must not survive regeneration")
+}
+
+effect fn expectFile(path: &Path, expected: string, message: string<'static>) -> ()
+! FileError | OutOfMemoryError | AssertionError<'static> ? &mut FileSystem | &mut Allocator {
+  let content = run FileSystem.readFile(path)
+  let actual = Bytes.asSlice(&content)
+  let wanted = String.utf8Bytes(expected)
+  run Testing.expect(actual.length == wanted.length, message)
+  let mut index = usize.ZERO
+  while index < wanted.length {
+    run Testing.expect(actual[index] == wanted[index], message)
+    index = index + usize.ONE
+  }
+}
+
+effect fn expectInjected(
+  attempted: Result<String, Problem | FileError | TomlError | OutOfMemoryError>,
+  boundary: FailureBoundary
+) -> () ! AssertionError<'static> {
+  match move attempted {
+    Result<String, Problem | FileError | TomlError | OutOfMemoryError>.Success { value } => {
+      drop value
+      run Testing.expect(false, "version must propagate the injected failure")
+    }
+    Result<String, Problem | FileError | TomlError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        FileError failure => {
+          run Testing.expect(Option<i32>.unwrapOr(FileSystem.providerCode(&failure), 0) == 8127,
+            "version must preserve the injected FileError, not another failure")
+          match boundary {
+            FailureBoundary.ChangelogPrefix => {
+              run Testing.expect(failure.operation.code == 1 && failure.reason.code == 6,
+                "partial changelog write must propagate write/no-space")
+            }
+            FailureBoundary.PendingUnlink => {
+              run Testing.expect(failure.operation.code == 5 && failure.reason.code == 9,
+                "completed unlink must propagate remove-file/other")
+            }
+          }
+        }
+        Problem problem => { run Testing.expect(false, "valid fixture must reach the filesystem failure") }
+        TomlError malformed => { run Testing.expect(false, "valid fixture must not fail TOML parsing") }
+        OutOfMemoryError exhausted => { run Testing.expect(false, "allocation failure is not the injected failure") }
+      }
+    }
+  }
+}
+
+effect<'env> fn expectLocked<T: 'env, 'env>(attempted: Result<T, Problem | FileError | TomlError | OutOfMemoryError>) -> ()
+! AssertionError<'static> {
+  match move attempted {
+    Result<T, Problem | FileError | TomlError | OutOfMemoryError>.Success { value } => {
+      drop value
+      run Testing.expect(false, "normal operations must refuse an interrupted release")
+    }
+    Result<T, Problem | FileError | TomlError | OutOfMemoryError>.Failure { error } => {
+      match move error {
+        Problem problem => {}
+        FileError failure => { run Testing.expect(false, "lock refusal must be a Problem, not an IO error") }
+        TomlError malformed => { run Testing.expect(false, "lock refusal must not be a parse error") }
+        OutOfMemoryError exhausted => { run Testing.expect(false, "lock refusal must not be an allocation error") }
+      }
+    }
+  }
+}
+
+effect fn recoveryClaims(root: &Path, boundary: FailureBoundary, hadChangelog: bool) -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static>
+? &mut FileSystem | &mut Allocator {
+  let manifest = run Path.join(root, "silk.toml")
+  let changelog = run Path.join(root, "CHANGELOG.md")
+  let changes = run Path.join(root, ".changes")
+  let first = run Path.join(root, ".changes/a.md")
+  let second = run Path.join(root, ".changes/b.md")
+  let lock = run Path.join(root, ".changes/.lock")
+  let ready = run Path.join(root, ".changes/.lock/ready")
+  run FileSystem.writeFile(&manifest, String.utf8Bytes(originalManifest()))
+  run FileSystem.createDirectory(&changes)
+  run FileSystem.writeFile(&first, String.utf8Bytes(firstChange()))
+  run FileSystem.writeFile(&second, String.utf8Bytes(secondChange()))
+  if hadChangelog { run FileSystem.writeFile(&changelog, String.utf8Bytes(originalChangelog())) }
+
+  let files = run OsFileSystem.make(temporaryRoot())
+  let mut interrupted = InterruptedFileSystem { files: move files, boundary: boundary, armed: true }
+  let attempted = run Effect.result(Release.version(root, ""))
+    |> Effect.provideMut<FileSystem>(&mut interrupted)
+  run expectInjected(move attempted, boundary)
+  run Testing.expect(interrupted.armed == false, "the selected mutation must actually be reached")
+  run Testing.expect(run FileSystem.exists(&lock), "failed release must retain its lock")
+  run Testing.expect(run FileSystem.exists(&ready), "failed release must retain rollback readiness")
+  run expectFile(&manifest, releasedManifest(), "the manifest must have changed before either injected failure")
+  match boundary {
+    FailureBoundary.ChangelogPrefix => {
+      run expectFile(&changelog, "# Ch", "failed write must leave a genuinely truncated changelog on disk")
+      run expectFile(&first, firstChange(), "write failure must precede pending deletions")
+    }
+    FailureBoundary.PendingUnlink => {
+      run Testing.expect((run FileSystem.exists(&first)) == false,
+        "the injected unlink must actually remove the first pending file")
+      run expectPublishedChangelog(&changelog)
+    }
+  }
+  run expectFile(&second, secondChange(), "the second pending file must survive the interrupted operation")
+
+  let planned = run Effect.result(Release.plan(root, ""))
+  run expectLocked<Plan>(move planned)
+  let mut random = OsRandom.make()
+  let added = run Effect.result(Release.add(root, Bump.Major, "Must not be added while locked.", ""))
+    |> Effect.provideMut<Random>(&mut random)
+  run expectLocked<Path>(move added)
+  let versioned = run Effect.result(Release.version(root, ""))
+  run expectLocked<String>(move versioned)
+  run Testing.expect(run FileSystem.exists(&ready), "refused operations must not clear recovery readiness")
+
+  run Release.recover(root)
+  run Testing.expect((run FileSystem.exists(&lock)) == false, "explicit recovery must remove the lock")
+  run expectFile(&manifest, originalManifest(), "recovery must restore every original manifest byte")
+  if hadChangelog {
+    run expectFile(&changelog, originalChangelog(), "recovery must restore every original changelog byte")
+  } else {
+    run Testing.expect((run FileSystem.exists(&changelog)) == false,
+      "recovery must remove a newly created changelog when none originally existed")
+  }
+  run expectFile(&first, firstChange(), "recovery must restore the first pending file exactly, including CRLF")
+  run expectFile(&second, secondChange(), "recovery must preserve the second pending file exactly")
+  let recordPath = run History.path(root, "1.3.0")
+  run Testing.expect((run FileSystem.exists(&recordPath)) == false, "rollback removes the uncommitted release record")
+  let restored = run Release.plan(root, "")
+  run Testing.expect(String.view(&restored.manifest.version) == "1.2.3", "recovered plan must start at the original version")
+  run Testing.expect(String.view(&restored.release.version) == "1.3.0", "recovered plan must select the highest bump only once")
+  run Testing.expect(Vector<Release.Pending>.length(&restored.pending) == 2, "recovered plan must see both pending changes")
+
+  let released = run Release.version(root, "")
+  run Testing.expect(String.view(&released) == "1.3.0", "retry must produce the intended single minor bump")
+  run expectFile(&manifest, releasedManifest(), "successful retry must change only the version token")
+  run expectPublishedChangelog(&changelog)
+  let publishedLog = run FileSystem.readFile(&changelog)
+  let recorded = run History.load(root, "1.3.0")
+  run Testing.expect(Vector<History.Entry>.length(&recorded.entries) == 2, "committed history contains both changes")
+  run Testing.expect((run FileSystem.exists(&lock)) == false, "successful retry must remove its lock")
+  run Testing.expect((run FileSystem.exists(&first)) == false, "successful release consumes the first pending file")
+  run Testing.expect((run FileSystem.exists(&second)) == false, "successful release consumes the second pending file")
+  let repeated = run Release.version(root, "")
+  run Testing.expect(String.view(&repeated) == "1.3.0", "running version again without pending changes must not bump twice")
+  run expectFile(&manifest, releasedManifest(), "a no-op release must retain the successful manifest bytes")
+  run expectFile(&changelog, unsafe String.fromUtf8Unchecked(Bytes.asSlice(&publishedLog)), "a no-op release must not duplicate its changelog section")
+}
+
+effect fn writeArchive(root: &Path, filename: string, version: string, packageName: string, summary: string) -> Path
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let directory = run Path.join(root, ".changes/releases")
+  let path = run Path.join(&directory, filename)
+  let mut source = run String.copy("format = 1\npackage = \"")
+  run String.append(&mut source, packageName)
+  run String.append(&mut source, "\"\nfrom = \"1.0.0\"\nversion = \"")
+  run String.append(&mut source, version)
+  run String.append(&mut source, "\"\nbase = \"1.0.0\"\n\n[[changes]]\nid = \"")
+  run String.append(&mut source, version)
+  run String.append(&mut source, "/note.md\"\nbump = \"patch\"\nsummary = \"")
+  run String.append(&mut source, summary)
+  run String.append(&mut source, "\"\n")
+  run FileSystem.writeFile(&path, String.ownedUtf8Bytes(&source))
+  return move path
+}
+
+fn sectionBefore(text: string, newer: string, older: string) -> bool {
+  let length = String.byteLength(text)
+  let count = String.byteLength(newer)
+  if count > length { return false }
+  let mut at = usize.ZERO
+  while at <= length - count {
+    if Text.part(text, at, at + count) == newer {
+      return contains(Text.part(text, at + count, length), older)
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn rejectArchiveWithoutMutation(root: &Path, invalid: &Path) -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static>
+? &mut FileSystem | &mut Allocator {
+  let manifest = run Path.join(root, "silk.toml")
+  let changelog = run Path.join(root, "CHANGELOG.md")
+  let pending = run Path.join(root, ".changes/a.md")
+  let lock = run Path.join(root, ".changes/.lock")
+  let record = run Path.join(root, ".changes/releases/1.10.1.toml")
+  let beforeManifest = run FileSystem.readFile(&manifest)
+  let beforeChangelog = run FileSystem.readFile(&changelog)
+  let beforeArchive = run FileSystem.readFile(invalid)
+  let attempted = run Effect.result(Release.version(root, ""))
+  match move attempted {
+    Result<String, Problem | FileError | TomlError | OutOfMemoryError>.Success { value: released } => {
+      drop released
+      run Testing.expect(false, "unsafe archive must prevent release")
+    }
+    Result<String, Problem | FileError | TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      Problem rejected => {}
+      FileError io => { run Testing.expect(false, "archive rejection must not be an unrelated IO failure") }
+      TomlError malformed => { run Testing.expect(false, "archive parsing must surface its history Problem") }
+      OutOfMemoryError allocation => { run Testing.expect(false, "archive rejection must not be an allocation failure") }
+    }
+  }
+  run expectFile(&manifest, unsafe String.fromUtf8Unchecked(Bytes.asSlice(&beforeManifest)), "rejected history must not change the manifest")
+  run expectFile(&changelog, unsafe String.fromUtf8Unchecked(Bytes.asSlice(&beforeChangelog)), "rejected history must not change Markdown")
+  run expectFile(invalid, unsafe String.fromUtf8Unchecked(Bytes.asSlice(&beforeArchive)), "rejected history must not overwrite the bad archive")
+  run expectFile(&pending, firstChange(), "rejected history must not consume pending changes")
+  run Testing.expect((run FileSystem.exists(&record)) == false, "rejected history must not publish a release record")
+  run Testing.expect((run FileSystem.exists(&lock)) == false, "preflight rejection must not require rollback")
+  run FileSystem.removeFile(invalid)
+}
+
+effect fn regenerationClaims(root: &Path) -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static>
+? &mut FileSystem | &mut Allocator {
+  let manifest = run Path.join(root, "silk.toml")
+  let changelog = run Path.join(root, "CHANGELOG.md")
+  let history = run Path.join(root, ".changes/releases")
+  let pending = run Path.join(root, ".changes/a.md")
+  run FileSystem.createDirectoriesRecursively(&history)
+  run FileSystem.writeFile(&manifest, b"[package]\nname = \"regeneration\"\nversion = \"1.10.0\"\n")
+  run FileSystem.writeFile(&changelog, b"Manual Markdown that must disappear.\n")
+  run FileSystem.writeFile(&pending, String.utf8Bytes(firstChange()))
+  let stable = run writeArchive(root, "1.10.0.toml", "1.10.0", "regeneration", "Original stable notes.")
+  let old = run writeArchive(root, "1.2.0.toml", "1.2.0", "regeneration", "Older archived notes.")
+  let betaTen = run writeArchive(root, "1.10.0-beta.10.toml", "1.10.0-beta.10", "regeneration", "Tenth beta notes.")
+  let betaTwo = run writeArchive(root, "1.10.0-beta.2.toml", "1.10.0-beta.2", "regeneration", "Second beta notes.")
+
+  let malformed = run Path.join(&history, "1.1.0.toml")
+  run FileSystem.writeFile(&malformed, b"format = [")
+  run rejectArchiveWithoutMutation(root, &malformed)
+  let wrongPackage = run writeArchive(root, "1.1.0.toml", "1.1.0", "another-package", "Unrelated notes.")
+  run rejectArchiveWithoutMutation(root, &wrongPackage)
+  let wrongVersion = run writeArchive(root, "1.1.0.toml", "1.1.1", "regeneration", "Mismatched filename.")
+  run rejectArchiveWithoutMutation(root, &wrongVersion)
+  let future = run writeArchive(root, "2.0.0.toml", "2.0.0", "regeneration", "Future release.")
+  run rejectArchiveWithoutMutation(root, &future)
+  let duplicate = run writeArchive(root, "1.10.0+other.toml", "1.10.0+other", "regeneration", "Duplicate precedence.")
+  run rejectArchiveWithoutMutation(root, &duplicate)
+  let invalidName = run writeArchive(root, "not-a-version.toml", "1.1.0", "regeneration", "Invalid filename.")
+  run rejectArchiveWithoutMutation(root, &invalidName)
+
+  let first = run Release.version(root, "")
+  run Testing.expect(String.view(&first) == "1.10.1", "regeneration must publish the planned version")
+  let published = run FileSystem.readFile(&changelog)
+  let text = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&published))
+  run Testing.expect(contains(text, "Older archived notes.") && contains(text, "Original stable notes."),
+    "archived summaries survive regeneration")
+  run Testing.expect(contains(text, "Tenth beta notes.") && contains(text, "Second beta notes."),
+    "separate prerelease records retain their notes")
+  run Testing.expect(contains(text, "Manual Markdown") == false, "manual Markdown is not authoritative")
+  run Testing.expect(sectionBefore(text, "## 1.10.1\n", "## 1.10.0\n"), "planned release precedes archived releases")
+  run Testing.expect(sectionBefore(text, "## 1.10.0\n", "## 1.10.0-beta.10\n"), "stable release precedes prereleases")
+  run Testing.expect(sectionBefore(text, "## 1.10.0-beta.10\n", "## 1.10.0-beta.2\n"), "numeric prerelease identifiers sort numerically")
+  run Testing.expect(sectionBefore(text, "## 1.10.0-beta.2\n", "## 1.2.0\n"), "numeric minor components sort numerically")
+  let firstRecord = run History.load(root, "1.10.1")
+  run Testing.expect(Vector<History.Entry>.length(&firstRecord.entries) == usize.ONE, "new TOML archive contains the pending note")
+
+  let corrected = run writeArchive(root, "1.10.0.toml", "1.10.0", "regeneration", "Corrected in authoritative TOML.")
+  run FileSystem.writeFile(&changelog, b"Manually corrupted Markdown.\n")
+  let noOp = run Release.version(root, "")
+  run Testing.expect(String.view(&noOp) == "1.10.1", "no pending changes remain a no-op")
+  run expectFile(&changelog, "Manually corrupted Markdown.\n", "no-op version must not regenerate Markdown")
+  run FileSystem.writeFile(&pending, String.utf8Bytes(firstChange()))
+  let second = run Release.version(root, "")
+  run Testing.expect(String.view(&second) == "1.10.2", "the next release regenerates edited archives")
+  let regenerated = run FileSystem.readFile(&changelog)
+  let updated = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&regenerated))
+  run Testing.expect(contains(updated, "Corrected in authoritative TOML."), "TOML corrections must reach regenerated Markdown")
+  run Testing.expect(contains(updated, "Original stable notes.") == false, "superseded archived text must disappear")
+  run Testing.expect(contains(updated, "Manually corrupted Markdown.") == false, "manual Markdown edits must disappear")
+  run Testing.expect(contains(updated, "## 1.10.1\n") && contains(updated, "Older archived notes."),
+    "regeneration retains both newly archived and older releases")
+
+  run FileSystem.removeFile(&changelog)
+  run FileSystem.writeFile(&pending, String.utf8Bytes(firstChange()))
+  let third = run Release.version(root, "")
+  run Testing.expect(String.view(&third) == "1.10.3", "a missing changelog must not prevent release")
+  let recreated = run FileSystem.readFile(&changelog)
+  let restored = unsafe String.fromUtf8Unchecked(Bytes.asSlice(&recreated))
+  run Testing.expect(contains(restored, "Corrected in authoritative TOML.") && contains(restored, "Older archived notes."),
+    "deleted Markdown is reconstructed from all authoritative archives")
+}
+
+// Capture every typed outcome before cleanup so assertion and IO failures cannot
+// leak the fixture. Keep the primary failure if both the scenario and cleanup fail.
+effect fn isolatedReleaseCase(scenario: ReleaseCase) -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut files = run OsFileSystem.make(temporaryRoot())
+  let parent = run Path.root()
+  let root = run FileSystem.createTemporaryDirectory(&parent, b"changeset-recovery-")
+    |> Effect.provideMut<FileSystem>(&mut files)
+  let attempted = match move scenario {
+    ReleaseCase.Recovery { boundary, hadChangelog } =>
+      run Effect.result(recoveryClaims(&root, boundary, hadChangelog))
+        |> Effect.provideMut<FileSystem>(&mut files)
+    ReleaseCase.Regeneration =>
+      run Effect.result(regenerationClaims(&root))
+        |> Effect.provideMut<FileSystem>(&mut files)
+  }
+  let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(&root))
+    |> Effect.provideMut<FileSystem>(&mut files)
+  match move attempted {
+    Result<(), Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static>>.Success { value: completed } => {
+      match move cleaned {
+        Result<(), FileError | OutOfMemoryError>.Success { value: removed } => {}
+        Result<(), FileError | OutOfMemoryError>.Failure { error } => { fail move error }
+      }
+    }
+    Result<(), Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static>>.Failure { error } => {
+      drop cleaned
+      fail move error
+    }
+  }
+}
+
+test effect fn partialChangelogWriteRecoversExactOriginalsAndRetriesOnce() -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run isolatedReleaseCase(ReleaseCase.Recovery { boundary: FailureBoundary.ChangelogPrefix, hadChangelog: true })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn deletedPendingFileRecoversExactOriginalsAndRetriesOnce() -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run isolatedReleaseCase(ReleaseCase.Recovery { boundary: FailureBoundary.PendingUnlink, hadChangelog: true })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn partialNewChangelogRecoveryRestoresOriginalAbsence() -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run isolatedReleaseCase(ReleaseCase.Recovery { boundary: FailureBoundary.ChangelogPrefix, hadChangelog: false })
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn archivedTomlRegeneratesNotesInSemverOrderAndRejectsUnsafeHistory() -> ()
+! Problem | FileError | TomlError | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  run isolatedReleaseCase(ReleaseCase.Regeneration) |> Effect.provideMut<Allocator>(&mut allocator)
+}

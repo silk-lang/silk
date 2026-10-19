@@ -1,0 +1,502 @@
+//! Single-package release planning and filesystem operations.
+//!
+//! All paths are provider-absolute. Supply FileSystem and Allocator at the application edge.
+//! `plan` is read-only; `add` and `version` serialize cooperating writers with .changes/.lock.
+//! Versioning backs up all affected files before mutation. An interrupted operation leaves the
+//! lock and backups for explicit `recover`; never recover while another writer is running.
+//! This implementation uses ordinary whole-file writes with a recovery journal, not atomic
+//! publication or power-loss durability. External editors do not honor the directory lock.
+import Change as Changes
+import Change { Change }
+import Manifest as Manifests
+import Manifest { Manifest }
+import History
+import History { Entry, Record }
+import Problem { Problem }
+import Text
+import Version
+import Version { Bump }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { DirectoryEntry, FileError, FileSystem, Path }
+import silk.i32
+import silk.option { Option }
+import silk.random { Random }
+import silk.result { Result }
+import silk.string { String, InvalidUtf8 }
+import silk.toml_scanner { TomlError }
+import silk.u8
+import silk.usize
+import silk.vector { Vector }
+
+pub struct Pending {
+  pub path: Path
+  pub source: String
+  pub bump: Bump
+  pub hasMigration: bool
+}
+
+pub struct Plan {
+  pub manifest: Manifest
+  pub release: Record
+  pub changed: bool
+  pub pending: Vector<Pending>
+  pub changelog: String
+  pub hadChangelog: bool
+}
+
+/// Finds the closest ancestor containing silk.toml without parsing or mutating it.
+pub effect fn discover(start: &Path) -> Path
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut current = run Path.fromBytes(Path.rawBytes(start))
+  while true {
+    let manifest = run Path.join(&current, "silk.toml")
+    if run FileSystem.exists(&manifest) { return move current }
+    let parent = run Path.parent(&current)
+    match move parent {
+      Option<Path>.Some { value } => { current = move value }
+      Option<Path>.None => { fail Problem { message: "No silk.toml found in this directory or its ancestors." } }
+    }
+  }
+  fail Problem { message: "No silk.toml found." }
+}
+
+effect fn textFile(path: &Path) -> String
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let bytes = run FileSystem.readFile(path)
+  return match move String.fromBytes(move bytes) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { error: _ } => {
+      fail Problem { message: "Expected a UTF-8 manifest, change file, or changelog." }
+    }
+  }
+}
+
+fn pathName(path: &Path) -> string {
+  return Option<string>.unwrapOr(Path.name(path), "")
+}
+
+effect fn unlocked(root: &Path) -> ()
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let lock = run Path.join(root, ".changes/.lock")
+  if run FileSystem.exists(&lock) {
+    fail Problem { message: "A changeset operation is active or interrupted. If no writer is running, use silk changes [--dir PATH] recover." }
+  }
+}
+
+/// Read-only preview. Empty tag selects a stable release; a tag selects a prerelease channel.
+/// Existing prerelease entries are carried through channel changes and stable promotion.
+pub effect fn plan(root: &Path, tag: string) -> Plan
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  run unlocked(root)
+  return run readPlan(root, tag)
+}
+
+effect fn readPlan(root: &Path, tag: string) -> Plan
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let manifestPath = run Path.join(root, "silk.toml")
+  let manifestSource = run textFile(&manifestPath)
+  let manifest = run Manifests.parse(move manifestSource)
+  let current = String.view(&manifest.version)
+  run Version.validate(current)
+  let mut base = run String.copy(Version.core(current))
+  let mut carried = Vector<Entry>.make()
+  if Version.isPrerelease(current) {
+    let previous = run History.load(root, current)
+    if String.view(&previous.packageName) != String.view(&manifest.name) {
+      fail Problem { message: "Prerelease history belongs to a different package." }
+    }
+    base = move previous.baseVersion
+    carried = move previous.entries
+  }
+  let directory = run Path.join(root, ".changes")
+  let mut pending = Vector<Pending>.make()
+  let mut added = Vector<Entry>.make()
+  let mut highest = Bump.Patch
+  let inherited = Vector<Entry>.asSlice(&carried)
+  let mut at = usize.ZERO
+  while at < inherited.length {
+    if Version.rank(inherited[at].bump) > Version.rank(highest) { highest = inherited[at].bump }
+    at = at + usize.ONE
+  }
+  if run FileSystem.exists(&directory) {
+    let entries = run FileSystem.listDirectory(&directory)
+    let items = Vector<DirectoryEntry>.asSlice(&entries)
+    let mut index = usize.ZERO
+    while index < items.length {
+      let entry = &items[index]
+      if Text.ends(pathName(&entry.path), ".md") {
+        if entry.kind.code != 0 { fail Problem { message: "A .changes/*.md entry must be a regular file." } }
+        let source = run textFile(&entry.path)
+        let change = run Changes.parse(String.view(&source))
+        if Version.rank(change.bump) > Version.rank(highest) { highest = change.bump }
+        let path = run Path.fromBytes(Path.rawBytes(&entry.path))
+        run Vector<Pending>.append(&mut pending, Pending {
+          path: move path, source: move source, bump: change.bump,
+          hasMigration: String.ownedByteLength(&change.migration) != usize.ZERO
+        })
+        run Vector<Entry>.append(&mut added, Entry {
+          id: String.make(), bump: change.bump,
+          summary: move change.summary, migration: move change.migration
+        })
+      }
+      index = index + usize.ONE
+    }
+  }
+  let hasPending = Vector<Pending>.length(&pending) != usize.ZERO
+  let mut changed = hasPending || Version.isPrerelease(current)
+  let mut next = String.make()
+  if changed == false {
+    if tag != "" { fail Problem { message: "A tagged release needs pending changes." } }
+    next = run String.copy(current)
+  } else {
+    let target = run Version.bump(String.view(&base), highest)
+    if hasPending == false && tag != "" && sameTag(current, tag) {
+      changed = false
+      next = run String.copy(current)
+    } else {
+      next = run Version.release(current, String.view(&target), tag)
+    }
+  }
+  let newPaths = Vector<Pending>.asSlice(&pending)
+  let mut index = Vector<Entry>.length(&added)
+  while index > usize.ZERO {
+    index = index - usize.ONE
+    let entry = Vector<Entry>.remove(&mut added, index)
+    let mut id = run String.copy(String.view(&next))
+    run String.append(&mut id, "/")
+    run String.append(&mut id, pathName(&newPaths[index].path))
+    run Vector<Entry>.append(&mut carried, Entry {
+      id: move id, bump: entry.bump, summary: move entry.summary, migration: move entry.migration
+    })
+  }
+  let changelogPath = run Path.join(root, "CHANGELOG.md")
+  let hadChangelog = run FileSystem.exists(&changelogPath)
+  let mut changelog = String.make()
+  if hadChangelog { changelog = run textFile(&changelogPath) }
+  return Plan {
+    release: Record {
+      packageName: run String.copy(String.view(&manifest.name)),
+      fromVersion: run String.copy(current), version: move next, baseVersion: move base,
+      entries: move carried
+    },
+    manifest: move manifest, changed: changed, pending: move pending,
+    changelog: move changelog, hadChangelog: hadChangelog
+  }
+}
+
+fn sameTag(current: string, tag: string) -> bool {
+  let start = String.byteLength(Version.core(current)) + usize.ONE
+  let end = start + String.byteLength(tag)
+  if String.byteLength(current) <= end { return false }
+  return Text.part(current, start, end) == tag && Text.byte(current, end) == 46
+}
+
+fn archiveVersion(entry: &DirectoryEntry) -> string {
+  let name = pathName(&entry.path)
+  return Text.part(name, usize.ZERO, String.byteLength(name) - 5)
+}
+
+// Sort directory indices, not owned records: only one archive's notes need to be loaded at a time.
+// Vector.sort requires a pure Order implementation; SemVer comparison can fail.
+effect fn siftArchives(entries: &[DirectoryEntry], order: &mut [usize], start: usize, count: usize) -> ()
+! Problem {
+  let mut root = start
+  while root < count / 2 {
+    let mut child = root * 2 + usize.ONE
+    if child + usize.ONE < count {
+      if (run Version.compare(archiveVersion(&entries[order[child + usize.ONE]]),
+        archiveVersion(&entries[order[child]]))) < 0 {
+        child = child + usize.ONE
+      }
+    }
+    if (run Version.compare(archiveVersion(&entries[order[root]]),
+      archiveVersion(&entries[order[child]]))) <= 0 { return () }
+    let previous = order[root]
+    order[root] = order[child]
+    order[child] = previous
+    root = child
+  }
+}
+
+/// Regenerates all notes from authoritative archives, newest SemVer first, plus the planned release.
+pub effect fn renderChangelog(root: &Path, plan: &Plan) -> String
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut result = run String.copy("# Changelog\n\nAuto-generated from `.changes/releases/*.toml`. Manual edits are overwritten on the next release; edit the authoritative TOML files instead.\n\n")
+  let planned = run History.render(&plan.release)
+  run String.append(&mut result, String.view(&planned))
+  let directory = run Path.join(root, ".changes/releases")
+  if (run FileSystem.exists(&directory)) == false { return move result }
+  let listed = run FileSystem.listDirectory(&directory)
+  let entries = Vector<DirectoryEntry>.asSlice(&listed)
+  let mut indices = Vector<usize>.make()
+  let mut index = usize.ZERO
+  while index < entries.length {
+    if Text.ends(pathName(&entries[index].path), ".toml") {
+      if entries[index].kind.code != 0 {
+        fail Problem { message: "A .changes/releases/*.toml entry must be a regular file." }
+      }
+      let version = archiveVersion(&entries[index])
+      run Version.validate(version)
+      if (run Version.compare(version, String.view(&plan.manifest.version))) > 0 {
+        fail Problem { message: "Release history contains a version newer than the current manifest." }
+      }
+      if (run Version.compare(version, String.view(&plan.release.version))) >= 0 {
+        fail Problem { message: "Release history already contains the planned version or a newer release." }
+      }
+      run Vector<usize>.append(&mut indices, index)
+    }
+    index = index + usize.ONE
+  }
+  let count = Vector<usize>.length(&indices)
+  let mut start = count / 2
+  while start > usize.ZERO {
+    start = start - usize.ONE
+    run siftArchives(entries, Vector<usize>.asMutSlice(&mut indices), start, count)
+  }
+  let mut end = count
+  while end > usize.ONE {
+    end = end - usize.ONE
+    let mut order = Vector<usize>.asMutSlice(&mut indices)
+    let first = order[0]
+    order[0] = order[end]
+    order[end] = first
+    run siftArchives(entries, move order, usize.ZERO, end)
+  }
+  let order = Vector<usize>.asSlice(&indices)
+  index = usize.ZERO
+  while index < count {
+    let version = archiveVersion(&entries[order[index]])
+    if index > usize.ZERO {
+      if (run Version.compare(archiveVersion(&entries[order[index - usize.ONE]]), version)) == 0 {
+        fail Problem { message: "Release history contains duplicate SemVer precedence." }
+      }
+    }
+    let record = run History.load(root, version)
+    if String.view(&record.packageName) != String.view(&plan.manifest.name) {
+      fail Problem { message: "Release history belongs to a different package." }
+    }
+    let section = run History.render(&record)
+    run String.append(&mut result, String.view(&section))
+    index = index + usize.ONE
+  }
+  return move result
+}
+
+effect fn ensureDirectory(root: &Path) -> Path
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let directory = run Path.join(root, ".changes")
+  run FileSystem.createDirectoriesRecursively(&directory)
+  return move directory
+}
+
+effect fn lockDirectory(root: &Path) -> Path
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  run unlocked(root)
+  let lock = run Path.join(root, ".changes/.lock")
+  run FileSystem.createDirectory(&lock)
+  return move lock
+}
+
+/// Creates a 128-bit random filename. Callers commit the returned file with their source changes.
+/// The directory lock prevents overwriting an existing file by another cooperating add operation.
+pub effect fn add(root: &Path, kind: Bump, summary: string, migration: string) -> Path
+! Problem | FileError | TomlError | OutOfMemoryError
+? &mut FileSystem | &mut Allocator | &mut Random {
+  run unlocked(root)
+  let manifestPath = run Path.join(root, "silk.toml")
+  let source = run textFile(&manifestPath)
+  let manifest = run Manifests.parse(move source)
+  drop manifest
+  let content = run Changes.render(kind, summary, migration)
+  let mut random = [
+    u8.toU8(0), u8.toU8(0), u8.toU8(0), u8.toU8(0),
+    u8.toU8(0), u8.toU8(0), u8.toU8(0), u8.toU8(0),
+    u8.toU8(0), u8.toU8(0), u8.toU8(0), u8.toU8(0),
+    u8.toU8(0), u8.toU8(0), u8.toU8(0), u8.toU8(0)
+  ]
+  run Random.fillBytes(&mut random)
+  let mut name = String.make()
+  let digits = "0123456789abcdef"
+  let mut index = usize.ZERO
+  while index < 16 {
+    let value = u8.toUsize(random[index])
+    let high = value / 16
+    let low = value % 16
+    run String.append(&mut name, Text.part(digits, high, high + usize.ONE))
+    run String.append(&mut name, Text.part(digits, low, low + usize.ONE))
+    index = index + usize.ONE
+  }
+  run String.append(&mut name, ".md")
+  let directory = run ensureDirectory(root)
+  let path = run Path.join(&directory, String.view(&name))
+  let lock = run lockDirectory(root)
+  let result = run Effect.result(writeChange(&lock, &path, String.view(&name), &content))
+  match move result {
+    Result<(), Problem | FileError | OutOfMemoryError>.Success { value: _ } => {
+      run FileSystem.removeDirectory(&lock)
+      return move path
+    }
+    Result<(), Problem | FileError | OutOfMemoryError>.Failure { error } => {
+      // Preserve the journal for explicit recovery, including a possibly partial new file.
+      fail move error
+    }
+  }
+}
+
+effect fn writeChange(lock: &Path, path: &Path, name: string, content: &String) -> ()
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if run FileSystem.exists(path) { fail Problem { message: "Random change filename already exists; no file was overwritten." } }
+  // A directory records the filename atomically; a partially written marker cannot lose its name.
+  let marker = run Path.join(lock, name)
+  run FileSystem.createDirectory(&marker)
+  run FileSystem.writeFile(path, String.ownedUtf8Bytes(content))
+  run FileSystem.removeDirectory(&marker)
+}
+
+/// Applies one release. Invalid inputs are detected before backups or output writes.
+/// An error after the ready marker leaves originals in .changes/.lock; use recover before retrying.
+pub effect fn version(root: &Path, tag: string) -> String
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let directory = run Path.join(root, ".changes")
+  if (run FileSystem.exists(&directory)) == false {
+    let current = run plan(root, tag)
+    return move current.release.version
+  }
+  let lock = run lockDirectory(root)
+  let result = run Effect.result(apply(root, &lock, tag))
+  let ready = run Path.join(&lock, "ready")
+  if (run FileSystem.exists(&ready)) == false {
+    run FileSystem.removeDirectoryRecursively(&lock)
+  }
+  return match move result {
+    Result<String, Problem | FileError | TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<String, Problem | FileError | TomlError | OutOfMemoryError>.Failure { error } => { fail move error }
+  }
+}
+
+effect fn apply(root: &Path, lock: &Path, tag: string) -> String
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let release = run readPlan(root, tag)
+  if release.changed == false { return move release.release.version }
+  let pending = Vector<Pending>.asSlice(&release.pending)
+  let manifest = run Manifests.replaceVersion(&release.manifest, String.view(&release.release.version))
+  let changelog = run renderChangelog(root, &release)
+  let record = run History.encode(&release.release)
+  let recordPath = run History.path(root, String.view(&release.release.version))
+  if run FileSystem.exists(&recordPath) {
+    fail Problem { message: "This version already has a release record; refusing to overwrite history." }
+  }
+  let history = run Path.join(root, ".changes/releases")
+  run FileSystem.createDirectoriesRecursively(&history)
+  let historyJournal = run Path.join(lock, "history")
+  run FileSystem.createDirectory(&historyJournal)
+  let recordMarker = run Path.join(&historyJournal, pathName(&recordPath))
+  run FileSystem.createDirectory(&recordMarker)
+  let manifestPath = run Path.join(root, "silk.toml")
+  let changelogPath = run Path.join(root, "CHANGELOG.md")
+  let savedManifest = run Path.join(lock, "manifest")
+  let savedChangelog = run Path.join(lock, "changelog")
+  let savedChanges = run Path.join(lock, "changes")
+  let ready = run Path.join(lock, "ready")
+  run FileSystem.createDirectory(&savedChanges)
+  run FileSystem.writeFile(&savedManifest, String.ownedUtf8Bytes(&release.manifest.source))
+  if release.hadChangelog { run FileSystem.writeFile(&savedChangelog, String.ownedUtf8Bytes(&release.changelog)) }
+  let mut index = usize.ZERO
+  while index < pending.length {
+    let saved = run Path.join(&savedChanges, pathName(&pending[index].path))
+    run FileSystem.writeFile(&saved, String.ownedUtf8Bytes(&pending[index].source))
+    index = index + usize.ONE
+  }
+  run FileSystem.writeFile(&ready, b"")
+  run FileSystem.writeFile(&recordPath, String.ownedUtf8Bytes(&record))
+  run FileSystem.writeFile(&manifestPath, String.ownedUtf8Bytes(&manifest))
+  run FileSystem.writeFile(&changelogPath, String.ownedUtf8Bytes(&changelog))
+  index = usize.ZERO
+  while index < pending.length {
+    run FileSystem.removeFile(&pending[index].path)
+    index = index + usize.ONE
+  }
+  // Removing ready is the completion boundary. Cleanup interruption cannot cause a partial rollback.
+  run FileSystem.removeFile(&ready)
+  return move release.release.version
+}
+
+/// Explicit rollback of an interrupted operation. Never call while another writer is active.
+/// A completed operation with interrupted cleanup is retained. Recovery is repeatable after failure.
+pub effect fn recover(root: &Path) -> ()
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let lock = run Path.join(root, ".changes/.lock")
+  if (run FileSystem.exists(&lock)) == false { fail Problem { message: "There is no interrupted operation to recover." } }
+  let ready = run Path.join(&lock, "ready")
+  let journal = run FileSystem.listDirectory(&lock)
+  let markers = Vector<DirectoryEntry>.asSlice(&journal)
+  let mut markerIndex = usize.ZERO
+  while markerIndex < markers.length {
+    let marker = &markers[markerIndex]
+    let name = pathName(&marker.path)
+    if Text.ends(name, ".md") {
+      if marker.kind.code != 1 || String.byteLength(name) != 35 {
+        fail Problem { message: "Invalid add recovery journal; inspect .changes/.lock manually." }
+      }
+      let mut index = usize.ZERO
+      while index < 32 {
+        let byte = Text.byte(name, index)
+        if (byte < 48 || byte > 57) && (byte < 97 || byte > 102) {
+          fail Problem { message: "Invalid add recovery journal; inspect .changes/.lock manually." }
+        }
+        index = index + usize.ONE
+      }
+      let directory = run Path.join(root, ".changes")
+      let path = run Path.join(&directory, name)
+      if run FileSystem.exists(&path) { run FileSystem.removeFile(&path) }
+      run FileSystem.removeDirectory(&marker.path)
+    }
+    markerIndex = markerIndex + usize.ONE
+  }
+  if run FileSystem.exists(&ready) {
+    let historyJournal = run Path.join(&lock, "history")
+    if run FileSystem.exists(&historyJournal) {
+      let records = run FileSystem.listDirectory(&historyJournal)
+      let markers = Vector<DirectoryEntry>.asSlice(&records)
+      let mut at = usize.ZERO
+      while at < markers.length {
+        let name = pathName(&markers[at].path)
+        if Text.ends(name, ".toml") == false {
+          fail Problem { message: "Invalid release history recovery marker." }
+        }
+        let version = Text.part(name, usize.ZERO, String.byteLength(name) - 5)
+        let path = run History.path(root, version)
+        if run FileSystem.exists(&path) { run FileSystem.removeFile(&path) }
+        at = at + usize.ONE
+      }
+    }
+    let manifestPath = run Path.join(root, "silk.toml")
+    let changelogPath = run Path.join(root, "CHANGELOG.md")
+    let savedManifest = run Path.join(&lock, "manifest")
+    let savedChangelog = run Path.join(&lock, "changelog")
+    let savedChanges = run Path.join(&lock, "changes")
+    let manifest = run FileSystem.readFile(&savedManifest)
+    run FileSystem.writeFile(&manifestPath, Bytes.asSlice(&manifest))
+    if run FileSystem.exists(&savedChangelog) {
+      let changelog = run FileSystem.readFile(&savedChangelog)
+      run FileSystem.writeFile(&changelogPath, Bytes.asSlice(&changelog))
+    } else {
+      if run FileSystem.exists(&changelogPath) { run FileSystem.removeFile(&changelogPath) }
+    }
+    let changes = run FileSystem.listDirectory(&savedChanges)
+    let entries = Vector<DirectoryEntry>.asSlice(&changes)
+    let directory = run Path.join(root, ".changes")
+    let mut index = usize.ZERO
+    while index < entries.length {
+      let source = run FileSystem.readFile(&entries[index].path)
+      let path = run Path.join(&directory, pathName(&entries[index].path))
+      run FileSystem.writeFile(&path, Bytes.asSlice(&source))
+      index = index + usize.ONE
+    }
+    run FileSystem.removeFile(&ready)
+  }
+  run FileSystem.removeDirectoryRecursively(&lock)
+}

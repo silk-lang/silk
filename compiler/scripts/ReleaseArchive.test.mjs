@@ -6,6 +6,7 @@ import { createRequire } from 'node:module'
 import { pathToFileURL } from 'node:url'
 import { assert, it } from '@effect/vitest'
 import * as Effect from 'effect/Effect'
+import * as FileSystem from 'effect/FileSystem'
 const require = createRequire(new URL('../../package.json', import.meta.url))
 /** @type {typeof import('@effect/platform-node')} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
@@ -19,6 +20,13 @@ const directory = Effect.acquireRelease(
 it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibly', () =>
   Effect.gen(function* () {
     const root = yield* directory
+    const fs = yield* FileSystem.FileSystem
+    yield* fs.makeDirectory(join(root, 'changes/src'), { recursive: true })
+    yield* fs.writeFileString(join(root, 'changes/src/Command.silk'), 'compiled into silk\n')
+    yield* fs.writeFileString(
+      join(root, 'silk.toml'),
+      '[workspace]\nmembers = ["compiler", "changes"]\n',
+    )
     const deep =
       'silk/a-directory-name-long-enough/to-need-the-ustar-prefix-field/beyond-one-hundred-bytes'
     mkdirSync(join(root, 'stdlib', deep), { recursive: true })
@@ -42,6 +50,8 @@ it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibl
     assert.deepStrictEqual(readFileSync(first), readFileSync(second))
     execFileSync('tar', ['-xzf', first, '-C', root])
     const top = join(root, 'silk-0.1.0-x86_64-unknown-linux-gnu')
+    assert.deepStrictEqual((yield* fs.readDirectory(top)).sort(), ['bin', 'lib'])
+    assert.deepStrictEqual(yield* fs.readDirectory(join(top, 'lib/silk')), ['stdlib'])
     assert.strictEqual(readFileSync(join(top, 'bin/silk'), 'utf8'), '#!/bin/sh\necho silk\n')
     assert.strictEqual(statSync(join(top, 'bin/silk')).mode & 0o777, 0o755)
     assert.strictEqual(statSync(join(top, 'lib/silk/stdlib/manifest.json')).mode & 0o777, 0o644)

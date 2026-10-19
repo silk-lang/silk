@@ -226,10 +226,7 @@ export interface Measurement {
   readonly command: ReadonlyArray<string>
   readonly measurementCommand: ReadonlyArray<string>
   readonly cwd: string
-  readonly linkerEnvironment:
-    | { readonly SILK_CLANG: string }
-    | { readonly SILKC_CLANG: string }
-    | null
+  readonly linkerEnvironment: { readonly SILK_CLANG: string } | null
   readonly exitCode: number | null
   readonly signal: string | null
   readonly stdout: string
@@ -319,11 +316,7 @@ export const run = Effect.fn('NativeProcess.run')(function* ({
       Object.entries(constants.signals).find(([, value]) => value === number)?.[0] ??
       `signal-${number}`
   }
-  // The linker the measured build was given: SILK_CLANG, or the seed's older SILKC_CLANG.
-  let linkerEnvironment: { readonly SILK_CLANG: string } | { readonly SILKC_CLANG: string } | null =
-    null
-  if (env?.SILK_CLANG !== undefined) linkerEnvironment = { SILK_CLANG: env.SILK_CLANG }
-  else if (env?.SILKC_CLANG !== undefined) linkerEnvironment = { SILKC_CLANG: env.SILKC_CLANG }
+  const linkerEnvironment = env?.SILK_CLANG === undefined ? null : { SILK_CLANG: env.SILK_CLANG }
   return {
     measurement: {
       command,
