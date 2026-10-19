@@ -1,0 +1,180 @@
+//! Resolves history queries against the current package or a direct path dependency.
+//! Silk has no registry/lockfile source here: the dependency manifest is the installed version.
+//! A candidate source checkout must have the same package name; no network or Git operations occur.
+import Problem { Problem }
+import Text
+import Version
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.box { Box }
+import silk.bytes { Bytes }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.i32
+import silk.option { Option }
+import silk.string { String }
+import silk.toml_scanner { TomlError }
+import silk.toml_value { Toml, Value, TomlChild }
+import silk.usize
+import silk.vector { Vector }
+
+pub struct Target {
+  pub directory: Path
+  pub packageName: String
+  pub fromVersion: String
+  pub toVersion: String
+}
+
+struct Package {
+  name: String
+  version: String
+}
+
+effect fn document(root: &Path) -> Value
+! FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let manifest = run Path.join(root, "silk.toml")
+  let bytes = run FileSystem.readFile(&manifest)
+  return run Toml.parse(Bytes.asSlice(&bytes))
+}
+
+effect fn package(value: &Value) -> Package
+! Problem | OutOfMemoryError ? &mut Allocator {
+  let name = match move Toml.asString(Toml.fieldAt(Toml.field(value, "package"), "name")) {
+    Option<string>.Some { value: text } => text
+    Option<string>.None => {
+      if let Option<&Value>.None = move Toml.field(value, "package") {
+        if let Option<&Value>.Some { value: _ } = move Toml.field(value, "workspace") {
+          fail Problem { message: "This is a virtual workspace, not a release package. Select a member with silk changes --dir PATH, or run from a member directory." }
+        }
+      }
+      fail Problem { message: "History source needs a package.name string." }
+    }
+  }
+  if name == "" { fail Problem { message: "History source package name is empty." } }
+  let version = match move Toml.asString(Toml.fieldAt(Toml.field(value, "package"), "version")) {
+    Option<string>.Some { value: text } => text
+    Option<string>.None => { fail Problem { message: "History source needs a package.version string." } }
+  }
+  run Version.validate(version)
+  return Package { name: run String.copy(name), version: run String.copy(version) }
+}
+
+/// Normalizes a user-supplied relative or absolute directory against an explicit base.
+pub effect fn resolvePath(base: &Path, value: string) -> Path
+! FileError | OutOfMemoryError ? &mut Allocator {
+  if String.byteLength(value) > usize.ZERO {
+    if Text.byte(value, usize.ZERO) == 47 {
+      let root = run Path.root()
+      return run Path.resolve(&root, Text.part(value, usize.ONE, String.byteLength(value)))
+    }
+  }
+  return run Path.resolve(base, value)
+}
+
+effect fn dependencyPath(root: &Path, entry: &Value) -> Path
+! Problem | FileError | OutOfMemoryError ? &mut Allocator {
+  let path = match move Toml.asString(Toml.field(entry, "path")) {
+    Option<string>.Some { value } => value
+    Option<string>.None => { fail Problem { message: "Dependency must declare a local path to its silk.toml directory." } }
+  }
+  if path == "" { fail Problem { message: "Dependency path must not be empty." } }
+  return run resolvePath(root, path)
+}
+
+effect fn checkedDependency(entry: &Value, directory: &Path) -> Package
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let value = run document(directory)
+  let found = run package(&value)
+  let expectedField = Toml.field(entry, "package")
+  match move expectedField {
+    Option<&Value>.Some { value: constraint } => {
+      let expected = match move Toml.asString(Option<&Value>.some(constraint)) {
+        Option<string>.Some { value: text } => text
+        Option<string>.None => { fail Problem { message: "Dependency package constraint must be a string." } }
+      }
+      if expected != String.view(&found.name) {
+        fail Problem { message: "Dependency package constraint does not match its manifest name." }
+      }
+    }
+    Option<&Value>.None => {}
+  }
+  return move found
+}
+
+/// A version selects this package. An alias or unambiguous package name selects a direct dependency.
+/// source is an optional candidate directory, relative to the consuming project root.
+/// from overrides a dependency's installed baseline (useful after replacing a path checkout).
+pub effect fn resolve(root: &Path, selector: string, source: string, from: string) -> Target
+! Problem | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if selector == "" { fail Problem { message: "since requires a version or dependency name." } }
+  let owner = run document(root)
+  let mut directory = run Path.fromBytes(Path.rawBytes(root))
+  let mut selected = run package(&owner)
+  let mut baseline = String.make()
+  let initial = Text.byte(selector, usize.ZERO)
+  if initial >= 48 && initial <= 57 {
+    if from != "" { fail Problem { message: "A version selector already supplies the baseline; omit --from." } }
+    run Version.validate(selector)
+    baseline = run String.copy(selector)
+  } else {
+    let dependencies = match move Toml.field(&owner, "dependencies") {
+      Option<&Value>.Some { value } => value
+      Option<&Value>.None => { fail Problem { message: "No dependencies declared; pass a version to query this package." } }
+    }
+    let exact = Toml.field(dependencies, selector)
+    let mut found = false
+    match move exact {
+      Option<&Value>.Some { value } => {
+        directory = run dependencyPath(root, value)
+        selected = run checkedDependency(value, &directory)
+        found = true
+      }
+      Option<&Value>.None => {
+        match &dependencies.* {
+          Value.Table { entries, kind } => {
+            let values = Box<Vector<TomlChild>>.get(&entries)
+            let members = Vector<TomlChild>.asSlice(&values[0])
+            let mut at = usize.ZERO
+            while at < members.length {
+              if let TomlChild.Member { entry } = &members[at] {
+                let candidatePath = run dependencyPath(root, &entry.value)
+                let candidate = run checkedDependency(&entry.value, &candidatePath)
+                if String.view(&candidate.name) == selector {
+                  if found { fail Problem { message: "Dependency package name is ambiguous; use its manifest alias." } }
+                  selected = move candidate
+                  directory = move candidatePath
+                  found = true
+                }
+              }
+              at = at + usize.ONE
+            }
+          }
+          _ => { fail Problem { message: "dependencies must be a TOML table." } }
+        }
+      }
+    }
+    if found == false { fail Problem { message: "No direct dependency matches that alias or package name." } }
+    if from == "" {
+      baseline = run String.copy(String.view(&selected.version))
+    } else {
+      run Version.validate(from)
+      baseline = run String.copy(from)
+    }
+  }
+  if source != "" {
+    let candidatePath = run resolvePath(root, source)
+    let candidateDocument = run document(&candidatePath)
+    let candidate = run package(&candidateDocument)
+    if String.view(&candidate.name) != String.view(&selected.name) {
+      fail Problem { message: "Candidate history source belongs to a different package." }
+    }
+    directory = move candidatePath
+    selected = move candidate
+  }
+  if (run Version.compare(String.view(&baseline), String.view(&selected.version))) > 0 {
+    fail Problem { message: "History source is older than the requested baseline." }
+  }
+  return Target {
+    directory: move directory, packageName: move selected.name,
+    fromVersion: move baseline, toVersion: move selected.version
+  }
+}

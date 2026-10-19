@@ -16,14 +16,15 @@ import {
   targets,
   verifySeed,
 } from './NativeSeed.mjs'
-import { createSnapshot, hash, verifySnapshot } from './SourceSnapshot.mjs'
+import { createSnapshot, hash, restoreSnapshot, verifySnapshot } from './SourceSnapshot.mjs'
 
 const require = createRequire(new URL('../../package.json', import.meta.url))
 /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
 /** @type {{ NodeServices: {layer: import('effect/Layer').Layer<import('effect/FileSystem').FileSystem>} }} */
 const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/platform-node')).href)
 const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))
-const main = 'import nested.Dependency\nimport silk.i32\nfn main() -> i32 { return 42 }\n'
+const main =
+  'import changeset.Command\nimport nested.Dependency\nimport silk.i32\nfn main() -> i32 { return 42 }\n'
 const fixture = Effect.fnUntraced(function* () {
   const fs = yield* FileSystem.FileSystem
   const temporary = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-authored-seed-' })
@@ -36,9 +37,15 @@ const fixture = Effect.fnUntraced(function* () {
       yield* fs.writeFileString(join(repository, path), text)
     },
   )
+  yield* put('silk.toml', '[workspace]\nmembers = ["compiler", "changes"]\noutput-dir = "build"\n')
+  yield* put(
+    'changes/silk.toml',
+    '[package]\nname = "changeset"\nversion = "0.1.0"\nroot = "src/Command.silk"\n',
+  )
+  yield* put('changes/src/Command.silk', 'pub fn value() -> i32 { return 2 }\n')
   yield* put(
     'compiler/silk.toml',
-    '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nchangeset = { path = "../changes" }\n',
   )
   yield* put('compiler/src/main.silk', main)
   yield* put('compiler/src/nested/Dependency.silk', 'pub fn value() -> i32 { return 1 }\n')
@@ -82,6 +89,8 @@ it.effect(
     Effect.gen(function* () {
       const f = yield* fixture()
       yield* f.put('compiler/src/main.silk', '// formatter changed checkout\n')
+      yield* f.put('changes/src/Command.silk', '// changed dependency checkout\n')
+      yield* f.put('silk.toml', '# changed workspace checkout\n')
       const second = join(f.temporary, 'second')
       const receipt = yield* createSnapshot({ repository: f.repository, directory: second })
       assert.strictEqual(receipt.normalizedDigest, f.receipt.normalizedDigest)
@@ -96,6 +105,56 @@ it.effect(
       yield* f.fs.writeFileString(join(second, 'stdlib/silk/i32.silk'), 'changed stdlib')
       yield* failure(verifySnapshot({ directory: second }), /Snapshot bytes or mode changed/)
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
+it.effect('restores every workspace input and detects dependency and manifest tampering', () =>
+  Effect.gen(function* () {
+    const f = yield* fixture()
+    const restored = join(f.temporary, 'restored')
+    const receipt = yield* restoreSnapshot({ artifact: f.snapshot, directory: restored })
+    assert.deepStrictEqual(receipt, f.receipt)
+    const paths = ['silk.toml', 'changes/silk.toml', 'changes/src/Command.silk']
+    for (const path of paths) {
+      const committed = yield* f.fs.readFileString(join(f.repository, path))
+      assert.strictEqual(yield* f.fs.readFileString(join(restored, path)), committed)
+      assert.strictEqual(receipt.files.find((file) => file.path === path)?.sha256, hash(committed))
+      yield* f.fs.writeFileString(join(restored, path), `${committed}\n# changed\n`)
+      yield* failure(verifySnapshot({ directory: restored }), /Snapshot bytes or mode changed/)
+      yield* f.fs.writeFileString(join(restored, path), committed)
+    }
+    yield* f.fs.writeFileString(join(restored, 'changes/src/Extra.silk'), 'unrecorded dependency')
+    yield* failure(verifySnapshot({ directory: restored }), /Unrecorded snapshot input/)
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+)
+
+it.effect('binds workspace and dependency edits into the compiler and normalized digests', () =>
+  Effect.gen(function* () {
+    const f = yield* fixture()
+    let previous = f.receipt
+    const paths = ['silk.toml', 'changes/silk.toml', 'changes/src/Command.silk']
+    for (const [index, path] of paths.entries()) {
+      const original = yield* f.fs.readFileString(join(f.repository, path))
+      yield* f.put(path, `${original}\n# changed\n`)
+      yield* f.git('add', path)
+      yield* f.git(
+        '-c',
+        'user.name=Snapshot Test',
+        '-c',
+        'user.email=snapshot@example.invalid',
+        'commit',
+        '-qm',
+        path,
+      )
+      const next = yield* createSnapshot({
+        repository: f.repository,
+        directory: join(f.temporary, `revision-${index}`),
+      })
+      assert.notStrictEqual(next.compilerDigest, previous.compilerDigest, path)
+      assert.notStrictEqual(next.normalizedDigest, previous.normalizedDigest, path)
+      assert.strictEqual(next.stdlibDigest, previous.stdlibDigest, path)
+      previous = next
+    }
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 )
 
 it.effect('installs only downloaded bytes that match a Release pin', () =>

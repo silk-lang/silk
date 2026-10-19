@@ -306,6 +306,12 @@ prints one `build llvm/<target>: ok <artifact>` or `failed (exit <status>)` line
 `Build summary`; its status is 2 when any target failed operationally, else 1 when any build was
 refused, else 0. A missing or invalid manifest or an unknown target exits 2 before building.
 
+This repository's root `silk.toml` is a workspace with `compiler/` and `changes/` members.
+Their artifacts share the root `build/` directory; neither member declares its own output
+directory. The root is not a package, so select a member with `--manifest-path` or run from its
+directory. The compiler imports `changeset.Command` through its declared path dependency on
+`../changes`; workspace membership does not replace dependency declarations.
+
 Named profiles follow the TypeScript `ProjectProfile`: a `[profiles.<name>]` table is a complete
 logical profile (`target` is required; `cpu`, `optimization`, `debug` and the other profile fields
 are optional) with optional profile-tier `bindings`, and `[build].profile` names the default one.
@@ -380,10 +386,64 @@ everything below it, as the TypeScript `silk clean` does, and prints `Removed <d
 absent output directory is already clean. Only builds write there, and the manifest decoder keeps
 the directory inside the project. A missing or invalid manifest, or a failed removal, exits 2.
 
+### Native changes
+
+`silk changes` runs the source-written `changeset` library linked into the compiler; it does not
+spawn a separate tool or require a checkout of that library at runtime.
+
+```sh
+silk changes [--dir PATH] add patch|minor|major "Summary" [--migration "Guidance"]
+silk changes [--dir PATH] status [--tag beta]
+silk changes [--dir PATH] version [--tag beta]
+silk changes [--dir PATH] since VERSION|DEPENDENCY [--from VERSION] [--source PATH] [--json]
+silk changes [--dir PATH] recover
+```
+
+Root discovery chooses the nearest package manifest above the selected directory. `--dir` is
+relative to the working directory; `--source` is relative to that package's root. Operations are
+single-package: from this repository's workspace root, use `silk changes --dir compiler status`
+or `silk changes --dir changes status`. A workspace-only manifest cannot receive a release.
+
+`add` creates an independent `.changes/<random>.md` with its bump, summary, and optional
+`## Migration` section. Missing notes trigger a reminder and remain unknown impact, not an
+assertion that no migration is required. Guidance can describe API, behavior, defaults, or data
+changes at any bump level.
+
+`version` consumes the pending files, updates only the manifest's version token, and records the
+release at `.changes/releases/<version>.toml`. These TOML records are authoritative.
+`CHANGELOG.md` is regenerated, newest release first, with a visible warning that manual edits
+will be overwritten on the next release. Correct notes in the TOML records instead. Commit the
+manifest, records, generated changelog, and pending-file deletions together.
+
+For compiler releases, this updates `compiler/silk.toml`. The native compiler's reported version
+still comes from `release()` in `compiler/src/main.silk`; keep that literal in sync before publishing.
+
+`--tag beta` produces SemVer prereleases such as `1.2.0-beta.1`; subsequent pending changes
+advance the counter. `--tag rc` changes the channel, and omitting `--tag` promotes the accumulated
+notes to stable. There are no Git tags, commits, network requests, or publication operations.
+
+`since VERSION` returns this package's newer changes and migration guidance. `since DEPENDENCY`
+accepts a direct dependency alias or unambiguous package name and uses its installed manifest
+version as the baseline. `--source` selects a candidate checkout of the same package; `--from`
+overrides a dependency baseline after updating it. `--json` remains JSON for agents, with `null`
+for unspecified migration notes. Queries deduplicate carried prerelease entries and refuse
+incomplete history or an active release lock.
+
+An interrupted write retains `.changes/.lock` and its backups. Stop other writers before
+`recover`; it restores the old manifest, Markdown, and pending changes and removes an uncommitted
+TOML record. This is process-failure recovery, not a power-loss durability guarantee.
+
+Run the library's package-owned tests from the repository root:
+
+```sh
+silk test --manifest-path changes/silk.toml --root src/tests.silk --no-cache --stdlib stdlib
+```
+
 ### One native generation and its smoke receipt
 
-`NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored compiler/stdlib
-snapshot exported by `SourceSnapshot.mjs`. It invokes N0 once to build **N1**, then uses only that
+`NativeBuild.ts` accepts an explicit immutable native seed **N0** and the authored
+compiler/changes/workspace/stdlib snapshot exported by `SourceSnapshot.mjs`. It invokes N0 once
+to build **N1**, then uses only that
 new executable to compile and run the shared `trivial-features` program. N0 must be a regular
 executable with no write permission bits; a restored seed has mode `0555`. The output directory
 must not exist and must be separate from the inputs. Existing outputs, symbolic links and a hard
@@ -407,13 +467,18 @@ command and its waited children, not summed concurrent memory. Wall time measure
 including the measurement wrapper. A contract-test measurement command supplies fixture values;
 these are not real compiler measurements.
 
-`build-receipt.json` retains N0/N1 SHA-256 hashes, the exact validated source and stdlib file hashes
-and normalized digests, source commit and archive digest, target/profile, commands, working
+`build-receipt.json` retains N0/N1 SHA-256 hashes, the exact validated compiler/dependency/workspace
+and stdlib file hashes and normalized digests, source commit and archive digest, target/profile,
+commands, working
 directories, exits/signals, stdout/stderr, wall time and RSS for every attempted stage. Snapshot
 and seed hashes are checked before and after each stage. The smoke source is frozen before the
 native build from the existing plain `trivialFeatures` corpus template; the receipt records both
 that source's hash and the supplying corpus file's hash. `--corpus-source` can select an explicit
 copy of that corpus source file. Smoke success requires exit 42 and empty stdout.
+
+Source snapshots and native build receipts use schema version 2. Release source archives include
+the verified `input-snapshot.json` and `authored-inputs.tar`, preserving the workspace and changes
+dependency alongside the compiler and standard library.
 
 Build refusal, missing output, signals, failed smoke
 compilation, and wrong exit/stdout retain a failed receipt and a nonzero driver exit. No fallback
@@ -542,10 +607,9 @@ needed.
 A single-file `build` takes `--clang <path>` as the TypeScript `build-exe` does; it wins over
 `SILK_CLANG`. A value with a `/` is a path against the working directory and a bare name is
 searched on `PATH`. Without either, the native compiler runs the first `clang` on `PATH`, as the
-TypeScript CLI does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at the verified ARM64
-executable and `SILK_CLANG` pointing at LLVM 22 `clang`, development builds use the native
-compiler directly. A pinned seed predates `SILK_CLANG` and reads `SILKC_CLANG` until the next
-re-pin:
+TypeScript CLI does, and refuses with status 2 when there is none. With `SILK_COMPILER` pointing at
+the verified executable and `SILK_CLANG` pointing at LLVM 22 `clang`, development builds use the
+native compiler directly. The pinned producers support path dependencies and read `SILK_CLANG`.
 
 ```sh
 mkdir -p .scratch

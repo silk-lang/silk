@@ -1,0 +1,416 @@
+//! Versioned release archives; queries require a complete predecessor chain, never inferred changelog text.
+import Problem { Problem }
+import Text
+import Version
+import Version { Bump }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bool
+import silk.box { Box }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.i32
+import silk.toml_codec { TomlCodec }
+import silk.toml_scanner { TomlError }
+import silk.toml_value { Toml, TomlChild, Value }
+import silk.option { Option }
+import silk.result { Result }
+import silk.string { String, InvalidUtf8 }
+import silk.usize
+import silk.vector { Vector }
+
+/// Identity is assigned once as first-release-version/pending-filename and retained across a prerelease series.
+pub struct Entry {
+  pub id: String
+  pub bump: Bump
+  pub summary: String
+  pub migration: String
+}
+
+/// Prerelease records and their stable promotion retain the accumulated series entries.
+/// Query results keep original release metadata but contain only entries new to the requested range.
+pub struct Record {
+  pub packageName: String
+  pub fromVersion: String
+  pub version: String
+  pub baseVersion: String
+  pub entries: Vector<Entry>
+}
+
+effect fn requiredString<'a>(document: &'a Value, key: string) -> string<'a> ! Problem {
+  return match move Toml.asString(Toml.field(document, key)) {
+    Option<string<'a>>.Some { value } => value
+    Option<string<'a>>.None => { fail Problem { message: "Release history requires string package, from, version, base, id, bump, and summary fields." } }
+  }
+}
+
+effect fn document(text: string) -> Value ! Problem | OutOfMemoryError ? &mut Allocator {
+  let parsed = run Effect.result(Toml.parse(String.utf8Bytes(text)))
+  return match move parsed {
+    Result<Value, TomlError | OutOfMemoryError>.Success { value } => move value
+    Result<Value, TomlError | OutOfMemoryError>.Failure { error } => match move error {
+      TomlError malformed => { fail Problem { message: "Release history is not valid TOML (including duplicate keys)." } }
+      OutOfMemoryError allocation => { fail move allocation }
+    }
+  }
+}
+
+fn hasId(entries: &Vector<Entry>, id: string) -> bool {
+  let items = Vector<Entry>.asSlice(entries)
+  let mut index = usize.ZERO
+  while index < items.length {
+    if String.view(&items[index].id) == id { return true }
+    index = index + usize.ONE
+  }
+  return false
+}
+
+effect fn validate(record: &Record) -> () ! Problem {
+  if Text.trim(String.view(&record.packageName)) == "" {
+    fail Problem { message: "Release history package must not be empty." }
+  }
+  let from = String.view(&record.fromVersion)
+  let version = String.view(&record.version)
+  let base = String.view(&record.baseVersion)
+  run Version.validate(from)
+  run Version.validate(version)
+  run Version.validate(base)
+  if (run Version.compare(version, from)) <= 0 {
+    fail Problem { message: "Release history version must be strictly newer than its predecessor." }
+  }
+  if Version.isPrerelease(base) || (run Version.compare(base, Version.core(from))) > 0 {
+    fail Problem { message: "Release history base must be stable and no newer than the predecessor core." }
+  }
+  let entries = Vector<Entry>.asSlice(&record.entries)
+  let mut index = usize.ZERO
+  while index < entries.length {
+    if String.view(&entries[index].id) == "" || Text.trim(String.view(&entries[index].summary)) == "" {
+      fail Problem { message: "Release history change IDs and summaries must not be empty." }
+    }
+    if String.view(&entries[index].migration) != "" && Text.trim(String.view(&entries[index].migration)) == "" {
+      fail Problem { message: "Release history migration must be empty (unknown) or contain non-whitespace text." }
+    }
+    let mut previous = usize.ZERO
+    while previous < index {
+      if String.view(&entries[previous].id) == String.view(&entries[index].id) {
+        fail Problem { message: "Release history contains duplicate change IDs." }
+      }
+      previous = previous + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+}
+
+fn formatOne(document: &Value) -> bool {
+  return match move Toml.field(document, "format") {
+    Option<&Value>.Some { value: field } => match move TomlCodec.decodeOne<i32>(field) {
+      Result<i32, TomlError>.Success { value: decoded } => decoded == 1
+      Result<i32, TomlError>.Failure { error: invalid } => false
+    }
+    Option<&Value>.None => false
+  }
+}
+
+/// Reads the format-1 TOML schema. Omitted migration means unknown, not no impact.
+pub effect fn parse(text: string) -> Record ! Problem | OutOfMemoryError ? &mut Allocator {
+  let value = run document(text)
+  if !formatOne(&value) {
+    fail Problem { message: "Release history format must be the integer 1." }
+  }
+  let packageName = run String.copy(run requiredString(&value, "package"))
+  let fromVersion = run String.copy(run requiredString(&value, "from"))
+  let version = run String.copy(run requiredString(&value, "version"))
+  let baseVersion = run String.copy(run requiredString(&value, "base"))
+  let children = match move Toml.field(&value, "changes") {
+    Option<&Value>.Some { value: changes } => match &changes.* {
+      Value.Array { values, tables: _ } => Box<Vector<TomlChild>>.get(&values)
+      _ => { fail Problem { message: "Release history changes must be an array." } }
+    }
+    Option<&Value>.None => { fail Problem { message: "Release history requires a changes array." } }
+  }
+  let items = Vector<TomlChild>.asSlice(&children[0])
+  let mut entries = Vector<Entry>.make()
+  let mut index = usize.ZERO
+  while index < items.length {
+    match &items[index] {
+      TomlChild.Item { value: item } => {
+        let id = run String.copy(run requiredString(&item, "id"))
+        let bump = run Version.parseBump(run requiredString(&item, "bump"))
+        let summary = run String.copy(run requiredString(&item, "summary"))
+        let mut migration = String.make()
+        match move Toml.field(&item, "migration") {
+          Option<&Value>.Some { value: notes } => match &notes.* {
+            Value.String { text: body } => {
+              if Text.trim(String.view(&body)) == "" {
+                fail Problem { message: "Release history migration must be omitted or a nonempty string." }
+              }
+              migration = run String.copy(String.view(&body))
+            }
+            _ => { fail Problem { message: "Release history migration must be omitted or a string." } }
+          }
+          Option<&Value>.None => {}
+        }
+        run Vector<Entry>.append(&mut entries, Entry { id: move id, bump: bump, summary: move summary, migration: move migration })
+      }
+      _ => { fail Problem { message: "Release history changes must contain tables." } }
+    }
+    index = index + usize.ONE
+  }
+  let record = Record { packageName: move packageName, fromVersion: move fromVersion,
+    version: move version, baseVersion: move baseVersion, entries: move entries }
+  run validate(&record)
+  return move record
+}
+
+// Writer cannot propagate allocator failures. Append UTF-8 runs directly to owned
+// storage, retaining allocation errors without building an intermediate value tree.
+effect fn stringBody(output: &mut String, text: string, multiline: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut index = usize.ZERO
+  let mut start = usize.ZERO
+  let length = String.byteLength(text)
+  while index < length {
+    let byte = Text.byte(text, index)
+    if byte == 34 || byte == 92 || byte == 127 || (byte < 32 && !(multiline && byte == 10)) {
+      if start < index { run String.append(&mut output.*, Text.part(text, start, index)) }
+      if byte == 34 { run String.append(&mut output.*, "\\\"") }
+      else if byte == 92 { run String.append(&mut output.*, "\\\\") }
+      else {
+        run String.append(&mut output.*, "\\u00")
+        let high = i32.toUsize(byte / 16)
+        let low = i32.toUsize(byte % 16)
+        run String.append(&mut output.*, Text.part("0123456789abcdef", high, high + usize.ONE))
+        run String.append(&mut output.*, Text.part("0123456789abcdef", low, low + usize.ONE))
+      }
+      start = index + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  if start < length { run String.append(&mut output.*, Text.part(text, start, length)) }
+}
+
+effect fn quoted(output: &mut String, text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  run String.append(&mut output.*, "\"")
+  run stringBody(&mut output.*, text, false)
+  run String.append(&mut output.*, "\"")
+}
+
+// TOML trims exactly the first newline after the opening delimiter. Supply that
+// newline separately so original leading/trailing LF bytes survive. Escape CR,
+// every double quote and backslash: neither delimiters nor line folding can occur.
+effect fn multiline(output: &mut String, text: string) -> () ! OutOfMemoryError ? &mut Allocator {
+  run String.append(&mut output.*, "\"\"\"\n")
+  run stringBody(&mut output.*, text, true)
+  run String.append(&mut output.*, "\"\"\"")
+}
+
+/// Encodes authoritative format-1 TOML, with readable multiline Markdown bodies.
+/// Unknown migration notes are omitted; empty releases retain an explicit changes array.
+pub effect fn encode(record: &Record) -> String ! Problem | OutOfMemoryError ? &mut Allocator {
+  run validate(record)
+  let mut output = String.make()
+  run String.append(&mut output, "format = 1\npackage = ")
+  run quoted(&mut output, String.view(&record.packageName))
+  run String.append(&mut output, "\nfrom = ")
+  run quoted(&mut output, String.view(&record.fromVersion))
+  run String.append(&mut output, "\nversion = ")
+  run quoted(&mut output, String.view(&record.version))
+  run String.append(&mut output, "\nbase = ")
+  run quoted(&mut output, String.view(&record.baseVersion))
+  run String.append(&mut output, "\n")
+  let entries = Vector<Entry>.asSlice(&record.entries)
+  if entries.length == usize.ZERO { run String.append(&mut output, "changes = []\n") }
+  let mut index = usize.ZERO
+  while index < entries.length {
+    let entry = &entries[index]
+    run String.append(&mut output, "\n[[changes]]\nid = ")
+    run quoted(&mut output, String.view(&entry.id))
+    run String.append(&mut output, "\nbump = ")
+    run quoted(&mut output, Version.label(entry.bump))
+    run String.append(&mut output, "\nsummary = ")
+    run multiline(&mut output, String.view(&entry.summary))
+    if String.view(&entry.migration) != "" {
+      run String.append(&mut output, "\nmigration = ")
+      run multiline(&mut output, String.view(&entry.migration))
+    }
+    run String.append(&mut output, "\n")
+    index = index + usize.ONE
+  }
+  return move output
+}
+
+/// Encodes a validated record as JSON for CLI consumers; unknown migrations remain null.
+pub effect fn encodeJson(record: &Record) -> String ! Problem | OutOfMemoryError ? &mut Allocator {
+  run validate(record)
+  let mut output = String.make()
+  run String.append(&mut output, "{\"format\":1,\"package\":")
+  run quoted(&mut output, String.view(&record.packageName))
+  run String.append(&mut output, ",\"from\":")
+  run quoted(&mut output, String.view(&record.fromVersion))
+  run String.append(&mut output, ",\"version\":")
+  run quoted(&mut output, String.view(&record.version))
+  run String.append(&mut output, ",\"base\":")
+  run quoted(&mut output, String.view(&record.baseVersion))
+  run String.append(&mut output, ",\"changes\":[")
+  let entries = Vector<Entry>.asSlice(&record.entries)
+  let mut index = usize.ZERO
+  while index < entries.length {
+    let entry = &entries[index]
+    if index != usize.ZERO { run String.append(&mut output, ",") }
+    run String.append(&mut output, "{\"id\":")
+    run quoted(&mut output, String.view(&entry.id))
+    run String.append(&mut output, ",\"bump\":")
+    run quoted(&mut output, Version.label(entry.bump))
+    run String.append(&mut output, ",\"summary\":")
+    run quoted(&mut output, String.view(&entry.summary))
+    run String.append(&mut output, ",\"migration\":")
+    if String.view(&entry.migration) == "" { run String.append(&mut output, "null") }
+    else { run quoted(&mut output, String.view(&entry.migration)) }
+    run String.append(&mut output, "}")
+    index = index + usize.ONE
+  }
+  run String.append(&mut output, "]}\n")
+  return move output
+}
+
+/// Only validated SemVer text may become an archive filename; entry IDs never become paths.
+pub effect fn path(root: &Path, version: string) -> Path
+! Problem | FileError | OutOfMemoryError ? &mut Allocator {
+  run Version.validate(version)
+  let mut name = run String.copy(".changes/releases/")
+  run String.append(&mut name, version)
+  run String.append(&mut name, ".toml")
+  return run Path.join(root, String.view(&name))
+}
+
+/// Loads an exact archive spelling. It deliberately permits the release owner to hold its lock.
+pub effect fn load(root: &Path, version: string) -> Record
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let location = run path(root, version)
+  let attempted = run Effect.result(FileSystem.readFile(&location))
+  let bytes = match move attempted {
+    Result<Bytes, FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure { error } => match move error {
+      FileError file => {
+        if file.reason.code == FileSystem.notFound().code {
+          fail Problem { message: "Incomplete release history: a required release archive is missing." }
+        }
+        fail move file
+      }
+      OutOfMemoryError allocation => { fail move allocation }
+    }
+  }
+  let text = match move String.fromBytes(move bytes) {
+    Result<String, InvalidUtf8>.Success { value } => move value
+    Result<String, InvalidUtf8>.Failure { error: invalid } => {
+      fail Problem { message: "Release history must contain UTF-8 TOML." }
+    }
+  }
+  let record = run parse(String.view(&text))
+  if String.view(&record.version) != version {
+    fail Problem { message: "Release history filename does not match its recorded version." }
+  }
+  return move record
+}
+
+fn shouldOmit(records: &Vector<Record>, excluded: &Vector<Entry>, before: usize, entryIndex: usize) -> bool {
+  let items = Vector<Record>.asSlice(records)
+  let id = String.view(&Vector<Entry>.asSlice(&items[before].entries)[entryIndex].id)
+  if hasId(excluded, id) { return true }
+  let mut index = usize.ZERO
+  while index < before {
+    if hasId(&items[index].entries, id) { return true }
+    index = index + usize.ONE
+  }
+  return false
+}
+
+/// Walks real predecessor links newest-first. Missing coverage fails rather than reporting no changes.
+/// A prerelease baseline excludes entries known in its ancestor, including between published versions.
+pub effect fn query(root: &Path, packageName: string, from: string, to: string) -> Vector<Record>
+! Problem | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let ordering = run Version.compare(from, to)
+  if ordering > 0 { fail Problem { message: "The history baseline must not be newer than the target version." } }
+  let lock = run Path.join(root, ".changes/.lock")
+  if run FileSystem.exists(&lock) {
+    fail Problem { message: "A changeset operation is active or interrupted; release history cannot be read until it completes or is recovered." }
+  }
+  if ordering == 0 { return Vector<Record>.make() }
+  let mut records = Vector<Record>.make()
+  let mut cursor = run String.copy(to)
+  while (run Version.compare(String.view(&cursor), from)) > 0 {
+    let record = run load(root, String.view(&cursor))
+    if String.view(&record.packageName) != packageName {
+      fail Problem { message: "Release history belongs to a different package." }
+    }
+    cursor = run String.copy(String.view(&record.fromVersion))
+    run Vector<Record>.append(&mut records, move record)
+  }
+  let mut excluded = Vector<Entry>.make()
+  if Version.isPrerelease(from) && Version.isPrerelease(String.view(&cursor)) {
+    let baseline = run load(root, String.view(&cursor))
+    if String.view(&baseline.packageName) != packageName {
+      fail Problem { message: "Release history baseline belongs to a different package." }
+    }
+    let items = Vector<Record>.asSlice(&records)
+    let oldest = &items[items.length - usize.ONE]
+    if (run Version.compare(String.view(&baseline.baseVersion), String.view(&oldest.baseVersion))) == 0 {
+      excluded = move baseline.entries
+    }
+  }
+  // Filter newest-first in place: preserve body ownership and allocate no second record list.
+  let mut recordIndex = usize.ZERO
+  while recordIndex < Vector<Record>.length(&records) {
+    let mut index = Vector<Entry>.length(&Vector<Record>.asSlice(&records)[recordIndex].entries)
+    while index > usize.ZERO {
+      index = index - usize.ONE
+      let omit = shouldOmit(&records, &excluded, recordIndex, index)
+      if omit {
+        let record = &mut Vector<Record>.asMutSlice(&mut records)[recordIndex]
+        let removed = Vector<Entry>.remove(&mut record.entries, index)
+        drop removed
+      }
+    }
+    recordIndex = recordIndex + usize.ONE
+  }
+  let mut index = Vector<Record>.length(&records)
+  while index > usize.ZERO {
+    index = index - usize.ONE
+    if Vector<Entry>.length(&Vector<Record>.asSlice(&records)[index].entries) == usize.ZERO {
+      let removed = Vector<Record>.remove(&mut records, index)
+      drop removed
+    }
+  }
+  return move records
+}
+
+/// Groups notes by bump while retaining each multiline Markdown body and explicitly marking unknown migrations.
+pub effect fn render(record: &Record) -> String ! OutOfMemoryError ? &mut Allocator {
+  let mut output = run String.copy("## ")
+  run String.append(&mut output, String.view(&record.version))
+  run String.append(&mut output, "\n\n")
+  let entries = Vector<Entry>.asSlice(&record.entries)
+  let mut rank = 3
+  while rank > 0 {
+    let mut heading = false
+    let mut index = usize.ZERO
+    while index < entries.length {
+      let entry = &entries[index]
+      if Version.rank(entry.bump) == rank {
+        if heading == false {
+          if rank == 3 { run String.append(&mut output, "### Major\n\n") }
+          if rank == 2 { run String.append(&mut output, "### Minor\n\n") }
+          if rank == 1 { run String.append(&mut output, "### Patch\n\n") }
+          heading = true
+        }
+        run String.append(&mut output, String.view(&entry.summary))
+        run String.append(&mut output, "\n\n#### Migration\n\n")
+        if String.view(&entry.migration) == "" { run String.append(&mut output, "Migration notes not provided") }
+        else { run String.append(&mut output, String.view(&entry.migration)) }
+        run String.append(&mut output, "\n\n")
+      }
+      index = index + usize.ONE
+    }
+    rank = rank - 1
+  }
+  return move output
+}

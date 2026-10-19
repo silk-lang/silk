@@ -38,10 +38,16 @@ const fixture = Effect.fnUntraced(
         const snapshot = join(root, 'snapshot')
         const inputs = [
           [
+            'changes/silk.toml',
+            '[package]\nname = "changeset"\nversion = "0.1.0"\nroot = "src/Command.silk"\n',
+          ],
+          ['changes/src/Command.silk', 'pub fn value() -> i32 { return 2 }'],
+          [
             'compiler/silk.toml',
-            '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+            '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nchangeset = { path = "../changes" }\n',
           ],
           ['compiler/src/main.silk', 'pub fn main() -> i32 { return 0 }'],
+          ['silk.toml', '[workspace]\nmembers = ["compiler", "changes"]\noutput-dir = "build"\n'],
           ['stdlib/silk/i32.silk', 'pub fn identity(value: i32) -> i32 { return value }'],
         ]
         const files = inputs.map(([path, bytes]) => {
@@ -53,13 +59,13 @@ const fixture = Effect.fnUntraced(
         })
         writeFileSync(join(snapshot, 'authored-inputs.tar'), 'fixture archive')
         const manifest = {
-          schemaVersion: 1,
+          schemaVersion: 2,
           sourceCommit: 'a'.repeat(40),
           roots: SourceSnapshot.roots,
           files,
           normalizedDigest: SourceSnapshot.fileDigest(files),
           compilerDigest: SourceSnapshot.fileDigest(
-            files.filter(({ path }) => path.startsWith('compiler/')),
+            files.filter(({ path }) => SourceSnapshot.isCompilerInput(path)),
           ),
           stdlibDigest: SourceSnapshot.fileDigest(
             files.filter(({ path }) => path.startsWith('stdlib/')),
@@ -138,16 +144,12 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
       fixture(function* ({ root, options }) {
         const alias = join(root, 'clang')
         symlinkSync('clang-22', alias)
-        // The pinned seed reads SILKC_CLANG; every newer generation reads SILK_CLANG.
-        const check = (variable, other) =>
-          `test "$${variable}" = '${options.clang}' && test -z "$${other}" || exit 81\ntest -z "$SILK_PRIVATE_SECRET" && test -z "$SILK_TEST_CLANG" || exit 82`
-        const seedCheck = check('SILKC_CLANG', 'SILK_CLANG')
-        const outputCheck = check('SILK_CLANG', 'SILKC_CLANG')
+        const check = `test "$SILK_CLANG" = '${options.clang}' && test -z "$SILKC_CLANG" || exit 81\ntest -z "$SILK_PRIVATE_SECRET" && test -z "$SILK_TEST_CLANG" || exit 82`
         executable(
           options.producer,
-          `${seedCheck}\n${producer(outputCheck + '\nexit 42').replace(
+          `${check}\n${producer(check + '\nexit 42').replace(
             'test "$1" = build && test "$3" = -o || exit 93',
-            outputCheck + '\ntest "$1" = build && test "$3" = -o || exit 93',
+            check + '\ntest "$1" = build && test "$3" = -o || exit 93',
           )}`,
         )
         const result = yield* fixtureBuild({
@@ -167,12 +169,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         assert.strictEqual(result.linker.version, 'fixture clang version 22')
         assert.strictEqual(result.linker.sha256, SourceSnapshot.hash(readFileSync(options.clang)))
         for (const stage of result.stages)
-          assert.deepStrictEqual(
-            stage.linkerEnvironment,
-            stage.name === 'native-build'
-              ? { SILKC_CLANG: options.clang }
-              : { SILK_CLANG: options.clang },
-          )
+          assert.deepStrictEqual(stage.linkerEnvironment, { SILK_CLANG: options.clang })
         assert.strictEqual(JSON.stringify(result).includes('unrecorded-private-value'), false)
       }),
   )
@@ -254,7 +251,20 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         assert.notStrictEqual(result.output.sha256, result.producer.sha256)
         assert.strictEqual(result.inputs.compiler.sha256, manifest.compilerDigest)
         assert.strictEqual(result.inputs.stdlib.sha256, manifest.stdlibDigest)
-        assert.deepStrictEqual(result.inputs.compiler.files, manifest.files.slice(0, 2))
+        assert.deepStrictEqual(
+          result.inputs.compiler.files.map(({ path }) => path),
+          [
+            'changes/silk.toml',
+            'changes/src/Command.silk',
+            'compiler/silk.toml',
+            'compiler/src/main.silk',
+            'silk.toml',
+          ],
+        )
+        assert.deepStrictEqual(
+          [...result.inputs.compiler.files, ...result.inputs.stdlib.files],
+          manifest.files,
+        )
         assert.deepStrictEqual(
           result.stages.map(({ name }) => name),
           ['native-build', 'smoke-build', 'smoke-run'],
@@ -507,14 +517,25 @@ sleep 60`,
         const result = yield* fixtureBuild(options)
         assert.match(result.failure.message, /no write permission/)
       })
-      yield* fixture(function* ({ options }) {
-        executable(options.producer, `printf 'changed' >> "$2"\n${producer()}`)
-        const result = yield* fixtureBuild(options)
-        assert.strictEqual(result.status, 'failed')
-        assert.strictEqual(result.failure.stage, 'native-build')
-        assert.match(result.failure.message, /Snapshot bytes or mode changed/)
-        assert.strictEqual(result.stages.length, 1)
-      })
+      for (const path of [
+        'compiler/src/main.silk',
+        'changes/src/Command.silk',
+        'changes/silk.toml',
+        'silk.toml',
+      ]) {
+        yield* fixture(function* ({ options }) {
+          executable(
+            options.producer,
+            `printf 'changed' >> '${join(options.snapshot, path)}'\n${producer()}`,
+          )
+          const result = yield* fixtureBuild(options)
+          assert.strictEqual(result.status, 'failed', path)
+          assert.strictEqual(result.failure.stage, 'native-build', path)
+          assert.match(result.failure.message, /Snapshot bytes or mode changed/)
+          assert.strictEqual(result.stages.length, 1, path)
+          assert.strictEqual(existsSync(join(options.outputDirectory, 'smoke')), false, path)
+        })
+      }
       yield* fixture(function* ({ options, root }) {
         executable(options.producer, producer())
         const result = yield* fixtureBuild({
