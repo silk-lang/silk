@@ -208,6 +208,6 @@ representation, or compiler-known redirect operation.
 
 The implementation lives in
 [`http_redirect.silk`](../stdlib/silk/http_redirect.silk), with narrow
-composition in [`http_client.silk`](../stdlib/silk/http_client.silk) and
+composition in [`http_exchange.silk`](../stdlib/silk/http_exchange.silk) and
 the existing proxy/native actors. The normative delivery contract is the
 `bounded-http-redirects` OpenSpec.

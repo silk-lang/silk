@@ -8,7 +8,7 @@ description: Explicit bounded forward-proxy policy, routed request admission, CO
 Use `silk.http_proxy` to select an explicit route for one HTTP origin. Proxy configuration is an
 owned, bounded value. Route selection is pure: it does not resolve a name, open a connection, read
 ambient settings, or generate output. `silk.http_request` turns a selected route into a sealed
-routed request, and `silk.http_client.withRoute` scopes acquisition, CONNECT, optional origin TLS,
+routed request, and `silk.http_exchange.withRoute` scopes acquisition, CONNECT, optional origin TLS,
 and the final HTTP connection.
 
 > `silk.http_proxy` supports only plaintext HTTP proxy endpoints. A Forward route exposes the
@@ -216,6 +216,6 @@ plaintext proxy hop protects request metadata or credentials.
 The implementation lives in
 [`http_proxy.silk`](../stdlib/silk/http_proxy.silk),
 [`http_request.silk`](../stdlib/silk/http_request.silk), and
-[`http_client.silk`](../stdlib/silk/http_client.silk). The normative
+[`http_exchange.silk`](../stdlib/silk/http_exchange.silk). The normative
 delivery contract is recorded in the
 `http-proxy-routing` OpenSpec.

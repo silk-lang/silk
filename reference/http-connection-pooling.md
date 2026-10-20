@@ -159,7 +159,7 @@ idle capacity permits it. A pool that closes during acquisition rejects the late
 closes the new owner, and refunds the reservation.
 
 `close` is idempotent. It marks state closed synchronously, extracts idle owners, and attempts to
-close every one outside shared access. Explicit close preserves the first `ClientError` after all
+close every one outside shared access. Explicit close preserves the first `ExchangeError` after all
 idle owners have received a close attempt. New checkout and surviving handles then return
 `PoolClosed`. A connection already lent to a callback remains valid until that callback ends; its
 release closes instead of republishing it. Scoped finalization and explicit close use the same
@@ -207,9 +207,9 @@ replacement, or a general Stream abstraction.
 The implementation lives in
 [`http_connection_pool.silk`](../stdlib/silk/http_connection_pool.silk),
 with client ownership in
-[`http_client.silk`](../stdlib/silk/http_client.silk), native acquisition
+[`http_exchange.silk`](../stdlib/silk/http_exchange.silk), native acquisition
 in
-[`http_client_native.silk`](../stdlib/silk/http_client_native.silk), and
+[`http_exchange_native.silk`](../stdlib/silk/http_exchange_native.silk), and
 route identity in [`http_proxy.silk`](../stdlib/silk/http_proxy.silk).
 The normative delivery contract is the
 `bounded-http-connection-pooling` OpenSpec.
