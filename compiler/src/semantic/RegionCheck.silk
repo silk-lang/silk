@@ -29,18 +29,25 @@
 //! storage conflicts with every loan of it. A universal region that must outlive another universal
 //! region needs a declared bound. Moves are checked on the same graph, independently of regions.
 //!
+//! An anonymous body does not own its by-reference captures: a loan of one reborrows through the
+//! environment reference's region. A relation it needs between regions its creator chooses that its
+//! premises do not prove is a requirement on its verdict (as rustc's closure region requirements);
+//! the creator adds it between the regions the captured operands give them where it builds the
+//! value, and reports what it breaks there.
+//!
 //! # Gotchas
 //! Regions are location-insensitive (NLL): a holder keeps every loan stored in it alive while it
 //! is live, even after the field holding it is overwritten. Location-sensitive regions are issue
 //! #2022. Precision is per lifetime: two fields that share a lifetime parameter share its loans.
 
+import CompilerBug
 import hir.Hir {Access, CallableMode, InfixOperator}
 import semantic.SourceLocations {Location}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime, Intersection, Member}
 import semantic.Rejection {RejectionCode}
 import semantic.StorageOperation {StorageOperation}
-import semantic.Type {Type}
+import semantic.Type {Outlives, Type}
 import semantic.RegionSolver {Bound, Cfg, Live, Liveness, Loan, LoanScope, Loans, Region, Regions, Values}
 import semantic.TypedBody {
   AggregateField,
@@ -88,6 +95,9 @@ pub struct Verdict {
   pub earlier: Option<Location>
   /// Every conflict the body reports, the one above included, ordered by span.
   pub reports: List<Report>
+  /// For a clear anonymous body, the relations between regions its creator chooses that the body
+  /// needs and its premises do not prove. The creator proves them where it builds the body's value.
+  pub requirements: List<Outlives>
 }
 
 /// One reported conflict: the rejected access and, when `related`, the borrow or move it conflicts
@@ -153,6 +163,14 @@ pub struct DeclaredVariance {
   pub binders: List<Variance>
 }
 
+/// A local of an anonymous body that names its creator's storage through a reference its
+/// environment holds, as a by-reference capture does. The body never owns that storage: each loan of
+/// it reborrows through the reference, whose region `region` the creator chooses.
+pub struct EnvironmentAlias {
+  pub local: usize
+  pub region: Shared<Lifetime>
+}
+
 /// Everything one body's check reads. Only the body itself and tiny facts about the declarations
 /// it names: callee signatures, construction shapes, variance and drop observation.
 pub struct Input<'a> {
@@ -173,6 +191,11 @@ pub struct Input<'a> {
   /// Per storage root (each local, then each node's value), whether its cleanup can observe the
   /// regions its type names.
   pub observes: &'a [bool]
+  /// Whether the body is anonymous: a relation it needs between regions its creator chooses is then
+  /// one of its verdict's `requirements` rather than a conflict.
+  pub anonymous: bool
+  /// An anonymous body's by-reference captures.
+  pub environment: &'a [EnvironmentAlias]
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1251,6 +1274,16 @@ effect fn extendPath(walker: &mut Walker, id: NodeId, temporary: usize, path: &m
         path.place.root = local.index
         path.numbered = local.index
         path.ty = Shared<Type>.clone(&walker.input.locals[local.index].ty)
+        // A by-reference capture is reached through its environment reference.
+        let environment = walker.input.environment
+        let mut at = usize.ZERO
+        while at < environment.length {
+          if environment[at].local == local.index {
+            let region = run universalOf(&mut walker.table, &environment[at].region, walker.input.owner)
+            run List<Region>.append(&mut path.through, region)
+          }
+          at = at + usize.ONE
+        }
       }
       Expression.Field {value, index, declared} => {
         run extendPath(&mut walker.*, value, temporary, &mut path.*)
@@ -1755,8 +1788,7 @@ effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut 
     Expression.ForeignStatic {..} => Shape.Leaf
     Expression.ForeignAddress {..} => Shape.Leaf
     // An anonymous body that stores one captured loan where another capture reaches needs a
-    // relation between two body regions, which no premise of its own proves, so a body the borrow
-    // check closed stores none (ANON-OWN-001).
+    // relation between regions its creator chooses; the construction proves its requirements.
     Expression.Callable {fields, referents, ..} => Shape.Construct {
       values: run fieldValues(List<AggregateField>.asSlice(&fields)),
       referents: run referentOperands(List<AggregateField>.asSlice(&fields), List<ReferentCapture>.asSlice(&referents)), staged: false,
@@ -2754,7 +2786,34 @@ effect fn construct(walker: &mut Walker, id: NodeId, values: &[NodeId], referent
     }
     index = index + usize.ONE
   }
+  // A callable literal's body may need relations between the regions its captures carry that it
+  // cannot prove itself; they hold here, between the regions its fields take from the operands.
+  if let NodeKind.Expression {form: Expression.Callable {requirements, ..}, ..} = &nodes[id.index].kind {
+    let required = List<Outlives>.asSlice(&requirements)
+    walker.table.site = nodes[id.index].origin.location
+    index = usize.ZERO
+    while index < required.length {
+      let longer = run requirementRegion(&mut walker.table, fieldsNumbered, &required[index].longer, walker.input.owner)
+      let shorter = run requirementRegion(&mut walker.table, fieldsNumbered, &required[index].shorter, walker.input.owner)
+      run addOutlives(&mut walker.table, longer, shorter)
+      index = index + usize.ONE
+    }
+  }
   return point
+}
+
+// The region of a requirement's `lifetime` at a construction: the one a field type numbered in
+// `numbered` gives it, or else its universal region, or else a fresh one.
+effect fn requirementRegion(table: &mut RegionTable, numbered: usize, lifetime: &Shared<Lifetime>, owner: &DeclarationId) -> Region
+! OutOfMemoryError ? &mut Allocator {
+  let atoms = List<Shared<Lifetime>>.asSlice(&List<Renumbering>.asSlice(&table.numberings)[numbered].atoms)
+  let mut at = usize.ZERO
+  while at < atoms.length {
+    if Lifetime.equalsShared(&atoms[at], lifetime) { return List<Region>.asSlice(&List<Renumbering>.asSlice(&table.numberings)[numbered].regions)[at] }
+    at = at + usize.ONE
+  }
+  if universalLifetime(lifetime, owner) { return run universalOf(&mut table.*, lifetime, owner) }
+  return run resolve(&mut table.*, numbered, lifetime, owner)
 }
 
 // An invocation of a callable value (CALLABLE-002), or the construction of the Effect an `effect fn`
@@ -3373,7 +3432,8 @@ effect fn rejection(code: RejectionCode, access: Location, earlier: Option<Locat
   }
   run List<Report>.append(&mut reports, Report {code: code, access: access, related: related, earlier: site,
     requestedExclusive: false, existingExclusive: false})
-  return Verdict {outcome: Outcome.Conflict, code: code, access: access, earlier: move earlier, reports: move reports}
+  return Verdict {outcome: Outcome.Conflict, code: code, access: access, earlier: move earlier, reports: move reports,
+    requirements: List<Outlives>.make()}
 }
 
 // The solved facts the checks read.
@@ -3485,7 +3545,8 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
   let mut walker = Walker {
     input: Input {owner: input.owner, locals: input.locals, parameters: input.parameters, nodes: input.nodes, root: input.root,
       result: input.result, failure: input.failure, premises: input.premises, contracts: input.contracts,
-      constructions: input.constructions, variances: input.variances, observes: input.observes},
+      constructions: input.constructions, variances: input.variances, observes: input.observes, anonymous: input.anonymous,
+      environment: input.environment},
     table: RegionTable {universalFlags: List<bool>.make(), longer: List<Region>.make(), shorter: List<Region>.make(),
       sites: List<Location>.make(), site: nodes[input.root.index].origin.location, universals: List<Universal>.make(),
       bases: List<usize>.make(), numberings: List<Renumbering>.make()},
@@ -3508,6 +3569,13 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
     let numbered = run addNumbering(&mut walker.table, false)
     if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, NodeId {index: index}) {
       run renumber(&mut walker.table, numbered, &ty, owner)
+      if let NodeKind.Expression {form: Expression.Callable {body, ..}, ..} = &nodes[index].kind {
+        let literal = Shared<TypedBody>.with<DeclarationId>(&body, fn(anonymous: &TypedBody) -> DeclarationId {
+          return DeclarationId.copy(TypedBody.declarationId(anonymous))
+        })
+        walker.table.site = nodes[index].origin.location
+        run fixSignature(&mut walker.table, numbered, &ty, owner, &literal)
+      }
     }
     run List<usize>.append(&mut walker.matchLoans, usize.MAX)
     run List<usize>.append(&mut walker.contractOf, usize.MAX)
@@ -3542,7 +3610,8 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
   walker.exit = run newPoint(&mut walker, usize.MAX)
   let entry = run newPoint(&mut walker, usize.MAX)
   walker.entry = entry
-  // Parameters and capture aliases own their storage on entry.
+  // Parameters and capture aliases own their storage on entry; a by-reference capture's storage stays
+  // its creator's.
   let mut bound = List<bool>.make()
   index = usize.ZERO
   while index < locals.length {
@@ -3562,7 +3631,7 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
   index = usize.ZERO
   while index < locals.length {
     if !List<bool>.asSlice(&bound)[index] {
-      run registerRoot(&mut walker, index, false)
+      if !aliased(input.environment, index) { run registerRoot(&mut walker, index, false) }
       initialized = run newPoint(&mut walker, initialized)
       List<usize>.set(&mut walker.initializes, initialized, index)
     }
@@ -3579,14 +3648,134 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
   run edge(&mut walker, released, exit)
   run knownRelations(&walker.table, &mut declared)
   let solved = run solve(&walker, List<Bound>.asSlice(&declared))
-  // A universal region that must outlive another needs a declared bound (SEM0212).
+  // A universal region that must outlive another needs a declared bound (SEM0212). An anonymous body
+  // leaves one between regions its creator chooses to the creator, as a requirement.
   let missing = run Values.undeclared(&solved.values, List<Bound>.asSlice(&declared))
+  let unproved = List<Bound>.asSlice(&missing)
+  let mut requirements = List<Outlives>.make()
   let mut relation = Option<Location>.none()
-  if List<Bound>.length(&missing) > usize.ZERO {
-    let first = List<Bound>.asSlice(&missing)[usize.ZERO]
-    relation = Option<Location>.some(run relationSite(&walker.table, first.longer, first.shorter))
+  index = usize.ZERO
+  while index < unproved.length {
+    let longer = universalAtomOf(&walker.table, unproved[index].longer)
+    let shorter = universalAtomOf(&walker.table, unproved[index].shorter)
+    if input.anonymous && creatorChosen(&longer, owner) && creatorChosen(&shorter, owner) {
+      run List<Outlives>.append(&mut requirements, Outlives {longer: move longer, shorter: move shorter})
+    } else if let Option<Location>.None = &relation {
+      relation = Option<Location>.some(run relationSite(&walker.table, unproved[index].longer, unproved[index].shorter))
+    }
+    index = index + usize.ONE
   }
-  return run findConflicts(&walker, &solved, move relation)
+  return run findConflicts(&walker, &solved, move relation, move requirements)
+}
+
+// The atom of universal region `region`.
+fn universalAtomOf(table: &RegionTable, region: Region) -> Shared<Lifetime> {
+  let universals = List<Universal>.asSlice(&table.universals)
+  let mut at = usize.ZERO
+  while at < universals.length && universals[at].region.index != region.index {
+    at = at + usize.ONE
+  }
+  if at == universals.length { CompilerBug.panic(b"region query names a region that is not universal") }
+  return Shared<Lifetime>.clone(&universals[at].atom)
+}
+
+// Whether an anonymous body's creator chooses `lifetime`: every atom is `'static` or a region or
+// lifetime parameter of another declaration, never one of the body's own invocation binders.
+fn creatorChosen(lifetime: &Shared<Lifetime>, owner: &DeclarationId) -> bool {
+  return Lifetime.allAtoms(lifetime, fn(atom: &Lifetime) -> bool {
+    return match &atom.* {
+      Lifetime.Static => true
+      Lifetime.Parameter {declaration, ..} => !DeclarationId.equals(&declaration, owner)
+      Lifetime.Local {declaration, ..} => !DeclarationId.equals(&declaration, owner)
+      Lifetime.Invocation {..} => false
+      Lifetime.Supplied {..} => false
+      Lifetime.Meet {..} => false
+    }
+  })
+}
+
+// Whether `local` is a by-reference capture.
+fn aliased(environment: &[EnvironmentAlias], local: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < environment.length {
+    if environment[at].local == local { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// A callable literal's written parameter types fix the universal lifetimes they name: its body
+// assumes every argument outlives them. A binder of `literal` itself stays bound. Its result needs
+// no such tie, since a longer result only serves its callers.
+effect fn fixSignature(table: &mut RegionTable, numbered: usize, ty: &Shared<Type>, owner: &DeclarationId, literal: &DeclarationId) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut signature = List<Shared<Type>>.make()
+  let contract = Shared<Type>.with<Option<Shared<Type>>>(ty, fn(value: &Type) -> Option<Shared<Type>> {
+    return match &value.* {
+      Type.CallableValue {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+      _ => Option<Shared<Type>>.none()
+    }
+  })
+  if let Option<Shared<Type>>.Some {value: callable} = move contract {
+    let copied = run Type.copy(&callable)
+    if let Type.Callable {parameters, ..} = move copied { signature = move parameters }
+  }
+  let mut found = List<Shared<Lifetime>>.make()
+  let written = List<Shared<Type>>.asSlice(&signature)
+  let mut at = usize.ZERO
+  while at < written.length {
+    run namedLifetimes(&written[at], &mut found)
+    at = at + usize.ONE
+  }
+  let named = List<Shared<Lifetime>>.asSlice(&found)
+  at = usize.ZERO
+  while at < named.length {
+    let bound = Lifetime.allAtoms(&named[at], fn(atom: &Lifetime) -> bool {
+      return match &atom.* {
+        Lifetime.Invocation {..} => true
+        Lifetime.Parameter {declaration, ..} => DeclarationId.equals(&declaration, literal)
+        _ => false
+      }
+    })
+    if !bound && universalLifetime(&named[at], owner) {
+      let region = run resolve(&mut table.*, numbered, &named[at], owner)
+      let fixed = run universalOf(&mut table.*, &named[at], owner)
+      if region.index != fixed.index {
+        run addOutlives(&mut table.*, region, fixed)
+        run addOutlives(&mut table.*, fixed, region)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Every lifetime `ty` names, in its own positions and its parts'.
+effect fn namedLifetimes(ty: &Shared<Type>, found: &mut List<Shared<Lifetime>>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let regions = Type.lifetimeCount(ty)
+  let mut at = usize.ZERO
+  while at < regions {
+    if let Option<Shared<Lifetime>>.Some {value: lifetime} = move Type.lifetimeAt(ty, at) {
+      run List<Shared<Lifetime>>.append(&mut found.*, move lifetime)
+    }
+    at = at + usize.ONE
+  }
+  let children = Type.partCount(ty)
+  at = usize.ZERO
+  while at < children {
+    if let Option<Shared<Type>>.Some {value: child} = move Type.partAt(ty, at) {
+      run namedLifetimes(&child, &mut found.*)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn callableLiteral(nodes: &[Node], id: NodeId) -> bool {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form: Expression.Callable {..}, ..} => true
+    _ => false
+  }
 }
 
 // From here on a lifetime a numbering does not list comes from a type that names the value's
@@ -3678,37 +3867,37 @@ effect fn includePaths(walker: &Walker, regions: &mut Regions) -> () ! OutOfMemo
   let mut index = usize.ZERO
   while index < paths.length {
     let path = paths[index]
-    let mut reached = List<bool>.asMutSlice(&mut forward)
-    let mut reaching = List<bool>.asMutSlice(&mut backward)
     point = usize.ZERO
     while point < points {
-      reached[point] = false
-      reaching[point] = false
+      List<bool>.set(&mut forward, point, false)
+      List<bool>.set(&mut backward, point, false)
       point = point + usize.ONE
     }
-    reached[path.from] = true
+    List<bool>.set(&mut forward, path.from, true)
     run List<usize>.append(&mut stack, path.from)
     while List<usize>.length(&stack) != usize.ZERO {
-      let current = List<usize>.remove(&mut stack, List<usize>.length(&stack) - usize.ONE)
+      let last = List<usize>.length(&stack) - usize.ONE
+      let current = List<usize>.remove(&mut stack, last)
       let next = Cfg.next(&walker.cfg, current)
       let mut at = usize.ZERO
       while at < next.length {
-        if !reached[next[at]] {
-          reached[next[at]] = true
+        if !List<bool>.get(&forward, next[at]) {
+          List<bool>.set(&mut forward, next[at], true)
           run List<usize>.append(&mut stack, next[at])
         }
         at = at + usize.ONE
       }
     }
-    reaching[path.to] = true
+    List<bool>.set(&mut backward, path.to, true)
     run List<usize>.append(&mut stack, path.to)
     while List<usize>.length(&stack) != usize.ZERO {
-      let current = List<usize>.remove(&mut stack, List<usize>.length(&stack) - usize.ONE)
+      let last = List<usize>.length(&stack) - usize.ONE
+      let current = List<usize>.remove(&mut stack, last)
       let before = List<usize>.asSlice(&List<List<usize>>.asSlice(&previous)[current])
       let mut at = usize.ZERO
       while at < before.length {
-        if !reaching[before[at]] {
-          reaching[before[at]] = true
+        if !List<bool>.get(&backward, before[at]) {
+          List<bool>.set(&mut backward, before[at], true)
           run List<usize>.append(&mut stack, before[at])
         }
         at = at + usize.ONE
@@ -3716,7 +3905,7 @@ effect fn includePaths(walker: &Walker, regions: &mut Regions) -> () ! OutOfMemo
     }
     point = usize.ZERO
     while point < points {
-      if reached[point] && reaching[point] { Regions.include(&mut regions.*, path.region, point) }
+      if List<bool>.get(&forward, point) && List<bool>.get(&backward, point) { Regions.include(&mut regions.*, path.region, point) }
       point = point + usize.ONE
     }
     index = index + usize.ONE
@@ -3830,8 +4019,10 @@ effect fn solve(walker: &Walker, declared: &[Bound]) -> Solved ! OutOfMemoryErro
 }
 
 // Every check over the solved body, in evaluation order: loop headers, consumed targets, moves,
-// refinements, loan conflicts and storage ends; then the undeclared region relation, if any.
-effect fn findConflicts(walker: &Walker, solved: &Solved, relation: Option<Location>) -> Verdict ! OutOfMemoryError ? &mut Allocator {
+// refinements, loan conflicts and storage ends; then the undeclared region relation, if any. A clear
+// body's verdict carries `requirements`.
+effect fn findConflicts(walker: &Walker, solved: &Solved, relation: Option<Location>, requirements: List<Outlives>) -> Verdict
+! OutOfMemoryError ? &mut Allocator {
   let locals = walker.input.locals
   let events = List<Event>.asSlice(&walker.events)
   let loans = List<LoanFact>.asSlice(&walker.loans)
@@ -3966,11 +4157,12 @@ effect fn findConflicts(walker: &Walker, solved: &Solved, relation: Option<Locat
     let listed = run bySpan(List<Report>.asSlice(&reports))
     let mut earlier = Option<Location>.none()
     if first.related { earlier = Option<Location>.some(first.earlier) }
-    return Verdict {outcome: Outcome.Conflict, code: first.code, access: first.access, earlier: move earlier, reports: move listed}
+    return Verdict {outcome: Outcome.Conflict, code: first.code, access: first.access, earlier: move earlier, reports: move listed,
+      requirements: List<Outlives>.make()}
   }
   if let Option<Location>.Some {value: site} = &relation {
     return run rejection(RejectionCode.UnsatisfiedLifetimeBound, site, Option<Location>.none())
   }
   return Verdict {outcome: Outcome.Clear, code: RejectionCode.Unsupported, access: Location.make(usize.ZERO, usize.ZERO),
-    earlier: Option<Location>.none(), reports: List<Report>.make()}
+    earlier: Option<Location>.none(), reports: List<Report>.make(), requirements: move requirements}
 }
