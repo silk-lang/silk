@@ -3733,7 +3733,7 @@ effect fn sourceOwnershipOriginField<'body>(builder: &SourceGraph.Builder<'body>
   paths: &mut List<List<Step>>) -> SourceOriginField ! OutOfMemoryError ? &mut Allocator {
   let placement = match origin {
     SourceGraph.OwnershipOrigin.Read {placement, ..} => placement
-    SourceGraph.OwnershipOrigin.OperationReset {root, ..} => {
+    SourceGraph.OwnershipOrigin.OperationReset {root, ..} | SourceGraph.OwnershipOrigin.ThroughReset {root, ..} => {
       return SourceOriginField {root: root, field: SourceReadField {supported: true, field: usize.ZERO}}
     }
     SourceGraph.OwnershipOrigin.Move {candidate, storage, held, source, target, definition, read, ..} => {
@@ -8060,7 +8060,12 @@ effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraph.Builder<'body>
               run List<SourceBlockBinding>.append(&mut state.blocks, value)
             }
           }
-          Shape.Assignment {..} | Shape.Displace {..} => ()
+          Shape.Assignment {..} => ()
+          Shape.Displace {..} => {
+            if let Option<SourceGraph.ResultUse>.Some {value: directive} = move directive {
+              run sourceFinishThrough(&mut builder.*, actual, &directive, &mut state, loans, &mut paths.*, context)
+            }
+          }
           Shape.PlaceAssignment {..} => ()
           Shape.Drop {value, consumed} => {
             let inputs = List<SourceVisit.Input>.asSlice(&actual.inputs)
@@ -10700,7 +10705,7 @@ effect fn sourceDisplace<'body>(builder: &mut SourceGraph.Builder<'body>, actual
     let place = sourceAccessInput(actual, usize.ZERO, target)
     run sourceDispatchHolder(&mut builder.*, place.node, place.evaluation, reading.point, true, &mut state.*)
   }
-  if (path.through && retained) || (!path.through && List<Step>.length(&path.steps) != usize.ZERO) {
+  if !path.through && List<Step>.length(&path.steps) != usize.ZERO {
     run sourcePending(&mut state.*, dispatch, actual.evaluation, SourceHandlerGap.Projection, acceptedWrite, &mut builder.rules)
   }
   return ()
@@ -12952,6 +12957,140 @@ effect fn sourceCall<'body>(builder: &mut SourceGraph.Builder<'body>, visits: &[
 // version; consume runs at execute even when no successful result completes. The source graph
 // owns output transport, and the ordered result scan only binds its already-reserved ports.
 //
+// Alias alternatives can share one actual component Value. Join their histories here;
+// enumerating another canonical owner must not manufacture a second finish operand.
+effect fn sourceJoinThrough(target: &mut SourceObservation, incoming: SourceThroughObservation,
+  rules: &mut SourceProgram) -> () ! OutOfMemoryError ? &mut Allocator {
+  let empty = List<SourceAtom>.make()
+  let none = List<SourceAtom>.asSlice(&empty)
+  let gate = incoming.active
+  let observation = move incoming.observation
+  let required: [SourceAtom; 2] = [gate, observation.unknown]
+  let gaps: [SourceAtom; 2] = [target.unknown, run SourcePolicy.conjunction(&mut rules.*, &required, none)]
+  target.unknown = run SourcePolicy.disjunction(&mut rules.*, &gaps)
+  let mut positions = move observation.positions
+  while List<SourceCarryPosition>.length(&positions) != usize.ZERO {
+    let mut position = List<SourceCarryPosition>.remove(&mut positions, usize.ZERO)
+    let present: [SourceAtom; 2] = [gate, position.quality.present]
+    let stored: [SourceAtom; 2] = [gate, position.quality.stored]
+    let alternatives: [SourceAtom; 2] = [gate, position.quality.alternatives]
+    position.quality = SourceQuality {present: run SourcePolicy.conjunction(&mut rules.*, &present, none),
+      stored: run SourcePolicy.conjunction(&mut rules.*, &stored, none),
+      alternatives: run SourcePolicy.conjunction(&mut rules.*, &alternatives, none)}
+    let histories = List<SourceCarryCase>.asMutSlice(&mut position.cases)
+    let mut at = usize.ZERO
+    while at < histories.length {
+      histories[at].source = run sourceGatedCase(&histories[at].source, gate, &mut rules.*)
+      let observed: [SourceAtom; 2] = [gate, histories[at].observed]
+      histories[at].observed = run SourcePolicy.conjunction(&mut rules.*, &observed, none)
+      at = at + usize.ONE
+    }
+    let old = List<SourceCarryPosition>.asMutSlice(&mut target.positions)
+    at = usize.ZERO
+    while at < old.length && (old[at].value.index != position.value.index || old[at].leaf.index != position.leaf.index) {
+      at = at + usize.ONE
+    }
+    if at == old.length { run List<SourceCarryPosition>.append(&mut target.positions, move position) }
+    else {
+      if old[at].loan != position.loan || old[at].operand != position.operand || old[at].since != position.since {
+        return CompilerBug.panic(b"through alternatives changed their actual finish position")
+      }
+      let present: [SourceAtom; 2] = [old[at].quality.present, position.quality.present]
+      let stored: [SourceAtom; 2] = [old[at].quality.stored, position.quality.stored]
+      let alternatives: [SourceAtom; 2] = [old[at].quality.alternatives, position.quality.alternatives]
+      old[at].quality = SourceQuality {present: run SourcePolicy.disjunction(&mut rules.*, &present),
+        stored: run SourcePolicy.disjunction(&mut rules.*, &stored),
+        alternatives: run SourcePolicy.disjunction(&mut rules.*, &alternatives)}
+      run sourceAppendEffects<SourceCarryCase>(&mut old[at].cases, move position.cases)
+    }
+  }
+  run sourceAppendEffects<SourceGraph.Input>(&mut target.other, move observation.other)
+  return ()
+}
+
+// Replace finishes the original pre-Referent holder flight at the later write point.
+// The selected destination snapshot supplies physical data, never this ownership flight.
+effect fn sourceFinishThrough<'body>(builder: &mut SourceGraph.Builder<'body>, actual: &SourceVisit.Visit,
+  directive: &SourceGraph.ResultUse, state: &mut SourceDispatchProjection, loans: &[Loan],
+  paths: &mut List<List<Step>>, context: &RetentionContext) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let read = match directive.kind { SourceGraph.ResultKind.Read {read} => read
+    _ => { return CompilerBug.panic(b"through replacement has no original read directive") } }
+  let sameRead = match actual.displaced { Option<SourceGraph.EvalId>.Some {value} => value.index == read.index _ => false }
+  if !sameRead || directive.evaluation.index != actual.evaluation.index {
+    return CompilerBug.panic(b"through replacement substituted its displaced read")
+  }
+  let empty = List<SourceAtom>.make()
+  let none = List<SourceAtom>.asSlice(&empty)
+  let uses = List<SourceOrdinaryUse>.asSlice(&state.ordinary)
+  let mut accepted = List<SourceAtom>.make()
+  let mut at = usize.ZERO
+  while at < uses.length {
+    if uses[at].writer.index == actual.evaluation.index {
+      if uses[at].retained || List<SourceAtom>.length(&accepted) != usize.ZERO {
+        return CompilerBug.panic(b"through replacement lost its original write policy")
+      }
+      run List<SourceAtom>.append(&mut accepted, uses[at].active)
+    }
+    at = at + usize.ONE
+  }
+  if List<SourceAtom>.length(&accepted) != usize.ONE {
+    return CompilerBug.panic(b"through finish preceded its RHS refusal and write policy")
+  }
+  let active: [SourceAtom; 2] = [directive.active, List<SourceAtom>.asSlice(&accepted)[0]]
+  let active = run SourcePolicy.conjunction(&mut builder.rules, &active, none)
+  let mut observed = SourceObservation {positions: List<SourceCarryPosition>.make(),
+    other: List<SourceGraph.Input>.make(), unknown: SourceProgram.atom(&mut builder.rules)}
+  let mut found = false
+  at = usize.ZERO
+  while at < SourceGraph.Builder.throughFlightRequests(&builder.*).length {
+    let request = SourceGraph.Builder.throughFlightRequests(&builder.*)[at]
+    if request.operation.index == actual.evaluation.index && request.kind == SourceGraph.ThroughFlightKind.Read {
+      if found || request.evaluation.index != read.index {
+        return CompilerBug.panic(b"through finish changed its exact read flight")
+      }
+      found = true
+      let gaps: [SourceAtom; 2] = [observed.unknown, request.missing]
+      observed.unknown = run SourcePolicy.disjunction(&mut builder.rules, &gaps)
+      let mut row = usize.ZERO
+      while row < SourceGraph.Builder.throughFlightObservations(&builder.*).length {
+        let original = SourceGraph.Builder.throughFlightObservations(&builder.*)[row]
+        if original.request == at {
+          let mut prior = usize.ZERO
+          while prior < row {
+            let earlier = SourceGraph.Builder.throughFlightObservations(&builder.*)[prior]
+            if earlier.request == at && sourceSameStorage(earlier.owner, original.owner) { break }
+            prior = prior + usize.ONE
+          }
+          if prior == row {
+            let incoming = run sourceObserveThrough(&mut builder.*, row, &mut paths.*, loans.length)
+            run sourceJoinThrough(&mut observed, move incoming, &mut builder.rules)
+          }
+        }
+        row = row + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  if !found { let gaps: [SourceAtom; 2] = [observed.unknown, active]
+    observed.unknown = run SourcePolicy.disjunction(&mut builder.rules, &gaps) }
+  let prepared = SourceGraph.Builder.preparation(&builder.*)
+  let nodes = prepared.body.nodes
+  let owner = prepared.body.owner
+  let supplied = prepared.body.supplied
+  let root = sourceNodeValueRoot(prepared, actual.node)
+  let point = SourceGraph.Builder.evaluation(&builder.*, actual.evaluation).point
+  let unplaced = List<List<Step>>.make()
+  let untyped = List<NodeId>.make()
+  let sinks = List<OperandSink>.make()
+  let finished = run sourceFinish(&mut builder.*, &observed, &mut state.policy.state, loans, &mut paths.*,
+    nodes, owner, supplied, List<RetentionEdge>.asSlice(&context.requirements), List<ImpliedGroup>.asSlice(&context.relations),
+    context.settled, actual.node, actual.evaluation, root, point.index, active, false, Forwarding.None,
+    List<List<Step>>.asSlice(&unplaced), List<NodeId>.asSlice(&untyped), List<OperandSink>.asSlice(&sinks))
+  run sourceCollectFinish(&mut state.*, move finished, &mut builder.rules)
+  return ()
+}
+
 // A Read directive owns one joined incoming component family. Observe that actual Input,
 // attribute its canonical placement, then run the ordinary result policy at the separately
 // reserved result/use point. Historical definitions never become separate operands, and a
@@ -13467,6 +13606,31 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraph.Builder<'body>, ob
     let target = SourceGraph.Builder.value(&builder.*, port.target)
     if port.terminal && target.evaluation.index == evaluation.index {
       let borrowed = match &SourceGraph.Builder.leaf(&builder.*, port.leaf).kind { SourceGraph.SourceLeaf.Borrow {..} => true _ => false }
+      let source = SourceGraph.Builder.value(&builder.*, port.source)
+      let mut throughSnapshot = false
+      if port.outputRole == SourceGraph.SourceRole.Physical && source.phase == SourceGraph.ValuePhase.Input
+        && source.endpoint.index == target.endpoint.index {
+        if let SourceGraph.TransferAuthority.SameComponent = port.authority {
+          let requests = SourceGraph.Builder.throughFlightRequests(&builder.*)
+          let mut request = usize.ZERO
+          while request < requests.length {
+            if requests[request].kind == SourceGraph.ThroughFlightKind.Read
+              && requests[request].operation.index == evaluation.index
+              && requests[request].evaluation.index == source.evaluation.index { throughSnapshot = true }
+            request = request + usize.ONE
+          }
+        }
+      }
+      if throughSnapshot {
+        // Preserve actual descriptor/data provenance. This is not a held result decision;
+        // the finite observation projection must mask this branch through later copies.
+        // Until that consumer is wired, retain the explicit semantic coverage obligation.
+        run SourceGraph.Builder.bindPolicy(&mut builder.*, port.id, port.quality.present, no, no)
+        if borrowed { let gaps: [SourceAtom; 2] = [missing.*, port.quality.present]
+          missing.* = run SourcePolicy.disjunction(&mut builder.rules, &gaps) }
+        at = at + usize.ONE
+        continue
+      }
       if !borrowed {
         // These are genuine caller/expression/loan-free/unknown sources. They follow their
         // authenticated route and never enter a Borrow count or global Loan precision state.
@@ -13480,6 +13644,7 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraph.Builder<'body>, ob
         let placement = run sourceResultPlacement(&builder.*, port, root, &mut paths.*)
         let ownership = run SourceGraph.Builder.policyOwnershipPlacements(&builder.*, port.id)
         let reset = SourceGraph.Builder.policyOperationOwnershipReset(&builder.*, port.id)
+        let throughReset = SourceGraph.Builder.policyThroughOwnershipReset(&builder.*, port.id)
         let incoming = run SourceGraph.Builder.policyCases(&builder.*, port.id)
         let argument = match port.authority {
           SourceGraph.TransferAuthority.OperationResult {candidate, ..} => match candidate.binding {
@@ -13498,6 +13663,26 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraph.Builder<'body>, ob
               &positions[position], &histories[history])
             if let Option<SourceAtom>.Some {value: active} = paired {
               if port.outputRole == SourceGraph.SourceRole.Ownership {
+                if let Option<SourceGraph.ThroughOwnershipReset>.Some {value: boundary} = throughReset {
+                  let candidate = SourceGraph.Builder.throughResultCandidates(&builder.*)[boundary.candidate]
+                  let request = SourceGraph.Builder.throughFlightRequests(&builder.*)[candidate.request]
+                  if request.operation.index != evaluation.index || request.kind != SourceGraph.ThroughFlightKind.Read
+                    || candidate.source.index != positions[position].value.index || candidate.target.index != port.target.index
+                    || boundary.root.index != root.index || port.outputDirect
+                    || !sourceReadMatches(histories[history].source.read, Option<SourceControl.ReadId>.some(candidate.read)) {
+                    return CompilerBug.panic(b"through reset changed its original read flight or whole result")
+                  }
+                  let gates: [SourceAtom; 3] = [active, boundary.sourceActive, boundary.applicable]
+                  let empty = List<SourceAtom>.make()
+                  let arrived = run SourcePolicy.conjunction(&mut builder.rules, &gates, List<SourceAtom>.asSlice(&empty))
+                  run List<SourceAtom>.append(&mut covered, arrived)
+                  run List<SourceResultRoute>.append(&mut routes, SourceResultRoute {
+                    position: position, history: history, policy: at, field: usize.ZERO,
+                    wholeField: true, declared: no, active: arrived,
+                    reset: Option<SourceAtom>.some(boundary.accepted)})
+                  history = history + usize.ONE
+                  continue
+                }
                 if let Option<SourceGraph.OperationOwnershipReset>.Some {value: boundary} = reset {
                   // The original finish policy resets an ordinary whole result to field
                   // zero. Its accepted gate is written only after that policy decides;
