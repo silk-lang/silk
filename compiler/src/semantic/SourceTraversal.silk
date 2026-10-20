@@ -5,11 +5,11 @@
 //! transport and ownership actions to these actual occurrences before that same graph is solved.
 
 import hir.Hir {InfixOperator}
-import semantic.SourceAnalysis {Skeleton, SelectionUse, Directness, TransferPolicy, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, Storage, sameSelector, inputOperand, sameInputRead}
+import semantic.SourceAnalysis {Skeleton, SelectionUse, ThroughDescriptor, ThroughFlightKind, Directness, TransferPolicy, EvalId, EvaluationRole, Evaluation, EvaluationSite, Seed, Leaf, SourceLeaf, Storage, sameSelector, inputOperand, sameInputRead}
 import semantic.SourceFlow {Flow, PointId, Write}
 import semantic.SourceRules {Atom, Program}
 import semantic.SourcePreparation {SourcePreparation, Endpoint, EndpointId, Root, EndpointRole, Shape, ShapeState, Component, Selector, IndexClass, MapId, SelectionId, Selection, SelectionMap, MapKind, InputRead, InputRoute, Construction, Operation, Transport, Replacement, ArraySlice}
-import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, RunAccess, ConsumedPlace, SourceConstruction, PlaceStep}
+import semantic.TypedBody {Node, NodeId, NodeKind, Expression, LocalId, AggregateField, MatchArm, MatchSyntax, SubjectAccess, BindingAccess, RunAccess, ConsumedPlace, SourceConstruction, PlaceStep}
 import semantic.Type {Type}
 import semantic.StorageOperation {StorageOperation}
 import silk.allocator {Allocator, OutOfMemoryError}
@@ -1222,6 +1222,7 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
         }
         run Skeleton.replace(&mut reservation.skeleton, prepared, &rows[selected], inputs[usize.ZERO].evaluation,
           inputs[usize.ONE].evaluation, read, occurrence.evaluation, yes)
+        run throughFlights(prepared, &mut reservation.skeleton, visits, subjects, occurrence, yes)
       }
       NodeKind.Expression {form: Expression.UnionWiden {value}, ..} => {
         // Only the exact producer-paired children move. The root map has no generic
@@ -1280,6 +1281,10 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
         let placement = exactMap(maps, occurrence.node, from, into, MapKind.Place)
         run Skeleton.writeAliases(&mut reservation.skeleton, endpoints, maps, placement,
           inputs[1].evaluation, inputs[0].evaluation, occurrence.evaluation, yes)
+        let execution = run Skeleton.execution(&mut reservation.skeleton, occurrence.evaluation, occurrence.execute)
+        run Skeleton.fieldRehold(&mut reservation.skeleton, prepared, placement,
+          inputs[1].evaluation, inputs[0].evaluation, execution, occurrence.evaluation, yes)
+        run throughFlights(prepared, &mut reservation.skeleton, visits, subjects, occurrence, yes)
       }
       NodeKind.LocalBinding {local, initializer} => {
         run localReplacement(prepared, &mut reservation.skeleton, occurrence, inputs, local, initializer, yes)
@@ -1305,6 +1310,126 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
         storage, subjects[subject].evaluation, prepared.body.nodes[subjects[subject].site.index].origin, yes)
     }
     subject = subject + usize.ONE
+  }
+  return ()
+}
+
+// Walk the already executed first-operand chain backwards. Replacing the selected crossing
+// on each step finds the root-nearest Dereference/Slice, not the outermost projection.
+// Neither an index expression nor a retained match subject is evaluated again.
+effect fn throughFlights<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
+  visits: &[Visit], subjects: &[Subject], operation: &Visit, active: Atom) -> () ! OutOfMemoryError ? &mut Allocator {
+  let inputs = List<Input>.asSlice(&operation.inputs)
+  if inputs.length != 2 { return CompilerBug.panic(b"through operation lost its destination/RHS occurrences") }
+  let target = inputs[0].evaluation
+  let endpoints = List<Endpoint>.asSlice(&prepared.endpoints)
+  let shapes = List<Shape>.asSlice(&prepared.shapes)
+  let mut current = target
+  let mut selected = Option<ThroughDescriptor>.none()
+  let mut complete = true
+  let mut remaining = visits.length + subjects.length + usize.ONE
+  while true {
+    if remaining == usize.ZERO { return CompilerBug.panic(b"through operand occurrence chain is cyclic") }
+    remaining = remaining - usize.ONE
+    let mut retained = false
+    let mut each = usize.ZERO
+    while each < subjects.length {
+      if subjects[each].evaluation.index == current.index && subjects[each].owned { retained = true }
+      each = each + usize.ONE
+    }
+    // An owned subject is its own real canonical owner, not its earlier initializer.
+    if retained { break }
+    let mut found = usize.MAX
+    each = usize.ZERO
+    while each < visits.length {
+      if visits[each].evaluation.index == current.index {
+        if found != usize.MAX { return CompilerBug.panic(b"through path repeats an actual evaluation") }
+        found = each
+      }
+      each = each + usize.ONE
+    }
+    if found == usize.MAX { complete = false break }
+    let visit = &visits[found]
+    let mut operand = Option<NodeId>.none()
+    let mut crossing = false
+    let mut pattern = false
+    match &prepared.body.nodes[visit.node.index].kind {
+      NodeKind.Expression {form: Expression.Field {value, ..}, ..} => { operand = Option<NodeId>.some(value) }
+      NodeKind.Expression {form: Expression.Index {value, ..}, ..} => {
+        operand = Option<NodeId>.some(value)
+        let root = nodeRoot(endpoints, value, EndpointRole.Storage)
+        match &shapes[endpoints[root.index].shape.index].state {
+          ShapeState.Slice => { crossing = true }
+          ShapeState.Array {..} => ()
+          _ => { complete = false break }
+        }
+      }
+      NodeKind.Expression {form: Expression.Dereference {value}, ..} => {
+        operand = Option<NodeId>.some(value)
+        let root = nodeRoot(endpoints, value, EndpointRole.Storage)
+        let reference = match &shapes[endpoints[root.index].shape.index].state { ShapeState.Reference => true _ => false }
+        if !reference { complete = false break }
+        crossing = true
+      }
+      NodeKind.Expression {form: Expression.PatternBinding {subject, access, ..}, ..} => {
+        // A borrowed binding's implicit descriptor needs its own producer authority.
+        // Its subject's alias cannot stand in for that descriptor.
+        if access == BindingAccess.Shared || access == BindingAccess.Exclusive { complete = false break }
+        operand = Option<NodeId>.some(subject)
+        pattern = true
+      }
+      _ => { break }
+    }
+    let operand = match operand { Option<NodeId>.Some {value} => value _ => { break } }
+    let actual = List<Input>.asSlice(&visit.inputs)
+    if actual.length == usize.ZERO || actual[0].node.index != operand.index {
+      return CompilerBug.panic(b"through projection lost its actual first operand")
+    }
+    if pattern {
+      let uses = List<SelectionUse>.asSlice(&skeleton.selections)
+      let maps = List<SelectionMap>.asSlice(&prepared.maps)
+      let mut authentic = false
+      let mut each = usize.ZERO
+      while each < uses.length {
+        if uses[each].result.index == visit.evaluation.index && uses[each].operand.index == actual[0].evaluation.index {
+          let selectors = List<MapId>.asSlice(&uses[each].selectors)
+          let mut inline = true
+          let mut step = usize.ZERO
+          while step < selectors.length {
+            let map = &maps[selectors[step].index]
+            if !inlineComponent(prepared, map.source, map.target) { inline = false }
+            step = step + usize.ONE
+          }
+          if inline { authentic = true }
+        }
+        each = each + usize.ONE
+      }
+      if !authentic { complete = false break }
+    }
+    if crossing {
+      selected = Option<ThroughDescriptor>.some(ThroughDescriptor {evaluation: actual[0].evaluation,
+        root: nodeRoot(endpoints, operand, EndpointRole.Storage), crossing: visit.evaluation})
+    }
+    current = actual[0].evaluation
+  }
+  if complete {
+    if let Option<ThroughDescriptor>.None = selected { return () }
+  } else { selected = Option<ThroughDescriptor>.none() }
+  match &prepared.body.nodes[operation.node.index].kind {
+    NodeKind.PlaceAssignment {..} => {
+      let execution = run Skeleton.execution(&mut skeleton.*, operation.evaluation, operation.execute)
+      run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, execution,
+        ThroughFlightKind.Write, selected, active)
+    }
+    NodeKind.Expression {form: Expression.StorageCall {operation: StorageOperation.Replace, ..}, ..} => {
+      let displaced = match operation.displaced { Option<EvalId>.Some {value} => value
+        _ => { return CompilerBug.panic(b"through replacement lost its distinct read point") } }
+      run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, displaced,
+        ThroughFlightKind.Read, selected, active)
+      run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, operation.evaluation,
+        ThroughFlightKind.Write, selected, active)
+    }
+    _ => { return CompilerBug.panic(b"through flight is not a typed write operation") }
   }
   return ()
 }
