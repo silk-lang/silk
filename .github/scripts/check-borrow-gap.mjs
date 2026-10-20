@@ -312,10 +312,10 @@ if (mode === 'corpus') {
     if (actual.failures !== expected.failures || actual.notices !== expected.notices)
       throw new Error(`${label}: ${JSON.stringify(actual)}, expected ${JSON.stringify(expected)}`)
   }
-  const baselineText = 'retired patterns\nalpha regions=2\nbeta\n'
-  const agreeing = { alpha: { regions: 2 }, beta: {} }
+  const baselineText = 'retired patterns\nalpha awaiting=2\nbeta\n'
+  const agreeing = { alpha: { awaiting: 2 }, beta: {} }
   expect('agreeing run', outcome(baselineText, agreeing), { failures: 0, notices: 0 })
-  expect('absent program', outcome(baselineText, { alpha: { regions: 2 } }), {
+  expect('absent program', outcome(baselineText, { alpha: { awaiting: 2 } }), {
     failures: 0,
     notices: 1,
   })
@@ -323,7 +323,7 @@ if (mode === 'corpus') {
     failures: 1,
     notices: 0,
   })
-  expect('disagreeing line', outcome(baselineText, { ...agreeing, alpha: { regions: 1 } }), {
+  expect('disagreeing line', outcome(baselineText, { ...agreeing, alpha: { awaiting: 1 } }), {
     failures: 1,
     notices: 0,
   })
@@ -333,15 +333,15 @@ if (mode === 'corpus') {
     notices: 0,
   })
   const current = parseBaseline(baselineText, 'fixture')
-  const ran = new Map(Object.entries({ beta: { regions: 1 } }))
+  const ran = new Map(Object.entries({ beta: { awaiting: 1 } }))
   const kept = updatedLines(current, ran, false)
   const pruned = updatedLines(current, ran, true)
-  if (kept.lines.join('|') !== 'alpha regions=2|beta regions=1')
+  if (kept.lines.join('|') !== 'alpha awaiting=2|beta awaiting=1')
     throw new Error(`update keeps a line whose program did not run: ${kept.lines.join('|')}`)
-  if (pruned.lines.join('|') !== 'beta regions=1' || pruned.absent.join('|') !== 'alpha')
+  if (pruned.lines.join('|') !== 'beta awaiting=1' || pruned.absent.join('|') !== 'alpha')
     throw new Error(`update --prune drops it: ${pruned.lines.join('|')}`)
   const receipt = (name) =>
-    `SELFHOST_BORROW_GAP=${JSON.stringify({ name, reasons: { regions: 1 } })}`
+    `SELFHOST_BORROW_GAP=${JSON.stringify({ name, reasons: { awaiting: 1 } })}`
   const passing = `PASS alpha\n${receipt('alpha')}\n`
   if (refusal(passing, receiptsOf(passing)) !== undefined)
     throw new Error('update accepts a run whose programs all passed')
