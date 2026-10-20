@@ -888,7 +888,7 @@ const program = Effect.gen(function* () {
   assert.notEqual(cycle.status, 0, 'a dependency cycle was added')
   assert.match(
     cycle.stderr,
-    /hello@0\.1\.0 depends on greeting@0\.1\.0, which depends on hello@0\.1\.0 in turn/,
+    /dependency `hello`: hello@0\.1\.0 already depends on greeting@0\.1\.0, directly or through other packages, so adding it would form a cycle/,
   )
   assert.doesNotMatch(yield* fs.readFileString(join(managed, 'libs/greeting/silk.toml')), /hello/)
   yield* fs.writeFileString(
@@ -949,6 +949,20 @@ const program = Effect.gen(function* () {
     unknownMember.stderr,
     /has no package named `nope`\nsilk: its members are: greeting, hello, other\n/,
   )
+  // A member that cannot load its dependencies fails on its own; the others still run and the
+  // workspace summary is still written.
+  const greetingManifest = join(managed, 'libs/greeting/silk.toml')
+  const acyclic = yield* fs.readFileString(greetingManifest)
+  yield* fs.writeFileString(
+    greetingManifest,
+    `${acyclic}\n[dependencies]\nhello = { path = "../../apps/hello" }\n`,
+  )
+  const cyclic = yield* invoke(silk, ['check', '--stdlib', standardLibrary], managed)
+  assert.notEqual(cyclic.status, 0, 'a dependency cycle was checked')
+  assert.match(cyclic.stderr, /form a cycle/)
+  assert.match(cyclic.stdout, /^Package other \(/m)
+  assert.match(cyclic.stdout, /Workspace summary: 1 package succeeded, 2 failed\n$/)
+  yield* fs.writeFileString(greetingManifest, acyclic)
   // `format` and `doc` at the root cover every member.
   const managedFormat = yield* invoke(silk, ['format'], managed)
   assert.equal(managedFormat.status, 0, managedFormat.stderr + managedFormat.stdout)
