@@ -559,6 +559,30 @@ const program = Effect.gen(function* () {
     )
     assert.doesNotMatch(refused.stderr, /native_start_sync\.silk:/)
   }
+  // A runtime the package writes itself keeps its own errors: they are not blamed on a valid `main`.
+  yield* fs.makeDirectory(join(directory, 'ownruntime/src/support'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'ownruntime/silk.toml'),
+    '[package]\nname = "ownruntime"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[build]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"] }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'ownruntime/src/main.silk'),
+    'pub fn main() -> i32 {\n  return 3\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'ownruntime/src/support/start.silk'),
+    'import Intrinsic.application\n\nfn none<T>() -> i32 { return 0 }\n\nexport "C" fn enter() -> i32 as "main" {\n  let x = none()\n  return application.main() + x\n}\n',
+  )
+  for (const command of ['check', 'build']) {
+    const refused = yield* invoke(
+      silk,
+      [command, '--stdlib', standardLibrary],
+      join(directory, 'ownruntime'),
+    )
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(refused.stderr, /SEM0052/)
+    assert.doesNotMatch(refused.stderr, /SEM0225/)
+  }
   // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
   // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
   // the status 1, and a selection outside the source root is refused before anything is built.
