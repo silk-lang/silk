@@ -1245,6 +1245,25 @@ Dropping an uninvoked environment releases loans and cleans owned captures exact
 acquisition order. A consuming invocation transfers or cleans every owned capture exactly once; a
 second invocation cannot duplicate the environment.
 
+A body that stores what one capture carries where another capture reaches, such as a loan of a
+borrowed capture written into a captured holder, needs the first capture's region to outlive the
+second's. The body does not prove such a relation between regions its creator chooses; the creator
+proves it where it constructs the callable, as if each such store happened there. A relation that
+involves the callable's own parameter lifetimes is proved inside its body.
+
+```silk,ignore
+struct Slot<'a> { view: &'a i32 }
+
+fn invalid(slot: &mut Slot) -> () {
+  let count = 41
+  let mut store = fn() -> () { slot.view = &count }
+  store()
+}
+```
+
+Here the loan of `count` must outlive the caller's lifetime of `slot`'s view, so `invalid` reports
+`SEM0212` at its capture of `count`.
+
 **Boundary:** Invocation mode describes access to the retained environment, not ownership of newly
 supplied arguments. Copy moves remain reusable. A shared anonymous callable may satisfy a `mut fn`
 or `once fn` requirement, and a `mut fn` may satisfy a `once fn` requirement; the reverse
@@ -1252,7 +1271,7 @@ substitutions are invalid. Anonymous captures use the same escape, storage, and 
 other exact callable environments.
 
 **Diagnostics:** Conflicting access to a captured root reports the ordinary retained-loan
-diagnostic. A borrowed environment that escapes its root reports an ownership escape. Invoking a
+diagnostic, at the creator for a relation the body owes it. A borrowed environment that escapes its root reports an ownership escape. Invoking a
 consuming anonymous callable twice reports use after move, and supplying a derived consuming or
 exclusive mode where shared reusable access is required reports a callable-contract mismatch.
 
