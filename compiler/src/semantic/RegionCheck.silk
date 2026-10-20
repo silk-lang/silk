@@ -240,8 +240,13 @@ struct Renumbering {
   atoms: List<Shared<Lifetime>>
   regions: List<Region>
   // How a lifetime chosen outside the body maps: to its universal region (a type the signature
-  // fixes) or to a fresh variable.
+  // or a written annotation fixes) or to a fresh variable.
   universal: bool
+  // Whether typing inferred the value's type with nothing written to fix it (a local an unannotated
+  // binding types, a staged callable or a named section), so that even a `'static` it names is a
+  // fresh variable, which the flows into the value relate (as rustc renumbers every region of a
+  // local's type). A lifetime of another type resolved in a closed numbering keeps `'static` static.
+  inferred: bool
   // Whether every lifetime of the value's own type is numbered. A lifetime a closed numbering does
   // not list comes from a type that names the value's lifetimes differently, so its variable is
   // made equal to every variable of the value.
@@ -289,7 +294,8 @@ effect fn addOutlives(table: &mut RegionTable, longer: Region, shorter: Region) 
 effect fn addNumbering(table: &mut RegionTable, universal: bool) -> usize ! OutOfMemoryError ? &mut Allocator {
   let index = List<Renumbering>.length(&table.numberings)
   run List<Renumbering>.append(&mut table.numberings,
-    Renumbering {atoms: List<Shared<Lifetime>>.make(), regions: List<Region>.make(), universal: universal, closed: false})
+    Renumbering {atoms: List<Shared<Lifetime>>.make(), regions: List<Region>.make(), universal: universal, inferred: false,
+      closed: false})
   return index
 }
 
@@ -413,8 +419,9 @@ pub fn universalLifetime(lifetime: &Shared<Lifetime>, owner: &DeclarationId) -> 
 
 // The region `lifetime` names in numbering `numbered`, allocating it on first use. A lifetime of the
 // body's own is a fresh variable; a universal one is its universal region in a numbering of a type the
-// signature fixes, and otherwise a fresh variable too, since typing may have chosen it where a shorter
-// region would do. `'static` is always the static region.
+// signature or a written annotation fixes, and otherwise a fresh variable too, since typing may have
+// chosen it where a shorter region would do. `'static` is the static region, except in the value's
+// own type of an inferred numbering.
 effect fn resolve(table: &mut RegionTable, numbered: usize, lifetime: &Shared<Lifetime>, owner: &DeclarationId) -> Region
 ! OutOfMemoryError ? &mut Allocator {
   let numberings = List<Renumbering>.asSlice(&table.numberings)
@@ -426,8 +433,9 @@ effect fn resolve(table: &mut RegionTable, numbered: usize, lifetime: &Shared<Li
   }
   let universal = numberings[numbered].universal
   let closed = numberings[numbered].closed
+  let inferred = numberings[numbered].inferred
   let mut region = Region {index: usize.MAX}
-  if Shared<Lifetime>.with<bool>(lifetime, staticAtom) {
+  if Shared<Lifetime>.with<bool>(lifetime, staticAtom) && (closed || !inferred) {
     region = run universalOf(&mut table.*, lifetime, owner)
   } else if universal && universalLifetime(lifetime, owner) {
     region = run universalOf(&mut table.*, lifetime, owner)
@@ -3086,7 +3094,12 @@ effect fn construct(walker: &mut Walker, id: NodeId, values: &[NodeId], referent
         let value21 = nodeValue(&walker.*, operand)
         run flow(&mut walker.*, &ty, value21, &field, fieldsNumbered, Variance.Covariant, site)
       }
-      if let Option<Shared<Type>>.Some {value: constructed} = move nodeType(nodes, id) {
+      if inferredCallable(nodes, id) {
+        // A staged callable's or a section's field is its own type's component, so it holds that
+        // component's regions position by position: it need not outlive what another field holds,
+        // such as a result region the contract relates to another operand.
+        run flow(&mut walker.*, &field, fieldsNumbered, &field, numbered, Variance.Covariant, site)
+      } else if let Option<Shared<Type>>.Some {value: constructed} = move nodeType(nodes, id) {
         run outliveAll(&mut walker.*, &field, fieldsNumbered, &constructed, numbered, site)
       }
     } else {
@@ -3190,7 +3203,17 @@ effect fn invoke(walker: &mut Walker, id: NodeId, callee: NodeId, arguments: &[N
   }
   if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
     let value24 = nodeValue(&walker.*, id)
-    run outliveAll(&mut walker.*, &calleeTy, calleeNumbered, &ty, value24, span)
+    // A staged callable's or a section's contract names its result in the lifetimes of its own
+    // type, which hold its operands position by position, so the result holds just those regions.
+    let mut named = Option<Shared<Type>>.none()
+    if lent == usize.MAX && !deferred && inferredCallable(nodes, callee) {
+      named = Shared<Type>.with<Option<Shared<Type>>>(&calleeTy, contractResult)
+    }
+    if let Option<Shared<Type>>.Some {value: result} = move named {
+      run flow(&mut walker.*, &result, calleeNumbered, &ty, value24, Variance.Covariant, span)
+    } else {
+      run outliveAll(&mut walker.*, &calleeTy, calleeNumbered, &ty, value24, span)
+    }
   }
   let contract = List<usize>.asSlice(&walker.contractOf)[id.index]
   if !deferred && contract != usize.MAX {
@@ -3877,16 +3900,47 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
     refinements: List<Refinement>.make(), retention: Retention.None, guarded: List<usize>.make(), guardConsumed: Option<Location>.none(),
     exit: usize.ZERO, entry: usize.ZERO,
   }
-  // Every value's numbering: a parameter's or a written local's type fixes its universal lifetimes.
+  // Which locals a binding gives a value; every other local is a parameter, a capture alias or a
+  // pattern binding.
+  let mut bound = List<bool>.make()
   let mut index = usize.ZERO
   while index < locals.length {
-    let numbered = run addNumbering(&mut walker.table, index < input.parameters || locals[index].written)
-    run renumber(&mut walker.table, numbered, &locals[index].ty, owner)
+    run List<bool>.append(&mut bound, false)
     index = index + usize.ONE
   }
   index = usize.ZERO
   while index < nodes.length {
-    let numbered = run addNumbering(&mut walker.table, false)
+    match &nodes[index].kind {
+      NodeKind.LocalBinding {local, ..} => { List<bool>.set(&mut bound, local.index, true) }
+      NodeKind.MutableBinding {local, ..} => { List<bool>.set(&mut bound, local.index, true) }
+      _ => {}
+    }
+    index = index + usize.ONE
+  }
+  // Every value's numbering: a parameter's, a written local's or a written literal's type fixes its
+  // universal lifetimes (as rustc's user type annotations do); a local an unannotated binding types
+  // is inferred.
+  index = usize.ZERO
+  while index < locals.length {
+    let fixed = index < input.parameters || locals[index].written
+    let numbered = run addNumbering(&mut walker.table, fixed)
+    if !fixed && List<bool>.asSlice(&bound)[index] {
+      let mut numberings = List<Renumbering>.asMutSlice(&mut walker.table.numberings)
+      numberings[numbered].inferred = true
+    }
+    run renumber(&mut walker.table, numbered, &locals[index].ty, owner)
+    index = index + usize.ONE
+  }
+  // A staged callable's or a named section's type is typing's inference and is never written: its
+  // stored operands meet their declared types in a numbering of their own (`construct`), so a
+  // `'static` the value's type names, such as its callee's, is a fresh variable.
+  index = usize.ZERO
+  while index < nodes.length {
+    let numbered = run addNumbering(&mut walker.table, writtenLiteral(nodes, NodeId {index: index}))
+    if inferredCallable(nodes, NodeId {index: index}) {
+      let mut numberings = List<Renumbering>.asMutSlice(&mut walker.table.numberings)
+      numberings[numbered].inferred = true
+    }
     if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, NodeId {index: index}) {
       run renumber(&mut walker.table, numbered, &ty, owner)
       if let NodeKind.Expression {form: Expression.Callable {body, ..}, ..} = &nodes[index].kind {
@@ -3950,21 +4004,6 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
   walker.entry = entry
   // Parameters and capture aliases own their storage on entry; a by-reference capture's storage stays
   // its creator's.
-  let mut bound = List<bool>.make()
-  index = usize.ZERO
-  while index < locals.length {
-    run List<bool>.append(&mut bound, false)
-    index = index + usize.ONE
-  }
-  index = usize.ZERO
-  while index < nodes.length {
-    match &nodes[index].kind {
-      NodeKind.LocalBinding {local, ..} => { List<bool>.set(&mut bound, local.index, true) }
-      NodeKind.MutableBinding {local, ..} => { List<bool>.set(&mut bound, local.index, true) }
-      _ => {}
-    }
-    index = index + usize.ONE
-  }
   let mut initialized = entry
   index = usize.ZERO
   while index < locals.length {
@@ -4107,6 +4146,39 @@ effect fn namedLifetimes(ty: &Shared<Type>, found: &mut List<Shared<Lifetime>>) 
     at = at + usize.ONE
   }
   return ()
+}
+
+// Whether node `id` is an aggregate literal whose type the source wrote with its arguments.
+fn writtenLiteral(nodes: &[Node], id: NodeId) -> bool {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form: Expression.Aggregate {written, ..}, ..} => written
+    _ => false
+  }
+}
+
+// Whether node `id` constructs a callable value whose type typing inferred: a staged callable or a
+// named section.
+fn inferredCallable(nodes: &[Node], id: NodeId) -> bool {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form: Expression.StagedCallable {..}, ..} => true
+    NodeKind.Expression {form: Expression.Aggregate {section: Option<SectionRetention>.Some {..}, ..}, ..} => true
+    _ => false
+  }
+}
+
+// The result type of a callable value's or a stage's contract.
+fn contractResult(value: &Type) -> Option<Shared<Type>> {
+  let contract = match &value.* {
+    Type.CallableValue {contract, ..} => Shared<Type>.clone(&contract)
+    Type.CallableStage {contract, ..} => Shared<Type>.clone(&contract)
+    _ => { return Option<Shared<Type>>.none() }
+  }
+  return Shared<Type>.with<Option<Shared<Type>>>(&contract, fn(signature: &Type) -> Option<Shared<Type>> {
+    return match &signature.* {
+      Type.Callable {result, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&result))
+      _ => Option<Shared<Type>>.none()
+    }
+  })
 }
 
 fn callableLiteral(nodes: &[Node], id: NodeId) -> bool {
