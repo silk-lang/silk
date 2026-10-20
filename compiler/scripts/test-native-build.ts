@@ -816,13 +816,14 @@ const program = Effect.gen(function* () {
     'members share the workspace output',
   )
   assert.equal(yield* fs.exists(join(workspace, 'app/build')), false)
-  // The workspace manifest itself has no package to build, and every member needs a manifest.
+  // From the workspace root, `run` runs the one member that has an entry; the library member,
+  // which has none, is skipped with a note.
   const virtualRoot = yield* invoke(silk, ['run', '--stdlib', standardLibrary], workspace, {
     ...process.env,
-    SILK_CLANG: sentinel,
+    SILK_CLANG: clang,
   })
-  assert.notEqual(virtualRoot.status, 0, 'a workspace-only manifest was built')
-  assert.match(virtualRoot.stderr, /only defines a workspace/)
+  assert.equal(virtualRoot.status, 8, virtualRoot.stderr)
+  assert.match(virtualRoot.stderr, /Skipping math: it has no package\.root/)
   yield* fs.makeDirectory(join(workspace, 'libs/empty'), { recursive: true })
   const unmanifested = yield* invoke(
     silk,
