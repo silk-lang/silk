@@ -75,9 +75,9 @@ import semantic.InitialProfile {
   InitialProfile,
   Problem as InitialProfileProblem,
 }
-import semantic.ProfileBinding {Supplied}
+import semantic.ProfileBinding {BindingError, BindingIssue, Supplied}
 import semantic.ProfileAssembly {AssemblyProblem, assemble as assembleProfile}
-import semantic.ProfileShape {Registered, Problem as ShapeProblem, registered as registeredShapes}
+import semantic.ProfileShape {Registered, Problem as ShapeProblem, Refusal as ShapeRefusal, registeredOrRefused as registeredShapes}
 import semantic.SourceIndex {RevisionMismatch}
 import semantic.Target {Id as TargetId, Target}
 import semantic.ModuleIndex {NamedFunction}
@@ -554,6 +554,78 @@ fn originalGapReason(gap: &Gap) -> Option<RejectionCode> {
   }
 }
 
+// The module whose source a gap is located in.
+fn gapModule(gap: &Gap) -> ModuleId {
+  return match &gap.source {
+    GapSource.Declaration {declaration, ..} => Shared<DeclarationId>.with<ModuleId>(&declaration,
+      fn(value: &DeclarationId) -> ModuleId { return ModuleId.copy(DeclarationId.moduleId(value)) })
+    GapSource.Relative {declaration, ..} => Shared<DeclarationId>.with<ModuleId>(&declaration,
+      fn(value: &DeclarationId) -> ModuleId { return ModuleId.copy(DeclarationId.moduleId(value)) })
+    GapSource.Generated {declaration} => Shared<DeclarationId>.with<ModuleId>(&declaration,
+      fn(value: &DeclarationId) -> ModuleId { return ModuleId.copy(DeclarationId.moduleId(value)) })
+    GapSource.Diagnostic {diagnostic} => Shared<Rejection>.with<ModuleId>(&diagnostic,
+      fn(value: &Rejection) -> ModuleId { return ModuleId.copy(&value.module) })
+  }
+}
+
+// One human line per gap, as a refusal prints: `path:line:col: unsupported[<reason>] not supported
+// by the native compiler yet`, naming the refusal that became the gap or else the gap itself.
+effect fn gapLines(sources: &ModuleSources, gaps: &[Shared<Gap>], reported: &[ReportedSite]) -> Bytes
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut lines = Bytes.make()
+  let mut written = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < gaps.length {
+    let code = Shared<Gap>.with<GapCode>(&gaps[at], fn(gap: &Gap) -> GapCode { return gap.code })
+    let span = Shared<Gap>.with<Span>(&gaps[at], fn(gap: &Gap) -> Span { return Gap.span(gap) })
+    let module = Shared<Gap>.with<ModuleId>(&gaps[at], gapModule)
+    let mut line = Bytes.make()
+    run appendLocation(&mut line, sources, &module, span, false)
+    let original = Shared<Gap>.with<Option<RejectionCode>>(&gaps[at], originalGapReason)
+    // A gap that carries a refusal already printed at the same site adds nothing.
+    let mut printed = false
+    if let Option<RejectionCode>.Some {value: reason} = &original {
+      let mut earlier = usize.ZERO
+      while earlier < reported.length {
+        if reported[earlier].code == reason && reported[earlier].span.start == span.start && reported[earlier].span.end == span.end
+          && ModuleId.equals(&reported[earlier].module, &module) {
+          printed = true
+        }
+        earlier = earlier + usize.ONE
+      }
+    }
+    match move original {
+      Option<RejectionCode>.Some {value: reason} => {
+        if reason == RejectionCode.Unsupported {
+          run Bytes.append(&mut line, b": unsupported: this construct is not supported by the native compiler yet\n")
+        } else {
+          run Bytes.append(&mut line, b": unsupported[")
+          run Bytes.append(&mut line, Rejection.name(reason))
+          run Bytes.append(&mut line, b"] not supported by the native compiler yet\n")
+        }
+      }
+      Option<RejectionCode>.None => {
+        run Bytes.append(&mut line, b": unsupported[")
+        run Bytes.append(&mut line, Gap.name(code))
+        run Bytes.append(&mut line, b"] not supported by the native compiler yet\n")
+      }
+    }
+    let mut seen = false
+    let previous = List<Bytes>.asSlice(&written)
+    let mut earlier = usize.ZERO
+    while earlier < previous.length {
+      if same(Bytes.asSlice(&previous[earlier]), Bytes.asSlice(&line)) { seen = true }
+      earlier = earlier + usize.ONE
+    }
+    if !seen && !printed {
+      run Bytes.append(&mut lines, Bytes.asSlice(&line))
+      run List<Bytes>.append(&mut written, move line)
+    }
+    at = at + usize.ONE
+  }
+  return move lines
+}
+
 effect fn gapSummary(gaps: &[Shared<Gap>]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut message = run Bytes.copy(b"SILK_UNSUPPORTED_JSON={\"gaps\":[")
   let mut at = usize.ZERO
@@ -945,6 +1017,9 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   let target = Target.forId(Target.id(InitialProfile.target(profile)))
+  // A refused binding names its manifest, which `sources` takes over.
+  let mut manifestFile = Bytes.make()
+  if let Option<&Path>.Some {value} = &manifest { manifestFile = run Bytes.copy(Path.rawBytes(value)) }
   let libc = match move InitialProfile.text(profile, b"libc") {
     Option<&[u8]>.Some {value} => run Bytes.copy(value)
     Option<&[u8]>.None => run invalidBuildProfile()
@@ -982,13 +1057,24 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
   let mut request = SemanticRequest.forApplication(ModuleId.copy(&application))
   run SemanticRequest.registerSchemaModule(&mut request, &identity)
   let shapes = run registeredShapes(&mut store, &mut request, &target)
+  // The bindings are moved into assembly; a refused one is named from these copies.
+  let boundParameters = run boundNames(&bindings, true)
+  let boundModules = run boundNames(&bindings, false)
   let assembled = match move shapes {
-    Result<Registered, ShapeProblem>.Success {value} => run assembleProfile(
+    Result<Registered, ShapeRefusal>.Success {value} => run assembleProfile(
       run InitialProfile.copy(profile), &mut store, &mut request, &value, move bindings)
-    Result<Registered, ShapeProblem>.Failure {error} => {
-      run writeError(b"silk: error[SEM0214] invalid package parameter declaration: ")
-      run writeError(shapeProblemText(error))
-      run writeError(b"\n")
+    Result<Registered, ShapeRefusal>.Failure {error} => {
+      match move error {
+        // A rejected `param` declaration is reported where it is written.
+        ShapeRefusal.Rejected {rejection} => {
+          return Prepared.Finished {status: run reportRejection(&sources, &rejection, format, &mut out.*)}
+        }
+        ShapeRefusal.Shape {problem} => {
+          run writeError(b"silk: error[SEM0214] invalid package parameter declaration: ")
+          run writeError(shapeProblemText(problem))
+          run writeError(b"\n")
+        }
+      }
       return Prepared.Finished {status: 1}
     }
   }
@@ -1006,8 +1092,9 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
           run writeError(profileProblemText(problem))
           run writeError(b"\n")
         }
-        AssemblyProblem.Binding {error: _} => {
-          run writeError(b"silk: error[SEM0214] invalid package parameter binding\n")
+        AssemblyProblem.Binding {error: refused} => {
+          let line = run bindingProblem(&refused, List<Bytes>.asSlice(&boundParameters), List<Bytes>.asSlice(&boundModules), Bytes.asSlice(&manifestFile))
+          run writeError(Bytes.asSlice(&line))
         }
         AssemblyProblem.InputMismatch => {
           run writeError(b"silk: invalid package parameter profile\n")
@@ -1020,6 +1107,96 @@ effect fn prepare(sourcePath: &Path, manifest: Option<&Path>, standardLibrary: O
     sources: move sources, store: move store, request: move request, rootPackage: move rootPackage,
     identity: move identity, runtime: move runtime,
   }}
+}
+
+// The line that reports a refused package-parameter binding: the binding's parameter and module,
+// located at the line of `manifest` that names the parameter when it is found there.
+effect fn bindingProblem(refused: &BindingError, parameters: &[Bytes], modules: &[Bytes], manifest: &[u8]) -> Bytes
+! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut line = Bytes.make()
+  let mut parameter = Bytes.make()
+  let mut module = Bytes.make()
+  if refused.ordinal < parameters.length && refused.ordinal < modules.length {
+    parameter = run Bytes.copy(Bytes.asSlice(&parameters[refused.ordinal]))
+    module = run Bytes.copy(Bytes.asSlice(&modules[refused.ordinal]))
+  }
+  if manifest.length > usize.ZERO {
+    run Bytes.append(&mut line, manifest)
+    let manifestPath = run Path.fromBytes(manifest)
+    let read = run Effect.result(FileSystem.readFile(&manifestPath))
+    match move read {
+      Result<Bytes, FileError | OutOfMemoryError>.Success {value: text} => {
+        let mut needle = run Bytes.copy(b"\"")
+        run Bytes.append(&mut needle, Bytes.asSlice(&parameter))
+        run Bytes.append(&mut needle, b"\"")
+        let found = firstOccurrence(Bytes.asSlice(&text), Bytes.asSlice(&needle))
+        if Bytes.length(&parameter) > usize.ZERO && found != usize.MAX {
+          let position = Reports.position(Bytes.asSlice(&text), found)
+          run Bytes.append(&mut line, b":")
+          run JsonText.appendDecimal(&mut line, position.line)
+        }
+      }
+      Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError unreadable => { drop unreadable }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    run Bytes.append(&mut line, b": ")
+  } else {
+    run Bytes.append(&mut line, b"silk: ")
+  }
+  run Bytes.append(&mut line, b"error[SEM0214] invalid package parameter binding: ")
+  let reason: &'static [u8] = match refused.code {
+    BindingIssue.ProhibitedProvenance => b"the binding of `{p}` has a secret, physical or runtime origin"
+    BindingIssue.UnknownParameter => b"module `{m}` declares no package parameter `{p}`"
+    BindingIssue.PrivateParameter => b"package parameter `{p}` is not `pub`, so it cannot be bound"
+    BindingIssue.WrongType => b"the value bound to `{p}` does not have its parameter's type"
+    BindingIssue.SameTierConflict => b"package parameter `{p}` is bound more than once"
+  }
+  let mut at = usize.ZERO
+  while at < reason.length {
+    if at + 2 < reason.length && reason[at] == 123 && reason[at + 2] == 125 && reason[at + 1] == 112 {
+      run Bytes.append(&mut line, Bytes.asSlice(&parameter))
+      at = at + 3
+    } else if at + 2 < reason.length && reason[at] == 123 && reason[at + 2] == 125 && reason[at + 1] == 109 {
+      run Bytes.append(&mut line, Bytes.asSlice(&module))
+      at = at + 3
+    } else {
+      run Bytes.append(&mut line, &[reason[at]])
+      at = at + usize.ONE
+    }
+  }
+  run Bytes.append(&mut line, b"\n")
+  return move line
+}
+
+// The parameter (or, when not `parameters`, module) each binding names, in binding order.
+effect fn boundNames(bindings: &List<Supplied>, parameters: bool) -> List<Bytes> ! OutOfMemoryError ? &mut Allocator {
+  let mut names = List<Bytes>.make()
+  let supplied = List<Supplied>.asSlice(bindings)
+  let mut at = usize.ZERO
+  while at < supplied.length {
+    if parameters {
+      run List<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&supplied[at].parameter)))
+    } else {
+      run List<Bytes>.append(&mut names, run Bytes.copy(Bytes.asSlice(&supplied[at].module)))
+    }
+    at = at + usize.ONE
+  }
+  return move names
+}
+
+// The offset of the first occurrence of `needle` in `text`; `usize.MAX` when there is none.
+fn firstOccurrence(text: &[u8], needle: &[u8]) -> usize {
+  if needle.length == usize.ZERO || text.length < needle.length { return usize.MAX }
+  let mut at = usize.ZERO
+  while at + needle.length <= text.length {
+    let mut matched = usize.ZERO
+    while matched < needle.length && text[at + matched] == needle[matched] { matched = matched + usize.ONE }
+    if matched == needle.length { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
 }
 
 // Why the root package's `param` declarations cannot form a parameter schema.
@@ -1042,11 +1219,11 @@ fn profileProblemText(problem: ProfileProblem) -> &'static [u8] {
     ProfileProblem.WrongType => b"a default or binding has the wrong type"
     ProfileProblem.InvalidShape => b"a value does not fit its parameter's type"
     ProfileProblem.PredicateNotChecked => b"a parameter's `where` predicate could not be checked"
-    ProfileProblem.ResourceSafetyNotChecked => b"a parameter type that owns resources is not supported yet"
+    ProfileProblem.ResourceSafetyNotChecked => b"enum, struct, union and optional parameter types are not supported yet"
   }
 }
 
-effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, display: &Path, form: Form, stage: Stage, standardLibrary: Option<Path>, profile: InitialProfile, bindings: List<Supplied>, supplyRequest: &SupplyRequest, testing: bool, stats: bool, clang: &Option<Bytes>) -> Compiled
+effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, display: &Path, form: Form, stage: Stage, standardLibrary: Option<Path>, profile: InitialProfile, bindings: List<Supplied>, supplyRequest: &SupplyRequest, testing: bool, stats: bool, clang: &Option<Bytes>, heading: &Option<Bytes>) -> Compiled
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
   let target = Target.forId(Target.id(InitialProfile.target(&profile)))
@@ -1071,6 +1248,8 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
     Option<&[u8]>.None => Bytes.make()
   }
   let mut refused = Bytes.make()
+  // Whether this build's `[<target>]` heading has been written before its diagnostics.
+  let mut headed = false
   // A project build notes each body it could not borrow-check and prints diagnostics as `check`
   // does; the single-source form writes borrow-check counts as receipts and diagnostics as
   // `SILK_BUILD_ERROR` records for the corpus harness and self-build.
@@ -1081,7 +1260,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
   let mut machine = DiagnosticFormat.Machine
   if !receipts { machine = DiagnosticFormat.Human }
   let prepared = run prepare(sourcePath, move manifest, move standardLibrary, &profile, move bindings, testing, &machine, &mut refused)
-  run writeError(Bytes.asSlice(&refused))
+  run writeHeaded(heading, &mut headed, Bytes.asSlice(&refused))
   let analysis = match move prepared {
     Prepared.Ready {analysis} => move analysis
     Prepared.Finished {status} => { return Compiled.Finished {status: status} }
@@ -1111,15 +1290,16 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
     let mut failureStatus = 2
     while at < malformed.length {
       if diagnosticStatus(&malformed[at]) == 1 { failureStatus = 1 }
-      run writeRejection(&sources, &malformed[at], &machine)
+      run writeRejection(heading, &mut headed, &sources, &malformed[at], &machine)
       at = at + usize.ONE
     }
     return Compiled.Finished {status: failureStatus}
   }
   // A reached module's selected imports are checked whole as well, used or not (IMPORT-003).
   let mut imported = Bytes.make()
-  let importStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut imported)
-  run writeError(Bytes.asSlice(&imported))
+  let mut reportedImports = List<ReportedSite>.make()
+  let importStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut imported, &mut reportedImports)
+  run writeHeaded(heading, &mut headed, Bytes.asSlice(&imported))
   if importStatus != 0 { return Compiled.Finished {status: importStatus} }
   let mut status = 0
   match move compiled {
@@ -1190,8 +1370,15 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
       }
     }
     BackendBuild.Unsupported {gaps} => {
-      let message = run gapSummary(List<Shared<Gap>>.asSlice(&gaps))
-      run writeError(Bytes.asSlice(&message))
+      // The single-source form keeps the machine record the corpus harness parses.
+      let mut message = Bytes.make()
+      if receipts {
+        message = run gapSummary(List<Shared<Gap>>.asSlice(&gaps))
+      } else {
+        let unreported = List<ReportedSite>.make()
+        message = run gapLines(&sources, List<Shared<Gap>>.asSlice(&gaps), List<ReportedSite>.asSlice(&unreported))
+      }
+      run writeHeaded(heading, &mut headed, Bytes.asSlice(&message))
       status = 2
     }
     BackendBuild.Rejected {first, further, gaps} => {
@@ -1201,7 +1388,9 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
         Option<Shared<Rejection>>.Some {value} => move value
         Option<Shared<Rejection>>.None => move first
       }
-      run writeRejection(&sources, &reported, &machine)
+      let mut written = List<ReportedSite>.make()
+      run record(&mut written, &reported)
+      run writeRejection(heading, &mut headed, &sources, &reported, &machine)
       let others = List<Shared<Rejection>>.asSlice(&further)
       let mut at = usize.ZERO
       while at < others.length {
@@ -1210,12 +1399,18 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
           Option<Shared<Rejection>>.Some {value} => move value
           Option<Shared<Rejection>>.None => Shared<Rejection>.clone(&others[at])
         }
-        run writeRejection(&sources, &other, &machine)
+        run record(&mut written, &other)
+        run writeRejection(heading, &mut headed, &sources, &other, &machine)
         at = at + usize.ONE
       }
       if List<Shared<Gap>>.length(&gaps) > usize.ZERO {
-        let summary = run gapSummary(List<Shared<Gap>>.asSlice(&gaps))
-        run writeError(Bytes.asSlice(&summary))
+        let mut summary = Bytes.make()
+        if receipts {
+          summary = run gapSummary(List<Shared<Gap>>.asSlice(&gaps))
+        } else {
+          summary = run gapLines(&sources, List<Shared<Gap>>.asSlice(&gaps), List<ReportedSite>.asSlice(&written))
+        }
+        run writeHeaded(heading, &mut headed, Bytes.asSlice(&summary))
       }
     }
   }
@@ -1224,32 +1419,70 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
   let catalog = match move run Semantic.demandTests(&mut store, &mut request) {
     Result<Shared<TestCatalog>, Shared<Rejection>>.Success {value} => move value
     Result<Shared<TestCatalog>, Shared<Rejection>>.Failure {error} => {
-      run writeRejection(&sources, &error, &machine)
+      run writeRejection(heading, &mut headed, &sources, &error, &machine)
       return Compiled.Finished {status: diagnosticStatus(&error)}
     }
   }
   // Discovery reaches the test modules, whose selected imports are checked like the build's.
   let mut discovered = Bytes.make()
-  let discoveredImportStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut discovered)
-  run writeError(Bytes.asSlice(&discovered))
+  let discoveredImportStatus = run reportedImportRejections(&mut store, &mut request, &sources, &machine, &mut discovered, &mut reportedImports)
+  run writeHeaded(heading, &mut headed, Bytes.asSlice(&discovered))
   if discoveredImportStatus != 0 { return Compiled.Finished {status: discoveredImportStatus} }
   return Compiled.Tests {identities: run Semantic.testIdentities(&catalog)}
 }
 
 // Appends selected import refusals to `out`; 0 when absent, 1 for a language rejection, 2 for
 // uncoded coverage.
-effect fn reportedImportRejections(store: &mut Semantic, request: &mut SemanticRequest, sources: &ModuleSources, format: &DiagnosticFormat, out: &mut Bytes) -> i32
+effect fn reportedImportRejections(store: &mut Semantic, request: &mut SemanticRequest, sources: &ModuleSources, format: &DiagnosticFormat, out: &mut Bytes, seen: &mut List<ReportedSite>) -> i32
 ! Cycle | InvalidModulePath | RevisionMismatch | FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
   let rejections = run Semantic.importRejections(&mut store.*, &mut request.*)
   let listed = List<Shared<Rejection>>.asSlice(&rejections)
   let mut status = 0
   let mut at = usize.ZERO
   while at < listed.length {
-    let current = run reportRejection(sources, &listed[at], format, &mut out.*)
-    if status != 1 { status = current }
+    // Each name an import selects answers for the same module path, so one refused module is
+    // reached once per name; it is reported once.
+    if !run repeated(&mut seen.*, &listed[at]) {
+      let current = run reportRejection(sources, &listed[at], format, &mut out.*)
+      if status != 1 { status = current }
+    }
     at = at + usize.ONE
   }
   return status
+}
+
+// The code and location of one reported diagnostic.
+struct ReportedSite {
+  code: RejectionCode
+  module: ModuleId
+  span: Span
+}
+
+// Whether `diagnostic` has the code and location of one in `seen`; otherwise it is recorded there.
+effect fn repeated(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let site = Shared<Rejection>.with<ReportedSite>(diagnostic, fn(value: &Rejection) -> ReportedSite {
+    return ReportedSite {code: value.code, module: ModuleId.copy(&value.module), span: value.span}
+  })
+  let listed = List<ReportedSite>.asSlice(&seen.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].code == site.code && listed[at].span.start == site.span.start && listed[at].span.end == site.span.end
+      && ModuleId.equals(&listed[at].module, &site.module) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  run List<ReportedSite>.append(&mut seen.*, move site)
+  return false
+}
+
+// Records the code and location of `diagnostic` as printed.
+effect fn record(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let site = Shared<Rejection>.with<ReportedSite>(diagnostic, fn(value: &Rejection) -> ReportedSite {
+    return ReportedSite {code: value.code, module: ModuleId.copy(&value.module), span: value.span}
+  })
+  run List<ReportedSite>.append(&mut seen.*, move site)
+  return ()
 }
 
 // Appends one note per root-package body the borrow checker left unchecked, naming the ownership
@@ -1278,12 +1511,28 @@ effect fn appendUncheckedNotes(out: &mut Bytes, sources: &ModuleSources, uncheck
   }
 }
 
-// Writes `rejection` to standard error in `format`.
-effect fn writeRejection(sources: &ModuleSources, rejection: &Shared<Rejection>, format: &DiagnosticFormat) -> ()
+// Writes `rejection` to standard error in `format`, headed as [`writeHeaded`] heads diagnostics.
+effect fn writeRejection(heading: &Option<Bytes>, headed: &mut bool, sources: &ModuleSources, rejection: &Shared<Rejection>, format: &DiagnosticFormat) -> ()
 ! FileError | OutOfMemoryError | WriterError ? &mut FileSystem | &mut Allocator {
   let mut line = Bytes.make()
   let reported = run reportRejection(sources, rejection, format, &mut line)
-  run writeError(Bytes.asSlice(&line))
+  run writeHeaded(heading, &mut headed.*, Bytes.asSlice(&line))
+}
+
+// Writes diagnostics to standard error. When `heading` names a target, a `[<target>]` line comes
+// before the first of them, as `silk check` heads a target's diagnostics; nothing is written for
+// none, so a build without diagnostics prints no heading.
+effect fn writeHeaded(heading: &Option<Bytes>, headed: &mut bool, diagnostics: &[u8]) -> () ! WriterError {
+  if diagnostics.length == usize.ZERO { return () }
+  if let Option<Bytes>.Some {value: target} = &heading.* {
+    if !headed.* {
+      run writeError(b"[")
+      run writeError(Bytes.asSlice(&target))
+      run writeError(b"]\n")
+      headed.* = true
+    }
+  }
+  run writeError(diagnostics)
 }
 
 // The runtime's refusal of the application's `main`, reported at the entry's `main` instead of
@@ -1532,6 +1781,8 @@ effect fn reportRejection(sources: &ModuleSources, diagnostic: &Shared<Rejection
       run Bytes.append(&mut line, b": error[")
       run Bytes.append(&mut line, name)
       run Bytes.append(&mut line, b"]\n")
+    } else if same(name, b"Unsupported") {
+      run Bytes.append(&mut line, b": unsupported: this construct is not supported by the native compiler yet\n")
     } else {
       run Bytes.append(&mut line, b": unsupported[")
       run Bytes.append(&mut line, name)
@@ -1579,7 +1830,7 @@ effect fn test(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displa
   bindings: List<Supplied>, filter: Option<Bytes>, file: Option<Bytes>) -> i32
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Writer | &mut Types {
-  let built = run build(sourcePath, move manifest, output, display, Form.Executable, Stage.Final, move standardLibrary, move profile, move bindings, request, true, false, &Option<Bytes>.none())
+  let built = run build(sourcePath, move manifest, output, display, Form.Executable, Stage.Final, move standardLibrary, move profile, move bindings, request, true, false, &Option<Bytes>.none(), &Option<Bytes>.none())
   let identities = match move built {
     Compiled.Finished {status} => { return status }
     Compiled.Tests {identities} => move identities
@@ -1700,7 +1951,7 @@ effect fn buildSource(sourcePath: &Path, output: &Path, stage: Option<Stage>, st
     return run invalidBuildProfile()
   }
   let automatic = SupplyRequest.Automatic
-  let built = run build(sourcePath, Option<&Path>.none(), output, &directory, form, selected, move standardLibrary, move profile, List<Supplied>.make(), &automatic, false, stats, clang)
+  let built = run build(sourcePath, Option<&Path>.none(), output, &directory, form, selected, move standardLibrary, move profile, List<Supplied>.make(), &automatic, false, stats, clang, &Option<Bytes>.none())
   return match move built {
     Compiled.Finished {status} => status
     Compiled.Tests {identities} => {
@@ -2009,14 +2260,14 @@ effect fn projectPlans(project: &Project, options: &ProjectOptions, fallback: &[
 }
 
 // Builds one planned compilation into `<output-dir>/llvm/<target>/<profile>/`, where the profile
-// directory is `debug`, `release` or `release-with-debug` from the plan's optimization and debug
-// information, in the form and stage the manifest selects and with the file name
+// directory is the named project profile the plan builds, or else `debug`, `release` or
+// `release-with-debug` from the plan's optimization and debug information, in the form and stage the manifest selects and with the file name
 // `Projects.artifact` gives. A plan whose profile names no artifact takes the manifest's form.
 // Only the host target links an executable, and a shared library is not native yet.
-effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>) -> ProjectArtifact
+effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, headed: bool) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
-  let ProjectPlan {input: planned, bindings} = move plan
+  let ProjectPlan {input: planned, bindings, name: profileNamed} = move plan
   let form = Projects.form(project)
   let stage = Projects.stage(project)
   let mut input = move planned
@@ -2033,8 +2284,8 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
     Option<bool>.Some {value} => value
     Option<bool>.None => run invalidBuildProfile()
   }
-  let profileName = Projects.profileName(optimization, debug)
-  let path = run Projects.artifact(project, Target.name(&target), profileName)
+  let profileName = run Projects.profileDirectory(&profileNamed, optimization, debug)
+  let path = run Projects.artifact(project, Target.name(&target), Bytes.asSlice(&profileName))
   if form == Form.SharedLibrary {
     run writeError(b"SILK_GAP artifact-form: the ")
     run writeError(Projects.formSpelling(form))
@@ -2056,7 +2307,10 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
     Option<Path>.Some {value} => Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
     Option<Path>.None => Option<Path>.none()
   }
-  let built = run build(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), &path, Projects.directory(project), form, stage, move library, move profile, move bindings, Projects.supply(project), false, false, &Option<Bytes>.none())
+  // A headed build names its target before its diagnostics, as `silk check` does.
+  let mut heading = Option<Bytes>.none()
+  if headed { heading = Option<Bytes>.some(run Bytes.copy(Target.name(&target))) }
+  let built = run build(Projects.entry(project), Option<&Path>.some(Projects.manifest(project)), &path, Projects.directory(project), form, stage, move library, move profile, move bindings, Projects.supply(project), false, false, &Option<Bytes>.none(), &heading)
   return match move built {
     Compiled.Finished {status} => ProjectArtifact {status: status, target: target, path: move path}
     Compiled.Tests {identities} => {
@@ -2139,7 +2393,7 @@ effect fn buildOne(project: &Project, options: &ProjectOptions, standardLibrary:
   let mut attempts = List<ProjectArtifact>.make()
   while List<ProjectPlan>.length(&plans) > usize.ZERO {
     let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
-    run List<ProjectArtifact>.append(&mut attempts, run buildProjectTarget(project, move plan, standardLibrary))
+    run List<ProjectArtifact>.append(&mut attempts, run buildProjectTarget(project, move plan, standardLibrary, false))
   }
   let attempted = List<ProjectArtifact>.asSlice(&attempts)
   let mut succeeded = usize.ZERO
@@ -2193,7 +2447,7 @@ effect fn writeDiagnostics(target: &Target, json: bool, diagnostics: &Bytes) -> 
 effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Option<Path>, json: bool) -> ProjectArtifact
 ! ApplicationError | InitialProfileProblem | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
-  let ProjectPlan {input: planned, bindings} = move plan
+  let ProjectPlan {input: planned, bindings, name: _} = move plan
   let mut input = move planned
   if let Option<Bytes>.None = &input.artifact {
     input.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(Projects.form(project))))
@@ -2238,12 +2492,16 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   let checked = run Semantic.checkDeclarations(&mut store, &mut request, List<ModuleId>.asSlice(&rootPackage), &runtime)
   let syntax = run Semantic.syntaxRejections(&store)
   let malformed = List<Shared<Rejection>>.asSlice(&syntax)
+  // A diagnostic several answers reach, such as an import's refused module, prints once.
+  let mut seen = List<ReportedSite>.make()
   let mut at = usize.ZERO
   while at < malformed.length {
-    status = worse(status, run reportRejection(&sources, &malformed[at], &format, &mut out))
+    if !run repeated(&mut seen, &malformed[at]) {
+      status = worse(status, run reportRejection(&sources, &malformed[at], &format, &mut out))
+    }
     at = at + usize.ONE
   }
-  status = worse(status, run reportedImportRejections(&mut store, &mut request, &sources, &format, &mut out))
+  status = worse(status, run reportedImportRejections(&mut store, &mut request, &sources, &format, &mut out, &mut seen))
   // Malformed syntax leaves later phases without a complete tree, so their refusals of the
   // recovered constructs are not reported next to the syntax errors that caused them.
   let parsed = malformed.length == usize.ZERO
@@ -2251,12 +2509,20 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
   at = usize.ZERO
   while at < rejected.length {
     if parsed || diagnosticStatus(&rejected[at]) == 1 {
-      status = worse(status, run reportRejection(&sources, &rejected[at], &format, &mut out))
+      if !run repeated(&mut seen, &rejected[at]) {
+        status = worse(status, run reportRejection(&sources, &rejected[at], &format, &mut out))
+      }
     }
     at = at + usize.ONE
   }
   if parsed && List<Shared<Gap>>.length(&checked.gaps) > usize.ZERO {
-    let message = run gapSummary(List<Shared<Gap>>.asSlice(&checked.gaps))
+    // `--json` keeps the machine record; the human format names each gap's location.
+    let mut message = Bytes.make()
+    if json {
+      message = run gapSummary(List<Shared<Gap>>.asSlice(&checked.gaps))
+    } else {
+      message = run gapLines(&sources, List<Shared<Gap>>.asSlice(&checked.gaps), List<ReportedSite>.asSlice(&seen))
+    }
     run Bytes.append(&mut out, Bytes.asSlice(&message))
     status = 2
   }
@@ -2488,8 +2754,18 @@ effect fn runProject(working: &Path, command: RunCommand) -> i32
     return 2
   }
   let standardLibrary = run standardLibraryFor(working, &options.standardLibrary)
-  let built = run buildProjectTarget(&project, move plan, &standardLibrary)
-  if built.status != 0 { return built.status }
+  let built = run buildProjectTarget(&project, move plan, &standardLibrary, true)
+  // A refused build ends as `silk check` ends a failed target; a successful one prints nothing
+  // before the program's own output.
+  if built.status != 0 {
+    let mut summary = run Bytes.copy(b"run ")
+    run Bytes.append(&mut summary, Target.name(&built.target))
+    run Bytes.append(&mut summary, b": failed (exit ")
+    run JsonText.appendDecimal(&mut summary, i32.toUsize(built.status))
+    run Bytes.append(&mut summary, b")\nRun summary: 0 succeeded, 1 failed\n")
+    run writeOutput(Bytes.asSlice(&summary))
+    return built.status
+  }
   let failure = run ProcessImage.replace(&built.path, List<Bytes>.asSlice(&arguments))
   drop failure
   run writeError(b"Cannot run compiled program ")
@@ -2597,7 +2873,7 @@ effect fn testOne(working: &Path, project: &Project, options: &ProjectOptions, r
     Option<List<ProjectPlan>>.None => { return 2 }
   }
   let plan = List<ProjectPlan>.remove(&mut plans, usize.ZERO)
-  let ProjectPlan {input: planned, bindings} = move plan
+  let ProjectPlan {input: planned, bindings, name: profileNamed} = move plan
   let mut input = move planned
   input.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(Form.Executable)))
   let profile = run InitialProfile.freeze(&input)
@@ -2618,7 +2894,8 @@ effect fn testOne(working: &Path, project: &Project, options: &ProjectOptions, r
     Option<bool>.Some {value} => value
     Option<bool>.None => run invalidBuildProfile()
   }
-  let output = run Projects.testExecutable(project, Target.name(&target), Projects.profileName(optimization, debug))
+  let profileName = run Projects.profileDirectory(&profileNamed, optimization, debug)
+  let output = run Projects.testExecutable(project, Target.name(&target), Bytes.asSlice(&profileName))
   if let Option<Path>.Some {value: directory} = move run Path.parent(&output) {
     run FileSystem.createDirectoriesRecursively(&directory)
   }
