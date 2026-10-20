@@ -87,7 +87,7 @@ supplied branch state to exactly one take-once outcome callback:
 Nested `Effect.suspend` transfer may finish within the same activation. External parking
 relinquishes the Execution instead.
 
-**Boundary:** `Running`, registering, `Dormant`, notifying, `Completed`, and `Destroyed`
+**Boundary:** `Running`, registering, latched, `Dormant`, `Completed`, and `Destroyed`
 executions are not driveable. Attempting to drive one is a fatal state trap before either outcome
 callback runs. There is no recoverable “not ready” result.
 
@@ -115,7 +115,8 @@ Signaling or dropping a Wake consumes it. A stale or duplicate Wake cannot publi
 readiness event.
 
 The readiness phase and the park generation are ordinary source policy in `silk.execution`. They
-live in two package control words that the compiler zeroes and never reads. A Wake carries its
+live together in one package control word that the compiler zeroes and never interprets, so one
+compare-exchange checks a Wake's generation and moves its phase (EXEC-009). A Wake carries its
 generation; signaling a Wake whose Execution was dropped, completed, or parked again publishes
 nothing. A cancelled generation's Wake is therefore inert: it can only release its package
 authority.
@@ -139,9 +140,9 @@ Construction accepts only a detached body and detached endpoint state. A detache
 its captured values but retains no caller lexical or provider loan. Stable package-internal loans
 may cross parking; a result cannot return a view into package-owned storage.
 
-**Boundary:** `LocalExecution` permits same-thread suspension, parking, and owner transfer. It does
-not imply thread safety, atomics, locking, parallel execution, or eligibility for a future thread
-transfer operation.
+**Boundary:** `LocalExecution` permits same-thread suspension, parking, and owner transfer. The
+package protocol itself is safe across threads (EXEC-009), but no handle is `Transferable`
+(THREAD-002), so no source operation moves one to another thread yet.
 
 **Diagnostics:** Unsatisfied `Intrinsic.Detached` or `Intrinsic.NonParking` properties report
 `SEM0139` with the retained capture, provider, or parking path. Missing explicit ownership of a
@@ -223,7 +224,8 @@ The compiler recognizes only these sealed target-neutral Execution primitives:
 - `Intrinsic.relinquish` saves the running frame chain and returns the drive through `onSuspend`.
 - `Intrinsic.ExecutionRef` is counted authority over one package allocation. It is obtained with
   `Intrinsic.executionCurrent` or `Intrinsic.executionRefOf`.
-- `Intrinsic.executionLoad` and `Intrinsic.executionStore` access the two source control words.
+- `Intrinsic.executionLoad`, `Intrinsic.executionStore` and `Intrinsic.executionCompareExchange`
+  access the two source control words atomically (EXEC-009).
 - `Intrinsic.executionNotify` invokes the fixed readiness endpoint.
 - `Intrinsic.executionLive` reports whether the Execution handle still exists.
 
@@ -264,3 +266,36 @@ Lifecycle admission failure occurs at runtime as a fatal trap outside Effect fai
 
 **Evidence:** Execution package tests,
 [lifecycle transition actor](../bootstrap/packages/compiler/src/ExecutionTransition.ts).
+
+### EXEC-009 — The package protocol is safe when Wakes are signaled from other threads
+
+**Status:** Confirmed
+
+Every package field that a Wake's thread and the owner's thread can both reach is accessed
+atomically, under the memory model of ATOMIC-001:
+
+| Field | Access |
+| --- | --- |
+| Authority count | A grant adds one with relaxed ordering. A release subtracts one with release ordering, and the holder that released the last unit runs an acquire fence before it drops the allocation. |
+| Lifecycle | The owner's drive and drop store it atomically. Completion and destruction use release stores; `executionLive` loads it with acquire ordering. |
+| Notifying marker | `executionNotify` claims it with a compare-exchange before it checks liveness and runs the endpoint. A drop either claims it first, which makes later notifications run nothing, or leaves itself to the running notification, which performs it after the endpoint returns. |
+| Control words | `executionLoad` is an acquire load, `executionStore` a release store, and `executionCompareExchange` an acquire-release compare-exchange that yields the value it observed. |
+
+`silk.execution` keeps the park generation and the readiness phase in control word 0 as
+`generation * 8 + phase`, and moves between phases only by compare-exchange of that word. A parked
+generation stays `Registering` until its drive returns with the body's frames stored; the drive
+then makes it `Dormant`, or `Eligible` when a signal was latched meanwhile. A signal publishes
+`Eligible` before it runs the readiness endpoint, so the endpoint's queue may hand the Execution to
+an owner that drives it at once. Of any number of racing signals for one generation, exactly one
+runs the endpoint.
+
+**Boundary:** These rules make a later thread-capable owner possible; they do not make any handle
+`Transferable`. On a target built without atomics, such as single-threaded `wasm32`, LLVM lowers
+each access to the plain one.
+
+**Diagnostics:** None. A notification racing a drop runs nothing instead of trapping.
+
+**Evidence:** [ordinary source policy](../stdlib/silk/execution.silk), native corpus
+(`independent-execution-stale-generation-wake`).
+
+**Current compiler:** Aligned.
