@@ -125,6 +125,8 @@ not belong in a language rule unless a program can observe them.
   static specialization, including exact and opaque callable and Effect representations.
 - [Native pointer boundary](native-pointer-boundary.md) — qualified raw addresses, native output
   states, and independently checked C ABI behavior.
+- [Atomic memory operations](atomic-memory-operations.md) — the C++20 memory model, static
+  orderings, atomic loads, stores, read-modify-writes, compare-exchange, and fences.
 - [Unsafe code, intrinsics, and targets](unsafe-intrinsics-and-targets.md) — lexical unsafe
   acknowledgement, caller-owned unsafe contracts, sealed compiler primitives, and reachable target
   availability. Rules are confirmed.
