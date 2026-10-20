@@ -1,7 +1,7 @@
 //! Project source selection and the native formatter command's stable exit classes.
 
 import driver.CommandPath
-import driver.Project as Projects
+import driver.Project as Projects {Member, ProjectError, Workspace}
 import diagnostic.Catalog as Catalog {Code}
 import format.FormatError {FormatError, Reason as FormatReason}
 import format.SourceSyntax
@@ -21,7 +21,7 @@ import silk.result {Result}
 import silk.slice {Slice}
 import silk.string {InvalidUtf8, String}
 import silk.toml_scanner {TomlError}
-import silk.toml_value {Toml}
+import silk.toml_value {Toml, Value as TomlValue}
 import silk.usize
 import silk.list {List}
 import silk.writer {Writer, WriterError}
@@ -34,7 +34,7 @@ pub struct Command {
   pub manifest: Option<Bytes>
 }
 
-pub enum Reason { InvalidArgument, MissingProject, InvalidRoot, InvalidVersion, OutsideRoot, InvalidSelection, InvalidEncoding }
+pub enum Reason { InvalidArgument, MissingProject, InvalidRoot, InvalidVersion, OutsideRoot, InvalidSelection, InvalidEncoding, InvalidWorkspace }
 
 /// A request or project-selection failure before any source is rewritten.
 pub struct CommandError {
@@ -182,32 +182,79 @@ effect fn packageRoot(manifest: &Path, contents: &Bytes) -> Path
   return run reject(Reason.InvalidRoot, Path.rawBytes(manifest))
 }
 
-// The source root of the manifest `self` names, else of the nearest `silk.toml` at or above
-// `working`.
-effect fn sourceRoot(self: &Command, working: &Path) -> Path
+// The source roots of the manifest `self` names, else of the nearest `silk.toml` at or above
+// `working`: its package's, or, for a manifest that only defines a workspace, the source root of
+// each member that has a `[package].root`.
+effect fn sourceRoots(self: &Command, working: &Path) -> List<Path>
 ! CommandError | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut manifest = run Path.root()
+  let mut contents = Bytes.make()
   if let Option<Bytes>.Some {value: written} = &self.manifest {
-    let manifest = run resolve(working, Bytes.asSlice(&written))
-    return match move run readOptional(&manifest) {
-      Option<Bytes>.Some {value} => run packageRoot(&manifest, &value)
+    manifest = run resolve(working, Bytes.asSlice(&written))
+    contents = match move run readOptional(&manifest) {
+      Option<Bytes>.Some {value} => move value
       Option<Bytes>.None => run reject(Reason.MissingProject, Path.rawBytes(&manifest))
     }
-  }
-  let mut directory = run Path.fromBytes(Path.rawBytes(working))
-  while true {
-    let manifest = run Path.join(&directory, "silk.toml")
-    let contents = run readOptional(&manifest)
-    if let Option<Bytes>.Some {value} = move contents {
-      return run packageRoot(&manifest, &value)
+  } else {
+    let mut directory = run Path.fromBytes(Path.rawBytes(working))
+    while true {
+      let candidate = run Path.join(&directory, "silk.toml")
+      if let Option<Bytes>.Some {value} = move run readOptional(&candidate) {
+        manifest = move candidate
+        contents = move value
+        break
+      }
+      let parent = run Path.parent(&directory)
+      if let Option<Path>.Some {value} = move parent {
+        directory = move value
+      } else {
+        return run reject(Reason.MissingProject, Path.rawBytes(working))
+      }
     }
-    let parent = run Path.parent(&directory)
-    if let Option<Path>.Some {value} = move parent {
-      directory = move value
-    } else {
-      return run reject(Reason.MissingProject, Path.rawBytes(working))
+  }
+  let mut roots = List<Path>.make()
+  let document = run Toml.parse(Bytes.asSlice(&contents))
+  let packaged = match move Toml.field(&document, "package") {
+    Option<&TomlValue>.Some {value: _} => true
+    Option<&TomlValue>.None => false
+  }
+  let grouped = match move Toml.field(&document, "workspace") {
+    Option<&TomlValue>.Some {value: _} => true
+    Option<&TomlValue>.None => false
+  }
+  if packaged || !grouped {
+    run List<Path>.append(&mut roots, run packageRoot(&manifest, &contents))
+    return move roots
+  }
+  let loaded = run Effect.result(Projects.workspace(&manifest))
+  let workspace = match move loaded {
+    Result<Option<Workspace>, ProjectError | FileError | OutOfMemoryError>.Success {value} => match move value {
+      Option<Workspace>.Some {value: found} => move found
+      Option<Workspace>.None => run reject(Reason.InvalidRoot, Path.rawBytes(&manifest))
+    }
+    Result<Option<Workspace>, ProjectError | FileError | OutOfMemoryError>.Failure {error} => match move error {
+      ProjectError invalid => {
+        drop invalid
+        return run reject(Reason.InvalidWorkspace, Path.rawBytes(&manifest))
+      }
+      FileError failure => { fail move failure }
+      OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  return run reject(Reason.MissingProject, Path.rawBytes(working))
+  let members = List<Member>.asSlice(&workspace.members)
+  let mut at = usize.ZERO
+  while at < members.length {
+    if members[at].rooted {
+      let member = run Path.join(&members[at].directory, "silk.toml")
+      let text = match move run readOptional(&member) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => run reject(Reason.MissingProject, Path.rawBytes(&member))
+      }
+      run List<Path>.append(&mut roots, run packageRoot(&member, &text))
+    }
+    at = at + usize.ONE
+  }
+  return move roots
 }
 
 fn within(root: &Path, candidate: &Path) -> bool {
@@ -269,23 +316,33 @@ effect fn walk(selected: &mut List<Path>, root: &Path, directory: &Path) -> ()
 }
 
 /// Selects sorted, duplicate-free exact `.silk` files under the package's source root: the
-/// manifest `--manifest-path` names, else the nearest one.
+/// manifest `--manifest-path` names, else the nearest one. At a manifest that only defines a
+/// workspace, every member's source root is selected from.
 pub effect fn select(self: &Command, working: &Path) -> List<Path>
 ! CommandError | FileError | TomlError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let root = run sourceRoot(self, working)
+  let found = run sourceRoots(self, working)
+  let roots = List<Path>.asSlice(&found)
   let mut selected = List<Path>.make()
   let arguments = List<Bytes>.asSlice(&self.paths)
   if arguments.length == 0 {
-    run walk(&mut selected, &root, &root)
+    let mut index = usize.ZERO
+    while index < roots.length {
+      run walk(&mut selected, &roots[index], &roots[index])
+      index = index + usize.ONE
+    }
     return move selected
   }
   let mut at: usize = 0
   while at < arguments.length {
     let path = run resolve(working, Bytes.asSlice(&arguments[at]))
-    if !within(&root, &path) { return run reject(Reason.OutsideRoot, Path.rawBytes(&path)) }
+    let mut owner = usize.ZERO
+    while owner < roots.length && !within(&roots[owner], &path) {
+      owner = owner + usize.ONE
+    }
+    if owner == roots.length { return run reject(Reason.OutsideRoot, Path.rawBytes(&path)) }
     let info = run FileSystem.stat(&path)
     match move info {
-      DirectoryInfo directory => { run walk(&mut selected, &root, &path) }
+      DirectoryInfo directory => { run walk(&mut selected, &roots[owner], &path) }
       FileInfo file => {
         if !silkFile(&path) { return run reject(Reason.InvalidSelection, Path.rawBytes(&path)) }
         run include(&mut selected, move path)
@@ -512,6 +569,7 @@ fn reasonName(reason: Reason) -> &'static [u8] {
     Reason.OutsideRoot => b"selection is outside the package source root"
     Reason.InvalidSelection => b"expected a directory or exact .silk file"
     Reason.InvalidEncoding => b"path is not valid UTF-8"
+    Reason.InvalidWorkspace => b"invalid [workspace]; run silk check there for the details"
   }
 }
 

@@ -872,6 +872,9 @@ const program = Effect.gen(function* () {
     yield* fs.readFileString(join(managed, 'silk.toml')),
     '[workspace]\nmembers = ["apps/hello", "libs/greeting"]\n',
   )
+  // Members build into the workspace's output directory, which only the workspace ignores.
+  assert.equal(yield* fs.exists(join(managed, '.gitignore')), true)
+  assert.equal(yield* fs.exists(join(managed, 'apps/hello/.gitignore')), false)
   const added = yield* invoke(silk, ['add', '../../libs/greeting'], join(managed, 'apps/hello'))
   assert.equal(added.status, 0, added.stderr)
   assert.match(
@@ -881,6 +884,13 @@ const program = Effect.gen(function* () {
   const again = yield* invoke(silk, ['add', '../../libs/greeting'], join(managed, 'apps/hello'))
   assert.notEqual(again.status, 0, 'a dependency was added twice')
   assert.match(again.stderr, /already has a dependency of that name/)
+  const cycle = yield* invoke(silk, ['add', '../../apps/hello'], join(managed, 'libs/greeting'))
+  assert.notEqual(cycle.status, 0, 'a dependency cycle was added')
+  assert.match(
+    cycle.stderr,
+    /hello@0\.1\.0 depends on greeting@0\.1\.0, which depends on hello@0\.1\.0 in turn/,
+  )
+  assert.doesNotMatch(yield* fs.readFileString(join(managed, 'libs/greeting/silk.toml')), /hello/)
   yield* fs.writeFileString(
     join(managed, 'apps/hello/src/main.silk'),
     'import greeting.lib { add }\n\npub fn main() -> i32 {\n  return add(4, 3)\n}\n',
@@ -892,7 +902,8 @@ const program = Effect.gen(function* () {
     withClang,
   )
   assert.equal(managedBuild.status, 0, managedBuild.stderr + managedBuild.stdout)
-  assert.match(managedBuild.stdout, /^Package hello \(.*\)\n[\s\S]*^Package greeting \(/m)
+  // Members build in dependency order, whatever order `members` lists them in.
+  assert.match(managedBuild.stdout, /^Package greeting \(.*\)\n[\s\S]*^Package hello \(/m)
   assert.match(managedBuild.stdout, /Workspace summary: 2 packages succeeded, 0 failed\n$/)
   const managedRun = yield* invoke(
     silk,
@@ -901,6 +912,11 @@ const program = Effect.gen(function* () {
     withClang,
   )
   assert.equal(managedRun.status, 7, managedRun.stderr)
+  // With one executable member, `run` at the root runs it.
+  const onlyRunnable = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)
+  assert.equal(onlyRunnable.status, 7, onlyRunnable.stderr)
+  const other = yield* invoke(silk, ['init', 'apps/other'], managed)
+  assert.equal(other.status, 0, other.stderr)
   const unchosen = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, {
     ...process.env,
     SILK_CLANG: sentinel,
@@ -922,7 +938,7 @@ const program = Effect.gen(function* () {
     join(managed, 'apps/hello'),
   )
   assert.equal(managedCheck.status, 0, managedCheck.stderr + managedCheck.stdout)
-  assert.match(managedCheck.stdout, /Workspace summary: 2 packages succeeded, 0 failed/)
+  assert.match(managedCheck.stdout, /Workspace summary: 3 packages succeeded, 0 failed/)
   const unknownMember = yield* invoke(
     silk,
     ['build', '-p', 'nope', '--stdlib', standardLibrary],
@@ -931,13 +947,29 @@ const program = Effect.gen(function* () {
   assert.notEqual(unknownMember.status, 0, 'an unknown member was selected')
   assert.match(
     unknownMember.stderr,
-    /has no package named `nope`\nsilk: its members are: hello, greeting\n/,
+    /has no package named `nope`\nsilk: its members are: greeting, hello, other\n/,
   )
+  // `format` and `doc` at the root cover every member.
+  const managedFormat = yield* invoke(silk, ['format'], managed)
+  assert.equal(managedFormat.status, 0, managedFormat.stderr + managedFormat.stdout)
+  const managedFormatCheck = yield* invoke(silk, ['format', '--check'], managed)
+  assert.equal(managedFormatCheck.status, 0, managedFormatCheck.stderr + managedFormatCheck.stdout)
+  const managedDoc = yield* invoke(silk, ['doc', '--stdlib-root', standardLibrary], managed)
+  assert.equal(managedDoc.status, 0, managedDoc.stderr + managedDoc.stdout)
+  assert.equal(yield* fs.exists(join(managed, 'build/documentation/greeting.json')), true)
+  assert.equal(yield* fs.exists(join(managed, 'build/documentation/hello.json')), true)
+  const oneFile = yield* invoke(
+    silk,
+    ['doc', '--stdlib-root', standardLibrary, '--output', 'x.json'],
+    managed,
+  )
+  assert.notEqual(oneFile.status, 0, 'one --output file was written for a whole workspace')
   const dropped = yield* invoke(silk, ['remove', 'greeting'], join(managed, 'apps/hello'))
   assert.equal(dropped.status, 0, dropped.stderr)
+  // The emptied [dependencies] table goes with its last entry.
   assert.doesNotMatch(
     yield* fs.readFileString(join(managed, 'apps/hello/silk.toml')),
-    /greeting = /,
+    /greeting = |\[dependencies\]/,
   )
   const managedClean = yield* invoke(silk, ['clean'], managed)
   assert.equal(managedClean.status, 0, managedClean.stderr)
