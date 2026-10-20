@@ -491,8 +491,9 @@ pub struct Signature {
   pub staticSlots: List<usize>
   /// The environment of the Effect constructed by calling an `effect fn`. It is either written, or
   /// elaborated from the captured inputs as the intersection of the regions they retain (`'static`
-  /// when they retain none). An `effect fn` whose omitted environment would retain generic stored
-  /// contents is rejected, so an `effect fn` always has one. `None` means an ordinary function.
+  /// when they retain none), with one elaborated lifetime binder bounding the inputs whose stored
+  /// contents are generic. An anonymous `effect fn` with such inputs is rejected, so an `effect fn`
+  /// always has one. `None` means an ordinary function.
   pub environment: Option<Intersection>
   /// Whether `environment` was written (LIFE-004). The body then assumes every input outlives it,
   /// so a call owes that (`impliedSignatureBounds`); an elaborated one holds of its inputs already.
@@ -9021,10 +9022,12 @@ effect fn requireMember(
           }
         }
       }
-      run Row.require(
-        &mut row.*,
-        Requirement {capability: move capability, roleType: move roleType, access: access},
-      )
+      let requirement = Requirement {capability: move capability, roleType: move roleType, access: access}
+      // One key is required once: `&S | &mut S` would silently mean only `&mut S`.
+      if run Row.accessConflict(&row.*, &requirement) {
+        return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.ConflictingRequirementAccess, span))
+      }
+      run Row.require(&mut row.*, move requirement)
       return Option<Shared<Rejection>>.none()
     }
     if let Node.NamedType {path: written, hasMode, ..} = value.header {
@@ -22234,6 +22237,7 @@ effect fn resolveSignatureUnder(
   let mut retained = List<Shared<Lifetime>>.make()
   let mut hasUnknown = false
   let mut unknownSpan = Span.make(usize.ZERO, usize.ZERO)
+  let mut unknownInputs = List<Shared<Type>>.make()
   let entries = List<HirId>.asSlice(&value.parameters)
   let mut at = usize.ZERO
   while at < entries.length {
@@ -22285,18 +22289,48 @@ effect fn resolveSignatureUnder(
       hasUnknown = true
       unknownSpan = run parameterSpanOr(&mut resolver.*, &module, entries[at], unknownSpan)
     }
+    if !known { run List<Shared<Type>>.append(&mut unknownInputs, Shared<Type>.clone(&ty)) }
     run List<Shared<Type>>.append(&mut parameters, move ty)
     at = at + usize.ONE
+  }
+  // A named `effect fn` capturing an input whose stored contents involve a type parameter retains
+  // them for a region no written lifetime names. It elaborates one more lifetime binder for them,
+  // as an elided input lifetime does, bounded by each such input's contents (`A: 'env`): exactly
+  // `effect<'env> fn f<A: 'env, 'env>`, except that the environment still meets every other input's
+  // regions. The body assumes the bounds and every call proves them.
+  let ownerKind = DeclarationId.kind(&signatureOwner)
+  if value.isEffect && !value.environment.present && hasUnknown && ownerKind != OwnerKind.EffectBlock
+    && ownerKind != OwnerKind.Anonymous {
+    let contents = match move run elidedLifetime(&mut resolver.*, &module, unknownSpan, &mut elision) {
+      Result<Shared<Lifetime>, Shared<Rejection>>.Success {value: region} => move region
+      Result<Shared<Lifetime>, Shared<Rejection>>.Failure {error} => { return run memberRejected(move error, move dependencies) }
+    }
+    // Bounds are resolved as the application instantiates them (`boundSupplied` above).
+    let applied = run Type.applyLifetimeBindings(&contents, contextBindings)
+    let inputs = List<Shared<Type>>.asSlice(&unknownInputs)
+    let mut inputAt = usize.ZERO
+    while inputAt < inputs.length {
+      let bound = Constraint.Contents {subject: run Type.applyBindings(&inputs[inputAt], contextBindings, true),
+        region: Shared<Lifetime>.clone(&applied)}
+      if let Option<List<Constraint>>.Some {value: assumed} = &mut elision.assumptions {
+        run List<Constraint>.append(&mut assumed, copyConstraint(&bound))
+      }
+      run List<Constraint>.append(&mut constraints, move bound)
+      inputAt = inputAt + usize.ONE
+    }
+    run List<Shared<Lifetime>>.append(&mut retained, move contents)
+    hasUnknown = false
   }
   let mut result = run Types.intern(Type.Unit)
   elision.output = true
   // An `effect fn` captures every input, so its omitted environment is the intersection of the
   // regions its inputs retain: borrows, nominal lifetime arguments, and callable or Effect
   // environments, including a representation parameter's contract environment; `'static` when
-  // they retain none. A callable's or Effect's channels are not stored, but stored contents
-  // involving any other type parameter have no nameable region, so the environment must be
-  // written. An anonymous effect callable instead derives its intersection from its capture
-  // validity and the inputs it retains; generic contents keep their own outlives obligations.
+  // they retain none. A callable's or Effect's channels are not stored; stored contents involving
+  // any other type parameter retain the binder elaborated for them above. An anonymous `effect fn`
+  // has no binder to elaborate, so its environment must be written. An effect block instead
+  // derives its intersection from its capture validity and the inputs it retains; generic contents
+  // keep their own outlives obligations.
   if value.isEffect && !value.environment.present {
     if hasUnknown && DeclarationId.kind(&signatureOwner) != OwnerKind.EffectBlock {
       return run memberRejected(
@@ -29279,8 +29313,7 @@ effect fn finishInterfaceCall(resolver: &mut Resolver, owner: &mut Query<Answer,
   let mut pinned = List<usize>.make()
   let mut pinnedAt = usize.ZERO
   while pinnedAt < binderCount {
-    if !shortening || !containsOrdinal(&defaulted, pinnedAt) || Shared<Result<Answer, NoRejection>>.with<usize>(signature,
-      fn(answer: &Result<Answer, NoRejection>) -> usize { return outlivesBoundCount(answer, &operation, pinnedAt) }) > usize.ONE {
+    if !shortening || !containsOrdinal(&defaulted, pinnedAt) {
       run List<usize>.append(&mut pinned, pinnedAt)
     }
     pinnedAt = pinnedAt + usize.ONE
@@ -33019,6 +33052,122 @@ fn pendingOriginContext(value: &Option<Shared<Type>>) -> bool {
   return match &value.* { Option<Shared<Type>>.Some {value: pending} => pendingCallableSelection(&pending) _ => false }
 }
 
+// Bindings an operand fixes by moving binders earlier operands fixed, with the relations they owe.
+struct ReboundArgument {
+  bindings: List<Binding>
+  relations: List<RegionPair>
+}
+
+// An operand whose parameter is the only one observing an inferred lifetime binder invariantly, as
+// `out` of `stash<'a>(src: &'a i32, out: &mut Holder<'a>)`, fixes that binder to its own region
+// when an earlier operand fixed it differently, so inference does not depend on parameter order.
+// Every other parameter stores the binder covariantly, so each earlier operand offered a region the
+// old binding is no longer than; the relation `old: new` (`admitsRegion`) then carries each of them
+// to the new binding by subtyping, exactly as when this operand comes first. A written binder, a
+// call loan still being inferred and a binder a requirement row observes never move; the call
+// proves its bounds again on the final bindings.
+effect fn reboundInvariantBinders(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  parameter: &Shared<Type>, actual: &Shared<Type>, signature: &Shared<Result<Answer, NoRejection>>,
+  fresh: &DeclarationId, caller: &DeclarationId, variables: &[Shared<DeclarationId>], bindings: &[Binding],
+  explicit: &[usize], constraints: &[Constraint], span: Span,
+) -> Option<ReboundArgument>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut types = List<usize>.make()
+  let mut named = List<usize>.make()
+  let mut rows = List<usize>.make()
+  run Type.collectOwned(parameter, fresh, &mut types, &mut named, &mut rows)
+  let parameters = run signatureParameterTypes(signature)
+  let listed = List<Shared<Type>>.asSlice(&parameters)
+  let mut current = List<Shared<Type>>.make()
+  run List<Shared<Type>>.append(&mut current, Shared<Type>.clone(parameter))
+  let mut moved = List<usize>.make()
+  let mut trial = List<Binding>.make()
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    let ordinal = bindings[at].ordinal
+    let own = Shared<DeclarationId>.with<bool>(&bindings[at].declaration, fn(declared: &DeclarationId) -> bool {
+      return DeclarationId.equals(declared, fresh)
+    })
+    let mut candidate = own && containsOrdinal(&named, ordinal) && !fixedOrdinal(explicit, ordinal)
+    if candidate {
+      candidate = match &bindings[at].value {
+        Argument.Lifetime {value} => !variableCallLoan(&value, variables)
+        _ => false
+      }
+    }
+    if candidate {
+      candidate = !run storedCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+        List<Shared<Type>>.asSlice(&current), fresh, ordinal, span)
+    }
+    if candidate {
+      let mut invariant = usize.ZERO
+      let mut position = usize.ZERO
+      while position < listed.length {
+        let mut single = List<Shared<Type>>.make()
+        run List<Shared<Type>>.append(&mut single, Shared<Type>.clone(&listed[position]))
+        if !run storedCovariantly(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+          List<Shared<Type>>.asSlice(&single), fresh, ordinal, span) { invariant = invariant + usize.ONE }
+        position = position + usize.ONE
+      }
+      candidate = invariant == usize.ONE
+    }
+    if candidate {
+      run List<usize>.append(&mut moved, ordinal)
+    } else {
+      run List<Binding>.append(&mut trial, Binding {declaration: Shared<DeclarationId>.clone(&bindings[at].declaration),
+        ordinal: ordinal, value: Argument.copy(&bindings[at].value)})
+    }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&moved) == usize.ZERO { return Option<ReboundArgument>.none() }
+  let unified = match move run Type.unify(parameter, actual, variables, Comparison.Exact, &mut trial) {
+    Unification.Unified => true
+    _ => false
+  }
+  if !unified { return Option<ReboundArgument>.none() }
+  // Keep the original order so `rowObservesShortenedBinder` compares each binder with itself.
+  let mut rebound = List<Binding>.make()
+  let mut relations = List<RegionPair>.make()
+  at = usize.ZERO
+  while at < bindings.length {
+    let mut value = Argument.copy(&bindings[at].value)
+    if containsOrdinal(&moved, bindings[at].ordinal) && Shared<DeclarationId>.with<bool>(&bindings[at].declaration,
+      fn(declared: &DeclarationId) -> bool { return DeclarationId.equals(declared, fresh) }) {
+      let old = match &bindings[at].value {
+        Argument.Lifetime {value: region} => Shared<Lifetime>.clone(&region)
+        _ => { return Option<ReboundArgument>.none() }
+      }
+      let fixed = match move bindingArgument(List<Binding>.asSlice(&trial), fresh, bindings[at].ordinal) {
+        Option<Argument>.Some {value: Argument.Lifetime {value: region}} => move region
+        _ => { return Option<ReboundArgument>.none() }
+      }
+      if !Lifetime.equalsShared(&old, &fixed) && !run admitsRegion(&old, &fixed, caller, constraints, &mut relations) {
+        return Option<ReboundArgument>.none()
+      }
+      value = Argument.Lifetime {value: move fixed}
+    }
+    run List<Binding>.append(&mut rebound, Binding {declaration: Shared<DeclarationId>.clone(&bindings[at].declaration),
+      ordinal: bindings[at].ordinal, value: move value})
+    at = at + usize.ONE
+  }
+  let solved = List<Binding>.asSlice(&trial)
+  at = usize.ZERO
+  while at < solved.length {
+    let declared = DeclarationId.copyShared(&solved[at].declaration)
+    let known = match move bindingArgument(bindings, &declared, solved[at].ordinal) { Option<Argument>.Some {..} => true _ => false }
+    if !known {
+      run List<Binding>.append(&mut rebound, Binding {declaration: Shared<DeclarationId>.clone(&solved[at].declaration),
+        ordinal: solved[at].ordinal, value: Argument.copy(&solved[at].value)})
+    }
+    at = at + usize.ONE
+  }
+  if run rowObservesShortenedBinder(signature, fresh, bindings, List<Binding>.asSlice(&rebound)) {
+    return Option<ReboundArgument>.none()
+  }
+  return Option<ReboundArgument>.some(ReboundArgument {bindings: move rebound, relations: move relations})
+}
+
 // Direct calls and qualified operations use the same region inference and proof retention.
 effect fn matchArgumentRegions(
   resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
@@ -33153,6 +33302,29 @@ effect fn matchArgumentRegions(
             List<RegionPair>.asSlice(&candidate.relations)) {
             failed = Option<Shared<Rejection>>.none()
           }
+        }
+      }
+    }
+  }
+  // A remaining mismatch may be the one invariant position of a binder an earlier operand fixed
+  // covariantly; this operand then fixes it, and the earlier operands relate to it.
+  let mut reboundable = false
+  if let Option<Shared<Rejection>>.Some {value} = &failed {
+    reboundable = !inferredRepresentation && Shared<Rejection>.with<bool>(&value, fn(rejection: &Rejection) -> bool {
+      return valueMismatchReason(rejection.code)
+    })
+  }
+  if reboundable {
+    let rebound = run reboundInvariantBinders(&mut resolver.*, &mut owner.*, &mut dependencies.*, parameter, actual,
+      signature, fresh, caller, variables, List<Binding>.asSlice(&inferred.*), explicit, constraints, callSpan)
+    if let Option<ReboundArgument>.Some {value: ReboundArgument {bindings: candidateBindings, relations: candidateRelations}} = move rebound {
+      let mut trial = move candidateBindings
+      let admitted = run matchCallArgument(&resolver.*, module, callSpan, parameter, actual, variables, &mut trial,
+        constraints, RejectionCode.TypeMismatch)
+      if let Option<Shared<Rejection>>.None = move admitted {
+        if run retainRegionPairs(&mut resolver.*, origin, List<RegionPair>.asSlice(&candidateRelations)) {
+          inferred.* = move trial
+          failed = Option<Shared<Rejection>>.none()
         }
       }
     }
@@ -35286,34 +35458,13 @@ effect fn boundShortenedBinders(
   }
 }
 
-// How many bounds of a call signature require something to outlive its fresh lifetime binder
-// `ordinal`: each `'longer: 'binder` and each `T: 'binder`.
-fn outlivesBoundCount(answer: &Result<Answer, NoRejection>, fresh: &DeclarationId, ordinal: usize) -> usize {
-  let mut count = usize.ZERO
-  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
-    if let Outcome.Success {value: Value.Signature {signature}} = &value.outcome {
-      let listed = List<Constraint>.asSlice(&signature.constraints)
-      let mut at = usize.ZERO
-      while at < listed.length {
-        let bounded = match &listed[at] {
-          Constraint.Outlives {shorter, ..} => freshLifetimeOrdinal(&shorter, fresh) == ordinal
-          Constraint.Contents {region, ..} => freshLifetimeOrdinal(&region, fresh) == ordinal
-          _ => false
-        }
-        if bounded { count = count + usize.ONE }
-        at = at + usize.ONE
-      }
-    }
-  }
-  return count
-}
-
 // An inferred lifetime binder that a `'longer: 'binder` bound names shortens to the meet of its held
 // region and 'longer when the premises do not already prove the bound, exactly as a `T: 'binder`
 // bound shortens it (`boundShortenedBinders`): the bootstrap's region inference chooses the
 // shortest region (LIFE-002). A section of `effect<'held> fn f<'data: 'held, 'held>` whose captures
 // are owned holds no region, so 'held starts 'static and shortens to the 'data its remaining operand
-// lends; a call's result-only binder under `'b: 'a` shortens to the region its argument lends 'b.
+// lends; a call's result-only binder under `'b: 'a` shortens to the region its argument lends 'b,
+// and under several bounds, as `'a: 'c, 'b: 'c`, to the meet of every region they name.
 // A written binder, listed in `explicit`, never moves and every parameter must store the binder covariantly; the
 // bound proof then runs on the shortened binding. Reports whether any binder shortened.
 effect fn outlivesShortenedBinders(
@@ -43919,8 +44070,9 @@ effect fn checkRun<'scope>(
       }
       at = at + usize.ONE
     }
-    let coverage = run Row.covers(&enclosing.requirements, &channels.requirements)
-    if coverage != RowCoverage.Covered {
+    // A declared `?S in R` premise covers what it bounds, as at a call that proves it.
+    let premises = run rowPremises(constraints)
+    if !run Row.knownSubset(&channels.requirements, &enclosing.requirements, List<RowPremise>.asSlice(&premises)) {
       return run bodyRejection(&resolver.*, module, RejectionCode.UnhandledRequirement, span)
     }
   }
@@ -49651,15 +49803,13 @@ Option<Shared<StaticData>>,
   run boundShortenedBinders(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &inference, &freshOwner,
     &mut inferred, explicitOrdinals, constraints, caller, expression, span, &run cursorAnchor(cursor))
   // A binder shortens only in a runtime body with an enforced completion proof
-  // (`BodyFrame.shortened`), and only when one bound names it (`outlivesBoundCount`): the meet of
-  // several bounds' regions is held to no single loan.
+  // (`BodyFrame.shortened`). Under several bounds it shortens to the meet of their longer regions,
+  // the longest region every bound still proves; the borrow check holds each loan of that meet.
   let shortening = !staticBody && finiteResultBodyFrame(&resolver.*, caller)
   let mut pinnedOrdinals = List<usize>.make()
   let mut pinnedAt = usize.ZERO
   while pinnedAt < originalBinderCount {
-    if !shortening || !containsOrdinal(&defaultedOrdinals, pinnedAt) || fixedOrdinal(explicitOrdinals, pinnedAt)
-      || Shared<Result<Answer, NoRejection>>.with<usize>(&inference,
-        fn(answer: &Result<Answer, NoRejection>) -> usize { return outlivesBoundCount(answer, &freshOwner, pinnedAt) }) > usize.ONE {
+    if !shortening || !containsOrdinal(&defaultedOrdinals, pinnedAt) || fixedOrdinal(explicitOrdinals, pinnedAt) {
       run List<usize>.append(&mut pinnedOrdinals, pinnedAt)
     }
     pinnedAt = pinnedAt + usize.ONE
