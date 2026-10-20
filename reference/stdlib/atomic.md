@@ -332,6 +332,62 @@ Stores the larger of the pointee and `value`, and returns the previous value.
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
 
+<a id="Atomic.impl.wait"></a>
+
+### Associated function `wait`
+
+```silk
+pub unsafe fn wait(pointer: *const u32, expected: u32, timeout: Option<u64>) -> bool
+```
+
+Blocks while the pointee equals `expected`, until a notify, the timeout, or a spurious wakeup.
+
+#### Details
+
+The comparison and the sleep are one atomic step against [`Atomic.notifyOne`](#Atomic.impl.notifyOne) and
+[`Atomic.notifyAll`](#Atomic.impl.notifyAll), so a notify after a store that changed the pointee is never lost.
+`timeout` is a relative bound in nanoseconds; `Option.None` waits without one. Returns
+`false` only when the timeout elapsed. A `true` result promises nothing about the pointee:
+callers recheck their condition in a loop.
+
+#### Gotchas
+
+Single-threaded WebAssembly has no other thread to change the pointee, so a wait that would
+sleep without a timeout traps, and one with a timeout returns `false` at once.
+
+#### Safety
+
+The pointer must address live, naturally aligned storage for a `u32` that every other access
+reads or writes atomically.
+
+<a id="Atomic.impl.notifyOne"></a>
+
+### Associated function `notifyOne`
+
+```silk
+pub unsafe fn notifyOne(pointer: *const u32) -> ()
+```
+
+Wakes at least one thread blocked in [`Atomic.wait`](#Atomic.impl.wait) on `pointer`, if any is.
+
+#### Safety
+
+The pointer must address live, naturally aligned storage for a `u32`.
+
+<a id="Atomic.impl.notifyAll"></a>
+
+### Associated function `notifyAll`
+
+```silk
+pub unsafe fn notifyAll(pointer: *const u32) -> ()
+```
+
+Wakes every thread blocked in [`Atomic.wait`](#Atomic.impl.wait) on `pointer`.
+
+#### Safety
+
+The pointer must address live, naturally aligned storage for a `u32`.
+
 <a id="Atomic.impl.fence"></a>
 
 ### Associated function `fence`

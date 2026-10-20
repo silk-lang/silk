@@ -18,7 +18,60 @@
 //! even when the other access is atomic. Every access to a shared location must be atomic, and
 //! all of them must use the same width.
 
+import silk.option { Option }
 import silk.ownership { Copy }
+import silk.pointer { Pointer }
+import silk.u32
+import silk.u64
+
+extern "C" struct WaitTimespec {
+  seconds: i64
+  nanoseconds: i64
+}
+
+unsafe extern "C" fn __ulock_wait(operation: u32, address: *const u32, value: u64, timeout: u32) -> i32 with Intrinsic.foreign(noCapture: ("address",))
+unsafe extern "C" fn __ulock_wake(operation: u32, address: *const u32, wakeValue: u64) -> i32 with Intrinsic.foreign(noCapture: ("address",))
+unsafe extern "C" fn syscall(number: i64, ...) -> i64
+unsafe extern "C" fn __errno_location() -> *mut i32
+unsafe fn currentError() -> i32 { unsafe { return Pointer.read<i32>(__errno_location()) } }
+
+// Darwin `UL_COMPARE_AND_WAIT | ULF_NO_ERRNO`: failures return the negated errno.
+const darwinCompareAndWait: u32 = 16777217
+// Darwin `ULF_WAKE_ALL`.
+const darwinWakeAll: u32 = 256
+// Linux `FUTEX_WAIT | FUTEX_PRIVATE_FLAG` and `FUTEX_WAKE | FUTEX_PRIVATE_FLAG`.
+const futexWait: i64 = 128
+const futexWake: i64 = 129
+
+unsafe fn linuxFutex() -> i64 {
+  static if Intrinsic.targetArchitecture() == "x86_64" { return 202 } else { return 98 }
+}
+
+// Wakes one waiter on `pointer`, or every waiter when `all` is true.
+unsafe fn notifyWaiters(pointer: *const u32, all: bool) -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system" {
+    let mut operation = darwinCompareAndWait
+    if all { operation = darwinCompareAndWait | darwinWakeAll }
+    let status = unsafe __ulock_wake(operation, pointer, 0)
+    // -ENOENT reports that nothing waited.
+    if status != 0 && status != -2 { let invalid = 1 / 0 }
+    return ()
+  } else {
+    static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") {
+      let mut count: i64 = 1
+      if all { count = 2147483647 }
+      let address = Pointer.address<u32>(pointer)
+      let woken = unsafe syscall(unsafe linuxFutex(), address, futexWake, count)
+      if woken < 0 { let invalid = 1 / 0 }
+      return ()
+    } else {
+      static if Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "single" {
+        // One thread has nobody else to wake.
+        return ()
+      } else { compileError("Atomic notify requires a Darwin or GNU libc profile, or single-threaded WebAssembly") }
+    }
+  }
+}
 
 /// The ordering constraint of one atomic operation.
 pub enum MemoryOrder {
@@ -206,6 +259,94 @@ impl Atomic {
   pub unsafe fn fetchMaximum<T: Copy>(pointer: *mut T, value: T, static order: MemoryOrder) -> T {
     let static spelled = spelling(order)
     unsafe { return Intrinsic.atomicFetchMaximum<T>(pointer, value, spelled) }
+  }
+
+  /// Blocks while the pointee equals `expected`, until a notify, the timeout, or a spurious wakeup.
+  ///
+  /// # Details
+  ///
+  /// The comparison and the sleep are one atomic step against [`Atomic.notifyOne`] and
+  /// [`Atomic.notifyAll`], so a notify after a store that changed the pointee is never lost.
+  /// `timeout` is a relative bound in nanoseconds; `Option.None` waits without one. Returns
+  /// `false` only when the timeout elapsed. A `true` result promises nothing about the pointee:
+  /// callers recheck their condition in a loop.
+  ///
+  /// # Gotchas
+  ///
+  /// Single-threaded WebAssembly has no other thread to change the pointee, so a wait that would
+  /// sleep without a timeout traps, and one with a timeout returns `false` at once.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, naturally aligned storage for a `u32` that every other access
+  /// reads or writes atomically.
+  pub unsafe fn wait(pointer: *const u32, expected: u32, timeout: Option<u64>) -> bool {
+    static if Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system" {
+      // `__ulock_wait` takes whole microseconds, where zero means no timeout.
+      let mut microseconds: u32 = 0
+      let mut clamped = false
+      if let Option<u64>.Some {value} = move timeout {
+        let mut rounded = value / 1000
+        if value % 1000 != 0 || rounded == 0 { rounded = rounded + 1 }
+        if rounded > 4294967295 {
+          rounded = 4294967295
+          clamped = true
+        }
+        microseconds = u64.toU32(rounded)
+      }
+      let status = unsafe __ulock_wait(darwinCompareAndWait, pointer, u32.toU64(expected), microseconds)
+      // -ETIMEDOUT; a clamped timeout that elapsed is a spurious wakeup instead.
+      if status == -60 { return clamped }
+      if status < 0 && status != -4 { let invalid = 1 / 0 }
+      return true
+    } else {
+      static if Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64") {
+        let mut limit = WaitTimespec {seconds: 0, nanoseconds: 0}
+        let mut bounded = false
+        if let Option<u64>.Some {value} = move timeout {
+          let seconds = value / 1000000000
+          // Past `i64.MAX` seconds the bound is unreachable; wait without one.
+          if seconds <= 9223372036854775807 {
+            limit = WaitTimespec {seconds: u64.toI64(seconds), nanoseconds: u64.toI64(value % 1000000000)}
+            bounded = true
+          }
+        }
+        let address = Pointer.address<u32>(pointer)
+        let mut limitAddress: usize = 0
+        if bounded { limitAddress = Pointer.address<WaitTimespec>(Pointer.fromRef<WaitTimespec>(&limit)) }
+        let status = unsafe syscall(unsafe linuxFutex(), address, futexWait, u32.toU64(expected), limitAddress)
+        if status == 0 { return true }
+        let nativeError = unsafe currentError()
+        // ETIMEDOUT; EAGAIN when the pointee differed, and EINTR, are wakeups.
+        if nativeError == 110 { return false }
+        if nativeError != 11 && nativeError != 4 { let invalid = 1 / 0 }
+        return true
+      } else {
+        static if Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "single" {
+          if unsafe Atomic.load<u32>(pointer, MemoryOrder.SequentiallyConsistent) != expected { return true }
+          if let Option<u64>.None = move timeout { let deadlock = 1 / 0 }
+          return false
+        } else { compileError("Atomic wait requires a Darwin or GNU libc profile, or single-threaded WebAssembly") }
+      }
+    }
+  }
+
+  /// Wakes at least one thread blocked in [`Atomic.wait`] on `pointer`, if any is.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, naturally aligned storage for a `u32`.
+  pub unsafe fn notifyOne(pointer: *const u32) -> () {
+    return unsafe notifyWaiters(pointer, false)
+  }
+
+  /// Wakes every thread blocked in [`Atomic.wait`] on `pointer`.
+  ///
+  /// # Safety
+  ///
+  /// The pointer must address live, naturally aligned storage for a `u32`.
+  pub unsafe fn notifyAll(pointer: *const u32) -> () {
+    return unsafe notifyWaiters(pointer, true)
   }
 
   /// Orders memory accesses around this point without accessing memory itself.
