@@ -535,6 +535,30 @@ const program = Effect.gen(function* () {
     ),
     json.stderr,
   )
+  // The synchronous runtime starts only an i32 Effect requiring HostInput: check reports another
+  // `main` at the entry (SEM0225), as build does, rather than inside the runtime source.
+  yield* fs.makeDirectory(join(directory, 'synchronous/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'synchronous/silk.toml'),
+    '[package]\nname = "synchronous"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[build]\ncomposition = { runtimes = [{ name = "synchronous", module = "silk/native_start_sync" }], defaults = ["synchronous"] }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'synchronous/src/main.silk'),
+    'pub fn main() -> i32 {\n  return 7\n}\n',
+  )
+  for (const command of ['check', 'build']) {
+    const refused = yield* invoke(
+      silk,
+      [command, '--stdlib', standardLibrary],
+      join(directory, 'synchronous'),
+    )
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(
+      refused.stderr,
+      /\/synchronous\/src\/main\.silk:1:8: error\[SEM0225\] Entry point `main` has a result or requirement the selected runtime `silk\/native_start_sync` cannot start/,
+    )
+    assert.doesNotMatch(refused.stderr, /native_start_sync\.silk:/)
+  }
   // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
   // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
   // the status 1, and a selection outside the source root is refused before anything is built.
