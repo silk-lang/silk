@@ -14,6 +14,7 @@ import hir.Hir {
   Access,
   CallableMode,
   CauseCode,
+  Diagnostic as SyntaxDiagnostic,
   DiagnosticDetail,
   DurationUnit,
   HirId,
@@ -4836,6 +4837,68 @@ fn foreignFaultCall(diagnostic: &StaticDiagnostic, module: &ModuleId) -> Option<
   return Option<Span>.some(outermost)
 }
 
+// A rejection a static fault carries, such as the refused checked body of a standard-library
+// function the evaluation called, belongs to that function's module. When that module is owned
+// elsewhere, by the toolchain or another package, this module locates the refusal at the
+// outermost call frame of the fault's trace, with the refusal's own site related. A refusal in
+// this package's own source stays where it is, as does one whose trace has no call frame.
+effect fn relocatedStaticRejection(module: &ModuleId, rejected: Shared<Rejection>, trace: &List<StaticExecution.TraceStep>)
+-> Shared<Rejection> ! OutOfMemoryError ? &mut Allocator {
+  let foreign = Shared<Rejection>.with<bool>(&rejected, fn(value: &Rejection) -> bool {
+    return !ModuleId.samePackage(&value.module, module) || (toolchainModule(&value.module) && !toolchainModule(module))
+  })
+  if !foreign { return move rejected }
+  let steps = List<StaticExecution.TraceStep>.asSlice(trace)
+  let mut call = Option<Span>.none()
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if let Option<ModuleId>.Some {..} = &steps[at].module {
+      call = Option<Span>.some(steps[at].span)
+      break
+    }
+    at = at + usize.ONE
+  }
+  let span = match move call {
+    Option<Span>.Some {value} => value
+    Option<Span>.None => { return move rejected }
+  }
+  let code = Shared<Rejection>.with<RejectionCode>(&rejected, fn(value: &Rejection) -> RejectionCode { return value.code })
+  let mut diagnostic = run makeRejection(code, module, span)
+  diagnostic.related = Option<RelatedSite>.some(Shared<Rejection>.with<RelatedSite>(&rejected,
+    fn(value: &Rejection) -> RelatedSite { return RelatedSite {module: ModuleId.copy(&value.module), span: value.span} }))
+  // The shared rejection is read through pure accessors; its message arguments are copied outside them.
+  let count = Shared<Rejection>.with<usize>(&rejected, fn(value: &Rejection) -> usize { return List<MessageArgument>.length(&value.arguments) })
+  let mut index = usize.ZERO
+  while index < count {
+    let name = run sharedArgumentBytes(&rejected, index, true)
+    let value = run sharedArgumentBytes(&rejected, index, false)
+    run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: move name, value: move value})
+    index = index + usize.ONE
+  }
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
+// A copy of the name, or the value, of message argument `index` of a shared rejection.
+effect fn sharedArgumentBytes(rejection: &Shared<Rejection>, index: usize, name: bool) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = Shared<Rejection>.with<usize>(rejection, fn(value: &Rejection) -> usize {
+    let listed = List<MessageArgument>.asSlice(&value.arguments)
+    if name { return Bytes.length(&listed[index].name) }
+    return Bytes.length(&listed[index].value)
+  })
+  let mut copied = Bytes.make()
+  let mut at = usize.ZERO
+  while at < length {
+    let byte = Shared<Rejection>.with<u8>(rejection, fn(value: &Rejection) -> u8 {
+      let listed = List<MessageArgument>.asSlice(&value.arguments)
+      if name { return Bytes.asSlice(&listed[index].name)[at] }
+      return Bytes.asSlice(&listed[index].value)[at]
+    })
+    run Bytes.append(&mut copied, &[byte])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
 effect fn rejectStatic(resolver: &Resolver, module: &ModuleId, diagnostic: StaticDiagnostic) -> Shared<
   Rejection,
 > ! OutOfMemoryError ? &mut Allocator {
@@ -5652,6 +5715,7 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
     let mut foreign = false
     let mut linkageSpan = declarationSpan
     let mut unknown = Option<Span>.none()
+    let mut misplaced = Option<Span>.none()
     if let Node.FunctionHeader {contract, linkage, properties, isPublic: visible, ..} = written {
       callable = Option<HirId>.some(contract)
       isPublic = visible
@@ -5659,6 +5723,7 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
       if linkage.present { linkageSpan = Module.span(hir, linkage.id) }
       plain = linkage.present || nonParkingProperties(hir, properties)
       unknown = unknownProperty(hir, properties)
+      if !linkage.present { misplaced = misplacedProperty(hir, properties) }
     }
     let mut operation = false
     if let Node.OperationHeader {contract, properties, ..} = written {
@@ -5668,6 +5733,7 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
       isPublic = contractPublic(hir, declarations, ordinal)
       plain = nonParkingProperties(hir, properties)
       unknown = unknownProperty(hir, properties)
+      misplaced = misplacedProperty(hir, properties)
     }
     if let Node.CallableContract {..} = written {
       callable = Option<HirId>.some(declarations[ordinal].header)
@@ -5722,6 +5788,8 @@ effect fn signatureSyntax(resolver: &mut Resolver, module: &ModuleId, ordinal: u
           headerConflict = Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.InvalidTestDeclaration, span: conflict})
         } else if let Option<Span>.Some {value: clause} = move unknown {
           headerConflict = Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.UnknownProperty, span: clause})
+        } else if let Option<Span>.Some {value: clause} = move misplaced {
+          headerConflict = Option<HeaderConflict>.some(HeaderConflict {code: RejectionCode.MisplacedProperty, span: clause})
         } else if operation {
           // `mut` declares function-local owned storage, which a contract operation has none of.
           let mut scanned = usize.ZERO
@@ -25761,6 +25829,16 @@ effect fn primitiveImportRejection(code: RejectionCode, module: &ModuleId, span:
   return run Shared<Rejection>.make(move diagnostic)
 }
 
+// Whether `module`'s syntax has frontend errors. A name the parser recovered past, such as `i32`
+// in a misparsed `id<i32>` or `?i32`, is no evidence of a missing primitive import.
+effect fn syntaxDamaged(resolver: &mut Resolver, module: &ModuleId) -> bool ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run source(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
+    return List<SyntaxDiagnostic>.length(&IndexedSource.authored(value).diagnostics) > usize.ZERO
+  }
+  return false
+}
+
 // Whether `name` spells a primitive type whose operations a `silk.<name>` module declares.
 fn primitiveModuleName(name: &[u8]) -> bool {
   return fixedIntegerName(name) || pointerSizedIntegerName(name) || same(name, b"bool") || same(name, b"char")
@@ -28433,7 +28511,7 @@ effect fn callTarget(
         let mut code = RejectionCode.UnknownActor
         if syntax.exactItem { code = RejectionCode.UnresolvedExactRepresentation }
         // A primitive's operations live in its standard-library module, which must be imported.
-        if code == RejectionCode.UnknownActor && primitiveModuleName(namespaceName) {
+        if code == RejectionCode.UnknownActor && primitiveModuleName(namespaceName) && !run syntaxDamaged(&mut resolver.*, module) {
           return Result<ResolvedTarget, Shared<Rejection>>.failResult(run primitiveImportRejection(code, module, subjectSpan, namespaceName))
         }
         return Result<ResolvedTarget, Shared<Rejection>>.failResult(run Shared<Rejection>.make(run makeRejection(code, module, subjectSpan)))
@@ -28535,7 +28613,7 @@ effect fn callTarget(
           _ => Option<Bytes>.none()
         }
         if let Option<Bytes>.Some {value: name} = move unbound {
-          if primitiveModuleName(Bytes.asSlice(&name)) {
+          if primitiveModuleName(Bytes.asSlice(&name)) && !run syntaxDamaged(&mut resolver.*, module) {
             return Result<ResolvedTarget, Shared<Rejection>>.failResult(
               run primitiveImportRejection(RejectionCode.UnknownName, module, rejectionSpan(&error), Bytes.asSlice(&name)))
           }
@@ -58892,6 +58970,7 @@ effect fn resolveParameterSchema(
       let source = run source(&mut resolver.*, &module)
       let mut hasDefault = false
       let mut hasValidation = false
+      let mut optionalSpelled = false
       if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
         &resolver.*,
         &source,
@@ -58901,6 +58980,11 @@ effect fn resolveParameterSchema(
         let declarationAccess141 = declarationPosition(&resolver.*, key)
         if declarationAccess141 < declarations.length {
           let hir = IndexedSource.authored(indexed)
+          // `?T` spells an optional type; a type position does not parse it, so it reaches
+          // resolution as a recovered type, and is refused below as the optional type it means.
+          let annotated = Module.span(hir, annotation)
+          let bytes = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
+          optionalSpelled = annotated.start < bytes.length && bytes[annotated.start] == 63
           let declarationAccess142 = declarationPosition(&resolver.*, key)
           if let Node.Declaration {body, ..} = Module.node(hir, declarations[declarationAccess142].local) {
             if let Node.PackageParameterBody {default, validation} = Module.node(hir, body) {
@@ -58973,10 +59057,21 @@ effect fn resolveParameterSchema(
             move dependencies,
           )
         }
-        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => run memberRejected(
-          move error,
-          move dependencies,
-        )
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+          if optionalSpelled {
+            let declarationAccessOptional = declarationPosition(&resolver.*, key)
+            let mut name = Bytes.make()
+            if let Option<DeclarationId>.Some {value: declaration} = move run declarationAt(&mut resolver.*, &module, declarationAccessOptional) {
+              name = run DeclarationId.copySpelling(&declaration)
+            }
+            return run memberRejected(
+              run namedParameterRejection(RejectionCode.InvalidParameterSchema, &module, value.span, Bytes.asSlice(&name),
+                b"package parameter `", b"` has an enum, struct, union or optional type, which package parameters do not support yet"),
+              move dependencies,
+            )
+          }
+          return run memberRejected(move error, move dependencies)
+        }
       }
     }
     return run memberRejected(
@@ -59554,7 +59649,7 @@ effect fn staticEvaluationRejection<'source>(
   match move failure {
     StaticDiagnostic {fault, code, span: failedSpan, target: diagnosticTarget, message, origin, byteOffset, rejection, needed, missing, trace} => {
       if let Option<Shared<Rejection>>.Some {value: rejected} = move rejection {
-        return Option<Shared<Rejection>>.some(move rejected)
+        return Option<Shared<Rejection>>.some(run relocatedStaticRejection(module, move rejected, &trace))
       }
       if let Option<StaticNeeded>.Some {value: reached} = move needed {
         if StaticExecution.steps(&machine.*) >= StaticExecution.stepLimit(&machine.*) {
@@ -67311,6 +67406,23 @@ fn nonParkingProperties(hir: &Module, properties: Range) -> bool {
   return false
 }
 
+// The span of the first `Intrinsic.foreign(...)` or `Intrinsic.machine(...)` header property
+// clause, which describe an `extern` function only, on a declaration that has no foreign linkage
+// (SEM0236).
+fn misplacedProperty(hir: &Module, properties: Range) -> Option<Span> {
+  let mut at = usize.ZERO
+  while at < properties.length {
+    let clause = Module.child(hir, properties, at)
+    if let Node.PropertyClause {namespace, operation, ..} = Module.node(hir, clause) {
+      if nameIs(hir, namespace, b"Intrinsic") && (nameIs(hir, operation, b"foreign") || nameIs(hir, operation, b"machine")) {
+        return Option<Span>.some(Module.span(hir, clause))
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Span>.none()
+}
+
 // The span of the first header property clause that is, or has an argument, outside the
 // language's property vocabulary (SEM0235): `Intrinsic.foreign(memory:, locality:, noCapture:, callbacks:)`,
 // `Intrinsic.machine(naked:, noReturn:)` and the argument-free `Intrinsic.nonParking()`. Whether
@@ -68964,7 +69076,7 @@ effect fn selectionFacts(
       }
       StaticDiagnostic {fault, code, span, target, message, origin, byteOffset, rejection, needed, missing, trace} => {
         if let Option<Shared<Rejection>>.Some {value: reason} = move rejection {
-          return Result<List<ResolvedCall>, Shared<Rejection>>.failResult(move reason)
+          return Result<List<ResolvedCall>, Shared<Rejection>>.failResult(run relocatedStaticRejection(module, move reason, &trace))
         }
         if let Option<StaticNeeded>.Some {value: reached} = move needed {
           if List<StaticBinding>.length(&constants) < 4096 {
