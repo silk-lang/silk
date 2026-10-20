@@ -246,7 +246,7 @@ pub effect fn reserve<'body>(prepared: &SourcePreparation<'body>) -> Reservation
       PendingDispatch.ArmComplete {occurrence, arm} => Dispatch.ArmComplete {evaluation: dispatchEvaluation(encounters, occurrence), arm: arm}
       PendingDispatch.TransferComplete {occurrence} => Dispatch.TransferComplete {evaluation: dispatchEvaluation(encounters, occurrence)}
       PendingDispatch.Finish {occurrence} => Dispatch.Finish {evaluation: dispatchEvaluation(encounters, occurrence)}
-      PendingDispatch.OwnerExit {exit} => Dispatch.OwnerExit {exit: exit}
+      PendingDispatch.OwnerExit {exit: ownerExit} => Dispatch.OwnerExit {exit: ownerExit}
     }
     run List<Dispatch>.append(&mut walk.reservation.dispatch, action)
     at = at + usize.ONE
@@ -277,7 +277,8 @@ effect fn settleInput(walk: &mut Walk, inputs: &mut List<Input>, ended: PointId)
   let count = List<Input>.length(&inputs.*)
   let visiting = List<usize>.asSlice(&walk.visiting)
   if count == usize.ZERO || visiting.length == usize.ZERO { return CompilerBug.panic(b"settled source input has no actual parent encounter") }
-  List<Input>.asMutSlice(&mut inputs.*)[count - usize.ONE].completed = ended
+  let completedInputs = List<Input>.asMutSlice(&mut inputs.*)
+  completedInputs[count - usize.ONE].completed = ended
   run List<PendingDispatch>.append(&mut walk.dispatch, PendingDispatch.InputSettled {
     occurrence: visiting[visiting.length - usize.ONE], input: count - usize.ONE})
   return ()
@@ -367,6 +368,49 @@ effect fn replacementCleanup(walk: &mut Walk, local: LocalId, previous: PointId,
     return run ownerAction(&mut walk.*, owner, OwnerAction.Cleanup, previous, cause)
   }
   return CompilerBug.panic(b"whole replacement has no actual active local owner")
+}
+
+// Empty place/exclusive bindings over named storage retain the whole local's identity.
+// Follow only their recorded nonowned subject; rvalues and owned snapshots stop here.
+fn replacementLocal<'body>(prepared: &SourcePreparation<'body>, reservation: &Reservation, target: Input) -> Option<LocalId> {
+  let mut current = target
+  let mut remaining = List<Visit>.length(&reservation.visits) + usize.ONE
+  while remaining > usize.ZERO {
+    remaining = remaining - usize.ONE
+    if current.access != Access.Place { return Option<LocalId>.none() }
+    let actual = occurrence(reservation, current.evaluation)
+    if actual.node.index != current.node.index { return CompilerBug.panic(b"replacement changed its actual destination occurrence") }
+    match &prepared.body.nodes[actual.node.index].kind {
+      NodeKind.Expression {form: Expression.Local {local}, ..} => { return Option<LocalId>.some(local) }
+      NodeKind.Expression {form: Expression.PatternBinding {subject, access, path, ..}, ..} => {
+        if access != BindingAccess.Place && access != BindingAccess.Exclusive { return Option<LocalId>.none() }
+        if List<PlaceStep>.length(&path) != usize.ZERO { return Option<LocalId>.none() }
+        let inputs = List<Input>.asSlice(&actual.inputs)
+        if inputs.length != usize.ONE || inputs[0].node.index != subject.index {
+          return CompilerBug.panic(b"whole pattern replacement lost its actual subject")
+        }
+        let subjects = List<Subject>.asSlice(&reservation.subjects)
+        let mut retained = false
+        let mut at = usize.ZERO
+        while at < subjects.length {
+          if subjects[at].node.index == subject.index && subjects[at].evaluation.index == inputs[0].evaluation.index
+            && !subjects[at].owned {
+            let matched = match &prepared.body.nodes[subjects[at].site.index].kind {
+              NodeKind.Expression {form: Expression.Match {subject: matchedSubject, access: SubjectAccess.Place {access: mode}, ..}, ..} =>
+                matchedSubject.index == subject.index && mode == access
+              _ => false
+            }
+            if matched { retained = true }
+          }
+          at = at + usize.ONE
+        }
+        if !retained { return Option<LocalId>.none() }
+        current = inputs[0]
+      }
+      _ => { return Option<LocalId>.none() }
+    }
+  }
+  return CompilerBug.panic(b"whole replacement subject occurrence chain is cyclic")
 }
 
 // Conditional owner-use/cleanup actions get immutable points before solving. Their effects
@@ -585,7 +629,7 @@ effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id:
     NodeKind.PlaceAssignment {target, value} => {
       current = run input(prepared, &mut walk.*, &mut inputs, target, Access.Place, current)
       current = run input(prepared, &mut walk.*, &mut inputs, value, Access.Value, current)
-      if let NodeKind.Expression {form: Expression.Local {local}, ..} = &prepared.body.nodes[target.index].kind {
+      if let Option<LocalId>.Some {value: local} = replacementLocal(prepared, &walk.reservation, List<Input>.asSlice(&inputs)[0]) {
         prewrite = Option<usize>.some(List<OwnerExit>.length(&walk.reservation.ownerExits))
         current = run replacementCleanup(&mut walk.*, local, current, id)
       }
@@ -668,7 +712,10 @@ effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id:
       // Recovery never certifies. Its isolated suffix still gets ownership diagnostics exactly
       // as the accepted checker does; no failed statement transports prior source definitions.
       current = run point(&mut walk.*)
-      if resumes { run edge(&mut walk.*, walk.reservation.entry, current) }
+      if resumes {
+        let entry = walk.reservation.entry
+        run edge(&mut walk.*, entry, current)
+      }
     }
     NodeKind.Block {statements, ..} => {
       let enclosing = List<ScopeId>.length(&walk.active)
@@ -686,20 +733,24 @@ effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id:
   let execute = run after(&mut walk.*, current)
   let mut successful = execute
   let mut displaced = Option<EvalId>.none()
-  if let NodeKind.Expression {form: Expression.StorageCall {operation: StorageOperation.Replace, ..}, ..} = &node.kind {
-    displaced = Option<EvalId>.some(run Skeleton.evaluate(&mut walk.reservation.skeleton, id, EvaluationRole.Replacement, execute))
-    successful = run after(&mut walk.*, execute)
+  if let NodeKind.Expression {form: Expression.StorageCall {operation, ..}, ..} = &node.kind {
+    if operation == StorageOperation.Replace {
+      displaced = Option<EvalId>.some(run Skeleton.evaluate(&mut walk.reservation.skeleton, id, EvaluationRole.Replacement, execute))
+      successful = run after(&mut walk.*, execute)
+    }
   }
   if neverValue(node) || impossibleIndex(prepared, id) { successful = run point(&mut walk.*) }
   let evaluation = run Skeleton.evaluate(&mut walk.reservation.skeleton, id, EvaluationRole.Value, successful)
-  List<Option<EvalId>>.asMutSlice(&mut walk.encounters)[encounter] = Option<EvalId>.some(evaluation)
+  let encountered = List<Option<EvalId>>.asMutSlice(&mut walk.encounters)
+  encountered[encounter] = Option<EvalId>.some(evaluation)
   match &node.kind {
     NodeKind.LocalBinding {local, ..} => { drop run registerOwner(&mut walk.*, OwnerRoot.Local {local: local}, execute, true) }
     NodeKind.MutableBinding {local, ..} => { drop run registerOwner(&mut walk.*, OwnerRoot.Local {local: local}, execute, true) }
     _ => ()
   }
   if access == Access.Place && needsTemporary(&node.kind) {
-    let owner = run registerOwner(&mut walk.*, OwnerRoot.Temporary {evaluation: evaluation}, successful, walk.retention != Retention.None)
+    let cleanup = walk.retention != Retention.None
+    let owner = run registerOwner(&mut walk.*, OwnerRoot.Temporary {evaluation: evaluation}, successful, cleanup)
     let mut expires = walk.retention == Retention.Storage
     if walk.retention == Retention.Arrays {
       let array = match &node.kind {
@@ -730,11 +781,13 @@ effect fn visit<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk, id:
   drop List<usize>.pop(&mut walk.visiting)
   if let NodeKind.Expression {form: Expression.Run {..}, ..} = &node.kind {
     let failed = run closeScopes(&mut walk.*, usize.ZERO, execute, id, ExitKind.RunFailure)
-    run edge(&mut walk.*, failed, walk.reservation.exit)
+    let exit = walk.reservation.exit
+    run edge(&mut walk.*, failed, exit)
   }
   if terminates {
     let cleaned = run closeScopes(&mut walk.*, exitDepth, execute, id, exitKind)
-    List<Visit>.asMutSlice(&mut walk.reservation.visits)[visitIndex].completed = cleaned
+    let completedVisits = List<Visit>.asMutSlice(&mut walk.reservation.visits)
+    completedVisits[visitIndex].completed = cleaned
     run List<PendingDispatch>.append(&mut walk.dispatch, PendingDispatch.TransferComplete {occurrence: encounter})
     if let Option<PointId>.Some {value} = jump {
       run edge(&mut walk.*, cleaned, value)
@@ -779,7 +832,7 @@ fn impossibleIndex<'body>(prepared: &SourcePreparation<'body>, node: NodeId) -> 
   let mut at = usize.ZERO
   while at < endpoints.length {
     let actual = match &endpoints[at].root {
-      Root.Node {node: found, role} => found.index == base && role == EndpointRole.Value
+      Root.Node {node: found, category} => found.index == base && category == EndpointRole.Value
       _ => false
     }
     let root = match endpoints[at].parent { Option<EndpointId>.None => true _ => false }
@@ -820,8 +873,9 @@ effect fn expression<'body>(prepared: &SourcePreparation<'body>, walk: &mut Walk
           let mut scope = usize.ZERO
           while scope < active.length {
             if subjects[at].scope.index == active[scope].index {
+              let subjectEvaluation = subjects[at].evaluation
               let used = run after(&mut walk.*, previous)
-              run List<Input>.append(&mut inputs.*, Input {node: subject, evaluation: subjects[at].evaluation,
+              run List<Input>.append(&mut inputs.*, Input {node: subject, evaluation: subjectEvaluation,
                 usePoint: used, completed: used, access: Access.Place, read: Option<InputRead>.none()})
               run completeInput(&mut walk.*, List<Input>.length(&inputs.*))
               return used
@@ -1198,10 +1252,10 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
         run Skeleton.arraySlice(&mut reservation.skeleton, prepared, &rows[selected], inputs[usize.ZERO].evaluation,
           occurrence.evaluation, yes)
       }
-      NodeKind.Expression {form: Expression.ArrayRepeat {value, count}, ..} => {
-        run repeatValues(prepared, &mut reservation.skeleton, occurrence, value, count, yes)
+      NodeKind.Expression {form: Expression.ArrayRepeat {value, count: repeatedCount}, ..} => {
+        run repeatValues(prepared, &mut reservation.skeleton, occurrence, value, repeatedCount, yes)
       }
-      NodeKind.Expression {form: Expression.StorageCall {operation: StorageOperation.Replace, ..}, ..} => {
+      NodeKind.Expression {form: Expression.StorageCall {operation: storageOperation, ..}, ..} if storageOperation == StorageOperation.Replace => {
         let rows = List<Replacement>.asSlice(&prepared.replacements)
         let mut selected = usize.MAX
         let mut row = usize.ZERO
@@ -1257,15 +1311,27 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
       }
       NodeKind.Expression {form: Expression.PatternBinding {..}, ..} => {
         run projection(prepared, &mut reservation.skeleton, occurrence, yes)
+        if occurrence.access == Access.Value {
+          run throughFlights(prepared, &mut reservation.skeleton, visits, subjects, occurrence, yes)
+        }
       }
       NodeKind.Expression {form: Expression.Field {..}, ..} => {
         run projection(prepared, &mut reservation.skeleton, occurrence, yes)
+        if occurrence.access == Access.Value {
+          run throughFlights(prepared, &mut reservation.skeleton, visits, subjects, occurrence, yes)
+        }
       }
       NodeKind.Expression {form: Expression.Index {..}, ..} => {
         run projection(prepared, &mut reservation.skeleton, occurrence, yes)
+        if occurrence.access == Access.Value {
+          run throughFlights(prepared, &mut reservation.skeleton, visits, subjects, occurrence, yes)
+        }
       }
       NodeKind.Expression {form: Expression.Dereference {..}, ..} => {
         run projection(prepared, &mut reservation.skeleton, occurrence, yes)
+        if occurrence.access == Access.Value {
+          run throughFlights(prepared, &mut reservation.skeleton, visits, subjects, occurrence, yes)
+        }
       }
       NodeKind.Drop {value, consumed} => {
         if let Option<ConsumedPlace>.Some {..} = &consumed {
@@ -1320,8 +1386,14 @@ effect fn activateLocalStorage<'body>(prepared: &SourcePreparation<'body>, reser
 effect fn throughFlights<'body>(prepared: &SourcePreparation<'body>, skeleton: &mut Skeleton,
   visits: &[Visit], subjects: &[Subject], operation: &Visit, active: Atom) -> () ! OutOfMemoryError ? &mut Allocator {
   let inputs = List<Input>.asSlice(&operation.inputs)
-  if inputs.length != 2 { return CompilerBug.panic(b"through operation lost its destination/RHS occurrences") }
-  let target = inputs[0].evaluation
+  let writing = match &prepared.body.nodes[operation.node.index].kind {
+    NodeKind.PlaceAssignment {..} => true
+    NodeKind.Expression {form: Expression.StorageCall {operation: storageOperation, ..}, ..} if storageOperation == StorageOperation.Replace => true
+    _ => false
+  }
+  if writing && inputs.length != 2 { return CompilerBug.panic(b"through operation lost its destination/RHS occurrences") }
+  let mut target = operation.evaluation
+  if writing { target = inputs[0].evaluation }
   let endpoints = List<Endpoint>.asSlice(&prepared.endpoints)
   let shapes = List<Shape>.asSlice(&prepared.shapes)
   let mut current = target
@@ -1380,9 +1452,9 @@ effect fn throughFlights<'body>(prepared: &SourcePreparation<'body>, skeleton: &
       }
       _ => { break }
     }
-    let operand = match operand { Option<NodeId>.Some {value} => value _ => { break } }
+    let selectedOperand = match operand { Option<NodeId>.Some {value} => value _ => { break } }
     let actual = List<Input>.asSlice(&visit.inputs)
-    if actual.length == usize.ZERO || actual[0].node.index != operand.index {
+    if actual.length == usize.ZERO || actual[0].node.index != selectedOperand.index {
       return CompilerBug.panic(b"through projection lost its actual first operand")
     }
     if pattern {
@@ -1408,7 +1480,7 @@ effect fn throughFlights<'body>(prepared: &SourcePreparation<'body>, skeleton: &
     }
     if crossing {
       selected = Option<ThroughDescriptor>.some(ThroughDescriptor {evaluation: actual[0].evaluation,
-        root: nodeRoot(endpoints, operand, EndpointRole.Storage), crossing: visit.evaluation})
+        root: nodeRoot(endpoints, selectedOperand, EndpointRole.Storage), crossing: visit.evaluation})
     }
     current = actual[0].evaluation
   }
@@ -1421,7 +1493,7 @@ effect fn throughFlights<'body>(prepared: &SourcePreparation<'body>, skeleton: &
       run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, execution,
         ThroughFlightKind.Write, selected, active)
     }
-    NodeKind.Expression {form: Expression.StorageCall {operation: StorageOperation.Replace, ..}, ..} => {
+    NodeKind.Expression {form: Expression.StorageCall {operation: storageOperation, ..}, ..} if storageOperation == StorageOperation.Replace => {
       let displaced = match operation.displaced { Option<EvalId>.Some {value} => value
         _ => { return CompilerBug.panic(b"through replacement lost its distinct read point") } }
       run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, displaced,
@@ -1429,7 +1501,27 @@ effect fn throughFlights<'body>(prepared: &SourcePreparation<'body>, skeleton: &
       run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, operation.evaluation,
         ThroughFlightKind.Write, selected, active)
     }
-    _ => { return CompilerBug.panic(b"through flight is not a typed write operation") }
+    NodeKind.Expression {form: Expression.PatternBinding {..}, ..} => {
+      if operation.access != Access.Value { return CompilerBug.panic(b"through read observes an address-only visit") }
+      run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, operation.evaluation,
+        ThroughFlightKind.Read, selected, active)
+    }
+    NodeKind.Expression {form: Expression.Field {..}, ..} => {
+      if operation.access != Access.Value { return CompilerBug.panic(b"through read observes an address-only visit") }
+      run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, operation.evaluation,
+        ThroughFlightKind.Read, selected, active)
+    }
+    NodeKind.Expression {form: Expression.Index {..}, ..} => {
+      if operation.access != Access.Value { return CompilerBug.panic(b"through read observes an address-only visit") }
+      run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, operation.evaluation,
+        ThroughFlightKind.Read, selected, active)
+    }
+    NodeKind.Expression {form: Expression.Dereference {..}, ..} => {
+      if operation.access != Access.Value { return CompilerBug.panic(b"through read observes an address-only visit") }
+      run Skeleton.reserveThroughFlight(&mut skeleton.*, prepared, operation.evaluation, target, operation.evaluation,
+        ThroughFlightKind.Read, selected, active)
+    }
+    _ => { return CompilerBug.panic(b"through flight is not a typed read or write operation") }
   }
   return ()
 }
@@ -1510,9 +1602,9 @@ effect fn forwardedValue<'body>(prepared: &SourcePreparation<'body>, skeleton: &
   }
   let endpoints = List<Endpoint>.asSlice(&prepared.endpoints)
   let maps = List<SelectionMap>.asSlice(&prepared.maps)
-  let mut role = EndpointRole.Value
-  if storage { role = EndpointRole.Storage }
-  let source = nodeRoot(endpoints, operand, role)
+  let mut category = EndpointRole.Value
+  if storage { category = EndpointRole.Storage }
+  let source = nodeRoot(endpoints, operand, category)
   let mut target = nodeRoot(endpoints, occurrence.node, EndpointRole.Value)
   let mut kind = MapKind.Copy
   if let Option<usize>.Some {value: tag} = variant {
@@ -1638,7 +1730,7 @@ effect fn repeatValues<'body>(prepared: &SourcePreparation<'body>, skeleton: &mu
   if (exact < count) != remainder || (count == usize.ONE && exact != usize.ONE) {
     CompilerBug.panic(b"array repeat frozen partitions do not cover its exact extent")
   }
-  let partitions = List<EndpointId>.asSlice(&partitions)
+  let partitionRows = List<EndpointId>.asSlice(&partitions)
   // Every actual direct child must belong to the shape, and every root family must name
   // exactly this operand and one such child. Descendant maps remain owned by children IDs.
   at = usize.ZERO
@@ -1647,12 +1739,12 @@ effect fn repeatValues<'body>(prepared: &SourcePreparation<'body>, skeleton: &mu
     if child {
       let mut found = false
       let mut part = usize.ZERO
-      while part < partitions.length {
-        found = found || partitions[part].index == at
+      while part < partitionRows.length {
+        found = found || partitionRows[part].index == at
         part = part + usize.ONE
       }
       let root = match &endpoints[at].root {
-        Root.Node {node, role} => node.index == occurrence.node.index && role == EndpointRole.Value
+        Root.Node {node, category} => node.index == occurrence.node.index && category == EndpointRole.Value
         _ => false
       }
       if !found || !root { CompilerBug.panic(b"array repeat has an extraneous output component") }
@@ -1666,8 +1758,8 @@ effect fn repeatValues<'body>(prepared: &SourcePreparation<'body>, skeleton: &mu
     if maps[at].site.index == occurrence.node.index && maps[at].kind != MapKind.Select {
       let mut target = false
       let mut part = usize.ZERO
-      while part < partitions.length {
-        target = target || maps[at].target.index == partitions[part].index
+      while part < partitionRows.length {
+        target = target || maps[at].target.index == partitionRows[part].index
         part = part + usize.ONE
       }
       if maps[at].source.index == source.index || target || maps[at].target.index == output.index {
@@ -1681,8 +1773,8 @@ effect fn repeatValues<'body>(prepared: &SourcePreparation<'body>, skeleton: &mu
   }
   let absent = Program.atom(&mut skeleton.rules)
   at = usize.ZERO
-  while at < partitions.length {
-    let map = exactMap(maps, occurrence.node, source, partitions[at], MapKind.Place)
+  while at < partitionRows.length {
+    let map = exactMap(maps, occurrence.node, source, partitionRows[at], MapKind.Place)
     drop run Skeleton.transfer(&mut skeleton.*, endpoints, maps, map, inputs[0].evaluation,
       occurrence.evaluation, active, Directness.Preserve, absent, absent, TransferPolicy.Physical)
     at = at + usize.ONE
@@ -1964,7 +2056,7 @@ fn localRoot(endpoints: &[Endpoint], local: LocalId) -> EndpointId {
   let mut at = usize.ZERO
   while at < endpoints.length {
     let matches = match &endpoints[at].root {
-      Root.Local {local: actual, role} => actual.index == local.index && role == EndpointRole.Storage
+      Root.Local {local: actual, category} => actual.index == local.index && category == EndpointRole.Storage
       _ => false
     }
     let root = match endpoints[at].parent { Option<EndpointId>.None => true _ => false }
@@ -1978,12 +2070,12 @@ fn localRoot(endpoints: &[Endpoint], local: LocalId) -> EndpointId {
   return EndpointId {index: found}
 }
 
-fn nodeRoot(endpoints: &[Endpoint], node: NodeId, role: EndpointRole) -> EndpointId {
+fn nodeRoot(endpoints: &[Endpoint], node: NodeId, category: EndpointRole) -> EndpointId {
   let mut found = usize.MAX
   let mut at = usize.ZERO
   while at < endpoints.length {
     let matches = match &endpoints[at].root {
-      Root.Node {node: actual, role: actualRole} => actual.index == node.index && actualRole == role
+      Root.Node {node: actual, category: actualRole} => actual.index == node.index && actualRole == category
       _ => false
     }
     let root = match endpoints[at].parent { Option<EndpointId>.None => true _ => false }
