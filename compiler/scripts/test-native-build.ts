@@ -640,8 +640,9 @@ const program = Effect.gen(function* () {
   )
   assert.equal(foreignRun.status, 2, 'run must refuse a foreign target')
   assert.equal(yield* fs.exists(marker), false)
-  // A named profile builds once in the directory its optimization names, and conflicts with
-  // --release before anything is built.
+  // A named profile builds once in a directory of its own name, so profiles with different
+  // package parameters never replace each other's artifact, and conflicts with --release before
+  // anything is built.
   yield* fs.writeFileString(
     join(directory, manifest),
     (yield* fs.readFileString(join(directory, manifest))) +
@@ -656,7 +657,7 @@ const program = Effect.gen(function* () {
   assert.equal(profiled.status, 0, profiled.stderr)
   assert.equal(
     yield* fs.exists(
-      join(directory, 'greeting/build/llvm', hostTarget, 'release-with-debug/greeting'),
+      join(directory, 'greeting/build/llvm', hostTarget, 'fast/greeting'),
     ),
     true,
   )
