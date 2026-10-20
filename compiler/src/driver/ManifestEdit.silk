@@ -1,0 +1,480 @@
+//! Text edits to a `silk.toml` that keep everything else in it as written: its comments, its
+//! layout and the order of its tables.
+//!
+//! The edits find their place by scanning the manifest's top-level statements, the table headers
+//! and the key/value lines outside every array, inline table and string. `addMember` appends one
+//! entry to `[workspace].members`, `addDependency` adds one line to `[dependencies]` (creating the
+//! table at the end when it is missing) and `removeDependency` deletes one dependency's line or its
+//! `[dependencies.<name>]` table. An edit refuses a manifest whose shape it cannot place itself in
+//! rather than guess.
+
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.list { List }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.usize
+
+/// A manifest the edit cannot place itself in; `detail` says why.
+pub struct ManifestEditRefused {
+  pub detail: Bytes
+}
+
+// One top-level statement: a table header or a key/value pair, from its line start through its
+// last line's newline.
+struct Statement {
+  start: usize
+  end: usize
+  header: bool
+  // The header's table name, or the pair's key, without brackets, quotes or surrounding blanks.
+  nameStart: usize
+  nameEnd: usize
+  // The first byte of a pair's value.
+  value: usize
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn blank(byte: u8) -> bool {
+  return byte == 32 || byte == 9
+}
+
+fn newline(byte: u8) -> bool {
+  return byte == 10 || byte == 13
+}
+
+// Whether the three bytes at `at` are all `quote`.
+fn tripled(text: &[u8], at: usize, quote: u8) -> bool {
+  let two = usize.ONE + usize.ONE
+  return at + two < text.length && text[at] == quote && text[at + usize.ONE] == quote && text[at + two] == quote
+}
+
+// The offset just past the string that opens at `at`: basic or literal, single- or multi-line.
+fn skipString(text: &[u8], at: usize) -> usize {
+  let quote = text[at]
+  let three = usize.add(0, 3)
+  if tripled(text, at, quote) {
+    let mut index = at + three
+    while index < text.length {
+      if quote == 34 && text[index] == 92 {
+        index = index + usize.ONE + usize.ONE
+        continue
+      }
+      if tripled(text, index, quote) {
+        // A closing delimiter may carry up to two more quotes of the content before it.
+        let mut close = index + three
+        while close < text.length && text[close] == quote {
+          close = close + usize.ONE
+        }
+        return close
+      }
+      index = index + usize.ONE
+    }
+    return text.length
+  }
+  let mut index = at + usize.ONE
+  while index < text.length && !newline(text[index]) {
+    if quote == 34 && text[index] == 92 {
+      index = index + usize.ONE + usize.ONE
+      continue
+    }
+    if text[index] == quote {
+      return index + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  return index
+}
+
+// The offset just past the newline that ends the line holding `at`, or the end of the text.
+fn lineEnd(text: &[u8], at: usize) -> usize {
+  let mut index = at
+  while index < text.length && text[index] != 10 {
+    index = index + usize.ONE
+  }
+  if index < text.length {
+    return index + usize.ONE
+  }
+  return index
+}
+
+// The offset just past the value that begins at `at`, through the newline that ends it: arrays and
+// inline tables may span lines, and strings and comments never close one.
+fn valueEnd(text: &[u8], at: usize) -> usize {
+  let mut depth = usize.ZERO
+  let mut index = at
+  while index < text.length {
+    let byte = text[index]
+    if byte == 34 || byte == 39 {
+      index = skipString(text, index)
+      continue
+    }
+    if byte == 35 {
+      while index < text.length && text[index] != 10 {
+        index = index + usize.ONE
+      }
+      continue
+    }
+    if byte == 91 || byte == 123 {
+      depth = depth + usize.ONE
+    } else if (byte == 93 || byte == 125) && depth > usize.ZERO {
+      depth = depth - usize.ONE
+    } else if byte == 10 && depth == usize.ZERO {
+      return index + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  return text.length
+}
+
+// Narrows `[start, end)` to its non-blank bytes, then drops one pair of enclosing quotes.
+fn trimmedName(text: &[u8], start: usize, end: usize) -> [usize; 2] {
+  let mut first = start
+  let mut last = end
+  while first < last && blank(text[first]) {
+    first = first + usize.ONE
+  }
+  while last > first && blank(text[last - usize.ONE]) {
+    last = last - usize.ONE
+  }
+  if last - first >= usize.add(0, 2) && (text[first] == 34 || text[first] == 39) && text[last - usize.ONE] == text[first] {
+    first = first + usize.ONE
+    last = last - usize.ONE
+  }
+  return [first, last]
+}
+
+// The manifest's top-level statements in order. Blank and comment-only lines belong to none.
+effect fn statements(text: &[u8]) -> List<Statement>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = List<Statement>.make()
+  let mut at = usize.ZERO
+  while at < text.length {
+    let start = at
+    while at < text.length && blank(text[at]) {
+      at = at + usize.ONE
+    }
+    if at == text.length {
+      break
+    }
+    if newline(text[at]) || text[at] == 35 {
+      at = lineEnd(text, at)
+      continue
+    }
+    if text[at] == 91 {
+      let mut open = at + usize.ONE
+      let doubled = open < text.length && text[open] == 91
+      if doubled {
+        open = open + usize.ONE
+      }
+      let mut close = open
+      while close < text.length && text[close] != 93 && !newline(text[close]) {
+        if text[close] == 34 || text[close] == 39 {
+          close = skipString(text, close)
+          continue
+        }
+        close = close + usize.ONE
+      }
+      let name = trimmedName(text, open, close)
+      // An array-of-tables header never matches a table name.
+      let mut nameEnd = name[1]
+      if doubled {
+        nameEnd = name[0]
+      }
+      let end = lineEnd(text, close)
+      run List<Statement>.append(&mut found, Statement { start: start, end: end, header: true, nameStart: name[0], nameEnd: nameEnd, value: end })
+      at = end
+      continue
+    }
+    let mut equals = at
+    while equals < text.length && text[equals] != 61 && !newline(text[equals]) {
+      if text[equals] == 34 || text[equals] == 39 {
+        equals = skipString(text, equals)
+        continue
+      }
+      equals = equals + usize.ONE
+    }
+    let key = trimmedName(text, at, equals)
+    let mut value = equals
+    if value < text.length && text[value] == 61 {
+      value = value + usize.ONE
+    }
+    while value < text.length && blank(text[value]) {
+      value = value + usize.ONE
+    }
+    let end = valueEnd(text, value)
+    run List<Statement>.append(&mut found, Statement { start: start, end: end, header: false, nameStart: key[0], nameEnd: key[1], value: value })
+    at = end
+  }
+  return move found
+}
+
+fn named(text: &[u8], statement: &Statement, name: &[u8]) -> bool {
+  return same(Slice.view<u8>(text, statement.nameStart, statement.nameEnd - statement.nameStart), name)
+}
+
+// The index of the header of table `name`, if the manifest has one.
+fn headerOf(text: &[u8], found: &[Statement], name: &[u8]) -> Option<usize> {
+  let mut at = usize.ZERO
+  while at < found.length {
+    if found[at].header && named(text, &found[at], name) {
+      return Option<usize>.some(at)
+    }
+    at = at + usize.ONE
+  }
+  return Option<usize>.none()
+}
+
+// The index one past the last statement of the table whose header is at `header`.
+fn sectionEnd(found: &[Statement], header: usize) -> usize {
+  let mut at = header + usize.ONE
+  while at < found.length && !found[at].header {
+    at = at + usize.ONE
+  }
+  return at
+}
+
+effect fn refused(detail: &[u8]) -> never
+  ! ManifestEditRefused | OutOfMemoryError
+  ? &mut Allocator {
+  fail ManifestEditRefused { detail: run Bytes.copy(detail) }
+}
+
+/// `value` as a TOML basic string, with `"` and `\` escaped.
+pub effect fn quoted(value: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut text = run Bytes.copy(b"\"")
+  let mut at = usize.ZERO
+  while at < value.length {
+    if value[at] == 34 || value[at] == 92 {
+      run Bytes.append(&mut text, b"\\")
+    }
+    run Bytes.append(&mut text, Slice.view<u8>(value, at, usize.ONE))
+    at = at + usize.ONE
+  }
+  run Bytes.append(&mut text, b"\"")
+  return move text
+}
+
+// `text` with `inserted` placed at `at`.
+effect fn spliced(text: &[u8], at: usize, inserted: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = run Bytes.copy(Slice.view<u8>(text, usize.ZERO, at))
+  run Bytes.append(&mut result, inserted)
+  run Bytes.append(&mut result, Slice.view<u8>(text, at, text.length - at))
+  return move result
+}
+
+// `text` with a newline after its last byte unless it ends with one or is empty.
+effect fn terminated(text: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut result = run Bytes.copy(text)
+  if text.length > usize.ZERO && text[text.length - usize.ONE] != 10 {
+    run Bytes.append(&mut result, b"\n")
+  }
+  return move result
+}
+
+/// Appends `entry` to the `members` array of the manifest's `[workspace]` table, adding the key when
+/// the table has none. A multi-line array gets the entry on its own line, indented like the entry
+/// before it.
+pub effect fn addMember(manifest: &[u8], entry: &[u8]) -> Bytes
+  ! ManifestEditRefused | OutOfMemoryError
+  ? &mut Allocator {
+  let text = run terminated(manifest)
+  let source = Bytes.asSlice(&text)
+  let listed = run statements(source)
+  let found = List<Statement>.asSlice(&listed)
+  let header = match move headerOf(source, found, b"workspace") {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => run refused(b"the manifest has no [workspace] table")
+  }
+  let item = run quoted(entry)
+  let last = sectionEnd(found, header)
+  let mut at = header + usize.ONE
+  while at < last {
+    if named(source, &found[at], b"members") {
+      break
+    }
+    at = at + usize.ONE
+  }
+  if at == last {
+    let mut line = run Bytes.copy(b"members = [")
+    run Bytes.append(&mut line, Bytes.asSlice(&item))
+    run Bytes.append(&mut line, b"]\n")
+    return run spliced(source, found[header].end, Bytes.asSlice(&line))
+  }
+  let open = found[at].value
+  if open >= source.length || source[open] != 91 {
+    return run refused(b"workspace.members is not written as an array")
+  }
+
+  // Finds the closing bracket and the last byte before it that is neither blank nor comment.
+  let mut depth = usize.ZERO
+  let mut significant = open
+  let mut multiline = false
+  let mut index = open
+  let mut close = source.length
+  while index < source.length {
+    let byte = source[index]
+    if byte == 34 || byte == 39 {
+      index = skipString(source, index)
+      significant = index - usize.ONE
+      continue
+    }
+    if byte == 35 {
+      while index < source.length && source[index] != 10 {
+        index = index + usize.ONE
+      }
+      continue
+    }
+    if byte == 10 {
+      multiline = true
+    }
+    if byte == 91 || byte == 123 {
+      depth = depth + usize.ONE
+    } else if byte == 93 || byte == 125 {
+      depth = depth - usize.ONE
+      if depth == usize.ZERO {
+        close = index
+        break
+      }
+    }
+    if !blank(byte) && !newline(byte) {
+      significant = index
+    }
+    index = index + usize.ONE
+  }
+  if close == source.length {
+    return run refused(b"workspace.members is not a closed array")
+  }
+  let empty = significant == open
+  let separated = source[significant] == 44
+  let mut closeLine = close
+  while closeLine > open && blank(source[closeLine - usize.ONE]) {
+    closeLine = closeLine - usize.ONE
+  }
+  let ownLine = multiline && closeLine > open && source[closeLine - usize.ONE] == 10
+  if !ownLine {
+    let mut inserted = Bytes.make()
+    if !empty && !separated {
+      run Bytes.append(&mut inserted, b",")
+    }
+    if !empty {
+      run Bytes.append(&mut inserted, b" ")
+    }
+    run Bytes.append(&mut inserted, Bytes.asSlice(&item))
+    return run spliced(source, significant + usize.ONE, Bytes.asSlice(&inserted))
+  }
+
+  // The new line copies the indentation of the line holding the last entry.
+  let mut indentStart = significant
+  while indentStart > usize.ZERO && source[indentStart - usize.ONE] != 10 {
+    indentStart = indentStart - usize.ONE
+  }
+  let mut indentEnd = indentStart
+  while indentEnd < source.length && blank(source[indentEnd]) {
+    indentEnd = indentEnd + usize.ONE
+  }
+  let mut line = Bytes.make()
+  if empty || indentEnd == indentStart {
+    run Bytes.append(&mut line, b"  ")
+  } else {
+    run Bytes.append(&mut line, Slice.view<u8>(source, indentStart, indentEnd - indentStart))
+  }
+  run Bytes.append(&mut line, Bytes.asSlice(&item))
+  run Bytes.append(&mut line, b",\n")
+  let mut result = Bytes.make()
+  if !empty && !separated {
+    run Bytes.append(&mut result, Slice.view<u8>(source, usize.ZERO, significant + usize.ONE))
+    run Bytes.append(&mut result, b",")
+    run Bytes.append(&mut result, Slice.view<u8>(source, significant + usize.ONE, closeLine - significant - usize.ONE))
+  } else {
+    run Bytes.append(&mut result, Slice.view<u8>(source, usize.ZERO, closeLine))
+  }
+  run Bytes.append(&mut result, Bytes.asSlice(&line))
+  run Bytes.append(&mut result, Slice.view<u8>(source, closeLine, source.length - closeLine))
+  return move result
+}
+
+/// Adds `name = <value>` as the last line of the manifest's `[dependencies]` table, or appends the
+/// table with that one line when the manifest has none. `value` is the TOML value as written.
+pub effect fn addDependency(manifest: &[u8], name: &[u8], value: &[u8]) -> Bytes
+  ! ManifestEditRefused | OutOfMemoryError
+  ? &mut Allocator {
+  let text = run terminated(manifest)
+  let source = Bytes.asSlice(&text)
+  let listed = run statements(source)
+  let found = List<Statement>.asSlice(&listed)
+  let mut line = run Bytes.copy(name)
+  run Bytes.append(&mut line, b" = ")
+  run Bytes.append(&mut line, value)
+  run Bytes.append(&mut line, b"\n")
+  return match move headerOf(source, found, b"dependencies") {
+    Option<usize>.Some { value: header } => {
+      let last = sectionEnd(found, header)
+      return run spliced(source, found[last - usize.ONE].end, Bytes.asSlice(&line))
+    }
+    Option<usize>.None => {
+      let mut result = run Bytes.copy(source)
+      if source.length > usize.ZERO {
+        run Bytes.append(&mut result, b"\n")
+      }
+      run Bytes.append(&mut result, b"[dependencies]\n")
+      run Bytes.append(&mut result, Bytes.asSlice(&line))
+      return move result
+    }
+  }
+}
+
+/// Removes dependency `name`: its line in `[dependencies]`, or its whole `[dependencies.<name>]`
+/// table.
+pub effect fn removeDependency(manifest: &[u8], name: &[u8]) -> Bytes
+  ! ManifestEditRefused | OutOfMemoryError
+  ? &mut Allocator {
+  let listed = run statements(manifest)
+  let found = List<Statement>.asSlice(&listed)
+  if let Option<usize>.Some { value: header } = move headerOf(manifest, found, b"dependencies") {
+    let last = sectionEnd(found, header)
+    let mut at = header + usize.ONE
+    while at < last {
+      if named(manifest, &found[at], name) {
+        let mut result = run Bytes.copy(Slice.view<u8>(manifest, usize.ZERO, found[at].start))
+        run Bytes.append(&mut result, Slice.view<u8>(manifest, found[at].end, manifest.length - found[at].end))
+        return move result
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut table = run Bytes.copy(b"dependencies.")
+  run Bytes.append(&mut table, name)
+  return match move headerOf(manifest, found, Bytes.asSlice(&table)) {
+    Option<usize>.Some { value: header } => {
+      let last = sectionEnd(found, header)
+      let mut end = manifest.length
+      if last < found.length {
+        end = found[last].start
+      }
+      let mut result = run Bytes.copy(Slice.view<u8>(manifest, usize.ZERO, found[header].start))
+      run Bytes.append(&mut result, Slice.view<u8>(manifest, end, manifest.length - end))
+      return move result
+    }
+    Option<usize>.None => run refused(b"the manifest has no such dependency")
+  }
+}
