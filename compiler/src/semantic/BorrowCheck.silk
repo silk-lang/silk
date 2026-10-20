@@ -6323,7 +6323,7 @@ effect fn sourceEndLoan<'input, 'body>(input: &SourceRegionInput<'input, 'body>,
 
 // A handler gap is an actual execution obligation, distinct from a policy decision to drop
 // a source. It remains visible while the atomic consumer migration is unfinished.
-enum SourceHandlerGap { Handler, HolderUse, BlockLifetime, Projection, ReplacementCleanup }
+enum SourceHandlerGap { Handler, BlockLifetime, Projection, ReplacementCleanup }
 struct SourcePendingHandler { dispatch: usize, evaluation: SourceGraph.EvalId, reason: SourceHandlerGap, active: SourceAtom }
 struct SourcePolicyRefusal { dispatch: usize, point: SourceControl.PointId, reason: BorrowStatus, active: SourceAtom }
 struct SourceInheritedStatus { status: BorrowStatus, active: SourceAtom }
@@ -6352,6 +6352,43 @@ effect fn sourceDispatchMissing(state: &mut SourceDispatchProjection, missing: S
   rules: &mut SourceProgram) -> () ! OutOfMemoryError ? &mut Allocator {
   let gaps: [SourceAtom; 2] = [state.policy.missing, missing]
   state.policy.missing = run SourcePolicy.disjunction(&mut rules.*, &gaps)
+  return ()
+}
+
+// A Local has an actual read even under Access.Place, retained by Traversal without an
+// ownership Read event. Other selected places use their exact final storage endpoint.
+// Neither form invents a current read merely to satisfy whole-holder demand.
+effect fn sourceDispatchHolder<'body>(builder: &mut SourceGraph.Builder<'body>, node: NodeId,
+  evaluation: SourceGraph.EvalId, point: SourceControl.PointId, place: bool, state: &mut SourceDispatchProjection)
+  -> () ! OutOfMemoryError ? &mut Allocator {
+  let prepared = SourceGraph.Builder.preparation(&builder.*)
+  let local = match &prepared.body.nodes[node.index].kind {
+    NodeKind.Expression {form: Expression.Local {..}, ..} => true
+    _ => false
+  }
+  let role = match place && !local { true => PreparedSources.EndpointRole.Storage false => PreparedSources.EndpointRole.Value }
+  let endpoints = List<PreparedSources.Endpoint>.asSlice(&prepared.endpoints)
+  let mut root = usize.MAX
+  let mut at = usize.ZERO
+  while at < endpoints.length {
+    let whole = match endpoints[at].parent { Option<PreparedSources.EndpointId>.None => true _ => false }
+    let actual = match &endpoints[at].root {
+      PreparedSources.Root.Node {node: original, role: originalRole} => original.index == node.index && originalRole == role
+      _ => false
+    }
+    if whole && actual {
+      if root != usize.MAX { return CompilerBug.panic(b"holder demand has duplicate occurrence roots") }
+      root = at
+    }
+    at = at + usize.ONE
+  }
+  let active = List<SourceControl.Point>.asSlice(&builder.reaching.points)[point.index].reachable
+  if root == usize.MAX {
+    return run sourceDispatchMissing(&mut state.*, active, &mut builder.rules)
+  }
+  run List<SourceHolderRequest>.append(&mut state.policy.holderRequests, SourceHolderRequest {
+    owner: Option<SourceVisit.OwnerId>.none(), evaluation: evaluation,
+    root: PreparedSources.EndpointId {index: root}, point: point, active: active})
   return ()
 }
 
@@ -6410,7 +6447,7 @@ effect fn sourceDispatchConsume<'body>(builder: &mut SourceGraph.Builder<'body>,
 // the exact viewed descriptor occurrence retained by acquisition preparation; it does not
 // manufacture a reference result or use the enclosing match's later successful result.
 effect fn sourceMatchSubject<'body>(builder: &mut SourceGraph.Builder<'body>, actual: &SourceVisit.Visit,
-  views: &[SourceMatchView], dispatch: usize, state: &mut SourceDispatchProjection,
+  views: &[SourceMatchView], state: &mut SourceDispatchProjection,
   loans: &[Loan], paths: &mut List<List<Step>>) -> () ! OutOfMemoryError ? &mut Allocator {
   let inputs = List<SourceVisit.Input>.asSlice(&actual.inputs)
   if inputs.length == usize.ZERO { return CompilerBug.panic(b"match subject lost its actual input") }
@@ -6441,7 +6478,7 @@ effect fn sourceMatchSubject<'body>(builder: &mut SourceGraph.Builder<'body>, ac
   // Physical subject ownership and authored borrowed-view lifetime are already separate
   // reserved relations. A place use still owes the whole canonical holder demand.
   if input.access == SourceVisit.Access.Place {
-    run sourcePending(&mut state.*, dispatch, actual.evaluation, SourceHandlerGap.HolderUse, active, &mut builder.rules)
+    run sourceDispatchHolder(&mut builder.*, input.node, input.evaluation, input.usePoint, true, &mut state.*)
   }
   return ()
 }
@@ -6552,7 +6589,7 @@ effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraph.Builder<'body>
   let mut state = SourceDispatchProjection {
     policy: SourcePolicyEffects {state: run SourcePolicy.LoanState.make(&mut builder.rules, loans.length),
       results: List<SourcePositionResult>.make(), crossings: List<SourceCrossingEffect>.make(), written: List<SourceEscapeEffect>.make(),
-      callables: List<SourceCallableBinding>.make(),
+      callables: List<SourceCallableBinding>.make(), holderRequests: List<SourceHolderRequest>.make(),
       captures: List<SourceCaptureEffect>.make(), retention: List<SourceRetentionEffect>.make(), intervals: List<SourceIntervalEffect>.make(), missing: no},
     holders: move holders, outputs: List<SourceResultEffect>.make(), wholeHolds: List<SourceWholeHold>.make(),
     sealed: List<Location>.make(), unheld: List<Location>.make(), constructions: List<SourceInheritedStatus>.make(),
@@ -6576,10 +6613,31 @@ effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraph.Builder<'body>
         let actual = sourceVisitAt(visits, evaluation)
         let inputs = List<SourceVisit.Input>.asSlice(&actual.inputs)
         if input >= inputs.length { return CompilerBug.panic(b"dispatch trace lost an actual input completion") }
+        let mut borrowing = false
+        if let Shape.Borrow {value, ..} = move run shapeOf(nodes, actual.node) {
+          if input != usize.ZERO || inputs.length != usize.ONE || inputs[0].node.index != value.index {
+            return CompilerBug.panic(b"borrow holder demand changed its actual operand")
+          }
+          borrowing = true
+        }
+        let mut acquisition = usize.ZERO
+        while acquisition < acquired.length {
+          if acquired[acquisition].result.index == evaluation.index
+            && acquired[acquisition].input.index == inputs[input].evaluation.index {
+            if SourceGraph.Builder.evaluation(&builder.*, acquired[acquisition].acquisition).point.index != inputs[input].usePoint.index {
+              return CompilerBug.panic(b"implicit borrow holder demand left its acquisition point")
+            }
+            borrowing = true
+          }
+          acquisition = acquisition + usize.ONE
+        }
+        if borrowing {
+          run sourceDispatchHolder(&mut builder.*, inputs[input].node, inputs[input].evaluation, inputs[input].usePoint, true, &mut state)
+        }
         if input == usize.ZERO {
           if let Shape.Match {subject, ..} = move run shapeOf(nodes, actual.node) {
             if inputs[0].node.index != subject.index { return CompilerBug.panic(b"match subject changed its typed operand") }
-            run sourceMatchSubject(&mut builder.*, actual, List<SourceMatchView>.asSlice(&ownership.views), at,
+            run sourceMatchSubject(&mut builder.*, actual, List<SourceMatchView>.asSlice(&ownership.views),
               &mut state, loans, &mut paths.*)
           }
         }
@@ -6739,7 +6797,9 @@ effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraph.Builder<'body>
               return CompilerBug.panic(b"drop dispatch changed its actual operand")
             }
             run sourceDispatchConsume(&mut builder.*, visits, inputs[0], actual.execute, false, &mut state, loans, &mut paths.*)
-            if consumed { run sourcePending(&mut state, at, evaluation, SourceHandlerGap.HolderUse, active, &mut builder.rules) }
+            if consumed {
+              run sourceDispatchHolder(&mut builder.*, inputs[0].node, inputs[0].evaluation, actual.execute, true, &mut state)
+            }
           }
           Shape.PassThrough {value} | Shape.Move {value, consumed: false} => {
             let inputs = List<SourceVisit.Input>.asSlice(&actual.inputs)
@@ -6789,7 +6849,17 @@ effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraph.Builder<'body>
                 _ => run sourcePending(&mut state, at, evaluation, SourceHandlerGap.Projection, active, &mut builder.rules)
               }
             }
-            run sourcePending(&mut state, at, evaluation, SourceHandlerGap.HolderUse, active, &mut builder.rules)
+            if actual.access == SourceVisit.Access.Value {
+              let path = run pathOf(nodes, actual.node)
+              let mut held = path.root != usize.MAX
+              if !held {
+                let base = projectedBase(nodes, actual.node)
+                let descriptor = SourceGraph.Builder.preparation(&builder.*).body.locals.length + nodes.length + base.index
+                held = descriptor < cleanup.length
+                  && (cleanup[descriptor].unknown || List<Shared<Lifetime>>.length(&cleanup[descriptor].regions) != usize.ZERO)
+              }
+              if held { run sourceDispatchHolder(&mut builder.*, actual.node, actual.evaluation, actual.execute, false, &mut state) }
+            }
           }
           Shape.Leaf | Shape.Defer {..} | Shape.Match {..} | Shape.Exit {..} | Shape.Break | Shape.Continue | Shape.Outside {..} | Shape.Recovered {..} => ()
           _ => run sourcePending(&mut state, at, evaluation, SourceHandlerGap.Handler, active, &mut builder.rules)
@@ -6836,6 +6906,7 @@ effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraph.Builder<'body>
 struct SourcePolicyEffects {
   state: SourcePolicy.LoanState
   callables: List<SourceCallableBinding>
+  holderRequests: List<SourceHolderRequest>
   results: List<SourcePositionResult>
   crossings: List<SourceCrossingEffect>
   written: List<SourceEscapeEffect>
@@ -6874,6 +6945,17 @@ effect fn sourceSolveProjection<'body>(builder: SourceGraph.Builder<'body>, owne
 ! OutOfMemoryError ? &mut Allocator {
   let mut builder = move builder
   let storage = run sourceStorageProjection(&mut builder)
+  let requested = run sourceHolderProjection(&mut builder, List<SourceVisit.Owner>.asSlice(&owners), &storage, move effects.holderRequests)
+  let mut holders = move holders
+  let offset = List<SourceHolderRequest>.length(&holders.requests)
+  let mut requested = move requested
+  let uses = List<SourceHolderUse>.asMutSlice(&mut requested.uses)
+  let mut use = usize.ZERO
+  while use < uses.length { uses[use].request = uses[use].request + offset use = use + usize.ONE }
+  let gaps: [SourceAtom; 2] = [holders.missing, requested.missing]
+  holders.missing = run SourcePolicy.disjunction(&mut builder.rules, &gaps)
+  run sourceAppendEffects<SourceHolderRequest>(&mut holders.requests, move requested.requests)
+  run sourceAppendEffects<SourceHolderUse>(&mut holders.uses, move requested.uses)
   let bindings = run sourceCallableLifetimes(&mut builder, &storage, List<SourceCallableBinding>.asSlice(&effects.callables),
     List<SourceVisit.Owner>.asSlice(&owners), exits, &holders, List<Loan>.asSlice(&ownership.loans))
   let mut views = move views
