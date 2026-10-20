@@ -5,7 +5,7 @@ description: Explicit request policy, owned sessions, scoped exchanges, and boun
 
 # Streaming HTTP client
 
-Use `silk.http_request` to prepare an origin-bound request and `silk.http_client` to send it through
+Use `silk.http_request` to prepare an origin-bound request and `silk.http_exchange` to send it through
 one owned session. Request preparation copies the head before network output. The session retains
 its concrete transport, parser storage, buffered input suffix, origin, HTTP version, and overall
 absolute deadline. `makeOwned` returns that owner; `withOwned` lends it within a terminal-close
@@ -110,7 +110,7 @@ resource twice. Fatal traps remain outside structured cleanup guarantees.
 
 ## Native HTTPS and deadlines
 
-`silk.http_client_native.withConnection` resolves and connects an owned native socket. For HTTPS it
+`silk.http_exchange_native.withConnection` resolves and connects an owned native socket. For HTTPS it
 loads the selected trust snapshot inside the resource scope and authenticates the original origin
 before any HTTP bytes. TrustSource, SystemClock, MonotonicClock, Random and Allocator remain explicit
 requirements. HTTP/1.1 offers only `http/1.1`; absence is accepted by default and rejected under the

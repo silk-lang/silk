@@ -6,7 +6,7 @@ Native ownership context for one-shot HTTP fetch operations.
 
 ## Details
 
-The context retains one immutable proxy policy through [`NativeRedirectClient`](./http-client-native.md#NativeRedirectClient). Fresh
+The context retains one immutable proxy policy through [`NativeRedirectClient`](./http-exchange-native.md#NativeRedirectClient). Fresh
 attempts therefore recompute the sealed route for every current URI before contact. An
 optional native pool handle is copied explicitly, sharing only its preallocated slot state and
 bounded immutable direct-route context.
@@ -93,7 +93,7 @@ Returns whether this context owns an explicit direct native pool capability.
 
 <a id="Context.impl.FetchClient"></a>
 
-## Implementation `FetchClient<'policy, NativeRouteProvider, NativeTransport, A, HandlerError, ProxyError | RequestError | ValueError | OriginError | ClientError | NativeClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError | PoolError, HandlerRequirements, &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource> for Context<'configuration>`
+## Implementation `FetchClient<'policy, NativeRouteProvider, NativeTransport, A, HandlerError, ProxyError | RequestError | ValueError | OriginError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError | PoolError, HandlerRequirements, &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random | &mut TrustSource> for Context<'configuration>`
 
 ```silk
 impl<
@@ -112,8 +112,8 @@ impl<
       | RequestError
       | ValueError
       | OriginError
-      | ClientError
-      | NativeClientError
+      | ExchangeError
+      | NativeExchangeError
       | ResolverError
       | NativeSocketError
       | ConnectionError
@@ -148,8 +148,8 @@ effect fn withAttempt(
       | RequestError
       | ValueError
       | OriginError
-      | ClientError
-      | NativeClientError
+      | ExchangeError
+      | NativeExchangeError
       | ResolverError
       | NativeSocketError
       | ConnectionError

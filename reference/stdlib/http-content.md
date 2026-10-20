@@ -19,7 +19,7 @@ provisional because a later wrapper checksum, trailer, or framed boundary can st
 This low-level actor treats the body supplied to each `withReader` invocation as the encoded
 representation described by the plan. It does not prove that those bytes came from the retained
 head and cannot prevent a copied head from being planned over already-decoded bytes. The affine
-response/body envelope in `silk.http_client` owns that stronger provenance and decode-once contract.
+response/body envelope in `silk.http_exchange` owns that stronger provenance and decode-once contract.
 Cleanup is guaranteed for structured Effect exits, including interruption, but not for fatal
 traps that bypass Effect finalizers and Drop.
 

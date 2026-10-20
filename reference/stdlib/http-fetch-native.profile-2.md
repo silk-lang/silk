@@ -6,7 +6,7 @@ Native ownership context for one-shot HTTP fetch operations.
 
 ## Details
 
-The context retains one immutable proxy policy through [`NativeRedirectClient`](./http-client-native.md#NativeRedirectClient). Fresh
+The context retains one immutable proxy policy through [`NativeRedirectClient`](./http-exchange-native.md#NativeRedirectClient). Fresh
 attempts therefore recompute the sealed route for every current URI before contact. An
 optional native pool handle is copied explicitly, sharing only its preallocated slot state and
 bounded immutable direct-route context.
@@ -93,7 +93,7 @@ Returns whether this context owns an explicit direct native pool capability.
 
 <a id="Context.impl.FetchClient"></a>
 
-## Implementation `FetchClient<'policy, NativeRouteProvider, NativeTransport, A, HandlerError, NativeClientError, HandlerRequirements, never> for Context<'configuration>`
+## Implementation `FetchClient<'policy, NativeRouteProvider, NativeTransport, A, HandlerError, NativeExchangeError, HandlerRequirements, never> for Context<'configuration>`
 
 ```silk
 impl<
@@ -108,7 +108,7 @@ impl<
     NativeTransport,
     A,
     HandlerError,
-    NativeClientError,
+    NativeExchangeError,
     HandlerRequirements,
     never,
   > for Context<'configuration>
@@ -127,7 +127,7 @@ effect fn withAttempt(
       proxyMode: ProxyMode,
       deadline: Option<Instant>,
     ) -> A
-    ! HandlerError | NativeClientError
+    ! HandlerError | NativeExchangeError
     ? HandlerRequirements | &mut HybridAttempt<
       'policy,
       NativeRouteProvider,

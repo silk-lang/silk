@@ -78,14 +78,14 @@ copy: Context.copyContext
 
 <a id="Context.impl.PoolContext"></a>
 
-## Implementation `PoolContext<ConnectionKey, NativeTransport, NativeClientError | ClientError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random> for Context`
+## Implementation `PoolContext<ConnectionKey, NativeTransport, NativeExchangeError | ExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError | OutOfMemoryError ? &mut Allocator | &mut MonotonicClock | &mut SystemClock | &mut Random> for Context`
 
 ```silk
 impl PoolContext<
   ConnectionKey,
   NativeTransport,
-  NativeClientError
-    | ClientError
+  NativeExchangeError
+    | ExchangeError
     | ResolverError
     | NativeSocketError
     | ConnectionError
@@ -161,7 +161,7 @@ pub effect<'env> fn withUnixPool<
   preparedTrust: Option<&TrustSnapshot>,
   handler: H,
 ) -> A
-! E | PoolError | NativeClientError | NativeSocketError | TrustSourceError | OutOfMemoryError
+! E | PoolError | NativeExchangeError | NativeSocketError | TrustSourceError | OutOfMemoryError
 ? R | &mut Allocator
 where &mut NativeTransport provides &HttpTransport from &mut HttpTransport
 ```
@@ -230,8 +230,8 @@ pub effect<'env> fn withConnection<
 ) -> CheckoutResult<A>
 ! E
   | PoolError
-  | NativeClientError
-  | ClientError
+  | NativeExchangeError
+  | ExchangeError
   | ResolverError
   | NativeSocketError
   | ConnectionError
@@ -272,8 +272,8 @@ pub effect<'env> fn withUnixConnection<
 ) -> CheckoutResult<A>
 ! E
   | PoolError
-  | NativeClientError
-  | ClientError
+  | NativeExchangeError
+  | ExchangeError
   | ResolverError
   | NativeSocketError
   | ConnectionError

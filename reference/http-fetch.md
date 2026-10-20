@@ -97,7 +97,7 @@ representation.
 Reaching the discard cap before completion is an error and makes the connection ineligible for
 reuse. Discard is not redirect intermediate draining: it cannot convert truncation into success,
 does not stop at the response head, and performs no implicit cleanup read. Head-only handling
-belongs to `silk.http_client`.
+belongs to `silk.http_exchange`.
 
 ## Options and defaults
 
@@ -305,8 +305,8 @@ redirects, Raw content, a finite absolute deadline, and a 1 MiB collection cap:
 
 ```silk,ignore
 import silk.effect {Effect}
-import silk.http_client as Client
-import silk.http_client_native as Native
+import silk.http_exchange as Client
+import silk.http_exchange_native as Native
 import silk.http_content as Content
 import silk.http_fetch {Fetch, FetchOptions, FetchRequest, PoolMode, ProxyMode}
 import silk.http_fetch as HttpFetch
@@ -404,7 +404,7 @@ The target-neutral implementation lives in
 [`http_fetch.silk`](../stdlib/silk/http_fetch.silk), with supported native
 composition in
 [`http_fetch_native.silk`](../stdlib/silk/http_fetch_native.silk).
-The lower-level contracts are documented in [`silk.http_client`](http-client.md),
+The lower-level contracts are documented in [`silk.http_exchange`](http-exchange.md),
 [`silk.http_redirect`](http-redirects.md), [`silk.http_proxy`](http-proxy-routing.md), and
 [`silk.http_connection_pool`](http-connection-pooling.md). The normative delivery contract is the
 `one-shot-http-fetch` OpenSpec.

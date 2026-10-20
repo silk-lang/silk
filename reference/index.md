@@ -159,7 +159,7 @@ documentation remain separate from this reference.
 - [HTTP body framing](http-body-framing.md) — strict bounded message framing, chunked transfer, trailers, and completion evidence.
 - [HTTP content decoding](http-content-decoding.md) — bounded streaming content-coding plans, decoding, metadata, and reuse evidence.
 - [Streaming HTTP server](http-server.md) — bounded serial request handling, framed bodies, explicit response output, graceful shutdown, and scoped protocol handoff.
-- [Streaming HTTP client](http-client.md) — origin-bound request policy, owned sessions, staged exchanges, and authenticated native TLS transport.
+- [Streaming HTTP client](http-exchange.md) — origin-bound request policy, owned sessions, staged exchanges, and authenticated native TLS transport.
 - [HTTP proxy routing](http-proxy-routing.md) — explicit bounded proxy policy, routed admission, CONNECT tunnel ownership, and original-origin TLS.
 - [HTTP redirects](http-redirects.md) — bounded redirect policy, replay sources, authority changes, scoped cleanup, and final response ownership.
 - [HTTP connection pooling](http-connection-pooling.md) — bounded local ownership, conservative reuse, deterministic eviction, and explicit closure.
