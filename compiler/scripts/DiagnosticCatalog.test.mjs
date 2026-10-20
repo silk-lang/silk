@@ -66,6 +66,21 @@ it('accepts an exhaustive catalog and explicitly recorded diagnostic gap', () =>
   assert.deepStrictEqual(verify(fixture()), [])
 })
 
+it('rejects a code doc comment that documents no member or another member', () => {
+  const orphan = fixture()
+  orphan.catalog = orphan.catalog.replace(
+    '  UnknownType,',
+    '  /// OWN0020: Retired.\n  /// SEM0001: Unknown type.\n  UnknownType,',
+  )
+  reports(orphan, 'OWN0020: doc comment documents no Code member')
+  const mismatched = fixture()
+  mismatched.catalog = mismatched.catalog.replace('  UnknownType,', '  /// SEM0002\n  UnknownType,')
+  reports(mismatched, 'Code.UnknownType: doc comment names SEM0002')
+  const documented = fixture()
+  documented.catalog = documented.catalog.replace('  UnknownType,', '  /// SEM0001: Unknown type.\n  UnknownType,')
+  assert.deepStrictEqual(verify(documented), [])
+})
+
 it('accepts a refusal without a catalog code and rejects a default arm', () => {
   const input = fixture()
   input.rejection = input.rejection
