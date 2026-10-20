@@ -1513,12 +1513,19 @@ struct SourceLifetimeProjection {
   released: List<SourceAtom>
 }
 
+union SourceInputAcquisitionKind {
+  Reference,
+  CaptureReborrow {descriptor: SourceGraph.ValueId},
+}
+impl Copy for SourceInputAcquisitionKind {}
+
 struct SourceInputAcquisition {
   result: SourceGraph.EvalId
   input: SourceGraph.EvalId
   acquisition: SourceGraph.EvalId
   map: PreparedSources.MapId
   loan: usize
+  kind: SourceInputAcquisitionKind
 }
 impl Copy for SourceInputAcquisition {}
 
@@ -3482,6 +3489,17 @@ effect fn sourceOwnershipOriginField<'body>(builder: &SourceGraphBuilder<'body>,
     }
     SourceGraphOwnershipOrigin.RvalueDereference {root, ..} => {
       return SourceOriginField {root: root, field: SourceReadField {supported: true, field: usize.ZERO}}
+    }
+    SourceGraphOwnershipOrigin.CaptureReborrow {origin, case, ..} => {
+      let acquisition = SourceGraphBuilder.captureReborrows(builder)[origin]
+      let seed = SourceGraphBuilder.case(builder, case)
+      let descriptor = SourceGraphBuilder.value(builder, acquisition.descriptor)
+      if seed.target.value.index != acquisition.descriptor.index || seed.target.leaf.index != acquisition.leaf.index
+        || seed.target.category != SourceGraphSourceRole.Ownership || !seed.target.direct
+        || descriptor.evaluation.index != acquisition.acquisition.index || descriptor.phase != SourceGraphValuePhase.Output {
+        return CompilerBug.panic(b"capture reborrow ownership origin changed its actual seed")
+      }
+      return SourceOriginField {root: descriptor.endpoint, field: SourceReadField {supported: true, field: usize.ZERO}}
     }
     SourceGraphOwnershipOrigin.Move {candidate, storage, held, source, target, definition, read, ..} => {
       let actual = SourceGraphBuilder.moveHoldings(builder)[candidate]
@@ -9324,9 +9342,11 @@ effect fn sourceDispatchPolicies<'body>(builder: &mut SourceGraphBuilder<'body>,
             if SourceGraphBuilder.evaluation(&builder.*, acquired[acquisition].acquisition).point.index != inputs[input].usePoint.index {
               return CompilerBug.panic(b"implicit borrow holder demand left its acquisition point")
             }
-            run sourceReferenceAcquisition(&mut builder.*, acquired[acquisition].acquisition, &mut state, loans, &mut paths.*)
-            holderAcquisition = acquired[acquisition].acquisition
-            borrowing = true
+            if let SourceInputAcquisitionKind.Reference = acquired[acquisition].kind {
+              run sourceReferenceAcquisition(&mut builder.*, acquired[acquisition].acquisition, &mut state, loans, &mut paths.*)
+              holderAcquisition = acquired[acquisition].acquisition
+              borrowing = true
+            }
           }
           acquisition = acquisition + usize.ONE
         }
@@ -12036,7 +12056,17 @@ effect fn sourceConstructVisit<'body>(builder: &mut SourceGraphBuilder<'body>, a
             if evaluation.point.index != input.usePoint.index || capture.loan >= loans.length {
               return CompilerBug.panic(b"capture acquisition moved past a later input")
             }
-            let target = List<PreparedSources.SelectionMap>.asSlice(&SourceGraphBuilder.preparation(&builder.*).maps)[capture.map.index].target
+            let target = match capture.kind {
+              SourceInputAcquisitionKind.Reference =>
+                List<PreparedSources.SelectionMap>.asSlice(&SourceGraphBuilder.preparation(&builder.*).maps)[capture.map.index].target
+              SourceInputAcquisitionKind.CaptureReborrow {descriptor} => {
+                let value = SourceGraphBuilder.value(&builder.*, descriptor)
+                if value.evaluation.index != capture.acquisition.index || value.phase != SourceGraphValuePhase.Output {
+                  return CompilerBug.panic(b"capture reborrow changed its acquisition descriptor")
+                }
+                value.endpoint
+              }
+            }
             let descriptors: [SourceOperand; 1] = [SourceOperand {node: input.node, evaluation: capture.acquisition, root: target, ordinal: at}]
             let descriptor = run sourceObserve(&mut builder.*, &descriptors, SourceGraphValuePhase.Output, &mut paths.*, loans.length, false)
             let positions = List<SourceCarryPosition>.asSlice(&descriptor.positions)
@@ -13116,6 +13146,7 @@ union SourceBorrowKind {
   Construction {record: usize, route: usize},
   Invocation {record: usize, route: usize},
   MatchView {record: usize},
+  CaptureReborrow {record: usize},
 }
 impl Copy for SourceBorrowKind {}
 struct SourceBorrowSite {
@@ -13622,8 +13653,70 @@ effect fn sourceMatchViewLoan<'body>(prepared: &PreparedSources.SourcePreparatio
   return CompilerBug.panic(b"prepared match view belongs to another expression")
 }
 
-// Reserve all real reference creations first, without observing any policy-selected source.
-// Activating each Construction once also avoids executing future invocation destination writes.
+// Callable.referents is an explicit acquisition request. Its Place map keeps the
+// existing descriptor; the new referent loan has separate ownership publication.
+effect fn sourceCaptureReborrowLoan<'body>(prepared: &PreparedSources.SourcePreparation<'body>,
+  reservation: &mut SourceVisit.Reservation, visit: usize, record: usize, ownership: &mut SourceOwnership,
+  active: SourceAtom) -> () ! OutOfMemoryError ? &mut Allocator {
+  let row = &List<PreparedSources.CaptureReborrow>.asSlice(&prepared.captureReborrows)[record]
+  PreparedSources.validateCaptureReborrow(prepared, row)
+  let node = List<SourceVisit.Visit>.asSlice(&reservation.visits)[visit].node
+  let result = List<SourceVisit.Visit>.asSlice(&reservation.visits)[visit].evaluation
+  if row.site.index != node.index { return CompilerBug.panic(b"capture reborrow changed its construction occurrence") }
+  let ordinal = match row.read { PreparedSourcesInputRead.Field {ordinal} => ordinal
+    _ => { return CompilerBug.panic(b"capture reborrow lost its field input") } }
+  let input = List<SourceVisit.Input>.asSlice(&List<SourceVisit.Visit>.asSlice(&reservation.visits)[visit].inputs)[ordinal]
+  let matched = match input.read { Option<PreparedSourcesInputRead>.Some {value} => SourceGraph.sameInputRead(value, row.read)
+    _ => false }
+  if !matched {
+    return CompilerBug.panic(b"capture reborrow changed its actual input")
+  }
+  let nodes = prepared.body.nodes
+  let exclusive = match &nodes[node.index].kind {
+    NodeKind.Expression {form: Expression.Callable {fields, referents, ..}, ..} => {
+      if List<AggregateField>.asSlice(&fields)[ordinal].value.index != input.node.index {
+        return CompilerBug.panic(b"capture reborrow substituted another operand")
+      }
+      List<ReferentCapture>.asSlice(&referents)[row.referent].access == Access.Mutable
+    }
+    _ => { return CompilerBug.panic(b"capture reborrow has no typed callable") }
+  }
+  let encounter = sourceEncounter(List<SourceVisitDispatch>.asSlice(&reservation.dispatch), result,
+    SourceEncounter.Input {evaluation: input.evaluation}, List<SourceVisit.Visit>.asSlice(&reservation.visits))
+  let mut path = run pathOf(nodes, input.node)
+  // Preserve the original reborrowReferent eligibility. A selected/rvalue descriptor
+  // is not permission to fabricate a whole local place or infer its referent address.
+  if path.root == usize.MAX || path.through || List<Step>.length(&path.steps) != usize.ZERO {
+    run List<SourceAccessRefusal>.append(&mut ownership.geometry, SourceAccessRefusal {
+      uncertain: false, dispatch: encounter, point: input.usePoint, reason: BorrowStatus.StoredLoans})
+    return ()
+  }
+  run List<Step>.append(&mut path.steps, referent())
+  path.through = true
+  let loan = List<Loan>.length(&ownership.loans)
+  let span = nodes[input.node.index].origin.location
+  run List<usize>.append(&mut ownership.encounters, encounter)
+  run List<Loan>.append(&mut ownership.loans, run loanTyped(prepared.body.owner, &path, exclusive, span,
+    expressionType(nodes, input.node), nodeLoanLifetime(nodes, input.node), input.usePoint.index))
+  let mut kind = Kind.SharedBorrow
+  if exclusive { kind = Kind.ExclusiveBorrow }
+  run List<Event>.append(&mut ownership.events, Event {point: input.usePoint.index,
+    place: Place {root: path.root, steps: run copySteps(List<Step>.asSlice(&path.steps))}, kind: kind,
+    span: span, target: span, loan: loan, consumesTarget: usize.ZERO, refiner: path.refiner,
+    refinedDepth: path.refinedDepth, binders: run copyBinders(List<usize>.asSlice(&path.binders))})
+  let acquisition = run SourceGraphSkeleton.evaluate(&mut reservation.skeleton, node,
+    SourceGraphEvaluationRole.Capture, input.usePoint)
+  let descriptor = run SourceGraphSkeleton.captureReborrow(&mut reservation.skeleton, prepared, record,
+    result, input.evaluation, ordinal, input.usePoint,
+    SourceGraph.ReferenceAcquisition {evaluation: acquisition, loan: loan}, active)
+  run List<SourceInputAcquisition>.append(&mut ownership.acquisitions, SourceInputAcquisition {
+    result: result, input: input.evaluation, acquisition: acquisition, map: row.placement, loan: loan,
+    kind: SourceInputAcquisitionKind.CaptureReborrow {descriptor: descriptor}})
+  return ()
+}
+
+// Reserve all real acquisitions before observing policy-selected source histories.
+// Construction placement is not execution of a future invocation destination write.
 effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparation<'body>, reservation: &mut SourceVisit.Reservation)
   -> SourceOwnership ! OutOfMemoryError ? &mut Allocator {
   let mut ownership = SourceOwnership {encounters: List<usize>.make(), loans: List<Loan>.make(), events: List<Event>.make(), geometry: List<SourceAccessRefusal>.make(),
@@ -13678,6 +13771,27 @@ effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparatio
           kind: SourceBorrowKind.MatchView {record: record}})
       }
     }
+    let mut capture = usize.ZERO
+    let reborrows = List<PreparedSources.CaptureReborrow>.asSlice(&prepared.captureReborrows)
+    while capture < reborrows.length {
+      let row = &reborrows[capture]
+      if row.site.index == actual.node.index {
+        PreparedSources.validateCaptureReborrow(prepared, row)
+        let ordinal = match row.read { PreparedSourcesInputRead.Field {ordinal} => ordinal
+          _ => { return CompilerBug.panic(b"capture reborrow lost its actual field input") } }
+        let inputs = List<SourceVisit.Input>.asSlice(&actual.inputs)
+        let matched = ordinal < inputs.length && match inputs[ordinal].read {
+          Option<PreparedSourcesInputRead>.Some {value} => SourceGraph.sameInputRead(value, row.read)
+          _ => false
+        }
+        if !matched {
+          return CompilerBug.panic(b"capture reborrow lost its actual input occurrence")
+        }
+        run sourceBorrowOrder(&mut sites, SourceBorrowSite {visit: at, point: inputs[ordinal].usePoint.index,
+          kind: SourceBorrowKind.CaptureReborrow {record: capture}})
+      }
+      capture = capture + usize.ONE
+    }
     let mut each = usize.ZERO
     while each < constructions.length {
       if constructions[each].site.index == actual.node.index {
@@ -13716,6 +13830,11 @@ effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparatio
   at = usize.ZERO
   while at < ordered.length {
     let site = ordered[at]
+    if let SourceBorrowKind.CaptureReborrow {record} = site.kind {
+      run sourceCaptureReborrowLoan(prepared, &mut reservation.*, site.visit, record, &mut ownership, active)
+      at = at + usize.ONE
+      continue
+    }
     let actual = &List<SourceVisit.Visit>.asSlice(&reservation.visits)[site.visit]
     let evaluation = actual.evaluation
     if let SourceBorrowKind.MatchView {record} = site.kind {
@@ -13728,6 +13847,7 @@ effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparatio
     let mut map = PreparedSources.MapId {index: usize.MAX}
     match site.kind {
       SourceBorrowKind.MatchView {..} => { return CompilerBug.panic(b"match view entered descriptor acquisition") }
+      SourceBorrowKind.CaptureReborrow {..} => { return CompilerBug.panic(b"capture reborrow entered reference creation") }
       SourceBorrowKind.Authored {record} => {
         let operands = List<SourceVisit.Input>.asSlice(&actual.inputs)
         if operands.length != usize.ONE { CompilerBug.panic(b"authored borrow lost its actual operand") }
@@ -13791,7 +13911,8 @@ effect fn sourceDeclaredLoans<'body>(prepared: &PreparedSources.SourcePreparatio
         let acquisition = run SourceGraphSkeleton.evaluate(&mut reservation.skeleton, actual.node,
           SourceGraphEvaluationRole.Capture, input.usePoint)
         run List<SourceInputAcquisition>.append(&mut ownership.acquisitions,
-          SourceInputAcquisition {result: evaluation, input: input.evaluation, acquisition: acquisition, map: selected.map, loan: loan})
+          SourceInputAcquisition {result: evaluation, input: input.evaluation, acquisition: acquisition, map: selected.map, loan: loan,
+            kind: SourceInputAcquisitionKind.Reference})
         drop run SourceGraphSkeleton.input(&mut reservation.skeleton, endpoints, maps, selected,
           input.evaluation, evaluation, Option<SourceGraph.ReferenceAcquisition>.some(
             SourceGraph.ReferenceAcquisition {evaluation: acquisition, loan: loan}), active)
@@ -14516,6 +14637,9 @@ effect fn sourceCallInput<'body>(builder: &mut SourceGraphBuilder<'body>, actual
     return run sourceObserve(&mut builder.*, &operands, SourceGraphValuePhase.Output, &mut paths.*, loans, false)
   }
   let borrowed = acquired[selected]
+  if let SourceInputAcquisitionKind.CaptureReborrow {..} = borrowed.kind {
+    return CompilerBug.panic(b"call input substituted a callable capture reborrow")
+  }
   let maps = List<PreparedSources.SelectionMap>.asSlice(&SourceGraphBuilder.preparation(&builder.*).maps)
   let descriptor = maps[borrowed.map.index].target
   let acquisition = SourceGraphBuilder.evaluation(&builder.*, borrowed.acquisition)
@@ -15214,6 +15338,71 @@ fn sourceDeclaredArgument(nodes: &[Node], result: NodeId, position: &SourceCarry
   return false
 }
 
+fn sourceCaptureRawCell(cell: SourceGraph.InvocationCaptureCell, actual: SourceGraph.CellView) -> bool {
+  return cell.cell == actual.id && cell.value.index == actual.value.index && cell.leaf.index == actual.leaf.index
+    && cell.category == actual.category && cell.direct == actual.direct
+    && sourceDefinitionMatches(cell.definition, actual.definition) && sourceReadMatches(cell.read, actual.read)
+}
+
+// A captured reborrow is ownership-only. Its outer descriptor evidence comes from
+// the exact original physical capture and paired current Cases, never its loan type.
+effect fn sourceCaptureDeclaredSnapshot<'body>(builder: &mut SourceGraphBuilder<'body>, position: &SourceCarryPosition)
+  -> SourceAtom ! OutOfMemoryError ? &mut Allocator {
+  let mut proofs = List<SourceAtom>.make()
+  let empty = List<SourceAtom>.make()
+  let none = List<SourceAtom>.asSlice(&empty)
+  let histories = List<SourceCarryCase>.asSlice(&position.cases)
+  let count = SourceGraphBuilder.captureReborrowDescriptorsAt(&builder.*, position.value).length
+  let mut at = usize.ZERO
+  while at < count {
+    let ordinal = SourceGraphBuilder.captureReborrowDescriptorsAt(&builder.*, position.value)[at]
+    let row = SourceGraphBuilder.captureReborrowDescriptors(&builder.*)[ordinal]
+    let origin = SourceGraphBuilder.captureReborrows(&builder.*)[row.origin]
+    if origin.leaf.index == position.leaf.index && origin.loan == position.loan {
+      let current = SourceGraphBuilder.case(&builder.*, row.case).target
+      let physical = SourceGraphBuilder.case(&builder.*, row.physicalCase).target
+      let original = SourceGraphBuilder.case(&builder.*, row.originalCase).target
+      let placement = SourceGraphBuilder.case(&builder.*, row.placementCase)
+      let previous = match placement.source { Option<SourceGraph.CellView>.Some {value} => value
+        _ => { return CompilerBug.panic(b"captured descriptor placement has no actual predecessor") } }
+      let placementId = List<PreparedSources.CaptureReborrow>.asSlice(
+        &SourceGraphBuilder.preparation(&builder.*).captureReborrows)[origin.prepared].placement
+      let sourceEndpoint = List<PreparedSources.SelectionMap>.asSlice(
+        &SourceGraphBuilder.preparation(&builder.*).maps)[placementId.index].source
+      let targetEndpoint = List<PreparedSources.SelectionMap>.asSlice(
+        &SourceGraphBuilder.preparation(&builder.*).maps)[placementId.index].target
+      let originalValue = SourceGraphBuilder.value(&builder.*, original.value)
+      let placedValue = SourceGraphBuilder.value(&builder.*, placement.target.value)
+      let originalPlacement = match placement.authority {
+        SourceGraphTransferAuthority.Physical {map, direction, ..} =>
+          map.index == placementId.index && direction == SourceGraphMapDirection.Forward
+        _ => false
+      }
+      if !originalPlacement || !sourceCaptureRawCell(row.current, current) || !sourceCaptureRawCell(row.physical, physical)
+        || current.category != SourceGraphSourceRole.Ownership || physical.category != SourceGraphSourceRole.Physical
+        || physical.value.index != position.value.index || current.value.index != position.value.index
+        || original.category != SourceGraphSourceRole.Physical || previous.id != original.id
+        || placement.target.category != SourceGraphSourceRole.Physical
+        || originalValue.evaluation.index != origin.source.index || originalValue.endpoint.index != sourceEndpoint.index
+        || placedValue.evaluation.index != origin.result.index || placedValue.endpoint.index != targetEndpoint.index {
+        return CompilerBug.panic(b"captured reborrow changed its paired outer descriptor history")
+      }
+      let mut each = usize.ZERO
+      while each < histories.length {
+        let history = &histories[each]
+        if row.case == history.source.case && sourceCaptureCell(row.current, position, history) {
+          let raw = SourceGraphBuilder.observationCase(&builder.*, row.physicalCase).raw
+          let gates: [SourceAtom; 3] = [row.active, raw.present, history.observed]
+          run List<SourceAtom>.append(&mut proofs, run SourcePolicy.conjunction(&mut builder.rules, &gates, none))
+        }
+        each = each + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&proofs))
+}
+
 // Snapshot Exact and an actual outer descriptor are independent requirements. A known region
 // name or an arbitrary contract route cannot turn a nested content source into that descriptor.
 effect fn sourceDeclaredSnapshot<'body>(builder: &mut SourceGraphBuilder<'body>, observation: &SourceObservation,
@@ -15242,6 +15431,7 @@ effect fn sourceDeclaredSnapshot<'body>(builder: &mut SourceGraphBuilder<'body>,
         _ => false
       }
       if outer {
+        seed = run sourceCaptureDeclaredSnapshot(&mut builder.*, position)
         if let Option<SourceGraph.ReferenceOrigin>.Some {value: origin} = SourceGraphBuilder.referenceOrigin(&builder.*, position.leaf) {
           let descriptor = SourceGraphBuilder.value(&builder.*, origin.descriptor)
           let created = match &SourceGraphBuilder.leaf(&builder.*, origin.leaf).kind {
@@ -15259,6 +15449,7 @@ effect fn sourceDeclaredSnapshot<'body>(builder: &mut SourceGraphBuilder<'body>,
               }
               each = each + usize.ONE
             }
+            run List<SourceAtom>.append(&mut descriptors, seed)
             seed = run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&descriptors))
           }
         }
@@ -15445,6 +15636,17 @@ effect fn sourceResultPair<'body>(builder: &mut SourceGraphBuilder<'body>, port:
             SourceGraphInvocationCaptureAcquisition.Copy {source} => {
               matches = sourceCaptureCell(source, position, history)
                 && SourceGraphBuilder.value(&builder.*, source.value).evaluation.index == original.evaluation.index
+            }
+            SourceGraphInvocationCaptureAcquisition.CaptureReborrow {origin: id, source} => {
+              let acquisition = SourceGraphBuilder.captureReborrows(&builder.*)[id]
+              if source.value.index != acquisition.descriptor.index || source.leaf.index != acquisition.leaf.index
+                || source.category != SourceGraphSourceRole.Ownership || !source.direct
+                || acquisition.result.index != original.producer.index
+                || acquisition.acquisition.index != original.evaluation.index {
+                return CompilerBug.panic(b"invocation capture changed its reborrow acquisition")
+              }
+              matches = sourceCaptureCell(source, position, history)
+                && SourceGraphBuilder.case(&builder.*, history.source.case).target.id == source.cell
             }
             SourceGraphInvocationCaptureAcquisition.Reference {reference: id} => {
               if let SourceResultsDescriptorSource.Environment {..} = binding {
