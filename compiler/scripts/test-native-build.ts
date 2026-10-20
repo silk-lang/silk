@@ -816,13 +816,14 @@ const program = Effect.gen(function* () {
     'members share the workspace output',
   )
   assert.equal(yield* fs.exists(join(workspace, 'app/build')), false)
-  // The workspace manifest itself has no package to build, and every member needs a manifest.
+  // From the workspace root, `run` runs the one member that has an entry; the library member,
+  // which has none, is skipped with a note.
   const virtualRoot = yield* invoke(silk, ['run', '--stdlib', standardLibrary], workspace, {
     ...process.env,
-    SILK_CLANG: sentinel,
+    SILK_CLANG: clang,
   })
-  assert.notEqual(virtualRoot.status, 0, 'a workspace-only manifest was built')
-  assert.match(virtualRoot.stderr, /only defines a workspace/)
+  assert.equal(virtualRoot.status, 8, virtualRoot.stderr)
+  assert.match(virtualRoot.stderr, /Skipping math: it has no package\.root/)
   yield* fs.makeDirectory(join(workspace, 'libs/empty'), { recursive: true })
   const unmanifested = yield* invoke(
     silk,
@@ -855,6 +856,92 @@ const program = Effect.gen(function* () {
   assert.equal(outsider.status, 3, outsider.stderr)
   assert.equal(yield* fs.exists(join(workspace, 'tool/build')), true)
   assert.equal(yield* fs.exists(marker), false)
+  // `init --workspace`, `init` inside it and `add` assemble a workspace from the command line, and
+  // the building commands run over its members from the workspace root.
+  const managed = join(directory, 'managed')
+  const withClang = { ...process.env, SILK_CLANG: clang }
+  const managedRoot = yield* invoke(silk, ['init', '--workspace', 'managed'], directory)
+  assert.equal(managedRoot.status, 0, managedRoot.stderr)
+  assert.equal(yield* fs.readFileString(join(managed, 'silk.toml')), '[workspace]\nmembers = []\n')
+  const hello = yield* invoke(silk, ['init', 'apps/hello'], managed)
+  assert.equal(hello.status, 0, hello.stderr)
+  assert.match(hello.stdout, /Added apps\/hello to the workspace members in /)
+  const greeting = yield* invoke(silk, ['init', '--lib', 'libs/greeting'], managed)
+  assert.equal(greeting.status, 0, greeting.stderr)
+  assert.equal(
+    yield* fs.readFileString(join(managed, 'silk.toml')),
+    '[workspace]\nmembers = ["apps/hello", "libs/greeting"]\n',
+  )
+  const added = yield* invoke(silk, ['add', '../../libs/greeting'], join(managed, 'apps/hello'))
+  assert.equal(added.status, 0, added.stderr)
+  assert.match(
+    yield* fs.readFileString(join(managed, 'apps/hello/silk.toml')),
+    /\n\[dependencies\]\ngreeting = \{ path = "\.\.\/\.\.\/libs\/greeting" \}\n$/,
+  )
+  const again = yield* invoke(silk, ['add', '../../libs/greeting'], join(managed, 'apps/hello'))
+  assert.notEqual(again.status, 0, 'a dependency was added twice')
+  assert.match(again.stderr, /already has a dependency of that name/)
+  yield* fs.writeFileString(
+    join(managed, 'apps/hello/src/main.silk'),
+    'import greeting.lib { add }\n\npub fn main() -> i32 {\n  return add(4, 3)\n}\n',
+  )
+  const managedBuild = yield* invoke(
+    silk,
+    ['build', '--stdlib', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(managedBuild.status, 0, managedBuild.stderr + managedBuild.stdout)
+  assert.match(managedBuild.stdout, /^Package hello \(.*\)\n[\s\S]*^Package greeting \(/m)
+  assert.match(managedBuild.stdout, /Workspace summary: 2 packages succeeded, 0 failed\n$/)
+  const managedRun = yield* invoke(
+    silk,
+    ['run', '-p', 'hello', '--stdlib', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(managedRun.status, 7, managedRun.stderr)
+  const unchosen = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, {
+    ...process.env,
+    SILK_CLANG: sentinel,
+  })
+  assert.notEqual(unchosen.status, 0, 'run picked one of several members')
+  assert.match(unchosen.stderr, /pass --package <name>/)
+  const managedTest = yield* invoke(
+    silk,
+    ['test', '-p', 'greeting', '--no-cache', '--stdlib', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(managedTest.status, 0, managedTest.stderr + managedTest.stdout)
+  assert.match(managedTest.stdout, /addsTwoNumbers/)
+  // From a member directory, `--workspace` selects every member.
+  const managedCheck = yield* invoke(
+    silk,
+    ['check', '--workspace', '--stdlib', standardLibrary],
+    join(managed, 'apps/hello'),
+  )
+  assert.equal(managedCheck.status, 0, managedCheck.stderr + managedCheck.stdout)
+  assert.match(managedCheck.stdout, /Workspace summary: 2 packages succeeded, 0 failed/)
+  const unknownMember = yield* invoke(
+    silk,
+    ['build', '-p', 'nope', '--stdlib', standardLibrary],
+    managed,
+  )
+  assert.notEqual(unknownMember.status, 0, 'an unknown member was selected')
+  assert.match(
+    unknownMember.stderr,
+    /has no package named `nope`\nsilk: its members are: hello, greeting\n/,
+  )
+  const dropped = yield* invoke(silk, ['remove', 'greeting'], join(managed, 'apps/hello'))
+  assert.equal(dropped.status, 0, dropped.stderr)
+  assert.doesNotMatch(
+    yield* fs.readFileString(join(managed, 'apps/hello/silk.toml')),
+    /greeting = /,
+  )
+  const managedClean = yield* invoke(silk, ['clean'], managed)
+  assert.equal(managedClean.status, 0, managedClean.stderr)
+  assert.equal(yield* fs.exists(join(managed, 'build')), false)
   // A composition retention root keeps a private function from a module nothing imports.
   yield* fs.makeDirectory(join(directory, 'retained/support'), { recursive: true })
   yield* fs.writeFileString(
