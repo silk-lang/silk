@@ -24,6 +24,7 @@
 //! connect are not bounded by it. The macOS keychain is not consulted; only the PEM bundle is.
 
 import silk.allocator {Allocator, OutOfMemoryError}
+import silk.byte_duplex {ByteIoError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
 import silk.filesystem {FileError, Path}
@@ -46,14 +47,11 @@ import silk.http_headers {Headers, Limits as HeaderLimits}
 import silk.http_origin {Origin}
 import silk.http_request as Prepare
 import silk.http_request {Authorization, BodyMode, HeaderControl, HeaderPolicy, PreparedRequest, RequestError}
+import silk.http_transport {TransportError}
 import silk.https_identity {IdentityError}
 import silk.list {List}
 import silk.monotonic_clock {MonotonicClock}
-import silk.native_file_trust_source {NativeFileTrustSource}
 import silk.option {Option}
-import silk.os_monotonic_clock {OsMonotonicClock}
-import silk.os_random {OsRandom}
-import silk.os_system_clock {OsSystemClock}
 import silk.random {Random}
 import silk.resolver {ResolverError}
 import silk.result {Result}
@@ -68,268 +66,270 @@ import silk.uri {Uri}
 import silk.uri_reference {UriReference}
 import silk.usize
 
-/// The default deadline for one request, in seconds.
-pub const DEFAULT_TIMEOUT_SECONDS: u64 = 30
-/// The default response body limit, in bytes.
-pub const DEFAULT_MAX_BODY_BYTES: usize = 16777216
-/// The default number of redirects followed.
-pub const DEFAULT_MAX_REDIRECTS: usize = 10
-/// The maximum number of default headers one provider holds.
-pub const MAX_DEFAULT_HEADERS: usize = 16
-
-union TrustChoice<'config> {
-  Platform,
-  Borrowed {path: &'config [u8]},
-  Owned {path: Bytes},
-}
-
-/// A native HTTP client: sockets, TLS, redirects, and the defaults every request starts from.
-pub struct NativeHttp<'config> {
-  baseValue: string<'config>
-  headerValues: [Field<'config>; 16]
-  headerCount: usize
-  overflowValue: bool
-  timeoutValue: u64
-  maxBodyValue: usize
-  redirectValue: usize
-  failOnStatusValue: bool
-  trustChoice: TrustChoice<'config>
-  trust: Option<NativeFileTrustSource>
-  clock: OsMonotonicClock
-  wall: OsSystemClock
-  random: OsRandom
-}
-
-impl<'config> NativeHttp<'config> {
-  /// Makes a client with the default limits and the platform PEM bundle; nothing is read yet.
-  pub fn make() -> NativeHttp<'config> {
-    let empty = Field<'config> {name: "", value: ""}
-    return NativeHttp<'config> {
-      baseValue: "",
-      headerValues: [
-        empty, empty,
-        empty, empty,
-        empty, empty,
-        empty, empty,
-        empty, empty,
-        empty, empty,
-        empty, empty,
-        empty, empty,
-      ],
-      headerCount: usize.ZERO,
-      overflowValue: false,
-      timeoutValue: DEFAULT_TIMEOUT_SECONDS,
-      maxBodyValue: DEFAULT_MAX_BODY_BYTES,
-      redirectValue: DEFAULT_MAX_REDIRECTS,
-      failOnStatusValue: false,
-      trustChoice: TrustChoice<'config>.Platform,
-      trust: Option<NativeFileTrustSource>.none(),
-      clock: OsMonotonicClock.make(),
-      wall: OsSystemClock.make(),
-      random: OsRandom.make(),
-    }
-  }
-
-  /// Makes a client that uses `SSL_CERT_FILE` as its PEM bundle when that variable is set.
-  ///
-  /// # Details
-  ///
-  /// A relative path is resolved against the working directory. An empty value fails.
-  pub effect fn fromEnvironment() -> NativeHttp<'config>
-  ! HttpError | HostInputError | OutOfMemoryError
-  ? &mut HostInput | &mut Allocator {
-    let selected = run HostInput.variable(b"SSL_CERT_FILE")
-    let mut client = NativeHttp<'config>.make()
-    match move selected {
-      Option.None => { return move client }
-      Option.Some {value} => {
-        if Bytes.length(&value) == usize.ZERO {
-          fail HttpError.make(HttpErrorKind.Tls, "SSL_CERT_FILE is empty; unset it to use the platform PEM bundle.")
-        }
-        if Bytes.asSlice(&value)[usize.ZERO] == 47 {
-          client.trustChoice = TrustChoice<'config>.Owned {path: move value}
-          return move client
-        }
-        let mut absolute = run HostInput.workingDirectory()
-        let cwd = Bytes.asSlice(&absolute)
-        let needsSeparator = cwd.length > usize.ZERO && cwd[cwd.length - usize.ONE] != 47
-        drop cwd
-        if needsSeparator { run Bytes.append(&mut absolute, b"/") }
-        run Bytes.append(&mut absolute, Bytes.asSlice(&value))
-        client.trustChoice = TrustChoice<'config>.Owned {path: move absolute}
-        return move client
-      }
-    }
-  }
-
-  /// Prefixes every request URL that has no scheme, such as `"/repos"`, with `url`.
-  pub fn baseUrl(self: Self, url: string<'config>) -> NativeHttp<'config> {
-    let mut next = move self
-    next.baseValue = url
-    return move next
-  }
-
-  /// Adds a header to every request; a request header with the same name replaces it.
-  pub fn header(self: Self, name: string<'config>, value: string<'config>) -> NativeHttp<'config> {
-    let mut next = move self
-    if next.headerCount == MAX_DEFAULT_HEADERS {
-      next.overflowValue = true
-      return move next
-    }
-    next.headerValues[next.headerCount] = Field<'config> {name: name, value: value}
-    next.headerCount = next.headerCount + usize.ONE
-    return move next
-  }
-
-  /// Sets the default deadline for each request.
-  pub fn timeoutSeconds(self: Self, seconds: u64) -> NativeHttp<'config> {
-    let mut next = move self
-    next.timeoutValue = seconds
-    return move next
-  }
-
-  /// Sets the default response body limit.
-  pub fn maxBodyBytes(self: Self, limit: usize) -> NativeHttp<'config> {
-    let mut next = move self
-    next.maxBodyValue = limit
-    return move next
-  }
-
-  /// Sets how many redirects requests follow by default; zero returns redirects as responses.
-  pub fn maxRedirects(self: Self, hops: usize) -> NativeHttp<'config> {
-    let mut next = move self
-    next.redirectValue = hops
-    return move next
-  }
-
-  /// Makes every non-2xx final response fail with an `HttpErrorKind.Status` error.
-  pub fn failOnStatus(self: Self) -> NativeHttp<'config> {
-    let mut next = move self
-    next.failOnStatusValue = true
-    return move next
-  }
-
-  /// Uses the PEM bundle at this absolute path instead of the platform bundle.
-  pub fn trustBundle(self: Self, path: &'config [u8]) -> NativeHttp<'config> {
-    let mut next = move self
-    next.trustChoice = TrustChoice<'config>.Borrowed {path: path}
-    next.trust = Option<NativeFileTrustSource>.none()
-    return move next
-  }
-}
-
-fn platformBundle() -> &'static [u8] {
-  static if Intrinsic.targetOperatingSystem() == "darwin" {
-    return b"/etc/ssl/cert.pem"
-  } else {
-    return b"/etc/ssl/certs/ca-certificates.crt"
-  }
-}
-
-struct Settings {
-  timeoutSeconds: u64
-  maxBody: usize
-  redirects: usize
-}
-
-struct Received {
-  status: u16
-  head: OwnedResponseHead
-  body: Bytes
-  location: Option<String>
-}
-
-fn isRedirect(status: u16) -> bool {
-  return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
-}
-
-fn sameName(left: string, right: string) -> bool {
-  let a = String.utf8Bytes(left)
-  let b = String.utf8Bytes(right)
-  if a.length != b.length { return false }
-  let mut index = usize.ZERO
-  while index < a.length {
-    let mut x = a[index]
-    let mut y = b[index]
-    if x >= 65 && x <= 90 { x = x + 32 }
-    if y >= 65 && y <= 90 { y = y + 32 }
-    if x != y { return false }
-    index = index + usize.ONE
-  }
-  return true
-}
-
-fn invalid(message: string<'static>) -> HttpError {
-  return HttpError.make(HttpErrorKind.InvalidRequest, message)
-}
-
-fn redirectFailure(message: string<'static>) -> HttpError {
-  return HttpError.make(HttpErrorKind.Redirect, message)
-}
-
-fn limitsFor(maxBody: usize) -> Limits {
-  let mut selected = Limits.defaults()
-  selected.maxRequests = usize.ONE
-  // Leave room above the caller's limit so the client reports TooLarge before framing does.
-  let room = usize.toU64(maxBody) + u64.toU64(65536)
-  if room > selected.responseBody.maxPayloadBytes {
-    selected.responseBody.maxPayloadBytes = room
-    selected.responseBody.maxWireBytes = room + room
-  }
-  return selected
-}
-
-effect fn ensureTrust(client: &mut NativeHttp) -> () ! HttpError | OutOfMemoryError ? &mut Allocator {
-  if let Option.Some {value} = &client.trust { return () }
-  let configured = match & client.trustChoice {
-    TrustChoice.Platform => run Effect.result(trustAt(platformBundle()))
-    TrustChoice.Borrowed {path} => run Effect.result(trustAt(path))
-    TrustChoice.Owned {path} => run Effect.result(trustAt(Bytes.asSlice(&path)))
-  }
-  match move configured {
-    Result.Success {value} => { client.trust = Option<NativeFileTrustSource>.some(move value) }
-    Result.Failure {error} => match move error {
-      HttpError failure => { fail move failure }
-      FileError failure => { fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path is not a valid file name.") }
-      TrustSourceError failure => {
-        fail HttpError.caused(HttpErrorKind.Tls, "Could not configure the PEM trust bundle.", HttpCause.Trust {error: move failure})
-      }
-      OutOfMemoryError exhausted => { fail move exhausted }
-    }
-  }
-}
-
-effect fn trustAt(bundle: &[u8]) -> NativeFileTrustSource
-! HttpError | FileError | TrustSourceError | OutOfMemoryError
-? &mut Allocator {
-  if bundle.length == usize.ZERO || bundle.length > 4096 || bundle[usize.ZERO] != 47 {
-    fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle must be an absolute path of at most 4096 bytes.")
-  }
-  let mut index = usize.ZERO
-  let mut separator = usize.ZERO
-  while index < bundle.length {
-    if bundle[index] == 0 { fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path contains a NUL byte.") }
-    if bundle[index] == 47 { separator = index }
-    index = index + usize.ONE
-  }
-  if separator + usize.ONE == bundle.length {
-    fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path names a directory, not a file.")
-  }
-  // The parent directory is trusted configuration (on macOS /etc is a symlink); only the final
-  // file is opened beneath it with the no-follow policy.
-  let path = run Path.fromBytes(Slice.view<u8>(bundle, separator, bundle.length - separator))
-  if separator == usize.ZERO {
-    return run NativeFileTrustSource.make(b"/", &path)
-  }
-  return run NativeFileTrustSource.make(Slice.view<u8>(bundle, usize.ZERO, separator), &path)
-}
-
 static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
   "libc",
 ) == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText(
   "libc",
 ) == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+  import silk.native_file_trust_source {NativeFileTrustSource}
+  import silk.os_monotonic_clock {OsMonotonicClock}
+  import silk.os_random {OsRandom}
   import silk.native_socket {NativeSocketError}
+  import silk.os_system_clock {OsSystemClock}
+
+  /// The default deadline for one request, in seconds.
+  pub const DEFAULT_TIMEOUT_SECONDS: u64 = 30
+  /// The default response body limit, in bytes.
+  pub const DEFAULT_MAX_BODY_BYTES: usize = 16777216
+  /// The default number of redirects followed.
+  pub const DEFAULT_MAX_REDIRECTS: usize = 10
+  /// The maximum number of default headers one provider holds.
+  pub const MAX_DEFAULT_HEADERS: usize = 16
+
+  union TrustChoice<'config> {
+    Platform,
+    Borrowed {path: &'config [u8]},
+    Owned {path: Bytes},
+  }
+
+  /// A native HTTP client: sockets, TLS, redirects, and the defaults every request starts from.
+  pub struct NativeHttp<'config> {
+    baseValue: string<'config>
+    headerValues: [Field<'config>; 16]
+    headerCount: usize
+    overflowValue: bool
+    timeoutValue: u64
+    maxBodyValue: usize
+    redirectValue: usize
+    failOnStatusValue: bool
+    trustChoice: TrustChoice<'config>
+    trust: Option<NativeFileTrustSource>
+    clock: OsMonotonicClock
+    random: OsRandom
+  }
+
+  impl<'config> NativeHttp<'config> {
+    /// Makes a client with the default limits and the platform PEM bundle; nothing is read yet.
+    pub fn make() -> NativeHttp<'config> {
+      let empty = Field<'config> {name: "", value: ""}
+      return NativeHttp<'config> {
+        baseValue: "",
+        headerValues: [
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+          empty, empty,
+        ],
+        headerCount: usize.ZERO,
+        overflowValue: false,
+        timeoutValue: DEFAULT_TIMEOUT_SECONDS,
+        maxBodyValue: DEFAULT_MAX_BODY_BYTES,
+        redirectValue: DEFAULT_MAX_REDIRECTS,
+        failOnStatusValue: false,
+        trustChoice: TrustChoice<'config>.Platform,
+        trust: Option<NativeFileTrustSource>.none(),
+        clock: OsMonotonicClock.make(),
+        random: OsRandom.make(),
+      }
+    }
+
+    /// Makes a client that uses `SSL_CERT_FILE` as its PEM bundle when that variable is set.
+    ///
+    /// # Details
+    ///
+    /// A relative path is resolved against the working directory. An empty value fails.
+    pub effect fn fromEnvironment() -> NativeHttp<'config>
+    ! HttpError | HostInputError | OutOfMemoryError
+    ? &mut HostInput | &mut Allocator {
+      let selected = run HostInput.variable(b"SSL_CERT_FILE")
+      let mut client = NativeHttp<'config>.make()
+      match move selected {
+        Option.None => { return move client }
+        Option.Some {value} => {
+          if Bytes.length(&value) == usize.ZERO {
+            fail HttpError.make(HttpErrorKind.Tls, "SSL_CERT_FILE is empty; unset it to use the platform PEM bundle.")
+          }
+          if Bytes.asSlice(&value)[usize.ZERO] == 47 {
+            client.trustChoice = TrustChoice<'config>.Owned {path: move value}
+            return move client
+          }
+          let mut absolute = run HostInput.workingDirectory()
+          let cwd = Bytes.asSlice(&absolute)
+          let needsSeparator = cwd.length > usize.ZERO && cwd[cwd.length - usize.ONE] != 47
+          drop cwd
+          if needsSeparator { run Bytes.append(&mut absolute, b"/") }
+          run Bytes.append(&mut absolute, Bytes.asSlice(&value))
+          client.trustChoice = TrustChoice<'config>.Owned {path: move absolute}
+          return move client
+        }
+      }
+    }
+
+    /// Prefixes every request URL that has no scheme, such as `"/repos"`, with `url`.
+    pub fn baseUrl(self: Self, url: string<'config>) -> NativeHttp<'config> {
+      let mut next = move self
+      next.baseValue = url
+      return move next
+    }
+
+    /// Adds a header to every request; a request header with the same name replaces it.
+    pub fn header(self: Self, name: string<'config>, value: string<'config>) -> NativeHttp<'config> {
+      let mut next = move self
+      if next.headerCount == MAX_DEFAULT_HEADERS {
+        next.overflowValue = true
+        return move next
+      }
+      next.headerValues[next.headerCount] = Field<'config> {name: name, value: value}
+      next.headerCount = next.headerCount + usize.ONE
+      return move next
+    }
+
+    /// Sets the default deadline for each request.
+    pub fn timeoutSeconds(self: Self, seconds: u64) -> NativeHttp<'config> {
+      let mut next = move self
+      next.timeoutValue = seconds
+      return move next
+    }
+
+    /// Sets the default response body limit.
+    pub fn maxBodyBytes(self: Self, limit: usize) -> NativeHttp<'config> {
+      let mut next = move self
+      next.maxBodyValue = limit
+      return move next
+    }
+
+    /// Sets how many redirects requests follow by default; zero returns redirects as responses.
+    pub fn maxRedirects(self: Self, hops: usize) -> NativeHttp<'config> {
+      let mut next = move self
+      next.redirectValue = hops
+      return move next
+    }
+
+    /// Makes every non-2xx final response fail with an `HttpErrorKind.Status` error.
+    pub fn failOnStatus(self: Self) -> NativeHttp<'config> {
+      let mut next = move self
+      next.failOnStatusValue = true
+      return move next
+    }
+
+    /// Uses the PEM bundle at this absolute path instead of the platform bundle.
+    pub fn trustBundle(self: Self, path: &'config [u8]) -> NativeHttp<'config> {
+      let mut next = move self
+      next.trustChoice = TrustChoice<'config>.Borrowed {path: path}
+      next.trust = Option<NativeFileTrustSource>.none()
+      return move next
+    }
+  }
+
+  fn platformBundle() -> &'static [u8] {
+    static if Intrinsic.targetOperatingSystem() == "darwin" {
+      return b"/etc/ssl/cert.pem"
+    } else {
+      return b"/etc/ssl/certs/ca-certificates.crt"
+    }
+  }
+
+  struct Settings {
+    timeoutSeconds: u64
+    maxBody: usize
+    redirects: usize
+  }
+
+  struct Received {
+    status: u16
+    head: OwnedResponseHead
+    body: Bytes
+    location: Option<String>
+  }
+
+  fn isRedirect(status: u16) -> bool {
+    return status == 301 || status == 302 || status == 303 || status == 307 || status == 308
+  }
+
+  fn sameName(left: string, right: string) -> bool {
+    let a = String.utf8Bytes(left)
+    let b = String.utf8Bytes(right)
+    if a.length != b.length { return false }
+    let mut index = usize.ZERO
+    while index < a.length {
+      let mut x = a[index]
+      let mut y = b[index]
+      if x >= 65 && x <= 90 { x = x + 32 }
+      if y >= 65 && y <= 90 { y = y + 32 }
+      if x != y { return false }
+      index = index + usize.ONE
+    }
+    return true
+  }
+
+  fn invalid(message: string<'static>) -> HttpError {
+    return HttpError.make(HttpErrorKind.InvalidRequest, message)
+  }
+
+  fn redirectFailure(message: string<'static>) -> HttpError {
+    return HttpError.make(HttpErrorKind.Redirect, message)
+  }
+
+  fn limitsFor(maxBody: usize) -> Limits {
+    let mut selected = Limits.defaults()
+    selected.maxRequests = usize.ONE
+    // Leave room above the caller's limit so the client reports TooLarge before framing does.
+    let room = usize.toU64(maxBody) + u64.toU64(65536)
+    if room > selected.responseBody.maxPayloadBytes {
+      selected.responseBody.maxPayloadBytes = room
+      selected.responseBody.maxWireBytes = room + room
+    }
+    return selected
+  }
+
+  effect fn ensureTrust(client: &mut NativeHttp) -> () ! HttpError | OutOfMemoryError ? &mut Allocator {
+    if let Option.Some {value} = &client.trust { return () }
+    let configured = match & client.trustChoice {
+      TrustChoice.Platform => run Effect.result(trustAt(platformBundle()))
+      TrustChoice.Borrowed {path} => run Effect.result(trustAt(path))
+      TrustChoice.Owned {path} => run Effect.result(trustAt(Bytes.asSlice(&path)))
+    }
+    match move configured {
+      Result.Success {value} => { client.trust = Option<NativeFileTrustSource>.some(move value) }
+      Result.Failure {error} => match move error {
+        HttpError failure => { fail move failure }
+        FileError failure => { fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path is not a valid file name.") }
+        TrustSourceError failure => {
+          fail HttpError.caused(HttpErrorKind.Tls, "Could not configure the PEM trust bundle.", HttpCause.Trust {error: move failure})
+        }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+
+  effect fn trustAt(bundle: &[u8]) -> NativeFileTrustSource
+  ! HttpError | FileError | TrustSourceError | OutOfMemoryError
+  ? &mut Allocator {
+    if bundle.length == usize.ZERO || bundle.length > 4096 || bundle[usize.ZERO] != 47 {
+      fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle must be an absolute path of at most 4096 bytes.")
+    }
+    let mut index = usize.ZERO
+    let mut separator = usize.ZERO
+    while index < bundle.length {
+      if bundle[index] == 0 { fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path contains a NUL byte.") }
+      if bundle[index] == 47 { separator = index }
+      index = index + usize.ONE
+    }
+    if separator + usize.ONE == bundle.length {
+      fail HttpError.make(HttpErrorKind.Tls, "The PEM bundle path names a directory, not a file.")
+    }
+    // The parent directory is trusted configuration (on macOS /etc is a symlink); only the final
+    // file is opened beneath it with the no-follow policy.
+    let path = run Path.fromBytes(Slice.view<u8>(bundle, separator, bundle.length - separator))
+    if separator == usize.ZERO {
+      return run NativeFileTrustSource.make(b"/", &path)
+    }
+    return run NativeFileTrustSource.make(Slice.view<u8>(bundle, usize.ZERO, separator), &path)
+  }
 
   struct Handler<'b> {
     request: PreparedRequest
@@ -537,9 +537,10 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
       Option.Some {value} => move value
       Option.None => { fail HttpError.make(HttpErrorKind.Tls, "The PEM trust bundle is not configured.") }
     }
+    let mut wall = OsSystemClock.make()
     let outcome = run Effect.result(ExchangeNative.withConnection(origin, move options, limits, move handler)
       |> Effect.provideMut<TrustSource>(&mut trust)
-      |> Effect.provideMut<SystemClock>(&mut client.wall)
+      |> Effect.provideMut<SystemClock>(&mut wall)
       |> Effect.provideMut<MonotonicClock>(&mut client.clock)
       |> Effect.provideMut<Random>(&mut client.random))
     client.trust = Option<NativeFileTrustSource>.some(move trust)
@@ -686,21 +687,45 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
     return resolved.intoString()
   }
 
+  /// Whether an exchange failure is the request deadline, at any transport layer.
+  fn exchangeTimedOut(failure: &ExchangeError) -> bool {
+    return match &failure.* {
+      ExchangeError.Timeout => true
+      ExchangeError.OutputTimeout {progress} => true
+      ExchangeError.Transport {error} => transportTimedOut(&error)
+      ExchangeError.Output {error, progress} => transportTimedOut(&error)
+      _ => false
+    }
+  }
+
+  fn transportTimedOut(failure: &TransportError) -> bool {
+    return match &failure.* {
+      TransportError.Plain {error} => ioTimedOut(&error)
+      TransportError.Secured {error} => match &error {
+        ConnectionError.Io {error: io} => ioTimedOut(&io)
+        ConnectionError.HandshakeTimeout => true
+        _ => false
+      }
+    }
+  }
+
+  fn ioTimedOut(failure: &ByteIoError) -> bool {
+    return match &failure.* {
+      ByteIoError.Timeout {operation} => true
+      _ => false
+    }
+  }
+
   effect fn classify(error: RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError) -> never ! HttpError {
     return match move error {
       RequestError failure => {
         fail HttpError.caused(HttpErrorKind.InvalidRequest, "Could not prepare the request.", HttpCause.Request {error: move failure})
       }
-      ExchangeError failure => match & failure {
-        ExchangeError.Timeout => {
+      ExchangeError failure => {
+        if exchangeTimedOut(&failure) {
           fail HttpError.caused(HttpErrorKind.Timeout, "The request deadline passed.", HttpCause.Exchange {error: move failure})
         }
-        ExchangeError.OutputTimeout {progress} => {
-          fail HttpError.caused(HttpErrorKind.Timeout, "The request deadline passed.", HttpCause.Exchange {error: move failure})
-        }
-        _ => {
-          fail HttpError.caused(HttpErrorKind.Protocol, "The HTTP exchange failed.", HttpCause.Exchange {error: move failure})
-        }
+        fail HttpError.caused(HttpErrorKind.Protocol, "The HTTP exchange failed.", HttpCause.Exchange {error: move failure})
       }
       NativeExchangeError failure => match move failure {
         NativeExchangeError.AlpnMismatch {error: connection} => {
@@ -745,12 +770,6 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
           TrustSourceError failure => run classify(move failure)
         }
       }
-    }
-  }
-} else {
-  impl<'config> Http for NativeHttp<'config> {
-    effect fn send(self: &mut Self, request: Request) -> Response ! HttpError | OutOfMemoryError ? &mut Allocator {
-      compileError("NativeHttp requires a supported Darwin or GNU libc profile")
     }
   }
 }

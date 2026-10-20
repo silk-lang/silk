@@ -1237,7 +1237,7 @@ orchestration without exposing sockets, TLS state, proxy credentials, or pooled 
 `withAttempt` consumes and retains `request` through its complete bracket. It derives one
 validated method and the URI/header views from that owner, selects the current route, prepares a
 new origin- or absolute-form request, acquires its physical peer under the unchanged absolute
-deadline, and invokes exactly one `http_client.withExchange`. The same method view, a fresh
+deadline, and invokes exactly one `http_exchange.withExchange`. The same method view, a fresh
 request borrow, and the resulting exchange are lent only through [`Attempt`](#Attempt), so redirect
 transition and sanitization do not copy semantic state or reparse the method. Handler and source
 errors remain direct. `AcquisitionError` directly carries preparation, route, acquisition, and
@@ -1550,7 +1550,7 @@ pub effect<'env> fn withEmptyResponse<
   ?CallbackRequirements,
   ?AcquisitionRequirements,
   H: ResponseHandler<P, A, CallbackError ? CallbackRequirements> + 'env,
-  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
+  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
     never,
     never,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1563,7 +1563,7 @@ pub effect<'env> fn withEmptyResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1608,7 +1608,7 @@ pub effect<'env> fn withEmptyHybridResponse<
   ?CallbackRequirements,
   ?AcquisitionRequirements,
   H: HybridResponseHandler<RoutedP, DirectP, A, CallbackError ? CallbackRequirements> + 'env,
-  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
+  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
     never,
     never,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1621,7 +1621,7 @@ pub effect<'env> fn withEmptyHybridResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1663,7 +1663,7 @@ pub effect<'env> fn withBytesResponse<
   ?CallbackRequirements,
   ?AcquisitionRequirements,
   H: ResponseHandler<P, A, CallbackError ? CallbackRequirements> + 'env,
-  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
+  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
     never,
     never,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1677,7 +1677,7 @@ pub effect<'env> fn withBytesResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1723,7 +1723,7 @@ pub effect<'env> fn withBytesHybridResponse<
   ?CallbackRequirements,
   ?AcquisitionRequirements,
   H: HybridResponseHandler<RoutedP, DirectP, A, CallbackError ? CallbackRequirements> + 'env,
-  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
+  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? CallbackRequirements | &mut SelectedBody<
     never,
     never,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1737,7 +1737,7 @@ pub effect<'env> fn withBytesHybridResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1781,7 +1781,7 @@ pub effect<'env> fn withOneShotResponse<
   ?AcquisitionRequirements,
   Producer: BodyProducer<ProducerError ? ProducerRequirements> + 'env,
   H: ResponseHandler<P, A, CallbackError ? CallbackRequirements> + 'env,
-  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
+  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
     ProducerError,
     ProducerRequirements,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1795,7 +1795,7 @@ pub effect<'env> fn withOneShotResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | ProducerError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? ProducerRequirements | CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1845,7 +1845,7 @@ pub effect<'env> fn withOneShotHybridResponse<
   ?AcquisitionRequirements,
   Producer: BodyProducer<ProducerError ? ProducerRequirements> + 'env,
   H: HybridResponseHandler<RoutedP, DirectP, A, CallbackError ? CallbackRequirements> + 'env,
-  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
+  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
     ProducerError,
     ProducerRequirements,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1859,7 +1859,7 @@ pub effect<'env> fn withOneShotHybridResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | ProducerError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? ProducerRequirements | CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1907,7 +1907,7 @@ pub effect<'env> fn withReplayResponse<
   ?AcquisitionRequirements,
   Producer: BodyProducer<ProducerError ? ProducerRequirements>,
   H: ResponseHandler<P, A, CallbackError ? CallbackRequirements> + 'env,
-  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
+  C: AttemptClient<'policy, P, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
     ProducerError,
     ProducerRequirements,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1922,7 +1922,7 @@ pub effect<'env> fn withReplayResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | FactoryError | ProducerError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | FactoryError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? FactoryRequirements | ProducerRequirements | CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1977,7 +1977,7 @@ pub effect<'env> fn withReplayHybridResponse<
   ?AcquisitionRequirements,
   Producer: BodyProducer<ProducerError ? ProducerRequirements>,
   H: HybridResponseHandler<RoutedP, DirectP, A, CallbackError ? CallbackRequirements> + 'env,
-  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ClientError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
+  C: HybridAttemptClient<'policy, RoutedP, DirectP, AttemptStep<'policy, A>, RedirectError | ValueError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError, AcquisitionError, AcquisitionRequirements ? ProducerRequirements | CallbackRequirements | &mut SelectedBody<
     ProducerError,
     ProducerRequirements,
   > | &mut MonotonicClock | &mut Allocator | &mut Random>,
@@ -1992,7 +1992,7 @@ pub effect<'env> fn withReplayHybridResponse<
   scratch: &'scratch mut [u8],
   handler: H,
 ) -> A
-! RedirectError | ValueError | FactoryError | ProducerError | CallbackError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | ValueError | FactoryError | ProducerError | CallbackError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? FactoryRequirements | ProducerRequirements | CallbackRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -2045,7 +2045,7 @@ pub effect<'env> fn writeBody<
   trailers: &Headers,
   hop: usize,
 ) -> BodyWriteOutcome
-! RedirectError | OneShotError | ReplayError | ClientError | OutOfMemoryError
+! RedirectError | OneShotError | ReplayError | ExchangeError | OutOfMemoryError
 ? OneShotRequirements | ReplayRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut P provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random

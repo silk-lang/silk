@@ -863,7 +863,7 @@ Samples the monotonic clock once, lazily removes every expired idle owner, and c
 ## `close`
 
 ```silk
-pub effect fn close<K, P, C>(pool: &mut Pool<K, P, C>) -> () ! ClientError
+pub effect fn close<K, P, C>(pool: &mut Pool<K, P, C>) -> () ! ExchangeError
 where &mut P provides &HttpTransport from &mut HttpTransport
 ```
 

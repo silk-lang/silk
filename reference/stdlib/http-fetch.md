@@ -14,7 +14,7 @@ Select the suffix matching the request body's replay authority.
 
 Fetch owns no transport policy. A [`FetchClient`](#FetchClient) supplies routed or pooled attempts under one
 unchanged deadline, `silk.http_redirect` owns redirect and source authority, and
-`silk.http_client` owns response framing and content provenance. Every public destination is
+`silk.http_exchange` owns response framing and content provenance. Every public destination is
 finite, and every completed result owns the metadata that outlives the live response.
 
 Import as `Fetch` with `import silk.http_fetch { Fetch }`.
@@ -646,7 +646,7 @@ The supplied HTTP connection limits failed their owning client's pre-contact adm
 #### Field `error`
 
 ```silk
-pub error: ClientError
+pub error: ExchangeError
 ```
 
 The client's original pre-contact admission failure.
@@ -706,7 +706,7 @@ The streaming client failed inside Fetch's final-response delivery boundary.
 #### Field `error`
 
 ```silk
-pub error: ClientError
+pub error: ExchangeError
 ```
 
 The original final-response client failure.
@@ -1422,7 +1422,7 @@ pub effect<'env> fn toSinkEmpty<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, FetchResult>,
-    RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     SinkRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1434,7 +1434,7 @@ pub effect<'env> fn toSinkEmpty<
   options: FetchOptions,
   sink: S,
 ) -> FetchResult
-! RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError | AcquisitionError
 ? SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1471,7 +1471,7 @@ pub effect fn collectEmpty<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, CollectedResponse>,
-    RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1482,7 +1482,7 @@ pub effect fn collectEmpty<
   options: FetchOptions,
   maxBodyBytes: usize,
 ) -> CollectedResponse
-! RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1517,7 +1517,7 @@ pub effect fn discardEmpty<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, FetchResult>,
-    RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1528,7 +1528,7 @@ pub effect fn discardEmpty<
   options: FetchOptions,
   maxDiscardBytes: u64,
 ) -> FetchResult
-! RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1567,7 +1567,7 @@ pub effect<'env> fn toSinkBytes<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, FetchResult>,
-    RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     SinkRequirements | &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1580,7 +1580,7 @@ pub effect<'env> fn toSinkBytes<
   options: FetchOptions,
   sink: S,
 ) -> FetchResult
-! RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | DestinationFailure<SinkError> | ExchangeError | OutOfMemoryError | AcquisitionError
 ? SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1618,7 +1618,7 @@ pub effect fn collectBytes<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, CollectedResponse>,
-    RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1630,7 +1630,7 @@ pub effect fn collectBytes<
   options: FetchOptions,
   maxBodyBytes: usize,
 ) -> CollectedResponse
-! RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1666,7 +1666,7 @@ pub effect fn discardBytes<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, FetchResult>,
-    RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     &mut Redirect.SelectedBody<never, never> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1678,7 +1678,7 @@ pub effect fn discardBytes<
   options: FetchOptions,
   maxDiscardBytes: u64,
 ) -> FetchResult
-! RedirectError | FetchError | ValueError | BodyError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1721,7 +1721,7 @@ pub effect<'env> fn toSinkOneShot<
     Redirect.AttemptStep<'policy, FetchResult>,
     RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationFailure<
       SinkError,
-    > | ClientError | OutOfMemoryError,
+    > | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     ProducerRequirements | SinkRequirements | &mut Redirect.SelectedBody<
       ProducerError,
@@ -1739,7 +1739,7 @@ pub effect<'env> fn toSinkOneShot<
 ) -> FetchResult
 ! RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationFailure<
   SinkError,
-> | ClientError | OutOfMemoryError | AcquisitionError
+> | ExchangeError | OutOfMemoryError | AcquisitionError
 ? ProducerRequirements | SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1781,7 +1781,7 @@ pub effect<'env> fn collectOneShot<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, CollectedResponse>,
-    RedirectError | FetchError | ValueError | BodyError | ProducerError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1794,7 +1794,7 @@ pub effect<'env> fn collectOneShot<
   options: FetchOptions,
   maxBodyBytes: usize,
 ) -> CollectedResponse
-! RedirectError | FetchError | ValueError | BodyError | ProducerError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1834,7 +1834,7 @@ pub effect<'env> fn discardOneShot<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, FetchResult>,
-    RedirectError | FetchError | ValueError | BodyError | ProducerError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1847,7 +1847,7 @@ pub effect<'env> fn discardOneShot<
   options: FetchOptions,
   maxDiscardBytes: u64,
 ) -> FetchResult
-! RedirectError | FetchError | ValueError | BodyError | ProducerError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1895,7 +1895,7 @@ pub effect<'env> fn toSinkReplay<
     Redirect.AttemptStep<'policy, FetchResult>,
     RedirectError | FetchError | ValueError | BodyError | ProducerError | DestinationFailure<
       SinkError,
-    > | ClientError | OutOfMemoryError,
+    > | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     ProducerRequirements | SinkRequirements | &mut Redirect.SelectedBody<
       ProducerError,
@@ -1913,7 +1913,7 @@ pub effect<'env> fn toSinkReplay<
 ) -> FetchResult
 ! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | DestinationFailure<
   SinkError,
-> | ClientError | OutOfMemoryError | AcquisitionError
+> | ExchangeError | OutOfMemoryError | AcquisitionError
 ? FactoryRequirements | ProducerRequirements | SinkRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -1960,7 +1960,7 @@ pub effect<'env> fn collectReplay<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, CollectedResponse>,
-    RedirectError | FetchError | ValueError | BodyError | ProducerError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -1973,7 +1973,7 @@ pub effect<'env> fn collectReplay<
   options: FetchOptions,
   maxBodyBytes: usize,
 ) -> CollectedResponse
-! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? FactoryRequirements | ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
@@ -2018,7 +2018,7 @@ pub effect<'env> fn discardReplay<
     RoutedP,
     DirectP,
     Redirect.AttemptStep<'policy, FetchResult>,
-    RedirectError | FetchError | ValueError | BodyError | ProducerError | ClientError | OutOfMemoryError,
+    RedirectError | FetchError | ValueError | BodyError | ProducerError | ExchangeError | OutOfMemoryError,
     AcquisitionError,
     ProducerRequirements | &mut Redirect.SelectedBody<ProducerError, ProducerRequirements> | &mut MonotonicClock | &mut Allocator | &mut Random,
     AcquisitionRequirements,
@@ -2031,7 +2031,7 @@ pub effect<'env> fn discardReplay<
   options: FetchOptions,
   maxDiscardBytes: u64,
 ) -> FetchResult
-! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | ClientError | OutOfMemoryError | AcquisitionError
+! RedirectError | FetchError | ValueError | BodyError | FactoryError | ProducerError | ExchangeError | OutOfMemoryError | AcquisitionError
 ? FactoryRequirements | ProducerRequirements | AcquisitionRequirements | &mut MonotonicClock | &mut Allocator | &mut Random
 where
   &mut RoutedP provides &HttpTransport from &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random,
