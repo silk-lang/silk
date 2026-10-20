@@ -85,7 +85,12 @@ const runProcess = (
   cwd?: string,
 ): Promise<ProcessResult> =>
   new Promise((resolveResult) => {
-    const child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'pipe'] })
+    // SILK_RECEIPTS makes the compiler write the SILK_GAP borrow-check receipts the harness reads.
+    const child = spawn(command, args, {
+      cwd,
+      env: { ...process.env, SILK_RECEIPTS: '1' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
     const output = { stdout: '', stderr: '' }
     let bytes = 0
     let failure: Error | undefined
