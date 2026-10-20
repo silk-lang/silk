@@ -3484,6 +3484,9 @@ effect fn sourceOwnershipOriginField<'body>(builder: &SourceGraphBuilder<'body>,
     SourceGraphOwnershipOrigin.OperationReset {root, ..} => {
       return SourceOriginField {root: root, field: SourceReadField {supported: true, field: usize.ZERO}}
     }
+    SourceGraphOwnershipOrigin.OrdinaryReset {root, ..} => {
+      return SourceOriginField {root: root, field: SourceReadField {supported: true, field: usize.ZERO}}
+    }
     SourceGraphOwnershipOrigin.ThroughReset {root, ..} => {
       return SourceOriginField {root: root, field: SourceReadField {supported: true, field: usize.ZERO}}
     }
@@ -14440,6 +14443,7 @@ struct SourceResultRoute {
   active: SourceAtom
   quality: SourceQuality
   reset: Option<SourceAtom>
+  ordinary: bool
 }
 
 struct SourceResultEffect {
@@ -14465,6 +14469,7 @@ struct SourceResultScan {
   inputs: List<SourcePositionResult>
   outputs: List<SourceResultEffect>
   missing: SourceAtom
+  ordinaryMissing: SourceAtom
 }
 
 struct SourceFinishEffects {
@@ -15111,9 +15116,54 @@ struct SourceOutputGap {
 }
 impl Copy for SourceOutputGap {}
 
-effect fn sourceOperationResultGaps<'body>(builder: &mut SourceGraphBuilder<'body>, evaluation: SourceGraph.EvalId)
-  -> SourceAtom ! OutOfMemoryError ? &mut Allocator {
+// One completed Named call has an independent ordinary whole-ownership demand even
+// when it has no candidate or Borrow history. It never substitutes for selected
+// provenance, callable channels, or a storing operation.
+fn sourceOrdinaryResultDemand<'body>(builder: &SourceGraphBuilder<'body>, evaluation: SourceGraph.EvalId,
+  root: PreparedSources.EndpointId, stores: bool, forwarding: Forwarding) -> Option<usize> {
+  let demands = SourceGraphBuilder.ordinaryResultDemands(builder)
+  let mut selected = Option<usize>.none()
+  let mut at = usize.ZERO
+  while at < demands.length {
+    let demand = demands[at]
+    if demand.evaluation.index == evaluation.index {
+      if let Option<usize>.Some {..} = selected {
+        return CompilerBug.panic(b"ordinary result has duplicate whole-finish demands")
+      }
+      let operation = &List<SourceResults.Operation>.asSlice(
+        &SourceGraphBuilder.operationResults(builder).operations)[demand.operation]
+      let directive = &SourceGraphBuilder.resultUses(builder)[demand.result]
+      let output = match &operation.plan {
+        SourceResultsPlan.NamedInvoke {result, ..} => result
+        _ => { return CompilerBug.panic(b"ordinary result changed its named invocation") }
+      }
+      let prepared = SourceGraphBuilder.preparation(builder)
+      let map = &List<PreparedSources.SelectionMap>.asSlice(&prepared.maps)[output.index]
+      let endpoint = &List<PreparedSources.Endpoint>.asSlice(&prepared.endpoints)[root.index]
+      let declared = match directive.kind { SourceGraphResultKind.Declared => true _ => false }
+      let parentless = match endpoint.parent { Option<PreparedSources.EndpointId>.None => true _ => false }
+      if stores || forwarding != Forwarding.None || !declared || !parentless
+        || List<PreparedSources.Operation>.asSlice(&prepared.operations)[operation.prepared].phase != PreparedSourcesOperationPhase.Invoke
+        || operation.evaluation.index != evaluation.index || directive.evaluation.index != evaluation.index
+        || demand.output.index != output.index || demand.root.index != root.index || map.target.index != root.index {
+        return CompilerBug.panic(b"ordinary result demand changed its actual whole finish")
+      }
+      selected = Option<usize>.some(at)
+    }
+    at = at + usize.ONE
+  }
+  return selected
+}
+
+struct SourceResultGaps {
+  namedWhole: SourceAtom
+  independent: SourceAtom
+}
+
+effect fn sourceOperationResultGaps<'body>(builder: &mut SourceGraphBuilder<'body>, evaluation: SourceGraph.EvalId,
+  ordinary: Option<usize>) -> SourceResultGaps ! OutOfMemoryError ? &mut Allocator {
   let mut gaps = List<SourceAtom>.make()
+  let mut named = List<SourceAtom>.make()
   let mut outputGaps = List<SourceOutputGap>.make()
   let prepared = SourceGraphBuilder.preparation(&builder.*)
   let selections = List<PreparedSources.ContractSelection>.asSlice(&prepared.contractSelections)
@@ -15129,7 +15179,14 @@ effect fn sourceOperationResultGaps<'body>(builder: &mut SourceGraphBuilder<'bod
       let original = &List<SourceResults.Contributor>.asSlice(&outputs[contributor.output].contributors)[contributor.contributor]
       if let PreparedSourcesContractCoverage.Incomplete {..} = &selections[original.selection.index].coverage {
         if run SourceResults.wholeResultContributor(prepared, actual.prepared, outputs[contributor.output].map, original) {
-          run List<SourceAtom>.append(&mut gaps, contributor.active)
+          let mut whole = false
+          if let Option<usize>.Some {value: demand} = ordinary {
+            whole = SourceGraphBuilder.ordinaryResultDemands(&builder.*)[demand].operation == contributor.operation
+          }
+          // Inline continuation/member rows are part of this eager whole-call inventory.
+          // Their original selections remain incomplete for every actual proof consumer.
+          if whole { run List<SourceAtom>.append(&mut named, contributor.active) }
+          else { run List<SourceAtom>.append(&mut gaps, contributor.active) }
         }
       }
     }
@@ -15187,7 +15244,9 @@ effect fn sourceOperationResultGaps<'body>(builder: &mut SourceGraphBuilder<'bod
     run List<SourceAtom>.append(&mut gaps, run SourcePolicy.conjunction(&mut builder.rules, &output, List<SourceAtom>.asSlice(&empty)))
     at = at + usize.ONE
   }
-  return run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&gaps))
+  return SourceResultGaps {
+    namedWhole: run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&named)),
+    independent: run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&gaps))}
 }
 
 // A computed scalar dereference has a value even though ordinary finish retains none
@@ -15252,9 +15311,8 @@ effect fn sourceFinish<'body>(builder: &mut SourceGraphBuilder<'body>, observati
     results: List<SourceResultEffect>.make(), wholeHolds: List<SourceWholeHold>.make(),
     sealed: List<Location>.make(), unheld: List<Location>.make(),
     missing: inputMissing}
-  let enumeration = run sourceOperationResultGaps(&mut builder.*, evaluation)
-  let missingSources: [SourceAtom; 2] = [effects.missing, enumeration]
-  effects.missing = run SourcePolicy.disjunction(&mut builder.rules, &missingSources)
+  let ordinary = sourceOrdinaryResultDemand(&builder.*, evaluation, root, stores, forwarding)
+  let enumeration = run sourceOperationResultGaps(&mut builder.*, evaluation, ordinary)
   if !retained { run List<Location>.append(&mut effects.sealed, nodes[result.index].origin.location) }
   if let NodeKind.Expression {form: Expression.DirectCall {arguments, ..}, ..} = &nodes[result.index].kind {
     let operands = List<NodeId>.asSlice(&arguments)
@@ -15269,9 +15327,12 @@ effect fn sourceFinish<'body>(builder: &mut SourceGraphBuilder<'body>, observati
   run sourceConsume(observation, point, active, &mut builder.rules, &mut effects.intervals)
   let declared = run sourceDeclaredSnapshot(&mut builder.*, observation, snapshot, loans, nodes, result)
   let declarations = List<SourceAtom>.asSlice(&declared)
+  let mut routeMissing = SourceProgram.atom(&mut builder.rules)
   let routes = run sourceFinishRoutes(&mut builder.*, observation, declarations, nodes, result, evaluation, root,
-    retained, &mut paths.*, &mut effects.missing)
+    retained, &mut paths.*, &mut routeMissing)
   if !retained {
+    let missing: [SourceAtom; 4] = [inputMissing, routeMissing, enumeration.independent, enumeration.namedWhole]
+    effects.missing = run SourcePolicy.disjunction(&mut builder.rules, &missing)
     run sourceCompleteScalarDereference(&mut builder.*, result, evaluation, root, active, effects.missing)
     return move effects
   }
@@ -15290,10 +15351,23 @@ effect fn sourceFinish<'body>(builder: &mut SourceGraphBuilder<'body>, observati
     mayOutlive: no, hasTyped: typed.length != usize.ZERO}
   let produced = SourceGraphBuilder.evaluation(&builder.*, evaluation)
   let completed = List<SourceControl.Point>.asSlice(&builder.reaching.points)[produced.point.index].reachable
+  let ordinaryFinish = match ordinary { Option<usize>.Some {..} => true _ => false }
   let scanned = run sourceFinishPositions(&mut builder.*, observation, &mut state.*, snapshot, loans, nodes, owner,
     supplied, requirements, relations, result, evaluation, named, &facts, &implied, declarations, placed, completed,
-    List<SourceResultRoute>.asSlice(&routes), &mut paths.*)
-  let missing: [SourceAtom; 2] = [effects.missing, scanned.missing]
+    List<SourceResultRoute>.asSlice(&routes), ordinaryFinish, &mut paths.*)
+  let mut certificate = SourceProgram.atom(&mut builder.rules)
+  if let Option<usize>.Some {value: demand} = ordinary {
+    let applicable = SourceGraphBuilder.ordinaryResultDemands(&builder.*)[demand].applicable
+    let positive: [SourceAtom; 3] = [active, completed, applicable]
+    let negative: [SourceAtom; 5] = [inputMissing, routeMissing, enumeration.independent, scanned.missing, scanned.ordinaryMissing]
+    // This certificate depends on the complete actual input scan and prepolicy
+    // publication prerequisites, never the declared gap or its own output/accepted gate.
+    certificate = run SourcePolicy.conjunction(&mut builder.rules, &positive, &negative)
+  }
+  let namedDemand: [SourceAtom; 1] = [enumeration.namedWhole]
+  let alternative: [SourceAtom; 1] = [certificate]
+  let namedMissing = run SourcePolicy.conjunction(&mut builder.rules, &namedDemand, &alternative)
+  let missing: [SourceAtom; 5] = [inputMissing, routeMissing, enumeration.independent, scanned.missing, namedMissing]
   effects.missing = run SourcePolicy.disjunction(&mut builder.rules, &missing)
   effects.inputResults = move scanned.inputs
   effects.results = move scanned.outputs
@@ -15596,12 +15670,48 @@ effect fn sourceCallableArgument<'body>(builder: &mut SourceGraphBuilder<'body>,
   return CompilerBug.panic(b"callable argument policy selected another binding kind")
 }
 
+// Ordinary whole ownership names an actual argument occurrence and input-family member;
+// the result root is semantic placement, not a physical input-to-output correspondence.
+fn sourceOrdinaryResultPair<'body>(builder: &SourceGraphBuilder<'body>, candidate: usize,
+  port: SourceGraph.PolicyPort, position: &SourceCarryPosition) -> bool {
+  let selected = SourceGraphBuilder.ordinaryResultCandidates(builder)[candidate]
+  let demand = SourceGraphBuilder.ordinaryResultDemands(builder)[selected.demand]
+  let operation = &List<SourceResults.Operation>.asSlice(
+    &SourceGraphBuilder.operationResults(builder).operations)[demand.operation]
+  let input = List<SourceResults.Input>.asSlice(&operation.inputs)[selected.input]
+  let prepared = SourceGraphBuilder.preparation(builder)
+  let route = &List<PreparedSources.InputRoute>.asSlice(
+    &List<PreparedSources.Operation>.asSlice(&prepared.operations)[operation.prepared].inputs)[selected.route]
+  let map = &List<PreparedSources.SelectionMap>.asSlice(&prepared.maps)[selected.sourceMap.index]
+  let source = SourceGraphBuilder.value(builder, selected.source)
+  let target = SourceGraphBuilder.value(builder, selected.target)
+  let whole = match target.subject { Option<SourceGraph.ResidualSubject>.None => true _ => false }
+  let ordinal = match route.read {
+    PreparedSourcesInputRead.Argument {ordinal} => ordinal
+    _ => { return CompilerBug.panic(b"ordinary named result substituted a receiver for its actual argument") }
+  }
+  if input.route != selected.route || input.position != selected.position
+    || input.actual.evaluation.index != selected.operand.index || input.actual.usePoint.index != selected.usePoint.index
+    || source.evaluation.index != selected.operand.index || source.endpoint.index != map.source.index
+    || source.phase != SourceGraphValuePhase.Output || target.phase != SourceGraphValuePhase.Output || !whole
+    || target.evaluation.index != demand.evaluation.index || target.endpoint.index != demand.root.index
+    || selected.root.index != demand.root.index || selected.source.index != port.source.index
+    || selected.target.index != port.target.index || port.outputRole != SourceGraphSourceRole.Ownership || port.outputDirect {
+    return CompilerBug.panic(b"ordinary result changed its actual input or whole output")
+  }
+  return ordinal == position.operand && input.actual.node.index == position.node.index
+    && selected.source.index == position.value.index
+}
+
 // A current receiver component is not the original argument by identity. The graph retains
 // the exact acquisition/copy and every subsequent descriptor/component Case in its finite
 // capture product. Pair those histories without adding another physical finish position.
 effect fn sourceResultPair<'body>(builder: &mut SourceGraphBuilder<'body>, port: SourceGraph.PolicyPort,
   cases: &[SourceGraph.InputCase], position: &SourceCarryPosition, history: &SourceCarryCase) -> Option<SourceAtom>
 ! OutOfMemoryError ? &mut Allocator {
+  if let SourceGraphTransferAuthority.OrdinaryResult {candidate} = port.authority {
+    if !sourceOrdinaryResultPair(&builder.*, candidate, port, position) { return Option<SourceAtom>.none() }
+  }
   if let SourceGraphTransferAuthority.OperationResult {candidate, ..} = port.authority {
     if let SourceResultsBinding.CallableArgument {..} = candidate.binding {
       return run sourceCallableArgument(&mut builder.*, port, candidate, cases, position, history)
@@ -15757,20 +15867,27 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
     let target = SourceGraphBuilder.value(&builder.*, port.target)
     if port.terminal && target.evaluation.index == evaluation.index {
       let borrowed = match &SourceGraphBuilder.leaf(&builder.*, port.leaf).kind { SourceGraphSourceLeaf.Borrow {..} => true _ => false }
+      let ordinary = match port.authority { SourceGraphTransferAuthority.OrdinaryResult {..} => true _ => false }
       let projected = run sourcePolicyObservation(&mut builder.*, port.id, Option<usize>.none())
       if !borrowed {
         // These are genuine caller/expression/loan-free/unknown sources. They follow their
         // authenticated route and never enter a Borrow count or global Loan precision state.
+        // Ordinary ownership policy supplies no result-source proof for these inputs.
+        let mut kept = port.quality.present
+        if ordinary { kept = no }
         run SourceGraphBuilder.bindPolicy(&mut builder.*, port.id,
-          port.quality.present, no, no)
+          kept, no, no)
       } else if !retained {
         // A nonretaining result drops every Borrow regardless of its input binding. This
         // grounded policy does not require a fabricated original argument correspondence.
-        run SourceGraphBuilder.bindPolicy(&mut builder.*, port.id, projected.masked, no, no)
+        let mut kept = projected.masked
+        if ordinary { kept = no }
+        run SourceGraphBuilder.bindPolicy(&mut builder.*, port.id, kept, no, no)
       } else {
         let placement = run sourceResultPlacement(&builder.*, port, root, &mut paths.*)
         let ownership = run SourceGraphBuilder.policyOwnershipPlacements(&builder.*, port.id)
         let reset = SourceGraphBuilder.policyOperationOwnershipReset(&builder.*, port.id)
+        let ordinaryReset = SourceGraphBuilder.policyOrdinaryOwnershipReset(&builder.*, port.id)
         let throughReset = SourceGraphBuilder.policyThroughOwnershipReset(&builder.*, port.id)
         let dereference = SourceGraphBuilder.policyRvalueDereferencePublication(&builder.*, port.id)
         let incoming = run SourceGraphBuilder.policyCases(&builder.*, port.id)
@@ -15800,6 +15917,26 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
               let empty = List<SourceAtom>.make()
               let active = run SourcePolicy.conjunction(&mut builder.rules, &gates, List<SourceAtom>.asSlice(&empty))
               if port.outputRole == SourceGraphSourceRole.Ownership {
+                if let Option<SourceGraph.OrdinaryOwnershipReset>.Some {value: boundary} = ordinaryReset {
+                  let candidate = SourceGraphBuilder.ordinaryResultCandidates(&builder.*)[boundary.candidate]
+                  let demand = SourceGraphBuilder.ordinaryResultDemands(&builder.*)[boundary.demand]
+                  if !ordinary || !exact || candidate.demand != boundary.demand
+                    || demand.evaluation.index != evaluation.index || demand.root.index != root.index
+                    || boundary.root.index != root.index || candidate.source.index != positions[position].value.index
+                    || candidate.target.index != port.target.index || port.outputDirect {
+                    return CompilerBug.panic(b"ordinary publication changed its exact whole-finish source")
+                  }
+                  let gates: [SourceAtom; 3] = [active, boundary.sourceActive, boundary.applicable]
+                  let empty = List<SourceAtom>.make()
+                  let arrived = run SourcePolicy.conjunction(&mut builder.rules, &gates, List<SourceAtom>.asSlice(&empty))
+                  run List<SourceAtom>.append(&mut covered, arrived)
+                  run List<SourceResultRoute>.append(&mut routes, SourceResultRoute {
+                    position: position, history: history, policy: at, field: usize.ZERO,
+                    wholeField: true, declared: no, active: arrived, quality: semantic.quality,
+                    reset: Option<SourceAtom>.some(boundary.accepted), ordinary: true})
+                  history = history + usize.ONE
+                  continue
+                }
                 if let Option<SourceGraph.RvalueDereferencePublication>.Some {value: boundary} = dereference {
                   let candidate = SourceGraphBuilder.rvalueDereferenceResults(&builder.*)[boundary.candidate]
                   let operand = SourceGraphBuilder.value(&builder.*, candidate.source)
@@ -15826,7 +15963,7 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
                   run List<SourceResultRoute>.append(&mut routes, SourceResultRoute {
                     position: position, history: history, policy: at, field: usize.ZERO,
                     wholeField: true, declared: no, active: arrived, quality: semantic.quality,
-                    reset: Option<SourceAtom>.some(boundary.accepted)})
+                    reset: Option<SourceAtom>.some(boundary.accepted), ordinary: false})
                   history = history + usize.ONE
                   continue
                 }
@@ -15846,7 +15983,7 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
                   run List<SourceResultRoute>.append(&mut routes, SourceResultRoute {
                     position: position, history: history, policy: at, field: usize.ZERO,
                     wholeField: true, declared: no, active: arrived, quality: semantic.quality,
-                    reset: Option<SourceAtom>.some(boundary.accepted)})
+                    reset: Option<SourceAtom>.some(boundary.accepted), ordinary: false})
                   history = history + usize.ONE
                   continue
                 }
@@ -15864,7 +16001,7 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
                   run List<SourceResultRoute>.append(&mut routes, SourceResultRoute {
                     position: position, history: history, policy: at, field: usize.ZERO,
                     wholeField: true, declared: no, active: arrived, quality: semantic.quality,
-                    reset: Option<SourceAtom>.some(boundary.accepted)})
+                    reset: Option<SourceAtom>.some(boundary.accepted), ordinary: false})
                   history = history + usize.ONE
                   continue
                 }
@@ -15889,7 +16026,7 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
                     run List<SourceResultRoute>.append(&mut routes, SourceResultRoute {
                       position: position, history: history, policy: at, field: output.field,
                       wholeField: output.field == usize.ZERO, declared: no, active: arrived, quality: semantic.quality,
-                      reset: Option<SourceAtom>.none()})
+                      reset: Option<SourceAtom>.none(), ordinary: false})
                   }
                   edge = edge + usize.ONE
                 }
@@ -15905,7 +16042,7 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
               run List<SourceResultRoute>.append(&mut routes,
                 SourceResultRoute {position: position, history: history, policy: at, field: placement.field,
                   wholeField: placement.whole, declared: declaration, active: active, quality: semantic.quality,
-                  reset: Option<SourceAtom>.none()})
+                  reset: Option<SourceAtom>.none(), ordinary: false})
             }
             history = history + usize.ONE
           }
@@ -15919,7 +16056,9 @@ effect fn sourceFinishRoutes<'body>(builder: &mut SourceGraphBuilder<'body>, obs
         let gaps: [SourceAtom; 2] = [missing.*, unsupported]
         missing.* = run SourcePolicy.disjunction(&mut builder.rules, &gaps)
         if List<SourceAtom>.length(&covered) == usize.ZERO {
-          run SourceGraphBuilder.bindPolicy(&mut builder.*, port.id, projected.masked, no, no)
+          let mut kept = projected.masked
+          if ordinary { kept = no }
+          run SourceGraphBuilder.bindPolicy(&mut builder.*, port.id, kept, no, no)
         }
       }
     }
@@ -15935,7 +16074,7 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
   state: &mut SourceLoanState, observed: &[SourceQuality], loans: &[Loan], nodes: &[Node],
   owner: &DeclarationId, supplied: &[Shared<Lifetime>], requirements: &[RetentionEdge], relations: &[ImpliedGroup],
   result: NodeId, evaluation: SourceGraph.EvalId, named: &[Shared<Lifetime>], facts: &SourceResultFacts, implied: &Implied, declared: &[SourceAtom],
-  placed: &[List<Step>], completed: SourceAtom, routes: &[SourceResultRoute], paths: &mut List<List<Step>>)
+  placed: &[List<Step>], completed: SourceAtom, routes: &[SourceResultRoute], ordinaryFinish: bool, paths: &mut List<List<Step>>)
   -> SourceResultScan ! OutOfMemoryError ? &mut Allocator {
   let positions = List<SourceCarryPosition>.asSlice(&observation.positions)
   if observed.length != positions.length || declared.length != positions.length {
@@ -15960,6 +16099,7 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
   let mut effects = List<SourceResultEffect>.make()
   let mut inputEffects = List<SourcePositionResult>.make()
   let mut gaps = List<SourceAtom>.make()
+  let mut ordinaryGaps = List<SourceAtom>.make()
   at = usize.ZERO
   while at < positions.length {
     let position = &positions[at]
@@ -15967,7 +16107,9 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
     let mut losses = List<SourcePolicy.Precision>.make()
     if histories.length == usize.ZERO {
       let unsupported: [SourceAtom; 2] = [completed, observed[at].present]
-      run List<SourceAtom>.append(&mut gaps, run SourcePolicy.conjunction(&mut builder.rules, &unsupported, none))
+      let missing = run SourcePolicy.conjunction(&mut builder.rules, &unsupported, none)
+      run List<SourceAtom>.append(&mut gaps, missing)
+      if ordinaryFinish { run List<SourceAtom>.append(&mut ordinaryGaps, missing) }
     }
     let mut history = usize.ZERO
     while history < histories.length {
@@ -15998,6 +16140,7 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
       let afterCase = run SourcePolicy.advance(&mut builder.rules,
         SourcePolicy.Precision {stored: before.stored, alternatives: before.alternatives}, &caseLoss)
       let mut publications = List<SourceAtom>.make()
+      let mut ordinaryPublications = List<SourceAtom>.make()
       let mut route = usize.ZERO
       while route < routes.length {
         let output = &routes[route]
@@ -16029,6 +16172,14 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
           run List<SourceAtom>.append(&mut publications, published)
           let retained: [SourceAtom; 2] = [decision.kept, published]
           let kept = run SourcePolicy.conjunction(&mut builder.rules, &retained, none)
+          if ordinaryFinish && output.ordinary {
+            // These are the same accepted policy prerequisites, before the reset's
+            // accepted atom and output Case. Declared-kept histories cannot certify
+            // completeness through an ordinary duplicate.
+            let retained: [SourceAtom; 2] = [kept, ordinary]
+            run List<SourceAtom>.append(&mut ordinaryPublications,
+              run SourcePolicy.conjunction(&mut builder.rules, &retained, none))
+          }
           if let Option<SourceAtom>.Some {value: accepted} = output.reset {
             let reset: [SourceAtom; 2] = [kept, ordinary]
             run SourceProgram.rule(&mut builder.rules, accepted, &reset, none)
@@ -16050,6 +16201,16 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
       }
       let missing = run sourceResultCoverage(&mut builder.rules, decision.kept, List<SourceAtom>.asSlice(&publications))
       run List<SourceAtom>.append(&mut gaps, missing)
+      if ordinaryFinish {
+        let present: [SourceAtom; 1] = [applicable]
+        let retained: [SourceAtom; 1] = [decision.kept]
+        let dropped = run SourcePolicy.conjunction(&mut builder.rules, &present, &retained)
+        run List<SourceAtom>.append(&mut ordinaryPublications, dropped)
+        let handled = run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&ordinaryPublications))
+        let covered: [SourceAtom; 1] = [handled]
+        run List<SourceAtom>.append(&mut ordinaryGaps,
+          run SourcePolicy.conjunction(&mut builder.rules, &present, &covered))
+      }
       run List<SourcePositionResult>.append(&mut inputEffects, SourcePositionResult {
         result: evaluation, position: at, source: sourceEffectSource(position, actual), decision: move decision, missing: missing})
       history = history + usize.ONE
@@ -16085,7 +16246,8 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
       let projected = run sourcePolicyObservation(&mut builder.*, port.id, Option<usize>.none())
       // Raw source Q already flows through the physical Case. The masked branch adds
       // only kept; feeding its raw Q back as a policy loss would taint semantic arrivals.
-      run List<SourceAtom>.append(&mut keptSources, projected.masked)
+      let ordinary = match port.authority { SourceGraphTransferAuthority.OrdinaryResult {..} => true _ => false }
+      if !ordinary { run List<SourceAtom>.append(&mut keptSources, projected.masked) }
       let kept = run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&keptSources))
       let stored = run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&storedSources))
       let alternatives = run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&alternativeSources))
@@ -16094,7 +16256,8 @@ effect fn sourceFinishPositions<'body>(builder: &mut SourceGraphBuilder<'body>, 
     at = at + usize.ONE
   }
   return SourceResultScan {inputs: move inputEffects, outputs: move effects,
-    missing: run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&gaps))}
+    missing: run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&gaps)),
+    ordinaryMissing: run SourcePolicy.disjunction(&mut builder.rules, List<SourceAtom>.asSlice(&ordinaryGaps))}
 }
 
 effect fn sourceForwardedField(forwarding: Forwarding, operand: usize, field: usize,
