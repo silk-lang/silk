@@ -19,8 +19,8 @@
 //! Wherever a value flows (a binding, an assignment, a call argument, a result, a return, a field
 //! store, a capture) its type is related to the destination's structurally, by each position's
 //! variance, adding outlives edges between variables (`relate`). A call instantiates the callee's
-//! signature, which [`CallContract`] supplies, with fresh variables, so the check never reads a
-//! callee body. A borrow creates a loan whose region is its reference's variable; a reborrow adds
+//! signature, which [`CallContract`] supplies, with fresh variables for the callee's own binders,
+//! so the check never reads a callee body. A borrow creates a loan whose region is its reference's variable; a reborrow adds
 //! that every reference it goes through outlives it.
 //!
 //! A region holds every point where a value whose type names it is live, plus what its outlives
@@ -47,6 +47,7 @@ import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime, Intersection, Member}
 import semantic.Rejection {RejectionCode}
 import semantic.StorageOperation {StorageOperation}
+import semantic.CallableSchema {CallableSchema}
 import semantic.Type {Outlives, Type}
 import semantic.RegionSolver {Bound, Cfg, Live, Liveness, Loan, LoanScope, Loans, Region, Regions, Values}
 import semantic.TypedBody {
@@ -127,17 +128,58 @@ pub struct ContentsBound {
   pub region: Shared<Lifetime>
 }
 
-/// The instantiated signature of one call: the callee's parameter types in argument order and its
-/// result type, with the callee's own lifetime parameters left as they are written and its type
-/// parameters replaced by the call's type arguments. `bounds` and `contents` are the callee's
-/// declared and implied bounds in the same terms. Every lifetime in it is instantiated afresh for
-/// the call, except `'static`.
+/// The instantiated signature of one call: the callee's parameter types and its result type, with
+/// the callee's own lifetime binders left as they are written and every other binder replaced by
+/// the call's argument. `bounds` and `contents` are the callee's declared and implied bounds in the
+/// same terms.
+///
+/// Each call instantiates the lifetime parameters of `binders` afresh, as rustc renumbers a call's
+/// generic regions, and so every lifetime typing inferred for the call. A lifetime of the invoked
+/// callable value's own type, or of the constructed value's for a construction, is that value's
+/// region where that type names it; a lifetime in `pinned` (one the call writes, or an enclosing
+/// declaration's parameter the signature names) is the caller's universal region; any other is
+/// fresh.
 pub struct CallContract {
   pub call: NodeId
+  pub form: ContractForm
+  /// For a section, the first parameter its operands supply; otherwise zero.
+  pub first: usize
+  pub binders: Option<DeclarationId>
   pub parameters: List<Shared<Type>>
   pub result: Shared<Type>
   pub bounds: List<RegionBound>
   pub contents: List<ContentsBound>
+  /// Each service the callee requires as it runs, paired with the caller's own requirement that
+  /// provides it.
+  pub requirements: List<ProvidedRequirement>
+  /// The caller's lifetimes the call fixes rather than infers.
+  pub pinned: List<Shared<Lifetime>>
+  /// For an invocation of a section, the target parameter each value the section stores stands
+  /// for, in the section's storage order: each invocation relates the stored values to them, so the
+  /// binders the section left to the invocation meet what it stored.
+  pub captured: List<Shared<Type>>
+}
+
+/// How a call contract's instantiation meets the value of the node it is keyed by.
+pub enum ContractForm {
+  /// The call runs the callee: its value is the result.
+  Call,
+  /// The call constructs the Effect the callee promises without running it (EFF-001): the Effect
+  /// stores every argument, so each parameter region outlives the Effect's environment, and the
+  /// result is the Effect's success.
+  Effect,
+  /// A named function's section stores its operands as the parameters from `first` (CALLABLE-001):
+  /// each stored parameter region outlives the section's environment, the section's own contract
+  /// supplies the leading parameters, and the result is the section's result.
+  Section,
+}
+
+/// A service requirement of a callee, and the caller's requirement of the same service that
+/// provides it while the callee runs. Both name the same service instance, so their regions are
+/// equal.
+pub struct ProvidedRequirement {
+  pub required: Shared<Type>
+  pub provided: Shared<Type>
 }
 
 /// The declared type of each field a construction writes, in operand order, and the constructed
@@ -464,6 +506,73 @@ effect fn resolve(table: &mut RegionTable, numbered: usize, lifetime: &Shared<Li
   return region
 }
 
+// The region numbering `numbered` already gives `lifetime`, or none (`usize.MAX`).
+fn listedRegion(table: &RegionTable, numbered: usize, lifetime: &Shared<Lifetime>) -> Region {
+  let numberings = List<Renumbering>.asSlice(&table.numberings)
+  let atoms = List<Shared<Lifetime>>.asSlice(&numberings[numbered].atoms)
+  let mut at = usize.ZERO
+  while at < atoms.length {
+    if Lifetime.equalsShared(&atoms[at], lifetime) { return List<Region>.asSlice(&numberings[numbered].regions)[at] }
+    at = at + usize.ONE
+  }
+  return Region {index: usize.MAX}
+}
+
+// A numbering for relating the contract a value numbered `numbered` holds: each lifetime the value
+// lists keeps its region, and a binder the contract leaves to each invocation (a section's target
+// binder its arguments did not fix) is a fresh region rather than one of the value's.
+effect fn heldNumbering(table: &mut RegionTable, numbered: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let universal = List<Renumbering>.asSlice(&table.numberings)[numbered].universal
+  let index = run addNumbering(&mut table.*, universal)
+  let count = List<Shared<Lifetime>>.length(&List<Renumbering>.asSlice(&table.numberings)[numbered].atoms)
+  let mut at = usize.ZERO
+  while at < count {
+    let atom = Shared<Lifetime>.clone(&List<Shared<Lifetime>>.asSlice(&List<Renumbering>.asSlice(&table.numberings)[numbered].atoms)[at])
+    let region = List<Region>.asSlice(&List<Renumbering>.asSlice(&table.numberings)[numbered].regions)[at]
+    run pinRegion(&mut table.*, index, &atom, region)
+    at = at + usize.ONE
+  }
+  return index
+}
+
+// Numbers `lifetime` as `region` in numbering `numbered`.
+effect fn pinRegion(table: &mut RegionTable, numbered: usize, lifetime: &Shared<Lifetime>, region: Region) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut stored = List<Renumbering>.asMutSlice(&mut table.numberings)
+  run List<Shared<Lifetime>>.append(&mut stored[numbered].atoms, Shared<Lifetime>.clone(lifetime))
+  run List<Region>.append(&mut stored[numbered].regions, region)
+  return ()
+}
+
+// Appends every lifetime `ty` names, its environments' members included, except the invocation
+// binders of its callable types.
+effect fn contractLifetimes(ty: &Shared<Type>, found: &mut List<Shared<Lifetime>>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let regions = Type.lifetimeCount(ty)
+  let mut at = usize.ZERO
+  while at < regions {
+    if let Option<Shared<Lifetime>>.Some {value: lifetime} = move Type.lifetimeAt(ty, at) {
+      if !boundInvocation(ty, &lifetime) { run List<Shared<Lifetime>>.append(&mut found.*, move lifetime) }
+    }
+    at = at + usize.ONE
+  }
+  if let Option<Shared<Intersection>>.Some {value: environment} = move Shared<Type>.with<Option<Shared<Intersection>>>(ty, environmentOf) {
+    let mut members = run environmentRegions(&environment)
+    while List<Shared<Lifetime>>.length(&members) != usize.ZERO {
+      let last = List<Shared<Lifetime>>.length(&members) - usize.ONE
+      run List<Shared<Lifetime>>.append(&mut found.*, List<Shared<Lifetime>>.remove(&mut members, last))
+    }
+  }
+  let children = Type.partCount(ty)
+  at = usize.ZERO
+  while at < children {
+    if let Option<Shared<Type>>.Some {value: child} = move Type.partAt(ty, at) {
+      run contractLifetimes(&child, &mut found.*)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
 // The lifetimes cleanup of a value of type `ty` may read: those a nominal declaration's cleanup
 // observes through its binders, what each dropped part's own cleanup reads, and every lifetime of a
 // type whose cleanup is not described. References, slices and strings have no cleanup.
@@ -575,6 +684,87 @@ effect fn everyLifetime(ty: &Shared<Type>, found: &mut List<Shared<Lifetime>>) -
   while at < children {
     if let Option<Shared<Type>>.Some {value: child} = move Type.partAt(ty, at) {
       run everyLifetime(&child, &mut found.*)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn listsLifetime(listed: &[Shared<Lifetime>], wanted: &Shared<Lifetime>) -> bool {
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if Lifetime.equalsShared(&listed[at], wanted) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether `lifetime` is a lifetime parameter of `binders`.
+fn ownBinder(lifetime: &Shared<Lifetime>, binders: &Option<DeclarationId>) -> bool {
+  if let Option<DeclarationId>.Some {value: callee} = &binders.* {
+    return Shared<Lifetime>.with<bool>(lifetime, fn(value: &Lifetime) -> bool {
+      return match &value.* { Lifetime.Parameter {declaration, ..} => DeclarationId.equals(&declaration, &callee) _ => false }
+    })
+  }
+  return false
+}
+
+// Numbers the caller's lifetimes of call contract `contract` in its numbering `numbered` before
+// the walk relates it (see `CallContract`): a pinned universal lifetime as its universal region,
+// and any other as the numbering `outer`, of a value of type `outerType`, does where that type
+// names it. Every other lifetime is left to be numbered afresh.
+effect fn pinCaller(walker: &mut Walker, numbered: usize, contract: usize, outer: usize, outerType: &Shared<Type>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let owner = walker.input.owner
+  let mut shown = List<Shared<Lifetime>>.make()
+  if outer != usize.MAX { run contractLifetimes(outerType, &mut shown) }
+  let contracts = walker.input.contracts
+  let signature = &contracts[contract]
+  let mut named = List<Shared<Lifetime>>.make()
+  let parameters = List<Shared<Type>>.asSlice(&signature.parameters)
+  let mut at = usize.ZERO
+  while at < parameters.length {
+    run contractLifetimes(&parameters[at], &mut named)
+    at = at + usize.ONE
+  }
+  run contractLifetimes(&signature.result, &mut named)
+  let bounds = List<RegionBound>.asSlice(&signature.bounds)
+  at = usize.ZERO
+  while at < bounds.length {
+    run List<Shared<Lifetime>>.append(&mut named, Shared<Lifetime>.clone(&bounds[at].longer))
+    run List<Shared<Lifetime>>.append(&mut named, Shared<Lifetime>.clone(&bounds[at].shorter))
+    at = at + usize.ONE
+  }
+  let contents = List<ContentsBound>.asSlice(&signature.contents)
+  at = usize.ZERO
+  while at < contents.length {
+    run contractLifetimes(&contents[at].subject, &mut named)
+    run List<Shared<Lifetime>>.append(&mut named, Shared<Lifetime>.clone(&contents[at].region))
+    at = at + usize.ONE
+  }
+  let required = List<ProvidedRequirement>.asSlice(&signature.requirements)
+  at = usize.ZERO
+  while at < required.length {
+    run contractLifetimes(&required[at].required, &mut named)
+    at = at + usize.ONE
+  }
+  let lifetimes = List<Shared<Lifetime>>.asSlice(&named)
+  at = usize.ZERO
+  while at < lifetimes.length {
+    let lifetime = &lifetimes[at]
+    if listedRegion(&walker.table, numbered, lifetime).index == usize.MAX && !ownBinder(lifetime, &signature.binders)
+      && !Shared<Lifetime>.with<bool>(lifetime, staticAtom) {
+      let mut region = Region {index: usize.MAX}
+      if universalLifetime(lifetime, owner) && listsLifetime(List<Shared<Lifetime>>.asSlice(&signature.pinned), lifetime) {
+        region = run universalOf(&mut walker.table, lifetime, owner)
+      } else if outer != usize.MAX {
+        if listsLifetime(List<Shared<Lifetime>>.asSlice(&shown), lifetime) {
+          region = run resolve(&mut walker.table, outer, lifetime, owner)
+        } else {
+          region = listedRegion(&walker.table, outer, lifetime)
+        }
+      }
+      if region.index != usize.MAX { run pinRegion(&mut walker.table, numbered, lifetime, region) }
     }
     at = at + usize.ONE
   }
@@ -815,6 +1005,33 @@ effect fn relate(table: &mut RegionTable, sub: &Side, sup: &Side, variance: Vari
   let environments = match &subEnvironment { Option<Shared<Intersection>>.Some {..} => true _ => false }
   let sameShape = subTag == supTag && children == Type.partCount(&sup.ty)
     && (environments || regions == Type.lifetimeCount(&sup.ty))
+  // An opaque representation promises what its contract describes: a value stands for it, or it
+  // stands for another type, by that contract.
+  if !sameShape {
+    let subOpaque = Shared<Type>.with<Option<Shared<Type>>>(&sub.ty, opaqueContract)
+    let supOpaque = Shared<Type>.with<Option<Shared<Type>>>(&sup.ty, opaqueContract)
+    let subOpened = match &subOpaque { Option<Shared<Type>>.Some {..} => true _ => false }
+    let supOpened = match &supOpaque { Option<Shared<Type>>.Some {..} => true _ => false }
+    if subOpened || supOpened {
+      let mut left = Shared<Type>.clone(&sub.ty)
+      if let Option<Shared<Type>>.Some {value} = move subOpaque { left = move value }
+      let mut right = Shared<Type>.clone(&sup.ty)
+      if let Option<Shared<Type>>.Some {value} = move supOpaque { right = move value }
+      let used = Side {ty: move left, numbered: sub.numbered}
+      let promised = Side {ty: move right, numbered: sup.numbered}
+      return run relate(&mut table.*, &used, &promised, variance, variances, owner)
+    }
+  }
+  // A callable value or an Effect construction stands where its contract is expected, unless a
+  // contract quantifies its invocation's lifetimes, which no region of the body stands for.
+  if subTag != supTag && !Type.mentionsInvocation(&sup.ty) {
+    if let Option<Shared<Type>>.Some {value: contract} = move Shared<Type>.with<Option<Shared<Type>>>(&sub.ty, heldContract) {
+      if Shared<Type>.with<usize>(&contract, headTag) == supTag && !Type.mentionsInvocation(&contract) {
+        let held = Side {ty: move contract, numbered: run heldNumbering(&mut table.*, sub.numbered)}
+        return run relate(&mut table.*, &held, sup, variance, variances, owner)
+      }
+    }
+  }
   if !sameShape {
     // A reference to an array viewed as a slice relates the two views and their elements.
     let array = Shared<Type>.with<Option<View>>(&sub.ty, arrayView)
@@ -2875,17 +3092,21 @@ effect fn outliveAll(walker: &mut Walker, fromTy: &Shared<Type>, from: usize, to
   return ()
 }
 
-// Instantiates call contract `contract` in the fresh numbering `numbered` at the call's point: each
-// argument's value stands where its parameter is expected, the result stands for the call's value,
-// the callee's bounds hold, and every region the signature names holds the call point. `skip` is
-// an argument already related (a lent receiver), or `usize.MAX`.
-effect fn instantiate(walker: &mut Walker, id: NodeId, numbered: usize, contract: usize, arguments: &[NodeId], skip: usize, point: usize) -> ()
-! OutOfMemoryError ? &mut Allocator {
+// Instantiates call contract `contract` in the fresh numbering `numbered` at the call's point: the
+// caller's lifetimes are numbered first (`pinCaller`, with `outer` the numbering of an invoked
+// callable value or of a constructed value, or `usize.MAX`), each argument's value stands where its
+// parameter is expected, the result stands for the call's value (`deliver` for a construction), the
+// callee's bounds hold, each service it requires is the caller's, and every region the signature
+// names holds the call point. `skip` is an argument already related (a lent receiver), or
+// `usize.MAX`.
+effect fn instantiate(walker: &mut Walker, id: NodeId, numbered: usize, contract: usize, arguments: &[NodeId], skip: usize, point: usize,
+  outer: usize, outerType: &Shared<Type>) -> () ! OutOfMemoryError ? &mut Allocator {
   let nodes = walker.input.nodes
   let owner = walker.input.owner
   let span = nodes[id.index].origin.location
   let contracts = walker.input.contracts
   let signature = &contracts[contract]
+  run pinCaller(&mut walker.*, numbered, contract, outer, outerType)
   let parameters = List<Shared<Type>>.asSlice(&signature.parameters)
   let mut index = usize.ZERO
   while index < parameters.length {
@@ -2893,15 +3114,33 @@ effect fn instantiate(walker: &mut Walker, id: NodeId, numbered: usize, contract
     index = index + usize.ONE
   }
   run renumber(&mut walker.table, numbered, &signature.result, owner)
+  let captured = List<Shared<Type>>.asSlice(&signature.captured)
+  index = usize.ZERO
+  while index < captured.length {
+    run renumber(&mut walker.table, numbered, &captured[index], owner)
+    index = index + usize.ONE
+  }
+  if captured.length > usize.ZERO && outer != usize.MAX {
+    let stored = run storedValues(outerType)
+    let held = List<Shared<Type>>.asSlice(&stored)
+    index = usize.ZERO
+    while index < captured.length && index < held.length {
+      run flow(&mut walker.*, &held[index], outer, &captured[index], numbered, Variance.Covariant, span)
+      index = index + usize.ONE
+    }
+  }
   index = usize.ZERO
   while index < arguments.length {
     let argument = arguments[index]
     let site = nodes[argument.index].origin.location
+    let parameter = signature.first + index
     if index != skip {
       if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, argument) {
-        if index < parameters.length {
+        if parameter < parameters.length {
           let value17 = nodeValue(&walker.*, argument)
-          run flow(&mut walker.*, &ty, value17, &parameters[index], numbered, Variance.Covariant, site)
+          // A relation an argument's type cannot meet is the call's to answer for; a loan that
+          // cannot is reported at its borrow.
+          run flow(&mut walker.*, &ty, value17, &parameters[parameter], numbered, Variance.Covariant, span)
         } else {
           run joinNodes(&mut walker.*, argument, id, site)
         }
@@ -2910,8 +3149,12 @@ effect fn instantiate(walker: &mut Walker, id: NodeId, numbered: usize, contract
     index = index + usize.ONE
   }
   if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
-    let value18 = nodeValue(&walker.*, id)
-    run flow(&mut walker.*, &signature.result, numbered, &ty, value18, Variance.Covariant, span)
+    if signature.form == ContractForm.Call {
+      let value18 = nodeValue(&walker.*, id)
+      run flow(&mut walker.*, &signature.result, numbered, &ty, value18, Variance.Covariant, span)
+    } else {
+      run deliver(&mut walker.*, id, &ty, numbered, contract)
+    }
   }
   walker.table.site = span
   index = usize.ZERO
@@ -2935,6 +3178,18 @@ effect fn instantiate(walker: &mut Walker, id: NodeId, numbered: usize, contract
     run contentsOutlive(&mut walker.table, numbered, &contents[index].subject, region, owner)
     index = index + usize.ONE
   }
+  let required = List<ProvidedRequirement>.asSlice(&signature.requirements)
+  if required.length > usize.ZERO {
+    // The caller's requirements are typed by its signature, so their lifetimes are universal.
+    let provided = run addNumbering(&mut walker.table, true)
+    index = usize.ZERO
+    while index < required.length {
+      let needed = Side {ty: Shared<Type>.clone(&required[index].required), numbered: numbered}
+      let provider = Side {ty: Shared<Type>.clone(&required[index].provided), numbered: provided}
+      run relate(&mut walker.table, &needed, &provider, Variance.Invariant, walker.input.variances, owner)
+      index = index + usize.ONE
+    }
+  }
   let regions = run copyRegions(List<Region>.asSlice(&List<Renumbering>.asSlice(&walker.table.numberings)[numbered].regions))
   let listed = List<Region>.asSlice(&regions)
   index = usize.ZERO
@@ -2943,6 +3198,198 @@ effect fn instantiate(walker: &mut Walker, id: NodeId, numbered: usize, contract
     index = index + usize.ONE
   }
   return ()
+}
+
+// Delivers a construction contract's result to the value node `id`, of type `ty`, builds. An
+// Effect construction holds the Effect it promises, whose success is the callee's result. A section
+// holds its own contract: its leading parameters stand where the callee's are expected, its result
+// is the callee's, and its environment is the validity of the parameters the section stores. Every
+// parameter an Effect stores outlives the Effect's environment (LIFE-004).
+effect fn deliver(walker: &mut Walker, id: NodeId, ty: &Shared<Type>, numbered: usize, contract: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[id.index].origin.location
+  let contracts = walker.input.contracts
+  let signature = &contracts[contract]
+  let parameters = List<Shared<Type>>.asSlice(&signature.parameters)
+  let mut value = nodeValue(&walker.*, id)
+  let mut built = Shared<Type>.clone(ty)
+  if let Option<Shared<Type>>.Some {value: held} = move Shared<Type>.with<Option<Shared<Type>>>(ty, heldContract) {
+    built = move held
+    if value != usize.MAX { value = run heldNumbering(&mut walker.table, value) }
+  }
+  let mut destination = Shared<Type>.clone(&built)
+  let mut stored = usize.ZERO
+  if signature.form == ContractForm.Section {
+    stored = signature.first
+    if Shared<Type>.with<usize>(&built, callableArity) == signature.first {
+      let mut at = usize.ZERO
+      while at < signature.first && at < parameters.length {
+        if let Option<Shared<Type>>.Some {value: leading} = move Type.partAt(&built, at) {
+          run flow(&mut walker.*, &leading, value, &parameters[at], numbered, Variance.Covariant, span)
+        }
+        at = at + usize.ONE
+      }
+    }
+    run outliveEnvironment(&mut walker.*, contract, numbered, stored, &built, value, span)
+    if let Option<Shared<Type>>.Some {value: result} = move Shared<Type>.with<Option<Shared<Type>>>(&built, callableResult) {
+      destination = move result
+    }
+  }
+  let promised = Shared<Type>.with<bool>(&signature.result, isEffect)
+  if Shared<Type>.with<bool>(&destination, isEffect) {
+    let mut delivered = Shared<Type>.clone(&destination)
+    if !promised {
+      if let Option<Shared<Type>>.Some {value: success} = move Shared<Type>.with<Option<Shared<Type>>>(&destination, effectSuccess) {
+        delivered = move success
+      }
+    }
+    run flow(&mut walker.*, &signature.result, numbered, &delivered, value, Variance.Covariant, span)
+    // A section's Effect is constructed where the section is invoked, which owes its environment.
+    if signature.form == ContractForm.Effect {
+      run outliveEnvironment(&mut walker.*, contract, numbered, stored, &destination, value, span)
+    }
+  } else {
+    run flow(&mut walker.*, &signature.result, numbered, &destination, value, Variance.Covariant, span)
+  }
+  return ()
+}
+
+// Every region the parameters of contract `contract` from `stored` name in its numbering
+// `numbered` outlives `built`'s environment in numbering `value`: its one member, or the meet of
+// several; an empty environment, or one of `'static` members only, is `'static`.
+effect fn outliveEnvironment(walker: &mut Walker, contract: usize, numbered: usize, stored: usize, built: &Shared<Type>, value: usize,
+  site: Location) -> () ! OutOfMemoryError ? &mut Allocator {
+  let owner = walker.input.owner
+  let environment = match move Shared<Type>.with<Option<Shared<Intersection>>>(built, environmentOf) {
+    Option<Shared<Intersection>>.Some {value: found} => move found
+    Option<Shared<Intersection>>.None => { return () }
+  }
+  let members = run environmentRegions(&environment)
+  let listed = List<Shared<Lifetime>>.asSlice(&members)
+  // The environment is the meet of its members, which a `'static` member leaves as the others'.
+  let mut bounded = false
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if !Shared<Lifetime>.with<bool>(&listed[at], staticAtom) { bounded = true }
+    at = at + usize.ONE
+  }
+  let mut shorter = List<Region>.make()
+  at = usize.ZERO
+  while at < listed.length {
+    if !bounded || !Shared<Lifetime>.with<bool>(&listed[at], staticAtom) {
+      run List<Region>.append(&mut shorter, run resolve(&mut walker.table, value, &listed[at], owner))
+    }
+    at = at + usize.ONE
+  }
+  if List<Region>.length(&shorter) == usize.ZERO {
+    let forever = run Shared<Lifetime>.make(Lifetime.Static)
+    run List<Region>.append(&mut shorter, run universalOf(&mut walker.table, &forever, owner))
+  }
+  let contracts = walker.input.contracts
+  let parameters = List<Shared<Type>>.asSlice(&contracts[contract].parameters)
+  let mut longer = List<Region>.make()
+  at = stored
+  while at < parameters.length {
+    run collectRegions(&mut walker.table, numbered, &parameters[at], owner, &mut longer)
+    at = at + usize.ONE
+  }
+  walker.table.site = site
+  // A meet of several members is a region each member outlives, which no single member needs to.
+  let mut met = List<Region>.make()
+  if List<Region>.length(&shorter) > usize.ONE {
+    let meet = run newRegion(&mut walker.table)
+    let members = List<Region>.asSlice(&shorter)
+    at = usize.ZERO
+    while at < members.length {
+      run addOutlives(&mut walker.table, members[at], meet)
+      at = at + usize.ONE
+    }
+    run List<Region>.append(&mut met, meet)
+  } else {
+    met = move shorter
+  }
+  let first = List<Region>.asSlice(&longer)
+  let second = List<Region>.asSlice(&met)
+  at = usize.ZERO
+  while at < first.length {
+    let mut other = usize.ZERO
+    while other < second.length {
+      if first[at].index != second[other].index { run addOutlives(&mut walker.table, first[at], second[other]) }
+      other = other + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The contract an opaque representation promises.
+fn opaqueContract(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.OpaqueRepresentation {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+// The contract a callable value, section schema or staged callable holds: what invoking it promises.
+fn heldContract(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.CallableValue {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+    Type.CallableSchema {schema, ..} => Option<Shared<Type>>.some(Shared<CallableSchema>.with<Shared<Type>>(&schema,
+      fn(staged: &CallableSchema) -> Shared<Type> { return Shared<Type>.clone(&staged.contract) }))
+    Type.CallableStage {contract, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&contract))
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+// The values a section of type `value` stores, in its storage order.
+effect fn storedValues(value: &Shared<Type>) -> List<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  let mut stored = List<Shared<Type>>.make()
+  let count = Shared<Type>.with<usize>(value, storedCount)
+  let mut at = usize.ZERO
+  while at < count {
+    run List<Shared<Type>>.append(&mut stored, Shared<Type>.with<Shared<Type>>(value, fn(node: &Type) -> Shared<Type> { return storedAt(node, at) }))
+    at = at + usize.ONE
+  }
+  return move stored
+}
+
+fn storedCount(value: &Type) -> usize {
+  return match &value.* {
+    Type.CallableSchema {captures, ..} => List<Shared<Type>>.length(&captures)
+    Type.CallableValue {captures, ..} => List<Shared<Type>>.length(&captures)
+    _ => usize.ZERO
+  }
+}
+
+fn storedAt(value: &Type, at: usize) -> Shared<Type> {
+  return match &value.* {
+    Type.CallableSchema {captures, ..} => Shared<Type>.clone(&List<Shared<Type>>.asSlice(&captures)[at])
+    Type.CallableValue {captures, ..} => Shared<Type>.clone(&List<Shared<Type>>.asSlice(&captures)[at])
+    _ => CompilerBug.panic(b"a stored value of a type that stores none")
+  }
+}
+
+// How many parameters a callable contract has, or `usize.MAX` for any other type.
+fn callableArity(value: &Type) -> usize {
+  return match &value.* { Type.Callable {parameters, ..} => List<Shared<Type>>.length(&parameters) _ => usize.MAX }
+}
+
+fn callableResult(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Callable {result, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&result))
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+fn isEffect(value: &Type) -> bool {
+  return match &value.* { Type.Effect {..} => true _ => false }
+}
+
+fn effectSuccess(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Effect {success, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&success))
+    _ => Option<Shared<Type>>.none()
+  }
 }
 
 effect fn copyRegions(values: &[Region]) -> List<Region> ! OutOfMemoryError ? &mut Allocator {
@@ -2964,7 +3411,15 @@ effect fn call(walker: &mut Walker, id: NodeId, arguments: &[NodeId], receiver: 
   let contracts = walker.input.contracts
   let contract = List<usize>.asSlice(&walker.contractOf)[id.index]
   let mut numbered = usize.MAX
-  if contract != usize.MAX { numbered = run addNumbering(&mut walker.table, false) }
+  // A construction's contract names the constructed value's own regions where its type does.
+  let mut outer = usize.MAX
+  let mut built = run unitType()
+  if let Option<Shared<Type>>.Some {value} = move nodeType(nodes, id) { built = move value }
+  if contract != usize.MAX {
+    numbered = run addNumbering(&mut walker.table, false)
+    if contracts[contract].form != ContractForm.Call { outer = nodeValue(&walker.*, id) }
+    run pinCaller(&mut walker.*, numbered, contract, outer, &built)
+  }
   let mut current = at
   let mut lent = usize.MAX
   let mut lentRegion = Region {index: usize.MAX}
@@ -2995,7 +3450,14 @@ effect fn call(walker: &mut Walker, id: NodeId, arguments: &[NodeId], receiver: 
         let mut variance = Variance.Covariant
         if receiver == 2 { variance = Variance.Invariant }
         if let Option<Shared<Type>>.Some {value: viewed} = move referent {
-          run flow(&mut walker.*, &path.ty, path.numbered, &viewed, numbered, variance, span)
+          // A receiver that is already a reference stands for its referent.
+          let mut source = Shared<Type>.clone(&path.ty)
+          if Shared<Type>.with<usize>(&path.ty, headTag) != Shared<Type>.with<usize>(&viewed, headTag) {
+            if let Option<Shared<Type>>.Some {value: inner} = move Shared<Type>.with<Option<Shared<Type>>>(&path.ty, referentOf) {
+              source = move inner
+            }
+          }
+          run flow(&mut walker.*, &source, path.numbered, &viewed, numbered, variance, span)
         }
         current = lent
         skip = usize.ZERO
@@ -3015,7 +3477,7 @@ effect fn call(walker: &mut Walker, id: NodeId, arguments: &[NodeId], receiver: 
     index = index + usize.ONE
   }
   if contract != usize.MAX {
-    run instantiate(&mut walker.*, id, numbered, contract, arguments, skip, point)
+    run instantiate(&mut walker.*, id, numbered, contract, arguments, skip, point, outer, &built)
   } else {
     index = usize.ZERO
     while index < arguments.length {
@@ -3077,6 +3539,38 @@ effect fn construct(walker: &mut Walker, id: NodeId, values: &[NodeId], referent
   while index < regions.length {
     run includeRange(&mut walker.*, regions[index], points[index], point)
     index = index + usize.ONE
+  }
+  // A named function's section stores each operand as its capture, typed in the section's own
+  // regions, and as the callee's parameter (CALLABLE-001).
+  let contract = List<usize>.asSlice(&walker.contractOf)[id.index]
+  if contract != usize.MAX {
+    index = usize.ZERO
+    while index < values.length {
+      let operand = nodeValue(&walker.*, values[index])
+      run readValue(&mut walker.*, operand, point)
+      if shape != usize.MAX {
+        let fields = List<Shared<Type>>.asSlice(&constructions[shape].fields)
+        if index < fields.length {
+          if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, values[index]) {
+            run flow(&mut walker.*, &ty, operand, &fields[index], numbered, Variance.Covariant, nodes[values[index].index].origin.location)
+          }
+        }
+      }
+      index = index + usize.ONE
+    }
+    // A staged callable's first operand is its callee, which the contract describes.
+    let mut supplied = List<NodeId>.make()
+    index = usize.ZERO
+    if let NodeKind.Expression {form: Expression.StagedCallable {..}, ..} = &nodes[id.index].kind { index = usize.ONE }
+    while index < values.length {
+      run List<NodeId>.append(&mut supplied, values[index])
+      index = index + usize.ONE
+    }
+    let mut built = run unitType()
+    if let Option<Shared<Type>>.Some {value} = move nodeType(nodes, id) { built = move value }
+    let instantiated = run addNumbering(&mut walker.table, false)
+    run instantiate(&mut walker.*, id, instantiated, contract, List<NodeId>.asSlice(&supplied), usize.MAX, point, numbered, &built)
+    return point
   }
   index = usize.ZERO
   while index < values.length {
@@ -3201,25 +3695,28 @@ effect fn invoke(walker: &mut Walker, id: NodeId, callee: NodeId, arguments: &[N
     run readValue(&mut walker.*, value23, point)
     index = index + usize.ONE
   }
-  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
-    let value24 = nodeValue(&walker.*, id)
-    // A staged callable's or a section's contract names its result in the lifetimes of its own
-    // type, which hold its operands position by position, so the result holds just those regions.
-    let mut named = Option<Shared<Type>>.none()
-    if lent == usize.MAX && !deferred && inferredCallable(nodes, callee) {
-      named = Shared<Type>.with<Option<Shared<Type>>>(&calleeTy, contractResult)
-    }
-    if let Option<Shared<Type>>.Some {value: result} = move named {
-      run flow(&mut walker.*, &result, calleeNumbered, &ty, value24, Variance.Covariant, span)
-    } else {
-      run outliveAll(&mut walker.*, &calleeTy, calleeNumbered, &ty, value24, span)
-    }
-  }
+  // The contract's lifetimes that its parameters do not open are the callee value's own regions, so
+  // its result holds what the callee's environment holds exactly where the contract says. Without
+  // a contract, a staged callable's or a section's own type names its result in the lifetimes that
+  // hold its operands position by position, so the result holds just those regions; any other
+  // result may hold anything the callee holds.
   let contract = List<usize>.asSlice(&walker.contractOf)[id.index]
-  if !deferred && contract != usize.MAX {
+  if contract != usize.MAX {
     let numbered = run addNumbering(&mut walker.table, false)
-    run instantiate(&mut walker.*, id, numbered, contract, arguments, usize.MAX, point)
+    run instantiate(&mut walker.*, id, numbered, contract, arguments, usize.MAX, point, calleeNumbered, &calleeTy)
   } else {
+    if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
+      let value24 = nodeValue(&walker.*, id)
+      let mut named = Option<Shared<Type>>.none()
+      if lent == usize.MAX && !deferred && inferredCallable(nodes, callee) {
+        named = Shared<Type>.with<Option<Shared<Type>>>(&calleeTy, contractResult)
+      }
+      if let Option<Shared<Type>>.Some {value: result} = move named {
+        run flow(&mut walker.*, &result, calleeNumbered, &ty, value24, Variance.Covariant, span)
+      } else {
+        run outliveAll(&mut walker.*, &calleeTy, calleeNumbered, &ty, value24, span)
+      }
+    }
     index = usize.ZERO
     while index < arguments.length {
       run joinNodes(&mut walker.*, arguments[index], id, nodes[arguments[index].index].origin.location)
@@ -4033,27 +4530,36 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
   let mut relation = Option<Location>.none()
   index = usize.ZERO
   while index < unproved.length {
-    let longer = universalAtomOf(&walker.table, unproved[index].longer)
-    let shorter = universalAtomOf(&walker.table, unproved[index].shorter)
-    if input.anonymous && creatorChosen(&longer, owner) && creatorChosen(&shorter, owner) {
-      run List<Outlives>.append(&mut requirements, Outlives {longer: move longer, shorter: move shorter})
-    } else if let Option<Location>.None = &relation {
-      relation = Option<Location>.some(run relationSite(&walker.table, unproved[index].longer, unproved[index].shorter))
+    let mut required = false
+    if input.anonymous {
+      if let Option<Shared<Lifetime>>.Some {value: longer} = move universalAtomOf(&walker.table, unproved[index].longer) {
+        if let Option<Shared<Lifetime>>.Some {value: shorter} = move universalAtomOf(&walker.table, unproved[index].shorter) {
+          if creatorChosen(&longer, owner) && creatorChosen(&shorter, owner) {
+            run List<Outlives>.append(&mut requirements, Outlives {longer: move longer, shorter: move shorter})
+            required = true
+          }
+        }
+      }
+    }
+    if !required {
+      if let Option<Location>.None = &relation {
+        relation = Option<Location>.some(run relationSite(&walker.table, unproved[index].longer, unproved[index].shorter))
+      }
     }
     index = index + usize.ONE
   }
   return run findConflicts(&walker, &solved, move relation, move requirements)
 }
 
-// The atom of universal region `region`.
-fn universalAtomOf(table: &RegionTable, region: Region) -> Shared<Lifetime> {
+// The atom of universal region `region`, or none for a type parameter's placeholder region.
+fn universalAtomOf(table: &RegionTable, region: Region) -> Option<Shared<Lifetime>> {
   let universals = List<Universal>.asSlice(&table.universals)
   let mut at = usize.ZERO
-  while at < universals.length && universals[at].region.index != region.index {
+  while at < universals.length {
+    if universals[at].region.index == region.index { return Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&universals[at].atom)) }
     at = at + usize.ONE
   }
-  if at == universals.length { CompilerBug.panic(b"region query names a region that is not universal") }
-  return Shared<Lifetime>.clone(&universals[at].atom)
+  return Option<Shared<Lifetime>>.none()
 }
 
 // Whether an anonymous body's creator chooses `lifetime`: every atom is `'static` or a region or
