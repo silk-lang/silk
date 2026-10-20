@@ -1,0 +1,3776 @@
+//! Loans, moves and regions in one typed body: borrow checking in the style of rustc's NLL.
+//!
+//! # When to use
+//! Call [`check`] on a successfully typed, unselected body before it is published. A
+//! [`Outcome.Conflict`] rejects the body with `LoanConflict` (`OWN0010`), `AccessDuringLoan`
+//! (`OWN0011`), `ExpiredLifetime` (`OWN0019`), `UseAfterMove` (`OWN0001`), `OverlappingAssignment`
+//! (`OWN0004`), `IncompatibleLoopHeader` (`OWN0005`), `ExtractionBoundary` (`OWN0002`),
+//! `GuardConsumesPattern` (`OWN0008`) or `UnsatisfiedLifetimeBound` (`SEM0212`).
+//! Every other body is proved: there is no partial verdict.
+//!
+//! # Details
+//! The check numbers evaluation points in evaluation order and links them into a control-flow
+//! graph. Every value has a type with region variables: each local, and each expression's result,
+//! which lives from its evaluation to the node that consumes it. A value's variables are numbered
+//! per distinct lifetime its type names (`Renumbering`). Lifetimes chosen outside the body (its own
+//! and its enclosing declarations' lifetime parameters, `'static`, and the regions an anonymous
+//! body's environment names) are universal; every other lifetime is the body's own.
+//!
+//! Wherever a value flows (a binding, an assignment, a call argument, a result, a return, a field
+//! store, a capture) its type is related to the destination's structurally, by each position's
+//! variance, adding outlives edges between variables (`relate`). A call instantiates the callee's
+//! signature, which [`CallContract`] supplies, with fresh variables, so the check never reads a
+//! callee body. A borrow creates a loan whose region is its reference's variable; a reborrow adds
+//! that every reference it goes through outlives it.
+//!
+//! A region holds every point where a value whose type names it is live, plus what its outlives
+//! edges add. A loan is in scope from its borrow while its region holds the point and its place is
+//! not overwritten. Each access conflicts with the loans in scope it overlaps; the end of a local's
+//! storage conflicts with every loan of it. A universal region that must outlive another universal
+//! region needs a declared bound. Moves are checked on the same graph, independently of regions.
+//!
+//! # Gotchas
+//! Regions are location-insensitive (NLL): a holder keeps every loan stored in it alive while it
+//! is live, even after the field holding it is overwritten. Location-sensitive regions are issue
+//! #2022. Precision is per lifetime: two fields that share a lifetime parameter share its loans.
+
+import hir.Hir {Access, CallableMode, InfixOperator}
+import semantic.SourceLocations {Location}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {Lifetime, Intersection, Member}
+import semantic.Rejection {RejectionCode}
+import semantic.StorageOperation {StorageOperation}
+import semantic.Type {Type}
+import semantic.RegionSolver {Bound, Cfg, Live, Liveness, Loan, LoanScope, Loans, Region, Regions, Values}
+import semantic.TypedBody {
+  AggregateField,
+  BindingAccess,
+  ConsumedPlace,
+  Expression,
+  Local,
+  MatchArm,
+  MatchSyntax,
+  Node,
+  NodeId,
+  NodeKind,
+  PlaceRoot,
+  PlaceStep,
+  ReceiverPass,
+  ReferentCapture,
+  RunAccess,
+  SectionRetention,
+  SubjectAccess,
+  TypedBody,
+}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.shared {Shared}
+import silk.u64
+import silk.usize
+import silk.list {List}
+
+/// What checking one body's loans, moves and regions established.
+pub enum Outcome {
+  /// Every loan, move and region of the body is proved.
+  Clear,
+  /// An access conflicts with a loan in scope, a place is used after it moved, a loop repeats with
+  /// different moved places, or a region relation needs a bound the body does not declare.
+  Conflict,
+}
+
+/// The outcome of checking one body. For a conflict, `code`, `access` and `earlier` describe the
+/// first report; otherwise they are unused. Spans count from the checked body's anchor.
+pub struct Verdict {
+  pub outcome: Outcome
+  pub code: RejectionCode
+  pub access: Location
+  pub earlier: Option<Location>
+  /// Every conflict the body reports, the one above included, ordered by span.
+  pub reports: List<Report>
+}
+
+/// One reported conflict: the rejected access and, when `related`, the borrow or move it conflicts
+/// with at `earlier`.
+pub struct Report {
+  pub code: RejectionCode
+  pub access: Location
+  pub related: bool
+  pub earlier: Location
+  /// For a conflicting borrow (OWN0010), whether the rejected borrow is exclusive.
+  pub requestedExclusive: bool
+  /// For a conflicting borrow (OWN0010), whether the loan in scope it conflicts with is exclusive.
+  pub existingExclusive: bool
+}
+
+impl Copy for Report {}
+
+/// `longer` outlives `shorter`: a declared or implied bound.
+pub struct RegionBound {
+  pub longer: Shared<Lifetime>
+  pub shorter: Shared<Lifetime>
+}
+
+/// `subject`'s borrowed contents outlive `region` (`T: 'r`).
+pub struct ContentsBound {
+  pub subject: Shared<Type>
+  pub region: Shared<Lifetime>
+}
+
+/// The instantiated signature of one call: the callee's parameter types in argument order and its
+/// result type, with the callee's own lifetime parameters left as they are written and its type
+/// parameters replaced by the call's type arguments. `bounds` and `contents` are the callee's
+/// declared and implied bounds in the same terms. Every lifetime in it is instantiated afresh for
+/// the call, except `'static`.
+pub struct CallContract {
+  pub call: NodeId
+  pub parameters: List<Shared<Type>>
+  pub result: Shared<Type>
+  pub bounds: List<RegionBound>
+  pub contents: List<ContentsBound>
+}
+
+/// The declared type of each field a construction writes, in operand order, in the lifetimes of the
+/// constructed node's own type.
+pub struct ConstructionShape {
+  pub node: NodeId
+  pub fields: List<Shared<Type>>
+}
+
+/// How a type's lifetime or type parameter may vary under subtyping.
+pub enum Variance {
+  Covariant,
+  Contravariant,
+  Invariant,
+  /// The parameter is unused: no relation is required.
+  Bivariant,
+}
+
+impl Copy for Variance {}
+
+/// The variance of each binder of one nominal declaration, in its complete binder order.
+pub struct DeclaredVariance {
+  pub declaration: DeclarationId
+  pub binders: List<Variance>
+}
+
+/// Everything one body's check reads. Only the body itself and tiny facts about the declarations
+/// it names: callee signatures, construction shapes, variance and drop observation.
+pub struct Input<'a> {
+  pub owner: &'a DeclarationId
+  pub locals: &'a [Local]
+  /// How many leading locals are the body's parameters, typed by its signature.
+  pub parameters: usize
+  pub nodes: &'a [Node]
+  pub root: NodeId
+  /// The body's declared result and failure types, in its universal lifetimes.
+  pub result: &'a Shared<Type>
+  pub failure: &'a Shared<Type>
+  /// The body's declared and implied bounds between its universal lifetimes.
+  pub premises: &'a [RegionBound]
+  pub contracts: &'a [CallContract]
+  pub constructions: &'a [ConstructionShape]
+  pub variances: &'a [DeclaredVariance]
+  /// Per storage root (each local, then each node's value), whether its cleanup can observe the
+  /// regions its type names.
+  pub observes: &'a [bool]
+}
+
+// ---------------------------------------------------------------------------------------------
+// Region variables.
+
+// One universal region: its variable and the base universal lifetimes it is the meet of. A base
+// universal (a lifetime parameter, `'static`, or a region from outside the body) is its own sole
+// member.
+struct Universal {
+  region: Region
+  atom: Shared<Lifetime>
+  members: List<usize>
+}
+
+// The per-value map from the lifetimes a type names to that value's region variables.
+struct Renumbering {
+  atoms: List<Shared<Lifetime>>
+  regions: List<Region>
+  // How a lifetime chosen outside the body maps: to its universal region (a type the signature
+  // fixes) or to a fresh variable.
+  universal: bool
+  // Whether every lifetime of the value's own type is numbered. A lifetime a closed numbering does
+  // not list comes from a type that names the value's lifetimes differently, so its variable is
+  // made equal to every variable of the value.
+  closed: bool
+}
+
+// The body's region variables and outlives edges, built while the walk relates types.
+struct RegionTable {
+  // Each region in creation order, and whether it is universal; the solver is built from these
+  // once the walk has numbered every point.
+  universalFlags: List<bool>
+  longer: List<Region>
+  shorter: List<Region>
+  // The source site of each edge, for reports; `site` is the one new edges take.
+  sites: List<Location>
+  site: Location
+  universals: List<Universal>
+  // Indexes into `universals` of the base universals.
+  bases: List<usize>
+  // Every numbering: each local, each node's value, the body's result and failure types, then one
+  // per instantiated call contract.
+  numberings: List<Renumbering>
+}
+
+effect fn newRegion(table: &mut RegionTable) -> Region ! OutOfMemoryError ? &mut Allocator {
+  let region = Region {index: List<bool>.length(&table.universalFlags)}
+  run List<bool>.append(&mut table.universalFlags, false)
+  return region
+}
+
+effect fn newUniversal(table: &mut RegionTable) -> Region ! OutOfMemoryError ? &mut Allocator {
+  let region = Region {index: List<bool>.length(&table.universalFlags)}
+  run List<bool>.append(&mut table.universalFlags, true)
+  return region
+}
+
+effect fn addOutlives(table: &mut RegionTable, longer: Region, shorter: Region) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<Region>.append(&mut table.longer, longer)
+  run List<Region>.append(&mut table.shorter, shorter)
+  run List<Location>.append(&mut table.sites, table.site)
+  return ()
+}
+
+effect fn addNumbering(table: &mut RegionTable, universal: bool) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let index = List<Renumbering>.length(&table.numberings)
+  run List<Renumbering>.append(&mut table.numberings,
+    Renumbering {atoms: List<Shared<Lifetime>>.make(), regions: List<Region>.make(), universal: universal, closed: false})
+  return index
+}
+
+// Whether `lifetime` is one the body cannot choose: `'static`, a lifetime parameter, a region of
+// another declaration's body, a caller-supplied atom, or an invocation binder outside any callable
+// type (an anonymous body's own invocation region).
+fn universalAtom(lifetime: &Lifetime, owner: &DeclarationId) -> bool {
+  return match &lifetime.* {
+    Lifetime.Static => true
+    Lifetime.Parameter {..} => true
+    Lifetime.Local {declaration, ..} => !DeclarationId.equals(&declaration, owner)
+    Lifetime.Invocation {..} => true
+    Lifetime.Supplied {..} => true
+    Lifetime.Meet {..} => false
+  }
+}
+
+fn staticAtom(lifetime: &Lifetime) -> bool {
+  return match &lifetime.* { Lifetime.Static => true _ => false }
+}
+
+// The universal region of a base atom, creating it on first use.
+effect fn baseUniversal(table: &mut RegionTable, atom: &Shared<Lifetime>) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let bases = List<usize>.asSlice(&table.bases)
+  let universals = List<Universal>.asSlice(&table.universals)
+  let mut at = usize.ZERO
+  while at < bases.length {
+    if Lifetime.equalsShared(&universals[bases[at]].atom, atom) { return bases[at] }
+    at = at + usize.ONE
+  }
+  let index = List<Universal>.length(&table.universals)
+  let region = run newUniversal(&mut table.*)
+  let mut members = List<usize>.make()
+  run List<usize>.append(&mut members, List<usize>.length(&table.bases))
+  run List<Universal>.append(&mut table.universals, Universal {region: region, atom: Shared<Lifetime>.clone(atom), members: move members})
+  run List<usize>.append(&mut table.bases, index)
+  return index
+}
+
+// The universal region of `lifetime`, a base atom or a meet of base atoms. A meet's region is
+// contained in each member's.
+effect fn universalOf(table: &mut RegionTable, lifetime: &Shared<Lifetime>, owner: &DeclarationId) -> Region
+! OutOfMemoryError ? &mut Allocator {
+  let count = Lifetime.atomCount(lifetime)
+  if count == usize.ONE {
+    let index = run baseUniversal(&mut table.*, lifetime)
+    return List<Universal>.asSlice(&table.universals)[index].region
+  }
+  let universals = List<Universal>.asSlice(&table.universals)
+  let mut at = usize.ZERO
+  while at < universals.length {
+    if Lifetime.equalsShared(&universals[at].atom, lifetime) { return universals[at].region }
+    at = at + usize.ONE
+  }
+  let mut members = List<usize>.make()
+  let mut part = usize.ZERO
+  while part < count {
+    let atom = Lifetime.atomAt(lifetime, part)
+    let base = run baseUniversal(&mut table.*, &atom)
+    let all = List<Universal>.asSlice(&table.universals)
+    run List<usize>.append(&mut members, List<usize>.asSlice(&all[base].members)[usize.ZERO])
+    part = part + usize.ONE
+  }
+  let region = run newUniversal(&mut table.*)
+  let memberList = List<usize>.asSlice(&members)
+  part = usize.ZERO
+  while part < memberList.length {
+    let base = List<usize>.asSlice(&table.bases)[memberList[part]]
+    let longer = List<Universal>.asSlice(&table.universals)[base].region
+    run addOutlives(&mut table.*, longer, region)
+    part = part + usize.ONE
+  }
+  run List<Universal>.append(&mut table.universals, Universal {region: region, atom: Shared<Lifetime>.clone(lifetime), members: move members})
+  return region
+}
+
+fn universalLifetime(lifetime: &Shared<Lifetime>, owner: &DeclarationId) -> bool {
+  return Lifetime.allAtoms(lifetime, fn(atom: &Lifetime) -> bool { return universalAtom(atom, owner) })
+}
+
+// The region `lifetime` names in numbering `numbered`, allocating it on first use. A lifetime of the
+// body's own is a fresh variable; a universal one is its universal region in a numbering of a type the
+// signature fixes, and otherwise a fresh variable too, since typing may have chosen it where a shorter
+// region would do. `'static` is always the static region.
+effect fn resolve(table: &mut RegionTable, numbered: usize, lifetime: &Shared<Lifetime>, owner: &DeclarationId) -> Region
+! OutOfMemoryError ? &mut Allocator {
+  let numberings = List<Renumbering>.asSlice(&table.numberings)
+  let atoms = List<Shared<Lifetime>>.asSlice(&numberings[numbered].atoms)
+  let mut at = usize.ZERO
+  while at < atoms.length {
+    if Lifetime.equalsShared(&atoms[at], lifetime) { return List<Region>.asSlice(&numberings[numbered].regions)[at] }
+    at = at + usize.ONE
+  }
+  let universal = numberings[numbered].universal
+  let closed = numberings[numbered].closed
+  let mut region = Region {index: usize.MAX}
+  if Shared<Lifetime>.with<bool>(lifetime, staticAtom) {
+    region = run universalOf(&mut table.*, lifetime, owner)
+  } else if universal && universalLifetime(lifetime, owner) {
+    region = run universalOf(&mut table.*, lifetime, owner)
+  } else {
+    region = run newRegion(&mut table.*)
+    if closed {
+      let listed = List<Region>.asSlice(&List<Renumbering>.asSlice(&table.numberings)[numbered].regions)
+      let mut copies = List<Region>.make()
+      let mut each = usize.ZERO
+      while each < listed.length {
+        run List<Region>.append(&mut copies, listed[each])
+        each = each + usize.ONE
+      }
+      let others = List<Region>.asSlice(&copies)
+      each = usize.ZERO
+      while each < others.length {
+        run addOutlives(&mut table.*, region, others[each])
+        run addOutlives(&mut table.*, others[each], region)
+        each = each + usize.ONE
+      }
+    }
+  }
+  let mut stored = List<Renumbering>.asMutSlice(&mut table.numberings)
+  run List<Shared<Lifetime>>.append(&mut stored[numbered].atoms, Shared<Lifetime>.clone(lifetime))
+  run List<Region>.append(&mut stored[numbered].regions, region)
+  return region
+}
+
+// Renumbers every lifetime `ty` names into `numbering`, so liveness reaches all of them.
+effect fn renumber(table: &mut RegionTable, numbered: usize, ty: &Shared<Type>, owner: &DeclarationId) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let regions = Type.lifetimeCount(ty)
+  let mut at = usize.ZERO
+  while at < regions {
+    if let Option<Shared<Lifetime>>.Some {value: lifetime} = move Type.lifetimeAt(ty, at) {
+      if !boundInvocation(ty, &lifetime) { run resolve(&mut table.*, numbered, &lifetime, owner) }
+    }
+    at = at + usize.ONE
+  }
+  let children = Type.partCount(ty)
+  at = usize.ZERO
+  while at < children {
+    if let Option<Shared<Type>>.Some {value: child} = move Type.partAt(ty, at) {
+      run renumber(&mut table.*, numbered, &child, owner)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether `lifetime` at a position of `ty` is bound by `ty` itself: an invocation binder of a
+// callable type, which a value of the type never retains.
+fn boundInvocation(ty: &Shared<Type>, lifetime: &Shared<Lifetime>) -> bool {
+  let callable = Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* { Type.Callable {..} => true _ => false }
+  })
+  if !callable { return false }
+  return Shared<Lifetime>.with<bool>(lifetime, fn(value: &Lifetime) -> bool {
+    return match &value.* { Lifetime.Invocation {..} => true _ => false }
+  })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Relating types.
+
+// One side of a relation: a type and the numbering its lifetimes resolve in.
+struct Side {
+  ty: Shared<Type>
+  numbered: usize
+}
+
+fn compose(outer: Variance, inner: Variance) -> Variance {
+  if outer == Variance.Bivariant || inner == Variance.Bivariant { return Variance.Bivariant }
+  if outer == Variance.Invariant || inner == Variance.Invariant { return Variance.Invariant }
+  if outer == inner { return Variance.Covariant }
+  return Variance.Contravariant
+}
+
+// Adds the edges that `sub`'s region may stand where `sup`'s is expected, under `variance`.
+effect fn relateRegions(table: &mut RegionTable, sub: Region, sup: Region, variance: Variance) -> () ! OutOfMemoryError ? &mut Allocator {
+  if sub.index == sup.index || variance == Variance.Bivariant { return () }
+  if variance == Variance.Covariant || variance == Variance.Invariant { run addOutlives(&mut table.*, sub, sup) }
+  if variance == Variance.Contravariant || variance == Variance.Invariant { run addOutlives(&mut table.*, sup, sub) }
+  return ()
+}
+
+// A shape-independent tag of a type's head; two types with equal tags, lifetime counts and child
+// counts are related position by position.
+fn headTag(value: &Type) -> usize {
+  return match &value.* {
+    Type.Primitive {..} => 1
+    Type.Unit => 2
+    Type.Nominal {..} => 3
+    Type.OpaqueRepresentation {..} => 4
+    Type.Parameter {..} => 5
+    Type.String {..} => 6
+    Type.Reference {..} => 7
+    Type.Slice {..} => 8
+    Type.Pointer {..} => 9
+    Type.ForeignFunction {..} => 10
+    Type.Array {..} => 11
+    Type.Anonymous {..} => 12
+    Type.TypeDescriptor {..} => 13
+    Type.Union {..} => 14
+    Type.Without {..} => 15
+    Type.CallableValue {..} => 16
+    Type.CallableSchema {..} => 17
+    Type.CallableStage {..} => 18
+    Type.CallableResult {..} => 19
+    Type.CallableOrigin {..} => 20
+    Type.CallableWitnessResult {..} => 21
+    Type.CallableView {..} => 22
+    Type.Callable {..} => 23
+    Type.EffectComposite {..} => 24
+    Type.EffectJoin {..} => 25
+    Type.Effect {..} => 26
+  }
+}
+
+fn declaredVariance(variances: &[DeclaredVariance], declaration: &DeclarationId, binder: usize) -> Variance {
+  let mut at = usize.ZERO
+  while at < variances.length {
+    if DeclarationId.equals(&variances[at].declaration, declaration) {
+      let binders = List<Variance>.asSlice(&variances[at].binders)
+      if binder < binders.length { return binders[binder] }
+      return Variance.Invariant
+    }
+    at = at + usize.ONE
+  }
+  return Variance.Invariant
+}
+
+// The variance of lifetime position `at` of `value`. Positions not listed are invariant, which only
+// adds relations.
+fn lifetimeVariance(value: &Type, at: usize, variances: &[DeclaredVariance]) -> Variance {
+  return match &value.* {
+    Type.String {..} => Variance.Covariant
+    Type.Reference {..} => Variance.Covariant
+    Type.Slice {..} => Variance.Covariant
+    Type.Nominal {declaration, ..} => declaredVariance(variances, &declaration, at)
+    _ => Variance.Invariant
+  }
+}
+
+// The variance of child position `at` of `value`, given the access the destination type grants.
+fn childVariance(value: &Type, at: usize, variances: &[DeclaredVariance]) -> Variance {
+  return match &value.* {
+    Type.Reference {access, ..} => {
+      if access == Access.Shared { return Variance.Covariant }
+      return Variance.Invariant
+    }
+    Type.Slice {access, ..} => {
+      if access == Access.Shared { return Variance.Covariant }
+      return Variance.Invariant
+    }
+    Type.Array {..} => Variance.Covariant
+    Type.Anonymous {..} => Variance.Covariant
+    Type.Nominal {declaration, ..} => declaredVariance(variances, &declaration, at)
+    Type.Callable {parameters, ..} => {
+      if at < List<Shared<Type>>.length(&parameters) { return Variance.Contravariant }
+      return Variance.Covariant
+    }
+    Type.Effect {..} => Variance.Covariant
+    Type.Union {..} => Variance.Covariant
+    _ => Variance.Invariant
+  }
+}
+
+fn environmentOf(value: &Type) -> Option<Shared<Intersection>> {
+  return match &value.* {
+    Type.Callable {environment, ..} => Option<Shared<Intersection>>.some(Shared<Intersection>.clone(&environment))
+    Type.Effect {environment, ..} => Option<Shared<Intersection>>.some(Shared<Intersection>.clone(&environment))
+    _ => Option<Shared<Intersection>>.none()
+  }
+}
+
+effect fn environmentRegions(environment: &Shared<Intersection>) -> List<Shared<Lifetime>> ! OutOfMemoryError ? &mut Allocator {
+  let mut regions = List<Shared<Lifetime>>.make()
+  let count = Shared<Intersection>.with<usize>(environment, fn(found: &Intersection) -> usize { return List<Member>.length(&found.members) })
+  let mut at = usize.ZERO
+  while at < count {
+    let region = Shared<Intersection>.with<Shared<Lifetime>>(environment, fn(found: &Intersection) -> Shared<Lifetime> {
+      return Shared<Lifetime>.clone(&List<Member>.asSlice(&found.members)[at].region)
+    })
+    run List<Shared<Lifetime>>.append(&mut regions, move region)
+    at = at + usize.ONE
+  }
+  return move regions
+}
+
+// Relates `sub` to `sup` under `variance`: each lifetime position of `sub` to the same position of
+// `sup`, by the position's variance composed with `variance`. Types whose shapes differ are related
+// conservatively: every region of one is made equal to every region of the other.
+effect fn relate(table: &mut RegionTable, sub: &Side, sup: &Side, variance: Variance, variances: &[DeclaredVariance], owner: &DeclarationId) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if variance == Variance.Bivariant { return () }
+  let subTag = Shared<Type>.with<usize>(&sub.ty, headTag)
+  let supTag = Shared<Type>.with<usize>(&sup.ty, headTag)
+  let subEnvironment = Shared<Type>.with<Option<Shared<Intersection>>>(&sub.ty, environmentOf)
+  let supEnvironment = Shared<Type>.with<Option<Shared<Intersection>>>(&sup.ty, environmentOf)
+  let regions = Type.lifetimeCount(&sub.ty)
+  let children = Type.partCount(&sub.ty)
+  let environments = match &subEnvironment { Option<Shared<Intersection>>.Some {..} => true _ => false }
+  let sameShape = subTag == supTag && children == Type.partCount(&sup.ty)
+    && (environments || regions == Type.lifetimeCount(&sup.ty))
+  if !sameShape {
+    return run equateAll(&mut table.*, sub, sup, owner)
+  }
+  if let Option<Shared<Intersection>>.Some {value: subEnv} = &subEnvironment {
+    if let Option<Shared<Intersection>>.Some {value: supEnv} = &supEnvironment {
+      run relateEnvironments(&mut table.*, sub.numbered, &subEnv, sup.numbered, &supEnv, variance, owner)
+    }
+  } else {
+    let mut at = usize.ZERO
+    while at < regions {
+      let first = Type.lifetimeAt(&sub.ty, at)
+      let second = Type.lifetimeAt(&sup.ty, at)
+      if let Option<Shared<Lifetime>>.Some {value: subLifetime} = &first {
+        if let Option<Shared<Lifetime>>.Some {value: supLifetime} = &second {
+          let position = Shared<Type>.with<Variance>(&sup.ty, fn(value: &Type) -> Variance { return lifetimeVariance(value, at, variances) })
+          let subRegion = run resolve(&mut table.*, sub.numbered, &subLifetime, owner)
+          let supRegion = run resolve(&mut table.*, sup.numbered, &supLifetime, owner)
+          run relateRegions(&mut table.*, subRegion, supRegion, compose(variance, position))
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  let mut at = usize.ZERO
+  while at < children {
+    let first = Type.partAt(&sub.ty, at)
+    let second = Type.partAt(&sup.ty, at)
+    if let Option<Shared<Type>>.Some {value: subChild} = move first {
+      if let Option<Shared<Type>>.Some {value: supChild} = move second {
+        let position = Shared<Type>.with<Variance>(&sup.ty, fn(value: &Type) -> Variance { return childVariance(value, at, variances) })
+        let left = Side {ty: move subChild, numbered: sub.numbered}
+        let right = Side {ty: move supChild, numbered: sup.numbered}
+        run relate(&mut table.*, &left, &right, compose(variance, position), variances, owner)
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// An environment is the meet of its members: `∩A` stands for `∩B` when every member of `A`
+// outlives every member of `B`. An empty environment is `'static`.
+effect fn relateEnvironments(table: &mut RegionTable, subNumbered: usize, sub: &Shared<Intersection>, supNumbered: usize,
+  sup: &Shared<Intersection>, variance: Variance, owner: &DeclarationId) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut left = run environmentRegions(sub)
+  let mut right = run environmentRegions(sup)
+  let staticLifetime = run Shared<Lifetime>.make(Lifetime.Static)
+  if List<Shared<Lifetime>>.length(&left) == usize.ZERO { run List<Shared<Lifetime>>.append(&mut left, Shared<Lifetime>.clone(&staticLifetime)) }
+  if List<Shared<Lifetime>>.length(&right) == usize.ZERO { run List<Shared<Lifetime>>.append(&mut right, Shared<Lifetime>.clone(&staticLifetime)) }
+  let first = List<Shared<Lifetime>>.asSlice(&left)
+  let second = List<Shared<Lifetime>>.asSlice(&right)
+  let mut at = usize.ZERO
+  while at < first.length {
+    let subRegion = run resolve(&mut table.*, subNumbered, &first[at], owner)
+    let mut other = usize.ZERO
+    while other < second.length {
+      let supRegion = run resolve(&mut table.*, supNumbered, &second[other], owner)
+      run relateRegions(&mut table.*, subRegion, supRegion, variance)
+      other = other + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Makes every region either side's type names equal, through one fresh hub region.
+effect fn equateAll(table: &mut RegionTable, sub: &Side, sup: &Side, owner: &DeclarationId) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Region>.make()
+  run collectRegions(&mut table.*, sub.numbered, &sub.ty, owner, &mut found)
+  run collectRegions(&mut table.*, sup.numbered, &sup.ty, owner, &mut found)
+  let regions = List<Region>.asSlice(&found)
+  if regions.length < 2 { return () }
+  let hub = run newRegion(&mut table.*)
+  let mut at = usize.ZERO
+  while at < regions.length {
+    run relateRegions(&mut table.*, regions[at], hub, Variance.Invariant)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn collectRegions(table: &mut RegionTable, numbered: usize, ty: &Shared<Type>, owner: &DeclarationId, found: &mut List<Region>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let regions = Type.lifetimeCount(ty)
+  let mut at = usize.ZERO
+  while at < regions {
+    if let Option<Shared<Lifetime>>.Some {value: lifetime} = move Type.lifetimeAt(ty, at) {
+      if !boundInvocation(ty, &lifetime) {
+        let region = run resolve(&mut table.*, numbered, &lifetime, owner)
+        run List<Region>.append(&mut found.*, region)
+      }
+    }
+    at = at + usize.ONE
+  }
+  let children = Type.partCount(ty)
+  at = usize.ZERO
+  while at < children {
+    if let Option<Shared<Type>>.Some {value: child} = move Type.partAt(ty, at) {
+      run collectRegions(&mut table.*, numbered, &child, owner, &mut found.*)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Every region `subject` names outlives `region` (`T: 'r`), both in `numbered`.
+effect fn contentsOutlive(table: &mut RegionTable, numbered: usize, subject: &Shared<Type>, region: Region, owner: &DeclarationId) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut found = List<Region>.make()
+  run collectRegions(&mut table.*, numbered, subject, owner, &mut found)
+  let regions = List<Region>.asSlice(&found)
+  let mut at = usize.ZERO
+  while at < regions.length {
+    run relateRegions(&mut table.*, regions[at], region, Variance.Covariant)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// A reference type is well formed only if its referent's regions outlive the reference's own
+// (`&'r T` needs `T: 'r`). A call assumes this of its signature, so the caller owes it.
+effect fn wellFormed(table: &mut RegionTable, numbered: usize, ty: &Shared<Type>, owner: &DeclarationId) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let referenced = Shared<Type>.with<Option<Shared<Lifetime>>>(ty, fn(value: &Type) -> Option<Shared<Lifetime>> {
+    return match &value.* {
+      Type.Reference {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+      Type.Slice {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+      _ => Option<Shared<Lifetime>>.none()
+    }
+  })
+  let children = Type.partCount(ty)
+  let mut at = usize.ZERO
+  while at < children {
+    if let Option<Shared<Type>>.Some {value: child} = move Type.partAt(ty, at) {
+      if let Option<Shared<Lifetime>>.Some {value: lifetime} = &referenced {
+        let region = run resolve(&mut table.*, numbered, &lifetime, owner)
+        run contentsOutlive(&mut table.*, numbered, &child, region, owner)
+      }
+      run wellFormed(&mut table.*, numbered, &child, owner)
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Places and accesses.
+
+// The kind of one place step. Each kind numbers its own steps, so no field, element or member
+// ordinal can stand for another kind of step.
+enum StepKind {
+  Field,
+  Element,
+  // A union member or variant payload; distinct members of one union are disjoint places.
+  Member,
+  // The step from a reference to its referent. A place through a reference names the referent's
+  // storage, so a reborrow is a loan of that place (BORROW-005).
+  Referent,
+  // An index step whose value is unknown; it overlaps every element step.
+  AnyElement,
+}
+
+struct Step {
+  kind: StepKind
+  ordinal: usize
+}
+
+impl Copy for Step {}
+
+fn step(kind: StepKind, ordinal: usize) -> Step {
+  return Step {kind: kind, ordinal: ordinal}
+}
+
+fn sameStep(left: Step, right: Step) -> bool {
+  return left.kind == right.kind && left.ordinal == right.ordinal
+}
+
+// A storage root and its static projection path. Roots below the local count are locals; root
+// `locals + n` is the storage of node `n`'s value: a temporary's hidden owner, or a match subject's
+// own storage.
+struct Place {
+  root: usize
+  steps: List<Step>
+}
+
+effect fn copyPlace(place: &Place) -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut steps = List<Step>.make()
+  let listed = List<Step>.asSlice(&place.steps)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run List<Step>.append(&mut steps, listed[at])
+    at = at + usize.ONE
+  }
+  return Place {root: place.root, steps: move steps}
+}
+
+// The overlap of two places: 0 disjoint, 1 overlapping. An unknown index overlaps every element.
+fn overlaps(left: &Place, right: &Place) -> bool {
+  if left.root != right.root { return false }
+  let first = List<Step>.asSlice(&left.steps)
+  let second = List<Step>.asSlice(&right.steps)
+  let mut at = usize.ZERO
+  while at < first.length && at < second.length {
+    let indexed = (first[at].kind == StepKind.AnyElement && (second[at].kind == StepKind.Element || second[at].kind == StepKind.AnyElement))
+      || (second[at].kind == StepKind.AnyElement && first[at].kind == StepKind.Element)
+    if !indexed && !sameStep(first[at], second[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `inner` lies behind a reference stored within `outer`: `outer`'s steps are a prefix of
+// `inner`'s and a later step of `inner` dereferences. A shallow access to `outer` (a write or the
+// end of its storage) leaves that referent alone.
+fn behind(outer: &Place, inner: &Place) -> bool {
+  if outer.root != inner.root { return false }
+  let first = List<Step>.asSlice(&outer.steps)
+  let second = List<Step>.asSlice(&inner.steps)
+  if first.length >= second.length { return false }
+  let mut at = first.length
+  while at < second.length {
+    if second[at].kind == StepKind.Referent { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Whether `written` names `moved` or a prefix of it, by known steps only.
+fn covers(written: &Place, moved: &Place) -> bool {
+  if written.root != moved.root { return false }
+  let first = List<Step>.asSlice(&written.steps)
+  let second = List<Step>.asSlice(&moved.steps)
+  if first.length > second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    if first[at].kind == StepKind.AnyElement || !sameStep(first[at], second[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `written` may name the first `depth` steps of `used`, or a prefix of them: replacing it
+// replaces the subject a refined binding of `used` was selected from. An unknown index may name
+// the refined element.
+fn coversRefined(written: &Place, used: &Place, depth: usize) -> bool {
+  if written.root != used.root { return false }
+  let first = List<Step>.asSlice(&written.steps)
+  let second = List<Step>.asSlice(&used.steps)
+  if first.length > depth || depth > second.length { return false }
+  let mut at = usize.ZERO
+  while at < first.length {
+    let indexed = first[at].kind == StepKind.AnyElement
+      && (second[at].kind == StepKind.Element || second[at].kind == StepKind.AnyElement)
+    if !indexed && !sameStep(first[at], second[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn determined(place: &Place) -> bool {
+  let steps = List<Step>.asSlice(&place.steps)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    if steps[at].kind == StepKind.AnyElement { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+enum Kind {
+  Read,
+  // A complete or projected replacement: it reinitializes the place.
+  Write,
+  // A transfer of ownership out of the place.
+  Move,
+  // An explicit `drop`: it ends the place's remaining parts.
+  Drop,
+  SharedBorrow,
+  ExclusiveBorrow,
+  // A `match &mut` scrutinee: like a write it conflicts with every loan, but it replaces nothing.
+  Update,
+  // A `match place` scrutinee reads the tag of an owner whose payload parts may have moved.
+  Inspect,
+  // Ends the storage of one scope owner after its cleanup.
+  End,
+  // Ends the validity of a hidden owner's loans while its storage lives on (BORROW-006).
+  Expire,
+}
+
+// Whether an access may replace the value of its place.
+fn replaces(kind: Kind) -> bool {
+  return kind == Kind.Write || kind == Kind.Move || kind == Kind.Drop || kind == Kind.ExclusiveBorrow || kind == Kind.Update
+}
+
+fn conflictCode(kind: Kind, exclusive: bool) -> Option<RejectionCode> {
+  if kind == Kind.ExclusiveBorrow || (kind == Kind.SharedBorrow && exclusive) {
+    return Option<RejectionCode>.some(RejectionCode.LoanConflict)
+  }
+  if kind == Kind.Write || kind == Kind.Move || kind == Kind.Drop || kind == Kind.Update || kind == Kind.Inspect
+    || (kind == Kind.Read && exclusive) {
+    return Option<RejectionCode>.some(RejectionCode.AccessDuringLoan)
+  }
+  return Option<RejectionCode>.none()
+}
+
+/// The codes loan conflicts and expired storage report; a caller that cannot run the check (an
+/// unselected static body) lists them as possibly missing.
+pub effect fn livenessCodes() -> List<RejectionCode> ! OutOfMemoryError ? &mut Allocator {
+  let mut codes = List<RejectionCode>.make()
+  run List<RejectionCode>.append(&mut codes, RejectionCode.ExpiredLifetime)
+  run List<RejectionCode>.append(&mut codes, RejectionCode.LoanConflict)
+  run List<RejectionCode>.append(&mut codes, RejectionCode.AccessDuringLoan)
+  return move codes
+}
+
+struct Event {
+  point: usize
+  place: Place
+  kind: Kind
+  span: Location
+  // The accessed place itself, which a loan conflict reports (OWN0011): the operand of a `move`,
+  // otherwise `span`.
+  target: Location
+  // The loan this access creates, or `usize.MAX`.
+  loan: usize
+  // For a replacement, whether its right-hand side moves out of the target: 0 no, 1 yes.
+  consumesTarget: bool
+  // The place match whose binding this access goes through, or `usize.MAX`, and how many leading
+  // steps name its subject (MATCH-001).
+  refiner: usize
+  refinedDepth: usize
+  // The loans of the borrowing matches whose bindings this access goes through: the access reaches
+  // their place through them, so it never conflicts with them (MATCH-002).
+  via: List<usize>
+}
+
+struct LoanFact {
+  place: Place
+  exclusive: bool
+  region: Region
+  point: usize
+  span: Location
+}
+
+// One read, assignment or drop use of a value for liveness, at a point.
+struct ValueUse {
+  point: usize
+  value: usize
+}
+
+impl Copy for ValueUse {}
+
+// A region holds this point whatever is live there: a call's instantiated signature, or a borrowing
+// match's loan at a binding use.
+struct Inclusion {
+  region: Region
+  point: usize
+}
+
+impl Copy for Inclusion {}
+
+// A loop: the point before it, its header, the sources of its back edges, the end of its points,
+// and the span reported for an incompatible header.
+struct Loop {
+  before: usize
+  header: usize
+  sources: List<usize>
+  end: usize
+  span: Location
+}
+
+struct Frame {
+  exit: usize
+  repeat: usize
+  scopes: usize
+}
+
+impl Copy for Frame {}
+
+// The roots a lexical scope releases on every path out of it. A statement scope holds only the
+// hidden owners of the temporaries its statement, condition, guard or short-circuit operand
+// borrows (BORROW-006). `expiring` roots stop being valid here while their storage and cleanup stay
+// with an enclosing scope. `lent` are borrowing-match loans whose bindings live to this scope's end.
+struct Scope {
+  roots: List<usize>
+  expiring: List<usize>
+  lent: List<Region>
+  statement: bool
+}
+
+// How lowering keeps a binding's temporaries (BORROW-006).
+enum Retention {
+  // The temporaries end with their statement, arm or operand.
+  None,
+  // Storage and cleanup end with the scope; every temporary but a borrowed array expires with its
+  // statement.
+  Arrays,
+  // Storage and cleanup end with the scope; every temporary expires with its statement.
+  Storage,
+}
+
+// A `match place` at `subject` selects the variant its bindings refine at point `test`.
+struct Refinement {
+  subject: usize
+  test: usize
+}
+
+impl Copy for Refinement {}
+
+// The place a place expression names, with the type of the value stored there, the numbering that
+// type's lifetimes resolve in, and the reference regions it is reached through, innermost last.
+struct Path {
+  place: Place
+  ty: Shared<Type>
+  numbered: usize
+  // Each reference dereferenced on the way, outermost first, until a shared one: a reborrow of the
+  // place is valid only while each of them is (BORROW-005).
+  through: List<Region>
+  // Whether the place is reached through a reference.
+  indirect: bool
+  indexes: List<NodeId>
+  refiner: usize
+  refinedDepth: usize
+  via: List<usize>
+  // The node whose value is the root when the root is a temporary, or `usize.MAX`.
+  base: usize
+}
+
+struct Walker<'a> {
+  input: Input<'a>
+  table: RegionTable
+  cfg: Cfg
+  spans: List<Location>
+  events: List<Event>
+  // The event recorded at each point, or `usize.MAX`.
+  pointEvents: List<usize>
+  // The local or root a binding initializes at each point, or `usize.MAX`.
+  initializes: List<usize>
+  reads: List<ValueUse>
+  assigns: List<ValueUse>
+  drops: List<ValueUse>
+  inclusions: List<Inclusion>
+  loans: List<LoanFact>
+  // Per node, the borrowing-match loan its bindings go through, or `usize.MAX`.
+  matchLoans: List<usize>
+  // Per node, its call contract index, or `usize.MAX`.
+  contractOf: List<usize>
+  // Per node, its construction shape index, or `usize.MAX`.
+  shapeOf: List<usize>
+  frames: List<Frame>
+  loops: List<Loop>
+  scopes: List<Scope>
+  refinements: List<Refinement>
+  retention: Retention
+  // The binding roots of the consuming matches whose guards are being walked.
+  guarded: List<usize>
+  // The first move or drop of a guarded binding root: a guard consumed a provisional binding.
+  guardConsumed: Option<Location>
+  exit: usize
+  entry: usize
+}
+
+fn localCount(walker: &Walker) -> usize { return walker.input.locals.length }
+
+// The numbering of node `id`'s value.
+fn nodeValue(walker: &Walker, id: NodeId) -> usize { return walker.input.locals.length + id.index }
+
+fn resultNumbering(walker: &Walker) -> usize { return walker.input.locals.length + walker.input.nodes.length }
+
+fn failureNumbering(walker: &Walker) -> usize { return walker.input.locals.length + walker.input.nodes.length + usize.ONE }
+
+fn nodeType(nodes: &[Node], id: NodeId) -> Option<Shared<Type>> {
+  if let NodeKind.Expression {ty, ..} = &nodes[id.index].kind { return Option<Shared<Type>>.some(Shared<Type>.clone(&ty)) }
+  return Option<Shared<Type>>.none()
+}
+
+fn hasRegions(walker: &Walker, numbered: usize) -> bool {
+  return List<Region>.length(&List<Renumbering>.asSlice(&walker.table.numberings)[numbered].regions) > usize.ZERO
+}
+
+effect fn newPoint(walker: &mut Walker, from: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let created = run Cfg.point(&mut walker.cfg)
+  run List<Location>.append(&mut walker.spans, Location.make(usize.ZERO, usize.ZERO))
+  run List<usize>.append(&mut walker.pointEvents, usize.MAX)
+  run List<usize>.append(&mut walker.initializes, usize.MAX)
+  run edge(&mut walker.*, from, created)
+  return created
+}
+
+effect fn edge(walker: &mut Walker, from: usize, to: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if from == usize.MAX || to == usize.MAX { return () }
+  run Cfg.edge(&mut walker.cfg, from, to)
+  return ()
+}
+
+effect fn backEdge(walker: &mut Walker, repeat: usize, from: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if from == usize.MAX { return () }
+  let mut loops = List<Loop>.asMutSlice(&mut walker.loops)
+  run List<usize>.append(&mut loops[repeat].sources, from)
+  let header = loops[repeat].header
+  run edge(&mut walker.*, from, header)
+  return ()
+}
+
+fn setSpan(walker: &mut Walker, point: usize, span: Location) -> () {
+  let mut spans = List<Location>.asMutSlice(&mut walker.spans)
+  spans[point] = span
+  return ()
+}
+
+// A read of a value at `point`, which keeps every region of its type live there.
+effect fn readValue(walker: &mut Walker, value: usize, point: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if point == usize.MAX || !hasRegions(&walker.*, value) { return () }
+  run List<ValueUse>.append(&mut walker.reads, ValueUse {point: point, value: value})
+  return ()
+}
+
+effect fn assignValue(walker: &mut Walker, value: usize, point: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if point == usize.MAX || !hasRegions(&walker.*, value) { return () }
+  run List<ValueUse>.append(&mut walker.assigns, ValueUse {point: point, value: value})
+  return ()
+}
+
+effect fn include(walker: &mut Walker, region: Region, point: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if point == usize.MAX { return () }
+  run List<Inclusion>.append(&mut walker.inclusions, Inclusion {region: region, point: point})
+  return ()
+}
+
+// Records an access to `path`'s place at a fresh point after `at`.
+effect fn access(walker: &mut Walker, path: &Path, kind: Kind, span: Location, at: usize, loan: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  if at == usize.MAX { return at }
+  if (kind == Kind.Move || kind == Kind.Drop) && listed(List<usize>.asSlice(&walker.guarded), path.place.root) {
+    if let Option<Location>.None = &walker.guardConsumed { walker.guardConsumed = Option<Location>.some(span) }
+  }
+  let point = run newPoint(&mut walker.*, at)
+  setSpan(&mut walker.*, point, span)
+  let mut events = List<usize>.asMutSlice(&mut walker.pointEvents)
+  events[point] = List<Event>.length(&walker.events)
+  run List<Event>.append(&mut walker.events, Event {
+    point: point, place: run copyPlace(&path.place), kind: kind, span: span, target: span, loan: loan, consumesTarget: false,
+    refiner: path.refiner, refinedDepth: path.refinedDepth, via: run copyIndexes(List<usize>.asSlice(&path.via)),
+  })
+  // Every access but the end of storage or a replacement uses the root's value; a borrowing match's
+  // loan is used wherever its bindings are.
+  if kind != Kind.Write && kind != Kind.End && kind != Kind.Expire {
+    run readValue(&mut walker.*, path.place.root, point)
+    let via = List<usize>.asSlice(&path.via)
+    let mut at = usize.ZERO
+    while at < via.length {
+      let region = List<LoanFact>.asSlice(&walker.loans)[via[at]].region
+      run include(&mut walker.*, region, point)
+      at = at + usize.ONE
+    }
+  }
+  return point
+}
+
+fn listed(values: &[usize], value: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < values.length {
+    if values[at] == value { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn copyIndexes(values: &[usize]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run List<usize>.append(&mut copied, values[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// ---------------------------------------------------------------------------------------------
+// Paths of place expressions.
+
+effect fn emptyPath(ty: Shared<Type>) -> Path ! OutOfMemoryError ? &mut Allocator {
+  return Path {place: Place {root: usize.MAX, steps: List<Step>.make()}, ty: move ty, numbered: usize.MAX, through: List<Region>.make(),
+    indirect: false, indexes: List<NodeId>.make(), refiner: usize.MAX, refinedDepth: usize.ZERO, via: List<usize>.make(), base: usize.MAX}
+}
+
+effect fn unitType() -> Shared<Type> ! OutOfMemoryError ? &mut Allocator {
+  return run Shared<Type>.make(Type.Unit)
+}
+
+// The place node `id` names, or a path with root `usize.MAX` when it names none. `temporary` is a
+// node whose value is read through its hidden owner, or `usize.MAX`.
+effect fn pathOf(walker: &mut Walker, id: NodeId, temporary: usize) -> Path ! OutOfMemoryError ? &mut Allocator {
+  let mut path = run emptyPath(run unitType())
+  run extendPath(&mut walker.*, id, temporary, &mut path)
+  return move path
+}
+
+// The node whose value is the base of a chain of projections, indexes and dereferences.
+fn projectedBase(nodes: &[Node], id: NodeId) -> NodeId {
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    return match &form {
+      Expression.Field {value, ..} => projectedBase(nodes, value)
+      Expression.Index {value, ..} => projectedBase(nodes, value)
+      Expression.Dereference {value} => projectedBase(nodes, value)
+      _ => id
+    }
+  }
+  return id
+}
+
+// A dereference of `path`'s value: the reference's region joins the reborrow chain until a shared
+// reference ends it, since a shared reference's referent is valid for its own region whatever
+// reached it.
+effect fn dereference(walker: &mut Walker, path: &mut Path) -> () ! OutOfMemoryError ? &mut Allocator {
+  let pointed = Shared<Type>.with<Option<Shared<Type>>>(&path.ty, fn(value: &Type) -> Option<Shared<Type>> {
+    return match &value.* {
+      Type.Reference {referent, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&referent))
+      Type.Pointer {pointee, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&pointee))
+      Type.Slice {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+      _ => Option<Shared<Type>>.none()
+    }
+  })
+  let lifetime = Shared<Type>.with<Option<Shared<Lifetime>>>(&path.ty, referenceLifetime)
+  let shared = Shared<Type>.with<bool>(&path.ty, sharedReference)
+  if let Option<Shared<Lifetime>>.Some {value} = &lifetime {
+    let region = run resolve(&mut walker.table, path.numbered, &value, walker.input.owner)
+    if shared { List<Region>.truncate(&mut path.through, usize.ZERO) }
+    run List<Region>.append(&mut path.through, region)
+  }
+  run List<Step>.append(&mut path.place.steps, step(StepKind.Referent, usize.ZERO))
+  path.indirect = true
+  if let Option<Shared<Type>>.Some {value} = move pointed { path.ty = move value }
+  return ()
+}
+
+fn referenceLifetime(value: &Type) -> Option<Shared<Lifetime>> {
+  return match &value.* {
+    Type.Reference {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    Type.Slice {lifetime, ..} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    Type.String {lifetime} => Option<Shared<Lifetime>>.some(Shared<Lifetime>.clone(&lifetime))
+    _ => Option<Shared<Lifetime>>.none()
+  }
+}
+
+fn sharedReference(value: &Type) -> bool {
+  return match &value.* {
+    Type.Reference {access, ..} => access == Access.Shared
+    Type.Slice {access, ..} => access == Access.Shared
+    _ => false
+  }
+}
+
+fn sliceType(value: &Type) -> bool {
+  return match &value.* { Type.Slice {..} => true _ => false }
+}
+
+fn arrayElement(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Array {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+effect fn extendPath(walker: &mut Walker, id: NodeId, temporary: usize, path: &mut Path) -> () ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  if id.index == temporary {
+    path.place.root = nodeValue(&walker.*, id)
+    path.numbered = nodeValue(&walker.*, id)
+    path.base = id.index
+    if let Option<Shared<Type>>.Some {value} = move nodeType(nodes, id) { path.ty = move value }
+    return ()
+  }
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    match &form {
+      Expression.Local {local} => {
+        path.place.root = local.index
+        path.numbered = local.index
+        path.ty = Shared<Type>.clone(&walker.input.locals[local.index].ty)
+      }
+      Expression.Field {value, index, declared} => {
+        run extendPath(&mut walker.*, value, temporary, &mut path.*)
+        if path.place.root != usize.MAX {
+          run List<Step>.append(&mut path.place.steps, step(StepKind.Field, index))
+          path.ty = Shared<Type>.clone(&declared)
+        }
+      }
+      Expression.Index {value, index, element} => {
+        run extendPath(&mut walker.*, value, temporary, &mut path.*)
+        if path.place.root != usize.MAX {
+          // A slice's elements live in its referent: indexing one goes through the slice.
+          if Shared<Type>.with<bool>(&path.ty, sliceType) {
+            run dereference(&mut walker.*, &mut path.*)
+          } else if let Option<Shared<Type>>.Some {value: inner} = move Shared<Type>.with<Option<Shared<Type>>>(&path.ty, arrayElement) {
+            path.ty = move inner
+          }
+          // A literal in-bounds index of a fixed array names its static element; any other index
+          // may name every element.
+          if element != usize.MAX {
+            run List<Step>.append(&mut path.place.steps, step(StepKind.Element, element))
+          } else {
+            run List<Step>.append(&mut path.place.steps, step(StepKind.AnyElement, usize.ZERO))
+          }
+          run List<NodeId>.append(&mut path.indexes, index)
+        }
+      }
+      Expression.Dereference {value} => {
+        run extendPath(&mut walker.*, value, temporary, &mut path.*)
+        if path.place.root != usize.MAX { run dereference(&mut walker.*, &mut path.*) }
+      }
+      Expression.PatternBinding {subject, path: steps, access, declared} => {
+        run bindingPath(&mut walker.*, subject, List<PlaceStep>.asSlice(&steps), access, &mut path.*)
+        path.ty = Shared<Type>.clone(&declared)
+      }
+      _ => {}
+    }
+  }
+  return ()
+}
+
+// The place a pattern binding names. A place-addressing binding (`match place`, `&`, `&mut`) is a
+// projection of the subject's own place; a copied or moved binding, or a binding of a subject with
+// no place, is a projection of the subject's own storage.
+effect fn bindingPath(walker: &mut Walker, subject: NodeId, steps: &[PlaceStep], access: BindingAccess, path: &mut Path) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if access == BindingAccess.Place || access == BindingAccess.Shared || access == BindingAccess.Exclusive {
+    let base = run pathOf(&mut walker.*, subject, usize.MAX)
+    if base.place.root != usize.MAX {
+      path.* = move base
+      if access == BindingAccess.Place {
+        path.refiner = subject.index
+        path.refinedDepth = List<Step>.length(&path.place.steps)
+      }
+    }
+    let lent = List<usize>.asSlice(&walker.matchLoans)[subject.index]
+    if access != BindingAccess.Place && lent != usize.MAX { run List<usize>.append(&mut path.via, lent) }
+  }
+  if path.place.root == usize.MAX {
+    path.place.root = nodeValue(&walker.*, subject)
+    path.numbered = nodeValue(&walker.*, subject)
+  }
+  let mut at = usize.ZERO
+  while at < steps.length {
+    match &steps[at] {
+      PlaceStep.Member {tag, ..} => { run List<Step>.append(&mut path.place.steps, step(StepKind.Member, tag)) }
+      PlaceStep.VariantField {tag, field} => {
+        run List<Step>.append(&mut path.place.steps, step(StepKind.Member, tag))
+        run List<Step>.append(&mut path.place.steps, step(StepKind.Field, field))
+      }
+      PlaceStep.Field {index} => { run List<Step>.append(&mut path.place.steps, step(StepKind.Field, index)) }
+      PlaceStep.Element {index} => { run List<Step>.append(&mut path.place.steps, step(StepKind.Element, index)) }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// The path of a consumed place a `move` or `drop` names.
+effect fn consumedPath(walker: &mut Walker, value: NodeId) -> Path ! OutOfMemoryError ? &mut Allocator {
+  return run pathOf(&mut walker.*, value, usize.MAX)
+}
+
+// Evaluates a path's index operands in order and returns the point after them.
+effect fn indexes(walker: &mut Walker, path: &Path, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let operands = List<NodeId>.asSlice(&path.indexes)
+  let mut current = at
+  let mut index = usize.ZERO
+  while index < operands.length {
+    current = run visit(&mut walker.*, operands[index], current)
+    let point = run newPoint(&mut walker.*, current)
+    run readValue(&mut walker.*, nodeValue(&walker.*, operands[index]), point)
+    current = point
+    index = index + usize.ONE
+  }
+  return current
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scopes.
+
+effect fn pushScope(walker: &mut Walker, statement: bool) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let depth = List<Scope>.length(&walker.scopes)
+  run List<Scope>.append(&mut walker.scopes, Scope {roots: List<usize>.make(), expiring: List<usize>.make(), lent: List<Region>.make(),
+    statement: statement})
+  return depth
+}
+
+// Registers a root in the innermost scope, or in the innermost scope that is not a statement's
+// when `lexical`.
+effect fn registerRoot(walker: &mut Walker, root: usize, lexical: bool) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = List<Scope>.length(&walker.scopes) - usize.ONE
+  while lexical && at > usize.ZERO && List<Scope>.asSlice(&walker.scopes)[at].statement {
+    at = at - usize.ONE
+  }
+  let mut scopes = List<Scope>.asMutSlice(&mut walker.scopes)
+  run List<usize>.append(&mut scopes[at].roots, root)
+  return ()
+}
+
+// Keeps a borrowing match's loan live to the end of the innermost ordinary scope.
+effect fn lendToScope(walker: &mut Walker, region: Region) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = List<Scope>.length(&walker.scopes) - usize.ONE
+  while at > usize.ZERO && List<Scope>.asSlice(&walker.scopes)[at].statement {
+    at = at - usize.ONE
+  }
+  let mut scopes = List<Scope>.asMutSlice(&mut walker.scopes)
+  run List<Region>.append(&mut scopes[at].lent, region)
+  return ()
+}
+
+effect fn rootPath(root: usize) -> Path ! OutOfMemoryError ? &mut Allocator {
+  return Path {place: Place {root: root, steps: List<Step>.make()}, ty: run unitType(), numbered: root, through: List<Region>.make(),
+    indirect: false, indexes: List<NodeId>.make(), refiner: usize.MAX, refinedDepth: usize.ZERO, via: List<usize>.make(), base: usize.MAX}
+}
+
+// Ends every scope above `keep` on the path from `at`, innermost first: its expiring roots stop
+// being valid, its lent loans are used one last time, and its roots are cleaned up and end.
+effect fn releaseScopes(walker: &mut Walker, keep: usize, span: Location, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if at == usize.MAX { return at }
+  let mut releasing = List<usize>.make()
+  let mut expiring = List<bool>.make()
+  let mut lent = List<Region>.make()
+  let scopes = List<Scope>.asSlice(&walker.scopes)
+  let mut scope = scopes.length
+  while scope > keep {
+    scope = scope - usize.ONE
+    let ended = List<usize>.asSlice(&scopes[scope].expiring)
+    let mut index = ended.length
+    while index > usize.ZERO {
+      index = index - usize.ONE
+      run List<usize>.append(&mut releasing, ended[index])
+      run List<bool>.append(&mut expiring, true)
+    }
+    let regions = List<Region>.asSlice(&scopes[scope].lent)
+    index = usize.ZERO
+    while index < regions.length {
+      run List<Region>.append(&mut lent, regions[index])
+      index = index + usize.ONE
+    }
+    let roots = List<usize>.asSlice(&scopes[scope].roots)
+    index = roots.length
+    while index > usize.ZERO {
+      index = index - usize.ONE
+      run List<usize>.append(&mut releasing, roots[index])
+      run List<bool>.append(&mut expiring, false)
+    }
+  }
+  let mut current = at
+  let regions = List<Region>.asSlice(&lent)
+  if regions.length > usize.ZERO {
+    current = run newPoint(&mut walker.*, current)
+    setSpan(&mut walker.*, current, span)
+    let mut index = usize.ZERO
+    while index < regions.length {
+      run include(&mut walker.*, regions[index], current)
+      index = index + usize.ONE
+    }
+  }
+  let roots = List<usize>.asSlice(&releasing)
+  let expires = List<bool>.asSlice(&expiring)
+  let mut index = usize.ZERO
+  while index < roots.length {
+    let path = run rootPath(roots[index])
+    if expires[index] {
+      current = run access(&mut walker.*, &path, Kind.Expire, span, current, usize.MAX)
+    } else {
+      current = run access(&mut walker.*, &path, Kind.End, span, current, usize.MAX)
+      // Cleanup that can observe the value's regions uses them as the storage ends.
+      if roots[index] < walker.input.observes.length && walker.input.observes[roots[index]] {
+        run List<ValueUse>.append(&mut walker.drops, ValueUse {point: current, value: roots[index]})
+      }
+    }
+    index = index + usize.ONE
+  }
+  return current
+}
+
+// ---------------------------------------------------------------------------------------------
+// Node shapes.
+
+effect fn fieldIndexes(fields: &[AggregateField]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut indexes = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < fields.length {
+    run List<usize>.append(&mut indexes, fields[at].index)
+    at = at + usize.ONE
+  }
+  return move indexes
+}
+
+// Where each field, in evaluation order, can have what it carries stored, from per-ordinal answers.
+// A field typing recorded no answer for can hold anywhere.
+effect fn fieldValues(fields: &[AggregateField]) -> List<NodeId> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = List<NodeId>.make()
+  let mut at = usize.ZERO
+  while at < fields.length {
+    run List<NodeId>.append(&mut values, fields[at].value)
+    at = at + usize.ONE
+  }
+  return move values
+}
+
+// The referent captures of an environment, each naming the position of its field's operand.
+effect fn referentOperands(fields: &[AggregateField], referents: &[ReferentCapture]) -> List<ReferentCapture>
+! OutOfMemoryError ? &mut Allocator {
+  let mut operands = List<ReferentCapture>.make()
+  let mut at = usize.ZERO
+  while at < referents.length {
+    let mut position = usize.ZERO
+    while position < fields.length && fields[position].index != referents[at].field {
+      position = position + usize.ONE
+    }
+    run List<ReferentCapture>.append(&mut operands, ReferentCapture {field: position, access: referents[at].access})
+    at = at + usize.ONE
+  }
+  return move operands
+}
+
+effect fn single(value: NodeId) -> List<NodeId> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = List<NodeId>.make()
+  run List<NodeId>.append(&mut values, value)
+  return move values
+}
+
+effect fn copyIds(values: &[NodeId]) -> List<NodeId> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<NodeId>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run List<NodeId>.append(&mut copied, values[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// A call's arguments in order. A shared or mutable receiver pass borrows the receiver place for the
+// whole call; a taking receiver pass moves it.
+
+union Shape {
+  Leaf,
+  ReadPlace,
+  Borrow {access: Access, value: NodeId},
+  Move {value: NodeId, consumed: bool},
+  // `places` are the field or element indexes of an aggregate's operands, in order; usize.MAX
+  // denotes all repeated elements. Empty for any other value built from operands.
+  Operands {values: List<NodeId>, places: List<usize>, member: usize},
+  // `&&` or `||`: the right operand runs on one path, and its temporaries end with it.
+  ShortCircuit {left: NodeId, right: NodeId},
+  PassThrough {value: NodeId},
+  // `signature` marks a call to a declaration or interface operation, whose written signature
+  // types its arguments and result.
+  Call {arguments: List<NodeId>, receiver: usize, exact: bool, signature: bool},
+  Invoke {callee: NodeId, arguments: List<NodeId>, pipeline: bool, exclusive: bool},
+  // `referents` name their operands by position.
+  Construct {values: List<NodeId>, referents: List<ReferentCapture>, staged: bool},
+  Defer {callee: NodeId, arguments: List<NodeId>, pipeline: bool, mode: CallableMode},
+  Binding {local: usize, initializer: NodeId, mutable: bool},
+  Assignment {local: usize, value: NodeId},
+  PlaceAssignment {target: NodeId, value: NodeId},
+  Displace {target: NodeId, value: NodeId},
+  Exit {value: Option<NodeId>},
+  Drop {value: NodeId, consumed: bool},
+  Branch {condition: NodeId, thenBranch: NodeId, elseBranch: Option<NodeId>},
+  While {condition: NodeId, body: NodeId},
+  Break,
+  Continue,
+  // A statement that failed to check in a rejected body. No edge leaves it, so no move or loan
+  // crosses a statement whose effects are unknown. When it surely let a path continue, the
+  // statement after it resumes from the body's entry and the statements after it are still
+  // checked among themselves; otherwise they stay unreached, as after a `return`.
+  Recovered {resumes: bool},
+  Block {statements: List<NodeId>},
+  Match {subject: NodeId, access: Scrutinee, arms: List<ArmShape>, syntax: MatchSyntax},
+}
+
+// How a match reaches its subject, read from `SubjectAccess` without holding the node.
+enum Scrutinee {
+  // A bare match copies the subject; `match move` of a value with no place consumes it.
+  Value,
+  // `match move` of a place moves it.
+  Moved,
+  // `match &` reads the subject place.
+  Shared,
+  // `match &mut` updates it.
+  Exclusive,
+  // `match place` inspects its tag.
+  Place,
+}
+
+struct ArmShape {
+  guard: Option<NodeId>
+  result: NodeId
+  // Whether the arm's pattern declares a binding.
+  binds: bool
+}
+
+fn scrutineeOf(access: &SubjectAccess) -> Scrutinee {
+  return match &access.* {
+    SubjectAccess.Copy => Scrutinee.Value
+    SubjectAccess.Consume {consumed} => {
+      if hasPlace(&consumed) {
+        return Scrutinee.Moved
+      }
+      return Scrutinee.Value
+    }
+    SubjectAccess.Place {access: binding} => {
+      if binding == BindingAccess.Shared {
+        return Scrutinee.Shared
+      }
+      if binding == BindingAccess.Exclusive {
+        return Scrutinee.Exclusive
+      }
+      return Scrutinee.Place
+    }
+  }
+}
+
+effect fn armShapes(arms: &[MatchArm]) -> List<ArmShape> ! OutOfMemoryError ? &mut Allocator {
+  let mut shapes = List<ArmShape>.make()
+  let mut at = usize.ZERO
+  while at < arms.length {
+    run List<ArmShape>.append(&mut shapes, ArmShape {guard: copyNode(&arms[at].guard), result: arms[at].result,
+      binds: List<NodeId>.length(&arms[at].bindings) > usize.ZERO})
+    at = at + usize.ONE
+  }
+  return move shapes
+}
+
+effect fn shapeOf(nodes: &[Node], id: NodeId) -> Shape ! OutOfMemoryError ? &mut Allocator {
+  return match &nodes[id.index].kind {
+    NodeKind.Expression {form, ty} => {
+      // A named function's section is an aggregate of its captured operands (CALLABLE-001).
+      if let Expression.Aggregate {fields, section, ..} = &form {
+        if Shared<Type>.with<bool>(&ty, callableValue) {
+          return Shape.Construct {values: run fieldValues(List<AggregateField>.asSlice(&fields)), referents: List<ReferentCapture>.make(),
+            staged: match &section { Option<SectionRetention>.Some {..} => true _ => false }}
+        }
+      }
+      // An immediate run is exactly the one call it executes (EFF-003): the Effect that call
+      // constructs is a temporary only this run consumes, so its operands are the call's arguments
+      // and the run node is the call's result (EFFECT-OWN-001, BORROW-004).
+      if let Expression.Run {value, access} = &form {
+        if access == RunAccess.Immediate {
+          if let NodeKind.Expression {form: operand, ..} = &nodes[value.index].kind {
+            // Running an `effect fn` value's invocation in place invokes that value (CALLABLE-002).
+            if let Expression.CallableCall {callee, mode, arguments, pipeline, ..} = &operand {
+              return Shape.Invoke {callee: callee, arguments: run copyIds(List<NodeId>.asSlice(&arguments)), pipeline: pipeline,
+                exclusive: mode == CallableMode.Mutable}
+            }
+            // The run's result is the call's success value, which stores none of its operands
+            // beyond what its own type retains.
+            if let Expression.DirectCall {arguments, receiverPass, ..} = &operand {
+              return Shape.Call {arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: false,
+                signature: true}
+            }
+            if let Expression.InterfaceCall {arguments, receiverPass, ..} = &operand {
+              return Shape.Call {arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: false,
+                signature: true}
+            }
+            // A drive retains its operands in an opaque Effect until activation. Only this
+            // immediate run can consume all operand/capture loans at the S2 call point.
+            if let Expression.StorageCall {operation, arguments, ..} = &operand {
+              if operation == StorageOperation.ExecutionDrive {
+                return Shape.Call {arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false,
+                  signature: false}
+              }
+            }
+            return run expressionShape(&operand)
+          }
+        }
+      }
+      return run expressionShape(&form)
+    }
+    NodeKind.LocalBinding {local, initializer} => Shape.Binding {local: local.index, initializer: initializer, mutable: false}
+    NodeKind.MutableBinding {local, initializer} => Shape.Binding {local: local.index, initializer: initializer, mutable: true}
+    NodeKind.Assignment {local, value} => Shape.Assignment {local: local.index, value: value}
+    NodeKind.PlaceAssignment {target, value} => Shape.PlaceAssignment {target: target, value: value}
+    NodeKind.Return {value} => Shape.Exit {value: copyNode(&value)}
+    NodeKind.Fail {value} => Shape.Exit {value: Option<NodeId>.some(value)}
+    NodeKind.Drop {value, consumed} => Shape.Drop {value: value, consumed: hasPlace(&consumed)}
+    NodeKind.Branch {condition, thenBranch, elseBranch, ..} => Shape.Branch {condition: condition, thenBranch: thenBranch, elseBranch: copyNode(&elseBranch)}
+    NodeKind.While {condition, body} => Shape.While {condition: condition, body: body}
+    NodeKind.Break => Shape.Break
+    NodeKind.Continue => Shape.Continue
+    NodeKind.Recovered {resumes} => Shape.Recovered {resumes: resumes}
+    NodeKind.Block {statements, ..} => Shape.Block {statements: run copyIds(List<NodeId>.asSlice(&statements))}
+  }
+}
+
+fn copyNode(value: &Option<NodeId>) -> Option<NodeId> {
+  if let Option<NodeId>.Some {value: node} = &value.* {
+    return Option<NodeId>.some(node)
+  }
+  return Option<NodeId>.none()
+}
+
+// The receiver pass of a call: 0 none, 1 shared, 2 mutable, 3 taking.
+fn receiverOf(value: &Option<ReceiverPass>) -> usize {
+  if let Option<ReceiverPass>.Some {value: pass} = &value.* {
+    if pass == ReceiverPass.Shared {
+      return usize.ONE
+    }
+    if pass == ReceiverPass.Mutable {
+      return 2
+    }
+    return 3
+  }
+  return usize.ZERO
+}
+
+fn hasPlace(consumed: &Option<ConsumedPlace>) -> bool {
+  return match &consumed.* {
+    Option<ConsumedPlace>.Some {..} => true
+    Option<ConsumedPlace>.None => false
+  }
+}
+
+effect fn expressionShape(form: &Expression) -> Shape ! OutOfMemoryError ? &mut Allocator {
+  return match &form.* {
+    Expression.Local {..} => Shape.ReadPlace
+    Expression.Field {..} => Shape.ReadPlace
+    Expression.Index {..} => Shape.ReadPlace
+    Expression.Dereference {..} => Shape.ReadPlace
+    Expression.Borrow {access, value} => Shape.Borrow {access: access, value: value}
+    Expression.Move {value, consumed} => Shape.Move {value: value, consumed: hasPlace(&consumed)}
+    Expression.PointerWeaken {value} => Shape.PassThrough {value: value}
+    Expression.ArraySlice {value, ..} => Shape.PassThrough {value: value}
+    Expression.SliceLength {value} => Shape.Operands {values: run single(value), places: List<usize>.make(), member: usize.MAX}
+    Expression.ArrayLength {value, ..} => Shape.Operands {values: run single(value), places: List<usize>.make(), member: usize.MAX}
+    Expression.ArrayRepeat {value, count} => {
+      if count == usize.ZERO { return Shape.Drop {value: value, consumed: false} }
+      let mut places = List<usize>.make()
+      let mut element = usize.MAX
+      if count == usize.ONE { element = usize.ZERO }
+      run List<usize>.append(&mut places, element)
+      return Shape.Operands {values: run single(value), places: move places, member: usize.MAX}
+    }
+    Expression.EnumValue {value} => Shape.Operands {values: run single(value), places: List<usize>.make(), member: usize.MAX}
+    Expression.UnionInject {value, ..} => Shape.Operands {values: run single(value), places: List<usize>.make(), member: usize.MAX}
+    Expression.UnionWiden {value} => Shape.Operands {values: run single(value), places: List<usize>.make(), member: usize.MAX}
+    Expression.ConcretePrefix {operand, ..} => Shape.Operands {values: run single(operand), places: List<usize>.make(), member: usize.MAX}
+    Expression.CompileError {message} => Shape.Operands {values: run single(message), places: List<usize>.make(), member: usize.MAX}
+    Expression.ConcreteInfix {operator, left, right} => {
+      if operator == InfixOperator.And || operator == InfixOperator.Or {
+        return Shape.ShortCircuit {left: left, right: right}
+      }
+      let mut values = run single(left)
+      run List<NodeId>.append(&mut values, right)
+      return Shape.Operands {values: move values, places: List<usize>.make(), member: usize.MAX}
+    }
+    Expression.Aggregate {fields, ..} => Shape.Operands {
+      values: run fieldValues(List<AggregateField>.asSlice(&fields)), places: run fieldIndexes(List<AggregateField>.asSlice(&fields)), member: usize.MAX,
+    }
+    Expression.VariantConstruct {tag, fields} => Shape.Operands {
+      values: run fieldValues(List<AggregateField>.asSlice(&fields)), places: run fieldIndexes(List<AggregateField>.asSlice(&fields)), member: tag,
+    }
+    // An `effect fn` call's Effect stores exactly its written arguments (EFFECT-OWN-001).
+    Expression.DirectCall {arguments, receiverPass, constructs, ..} => Shape.Call {
+      arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: constructs, signature: true,
+    }
+    Expression.InterfaceCall {arguments, receiverPass, isEffect, ..} => Shape.Call {
+      arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: receiverOf(&receiverPass), exact: isEffect, signature: true,
+    }
+    Expression.ForeignCall {arguments, ..} => Shape.Call {
+      arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false,
+    }
+    Expression.IntrinsicCall {arguments, ..} => Shape.Call {
+      arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false,
+    }
+    Expression.Integer {..} => Shape.Leaf
+    Expression.Float {..} => Shape.Leaf
+    Expression.Text {..} => Shape.Leaf
+    Expression.Boolean {..} => Shape.Leaf
+    Expression.Unit => Shape.Leaf
+    Expression.Embedded {..} => Shape.Leaf
+    Expression.EnumMember {..} => Shape.Leaf
+    Expression.Constant {..} => Shape.Leaf
+    Expression.ForeignStatic {..} => Shape.Leaf
+    Expression.ForeignAddress {..} => Shape.Leaf
+    // An anonymous body that stores one captured loan where another capture reaches needs a
+    // relation between two body regions, which no premise of its own proves, so a body the borrow
+    // check closed stores none (ANON-OWN-001).
+    Expression.Callable {fields, referents, ..} => Shape.Construct {
+      values: run fieldValues(List<AggregateField>.asSlice(&fields)),
+      referents: run referentOperands(List<AggregateField>.asSlice(&fields), List<ReferentCapture>.asSlice(&referents)), staged: false,
+    }
+    Expression.StagedCallable {callee, arguments, ..} => {
+      let mut values = run single(callee)
+      let supplied = List<NodeId>.asSlice(&arguments)
+      let mut at = usize.ZERO
+      while at < supplied.length {
+        run List<NodeId>.append(&mut values, supplied[at])
+        at = at + usize.ONE
+      }
+      return Shape.Construct {values: move values, referents: List<ReferentCapture>.make(), staged: true}
+    }
+    Expression.CallableCall {callee, mode, arguments, pipeline, constructs, ..} => {
+      // Invoking an `effect fn` value without running it constructs an Effect that stores its
+      // operands (EFF-001).
+      if constructs {
+        return Shape.Defer {callee: callee, arguments: run copyIds(List<NodeId>.asSlice(&arguments)), pipeline: pipeline, mode: mode}
+      }
+      return Shape.Invoke {callee: callee, arguments: run copyIds(List<NodeId>.asSlice(&arguments)), pipeline: pipeline,
+        exclusive: mode == CallableMode.Mutable}
+    }
+    // A stored Effect's run invokes the Effect value with the access its contract grants
+    // (EFFECT-OWN-002): a shared Effect is read, a `mut Effect` place is borrowed exclusively, and a
+    // `once Effect` operand is already a typed move. The loans its environment holds stay live
+    // through the run (EFFECT-OWN-001, CALLABLE-003).
+    Expression.Run {value, access} => Shape.Invoke {callee: value, arguments: List<NodeId>.make(), pipeline: false,
+      exclusive: access == RunAccess.Exclusive}
+    Expression.Match {subject, access, arms, syntax, ..} => Shape.Match {
+      subject: subject, access: scrutineeOf(&access), arms: run armShapes(List<MatchArm>.asSlice(&arms)), syntax: syntax,
+    }
+    Expression.PatternBinding {..} => Shape.ReadPlace
+    // A storage primitive whose contract names every region its result reaches is a call to that
+    // contract; `unsafe` discharges only its memory obligations, never an aliasing one. Each result
+    // that views or reaches an operand names that operand's region, so the call's retention rules
+    // hold its loans.
+    // `sharedWithMut` is such a call: it consumes its two callbacks, whose capture loans are live
+    // through it, and the `&mut T` it lends comes from the runtime conflict check (SHARED-004), not
+    // from a place this body holds. Callback result retention is checked against that invocation's
+    // contract; Semantic.buildFrom judges every reached callback's suspension and notification
+    // escapes with localSharedEscapes before emission (OWN0016, SHARED-003), even if this body is
+    // region-closed and Checked. Notifications have the same independent gate; see
+    // SemanticLoweringCases.localSharedAccessRejectsEveryReachedEscape's exact OWN0016 spans.
+    // Current and relinquish have no operands or capture loans. `executionFromAllocation` consumes its
+    // allocation, body, readiness state and endpoint; typing proves the last three
+    // `Intrinsic.Detached` (EXEC-004), so the package retains no loan of the caller beyond what its
+    // `Intrinsic.Execution<A>` result names. `slotAddress` consumes its slot, and its `*mut T` result
+    // names no region, so it holds no loan: the address keeps no storage alive, and every access
+    // through it is `unsafe` and proves its own validity.
+    Expression.StorageCall {operation, arguments, ..} => {
+      // `replace` writes its place operand and yields the value it displaces.
+      if operation == StorageOperation.Replace {
+        let operands = List<NodeId>.asSlice(&arguments)
+        return Shape.Displace {target: operands[usize.ZERO], value: operands[usize.ONE]}
+      }
+      // A delayed drive's empty native environment does not prove the loans it stores; lowering
+      // runs only an immediate drive, so such a body is never emitted (EXEC-002).
+      if operation == StorageOperation.ExecutionDrive {
+        return Shape.Call {arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false}
+      }
+      if contractCall(operation) {
+        return Shape.Call {arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false}
+      }
+      // Only `replace` and a stored drive have no contract call, and both are handled above.
+      return Shape.Call {arguments: run copyIds(List<NodeId>.asSlice(&arguments)), receiver: usize.ZERO, exact: false, signature: false}
+    }
+  }
+}
+
+// Whether a storage primitive is checked as a call to its catalog contract. The match is
+fn contractCall(operation: StorageOperation) -> bool {
+  return match operation {
+    StorageOperation.RawBufferFrom => true
+    StorageOperation.RawBufferSlot => true
+    StorageOperation.RawBufferCount => true
+    StorageOperation.RawBufferRead => true
+    StorageOperation.RawBufferCopy => true
+    StorageOperation.RawBufferFill => true
+    StorageOperation.RawBufferView => true
+    StorageOperation.RawBufferViewMut => true
+    StorageOperation.SlotWrite => true
+    StorageOperation.SlotTake => true
+    StorageOperation.SlotDrop => true
+    StorageOperation.SlotCopy => true
+    StorageOperation.SlotAddress => true
+    StorageOperation.SharedLayout => true
+    StorageOperation.SharedFromAllocation => true
+    StorageOperation.SharedClone => true
+    StorageOperation.SharedWithMut => true
+    StorageOperation.LayoutOf => true
+    StorageOperation.SystemAllocationAcquire => true
+    StorageOperation.StringUtf8Bytes => true
+    StorageOperation.StringFromUtf8Unchecked => true
+    StorageOperation.StringByteLength => true
+    StorageOperation.Replace => false
+    StorageOperation.ExecutionLayout => true
+    StorageOperation.ExecutionFromAllocation => true
+    StorageOperation.ExecutionDrive => false
+    StorageOperation.Relinquish => true
+    StorageOperation.ExecutionCurrent => true
+    StorageOperation.ExecutionRefOf => true
+    StorageOperation.ExecutionLoad => true
+    StorageOperation.ExecutionStore => true
+    StorageOperation.ExecutionNotify => true
+    StorageOperation.ExecutionLive => true
+  }
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// The walk.
+
+// Relates the value of numbering `from`, typed `fromTy`, to the destination `to`, typed `toTy`,
+// for a flow at `site`.
+effect fn flow(walker: &mut Walker, fromTy: &Shared<Type>, from: usize, toTy: &Shared<Type>, to: usize, variance: Variance, site: Location) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if from == usize.MAX || to == usize.MAX { return () }
+  walker.table.site = site
+  let sub = Side {ty: Shared<Type>.clone(fromTy), numbered: from}
+  let sup = Side {ty: Shared<Type>.clone(toTy), numbered: to}
+  run relate(&mut walker.table, &sub, &sup, variance, walker.input.variances, walker.input.owner)
+  return ()
+}
+
+// Relates node `from`'s value to node `to`'s value.
+effect fn flowNodes(walker: &mut Walker, from: NodeId, to: NodeId, site: Location) -> () ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  if let Option<Shared<Type>>.Some {value: fromTy} = move nodeType(nodes, from) {
+    if let Option<Shared<Type>>.Some {value: toTy} = move nodeType(nodes, to) {
+      run flow(&mut walker.*, &fromTy, nodeValue(&walker.*, from), &toTy, nodeValue(&walker.*, to), Variance.Covariant, site)
+    }
+  }
+  return ()
+}
+
+// Relates node `from`'s value conservatively to node `to`'s: every region of either is equal.
+effect fn joinNodes(walker: &mut Walker, from: NodeId, to: NodeId, site: Location) -> () ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  if let Option<Shared<Type>>.Some {value: fromTy} = move nodeType(nodes, from) {
+    if let Option<Shared<Type>>.Some {value: toTy} = move nodeType(nodes, to) {
+      walker.table.site = site
+      let sub = Side {ty: move fromTy, numbered: nodeValue(&walker.*, from)}
+      let sup = Side {ty: move toTy, numbered: nodeValue(&walker.*, to)}
+      run equateAll(&mut walker.table, &sub, &sup, walker.input.owner)
+    }
+  }
+  return ()
+}
+
+// A new point after `at` where node `id`'s value is produced.
+effect fn produce(walker: &mut Walker, id: NodeId, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if at == usize.MAX { return at }
+  let point = run newPoint(&mut walker.*, at)
+  setSpan(&mut walker.*, point, walker.input.nodes[id.index].origin.location)
+  run assignValue(&mut walker.*, nodeValue(&walker.*, id), point)
+  return point
+}
+
+// Visits node `id` from point `at` and returns the point after it, where its value is produced, or
+// `usize.MAX` when no path continues.
+effect fn visit(walker: &mut Walker, id: NodeId, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  if at == usize.MAX { return at }
+  let point = run visitNode(&mut walker.*, id, at)
+  let nodes = walker.input.nodes
+  if point != usize.MAX {
+    // A `run` may fail, which leaves every scope on the way to the body's exit.
+    if let NodeKind.Expression {form: Expression.Run {..}, ..} = &nodes[id.index].kind {
+      let failed = run releaseScopes(&mut walker.*, usize.ZERO, nodes[id.index].origin.location, point)
+      let exit = walker.exit
+      run edge(&mut walker.*, failed, exit)
+    }
+    // An expression of type `never` does not complete.
+    if neverValue(nodes, id) { return usize.MAX }
+  }
+  return point
+}
+
+fn neverValue(nodes: &[Node], id: NodeId) -> bool {
+  if let NodeKind.Expression {ty, ..} = &nodes[id.index].kind {
+    return Shared<Type>.with<bool>(&ty, fn(value: &Type) -> bool {
+      return match &value.* { Type.Union {members} => List<Shared<Type>>.length(&members) == usize.ZERO _ => false }
+    })
+  }
+  return false
+}
+
+effect fn visitNode(walker: &mut Walker, id: NodeId, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[id.index].origin.location
+  let shape = run shapeOf(nodes, id)
+  match move shape {
+    Shape.Leaf => { return run produce(&mut walker.*, id, at) }
+    Shape.ReadPlace => { return run readPlace(&mut walker.*, id, at) }
+    Shape.Borrow {access, value} => { return run borrow(&mut walker.*, id, value, access == Access.Mutable, at) }
+    Shape.Move {value, consumed} => {
+      if consumed {
+        let path = run consumedPath(&mut walker.*, value)
+        if path.place.root != usize.MAX {
+          let current = run indexes(&mut walker.*, &path, at)
+          let point = run access(&mut walker.*, &path, Kind.Move, span, current, usize.MAX)
+          let event = List<usize>.asSlice(&walker.pointEvents)[point]
+          let mut events = List<Event>.asMutSlice(&mut walker.events)
+          events[event].target = nodes[value.index].origin.location
+          if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
+            run flow(&mut walker.*, &path.ty, path.numbered, &ty, nodeValue(&walker.*, id), Variance.Covariant, span)
+          }
+          run assignValue(&mut walker.*, nodeValue(&walker.*, id), point)
+          return point
+        }
+      }
+      let current = run visit(&mut walker.*, value, at)
+      let point = run produce(&mut walker.*, id, current)
+      run readValue(&mut walker.*, nodeValue(&walker.*, value), point)
+      run flowNodes(&mut walker.*, value, id, span)
+      return point
+    }
+    Shape.Operands {values, places, member} => {
+      return run operands(&mut walker.*, id, List<NodeId>.asSlice(&values), List<usize>.asSlice(&places), member, at)
+    }
+    Shape.ShortCircuit {left, right} => {
+      let first = run visit(&mut walker.*, left, at)
+      let tested = run newPoint(&mut walker.*, first)
+      let second = run settled(&mut walker.*, right, tested)
+      let mut reached = second
+      if tested != usize.MAX {
+        reached = run newPoint(&mut walker.*, second)
+        run edge(&mut walker.*, tested, reached)
+      }
+      return run produce(&mut walker.*, id, reached)
+    }
+    Shape.PassThrough {value} => {
+      let current = run visit(&mut walker.*, value, at)
+      let point = run produce(&mut walker.*, id, current)
+      run readValue(&mut walker.*, nodeValue(&walker.*, value), point)
+      run flowNodes(&mut walker.*, value, id, span)
+      return point
+    }
+    Shape.Call {arguments, receiver, ..} => {
+      return run call(&mut walker.*, id, List<NodeId>.asSlice(&arguments), receiver, at)
+    }
+    Shape.Construct {values, referents, ..} => {
+      return run construct(&mut walker.*, id, List<NodeId>.asSlice(&values), List<ReferentCapture>.asSlice(&referents), at)
+    }
+    Shape.Invoke {callee, arguments, pipeline, exclusive} => {
+      // A `mut fn` callee place is borrowed exclusively for the call; any other callee is read.
+      return run invoke(&mut walker.*, id, callee, List<NodeId>.asSlice(&arguments), pipeline, exclusive, exclusive, false, at)
+    }
+    Shape.Defer {callee, arguments, pipeline, mode} => {
+      // The Effect owns a `once fn` callee and borrows any other callee place for as long as it lives.
+      return run invoke(&mut walker.*, id, callee, List<NodeId>.asSlice(&arguments), pipeline, mode != CallableMode.Once,
+        mode == CallableMode.Mutable, true, at)
+    }
+    Shape.Binding {local, initializer, ..} => {
+      let declared = Shared<Type>.clone(&walker.input.locals[local].ty)
+      walker.retention = Retention.None
+      if Shared<Type>.with<bool>(&declared, Type.holdsView) {
+        walker.retention = Retention.Arrays
+      } else if Type.hasOpenRuntimeParameters(&declared) {
+        walker.retention = Retention.Storage
+      }
+      let current = run visit(&mut walker.*, initializer, at)
+      walker.retention = Retention.None
+      if current == usize.MAX { return current }
+      let point = run newPoint(&mut walker.*, current)
+      setSpan(&mut walker.*, point, nodes[initializer.index].origin.location)
+      let mut initialized = List<usize>.asMutSlice(&mut walker.initializes)
+      initialized[point] = local
+      run readValue(&mut walker.*, nodeValue(&walker.*, initializer), point)
+      if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, initializer) {
+        run flow(&mut walker.*, &ty, nodeValue(&walker.*, initializer), &declared, local, Variance.Covariant, nodes[initializer.index].origin.location)
+      }
+      run assignValue(&mut walker.*, local, point)
+      run registerRoot(&mut walker.*, local, true)
+      return point
+    }
+    Shape.Assignment {local, value} => {
+      // The written binding is the statement's first token.
+      let target = Location {start: span.start, end: span.start + usize.ONE}
+      return run replaceLocal(&mut walker.*, local, value, span, target, at)
+    }
+    Shape.PlaceAssignment {target, value} => {
+      return run assignPlace(&mut walker.*, target, value, span, at)
+    }
+    Shape.Displace {target, value} => {
+      return run displace(&mut walker.*, id, target, value, at)
+    }
+    Shape.Exit {value} => {
+      let mut current = at
+      let mut required = span
+      if let Option<NodeId>.Some {value: operand} = &value {
+        current = run visit(&mut walker.*, operand, at)
+        if current == usize.MAX { return current }
+        current = run newPoint(&mut walker.*, current)
+        let mut destination = resultNumbering(&walker.*)
+        let mut ty = Shared<Type>.clone(walker.input.result)
+        if let NodeKind.Return {..} = &nodes[id.index].kind {
+          required = nodes[operand.index].origin.location
+        } else {
+          destination = failureNumbering(&walker.*)
+          ty = Shared<Type>.clone(walker.input.failure)
+        }
+        setSpan(&mut walker.*, current, required)
+        run readValue(&mut walker.*, nodeValue(&walker.*, operand), current)
+        if let Option<Shared<Type>>.Some {value: operandType} = move nodeType(nodes, operand) {
+          run flow(&mut walker.*, &operandType, nodeValue(&walker.*, operand), &ty, destination, Variance.Covariant, required)
+        }
+      }
+      let released = run releaseScopes(&mut walker.*, usize.ZERO, required, current)
+      let exit = walker.exit
+      run edge(&mut walker.*, released, exit)
+      return usize.MAX
+    }
+    Shape.Drop {value, consumed} => {
+      if consumed {
+        let path = run consumedPath(&mut walker.*, value)
+        if path.place.root != usize.MAX {
+          let current = run indexes(&mut walker.*, &path, at)
+          return run access(&mut walker.*, &path, Kind.Drop, span, current, usize.MAX)
+        }
+      }
+      let current = run visit(&mut walker.*, value, at)
+      if current == usize.MAX { return current }
+      let point = run newPoint(&mut walker.*, current)
+      setSpan(&mut walker.*, point, span)
+      let dropped = nodeValue(&walker.*, value)
+      run readValue(&mut walker.*, dropped, point)
+      if dropped < walker.input.observes.length && walker.input.observes[dropped] {
+        run List<ValueUse>.append(&mut walker.drops, ValueUse {point: point, value: dropped})
+      }
+      return point
+    }
+    Shape.Branch {condition, thenBranch, elseBranch} => {
+      let tested = run settled(&mut walker.*, condition, at)
+      let split = run newPoint(&mut walker.*, tested)
+      let taken = run visit(&mut walker.*, thenBranch, split)
+      let mut other = split
+      if let Option<NodeId>.Some {value: alternative} = &elseBranch {
+        other = run visit(&mut walker.*, alternative, split)
+      }
+      if taken == usize.MAX && other == usize.MAX { return usize.MAX }
+      let joined = run newPoint(&mut walker.*, taken)
+      run edge(&mut walker.*, other, joined)
+      return joined
+    }
+    Shape.While {condition, body} => {
+      let header = run newPoint(&mut walker.*, at)
+      let exit = run newPoint(&mut walker.*, usize.MAX)
+      let repeat = List<Loop>.length(&walker.loops)
+      run List<Loop>.append(&mut walker.loops, Loop {before: at, header: header, sources: List<usize>.make(), end: usize.ZERO, span: span})
+      // A `break` or `continue` in the condition belongs to the enclosing loop (TRANSFER-001).
+      let tested = run settled(&mut walker.*, condition, header)
+      if tested == usize.MAX {
+        let mut loops = List<Loop>.asMutSlice(&mut walker.loops)
+        loops[repeat].end = Cfg.points(&walker.cfg)
+        return usize.MAX
+      }
+      // Only a literal condition decides which edges are feasible.
+      let mut enters = true
+      let mut skips = true
+      if let NodeKind.Expression {form: Expression.Boolean {value}, ..} = &nodes[condition.index].kind {
+        enters = value
+        skips = !value
+      }
+      run List<Frame>.append(&mut walker.frames, Frame {exit: exit, repeat: repeat, scopes: List<Scope>.length(&walker.scopes)})
+      let split = run newPoint(&mut walker.*, tested)
+      if skips { run edge(&mut walker.*, split, exit) }
+      let mut repeated = usize.MAX
+      if enters { repeated = run visit(&mut walker.*, body, split) }
+      run backEdge(&mut walker.*, repeat, repeated)
+      let mut loops = List<Loop>.asMutSlice(&mut walker.loops)
+      loops[repeat].end = Cfg.points(&walker.cfg)
+      let enclosing = List<Frame>.length(&walker.frames) - usize.ONE
+      List<Frame>.truncate(&mut walker.frames, enclosing)
+      if !skips && !run breaks(&walker.*, split, exit) { return usize.MAX }
+      return exit
+    }
+    Shape.Break => {
+      let frames = List<Frame>.asSlice(&walker.frames)
+      if frames.length == usize.ZERO { return usize.MAX }
+      let frame = frames[frames.length - usize.ONE]
+      let released = run releaseScopes(&mut walker.*, frame.scopes, span, at)
+      run edge(&mut walker.*, released, frame.exit)
+      return usize.MAX
+    }
+    Shape.Continue => {
+      let frames = List<Frame>.asSlice(&walker.frames)
+      if frames.length == usize.ZERO { return usize.MAX }
+      let frame = frames[frames.length - usize.ONE]
+      let released = run releaseScopes(&mut walker.*, frame.scopes, span, at)
+      run backEdge(&mut walker.*, frame.repeat, released)
+      return usize.MAX
+    }
+    Shape.Recovered {resumes} => {
+      if !resumes { return usize.MAX }
+      let entry = walker.entry
+      return run newPoint(&mut walker.*, entry)
+    }
+    Shape.Match {subject, access, arms, syntax} => {
+      return run matchArms(&mut walker.*, id, subject, access, List<ArmShape>.asSlice(&arms), syntax, at)
+    }
+    Shape.Block {statements} => {
+      let enclosing = run pushScope(&mut walker.*, false)
+      let list = List<NodeId>.asSlice(&statements)
+      let retention = walker.retention
+      let mut current = at
+      let mut index = usize.ZERO
+      while index < list.length {
+        // A statement's temporaries end with it (BORROW-006).
+        let statement = run pushScope(&mut walker.*, true)
+        walker.retention = Retention.None
+        current = run visit(&mut walker.*, list[index], current)
+        current = run releaseScopes(&mut walker.*, statement, nodes[list[index].index].origin.location, current)
+        List<Scope>.truncate(&mut walker.scopes, statement)
+        index = index + usize.ONE
+      }
+      walker.retention = retention
+      let released = run releaseScopes(&mut walker.*, enclosing, span, current)
+      List<Scope>.truncate(&mut walker.scopes, enclosing)
+      return run produce(&mut walker.*, id, released)
+    }
+  }
+}
+
+// Whether a literal-true loop's exit is reached from inside it, by a `break`.
+effect fn breaks(walker: &Walker, from: usize, exit: usize) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let reached = run reachable(&walker.cfg, from, usize.MAX)
+  return List<bool>.asSlice(&reached)[exit]
+}
+
+// The points control can reach from `from` without passing `avoid`, back edges included.
+effect fn reachable(cfg: &Cfg, from: usize, avoid: usize) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let count = Cfg.points(cfg)
+  let mut seen = List<bool>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<bool>.append(&mut seen, false)
+    at = at + usize.ONE
+  }
+  let mut pending = List<usize>.make()
+  run List<usize>.append(&mut pending, from)
+  while List<usize>.length(&pending) > usize.ZERO {
+    let last = List<usize>.length(&pending) - usize.ONE
+    let point = List<usize>.asSlice(&pending)[last]
+    List<usize>.truncate(&mut pending, last)
+    let next = Cfg.successors(cfg, point)
+    let mut successor = usize.ZERO
+    while successor < next.length {
+      let target = next[successor]
+      if !List<bool>.asSlice(&seen)[target] {
+        let mut marked = List<bool>.asMutSlice(&mut seen)
+        marked[target] = true
+        if target != avoid { run List<usize>.append(&mut pending, target) }
+      }
+      successor = successor + usize.ONE
+    }
+  }
+  return move seen
+}
+
+// Visits an operand whose temporaries end with it, before control flow depends on its value: a
+// condition, a guard or a short-circuit right operand (BORROW-006).
+effect fn settled(walker: &mut Walker, id: NodeId, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let scope = run pushScope(&mut walker.*, true)
+  let retention = walker.retention
+  walker.retention = Retention.None
+  let current = run visit(&mut walker.*, id, at)
+  walker.retention = retention
+  let ended = run releaseScopes(&mut walker.*, scope, walker.input.nodes[id.index].origin.location, current)
+  List<Scope>.truncate(&mut walker.scopes, scope)
+  return ended
+}
+
+// Evaluates `base`, a value with no place, into its hidden owner, which ends with the innermost
+// statement, arm, condition, guard or short-circuit operand that evaluates it. In the initializer of
+// a binding that can hold a view, lowering keeps every temporary for the binding's scope, so the
+// owner's storage and cleanup end there; only a borrowed array stays valid that long, and any other
+// temporary's loans expire with its statement (BORROW-006).
+effect fn holdTemporary(walker: &mut Walker, base: NodeId, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let current = run visit(&mut walker.*, base, at)
+  if current == usize.MAX { return current }
+  let root = nodeValue(&walker.*, base)
+  let point = run newPoint(&mut walker.*, current)
+  let mut initialized = List<usize>.asMutSlice(&mut walker.initializes)
+  initialized[point] = root
+  let retention = walker.retention
+  run registerRoot(&mut walker.*, root, retention != Retention.None)
+  let array = match move nodeType(walker.input.nodes, base) {
+    Option<Shared<Type>>.Some {value} => match move Shared<Type>.with<Option<Shared<Type>>>(&value, arrayElement) {
+      Option<Shared<Type>>.Some {..} => true
+      Option<Shared<Type>>.None => false
+    }
+    Option<Shared<Type>>.None => false
+  }
+  if retention == Retention.Storage || (retention == Retention.Arrays && !array) {
+    let innermost = List<Scope>.length(&walker.scopes) - usize.ONE
+    let mut scopes = List<Scope>.asMutSlice(&mut walker.scopes)
+    run List<usize>.append(&mut scopes[innermost].expiring, root)
+  }
+  return point
+}
+
+// A place expression read as a value: the place is read, and its value flows into the node's.
+effect fn readPlace(walker: &mut Walker, id: NodeId, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[id.index].origin.location
+  let mut path = run pathOf(&mut walker.*, id, usize.MAX)
+  let mut current = at
+  if path.place.root == usize.MAX {
+    // A projection out of a value with no place reads that value; one whose cleanup can observe a
+    // loan is read through its hidden owner, which holds it until the cleanup (BORROW-006).
+    let base = projectedBase(nodes, id)
+    let root = nodeValue(&walker.*, base)
+    if root < walker.input.observes.length && walker.input.observes[root] {
+      current = run holdTemporary(&mut walker.*, base, at)
+    } else {
+      current = run visit(&mut walker.*, base, at)
+    }
+    path = run pathOf(&mut walker.*, id, base.index)
+  }
+  current = run indexes(&mut walker.*, &path, current)
+  let point = run access(&mut walker.*, &path, Kind.Read, span, current, usize.MAX)
+  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
+    run flow(&mut walker.*, &path.ty, path.numbered, &ty, nodeValue(&walker.*, id), Variance.Covariant, span)
+  }
+  run assignValue(&mut walker.*, nodeValue(&walker.*, id), point)
+  return point
+}
+
+// Records a loan of `path`'s place with region `region`, at a fresh point after `at`. Every
+// reference the place is reached through, and every borrowing match it goes through, outlives the
+// loan (BORROW-005, MATCH-002).
+effect fn takeLoan(walker: &mut Walker, path: &Path, exclusive: bool, region: Region, span: Location, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  if at == usize.MAX { return at }
+  let loan = List<LoanFact>.length(&walker.loans)
+  run List<LoanFact>.append(&mut walker.loans, LoanFact {place: run copyPlace(&path.place), exclusive: exclusive, region: region,
+    point: usize.MAX, span: span})
+  let mut kind = Kind.SharedBorrow
+  if exclusive { kind = Kind.ExclusiveBorrow }
+  let point = run access(&mut walker.*, path, kind, span, at, loan)
+  let mut loans = List<LoanFact>.asMutSlice(&mut walker.loans)
+  loans[loan].point = point
+  walker.table.site = span
+  let through = List<Region>.asSlice(&path.through)
+  let mut index = usize.ZERO
+  while index < through.length {
+    run addOutlives(&mut walker.table, through[index], region)
+    index = index + usize.ONE
+  }
+  let via = List<usize>.asSlice(&path.via)
+  index = usize.ZERO
+  while index < via.length {
+    let lent = List<LoanFact>.asSlice(&walker.loans)[via[index]].region
+    run addOutlives(&mut walker.table, lent, region)
+    index = index + usize.ONE
+  }
+  // The borrowed place's regions outlive the loan: `&'r T` needs `T: 'r`.
+  run contentsOutlive(&mut walker.table, path.numbered, &path.ty, region, walker.input.owner)
+  return point
+}
+
+effect fn borrow(walker: &mut Walker, id: NodeId, value: NodeId, exclusive: bool, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[id.index].origin.location
+  let mut path = run pathOf(&mut walker.*, value, usize.MAX)
+  let mut current = at
+  if path.place.root == usize.MAX {
+    // A borrow of a value with no place lends its hidden owner (BORROW-006).
+    let base = projectedBase(nodes, value)
+    current = run holdTemporary(&mut walker.*, base, at)
+    path = run pathOf(&mut walker.*, value, base.index)
+  }
+  let ty = match move nodeType(nodes, id) {
+    Option<Shared<Type>>.Some {value: found} => move found
+    Option<Shared<Type>>.None => run unitType()
+  }
+  // A slice borrow of a slice reborrows its backing storage; it never lends the descriptor slot.
+  if Shared<Type>.with<bool>(&path.ty, sliceType) && Shared<Type>.with<bool>(&ty, sliceType) {
+    run dereference(&mut walker.*, &mut path)
+  }
+  current = run indexes(&mut walker.*, &path, current)
+  let numbered = nodeValue(&walker.*, id)
+  let mut region = Region {index: usize.MAX}
+  if let Option<Shared<Lifetime>>.Some {value: lifetime} = move Shared<Type>.with<Option<Shared<Lifetime>>>(&ty, referenceLifetime) {
+    region = run resolve(&mut walker.table, numbered, &lifetime, walker.input.owner)
+  } else {
+    region = run newRegion(&mut walker.table)
+  }
+  let point = run takeLoan(&mut walker.*, &path, exclusive, region, span, current)
+  if point == usize.MAX { return point }
+  // The place's value is what the reference views: shared views are covariant, exclusive ones are
+  // invariant.
+  let viewed = Shared<Type>.with<Option<Shared<Type>>>(&ty, fn(value: &Type) -> Option<Shared<Type>> {
+    return match &value.* {
+      Type.Reference {referent, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&referent))
+      _ => Option<Shared<Type>>.none()
+    }
+  })
+  let mut variance = Variance.Covariant
+  if exclusive { variance = Variance.Invariant }
+  if let Option<Shared<Type>>.Some {value: referent} = move viewed {
+    run flow(&mut walker.*, &path.ty, path.numbered, &referent, numbered, variance, span)
+  } else {
+    let sub = Side {ty: Shared<Type>.clone(&path.ty), numbered: path.numbered}
+    let sup = Side {ty: Shared<Type>.clone(&ty), numbered: numbered}
+    walker.table.site = span
+    run equateAll(&mut walker.table, &sub, &sup, walker.input.owner)
+  }
+  walker.table.site = span
+  run wellFormed(&mut walker.table, numbered, &ty, walker.input.owner)
+  run assignValue(&mut walker.*, numbered, point)
+  return point
+}
+
+// Evaluates operands in order and builds the node's value from them at one fresh point.
+effect fn operands(walker: &mut Walker, id: NodeId, values: &[NodeId], places: &[usize], member: usize, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[id.index].origin.location
+  let mut current = at
+  let mut index = usize.ZERO
+  while index < values.length {
+    current = run visit(&mut walker.*, values[index], current)
+    index = index + usize.ONE
+  }
+  let point = run produce(&mut walker.*, id, current)
+  if point == usize.MAX { return point }
+  let numbered = nodeValue(&walker.*, id)
+  let ty = match move nodeType(nodes, id) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return point }
+  }
+  let shape = List<usize>.asSlice(&walker.shapeOf)[id.index]
+  index = usize.ZERO
+  while index < values.length {
+    let operand = values[index]
+    run readValue(&mut walker.*, nodeValue(&walker.*, operand), point)
+    let site = nodes[operand.index].origin.location
+    let mut destination = Option<Shared<Type>>.none()
+    if shape != usize.MAX {
+      let fields = List<Shared<Type>>.asSlice(&walker.input.constructions[shape].fields)
+      if index < fields.length { destination = Option<Shared<Type>>.some(Shared<Type>.clone(&fields[index])) }
+    } else if index < places.length {
+      destination = run componentType(&ty, places[index])
+    }
+    if let Option<Shared<Type>>.Some {value: field} = move destination {
+      if let Option<Shared<Type>>.Some {value: operandType} = move nodeType(nodes, operand) {
+        run flow(&mut walker.*, &operandType, nodeValue(&walker.*, operand), &field, numbered, Variance.Covariant, site)
+      }
+    } else if member != usize.MAX || places.length > usize.ZERO || operandFlows(nodes, id) {
+      run joinNodes(&mut walker.*, operand, id, site)
+    }
+    index = index + usize.ONE
+  }
+  return point
+}
+
+// Whether an operand's value flows into the node's result, so their regions must be related even
+// without a known component type: an injection, a widening, or an aggregate.
+fn operandFlows(nodes: &[Node], id: NodeId) -> bool {
+  if let NodeKind.Expression {form, ..} = &nodes[id.index].kind {
+    return match &form {
+      Expression.UnionInject {..} => true
+      Expression.UnionWiden {..} => true
+      Expression.Aggregate {..} => true
+      Expression.VariantConstruct {..} => true
+      Expression.ArrayRepeat {..} => true
+      _ => false
+    }
+  }
+  return false
+}
+
+// The type of component `place` of an aggregate type: an array's element, or a tuple member.
+effect fn componentType(ty: &Shared<Type>, place: usize) -> Option<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  return Shared<Type>.with<Option<Shared<Type>>>(ty, fn(value: &Type) -> Option<Shared<Type>> {
+    return match &value.* {
+      Type.Array {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+      Type.Anonymous {members, ..} => {
+        let listed = List<Shared<Type>>.asSlice(&members)
+        if place < listed.length { return Option<Shared<Type>>.some(Shared<Type>.clone(&listed[place])) }
+        return Option<Shared<Type>>.none()
+      }
+      _ => Option<Shared<Type>>.none()
+    }
+  })
+}
+
+// Whether a type is a callable value in any of its typed forms.
+fn callableValue(ty: &Type) -> bool {
+  return match &ty.* {
+    Type.Callable {..} => true
+    Type.CallableValue {..} => true
+    Type.CallableSchema {..} => true
+    Type.CallableStage {..} => true
+    Type.CallableResult {..} => true
+    Type.CallableOrigin {..} => true
+    Type.CallableWitnessResult {..} => true
+    Type.CallableView {..} => true
+    _ => false
+  }
+}
+
+fn isBorrow(nodes: &[Node], id: NodeId) -> bool {
+  if let NodeKind.Expression {form: Expression.Borrow {..}, ..} = &nodes[id.index].kind { return true }
+  return false
+}
+
+fn referentOf(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Reference {referent, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&referent))
+    _ => Option<Shared<Type>>.none()
+  }
+}
+
+// A region holds every point from `from` to `to` in creation order: a loan no value carries yet, from
+// its borrow to the call that consumes it, holds the operands evaluated in between.
+effect fn includeRange(walker: &mut Walker, region: Region, from: usize, to: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  if from == usize.MAX || to == usize.MAX { return () }
+  let mut point = from
+  while point <= to {
+    run include(&mut walker.*, region, point)
+    point = point + usize.ONE
+  }
+  return ()
+}
+
+// Every region `fromTy` names in `from` outlives every region `toTy` names in `to`: a value whose
+// regions are not related position by position may hold anything the other holds.
+effect fn outliveAll(walker: &mut Walker, fromTy: &Shared<Type>, from: usize, toTy: &Shared<Type>, to: usize, site: Location) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if from == usize.MAX || to == usize.MAX { return () }
+  let mut longer = List<Region>.make()
+  let mut shorter = List<Region>.make()
+  run collectRegions(&mut walker.table, from, fromTy, walker.input.owner, &mut longer)
+  run collectRegions(&mut walker.table, to, toTy, walker.input.owner, &mut shorter)
+  walker.table.site = site
+  let first = List<Region>.asSlice(&longer)
+  let second = List<Region>.asSlice(&shorter)
+  let mut at = usize.ZERO
+  while at < first.length {
+    let mut other = usize.ZERO
+    while other < second.length {
+      if first[at].index != second[other].index { run addOutlives(&mut walker.table, first[at], second[other]) }
+      other = other + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Instantiates call contract `contract` in the fresh numbering `numbered` at the call's point: each
+// argument's value stands where its parameter is expected, the result stands for the call's value,
+// the callee's bounds hold, and every region the signature names holds the call point. `skip` is
+// an argument already related (a lent receiver), or `usize.MAX`.
+effect fn instantiate(walker: &mut Walker, id: NodeId, numbered: usize, contract: usize, arguments: &[NodeId], skip: usize, point: usize) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let owner = walker.input.owner
+  let span = nodes[id.index].origin.location
+  let signature = &walker.input.contracts[contract]
+  let parameters = List<Shared<Type>>.asSlice(&signature.parameters)
+  let mut index = usize.ZERO
+  while index < parameters.length {
+    run renumber(&mut walker.table, numbered, &parameters[index], owner)
+    index = index + usize.ONE
+  }
+  run renumber(&mut walker.table, numbered, &signature.result, owner)
+  index = usize.ZERO
+  while index < arguments.length {
+    let argument = arguments[index]
+    let site = nodes[argument.index].origin.location
+    if index != skip {
+      if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, argument) {
+        if index < parameters.length {
+          run flow(&mut walker.*, &ty, nodeValue(&walker.*, argument), &parameters[index], numbered, Variance.Covariant, site)
+        } else {
+          run joinNodes(&mut walker.*, argument, id, site)
+        }
+      }
+    }
+    index = index + usize.ONE
+  }
+  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
+    run flow(&mut walker.*, &signature.result, numbered, &ty, nodeValue(&walker.*, id), Variance.Covariant, span)
+  }
+  walker.table.site = span
+  index = usize.ZERO
+  while index < parameters.length {
+    run wellFormed(&mut walker.table, numbered, &parameters[index], owner)
+    index = index + usize.ONE
+  }
+  run wellFormed(&mut walker.table, numbered, &signature.result, owner)
+  let bounds = List<RegionBound>.asSlice(&signature.bounds)
+  index = usize.ZERO
+  while index < bounds.length {
+    let longer = run resolve(&mut walker.table, numbered, &bounds[index].longer, owner)
+    let shorter = run resolve(&mut walker.table, numbered, &bounds[index].shorter, owner)
+    run addOutlives(&mut walker.table, longer, shorter)
+    index = index + usize.ONE
+  }
+  let contents = List<ContentsBound>.asSlice(&signature.contents)
+  index = usize.ZERO
+  while index < contents.length {
+    let region = run resolve(&mut walker.table, numbered, &contents[index].region, owner)
+    run contentsOutlive(&mut walker.table, numbered, &contents[index].subject, region, owner)
+    index = index + usize.ONE
+  }
+  let regions = run copyRegions(List<Region>.asSlice(&List<Renumbering>.asSlice(&walker.table.numberings)[numbered].regions))
+  let listed = List<Region>.asSlice(&regions)
+  index = usize.ZERO
+  while index < listed.length {
+    run include(&mut walker.*, listed[index], point)
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+effect fn copyRegions(values: &[Region]) -> List<Region> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<Region>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run List<Region>.append(&mut copied, values[at])
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// A call: its arguments in order, then the call at one point. A shared or mutable receiver pass
+// lends the receiver place, with its parameter's region, from before the other arguments until
+// the call.
+effect fn call(walker: &mut Walker, id: NodeId, arguments: &[NodeId], receiver: usize, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let contract = List<usize>.asSlice(&walker.contractOf)[id.index]
+  let mut numbered = usize.MAX
+  if contract != usize.MAX { numbered = run addNumbering(&mut walker.table, false) }
+  let mut current = at
+  let mut lent = usize.MAX
+  let mut lentRegion = Region {index: usize.MAX}
+  let mut skip = usize.MAX
+  let mut index = usize.ZERO
+  while index < arguments.length {
+    let argument = arguments[index]
+    let mut handled = false
+    if index == usize.ZERO && (receiver == usize.ONE || receiver == 2) && !isBorrow(nodes, argument) {
+      let path = run pathOf(&mut walker.*, argument, usize.MAX)
+      if path.place.root != usize.MAX {
+        current = run indexes(&mut walker.*, &path, current)
+        let mut formal = Option<Shared<Type>>.none()
+        if contract != usize.MAX {
+          let parameters = List<Shared<Type>>.asSlice(&walker.input.contracts[contract].parameters)
+          if parameters.length > usize.ZERO { formal = Option<Shared<Type>>.some(Shared<Type>.clone(&parameters[usize.ZERO])) }
+        }
+        lentRegion = run newRegion(&mut walker.table)
+        let mut referent = Option<Shared<Type>>.none()
+        if let Option<Shared<Type>>.Some {value: ty} = &formal {
+          if let Option<Shared<Lifetime>>.Some {value: lifetime} = move Shared<Type>.with<Option<Shared<Lifetime>>>(&ty, referenceLifetime) {
+            lentRegion = run resolve(&mut walker.table, numbered, &lifetime, walker.input.owner)
+          }
+          referent = Shared<Type>.with<Option<Shared<Type>>>(&ty, referentOf)
+        }
+        let span = nodes[argument.index].origin.location
+        lent = run takeLoan(&mut walker.*, &path, receiver == 2, lentRegion, span, current)
+        let mut variance = Variance.Covariant
+        if receiver == 2 { variance = Variance.Invariant }
+        if let Option<Shared<Type>>.Some {value: viewed} = move referent {
+          run flow(&mut walker.*, &path.ty, path.numbered, &viewed, numbered, variance, span)
+        }
+        current = lent
+        skip = usize.ZERO
+        handled = true
+      }
+    }
+    if !handled { current = run visit(&mut walker.*, argument, current) }
+    index = index + usize.ONE
+  }
+  let point = run produce(&mut walker.*, id, current)
+  if point == usize.MAX { return point }
+  run includeRange(&mut walker.*, lentRegion, lent, point)
+  index = usize.ZERO
+  while index < arguments.length {
+    if index != skip { run readValue(&mut walker.*, nodeValue(&walker.*, arguments[index]), point) }
+    index = index + usize.ONE
+  }
+  if contract != usize.MAX {
+    run instantiate(&mut walker.*, id, numbered, contract, arguments, skip, point)
+  } else {
+    index = usize.ZERO
+    while index < arguments.length {
+      if index != skip { run joinNodes(&mut walker.*, arguments[index], id, nodes[arguments[index].index].origin.location) }
+      index = index + usize.ONE
+    }
+  }
+  return point
+}
+
+// A construction of a callable value from its captures, or a staged callable from its callee and
+// supplied operands. Each operand is stored at its field's declared type; a referent capture
+// reborrows what its operand references, with its field's region (CAPTURE-001, CAPTURE-002).
+effect fn construct(walker: &mut Walker, id: NodeId, values: &[NodeId], referents: &[ReferentCapture], at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let numbered = nodeValue(&walker.*, id)
+  let shape = List<usize>.asSlice(&walker.shapeOf)[id.index]
+  let mut current = at
+  let mut lentRegions = List<Region>.make()
+  let mut lentPoints = List<usize>.make()
+  let mut index = usize.ZERO
+  while index < values.length {
+    current = run visit(&mut walker.*, values[index], current)
+    let mut captured = usize.ZERO
+    while captured < referents.length {
+      if referents[captured].field == index && current != usize.MAX {
+        let mut path = run pathOf(&mut walker.*, values[index], usize.MAX)
+        if path.place.root != usize.MAX {
+          run dereference(&mut walker.*, &mut path)
+          let mut region = run newRegion(&mut walker.table)
+          if shape != usize.MAX {
+            let fields = List<Shared<Type>>.asSlice(&walker.input.constructions[shape].fields)
+            if index < fields.length {
+              if let Option<Shared<Lifetime>>.Some {value: lifetime} = move Shared<Type>.with<Option<Shared<Lifetime>>>(&fields[index], referenceLifetime) {
+                region = run resolve(&mut walker.table, numbered, &lifetime, walker.input.owner)
+              }
+            }
+          }
+          current = run takeLoan(&mut walker.*, &path, referents[captured].access == Access.Mutable, region,
+            nodes[values[index].index].origin.location, current)
+          run List<Region>.append(&mut lentRegions, region)
+          run List<usize>.append(&mut lentPoints, current)
+        }
+      }
+      captured = captured + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  let point = run produce(&mut walker.*, id, current)
+  if point == usize.MAX { return point }
+  let regions = List<Region>.asSlice(&lentRegions)
+  let points = List<usize>.asSlice(&lentPoints)
+  index = usize.ZERO
+  while index < regions.length {
+    run includeRange(&mut walker.*, regions[index], points[index], point)
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < values.length {
+    let operand = values[index]
+    let site = nodes[operand.index].origin.location
+    run readValue(&mut walker.*, nodeValue(&walker.*, operand), point)
+    let mut destination = Option<Shared<Type>>.none()
+    if shape != usize.MAX {
+      let fields = List<Shared<Type>>.asSlice(&walker.input.constructions[shape].fields)
+      if index < fields.length { destination = Option<Shared<Type>>.some(Shared<Type>.clone(&fields[index])) }
+    }
+    if let Option<Shared<Type>>.Some {value: field} = move destination {
+      if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, operand) {
+        run flow(&mut walker.*, &ty, nodeValue(&walker.*, operand), &field, numbered, Variance.Covariant, site)
+      }
+    } else {
+      run joinNodes(&mut walker.*, operand, id, site)
+    }
+    index = index + usize.ONE
+  }
+  return point
+}
+
+// An invocation of a callable value (CALLABLE-002), or the construction of the Effect an `effect fn`
+// value's invocation promises (`deferred`, EFF-001). A pipeline's input is evaluated before the
+// callee. A callee place `borrows` lends itself, `exclusive`ly for a `mut fn`, from before the
+// arguments until the call, and a deferred Effect holds that loan while it lives (EFFECT-OWN-001).
+// The callee's environment stays live through the call (CALLABLE-003), and a result may hold what
+// the environment holds.
+effect fn invoke(walker: &mut Walker, id: NodeId, callee: NodeId, arguments: &[NodeId], pipeline: bool, borrows: bool, exclusive: bool,
+  deferred: bool, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[id.index].origin.location
+  let mut current = at
+  let mut first = usize.ZERO
+  if pipeline && arguments.length > usize.ZERO {
+    current = run visit(&mut walker.*, arguments[usize.ZERO], current)
+    first = usize.ONE
+  }
+  let mut lent = usize.MAX
+  let mut region = Region {index: usize.MAX}
+  let mut calleeTy = run unitType()
+  let mut calleeNumbered = nodeValue(&walker.*, callee)
+  if let Option<Shared<Type>>.Some {value} = move nodeType(nodes, callee) { calleeTy = move value }
+  if borrows {
+    let path = run pathOf(&mut walker.*, callee, usize.MAX)
+    if path.place.root != usize.MAX {
+      current = run indexes(&mut walker.*, &path, current)
+      region = run newRegion(&mut walker.table)
+      lent = run takeLoan(&mut walker.*, &path, exclusive, region, nodes[callee.index].origin.location, current)
+      current = lent
+      calleeTy = Shared<Type>.clone(&path.ty)
+      calleeNumbered = path.place.root
+    }
+  }
+  if lent == usize.MAX { current = run visit(&mut walker.*, callee, current) }
+  let mut index = first
+  while index < arguments.length {
+    current = run visit(&mut walker.*, arguments[index], current)
+    index = index + usize.ONE
+  }
+  let point = run produce(&mut walker.*, id, current)
+  if point == usize.MAX { return point }
+  run readValue(&mut walker.*, calleeNumbered, point)
+  if lent != usize.MAX {
+    run includeRange(&mut walker.*, region, lent, point)
+    if deferred {
+      let mut held = List<Region>.make()
+      if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
+        run collectRegions(&mut walker.table, nodeValue(&walker.*, id), &ty, walker.input.owner, &mut held)
+      }
+      walker.table.site = span
+      let regions = List<Region>.asSlice(&held)
+      index = usize.ZERO
+      while index < regions.length {
+        run addOutlives(&mut walker.table, region, regions[index])
+        index = index + usize.ONE
+      }
+    }
+  }
+  index = usize.ZERO
+  while index < arguments.length {
+    run readValue(&mut walker.*, nodeValue(&walker.*, arguments[index]), point)
+    index = index + usize.ONE
+  }
+  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
+    run outliveAll(&mut walker.*, &calleeTy, calleeNumbered, &ty, nodeValue(&walker.*, id), span)
+  }
+  let contract = List<usize>.asSlice(&walker.contractOf)[id.index]
+  if !deferred && contract != usize.MAX {
+    let numbered = run addNumbering(&mut walker.table, false)
+    run instantiate(&mut walker.*, id, numbered, contract, arguments, usize.MAX, point)
+  } else {
+    index = usize.ZERO
+    while index < arguments.length {
+      run joinNodes(&mut walker.*, arguments[index], id, nodes[arguments[index].index].origin.location)
+      index = index + usize.ONE
+    }
+  }
+  return point
+}
+
+// Where a write to `target` is reported: the target place, or the reference a dereferenced target
+// writes through.
+fn writtenSpan(nodes: &[Node], target: NodeId) -> Location {
+  if let NodeKind.Expression {form: Expression.Dereference {value}, ..} = &nodes[target.index].kind {
+    return nodes[value.index].origin.location
+  }
+  return nodes[target.index].origin.location
+}
+
+// Marks the replacement recorded at `point` when a move or drop recorded since event `since`
+// overlaps its target: the right-hand side consumed the storage it replaces (OWN0004), reported at
+// the whole `statement`.
+fn markConsumedTarget(walker: &mut Walker, since: usize, point: usize, statement: Location) -> () {
+  if point == usize.MAX { return () }
+  let recorded = List<usize>.asSlice(&walker.pointEvents)[point]
+  let mut events = List<Event>.asMutSlice(&mut walker.events)
+  let mut at = since
+  while at < recorded {
+    if (events[at].kind == Kind.Move || events[at].kind == Kind.Drop) && overlaps(&events[at].place, &events[recorded].place) {
+      events[recorded].consumesTarget = true
+      events[recorded].span = statement
+      events[recorded].target = statement
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Replaces a whole local: the value is evaluated, the old value's cleanup observes it, and the
+// local is written and redefined.
+effect fn replaceLocal(walker: &mut Walker, local: usize, value: NodeId, span: Location, target: Location, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let since = List<Event>.length(&walker.events)
+  let mut current = run visit(&mut walker.*, value, at)
+  if current == usize.MAX { return current }
+  if local < walker.input.observes.length && walker.input.observes[local] {
+    current = run newPoint(&mut walker.*, current)
+    setSpan(&mut walker.*, current, span)
+    run List<ValueUse>.append(&mut walker.drops, ValueUse {point: current, value: local})
+  }
+  let mut path = run rootPath(local)
+  path.ty = Shared<Type>.clone(&walker.input.locals[local].ty)
+  let point = run access(&mut walker.*, &path, Kind.Write, target, current, usize.MAX)
+  markConsumedTarget(&mut walker.*, since, point, span)
+  run readValue(&mut walker.*, nodeValue(&walker.*, value), point)
+  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, value) {
+    run flow(&mut walker.*, &ty, nodeValue(&walker.*, value), &path.ty, local, Variance.Covariant, span)
+  }
+  run assignValue(&mut walker.*, local, point)
+  return point
+}
+
+// The path of a written place: a place expression, or a projection of a value with no place, which
+// its hidden owner holds for the statement.
+effect fn writtenPath(walker: &mut Walker, target: NodeId, at: usize, path: &mut Path) -> usize ! OutOfMemoryError ? &mut Allocator {
+  path.* = run pathOf(&mut walker.*, target, usize.MAX)
+  if path.place.root != usize.MAX { return at }
+  let base = projectedBase(walker.input.nodes, target)
+  let current = run holdTemporary(&mut walker.*, base, at)
+  path.* = run pathOf(&mut walker.*, target, base.index)
+  return current
+}
+
+// A write to a projected place, or through a reference: the place's index operands, then the
+// value, then the write. A write through a reference uses that reference.
+effect fn assignPlace(walker: &mut Walker, target: NodeId, value: NodeId, span: Location, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let mut path = run emptyPath(run unitType())
+  let mut current = run writtenPath(&mut walker.*, target, at, &mut path)
+  let root = path.place.root
+  if root < localCount(&walker.*) && !path.indirect && List<Step>.length(&path.place.steps) == usize.ZERO {
+    return run replaceLocal(&mut walker.*, root, value, span, nodes[target.index].origin.location, current)
+  }
+  current = run indexes(&mut walker.*, &path, current)
+  let since = List<Event>.length(&walker.events)
+  current = run visit(&mut walker.*, value, current)
+  if current == usize.MAX { return current }
+  let point = run access(&mut walker.*, &path, Kind.Write, writtenSpan(nodes, target), current, usize.MAX)
+  if path.indirect {
+    run readValue(&mut walker.*, root, point)
+  } else {
+    markConsumedTarget(&mut walker.*, since, point, span)
+  }
+  run readValue(&mut walker.*, nodeValue(&walker.*, value), point)
+  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, value) {
+    run flow(&mut walker.*, &ty, nodeValue(&walker.*, value), &path.ty, path.numbered, Variance.Covariant, span)
+  }
+  return point
+}
+
+// `replace(place, value)` is `let old = place; place = value` with nothing in between: the value is
+// evaluated, then the place is read and written at the call.
+effect fn displace(walker: &mut Walker, id: NodeId, target: NodeId, value: NodeId, at: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[id.index].origin.location
+  let mut path = run emptyPath(run unitType())
+  let mut current = run writtenPath(&mut walker.*, target, at, &mut path)
+  current = run indexes(&mut walker.*, &path, current)
+  let since = List<Event>.length(&walker.events)
+  current = run visit(&mut walker.*, value, current)
+  if current == usize.MAX { return current }
+  let targetSpan = writtenSpan(nodes, target)
+  let read = run access(&mut walker.*, &path, Kind.Read, targetSpan, current, usize.MAX)
+  let point = run access(&mut walker.*, &path, Kind.Write, targetSpan, read, usize.MAX)
+  if path.indirect {
+    run readValue(&mut walker.*, path.place.root, point)
+  } else {
+    markConsumedTarget(&mut walker.*, since, point, span)
+  }
+  run readValue(&mut walker.*, nodeValue(&walker.*, value), point)
+  run assignValue(&mut walker.*, nodeValue(&walker.*, id), point)
+  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, id) {
+    run flow(&mut walker.*, &path.ty, path.numbered, &ty, nodeValue(&walker.*, id), Variance.Covariant, span)
+  }
+  if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, value) {
+    run flow(&mut walker.*, &ty, nodeValue(&walker.*, value), &path.ty, path.numbered, Variance.Covariant, span)
+  }
+  return point
+}
+
+// A match (MATCH-001): the subject is accessed once as its form declares, then the arms are tried
+// in written order. A pattern that does not select the value, or a guard that answers false, goes
+// on to the next arm; every selected arm joins after the match. A borrowing match lends its subject
+// place with a region its bindings' uses hold (MATCH-002); an `if let` that binds holds it through
+// its taken body, and a destructuring `let` to its bindings' scope end (PATT-009).
+effect fn matchArms(walker: &mut Walker, id: NodeId, subject: NodeId, access: Scrutinee, arms: &[ArmShape], syntax: MatchSyntax, at: usize) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let nodes = walker.input.nodes
+  let span = nodes[subject.index].origin.location
+  let borrowing = access == Scrutinee.Shared || access == Scrutinee.Exclusive
+  // A borrowing destructuring `let` keeps its subject's temporaries for its bindings' scope.
+  let retention = walker.retention
+  if syntax == MatchSyntax.Let && (borrowing || access == Scrutinee.Place) { walker.retention = Retention.Storage }
+  let mut path = run pathOf(&mut walker.*, subject, usize.MAX)
+  let mut current = at
+  // Whether the subject's own storage holds its value.
+  let mut owned = true
+  if access == Scrutinee.Moved && path.place.root != usize.MAX {
+    current = run indexes(&mut walker.*, &path, current)
+    current = run access(&mut walker.*, &path, Kind.Move, span, current, usize.MAX)
+    if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, subject) {
+      run flow(&mut walker.*, &path.ty, path.numbered, &ty, nodeValue(&walker.*, subject), Variance.Covariant, span)
+    }
+    run assignValue(&mut walker.*, nodeValue(&walker.*, subject), current)
+  } else if (borrowing || access == Scrutinee.Place) {
+    owned = false
+    if path.place.root == usize.MAX {
+      // Projecting a value with no place addresses its hidden owner.
+      let base = projectedBase(nodes, subject)
+      current = run holdTemporary(&mut walker.*, base, current)
+      path = run pathOf(&mut walker.*, subject, base.index)
+    }
+    current = run indexes(&mut walker.*, &path, current)
+    if access == Scrutinee.Exclusive {
+      current = run access(&mut walker.*, &path, Kind.Update, span, current, usize.MAX)
+    } else if access == Scrutinee.Place {
+      current = run access(&mut walker.*, &path, Kind.Inspect, span, current, usize.MAX)
+    }
+  } else {
+    current = run visit(&mut walker.*, subject, current)
+  }
+  walker.retention = retention
+  let mut lent = Region {index: usize.MAX}
+  if borrowing && current != usize.MAX {
+    // `match &mut` lends shared beside an idle exclusive binding; an `if let` or a destructuring
+    // `let` lends as its subject is borrowed (PATT-009).
+    let exclusive = access == Scrutinee.Exclusive && syntax != MatchSyntax.Match
+    lent = run newRegion(&mut walker.table)
+    let loan = List<LoanFact>.length(&walker.loans)
+    current = run takeLoan(&mut walker.*, &path, exclusive, lent, span, current)
+    let mut lending = List<usize>.asMutSlice(&mut walker.matchLoans)
+    lending[subject.index] = loan
+    // Its bindings belong to the enclosing block (PATT-008), which keeps the loan to its end.
+    if syntax == MatchSyntax.Let && arms.length > usize.ZERO && arms[usize.ZERO].binds { run lendToScope(&mut walker.*, lent) }
+  }
+  let tested = run newPoint(&mut walker.*, current)
+  if access == Scrutinee.Place {
+    run List<Refinement>.append(&mut walker.refinements, Refinement {subject: subject.index, test: tested})
+  }
+  let enclosing = List<Scope>.length(&walker.scopes)
+  // A destructuring let's bindings belong to its enclosing block (PATT-008); match and if-let
+  // bindings end on their selected arm's path.
+  if syntax != MatchSyntax.Let { run pushScope(&mut walker.*, false) }
+  if owned && tested != usize.MAX {
+    // The subject's own storage is bound here, so moves of its parts in an earlier iteration of an
+    // enclosing loop do not reach this one.
+    let mut initialized = List<usize>.asMutSlice(&mut walker.initializes)
+    initialized[tested] = nodeValue(&walker.*, subject)
+    run registerRoot(&mut walker.*, nodeValue(&walker.*, subject), false)
+  }
+  let mut ends = List<usize>.make()
+  let mut completes = false
+  let mut rejected = List<usize>.make()
+  run List<usize>.append(&mut rejected, tested)
+  let mut index = usize.ZERO
+  while index < arms.length {
+    let entry = run newPoint(&mut walker.*, usize.MAX)
+    let earlier = List<usize>.asSlice(&rejected)
+    let mut from = usize.ZERO
+    while from < earlier.length {
+      run edge(&mut walker.*, earlier[from], entry)
+      from = from + usize.ONE
+    }
+    List<usize>.truncate(&mut rejected, usize.ZERO)
+    run List<usize>.append(&mut rejected, entry)
+    let mut selected = entry
+    if let Option<NodeId>.Some {value: guard} = &arms[index].guard {
+      // A consuming match's bindings are parts of the subject's own storage until the guard holds.
+      let consuming = access == Scrutinee.Moved || access == Scrutinee.Value
+      if consuming { run List<usize>.append(&mut walker.guarded, nodeValue(&walker.*, subject)) }
+      let checked = run settled(&mut walker.*, guard, entry)
+      if consuming { List<usize>.truncate(&mut walker.guarded, List<usize>.length(&walker.guarded) - usize.ONE) }
+      selected = run newPoint(&mut walker.*, checked)
+      run List<usize>.append(&mut rejected, selected)
+    }
+    let result = arms[index].result
+    let taken = run visit(&mut walker.*, result, selected)
+    let released = run releaseScopes(&mut walker.*, enclosing, nodes[id.index].origin.location, taken)
+    if released != usize.MAX { completes = true }
+    let point = run newPoint(&mut walker.*, released)
+    // An `if let` body that binds holds the loan throughout (PATT-009).
+    if syntax == MatchSyntax.IfLet && arms[index].binds && lent.index != usize.MAX && released != usize.MAX {
+      run includeRange(&mut walker.*, lent, entry, point)
+    }
+    if released != usize.MAX {
+      run readValue(&mut walker.*, nodeValue(&walker.*, result), point)
+      run flowNodes(&mut walker.*, result, id, nodes[result.index].origin.location)
+      run List<usize>.append(&mut ends, point)
+    }
+    index = index + usize.ONE
+  }
+  List<Scope>.truncate(&mut walker.scopes, enclosing)
+  if !completes { return usize.MAX }
+  let joined = run newPoint(&mut walker.*, usize.MAX)
+  let selected = List<usize>.asSlice(&ends)
+  index = usize.ZERO
+  while index < selected.length {
+    run edge(&mut walker.*, selected[index], joined)
+    index = index + usize.ONE
+  }
+  return run produce(&mut walker.*, id, joined)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Checking.
+
+// The overlap of two places: 0 disjoint, 1 overlapping, 2 decided only by an unknown index.
+fn overlap(left: &Place, right: &Place) -> usize {
+  if left.root != right.root { return usize.ZERO }
+  let first = List<Step>.asSlice(&left.steps)
+  let second = List<Step>.asSlice(&right.steps)
+  let mut unknown = false
+  let mut at = usize.ZERO
+  while at < first.length && at < second.length {
+    if first[at].kind == StepKind.AnyElement || second[at].kind == StepKind.AnyElement {
+      unknown = true
+    } else if !sameStep(first[at], second[at]) {
+      return usize.ZERO
+    }
+    at = at + usize.ONE
+  }
+  if unknown { return 2 }
+  return usize.ONE
+}
+
+// Only a whole local whose type is a shared reference proves that consuming the descriptor leaves
+// its referent alone.
+fn sharedLocalDescriptor(locals: &[Local], place: &Place) -> bool {
+  if place.root >= locals.length || List<Step>.length(&place.steps) != usize.ZERO { return false }
+  return Shared<Type>.with<bool>(&locals[place.root].ty, sharedReference)
+}
+
+fn isBackEdge(walker: &Walker, from: usize, to: usize) -> bool {
+  let loops = List<Loop>.asSlice(&walker.loops)
+  let mut at = usize.ZERO
+  while at < loops.length {
+    if loops[at].header == to && listed(List<usize>.asSlice(&loops[at].sources), from) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn wordOf(bit: usize) -> usize { return bit / 64 }
+
+fn maskOf(bit: usize) -> u64 { return u64.shiftLeft(1, u64.fromUsize(bit % 64)) }
+
+fn reaches(state: &[u64], width: usize, point: usize, bit: usize) -> bool {
+  return u64.bitAnd(state[point * width + wordOf(bit)], maskOf(bit)) != 0
+}
+
+// Reaching moves along forward edges: bit `m` of a point's row is set when move event `moves[m]`
+// reaches it in the same loop iteration, on a path that neither rebinds nor replaces its place.
+// Repetition is checked separately at each loop header.
+struct Reach {
+  entering: List<u64>
+  leaving: List<u64>
+}
+
+effect fn reaching(walker: &Walker, moves: &[usize], width: usize) -> Reach ! OutOfMemoryError ? &mut Allocator {
+  let points = Cfg.points(&walker.cfg)
+  let events = List<Event>.asSlice(&walker.events)
+  let recorded = List<usize>.asSlice(&walker.pointEvents)
+  let initializes = List<usize>.asSlice(&walker.initializes)
+  let mut entering = List<u64>.make()
+  let mut leaving = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < points * width {
+    run List<u64>.append(&mut entering, 0)
+    run List<u64>.append(&mut leaving, 0)
+    at = at + usize.ONE
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut point = usize.ZERO
+    while point < points {
+      let mut word = usize.ZERO
+      while word < width {
+        List<u64>.set(&mut leaving, point * width + word, List<u64>.asSlice(&entering)[point * width + word])
+        word = word + usize.ONE
+      }
+      let event = recorded[point]
+      let mut bit = usize.ZERO
+      while bit < moves.length {
+        let moved = &events[moves[bit]].place
+        let kill = initializes[point] == moved.root
+          || (event != usize.MAX && events[event].kind == Kind.Write && covers(&events[event].place, moved))
+        let slot = point * width + wordOf(bit)
+        let mut value = List<u64>.asSlice(&leaving)[slot]
+        if kill { value = u64.bitAnd(value, u64.bitNot(maskOf(bit))) }
+        if event == moves[bit] { value = u64.bitOr(value, maskOf(bit)) }
+        List<u64>.set(&mut leaving, slot, value)
+        bit = bit + usize.ONE
+      }
+      let next = Cfg.successors(&walker.cfg, point)
+      let mut successor = usize.ZERO
+      while successor < next.length {
+        if !isBackEdge(walker, point, next[successor]) {
+          word = usize.ZERO
+          while word < width {
+            let slot = next[successor] * width + word
+            let current = List<u64>.asSlice(&entering)[slot]
+            let merged = u64.bitOr(current, List<u64>.asSlice(&leaving)[point * width + word])
+            if merged != current {
+              List<u64>.set(&mut entering, slot, merged)
+              changed = true
+            }
+            word = word + usize.ONE
+          }
+        }
+        successor = successor + usize.ONE
+      }
+      point = point + usize.ONE
+    }
+  }
+  return Reach {entering: move entering, leaving: move leaving}
+}
+
+fn samePlace(left: &Place, right: &Place) -> bool {
+  return overlap(left, right) == usize.ONE && List<Step>.length(&left.steps) == List<Step>.length(&right.steps)
+}
+
+// Whether `place` is moved in `state` at `point`: some reaching move names exactly it.
+fn movedIn(events: &[Event], moves: &[usize], state: &[u64], width: usize, point: usize, place: &Place) -> bool {
+  let mut bit = usize.ZERO
+  while bit < moves.length {
+    if reaches(state, width, point, bit) && samePlace(&events[moves[bit]].place, place) { return true }
+    bit = bit + usize.ONE
+  }
+  return false
+}
+
+// Whether `root` is bound inside the loop, so it has no owner state at the header.
+fn boundInside(walker: &Walker, repeat: &Loop, root: usize) -> bool {
+  let initializes = List<usize>.asSlice(&walker.initializes)
+  let mut point = repeat.header
+  while point < repeat.end {
+    if initializes[point] == root { return true }
+    point = point + usize.ONE
+  }
+  return false
+}
+
+// Whether a loop repeats with the same moved places of its outer roots as it enters with (OWN0005
+// otherwise).
+fn compatibleHeader(walker: &Walker, events: &[Event], moves: &[usize], reach: &Reach, width: usize, repeat: &Loop) -> bool {
+  if repeat.before == usize.MAX { return true }
+  let leaving = List<u64>.asSlice(&reach.leaving)
+  let sources = List<usize>.asSlice(&repeat.sources)
+  let mut bit = usize.ZERO
+  while bit < moves.length {
+    let place = &events[moves[bit]].place
+    if !boundInside(walker, repeat, place.root) {
+      let entered = movedIn(events, moves, leaving, width, repeat.before, place)
+      let mut index = usize.ZERO
+      while index < sources.length {
+        if movedIn(events, moves, leaving, width, sources[index], place) != entered { return false }
+        index = index + usize.ONE
+      }
+    }
+    bit = bit + usize.ONE
+  }
+  return true
+}
+
+// The points reached from one source while avoiding one point, computed once per pair.
+struct Reached {
+  source: usize
+  avoid: usize
+  seen: List<bool>
+}
+
+// Whether control can pass from `from` to `to` without passing `avoid`.
+effect fn reachesAvoiding(walker: &Walker, cache: &mut List<Reached>, from: usize, to: usize, avoid: usize) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let known = List<Reached>.asSlice(&cache.*)
+  let mut at = usize.ZERO
+  while at < known.length {
+    if known[at].source == from && known[at].avoid == avoid { return List<bool>.asSlice(&known[at].seen)[to] }
+    at = at + usize.ONE
+  }
+  let seen = run reachable(&walker.cfg, from, avoid)
+  let reached = List<bool>.asSlice(&seen)[to]
+  run List<Reached>.append(&mut cache.*, Reached {source: from, avoid: avoid, seen: move seen})
+  return reached
+}
+
+// The point where the `match place` at `subject` selects its variant, or `usize.MAX`.
+fn refinementTest(walker: &Walker, subject: usize) -> usize {
+  let refinements = List<Refinement>.asSlice(&walker.refinements)
+  let mut at = usize.ZERO
+  while at < refinements.length {
+    if refinements[at].subject == subject { return refinements[at].test }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// Whether a loop repeats with every `match place` refinement it uses intact: a replacement in the
+// body of the subject of a match outside the loop invalidates a binding the next iteration uses.
+effect fn refinementRepeats(walker: &Walker, events: &[Event], repeat: &Loop, cache: &mut List<Reached>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  let mut use = usize.ZERO
+  while use < events.length {
+    let used = &events[use]
+    if used.refiner != usize.MAX && used.point >= repeat.header && used.point < repeat.end && used.kind != Kind.End && used.kind != Kind.Expire {
+      let test = refinementTest(walker, used.refiner)
+      if test != usize.MAX && (test < repeat.header || test >= repeat.end) {
+        let mut source = usize.ZERO
+        while source < events.length {
+          let written = &events[source]
+          if written.point >= repeat.header && written.point < repeat.end && replaces(written.kind)
+            && coversRefined(&written.place, &used.place, used.refinedDepth)
+            && run reachesAvoiding(walker, &mut cache.*, written.point, used.point, test) {
+            return false
+          }
+          source = source + usize.ONE
+        }
+      }
+    }
+    use = use + usize.ONE
+  }
+  return true
+}
+
+// Records a conflict unless one with the same code and span was already found.
+effect fn addReport(reports: &mut List<Report>, report: Report) -> () ! OutOfMemoryError ? &mut Allocator {
+  let found = List<Report>.asSlice(&reports.*)
+  let mut at = usize.ZERO
+  while at < found.length {
+    if found[at].code == report.code && found[at].access.start == report.access.start && found[at].access.end == report.access.end { return () }
+    at = at + usize.ONE
+  }
+  run List<Report>.append(&mut reports.*, report)
+  return ()
+}
+
+// The reports ordered by span, earlier first; reports with one span keep the order they were found.
+effect fn bySpan(reports: &[Report]) -> List<Report> ! OutOfMemoryError ? &mut Allocator {
+  let mut sorted = List<Report>.make()
+  let mut at = usize.ZERO
+  while at < reports.length {
+    run List<Report>.append(&mut sorted, reports[at])
+    let mut slot = List<Report>.length(&sorted) - usize.ONE
+    while slot > usize.ZERO {
+      let mut items = List<Report>.asMutSlice(&mut sorted)
+      let previous = items[slot - usize.ONE]
+      let current = items[slot]
+      let later = previous.access.start > current.access.start
+        || (previous.access.start == current.access.start && previous.access.end > current.access.end)
+      if !later { break }
+      items[slot - usize.ONE] = current
+      items[slot] = previous
+      slot = slot - usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move sorted
+}
+
+fn rejection(code: RejectionCode, access: Location, earlier: Option<Location>) -> Verdict {
+  return Verdict {outcome: Outcome.Conflict, code: code, access: access, earlier: earlier, reports: List<Report>.make()}
+}
+
+// The solved facts the checks read.
+struct Solved {
+  values: Values
+  scope: LoanScope
+  // Per region, the regions it outlives directly.
+  shorter: List<List<usize>>
+}
+
+// Where a view that carries `loan` is next used after `point`: the first read reachable from it of
+// a value one of whose regions the loan's region outlives. Points are numbered in creation order,
+// so a read reached only around a loop's back edge comes earlier: the scan wraps around. Without
+// such a read the access itself is reported.
+effect fn expiredUse(walker: &Walker, solved: &Solved, loan: usize, point: usize, fallback: Location) -> Location
+! OutOfMemoryError ? &mut Allocator {
+  let region = List<LoanFact>.asSlice(&walker.loans)[loan].region
+  let regions = List<bool>.length(&walker.table.universalFlags)
+  let mut carried = List<bool>.make()
+  let mut at = usize.ZERO
+  while at < regions {
+    run List<bool>.append(&mut carried, false)
+    at = at + usize.ONE
+  }
+  let mut pending = List<usize>.make()
+  run List<usize>.append(&mut pending, region.index)
+  List<bool>.set(&mut carried, region.index, true)
+  while List<usize>.length(&pending) > usize.ZERO {
+    let last = List<usize>.length(&pending) - usize.ONE
+    let current = List<usize>.asSlice(&pending)[last]
+    List<usize>.truncate(&mut pending, last)
+    let next = List<usize>.asSlice(&List<List<usize>>.asSlice(&solved.shorter)[current])
+    let mut each = usize.ZERO
+    while each < next.length {
+      if !List<bool>.asSlice(&carried)[next[each]] {
+        List<bool>.set(&mut carried, next[each], true)
+        run List<usize>.append(&mut pending, next[each])
+      }
+      each = each + usize.ONE
+    }
+  }
+  let reached = run reachable(&walker.cfg, point, usize.MAX)
+  let points = Cfg.points(&walker.cfg)
+  let reads = List<ValueUse>.asSlice(&walker.reads)
+  let numberings = List<Renumbering>.asSlice(&walker.table.numberings)
+  let mut step = usize.ONE
+  while step < points {
+    let candidate = (point + step) % points
+    if List<bool>.asSlice(&reached)[candidate] {
+      let mut read = usize.ZERO
+      while read < reads.length {
+        if reads[read].point == candidate {
+          let held = List<Region>.asSlice(&numberings[reads[read].value].regions)
+          let mut index = usize.ZERO
+          while index < held.length {
+            if List<bool>.asSlice(&carried)[held[index].index] && Values.contains(&solved.values, held[index], candidate) {
+              return List<Location>.asSlice(&walker.spans)[candidate]
+            }
+            index = index + usize.ONE
+          }
+        }
+        read = read + usize.ONE
+      }
+    }
+    step = step + usize.ONE
+  }
+  return fallback
+}
+
+// The site of the last edge on a path of outlives edges from `longer` to `shorter`, which is where a
+// flow required the relation.
+effect fn relationSite(table: &RegionTable, longer: Region, shorter: Region) -> Location ! OutOfMemoryError ? &mut Allocator {
+  let regions = List<bool>.length(&table.universalFlags)
+  let edges = List<Region>.asSlice(&table.longer)
+  let ends = List<Region>.asSlice(&table.shorter)
+  let sites = List<Location>.asSlice(&table.sites)
+  let mut entered = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < regions {
+    run List<usize>.append(&mut entered, usize.MAX)
+    at = at + usize.ONE
+  }
+  let mut pending = List<usize>.make()
+  run List<usize>.append(&mut pending, longer.index)
+  let mut first = usize.ZERO
+  while first < List<usize>.length(&pending) {
+    let current = List<usize>.asSlice(&pending)[first]
+    first = first + usize.ONE
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      let target = ends[edge].index
+      if edges[edge].index == current && target != longer.index && List<usize>.asSlice(&entered)[target] == usize.MAX {
+        List<usize>.set(&mut entered, target, edge)
+        if target == shorter.index { return sites[edge] }
+        run List<usize>.append(&mut pending, target)
+      }
+      edge = edge + usize.ONE
+    }
+  }
+  return table.site
+}
+
+/// Checks the loans, moves and regions of one typed body. Conflicts are found in evaluation order;
+/// the first is returned, with every loan conflict and expired use found after it.
+pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocator {
+  let owner = input.owner
+  let locals = input.locals
+  let nodes = input.nodes
+  let mut walker = Walker {
+    input: Input {owner: input.owner, locals: input.locals, parameters: input.parameters, nodes: input.nodes, root: input.root,
+      result: input.result, failure: input.failure, premises: input.premises, contracts: input.contracts,
+      constructions: input.constructions, variances: input.variances, observes: input.observes},
+    table: RegionTable {universalFlags: List<bool>.make(), longer: List<Region>.make(), shorter: List<Region>.make(),
+      sites: List<Location>.make(), site: nodes[input.root.index].origin.location, universals: List<Universal>.make(),
+      bases: List<usize>.make(), numberings: List<Renumbering>.make()},
+    cfg: Cfg.make(), spans: List<Location>.make(), events: List<Event>.make(), pointEvents: List<usize>.make(),
+    initializes: List<usize>.make(), reads: List<ValueUse>.make(), assigns: List<ValueUse>.make(), drops: List<ValueUse>.make(),
+    inclusions: List<Inclusion>.make(), loans: List<LoanFact>.make(), matchLoans: List<usize>.make(), contractOf: List<usize>.make(),
+    shapeOf: List<usize>.make(), frames: List<Frame>.make(), loops: List<Loop>.make(), scopes: List<Scope>.make(),
+    refinements: List<Refinement>.make(), retention: Retention.None, guarded: List<usize>.make(), guardConsumed: Option<Location>.none(),
+    exit: usize.ZERO, entry: usize.ZERO,
+  }
+  // Every value's numbering: a parameter's or a written local's type fixes its universal lifetimes.
+  let mut index = usize.ZERO
+  while index < locals.length {
+    let numbered = run addNumbering(&mut walker.table, index < input.parameters || locals[index].written)
+    run renumber(&mut walker.table, numbered, &locals[index].ty, owner)
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < nodes.length {
+    let numbered = run addNumbering(&mut walker.table, false)
+    if let Option<Shared<Type>>.Some {value: ty} = move nodeType(nodes, NodeId {index: index}) {
+      run renumber(&mut walker.table, numbered, &ty, owner)
+    }
+    run List<usize>.append(&mut walker.matchLoans, usize.MAX)
+    run List<usize>.append(&mut walker.contractOf, usize.MAX)
+    run List<usize>.append(&mut walker.shapeOf, usize.MAX)
+    index = index + usize.ONE
+  }
+  let result = run addNumbering(&mut walker.table, true)
+  run renumber(&mut walker.table, result, input.result, owner)
+  let failure = run addNumbering(&mut walker.table, true)
+  run renumber(&mut walker.table, failure, input.failure, owner)
+  closeNumberings(&mut walker.table)
+  index = usize.ZERO
+  while index < input.contracts.length {
+    List<usize>.set(&mut walker.contractOf, input.contracts[index].call.index, index)
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < input.constructions.length {
+    List<usize>.set(&mut walker.shapeOf, input.constructions[index].node.index, index)
+    index = index + usize.ONE
+  }
+  // The body's declared and implied premises, and what every universal region is known to outlive.
+  let mut declared = List<Bound>.make()
+  index = usize.ZERO
+  while index < input.premises.length {
+    let longer = run universalOf(&mut walker.table, &input.premises[index].longer, owner)
+    let shorter = run universalOf(&mut walker.table, &input.premises[index].shorter, owner)
+    run List<Bound>.append(&mut declared, Bound {longer: longer, shorter: shorter})
+    index = index + usize.ONE
+  }
+  run pushScope(&mut walker, false)
+  walker.exit = run newPoint(&mut walker, usize.MAX)
+  let entry = run newPoint(&mut walker, usize.MAX)
+  walker.entry = entry
+  // Parameters and capture aliases own their storage on entry.
+  let mut bound = List<bool>.make()
+  index = usize.ZERO
+  while index < locals.length {
+    run List<bool>.append(&mut bound, false)
+    index = index + usize.ONE
+  }
+  index = usize.ZERO
+  while index < nodes.length {
+    match &nodes[index].kind {
+      NodeKind.LocalBinding {local, ..} => { List<bool>.set(&mut bound, local.index, true) }
+      NodeKind.MutableBinding {local, ..} => { List<bool>.set(&mut bound, local.index, true) }
+      _ => {}
+    }
+    index = index + usize.ONE
+  }
+  let mut initialized = entry
+  index = usize.ZERO
+  while index < locals.length {
+    if !List<bool>.asSlice(&bound)[index] {
+      run registerRoot(&mut walker, index, false)
+      initialized = run newPoint(&mut walker, initialized)
+      List<usize>.set(&mut walker.initializes, initialized, index)
+    }
+    index = index + usize.ONE
+  }
+  let reached = run visit(&mut walker, input.root, initialized)
+  // A guard may inspect its arm's bindings but not consume them: a later arm still receives the
+  // unchanged payload when the guard is false (MATCH-002).
+  if let Option<Location>.Some {value: consumed} = &walker.guardConsumed {
+    return rejection(RejectionCode.GuardConsumesPattern, consumed, Option<Location>.none())
+  }
+  let released = run releaseScopes(&mut walker, usize.ZERO, nodes[input.root.index].origin.location, reached)
+  let exit = walker.exit
+  run edge(&mut walker, released, exit)
+  run knownRelations(&walker.table, &mut declared)
+  let solved = run solve(&walker, List<Bound>.asSlice(&declared))
+  // A universal region that must outlive another needs a declared bound (SEM0212).
+  let missing = run Values.undeclared(&solved.values, List<Bound>.asSlice(&declared))
+  let mut relation = Option<Location>.none()
+  if List<Bound>.length(&missing) > usize.ZERO {
+    let first = List<Bound>.asSlice(&missing)[usize.ZERO]
+    relation = Option<Location>.some(run relationSite(&walker.table, first.longer, first.shorter))
+  }
+  return run findConflicts(&walker, &solved, relation)
+}
+
+// From here on a lifetime a numbering does not list comes from a type that names the value's
+// lifetimes differently.
+fn closeNumberings(table: &mut RegionTable) -> () {
+  let mut numberings = List<Renumbering>.asMutSlice(&mut table.numberings)
+  let mut index = usize.ZERO
+  while index < numberings.length {
+    numberings[index].closed = true
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+// What universal regions outlive by construction: each member of a meet outlives the meet, and
+// `'static` outlives every universal region.
+effect fn knownRelations(table: &RegionTable, declared: &mut List<Bound>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let universals = List<Universal>.asSlice(&table.universals)
+  let bases = List<usize>.asSlice(&table.bases)
+  let mut staticRegion = Region {index: usize.MAX}
+  let mut at = usize.ZERO
+  while at < universals.length {
+    if Shared<Lifetime>.with<bool>(&universals[at].atom, staticAtom) { staticRegion = universals[at].region }
+    let members = List<usize>.asSlice(&universals[at].members)
+    let mut member = usize.ZERO
+    while member < members.length {
+      let longer = universals[bases[members[member]]].region
+      if longer.index != universals[at].region.index {
+        run List<Bound>.append(&mut declared.*, Bound {longer: longer, shorter: universals[at].region})
+      }
+      member = member + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if staticRegion.index != usize.MAX {
+    at = usize.ZERO
+    while at < universals.length {
+      run List<Bound>.append(&mut declared.*, Bound {longer: staticRegion, shorter: universals[at].region})
+      at = at + usize.ONE
+    }
+  }
+  return ()
+}
+
+// Builds the solver problems from the walk and solves them: liveness of every value with regions,
+// region values seeded by it, and the loans in scope at each point.
+effect fn solve(walker: &Walker, declared: &[Bound]) -> Solved ! OutOfMemoryError ? &mut Allocator {
+  let points = Cfg.points(&walker.cfg)
+  let numberings = List<Renumbering>.asSlice(&walker.table.numberings)
+  let values = walker.input.locals.length + walker.input.nodes.length
+  // Only values whose types name regions take part in liveness, densely numbered.
+  let mut dense = List<usize>.make()
+  let mut members = List<usize>.make()
+  let mut index = usize.ZERO
+  while index < values {
+    if List<Region>.length(&numberings[index].regions) > usize.ZERO {
+      run List<usize>.append(&mut dense, List<usize>.length(&members))
+      run List<usize>.append(&mut members, index)
+    } else {
+      run List<usize>.append(&mut dense, usize.MAX)
+    }
+    index = index + usize.ONE
+  }
+  let denseOf = List<usize>.asSlice(&dense)
+  let tracked = List<usize>.asSlice(&members)
+  let mut liveness = run Liveness.make(points, tracked.length)
+  let reads = List<ValueUse>.asSlice(&walker.reads)
+  index = usize.ZERO
+  while index < reads.length {
+    if reads[index].value < values && denseOf[reads[index].value] != usize.MAX { Liveness.read(&mut liveness, reads[index].point, denseOf[reads[index].value]) }
+    index = index + usize.ONE
+  }
+  let drops = List<ValueUse>.asSlice(&walker.drops)
+  index = usize.ZERO
+  while index < drops.length {
+    if drops[index].value < values && denseOf[drops[index].value] != usize.MAX { Liveness.dropUse(&mut liveness, drops[index].point, denseOf[drops[index].value]) }
+    index = index + usize.ONE
+  }
+  let assigns = List<ValueUse>.asSlice(&walker.assigns)
+  index = usize.ZERO
+  while index < assigns.length {
+    if assigns[index].value < values && denseOf[assigns[index].value] != usize.MAX { Liveness.assign(&mut liveness, assigns[index].point, denseOf[assigns[index].value]) }
+    index = index + usize.ONE
+  }
+  let live = run Liveness.solve(&liveness, &walker.cfg)
+  let flags = List<bool>.asSlice(&walker.table.universalFlags)
+  let mut regions = Regions.make(points)
+  let mut shorter = List<List<usize>>.make()
+  index = usize.ZERO
+  while index < flags.length {
+    if flags[index] { run Regions.universal(&mut regions) } else { run Regions.region(&mut regions) }
+    run List<List<usize>>.append(&mut shorter, List<usize>.make())
+    index = index + usize.ONE
+  }
+  let longer = List<Region>.asSlice(&walker.table.longer)
+  let ends = List<Region>.asSlice(&walker.table.shorter)
+  index = usize.ZERO
+  while index < longer.length {
+    run Regions.outlives(&mut regions, longer[index], ends[index])
+    run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut shorter)[longer[index].index], ends[index].index)
+    index = index + usize.ONE
+  }
+  let inclusions = List<Inclusion>.asSlice(&walker.inclusions)
+  index = usize.ZERO
+  while index < inclusions.length {
+    Regions.include(&mut regions, inclusions[index].region, inclusions[index].point)
+    index = index + usize.ONE
+  }
+  // A region holds every point where a value whose type names it is live.
+  let mut point = usize.ZERO
+  while point < points {
+    let mut member = usize.ZERO
+    while member < tracked.length {
+      if Live.live(&live, point, member) || Live.dropLive(&live, point, member) {
+        let held = List<Region>.asSlice(&numberings[tracked[member]].regions)
+        let mut each = usize.ZERO
+        while each < held.length {
+          Regions.include(&mut regions, held[each], point)
+          each = each + usize.ONE
+        }
+      }
+      member = member + usize.ONE
+    }
+    point = point + usize.ONE
+  }
+  let solvedValues = run Regions.solve(&regions)
+  let mut loans = Loans.make()
+  let facts = List<LoanFact>.asSlice(&walker.loans)
+  index = usize.ZERO
+  while index < facts.length {
+    run Loans.loan(&mut loans, facts[index].point, facts[index].region)
+    index = index + usize.ONE
+  }
+  // Replacing a place, or a prefix of it, leaves no path to what a loan of it borrowed.
+  let events = List<Event>.asSlice(&walker.events)
+  index = usize.ZERO
+  while index < events.length {
+    if events[index].kind == Kind.Write {
+      let mut loan = usize.ZERO
+      while loan < facts.length {
+        if covers(&events[index].place, &facts[loan].place) { run Loans.overwrite(&mut loans, Loan {index: loan}, events[index].point) }
+        loan = loan + usize.ONE
+      }
+    }
+    index = index + usize.ONE
+  }
+  let scope = run Loans.solve(&loans, &walker.cfg, &solvedValues)
+  return Solved {values: move solvedValues, scope: move scope, shorter: move shorter}
+}
+
+// Every check over the solved body, in evaluation order: loop headers, consumed targets, moves,
+// refinements, loan conflicts and storage ends; then the undeclared region relation, if any.
+effect fn findConflicts(walker: &Walker, solved: &Solved, relation: Option<Location>) -> Verdict ! OutOfMemoryError ? &mut Allocator {
+  let locals = walker.input.locals
+  let events = List<Event>.asSlice(&walker.events)
+  let loans = List<LoanFact>.asSlice(&walker.loans)
+  let loops = List<Loop>.asSlice(&walker.loops)
+  let lending = List<usize>.asSlice(&walker.matchLoans)
+  let mut moves = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < events.length {
+    if events[at].kind == Kind.Move || events[at].kind == Kind.Drop { run List<usize>.append(&mut moves, at) }
+    at = at + usize.ONE
+  }
+  let moved = List<usize>.asSlice(&moves)
+  let width = (moved.length + 63) / 64
+  let mut reach = Reach {entering: List<u64>.make(), leaving: List<u64>.make()}
+  if width > usize.ZERO { reach = run reaching(walker, moved, width) }
+  let mut cache = List<Reached>.make()
+  let mut reports = List<Report>.make()
+  let mut checkedLoops = usize.ZERO
+  let mut stopped = false
+  at = usize.ZERO
+  while at <= events.length && !stopped {
+    // A loop header is checked in evaluation order, before the first access after it.
+    while checkedLoops < loops.length && (at == events.length || loops[checkedLoops].header < events[at].point) {
+      let repeats = run refinementRepeats(walker, events, &loops[checkedLoops], &mut cache)
+      if !repeats || (width > usize.ZERO && !compatibleHeader(walker, events, moved, &reach, width, &loops[checkedLoops])) {
+        if List<Report>.length(&reports) == usize.ZERO {
+          return rejection(RejectionCode.IncompatibleLoopHeader, loops[checkedLoops].span, Option<Location>.none())
+        }
+        stopped = true
+        break
+      }
+      checkedLoops = checkedLoops + usize.ONE
+    }
+    if stopped || at == events.length { break }
+    let event = &events[at]
+    if event.consumesTarget {
+      if List<Report>.length(&reports) == usize.ZERO {
+        return rejection(RejectionCode.OverlappingAssignment, event.span, Option<Location>.none())
+      }
+      break
+    }
+    let mut bit = usize.ZERO
+    while event.kind != Kind.End && event.kind != Kind.Expire && bit < moved.length {
+      let source = &events[moved[bit]]
+      if reaches(List<u64>.asSlice(&reach.entering), width, event.point, bit) && overlap(&source.place, &event.place) != usize.ZERO {
+        // A replacement of the whole moved place reinitializes it, a drop of an owner ends the parts
+        // left after a part moved out, and inspecting an owner's tag reads none of its moved parts.
+        let ends = event.kind == Kind.Drop && covers(&event.place, &source.place)
+          && List<Step>.length(&event.place.steps) < List<Step>.length(&source.place.steps)
+        let reinitializes = event.kind == Kind.Write && covers(&event.place, &source.place)
+        let partial = event.kind == Kind.Inspect && !covers(&source.place, &event.place)
+        if !ends && !reinitializes && !partial {
+          if List<Report>.length(&reports) == usize.ZERO {
+            return rejection(RejectionCode.UseAfterMove, event.span, Option<Location>.some(source.span))
+          }
+          stopped = true
+          break
+        }
+      }
+      bit = bit + usize.ONE
+    }
+    if stopped { break }
+    // A `match place` binding names the payload its match selected; once the subject place is
+    // replaced, the binding no longer denotes a place of it.
+    if event.refiner != usize.MAX && event.kind != Kind.End && event.kind != Kind.Expire && List<Report>.length(&reports) == usize.ZERO {
+      let test = refinementTest(walker, event.refiner)
+      let mut source = usize.ZERO
+      while test != usize.MAX && source < events.length {
+        let written = &events[source]
+        if replaces(written.kind) && coversRefined(&written.place, &event.place, event.refinedDepth)
+          && run reachesAvoiding(walker, &mut cache, written.point, event.point, test) {
+          run List<Report>.append(&mut reports, Report {code: RejectionCode.ExtractionBoundary, access: event.span, related: true,
+            earlier: written.span, requestedExclusive: false, existingExclusive: false})
+          break
+        }
+        source = source + usize.ONE
+      }
+    }
+    let mut index = usize.ZERO
+    while index < loans.length {
+      let loan = &loans[index]
+      if LoanScope.contains(&solved.scope, event.point, Loan {index: index}) {
+        if event.kind == Kind.End || event.kind == Kind.Expire {
+          // The end of an owner's storage leaves every loan of it expired; a referent behind a
+          // reference it stores lives on.
+          if covers(&event.place, &loan.place) && !behind(&event.place, &loan.place) {
+            let use = run expiredUse(walker, solved, index, event.point, event.span)
+            run addReport(&mut reports, Report {code: RejectionCode.ExpiredLifetime, access: use, related: true, earlier: loan.span,
+              requestedExclusive: false, existingExclusive: false})
+          }
+        } else if index != event.loan && !listed(List<usize>.asSlice(&event.via), index) {
+          if let Option<RejectionCode>.Some {value: code} = move conflictCode(event.kind, loan.exclusive) {
+            let mut shared = overlap(&loan.place, &event.place)
+            if shared != usize.ZERO && behind(&event.place, &loan.place) {
+              // Replacing a reference leaves the referent it lent alone, and so does consuming a
+              // shared one.
+              if event.kind == Kind.Write || ((event.kind == Kind.Move || event.kind == Kind.Drop) && sharedLocalDescriptor(locals, &event.place)) {
+                shared = usize.ZERO
+              }
+            }
+            if shared != usize.ZERO {
+              run addReport(&mut reports, Report {code: code, access: event.target, related: true, earlier: loan.span,
+                requestedExclusive: event.kind == Kind.ExclusiveBorrow, existingExclusive: loan.exclusive})
+              // A write, move or drop of storage leaves a view its borrow made expired, which the
+              // view's next use reports (OWN0019); a match binding's loan is not such a view.
+              if (event.kind == Kind.Write || event.kind == Kind.Move || event.kind == Kind.Drop) && !listed(lending, index) {
+                let use = run expiredUse(walker, solved, index, event.point, event.span)
+                if use.start != event.span.start || use.end != event.span.end {
+                  run addReport(&mut reports, Report {code: RejectionCode.ExpiredLifetime, access: use, related: true, earlier: loan.span,
+                    requestedExclusive: false, existingExclusive: false})
+                }
+              }
+              break
+            }
+          }
+        }
+      }
+      index = index + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  if List<Report>.length(&reports) > usize.ZERO {
+    let first = List<Report>.asSlice(&reports)[usize.ZERO]
+    let listed = run bySpan(List<Report>.asSlice(&reports))
+    return Verdict {outcome: Outcome.Conflict, code: first.code, access: first.access, earlier: Option<Location>.some(first.earlier),
+      reports: move listed}
+  }
+  if let Option<Location>.Some {value: site} = &relation {
+    return rejection(RejectionCode.UnsatisfiedLifetimeBound, site, Option<Location>.none())
+  }
+  return Verdict {outcome: Outcome.Clear, code: RejectionCode.Unsupported, access: Location.make(usize.ZERO, usize.ZERO),
+    earlier: Option<Location>.none(), reports: List<Report>.make()}
+}
