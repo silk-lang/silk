@@ -48,11 +48,11 @@ mkdir -p "$stage"
 cp -R "$repository/compiler" "$repository/changes" "$stage/"
 
 profiler="$stage/compiler/src/Profiler.silk"
-if [ "$(grep -c '^const enabled: bool = false$' "$profiler")" != 1 ]; then
-  echo "Expected one 'const enabled: bool = false' in compiler/src/Profiler.silk" >&2
+if [ "$(grep -c '^pub const enabled: bool = false$' "$profiler")" != 1 ]; then
+  echo "Expected one 'pub const enabled: bool = false' in compiler/src/Profiler.silk" >&2
   exit 1
 fi
-sed -i.off 's/^const enabled: bool = false$/const enabled: bool = true/' "$profiler"
+sed -i.off 's/^pub const enabled: bool = false$/pub const enabled: bool = true/' "$profiler"
 rm "$profiler.off"
 
 mkdir "$stage/compiler/tracy"
