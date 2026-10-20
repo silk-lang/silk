@@ -84,5 +84,22 @@ pub fn matches(
 Applies exact logical-file matching and literal ASCII case-insensitive name matching.
 Empty file or name filters match every test.
 
+<a id="Testing.impl.matchesQualified"></a>
+
+### Associated function `matchesQualified`
+
+```silk
+pub fn matchesQualified(
+    path: string,
+    module: string,
+    name: string,
+    fileFilter: string,
+    nameFilter: string,
+  ) -> bool
+```
+
+Applies [`matches`](#Testing.impl.matches), except that the name filter matches anywhere in the test's qualified
+name `module::name`, as the builtin runner reports it.
+
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
