@@ -189,6 +189,17 @@ import semantic.ModuleIndex {
 }
 import semantic.Operator
 import semantic.BorrowCheck {Outcome as LoanOutcome, Report as LoanReport, check as checkLoans, livenessCodes, regionClosed, storageNodes, LoanCleanup, RegionBound}
+import semantic.RegionCheck {
+  CallContract,
+  ConstructionShape,
+  ContentsBound,
+  DeclaredVariance,
+  Input as RegionInput,
+  RegionBound as RegionPremise,
+  contractCall as storageContractCall,
+  projectedBase,
+  universalLifetime,
+}
 import semantic.ReturnFlow
 import semantic.OpaqueRealization
 import semantic.CallableOrigin
@@ -64347,6 +64358,629 @@ effect fn borrowCleanup(
     at = at + usize.ONE
   }
   return Result<List<LoanCleanup>, Shared<Rejection>>.succeed(move observed)
+}
+
+// What the region check reads of one typed body besides the body itself (`RegionCheck.Input`),
+// owned here so that `regionInput` can lend it together with the body.
+struct RegionFacts {
+  parameters: usize
+  result: Shared<Type>
+  failure: Shared<Type>
+  premises: List<RegionPremise>
+  contracts: List<CallContract>
+  constructions: List<ConstructionShape>
+  variances: List<DeclaredVariance>
+  observes: List<bool>
+}
+
+fn regionInput<'a>(facts: &'a RegionFacts, identity: &'a DeclarationId, locals: &'a [BodyLocal], nodes: &'a [BodyNode],
+  root: BodyNodeId) -> RegionInput<'a> {
+  return RegionInput {owner: identity, locals: locals, parameters: facts.parameters, nodes: nodes, root: root,
+    result: &facts.result, failure: &facts.failure, premises: List<RegionPremise>.asSlice(&facts.premises),
+    contracts: List<CallContract>.asSlice(&facts.contracts), constructions: List<ConstructionShape>.asSlice(&facts.constructions),
+    variances: List<DeclaredVariance>.asSlice(&facts.variances), observes: List<bool>.asSlice(&facts.observes)}
+}
+
+// Builds the facts the region check reads about a typed body. The first `parameters` locals are typed
+// by the body's signature: an anonymous body's captured outer locals, then its own parameters.
+// `signatures` are those whose implied bounds the body assumes: its own, and an anonymous body's
+// enclosing root body's. `constraints` are the bounds it declares or inherits.
+effect fn regionFacts(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  identity: &DeclarationId, signatures: &[Shared<Result<Answer, NoRejection>>], result: &Shared<Type>, failure: &Shared<Type>,
+  parameters: usize, locals: &[BodyLocal], nodes: &[BodyNode], root: BodyNodeId, constraints: &[Constraint], anchor: &Anchor,
+) -> Result<RegionFacts, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let span = BodyOrigin.span(nodes[root.index].origin, anchor)
+  let premises = run regionPremises(&mut resolver.*, &mut owner.*, &mut dependencies.*, identity, signatures, constraints, span)
+  let contracts = run callContracts(&mut resolver.*, &mut owner.*, &mut dependencies.*, nodes, constraints, anchor)
+  let constructions = run constructionShapes(&mut resolver.*, &mut owner.*, &mut dependencies.*, nodes, anchor)
+  let observes = match move run regionObservers(&mut resolver.*, &mut owner.*, &mut dependencies.*, identity, locals, nodes,
+    constraints, anchor) {
+    Result<List<bool>, Shared<Rejection>>.Success {value} => move value
+    Result<List<bool>, Shared<Rejection>>.Failure {error} => { return Result<RegionFacts, Shared<Rejection>>.failResult(move error) }
+  }
+  // No declaration's variance is known yet, so the check relates every nominal binder invariantly
+  // (`RegionCheck.declaredVariance`). That adds relations and never drops one.
+  return Result<RegionFacts, Shared<Rejection>>.succeed(RegionFacts {parameters: parameters, result: Shared<Type>.clone(result),
+    failure: Shared<Type>.clone(failure), premises: move premises, contracts: move contracts, constructions: move constructions,
+    variances: List<DeclaredVariance>.make(), observes: move observes})
+}
+
+// The bounds the body assumes between two of its universal lifetimes: its declared bounds and those
+// its signatures imply, with each contents bound reduced to the regions its subject names.
+effect fn regionPremises(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  identity: &DeclarationId, signatures: &[Shared<Result<Answer, NoRejection>>], constraints: &[Constraint], span: Span)
+  -> List<RegionPremise>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut assumed = run copyConstraints(constraints)
+  let mut at = usize.ZERO
+  while at < signatures.length {
+    let implied = run signatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, &signatures[at], false, span)
+    run appendConstraints(&mut assumed, List<Constraint>.asSlice(&implied))
+    at = at + usize.ONE
+  }
+  let edges = run contentsOutlives(List<Constraint>.asSlice(&assumed), identity)
+  let listed = List<Constraint>.asSlice(&edges)
+  let mut premises = List<RegionPremise>.make()
+  at = usize.ZERO
+  while at < listed.length {
+    if let Constraint.Outlives {longer, shorter} = &listed[at] {
+      if universalLifetime(&longer, identity) && universalLifetime(&shorter, identity) {
+        run List<RegionPremise>.append(&mut premises, RegionPremise {longer: Shared<Lifetime>.clone(&longer),
+          shorter: Shared<Lifetime>.clone(&shorter)})
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move premises
+}
+
+// One contract per call the region check instantiates: a direct or interface call, a callable
+// invocation, and a storage primitive checked as a call to its catalog contract, each keyed by its
+// own node or by the immediate `run` that executes it (EFF-003). A call that constructs an Effect no
+// immediate run executes has none: the Effect stores its operands (EFF-001).
+effect fn callContracts(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  nodes: &[BodyNode], constraints: &[Constraint], anchor: &Anchor) -> List<CallContract>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let runners = run immediateRunners(nodes)
+  let ran = List<usize>.asSlice(&runners)
+  let mut implied = List<ImpliedEntry>.make()
+  let mut contracts = List<CallContract>.make()
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    let running = ran[at] != usize.MAX
+    let mut call = BodyNodeId {index: at}
+    if running { call = BodyNodeId {index: ran[at]} }
+    let span = BodyOrigin.span(nodes[at].origin, anchor)
+    let mut contract = Option<CallContract>.none()
+    if let BodyNodeKind.Expression {form, ..} = &nodes[at].kind {
+      if let BodyExpression.DirectCall {application, constructs, arguments, ..} = &form {
+        if running || !constructs {
+          let selected = run Application.copyShared(&application)
+          let supplied = run Application.bindings(&selected)
+          let callee = Application.bodyDeclaration(&selected)
+          if let Option<Key>.Some {value: key} = move run signatureKey(&mut resolver.*, callee) {
+            contract = run signatureContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, call, key, callee,
+              List<Binding>.asSlice(&supplied), List<BodyNodeId>.length(&arguments), running && !constructs, &mut implied, span)
+          }
+        }
+      }
+      if let BodyExpression.InterfaceCall {contract: selected, provider, operation, bindings, isEffect, arguments, ..} = &form {
+        if running || !isEffect {
+          if let Option<Key>.Some {value: key} = move run operationKey(&mut resolver.*, &selected, &provider, &operation) {
+            let supplied = run sharedBindings(&bindings)
+            contract = run signatureContract(&mut resolver.*, &mut owner.*, &mut dependencies.*, call, key, &operation,
+              List<Binding>.asSlice(&supplied), List<BodyNodeId>.length(&arguments), running && !isEffect, &mut implied, span)
+          }
+        }
+      }
+      if let BodyExpression.CallableCall {callee, arguments, inference, bindings, constructs, ..} = &form {
+        if running || !constructs {
+          if let Option<Shared<Type>>.Some {value: calleeType} = move bodyExpressionType(nodes, &callee) {
+            contract = run invocationContract(&calleeType, &inference, &bindings, call, List<BodyNodeId>.length(&arguments),
+              running, constraints)
+          }
+        }
+      }
+      if let BodyExpression.StorageCall {operation, arguments, ..} = &form {
+        if storageContractCall(operation) {
+          contract = run storageContract(nodes, call, List<BodyNodeId>.asSlice(&arguments))
+        }
+      }
+    }
+    if let Option<CallContract>.Some {value} = move contract { run List<CallContract>.append(&mut contracts, move value) }
+    at = at + usize.ONE
+  }
+  return move contracts
+}
+
+// For each node, the immediate `run` whose operand it is, or `usize.MAX`.
+effect fn immediateRunners(nodes: &[BodyNode]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut runners = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    run List<usize>.append(&mut runners, usize.MAX)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < nodes.length {
+    if let BodyNodeKind.Expression {form: BodyExpression.Run {value, access}, ..} = &nodes[at].kind {
+      if access == RunAccess.Immediate { List<usize>.set(&mut runners, value.index, at) }
+    }
+    at = at + usize.ONE
+  }
+  return move runners
+}
+
+// The Signature key of `target`, or none when this revision does not index it.
+effect fn signatureKey(resolver: &mut Resolver, target: &DeclarationId) -> Option<Key> ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let moduleAt = knownModuleOrdinal(&resolver.*, DeclarationId.moduleId(target))
+  if moduleAt == usize.MAX { return Option<Key>.none() }
+  let module = resolvedModule(&resolver.*, moduleAt)
+  let identity = run Shared<DeclarationId>.make(DeclarationId.copy(target))
+  let position = match move run ordinalOfIdentity(&mut resolver.*, &module, &identity) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option<Key>.none() }
+  }
+  return Option<Key>.some(run internDeclaration(&mut resolver.*, Key {family: Family.Signature, module: moduleAt, name: usize.ZERO,
+    declaration: position, member: usize.ZERO, external: false}))
+}
+
+// The AppliedOperation key of `operation` selected for `provider` under `contract`, as
+// `selectOperationCall` demands it, or none when this revision does not index it.
+effect fn operationKey(resolver: &mut Resolver, contract: &Shared<Type>, provider: &Shared<Type>, operation: &DeclarationId) -> Option<Key>
+! Cycle | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let moduleAt = declaringModuleOrdinal(&resolver.*, contract)
+  if moduleAt == usize.MAX { return Option<Key>.none() }
+  let module = resolvedModule(&resolver.*, moduleAt)
+  let identity = run Shared<DeclarationId>.make(DeclarationId.copy(operation))
+  let position = match move run ordinalOfIdentity(&mut resolver.*, &module, &identity) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option<Key>.none() }
+  }
+  let contractKey = run internApplication(&mut resolver.*, contract)
+  let providerKey = run internApplication(&mut resolver.*, provider)
+  return Option<Key>.some(run internDeclaration(&mut resolver.*, Key {family: Family.AppliedOperation, module: moduleAt,
+    name: contractKey, declaration: position, member: providerKey, external: false}))
+}
+
+// The contract of calling the signature at `key` with `arguments` operands: its parameter and result
+// types and its declared and implied bounds, under every binding of the call except the callee's
+// own lifetime binders, which the check numbers afresh for each call. `ranValue` is a run of the
+// Effect value a plain function returns, whose result is that Effect's success. None when the arity
+// differs from the call's or a ran result is no Effect.
+effect fn signatureContract(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  call: BodyNodeId, key: Key, callee: &DeclarationId, supplied: &[Binding], arguments: usize, ranValue: bool,
+  implied: &mut List<ImpliedEntry>, span: Span) -> Option<CallContract>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let signature = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span)
+  if let Option<Shared<Rejection>>.Some {..} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&signature, answerCause) {
+    return Option<CallContract>.none()
+  }
+  let declared = run signatureParameterTypes(&signature)
+  let written = List<Shared<Type>>.asSlice(&declared)
+  if written.length != arguments { return Option<CallContract>.none() }
+  let declaredResult = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&signature, signatureResult) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return Option<CallContract>.none() }
+  }
+  let binding = run contractBindings(supplied, callee)
+  let applied = List<Binding>.asSlice(&binding)
+  let mut result = run Type.applyBindings(&declaredResult, applied, true)
+  if ranValue {
+    result = match move effectSuccess(&result) {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => { return Option<CallContract>.none() }
+    }
+  }
+  let mut parameters = List<Shared<Type>>.make()
+  let mut at = usize.ZERO
+  while at < written.length {
+    run List<Shared<Type>>.append(&mut parameters, run Type.applyBindings(&written[at], applied, true))
+    at = at + usize.ONE
+  }
+  let mut bounds = List<RegionPremise>.make()
+  let mut contents = List<ContentsBound>.make()
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureConstraintCount)
+  at = usize.ZERO
+  while at < count {
+    let bound = Shared<Result<Answer, NoRejection>>.with<Option<Constraint>>(&signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Constraint> { return signatureConstraintAt(answer, at) })
+    if let Option<Constraint>.Some {value} = move bound {
+      run appendRegionBound(&run bindConstraint(&value, applied), &mut bounds, &mut contents)
+    }
+    at = at + usize.ONE
+  }
+  let assumed = run calleeImplied(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, &signature, &mut implied.*, span)
+  let listed = List<Constraint>.asSlice(&assumed)
+  at = usize.ZERO
+  while at < listed.length {
+    run appendRegionBound(&run bindConstraint(&listed[at], applied), &mut bounds, &mut contents)
+    at = at + usize.ONE
+  }
+  return Option<CallContract>.some(CallContract {call: call, parameters: move parameters, result: move result, bounds: move bounds,
+    contents: move contents})
+}
+
+// The bounds one callee's parameter and result types imply, in its own terms, computed once per
+// callee of a body.
+struct ImpliedEntry {
+  key: Key
+  bounds: List<Constraint>
+}
+
+effect fn calleeImplied(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  key: Key, signature: &Shared<Result<Answer, NoRejection>>, cache: &mut List<ImpliedEntry>, span: Span) -> List<Constraint>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let entries = List<ImpliedEntry>.asSlice(&cache.*)
+  let mut at = usize.ZERO
+  while at < entries.length {
+    if sameKey(entries[at].key, key) { return run copyConstraints(List<Constraint>.asSlice(&entries[at].bounds)) }
+    at = at + usize.ONE
+  }
+  // Only the call's own premises are wanted here, so nothing is owed to the active body frame.
+  let implied = run signatureImpliedBounds(&mut resolver.*, &mut owner.*, &mut dependencies.*, signature, false, span)
+  run List<ImpliedEntry>.append(&mut cache.*, ImpliedEntry {key: key, bounds: run copyConstraints(List<Constraint>.asSlice(&implied))})
+  return move implied
+}
+
+// The contract of invoking a callable value of type `callee` (CALLABLE-002): its use contract's
+// parameters and result with the invocation binders opened for `inference` and left as written,
+// the bounds written on them, and its `for<use 'call>` contents (LIFE-004), under the invocation's
+// other bindings. A run of the invocation results in its Effect's success.
+effect fn invocationContract(callee: &Shared<Type>, inference: &Shared<DeclarationId>, bindings: &Shared<List<Binding>>,
+  call: BodyNodeId, arguments: usize, ran: bool, constraints: &[Constraint]) -> Option<CallContract>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let selected = match move run valueCallableContract(callee, constraints) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return Option<CallContract>.none() }
+  }
+  let copied = run Type.copy(&selected)
+  if let Type.Callable {invocationUse, invocationBounds, parameters, result, ..} = move copied {
+    let declared = List<Shared<Type>>.asSlice(&parameters)
+    if declared.length != arguments { return Option<CallContract>.none() }
+    let fresh = DeclarationId.copyShared(inference)
+    let supplied = run sharedBindings(bindings)
+    let binding = run contractBindings(List<Binding>.asSlice(&supplied), &fresh)
+    let applied = List<Binding>.asSlice(&binding)
+    let mut opened = List<Shared<Type>>.make()
+    let mut at = usize.ZERO
+    while at < declared.length {
+      run List<Shared<Type>>.append(&mut opened, run Type.openInvocation(&declared[at], &fresh))
+      at = at + usize.ONE
+    }
+    let mut used = List<Constraint>.make()
+    run invocationUseConstraints(List<Shared<Type>>.asSlice(&opened), invocationUse, &Option<DeclarationId>.some(DeclarationId.copy(&fresh)),
+      &mut used)
+    let inputs = List<Shared<Type>>.asSlice(&opened)
+    let mut instantiated = List<Shared<Type>>.make()
+    at = usize.ZERO
+    while at < inputs.length {
+      run List<Shared<Type>>.append(&mut instantiated, run Type.applyBindings(&inputs[at], applied, true))
+      at = at + usize.ONE
+    }
+    let mut returned = run Type.applyBindings(&run Type.openInvocation(&result, &fresh), applied, true)
+    if ran {
+      returned = match move effectSuccess(&returned) {
+        Option<Shared<Type>>.Some {value} => move value
+        Option<Shared<Type>>.None => { return Option<CallContract>.none() }
+      }
+    }
+    let mut bounds = List<RegionPremise>.make()
+    let written = List<Outlives>.asSlice(&invocationBounds)
+    at = usize.ZERO
+    while at < written.length {
+      run List<RegionPremise>.append(&mut bounds, RegionPremise {
+        longer: run Type.applyLifetimeBindings(&run Type.openInvocationLifetime(&written[at].longer, &fresh), applied),
+        shorter: run Type.applyLifetimeBindings(&run Type.openInvocationLifetime(&written[at].shorter, &fresh), applied)})
+      at = at + usize.ONE
+    }
+    let mut contents = List<ContentsBound>.make()
+    let listed = List<Constraint>.asSlice(&used)
+    at = usize.ZERO
+    while at < listed.length {
+      run appendRegionBound(&run bindConstraint(&listed[at], applied), &mut bounds, &mut contents)
+      at = at + usize.ONE
+    }
+    return Option<CallContract>.some(CallContract {call: call, parameters: move instantiated, result: move returned,
+      bounds: move bounds, contents: move contents})
+  }
+  return Option<CallContract>.none()
+}
+
+// A storage primitive's catalog contract as typing instantiated it. Typing states each result in the
+// regions of the operands it views or reaches, so the operands' types are the parameters and the
+// call's own type is the result.
+effect fn storageContract(nodes: &[BodyNode], call: BodyNodeId, arguments: &[BodyNodeId]) -> Option<CallContract>
+! OutOfMemoryError ? &mut Allocator {
+  let mut parameters = List<Shared<Type>>.make()
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    match move bodyExpressionType(nodes, &arguments[at]) {
+      Option<Shared<Type>>.Some {value} => { run List<Shared<Type>>.append(&mut parameters, move value) }
+      Option<Shared<Type>>.None => { return Option<CallContract>.none() }
+    }
+    at = at + usize.ONE
+  }
+  let result = match move bodyExpressionType(nodes, &call) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return Option<CallContract>.none() }
+  }
+  return Option<CallContract>.some(CallContract {call: call, parameters: move parameters, result: move result,
+    bounds: List<RegionPremise>.make(), contents: List<ContentsBound>.make()})
+}
+
+// Every binding of a call except the lifetime binders `callee` owns.
+effect fn contractBindings(supplied: &[Binding], callee: &DeclarationId) -> List<Binding> ! OutOfMemoryError ? &mut Allocator {
+  let mut kept = List<Binding>.make()
+  let mut at = usize.ZERO
+  while at < supplied.length {
+    let own = match &supplied[at].value {
+      Argument.Lifetime {..} => declarationEqualsShared(callee, &supplied[at].declaration)
+      _ => false
+    }
+    if !own {
+      run List<Binding>.append(&mut kept, Binding {declaration: Shared<DeclarationId>.clone(&supplied[at].declaration),
+        ordinal: supplied[at].ordinal, value: Argument.copy(&supplied[at].value)})
+    }
+    at = at + usize.ONE
+  }
+  return move kept
+}
+
+effect fn sharedBindings(value: &Shared<List<Binding>>) -> List<Binding> ! OutOfMemoryError ? &mut Allocator {
+  let count = Shared<List<Binding>>.with<usize>(value, fn(listed: &List<Binding>) -> usize { return List<Binding>.length(listed) })
+  let mut copied = List<Binding>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    let binding = Shared<List<Binding>>.with<Binding>(value, fn(listed: &List<Binding>) -> Binding {
+      let current = List<Binding>.asSlice(listed)
+      return Binding {declaration: Shared<DeclarationId>.clone(&current[at].declaration), ordinal: current[at].ordinal,
+        value: Argument.copy(&current[at].value)}
+    })
+    run List<Binding>.append(&mut copied, move binding)
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+// Files an outlives bound as a region bound and a contents bound as itself; the check reads no
+// other kind of bound.
+effect fn appendRegionBound(bound: &Constraint, bounds: &mut List<RegionPremise>, contents: &mut List<ContentsBound>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  if let Constraint.Outlives {longer, shorter} = &bound.* {
+    run List<RegionPremise>.append(&mut bounds.*, RegionPremise {longer: Shared<Lifetime>.clone(&longer),
+      shorter: Shared<Lifetime>.clone(&shorter)})
+  }
+  if let Constraint.Contents {subject, region} = &bound.* {
+    run List<ContentsBound>.append(&mut contents.*, ContentsBound {subject: Shared<Type>.clone(&subject),
+      region: Shared<Lifetime>.clone(&region)})
+  }
+  return ()
+}
+
+fn effectSuccess(value: &Shared<Type>) -> Option<Shared<Type>> {
+  return Shared<Type>.with<Option<Shared<Type>>>(value, fn(ty: &Type) -> Option<Shared<Type>> {
+    return match &ty.* {
+      Type.Effect {success, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&success))
+      _ => Option<Shared<Type>>.none()
+    }
+  })
+}
+
+// One shape per construction whose operands are stored at declared field types, in the lifetimes of
+// the constructed node's own type: a callable's or named section's captures (CALLABLE-001), a staged
+// callable's callee and stored operands, and a nominal record's or variant's fields.
+effect fn constructionShapes(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  nodes: &[BodyNode], anchor: &Anchor) -> List<ConstructionShape>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut shapes = List<ConstructionShape>.make()
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    let mut fields = Option<List<Shared<Type>>>.none()
+    if let BodyNodeKind.Expression {ty, form} = &nodes[at].kind {
+      let span = BodyOrigin.span(nodes[at].origin, anchor)
+      if let BodyExpression.Callable {fields: written, ..} = &form {
+        fields = run capturedFields(&ty, List<BodyAggregateField>.asSlice(&written))
+      }
+      if let BodyExpression.Aggregate {fields: written, ..} = &form {
+        fields = run capturedFields(&ty, List<BodyAggregateField>.asSlice(&written))
+        if let Option<List<Shared<Type>>>.None = &fields {
+          fields = run memberFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, &ty, usize.MAX,
+            List<BodyAggregateField>.asSlice(&written), span)
+        }
+      }
+      if let BodyExpression.VariantConstruct {tag, fields: written} = &form {
+        fields = run memberFields(&mut resolver.*, &mut owner.*, &mut dependencies.*, &ty, tag,
+          List<BodyAggregateField>.asSlice(&written), span)
+      }
+      if let BodyExpression.StagedCallable {arguments, ..} = &form {
+        fields = run stagedFields(&ty, List<BodyNodeId>.length(&arguments))
+      }
+    }
+    if let Option<List<Shared<Type>>>.Some {value} = move fields {
+      run List<ConstructionShape>.append(&mut shapes, ConstructionShape {node: BodyNodeId {index: at}, fields: move value})
+    }
+    at = at + usize.ONE
+  }
+  return move shapes
+}
+
+// A callable environment's capture types in operand order: each operand's field names its capture.
+effect fn capturedFields(value: &Shared<Type>, written: &[BodyAggregateField]) -> Option<List<Shared<Type>>>
+! OutOfMemoryError ? &mut Allocator {
+  let copied = run Type.copy(value)
+  let captures = match move copied {
+    Type.CallableValue {captures, ..} => move captures
+    Type.CallableSchema {captures, ..} => move captures
+    _ => { return Option<List<Shared<Type>>>.none() }
+  }
+  let listed = List<Shared<Type>>.asSlice(&captures)
+  let mut fields = List<Shared<Type>>.make()
+  let mut at = usize.ZERO
+  while at < written.length {
+    if written[at].index >= listed.length { return Option<List<Shared<Type>>>.none() }
+    run List<Shared<Type>>.append(&mut fields, Shared<Type>.clone(&listed[written[at].index]))
+    at = at + usize.ONE
+  }
+  return Option<List<Shared<Type>>>.some(move fields)
+}
+
+// A staged callable stores its callee as its base and each supplied operand as the next capture.
+// A flattened environment no longer separates the callee from its captures, so it has no shape.
+effect fn stagedFields(value: &Shared<Type>, supplied: usize) -> Option<List<Shared<Type>>> ! OutOfMemoryError ? &mut Allocator {
+  let copied = run Type.copy(value)
+  if let Type.CallableStage {base, captures, ..} = move copied {
+    let listed = List<Shared<Type>>.asSlice(&captures)
+    if listed.length != supplied { return Option<List<Shared<Type>>>.none() }
+    let mut fields = List<Shared<Type>>.make()
+    run List<Shared<Type>>.append(&mut fields, move base)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      run List<Shared<Type>>.append(&mut fields, Shared<Type>.clone(&listed[at]))
+      at = at + usize.ONE
+    }
+    return Option<List<Shared<Type>>>.some(move fields)
+  }
+  return Option<List<Shared<Type>>>.none()
+}
+
+// The declared type of each written field of a nominal record (`tag` is `usize.MAX`) or of variant
+// `tag`, instantiated for the constructed type itself, as its MemberShape answers state them.
+effect fn memberFields(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  value: &Shared<Type>, tag: usize, written: &[BodyAggregateField], span: Span) -> Option<List<Shared<Type>>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let moduleAt = declaringModuleOrdinal(&resolver.*, value)
+  if moduleAt == usize.MAX { return Option<List<Shared<Type>>>.none() }
+  let module = resolvedModule(&resolver.*, moduleAt)
+  let declaration = match move run ordinalOfProvider(&mut resolver.*, &module, value) {
+    Option<usize>.Some {value: position} => position
+    Option<usize>.None => { return Option<List<Shared<Type>>>.none() }
+  }
+  let application = run internApplication(&mut resolver.*, value)
+  let mut variant = Option<Shared<Result<Answer, NoRejection>>>.none()
+  if tag != usize.MAX {
+    let key = run internDeclaration(&mut resolver.*, Key {family: Family.MemberShape, module: moduleAt, name: application,
+      declaration: declaration, member: tag, external: false})
+    variant = Option<Shared<Result<Answer, NoRejection>>>.some(run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span))
+  }
+  let mut fields = List<Shared<Type>>.make()
+  let mut at = usize.ZERO
+  while at < written.length {
+    let part = written[at].index
+    let mut field = Option<Shared<Type>>.none()
+    if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: shaped} = &variant {
+      field = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&shaped,
+        fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return shapeTypeAt(answer, part) })
+    } else {
+      let key = run internDeclaration(&mut resolver.*, Key {family: Family.MemberShape, module: moduleAt, name: application,
+        declaration: declaration, member: part, external: false})
+      let shaped = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, key, span)
+      field = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&shaped, singleMemberType)
+    }
+    match move field {
+      Option<Shared<Type>>.Some {value: declared} => { run List<Shared<Type>>.append(&mut fields, move declared) }
+      Option<Shared<Type>>.None => { return Option<List<Shared<Type>>>.none() }
+    }
+    at = at + usize.ONE
+  }
+  return Option<List<Shared<Type>>>.some(move fields)
+}
+
+// Per storage root, each local and then each node's value, whether its cleanup can observe the
+// regions its type names: a cleanup `cleanupLoanRegions` cannot describe, or one that reaches a
+// region. Of the nodes, only those the check can own (`ownedValues`) are asked; it reads no other.
+effect fn regionObservers(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  identity: &DeclarationId, locals: &[BodyLocal], nodes: &[BodyNode], constraints: &[Constraint], anchor: &Anchor)
+  -> Result<List<bool>, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let owning = run ownedValues(nodes)
+  let owned = List<bool>.asSlice(&owning)
+  let mut known = List<Shared<Type>>.make()
+  let mut verdicts = List<bool>.make()
+  let mut observes = List<bool>.make()
+  let mut at = usize.ZERO
+  while at < locals.length + nodes.length {
+    let mut selected = Option<Shared<Type>>.none()
+    let mut span = Span.make(usize.ZERO, usize.ZERO)
+    if at < locals.length {
+      selected = Option<Shared<Type>>.some(Shared<Type>.clone(&locals[at].ty))
+      span = BodyOrigin.span(locals[at].origin, anchor)
+    } else if owned[at - locals.length] {
+      if let BodyNodeKind.Expression {ty, ..} = &nodes[at - locals.length].kind {
+        selected = Option<Shared<Type>>.some(Shared<Type>.clone(&ty))
+        span = BodyOrigin.span(nodes[at - locals.length].origin, anchor)
+      }
+    }
+    let mut observed = false
+    if let Option<Shared<Type>>.Some {value: ty} = move selected {
+      let listed = List<Shared<Type>>.asSlice(&known)
+      let mut scan = usize.ZERO
+      while scan < listed.length && !run Type.equalsShared(&listed[scan], &ty) {
+        scan = scan + usize.ONE
+      }
+      if scan < listed.length {
+        observed = List<bool>.asSlice(&verdicts)[scan]
+      } else {
+        let mut regions = List<Shared<Lifetime>>.make()
+        let answer = run cleanupLoanRegions(&mut resolver.*, &mut owner.*, &mut dependencies.*, identity, &ty, constraints, span,
+          &mut regions)
+        observed = match move answer {
+          Result<bool, Shared<Rejection>>.Success {value} => !value || List<Shared<Lifetime>>.length(&regions) != usize.ZERO
+          Result<bool, Shared<Rejection>>.Failure {error} => { return Result<List<bool>, Shared<Rejection>>.failResult(move error) }
+        }
+        run List<Shared<Type>>.append(&mut known, move ty)
+        run List<bool>.append(&mut verdicts, observed)
+      }
+    }
+    run List<bool>.append(&mut observes, observed)
+    at = at + usize.ONE
+  }
+  return Result<List<bool>, Shared<Rejection>>.succeed(move observes)
+}
+
+// The nodes whose value the check may own: the base of a projection, borrow or written place with no
+// place of its own, which its hidden owner holds until its scope ends (BORROW-006), a match subject,
+// and a dropped value. A base that is a local's place is that local's storage instead.
+effect fn ownedValues(nodes: &[BodyNode]) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut owned = List<bool>.make()
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    run List<bool>.append(&mut owned, false)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < nodes.length {
+    let id = BodyNodeId {index: at}
+    let mut base = usize.MAX
+    let mut value = usize.MAX
+    if let BodyNodeKind.Expression {form, ..} = &nodes[at].kind {
+      base = match &form {
+        BodyExpression.Field {..} => projectedBase(nodes, id).index
+        BodyExpression.Index {..} => projectedBase(nodes, id).index
+        BodyExpression.Dereference {..} => projectedBase(nodes, id).index
+        BodyExpression.PatternBinding {..} => at
+        BodyExpression.Borrow {value: borrowed, ..} => projectedBase(nodes, borrowed).index
+        BodyExpression.Match {subject, ..} => projectedBase(nodes, subject).index
+        _ => usize.MAX
+      }
+      if let BodyExpression.Match {subject, ..} = &form { value = subject.index }
+    }
+    if let BodyNodeKind.PlaceAssignment {target, ..} = &nodes[at].kind { base = projectedBase(nodes, target).index }
+    if let BodyNodeKind.Drop {value: dropped, ..} = &nodes[at].kind { value = dropped.index }
+    if base != usize.MAX && !localPlace(nodes, base) { List<bool>.set(&mut owned, base, true) }
+    if value != usize.MAX { List<bool>.set(&mut owned, value, true) }
+    at = at + usize.ONE
+  }
+  return move owned
+}
+
+fn localPlace(nodes: &[BodyNode], at: usize) -> bool {
+  return match &nodes[at].kind {
+    BodyNodeKind.Expression {form: BodyExpression.Local {..}, ..} => true
+    _ => false
+  }
 }
 
 effect fn cleanupNeeds(
