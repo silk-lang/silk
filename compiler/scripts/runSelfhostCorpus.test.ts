@@ -192,7 +192,7 @@ void it('records the per-reason borrow-check gap of a successful build', async (
   assert.strictEqual(parseBorrowGap('SILK_GAP test-result-cache: off'), undefined)
   assert.throws(() => parseBorrowGap('SILK_GAP borrow-check: many'))
   await withStub(
-    `echo 'SILK_GAP borrow-check: 1 bodies not borrow-checked (captures 1; native borrow checking is roadmap step 14)' >&2
+    `test "$SILK_RECEIPTS" = 1 && echo 'SILK_GAP borrow-check: 1 bodies not borrow-checked (captures 1; native borrow checking is roadmap step 14)' >&2
 ${compiled}`,
     async (silkc) => {
       assert.deepStrictEqual(await runCase(silkc, literal), {

@@ -86,6 +86,19 @@ const program = Effect.gen(function* () {
   assert.equal(helped.status, 0, helped.stderr)
   assert.match(helped.stdout, /usage: silk build/)
   assert.match(helped.stdout, /silk changes/)
+  assert.match(helped.stdout, /silk doc-reference \[--stdlib-root <directory>\] --output/)
+  // `silk <command> --help` prints that command's lines of the usage.
+  const commandHelp = yield* invoke(silk, ['format', '--help'], directory)
+  assert.equal(commandHelp.status, 0, commandHelp.stderr)
+  assert.equal(commandHelp.stdout, 'usage: silk format [paths] [--check] [--manifest-path <path>]\n')
+  // A command line that does not parse is a usage error, status 2, like format's and doc's.
+  const unparsed = yield* invoke(silk, ['check', '--bogus'], directory)
+  assert.equal(unparsed.status, 2, unparsed.stderr)
+  assert.match(unparsed.stderr, /usage: silk build/)
+  // A lone word that names no file is a mistyped command, not a source to dump.
+  const unknown = yield* invoke(silk, ['frobnicate'], directory)
+  assert.equal(unknown.status, 2, unknown.stderr)
+  assert.match(unknown.stderr, /^silk: unknown command `frobnicate`\n/)
   // Exercise the linked changes library through the actual native entry point. No compiler,
   // standalone changes executable, Git, or other tool is available on this subprocess PATH.
   const releaseWorkspace = join(directory, 'release-workspace')
@@ -122,6 +135,7 @@ const program = Effect.gen(function* () {
   )
   assert.equal(missingDirectory.status, 1)
   assert.match(missingDirectory.stderr, /silk changes: --dir requires/)
+  assert.doesNotMatch(missingDirectory.stderr, /\.lock/, 'an argument error writes nothing to recover')
   for (const args of [
     ['add', 'patch', 'Must not create a workspace release'],
     ['status'],
@@ -307,6 +321,15 @@ const program = Effect.gen(function* () {
     SILK_CLANG: linker,
   })
   assert.equal(linked.status, 0, linked.stderr)
+  // Borrow-check receipts are for the harnesses that set SILK_RECEIPTS, not a successful build.
+  assert.doesNotMatch(linked.stderr, /SILK_GAP/)
+  const receipted = yield* invoke(silk, argumentsFor('receipted'), directory, {
+    ...process.env,
+    SILK_CLANG: clang,
+    SILK_RECEIPTS: '1',
+  })
+  assert.equal(receipted.status, 0, receipted.stderr)
+  assert.match(receipted.stderr, /^SILK_GAP borrow-check: \d+ bodies not borrow-checked/m)
   assert.deepEqual(
     yield* fs.readFile(captured),
     bytes,
@@ -371,6 +394,25 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(unnamed.status, 2, 'a --clang name missing from PATH is an operational failure')
+  // A SILK_CLANG that cannot start is named with where it came from.
+  const unstarted = yield* invoke(silk, argumentsFor('unstarted'), directory, {
+    ...process.env,
+    SILK_CLANG: join(directory, 'no-such-clang'),
+  })
+  assert.equal(unstarted.status, 2, unstarted.stderr)
+  assert.match(
+    unstarted.stderr,
+    /silk: cannot run the C compiler .*no-such-clang \(from SILK_CLANG\)/,
+  )
+  // A --stdlib that holds no standard library is named, not reported as ARTIFACT-001.
+  const noLibrary = yield* invoke(
+    silk,
+    ['build', 'main.silk', '-o', 'no-library', '--stdlib', join(directory, 'no-library')],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(noLibrary.status, 1, noLibrary.stderr)
+  assert.match(noLibrary.stderr, /--stdlib .*no-library is not a standard library directory/)
   assert.equal(yield* fs.exists(join(directory, 'unnamed')), false)
   // Another target emits its IR without linking; only the host target links an executable.
   const foreign =
@@ -632,6 +674,70 @@ const program = Effect.gen(function* () {
   )
   assert.equal(failedTests.status, 1, failedTests.stderr)
   assert.match(failedTests.stdout, /2 passed, 1 failed/)
+  // A selection that matches no test verified nothing, so it fails.
+  const unmatchedTests = yield* invoke(
+    silk,
+    ['test', '--no-cache', '--stdlib', standardLibrary, '--filter', 'zzz'],
+    join(directory, 'tested'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(unmatchedTests.status, 1, unmatchedTests.stderr)
+  assert.match(unmatchedTests.stderr, /no tests matched/)
+  // Package commands take --clang as they honor SILK_CLANG, and a Clang that cannot start fails
+  // the target with the usual per-target and summary lines.
+  const clangTests = yield* invoke(
+    silk,
+    ['test', '--no-cache', '--stdlib', standardLibrary, '--filter', 'EVEN', '--clang', clang],
+    join(directory, 'tested'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.equal(clangTests.status, 0, clangTests.stderr)
+  const unstartedBuild = yield* invoke(
+    silk,
+    ['build', '--stdlib', standardLibrary, '--clang', join(directory, 'no-such-clang')],
+    join(directory, 'tested'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(unstartedBuild.status, 2, unstartedBuild.stderr)
+  assert.match(unstartedBuild.stderr, /no-such-clang \(from --clang\)/)
+  assert.match(unstartedBuild.stdout, /: failed \(exit 2\)\nBuild summary: 0 succeeded, 1 failed\n/)
+  // A single-file test without a manifest is refused as a single-file build is.
+  // The build directory has a manifest, so the manifest-less source lives in its own directory.
+  const unpackaged = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-unpackaged-' })
+  yield* fs.writeFileString(join(unpackaged, 'lone.silk'), 'test fn lone() -> () {\n}\n')
+  for (const command of ['build', 'test']) {
+    const lone = yield* invoke(
+      silk,
+      [command, 'lone.silk', '-o', 'lone', '--stdlib', standardLibrary, '--no-cache'].slice(
+        0,
+        command === 'build' ? 6 : 7,
+      ),
+      unpackaged,
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(lone.status, 2, `${command}: ${lone.stderr}`)
+    assert.match(lone.stderr, /^No silk\.toml found from /)
+  }
+  // A native link input refusal names the manifest, the entry and the rule it breaks.
+  for (const [entry, rule] of [
+    ['{ object = "a.o", library = "m" }', /\[build\]\.native-link-inputs\[0\]: an entry is exactly one/],
+    ['{ object = "/tmp/a.o" }', /object \/tmp\/a\.o must be a relative path below the manifest's directory/],
+  ] as const) {
+    yield* fs.writeFileString(
+      join(unpackaged, 'silk.toml'),
+      `[package]\nname = "linked"\nversion = "0.1.0"\nroot = "main.silk"\n[build]\nnative-link-inputs = [${entry}]\n`,
+    )
+    yield* fs.writeFileString(join(unpackaged, 'main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+    const refusedInput = yield* invoke(
+      silk,
+      ['build', '--stdlib', standardLibrary],
+      unpackaged,
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(refusedInput.status, 1, refusedInput.stderr)
+    assert.match(refusedInput.stderr, /silk: invalid native link input: .*silk\.toml: /)
+    assert.match(refusedInput.stderr, rule)
+  }
   for (const selection of [['--root', 'main.silk'], ['--file', 'src/util/check.txt'], []]) {
     const refusedTests = yield* invoke(
       silk,

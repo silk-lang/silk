@@ -196,22 +196,24 @@ printf '%s\n' "$release" > "$install_dir/release"
 
 printf '\nInstalled %s to %s/bin/silk\n' "$("$install_dir/bin/silk" --version 2> /dev/null || echo silk)" "$install_dir"
 
-# Silk compiles through Clang; an older Clang may not read its LLVM 22 bitcode.
+# Silk hands Clang textual LLVM IR. Clang 18 or newer reads it for ordinary programs; inline
+# assembly that reads or writes memory, as the no-libc Linux runtime uses, is emitted with LLVM 22's
+# target_mem0/target_mem1 memory locations, which only Clang 22 or newer reads.
 clang=${SILK_CLANG:-clang}
 if ! command -v "$clang" > /dev/null 2>&1; then
-  printf '\nSilk needs Clang 22 or newer to build programs. Put it on PATH, or set SILK_CLANG to it.\n'
+  printf '\nSilk needs Clang 18 or newer to build programs (22 or newer for no-libc targets). Put it on PATH, or set SILK_CLANG to it.\n'
 else
   clang_version=$("$clang" --version 2> /dev/null | head -n 1)
+  major=
   case "$clang_version" in
-    *"Apple clang"*) old=yes ;;
-    *)
-      major=$(printf '%s\n' "$clang_version" | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p')
-      if [ -n "$major" ] && [ "$major" -ge 22 ]; then old=no; else old=yes; fi
-      ;;
+    *"Apple clang"*) ;;
+    *) major=$(printf '%s\n' "$clang_version" | sed -n 's/.*version \([0-9][0-9]*\).*/\1/p') ;;
   esac
-  if [ "$old" = yes ]; then
-    printf '\nSilk needs Clang 22 or newer, but %s is: %s\n' "$clang" "$clang_version"
-    printf 'Put LLVM 22 on PATH, or set SILK_CLANG to its clang.\n'
+  if [ -z "$major" ] || [ "$major" -lt 18 ]; then
+    printf '\nSilk needs Clang 18 or newer, but %s is: %s\n' "$clang" "$clang_version"
+    printf 'Put LLVM 18 or newer (22 for no-libc targets) on PATH, or set SILK_CLANG to its clang.\n'
+  elif [ "$major" -lt 22 ]; then
+    printf '\n%s is Clang %s: it builds ordinary programs, but no-libc targets need Clang 22 or newer.\n' "$clang" "$major"
   fi
 fi
 
