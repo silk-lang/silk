@@ -1,0 +1,973 @@
+//! Region inference kernels for one body: liveness, region values, loans in scope, universals.
+//!
+//! The caller numbers CFG points, locals, regions and loans; this module only solves the
+//! integer problems they describe. Every set is a bitset of u64 words stored back to back,
+//! one row per point, region component or loan owner. Nothing here reads types or queries.
+
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.effect {Effect}
+import silk.testing {AssertionError, Testing}
+import silk.ownership {Copy}
+import silk.list {List}
+import silk.u64
+import silk.usize
+import CompilerBug
+
+/// A region variable reserved in one `Regions`.
+pub struct Region { pub index: usize }
+impl Copy for Region {}
+
+/// A loan reserved in one `Loans`.
+pub struct Loan { pub index: usize }
+impl Copy for Loan {}
+
+/// `longer: shorter`, between two universal regions.
+pub struct Bound {
+  pub longer: Region
+  pub shorter: Region
+}
+impl Copy for Bound {}
+
+/// Points `0..points` and their successor edges.
+pub struct Cfg {
+  successors: List<List<usize>>
+}
+
+impl Cfg {
+  pub fn make() -> Self { return Cfg {successors: List<List<usize>>.make()} }
+
+  pub effect fn point(self: &mut Self) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let created = List<List<usize>>.length(&self.successors)
+    run List<List<usize>>.append(&mut self.successors, List<usize>.make())
+    return created
+  }
+
+  pub effect fn edge(self: &mut Self, from: usize, to: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    let count = List<List<usize>>.length(&self.successors)
+    if from >= count || to >= count { CompilerBug.panic(b"region CFG edge names an unreserved point") }
+    run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut self.successors)[from], to)
+    return ()
+  }
+
+  pub fn points(self: &Self) -> usize { return List<List<usize>>.length(&self.successors) }
+}
+
+/// Per-point reads, drop uses and assignments of `locals` locals. Bit `local` of a row is an
+/// ordinary use, bit `locals + local` a drop use; an assignment kills both.
+pub struct Liveness {
+  points: usize
+  locals: usize
+  width: usize
+  reads: List<u64>
+  kills: List<u64>
+}
+
+/// Live-on-entry locals per point.
+pub struct Live {
+  points: usize
+  locals: usize
+  width: usize
+  entering: List<u64>
+}
+
+impl Liveness {
+  pub effect fn make(points: usize, locals: usize) -> Self ! OutOfMemoryError ? &mut Allocator {
+    let width = wordsFor(locals + locals)
+    let reads = run zeros(points * width)
+    let kills = run zeros(points * width)
+    return Liveness {points: points, locals: locals, width: width, reads: move reads, kills: move kills}
+  }
+
+  /// `local` is read at `point`, before any assignment there.
+  pub fn read(self: &mut Self, point: usize, local: usize) -> () {
+    let bit = requireLocal(&self.*, point, local)
+    let base = point * self.width
+    mark(List<u64>.asMutSlice(&mut self.reads), base, bit)
+  }
+
+  /// `local`'s destructor runs at `point`; only a type with a user `Drop` has such a use.
+  pub fn dropUse(self: &mut Self, point: usize, local: usize) -> () {
+    let bit = requireLocal(&self.*, point, local) + self.locals
+    let base = point * self.width
+    mark(List<u64>.asMutSlice(&mut self.reads), base, bit)
+  }
+
+  /// `local` is wholly overwritten or bound at `point`, after any read there.
+  pub fn assign(self: &mut Self, point: usize, local: usize) -> () {
+    let bit = requireLocal(&self.*, point, local)
+    let base = point * self.width
+    let dropBit = bit + self.locals
+    mark(List<u64>.asMutSlice(&mut self.kills), base, bit)
+    mark(List<u64>.asMutSlice(&mut self.kills), base, dropBit)
+  }
+
+  /// Backward may-dataflow: live-in = reads | (union of successors' live-in & ~kills).
+  pub effect fn solve(self: &Self, cfg: &Cfg) -> Live ! OutOfMemoryError ? &mut Allocator {
+    if Cfg.points(cfg) != self.points { CompilerBug.panic(b"liveness and CFG disagree on point count") }
+    let successors = List<List<usize>>.asSlice(&cfg.successors)
+    let predecessors = run reverse(successors)
+    let before = List<List<usize>>.asSlice(&predecessors)
+    let reads = List<u64>.asSlice(&self.reads)
+    let kills = List<u64>.asSlice(&self.kills)
+    let width = self.width
+    let mut entering = run zeros(self.points * width)
+    let mut queued = List<bool>.make()
+    let mut pending = List<usize>.make()
+    let mut point = usize.ZERO
+    while point < self.points {
+      run List<bool>.append(&mut queued, true)
+      run List<usize>.append(&mut pending, point)
+      point = point + usize.ONE
+    }
+    // A stack popped from the end visits later points first, the usual backward order.
+    while List<usize>.length(&pending) > usize.ZERO {
+      let last = List<usize>.length(&pending) - usize.ONE
+      let at = List<usize>.asSlice(&pending)[last]
+      List<usize>.truncate(&mut pending, last)
+      List<bool>.set(&mut queued, at, false)
+      let next = List<usize>.asSlice(&successors[at])
+      let mut changed = false
+      let mut word = usize.ZERO
+      while word < width {
+        let mut out = u64.MIN
+        let mut each = usize.ZERO
+        while each < next.length {
+          out = u64.bitOr(out, List<u64>.asSlice(&entering)[next[each] * width + word])
+          each = each + usize.ONE
+        }
+        let slot = at * width + word
+        let value = u64.bitOr(reads[slot], u64.bitAnd(out, u64.bitNot(kills[slot])))
+        if List<u64>.asSlice(&entering)[slot] != value {
+          List<u64>.set(&mut entering, slot, value)
+          changed = true
+        }
+        word = word + usize.ONE
+      }
+      if changed { run enqueue(&mut pending, &mut queued, List<usize>.asSlice(&before[at])) }
+    }
+    return Live {points: self.points, locals: self.locals, width: width, entering: move entering}
+  }
+}
+
+impl Live {
+  /// A later ordinary use may read `local` from `point` on.
+  pub fn live(self: &Self, point: usize, local: usize) -> bool {
+    if point >= self.points || local >= self.locals { CompilerBug.panic(b"liveness query out of range") }
+    return isSet(List<u64>.asSlice(&self.entering), point * self.width, local)
+  }
+
+  /// `local`'s destructor may still run from `point` on.
+  pub fn dropLive(self: &Self, point: usize, local: usize) -> bool {
+    if point >= self.points || local >= self.locals { CompilerBug.panic(b"liveness query out of range") }
+    return isSet(List<u64>.asSlice(&self.entering), point * self.width, local + self.locals)
+  }
+}
+
+/// Region variables, their liveness seeds and location-insensitive outlives edges.
+pub struct Regions {
+  points: usize
+  width: usize
+  seeds: List<u64>
+  // Each region's universal marker, or `usize.MAX` for an existential region.
+  markers: List<usize>
+  // The region of each universal marker.
+  universals: List<usize>
+  longer: List<usize>
+  shorter: List<usize>
+}
+
+/// Solved region values: one points row and one markers row per strongly connected component.
+pub struct Values {
+  points: usize
+  width: usize
+  markerWidth: usize
+  component: List<usize>
+  markers: List<usize>
+  universals: List<usize>
+  pointRows: List<u64>
+  markerRows: List<u64>
+}
+
+impl Regions {
+  pub fn make(points: usize) -> Self {
+    return Regions {points: points, width: wordsFor(points), seeds: List<u64>.make(),
+      markers: List<usize>.make(), universals: List<usize>.make(),
+      longer: List<usize>.make(), shorter: List<usize>.make()}
+  }
+
+  pub effect fn region(self: &mut Self) -> Region ! OutOfMemoryError ? &mut Allocator {
+    let created = Region {index: List<usize>.length(&self.markers)}
+    run appendZeros(&mut self.seeds, self.width)
+    run List<usize>.append(&mut self.markers, usize.MAX)
+    return created
+  }
+
+  /// A lifetime parameter or `'static`: every point plus its own end-of-body marker.
+  pub effect fn universal(self: &mut Self) -> Region ! OutOfMemoryError ? &mut Allocator {
+    let created = Region {index: List<usize>.length(&self.markers)}
+    run appendZeros(&mut self.seeds, self.width)
+    run List<usize>.append(&mut self.markers, List<usize>.length(&self.universals))
+    run List<usize>.append(&mut self.universals, created.index)
+    let base = created.index * self.width
+    let points = self.points
+    let mut point = usize.ZERO
+    while point < points {
+      mark(List<u64>.asMutSlice(&mut self.seeds), base, point)
+      point = point + usize.ONE
+    }
+    return created
+  }
+
+  /// A liveness seed: `region` contains `point`.
+  pub fn include(self: &mut Self, region: Region, point: usize) -> () {
+    requireRegion(&self.*, region)
+    if point >= self.points { CompilerBug.panic(b"region seed names an unreserved point") }
+    let base = region.index * self.width
+    mark(List<u64>.asMutSlice(&mut self.seeds), base, point)
+  }
+
+  /// `longer: shorter`: the value of `longer` contains the value of `shorter`.
+  pub effect fn outlives(self: &mut Self, longer: Region, shorter: Region) -> () ! OutOfMemoryError ? &mut Allocator {
+    requireRegion(&self.*, longer)
+    requireRegion(&self.*, shorter)
+    run List<usize>.append(&mut self.longer, longer.index)
+    run List<usize>.append(&mut self.shorter, shorter.index)
+    return ()
+  }
+
+  /// Collapses outlives cycles with an iterative Tarjan search. Tarjan completes a component
+  /// only after every component it reaches, so each value is the union of its members' seeds
+  /// and its completed successors' values, computed once when the component completes.
+  pub effect fn solve(self: &Self) -> Values ! OutOfMemoryError ? &mut Allocator {
+    let regions = List<usize>.length(&self.markers)
+    let width = self.width
+    let markerWidth = wordsFor(List<usize>.length(&self.universals))
+    let markers = List<usize>.asSlice(&self.markers)
+    let seeds = List<u64>.asSlice(&self.seeds)
+    // Compressed adjacency: the edges of region `r` are targets[offsets[r]..offsets[r + 1]].
+    let longer = List<usize>.asSlice(&self.longer)
+    let shorter = List<usize>.asSlice(&self.shorter)
+    let mut offsets = run filled(regions + usize.ONE, usize.ZERO)
+    let mut at = usize.ZERO
+    while at < longer.length {
+      let slots = List<usize>.asMutSlice(&mut offsets)
+      slots[longer[at] + usize.ONE] = slots[longer[at] + usize.ONE] + usize.ONE
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < regions {
+      let slots = List<usize>.asMutSlice(&mut offsets)
+      slots[at + usize.ONE] = slots[at + usize.ONE] + slots[at]
+      at = at + usize.ONE
+    }
+    let mut cursor = run copyAll(List<usize>.asSlice(&offsets))
+    let mut targets = run filled(longer.length, usize.ZERO)
+    at = usize.ZERO
+    while at < longer.length {
+      let place = List<usize>.asSlice(&cursor)[longer[at]]
+      List<usize>.set(&mut targets, place, shorter[at])
+      List<usize>.set(&mut cursor, longer[at], place + usize.ONE)
+      at = at + usize.ONE
+    }
+    let edges = List<usize>.asSlice(&offsets)
+    let toward = List<usize>.asSlice(&targets)
+    let order = run filled(regions, usize.MAX)
+    let lows = run filled(regions, usize.MAX)
+    let mut search = Search {order: move order, low: move lows,
+      onStack: List<bool>.make(), stack: List<usize>.make(), frames: List<usize>.make(), cursors: List<usize>.make(),
+      visited: usize.ZERO}
+    at = usize.ZERO
+    while at < regions {
+      run List<bool>.append(&mut search.onStack, false)
+      at = at + usize.ONE
+    }
+    let mut component = run filled(regions, usize.MAX)
+    let mut pointRows = List<u64>.make()
+    let mut markerRows = List<u64>.make()
+    let mut components = usize.ZERO
+    let mut root = usize.ZERO
+    while root < regions {
+      if List<usize>.asSlice(&search.order)[root] == usize.MAX {
+        run Search.enter(&mut search, root, edges[root])
+        while List<usize>.length(&search.frames) > usize.ZERO {
+          let top = List<usize>.length(&search.frames) - usize.ONE
+          let region = List<usize>.asSlice(&search.frames)[top]
+          let edge = List<usize>.asSlice(&search.cursors)[top]
+          if edge < edges[region + usize.ONE] {
+            List<usize>.set(&mut search.cursors, top, edge + usize.ONE)
+            let target = toward[edge]
+            let reached = List<usize>.asSlice(&search.order)[target]
+            if reached == usize.MAX {
+              run Search.enter(&mut search, target, edges[target])
+            } else if List<bool>.asSlice(&search.onStack)[target] {
+              Search.lower(&mut search, region, reached)
+            }
+          } else {
+            List<usize>.truncate(&mut search.frames, top)
+            List<usize>.truncate(&mut search.cursors, top)
+            let low = List<usize>.asSlice(&search.low)[region]
+            if top > usize.ZERO {
+              let parent = List<usize>.asSlice(&search.frames)[top - usize.ONE]
+              Search.lower(&mut search, parent, low)
+            }
+            if low == List<usize>.asSlice(&search.order)[region] {
+              let id = components
+              components = components + usize.ONE
+              run appendZeros(&mut pointRows, width)
+              run appendZeros(&mut markerRows, markerWidth)
+              let mut first = List<usize>.length(&search.stack)
+              let mut found = false
+              while !found {
+                first = first - usize.ONE
+                let member = List<usize>.asSlice(&search.stack)[first]
+                List<bool>.set(&mut search.onStack, member, false)
+                List<usize>.set(&mut component, member, id)
+                found = member == region
+              }
+              let members = List<usize>.asSlice(&search.stack)
+              let mut each = first
+              while each < members.length {
+                let member = members[each]
+                orRow(List<u64>.asMutSlice(&mut pointRows), id * width, seeds, member * width, width)
+                if markers[member] != usize.MAX {
+                  mark(List<u64>.asMutSlice(&mut markerRows), id * markerWidth, markers[member])
+                }
+                let mut out = edges[member]
+                while out < edges[member + usize.ONE] {
+                  let from = List<usize>.asSlice(&component)[toward[out]]
+                  if from != id {
+                    orSelf(List<u64>.asMutSlice(&mut pointRows), id * width, from * width, width)
+                    orSelf(List<u64>.asMutSlice(&mut markerRows), id * markerWidth, from * markerWidth, markerWidth)
+                  }
+                  out = out + usize.ONE
+                }
+                each = each + usize.ONE
+              }
+              List<usize>.truncate(&mut search.stack, first)
+            }
+          }
+        }
+      }
+      root = root + usize.ONE
+    }
+    let markerCopy = run copyAll(markers)
+    let universalCopy = run copyAll(List<usize>.asSlice(&self.universals))
+    return Values {points: self.points, width: width, markerWidth: markerWidth, component: move component,
+      markers: move markerCopy, universals: move universalCopy, pointRows: move pointRows, markerRows: move markerRows}
+  }
+}
+
+// Iterative Tarjan state: `frames`/`cursors` replace the recursion, `stack` is Tarjan's stack.
+struct Search {
+  order: List<usize>
+  low: List<usize>
+  onStack: List<bool>
+  stack: List<usize>
+  frames: List<usize>
+  cursors: List<usize>
+  visited: usize
+}
+
+impl Search {
+  effect fn enter(self: &mut Self, region: usize, firstEdge: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    List<usize>.set(&mut self.order, region, self.visited)
+    List<usize>.set(&mut self.low, region, self.visited)
+    self.visited = self.visited + usize.ONE
+    List<bool>.set(&mut self.onStack, region, true)
+    run List<usize>.append(&mut self.stack, region)
+    run List<usize>.append(&mut self.frames, region)
+    run List<usize>.append(&mut self.cursors, firstEdge)
+    return ()
+  }
+
+  fn lower(self: &mut Self, region: usize, bound: usize) -> () {
+    let lows = List<usize>.asMutSlice(&mut self.low)
+    if bound < lows[region] { lows[region] = bound }
+  }
+}
+
+impl Values {
+  pub fn contains(self: &Self, region: Region, point: usize) -> bool {
+    if point >= self.points { CompilerBug.panic(b"region query names an unreserved point") }
+    return isSet(List<u64>.asSlice(&self.pointRows), Values.componentOf(self, region) * self.width, point)
+  }
+
+  /// `region`'s value contains `universal`'s end-of-body marker, so it must outlive it.
+  pub fn reaches(self: &Self, region: Region, universal: Region) -> bool {
+    return isSet(List<u64>.asSlice(&self.markerRows), Values.componentOf(self, region) * self.markerWidth,
+      Values.markerOf(self, universal))
+  }
+
+  /// `region`'s value contains some universal marker: a borrow with it outlives the body.
+  pub fn escapes(self: &Self, region: Region) -> bool {
+    let rows = List<u64>.asSlice(&self.markerRows)
+    let base = Values.componentOf(self, region) * self.markerWidth
+    let mut word = usize.ZERO
+    while word < self.markerWidth {
+      if rows[base + word] != 0 { return true }
+      word = word + usize.ONE
+    }
+    return false
+  }
+
+  /// Every `u: v` between distinct universals that the values require and the reflexive,
+  /// transitive closure of `declared` does not imply, ordered by `u` then `v` creation.
+  pub effect fn undeclared(self: &Self, declared: &[Bound]) -> List<Bound> ! OutOfMemoryError ? &mut Allocator {
+    let universals = List<usize>.asSlice(&self.universals)
+    let count = universals.length
+    let mut implied = List<bool>.make()
+    let mut at = usize.ZERO
+    while at < count * count {
+      run List<bool>.append(&mut implied, at / count == at % count)
+      at = at + usize.ONE
+    }
+    at = usize.ZERO
+    while at < declared.length {
+      let slot = Values.markerOf(self, declared[at].longer) * count + Values.markerOf(self, declared[at].shorter)
+      List<bool>.set(&mut implied, slot, true)
+      at = at + usize.ONE
+    }
+    let mut middle = usize.ZERO
+    while middle < count {
+      let mut from = usize.ZERO
+      while from < count {
+        if List<bool>.asSlice(&implied)[from * count + middle] {
+          let mut to = usize.ZERO
+          while to < count {
+            if List<bool>.asSlice(&implied)[middle * count + to] {
+              List<bool>.set(&mut implied, from * count + to, true)
+            }
+            to = to + usize.ONE
+          }
+        }
+        from = from + usize.ONE
+      }
+      middle = middle + usize.ONE
+    }
+    let mut missing = List<Bound>.make()
+    let mut longer = usize.ZERO
+    while longer < count {
+      let base = List<usize>.asSlice(&self.component)[universals[longer]] * self.markerWidth
+      let mut shorter = usize.ZERO
+      while shorter < count {
+        if isSet(List<u64>.asSlice(&self.markerRows), base, shorter)
+          && !List<bool>.asSlice(&implied)[longer * count + shorter] {
+          run List<Bound>.append(&mut missing, Bound {longer: Region {index: universals[longer]},
+            shorter: Region {index: universals[shorter]}})
+        }
+        shorter = shorter + usize.ONE
+      }
+      longer = longer + usize.ONE
+    }
+    return move missing
+  }
+
+  fn componentOf(self: &Self, region: Region) -> usize {
+    if region.index >= List<usize>.length(&self.component) { CompilerBug.panic(b"region query names an unreserved region") }
+    return List<usize>.asSlice(&self.component)[region.index]
+  }
+
+  fn markerOf(self: &Self, universal: Region) -> usize {
+    if universal.index >= List<usize>.length(&self.markers)
+      || List<usize>.asSlice(&self.markers)[universal.index] == usize.MAX {
+      CompilerBug.panic(b"universal query names an existential region")
+    }
+    return List<usize>.asSlice(&self.markers)[universal.index]
+  }
+}
+
+/// Loans with their birth point, region and the points that overwrite the borrowed place.
+pub struct Loans {
+  births: List<usize>
+  regions: List<Region>
+  overwrittenLoans: List<usize>
+  overwrittenPoints: List<usize>
+}
+
+/// Loans in scope on entry to each point, and which loans escape the body.
+pub struct LoanScope {
+  points: usize
+  loans: usize
+  width: usize
+  inScope: List<u64>
+  escaping: List<bool>
+}
+
+impl Loans {
+  pub fn make() -> Self {
+    return Loans {births: List<usize>.make(), regions: List<Region>.make(),
+      overwrittenLoans: List<usize>.make(), overwrittenPoints: List<usize>.make()}
+  }
+
+  /// A borrow at `birth` whose reference has `region`.
+  pub effect fn loan(self: &mut Self, birth: usize, region: Region) -> Loan ! OutOfMemoryError ? &mut Allocator {
+    let created = Loan {index: List<usize>.length(&self.births)}
+    run List<usize>.append(&mut self.births, birth)
+    run List<Region>.append(&mut self.regions, region)
+    return created
+  }
+
+  /// `point` overwrites the borrowed place or a prefix of it, after checking its own access.
+  pub effect fn overwrite(self: &mut Self, loan: Loan, point: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+    if loan.index >= List<usize>.length(&self.births) { CompilerBug.panic(b"overwrite names an unreserved loan") }
+    run List<usize>.append(&mut self.overwrittenLoans, loan.index)
+    run List<usize>.append(&mut self.overwrittenPoints, point)
+    return ()
+  }
+
+  /// Forward may-dataflow. On entry to a point, loans whose region excludes it leave scope;
+  /// the point's own overwrites then kill, and its borrows generate, on exit.
+  pub effect fn solve(self: &Self, cfg: &Cfg, values: &Values) -> LoanScope ! OutOfMemoryError ? &mut Allocator {
+    let points = Cfg.points(cfg)
+    if values.points != points { CompilerBug.panic(b"loans, regions and CFG disagree on point count") }
+    let births = List<usize>.asSlice(&self.births)
+    let regions = List<Region>.asSlice(&self.regions)
+    let loans = births.length
+    let width = wordsFor(loans)
+    let mut generated = run zeros(points * width)
+    let mut exited = run zeros(points * width)
+    let mut overwritten = run zeros(points * width)
+    let mut escaping = List<bool>.make()
+    let mut loan = usize.ZERO
+    while loan < loans {
+      if births[loan] >= points { CompilerBug.panic(b"loan birth names an unreserved point") }
+      mark(List<u64>.asMutSlice(&mut generated), births[loan] * width, loan)
+      let mut outside = usize.ZERO
+      while outside < points {
+        if !Values.contains(values, regions[loan], outside) {
+          mark(List<u64>.asMutSlice(&mut exited), outside * width, loan)
+        }
+        outside = outside + usize.ONE
+      }
+      run List<bool>.append(&mut escaping, Values.escapes(values, regions[loan]))
+      loan = loan + usize.ONE
+    }
+    let killedLoans = List<usize>.asSlice(&self.overwrittenLoans)
+    let killedPoints = List<usize>.asSlice(&self.overwrittenPoints)
+    let mut at = usize.ZERO
+    while at < killedLoans.length {
+      if killedPoints[at] >= points { CompilerBug.panic(b"overwrite names an unreserved point") }
+      mark(List<u64>.asMutSlice(&mut overwritten), killedPoints[at] * width, killedLoans[at])
+      at = at + usize.ONE
+    }
+    let successors = List<List<usize>>.asSlice(&cfg.successors)
+    let mut entering = run zeros(points * width)
+    let mut queued = List<bool>.make()
+    let mut pending = List<usize>.make()
+    let mut point = points
+    while point > usize.ZERO {
+      point = point - usize.ONE
+      run List<usize>.append(&mut pending, point)
+    }
+    at = usize.ZERO
+    while at < points {
+      run List<bool>.append(&mut queued, true)
+      at = at + usize.ONE
+    }
+    let mut leaving = run zeros(width)
+    // A stack seeded in reverse visits earlier points first, the usual forward order.
+    while List<usize>.length(&pending) > usize.ZERO {
+      let last = List<usize>.length(&pending) - usize.ONE
+      let current = List<usize>.asSlice(&pending)[last]
+      List<usize>.truncate(&mut pending, last)
+      List<bool>.set(&mut queued, current, false)
+      let mut word = usize.ZERO
+      while word < width {
+        let slot = current * width + word
+        let scoped = u64.bitAnd(List<u64>.asSlice(&entering)[slot], u64.bitNot(List<u64>.asSlice(&exited)[slot]))
+        let kept = u64.bitAnd(scoped, u64.bitNot(List<u64>.asSlice(&overwritten)[slot]))
+        List<u64>.set(&mut leaving, word, u64.bitOr(kept, List<u64>.asSlice(&generated)[slot]))
+        word = word + usize.ONE
+      }
+      let next = List<usize>.asSlice(&successors[current])
+      let mut each = usize.ZERO
+      while each < next.length {
+        let target = next[each]
+        let mut grew = false
+        word = usize.ZERO
+        while word < width {
+          let slot = target * width + word
+          let before = List<u64>.asSlice(&entering)[slot]
+          let merged = u64.bitOr(before, List<u64>.asSlice(&leaving)[word])
+          if merged != before {
+            List<u64>.set(&mut entering, slot, merged)
+            grew = true
+          }
+          word = word + usize.ONE
+        }
+        if grew && !List<bool>.asSlice(&queued)[target] {
+          List<bool>.set(&mut queued, target, true)
+          run List<usize>.append(&mut pending, target)
+        }
+        each = each + usize.ONE
+      }
+    }
+    at = usize.ZERO
+    while at < points * width {
+      let scoped = u64.bitAnd(List<u64>.asSlice(&entering)[at], u64.bitNot(List<u64>.asSlice(&exited)[at]))
+      List<u64>.set(&mut entering, at, scoped)
+      at = at + usize.ONE
+    }
+    return LoanScope {points: points, loans: loans, width: width, inScope: move entering, escaping: move escaping}
+  }
+}
+
+impl LoanScope {
+  /// `loan` is in scope when the access at `point` is checked.
+  pub fn contains(self: &Self, point: usize, loan: Loan) -> bool {
+    if point >= self.points || loan.index >= self.loans { CompilerBug.panic(b"loan scope query out of range") }
+    return isSet(List<u64>.asSlice(&self.inScope), point * self.width, loan.index)
+  }
+
+  /// `loan`'s region reaches a universal marker, so the borrow outlives the body.
+  pub fn escapes(self: &Self, loan: Loan) -> bool {
+    if loan.index >= self.loans { CompilerBug.panic(b"loan scope query out of range") }
+    return List<bool>.asSlice(&self.escaping)[loan.index]
+  }
+}
+
+fn wordsFor(bits: usize) -> usize { return (bits + 63) / 64 }
+
+fn maskOf(bit: usize) -> u64 { return u64.shiftLeft(1, usize.toU64(bit % 64)) }
+
+fn isSet(rows: &[u64], base: usize, bit: usize) -> bool {
+  return u64.bitAnd(rows[base + bit / 64], maskOf(bit)) != 0
+}
+
+fn mark(rows: &mut [u64], base: usize, bit: usize) -> () {
+  let at = base + bit / 64
+  rows[at] = u64.bitOr(rows[at], maskOf(bit))
+}
+
+fn orRow(rows: &mut [u64], base: usize, from: &[u64], start: usize, width: usize) -> () {
+  let mut word = usize.ZERO
+  while word < width {
+    rows[base + word] = u64.bitOr(rows[base + word], from[start + word])
+    word = word + usize.ONE
+  }
+}
+
+fn orSelf(rows: &mut [u64], base: usize, start: usize, width: usize) -> () {
+  let mut word = usize.ZERO
+  while word < width {
+    rows[base + word] = u64.bitOr(rows[base + word], rows[start + word])
+    word = word + usize.ONE
+  }
+}
+
+fn requireLocal(liveness: &Liveness, point: usize, local: usize) -> usize {
+  if point >= liveness.points || local >= liveness.locals { CompilerBug.panic(b"liveness fact out of range") }
+  return local
+}
+
+fn requireRegion(regions: &Regions, region: Region) -> () {
+  if region.index >= List<usize>.length(&regions.markers) { CompilerBug.panic(b"region names an unreserved region") }
+  return ()
+}
+
+effect fn zeros(count: usize) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<u64>.make()
+  run appendZeros(&mut result, count)
+  return move result
+}
+
+effect fn appendZeros(rows: &mut List<u64>, count: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < count {
+    run List<u64>.append(&mut rows.*, 0)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+effect fn filled(count: usize, value: usize) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut result, value)
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn copyAll(values: &[usize]) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run List<usize>.append(&mut result, values[at])
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn reverse(successors: &[List<usize>]) -> List<List<usize>> ! OutOfMemoryError ? &mut Allocator {
+  let mut predecessors = List<List<usize>>.make()
+  let mut at = usize.ZERO
+  while at < successors.length {
+    run List<List<usize>>.append(&mut predecessors, List<usize>.make())
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < successors.length {
+    let next = List<usize>.asSlice(&successors[at])
+    let mut each = usize.ZERO
+    while each < next.length {
+      run List<usize>.append(&mut List<List<usize>>.asMutSlice(&mut predecessors)[next[each]], at)
+      each = each + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  return move predecessors
+}
+
+effect fn enqueue(pending: &mut List<usize>, queued: &mut List<bool>, points: &[usize]) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < points.length {
+    if !List<bool>.asSlice(&queued.*)[points[at]] {
+      List<bool>.set(&mut queued.*, points[at], true)
+      run List<usize>.append(&mut pending.*, points[at])
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Each test pins one solver duty: back-edge liveness, SCC collapse, completion order across
+// words, region-exit versus overwrite kills, declared-bound closure, and marker escape.
+
+test effect fn regionSolverLivenessFollowsLoopBackEdge() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run livenessClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn livenessClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // 0 -> 1 (loop header) -> 2 (body) -> 1, and 1 -> 3 (exit).
+  let mut cfg = Cfg.make()
+  let entry = run Cfg.point(&mut cfg)
+  let header = run Cfg.point(&mut cfg)
+  let body = run Cfg.point(&mut cfg)
+  let exit = run Cfg.point(&mut cfg)
+  run Cfg.edge(&mut cfg, entry, header)
+  run Cfg.edge(&mut cfg, header, body)
+  run Cfg.edge(&mut cfg, body, header)
+  run Cfg.edge(&mut cfg, header, exit)
+  let condition = usize.ZERO
+  let item = usize.ONE
+  let result: usize = 2
+  let guard: usize = 3
+  let mut facts = run Liveness.make(Cfg.points(&cfg), 4)
+  Liveness.assign(&mut facts, entry, condition)
+  Liveness.read(&mut facts, header, condition)
+  Liveness.assign(&mut facts, entry, item)
+  Liveness.read(&mut facts, body, item)
+  Liveness.assign(&mut facts, entry, result)
+  Liveness.assign(&mut facts, body, result)
+  Liveness.read(&mut facts, exit, result)
+  Liveness.assign(&mut facts, entry, guard)
+  Liveness.dropUse(&mut facts, exit, guard)
+  let live = run Liveness.solve(&facts, &cfg)
+  run Testing.expect(Live.live(&live, body, condition) && Live.live(&live, header, condition),
+    "a header read keeps its local live through the loop body via the back edge")
+  run Testing.expect(!Live.live(&live, entry, condition) && !Live.live(&live, exit, condition),
+    "a local is dead before its assignment and after its last read")
+  run Testing.expect(Live.live(&live, header, item) && !Live.live(&live, exit, item),
+    "a body read is live at the header and dead on the exit path")
+  run Testing.expect(Live.live(&live, header, result) && !Live.live(&live, body, result),
+    "an assignment without a read kills liveness flowing back from the exit")
+  run Testing.expect(Live.dropLive(&live, body, guard) && Live.dropLive(&live, exit, guard)
+    && !Live.dropLive(&live, entry, guard) && !Live.live(&live, exit, guard),
+    "a drop use is drop-liveness only and is killed by assignment")
+  return ()
+}
+
+test effect fn regionSolverCollapsesOutlivesCycle() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run cycleClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn cycleClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut regions = Regions.make(4)
+  let outer = run Regions.region(&mut regions)
+  let first = run Regions.region(&mut regions)
+  let second = run Regions.region(&mut regions)
+  let third = run Regions.region(&mut regions)
+  let inner = run Regions.region(&mut regions)
+  run Regions.outlives(&mut regions, outer, first)
+  run Regions.outlives(&mut regions, first, second)
+  run Regions.outlives(&mut regions, second, third)
+  run Regions.outlives(&mut regions, third, first)
+  run Regions.outlives(&mut regions, third, inner)
+  Regions.include(&mut regions, first, usize.ZERO)
+  Regions.include(&mut regions, third, 2)
+  Regions.include(&mut regions, inner, usize.ONE)
+  Regions.include(&mut regions, outer, 3)
+  let values = run Regions.solve(&regions)
+  run Testing.expect(Values.contains(&values, first, 2) && Values.contains(&values, second, usize.ZERO)
+    && Values.contains(&values, third, usize.ZERO) && Values.contains(&values, second, usize.ONE),
+    "every member of an outlives cycle holds the cycle's seeds and what it outlives")
+  run Testing.expect(Values.contains(&values, outer, usize.ZERO) && Values.contains(&values, outer, usize.ONE),
+    "a region outliving the cycle receives its value")
+  run Testing.expect(!Values.contains(&values, first, 3) && !Values.contains(&values, inner, usize.ZERO),
+    "values never flow against the outlives direction")
+  return ()
+}
+
+test effect fn regionSolverPropagatesChainInCompletionOrder() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run chainClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn chainClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // last: second: first: fourth: third, interleaved with creation and edge order so that
+  // neither creation order nor its reverse is a valid single pass. 70 points span two words.
+  let mut regions = Regions.make(70)
+  let first = run Regions.region(&mut regions)
+  let second = run Regions.region(&mut regions)
+  let third = run Regions.region(&mut regions)
+  let fourth = run Regions.region(&mut regions)
+  let last = run Regions.region(&mut regions)
+  run Regions.outlives(&mut regions, fourth, third)
+  run Regions.outlives(&mut regions, last, second)
+  run Regions.outlives(&mut regions, first, fourth)
+  run Regions.outlives(&mut regions, second, first)
+  Regions.include(&mut regions, third, 66)
+  Regions.include(&mut regions, first, 5)
+  let values = run Regions.solve(&regions)
+  run Testing.expect(Values.contains(&values, last, 66) && Values.contains(&values, second, 66)
+    && Values.contains(&values, first, 66) && Values.contains(&values, fourth, 66),
+    "a seed in the second word reaches every region along the chain")
+  run Testing.expect(Values.contains(&values, last, 5) && !Values.contains(&values, fourth, 5)
+    && !Values.contains(&values, third, 5) && !Values.contains(&values, last, 2),
+    "a mid-chain seed reaches only longer regions")
+  return ()
+}
+
+test effect fn regionSolverEndsLoansAtRegionExitOrOverwrite() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run loanClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn loanClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // 0 (borrows) -> 1 -> {2, 3} -> 4 -> 5.
+  let mut cfg = Cfg.make()
+  let mut point = usize.ZERO
+  while point < 6 {
+    let created = run Cfg.point(&mut cfg)
+    point = created + usize.ONE
+  }
+  run Cfg.edge(&mut cfg, usize.ZERO, usize.ONE)
+  run Cfg.edge(&mut cfg, usize.ONE, 2)
+  run Cfg.edge(&mut cfg, usize.ONE, 3)
+  run Cfg.edge(&mut cfg, 2, 4)
+  run Cfg.edge(&mut cfg, 3, 4)
+  run Cfg.edge(&mut cfg, 4, 5)
+  let mut regions = Regions.make(6)
+  let gapped = run Regions.region(&mut regions)
+  let whole = run Regions.region(&mut regions)
+  Regions.include(&mut regions, gapped, usize.ONE)
+  Regions.include(&mut regions, gapped, 2)
+  Regions.include(&mut regions, gapped, 3)
+  Regions.include(&mut regions, gapped, 5)
+  point = usize.ONE
+  while point < 6 {
+    Regions.include(&mut regions, whole, point)
+    point = point + usize.ONE
+  }
+  let values = run Regions.solve(&regions)
+  let mut loans = Loans.make()
+  let exits = run Loans.loan(&mut loans, usize.ZERO, gapped)
+  let oneArm = run Loans.loan(&mut loans, usize.ZERO, whole)
+  let bothArms = run Loans.loan(&mut loans, usize.ZERO, whole)
+  run Loans.overwrite(&mut loans, oneArm, 2)
+  run Loans.overwrite(&mut loans, bothArms, 2)
+  run Loans.overwrite(&mut loans, bothArms, 3)
+  let scope = run Loans.solve(&loans, &cfg, &values)
+  run Testing.expect(!LoanScope.contains(&scope, usize.ZERO, exits) && LoanScope.contains(&scope, usize.ONE, exits)
+    && LoanScope.contains(&scope, 3, exits),
+    "a loan enters scope after its borrow point and stays while its region holds")
+  run Testing.expect(!LoanScope.contains(&scope, 4, exits) && !LoanScope.contains(&scope, 5, exits),
+    "leaving the region ends the loan, and re-entering the region does not revive it")
+  run Testing.expect(LoanScope.contains(&scope, 2, bothArms) && LoanScope.contains(&scope, 3, bothArms)
+    && !LoanScope.contains(&scope, 4, bothArms) && !LoanScope.contains(&scope, 5, bothArms),
+    "an overwrite is checked against the loan and then ends it")
+  run Testing.expect(LoanScope.contains(&scope, 4, oneArm) && LoanScope.contains(&scope, 5, oneArm),
+    "an overwrite on one arm leaves the loan in scope through the other arm")
+  return ()
+}
+
+test effect fn regionSolverReportsUndeclaredUniversalBounds() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run universalClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn universalClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  // 'a: local: 'b, and 'c: 'a. The body therefore requires 'a: 'b, 'c: 'a and 'c: 'b.
+  let mut regions = Regions.make(3)
+  let a = run Regions.universal(&mut regions)
+  let b = run Regions.universal(&mut regions)
+  let c = run Regions.universal(&mut regions)
+  let local = run Regions.region(&mut regions)
+  Regions.include(&mut regions, local, usize.ONE)
+  run Regions.outlives(&mut regions, a, local)
+  run Regions.outlives(&mut regions, local, b)
+  run Regions.outlives(&mut regions, c, a)
+  let values = run Regions.solve(&regions)
+  run Testing.expect(Values.reaches(&values, a, b) && !Values.reaches(&values, b, a),
+    "a universal reaches another universal's marker only along outlives edges")
+  let empty = List<Bound>.make()
+  let none = run Values.undeclared(&values, List<Bound>.asSlice(&empty))
+  run Testing.expect(List<Bound>.length(&none) == 3 && listed(List<Bound>.asSlice(&none), a, b)
+    && listed(List<Bound>.asSlice(&none), c, a) && listed(List<Bound>.asSlice(&none), c, b),
+    "without declared bounds every required universal relation is reported once")
+  let partial: [Bound; 1] = [Bound {longer: a, shorter: b}]
+  let some = run Values.undeclared(&values, &partial)
+  run Testing.expect(List<Bound>.length(&some) == 2 && listed(List<Bound>.asSlice(&some), c, a)
+    && listed(List<Bound>.asSlice(&some), c, b),
+    "a declared bound covers exactly its own relation")
+  let full: [Bound; 2] = [Bound {longer: c, shorter: a}, Bound {longer: a, shorter: b}]
+  let closed = run Values.undeclared(&values, &full)
+  run Testing.expect(List<Bound>.length(&closed) == usize.ZERO,
+    "declared bounds imply their transitive closure")
+  return ()
+}
+
+fn listed(bounds: &[Bound], longer: Region, shorter: Region) -> bool {
+  let mut at = usize.ZERO
+  while at < bounds.length {
+    if bounds[at].longer.index == longer.index && bounds[at].shorter.index == shorter.index { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+test effect fn regionSolverFindsEscapingLoans() -> () ! OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run escapeClaims() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn escapeClaims() -> () ! OutOfMemoryError | AssertionError<'static> ? &mut Allocator {
+  let mut cfg = Cfg.make()
+  let start = run Cfg.point(&mut cfg)
+  let end = run Cfg.point(&mut cfg)
+  run Cfg.edge(&mut cfg, start, end)
+  let mut regions = Regions.make(2)
+  let returned = run Regions.universal(&mut regions)
+  let outer = run Regions.region(&mut regions)
+  let stored = run Regions.region(&mut regions)
+  let local = run Regions.region(&mut regions)
+  run Regions.outlives(&mut regions, outer, stored)
+  run Regions.outlives(&mut regions, stored, returned)
+  run Regions.outlives(&mut regions, returned, local)
+  Regions.include(&mut regions, local, end)
+  let values = run Regions.solve(&regions)
+  let mut loans = Loans.make()
+  let escaping = run Loans.loan(&mut loans, start, outer)
+  let contained = run Loans.loan(&mut loans, start, local)
+  let scope = run Loans.solve(&loans, &cfg, &values)
+  run Testing.expect(LoanScope.escapes(&scope, escaping),
+    "a loan whose region transitively outlives a universal escapes the body")
+  run Testing.expect(!LoanScope.escapes(&scope, contained) && LoanScope.contains(&scope, end, contained),
+    "a loan that a universal outlives stays local")
+  return ()
+}
