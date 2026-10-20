@@ -999,6 +999,9 @@ struct Walker<'a> {
   reads: List<ValueUse>
   assigns: List<ValueUse>
   drops: List<ValueUse>
+  // Whole roots moved or dropped: dead afterwards until assigned again, so their scope's cleanup
+  // does not observe them on a path where they are definitely moved.
+  consumed: List<ValueUse>
   inclusions: List<Inclusion>
   paths: List<PathInclusion>
   loans: List<LoanFact>
@@ -1125,8 +1128,9 @@ effect fn access(walker: &mut Walker, path: &Path, kind: Kind, span: Location, a
   }
   // A whole root moved or dropped holds no value afterwards, so neither a later use nor its scope's
   // cleanup observes what it held.
-  if (kind == Kind.Move || kind == Kind.Drop) && path.place.root != usize.MAX && List<Step>.length(&path.place.steps) == usize.ZERO {
-    run assignValue(&mut walker.*, path.place.root, point)
+  if (kind == Kind.Move || kind == Kind.Drop) && path.place.root != usize.MAX && List<Step>.length(&path.place.steps) == usize.ZERO
+    && hasRegions(&walker.*, path.place.root) {
+    run List<ValueUse>.append(&mut walker.consumed, ValueUse {point: point, value: path.place.root})
   }
   return point
 }
@@ -2373,8 +2377,20 @@ effect fn borrow(walker: &mut Walker, id: NodeId, value: NodeId, exclusive: bool
   })
   let mut variance = Variance.Covariant
   if exclusive { variance = Variance.Invariant }
+  // A slice views the elements of the array or slice it borrows.
+  let viewedElement = Shared<Type>.with<Option<Shared<Type>>>(&ty, elementOf)
+  let placeElement = Shared<Type>.with<Option<Shared<Type>>>(&path.ty, elementOf)
   if let Option<Shared<Type>>.Some {value: referent} = move viewed {
     run flow(&mut walker.*, &path.ty, path.numbered, &referent, numbered, variance, span)
+  } else if let Option<Shared<Type>>.Some {value: element} = move viewedElement {
+    if let Option<Shared<Type>>.Some {value: stored} = move placeElement {
+      run flow(&mut walker.*, &stored, path.numbered, &element, numbered, variance, span)
+    } else {
+      let sub = Side {ty: Shared<Type>.clone(&path.ty), numbered: path.numbered}
+      let sup = Side {ty: Shared<Type>.clone(&ty), numbered: numbered}
+      walker.table.site = span
+      run equateAll(&mut walker.table, &sub, &sup, walker.input.owner)
+    }
   } else {
     let sub = Side {ty: Shared<Type>.clone(&path.ty), numbered: path.numbered}
     let sup = Side {ty: Shared<Type>.clone(&ty), numbered: numbered}
@@ -2385,6 +2401,15 @@ effect fn borrow(walker: &mut Walker, id: NodeId, value: NodeId, exclusive: bool
   run wellFormed(&mut walker.table, numbered, &ty, walker.input.owner)
   run assignValue(&mut walker.*, numbered, point)
   return point
+}
+
+// The element type of an array or slice.
+fn elementOf(value: &Type) -> Option<Shared<Type>> {
+  return match &value.* {
+    Type.Array {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+    Type.Slice {element, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&element))
+    _ => Option<Shared<Type>>.none()
+  }
 }
 
 // Evaluates operands in order and builds the node's value from them at one fresh point.
@@ -3490,7 +3515,7 @@ pub effect fn check(input: &Input) -> Verdict ! OutOfMemoryError ? &mut Allocato
       sites: List<Location>.make(), site: nodes[input.root.index].origin.location, universals: List<Universal>.make(),
       bases: List<usize>.make(), numberings: List<Renumbering>.make()},
     cfg: Cfg.make(), spans: List<Location>.make(), events: List<Event>.make(), pointEvents: List<usize>.make(),
-    initializes: List<usize>.make(), reads: List<ValueUse>.make(), assigns: List<ValueUse>.make(), drops: List<ValueUse>.make(),
+    initializes: List<usize>.make(), reads: List<ValueUse>.make(), assigns: List<ValueUse>.make(), drops: List<ValueUse>.make(), consumed: List<ValueUse>.make(),
     inclusions: List<Inclusion>.make(), paths: List<PathInclusion>.make(), loans: List<LoanFact>.make(), matchLoans: List<usize>.make(), contractOf: List<usize>.make(),
     shapeOf: List<usize>.make(), frames: List<Frame>.make(), loops: List<Loop>.make(), scopes: List<Scope>.make(),
     refinements: List<Refinement>.make(), retention: Retention.None, guarded: List<usize>.make(), guardConsumed: Option<Location>.none(),
@@ -3645,6 +3670,113 @@ effect fn knownRelations(table: &RegionTable, declared: &mut List<Bound>) -> () 
 
 // Builds the solver problems from the walk and solves them: liveness of every value with regions,
 // region values seeded by it, and the loans in scope at each point.
+// For each consumed root (in `walker.consumed` order of first appearance), the points where it is moved
+// on every path: a forward must-analysis that a move sets and an assignment clears.
+struct Moved {
+  roots: List<usize>
+  // `points` rows of `roots` flags.
+  flags: List<bool>
+}
+
+effect fn definitelyMoved(walker: &Walker) -> Moved ! OutOfMemoryError ? &mut Allocator {
+  let consumed = List<ValueUse>.asSlice(&walker.consumed)
+  let mut roots = List<usize>.make()
+  let mut index = usize.ZERO
+  while index < consumed.length {
+    if !listed(List<usize>.asSlice(&roots), consumed[index].value) { run List<usize>.append(&mut roots, consumed[index].value) }
+    index = index + usize.ONE
+  }
+  let width = List<usize>.length(&roots)
+  let points = Cfg.points(&walker.cfg)
+  let mut flags = List<bool>.make()
+  let mut known = List<bool>.make()
+  let mut at = usize.ZERO
+  while at < points * width {
+    run List<bool>.append(&mut flags, true)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < points {
+    run List<bool>.append(&mut known, false)
+    at = at + usize.ONE
+  }
+  if width == usize.ZERO { return Moved {roots: move roots, flags: move flags} }
+  // Per point: which roots it moves (1) or assigns (2).
+  let mut effects = List<u64>.make()
+  at = usize.ZERO
+  while at < points * width {
+    run List<u64>.append(&mut effects, 0)
+    at = at + usize.ONE
+  }
+  let listedRoots = List<usize>.asSlice(&roots)
+  index = usize.ZERO
+  while index < consumed.length {
+    let column = slot(listedRoots, consumed[index].value)
+    List<u64>.set(&mut effects, consumed[index].point * width + column, 1)
+    index = index + usize.ONE
+  }
+  let assigns = List<ValueUse>.asSlice(&walker.assigns)
+  index = usize.ZERO
+  while index < assigns.length {
+    let column = slot(listedRoots, assigns[index].value)
+    if column != usize.MAX { List<u64>.set(&mut effects, assigns[index].point * width + column, 2) }
+    index = index + usize.ONE
+  }
+  // Entry holds nothing moved; every other point starts unknown (all moved) and only loses flags.
+  let mut pending = List<usize>.make()
+  at = usize.ZERO
+  while at < width {
+    List<bool>.set(&mut flags, walker.entry * width + at, false)
+    at = at + usize.ONE
+  }
+  List<bool>.set(&mut known, walker.entry, true)
+  run List<usize>.append(&mut pending, walker.entry)
+  while List<usize>.length(&pending) != usize.ZERO {
+    let last = List<usize>.length(&pending) - usize.ONE
+    let point = List<usize>.remove(&mut pending, last)
+    let next = Cfg.next(&walker.cfg, point)
+    let mut successor = usize.ZERO
+    while successor < next.length {
+      let target = next[successor]
+      let mut changed = !List<bool>.get(&known, target)
+      List<bool>.set(&mut known, target, true)
+      let mut column = usize.ZERO
+      while column < width {
+        // The state after `point`: its own move or assignment applies after its uses.
+        let change = List<u64>.get(&effects, point * width + column)
+        let mut out = List<bool>.get(&flags, point * width + column)
+        if change == 1 { out = true }
+        if change == 2 { out = false }
+        if !out && List<bool>.get(&flags, target * width + column) {
+          List<bool>.set(&mut flags, target * width + column, false)
+          changed = true
+        }
+        column = column + usize.ONE
+      }
+      if changed { run List<usize>.append(&mut pending, target) }
+      successor = successor + usize.ONE
+    }
+  }
+  return Moved {roots: move roots, flags: move flags}
+}
+
+fn slot(roots: &[usize], root: usize) -> usize {
+  let mut at = usize.ZERO
+  while at < roots.length {
+    if roots[at] == root { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// Whether `use`'s value is definitely moved where it is used.
+fn movedAt(moved: &Moved, walker: &Walker, use: ValueUse) -> bool {
+  let column = slot(List<usize>.asSlice(&moved.roots), use.value)
+  if column == usize.MAX { return false }
+  let width = List<usize>.length(&moved.roots)
+  return List<bool>.get(&moved.flags, use.point * width + column)
+}
+
 // Adds each path inclusion's points: those reachable from its `from` from which its `to` is reachable.
 effect fn includePaths(walker: &Walker, regions: &mut Regions) -> () ! OutOfMemoryError ? &mut Allocator {
   let paths = List<PathInclusion>.asSlice(&walker.paths)
@@ -3750,10 +3882,19 @@ effect fn solve(walker: &Walker, declared: &[Bound]) -> Solved ! OutOfMemoryErro
     if reads[index].value < values && denseOf[reads[index].value] != usize.MAX { Liveness.read(&mut liveness, reads[index].point, denseOf[reads[index].value]) }
     index = index + usize.ONE
   }
+  let moved = run definitelyMoved(&walker.*)
   let drops = List<ValueUse>.asSlice(&walker.drops)
   index = usize.ZERO
   while index < drops.length {
-    if drops[index].value < values && denseOf[drops[index].value] != usize.MAX { Liveness.dropUse(&mut liveness, drops[index].point, denseOf[drops[index].value]) }
+    if drops[index].value < values && denseOf[drops[index].value] != usize.MAX && !movedAt(&moved, &walker.*, drops[index]) {
+      Liveness.dropUse(&mut liveness, drops[index].point, denseOf[drops[index].value])
+    }
+    index = index + usize.ONE
+  }
+  let consumed = List<ValueUse>.asSlice(&walker.consumed)
+  index = usize.ZERO
+  while index < consumed.length {
+    if consumed[index].value < values && denseOf[consumed[index].value] != usize.MAX { Liveness.assign(&mut liveness, consumed[index].point, denseOf[consumed[index].value]) }
     index = index + usize.ONE
   }
   let assigns = List<ValueUse>.asSlice(&walker.assigns)
