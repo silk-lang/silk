@@ -2,7 +2,8 @@
 
 A lifetime describes how long a borrowed value is valid. It is part of the static type contract;
 it is not a runtime token, an allocation, or the identity of a particular owner. Concrete loans
-separately track which places supply the value and which uses keep those places borrowed.
+separately track which places supply the value and which uses keep those places borrowed. LIFE-006
+defines how each body's regions and loans are checked.
 
 ## LIFE-001 — Lifetime parameters name validity relationships
 
@@ -58,6 +59,13 @@ outer access, but their target type is invariant: `&mut Holder<'long>` cannot be
 for an unrelated `Holder<'short>`. Nominal lifetime variance follows its fields; opaque or interior
 mutable storage retains conservative invariant boundaries. Callable inputs reverse variance and
 results preserve it.
+
+A body assumes the bounds its header declares and the bounds its parameter and result types imply.
+Inside a generic body, the contents of each type parameter are one opaque region chosen by the
+caller: it outlives the body, `'static` outlives it, and it outlives one of the body's lifetimes
+only through a declared or implied `T: 'a`. Each call proves the callee's declared and implied
+bounds, `T: 'a` included, for its arguments. A call through a callable value proves the bounds its
+parameter and result types imply in the same way.
 
 **Boundary:** A call checks the contract of the operation already selected. Lifetime failure does
 not choose another implementation, conversion, or provider. A bound constrains validity; it never
@@ -164,6 +172,12 @@ Their own captures must satisfy formation independently. A named generic callbac
 actual parameter, result, access, failure, and requirement contracts under those conditions; a
 contextual expected result cannot replace its real implementation signature.
 
+An anonymous callable or Effect body is checked on its own (LIFE-006). The lifetimes of its
+signature and the regions its environment names are chosen outside it. A relation between those
+regions that the body needs and no declared bound states does not reject the anonymous body: it
+becomes a requirement of the body that constructs the callable or Effect, proved there at the
+construction. A requirement the creator cannot satisfy is reported in the creator.
+
 An effect-function declaration may name its retained environment with
 `effect<'env> fn retain<T: 'env, 'env>(value: T) -> i32`. The environment resolves against the
 complete declaration binder list. Naming it retains every obligation of captured contents; it
@@ -255,9 +269,21 @@ survive the List while their backing owners remain valid. A List's Drop cleans i
 elements before releasing storage, including after growth failure.
 
 A user Drop hook conservatively retains every component its declared receiver could observe.
-An empty hook body does not waive this contract. Recursive field cleanup follows the initialized
-remainder: a moved whole Drop-bearing field belongs to its new owner, while its plain former
-container cleans the fields it still owns. Moving through a whole-value Drop ancestor is invalid.
+An empty hook body does not waive this contract, and no declaration marks one of its lifetime or
+type parameters unobserved. Cleanup of a value keeps alive only the lifetimes its type's cleanup
+observes. A nominal type with a hook observes every lifetime and type argument it is applied to.
+A nominal type without a hook observes what its fields' cleanup observes, composed through every
+nominal type they apply; a field whose type is one of its type parameters observes what the
+argument's own cleanup observes. Arrays, unions, anonymous aggregates, and callable and Effect
+environments observe what their parts observe. References, slices, strings, raw pointers, and
+primitives run no cleanup, so a holder that only borrows keeps nothing alive through its cleanup.
+Inside a generic body, a value of a type parameter keeps none of the body's regions alive through
+its cleanup, because its contents outlive the body (LIFE-002). A type whose cleanup these rules do
+not describe, such as an opaque callable or Effect, observes every lifetime it names.
+
+Recursive field cleanup follows the initialized remainder: a moved whole Drop-bearing field belongs
+to its new owner, while its plain former container cleans the fields it still owns. Moving through
+a whole-value Drop ancestor is invalid.
 Replacement preserves the declared destination type and evaluates incoming expressions before
 committing installation. A typed failure cleans the actual remaining state, including earlier
 permitted moves, without rollback.
@@ -272,3 +298,89 @@ reports `OWN0019`. Invalid replacement uses the ordinary type and lifetime diagn
 **Evidence:** owned-allocation requirements,
 dependent ownership tests,
 List tests.
+
+## LIFE-006 — Regions are sets of program points
+
+**Status:** Confirmed
+
+Every runtime function body, including the body of an anonymous callable or Effect, is either
+checked completely or rejected. The compiler proves every loan, move, and region relation in the
+body, or it reports a diagnostic. No body is accepted with an obligation left open.
+
+Inside a body, each lifetime denotes a region: a set of points in the body's control flow. A value
+has one region for each distinct lifetime its type names. A region holds every point where a value
+whose type names it is live, plus whatever the outlives relations required by the body's bindings,
+assignments, calls, returns, field stores, and captures add. A value is live at a point when some
+path from that point reads it before it is written again. Cleanup counts as a read only for the
+lifetimes that cleanup observes (LIFE-005). The lifetime parameters of the body and its enclosing
+declarations, and `'static`, are chosen by the caller: their regions hold the whole body.
+
+A borrow creates a loan whose region is the region of the resulting reference. The loan is in scope
+from the borrow along each path until the path reaches a point its region does not hold, or a write
+of the borrowed place or a prefix of it. While a loan is in scope, conflicting access to its place
+is rejected (BORROW-001, BORROW-002), and so is the end of that place's storage.
+
+Writing a whole local, or moving or dropping it, ends the liveness of its old value. Its regions
+therefore need not hold the points between the old value's last use and the write that replaces it,
+and a loan carried only by the old value leaves scope in that gap:
+
+```silk
+struct Token { value: i32 }
+struct View<'a> { left: &'a Token }
+
+fn replaced(restore: bool) -> i32 {
+  let base = Token { value: 42 }
+  let mut view = View { left: &base }
+  if restore {
+    let owner = Token { value: 3 }
+    view = View { left: &owner }
+    view = View { left: &base }
+  }
+  return view.left.value
+}
+```
+
+The loan of `owner` ends at the first replacement, before `owner`'s storage ends. A replaced value's
+cleanup runs at the write, so for a lifetime that cleanup observes there is no gap: replacing a
+holder whose `Drop` hook observes the loan keeps the loan in scope up to the write.
+
+**Boundary:** Regions are not location-sensitive. Precision is per lifetime: a value has one region
+for each lifetime its type names, not one per field or per write, so fields that share a lifetime
+share every loan stored in either of them. Writing a field, or writing through a reference, does
+not end the holder's liveness, and a later use of any part of a local keeps every region its type
+names. A program that is valid only if such a write released a loan is rejected:
+
+```silk,ignore
+struct Token { value: i32 }
+struct View<'a> { left: &'a Token }
+
+fn restored(restore: bool) -> i32 {
+  let base = Token { value: 42 }
+  let mut view = View { left: &base }
+  if restore {
+    let owner = Token { value: 3 }
+    view.left = &owner
+    view.left = &base
+  }
+  return view.left.value
+}
+```
+
+The field writes leave `view` live, so its region still holds the loan of `owner` when `owner`'s
+storage ends, and the return's `view.left.value` reports `OWN0019`. Location-sensitive regions, which would accept this program, are not part of the
+language; GitHub issue #2022 tracks them.
+
+Static evaluation has no loans (STATIC-005), so a `static fn` body and an expression selected for
+static evaluation are not region-checked.
+
+**Diagnostics:** A borrow of local or temporary storage whose loan must outlive a lifetime chosen by
+the caller, such as a lifetime parameter or `'static`, reports `SEM0212` at the borrow. A relation
+between two caller-chosen lifetimes that no declared or implied bound gives reports `SEM0212` at
+the flow that requires it. A use of a view after its referent's storage has ended reports `OWN0019`
+at that use. Storage that ends with a block ends at the block's closing brace, which is the reported
+span when the use is cleanup there. A write, move, or drop that conflicts with a loan in scope
+reports `OWN0011` at that access, and the next use of a view carrying the loan reports `OWN0019`.
+
+**Evidence:** region checker decisions,
+rustc NLL comparison,
+lifetime checking tests.

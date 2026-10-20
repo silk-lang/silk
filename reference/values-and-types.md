@@ -1429,9 +1429,9 @@ fn use() -> i32 {
 }
 ```
 
-The explicit borrow converts neither array ownership nor array type. It creates a view for the
-borrow's lexical lifetime. Arrays of different lengths may therefore be borrowed for the same
-`&[T]` parameter.
+The explicit borrow converts neither array ownership nor array type. It creates a view valid for
+the borrow's region ([LIFE-006](lifetimes.md#life-006--regions-are-sets-of-program-points)).
+Arrays of different lengths may therefore be borrowed for the same `&[T]` parameter.
 
 **Boundary:** There is no implicit array-to-slice decay. Shared access cannot strengthen to
 exclusive access. Shared views may be stored in ordinary values whose declared lifetimes retain
