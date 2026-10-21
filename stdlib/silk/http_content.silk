@@ -1,23 +1,168 @@
-//! Bounded scoped HTTP response content decoding over strict body framing.
+//! Decode the content of an HTTP response: gzip, deflate, and Zstandard, as named in
+//! `Content-Encoding`.
 //!
 //! # When to use
-//! Build a [`ResponseContext`] from one validated response head, request method, and trailer
-//! policy, consume it into a [`CodingPlan`], then use [`withReader`] to stream either the raw
-//! representation or a validated reverse content-decoding stack.
+//! Make a [`ResponseContext`] from a response head, and a [`CodingPlan`] from it. Then decode the
+//! body with a [`Decoder`] when you have the wire bytes, or with [`withReader`] over a
+//! `BufferedDuplex`. Use [`acceptEncoding`] to make the `Accept-Encoding` field of a request.
+//! `silk.http_exchange` and `silk.http_fetch` use this module for you.
 //!
 //! # Details
-//! Planning parses at most four content codings and performs every configuration and owned-memory
-//! check before codec acquisition or body I/O. Readers exclusively borrow an existing
-//! [`BufferedDuplex`] for one callback. Bytes returned before [`ContentCompletion`] are
-//! provisional because a later wrapper checksum, trailer, or framed boundary can still fail.
+//! With `Mode.Raw`, the body is returned as it was sent. With `Mode.Decode`, the codings in
+//! `Content-Encoding` are decoded in reverse order. A response can have at most four codings.
+//! [`CodingPlan.make`] checks all limits and memory before it reads the body. The decoder also
+//! removes the body framing, so give it the bytes after the head.
+//!
+//! # Errors
+//! - [`ContentError`] tells the reason and the byte counts so far. A coding error tells where the
+//!   coding is in `Content-Encoding`.
+//! - `OutOfMemoryError` if the `Allocator` fails.
 //!
 //! # Gotchas
-//! This low-level actor treats the body supplied to each `withReader` invocation as the encoded
-//! representation described by the plan. It does not prove that those bytes came from the retained
-//! head and cannot prevent a copied head from being planned over already-decoded bytes. The affine
-//! response/body envelope in `silk.http_exchange` owns that stronger provenance and decode-once contract.
-//! Cleanup is guaranteed for structured Effect exits, including interruption, but not for fatal
-//! traps that bypass Effect finalizers and Drop.
+//! Decoded bytes are not final until the state is `End`. A later checksum, trailer, or framing
+//! error can still fail. A step can return no bytes, so call it again until the state is `End`.
+//! This module does not check that the body belongs to the head. `silk.http_exchange` does.
+//!
+//! # Examples
+//! ## Decode a gzip body
+//! ```silk
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.http { Method }
+//! import silk.http_body { TrailerPolicy }
+//! import silk.http_content {
+//!   CodingPlan,
+//!   ContentError,
+//!   ContentProgressState,
+//!   DecodeFailure,
+//!   DecodeProgress,
+//!   Decoder,
+//!   Mode,
+//!   ResponseContext
+//! }
+//! import silk.http_exchange { Limits as ClientLimits }
+//! import silk.http_fetch { FetchOptions }
+//! import silk.http_head { ParseError, ParsedResponse, ResponseHead, ResponseParser, parseResponse }
+//! import silk.http_body { BodyError }
+//! import silk.result { Result }
+//! import silk.slice { Slice }
+//! import silk.usize
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError
+//!   ? &mut Allocator {
+//!   let limits = ClientLimits.defaults()
+//!   let wire = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 28\r\n\r\n"
+//!   let parsed = match run parseResponse(&wire, limits.head) {
+//!     Result<ParsedResponse, ParseError>.Success { value } => move value
+//!     Result<ParsedResponse, ParseError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let head = match ResponseParser.head(&parsed.parser) {
+//!     Result<ResponseHead, ParseError>.Success { value } => value
+//!     Result<ResponseHead, ParseError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let context = match ResponseContext.make(head, Method.get(), TrailerPolicy.defaultPolicy()) {
+//!     Result<ResponseContext, BodyError>.Success { value } => move value
+//!     Result<ResponseContext, BodyError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let options = FetchOptions.defaults()
+//!   let plan = match CodingPlan.make(
+//!     move context,
+//!     Mode.Decode,
+//!     limits.responseBody,
+//!     move options.contentLimits
+//!   ) {
+//!     Result<CodingPlan, ContentError>.Success { value } => move value
+//!     Result<CodingPlan, ContentError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let made = run Effect.result(Decoder.make(move plan))
+//!   let mut decoder = match move made {
+//!     Result.Success { value } => move value
+//!     Result.Failure { error } => {
+//!       drop error
+//!       return 1
+//!     }
+//!   }
+//!
+//!   // gzip of "hello hello hello"
+//!   let body: [u8; 28] = [
+//!     31,
+//!     139,
+//!     8,
+//!     0,
+//!     0,
+//!     0,
+//!     0,
+//!     0,
+//!     2,
+//!     255,
+//!     203,
+//!     72,
+//!     205,
+//!     201,
+//!     201,
+//!     87,
+//!     200,
+//!     64,
+//!     144,
+//!     0,
+//!     128,
+//!     136,
+//!     249,
+//!     229,
+//!     17,
+//!     0,
+//!     0,
+//!     0,
+//!   ]
+//!
+//!   // A step can return no bytes. Call it again until the state is End.
+//!   let mut chunk: [u8; 64] = [0; 64]
+//!   let mut offset = usize.ZERO
+//!   let mut total = usize.ZERO
+//!   let mut first: u8 = 0
+//!   let mut done = false
+//!   let mut steps = 0
+//!   while !done && steps < 1000 {
+//!     let rest = Slice.view<u8>(&body, offset, body.length - offset)
+//!     let step = match Decoder.step(&mut decoder, rest, &mut chunk, true) {
+//!       Result<DecodeProgress, DecodeFailure>.Success { value } => move value
+//!       Result<DecodeProgress, DecodeFailure>.Failure { error: _ } => {
+//!         return 1
+//!       }
+//!     }
+//!     offset = offset + step.consumed
+//!     if step.progress.written > usize.ZERO && total == usize.ZERO {
+//!       first = chunk[0]
+//!     }
+//!     total = total + step.progress.written
+//!     done = step.progress.state == ContentProgressState.End
+//!     steps = steps + 1
+//!   }
+//!   if !done || total != 17 || first != 104 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
 
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.buffered_duplex {BufferedDuplex}
@@ -79,210 +224,211 @@ const MAX_CODINGS: usize = 4
 const MAX_INTERMEDIATE_CAPACITY: usize = 65536
 const ZSTD_BLOCK_CAPACITY: usize = 131072
 
-/// Whether the representation is preserved or decoded.
+/// Whether to decode the content.
 pub enum Mode {
-  /// Preserves encoded representation bytes without interpreting Content-Encoding.
+  /// Return the body as it was sent. `Content-Encoding` is not read.
   Raw,
-  /// Validates Content-Encoding and applies the supported reverse decoding stack.
+  /// Decode the codings in `Content-Encoding`.
   Decode,
 }
 
-/// One recognized response content coding.
+/// A content coding that this module knows.
 pub enum Coding {
-  /// Leaves representation bytes unchanged and counts toward the coding depth.
+  /// `identity`: no change. It still counts in `maxDepth`.
   Identity,
-  /// Decodes gzip members, including permitted concatenated members.
+  /// `gzip`. More gzip members after the first are decoded too.
   Gzip,
-  /// Accepts the legacy response spelling of gzip with the same decoding rules.
+  /// `x-gzip`, the old name of `gzip`.
   XGzip,
-  /// Decodes one zlib-wrapped stream; raw DEFLATE and trailing bytes fail.
+  /// `deflate`, as a zlib stream. Raw DEFLATE without the zlib wrapper fails.
   Deflate,
-  /// Decodes Zstandard frames under the configured window and workspace limits.
+  /// `zstd`, within the window and memory limits.
   Zstd,
 }
 
-/// The exact source coordinates of one coding token.
+/// Where a coding is in the `Content-Encoding` fields.
 pub struct CodingPosition {
-  /// The zero-based coding position across all Content-Encoding fields.
+  /// The position of the coding over all `Content-Encoding` fields, from 0.
   pub wireIndex: usize
-  /// The zero-based header field position in the original response.
+  /// The position of the field in the response head, from 0.
   pub fieldIndex: usize
-  /// The zero-based comma element within its Content-Encoding field.
+  /// The position of the coding in its field, from 0.
   pub elementIndex: usize
-  /// The byte offset of the coding token or invalid byte within the field value.
+  /// The byte offset of the coding, or the bad byte, in the field value.
   pub offset: usize
 }
 
 impl Copy for CodingPosition {}
 
-/// The finite content, composition, and codec allowances copied into a plan.
+/// The limits for content decoding.
 pub struct Limits {
-  /// The maximum representation bytes accepted after HTTP deframing.
+  /// The maximum body bytes before decoding, after the framing is removed.
   pub maxEncoded: u64
-  /// The maximum combined bytes produced by all nonfinal codec stages.
+  /// The maximum total bytes from all decoding stages except the last.
   pub maxIntermediate: u64
-  /// The maximum final representation bytes returned to the caller.
+  /// The maximum decoded bytes.
   pub maxDecoded: u64
-  /// The maximum admitted composition and codec storage reservation, excluding body-decoder storage.
+  /// The maximum memory for the decoders, without the memory of the body decoder.
   pub maxOwned: usize
-  /// The maximum coding entries, including identity; must be between one and four.
+  /// The maximum number of codings, including `identity`. It is from 1 to 4.
   pub maxDepth: usize
-  /// The capacity of each active stage edge; must be between one and 65,536 bytes.
+  /// The size of the buffer between two stages. It is from 1 to 65536.
   pub intermediateCapacity: usize
-  /// The limits applied independently to each gzip or zlib decoder.
+  /// The limits for each gzip or deflate decoder.
   pub inflate: InflateLimits
-  /// The limits applied independently to each Zstandard decoder.
+  /// The limits for each Zstandard decoder.
   pub zstd: ZstdLimits
 }
 
-/// The configuration or byte class rejected by the content layer.
+/// The limit that failed. See [`ContentReason.InvalidLimit`].
 pub enum ContentLimitKind {
-  /// The permitted number of content-coding entries.
+  /// `maxDepth`.
   CodingDepth,
-  /// The finite capacity of one stage edge.
+  /// `intermediateCapacity`.
   IntermediateCapacity,
-  /// The admitted composition and codec storage reservation.
+  /// `maxOwned`.
   OwnedBytes,
-  /// The deframed representation input byte allowance.
+  /// `maxEncoded`.
   EncodedBytes,
-  /// The combined output allowance for nonfinal decoding stages.
+  /// `maxIntermediate`.
   IntermediateBytes,
-  /// The final representation output byte allowance.
+  /// `maxDecoded`.
   DecodedBytes,
 }
 
-/// A stage-aware content, framing, transport, or codec failure.
+/// The reason that content decoding failed.
 pub union ContentReason<'head> {
-  /// A configuration or byte count exceeds its permitted range.
+  /// A limit is not valid, or a byte count exceeded it.
   InvalidLimit {
-    /// The rejected configuration or byte class.
+    /// The limit.
     pub limit: ContentLimitKind,
-    /// The applicable maximum.
+    /// The value of the limit.
     pub allowed: u64,
-    /// The rejected value or count.
+    /// The value that was found.
     pub attempted: u64,
   },
-  /// A Content-Encoding element is empty or contains invalid syntax.
+  /// An item in `Content-Encoding` is empty or not valid.
   CodingSyntax {
-    /// The exact location of the invalid token or byte.
+    /// Where the item is.
     pub position: CodingPosition,
   },
-  /// A valid coding token names an unsupported decoder.
+  /// A coding has no decoder, for example `br`.
   UnsupportedCoding {
-    /// The token position in the original response.
+    /// Where the coding is.
     pub position: CodingPosition,
-    /// The untouched unsupported token borrowed from the response.
+    /// The name of the coding, from the response head.
     pub token: &'head [u8],
   },
-  /// A 206 response selects a nonidentity coding in Decode mode.
+  /// A 206 partial response has a coding other than `identity`, and `Mode.Decode` cannot decode a
+  /// part.
   PartialResponse {
-    /// The first nonidentity coding in wire order.
+    /// The first coding that is not `identity`.
     pub position: CodingPosition,
   },
-  /// The selected body is a protocol tunnel rather than an HTTP representation.
+  /// The body is a tunnel, not content.
   Tunnel,
-  /// HTTP body framing failed before content completion.
+  /// The body framing failed.
   Body {
-    /// The original body error, including committed wire progress.
+    /// The error from `silk.http_body`.
     pub error: BodyError,
   },
-  /// The buffered transport failed.
+  /// Reading from the transport failed.
   Buffer {
-    /// The original buffer error and its transport cause.
+    /// The error, with its transport cause.
     pub error: BufferError,
   },
-  /// A gzip or zlib decoder rejected configuration or input.
+  /// Gzip or deflate decoding failed.
   Inflate {
-    /// The zero-based reverse application stage.
+    /// The decoding stage, from 0. Stage 0 decodes the last coding.
     pub stage: usize,
-    /// The original coding position in wire order.
+    /// The position of the coding in `Content-Encoding`, from 0.
     pub wireIndex: usize,
-    /// The exact inflate failure and decoder-call progress.
+    /// The error from `silk.inflate`.
     pub error: DecodeError,
   },
-  /// A Zstandard decoder rejected configuration or input.
+  /// Zstandard decoding failed.
   Zstandard {
-    /// The zero-based reverse application stage.
+    /// The decoding stage, from 0. Stage 0 decodes the last coding.
     pub stage: usize,
-    /// The original coding position in wire order.
+    /// The position of the coding in `Content-Encoding`, from 0.
     pub wireIndex: usize,
-    /// The exact Zstandard failure and decoder-call progress.
+    /// The error from `silk.zstd`.
     pub error: ZstdError,
   },
-  /// A finished coding stream has additional encoded bytes.
+  /// There were more bytes after the end of a compressed stream.
   TrailingEncodedData {
-    /// The zero-based reverse application stage.
+    /// The decoding stage, from 0. Stage 0 decodes the last coding.
     pub stage: usize,
-    /// The original coding position in wire order.
+    /// The position of the coding in `Content-Encoding`, from 0.
     pub wireIndex: usize,
   },
-  /// A checked byte or reservation calculation cannot represent its result.
+  /// A byte count overflowed.
   ArithmeticOverflow,
-  /// The reader previously failed or was abandoned.
+  /// The reader had already failed or stopped.
   InvalidState,
 }
 
-/// Exact per-call and cumulative coordinates for a content failure.
+/// The error from content decoding, with the byte counts so far.
 pub struct ContentError<'head> {
-  /// The exact failure category and its lower-level cause when available.
+  /// The reason.
   pub reason: ContentReason<'head>
-  /// The representation bytes written to the caller destination during this read.
+  /// The decoded bytes written by the call before the error.
   pub written: usize
-  /// The cumulative representation bytes accepted after HTTP deframing.
+  /// The total body bytes read, after the framing is removed.
   pub totalEncoded: u64
-  /// The cumulative output bytes accepted from all nonfinal codec stages.
+  /// The total bytes from all stages except the last.
   pub totalIntermediate: u64
-  /// The cumulative representation bytes written to caller destinations.
+  /// The total decoded bytes written.
   pub totalDecoded: u64
 }
 
-/// Whether one successful read returned data or established terminal completion.
+/// Whether the content is complete.
 pub enum ContentProgressState {
-  /// Reports provisional output or internal progress before complete validation.
+  /// There is more content. The bytes so far are not final.
   Data,
-  /// Reports successful completion of the framed body and all content stages.
+  /// The body and all decoding completed, and all checks passed.
   End,
 }
 
-/// Exact per-call and cumulative committed content progress.
+/// The progress of a read.
 pub struct ContentProgress {
-  /// The representation bytes written to the caller destination during this read.
+  /// The decoded bytes written by this call.
   pub written: usize
-  /// The cumulative representation bytes accepted after HTTP deframing.
+  /// The total body bytes read, after the framing is removed.
   pub totalEncoded: u64
-  /// The cumulative output bytes accepted from all nonfinal codec stages.
+  /// The total bytes from all stages except the last.
   pub totalIntermediate: u64
-  /// The cumulative representation bytes written to caller destinations.
+  /// The total decoded bytes written.
   pub totalDecoded: u64
-  /// Whether content remains provisional or has completed validation.
+  /// Whether the content is complete.
   pub state: ContentProgressState
 }
 
-/// Connection reuse policy before and after positive completion evidence.
+/// Whether the connection can be used again after this response.
 pub enum ReuseDisposition {
-  /// Allows reuse only after successful content completion supplies positive evidence.
+  /// Yes, but only after the content completes.
   EligibleAfterCompletion,
-  /// Confirms delimited framing, no framing anomaly, and successful content completion.
+  /// Yes. The body had a clear end, there was no problem, and the content completed.
   Reusable,
-  /// Forbids reuse because framing closes the connection or carries an anomaly.
+  /// No. The body ends when the connection closes, or the framing had a problem.
   NonReusable,
 }
 
-/// Public applied-plan metadata without exposing the affine plan itself.
+/// A summary of a [`CodingPlan`].
 pub struct AppliedPlan {
-  /// Whether the plan preserves or decodes the representation.
+  /// Whether the content is decoded.
   pub mode: Mode
-  /// The number of parsed coding entries, including identity.
+  /// The number of codings in `Content-Encoding`, including `identity`.
   pub codingCount: usize
-  /// The number of active nonidentity codec stages.
+  /// The number of decoders that run, without `identity`.
   pub decoderCount: usize
-  /// The reuse disposition established by the plan or completion.
+  /// Whether the connection can be used again.
   pub reuse: ReuseDisposition
 }
 
 impl Copy for AppliedPlan {}
 
-/// Borrowed effective representation metadata that never rewrites wire headers.
+/// Information about the decoded content. The headers of the response are not changed.
 pub struct RepresentationView<'owner, 'head> {
   headValue: ResponseHead<'head>
   appliedValue: AppliedPlan
@@ -293,15 +439,16 @@ pub struct RepresentationView<'owner, 'head> {
 }
 
 impl<'owner, 'head> RepresentationView<'owner, 'head> {
-  /// Returns the untouched response head with its original coding and length headers.
+  /// Returns the response head as received, with its `Content-Encoding` and `Content-Length`.
   pub fn originalHead(self: &Self) -> ResponseHead<'head> { return self.headValue }
-  /// Returns the effective coding counts, mode, and reuse disposition.
+  /// Returns the summary of the plan.
   pub fn appliedPlan(self: &Self) -> AppliedPlan { return self.appliedValue }
-  /// Returns the exact framing anomaly selected from the original response.
+  /// Returns a framing problem of the response, if any.
   pub fn anomaly(self: &Self) -> Anomaly { return self.anomalyValue }
-  /// Returns whether at least one nonidentity content decoder was selected.
+  /// Returns `true` if at least one decoder runs.
   pub fn decodingApplied(self: &Self) -> bool { return self.decodedAppliedValue }
-  /// Returns the final decoded length only after completion, or zero for semantic no-body responses.
+  /// Returns the decoded length after completion, 0 for a response without a body, or `None` before
+  /// completion.
   pub fn decodedLength(self: &Self) -> Option<u64> {
     return match &self.decodedLengthValue {
       Option<u64>.None => Option<u64>.none()
@@ -310,7 +457,7 @@ impl<'owner, 'head> RepresentationView<'owner, 'head> {
   }
 }
 
-/// Opaque positive evidence that framing and every selected codec completed.
+/// Proof that the body and all decoding completed.
 pub struct ContentCompletion<'owner> {
   kindValue: BodyCompletionKind
   decodedValue: u64
@@ -320,17 +467,17 @@ pub struct ContentCompletion<'owner> {
 }
 
 impl<'owner> ContentCompletion<'owner> {
-  /// Returns whether the completed body was delimited or ended at transport closure.
+  /// Returns how the body ended: at a clear end, or when the connection closed.
   pub fn bodyKind(self: &Self) -> BodyCompletionKind { return self.kindValue }
-  /// Returns the final validated representation byte count.
+  /// Returns the number of decoded bytes.
   pub fn decodedBytes(self: &Self) -> u64 { return self.decodedValue }
-  /// Returns the exact framing anomaly selected from the original response.
+  /// Returns a framing problem of the response, if any.
   pub fn anomaly(self: &Self) -> Anomaly { return self.anomalyValue }
-  /// Returns the reuse disposition supported by this completed representation.
+  /// Returns whether the connection can be used again.
   pub fn reuse(self: &Self) -> ReuseDisposition { return self.reuseValue }
 }
 
-/// Atomic response-selection provenance. Its fields are intentionally private.
+/// A response head with its request method and trailer policy, ready for a [`CodingPlan`].
 pub struct ResponseContext<'head, 'method, 'names> {
   head: ResponseHead<'head>
   requestMethod: Method<'method>
@@ -341,7 +488,7 @@ pub struct ResponseContext<'head, 'method, 'names> {
 }
 
 impl<'head, 'method, 'names> ResponseContext<'head, 'method, 'names> {
-  /// Selects response framing and constructs no context when selection fails.
+  /// Selects the body framing of `head`, and returns a context. Fails if the framing is not valid.
   pub fn make(
     head: ResponseHead<'head>,
     requestMethod: Method<'method>,
@@ -395,7 +542,7 @@ union CodecConfigFailure {
   Zstandard {stage: usize, wireIndex: usize, reason: ZstdReason},
 }
 
-/// A validated single-use response plan. Construction consumes its complete context.
+/// A checked plan to decode one response body. Use it one time.
 pub struct CodingPlan<'head, 'method, 'names> {
   headValue: ResponseHead<'head>
   requestMethod: Method<'method>
@@ -416,7 +563,9 @@ pub struct CodingPlan<'head, 'method, 'names> {
 }
 
 impl<'head, 'method, 'names> CodingPlan<'head, 'method, 'names> {
-  /// Validates all policy and storage requirements without allocation or body I/O.
+  /// Reads `Content-Encoding` in `Mode.Decode`, and checks all limits and memory.
+  ///
+  /// It does not allocate or read the body.
   pub fn make(
     context: ResponseContext<'head, 'method, 'names>,
     mode: Mode,
@@ -526,16 +675,16 @@ impl<'head, 'method, 'names> CodingPlan<'head, 'method, 'names> {
     })
   }
 
-  /// Returns the untouched response head with its original coding and length headers.
+  /// Returns the response head as received.
   pub fn originalHead(self: &Self) -> ResponseHead<'head> { return self.headValue }
 
-  /// Returns the selected framing anomaly exactly.
+  /// Returns a framing problem of the response, if any.
   pub fn selectionAnomaly(self: &Self) -> Anomaly { return self.anomalyValue }
 
-  /// Returns the framing retained by atomic selection.
+  /// Returns the body framing.
   pub fn selectedFraming(self: &Self) -> Framing { return self.framingValue }
 
-  /// Returns the effective plan metadata.
+  /// Returns the summary of the plan.
   pub fn applied(self: &Self) -> AppliedPlan {
     return AppliedPlan {
       mode: self.mode,
@@ -545,49 +694,49 @@ impl<'head, 'method, 'names> CodingPlan<'head, 'method, 'names> {
     }
   }
 
-  /// Returns the deterministic owned reservation admitted by the plan.
+  /// Returns the memory that the plan needs, as counted against `maxOwned`.
   pub fn ownedBytes(self: &Self) -> usize { return self.ownedReservation }
 }
 
-/// Enabled automatic request codings. `x-gzip` is deliberately absent.
+/// The codings to name in an automatic `Accept-Encoding` field. `x-gzip` is never named.
 pub struct EnabledCodings {
-  /// Enables gzip in automatic Accept-Encoding output.
+  /// Name `gzip`.
   pub gzip: bool
-  /// Enables zlib-wrapped deflate in automatic Accept-Encoding output.
+  /// Name `deflate`.
   pub deflate: bool
-  /// Enables zstd in automatic Accept-Encoding output.
+  /// Name `zstd`.
   pub zstd: bool
 }
 
 impl Copy for EnabledCodings {}
 
-/// The explicit automatic behavior when no decoder is enabled.
+/// What to send when no coding is enabled.
 pub enum EmptyEncodingPolicy {
-  /// Advertises identity when automatic negotiation enables no codec.
+  /// Send `Accept-Encoding: identity`.
   Identity,
-  /// Omits Accept-Encoding when automatic negotiation enables no codec.
+  /// Send no `Accept-Encoding` field.
   Omit,
 }
 
-/// Automatic, exact borrowed override, or omitted `Accept-Encoding` policy.
+/// How to make the `Accept-Encoding` field.
 pub union AcceptEncoding<'value> {
-  /// Advertises enabled codecs in stable gzip, deflate, zstd order for Decode mode.
+  /// Name the enabled codings, in the order gzip, deflate, zstd. Only in `Mode.Decode`.
   Automatic {
-    /// The supported codecs to advertise.
+    /// The codings to name.
     pub enabled: EnabledCodings,
-    /// The policy when no codec is enabled.
+    /// What to send when no coding is enabled.
     pub empty: EmptyEncodingPolicy
   },
-  /// Uses the caller value exactly after shared HTTP header validation.
+  /// Send this value. The response is still checked as in the other cases.
   Override {
-    /// The borrowed field value; this value does not weaken response decoding validation.
+    /// The field value.
     pub value: &'value [u8]
   },
-  /// Omits Accept-Encoding without constructing a header.
+  /// Send no `Accept-Encoding` field.
   Omit,
 }
 
-/// Builds at most one validated `Accept-Encoding` field without mutating a request.
+/// Returns the `Accept-Encoding` field for `mode` and `policy`, or `None` when no field is sent.
 pub fn acceptEncoding<'value>(
   mode: Mode,
   policy: AcceptEncoding<'value>,
@@ -636,13 +785,12 @@ fn makeAcceptEncoding<'value>(
   return Result<Option<Header<'value>>, ValueError>.succeed(Option<Header<'value>>.none())
 }
 
-/// Validates source-independent content limits without allocation or body I/O.
+/// Checks `limits` without allocation or I/O.
 ///
 /// # Details
-///
-/// `maxDepth` must be from one through four. `intermediateCapacity` must be from one through
-/// 65,536 bytes. Other byte limits can be zero and are enforced by planning or content I/O.
-/// Codec-specific storage validation occurs when a plan selects that codec.
+/// `maxDepth` must be from 1 to 4, and `intermediateCapacity` from 1 to 65536. The other limits can
+/// be 0, and are checked during planning or decoding. The limits of a decoder are checked when a
+/// plan selects it.
 pub fn validateLimits<'head>(limits: &Limits) -> Result<(), ContentError<'head>> {
   if limits.maxDepth == usize.ZERO || limits.maxDepth > MAX_CODINGS {
     return planFailure<()>(ContentReason<'head>.InvalidLimit {
@@ -1075,48 +1223,47 @@ struct Core {
   marker: u8
 }
 
-/// Owned framing and content state for a caller-owned wire transport.
+/// Decodes a body from wire bytes that you give, without I/O.
 ///
 /// # Details
-/// Planning consumes borrowed metadata, but the resulting decoder owns all runtime state. The
-/// caller retains input bytes not consumed by `step`, including the next HTTP message suffix.
-/// A higher-level response owner must bind the plan and those wire bytes to the same response.
+/// The decoder owns its state. Bytes that `step` does not use, such as the next HTTP message, stay
+/// with you.
 pub struct Decoder {
   core: Core
 }
 
-/// One incremental wire-to-representation transition.
+/// The result of a [`Decoder.step`].
 pub struct DecodeProgress {
-  /// The exact wire prefix consumed from the supplied input.
+  /// The input bytes that the step used.
   pub consumed: usize
-  /// Provisional output and cumulative representation coordinates.
+  /// The decoded bytes and the totals.
   pub progress: ContentProgress
-  /// Whether another wire prefix is needed before the decoder can advance.
+  /// `true` when the decoder needs more input before it can continue.
   pub needsInput: bool
 }
 
-/// A content failure with its committed input prefix and owned runtime cause.
+/// The error from a [`Decoder.step`].
 pub struct DecodeFailure {
-  /// The exact wire prefix consumed before the failure.
+  /// The input bytes that the step used before the error.
   pub consumed: usize
-  /// The original content, framing, or codec failure and output coordinates.
+  /// The error.
   pub error: ContentError<'static>
 }
 
 impl Decoder {
-  /// Acquires the existing bounded framing and codec stack from one validated plan.
+  /// Returns a decoder for `plan`, and allocates its memory.
   pub effect fn make<'head, 'method, 'names>(plan: CodingPlan<'head, 'method, 'names>) -> Decoder
   ! ContentError<'head> | OutOfMemoryError
   ? &mut Allocator {
     let core = run acquireCore(move plan)
     return Decoder {core: move core}
   }
-  /// Advances without I/O, retaining exact consumed and written prefixes on failure.
+  /// Decodes from `input` into `output`, and returns how much it used and wrote.
   ///
   /// # Details
-  /// `endOfInput` promises no bytes follow the supplied input. Returned representation bytes
-  /// remain provisional until `completion` confirms framing, checksums and pending output.
-  /// Empty output completes locally without consuming input or changing a live decoder.
+  /// Set `endOfInput` to `true` when no bytes come after `input`. The decoded bytes are final only
+  /// after the state is `End`. A step can write no bytes, so call it again. An empty `output` does
+  /// nothing.
   pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], endOfInput: bool) -> Result<
     DecodeProgress,
     DecodeFailure,
@@ -1158,32 +1305,32 @@ impl Decoder {
       }
     }
   }
-  /// Reports the current cumulative representation coordinates without advancing input.
+  /// Returns the totals so far.
   pub fn progress(self: &Self) -> ContentProgress {
     return contentProgress(&self.core, usize.ZERO)
   }
-  /// Borrows successful framing and content completion from this owner.
+  /// Returns proof of completion, or `None` if the content is not complete.
   pub fn completion<'owner>(self: &'owner Self) -> Result<
     Option<ContentCompletion<'owner>>,
     ContentError<'static>,
   > {
     return coreCompletion(&self.core)
   }
-  /// Borrows trailers only after successful content and body completion.
+  /// Returns the trailers, after the content completes.
   pub fn trailers<'owner>(self: &'owner Self) -> Result<
     Option<Trailers<'owner>>,
     ContentError<'static>,
   > {
     return coreTrailers(&self.core)
   }
-  /// Permanently abandons unfinished decoding without reading or draining the transport.
+  /// Stops the decoder. Later calls fail.
   pub fn abandon(self: &mut Self) -> () {
     abandonCore(&mut self.core)
     return ()
   }
 }
 
-/// One callback-scoped exclusive content reader.
+/// Reads the content of a body in the callback of [`withReader`].
 pub struct ContentReader<'reader, 'transport, 'head, P> {
   transport: &'reader mut BufferedDuplex<'transport, P>
   core: Core
@@ -1191,7 +1338,7 @@ pub struct ContentReader<'reader, 'transport, 'head, P> {
 }
 
 impl<'reader, 'transport, 'head, P> ContentReader<'reader, 'transport, 'head, P> {
-  /// Borrows untouched wire metadata and the effective applied plan.
+  /// Returns information about the response head and the plan.
   pub fn representation<'owner>(
     self: &'owner Self,
   ) -> Result<RepresentationView<'owner, 'head>, ContentError<'head>> {
@@ -1216,21 +1363,22 @@ impl<'reader, 'transport, 'head, P> ContentReader<'reader, 'transport, 'head, P>
     )
   }
 
-  /// Returns positive completion only after framing, codecs, and pending output finish.
+  /// Returns proof of completion, after the body and all decoders finish.
   pub fn completion<'owner>(
     self: &'owner Self,
   ) -> Result<Option<ContentCompletion<'owner>>, ContentError<'head>> {
     return coreCompletion(&self.core)
   }
 
-  /// Borrows trailers only through successful content and body completion.
+  /// Returns the trailers, after the content completes.
   pub fn trailers<'owner>(
     self: &'owner Self,
   ) -> Result<Option<Trailers<'owner>>, ContentError<'head>> {
     return coreTrailers(&self.core)
   }
 
-  /// Streams one provisional prefix with one unchanged absolute deadline.
+  /// Reads decoded bytes into `output`. The bytes are final only after the state is `End`.
+  /// `deadline` is on the `MonotonicClock`.
   pub effect fn readSome(
     self: &mut Self,
     output: &mut [u8],
@@ -2144,7 +2292,7 @@ fn stageInputFinal(core: &Core, stage: usize) -> bool {
   return core.edge3.finalInput
 }
 
-/// Runs one higher-ranked callback while exclusively borrowing the encoded body.
+/// Gives a [`ContentReader`] for the body in `body` to `callback`, with the decoders of `plan`.
 pub effect fn withReader<
   'reader,
   'transport: 'reader,
