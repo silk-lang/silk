@@ -414,7 +414,7 @@ const program = Effect.gen(function* () {
   assert.equal(noLibrary.status, 1, noLibrary.stderr)
   assert.match(noLibrary.stderr, /--stdlib .*no-library is not a standard library directory/)
   assert.equal(yield* fs.exists(join(directory, 'unnamed')), false)
-  // Another target emits its IR without linking; only the host target links an executable.
+  // Another native target emits its IR without linking; only the host links a native executable.
   const foreign =
     process.platform === 'darwin' ? 'x86_64-unknown-linux-gnu' : 'aarch64-apple-darwin'
   const cross = yield* invoke(
@@ -428,6 +428,26 @@ const program = Effect.gen(function* () {
   const crossIr = yield* fs.readFile(join(directory, 'cross.ll'))
   assert.ok(crossIr.length > 0)
   assert.notDeepEqual(crossIr, bytes, 'IR must follow the requested target, not the host')
+  // wasm32 links freestanding on any host, with the compiler's own C runtime and no host imports.
+  const wasm = yield* invoke(
+    silk,
+    [...argumentsFor('program.wasm'), '--target', 'wasm32-unknown-unknown'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(wasm.status, 0, wasm.stderr)
+  assert.equal(yield* fs.exists(join(directory, 'program.wasm.silk-runtime.c')), false)
+  const wasmModule = new WebAssembly.Module(yield* fs.readFile(join(directory, 'program.wasm')))
+  assert.deepEqual(WebAssembly.Module.imports(wasmModule), [])
+  assert.deepEqual(
+    WebAssembly.Module.exports(wasmModule)
+      .map((entry) => entry.name)
+      .sort(),
+    ['main', 'memory'],
+    'a module exports only its named C exports and its memory',
+  )
+  const wasmMain = new WebAssembly.Instance(wasmModule, {}).exports.main as () => number
+  assert.equal(wasmMain(), 42)
   for (const selectors of [
     ['--emit', 'invalid'],
     ['--emit'],
