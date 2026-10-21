@@ -15,7 +15,8 @@ The sealed `Intrinsic.foreign` declaration clause accepts `callbacks`, a tuple n
 function-pointer parameter. Each listed parameter promises synchronous invocation on the calling
 thread, entirely within the enclosing call, without retention for later invocation. Omitting a
 callback parameter does not imply that promise: unrestricted invocation is unadmitted and diagnoses.
-Requests for escaping callbacks, another thread or permitted unwind also diagnose.
+Requests for escaping callbacks or permitted unwind also diagnose; a callback that runs on another
+thread uses `threadCallbacks` instead.
 
 The function-pointer type itself accepts the same clause for its access behavior. In type clauses,
 unnamed parameters are identified by decimal ordinal strings, starting at `"0"`. Declaration clauses
@@ -35,6 +36,28 @@ The selected platform's actual declaration and implementation justify the unsafe
 the compiler never recognizes its name. The comparator must not modify the array. The wrapper keeps
 the array alive until qsort returns and prevents competing access. Forming a raw pointer does not
 create a loan or prove that arbitrary native code obeys these obligations.
+
+## Callbacks that run on another thread
+
+`Intrinsic.foreign(threadCallbacks: ("start",))` is the alternative to `callbacks` for a callback
+that native code may invoke on any thread, during the call or after it returns, such as the start
+routine of `pthread_create`. The tuple follows the `callbacks` rules: it names every native
+function-pointer parameter exactly once, and the resolved C signature is authenticated again. A
+listed callback may take no reference parameter, since no loan of the caller can last until it runs.
+
+```silk,ignore
+unsafe extern "C" fn pthread_create(
+  thread: *mut usize,
+  attributes: ?*const u8,
+  start: extern "C" fn(?*mut u8) -> ?*mut u8,
+  argument: ?*mut u8,
+) -> i32 with Intrinsic.foreign(threadCallbacks: ("start",))
+```
+
+The export itself needs nothing more: it has no captured environment, and Silk has no thread-local
+or mutable global storage, so its body runs the same on a new thread. Whatever reaches it through
+its raw-pointer arguments is the unsafe caller's obligation, typically an owned value moved with
+`Pointer.take` (see the native pointer boundary) whose type is `Transferable` (THREAD-001).
 
 ## Exported addresses and exact behavior
 
