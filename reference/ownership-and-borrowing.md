@@ -1444,8 +1444,9 @@ fn prepare(values: &[i32]) -> Effect<i32> {
 ```
 
 `prepare` returns an Effect retaining a shared reborrow of `values`. No indexing occurs until the
-Effect runs, but the loan must remain valid from construction through the Effect's last possible
-run or drop.
+Effect runs, but the loan must remain valid from construction through the Effect's last run or
+explicit `drop`. An Effect left to its scope's cleanup holds its loans only through its last use,
+since that cleanup reads no borrowed capture.
 
 Effect service provision follows the same rule. Providing `&clock`, `&mut logger`, or `move
 provider` captures a shared loan, exclusive loan, or owner respectively; service providers do not
