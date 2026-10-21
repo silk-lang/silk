@@ -823,6 +823,79 @@ const program = Effect.gen(function* () {
   )
   assert.equal(conflicting.status, 2, 'a named profile must conflict with --release')
   assert.equal(yield* fs.exists(marker), false)
+  // A profile's CPU features, large code model and static link reach Clang.
+  const argumentLog = join(directory, 'clang-arguments')
+  const recorder = join(directory, 'clang-recorder')
+  yield* fs.writeFileString(
+    recorder,
+    `#!/bin/sh\nprintf '%s\\n' "$@" >> ${quote(argumentLog)}\nexec ${quote(clang)} "$@"\n`,
+  )
+  yield* fs.chmod(recorder, 0o755)
+  const x86 = hostTarget.startsWith('x86_64-')
+  const tuned = join(directory, 'tuned')
+  yield* fs.makeDirectory(join(tuned, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(tuned, 'src/main.silk'),
+    'pub fn main() -> i32 {\n  return 0\n}\n',
+  )
+  const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nroot = "src/main.silk"\n'
+  yield* fs.writeFileString(
+    join(tuned, 'silk.toml'),
+    `${tunedHeader}\n[profiles.tuned]\ntarget = "${hostTarget}"\ncpu = { features = ["${x86 ? 'avx2' : 'crc'}"] }\n${
+      x86 ? 'codeModel = "large"\n' : ''
+    }${process.platform === 'darwin' ? '' : 'link = "static"\n'}`,
+  )
+  const tunedBuild = yield* invoke(
+    silk,
+    ['build', '--profile', 'tuned', '--stdlib', standardLibrary],
+    tuned,
+    { ...process.env, SILK_CLANG: recorder },
+  )
+  assert.equal(tunedBuild.status, 0, tunedBuild.stderr)
+  const recorded = (yield* fs.readFileString(argumentLog)).split('\n')
+  assert.ok(recorded.includes(x86 ? '+avx2' : '+crc'), recorded.join(' '))
+  assert.equal(recorded.includes('-mcmodel=large'), x86, recorded.join(' '))
+  assert.equal(recorded.includes('-static'), process.platform !== 'darwin', recorded.join(' '))
+  const tunedRun = yield* invoke(
+    join(tuned, 'build/llvm', hostTarget, 'tuned/tuned'),
+    [],
+    tuned,
+  )
+  assert.equal(tunedRun.status, 0, tunedRun.stderr)
+  // Profile fields the native build cannot honor yet, a profile artifact other than the one
+  // [build].artifact requests, unknown manifest fields and reserved module names are refused
+  // before anything is built, naming the manifest line.
+  const refusedProfiles = [
+    ['sanitizers = ["address"]', /silk\.toml:7: profiles\.p\.sanitizers is not supported by the native compiler yet/],
+    ['unwind = "native"', /silk\.toml:7: profiles\.p\.unwind = "native" is not supported by the native compiler yet/],
+    ['artifact = "object"', /silk\.toml:7: UnsupportedCombination: profiles\.p\.artifact = "object" differs from \[build\]\.artifact = "executable"/],
+    ['opt = "speed"', /silk\.toml:7: profiles\.p\.opt is not a supported field/],
+  ] as const
+  for (const [field, message] of refusedProfiles) {
+    yield* fs.writeFileString(
+      join(tuned, 'silk.toml'),
+      `${tunedHeader}[profiles.p]\ntarget = "${hostTarget}"\n${field}\n`,
+    )
+    const refusedProfile = yield* invoke(
+      silk,
+      ['build', '--profile', 'p', '--stdlib', standardLibrary],
+      tuned,
+      { ...process.env, SILK_CLANG: sentinel },
+    )
+    assert.equal(refusedProfile.status, 2, `${field} must be refused`)
+    assert.match(refusedProfile.stderr, message)
+  }
+  yield* fs.writeFileString(join(tuned, 'silk.toml'), `${tunedHeader}\n[packge]\nname = "x"\n`)
+  const misspelled = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
+  assert.equal(misspelled.status, 2, misspelled.stderr)
+  assert.match(misspelled.stderr, /silk\.toml:6: packge is not a supported field/)
+  yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
+  yield* fs.makeDirectory(join(tuned, 'src/silk'), { recursive: true })
+  yield* fs.writeFileString(join(tuned, 'src/silk/extra.silk'), 'pub fn hi() -> i32 {\n  return 1\n}\n')
+  const reserved = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
+  assert.notEqual(reserved.status, 0, reserved.stderr)
+  assert.match(reserved.stderr, /`silk` and `Intrinsic` are reserved module names/)
+  assert.equal(yield* fs.exists(marker), false)
   // `[build].bindings` reach the package parameters of every project build.
   yield* fs.makeDirectory(join(directory, 'bound/src'), { recursive: true })
   yield* fs.writeFileString(
