@@ -1248,8 +1248,11 @@ second invocation cannot duplicate the environment.
 A body that stores what one capture carries where another capture reaches, such as a loan of a
 borrowed capture written into a captured holder, needs the first capture's region to outlive the
 second's. The body does not prove such a relation between regions its creator chooses; the creator
-proves it where it constructs the callable, as if each such store happened there. A relation that
-involves the callable's own parameter lifetimes is proved inside its body.
+proves it where it constructs the callable, as if each such store happened there. A captured
+exclusive reference the body reads or writes through is reached only through the loan of its
+referent that the construction takes. A body that stores a reborrow of that referent for the
+reference's own lifetime therefore makes that loan last as long. A relation that involves the
+callable's own parameter lifetimes is proved inside its body.
 
 ```silk,ignore
 struct Slot<'a> { view: &'a i32 }

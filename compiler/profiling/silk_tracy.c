@@ -1,4 +1,4 @@
-// The two calls `compiler/src/Profiler.silk` makes when Tracy is enabled. Silk cannot pass Tracy's
+// The calls `compiler/src/Profiler.silk` makes when Tracy is enabled. Silk cannot pass Tracy's
 // C zone context by value yet, so a zone crosses the boundary packed into one word.
 #include <stddef.h>
 #include <stdint.h>
@@ -11,7 +11,13 @@ uint64_t silk_tracy_zone_begin(const char *name, size_t size) {
   return ((uint64_t)zone.id << 32) | (uint32_t)zone.active;
 }
 
-void silk_tracy_zone_end(uint64_t packed) {
+static TracyCZoneCtx unpack(uint64_t packed) {
   TracyCZoneCtx zone = {(uint32_t)(packed >> 32), (int32_t)(uint32_t)packed};
-  ___tracy_emit_zone_end(zone);
+  return zone;
+}
+
+void silk_tracy_zone_end(uint64_t packed) { ___tracy_emit_zone_end(unpack(packed)); }
+
+void silk_tracy_zone_text(uint64_t packed, const char *text, size_t size) {
+  ___tracy_emit_zone_text(unpack(packed), text, size);
 }

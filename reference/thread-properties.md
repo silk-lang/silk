@@ -1,0 +1,166 @@
+# Thread properties
+
+Two sealed properties say which values may cross a thread boundary. Thread-spawning and
+execution APIs bound their inputs on them, so a program that would share non-atomic state between
+threads is rejected where the value is handed off. The compiler derives both properties from a
+type's stored parts. A type that synchronizes its own storage, such as a lock built on
+`silk.atomic`, asserts them with an `impl`.
+
+## Terms
+
+- A value is **transferred** when ownership of it moves to code that may run on another thread.
+- A value is **shared across threads** when several threads may use one shared borrow of it at
+  the same time.
+- A type's **stored parts** are the types it holds by value: a record's fields, a union's variant
+  payloads, a structural union's members, an array's element, a closure's captures, and the
+  realized storage of an opaque representation.
+
+## THREAD-001 — `Transferable` and `Concurrent` are sealed `Intrinsic` properties published by `silk.thread`
+
+**Status:** Confirmed
+
+The sealed namespace has two thread properties:
+
+- `Intrinsic.Transferable`: ownership of a value may move to another thread.
+- `Intrinsic.Concurrent`: a shared borrow of a value may be used from several threads at once.
+
+The standard library publishes them under ordinary names through TYPE-004 aliases:
+
+```silk,ignore
+// silk/thread.silk
+pub type Transferable = Intrinsic.Transferable
+pub type Concurrent = Intrinsic.Concurrent
+```
+
+Either one is a bound, `T: Transferable`, or an `impl` head, `impl Concurrent for Lock {}`, like
+`Copy` (INTR-006). A bound on a type parameter is a premise inside the body and an obligation at
+each use:
+
+```silk
+import silk.thread { Transferable }
+
+struct Job { id: i32 }
+
+fn handOff<T: Transferable>(value: T) -> T {
+  return move value
+}
+
+pub fn main() -> i32 {
+  let job = handOff(Job { id: 42 })
+  return job.id
+}
+```
+
+**Boundary:** The properties are bounds and `impl` heads only; neither is a value type. `Drop` is
+not a bound. A second bound naming the same property on the same parameter is a duplicate.
+
+**Diagnostics:** A duplicate bound reports `SEM0083`. An unknown `Intrinsic` member reports the
+unknown-intrinsic diagnostic of INTR-001.
+
+**Current compiler:** Aligned.
+
+## THREAD-002 — Both properties are derived from a type's stored parts
+
+**Status:** Confirmed
+
+A type has a thread property when the first matching row holds:
+
+| Type | `Transferable` | `Concurrent` |
+| --- | --- | --- |
+| A type parameter with the property as a premise | yes | yes |
+| `()`, a scalar primitive, `string`, a C function address, an enum | yes | yes |
+| A raw pointer `*T`, `*mut T`, `[*]T` | no | no |
+| `&T`, `&[T]` | when `T` is `Concurrent` | when `T` is `Concurrent` |
+| `&mut T`, `&mut [T]` | when `T` is `Transferable` | when `T` is `Concurrent` |
+| A record, union, structural union, array, anonymous tuple or record, closure or composed Effect | when every stored part is | when every stored part is |
+| A nominal type with an applicable `impl` of the property (THREAD-003) | yes | yes |
+| `Allocation`, `Intrinsic.StorageFailure` | yes | yes |
+| `RawBuffer<T>`, `Slot<'s, T>` | when `T` is | when `T` is |
+| `Shared<T>` (its `Intrinsic.SharedCore<T>`), `Intrinsic.Execution<A>`, `Intrinsic.ExecutionRef` | no | no |
+| Any other type, including a parameter without the premise and a callable or Effect contract | no | no |
+
+A raw pointer may alias storage that another thread also reaches, so it proves neither property;
+the type that owns the pointer decides with an `impl`. `Shared<T>` counts references without
+atomic operations, so a second thread's clone or drop would race. An execution package belongs to
+the executor that created it.
+
+A nominal type that stores itself through owned storage is checked once: reaching the same exact
+type again while proving it holds. Reaching the same declaration with different arguments, such as
+`Growing<T>` storing `Growing<[T; 1]>`, cannot be proved.
+
+```silk
+import silk.list { List }
+import silk.thread { Concurrent, Transferable }
+
+struct Inbox { items: List<i32> }
+
+fn send<T: Transferable>(value: T) -> i32 { return 21 }
+fn share<T: Concurrent>(value: &T) -> i32 { return 21 }
+
+pub fn main() -> i32 {
+  let inbox = Inbox { items: List<i32>.make() }
+  let shared = share(&inbox)
+  return shared + send(move inbox)
+}
+```
+
+**Boundary:** Derivation reads stored parts, never method bodies, so editing a function never
+changes a type's thread properties. An `impl` only adds a property; it never removes a derived one.
+
+**Diagnostics:** A bound the type does not satisfy reports `SEM0121` (THREAD-004).
+
+**Current compiler:** Aligned.
+
+## THREAD-003 — An `impl` of a thread property is an unchecked assertion
+
+**Status:** Confirmed
+
+A module asserts a property for a nominal type it declares with an empty `impl`, which may carry
+bounds:
+
+```silk,ignore
+struct Buffer<T> { base: *mut T count: usize }
+
+impl<T: Transferable> Transferable for Buffer<T> {}
+impl<T: Concurrent> Concurrent for Buffer<T> {}
+```
+
+The compiler does not inspect the type's parts when such an `impl` applies. The declaring module
+is responsible for every access through the storage the type reaches: transferring a `Buffer<T>`
+must not leave another owner of `base`, and sharing one across threads must synchronize every
+write, for example with `silk.atomic`.
+
+Coherence follows the sealed-property rules for `Copy`: the `impl` lives in the type's declaring
+module, and at most one `impl` of a property applies to a type.
+
+**Boundary:** The `impl` declares no members. An enum always has both properties, so an `impl` for
+one is rejected.
+
+**Diagnostics:** An `impl` with a member, or an `impl` for an enum, reports `SEM0083`.
+
+**Current compiler:** Aligned.
+
+## THREAD-004 — An unsatisfied thread bound is a missing conformance
+
+**Status:** Confirmed
+
+Each use of a function, type or `impl` head whose bounds name a thread property proves the bound
+for the applied type under the caller's premises (THREAD-002). A generic caller passes its own
+parameter only when it declares the same bound.
+
+```silk,ignore
+import silk.shared { Shared }
+import silk.thread { Transferable }
+
+fn send<T: Transferable>(value: T) -> () {}
+
+pub fn main() -> i32 {
+  let counter = Shared<i32>.make(1)
+  send(move counter) // SEM0121: `Shared<i32>: Transferable`
+  return 0
+}
+```
+
+**Diagnostics:** `SEM0121` at the use, naming the goal, such as `` `Shared<i32>: Transferable` ``.
+
+**Current compiler:** Aligned.

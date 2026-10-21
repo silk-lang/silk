@@ -52,6 +52,7 @@ import backend.DropGlue {
   Variant as GlueVariant,
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
+import backend.Mir
 import backend.MirVerification
 import backend.MirVerification {UseAfterDrop}
 import backend.InstanceRecipe {InstanceRecipe}
@@ -152,6 +153,8 @@ import semantic.Intrinsic {
   genericArgument as intrinsicGenericArgument,
   genericParameter as intrinsicGenericParameter,
   genericResult as intrinsicGenericResult,
+  MemoryOrder as IntrinsicMemoryOrder,
+  isAtomic as intrinsicIsAtomic,
   isGeneric as intrinsicIsGeneric,
   isPrimitive as intrinsicIsPrimitive,
   isReflection as intrinsicIsReflection,
@@ -612,6 +615,9 @@ pub union Constraint {
   Outlives {pub longer: Shared<Lifetime>, pub shorter: Shared<Lifetime>},
   /// `T: Copy` requires the compiler-sealed Copy property, which no ordinary interface supplies.
   Copyable {pub subject: Shared<Type>},
+  /// `T: Transferable` or `T: Concurrent` requires that sealed thread property, derived from the
+  /// type's parts or asserted by its declaring module's `impl` (THREAD-002, THREAD-003).
+  ThreadSafe {pub subject: Shared<Type>, pub property: SealedProperty},
   /// `F: Intrinsic.Detached` or `F: Intrinsic.NonParking` requires one sealed compiler property of
   /// an executable. It is a witness-free static obligation, not an interface or service.
   Property {pub subject: Shared<Type>, pub property: IntrinsicProperty},
@@ -674,6 +680,10 @@ pub enum SealedProperty {
   Copy,
   /// One restricted automatic cleanup hook.
   Drop,
+  /// Ownership of a value may move to another thread.
+  Transferable,
+  /// A shared borrow of a value may be used from several threads at once.
+  Concurrent,
 }
 
 /// What one `impl` declaration implements.
@@ -1019,6 +1029,24 @@ impl Dependency {
 }
 
 // Families whose key names one declaration handle.
+// The declaration a query key names, as `module.Owner.name`, for its Tracy zone text; empty for a
+// family keyed by content. Reads the preloaded source unobserved, so it records no dependency.
+effect fn zoneSubject(resolver: &mut Resolver, key: Key) -> Bytes ! Cycle | OutOfMemoryError ? &mut Allocator {
+  if !declarationFamily(key.family) || key.declaration == usize.MAX || key.module >= List<ModuleId>.length(&resolver.modules) {
+    return Bytes.make()
+  }
+  let module = resolvedModule(&resolver.*, key.module)
+  let answer = run demandSource(&mut resolver.*, &module)
+  if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, &module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(value))
+    let position = declarationPosition(&resolver.*, key)
+    if position < declarations.length {
+      return run Mir.declarationName(&declarations[position].identity)
+    }
+  }
+  return Bytes.make()
+}
+
 fn declarationFamily(family: Family) -> bool {
   return family != Family.Name && family != Family.OperatorInterfaces && family != Family.Tests
     && family != Family.Implementations && family != Family.ImplementationShapes
@@ -3001,6 +3029,13 @@ fn sameReuseConstraint(left: &Constraint, right: &Constraint) -> bool {
       Constraint.Copyable {subject: other} => sameReusableType(&subject, &other)
       _ => false
     }
+    Constraint.ThreadSafe {subject, property} => match & right.* {
+      Constraint.ThreadSafe {subject: other, property: otherProperty} => property == otherProperty && sameReusableType(
+        &subject,
+        &other,
+      )
+      _ => false
+    }
     Constraint.Property {subject, property} => match & right.* {
       Constraint.Property {subject: other, property: otherProperty} => property == otherProperty && sameReusableType(
         &subject,
@@ -4112,6 +4147,10 @@ fn copyConstraint(constraint: &Constraint) -> Constraint {
       shorter: Shared<Lifetime>.clone(&shorter),
     }
     Constraint.Copyable {subject} => Constraint.Copyable {subject: Shared<Type>.clone(&subject)}
+    Constraint.ThreadSafe {subject, property} => Constraint.ThreadSafe {
+      subject: Shared<Type>.clone(&subject),
+      property: property,
+    }
     Constraint.Property {subject, property} => Constraint.Property {
       subject: Shared<Type>.clone(&subject),
       property: property,
@@ -6548,6 +6587,10 @@ effect fn demandUnit(
     > ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError | StaticBudgetRefusal ? &mut Allocator | &mut Types {
       run emit(&mut resolver.*, EventKind.Start, demanded)
       let zone = Profiler.zone(familyZone(key.family))
+      static if Profiler.enabled {
+        let subject = run zoneSubject(&mut resolver.*, key)
+        Profiler.text(&zone, Bytes.asSlice(&subject))
+      }
       let resolved = run withRunning(&mut resolver.*, &mut query.*, demanded)
       if isTransientStaticBudgetAnswer(&resolved) {
         fail StaticBudgetRefusal {answer: move resolved}
@@ -12984,15 +13027,31 @@ effect fn declareBound(
     let sealed = run sealedProperty(&mut resolver.*, &mut owner.*, &mut dependencies.*, moduleOrdinal, module, boundId,
       binders)
     if let Option<SealedProperty>.Some {value: property} = move sealed {
-      // Only Copy is a bound; Drop is requested by an `impl`, never required of a parameter.
-      let copyable = match property {
-        SealedProperty.Copy => true
-        SealedProperty.Drop => false
-      }
-      if !copyable {
+      // Drop is requested by an `impl`, never required of a parameter.
+      if property == SealedProperty.Drop {
         return Option<Shared<Rejection>>.some(
           run reject(&resolver.*, module, RejectionCode.InvalidBound, span),
         )
+      }
+      if property != SealedProperty.Copy {
+        let written = List<Constraint>.asSlice(&constraints.*)
+        let mut each = usize.ZERO
+        while each < written.length {
+          if let Constraint.ThreadSafe {subject, property: found} = &written[each] {
+            if found == property && run Type.equalsShared(&subject, &provider) {
+              if phase == BoundPhase.Application {
+                return Option<Shared<Rejection>>.none()
+              }
+              return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.DuplicateBound, span))
+            }
+          }
+          each = each + usize.ONE
+        }
+        run List<Constraint>.append(
+          &mut constraints.*,
+          Constraint.ThreadSafe {subject: Shared<Type>.clone(&provider), property: property},
+        )
+        return Option<Shared<Rejection>>.none()
       }
       let prior = List<Constraint>.asSlice(&constraints.*)
       let mut at = usize.ZERO
@@ -13910,6 +13969,9 @@ effect fn collectConstraint(
     Constraint.Copyable {subject} => {
       run Type.collectOwned(&subject, owner, &mut types.*, &mut regions.*, &mut rows.*)
     }
+    Constraint.ThreadSafe {subject, ..} => {
+      run Type.collectOwned(&subject, owner, &mut types.*, &mut regions.*, &mut rows.*)
+    }
     Constraint.Property {subject, ..} => {
       run Type.collectOwned(&subject, owner, &mut types.*, &mut regions.*, &mut rows.*)
     }
@@ -14772,8 +14834,9 @@ effect fn intrinsicBound(resolver: &mut Resolver, module: &ModuleId, id: HirId) 
   return move found
 }
 
-// The sealed property a written `Intrinsic.Copy` or `Intrinsic.Drop` names (INTR-006). The bare
-// `Copy` and `Drop` are ordinary names, such as the `silk.ownership` aliases.
+// The sealed property a written `Intrinsic.Copy`, `Intrinsic.Drop`, `Intrinsic.Transferable` or
+// `Intrinsic.Concurrent` names (INTR-006, THREAD-001). The bare names are ordinary, such as the
+// `silk.ownership` and `silk.thread` aliases.
 effect fn sealedPropertyName(resolver: &mut Resolver, module: &ModuleId, id: HirId) -> Option<SealedProperty>
 ! Cycle | OutOfMemoryError ? &mut Allocator {
   let syntax = run typeNode(&mut resolver.*, module, id)
@@ -14797,6 +14860,12 @@ fn propertyNamed(name: &[u8]) -> Option<SealedProperty> {
   }
   if same(name, b"Drop") {
     return Option<SealedProperty>.some(SealedProperty.Drop)
+  }
+  if same(name, b"Transferable") {
+    return Option<SealedProperty>.some(SealedProperty.Transferable)
+  }
+  if same(name, b"Concurrent") {
+    return Option<SealedProperty>.some(SealedProperty.Concurrent)
   }
   return Option<SealedProperty>.none()
 }
@@ -15483,9 +15552,12 @@ effect fn resolveImplementationShape(
   // ENUM-003: a scalar enum is always Copy and never admits a Drop hook, so neither is requested.
   if let ImplementationKind.Sealed {property} = &kind {
     if Shared<Type>.with<OwnerKind>(&provider, nominalKind) == OwnerKind.Enumeration {
+      // A scalar enum is also always Transferable and Concurrent, so no assertion is needed.
       let code = match property {
         SealedProperty.Copy => RejectionCode.InvalidCopyConformance
         SealedProperty.Drop => RejectionCode.InvalidDropImplementation
+        SealedProperty.Transferable => RejectionCode.InvalidThreadPropertyConformance
+        SealedProperty.Concurrent => RejectionCode.InvalidThreadPropertyConformance
       }
       return run memberRejected(run reject(&resolver.*, &module, code, span), move dependencies)
     }
@@ -17695,6 +17767,13 @@ effect fn sealedMemberRejection(
     if entries.length > usize.ZERO {
       return Option<Shared<Rejection>>.some(run sealedMemberRefusal(module, RejectionCode.InvalidCopyConformance, entries[usize.ZERO].span,
         b"`impl Copy` declares no members; the compiler copies the value"))
+    }
+    return Option<Shared<Rejection>>.none()
+  }
+  if property == SealedProperty.Transferable || property == SealedProperty.Concurrent {
+    if entries.length > usize.ZERO {
+      return Option<Shared<Rejection>>.some(run sealedMemberRefusal(module, RejectionCode.InvalidThreadPropertyConformance,
+        entries[usize.ZERO].span, b"a thread property `impl` declares no members; it only asserts the property"))
     }
     return Option<Shared<Rejection>>.none()
   }
@@ -20459,6 +20538,13 @@ effect fn sameConstraint(left: &Constraint, right: &Constraint) -> bool
   if let Constraint.Copyable {subject} = &left.* {
     if let Constraint.Copyable {subject: otherSubject} = &right.* {
       return run Type.equalsShared(&subject, &otherSubject)
+    }
+    return false
+  }
+  if let Constraint.ThreadSafe {subject, property} = &left.* {
+    if let Constraint.ThreadSafe {subject: otherSubject, property: otherProperty} = &right.* {
+      let sameSubject = run Type.equalsShared(&subject, &otherSubject)
+      return sameSubject && property == otherProperty
     }
     return false
   }
@@ -24612,6 +24698,10 @@ effect fn applyConstraintBindings(value: &Constraint, bindings: &[Binding]) -> C
     Constraint.Copyable {subject} => Constraint.Copyable {
       subject: run Type.applyBindings(&subject, bindings, true),
     }
+    Constraint.ThreadSafe {subject, property} => Constraint.ThreadSafe {
+      subject: run Type.applyBindings(&subject, bindings, true),
+      property: property,
+    }
     Constraint.Property {subject, property} => Constraint.Property {
       subject: run Type.applyBindings(&subject, bindings, true),
       property: property,
@@ -24896,6 +24986,7 @@ effect fn constraintMentionsOwner(value: &Constraint, owner: &DeclarationId) -> 
     Constraint.Contents {subject, region} => (run typeMentionsOwner(&subject, owner)) || (run argumentMentionsOwner(&Argument.Lifetime {value: Shared<Lifetime>.clone(&region)}, owner))
     Constraint.Outlives {longer, shorter} => (run argumentMentionsOwner(&Argument.Lifetime {value: Shared<Lifetime>.clone(&longer)}, owner)) || (run argumentMentionsOwner(&Argument.Lifetime {value: Shared<Lifetime>.clone(&shorter)}, owner))
     Constraint.Copyable {subject} => run typeMentionsOwner(&subject, owner)
+    Constraint.ThreadSafe {subject, ..} => run typeMentionsOwner(&subject, owner)
     Constraint.Property {subject, ..} => run typeMentionsOwner(&subject, owner)
     Constraint.Provides {provider, selector, source} => (run typeMentionsOwner(&provider, owner)) || (run argumentMentionsOwner(&Argument.Row {value: Shared<Row>.clone(&selector)}, owner)) || (run argumentMentionsOwner(&Argument.Row {value: Shared<Row>.clone(&source)}, owner))
     Constraint.FailureSubset {selected, source} => (run typeMentionsOwner(&selected, owner)) || (run typeMentionsOwner(&source, owner))
@@ -36218,6 +36309,13 @@ effect fn boundsAdmitGroupShortening(
         run Type.collectOwned(&subject, fresh, &mut types, &mut lifetimes, &mut rows)
         admitted = !containsOrdinal(&lifetimes, ordinal)
       }
+      Option<Constraint>.Some {value: Constraint.ThreadSafe {subject, ..}} => {
+        let mut types = List<usize>.make()
+        let mut lifetimes = List<usize>.make()
+        let mut rows = List<usize>.make()
+        run Type.collectOwned(&subject, fresh, &mut types, &mut lifetimes, &mut rows)
+        admitted = !containsOrdinal(&lifetimes, ordinal)
+      }
       Option<Constraint>.Some {value: Constraint.Property {subject, ..}} => {
         let mut types = List<usize>.make()
         let mut lifetimes = List<usize>.make()
@@ -37390,6 +37488,116 @@ effect fn checkedReflectedMember(
     Option<Shared<Type>>.None => Result<CheckedRecordMember, Shared<Rejection>>.failResult(
       run reject(&resolver.*, module, RejectionCode.Unsupported, span))
   }
+}
+
+// One atomic memory operation (ATOMIC-002 through ATOMIC-004): runtime operands at their
+// instantiated types, then each static ordering, embedded as the text the selection pass
+// evaluated. A concrete element and every ordering must be admitted by the operation.
+effect fn checkAtomicCall<'scope>(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, request: &mut Request,
+  dependencies: &mut List<Dependency>, module: &ModuleId, cursor: &AuthoredCursor,
+  caller: &DeclarationId, statementScope: &mut StatementScope<'scope>, calls: &[ResolvedCall],
+  nodes: &mut List<BodyNode>, signatures: &mut List<SignatureDependency>,
+  requiredBodies: &mut List<DeclarationId>, expression: HirId, span: Span, member: IntrinsicMember,
+  typeArguments: &[Shared<Type>], arguments: CallArguments, expected: &Option<Shared<Type>>, mismatchCode: RejectionCode,
+  constraints: &[Constraint], contractBody: bool, unsafeAllowed: bool,
+) -> Result<BodyNodeId, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  if typeArguments.length != intrinsicTypeArity(member) {
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(run rejectArity(&resolver.*, module, span, intrinsicTypeArity(member), typeArguments.length))
+  }
+  if typeArguments.length == usize.ONE && !Type.hasOpenParameters(&typeArguments[usize.ZERO]) {
+    let admitted = Shared<Type>.with<bool>(&typeArguments[usize.ZERO], fn(element: &Type) -> bool {
+      return CheckedIntrinsic.admitsElement(member, element)
+    })
+    if !admitted { return run bodyRejection(&resolver.*, module, RejectionCode.InvalidAtomicOperation, span) }
+  }
+  let orderings = match move CheckedIntrinsic.orderingStart(member) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return CompilerBug.panic(b"MissingRetainedFact: checkAtomicCall") }
+  }
+  let mut checkedArguments = List<BodyNodeId>.make()
+  let mut at = usize.ZERO
+  while at < orderings {
+    let parameterType = match move run intrinsicGenericParameter(member, typeArguments, at) {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => { return CompilerBug.panic(b"MissingRetainedFact: checkAtomicCall") }
+    }
+    let argumentId = run bodyArgument(&resolver.source, cursor, arguments, at)
+    let context = Option<Shared<Type>>.some(Shared<Type>.clone(&parameterType))
+    let checked = run checkExpression(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module, cursor,
+      caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, argumentId, &context,
+      RejectionCode.TypeMismatch, constraints, contractBody, false, unsafeAllowed)
+    let mut argumentNode = match move checked {
+      Result<BodyNodeId, Shared<Rejection>>.Success {value} => value
+      Result<BodyNodeId, Shared<Rejection>>.Failure {error} => { return Result<BodyNodeId, Shared<Rejection>>.failResult(move error) }
+    }
+    let noVariables = List<Shared<DeclarationId>>.make()
+    let noBindings = List<Binding>.make()
+    argumentNode = run pointerArgument(&mut nodes.*, argumentNode, &parameterType,
+      List<Shared<DeclarationId>>.asSlice(&noVariables), List<Binding>.asSlice(&noBindings))
+    let valid = match move bodyExpressionType(List<BodyNode>.asSlice(&nodes.*), &argumentNode) {
+      Option<Shared<Type>>.Some {value} => run Type.equalsShared(&value, &parameterType)
+      Option<Shared<Type>>.None => false
+    }
+    if !valid { return run bodyRejection(&resolver.*, module, RejectionCode.TypeMismatch, run bodySpan(&resolver.source, cursor, argumentId)) }
+    run List<BodyNodeId>.append(&mut checkedArguments, argumentNode)
+    at = at + usize.ONE
+  }
+  let slots = match move staticArgumentsFact(calls, expression) {
+    Option<Shared<List<StaticSlot>>>.Some {value} => move value
+    Option<Shared<List<StaticSlot>>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, span) }
+  }
+  let mut orders = List<IntrinsicMemoryOrder>.make()
+  while at < intrinsicArity(member) {
+    let argumentId = run bodyArgument(&resolver.source, cursor, arguments, at)
+    let argumentSpan = run bodySpan(&resolver.source, cursor, argumentId)
+    let ordinal = at
+    let value = match move Shared<List<StaticSlot>>.with<Option<Shared<StaticData>>>(&slots,
+      fn(listed: &List<StaticSlot>) -> Option<Shared<StaticData>> { return staticSlotValue(listed, ordinal) }) {
+      Option<Shared<StaticData>>.Some {value} => move value
+      Option<Shared<StaticData>>.None => { return run bodyRejection(&resolver.*, module, RejectionCode.StaticPhaseViolation, argumentSpan) }
+    }
+    let order = Shared<StaticData>.with<Option<IntrinsicMemoryOrder>>(&value, fn(data: &StaticData) -> Option<IntrinsicMemoryOrder> {
+      return match &data.* {
+        StaticData.Text {bytes} => CheckedIntrinsic.memoryOrder(Bytes.asSlice(&bytes))
+        _ => Option<IntrinsicMemoryOrder>.none()
+      }
+    })
+    match move order {
+      Option<IntrinsicMemoryOrder>.Some {value: selected} => run List<IntrinsicMemoryOrder>.append(&mut orders, selected)
+      Option<IntrinsicMemoryOrder>.None => {
+        return run bodyRejection(&resolver.*, module, RejectionCode.InvalidAtomicOperation, argumentSpan)
+      }
+    }
+    let embedded = List<BodyNode>.length(&nodes.*)
+    run List<BodyNode>.append(&mut nodes.*, BodyNode {
+      origin: run originAt(cursor, argumentId, argumentSpan),
+      kind: BodyNodeKind.Expression {ty: run CheckedIntrinsic.staticTextType(), form: BodyExpression.Embedded {value: move value}},
+    })
+    run List<BodyNodeId>.append(&mut checkedArguments, BodyNodeId {index: embedded})
+    at = at + usize.ONE
+  }
+  let listed = List<IntrinsicMemoryOrder>.asSlice(&orders)
+  let success = listed[usize.ZERO]
+  let mut failure = IntrinsicMemoryOrder.Relaxed
+  if listed.length == 2 { failure = listed[usize.ONE] }
+  if !CheckedIntrinsic.admitsOrders(member, success, failure) {
+    // Only a compare-exchange's failure ordering can be refused when it takes two.
+    let blamed = run bodyArgument(&resolver.source, cursor, arguments, orderings + listed.length - usize.ONE)
+    return run bodyRejection(&resolver.*, module, RejectionCode.InvalidAtomicOperation, run bodySpan(&resolver.source, cursor, blamed))
+  }
+  let ty = match move run intrinsicGenericResult(member, typeArguments) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => run Types.intern(Type.Unit)
+  }
+  let index = List<BodyNode>.length(&nodes.*)
+  run List<BodyNode>.append(&mut nodes.*, BodyNode {
+    origin: run originAt(cursor, expression, span),
+    kind: BodyNodeKind.Expression {ty: move ty, form: BodyExpression.IntrinsicCall {member: member, arguments: move checkedArguments}},
+  })
+  return run checkExpectedValue(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, caller, constraints, &mut nodes.*,
+    BodyNodeId {index: index}, expected, mismatchCode, span)
 }
 
 effect fn checkBorrowFieldCall<'scope>(
@@ -41883,14 +42091,16 @@ effect fn finishLiteral(
       // Each by-reference capture has its own region, opened at its first use.
       let region = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(caller), ordinal: capture.firstUse.node,
         binder: usize.MAX})
-      run List<EnvironmentAlias>.append(&mut environmentAliases, EnvironmentAlias {local: capture.local.index, region: Shared<Lifetime>.clone(&region)})
+      run List<EnvironmentAlias>.append(&mut environmentAliases, EnvironmentAlias {local: capture.local.index,
+        region: Shared<Lifetime>.clone(&region), held: false})
       fieldType = run Types.intern(Type.Reference {access: access, referent: Shared<Type>.clone(&capture.ty), lifetime: move region})
       operand = BodyNodeId {index: List<BodyNode>.length(&nodes.*)}
       run List<BodyNode>.append(&mut nodes.*, BodyNode {origin: capture.firstUse, kind: BodyNodeKind.Expression {
         ty: Shared<Type>.clone(&fieldType), form: BodyExpression.Borrow {access: access, value: local}}})
     }
     // A captured exclusive descriptor the body reads or writes through stays in its field, and its
-    // referent is reborrowed with that access for as long as the callable lives (CAPTURE-002).
+    // referent is reborrowed with that access for as long as the callable lives (CAPTURE-002). The
+    // body reaches the referent only through that loan, whose region its creator chooses.
     let exclusiveView = Shared<Type>.with<bool>(&capture.ty, fn(ty: &Type) -> bool {
       return match &ty.* {
         Type.Reference {access, ..} => access == Access.Mutable
@@ -41901,7 +42111,11 @@ effect fn finishLiteral(
     if exclusiveView && (capture.access == CaptureAccess.Shared || capture.access == CaptureAccess.Mutable) {
       let mut access = Access.Shared
       if capture.access == CaptureAccess.Mutable { access = Access.Mutable }
-      run List<BodyReferentCapture>.append(&mut referents, BodyReferentCapture {field: at, access: access})
+      let region = run Shared<Lifetime>.make(Lifetime.Local {declaration: DeclarationId.copy(caller), ordinal: capture.firstUse.node,
+        binder: usize.MAX})
+      run List<EnvironmentAlias>.append(&mut environmentAliases, EnvironmentAlias {local: capture.local.index,
+        region: Shared<Lifetime>.clone(&region), held: true})
+      run List<BodyReferentCapture>.append(&mut referents, BodyReferentCapture {field: at, access: access, region: move region})
     }
     if capture.access == CaptureAccess.Move {
       let consumed = match move run consumedPlace(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, cursor,
@@ -48207,6 +48421,18 @@ effect fn valueCallableContract(value: &Shared<Type>, constraints: &[Constraint]
   return Option<Shared<Type>>.none()
 }
 
+// Whether `value` is a representation parameter, whose contract a `Represents` constraint states.
+effect fn representedValue(value: &Shared<Type>, constraints: &[Constraint]) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut at = usize.ZERO
+  while at < constraints.length {
+    if let Constraint.Represents {parameter, ..} = &constraints[at] {
+      if run Type.equalsShared(value, &parameter) { return true }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // `input: 'call` for every input of a contract whose `for<use 'call>` binder has canonical ordinal
 // `marked`: an obligation on a caller, or a premise inside a checked callback. With an `opener`,
 // the inputs are already opened in that invocation and the binder is opened the same way.
@@ -49792,6 +50018,12 @@ effect fn checkInvocation<'scope>(
       if CheckedIntrinsic.sequencePending(member) { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
       if CallArguments.length(arguments) != intrinsicArity(member) {
         return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
+      }
+      if intrinsicIsAtomic(member) {
+        return run checkAtomicCall(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
+          module, cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*,
+          &mut requiredBodies.*, expression, span, member, List<Shared<Type>>.asSlice(&typeArguments), arguments,
+          expected, mismatchCode, constraints, contractBody, unsafeAllowed)
       }
       if intrinsicIsReflection(member) {
         return run checkReflectionCall(
@@ -52655,6 +52887,7 @@ effect fn retainedArguments(signature: &Shared<Result<Answer, NoRejection>>, arg
         }
       }
       Option<Constraint>.Some {value: Constraint.Copyable {..}} => ()
+      Option<Constraint>.Some {value: Constraint.ThreadSafe {..}} => ()
       _ => { described = false }
     }
     at = at + usize.ONE
@@ -53629,6 +53862,129 @@ effect fn copyTypeWithin(
     constraints, span, List<Shared<Type>>.asSlice(&nested))
 }
 
+// Whether `ty` has thread property `property` (THREAD-002). A premise `T: Transferable` or
+// `T: Concurrent` proves itself; scalars, text and enums always hold; a raw pointer never does,
+// since it may alias storage another thread uses. A shared borrow moves or shares its referent's
+// shared access, so it needs a Concurrent referent; an exclusive borrow needs the property itself.
+// A structural or nominal aggregate holds when every stored part does, and an `impl` of the
+// property in the declaring module asserts it for a nominal whose parts cannot prove it
+// (THREAD-003). An exact nominal repeat is coinductive; a growing repeat cannot be proved.
+effect fn threadSafeWithin(
+  resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>, ty: &Shared<Type>, property: SealedProperty, constraints: &[Constraint],
+  span: Span, active: &[Shared<Type>],
+) -> Result<bool, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut premise = usize.ZERO
+  while premise < constraints.length {
+    if let Constraint.ThreadSafe {subject, property: assumed} = &constraints[premise] {
+      if assumed == property && run Type.equalsShared(ty, &subject) {
+        return Result<bool, Shared<Rejection>>.succeed(true)
+      }
+    }
+    premise = premise + usize.ONE
+  }
+  let mut nested = run storedPropertyAncestors(ty, active)
+  let mut parts = List<Shared<Type>>.make()
+  let mut partProperty = property
+  // Allocation storage is owned outright; a buffer or slot is as safe as its element. A shared
+  // core counts references without atomics, and an execution package is bound to its executor.
+  if let Option<SealedKind>.Some {value: core} = move SealedCore.coreOf(ty) {
+    return match core {
+      SealedKind.Allocation => Result<bool, Shared<Rejection>>.succeed(true)
+      SealedKind.StorageFailure => Result<bool, Shared<Rejection>>.succeed(true)
+      SealedKind.RawBuffer => match move SealedCore.element(ty) {
+        Option<Shared<Type>>.Some {value} => run threadSafeWithin(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+          &value, property, constraints, span, List<Shared<Type>>.asSlice(&nested))
+        Option<Shared<Type>>.None => Result<bool, Shared<Rejection>>.succeed(false)
+      }
+      SealedKind.Slot => match move SealedCore.element(ty) {
+        Option<Shared<Type>>.Some {value} => run threadSafeWithin(&mut resolver.*, &mut owner.*, &mut dependencies.*,
+          &value, property, constraints, span, List<Shared<Type>>.asSlice(&nested))
+        Option<Shared<Type>>.None => Result<bool, Shared<Rejection>>.succeed(false)
+      }
+      _ => Result<bool, Shared<Rejection>>.succeed(false)
+    }
+  }
+  let node = run Type.copy(ty)
+  match &node {
+    Type.Unit => { return Result<bool, Shared<Rejection>>.succeed(true) }
+    Type.Primitive {..} => { return Result<bool, Shared<Rejection>>.succeed(true) }
+    Type.String {..} => { return Result<bool, Shared<Rejection>>.succeed(true) }
+    Type.ForeignFunction {..} => { return Result<bool, Shared<Rejection>>.succeed(true) }
+    Type.Reference {referent, access, ..} => {
+      if access == Access.Shared { partProperty = SealedProperty.Concurrent }
+      run List<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&referent))
+    }
+    Type.Slice {element, access, ..} => {
+      if access == Access.Shared { partProperty = SealedProperty.Concurrent }
+      run List<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&element))
+    }
+    Type.Array {element, ..} => { run List<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&element)) }
+    Type.Union {members} => { parts = run copyTypes(List<Shared<Type>>.asSlice(&members)) }
+    Type.Anonymous {members, ..} => { parts = run copyTypes(List<Shared<Type>>.asSlice(&members)) }
+    Type.CallableValue {captures, ..} => { parts = run copyTypes(List<Shared<Type>>.asSlice(&captures)) }
+    Type.CallableSchema {captures, ..} => { parts = run copyTypes(List<Shared<Type>>.asSlice(&captures)) }
+    Type.CallableView {representation, ..} => { run List<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&representation)) }
+    Type.EffectComposite {parts: stored, ..} => { parts = run copyTypes(List<Shared<Type>>.asSlice(&stored)) }
+    Type.EffectJoin {alternatives, ..} => { parts = run copyTypes(List<Shared<Type>>.asSlice(&alternatives)) }
+    Type.CallableStage {base, captures, ..} => {
+      run List<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&base))
+      let supplied = List<Shared<Type>>.asSlice(&captures)
+      let mut at = usize.ZERO
+      while at < supplied.length {
+        run List<Shared<Type>>.append(&mut parts, Shared<Type>.clone(&supplied[at]))
+        at = at + usize.ONE
+      }
+    }
+    // A closed producer's family is as safe as the storage it realizes to, as for Copy.
+    Type.OpaqueRepresentation {application, ..} => {
+      if Type.hasOpenRuntimeParameters(ty) { return Result<bool, Shared<Rejection>>.succeed(false) }
+      if run activeOpaqueProducer(&mut resolver.*, &application) { return Result<bool, Shared<Rejection>>.succeed(false) }
+      let storage = match move run realizedOpaqueStorage(&mut resolver.*, &mut owner.*, &mut dependencies.*, &application, ty, span) {
+        Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
+      }
+      run List<Shared<Type>>.append(&mut parts, move storage)
+    }
+    Type.Nominal {..} => {
+      if nominalKind(&node) == OwnerKind.Enumeration { return Result<bool, Shared<Rejection>>.succeed(true) }
+      let mut at = usize.ZERO
+      while at < active.length {
+        if run Type.equalsShared(ty, &active[at]) { return Result<bool, Shared<Rejection>>.succeed(true) }
+        at = at + usize.ONE
+      }
+      if storedPropertyCycle(ty, List<Shared<Type>>.asSlice(&nested)) {
+        return Result<bool, Shared<Rejection>>.succeed(false)
+      }
+      run List<Shared<Type>>.append(&mut nested, Shared<Type>.clone(ty))
+      let asserted = run implementsSealedWithin(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, property,
+        constraints, span, List<Shared<Type>>.asSlice(&nested))
+      match move asserted {
+        Result<bool, Shared<Rejection>>.Success {value} => { if value { return Result<bool, Shared<Rejection>>.succeed(true) } }
+        Result<bool, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
+      }
+      parts = match move run nominalParts(&mut resolver.*, &mut owner.*, &mut dependencies.*, ty, span) {
+        Result<List<Shared<Type>>, Shared<Rejection>>.Success {value} => move value
+        Result<List<Shared<Type>>, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
+      }
+    }
+    _ => { return Result<bool, Shared<Rejection>>.succeed(false) }
+  }
+  let listed = List<Shared<Type>>.asSlice(&parts)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let part = run threadSafeWithin(&mut resolver.*, &mut owner.*, &mut dependencies.*, &listed[at], partProperty,
+      constraints, span, List<Shared<Type>>.asSlice(&nested))
+    match move part {
+      Result<bool, Shared<Rejection>>.Success {value} => { if !value { return Result<bool, Shared<Rejection>>.succeed(false) } }
+      Result<bool, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
+    }
+    at = at + usize.ONE
+  }
+  return Result<bool, Shared<Rejection>>.succeed(true)
+}
+
 // A selected sealed head retains the exact provider match for its hook application.
 struct SealedMatch {
   declaration: Shared<DeclarationId>
@@ -53663,6 +54019,19 @@ effect fn boundProof(
   if let Constraint.Copyable {subject} = &bound.* {
     let copied = run copyTypeWithin(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, declared, span, active)
     return match move copied {
+      Result<bool, Shared<Rejection>>.Success {value} => {
+        if value { return Result<BoundProof, Shared<Rejection>>.succeed(BoundProof.Proven) }
+        if Type.hasOpenRuntimeParameters(&subject) {
+          return Result<BoundProof, Shared<Rejection>>.succeed(BoundProof.Unavailable)
+        }
+        return Result<BoundProof, Shared<Rejection>>.succeed(BoundProof.Rejected)
+      }
+      Result<bool, Shared<Rejection>>.Failure {error} => Result<BoundProof, Shared<Rejection>>.failResult(move error)
+    }
+  }
+  if let Constraint.ThreadSafe {subject, property} = &bound.* {
+    let safe = run threadSafeWithin(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, property, declared, span, active)
+    return match move safe {
       Result<bool, Shared<Rejection>>.Success {value} => {
         if value { return Result<BoundProof, Shared<Rejection>>.succeed(BoundProof.Proven) }
         if Type.hasOpenRuntimeParameters(&subject) {
@@ -53859,8 +54228,9 @@ effect fn sealedHeadMatchWithin(
   }
   if unavailable {
     // Check every premise first: a disproved bound rules out the head regardless of bound order.
-    // Abstract Copy may conservatively be affine; unavailable Drop evidence remains a loud gap.
-    if property == SealedProperty.Copy && Type.hasOpenParameters(ty) {
+    // Abstract Copy may conservatively be affine and an abstract thread property may be unproved;
+    // unavailable Drop evidence remains a loud gap.
+    if property != SealedProperty.Drop && Type.hasOpenParameters(ty) {
       return Result<Option<SealedMatch>, Shared<Rejection>>.succeed(Option<SealedMatch>.none())
     }
     return Result<Option<SealedMatch>, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
@@ -54856,6 +55226,7 @@ fn wholeCallInference(answer: &Result<Answer, NoRejection>) -> bool {
       while at < bounds.length {
         let settled = match &bounds[at] {
           Constraint.Copyable {..} => true
+          Constraint.ThreadSafe {..} => true
           Constraint.Property {..} => true
           Constraint.Contents {..} => true
           Constraint.Outlives {..} => true
@@ -58598,7 +58969,6 @@ effect fn resolveParameterSchema(
       let source = run source(&mut resolver.*, &module)
       let mut hasDefault = false
       let mut hasValidation = false
-      let mut optionalSpelled = false
       if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
         &resolver.*,
         &source,
@@ -58608,11 +58978,6 @@ effect fn resolveParameterSchema(
         let declarationAccess141 = declarationPosition(&resolver.*, key)
         if declarationAccess141 < declarations.length {
           let hir = IndexedSource.authored(indexed)
-          // `?T` spells an optional type; a type position does not parse it, so it reaches
-          // resolution as a recovered type, and is refused below as the optional type it means.
-          let annotated = Module.span(hir, annotation)
-          let bytes = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
-          optionalSpelled = annotated.start < bytes.length && bytes[annotated.start] == 63
           let declarationAccess142 = declarationPosition(&resolver.*, key)
           if let Node.Declaration {body, ..} = Module.node(hir, declarations[declarationAccess142].local) {
             if let Node.PackageParameterBody {default, validation} = Module.node(hir, body) {
@@ -58685,21 +59050,10 @@ effect fn resolveParameterSchema(
             move dependencies,
           )
         }
-        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
-          if optionalSpelled {
-            let declarationAccessOptional = declarationPosition(&resolver.*, key)
-            let mut name = Bytes.make()
-            if let Option<DeclarationId>.Some {value: declaration} = move run declarationAt(&mut resolver.*, &module, declarationAccessOptional) {
-              name = run DeclarationId.copySpelling(&declaration)
-            }
-            return run memberRejected(
-              run namedParameterRejection(RejectionCode.InvalidParameterSchema, &module, value.span, Bytes.asSlice(&name),
-                b"package parameter `", b"` has an enum, struct, union or optional type, which package parameters do not support yet"),
-              move dependencies,
-            )
-          }
-          return run memberRejected(move error, move dependencies)
-        }
+        Result<Shared<Type>, Shared<Rejection>>.Failure {error} => run memberRejected(
+          move error,
+          move dependencies,
+        )
       }
     }
     return run memberRejected(
@@ -64497,7 +64851,8 @@ effect fn calleeImplied(resolver: &mut Resolver, owner: &mut Query<Answer, NoRej
 // `for<use 'call>` contents (LIFE-004), under the invocation's other bindings. A run of the
 // invocation results in its Effect's success. A section of a named function (`staging`) leaves
 // the target's binders its selected arguments did not fix to each invocation, which owes what the
-// target's declared and implied bounds require of them (`owing`).
+// target's declared and implied bounds require of them (`owing`). A representation parameter's
+// contract is written in the caller's signature, so the caller's lifetimes it names are pinned.
 effect fn invocationContract(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
   identity: &DeclarationId, callee: &Shared<Type>, fresh: DeclarationId, supplied: &[Binding], call: BodyNodeId, shape: ContractShape,
   constraints: &[Constraint], staging: &Option<SectionStaging>, owing: &SectionOwed, span: Span) -> Option<CallContract>
@@ -64607,6 +64962,28 @@ effect fn invocationContract(resolver: &mut Resolver, owner: &mut Query<Answer, 
         if universalLifetime(&addedContents[at].region, identity) {
           run List<Shared<Lifetime>>.append(&mut pinned, Shared<Lifetime>.clone(&addedContents[at].region))
         }
+        at = at + usize.ONE
+      }
+    }
+    if !staged && run representedValue(callee, constraints) {
+      let typed = List<Shared<Type>>.asSlice(&instantiated)
+      at = usize.ZERO
+      while at < typed.length {
+        run enclosingLifetimes(&typed[at], identity, &mut pinned)
+        at = at + usize.ONE
+      }
+      run enclosingLifetimes(&returned, identity, &mut pinned)
+      let owed = List<RegionPremise>.asSlice(&bounds)
+      at = usize.ZERO
+      while at < owed.length {
+        if universalLifetime(&owed[at].longer, identity) { run List<Shared<Lifetime>>.append(&mut pinned, Shared<Lifetime>.clone(&owed[at].longer)) }
+        if universalLifetime(&owed[at].shorter, identity) { run List<Shared<Lifetime>>.append(&mut pinned, Shared<Lifetime>.clone(&owed[at].shorter)) }
+        at = at + usize.ONE
+      }
+      let held = List<ContentsBound>.asSlice(&contents)
+      at = usize.ZERO
+      while at < held.length {
+        if universalLifetime(&held[at].region, identity) { run List<Shared<Lifetime>>.append(&mut pinned, Shared<Lifetime>.clone(&held[at].region)) }
         at = at + usize.ONE
       }
     }
@@ -69425,6 +69802,18 @@ effect fn resolvedCallPhase(
       run List<Option<Shared<Type>>>.append(&mut types, Option<Shared<Type>>.none())
       return Result<CallPhase, Shared<Rejection>>.succeed(CallPhase.StaticSlots {slots: move slots, types: move types})
     }
+    // An atomic operation takes its memory orderings statically, as text (ATOMIC-001).
+    if let Option<usize>.Some {value: start} = move CheckedIntrinsic.orderingStart(member) {
+      let mut slots = List<usize>.make()
+      let mut types = List<Option<Shared<Type>>>.make()
+      let mut at = start
+      while at < intrinsicArity(member) {
+        run List<usize>.append(&mut slots, at)
+        run List<Option<Shared<Type>>>.append(&mut types, Option<Shared<Type>>.some(run CheckedIntrinsic.staticTextType()))
+        at = at + usize.ONE
+      }
+      return Result<CallPhase, Shared<Rejection>>.succeed(CallPhase.StaticSlots {slots: move slots, types: move types})
+    }
     if intrinsicIsPrimitive(member, IntrinsicPrimitive.BorrowField) {
       let span = run staticSpan(&mut resolver.*, module, call.id)
       let arguments = List<Shared<Type>>.asSlice(&typeArguments)
@@ -71622,6 +72011,12 @@ effect fn proveGoal(
       }
     } else if let Constraint.Copyable {subject} = &all[at] {
       let failed = run proveCopyable(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, declared, siteModule, siteSpan)
+      if let Option<Shared<Rejection>>.Some {value} = move failed {
+        return Option<Shared<Rejection>>.some(move value)
+      }
+    } else if let Constraint.ThreadSafe {subject, property} = &all[at] {
+      let failed = run proveThreadSafe(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, property, declared,
+        siteModule, siteSpan)
       if let Option<Shared<Rejection>>.Some {value} = move failed {
         return Option<Shared<Rejection>>.some(move value)
       }
@@ -75977,6 +76372,47 @@ effect fn proveCopyable(
   }
 }
 
+// `T: Transferable` or `T: Concurrent` holds of a type the thread property admits under the
+// caller's premises (THREAD-004). An unproved one is a missing conformance (SEM0121).
+effect fn proveThreadSafe(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  subject: &Shared<Type>,
+  property: SealedProperty,
+  declared: &[Constraint],
+  module: &ModuleId,
+  span: Span,
+) -> Option<Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let active = List<Shared<Type>>.make()
+  let safe = run threadSafeWithin(&mut resolver.*, &mut owner.*, &mut dependencies.*, subject, property, declared, span,
+    List<Shared<Type>>.asSlice(&active))
+  return match move safe {
+    Result<bool, Shared<Rejection>>.Success {value} => {
+      if value { return Option<Shared<Rejection>>.none() }
+      let mut name = b"Concurrent"
+      if property == SealedProperty.Transferable { name = b"Transferable" }
+      let mut diagnostic = run makeRejection(RejectionCode.MissingConformance, module, span)
+      if let Option<Bytes>.Some {value: typeText} = move run TypeText.display(subject) {
+        let mut goal = run Bytes.copy(b"`")
+        run Bytes.append(&mut goal, Bytes.asSlice(&typeText))
+        run Bytes.append(&mut goal, b": ")
+        run Bytes.append(&mut goal, name)
+        run Bytes.append(&mut goal, b"`")
+        let mut detail = run Bytes.copy(b"the callee requires a `")
+        run Bytes.append(&mut detail, name)
+        run Bytes.append(&mut detail, b"` type argument here, and this type has a part that cannot cross threads")
+        run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"goal"), value: move goal})
+        run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"detail"), value: move detail})
+      }
+      return Option<Shared<Rejection>>.some(run Shared<Rejection>.make(move diagnostic))
+    }
+    Result<bool, Shared<Rejection>>.Failure {error} => Option<Shared<Rejection>>.some(move error)
+  }
+}
+
 // The declared premises with each contents premise's retained regions as outlives edges: a
 // premise `T: 'r` (such as an input borrow's implied well-formedness) makes every region `T`
 // retains outlive `'r`.
@@ -76047,6 +76483,13 @@ effect fn proveAppliedBounds(
     }
     if let Constraint.Copyable {subject} = &bounds[at] {
       let failed = run proveCopyable(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, assumptions, module, span)
+      if let Option<Shared<Rejection>>.Some {value} = move failed { return Option<Shared<Rejection>>.some(move value) }
+      at = at + usize.ONE
+      continue
+    }
+    if let Constraint.ThreadSafe {subject, property} = &bounds[at] {
+      let failed = run proveThreadSafe(&mut resolver.*, &mut owner.*, &mut dependencies.*, &subject, property, assumptions,
+        module, span)
       if let Option<Shared<Rejection>>.Some {value} = move failed { return Option<Shared<Rejection>>.some(move value) }
       at = at + usize.ONE
       continue
@@ -83419,6 +83862,7 @@ effect fn bindConstraint(value: &Constraint, bindings: &[Binding]) -> Constraint
     Constraint.Outlives {longer, shorter} => Constraint.Outlives {
       longer: run Type.applyLifetimeBindings(&longer, bindings), shorter: run Type.applyLifetimeBindings(&shorter, bindings)}
     Constraint.Copyable {subject} => Constraint.Copyable {subject: run Type.applyBindings(&subject, bindings, true)}
+    Constraint.ThreadSafe {subject, property} => Constraint.ThreadSafe {subject: run Type.applyBindings(&subject, bindings, true), property: property}
     Constraint.Property {subject, property} => Constraint.Property {subject: run Type.applyBindings(&subject, bindings, true), property: property}
     Constraint.Provides {provider, selector, source} => Constraint.Provides {provider: run Type.applyBindings(&provider, bindings, true),
       selector: run Row.applyBindings(&selector, bindings, true), source: run Row.applyBindings(&source, bindings, true)}

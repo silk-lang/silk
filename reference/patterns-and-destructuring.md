@@ -230,8 +230,8 @@ conditional initializer as the consuming operation.
 
 **Status:** Confirmed
 
-With `&` or `&mut`, successful bindings are pattern-local loans and end with the selected body. A
-pattern that introduces no bindings holds no loan in the selected body. A mismatch introduces no
+With `&` or `&mut`, successful bindings are pattern-local loans that last through their last use and
+never past the selected body. A pattern that introduces no bindings holds no loan in the selected body. A mismatch introduces no
 field bindings. The original owner remains live after the complete
 conditional, subject to ordinary loan lifetimes.
 
