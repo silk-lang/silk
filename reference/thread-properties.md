@@ -324,9 +324,10 @@ The standard library ships a host for Node and browsers in `stdlib/host/wasm-run
 to it. `main` runs in a Worker, not on the host's own thread, because a browser's main thread may
 not block in `memory.atomic.wait32`; the top-level thread creates every thread's Worker.
 
-**Boundary:** The memory allocator is a lock-free bump allocator that never frees, so a long-running
-program that allocates steadily exhausts `maxMemory`. A browser needs cross-origin isolation for
-shared memory. A wait the host refuses traps. The module also exports `silk_wasm_thread_entry_v1`,
+**Boundary:** Every thread allocates through the runtime's one heap, serialized by one lock that
+waits with `memory.atomic.wait32`. Joining a thread returns its stack and record to that heap; a
+wasm memory never shrinks, so freed memory is reused but not handed back to the host. A browser
+needs cross-origin isolation for shared memory. A wait the host refuses traps. The module also exports `silk_wasm_thread_entry_v1`,
 the thread entry the runtime calls; hosts do not call it.
 
 **Diagnostics:** `threading = "multi"` on a native target is still refused as not native. A thread
