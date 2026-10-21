@@ -40,6 +40,12 @@ The profile separates these domains:
 | Runtime               | default, named package composition, none                              |
 | Package configuration | typed values keyed by package/module/parameter identity               |
 
+A project profile may also set `maxMemory`, the most linear memory a wasm32 module may grow to: a
+whole number of bytes, `KiB`, `MiB` or `GiB` that is a positive multiple of the 64 KiB page and at
+most 4 GiB, such as `maxMemory = "256MiB"`. It is a final-link setting, not an initial fact, so it
+never enters source specialization or its identity. Another target refuses it as an unsupported
+combination. A multi-threaded wasm32 profile defaults it to 1 GiB (THREAD-009).
+
 Safety and threading choices are source-visible policy requests; they never change the language's
 ownership or type rules. Logical runtime, entry and native link requests do not resolve startup
 roots, runtime packages, SDKs or sysroots. Their later resolution has separate contracts.
