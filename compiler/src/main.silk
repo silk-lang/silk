@@ -93,6 +93,7 @@ import silk.u64
 import backend.EmissionPlan {EmissionPlan}
 import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.InstanceKey {InstanceKey}
+import backend.WasmRuntime
 import lexer.Span {Span}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Rejection as Rejections {MessageArgument, RelatedSite, Rejection, RejectionCode}
@@ -242,6 +243,12 @@ effect fn writeDeferredTemplates(deferred: &[DeferredStaticTemplate]) -> ()
     at = at + usize.ONE
   }
   return ()
+}
+
+// Whether `host` links an executable for `target`: its own target, or freestanding wasm32, which
+// needs only Clang and its WebAssembly linker.
+fn linksOn(target: &Target, host: &Target) -> bool {
+  return Target.id(target) == Target.id(host) || same(Target.objectFormat(target), b"wasm")
 }
 
 effect fn invalidBuildProfile() -> never ! ApplicationError {
@@ -844,7 +851,7 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 /// static library's final stage archives its compiled object beside the declared objects. Each
 /// refuses any other declared input; an intermediate stage takes no declared inputs.
 effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
-  target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], selectedClang: &Option<Bytes>) -> i32
+  profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], selectedClang: &Option<Bytes>) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let mut intermediate = run Bytes.copy(Path.rawBytes(output))
@@ -880,6 +887,20 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   let linked = final && form == Form.Executable
   let merged = final && form == Form.Object && linkInputs.length > usize.ZERO
   let archive = final && form == Form.StaticLibrary
+  // A wasm32 executable links freestanding: no libc, no entry, and the source runtime beside the IR.
+  let freestanding = linked && same(Target.objectFormat(target), b"wasm")
+  let mut runtimeBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut runtimeBytes, b".silk-runtime.c")
+  let runtimePath = run Path.fromBytes(Bytes.asSlice(&runtimeBytes))
+  if freestanding {
+    let mut selected = run Bytes.copy(b"--target=")
+    run Bytes.append(&mut selected, Target.name(target))
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&selected))
+    run ChildProcess.addArgument(&mut process, b"-nostdlib")
+    run ChildProcess.addArgument(&mut process, b"-Wl,--no-entry")
+    // The backend's `main` wrapper carries no export attribute; see LlvmText's export names.
+    run ChildProcess.addArgument(&mut process, b"-Wl,--export=main")
+  }
   if !linked {
     // The IR names no triple, so a cross-target output states its target to Clang.
     let mut selected = run Bytes.copy(b"--target=")
@@ -908,6 +929,11 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   if debug {
     run ChildProcess.addArgument(&mut process, b"-g")
   }
+  let mut flag = usize.ZERO
+  while flag < profileFlags.length {
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&profileFlags[flag]))
+    flag = flag + usize.ONE
+  }
   // A link uses its resolved supply, never ambient SDK, sysroot or linker settings.
   if let Option<Supply>.Some {value: selected} = &supply.* {
     if selected.darwin {
@@ -935,6 +961,11 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   run ChildProcess.addArgument(&mut process, b"-x")
   run ChildProcess.addArgument(&mut process, b"ir")
   run ChildProcess.addArgument(&mut process, Bytes.asSlice(&intermediate))
+  if freestanding {
+    run ChildProcess.addArgument(&mut process, b"-x")
+    run ChildProcess.addArgument(&mut process, b"c")
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&runtimeBytes))
+  }
   // Restore extension-based input kinds so declared objects and archives are not read as IR.
   run ChildProcess.addArgument(&mut process, b"-x")
   run ChildProcess.addArgument(&mut process, b"none")
@@ -967,7 +998,7 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
       input = input + usize.ONE
     }
   }
-  if linked {
+  if linked && !freestanding {
     run ChildProcess.addArgument(&mut process, b"-lc")
     run ChildProcess.addArgument(&mut process, b"-lm")
   }
@@ -989,6 +1020,7 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   ! FileError | ProcessError | OutOfMemoryError | WriterError
   ? &mut FileSystem | &mut ChildProcess | &mut Allocator {
     run FileSystem.writeFile(&resource.*, Bytes.asSlice(ir))
+    if freestanding { run FileSystem.writeFile(&runtimePath, WasmRuntime.source()) }
     // A Clang that cannot start fails this target, which reports as any failed target does.
     let compiled = match move run Effect.result(submitted(&process)) {
       Result<i32, ProcessError | OutOfMemoryError | WriterError>.Success {value} => value
@@ -1017,6 +1049,7 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem {
     run removeQuietly(&resource.*)
     if archive { run removeQuietly(&member) }
+    if freestanding { run removeQuietly(&runtimePath) }
     return ()
   }
   return run Effect.useReleaseNonParking(move irPath, move use, move release)
@@ -1301,6 +1334,41 @@ fn profileProblemText(problem: ProfileProblem) -> &'static [u8] {
   }
 }
 
+// The Clang arguments of the profile facts LLVM text does not carry: each selected CPU feature, a
+// large code model, and for a linked executable a static, non-position-independent link.
+effect fn clangProfileFlags(profile: &InitialProfile, target: &Target, linked: bool) -> List<Bytes>
+! OutOfMemoryError ? &mut Allocator {
+  let mut flags = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < Target.featureCount(target) {
+    let feature = Target.feature(target, at)
+    let selected = match move InitialProfile.contains(profile, b"cpu-features", feature) {
+      Option<bool>.Some {value} => value
+      Option<bool>.None => false
+    }
+    if selected {
+      let mut enabled = run Bytes.copy(b"+")
+      run Bytes.append(&mut enabled, feature)
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-Xclang"))
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-target-feature"))
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-Xclang"))
+      run List<Bytes>.append(&mut flags, move enabled)
+    }
+    at = at + usize.ONE
+  }
+  if let Option<&[u8]>.Some {value: model} = move InitialProfile.text(profile, b"code-model") {
+    if same(model, b"large") { run List<Bytes>.append(&mut flags, run Bytes.copy(b"-mcmodel=large")) }
+  }
+  if let Option<&[u8]>.Some {value: link} = move InitialProfile.text(profile, b"link") {
+    // A static executable is never position independent, so its code is not either.
+    if linked && same(link, b"static") {
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-static"))
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-fno-pic"))
+    }
+  }
+  return move flags
+}
+
 effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, display: &Path, form: Form, stage: Stage, standardLibrary: Option<Path>, profile: InitialProfile, bindings: List<Supplied>, supplyRequest: &SupplyRequest, testing: bool, stats: bool, clang: &Option<Bytes>, heading: &Option<Bytes>) -> Compiled
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
@@ -1326,6 +1394,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
     Option<&[u8]>.Some {value} => run Bytes.copy(value)
     Option<&[u8]>.None => Bytes.make()
   }
+  let profileFlags = run clangProfileFlags(&profile, &target, form == Form.Executable && stage == Stage.Final)
   let mut refused = Bytes.make()
   // Whether this build's `[<target>]` heading has been written before its diagnostics.
   let mut headed = false
@@ -1395,11 +1464,6 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
     BackendBuild.Module {text, unchecked, plan} => {
       // Emit zero too: absence of a receipt cannot distinguish a fully checked build from a
       // missing measurement. The corpus harness records this line for every successful program.
-      if !receipts {
-        let mut notes = Bytes.make()
-        run appendUncheckedNotes(&mut notes, &sources, Semantic.uncheckedRootBodies(&store))
-        run writeError(Bytes.asSlice(&notes))
-      }
       if counted { run writeBorrowGap(b"SILK_GAP borrow-check: ", List<usize>.asSlice(&unchecked)) }
       // The emitted count covers only reached instances. Every root-package body was checked as
       // well, reached or not, so its unchecked count shows a body no build path reaches, and each
@@ -1432,6 +1496,17 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
         run reportCompiled(display, sourcePath, output, &target, EmissionPlan.symbolCount(&plan))
         return Compiled.Finished {status: 0}
       }
+      // Without a runtime nothing starts the program but a C `main` the application exports or a
+      // declared link input defines, so a link that would miss it is refused before Clang runs.
+      let started = match &runtime {
+        Option<ModuleId>.Some {..} => true
+        Option<ModuleId>.None => false
+      }
+      if form == Form.Executable && stage == Stage.Final && !started && Target.id(&target) != TargetId.Wasm32UnknownUnknown &&
+        ModuleSourceFiles.nativeLinkInputs(&sources).length == usize.ZERO && !definesMain(Bytes.asSlice(&text)) {
+        run writeHeaded(heading, &mut headed, b"silk: an executable built with runtime = { kind = \"none\" } has no `main`; export one, as `export \"C\" fn start() -> i32 as \"main\"` does, or select a runtime\n")
+        return Compiled.Finished {status: 2}
+      }
       // Only a link consumes a platform supply; compiling to an object or an intermediate stage
       // needs no SDK, so a cross-target object never runs discovery.
       let mut supply = Option<Supply>.none()
@@ -1452,7 +1527,8 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
       }
       let linking = Profiler.zone(b"compileIr")
       status = run compileIr(
-        &text, output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation), &target,
+        &text, output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
+        List<Bytes>.asSlice(&profileFlags), &target,
         &supply, ModuleSourceFiles.nativeLinkInputs(&sources), clang,
       )
       if status == 0 {
@@ -1566,6 +1642,32 @@ effect fn repeated(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>
   return false
 }
 
+// Whether the LLVM module `ir` defines the C symbol `main`, written `@main` or, as an export,
+// `@"main"`.
+fn definesMain(ir: &[u8]) -> bool {
+  let mut start = usize.ZERO
+  while start < ir.length {
+    let mut end = start
+    while end < ir.length && ir[end] != 10 { end = end + usize.ONE }
+    let defining = end - start > usize.add(0, 6) && same(Slice.view<u8>(ir, start, usize.add(0, 7)), b"define ")
+    if defining {
+      if containsBetween(ir, start, end, b" @main(") || containsBetween(ir, start, end, b" @\"main\"(") { return true }
+    }
+    start = end + usize.ONE
+  }
+  return false
+}
+
+// Whether `ir` holds `symbol` within the bytes from `start` to `end`.
+fn containsBetween(ir: &[u8], start: usize, end: usize, symbol: &[u8]) -> bool {
+  let mut at = start
+  while at + symbol.length <= end {
+    if same(Slice.view<u8>(ir, at, symbol.length), symbol) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // Records the code and location of `diagnostic` as printed.
 effect fn record(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>) -> () ! OutOfMemoryError ? &mut Allocator {
   let site = Shared<Rejection>.with<ReportedSite>(diagnostic, fn(value: &Rejection) -> ReportedSite {
@@ -1573,32 +1675,6 @@ effect fn record(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>) 
   })
   run List<ReportedSite>.append(&mut seen.*, move site)
   return ()
-}
-
-// Appends one note per root-package body the borrow checker left unchecked, naming the ownership
-// codes it may hide, so such a body is not accepted silently.
-effect fn appendUncheckedNotes(out: &mut Bytes, sources: &ModuleSources, unchecked: &[UncheckedBody]) -> ()
-! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut body = usize.ZERO
-  while body < unchecked.length {
-    run appendLocation(&mut out.*, sources, &unchecked[body].module, unchecked[body].block, false)
-    run Bytes.append(&mut out.*, b": note[borrow-check] this body is not borrow-checked yet (")
-    run Bytes.append(&mut out.*, String.utf8Bytes(uncheckedReasonName(unchecked[body].reason)))
-    run Bytes.append(&mut out.*, b")")
-    let skipped = run uncheckedBodyCodes()
-    let codes = List<RejectionCode>.asSlice(&skipped)
-    if codes.length > usize.ZERO {
-      run Bytes.append(&mut out.*, b"; it may hide ")
-      let mut code = usize.ZERO
-      while code < codes.length {
-        if code > usize.ZERO { run Bytes.append(&mut out.*, b", ") }
-        run Bytes.append(&mut out.*, Rejections.stableCode(codes[code]))
-        code = code + usize.ONE
-      }
-    }
-    run Bytes.append(&mut out.*, b"\n")
-    body = body + usize.ONE
-  }
 }
 
 // Writes `rejection` to standard error in `format`, headed as [`writeHeaded`] heads diagnostics.
@@ -2030,11 +2106,9 @@ effect fn reportProject(problem: &ProjectError) -> () ! WriterError {
       run writeError(Path.rawBytes(&manifest))
       run writeError(b"\n")
     }
-    ProjectError.InvalidProfile {manifest: _, code, subject} => run reportProfile(code, Bytes.asSlice(&subject))
-    ProjectError.InvalidManifest {manifest, detail} => {
-      run writeError(b"Invalid Silk project manifest ")
-      run writeError(Path.rawBytes(&manifest))
-      run writeError(b": ")
+    ProjectError.InvalidProfile {manifest, line, code, subject} => run reportProfile(&manifest, line, code, Bytes.asSlice(&subject))
+    ProjectError.InvalidManifest {manifest, line, detail} => {
+      run writeManifestLocation(&manifest, line)
       run writeError(Bytes.asSlice(&detail))
       run writeError(b"\n")
     }
@@ -2071,7 +2145,7 @@ effect fn buildSource(sourcePath: &Path, output: &Path, stage: Option<Stage>, st
   configured.artifact = Option<Bytes>.some(run Bytes.copy(Projects.profileArtifact(form)))
   let profile = run InitialProfile.freeze(&configured)
   let host = hostTarget()
-  if form == Form.Executable && selected == Stage.Final && Target.id(InitialProfile.target(&profile)) != Target.id(&host) {
+  if form == Form.Executable && selected == Stage.Final && !linksOn(InitialProfile.target(&profile), &host) {
     return run invalidBuildProfile()
   }
   let automatic = SupplyRequest.Automatic
@@ -2339,12 +2413,48 @@ struct ProjectArtifact {
   path: Path
 }
 
-// Writes a refused profile or binding as the TypeScript `<code>: <subject>`.
-effect fn reportProfile(code: ProfileCode, subject: &[u8]) -> () ! WriterError {
-  run writeError(ProjectProfiles.codeName(code))
-  run writeError(b": ")
-  run writeError(subject)
-  run writeError(b"\n")
+// Writes `value` in decimal.
+effect fn writeDecimal(value: usize) -> () ! WriterError {
+  if value >= 10 { run writeDecimal(usize.divide(value, 10)) }
+  return run writeError(&[usize.toU8(48 + usize.remainder(value, 10))])
+}
+
+// Writes `Invalid Silk project manifest <manifest>:<line>: `, without the line when it is zero.
+effect fn writeManifestLocation(manifest: &Path, line: usize) -> () ! WriterError {
+  run writeError(b"Invalid Silk project manifest ")
+  run writeError(Path.rawBytes(manifest))
+  if line > usize.ZERO {
+    run writeError(b":")
+    run writeDecimal(line)
+  }
+  return run writeError(b": ")
+}
+
+// Writes a refused profile or binding of the manifest `manifest` at `line`: an unknown field or a
+// value the native compiler cannot honor yet in words, else the TypeScript `<code>: <subject>`.
+effect fn reportProfile(manifest: &Path, line: usize, code: ProfileCode, subject: &[u8]) -> () ! WriterError {
+  run writeManifestLocation(manifest, line)
+  return run writeProfileReason(code, subject)
+}
+
+// Writes why a profile or binding was refused, as [`reportProfile`] words it after its location.
+effect fn writeProfileReason(code: ProfileCode, subject: &[u8]) -> () ! WriterError {
+  match code {
+    ProfileCode.UnknownField => {
+      run writeError(subject)
+      run writeError(b" is not a supported field")
+    }
+    ProfileCode.NotNative => {
+      run writeError(subject)
+      run writeError(b" is not supported by the native compiler yet")
+    }
+    _ => {
+      run writeError(ProjectProfiles.codeName(code))
+      run writeError(b": ")
+      run writeError(subject)
+    }
+  }
+  return run writeError(b"\n")
 }
 
 // Writes the TypeScript refusal of `--release` with another `--optimization`.
@@ -2372,7 +2482,17 @@ effect fn projectPlans(project: &Project, options: &ProjectOptions, fallback: &[
             run writeError(Bytes.asSlice(&selector))
             run writeError(b"\n")
           }
-          PlanError.Profile {code, subject} => run reportProfile(code, Bytes.asSlice(&subject))
+          PlanError.Profile {code, subject, key} => {
+            // A refused `--profile-input` field is the command line's, not the manifest's.
+            let named = Bytes.asSlice(&key)
+            let flag = b"--profile-input"
+            if named.length >= flag.length && same(Slice.view<u8>(named, usize.ZERO, flag.length), flag) {
+              run writeError(b"Invalid --profile-input: ")
+              run writeProfileReason(code, Bytes.asSlice(&subject))
+            } else {
+              run reportProfile(Projects.manifest(project), Projects.line(project, named), code, Bytes.asSlice(&subject))
+            }
+          }
           PlanError.InvalidProfileInput => run writeError(b"Invalid --profile-input JSON\n")
         }
         return Option<List<ProjectPlan>>.none()
@@ -2416,7 +2536,7 @@ effect fn buildProjectTarget(project: &Project, plan: ProjectPlan, standardLibra
     run writeError(b" form is not native yet\n")
     return ProjectArtifact {status: 2, target: target, path: move path}
   }
-  if form == Form.Executable && stage == Stage.Final && Target.id(&target) != Target.id(&hostTarget()) {
+  if form == Form.Executable && stage == Stage.Final && !linksOn(&target, &hostTarget()) {
     run writeError(b"Cannot link an executable for target ")
     run writeError(Target.name(&target))
     run writeError(b" on host ")
@@ -2676,11 +2796,6 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     }
     run Bytes.append(&mut out, Bytes.asSlice(&message))
     status = 2
-  }
-  // A body the borrow checker cannot prove yet is accepted without its ownership diagnostics; a
-  // note names it rather than letting it pass silently.
-  if !json && parsed {
-    run appendUncheckedNotes(&mut out, &sources, Semantic.uncheckedRootBodies(&store))
   }
   run writeDiagnostics(&target, json, &out)
   return ProjectArtifact {status: status, target: target, path: move path}
@@ -3194,6 +3309,7 @@ effect fn packageTable<'a>(manifest: &Path, document: &'a TomlValue) -> &'a Toml
     Option<&TomlValue>.None => {
       fail ProjectError.InvalidManifest {
         manifest: run Path.fromBytes(Path.rawBytes(manifest)),
+        line: usize.ZERO,
         detail: run Bytes.copy(b"dependencies belong to a package, and this manifest has no [package] table"),
       }
     }
@@ -3281,7 +3397,7 @@ effect fn addedDependency(working: &Path, command: AddCommand) -> ()
   let packageName = match move Toml.asString(Toml.field(dependencyPackage, "name")) {
     Option<string>.Some {value} => String.utf8Bytes(value)
     Option<string>.None => {
-      fail ProjectError.InvalidManifest {manifest: move dependencyManifest, detail: run Bytes.copy(b"missing [package] name")}
+      fail ProjectError.InvalidManifest {manifest: move dependencyManifest, line: usize.ZERO, detail: run Bytes.copy(b"missing [package] name")}
     }
   }
   let named = match move name {

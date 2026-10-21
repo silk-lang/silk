@@ -4737,7 +4737,13 @@ effect fn missingTypesRejection(module: &ModuleId, span: Span, members: &[Shared
 // An import naming a module the sources do not supply (MOD0001), spelled as written.
 effect fn missingModuleRejection(module: &ModuleId, span: Span, path: &PathSyntax) -> Shared<Rejection>
 ! OutOfMemoryError ? &mut Allocator {
-  let mut diagnostic = run makeRejection(RejectionCode.MissingModule, module, span)
+  return run importPathRejection(RejectionCode.MissingModule, module, span, path)
+}
+
+// A rejection with `code` naming the module an import spells, as written.
+effect fn importPathRejection(code: RejectionCode, module: &ModuleId, span: Span, path: &PathSyntax) -> Shared<Rejection>
+! OutOfMemoryError ? &mut Allocator {
+  let mut diagnostic = run makeRejection(code, module, span)
   let segments = List<Bytes>.asSlice(&path.segments)
   if segments.length > usize.ZERO {
     let mut written = Bytes.make()
@@ -5312,12 +5318,44 @@ fn repeatsImport(
   return false
 }
 
+// Whether the import whose header is `header` in `module`'s `hir` names `module` itself.
+effect fn importsItself(resolver: &Resolver, module: &ModuleId, hir: &Module, header: HirId) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if let Node.ImportHeader {path, ..} = Module.node(hir, header) {
+    if let Node.Path {segments} = Module.node(hir, path) {
+      let mut written = Bytes.make()
+      let mut at = usize.ZERO
+      while at < segments.length {
+        if let Node.Name {text} = Module.node(hir, Module.child(hir, segments, at)) {
+          if at > usize.ZERO { run Bytes.append(&mut written, b"/") }
+          run Bytes.append(&mut written, Module.text(hir, text))
+        } else {
+          return false
+        }
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut written, b".silk")
+      let target = run Effect.result(PackageGraph.target(&resolver.packages, module, Bytes.asSlice(&written)))
+      return match move target {
+        Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success {value} => ModuleId.equals(&value, module)
+        Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure {error} => match move error {
+          InvalidModulePath {} => false
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+  }
+  return false
+}
+
 // One written candidate of a name, copied out of the source loan before its arm is selected.
 struct WrittenCandidate {
   candidate: usize
   declaration: usize
   conditional: bool
   span: Span
+  // Whether the candidate is a member of an import of its own module.
+  selfImport: bool
 }
 
 impl Copy for WrittenCandidate {}
@@ -5359,13 +5397,17 @@ effect fn select(
     let hir = IndexedSource.authored(value)
     let mut at = ModuleIndex.firstCandidateNamed(index, name)
     while at != usize.MAX {
+      let mut selfImport = false
+      if candidates[at].kind != CandidateKind.Declaration {
+        selfImport = run importsItself(&resolver.*, module, hir, declarations[candidates[at].declaration].header)
+      }
       let conditional = match &declarations[candidates[at].declaration].arm {
         Option<Arm>.Some {..} => true
         Option<Arm>.None => false
       }
       run List<WrittenCandidate>.append(&mut written, WrittenCandidate {
         candidate: at, declaration: candidates[at].declaration, conditional: conditional,
-        span: Module.span(hir, candidates[at].local),
+        span: Module.span(hir, candidates[at].local), selfImport: selfImport,
       })
       at = ModuleIndex.nextCandidateNamed(index, at)
     }
@@ -5373,8 +5415,20 @@ effect fn select(
   drop answer
   let mut admitted = List<usize>.make()
   let listed = List<WrittenCandidate>.asSlice(&written)
+  // IMPORT-001: MOD0002 rejects a self-import, so beside another binding of the name it binds
+  // nothing: it neither collides with the module's own declaration nor reaches importers twice.
+  let mut otherwise = false
+  let mut scan = usize.ZERO
+  while scan < listed.length {
+    if !listed[scan].selfImport { otherwise = true }
+    scan = scan + usize.ONE
+  }
   let mut at = usize.ZERO
   while at < listed.length {
+    if otherwise && listed[at].selfImport {
+      at = at + usize.ONE
+      continue
+    }
     let mut present = true
     if listed[at].conditional {
       let outcome = run available(
@@ -6867,12 +6921,9 @@ effect fn resolveImport(
           destination = Option<ModuleId>.some(resolvedModule(&resolver.*, selected))
         }
       } else if intrinsicImport(&targetPath) {
-        let diagnostic = run reject(
-          &resolver.*,
-          &module,
-          RejectionCode.Unsupported,
-          targetPath.span,
-        )
+        // `Intrinsic` is a reserved module name: only `Intrinsic.application` is importable, and
+        // intrinsics are written `Intrinsic.<name>` without an import (MOD0004).
+        let diagnostic = run importPathRejection(RejectionCode.ReservedModule, &module, targetPath.span, &targetPath)
         return Answer {
           outcome: run rejectedOutcome(move diagnostic),
           dependencies: move dependencies,
@@ -26986,6 +27037,8 @@ effect fn collectPatternAnnotations(hir: &Module, pattern: HirId, annotations: &
 
 // These targets are values checked through their expression, rather than names selected from
 // the call table. Discovery must still visit the expression to retain any calls it contains.
+// An operator target, such as the `p != 7` that `x |> p != 7` pipes into, is typed as written, so
+// its own operand or callee refusal is reported rather than a missing call target.
 fn callableExpressionTarget(node: Node) -> bool {
   return match node {
     Node.IdentifierExpression {binding, ..} => binding.present
@@ -26994,6 +27047,7 @@ fn callableExpressionTarget(node: Node) -> bool {
     Node.BorrowExpression {..} => true
     Node.ReferentExpression {..} => true
     Node.PrefixExpression {..} => true
+    Node.InfixExpression {..} => true
     Node.CallExpression {..} => true
     Node.MatchExpression {..} => true
     _ => false
@@ -48615,6 +48669,13 @@ effect fn checkInvocation<'scope>(
           } else {
             if let Option<Shared<Type>>.Some {value: parameterType} = &context {
               valid = run Type.equalsShared(&argumentType, &parameterType)
+              // A selected instance body types the argument in its closed application, while the
+              // written type arguments still name the caller's binders.
+              if !valid {
+                let appliedParameter = run selectedBodyComparedType(&resolver.*, &parameterType)
+                let appliedArgument = run selectedBodyComparedType(&resolver.*, &argumentType)
+                valid = run Type.equalsShared(&appliedArgument, &appliedParameter)
+              }
             } else {
               valid = run intrinsicGenericArgument(member, instantiation, at, &argumentType)
             }
@@ -50158,14 +50219,6 @@ effect fn setBorrowRegion(
   return ()
 }
 
-fn ordinaryCallResult(nodes: &[BodyNode], node: BodyNodeId) -> bool {
-  if node.index >= nodes.length {return false}
-  if let BodyNodeKind.Expression {form, ..} = &nodes[node.index].kind {
-    return match &form {BodyExpression.DirectCall {..} => true _ => false}
-  }
-  return false
-}
-
 // Each expected-value boundary carries its own mismatch reason. Nested operands install their
 // own expectations, so a propagated error keeps its original reason without span-based relabeling.
 // Every immediate expected-value boundary retains the actual node before conversion. Fields and
@@ -50279,14 +50332,13 @@ effect fn admitExpectedValue(
       }
     }
     // A selected ordinary call may return a closed application type while its enclosing
-    // function still writes the same result with its own binders. Compare that result in
-    // the nearest selected body's domain without changing its node or loan obligations.
-    if ordinaryCallResult(List<BodyNode>.asSlice(&nodes.*), node) {
-      let appliedWanted = run selectedBodyComparedType(&resolver.*, &wanted)
-      let appliedOffered = run selectedBodyComparedType(&resolver.*, &offered)
-      if run Type.equalsShared(&appliedWanted, &appliedOffered) {
-        return Result<BodyNodeId, Shared<Rejection>>.succeed(node)
-      }
+    // function still writes the same result with its own binders, and a local initialized from
+    // it keeps that closed type. Compare such a value in the nearest selected body's domain
+    // without changing its node or loan obligations.
+    let appliedWanted = run selectedBodyComparedType(&resolver.*, &wanted)
+    let appliedOffered = run selectedBodyComparedType(&resolver.*, &offered)
+    if run Type.equalsShared(&appliedWanted, &appliedOffered) {
+      return Result<BodyNodeId, Shared<Rejection>>.succeed(node)
     }
     let injected = run unionArgument(&mut nodes.*, node, &value)
     if injected.index != node.index { return Result<BodyNodeId, Shared<Rejection>>.succeed(injected) }
@@ -67378,6 +67430,10 @@ effect fn foreignLane(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejec
     }
   })
   if callback { fail BackendGap.make(GapCode.CAbiCallback, declaration, span) }
+  let foreignFunction = Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match & value.* { Type.ForeignFunction {..} => true _ => false }
+  })
+  if foreignFunction && !CAbi.fullBoundary(&resolver.target) { fail BackendGap.make(GapCode.CAbiTarget, declaration, span) }
   if !Shared<Type>.with<bool>(ty, CAbi.admit) { fail BackendGap.make(GapCode.ForeignContract, declaration, span) }
   let application = run internErasedType(&mut resolver.*, ty)
   let declarationAccess196Request = Key {family: Family.Layout, module: usize.ZERO, name: application, declaration: usize.ZERO, member: usize.ZERO, external: false}
@@ -67560,6 +67616,7 @@ effect fn cSignature(
     fail BackendGap.make(value, declaration, written.span)
   }
   if written.global {
+    if !CAbi.fullBoundary(&resolver.target) { fail BackendGap.make(GapCode.CAbiTarget, declaration, written.span) }
     // A C object has one lane: the value its address holds.
     let selected = run foreignStaticType(&mut resolver.*, &mut owner.*, &mut dependencies.*, location.module, location.declaration, written.span)
     let objectType = match move selected {
@@ -67643,6 +67700,8 @@ effect fn cSignature(
   }
   let callbacksComplete = run resolvedCallbackParameters(&mut resolver.*, location, List<CAbi.Lane>.asSlice(&parameters))
   if !callbacksComplete { fail BackendGap.make(GapCode.CAbiCallback, declaration, written.span) }
+  let variadic = Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureIsVariadic)
+  if variadic && !CAbi.fullBoundary(&resolver.target) { fail BackendGap.make(GapCode.CAbiTarget, declaration, written.span) }
   return CAbi.Signature {
     behavior: written.behavior, noCapture: move written.noCapture,
     declaration: Shared<DeclarationId>.clone(declaration),
@@ -67651,7 +67710,7 @@ effect fn cSignature(
     result: move result,
     parameters: move parameters,
     global: false,
-    variadic: Shared<Result<Answer, NoRejection>>.with<bool>(&signature, signatureIsVariadic),
+    variadic: variadic,
   }
 }
 
@@ -76836,9 +76895,10 @@ impl Semantic {
     return DeclarationCheckResult { rejections: move rejections, gaps: move gaps, unchecked: move unchecked }
   }
 
-  // A nongeneric runtime declaration needs no invented arguments or providers to select its
-  // closed static work. Use the same Body selection as a reached named instance, so closed
-  // static-for expansions receive authentic iteration facts before checking.
+  // A runtime declaration needs no invented arguments or providers to select its closed static
+  // work. Use the same Body selection as a reached named instance, so closed static-for expansions
+  // and static call arguments receive authentic facts before checking. An open template selects
+  // over its own unbound binders; work that depends on them was deferred before this sweep.
   effect fn checkedDeclarationBody(
     self: &mut Self,
     request: &mut Request,
@@ -76847,9 +76907,7 @@ impl Semantic {
   ) -> Shared<Result<Answer, NoRejection>>
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
-    if
-      !declaration.open
-        && !Shared<Result<Answer, NoRejection>>.with<bool>(signature, signatureIsStatic) {
+    if !Shared<Result<Answer, NoRejection>>.with<bool>(signature, signatureIsStatic) {
       let mut selected = declaration.staticWork
       if
         !selected {

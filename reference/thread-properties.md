@@ -230,3 +230,70 @@ deadlocks. Reference cycles of `Arc` handles leak.
 **Evidence:** [synchronization](../stdlib/silk/sync.silk), native corpus (`sync-arc-mutex-parker`).
 
 **Current compiler:** Aligned.
+
+## THREAD-007 — `silk.work_queue` moves owned values between native threads
+
+**Status:** Confirmed
+
+`WorkDeque.make<T>()` returns the `Worker<T>` that owns a Chase-Lev deque. The worker pushes and
+pops at the bottom, and any number of `Stealer<T>`s take from the top with one compare-exchange; a
+steal that loses a race reports `Steal.Retry`. The ring doubles when full, and older rings stay
+allocated until the deque is dropped, because a stealer may still be reading one. `Injector<T>` is
+a FIFO queue under a `Mutex` that every handle may push to and pop from. `Mailbox.make<T>()`
+returns the one `MailboxReceiver<T>` of a multi-producer, single-consumer queue; each
+`MailboxSender<T>` sends with one swap and one store, without a lock.
+
+```silk,ignore
+let mut worker = run WorkDeque.make<i32>() |> Effect.provideMut<Allocator>(&mut allocator)
+run worker.push(42) |> Effect.provideMut<Allocator>(&mut allocator)
+let stealer = worker.stealer()
+let thief = run NativeThread.spawn(fn() -> Steal<i32> { return stealer.steal() })
+  |> Effect.provideMut<Allocator>(&mut allocator)
+```
+
+Every pushed value moves into its own allocation, a parcel, and the queues move parcel addresses
+atomically, so only the thread that wins a parcel reads its value. Handles share their queue
+through `Arc` (THREAD-006), and a queue still holding values when its last handle drops drops them.
+Handles are `Transferable` and `Concurrent` when `T` is `Transferable`, except that a
+`MailboxReceiver` takes `receive` exclusively.
+
+**Boundary:** The targets of `Atomic.wait`. Pushing and sending allocate, so they take an
+`Allocator`. A receive can report nothing for a moment while a send is between its swap and its
+store.
+
+**Evidence:** [work queues](../stdlib/silk/work_queue.silk), native corpus (`work-queue-threads`).
+
+**Current compiler:** Aligned.
+
+## THREAD-008 — `silk.thread_pool` runs tasks on a work-stealing pool of native threads
+
+**Status:** Confirmed
+
+`ThreadPool.make(workers)` starts the worker threads, and `pool()` returns a `Pool` handle.
+`Pool.spawn(task)` starts a closed, `Transferable`, `'static` lazy effect as a pool task and
+returns a `TaskHandle<A>`. `TaskHandle.join` parks the joining task until the result is ready.
+`Pool.block(task)` runs a task from an ordinary thread and sleeps that thread until it finishes.
+Dropping the `ThreadPool` stops and joins every worker and drops the tasks still unfinished.
+
+```silk,ignore
+let threads = run ThreadPool.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
+let pool = threads.pool()
+let total = run pool.block(Effect.result(split(pool.clone())))
+```
+
+Each task is packaged with `Execution.makeTransferable` (EXEC-010), so it can park on one worker
+and resume on another. Its readiness endpoint links the task's preallocated slot onto one shared
+ready list and wakes a sleeping worker; it never allocates. A worker moves a batch of ready tasks
+into its own `WorkDeque` (THREAD-007), and an idle worker steals from the others' deques before
+it sleeps on a `Parker`. A `Pool` is `Transferable` and `Concurrent`, so tasks capture it to spawn
+more tasks.
+
+**Boundary:** The targets of native threads and `Atomic.wait`. A task's effect has no
+requirements or errors, so a task returns its own failures as a value, for example with
+`Effect.result`. Waiting inside a task for anything other than a `TaskHandle` must park with
+`Execution.parkTransferable`; blocking the native thread holds up a whole worker. A task spawned
+after its pool was dropped is dropped unstarted, and its handle never finishes.
+
+**Evidence:** [thread pool](../stdlib/silk/thread_pool.silk), native corpus (`thread-pool-tasks`).
+
+**Current compiler:** Aligned.

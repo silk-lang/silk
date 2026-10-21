@@ -29,6 +29,7 @@ import silk.bytes { Bytes }
 import silk.effect { Effect }
 import silk.option { Option }
 import silk.result { Result }
+import silk.slice { Slice }
 import silk.string { String }
 import silk.json_value { JsonChild, Value as JsonValue }
 import silk.toml_value { TableKind, Toml, TomlChild, TomlEntry, Value as TomlValue }
@@ -45,14 +46,21 @@ pub enum Code {
   ForbiddenProvenance,
   /// More than one profile selection mode was requested.
   ConflictingBindings,
+  /// A profile table names a field profiles do not have; `subject` is the field.
+  UnknownField,
+  /// A valid value the native compiler cannot honor yet, refused rather than ignored.
+  NotNative,
 }
 
 /// A profile catalog, profile or binding that a build cannot use.
 pub struct InvalidProfile {
   /// The error class.
   pub code: Code
-  /// The refused input, such as `profile name` or `cpu.model`.
+  /// The refused input, such as `profiles.fast.cpu.model` or `profiles.fast.libc = "gnu"`.
   pub subject: Bytes
+  /// The dotted manifest key the refusal names, such as `profiles.fast.libc`, or empty when it
+  /// names none.
+  pub key: Bytes
 }
 
 /// One selected profile: its logical input and the bindings it supplies.
@@ -83,7 +91,12 @@ fn same(left: &[u8], right: &[u8]) -> bool {
 }
 
 effect fn refuse(code: Code, subject: &[u8]) -> never ! InvalidProfile | OutOfMemoryError ? &mut Allocator {
-  fail InvalidProfile { code: code, subject: run Bytes.copy(subject) }
+  fail InvalidProfile { code: code, subject: run Bytes.copy(subject), key: Bytes.make() }
+}
+
+// Refuses `subject` with `code`, naming the manifest key `key`.
+effect fn refuseAt(code: Code, subject: &[u8], key: &[u8]) -> never ! InvalidProfile | OutOfMemoryError ? &mut Allocator {
+  fail InvalidProfile { code: code, subject: run Bytes.copy(subject), key: run Bytes.copy(key) }
 }
 
 effect fn invalid(subject: &[u8]) -> never ! InvalidProfile | OutOfMemoryError ? &mut Allocator {
@@ -97,6 +110,8 @@ pub fn codeName(code: Code) -> &'static [u8] {
     Code.UnsupportedCombination => b"UnsupportedCombination"
     Code.ForbiddenProvenance => b"ForbiddenProvenance"
     Code.ConflictingBindings => b"ConflictingBindings"
+    Code.UnknownField => b"InvalidInput"
+    Code.NotNative => b"Unsupported"
   }
 }
 
@@ -154,6 +169,46 @@ fn memberValue<'a>(child: &'a TomlChild) -> Option<&'a TomlValue> {
     TomlChild.Member { entry } => Option<&'a TomlValue>.some(&entry.value)
     TomlChild.Item { value: _ } => Option<&'a TomlValue>.none()
   }
+}
+
+// The first key of `table` that is not one of `allowed`, or `None` when every key is.
+fn unknownKey<'a>(table: &'a TomlValue, allowed: &[&[u8]]) -> Option<&'a [u8]> {
+  let mut at = usize.ZERO
+  while at < keyCount(table) {
+    if let Option<&TomlChild>.Some { value: child } = move memberAt(table, at) {
+      if let Option<&[u8]>.Some { value: key } = move memberKey(child) {
+        let mut found = false
+        let mut index = usize.ZERO
+        while index < allowed.length {
+          if same(key, allowed[index]) {
+            found = true
+          }
+          index = index + usize.ONE
+        }
+        if !found {
+          return Option<&'a [u8]>.some(key)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<&'a [u8]>.none()
+}
+
+// The value of the member of `table` named `name`, or `None`.
+fn member<'a>(table: &'a TomlValue, name: &[u8]) -> Option<&'a TomlValue> {
+  let mut at = usize.ZERO
+  while at < keyCount(table) {
+    if let Option<&TomlChild>.Some { value: child } = move memberAt(table, at) {
+      if let Option<&[u8]>.Some { value: key } = move memberKey(child) {
+        if same(key, name) {
+          return memberValue(child)
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<&'a TomlValue>.none()
 }
 
 // Whether every key of `table` is one of `allowed`.
@@ -309,8 +364,8 @@ effect fn logical(table: &TomlValue) -> ProfileInput
     b"relocation", b"optimization", b"debug", b"safety", b"threading", b"sanitizers", b"unwind",
     b"runtime", b"bindings",
   ]
-  if !onlyKeys(table, &allowed) {
-    return run invalid(b"profile fields")
+  if let Option<&[u8]>.Some { value: key } = move unknownKey(table, &allowed) {
+    return run refuse(Code.UnknownField, key)
   }
   let mut input = ProfileInput.make()
   let target = match move text(Toml.field(table, "target")) {
@@ -320,8 +375,13 @@ effect fn logical(table: &TomlValue) -> ProfileInput
   input.target = Option<Bytes>.some(move target)
   if let Option<&TomlValue>.Some { value: cpu } = move Toml.field(table, "cpu") {
     let cpuFields: [&[u8]; 2] = [b"model", b"features"]
-    if !isTable(cpu) || !onlyKeys(cpu, &cpuFields) {
+    if !isTable(cpu) {
       return run invalid(b"cpu")
+    }
+    if let Option<&[u8]>.Some { value: key } = move unknownKey(cpu, &cpuFields) {
+      let mut field = run Bytes.copy(b"cpu.")
+      run Bytes.append(&mut field, key)
+      return run refuse(Code.UnknownField, Bytes.asSlice(&field))
     }
     if hasValue(&Toml.field(cpu, "model")) {
       let model = match move text(Toml.field(cpu, "model")) {
@@ -370,7 +430,51 @@ effect fn logical(table: &TomlValue) -> ProfileInput
       }
     }
   }
+  if let Option<&[u8]>.Some { value: field } = move nativeGap(&input) {
+    return run refuse(Code.NotNative, field)
+  }
   return move input
+}
+
+fn writes(value: &Option<Bytes>, spelling: &[u8]) -> bool {
+  return match &value.* {
+    Option<Bytes>.Some { value: written } => same(Bytes.asSlice(&written), spelling)
+    Option<Bytes>.None => false
+  }
+}
+
+// The first valid field the native compiler cannot honor yet, as a non-default value: sanitizers
+// need instrumented code, native unwinding needs unwind tables, the large code model is only
+// built for x86_64, an entry selection needs a composition that names one, and no library reads
+// the unchecked safety or multi-threading policies. The native build applies `cpu`, `link` and
+// `codeModel`.
+fn nativeGap(input: &ProfileInput) -> Option<&'static [u8]> {
+  if List<Bytes>.length(&input.sanitizers) > usize.ZERO {
+    return Option<&'static [u8]>.some(b"sanitizers")
+  }
+  if writes(&input.unwind, b"native") {
+    return Option<&'static [u8]>.some(b"unwind")
+  }
+  // AArch64 Clang admits the large code model only for code that is not position independent,
+  // and Darwin not at all.
+  let mut x86 = false
+  if let Option<Bytes>.Some { value: target } = &input.target {
+    let written = Bytes.asSlice(&target)
+    x86 = written.length > usize.add(0, 6) && same(Slice.view<u8>(written, usize.ZERO, usize.add(0, 7)), b"x86_64-")
+  }
+  if writes(&input.codeModel, b"large") && !x86 {
+    return Option<&'static [u8]>.some(b"codeModel")
+  }
+  if writes(&input.safety, b"unchecked") {
+    return Option<&'static [u8]>.some(b"safety")
+  }
+  if writes(&input.threading, b"multi") {
+    return Option<&'static [u8]>.some(b"threading")
+  }
+  return match &input.entry {
+    ProfileSelection.Default => Option<&'static [u8]>.none()
+    _ => Option<&'static [u8]>.some(b"entry")
+  }
 }
 
 fn exactKeys(table: &TomlValue, expected: &[&[u8]]) -> bool {
@@ -603,13 +707,13 @@ effect fn bindings(source: Option<&TomlValue>, tier: Tier) -> List<Supplied>
     if !isTable(item) {
       return run invalid(b"binding")
     }
+    if let Option<&[u8]>.Some { value: key } = move unknownKey(item, &identityKeys) {
+      return run refuse(Code.UnknownField, key)
+    }
     let origin = run provenance(item)
     let package = text(Toml.field(item, "package"))
     let module = text(Toml.field(item, "module"))
     let parameter = text(Toml.field(item, "parameter"))
-    if !onlyKeys(item, &identityKeys) {
-      return run invalid(b"binding identity")
-    }
     let packageName = match move package {
       Option<&[u8]>.Some { value: written } => written
       Option<&[u8]>.None => run invalid(b"binding identity")
@@ -666,7 +770,73 @@ fn isProfileName(name: &[u8]) -> bool {
 pub effect fn projectBindings(document: &TomlValue) -> List<Supplied>
   ! InvalidProfile | OutOfMemoryError
   ? &mut Allocator {
-  return run bindings(Toml.fieldAt(Toml.field(document, "build"), "bindings"), Tier.Project)
+  let decoded = run Effect.result(bindings(Toml.fieldAt(Toml.field(document, "build"), "bindings"), Tier.Project))
+  return match move decoded {
+    Result<List<Supplied>, InvalidProfile | OutOfMemoryError>.Success { value } => move value
+    Result<List<Supplied>, InvalidProfile | OutOfMemoryError>.Failure { error } => match move error {
+      InvalidProfile problem => run located(b"build.bindings", Option<&TomlValue>.none(), move problem)
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// The value of the dotted field `path`, such as `cpu.model`, of `table`, or `None`.
+fn fieldValue<'a>(table: &'a TomlValue, path: &[u8]) -> Option<&'a TomlValue> {
+  let mut dot = usize.ZERO
+  while dot < path.length && path[dot] != 46 {
+    dot = dot + usize.ONE
+  }
+  let head = match move member(table, Slice.view<u8>(path, usize.ZERO, dot)) {
+    Option<&'a TomlValue>.Some { value } => value
+    Option<&'a TomlValue>.None => {
+      return Option<&'a TomlValue>.none()
+    }
+  }
+  if dot == path.length {
+    return Option<&'a TomlValue>.some(head)
+  }
+  return member(head, Slice.view<u8>(path, dot + usize.ONE, path.length - dot - usize.ONE))
+}
+
+// Fails with `problem` located at the manifest key `prefix`. With the profile `table` the refusal
+// names one of its fields, which joins `prefix` (a string value is quoted after it, as in
+// `profiles.fast.libc = "gnu"`); without one, the refusal names an input of the bindings at `prefix`,
+// or the unknown binding field that joins it.
+effect fn located(prefix: &[u8], table: Option<&TomlValue>, problem: InvalidProfile) -> never
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let InvalidProfile { code, subject, key: _ } = move problem
+  let named = Bytes.asSlice(&subject)
+  let mut key = run Bytes.copy(prefix)
+  let profile = match move table {
+    Option<&TomlValue>.Some { value } => value
+    Option<&TomlValue>.None => {
+      // A binding's unknown field is its own key below the bindings, as `build.bindings.extra`.
+      if code == Code.UnknownField {
+        run Bytes.append(&mut key, b".")
+        run Bytes.append(&mut key, named)
+        let described = run Bytes.copy(Bytes.asSlice(&key))
+        fail InvalidProfile { code: code, subject: move described, key: move key }
+      }
+      let mut described = run Bytes.copy(prefix)
+      run Bytes.append(&mut described, b": ")
+      run Bytes.append(&mut described, named)
+      fail InvalidProfile { code: code, subject: move described, key: move key }
+    }
+  }
+  run Bytes.append(&mut key, b".")
+  run Bytes.append(&mut key, named)
+  let mut described = run Bytes.copy(Bytes.asSlice(&key))
+  if code != Code.UnknownField {
+    if let Option<&[u8]>.Some { value: written } = move text(fieldValue(profile, named)) {
+      run Bytes.append(&mut described, b" = \"")
+      run Bytes.append(&mut described, written)
+      run Bytes.append(&mut described, b"\"")
+    }
+  }
+  fail InvalidProfile { code: code, subject: move described, key: move key }
 }
 
 /// Validates the manifest's profile catalog and project bindings and answers the default profile
@@ -676,13 +846,13 @@ pub effect fn catalog(document: &TomlValue) -> Option<Bytes>
   ? &mut Allocator {
   if let Option<&TomlValue>.Some { value: table } = move Toml.field(document, "profiles") {
     if !isTable(table) {
-      return run invalid(b"profiles")
+      return run refuseAt(Code.InvalidInput, b"profiles", b"profiles")
     }
   }
   let defaultField = Toml.fieldAt(Toml.field(document, "build"), "profile")
   let defaultName = text(Toml.fieldAt(Toml.field(document, "build"), "profile"))
   if hasValue(&defaultField) && !hasText(&defaultName) {
-    return run invalid(b"build.profile")
+    return run refuseAt(Code.InvalidInput, b"build.profile", b"build.profile")
   }
   let mut found = false
   if let Option<&TomlValue>.Some { value: table } = move Toml.field(document, "profiles") {
@@ -696,14 +866,18 @@ pub effect fn catalog(document: &TomlValue) -> Option<Bytes>
         Option<&[u8]>.Some { value: key } => key
         Option<&[u8]>.None => run invalid(b"profile name")
       }
+      let mut prefix = run Bytes.copy(b"profiles.")
+      run Bytes.append(&mut prefix, name)
       if !isProfileName(name) {
-        return run invalid(b"profile name")
+        let mut described = run Bytes.copy(Bytes.asSlice(&prefix))
+        run Bytes.append(&mut described, b": a profile name is an ASCII letter, then letters, digits, `_` or `-`")
+        return run refuseAt(Code.InvalidInput, Bytes.asSlice(&described), Bytes.asSlice(&prefix))
       }
       let profile = match move memberValue(child) {
         Option<&TomlValue>.Some { value: present } => present
         Option<&TomlValue>.None => run invalid(b"profile")
       }
-      let decoded = run decode(profile)
+      let decoded = run decode(Bytes.asSlice(&prefix), profile)
       drop decoded
       if let Option<&[u8]>.Some { value: chosen } = &defaultName {
         if same(chosen, name) {
@@ -716,7 +890,12 @@ pub effect fn catalog(document: &TomlValue) -> Option<Bytes>
   let mut selected = Option<Bytes>.none()
   if let Option<&[u8]>.Some { value: chosen } = move defaultName {
     if !found {
-      return run invalid(b"unknown build.profile")
+      let mut described = run Bytes.copy(b"build.profile = \"")
+      run Bytes.append(&mut described, chosen)
+      run Bytes.append(&mut described, b"\" names no [profiles.")
+      run Bytes.append(&mut described, chosen)
+      run Bytes.append(&mut described, b"] table")
+      return run refuseAt(Code.InvalidInput, Bytes.asSlice(&described), b"build.profile")
     }
     selected = Option<Bytes>.some(run Bytes.copy(chosen))
   }
@@ -726,14 +905,34 @@ pub effect fn catalog(document: &TomlValue) -> Option<Bytes>
 }
 
 // Decodes one profile table with its profile-tier bindings.
-effect fn decode(table: &TomlValue) -> Profile
+// Decodes one profile table, written at the manifest key `prefix`, with its profile-tier bindings.
+// A refusal names the field or binding input at its key.
+effect fn decode(prefix: &[u8], table: &TomlValue) -> Profile
   ! InvalidProfile | OutOfMemoryError
   ? &mut Allocator {
   if !isTable(table) {
-    return run invalid(b"profile")
+    return run refuseAt(Code.InvalidInput, prefix, prefix)
   }
-  let own = run bindings(Toml.field(table, "bindings"), Tier.Override)
-  let input = run logical(table)
+  let mut bindingsKey = run Bytes.copy(prefix)
+  run Bytes.append(&mut bindingsKey, b".bindings")
+  let own = match move run Effect.result(bindings(Toml.field(table, "bindings"), Tier.Override)) {
+    Result<List<Supplied>, InvalidProfile | OutOfMemoryError>.Success { value } => move value
+    Result<List<Supplied>, InvalidProfile | OutOfMemoryError>.Failure { error } => match move error {
+      InvalidProfile problem => run located(Bytes.asSlice(&bindingsKey), Option<&TomlValue>.none(), move problem)
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let input = match move run Effect.result(logical(table)) {
+    Result<ProfileInput, InvalidProfile | OutOfMemoryError>.Success { value } => move value
+    Result<ProfileInput, InvalidProfile | OutOfMemoryError>.Failure { error } => match move error {
+      InvalidProfile problem => run located(prefix, Option<&TomlValue>.some(table), move problem)
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
   return Profile { input: move input, bindings: move own }
 }
 
@@ -750,7 +949,9 @@ pub effect fn select(document: &TomlValue, name: &[u8]) -> Profile
         if let Option<&[u8]>.Some { value: key } = move memberKey(child) {
           if same(key, name) {
             if let Option<&TomlValue>.Some { value: table } = move memberValue(child) {
-              let Profile { input, bindings: own } = move run decode(table)
+              let mut prefix = run Bytes.copy(b"profiles.")
+              run Bytes.append(&mut prefix, name)
+              let Profile { input, bindings: own } = move run decode(Bytes.asSlice(&prefix), table)
               let mut remaining = move own
               while List<Supplied>.length(&remaining) > usize.ZERO {
                 run List<Supplied>.append(&mut supplied, List<Supplied>.remove(&mut remaining, usize.ZERO))
@@ -765,7 +966,10 @@ pub effect fn select(document: &TomlValue, name: &[u8]) -> Profile
   }
   let mut subject = run Bytes.copy(b"unknown profile ")
   run Bytes.append(&mut subject, name)
-  fail InvalidProfile { code: Code.InvalidInput, subject: move subject }
+  run Bytes.append(&mut subject, b": the manifest has no [profiles.")
+  run Bytes.append(&mut subject, name)
+  run Bytes.append(&mut subject, b"] table")
+  fail InvalidProfile { code: Code.InvalidInput, subject: move subject, key: Bytes.make() }
 }
 
 // Rebuilds a JSON value as the TOML value the decoders read. Objects become tables and arrays stay
@@ -822,7 +1026,7 @@ pub effect fn fromInput(document: &TomlValue, input: &JsonValue) -> Profile
   ! InvalidProfile | OutOfMemoryError
   ? &mut Allocator {
   let table = run fromJson(input, usize.ZERO)
-  let Profile { input: logicalInput, bindings: own } = move run decode(&table)
+  let Profile { input: logicalInput, bindings: own } = move run decode(b"--profile-input", &table)
   let mut supplied = run projectBindings(document)
   let mut remaining = move own
   while List<Supplied>.length(&remaining) > usize.ZERO {
