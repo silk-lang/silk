@@ -889,6 +889,51 @@ const program = Effect.gen(function* () {
   const misspelled = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(misspelled.status, 2, misspelled.stderr)
   assert.match(misspelled.stderr, /silk\.toml:6: packge is not a supported field/)
+  // A quoted profile name, an unknown composition field and a deployment version on a target
+  // that is not Darwin are refused at their manifest line.
+  const locatedRefusals = [
+    ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
+    [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
+      /silk\.toml:6: build\.composition\.bogus is not a supported field/,
+    ],
+    [
+      '[profiles.d]\ntarget = "x86_64-unknown-linux-gnu"\ndeployment = "14.0"\n',
+      /silk\.toml:7: UnsupportedCombination: profiles\.d\.deployment = "14\.0"/,
+    ],
+  ] as const
+  for (const [tail, message] of locatedRefusals) {
+    yield* fs.writeFileString(join(tuned, 'silk.toml'), `${tunedHeader}${tail}`)
+    const locatedRefusal = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
+    assert.equal(locatedRefusal.status, 2, locatedRefusal.stderr)
+    assert.match(locatedRefusal.stderr, message)
+  }
+  // A refused `--profile-input` field is blamed on the flag, not on the manifest.
+  yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
+  const refusedInput = yield* invoke(
+    silk,
+    ['check', '--profile-input', encodeJson({ target: hostTarget, safety: 'unchecked' }), '--stdlib', standardLibrary],
+    tuned,
+  )
+  assert.equal(refusedInput.status, 2, refusedInput.stderr)
+  assert.match(refusedInput.stderr, /^Invalid --profile-input: --profile-input\.safety = "unchecked" is not supported/)
+  assert.doesNotMatch(refusedInput.stderr, /silk\.toml/)
+  // Without a runtime, an executable that exports no C `main` is refused before Clang links it.
+  const mainless = yield* invoke(
+    silk,
+    ['build', '--profile-input', encodeJson({ target: hostTarget, runtime: { kind: 'none' } }), '--stdlib', standardLibrary],
+    tuned,
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.equal(mainless.status, 2, mainless.stderr)
+  assert.match(mainless.stderr, /runtime = \{ kind = "none" \} has no `main`/)
+  // An unknown `[workspace]` field is refused at its line.
+  const looseWorkspace = join(directory, 'loose-workspace')
+  yield* fs.makeDirectory(looseWorkspace, { recursive: true })
+  yield* fs.writeFileString(join(looseWorkspace, 'silk.toml'), '[workspace]\nmembers = []\nfoo = 1\n')
+  const looseChecked = yield* invoke(silk, ['check', '--stdlib', standardLibrary], looseWorkspace)
+  assert.equal(looseChecked.status, 2, looseChecked.stderr)
+  assert.match(looseChecked.stderr, /silk\.toml:3: workspace\.foo is not a supported field/)
   yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
   yield* fs.makeDirectory(join(tuned, 'src/silk'), { recursive: true })
   yield* fs.writeFileString(join(tuned, 'src/silk/extra.silk'), 'pub fn hi() -> i32 {\n  return 1\n}\n')
