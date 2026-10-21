@@ -414,7 +414,7 @@ const program = Effect.gen(function* () {
   assert.equal(noLibrary.status, 1, noLibrary.stderr)
   assert.match(noLibrary.stderr, /--stdlib .*no-library is not a standard library directory/)
   assert.equal(yield* fs.exists(join(directory, 'unnamed')), false)
-  // Another target emits its IR without linking; only the host target links an executable.
+  // Another native target emits its IR without linking; only the host links a native executable.
   const foreign =
     process.platform === 'darwin' ? 'x86_64-unknown-linux-gnu' : 'aarch64-apple-darwin'
   const cross = yield* invoke(
@@ -428,6 +428,26 @@ const program = Effect.gen(function* () {
   const crossIr = yield* fs.readFile(join(directory, 'cross.ll'))
   assert.ok(crossIr.length > 0)
   assert.notDeepEqual(crossIr, bytes, 'IR must follow the requested target, not the host')
+  // wasm32 links freestanding on any host, with the compiler's own C runtime and no host imports.
+  const wasm = yield* invoke(
+    silk,
+    [...argumentsFor('program.wasm'), '--target', 'wasm32-unknown-unknown'],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(wasm.status, 0, wasm.stderr)
+  assert.equal(yield* fs.exists(join(directory, 'program.wasm.silk-runtime.c')), false)
+  const wasmModule = new WebAssembly.Module(yield* fs.readFile(join(directory, 'program.wasm')))
+  assert.deepEqual(WebAssembly.Module.imports(wasmModule), [])
+  assert.deepEqual(
+    WebAssembly.Module.exports(wasmModule)
+      .map((entry) => entry.name)
+      .sort(),
+    ['main', 'memory'],
+    'a module exports only its named C exports and its memory',
+  )
+  const wasmMain = new WebAssembly.Instance(wasmModule, {}).exports.main as () => number
+  assert.equal(wasmMain(), 42)
   for (const selectors of [
     ['--emit', 'invalid'],
     ['--emit'],
@@ -823,6 +843,66 @@ const program = Effect.gen(function* () {
   )
   assert.equal(conflicting.status, 2, 'a named profile must conflict with --release')
   assert.equal(yield* fs.exists(marker), false)
+  // A multi-threaded wasm32 profile links one shared memory the host imports, with the profile's
+  // maximum, and runs its native threads as Workers under the stdlib's Node runner.
+  const threads = join(directory, 'threads')
+  yield* fs.makeDirectory(threads, { recursive: true })
+  yield* fs.writeFileString(
+    join(threads, 'silk.toml'),
+    '[package]\nname = "threads"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "256MiB"\n',
+  )
+  yield* fs.writeFileString(
+    join(threads, 'main.silk'),
+    [
+      'import silk.allocator { Allocator, OutOfMemoryError }',
+      'import silk.box { Box }',
+      'import silk.effect { Effect }',
+      'import silk.native_thread { NativeThread, SpawnError }',
+      'effect fn program() -> i32 ! OutOfMemoryError | SpawnError {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  let owned = run Box<i32>.make(20) |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  let first = run NativeThread.spawn(fn() -> i32 { return (move owned).into() + 1 })',
+      '    |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  let second = run NativeThread.spawn(fn() -> i32 { return 21 })',
+      '    |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  return first.join() + second.join()',
+      '}',
+      'effect fn recover(error: OutOfMemoryError | SpawnError) -> i32 { return -2 }',
+      'pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }',
+      '',
+    ].join('\n'),
+  )
+  const threaded = yield* invoke(
+    silk,
+    [
+      'build',
+      '--manifest-path',
+      join('threads', 'silk.toml'),
+      '--profile',
+      'web',
+      '--stdlib',
+      standardLibrary,
+    ],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(threaded.status, 0, threaded.stderr)
+  const threadedPath = join(threads, 'build/llvm/wasm32-unknown-unknown/web/threads')
+  const threadedModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
+  assert.deepEqual(
+    WebAssembly.Module.imports(threadedModule)
+      .map((entry) => `${entry.module}.${entry.name}`)
+      .sort(),
+    ['env.memory', 'wasi.thread-spawn'],
+  )
+  const threadedRun = yield* invoke(
+    process.execPath,
+    [join(standardLibrary, 'host/wasm-runner.mjs'), threadedPath],
+    directory,
+    process.env,
+  )
+  assert.equal(threadedRun.status, 42, threadedRun.stderr)
   // A profile's CPU features, large code model and static link reach Clang.
   const argumentLog = join(directory, 'clang-arguments')
   const recorder = join(directory, 'clang-recorder')

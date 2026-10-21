@@ -33,6 +33,7 @@ import silk.slice { Slice }
 import silk.string { String }
 import silk.json_value { JsonChild, Value as JsonValue }
 import silk.toml_value { TableKind, Toml, TomlChild, TomlEntry, Value as TomlValue }
+import silk.u8
 import silk.usize
 import silk.list { List }
 
@@ -69,6 +70,10 @@ pub struct Profile {
   pub input: ProfileInput
   /// Project-tier bindings followed by the profile's own.
   pub bindings: List<Supplied>
+  /// The most linear memory a wasm32 module may grow to, in bytes, when `maxMemory` sets it. Only
+  /// the final link reads it, so it stays out of the frozen profile that source specialization
+  /// keys on.
+  pub maxMemory: Option<usize>
 }
 
 // The deepest binding value the TypeScript decoder admits.
@@ -359,10 +364,10 @@ fn fieldSubject(field: ProfileField) -> &'static [u8] {
 effect fn logical(table: &TomlValue) -> ProfileInput
   ! InvalidProfile | OutOfMemoryError
   ? &mut Allocator {
-  let allowed: [&[u8]; 17] = [
+  let allowed: [&[u8]; 18] = [
     b"target", b"cpu", b"deployment", b"libc", b"artifact", b"entry", b"link", b"codeModel",
     b"relocation", b"optimization", b"debug", b"safety", b"threading", b"sanitizers", b"unwind",
-    b"runtime", b"bindings",
+    b"runtime", b"bindings", b"maxMemory",
   ]
   if let Option<&[u8]>.Some { value: key } = move unknownKey(table, &allowed) {
     return run refuse(Code.UnknownField, key)
@@ -446,8 +451,8 @@ fn writes(value: &Option<Bytes>, spelling: &[u8]) -> bool {
 // The first valid field the native compiler cannot honor yet, as a non-default value: sanitizers
 // need instrumented code, native unwinding needs unwind tables, the large code model is only
 // built for x86_64, an entry selection needs a composition that names one, and no library reads
-// the unchecked safety or multi-threading policies. The native build applies `cpu`, `link` and
-// `codeModel`.
+// the unchecked safety policy or, outside wasm32, the multi-threading one. The native build
+// applies `cpu`, `link` and `codeModel`.
 fn nativeGap(input: &ProfileInput) -> Option<&'static [u8]> {
   if List<Bytes>.length(&input.sanitizers) > usize.ZERO {
     return Option<&'static [u8]>.some(b"sanitizers")
@@ -462,13 +467,18 @@ fn nativeGap(input: &ProfileInput) -> Option<&'static [u8]> {
     let written = Bytes.asSlice(&target)
     x86 = written.length > usize.add(0, 6) && same(Slice.view<u8>(written, usize.ZERO, usize.add(0, 7)), b"x86_64-")
   }
+  let mut wasm = false
+  if let Option<Bytes>.Some {value: target} = &input.target {
+    wasm = same(Bytes.asSlice(&target), b"wasm32-unknown-unknown")
+  }
   if writes(&input.codeModel, b"large") && !x86 {
     return Option<&'static [u8]>.some(b"codeModel")
   }
   if writes(&input.safety, b"unchecked") {
     return Option<&'static [u8]>.some(b"safety")
   }
-  if writes(&input.threading, b"multi") {
+  // Only wasm32 reads the threading policy: `multi` selects its wasi-threads profile.
+  if writes(&input.threading, b"multi") && !wasm {
     return Option<&'static [u8]>.some(b"threading")
   }
   return match &input.entry {
@@ -933,7 +943,71 @@ effect fn decode(prefix: &[u8], table: &TomlValue) -> Profile
       }
     }
   }
-  return Profile { input: move input, bindings: move own }
+  let maxMemory = match move run Effect.result(memoryLimit(table, &input)) {
+    Result<Option<usize>, InvalidProfile | OutOfMemoryError>.Success { value } => move value
+    Result<Option<usize>, InvalidProfile | OutOfMemoryError>.Failure { error } => match move error {
+      InvalidProfile problem => run located(prefix, Option<&TomlValue>.some(table), move problem)
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return Profile { input: move input, bindings: move own, maxMemory: move maxMemory }
+}
+
+// The `maxMemory` field: a whole number of bytes, or of `KiB`, `MiB` or `GiB`, that is a positive
+// multiple of the 64 KiB wasm page and at most the 4 GiB a wasm32 address reaches. Only wasm32
+// links a memory limit, so another target refuses it.
+effect fn memoryLimit(table: &TomlValue, input: &ProfileInput) -> Option<usize>
+  ! InvalidProfile | OutOfMemoryError
+  ? &mut Allocator {
+  let field = run optionalText(table, "maxMemory", b"maxMemory")
+  if let Option<Bytes>.None = &field {
+    return Option<usize>.none()
+  }
+  let written = match move field {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => run invalid(b"maxMemory")
+  }
+  let mut wasm = false
+  if let Option<Bytes>.Some { value: target } = &input.target {
+    wasm = same(Bytes.asSlice(&target), b"wasm32-unknown-unknown")
+  }
+  if !wasm {
+    return run refuse(Code.UnsupportedCombination, b"maxMemory")
+  }
+  let spelled = Bytes.asSlice(&written)
+  let mut digits = spelled.length
+  let mut scale = usize.ONE
+  if spelled.length > usize.add(0, 3) {
+    let unit = Slice.view<u8>(spelled, spelled.length - usize.add(0, 3), usize.add(0, 3))
+    if same(unit, b"KiB") { scale = usize.add(0, 1024) }
+    if same(unit, b"MiB") { scale = usize.add(0, 1048576) }
+    if same(unit, b"GiB") { scale = usize.add(0, 1073741824) }
+    if scale != usize.ONE { digits = spelled.length - usize.add(0, 3) }
+  }
+  let limit = usize.add(0, 4294967296)
+  if digits == usize.ZERO || digits > usize.add(0, 10) {
+    return run invalid(b"maxMemory")
+  }
+  let mut count = usize.ZERO
+  let mut at = usize.ZERO
+  while at < digits {
+    let digit = spelled[at]
+    if digit < 48 || digit > 57 {
+      return run invalid(b"maxMemory")
+    }
+    count = count * 10 + u8.toUsize(digit - 48)
+    at = at + usize.ONE
+  }
+  if count == usize.ZERO || count > limit / scale {
+    return run invalid(b"maxMemory")
+  }
+  let bytes = count * scale
+  if bytes % usize.add(0, 65536) != usize.ZERO {
+    return run invalid(b"maxMemory")
+  }
+  return Option<usize>.some(bytes)
 }
 
 /// The profile `[profiles.<name>]` declares, with the project bindings before its own, as the
@@ -951,12 +1025,12 @@ pub effect fn select(document: &TomlValue, name: &[u8]) -> Profile
             if let Option<&TomlValue>.Some { value: table } = move memberValue(child) {
               let mut prefix = run Bytes.copy(b"profiles.")
               run Bytes.append(&mut prefix, name)
-              let Profile { input, bindings: own } = move run decode(Bytes.asSlice(&prefix), table)
+              let Profile { input, bindings: own, maxMemory } = move run decode(Bytes.asSlice(&prefix), table)
               let mut remaining = move own
               while List<Supplied>.length(&remaining) > usize.ZERO {
                 run List<Supplied>.append(&mut supplied, List<Supplied>.remove(&mut remaining, usize.ZERO))
               }
-              return Profile { input: move input, bindings: move supplied }
+              return Profile { input: move input, bindings: move supplied, maxMemory: move maxMemory }
             }
           }
         }
@@ -1026,11 +1100,11 @@ pub effect fn fromInput(document: &TomlValue, input: &JsonValue) -> Profile
   ! InvalidProfile | OutOfMemoryError
   ? &mut Allocator {
   let table = run fromJson(input, usize.ZERO)
-  let Profile { input: logicalInput, bindings: own } = move run decode(b"--profile-input", &table)
+  let Profile { input: logicalInput, bindings: own, maxMemory } = move run decode(b"--profile-input", &table)
   let mut supplied = run projectBindings(document)
   let mut remaining = move own
   while List<Supplied>.length(&remaining) > usize.ZERO {
     run List<Supplied>.append(&mut supplied, List<Supplied>.remove(&mut remaining, usize.ZERO))
   }
-  return Profile { input: move logicalInput, bindings: move supplied }
+  return Profile { input: move logicalInput, bindings: move supplied, maxMemory: move maxMemory }
 }

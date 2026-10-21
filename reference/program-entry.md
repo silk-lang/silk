@@ -84,9 +84,13 @@ apply independently at the C boundary.
 **Status:** Confirmed
 
 Hosted native startup uses the platform C entry ABI and libc startup. Standalone Wasm exports a
-zero-parameter C `main` returning `i32`. Raw Linux startup instead selects its source `_start`, reads
-the validated initial stack, calls the application, and terminates through the kernel; see
-[raw Linux](raw-linux.md).
+zero-parameter C `main` returning `i32`. `silk build --target wasm32-unknown-unknown` links that
+module freestanding on any host: no libc and no start function, the compiler's C runtime beside the
+program, and exports for exactly the C exports source names plus the linear memory. A
+multi-threaded profile instead imports a shared memory and also exports `wasi_thread_start`
+(THREAD-009 in [thread properties](thread-properties.md)). Raw Linux startup instead selects its
+source `_start`, reads the validated initial stack, calls the application, and terminates through
+the kernel; see [raw Linux](raw-linux.md).
 
 Custom runtimes define their own C exports and loader entry according to the selected artifact and
 target contracts. The compiler preserves those exports and validates their ABI, while source calls

@@ -13,7 +13,7 @@ The closure and its result must be `Transferable`, and the closure must be detac
 everything it captures, so it borrows nothing from the spawning caller. Each thread runs its
 closure as the body of one transferable Execution package (EXEC-010), which is how one
 non-generic C entry point starts closures of any type. Threads use `pthread_create` on Darwin
-and GNU libc targets.
+and GNU libc targets, and wasi-threads on wasm32 with `threading = "multi"`.
 
 ## Gotchas
 Dropping a [`JoinHandle`](#JoinHandle) without joining waits for the thread, so the result storage it owns
@@ -169,6 +169,22 @@ Starts `work` on a new native thread and returns the handle that joins it.
 
 The thread's start storage and result storage come from the selected `Allocator`. Creation
 failure reports [`SpawnError`](#SpawnError) and drops `work` without running it.
+
+<a id="NativeThread.impl.runStarted"></a>
+
+### Associated function `runStarted`
+
+```silk
+pub unsafe fn runStarted(argument: ?*mut u8) -> ()
+```
+
+Runs the thread a wasm32 runtime started with `argument`.
+
+#### Details
+
+Only the wasm32 runtime calls this, on the new thread, with the argument `spawn` passed to the
+runtime's thread creation. A wasm32 module roots no standard-library export of its own, so the
+runtime's entry module exports the thread entry and forwards here.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -184,9 +184,10 @@ Each thread drives its closure as the body of one transferable Execution package
 non-generic C entry point, passed to `pthread_create` with `threadCallbacks`, starts closures of any
 type. The start and result cells come from the selected `Allocator`.
 
-**Boundary:** Darwin and GNU libc targets only; other targets report a compile-time error at the
-use. Dropping an unjoined handle waits for the thread, since the handle owns the result storage the
-thread writes. A fatal trap on any thread ends the process.
+**Boundary:** Darwin and GNU libc targets, and wasm32 with `threading = "multi"` (THREAD-009);
+other targets report a compile-time error at the use. Dropping an unjoined handle waits for the
+thread, since the handle owns the result storage the thread writes. A fatal trap on any thread ends
+the process.
 
 **Diagnostics:** A closure or result without its bound reports `SEM0121`. Thread creation failure
 is the typed `SpawnError` carrying the `pthread_create` error number.
@@ -295,5 +296,44 @@ requirements or errors, so a task returns its own failures as a value, for examp
 after its pool was dropped is dropped unstarted, and its handle never finishes.
 
 **Evidence:** [thread pool](../stdlib/silk/thread_pool.silk), native corpus (`thread-pool-tasks`).
+
+**Current compiler:** Aligned.
+
+## THREAD-009 — A multi-threaded wasm32 profile runs native threads through wasi-threads
+
+**Status:** Confirmed
+
+A project profile with `target = "wasm32-unknown-unknown"` and `threading = "multi"` compiles with
+atomics and bulk memory and links one shared memory that the module imports as `env.memory`, with
+`maxMemory` as its maximum (1 GiB by default, PROFILE-001). `NativeThread.spawn` asks the host for a
+thread through the wasi-threads import `wasi.thread-spawn`; the host instantiates the same module
+on the same memory and calls its exported `wasi_thread_start`. The compiler's linked runtime gives
+each thread a 1 MiB stack from the allocator before the thread runs, and `JoinHandle.join` and
+`Atomic.wait` block with `memory.atomic.wait32`. `NativeThread.processorCount` asks the host
+through `silk.thread-parallelism`.
+
+```toml
+[profiles.web]
+target = "wasm32-unknown-unknown"
+threading = "multi"
+maxMemory = "256MiB"
+```
+
+The standard library ships a host for Node and browsers in `stdlib/host/wasm-runner.mjs`.
+`node wasm-runner.mjs program` exits with the status `main` returns, and `runWasm(bytes)` resolves
+to it. `main` runs in a Worker, not on the host's own thread, because a browser's main thread may
+not block in `memory.atomic.wait32`; the top-level thread creates every thread's Worker.
+
+**Boundary:** The memory allocator is a lock-free bump allocator that never frees, so a long-running
+program that allocates steadily exhausts `maxMemory`. A browser needs cross-origin isolation for
+shared memory. A wait the host refuses traps. The module also exports `silk_wasm_thread_entry_v1`,
+the thread entry the runtime calls; hosts do not call it.
+
+**Diagnostics:** `threading = "multi"` on a native target is still refused as not native. A thread
+the host cannot start is the typed `SpawnError` carrying the error number the host returned.
+
+**Evidence:** [native threads](../stdlib/silk/native_thread.silk),
+[wasm entry](../stdlib/silk/wasm_start.silk), [runner](../stdlib/host/wasm-runner.mjs),
+`compiler/scripts/test-native-build.ts`.
 
 **Current compiler:** Aligned.

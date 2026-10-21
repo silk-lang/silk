@@ -9,7 +9,7 @@
 //! everything it captures, so it borrows nothing from the spawning caller. Each thread runs its
 //! closure as the body of one transferable Execution package (EXEC-010), which is how one
 //! non-generic C entry point starts closures of any type. Threads use `pthread_create` on Darwin
-//! and GNU libc targets.
+//! and GNU libc targets, and wasi-threads on wasm32 with `threading = "multi"`.
 //!
 //! # Gotchas
 //! Dropping a [`JoinHandle`] without joining waits for the thread, so the result storage it owns
@@ -37,6 +37,8 @@ import silk.execution { Execution, TransferableExecution }
 import silk.ownership { Drop }
 import silk.pointer { Pointer }
 import silk.i64
+import silk.isize
+import silk.u32
 import silk.thread { Transferable }
 
 unsafe extern "C" fn pthread_create(
@@ -48,6 +50,10 @@ unsafe extern "C" fn pthread_create(
 unsafe extern "C" fn pthread_join(thread: usize, result: ?*mut ?*mut u8) -> i32
 unsafe extern "C" fn sched_yield() -> i32
 unsafe extern "C" fn sysconf(name: i32) -> i64
+// The wasi-threads runtime the compiler links into a multi-threaded wasm32 module.
+unsafe extern "C" fn silk_wasm_thread_spawn(argument: ?*mut u8) -> isize
+unsafe extern "C" fn silk_wasm_thread_join(handle: usize) -> ()
+unsafe extern "C" fn silk_wasm_parallelism() -> u32
 
 /// The thread could not be created, for example because a resource limit was reached.
 pub struct SpawnError {
@@ -97,7 +103,11 @@ impl<T> JoinHandle<T> {
   fn wait(self: &mut Self) -> () {
     if self.joined { return () }
     self.joined = true
-    if unsafe pthread_join(self.thread, Pointer.null<?*mut u8>()) != 0 { failedJoin() }
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      unsafe silk_wasm_thread_join(self.thread)
+    } else {
+      if unsafe pthread_join(self.thread, Pointer.null<?*mut u8>()) != 0 { failedJoin() }
+    }
     return ()
   }
 }
@@ -121,6 +131,9 @@ impl NativeThread {
   /// those processors.
   pub fn processorCount() -> usize {
     supportedTarget()
+    static if Intrinsic.targetArchitecture() == "wasm32" {
+      return u32.toUsize(unsafe silk_wasm_parallelism())
+    }
     // `_SC_NPROCESSORS_ONLN`.
     let mut name: i32 = 84
     static if Intrinsic.targetOperatingSystem() == "darwin" { name = 58 }
@@ -132,7 +145,10 @@ impl NativeThread {
   /// Offers the rest of the current thread's time slice to other runnable threads.
   pub fn yieldNow() -> () {
     supportedTarget()
-    let ignored = unsafe sched_yield()
+    // A WebAssembly thread has no scheduler call to give up its slice.
+    static if Intrinsic.targetArchitecture() != "wasm32" {
+      let ignored = unsafe sched_yield()
+    }
     return ()
   }
 
@@ -152,13 +168,26 @@ impl NativeThread {
     let handle = run startThread<T, F>(move work)
     return move handle
   }
+
+  /// Runs the thread a wasm32 runtime started with `argument`.
+  ///
+  /// # Details
+  ///
+  /// Only the wasm32 runtime calls this, on the new thread, with the argument `spawn` passed to the
+  /// runtime's thread creation. A wasm32 module roots no standard-library export of its own, so the
+  /// runtime's entry module exports the thread entry and forwards here.
+  pub unsafe fn runStarted(argument: ?*mut u8) -> () {
+    unsafe runThread(argument)
+    return ()
+  }
 }
 
-// Native threads use `pthread_create`, which Darwin and GNU libc provide.
+// Native threads use `pthread_create`, which Darwin and GNU libc provide, or wasi-threads in a
+// multi-threaded wasm32 profile.
 fn supportedTarget() -> () {
-  static if Intrinsic.targetOperatingSystem() == "darwin" || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText("libc") == "gnu") {
+  static if Intrinsic.targetOperatingSystem() == "darwin" || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText("libc") == "gnu") || (Intrinsic.targetArchitecture() == "wasm32" && Intrinsic.profileText("threading") == "multi") {
     return ()
-  } else { compileError("Native threads require a Darwin or GNU libc target") }
+  } else { compileError("Native threads require a Darwin or GNU libc target, or wasm32 with threading = \"multi\"") }
 }
 
 // Allocates the result and start cells, packages `work`, and creates the thread.
@@ -176,10 +205,23 @@ effect<'static> fn startThread<
   let startCell = Pointer.fromMutRef(&mut start.getMut()[0])
   let erased = unsafe Intrinsic.pointerReinterpret<*mut StartCell, *mut u8>(startCell)
   let argument = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(erased)
-  let mut thread: usize = 0
-  let code = unsafe pthread_create(Pointer.fromMutRef(&mut thread), Pointer.null<u8>(), silkNativeThreadStart, argument)
-  if code != 0 { fail SpawnError { code: code } }
+  let thread = run createThread(argument)
   return JoinHandle<T> { thread: thread, joined: false, start: move start, result: move result }
+}
+
+// Starts a thread in `silkNativeThreadStart` with `argument`, answering the handle `wait` joins.
+effect fn createThread(argument: ?*mut u8) -> usize ! SpawnError {
+  static if Intrinsic.targetArchitecture() == "wasm32" {
+    // The runtime answers the thread's record address, or a negated error number.
+    let started = unsafe silk_wasm_thread_spawn(argument)
+    if started < 0 { fail SpawnError { code: isize.toI32(0 - started) } }
+    return isize.toUsize(started)
+  } else {
+    let mut thread: usize = 0
+    let code = unsafe pthread_create(Pointer.fromMutRef(&mut thread), Pointer.null<u8>(), silkNativeThreadStart, argument)
+    if code != 0 { fail SpawnError { code: code } }
+    return thread
+  }
 }
 
 // The thread body: run the closure and store its value where the handle will read it.
@@ -194,9 +236,15 @@ effect fn runWork<T, F: once fn() -> T>(work: F, address: ResultAddress<T>) -> (
 
 fn ready(state: &()) -> () { return () }
 
-// The one C entry point every thread starts in. It takes the package out of the start cell, so
-// the handle's later drop of that cell finds it empty, and drives it to completion.
+// The one C entry point every native thread starts in.
 export "C" fn silkNativeThreadStart(argument: ?*mut u8) -> ?*mut u8 {
+  unsafe runThread(argument)
+  return Pointer.null<u8>()
+}
+
+// A new thread's body. It takes the package out of the start cell, so the handle's later drop of
+// that cell finds it empty, and drives it to completion.
+unsafe fn runThread(argument: ?*mut u8) -> () {
   let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(argument)
   let cell = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut StartCell>(present)
   let taken = unsafe Pointer.take<StartCell>(cell)
@@ -206,7 +254,7 @@ export "C" fn silkNativeThreadStart(argument: ?*mut u8) -> ?*mut u8 {
     Waiting { execution } => run Execution.drive(execution.local(), (), completed, suspended)
     Taken nothing => ()
   }
-  return Pointer.null<u8>()
+  return ()
 }
 
 fn completed(state: (), value: ()) -> () { return () }
