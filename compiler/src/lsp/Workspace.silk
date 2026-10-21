@@ -1,0 +1,561 @@
+//! The documents a client has open, laid over the files on disk.
+//!
+//! Each open document belongs to the package whose manifest is nearest above it. A package keeps
+//! its disk sources and one revisable semantic store. An edit only replaces a document's text and
+//! marks its package stale; [`refresh`] then publishes every open document of a stale package over
+//! the package's disk revision and updates the store once, so a burst of edits costs one update.
+//!
+//! Syntax diagnostics come from parsing each changed document alone, so refreshing for them runs no
+//! semantic unit.
+
+import diagnostic.Report as Reports { RenderedDiagnostic }
+import driver.ModuleSources as Sources { ModuleSources }
+import driver.NativeLinkInput { InvalidNativeLinkInput }
+import driver.ModuleSources {
+  InvalidBuildComposition,
+  InvalidSourceRoot,
+  MissingManifest,
+  MissingStandardLibrary,
+}
+import driver.Packages { InvalidDependency }
+import lsp.Message { PositionEncoding }
+import semantic.FinalProfile { FinalProfile }
+import semantic.InitialProfile { Selection as RuntimeRequest }
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.Rejection as Rejections { Rejection }
+import semantic.Semantic as Semantics { Semantic, Statistics }
+import semantic.SourceRevision { Revision }
+import semantic.SourceUnit { SourceUnit }
+import semantic.Target { Target }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.list { List }
+import silk.option { Option }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.toml_scanner { TomlError }
+import silk.usize
+
+/// A zero-based line and column in a document, the column counted in the negotiated encoding.
+pub struct Position {
+  pub line: usize
+  pub character: usize
+}
+
+/// One syntax diagnostic, located for the client.
+pub struct Problem {
+  pub start: Position
+  pub end: Position
+  pub code: Bytes
+  pub message: Bytes
+}
+
+/// The diagnostics owed to the client for one document; an empty list clears its diagnostics.
+pub struct Published {
+  pub uri: Bytes
+  pub version: Option<usize>
+  pub problems: List<Problem>
+}
+
+/// One open document.
+pub struct Document {
+  pub uri: Bytes
+  pub version: usize
+  pub text: Bytes
+
+  // The package that owns the document, or usize.MAX when it has none.
+  package: usize
+
+  // The document's module in its package; none outside a package or a valid module path.
+  module: Option<ModuleId>
+
+  // Whether the client has not yet seen this text's diagnostics.
+  stale: bool
+}
+
+struct Package {
+  sources: ModuleSources
+  store: Semantic
+
+  // Whether an open document of this package changed since the store's last update.
+  stale: bool
+}
+
+/// The open documents and the packages they belong to.
+pub struct Workspace {
+  standardLibrary: Option<Path>
+  target: Target
+  documents: List<Document>
+  packages: List<Package>
+
+  // Documents closed since diagnostics were last taken, whose diagnostics the client must clear.
+  closed: List<Bytes>
+}
+
+/// An empty workspace whose packages read the standard library at `standardLibrary` and analyze
+/// for `target`.
+pub fn make(standardLibrary: Option<Path>, target: Target) -> Workspace {
+  return Workspace {
+    standardLibrary: move standardLibrary,
+    target: target,
+    documents: List<Document>.make(),
+    packages: List<Package>.make(),
+    closed: List<Bytes>.make(),
+  }
+}
+
+impl Workspace {
+  /// Opens the document at `uri` with `text`, or replaces it when it is already open.
+  pub effect fn open(self: &mut Self, uri: &[u8], version: usize, text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut FileSystem | &mut Allocator {
+    if documentAt(&self.*, uri) != usize.MAX {
+      return run self.change(uri, version, text)
+    }
+    let mut package = usize.MAX
+    let mut module = Option<ModuleId>.none()
+    if let Option<Bytes>.Some { value: path } = move run filePath(uri) {
+      package = run packageFor(&mut self.*, Bytes.asSlice(&path))
+      if package != usize.MAX {
+        let packages = List<Package>.asMutSlice(&mut self.packages)
+        module = run moduleIn(&packages[package].sources, Bytes.asSlice(&path))
+        packages[package].stale = true
+      }
+    }
+    return run List<Document>.append(
+      &mut self.documents,
+      Document {
+        uri: run Bytes.copy(uri),
+        version: version,
+        text: run Bytes.copy(text),
+        package: package,
+        module: move module,
+        stale: true,
+      }
+    )
+  }
+
+  /// Replaces the whole text of the open document at `uri`; an unknown document is ignored.
+  pub effect fn change(self: &mut Self, uri: &[u8], version: usize, text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = documentAt(&self.*, uri)
+    if at == usize.MAX {
+      return ()
+    }
+    let replaced = run Bytes.copy(text)
+    let documents = List<Document>.asMutSlice(&mut self.documents)
+    documents[at].text = move replaced
+    documents[at].version = version
+    documents[at].stale = true
+    let package = documents[at].package
+    if package != usize.MAX {
+      let packages = List<Package>.asMutSlice(&mut self.packages)
+      packages[package].stale = true
+    }
+    return ()
+  }
+
+  /// Closes the document at `uri`; its module returns to the package's disk contents.
+  pub effect fn close(self: &mut Self, uri: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let at = documentAt(&self.*, uri)
+    if at == usize.MAX {
+      return ()
+    }
+    let removed = List<Document>.remove(&mut self.documents, at)
+    if removed.package != usize.MAX {
+      let packages = List<Package>.asMutSlice(&mut self.packages)
+      packages[removed.package].stale = true
+    }
+    return run List<Bytes>.append(&mut self.closed, move removed.uri)
+  }
+
+  /// Reports whether any document or package is waiting for [`refresh`] or [`diagnostics`].
+  pub fn stale(self: &Self) -> bool {
+    if List<Bytes>.length(&self.closed) > usize.ZERO {
+      return true
+    }
+    let documents = List<Document>.asSlice(&self.documents)
+    let mut at = usize.ZERO
+    while at < documents.length {
+      if documents[at].stale {
+        return true
+      }
+      at = at + usize.ONE
+    }
+    let packages = List<Package>.asSlice(&self.packages)
+    at = usize.ZERO
+    while at < packages.length {
+      if packages[at].stale {
+        return true
+      }
+      at = at + usize.ONE
+    }
+    return false
+  }
+
+  /// Brings every stale package's store up to its open documents: one revision of the disk
+  /// sources with each open document published over its module, and one store update.
+  pub effect fn refresh(self: &mut Self) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut package = usize.ZERO
+    while package < List<Package>.length(&self.packages) {
+      if List<Package>.asSlice(&self.packages)[package].stale {
+        let mut revision = run Sources.revision(
+          &List<Package>.asSlice(&self.packages)[package].sources
+        )
+        let documents = List<Document>.asSlice(&self.documents)
+        let mut at = usize.ZERO
+        while at < documents.length {
+          if documents[at].package == package {
+            if let Option<ModuleId>.Some { value: module } = &documents[at].module {
+              let content = Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&documents[at].text)))
+              revision = run Revision.publish(&revision, &module, &content)
+            }
+          }
+          at = at + usize.ONE
+        }
+        let packages = List<Package>.asMutSlice(&mut self.packages)
+        run Semantic.update(&mut packages[package].store, move revision)
+        packages[package].stale = false
+      }
+      package = package + usize.ONE
+    }
+    return ()
+  }
+
+  /// Takes the diagnostics the client has not seen: those of every document changed since the
+  /// last call, and an empty list for every document closed since then.
+  pub effect fn diagnostics(self: &mut Self, encoding: PositionEncoding) -> List<Published>
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut published = List<Published>.make()
+    while List<Bytes>.length(&self.closed) > usize.ZERO {
+      let uri = List<Bytes>.remove(&mut self.closed, usize.ZERO)
+      run List<Published>.append(
+        &mut published,
+        Published { uri: move uri, version: Option<usize>.none(), problems: List<Problem>.make() }
+      )
+    }
+    let documents = List<Document>.asMutSlice(&mut self.documents)
+    let mut at = usize.ZERO
+    while at < documents.length {
+      if documents[at].stale {
+        let problems = run syntaxProblems(&documents[at], encoding)
+        run List<Published>.append(
+          &mut published,
+          Published {
+            uri: run Bytes.copy(Bytes.asSlice(&documents[at].uri)),
+            version: Option<usize>.some(documents[at].version),
+            problems: move problems,
+          }
+        )
+        documents[at].stale = false
+      }
+      at = at + usize.ONE
+    }
+    return move published
+  }
+
+  /// The demand counters of the store that owns the document at `uri`, if it has one.
+  pub fn statistics(self: &Self, uri: &[u8]) -> Option<Statistics> {
+    let at = documentAt(&self.*, uri)
+    if at == usize.MAX {
+      return Option<Statistics>.none()
+    }
+    let package = List<Document>.asSlice(&self.documents)[at].package
+    if package == usize.MAX {
+      return Option<Statistics>.none()
+    }
+    return Option<Statistics>.some(
+      Semantic.statistics(&List<Package>.asSlice(&self.packages)[package].store)
+    )
+  }
+}
+
+fn documentAt(self: &Workspace, uri: &[u8]) -> usize {
+  let documents = List<Document>.asSlice(&self.documents)
+  let mut at = usize.ZERO
+  while at < documents.length {
+    if same(Bytes.asSlice(&documents[at].uri), uri) {
+      return at
+    }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+// The package whose module directory holds `path`, discovered from the nearest manifest the first
+// time one of its documents opens; usize.MAX when no package holds it.
+effect fn packageFor(self: &mut Workspace, path: &[u8]) -> usize
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let packages = List<Package>.asSlice(&self.packages)
+  let mut at = usize.ZERO
+  while at < packages.length {
+    if within(Path.rawBytes(Sources.moduleRoot(&packages[at].sources)), path) {
+      return at
+    }
+    at = at + usize.ONE
+  }
+  let found = run Effect.result(discover(path, &self.standardLibrary))
+  let sources = match move found {
+    Result<
+      ModuleSources,
+      FileError
+        | TomlError
+        | InvalidSourceRoot
+        | InvalidDependency
+        | MissingManifest
+        | InvalidBuildComposition
+        | MissingStandardLibrary
+        | InvalidNativeLinkInput
+        | InvalidModulePath
+        | OutOfMemoryError
+    >.Success {
+      value
+    } => move value
+    Result<
+      ModuleSources,
+      FileError
+        | TomlError
+        | InvalidSourceRoot
+        | InvalidDependency
+        | MissingManifest
+        | InvalidBuildComposition
+        | MissingStandardLibrary
+        | InvalidNativeLinkInput
+        | InvalidModulePath
+        | OutOfMemoryError
+    >.Failure {
+      error
+    } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      _ => {
+        return usize.MAX
+      }
+    }
+  }
+  let revision = run Sources.revision(&sources)
+  let store = Semantic.make(move revision, self.target, Option<FinalProfile>.none())
+  run List<Package>.append(
+    &mut self.packages,
+    Package { sources: move sources, store: move store, stale: true }
+  )
+  return List<Package>.length(&self.packages) - usize.ONE
+}
+
+// The package of the nearest manifest above `path`, as a library with no runtime: the server only
+// reads it, and never builds an artifact.
+effect fn discover(path: &[u8], standardLibrary: &Option<Path>) -> ModuleSources
+  ! FileError
+    | TomlError
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | InvalidModulePath
+    | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let source = run Path.fromBytes(path)
+  let mut library = Option<Path>.none()
+  if let Option<Path>.Some { value } = &standardLibrary.* {
+    library = Option<Path>.some(run Path.fromBytes(Path.rawBytes(&value)))
+  }
+  return run Sources.make(&source, move library, b"", b"", false, RuntimeRequest.None)
+}
+
+// The module `path` names in the package of `sources`, if `path` is under its module directory.
+effect fn moduleIn(sources: &ModuleSources, path: &[u8]) -> Option<ModuleId>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let root = Path.rawBytes(Sources.moduleRoot(sources))
+  if !within(root, path) {
+    return Option<ModuleId>.none()
+  }
+  let logical = Slice.view<u8>(path, root.length + usize.ONE, path.length - root.length - usize.ONE)
+  let identified = run Effect.result(Sources.module(sources, logical))
+  return match move identified {
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success { value } => Option<
+      ModuleId
+    >.some(move value)
+    Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure { error } => match move error {
+      InvalidModulePath invalid => Option<ModuleId>.none()
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// Reports whether `path` is strictly below the directory `root`.
+fn within(root: &[u8], path: &[u8]) -> bool {
+  if path.length <= root.length + usize.ONE || path[root.length] != 47 {
+    return false
+  }
+  return same(Slice.view<u8>(path, usize.ZERO, root.length), root)
+}
+
+/// The filesystem path a `file:` URI names, with its percent escapes decoded; none for any other
+/// scheme or a malformed escape.
+pub effect fn filePath(uri: &[u8]) -> Option<Bytes>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let prefix = b"file://"
+  if uri.length <= prefix.length || !same(Slice.view<u8>(uri, usize.ZERO, prefix.length), prefix) {
+    return Option<Bytes>.none()
+  }
+  let mut path = Bytes.make()
+  let mut at = prefix.length
+  while at < uri.length {
+    let byte = uri[at]
+    if byte == 37 {
+      if at + 2 >= uri.length {
+        return Option<Bytes>.none()
+      }
+      let high = hexDigit(uri[at + 1])
+      let low = hexDigit(uri[at + 2])
+      if high > 15 || low > 15 {
+        return Option<Bytes>.none()
+      }
+      run Bytes.append(&mut path, &[high * 16 + low])
+      at = at + 3
+    } else {
+      run Bytes.append(&mut path, &[byte])
+      at = at + usize.ONE
+    }
+  }
+  return Option<Bytes>.some(move path)
+}
+
+// The value of one hexadecimal digit, or 255 for any other byte.
+fn hexDigit(byte: u8) -> u8 {
+  if byte >= 48 && byte <= 57 {
+    return byte - 48
+  }
+  if byte >= 97 && byte <= 102 {
+    return byte - 87
+  }
+  if byte >= 65 && byte <= 70 {
+    return byte - 55
+  }
+  return 255
+}
+
+// Parses the document alone and locates each of its syntax diagnostics.
+effect fn syntaxProblems(document: &Document, encoding: PositionEncoding) -> List<Problem>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let module = match &document.module {
+    Option<ModuleId>.Some { value } => ModuleId.copy(&value)
+    Option<ModuleId>.None => match move run Effect.result(
+      ModuleId.make(b"file", b"", b"document.silk")
+    ) {
+      Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Success { value } => move value
+      Result<ModuleId, InvalidModulePath | OutOfMemoryError>.Failure { error } => match move error {
+        InvalidModulePath invalid => {
+          return List<Problem>.make()
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+  }
+  let unit = run SourceUnit.parse(
+    &module,
+    usize.ZERO,
+    run Bytes.copy(Bytes.asSlice(&document.text))
+  )
+  let text = SourceUnit.bytes(&unit)
+  let mut problems = List<Problem>.make()
+  let mut at = usize.ZERO
+  while at < SourceUnit.diagnosticCount(&unit) {
+    let diagnostic = SourceUnit.diagnostic(&unit, at)
+    let rejection = run Semantics.syntaxRejection(
+      &module,
+      Rejection.causeCode(diagnostic.code),
+      diagnostic.span,
+      diagnostic.detail
+    )
+    if let Option<RenderedDiagnostic>.Some { value: rendered } = move run Reports.fields(
+      &rejection,
+      text,
+      b""
+    ) {
+      let mut message = run Bytes.copy(Bytes.asSlice(&rendered.code))
+      if let Option<Bytes>.Some { value: filled } = &rendered.message {
+        message = run Bytes.copy(Bytes.asSlice(&filled))
+      }
+      run List<Problem>.append(
+        &mut problems,
+        Problem {
+          start: locate(text, rendered.start, encoding),
+          end: locate(text, rendered.end, encoding),
+          code: move rendered.code,
+          message: move message,
+        }
+      )
+    }
+    at = at + usize.ONE
+  }
+  return move problems
+}
+
+/// The position of byte `offset` in `text`, clamped to its length, with the column counted in
+/// UTF-8 bytes or UTF-16 code units.
+pub fn locate(text: &[u8], offset: usize, encoding: PositionEncoding) -> Position {
+  let mut bounded = offset
+  if bounded > text.length {
+    bounded = text.length
+  }
+  let mut line = usize.ZERO
+  let mut character = usize.ZERO
+  let mut at = usize.ZERO
+  while at < bounded {
+    let byte = text[at]
+    if byte == 10 {
+      line = line + usize.ONE
+      character = usize.ZERO
+    } else {
+      match encoding {
+        PositionEncoding.Utf8 => {
+          character = character + usize.ONE
+        }
+        PositionEncoding.Utf16 => {
+          // Continuation bytes add nothing; a four-byte sequence is a surrogate pair.
+          if byte >= 240 {
+            character = character + 2
+          } else if byte < 128 || byte >= 192 {
+            character = character + usize.ONE
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Position { line: line, character: character }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
