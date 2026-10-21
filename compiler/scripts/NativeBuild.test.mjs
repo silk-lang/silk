@@ -148,7 +148,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
       fixture(function* ({ root, options }) {
         const alias = join(root, 'clang')
         symlinkSync('clang-22', alias)
-        const check = `test "$SILK_CLANG" = '${options.clang}' && test -z "$SILKC_CLANG" || exit 81\ntest -z "$SILK_PRIVATE_SECRET" && test -z "$SILK_TEST_CLANG" || exit 82`
+        const check = `test "$SILK_CLANG" = '${options.clang}' && test -z "$SILKC_CLANG" || exit 81\ntest -z "$SILK_PRIVATE_SECRET" && test -z "$SILK_TEST_CLANG" || exit 82\ntest "$SILK_RECEIPTS" = 1 || exit 83`
         executable(
           options.producer,
           `${check}\n${producer(check + '\nexit 42').replace(

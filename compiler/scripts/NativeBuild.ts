@@ -94,7 +94,8 @@ const nativeEnvironment = (
   current: Readonly<Record<string, string | undefined>>,
   clang: string,
 ): Readonly<Record<string, string>> => {
-  const env: Record<string, string> = { SILK_CLANG: clang }
+  // SILK_RECEIPTS makes each stage write its SILK_GAP borrow-check receipt lines.
+  const env: Record<string, string> = { SILK_CLANG: clang, SILK_RECEIPTS: '1' }
   for (const name of allowedEnvironment) {
     const value = current[name]
     if (value !== undefined) env[name] = value

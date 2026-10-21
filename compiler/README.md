@@ -21,7 +21,9 @@ The build and test steps CI runs are in `.github/workflows/selfhost.yml`.
 `src/Profiler.silk` opens [Tracy](https://github.com/wolfpld/tracy) zones around the build
 phases (`build`, `preloadProgram`, `buildArtifact`, `checkDeclarations`, `buildFrom`,
 `compileIr`), every semantic query provider run (named by its family, such as `Body`, `Signature`,
-`Mir` or `LlvmText`). Ordinary builds leave it off, so they declare and call nothing. To build an instrumented compiler at `.scratch/silk-tracy`:
+`Mir` or `LlvmText`) and each `BorrowCheck`. Query and borrow-check zones carry the declaration
+they work on, such as `semantic/Semantic.lowerMir`, as zone text. Ordinary builds leave it off, so they declare and call
+nothing. To build an instrumented compiler at `.scratch/silk-tracy`:
 
 ```sh
 SILK=path/to/silk CLANG=path/to/clang compiler/profiling/build-tracy.sh
@@ -32,4 +34,5 @@ switches `Profiler.enabled` on there and links the Tracy client; the checkout is
 Start the Tracy profiler or `tracy-capture -o run.tracy`, then run the compiler with
 `TRACY_NO_EXIT=1` so it waits until the trace is sent. Use the Tracy v0.14.1 tools; the trace
 protocol changes between releases. A new zone is one line, `let zone = Profiler.zone(b"name")`,
-and lasts until the value drops.
+and lasts until the value drops; `Profiler.text(&zone, text)` labels it, inside
+`static if Profiler.enabled` so ordinary builds never build the text.
