@@ -43,6 +43,15 @@ other kind replaces `find`, which must occur exactly once in the module, with `r
 cd compiler && silk check --stdlib ../stdlib --replay fixtures/replay/compiler.toml
 ```
 
+With `--differential`, each step also checks the same revision in a fresh `Semantic.oneShot`
+store and compares the two stores' rejections by module, code and span. It writes
+`silk-replay-differential step=<n> rejections=<count> differences=<count>`, after one
+`silk-replay-differential step=<n> only=revised|one-shot <module> <code> <start>-<end>` line per
+rejection only one store reached, and the replay exits with status 1 when any step differs. A
+difference is a reconciliation bug in the revisable store. The one-shot store gets the revisable
+store's final profile, so a step that edits a `param` declaration compares against the profile
+assembled before the edit.
+
 For the standard library, assemble `fixtures/stdlib-root` as the `stdlib-root` CI job does and
 run `silk check --stdlib <that directory> --replay <checkout>/compiler/fixtures/replay/stdlib.toml`
 in it.
