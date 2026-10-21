@@ -1,0 +1,422 @@
+//! What a written name at a source offset refers to.
+//!
+//! A name in a type position, in a header or a body, resolves at module scope as language lookup
+//! does: an enclosing declaration's generic parameter first, then the module's declarations and
+//! imports, then the members of what each earlier segment named. A name in a body expression
+//! reads the resolution table its checked body keeps for an editor (`TypedBody.resolutionSlice`).
+//! Every lookup demands answers the store caches, so a name costs one table walk once its body
+//! and the modules it names are checked.
+
+import hir.Hir { HirId, Module, Node, Range }
+import lexer.Span { Span }
+import semantic.Anchor { Anchor }
+import semantic.DeclarationId { DeclarationId }
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.ModuleIndex { IndexedDeclaration, ModuleIndex }
+import semantic.Query { Cycle }
+import semantic.Rejection { Rejection }
+import semantic.Semantic {
+  Answer,
+  Dependency,
+  DocumentationBinding,
+  Outcome,
+  Semantic,
+  StaticPort,
+  Value,
+}
+import semantic.SourceIndex { AuthoredCursor, IndexedSource, NoRejection, RevisionMismatch }
+import semantic.Type { Type }
+import semantic.TypedBody { Local, Referent, Resolution, TypedBody }
+import semantic.Types { Types }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.list { List }
+import silk.option { Option }
+import silk.result { Result }
+import silk.shared { Shared }
+import silk.usize
+
+/// What a name refers to.
+pub union Named {
+  /// A declaration: a type, function, constant or member.
+  Declaration { pub identity: DeclarationId },
+  /// A module that a namespace import names.
+  Namespace { pub module: ModuleId },
+  /// A parameter or binding of the enclosing body: its binder's span and its type.
+  Local { pub binder: Span, pub ty: Shared<Type> },
+  /// A generic parameter of an enclosing declaration, by its binder's span.
+  Binder { pub binder: Span },
+  /// A field of a record type, by its declaration ordinal.
+  Field { pub owner: Shared<Type>, pub index: usize },
+}
+
+/// A written name and what it refers to.
+pub struct NameAt {
+  /// The name's span in its module.
+  pub span: Span
+  pub named: Named
+}
+
+/// The innermost written name at `offset` in `module` and what it refers to; absent when the
+/// offset is not on a name or the name does not resolve.
+pub effect fn at(store: &mut Semantic, module: &ModuleId, offset: usize) -> Option<NameAt>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<NameAt>.none()
+    }
+  }
+  let written = match move run writtenAt(&port, &cursor, offset) {
+    Option<Written>.Some { value } => move value
+    Option<Written>.None => {
+      return Option<NameAt>.none()
+    }
+  }
+  match move written {
+    Written.InBody { span, identity, declaration } => {
+      return run bodyName(&mut port, &cursor, span, &identity, declaration, offset)
+    }
+    Written.TypePath { span, segments, binder } => {
+      if let Option<Span>.Some { value } = move binder {
+        return Option<NameAt>.some(NameAt { span: span, named: Named.Binder { binder: value } })
+      }
+      if let Option<Named>.Some { value } = move run pathTarget(&mut port, module, List<Bytes>.asSlice(&segments)) {
+        return Option<NameAt>.some(NameAt { span: span, named: move value })
+      }
+    }
+  }
+  return Option<NameAt>.none()
+}
+
+// What the syntax at an offset shows before anything is demanded.
+union Written {
+  // A segment of a type's written path: the path's segments up to and including it, and the
+  // binder it names when it is a lone generic parameter of an enclosing declaration.
+  TypePath { span: Span, segments: List<Bytes>, binder: Option<Span> },
+  // A name inside the body of the declaration at `declaration`.
+  InBody { span: Span, identity: DeclarationId, declaration: usize },
+}
+
+effect fn writtenAt<'s>(port: &StaticPort<'s>, cursor: &AuthoredCursor, offset: usize) -> Option<Written>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let indexed = match move StaticPort.sourceAtCursor(port, cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return Option<Written>.none()
+    }
+  }
+  let hir = IndexedSource.authored(indexed)
+  let name = match move innermostName(hir, offset) {
+    Option<HirId>.Some { value } => value
+    Option<HirId>.None => {
+      return Option<Written>.none()
+    }
+  }
+  let span = Module.span(hir, name)
+  if let Option<Range>.Some { value: path } = move typePath(hir, name) {
+    let mut segments = List<Bytes>.make()
+    let mut at = usize.ZERO
+    let mut through = true
+    while at < path.length && through {
+      let segment = Module.child(hir, path, at)
+      if let Node.Name { text } = Module.node(hir, segment) {
+        run List<Bytes>.append(&mut segments, run Bytes.copy(Module.text(hir, text)))
+      }
+      through = segment.index != name.index
+      at = at + usize.ONE
+    }
+    let mut binder = Option<Span>.none()
+    if List<Bytes>.length(&segments) == usize.ONE {
+      binder = genericBinder(hir, IndexedSource.moduleIndex(indexed), offset, Bytes.asSlice(&List<Bytes>.asSlice(&segments)[0]))
+    }
+    return Option<Written>.some(Written.TypePath { span: span, segments: move segments, binder: move binder })
+  }
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  let mut chosen = usize.MAX
+  let mut width = usize.MAX
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    if let Option<Span>.Some { value: block } = move bodyBlock(hir, declarations[at].local) {
+      if block.start <= offset && offset < block.end && block.end - block.start < width {
+        chosen = at
+        width = block.end - block.start
+      }
+    }
+    at = at + usize.ONE
+  }
+  if chosen == usize.MAX {
+    return Option<Written>.none()
+  }
+  return Option<Written>.some(
+    Written.InBody { span: span, identity: DeclarationId.copy(&declarations[chosen].identity), declaration: chosen }
+  )
+}
+
+// The innermost `Name` node whose span holds `offset`, end inclusive so a cursor just after a
+// name still names it.
+fn innermostName(hir: &Module, offset: usize) -> Option<HirId> {
+  let mut found = Option<HirId>.none()
+  let mut width = usize.MAX
+  let mut at = usize.ZERO
+  let count = Module.length(hir)
+  while at < count {
+    let id = HirId { index: at }
+    if let Node.Name { .. } = Module.node(hir, id) {
+      let span = Module.span(hir, id)
+      if span.start <= offset && offset <= span.end && span.end - span.start < width {
+        found = Option<HirId>.some(id)
+        width = span.end - span.start
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+// The segments of the path that names a type, when `name` is one of them. The arena is
+// postorder, so a node's parent comes after it.
+fn typePath(hir: &Module, name: HirId) -> Option<Range> {
+  let count = Module.length(hir)
+  let mut at = name.index + usize.ONE
+  while at < count {
+    if let Node.Path { segments } = Module.node(hir, HirId { index: at }) {
+      if holds(hir, segments, name) {
+        let path = HirId { index: at }
+        let mut parent = at + usize.ONE
+        while parent < count {
+          if let Node.NamedType { path: named, .. } = Module.node(hir, HirId { index: parent }) {
+            if named.index == path.index {
+              return Option<Range>.some(segments)
+            }
+          }
+          parent = parent + usize.ONE
+        }
+        return Option<Range>.none()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Range>.none()
+}
+
+fn holds(hir: &Module, range: Range, id: HirId) -> bool {
+  let mut at = usize.ZERO
+  while at < range.length {
+    if Module.child(hir, range, at).index == id.index {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// The binder of a generic parameter named `name` that an enclosing declaration of `offset`
+// writes, innermost first.
+fn genericBinder(hir: &Module, index: &ModuleIndex, offset: usize, name: &[u8]) -> Option<Span> {
+  let declarations = ModuleIndex.listDeclarations(index)
+  let mut found = Option<Span>.none()
+  let mut width = usize.MAX
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    let local = declarations[at].local
+    let span = Module.span(hir, local)
+    if span.start <= offset && offset <= span.end && span.end - span.start < width {
+      if let Option<HirId>.Some { value: first } = move Module.declarationStart(hir, local) {
+        let mut node = first.index
+        while node < local.index {
+          if let Node.TypeParameter { name: binder, .. } = Module.node(hir, HirId { index: node }) {
+            if let Node.Name { text } = Module.node(hir, binder) {
+              if same(Module.text(hir, text), name) {
+                found = Option<Span>.some(Module.span(hir, binder))
+                width = span.end - span.start
+              }
+            }
+          }
+          node = node + usize.ONE
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+// The span of a callable declaration's body block; absent for any other declaration.
+fn bodyBlock(hir: &Module, declaration: HirId) -> Option<Span> {
+  if let Node.Declaration { body, .. } = Module.node(hir, declaration) {
+    if let Node.CallableBody { block } = Module.node(hir, body) {
+      if block.present {
+        return Option<Span>.some(Module.span(hir, block.id))
+      }
+    }
+  }
+  return Option<Span>.none()
+}
+
+// Resolves a written path segment by segment, as language lookup does from `module`.
+effect fn pathTarget<'s>(port: &mut StaticPort<'s>, module: &ModuleId, segments: &[Bytes]) -> Option<Named>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  if segments.length == usize.ZERO {
+    return Option<Named>.none()
+  }
+  let mut named = match move run StaticPort.documentationBinding(&mut port.*, module, Bytes.asSlice(&segments[0]), false) {
+    Result<Option<DocumentationBinding>, Shared<Rejection>>.Success { value: Option<DocumentationBinding>.Some { value } } => move value
+    _ => {
+      return Option<Named>.none()
+    }
+  }
+  let mut at = usize.ONE
+  while at < segments.length {
+    let next = match move named {
+      DocumentationBinding.Namespace { module: namespace, .. } => run namespaceMember(&mut port.*, &namespace, Bytes.asSlice(&segments[at]))
+      DocumentationBinding.Declaration { identity, .. } => run declarationMember(&mut port.*, &identity, Bytes.asSlice(&segments[at]))
+    }
+    named = match move next {
+      Option<DocumentationBinding>.Some { value } => move value
+      Option<DocumentationBinding>.None => {
+        return Option<Named>.none()
+      }
+    }
+    at = at + usize.ONE
+  }
+  return match move named {
+    DocumentationBinding.Declaration { identity, .. } => Option<Named>.some(Named.Declaration { identity: move identity })
+    DocumentationBinding.Namespace { module: namespace, .. } => Option<Named>.some(Named.Namespace { module: move namespace })
+  }
+}
+
+// A public declaration of the module `namespace` names.
+effect fn namespaceMember<'s>(port: &mut StaticPort<'s>, namespace: &ModuleId, name: &[u8]) -> Option<DocumentationBinding>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  if let Result<Option<DocumentationBinding>, Shared<Rejection>>.Success { value } = move run StaticPort.documentationBinding(
+    &mut port.*,
+    namespace,
+    name,
+    true
+  ) {
+    return move value
+  }
+  return Option<DocumentationBinding>.none()
+}
+
+// An inherent member of the declaration `owner`, as `make` in `List.make`.
+effect fn declarationMember<'s>(port: &mut StaticPort<'s>, owner: &DeclarationId, name: &[u8]) -> Option<DocumentationBinding>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let spelling = run DeclarationId.copySpelling(owner)
+  let member = run StaticPort.documentationMember(&mut port.*, DeclarationId.moduleId(owner), Bytes.asSlice(&spelling), name)
+  if let Result<Option<DeclarationId>, Shared<Rejection>>.Success { value: Option<DeclarationId>.Some { value } } = move member {
+    return Option<DocumentationBinding>.some(DocumentationBinding.Declaration { identity: move value, isPublic: true })
+  }
+  return Option<DocumentationBinding>.none()
+}
+
+// Reads a body name from the resolution table of the checked body that holds it.
+effect fn bodyName<'s>(
+  port: &mut StaticPort<'s>,
+  cursor: &AuthoredCursor,
+  span: Span,
+  identity: &DeclarationId,
+  declaration: usize,
+  offset: usize,
+) -> Option<NameAt>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let answer = match move run StaticPort.demandBody(&mut port.*, identity, span) {
+    Option<Shared<Result<Answer, NoRejection>>>.Some { value } => move value
+    Option<Shared<Result<Answer, NoRejection>>>.None => {
+      return Option<NameAt>.none()
+    }
+  }
+  let body = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<TypedBody>>>(&answer, checkedBody) {
+    Option<Shared<TypedBody>>.Some { value } => move value
+    Option<Shared<TypedBody>>.None => {
+      return Option<NameAt>.none()
+    }
+  }
+  let anchor = match move anchorOf(&port.*, cursor, declaration) {
+    Option<Anchor>.Some { value } => move value
+    Option<Anchor>.None => {
+      return Option<NameAt>.none()
+    }
+  }
+  return Shared<TypedBody>.with<Option<NameAt>>(&body, fn(checked: &TypedBody) -> Option<NameAt> {
+    return tableName(checked, &anchor, offset)
+  })
+}
+
+fn anchorOf<'s>(port: &StaticPort<'s>, cursor: &AuthoredCursor, declaration: usize) -> Option<Anchor> {
+  if let Option<&IndexedSource>.Some { value } = move StaticPort.sourceAtCursor(port, cursor) {
+    return IndexedSource.anchorOf(value, declaration)
+  }
+  return Option<Anchor>.none()
+}
+
+// The narrowest table entry whose name holds `offset`.
+fn tableName(body: &TypedBody, anchor: &Anchor, offset: usize) -> Option<NameAt> {
+  let table = TypedBody.resolutionSlice(body)
+  let mut chosen = usize.MAX
+  let mut width = usize.MAX
+  let mut at = usize.ZERO
+  while at < table.length {
+    let span = Anchor.span(anchor, table[at].origin.location)
+    if span.start <= offset && offset <= span.end && span.end - span.start < width {
+      chosen = at
+      width = span.end - span.start
+    }
+    at = at + usize.ONE
+  }
+  if chosen == usize.MAX {
+    return Option<NameAt>.none()
+  }
+  let span = Anchor.span(anchor, table[chosen].origin.location)
+  let locals = TypedBody.localSlice(body)
+  return match &table[chosen].referent {
+    Referent.Declaration { declaration } => Option<NameAt>.some(NameAt { span: span, named: Named.Declaration {
+      identity: Shared<DeclarationId>.with<DeclarationId>(&declaration, DeclarationId.copy),
+    } })
+    Referent.Local { local } => localName(span, locals, local.index, anchor)
+    Referent.Field { owner, index } => Option<NameAt>.some(NameAt { span: span, named: Named.Field { owner: Shared<Type>.clone(&owner), index: index } })
+    Referent.Type { .. } => Option<NameAt>.none()
+  }
+}
+
+fn localName(span: Span, locals: &[Local], index: usize, anchor: &Anchor) -> Option<NameAt> {
+  if index < locals.length {
+    return Option<NameAt>.some(NameAt { span: span, named: Named.Local {
+      binder: Anchor.span(anchor, locals[index].origin.location),
+      ty: Shared<Type>.clone(&locals[index].ty),
+    } })
+  }
+  return Option<NameAt>.none()
+}
+
+fn checkedBody(answer: &Result<Answer, NoRejection>) -> Option<Shared<TypedBody>> {
+  if let Result<Answer, NoRejection>.Success { value } = &answer.* {
+    if let Outcome.Success { value: Value.Body { body } } = &value.outcome {
+      return Option<Shared<TypedBody>>.some(Shared<TypedBody>.clone(&body))
+    }
+  }
+  return Option<Shared<TypedBody>>.none()
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
