@@ -1,41 +1,198 @@
 //! The freestanding C runtime linked into every wasm32 executable.
 //!
 //! WebAssembly has no libc, so this one translation unit supplies what Silk code and LLVM lowering
-//! reach for: a bump allocator over linear memory (`free` keeps memory reserved), and the byte
-//! routines LLVM calls for copies, fills and comparisons. `optnone` keeps Clang from folding a byte
-//! loop back into a call to the routine it implements.
+//! reach for: a boundary-tag allocator over linear memory that reuses and coalesces freed chunks,
+//! and the byte routines LLVM calls for copies, fills and comparisons. `optnone` keeps Clang from
+//! folding a byte loop back into a call to the routine it implements. With atomics (the threads
+//! profile) it also implements wasi-threads: spawning through the host, the thread entry, joins and
+//! wait/notify.
 
 import silk.string {String}
 
 /// The runtime's C source, compiled by the same Clang that links the module.
 pub fn source() -> &'static [u8] {
-  return String.utf8Bytes("""typedef __SIZE_TYPE__ size_t;
+  return String.utf8Bytes(r"""typedef __SIZE_TYPE__ size_t;
 typedef __UINTPTR_TYPE__ uintptr_t;
 
 extern unsigned char __heap_base;
 
-static uintptr_t silk_heap_cursor_v1 = 0;
+// The allocator: boundary-tagged chunks over one heap that starts at `__heap_base` and grows with
+// `memory.grow`. Each chunk is a 16-byte header and a payload aligned to 16. A header holds the
+// chunk's size with two flags, and the size of the chunk before it while that one is free, so
+// `free` coalesces a chunk with both neighbors. Free chunks wait in bins by size: one per 16 bytes
+// below 1 KiB, then four per power of two. The last chunk is the top, which grows the memory
+// instead of joining a bin. One lock serializes the heap when threads share it.
+typedef struct silk_chunk_v1 {
+  size_t previous_size;
+  size_t head;
+  size_t unused[2];
+} silk_chunk_v1;
 
-static int silk_grow_memory_v1(uintptr_t required) {
+typedef struct silk_free_v1 {
+  struct silk_free_v1 *next;
+  struct silk_free_v1 *previous;
+} silk_free_v1;
+
+enum {
+  SILK_IN_USE = 1,
+  SILK_PREVIOUS_IN_USE = 2,
+  SILK_FLAGS = 15,
+  SILK_HEADER = 16,
+  SILK_MINIMUM_CHUNK = 32,
+  SILK_SMALL_BINS = 64,
+  SILK_BINS = 160,
+};
+
+static silk_chunk_v1 *silk_top_v1 = 0;
+static silk_free_v1 *silk_bins_v1[SILK_BINS];
+static unsigned silk_bin_map_v1[SILK_BINS / 32];
+static int silk_heap_lock_v1 = 0;
+
+static size_t silk_size_v1(const silk_chunk_v1 *chunk) { return chunk->head & ~(size_t)SILK_FLAGS; }
+static silk_chunk_v1 *silk_after_v1(silk_chunk_v1 *chunk) {
+  return (silk_chunk_v1 *)((unsigned char *)chunk + silk_size_v1(chunk));
+}
+static silk_free_v1 *silk_links_v1(silk_chunk_v1 *chunk) {
+  return (silk_free_v1 *)((unsigned char *)chunk + SILK_HEADER);
+}
+static silk_chunk_v1 *silk_owner_v1(silk_free_v1 *links) {
+  return (silk_chunk_v1 *)((unsigned char *)links - SILK_HEADER);
+}
+
+static unsigned silk_bin_v1(size_t size) {
+  if (size < 1024) return (unsigned)(size >> 4);
+  const unsigned power = 31u - (unsigned)__builtin_clz((unsigned)size);
+  const unsigned quarter = (unsigned)(size >> (power - 2)) & 3u;
+  const unsigned bin = SILK_SMALL_BINS + (power - 10u) * 4u + quarter;
+  return bin < SILK_BINS ? bin : SILK_BINS - 1;
+}
+
+static void silk_bin_insert_v1(silk_chunk_v1 *chunk) {
+  const unsigned bin = silk_bin_v1(silk_size_v1(chunk));
+  silk_free_v1 *links = silk_links_v1(chunk);
+  links->previous = 0;
+  links->next = silk_bins_v1[bin];
+  if (links->next != 0) links->next->previous = links;
+  silk_bins_v1[bin] = links;
+  silk_bin_map_v1[bin >> 5] |= 1u << (bin & 31u);
+}
+
+static void silk_bin_remove_v1(silk_chunk_v1 *chunk) {
+  const unsigned bin = silk_bin_v1(silk_size_v1(chunk));
+  silk_free_v1 *links = silk_links_v1(chunk);
+  if (links->previous != 0) links->previous->next = links->next;
+  else silk_bins_v1[bin] = links->next;
+  if (links->next != 0) links->next->previous = links->previous;
+  if (silk_bins_v1[bin] == 0) silk_bin_map_v1[bin >> 5] &= ~(1u << (bin & 31u));
+}
+
+// A free chunk of at least `size` bytes, taken out of its bin, or null.
+static silk_chunk_v1 *silk_bin_take_v1(size_t size) {
+  unsigned bin = silk_bin_v1(size);
+  // A bin holds sizes from its own lower bound up, so only the first bin needs a size check.
+  for (silk_free_v1 *links = silk_bins_v1[bin]; links != 0; links = links->next) {
+    silk_chunk_v1 *chunk = silk_owner_v1(links);
+    if (silk_size_v1(chunk) >= size) {
+      silk_bin_remove_v1(chunk);
+      return chunk;
+    }
+  }
+  bin += 1;
+  while (bin < SILK_BINS) {
+    const unsigned word = silk_bin_map_v1[bin >> 5] & (~0u << (bin & 31u));
+    if (word != 0) {
+      silk_chunk_v1 *chunk = silk_owner_v1(silk_bins_v1[(bin & ~31u) + (unsigned)__builtin_ctz(word)]);
+      silk_bin_remove_v1(chunk);
+      return chunk;
+    }
+    bin = (bin & ~31u) + 32u;
+  }
+  return 0;
+}
+
+// Grows the memory until the top chunk holds at least `size` bytes.
+static int silk_grow_top_v1(size_t size) {
   const size_t page_size = 65536;
-  const size_t current_pages = __builtin_wasm_memory_size(0);
-  if (current_pages > ((__SIZE_MAX__) / page_size)) return 0;
-  const uintptr_t current_bytes = current_pages * page_size;
-  if (required <= current_bytes) return 1;
-  const uintptr_t missing = required - current_bytes;
+  const size_t have = silk_size_v1(silk_top_v1);
+  if (have >= size) return 1;
+  const size_t missing = size - have;
   const size_t pages = (missing + page_size - 1) / page_size;
-  return __builtin_wasm_memory_grow(0, pages) != (__SIZE_TYPE__)-1;
+  if (pages > ((__SIZE_MAX__) - have) / page_size) return 0;
+  if (__builtin_wasm_memory_grow(0, pages) == (__SIZE_TYPE__)-1) return 0;
+  silk_top_v1->head += pages * page_size;
+  return 1;
+}
+
+static int silk_heap_start_v1(void) {
+  if (silk_top_v1 != 0) return 1;
+  const uintptr_t base = ((uintptr_t)&__heap_base + 15) & ~((uintptr_t)15);
+  const uintptr_t end = (uintptr_t)__builtin_wasm_memory_size(0) * 65536;
+  silk_top_v1 = (silk_chunk_v1 *)base;
+  silk_top_v1->previous_size = 0;
+  silk_top_v1->head = (end > base ? (end - base) & ~(size_t)SILK_FLAGS : 0) | SILK_PREVIOUS_IN_USE;
+  return 1;
+}
+
+// Gives the chunk `size` bytes and returns the rest to a bin when it is large enough to stand alone.
+static void silk_split_v1(silk_chunk_v1 *chunk, size_t size) {
+  const size_t whole = silk_size_v1(chunk);
+  if (whole - size >= SILK_MINIMUM_CHUNK) {
+    chunk->head = size | SILK_IN_USE | (chunk->head & SILK_PREVIOUS_IN_USE);
+    silk_chunk_v1 *rest = silk_after_v1(chunk);
+    rest->head = (whole - size) | SILK_PREVIOUS_IN_USE;
+    silk_after_v1(rest)->previous_size = whole - size;
+    silk_after_v1(rest)->head &= ~(size_t)SILK_PREVIOUS_IN_USE;
+    silk_bin_insert_v1(rest);
+  } else {
+    chunk->head |= SILK_IN_USE;
+    silk_after_v1(chunk)->head |= SILK_PREVIOUS_IN_USE;
+  }
+}
+
+static void silk_lock_v1(void) {
+#if defined(__wasm_atomics__)
+  int seen = 0;
+  if (__atomic_compare_exchange_n(&silk_heap_lock_v1, &seen, 1, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+  // 2 marks a lock someone waits for, so the holder knows to wake a waiter.
+  if (seen != 2) seen = __atomic_exchange_n(&silk_heap_lock_v1, 2, __ATOMIC_ACQUIRE);
+  while (seen != 0) {
+    __builtin_wasm_memory_atomic_wait32(&silk_heap_lock_v1, 2, -1);
+    seen = __atomic_exchange_n(&silk_heap_lock_v1, 2, __ATOMIC_ACQUIRE);
+  }
+#endif
+}
+
+static void silk_unlock_v1(void) {
+#if defined(__wasm_atomics__)
+  if (__atomic_exchange_n(&silk_heap_lock_v1, 0, __ATOMIC_RELEASE) == 2) {
+    __builtin_wasm_memory_atomic_notify(&silk_heap_lock_v1, 1);
+  }
+#endif
 }
 
 void *malloc(size_t size) {
-  if (silk_heap_cursor_v1 == 0) silk_heap_cursor_v1 = (uintptr_t)&__heap_base;
-  if (size == 0) size = 1;
-  const uintptr_t aligned = (silk_heap_cursor_v1 + 15) & ~((uintptr_t)15);
-  if (size > (__UINTPTR_MAX__) - aligned) return (void *)0;
-  const uintptr_t next = aligned + size;
-  if (!silk_grow_memory_v1(next)) return (void *)0;
-  silk_heap_cursor_v1 = next;
-  return (void *)aligned;
+  if (size > (__SIZE_MAX__) - SILK_HEADER - SILK_FLAGS) return (void *)0;
+  size_t needed = (size + SILK_HEADER + SILK_FLAGS) & ~(size_t)SILK_FLAGS;
+  if (needed < SILK_MINIMUM_CHUNK) needed = SILK_MINIMUM_CHUNK;
+  silk_lock_v1();
+  silk_heap_start_v1();
+  silk_chunk_v1 *chunk = silk_bin_take_v1(needed);
+  if (chunk == 0) {
+    // The top keeps room for its own header after the carve.
+    if (needed > (__SIZE_MAX__) - SILK_MINIMUM_CHUNK || !silk_grow_top_v1(needed + SILK_MINIMUM_CHUNK)) {
+      silk_unlock_v1();
+      return (void *)0;
+    }
+    chunk = silk_top_v1;
+    const size_t whole = silk_size_v1(chunk);
+    chunk->head = needed | SILK_IN_USE | (chunk->head & SILK_PREVIOUS_IN_USE);
+    silk_top_v1 = silk_after_v1(chunk);
+    silk_top_v1->head = (whole - needed) | SILK_PREVIOUS_IN_USE;
+  } else {
+    silk_split_v1(chunk, needed);
+  }
+  silk_unlock_v1();
+  return (unsigned char *)chunk + SILK_HEADER;
 }
 
 // Keep this implementation from folding its allocation and zeroing back into calloc.
@@ -48,7 +205,36 @@ __attribute__((optnone)) void *calloc(size_t count, size_t size) {
   return allocation;
 }
 
-void free(void *allocation) { (void)allocation; }
+void free(void *allocation) {
+  if (allocation == (void *)0) return;
+  silk_lock_v1();
+  silk_chunk_v1 *chunk = (silk_chunk_v1 *)((unsigned char *)allocation - SILK_HEADER);
+  size_t size = silk_size_v1(chunk);
+  if ((chunk->head & SILK_PREVIOUS_IN_USE) == 0) {
+    silk_chunk_v1 *before = (silk_chunk_v1 *)((unsigned char *)chunk - chunk->previous_size);
+    silk_bin_remove_v1(before);
+    size += silk_size_v1(before);
+    chunk = before;
+  }
+  silk_chunk_v1 *after = (silk_chunk_v1 *)((unsigned char *)chunk + size);
+  if (after == silk_top_v1) {
+    // Coalescing into the top returns the chunk to the region `malloc` carves from.
+    chunk->head = (size + silk_size_v1(after)) | (chunk->head & SILK_PREVIOUS_IN_USE);
+    silk_top_v1 = chunk;
+    silk_unlock_v1();
+    return;
+  }
+  if ((after->head & SILK_IN_USE) == 0) {
+    silk_bin_remove_v1(after);
+    size += silk_size_v1(after);
+  }
+  chunk->head = size | (chunk->head & SILK_PREVIOUS_IN_USE);
+  silk_chunk_v1 *next = silk_after_v1(chunk);
+  next->previous_size = size;
+  next->head &= ~(size_t)SILK_PREVIOUS_IN_USE;
+  silk_bin_insert_v1(chunk);
+  silk_unlock_v1();
+}
 
 __attribute__((optnone)) void *memcpy(void *destination, const void *source, size_t count) {
   unsigned char *destination_bytes = (unsigned char *)destination;
@@ -93,5 +279,122 @@ int memcmp(const void *left, const void *right, size_t count) {
   }
   return 0;
 }
+
+// 128-bit multiplication, which LLVM calls for overflow-checked 64-bit products. wasm32 has no
+// compiler-rt, so this builds the low 128 bits from 32-bit halves.
+__int128 __multi3(__int128 left, __int128 right) {
+  const unsigned long long a = (unsigned long long)left;
+  const unsigned long long b = (unsigned long long)right;
+  const unsigned long long a_high = (unsigned long long)((unsigned __int128)left >> 64);
+  const unsigned long long b_high = (unsigned long long)((unsigned __int128)right >> 64);
+  const unsigned long long a0 = a & 0xffffffffu, a1 = a >> 32;
+  const unsigned long long b0 = b & 0xffffffffu, b1 = b >> 32;
+  const unsigned long long low = a0 * b0;
+  const unsigned long long middle_a = a1 * b0 + (low >> 32);
+  const unsigned long long middle_b = a0 * b1 + (middle_a & 0xffffffffu);
+  const unsigned long long high = a1 * b1 + (middle_a >> 32) + (middle_b >> 32) + a * b_high + a_high * b;
+  const unsigned long long result_low = (middle_b << 32) | (low & 0xffffffffu);
+  return (__int128)(((unsigned __int128)high << 64) | result_low);
+}
+
+#if defined(__wasm_atomics__)
+// The wasi-threads profile: the host starts each thread as a new instance on the shared memory and
+// calls the exported `wasi_thread_start`, which first moves the shadow stack to the thread's own.
+// `wasi_thread_start` reads `stack_top` and writes `done` at the offsets the assembly names.
+struct silk_thread_v1 {
+  uintptr_t stack_top;
+  void *argument;
+  int done;
+  unsigned char *stack;
+};
+_Static_assert(__builtin_offsetof(struct silk_thread_v1, stack_top) == 0, "wasi_thread_start reads stack_top at 0");
+_Static_assert(__builtin_offsetof(struct silk_thread_v1, done) == 8, "wasi_thread_start writes done at 8");
+
+__attribute__((import_module("wasi"), import_name("thread-spawn"))) int silk_wasi_thread_spawn_v1(void *record);
+__attribute__((import_module("silk"), import_name("thread-parallelism"))) int silk_host_parallelism_v1(void);
+// The thread entry the stdlib's wasm32 entry module exports.
+void silk_wasm_thread_entry_v1(void *argument);
+
+long silk_wasm_thread_spawn(void *argument) {
+  const size_t stack_size = 1048576;
+  unsigned char *stack = malloc(stack_size);
+  struct silk_thread_v1 *record = malloc(sizeof(struct silk_thread_v1));
+  if (stack == (void *)0 || record == (void *)0) {
+    free(stack);
+    free(record);
+    return -12;
+  }
+  record->stack_top = ((uintptr_t)stack + stack_size) & ~((uintptr_t)15);
+  record->argument = argument;
+  record->done = 0;
+  record->stack = stack;
+  const int thread = silk_wasi_thread_spawn_v1(record);
+  if (thread < 0) {
+    free(stack);
+    free(record);
+    return thread;
+  }
+  return (long)(uintptr_t)record;
+}
+
+void silk_wasm_thread_run_v1(int thread, struct silk_thread_v1 *record) {
+  (void)thread;
+  silk_wasm_thread_entry_v1(record->argument);
+}
+
+// A thread sets `done` from `wasi_thread_start` after its last use of its stack, so the joiner may
+// free the stack and the record as soon as it sees `done`.
+void silk_wasm_thread_join(unsigned long handle) {
+  struct silk_thread_v1 *record = (struct silk_thread_v1 *)handle;
+  while (__atomic_load_n(&record->done, __ATOMIC_ACQUIRE) == 0) {
+    __builtin_wasm_memory_atomic_wait32(&record->done, 0, -1);
+  }
+  free(record->stack);
+  free(record);
+}
+
+// 0 when woken, 1 when the word differed, 2 when the timeout passed; a negative timeout waits forever.
+int silk_wasm_wait32(unsigned *address, unsigned expected, long long timeout) {
+  return __builtin_wasm_memory_atomic_wait32((int *)address, (int)expected, timeout);
+}
+
+void silk_wasm_notify(unsigned *address, unsigned count) {
+  __builtin_wasm_memory_atomic_notify((int *)address, count);
+}
+
+unsigned silk_wasm_parallelism(void) {
+  const int count = silk_host_parallelism_v1();
+  if (count < 1) return 1;
+  return (unsigned)count;
+}
+
+__asm__(
+  ".globaltype __stack_pointer, i32\n"
+  ".functype silk_wasm_thread_run_v1 (i32, i32) -> ()\n"
+  ".globl wasi_thread_start\n"
+  ".type wasi_thread_start,@function\n"
+  "wasi_thread_start:\n"
+  ".functype wasi_thread_start (i32, i32) -> ()\n"
+  "local.get 1\n"
+  "i32.load 0\n"
+  "global.set __stack_pointer\n"
+  "local.get 0\n"
+  "local.get 1\n"
+  "call silk_wasm_thread_run_v1\n"
+  // The thread's work is over and nothing below touches its stack: mark the record done and wake
+  // the joiner. The notify only names the word, so it is harmless once the joiner has freed it.
+  "local.get 1\n"
+  "i32.const 1\n"
+  "i32.atomic.store 8\n"
+  "local.get 1\n"
+  "i32.const 8\n"
+  "i32.add\n"
+  "i32.const -1\n"
+  "memory.atomic.notify 0\n"
+  "drop\n"
+  "end_function\n"
+);
+#endif
+
 """)
 }
