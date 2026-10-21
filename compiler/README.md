@@ -76,22 +76,25 @@ script and update its entry. Measured on 2026-10-21:
 | Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |
 | --- | --- | --- | --- | --- |
 | initial check | 132,048 | 15,869,737 | 64,550 | 2,185,506 |
-| trivia | 531 | 16.0% | 684 | 17.2% |
-| body | 2 | 6.8% | 684 | 17.2% |
-| header, same type | 531 | 16.0% | 684 | 17.2% |
-| add | 535 | 16.0% | 688 | 17.2% |
-| header, new type | 530 | 16.0% | 658 | 17.2% |
-| delete | 531 | 16.0% | 684 | 17.2% |
+| trivia | 3 | 6.8% | 16 | 9.7% |
+| body | 2 | 6.8% | 17 | 9.7% |
+| header, same type | 531 | 16.0% | 25 | 9.9% |
+| add | 532 | 16.0% | 660 | 17.2% |
+| header, new type | 6 | 6.8% | 19 | 9.7% |
+| delete | 528 | 16.0% | 656 | 17.2% |
 | rename | 8 | 6.2% | 176 | 9.9% |
 
-Implementation heads and members store absolute spans, so their units observe where each span
-sits, and an edit that moves an `impl` reruns its heads. That is why the trivia edit, and the
-standard library's body edit, which changes a line's length above `impl` blocks, cost as much as
-a header edit: unit results have no early cutoff yet, so every transitive depender of a head
-reruns too. The units that rerun on a trivia edit away from any `impl` are MIR lowerings, whose
-`module:line:column` site labels move with the lines. On a 4-core x86_64 machine the compiler's
-first check took about 74 s and each edit's recheck 7 to 18 s, almost all of it the walk over
-every root.
+An update marks outdated every unit that consumed a change, directly or through another unit,
+and a demand then verifies an outdated unit before it reruns it: the unit stays current when
+every dependee it consumed kept its answer, judged by the answer fingerprints. A budgeted
+`verified` count is a floor on the units an edit confirms that way. Implementation heads and
+members store absolute spans, so an edit that moves an `impl` reruns its heads, but their answers
+hash without those spans and their dependers are verified. The units that rerun on a trivia edit
+are those heads and MIR lowerings, whose `module:line:column` site labels move with the lines.
+Adding or deleting a declaration, and the compiler's header edit, still rerun every depender:
+name lookups and checked bodies have no fingerprint yet. On a 4-core x86_64 machine the
+compiler's first check took about 67 s and each edit's recheck 7 to 18 s, almost all of it the
+walk over every root.
 
 ## Check roots
 
