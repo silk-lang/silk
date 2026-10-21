@@ -286,6 +286,45 @@ Writes one value into naturally aligned storage.
 
 The caller must prove that the pointer addresses live writable storage for `T`.
 
+<a id="Pointer.impl.take"></a>
+
+### Associated function `take`
+
+```silk
+pub unsafe fn take<T>(pointer: *mut T) -> T
+```
+
+Moves one initialized value out of naturally aligned storage.
+
+#### Details
+
+Unlike [`read`](#Pointer.impl.read), `T` need not be `Copy`. The caller owns the returned value, and the storage
+is logically uninitialized afterwards: it must be refilled with [`put`](#Pointer.impl.put) or never read again.
+
+#### Gotchas
+
+The caller must prove that the pointer addresses a live, initialized `T` that nothing else
+will take or drop.
+
+<a id="Pointer.impl.put"></a>
+
+### Associated function `put`
+
+```silk
+pub unsafe fn put<T>(pointer: *mut T, value: T) -> ()
+```
+
+Moves one value into naturally aligned storage without dropping what it held.
+
+#### Details
+
+Unlike [`write`](#Pointer.impl.write), `T` need not be `Copy`. The storage takes ownership of `value`.
+
+#### Gotchas
+
+The caller must prove that the pointer addresses live writable storage for `T`. A value
+still initialized there is overwritten without being dropped.
+
 <a id="Pointer.impl.readUnaligned"></a>
 
 ### Associated function `readUnaligned`

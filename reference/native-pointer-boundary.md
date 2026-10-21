@@ -64,6 +64,13 @@ loan. It does not reconstruct pointers from integers. Qualifier changes remain
 separate explicit operations; reinterpretation cannot also grant write access or
 remove nullability.
 
+`Intrinsic.pointerTake<T>(pointer: *mut T) -> T` is the unsafe move out of naturally aligned
+storage, and `Intrinsic.pointerWrite<T>` is the matching move in; neither requires `T: Copy`.
+`Pointer.take` and `Pointer.put` expose them (`Pointer.read` and `Pointer.write` keep the `Copy`
+bound). Taking leaves the storage logically uninitialized: the caller must refill it or never read
+or drop it again, and putting over an initialized value does not drop that value. Together they
+move one owned value through storage that C code carries, such as a thread start argument.
+
 ## Native output storage
 
 Ordinary source owns `Uninitialized<T>` and `Initialized<T>` output states for Copy values. Private
