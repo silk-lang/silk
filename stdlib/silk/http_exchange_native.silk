@@ -1,15 +1,114 @@
-//! Native connection acquisition for one HTTP origin and one serial client scope.
+//! Native TCP, Unix socket, and TLS connections for HTTP clients.
+//!
+//! # When to use
+//! Most code uses `silk.http_client_native` or `silk.http_fetch_native`, which call this module.
+//! Use it directly to control the connection:
+//! - [`withConnection`] opens a connection to one origin and lends it to a handler. The handler
+//!   sends its exchanges with `silk.http_exchange`.
+//! - [`withUnixConnection`] does the same through a Unix socket, for example to a local daemon.
+//! - [`withProxyRoute`] connects through a route from `silk.http_proxy`.
+//! - [`acquireOwned`] and [`acquireUnixOwned`] return the connection, for a pool. The caller closes
+//!   it.
 //!
 //! # Details
+//! A connection does these steps:
+//! 1. It checks the [`Options`] and the deadline with [`preflight`].
+//! 2. It resolves the host, and tries the addresses until one connects.
+//! 3. For an `https` origin, it does TLS. The certificate is checked against the original origin,
+//!    not a `Host` field and not a Unix path.
 //!
-//! HTTPS authenticates the original origin with explicit trust. Absolute deadlines are unchanged
-//! through resolution, connection, and TLS authentication. Synchronous hostname resolution rejects
-//! an overall deadline before dispatch. Cleanup closes without a flush or TLS shutdown.
+//! The deadline in [`Options`] is absolute, and each step gets it unchanged. When the handler
+//! returns or fails, the connection is closed. Closing does not flush and does not send a TLS close
+//! message.
+//!
+//! [`withConnection`] and [`withUnixConnection`] load trust from the `TrustSource` service for an
+//! `https` origin. The `acquire` functions and [`withProxyRoute`] take a trust snapshot that you
+//! prepare.
+//!
+//! # Errors
+//! - [`NativeExchangeError`] for options that are not valid, a deadline that cannot be honored,
+//!   missing trust, or a failed ALPN negotiation.
+//! - `ResolverError`, `NativeSocketError`, `ConnectionError`, and `IdentityError` from resolution,
+//!   the socket, TLS, and the certificate check.
+//! - `ExchangeError` and the error of the handler.
 //!
 //! # Gotchas
+//! - Resolution of a host name cannot stop at a deadline. A host name with a deadline fails with
+//!   `UnsupportedDeadline` before any contact. An IP address with a deadline is accepted.
+//! - Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+//!   targets, a call that is used fails to compile. Unused imports and [`Options`] still compile.
 //!
-//! On unsupported targets or no-libc profiles, reached native acquisition produces a compile-time
-//! error. Unused imports and portable configuration remain available.
+//! # Examples
+//! ## Check a deadline before contact
+//! ```silk
+//! import silk.http_exchange_native { NativeExchangeError, Options, preflight }
+//! import silk.http_origin { Origin, OriginError }
+//! import silk.option { Option }
+//! import silk.result { Result }
+//! import silk.system_clock { Instant, SystemClock }
+//! import silk.uri { Uri }
+//! import silk.uri_reference { ParseError }
+//!
+//! fn origin(text: string<'static>) -> Option<Origin> {
+//!   let uri = match Uri.parse(text) {
+//!     Result<Uri, ParseError>.Success { value } => value
+//!     Result<Uri, ParseError>.Failure { error: _ } => {
+//!       return Option<Origin>.none()
+//!     }
+//!   }
+//!   return match Origin.fromUri(&uri) {
+//!     Result<Origin, OriginError>.Success { value } => Option<Origin>.some(value)
+//!     Result<Origin, OriginError>.Failure { error: _ } => Option<Origin>.none()
+//!   }
+//! }
+//!
+//! fn passes(checked: Result<(), NativeExchangeError>) -> bool {
+//!   return match move checked {
+//!     Result.Success { value: _ } => true
+//!     Result.Failure { error: _ } => false
+//!   }
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let named = match origin("https://example.com/") {
+//!     Option.Some { value } => value
+//!     Option.None => {
+//!       return 1
+//!     }
+//!   }
+//!   let numeric = match origin("http://127.0.0.1:8080/") {
+//!     Option.Some { value } => value
+//!     Option.None => {
+//!       return 1
+//!     }
+//!   }
+//!   let mut options = Options.defaults()
+//!
+//!   // With no deadline, both origins pass.
+//!   if !passes(preflight(&named, &options)) {
+//!     return 1
+//!   }
+//!
+//!   // The resolver cannot stop at a deadline, so a host name with a deadline fails.
+//!   options.deadline = Option<Instant>.some(SystemClock.make(5, 0))
+//!   let rejected = match move preflight(&named, &options) {
+//!     Result.Success { value: _ } => false
+//!     Result.Failure { error } => match move error {
+//!       NativeExchangeError.UnsupportedDeadline => true
+//!       _ => false
+//!     }
+//!   }
+//!   if !rejected {
+//!     return 1
+//!   }
+//!
+//!   // An IP address needs no resolver, so the deadline is accepted.
+//!   if !passes(preflight(&numeric, &options)) {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
 
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.byte_duplex {ByteDuplex, ByteIoError, ByteIoOperation, ReadTransfer}
@@ -56,7 +155,7 @@ import silk.u64
 import silk.usize
 import silk.http {Method, ValueError, Version}
 
-/// The immutable transport route retained independently of the HTTP origin.
+/// How a native connection reaches its peer: direct TCP, or a Unix socket path.
 pub struct NativeRoute {
   bytes: [u8; 108]
   length: usize
@@ -66,11 +165,11 @@ pub struct NativeRoute {
 impl Copy for NativeRoute {}
 
 impl NativeRoute {
-  /// Returns whether this route uses an explicit Unix socket path.
+  /// Returns whether the route uses a Unix socket.
   pub fn isUnix(self: &Self) -> bool {
     return self.unix
   }
-  /// Borrows the exact owned Unix path, or an empty slice for direct TCP.
+  /// Returns the Unix socket path, or an empty slice for direct TCP.
   pub fn path<'a>(self: &'a Self) -> &'a [u8] {
     return Slice.view<u8>(&self.bytes, usize.ZERO, self.length)
   }
@@ -193,57 +292,62 @@ fn directRoute() -> NativeRoute {
   }
 }
 
-/// A native HTTP option admission or authentication failure.
+/// The error of a native HTTP connection, before or during TLS.
 pub union NativeExchangeError {
-  /// The native polling interval or attempt count is outside its finite accepted range.
+  /// The poll interval or the attempt count of [`Options`] is out of range. See
+  /// `silk.native_socket`.
   InvalidConnectOptions,
-  /// Synchronous hostname resolution cannot honor the supplied overall deadline.
+  /// A host name must be resolved, and there is a deadline. Resolution cannot stop at a deadline.
   UnsupportedDeadline,
-  /// HTTPS owned acquisition requires one caller-prepared frozen trust snapshot.
+  /// The origin uses `https`, and no trust snapshot was given.
   TrustRequired,
-  /// Required HTTP/1.1 application protocol negotiation did not succeed.
+  /// The policy is `RequiredHttp11`, and the server did not select `http/1.1`.
   AlpnMismatch {
-    /// The complete TLS connection failure.
+    /// The TLS error.
     pub error: ConnectionError,
   },
 }
 
-/// The HTTP version policy for TLS application protocol negotiation.
+/// How TLS negotiates the HTTP version (ALPN).
 pub enum AlpnPolicy {
-  /// Offers only `http/1.1` and permits an absent selection.
+  /// Offers `http/1.1`. The server can select it or select nothing.
   OptionalHttp11,
-  /// Requires the peer to select `http/1.1`.
+  /// Offers `http/1.1`. If the server does not select it, the connection fails with `AlpnMismatch`.
   RequiredHttp11,
-  /// Sends no ALPN extension for an HTTP/1.0-only peer.
+  /// Sends no ALPN extension. Use it for a server that supports only HTTP/1.0.
   Http10,
 }
 
-/// Finite native acquisition and TLS authentication limits.
+/// The settings of a native connection. Start from [`Options.defaults`].
 pub struct Options {
-  /// Maximum number of resolved numeric addresses.
+  /// The maximum number of addresses to keep from resolution.
   pub maximumAddresses: usize
-  /// Address family admitted by resolution.
+  /// The address families to use: IPv4, IPv6, or both.
   pub family: FamilySelection
-  /// Whether the socket disables Nagle's algorithm.
+  /// Whether to disable Nagle's algorithm on the socket.
   pub noDelay: bool
-  /// Native readiness polling interval in nanoseconds.
+  /// The time between checks while a socket connects. It is 1 nanosecond through 1 second.
   pub pollIntervalNanoseconds: u64
-  /// Maximum native connection attempts.
+  /// The maximum number of connection attempts. It is 1 through 1024.
   pub maximumAttempts: usize
-  /// Absolute overall deadline on the active monotonic timeline.
+  /// The absolute deadline for the whole operation, on the monotonic clock. See [`preflight`] for
+  /// host names.
   pub deadline: Option<Instant>
-  /// Maximum TLS authentication duration in nanoseconds.
+  /// The maximum duration of the TLS handshake.
   pub handshakeNanoseconds: u64
-  /// TLS protocol storage limits.
+  /// The storage limits of the TLS client.
   pub tls: ClientLimits
-  /// Explicit trust source load bounds.
+  /// The limits for loading trust anchors.
   pub trust: TrustLoadLimits
-  /// HTTP-only application protocol negotiation policy.
+  /// How TLS negotiates the HTTP version.
   pub alpn: AlpnPolicy
 }
 
 impl Options {
-  /// Returns finite defaults with no overall deadline and optional HTTP/1.1 negotiation.
+  /// Returns the default settings.
+  ///
+  /// They are: 16 addresses, any family, Nagle on, a 1 ms poll interval, 64 attempts, no deadline,
+  /// 30 seconds for the handshake, and `OptionalHttp11`.
   pub fn defaults() -> Options {
     return Options {
       maximumAddresses: 16,
@@ -307,19 +411,19 @@ union State {
   Secured {connection: OwnedConnection<NativeConnection>},
 }
 
-/// One affine native HTTP transport that owns its exact socket or TLS connection.
+/// The transport of a native HTTP connection. It owns its socket or TLS connection.
 pub struct NativeTransport {
   state: State
   terminal: bool
   routeValue: NativeRoute
 }
 
-/// One affine plain native provider owned by a routed HTTP scope.
+/// The plain socket of a connection through [`withProxyRoute`].
 ///
 /// # Details
-///
-/// The provider retains the exact socket selected for the route's physical peer. HTTP and raw
-/// byte authority share one terminal state so CONNECT transfer cannot duplicate ownership.
+/// It is connected to the peer that the route selects: the origin or the proxy. After a `CONNECT`
+/// tunnel, TLS uses the same socket. The HTTP side and the byte side share one closed state, so the
+/// socket is never used by two owners.
 pub struct NativeRouteProvider {
   connection: NativeConnection
   terminal: bool
@@ -655,18 +759,17 @@ effect fn publishOwned(
   return run Effect.useReleaseNonParking(move guard, move use, move release)
 }
 
-/// Acquires and publishes one complete direct TCP or HTTPS HTTP connection owner.
+/// Opens a direct TCP or HTTPS connection to `origin`, and returns it.
 ///
 /// # Details
+/// The opening deadline is the earlier of `options.deadline` and `acquisitionDeadline`. For
+/// `https`, it uses `preparedTrust` and checks the certificate against `origin`. The returned
+/// connection keeps no deadline. Close it, or give it to another owner such as a pool.
 ///
-/// `acquisitionDeadline` can only shorten `options.deadline`. HTTPS consumes one caller-prepared
-/// frozen trust snapshot and authenticates the exact original origin. The returned HTTP owner
-/// retains no acquisition or request deadline; callers must close it or transfer it into another
-/// scoped owner.
-///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// # Errors
+/// - `NativeExchangeError.TrustRequired` if `origin` uses `https` and `preparedTrust` is none.
+/// - `NativeSocketError.Timeout` if the deadline has passed.
+/// - The errors of [`preflight`], resolution, the socket, and TLS.
 pub effect fn acquireOwned(
   origin: Origin,
   options: Options,
@@ -727,15 +830,10 @@ pub effect fn acquireOwned(
   }
 }
 
-/// Copies one Unix path into bounded native route metadata before transport contact.
+/// Returns a route for the Unix socket at `path`. It copies `path` and does not connect.
 ///
-/// # Details
-///
-/// The target-specific native address capacity is checked before the returned route is published.
-///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// # Errors
+/// `NativeSocketError` if `path` is too long for a socket address on the target.
 pub effect fn admitUnixRoute(path: &[u8]) -> NativeRoute ! NativeSocketError {
   static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
     "libc",
@@ -748,16 +846,11 @@ pub effect fn admitUnixRoute(path: &[u8]) -> NativeRoute ! NativeSocketError {
   }
 }
 
-/// Acquires and publishes one complete Unix-routed HTTP or HTTPS connection owner.
+/// Opens an HTTP or HTTPS connection to `origin` through the Unix socket at `path`, and returns it.
 ///
 /// # Details
-///
-/// The Unix path selects only the physical transport. TLS still authenticates `origin`, and the
-/// returned HTTP owner retains neither the acquisition nor request deadline.
-///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// `path` selects only the socket. For `https`, TLS checks the certificate against `origin`. The
+/// deadlines work as in [`acquireOwned`]. The returned connection keeps no deadline.
 pub effect fn acquireUnixOwned(
   path: &[u8],
   origin: Origin,
@@ -832,16 +925,16 @@ effect<'env> fn withPublishedConnection<
   return run Effect.useReleaseNonParking(move lease, move use, move release)
 }
 
-/// Resolves and acquires one origin, then lends its serial HTTP connection to one handler.
+/// Opens a connection to `origin`, lends it to `handler`, and closes it after.
 ///
 /// # Details
+/// For `https`, it loads trust from the `TrustSource` service before it connects, and checks the
+/// certificate against `origin`. A `Host` field never changes the identity that is checked.
 ///
-/// HTTPS freezes trust before opening and authenticates the original origin. Host fields never
-/// replace that identity. `Http10` disables ALPN; other policies offer only HTTP/1.1.
-///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// # Errors
+/// - The errors of [`preflight`] and [`acquireOwned`].
+/// - `TrustSourceError` if trust cannot be loaded.
+/// - The error of the handler.
 pub effect<'env> fn withConnection<
   A,
   E,
@@ -868,15 +961,12 @@ where R in Without<R, HttpTransport> {
   return run withPublishedConnection<A, E, R, H>(move connection, move handler)
 }
 
-/// Connects an explicit Unix socket while retaining a separate HTTP and TLS authority.
+/// Opens a connection to `origin` through the Unix socket at `path`, lends it to `handler`, and
+/// closes it after.
 ///
 /// # Details
-///
-/// The socket path selects only the transport. HTTPS authenticates `origin` with explicit trust.
-///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// `path` selects only the socket. For `https`, it loads trust from the `TrustSource` service and
+/// checks the certificate against `origin`.
 pub effect<'env> fn withUnixConnection<
   A,
   E,
@@ -938,17 +1028,18 @@ impl<A, E, ?R> RouteClient<NativeRouteProvider, A, E, ProxyError | NativeExchang
   acquire: NativeProxyClient.acquire
 }
 
-/// Resolves and connects only one sealed route's physical peer, then lends the final HTTP scope.
+/// Connects through `route`, lends the connection to `handler`, and closes it after.
 ///
 /// # Details
+/// It connects only to the peer that the route selects: the origin for `Direct`, or the proxy for
+/// `Forward` and `Tunnel`. For `Tunnel`, it sends `CONNECT`, then does TLS with the origin through
+/// the tunnel. `options.deadline` is used unchanged for all steps. `limits` applies to the HTTP
+/// connection and to the `CONNECT` exchange.
 ///
-/// `options.deadline` is passed unchanged through native preflight, resolution, connection,
-/// CONNECT, and TLS. `limits` supplies both the HTTP scope and generated CONNECT bounds. Secure
-/// routes consume caller-prepared trust; no resolver fallback or alternate endpoint is selected.
-///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// # Errors
+/// - `ProxyError` if the proxy rejects `CONNECT`, or the route is not valid.
+/// - `NativeExchangeError.TrustRequired` if the origin uses `https` and `preparedTrust` is none.
+/// - The errors of resolution, the socket, TLS, and the handler.
 pub effect<'env> fn withProxyRoute<
   'configuration,
   A,
@@ -1460,7 +1551,7 @@ fn unavailable<A>() -> A {
 }
 
 impl NativeTransport {
-  /// Returns owned immutable route metadata while leaving the transport exclusively inside its session.
+  /// Returns the route of the transport.
   pub fn route(self: &Self) -> NativeRoute {
     return self.routeValue
   }
@@ -1594,11 +1685,10 @@ fn preflightDeadline(origin: &Origin, deadline: &Option<Instant>) -> Result<(), 
   return Result<(), NativeExchangeError>.succeed(())
 }
 
-/// Checks native TCP support and rejects a hostname deadline before resolver dispatch.
+/// Checks if a connection to `origin` with `options` can start. It does no I/O.
 ///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// # Errors
+/// `UnsupportedDeadline` if the host of `origin` is a name and `options.deadline` is set.
 pub fn preflight(origin: &Origin, options: &Options) -> Result<(), NativeExchangeError> {
   static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText(
     "libc",
@@ -1611,16 +1701,9 @@ pub fn preflight(origin: &Origin, options: &Options) -> Result<(), NativeExchang
   }
 }
 
-/// Returns the exact route-selected native peer after target and deadline preflight.
+/// Returns the peer that `route` connects to, after the same checks as [`preflight`].
 ///
-/// # Details
-///
-/// Direct returns the original origin; Forward and Tunnel return the sealed plain proxy origin.
-/// A finite deadline with either selected domain fails before synchronous resolver dispatch.
-///
-/// # Gotchas
-///
-/// On unsupported targets or no-libc profiles, a reached call produces a compile-time error.
+/// The peer is the origin for `Direct`, and the proxy for `Forward` and `Tunnel`.
 pub fn preflightProxyRoute<'configuration>(route: &Route<'configuration>, options: &Options) -> Result<
   Origin,
   ProxyError | NativeExchangeError,
@@ -1649,17 +1732,13 @@ pub fn preflightProxyRoute<'configuration>(route: &Route<'configuration>, option
   }
 }
 
-/// Rebuildable native route acquisition for bounded redirect operations.
+/// Opens a new native connection for each attempt of a redirect operation.
 ///
 /// # Details
-///
-/// The initial sealed route retains the immutable proxy configuration. On supported native
-/// targets, every attempt recomputes policy for its current URI, completes method, target, header,
-/// and native-route preflight before destination contact, and replaces the stored option deadline
-/// with the operation's unchanged absolute deadline. Secure attempts load a fresh trust snapshot
-/// before acquisition; tunneled TLS continues to authenticate the original origin through
-/// [`withProxyRoute`]. On unsupported targets or no-libc profiles, reached acquisition produces a
-/// compile-time error.
+/// `silk.http_fetch_native` uses it with `silk.http_redirect`. For each attempt, it selects the
+/// route for the current URI again, checks the request and the route before contact, and uses the
+/// deadline of the operation. Each `https` attempt loads fresh trust. A tunnel still checks the
+/// certificate of the original origin.
 pub struct NativeRedirectClient<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> {
   routeValue: Route<'configuration>
   optionsValue: Options
@@ -1673,11 +1752,7 @@ impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> NativeRedir
   HandlerError,
   HandlerRequirements,
 > {
-  /// Creates a reusable redirect attempt client from one policy-selected route.
-  ///
-  /// # Gotchas
-  ///
-  /// Construction on unsupported targets or no-libc profiles produces a compile-time error.
+  /// Returns a client that starts from `route`, with `options` and `limits` for each attempt.
   pub fn make(route: Route<'configuration>, options: Options, limits: Limits) -> NativeRedirectClient<
     'configuration,
     'policy,
@@ -1938,7 +2013,7 @@ impl<'configuration, 'policy, A, HandlerError, ?HandlerRequirements> AttemptClie
   withAttempt: NativeRedirectClient.withAttempt
 }
 
-/// Returns immutable native route metadata from an owned HTTP session without lending its transport mutably.
+/// Returns the route of a native connection.
 pub fn route(connection: &Connection<NativeTransport>) -> NativeRoute {
   let context = connection.transportContext()
   return NativeTransport.route(&context.transport.*)
