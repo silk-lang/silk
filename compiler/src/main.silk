@@ -1436,11 +1436,6 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
     BackendBuild.Module {text, unchecked, plan} => {
       // Emit zero too: absence of a receipt cannot distinguish a fully checked build from a
       // missing measurement. The corpus harness records this line for every successful program.
-      if !receipts {
-        let mut notes = Bytes.make()
-        run appendUncheckedNotes(&mut notes, &sources, Semantic.uncheckedRootBodies(&store))
-        run writeError(Bytes.asSlice(&notes))
-      }
       if counted { run writeBorrowGap(b"SILK_GAP borrow-check: ", List<usize>.asSlice(&unchecked)) }
       // The emitted count covers only reached instances. Every root-package body was checked as
       // well, reached or not, so its unchecked count shows a body no build path reaches, and each
@@ -1472,6 +1467,17 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
         run FileSystem.writeFile(output, Bytes.asSlice(&text))
         run reportCompiled(display, sourcePath, output, &target, EmissionPlan.symbolCount(&plan))
         return Compiled.Finished {status: 0}
+      }
+      // Without a runtime nothing starts the program but a C `main` the application exports or a
+      // declared link input defines, so a link that would miss it is refused before Clang runs.
+      let started = match &runtime {
+        Option<ModuleId>.Some {..} => true
+        Option<ModuleId>.None => false
+      }
+      if form == Form.Executable && stage == Stage.Final && !started && Target.id(&target) != TargetId.Wasm32UnknownUnknown &&
+        ModuleSourceFiles.nativeLinkInputs(&sources).length == usize.ZERO && !definesMain(Bytes.asSlice(&text)) {
+        run writeHeaded(heading, &mut headed, b"silk: an executable built with runtime = { kind = \"none\" } has no `main`; export one, as `export \"C\" fn start() -> i32 as \"main\"` does, or select a runtime\n")
+        return Compiled.Finished {status: 2}
       }
       // Only a link consumes a platform supply; compiling to an object or an intermediate stage
       // needs no SDK, so a cross-target object never runs discovery.
@@ -1608,6 +1614,32 @@ effect fn repeated(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>
   return false
 }
 
+// Whether the LLVM module `ir` defines the C symbol `main`, written `@main` or, as an export,
+// `@"main"`.
+fn definesMain(ir: &[u8]) -> bool {
+  let mut start = usize.ZERO
+  while start < ir.length {
+    let mut end = start
+    while end < ir.length && ir[end] != 10 { end = end + usize.ONE }
+    let defining = end - start > usize.add(0, 6) && same(Slice.view<u8>(ir, start, usize.add(0, 7)), b"define ")
+    if defining {
+      if containsBetween(ir, start, end, b" @main(") || containsBetween(ir, start, end, b" @\"main\"(") { return true }
+    }
+    start = end + usize.ONE
+  }
+  return false
+}
+
+// Whether `ir` holds `symbol` within the bytes from `start` to `end`.
+fn containsBetween(ir: &[u8], start: usize, end: usize, symbol: &[u8]) -> bool {
+  let mut at = start
+  while at + symbol.length <= end {
+    if same(Slice.view<u8>(ir, at, symbol.length), symbol) { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
 // Records the code and location of `diagnostic` as printed.
 effect fn record(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>) -> () ! OutOfMemoryError ? &mut Allocator {
   let site = Shared<Rejection>.with<ReportedSite>(diagnostic, fn(value: &Rejection) -> ReportedSite {
@@ -1615,32 +1647,6 @@ effect fn record(seen: &mut List<ReportedSite>, diagnostic: &Shared<Rejection>) 
   })
   run List<ReportedSite>.append(&mut seen.*, move site)
   return ()
-}
-
-// Appends one note per root-package body the borrow checker left unchecked, naming the ownership
-// codes it may hide, so such a body is not accepted silently.
-effect fn appendUncheckedNotes(out: &mut Bytes, sources: &ModuleSources, unchecked: &[UncheckedBody]) -> ()
-! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
-  let mut body = usize.ZERO
-  while body < unchecked.length {
-    run appendLocation(&mut out.*, sources, &unchecked[body].module, unchecked[body].block, false)
-    run Bytes.append(&mut out.*, b": note[borrow-check] this body is not borrow-checked yet (")
-    run Bytes.append(&mut out.*, String.utf8Bytes(uncheckedReasonName(unchecked[body].reason)))
-    run Bytes.append(&mut out.*, b")")
-    let skipped = run uncheckedBodyCodes()
-    let codes = List<RejectionCode>.asSlice(&skipped)
-    if codes.length > usize.ZERO {
-      run Bytes.append(&mut out.*, b"; it may hide ")
-      let mut code = usize.ZERO
-      while code < codes.length {
-        if code > usize.ZERO { run Bytes.append(&mut out.*, b", ") }
-        run Bytes.append(&mut out.*, Rejections.stableCode(codes[code]))
-        code = code + usize.ONE
-      }
-    }
-    run Bytes.append(&mut out.*, b"\n")
-    body = body + usize.ONE
-  }
 }
 
 // Writes `rejection` to standard error in `format`, headed as [`writeHeaded`] heads diagnostics.
@@ -2400,6 +2406,11 @@ effect fn writeManifestLocation(manifest: &Path, line: usize) -> () ! WriterErro
 // value the native compiler cannot honor yet in words, else the TypeScript `<code>: <subject>`.
 effect fn reportProfile(manifest: &Path, line: usize, code: ProfileCode, subject: &[u8]) -> () ! WriterError {
   run writeManifestLocation(manifest, line)
+  return run writeProfileReason(code, subject)
+}
+
+// Writes why a profile or binding was refused, as [`reportProfile`] words it after its location.
+effect fn writeProfileReason(code: ProfileCode, subject: &[u8]) -> () ! WriterError {
   match code {
     ProfileCode.UnknownField => {
       run writeError(subject)
@@ -2444,7 +2455,15 @@ effect fn projectPlans(project: &Project, options: &ProjectOptions, fallback: &[
             run writeError(b"\n")
           }
           PlanError.Profile {code, subject, key} => {
-            run reportProfile(Projects.manifest(project), Projects.line(project, Bytes.asSlice(&key)), code, Bytes.asSlice(&subject))
+            // A refused `--profile-input` field is the command line's, not the manifest's.
+            let named = Bytes.asSlice(&key)
+            let flag = b"--profile-input"
+            if named.length >= flag.length && same(Slice.view<u8>(named, usize.ZERO, flag.length), flag) {
+              run writeError(b"Invalid --profile-input: ")
+              run writeProfileReason(code, Bytes.asSlice(&subject))
+            } else {
+              run reportProfile(Projects.manifest(project), Projects.line(project, named), code, Bytes.asSlice(&subject))
+            }
           }
           PlanError.InvalidProfileInput => run writeError(b"Invalid --profile-input JSON\n")
         }
@@ -2749,11 +2768,6 @@ effect fn checkTarget(project: &Project, plan: ProjectPlan, standardLibrary: &Op
     }
     run Bytes.append(&mut out, Bytes.asSlice(&message))
     status = 2
-  }
-  // A body the borrow checker cannot prove yet is accepted without its ownership diagnostics; a
-  // note names it rather than letting it pass silently.
-  if !json && parsed {
-    run appendUncheckedNotes(&mut out, &sources, Semantic.uncheckedRootBodies(&store))
   }
   run writeDiagnostics(&target, json, &out)
   return ProjectArtifact {status: status, target: target, path: move path}
