@@ -340,6 +340,11 @@ bounded helper at a smaller or equally sized concrete type, such as `decodeOne<O
 to `decodeOne<i32>()`. An Effect witness can delegate from a concrete aggregate to its field type
 even when its hidden Effect identity changes. The reachable type shapes remain finite.
 
+A `Drop` hook that cleanup selects is such a witness. When dropping a `Box<State<i32>>` frees a
+`Box<Node<i32>>` that `State<i32>` reached through a raw pointer, `Box<T>.drop` runs again at a type
+no larger than before, so the second drop is admitted even though `Node<i32>` is not part of
+`State<i32>`.
+
 **Boundary:** Ordinary polymorphic recursion that changes a type argument is outside the stable
 model. Witness delegation that grows a type argument along a recursive call cycle is also invalid:
 
