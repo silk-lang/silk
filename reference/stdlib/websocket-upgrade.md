@@ -91,12 +91,12 @@ impl Copy for Limits
 impl Limits
 ```
 
-<a id="Limits.impl.default"></a>
+<a id="Limits.impl.defaults"></a>
 
-### Associated function `default`
+### Associated function `defaults`
 
 ```silk
-pub fn default() -> Limits
+pub fn defaults() -> Limits
 ```
 
 Returns the default finite handshake budgets.

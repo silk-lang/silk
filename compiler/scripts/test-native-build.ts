@@ -2,7 +2,7 @@
 import { strict as assert } from 'node:assert'
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as Config from 'effect/Config'
 import * as Console from 'effect/Console'
@@ -99,6 +99,12 @@ const program = Effect.gen(function* () {
   const unknown = yield* invoke(silk, ['frobnicate'], directory)
   assert.equal(unknown.status, 2, unknown.stderr)
   assert.match(unknown.stderr, /^silk: unknown command `frobnicate`\n/)
+  // A path-like word that names no file reports that file, also as a usage error.
+  for (const missing of ['missing.silk', './frob']) {
+    const absent = yield* invoke(silk, [missing], directory)
+    assert.equal(absent.status, 2, absent.stderr)
+    assert.ok(absent.stderr.startsWith(`silk: no such source file \`${missing}\`;`), absent.stderr)
+  }
   // Exercise the linked changes library through the actual native entry point. No compiler,
   // standalone changes executable, Git, or other tool is available on this subprocess PATH.
   const releaseWorkspace = join(directory, 'release-workspace')
@@ -330,6 +336,33 @@ const program = Effect.gen(function* () {
   })
   assert.equal(receipted.status, 0, receipted.stderr)
   assert.match(receipted.stderr, /^SILK_GAP borrow-check: \d+ bodies not borrow-checked/m)
+  // The single-source `Compiled` line names the paths from the working directory, never with `../`
+  // steps relative to the source's directory, and an output outside it absolutely.
+  assert.match(linked.stdout, /^Compiled main\.silk -> program \(llvm, /)
+  const outsidePath = join(dirname(directory), `${basename(directory)}-outside.ll`)
+  const outside = yield* invoke(
+    silk,
+    [...argumentsFor(outsidePath), '--emit', 'llvm-ir'],
+    directory,
+  )
+  assert.equal(outside.status, 0, outside.stderr)
+  assert.ok(outside.stdout.startsWith(`Compiled main.silk -> ${outsidePath} (llvm, `), outside.stdout)
+  yield* fs.remove(outsidePath)
+  // A single-source rejection prints the human diagnostic; only SILK_RECEIPTS selects the
+  // SILK_BUILD_ERROR record the corpus harness parses.
+  yield* fs.writeFileString(join(directory, 'bad.silk'), 'pub fn main() -> i32 { return "x" }\n')
+  const badArguments = ['build', 'bad.silk', '-o', 'bad', '--stdlib', standardLibrary]
+  const human = yield* invoke(silk, badArguments, directory, { ...process.env, SILK_CLANG: clang })
+  assert.notEqual(human.status, 0)
+  assert.doesNotMatch(human.stderr, /SILK_BUILD_ERROR/)
+  assert.match(human.stderr, /SEM\d{4}/)
+  assert.match(human.stderr, /bad\.silk:1:/)
+  const machine = yield* invoke(silk, badArguments, directory, {
+    ...process.env,
+    SILK_CLANG: clang,
+    SILK_RECEIPTS: '1',
+  })
+  assert.match(machine.stderr, /^SILK_BUILD_ERROR=\{"code":"SEM\d{4}"/m)
   assert.deepEqual(
     yield* fs.readFile(captured),
     bytes,
@@ -722,6 +755,8 @@ const program = Effect.gen(function* () {
   for (const [entry, rule] of [
     ['{ object = "a.o", library = "m" }', /\[build\]\.native-link-inputs\[0\]: an entry is exactly one/],
     ['{ object = "/tmp/a.o" }', /object \/tmp\/a\.o must be a relative path below the manifest's directory/],
+    // Refused only when the link runs, yet named the same way.
+    ['{ framework = "Security" }', /\[build\]\.native-link-inputs\[0\]: framework Security links only on macOS targets/],
   ] as const) {
     yield* fs.writeFileString(
       join(unpackaged, 'silk.toml'),
