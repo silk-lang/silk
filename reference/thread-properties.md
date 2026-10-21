@@ -230,3 +230,37 @@ deadlocks. Reference cycles of `Arc` handles leak.
 **Evidence:** [synchronization](../stdlib/silk/sync.silk), native corpus (`sync-arc-mutex-parker`).
 
 **Current compiler:** Aligned.
+
+## THREAD-007 — `silk.work_queue` moves owned values between native threads
+
+**Status:** Confirmed
+
+`WorkDeque.make<T>()` returns the `Worker<T>` that owns a Chase-Lev deque. The worker pushes and
+pops at the bottom, and any number of `Stealer<T>`s take from the top with one compare-exchange; a
+steal that loses a race reports `Steal.Retry`. The ring doubles when full, and older rings stay
+allocated until the deque is dropped, because a stealer may still be reading one. `Injector<T>` is
+a FIFO queue under a `Mutex` that every handle may push to and pop from. `Mailbox.make<T>()`
+returns the one `MailboxReceiver<T>` of a multi-producer, single-consumer queue; each
+`MailboxSender<T>` sends with one swap and one store, without a lock.
+
+```silk,ignore
+let mut worker = run WorkDeque.make<i32>() |> Effect.provideMut<Allocator>(&mut allocator)
+run worker.push(42) |> Effect.provideMut<Allocator>(&mut allocator)
+let stealer = worker.stealer()
+let thief = run NativeThread.spawn(fn() -> Steal<i32> { return stealer.steal() })
+  |> Effect.provideMut<Allocator>(&mut allocator)
+```
+
+Every pushed value moves into its own allocation, a parcel, and the queues move parcel addresses
+atomically, so only the thread that wins a parcel reads its value. Handles share their queue
+through `Arc` (THREAD-006), and a queue still holding values when its last handle drops drops them.
+Handles are `Transferable` and `Concurrent` when `T` is `Transferable`, except that a
+`MailboxReceiver` takes `receive` exclusively.
+
+**Boundary:** The targets of `Atomic.wait`. Pushing and sending allocate, so they take an
+`Allocator`. A receive can report nothing for a moment while a send is between its swap and its
+store.
+
+**Evidence:** [work queues](../stdlib/silk/work_queue.silk), native corpus (`work-queue-threads`).
+
+**Current compiler:** Aligned.
