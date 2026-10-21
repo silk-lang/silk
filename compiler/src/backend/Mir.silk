@@ -453,7 +453,6 @@ pub enum TrapReason {
   SharedCountOverflow,
   InvalidExecutionAllocationLayout,
   InvalidExecutionControlWord,
-  ExecutionNotifyAfterDrop,
   InvalidExecutionDrive,
   RelinquishOutsideExecution,
   ExecutionReferenceOutsideExecution,
@@ -470,7 +469,6 @@ pub fn trapReasonText(reason: TrapReason) -> &'static [u8] {
     TrapReason.SharedCountOverflow => b"shared count overflow"
     TrapReason.InvalidExecutionAllocationLayout => b"invalid execution allocation layout"
     TrapReason.InvalidExecutionControlWord => b"invalid execution control word"
-    TrapReason.ExecutionNotifyAfterDrop => b"execution notify after its handle was dropped"
     TrapReason.InvalidExecutionDrive => b"invalid execution drive"
     TrapReason.RelinquishOutsideExecution => b"relinquish outside a running execution"
     TrapReason.ExecutionReferenceOutsideExecution => b"execution reference outside a running execution"
@@ -6955,10 +6953,11 @@ effect fn headerField(access: &PackageAccess, field: CoreField) -> Place ! OutOf
 effect fn grantReference(builder: &mut Builder, access: &PackageAccess, ty: &Shared<Type>, origin: Origin) -> Operand
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let word = run storagePrimitive(b"usize")
-  let count = run storageValue(&mut builder.*, &word, Rvalue.Use {value: Operand.Copy {
-    place: run headerField(access, CoreField.HeaderAuthority)}}, origin)
-  run assign(&mut builder.*, run headerField(access, CoreField.HeaderAuthority), Rvalue.Binary {operation: InfixOperator.Add,
-    left: Operand.Copy {place: place(count)}, right: run wordOperand(usize.ONE)}, origin)
+  // A new unit is granted from one the caller holds, so no ordering is needed (EXEC-009).
+  let mut added = List<Operand>.make()
+  run List<Operand>.append(&mut added, run wordOperand(usize.ONE))
+  drop run headerAtomic(&mut builder.*, run headerField(access, CoreField.HeaderAuthority), IntrinsicPrimitive.AtomicFetchAdd,
+    move added, MemoryOrder.Relaxed, &word, origin)
   let mut fields = List<AggregateField>.make()
   run List<AggregateField>.append(&mut fields, AggregateField {index: SealedCore.ordinal(CoreField.RefPackage),
     value: Operand.Copy {place: place(access.package)}})
@@ -6966,14 +6965,80 @@ effect fn grantReference(builder: &mut Builder, access: &PackageAccess, ty: &Sha
   return Operand.Move {place: place(output)}
 }
 
-// Whether the package's Execution handle still owns its body: neither completed nor dropped.
+// One atomic access of a word-sized header field: `primitive` over the field's address, then
+// `operands`, at `order` (EXEC-009). A compare-exchange fails with acquire ordering.
+effect fn headerAtomic(builder: &mut Builder, field: Place, primitive: IntrinsicPrimitive, operands: List<Operand>, order: MemoryOrder,
+  ty: &Shared<Type>, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let wordAddress = run SealedCore.address(&word)
+  let address = run storageValue(&mut builder.*, &wordAddress, Rvalue.AddressOf {access: Access.Mutable, place: move field}, origin)
+  return run wordAtomic(&mut builder.*, address, primitive, move operands, order, ty, origin)
+}
+
+// One atomic access of the word at the address in local `address`.
+effect fn wordAtomic(builder: &mut Builder, address: usize, primitive: IntrinsicPrimitive, operands: List<Operand>, order: MemoryOrder,
+  ty: &Shared<Type>, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let mut listed = List<Operand>.make()
+  run List<Operand>.append(&mut listed, Operand.Copy {place: place(address)})
+  let mut rest = move operands
+  while List<Operand>.length(&rest) > usize.ZERO {
+    run List<Operand>.append(&mut listed, List<Operand>.remove(&mut rest, usize.ZERO))
+  }
+  let mut failure = order
+  if primitive == IntrinsicPrimitive.AtomicCompareExchange { failure = MemoryOrder.Acquire }
+  return run storageValue(&mut builder.*, ty, Rvalue.Atomic {primitive: primitive, operands: move listed, success: order,
+    failure: failure, element: move word}, origin)
+}
+
+// A compare-exchange of the word at local `address` from `expected` to `desired`; returns the
+// local holding the value it observed, which equals `expected` exactly when it stored.
+effect fn wordExchange(builder: &mut Builder, address: usize, expected: Operand, desired: Operand, origin: Origin) -> usize
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let boolean = run storagePrimitive(b"bool")
+  let wordAddress = run SealedCore.address(&word)
+  let observed = run storageValue(&mut builder.*, &word, Rvalue.Use {value: move expected}, origin)
+  let slot = run storageValue(&mut builder.*, &wordAddress, Rvalue.AddressOf {access: Access.Mutable, place: place(observed)}, origin)
+  let mut operands = List<Operand>.make()
+  run List<Operand>.append(&mut operands, Operand.Copy {place: place(slot)})
+  run List<Operand>.append(&mut operands, move desired)
+  drop run wordAtomic(&mut builder.*, address, IntrinsicPrimitive.AtomicCompareExchange, move operands, MemoryOrder.AcquireRelease,
+    &boolean, origin)
+  return observed
+}
+
+// The address of one header field, in a fresh local.
+effect fn headerAddress(builder: &mut Builder, access: &PackageAccess, field: CoreField, origin: Origin) -> usize
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let word = run storagePrimitive(b"usize")
+  let wordAddress = run SealedCore.address(&word)
+  return run storageValue(&mut builder.*, &wordAddress, Rvalue.AddressOf {access: Access.Mutable,
+    place: run headerField(access, field)}, origin)
+}
+
+// Whether the package's Execution handle still owns its body: neither completed nor dropped. A
+// waking thread reads it with acquire ordering against the owner's release stores (EXEC-009).
 effect fn livePackage(builder: &mut Builder, access: &PackageAccess, origin: Origin) -> Operand ! OutOfMemoryError ? &mut Allocator | &mut Types {
-  return run storageCondition(&mut builder.*, InfixOperator.LessThan, Operand.Copy {place: run headerField(access, CoreField.HeaderLifecycle)},
+  let word = run storagePrimitive(b"usize")
+  let state = run headerAtomic(&mut builder.*, run headerField(access, CoreField.HeaderLifecycle), IntrinsicPrimitive.AtomicLoad,
+    List<Operand>.make(), MemoryOrder.Acquire, &word, origin)
+  return run storageCondition(&mut builder.*, InfixOperator.LessThan, Operand.Copy {place: place(state)},
     run wordOperand(SealedCore.lifecycleWord(Lifecycle.Completed)), origin)
 }
 
-// The control word an `executionLoad` or `executionStore` selects; any other index traps.
-effect fn controlWord(builder: &mut Builder, access: &PackageAccess, index: Operand, origin: Origin) -> Place
+// Records lifecycle `state` with an atomic store a waking thread may observe (EXEC-009).
+effect fn recordLifecycle(builder: &mut Builder, access: &PackageAccess, state: Lifecycle, order: MemoryOrder, origin: Origin) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let unit = run Types.intern(Type.Unit)
+  let mut stored = List<Operand>.make()
+  run List<Operand>.append(&mut stored, run wordOperand(SealedCore.lifecycleWord(state)))
+  drop run headerAtomic(&mut builder.*, run headerField(access, CoreField.HeaderLifecycle), IntrinsicPrimitive.AtomicStore,
+    move stored, order, &unit, origin)
+}
+
+// The address of the control word a control-word operation selects; any other index traps.
+effect fn controlWord(builder: &mut Builder, access: &PackageAccess, index: Operand, origin: Origin) -> usize
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let word = run storagePrimitive(b"usize")
   let selected = run storageValue(&mut builder.*, &word, Rvalue.Use {value: move index}, origin)
@@ -6984,16 +7049,14 @@ effect fn controlWord(builder: &mut Builder, access: &PackageAccess, index: Oper
   let wordAddress = run SealedCore.address(&word)
   let first = run storageValue(&mut builder.*, &wordAddress, Rvalue.AddressOf {access: Access.Mutable,
     place: run headerField(access, CoreField.HeaderControl)}, origin)
-  let wanted = run storageValue(&mut builder.*, &wordAddress, Rvalue.PointerOffset {
+  return run storageValue(&mut builder.*, &wordAddress, Rvalue.PointerOffset {
     pointer: Operand.Copy {place: place(first)}, index: Operand.Copy {place: place(selected)}, element: Shared<Type>.clone(&word)}, origin)
-  let mut target = place(wanted)
-  run List<Projection>.append(&mut target.projections, Projection.Deref)
-  return move target
 }
 
-// The reference operations over one package: a new reference from a handle, a control word read or
-// write, the fixed readiness endpoint, and liveness. A drop that arrives while the endpoint runs is
-// performed once it returns.
+// The reference operations over one package: a new reference from a handle, a control word load,
+// store or compare-exchange, the fixed readiness endpoint, and liveness. Notification first claims
+// the notifying marker; a drop that arrives while the endpoint runs is performed once it returns,
+// and a notification that finds the package dropping or dead runs nothing (EXEC-009).
 effect fn lowerReference(builder: &mut Builder, operation: StorageOperation, operands: List<Operand>, ty: &Shared<Type>,
   origin: Origin) -> Operand ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let owner = InstanceKey.identity(&builder.function.key)
@@ -7017,13 +7080,23 @@ effect fn lowerReference(builder: &mut Builder, operation: StorageOperation, ope
   match operation {
     StorageOperation.ExecutionLoad => {
       let selected = run controlWord(&mut builder.*, &access, List<Operand>.remove(&mut values, usize.ZERO), origin)
-      let output = run storageValue(&mut builder.*, ty, Rvalue.Use {value: Operand.Copy {place: move selected}}, origin)
+      let output = run wordAtomic(&mut builder.*, selected, IntrinsicPrimitive.AtomicLoad, List<Operand>.make(), MemoryOrder.Acquire, ty, origin)
       return Operand.Move {place: place(output)}
     }
     StorageOperation.ExecutionStore => {
       let selected = run controlWord(&mut builder.*, &access, List<Operand>.remove(&mut values, usize.ZERO), origin)
-      run assign(&mut builder.*, move selected, Rvalue.Use {value: List<Operand>.remove(&mut values, usize.ZERO)}, origin)
+      let unit = run Types.intern(Type.Unit)
+      let mut stored = List<Operand>.make()
+      run List<Operand>.append(&mut stored, List<Operand>.remove(&mut values, usize.ZERO))
+      drop run wordAtomic(&mut builder.*, selected, IntrinsicPrimitive.AtomicStore, move stored, MemoryOrder.Release, &unit, origin)
       return Operand.Unit
+    }
+    StorageOperation.ExecutionCompareExchange => {
+      let selected = run controlWord(&mut builder.*, &access, List<Operand>.remove(&mut values, usize.ZERO), origin)
+      let expected = List<Operand>.remove(&mut values, usize.ZERO)
+      let desired = List<Operand>.remove(&mut values, usize.ZERO)
+      let observed = run wordExchange(&mut builder.*, selected, move expected, move desired, origin)
+      return Operand.Move {place: place(observed)}
     }
     StorageOperation.ExecutionLive => {
       let live = run livePackage(&mut builder.*, &access, origin)
@@ -7031,17 +7104,30 @@ effect fn lowerReference(builder: &mut Builder, operation: StorageOperation, ope
       return Operand.Move {place: place(output)}
     }
     StorageOperation.ExecutionNotify => {
-      let live = run livePackage(&mut builder.*, &access, origin)
-      run trapUnless(&mut builder.*, move live, TrapReason.ExecutionNotifyAfterDrop, origin)
-      run assign(&mut builder.*, run headerField(&access, CoreField.HeaderNotifying), Rvalue.Use {value: run wordOperand(usize.ONE)}, origin)
-      run callErased(&mut builder.*, &access, CoreField.HeaderNotify, origin)
       let word = run storagePrimitive(b"usize")
-      let marker = run storageValue(&mut builder.*, &word, Rvalue.Use {value: Operand.Copy {
-        place: run headerField(&access, CoreField.HeaderNotifying)}}, origin)
-      run assign(&mut builder.*, run headerField(&access, CoreField.HeaderNotifying), Rvalue.Use {value: run wordOperand(usize.ZERO)}, origin)
-      let pending = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(marker)}, run wordOperand(2), origin)
-      let destroy = run block(&mut builder.*, origin)
+      // The marker is 0 when idle, 1 while notifying, 2 when a drop waits for the endpoint, and 3
+      // once the package is dropping.
+      let marker = run headerAddress(&mut builder.*, &access, CoreField.HeaderNotifying, origin)
+      let observed = run wordExchange(&mut builder.*, marker, run wordOperand(usize.ZERO), run wordOperand(usize.ONE), origin)
+      let claimed = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(observed)},
+        run wordOperand(usize.ZERO), origin)
+      let holding = run block(&mut builder.*, origin)
       let after = run block(&mut builder.*, origin)
+      terminate(&mut builder.*, Terminator.Branch {condition: move claimed, thenBlock: holding, elseBlock: after, origin: origin})
+      resume(&mut builder.*, holding)
+      let live = run livePackage(&mut builder.*, &access, origin)
+      let notifying = run block(&mut builder.*, origin)
+      let releasing = run block(&mut builder.*, origin)
+      terminate(&mut builder.*, Terminator.Branch {condition: move live, thenBlock: notifying, elseBlock: releasing, origin: origin})
+      resume(&mut builder.*, notifying)
+      run callErased(&mut builder.*, &access, CoreField.HeaderNotify, origin)
+      terminate(&mut builder.*, Terminator.Goto {target: releasing, origin: origin})
+      resume(&mut builder.*, releasing)
+      let mut cleared = List<Operand>.make()
+      run List<Operand>.append(&mut cleared, run wordOperand(usize.ZERO))
+      let previous = run wordAtomic(&mut builder.*, marker, IntrinsicPrimitive.AtomicSwap, move cleared, MemoryOrder.AcquireRelease, &word, origin)
+      let pending = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: place(previous)}, run wordOperand(2), origin)
+      let destroy = run block(&mut builder.*, origin)
       terminate(&mut builder.*, Terminator.Branch {condition: move pending, thenBlock: destroy, elseBlock: after, origin: origin})
       resume(&mut builder.*, destroy)
       run callErased(&mut builder.*, &access, CoreField.HeaderDrop, origin)
@@ -7162,7 +7248,7 @@ effect fn lowerDrive(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
     run wordOperand(SealedCore.lifecycleWord(Lifecycle.Relinquished)), origin)
   let admitted = run storageCondition(&mut builder.*, InfixOperator.BitOr, move unstarted, move relinquished, origin)
   run trapUnless(&mut builder.*, move admitted, TrapReason.InvalidExecutionDrive, origin)
-  run assign(&mut builder.*, run copyPlace(&recorded), Rvalue.Use {value: run wordOperand(SealedCore.lifecycleWord(Lifecycle.Running))}, origin)
+  run recordLifecycle(&mut builder.*, &access, Lifecycle.Running, MemoryOrder.Relaxed, origin)
   run callErased(&mut builder.*, &access, CoreField.HeaderStart, origin)
   // The start returns with the activation still Running when the body completed.
   let parked = run storageCondition(&mut builder.*, InfixOperator.Equals, Operand.Copy {place: run copyPlace(&recorded)},
@@ -7185,7 +7271,7 @@ effect fn lowerDrive(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
   run releaseCallable(&mut builder.*, body, arguments[2], completion, origin)
   terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
   resume(&mut builder.*, completing)
-  run assign(&mut builder.*, run copyPlace(&recorded), Rvalue.Use {value: run wordOperand(SealedCore.lifecycleWord(Lifecycle.Completed))}, origin)
+  run recordLifecycle(&mut builder.*, &access, Lifecycle.Completed, MemoryOrder.Release, origin)
   let completed = run storageValue(&mut builder.*, &result, Rvalue.Use {value: Operand.Move {
     place: run headerField(&access, CoreField.HeaderResult)}}, origin)
   let output = run temporary(&mut builder.*, &unit, origin)
@@ -7251,8 +7337,8 @@ effect fn lowerStorage(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Mo
     return run lowerExecutionPackage(&mut builder.*, body, node, move plan, move operands, ty, origin)
   }
   if operation == StorageOperation.ExecutionRefOf || operation == StorageOperation.ExecutionLoad
-    || operation == StorageOperation.ExecutionStore || operation == StorageOperation.ExecutionNotify
-    || operation == StorageOperation.ExecutionLive {
+    || operation == StorageOperation.ExecutionStore || operation == StorageOperation.ExecutionCompareExchange
+    || operation == StorageOperation.ExecutionNotify || operation == StorageOperation.ExecutionLive {
     return run lowerReference(&mut builder.*, operation, move operands, ty, origin)
   }
   let first = run operandPlace(&owner, List<Operand>.remove(&mut operands, usize.ZERO), origin)

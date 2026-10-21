@@ -79,8 +79,8 @@ capture/provider or reachability path.
 identity. Its compiler-owned activation lifecycle is `Unstarted`, `Running`, `Relinquished`,
 `Completed`, and `Destroyed`; these are semantic states, not a promised backend tag layout. The
 source readiness phases `Initial`, `InitialReady`, `Dormant`, and `Eligible` are ordinary
-`silk.execution` policy over two package control words. The owner may drive only `Initial`,
-`InitialReady`, or `Eligible`, and driving a dormant or notifying execution is a fatal state
+`silk.execution` policy over a package control word (EXEC-009). The owner may drive only `Initial`,
+`InitialReady`, or `Eligible`, and driving a registering or dormant execution is a fatal state
 trap. Execution-internal stable loans may cross
 parking, but construction cannot retain caller loans and completion cannot return a loan into
 package-owned storage.

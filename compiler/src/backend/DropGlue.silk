@@ -46,6 +46,7 @@ import semantic.DeclarationId {DeclarationId}
 import semantic.Lifetime {Lifetime}
 import semantic.SealedCore
 import semantic.SealedCore {Field as CoreField}
+import semantic.Intrinsic {MemoryOrder, Primitive as IntrinsicPrimitive}
 import semantic.Specialization {Edge}
 import semantic.Type {Type}
 import semantic.TypedBody {BorrowStatus, Origin}
@@ -306,20 +307,24 @@ impl DropGlue {
         let mut header = place(usize.ONE)
         run List<Projection>.append(&mut header.projections, Projection.Deref)
         run List<Projection>.append(&mut header.projections, Projection.Field {index: SealedCore.ordinal(CoreField.PackageHeader)})
-        let marker = run temporary(&mut builder, &word)
-        let notifying = run temporary(&mut builder, &boolean)
-        run statement(&mut builder, current, Statement.Assign {destination: place(marker), value: Rvalue.Use {
-          value: Operand.Copy {place: run fieldOf(&header, CoreField.HeaderNotifying)}}, origin: origin})
-        run statement(&mut builder, current, Statement.Assign {destination: place(notifying), value: Rvalue.Binary {
-          operation: InfixOperator.NotEquals, left: Operand.Copy {place: place(marker)}, right: run wordOf(b"0", &word)}, origin: origin})
-        let deferred = run block(&mut builder)
+        // The drop claims the notifying marker (0 idle, 1 notifying, 2 drop waiting, 3 dropping).
+        // While a notification holds it, the drop is left to that notification (EXEC-009).
+        let markerType = run SealedCore.address(&word)
+        let marker = run temporary(&mut builder, &markerType)
+        run statement(&mut builder, current, Statement.Assign {destination: place(marker), value: Rvalue.AddressOf {
+          access: Access.Mutable, place: run fieldOf(&header, CoreField.HeaderNotifying)}, origin: origin})
+        let claiming = run block(&mut builder)
+        let deferring = run block(&mut builder)
         let cleaning = run block(&mut builder)
         let exit = run block(&mut builder)
-        terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(notifying)}, thenBlock: deferred,
-          elseBlock: cleaning, origin: origin})
-        run statement(&mut builder, deferred, Statement.Assign {destination: run fieldOf(&header, CoreField.HeaderNotifying),
-          value: Rvalue.Use {value: run wordOf(b"2", &word)}, origin: origin})
-        terminate(&mut builder, deferred, Terminator.Goto {target: exit, origin: origin})
+        terminate(&mut builder, current, Terminator.Goto {target: claiming, origin: origin})
+        let idle = run exchangeWord(&mut builder, claiming, marker, b"0", b"3")
+        terminate(&mut builder, claiming, Terminator.Branch {condition: Operand.Copy {place: place(idle)}, thenBlock: cleaning,
+          elseBlock: deferring, origin: origin})
+        // A notification that finished in between leaves the marker idle again, so claim anew.
+        let deferred = run exchangeWord(&mut builder, deferring, marker, b"1", b"2")
+        terminate(&mut builder, deferring, Terminator.Branch {condition: Operand.Copy {place: place(deferred)}, thenBlock: exit,
+          elseBlock: claiming, origin: origin})
         current = cleaning
         let state = run temporary(&mut builder, &word)
         run statement(&mut builder, current, Statement.Assign {destination: place(state), value: Rvalue.Use {
@@ -348,8 +353,7 @@ impl DropGlue {
         let settled = run block(&mut builder)
         terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(relinquished)}, thenBlock: cancelled,
           elseBlock: settled, origin: origin})
-        run statement(&mut builder, cancelled, Statement.Assign {destination: run fieldOf(&header, CoreField.HeaderLifecycle),
-          value: Rvalue.Use {value: run wordOf(b"4", &word)}, origin: origin})
+        run storeLifecycle(&mut builder, cancelled, &header, b"4")
         let erased = run SealedCore.packageAddress()
         let bytes = run SealedCore.bytes()
         let package = run temporary(&mut builder, &erased)
@@ -388,8 +392,7 @@ impl DropGlue {
         let releasing = run block(&mut builder)
         terminate(&mut builder, current, Terminator.Branch {condition: Operand.Copy {place: place(completed)}, thenBlock: releasing,
           elseBlock: destroyed, origin: origin})
-        run statement(&mut builder, destroyed, Statement.Assign {destination: run fieldOf(&header, CoreField.HeaderLifecycle),
-          value: Rvalue.Use {value: run wordOf(b"4", &word)}, origin: origin})
+        run storeLifecycle(&mut builder, destroyed, &header, b"4")
         terminate(&mut builder, destroyed, Terminator.Goto {target: releasing, origin: origin})
         let released = run releaseAuthority(&mut builder, releasing, &header, &allocation)
         terminate(&mut builder, released, Terminator.Goto {target: exit, origin: origin})
@@ -460,31 +463,85 @@ impl DropGlue {
 }
 
 // Releases one unit of authority over the package allocation the header at `header` holds; the
-// last unit drops that allocation, after which nothing reads the package. Returns the block that
-// continues.
+// last unit drops that allocation, after which nothing reads the package. The decrement releases
+// this holder's accesses and the last holder acquires every other holder's before the drop
+// (EXEC-009). Returns the block that continues.
 effect fn releaseAuthority(builder: &mut Builder, at: usize, header: &Place, allocation: &Child) -> usize
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let origin = builder.origin
   let word = run Types.intern(Type.Primitive {name: run Bytes.copy(b"usize")})
   let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+  let unit = run Types.intern(Type.Unit)
+  let addressType = run SealedCore.address(&word)
+  let address = run temporary(&mut builder.*, &addressType)
   let count = run temporary(&mut builder.*, &word)
   let last = run temporary(&mut builder.*, &boolean)
-  run statement(&mut builder.*, at, Statement.Assign {destination: place(count), value: Rvalue.Use {
-    value: Operand.Copy {place: run fieldOf(header, CoreField.HeaderAuthority)}}, origin: origin})
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(address), value: Rvalue.AddressOf {access: Access.Mutable,
+    place: run fieldOf(header, CoreField.HeaderAuthority)}, origin: origin})
+  let mut operands = List<Operand>.make()
+  run List<Operand>.append(&mut operands, Operand.Copy {place: place(address)})
+  run List<Operand>.append(&mut operands, run wordOf(b"1", &word))
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(count), value: Rvalue.Atomic {
+    primitive: IntrinsicPrimitive.AtomicFetchSubtract, operands: move operands, success: MemoryOrder.Release,
+    failure: MemoryOrder.Release, element: Shared<Type>.clone(&word)}, origin: origin})
   run statement(&mut builder.*, at, Statement.Assign {destination: place(last), value: Rvalue.Binary {
-    operation: InfixOperator.LessOrEqual, left: Operand.Copy {place: place(count)}, right: run wordOf(b"1", &word)}, origin: origin})
-  let decrement = run block(&mut builder.*)
+    operation: InfixOperator.Equals, left: Operand.Copy {place: place(count)}, right: run wordOf(b"1", &word)}, origin: origin})
   let release = run block(&mut builder.*)
   let exit = run block(&mut builder.*)
   terminate(&mut builder.*, at, Terminator.Branch {condition: Operand.Copy {place: place(last)}, thenBlock: release,
-    elseBlock: decrement, origin: origin})
-  run statement(&mut builder.*, decrement, Statement.Assign {destination: run fieldOf(header, CoreField.HeaderAuthority),
-    value: Rvalue.Binary {operation: InfixOperator.Subtract, left: Operand.Copy {place: place(count)}, right: run wordOf(b"1", &word)},
-    origin: origin})
-  terminate(&mut builder.*, decrement, Terminator.Goto {target: exit, origin: origin})
+    elseBlock: exit, origin: origin})
+  let fenced = run temporary(&mut builder.*, &unit)
+  run statement(&mut builder.*, release, Statement.Assign {destination: place(fenced), value: Rvalue.Atomic {
+    primitive: IntrinsicPrimitive.AtomicFence, operands: List<Operand>.make(), success: MemoryOrder.Acquire,
+    failure: MemoryOrder.Acquire, element: Shared<Type>.clone(&unit)}, origin: origin})
   run dropAt(&mut builder.*, release, allocation, run fieldOf(header, CoreField.HeaderAllocation))
   terminate(&mut builder.*, release, Terminator.Goto {target: exit, origin: origin})
   return exit
+}
+
+// One acquire-release compare-exchange of the word at the address in local `address` from
+// `expected` to `desired`, appended to block `at`; returns the local holding whether it stored.
+effect fn exchangeWord(builder: &mut Builder, at: usize, address: usize, expected: &[u8], desired: &[u8]) -> usize
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let origin = builder.origin
+  let word = run Types.intern(Type.Primitive {name: run Bytes.copy(b"usize")})
+  let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+  let observed = run temporary(&mut builder.*, &word)
+  let slotType = run SealedCore.address(&word)
+  let slot = run temporary(&mut builder.*, &slotType)
+  let stored = run temporary(&mut builder.*, &boolean)
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(observed), value: Rvalue.Use {value: run wordOf(expected, &word)},
+    origin: origin})
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(slot), value: Rvalue.AddressOf {access: Access.Mutable,
+    place: place(observed)}, origin: origin})
+  let mut operands = List<Operand>.make()
+  run List<Operand>.append(&mut operands, Operand.Copy {place: place(address)})
+  run List<Operand>.append(&mut operands, Operand.Copy {place: place(slot)})
+  run List<Operand>.append(&mut operands, run wordOf(desired, &word))
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(stored), value: Rvalue.Atomic {
+    primitive: IntrinsicPrimitive.AtomicCompareExchange, operands: move operands, success: MemoryOrder.AcquireRelease,
+    failure: MemoryOrder.Acquire, element: move word}, origin: origin})
+  return stored
+}
+
+// Records lifecycle word `state` with a release store that a waking thread's liveness load
+// acquires (EXEC-009).
+effect fn storeLifecycle(builder: &mut Builder, at: usize, header: &Place, state: &[u8]) -> ()
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let origin = builder.origin
+  let word = run Types.intern(Type.Primitive {name: run Bytes.copy(b"usize")})
+  let unit = run Types.intern(Type.Unit)
+  let addressType = run SealedCore.address(&word)
+  let address = run temporary(&mut builder.*, &addressType)
+  let stored = run temporary(&mut builder.*, &unit)
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(address), value: Rvalue.AddressOf {access: Access.Mutable,
+    place: run fieldOf(header, CoreField.HeaderLifecycle)}, origin: origin})
+  let mut operands = List<Operand>.make()
+  run List<Operand>.append(&mut operands, Operand.Copy {place: place(address)})
+  run List<Operand>.append(&mut operands, run wordOf(state, &word))
+  run statement(&mut builder.*, at, Statement.Assign {destination: place(stored), value: Rvalue.Atomic {
+    primitive: IntrinsicPrimitive.AtomicStore, operands: move operands, success: MemoryOrder.Release,
+    failure: MemoryOrder.Release, element: move word}, origin: origin})
 }
 
 // One field of the package header at `header`.
