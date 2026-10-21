@@ -33,9 +33,11 @@ compile error, not a runtime error.
 - [`ParseError`](#ParseError) from the `...Value` parse functions, with the reason [`NotANumber`](#NotANumber) or
   [`OutOfRange`](#OutOfRange).
 
+Numbers align to the right by default. Text, `bool`, and `char` align to the left by default.
+
 ## Gotchas
-`NaN` and `Infinity` ignore width, fill, alignment, and precision. Strings ignore all options.
-To check that a float is finite before you display it, use `f64.isFinite` or `f32.isFinite`.
+`NaN` and `Infinity` ignore precision and zero padding. To check that a float is finite before
+you display it, use `f64.isFinite` or `f32.isFinite`.
 
 ## Examples
 ### Write a padded number and a template into a buffer
@@ -277,12 +279,13 @@ write can use it and must document what it changes.
 pub fn zeroPad(self: &Formatter) -> bool
 ```
 
-Returns `true` if the options ask to pad integers with zeros up to the width.
+Returns `true` if the options ask to pad numbers with zeros up to the width.
 
 #### Details
 
 The zeros go after the sign, so `-7` with width 4 displays as `-007`. A precision turns off
-this padding for integers. Floats always pad with the fill character, never with zeros.
+this padding for integers but not for floats. `NaN` and `Infinity` pad with the fill
+character.
 
 <a id="Format.impl.hasPrecision"></a>
 
@@ -307,7 +310,8 @@ Returns the precision. Returns 0 if the options set no precision.
 #### Details
 
 For integers, the precision is the minimum number of digits, with leading zeros. For floats,
-it is the exact number of digits after the decimal point.
+it is the exact number of digits after the decimal point. For text, it is the maximum number
+of Unicode scalars.
 
 <a id="Format.impl.color"></a>
 
@@ -457,6 +461,68 @@ from [`Format.trailingPadding`](#Format.impl.trailingPadding).
 - `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
   failure stay written. Nothing is rolled back.
 
+<a id="Format.impl.padText"></a>
+
+### Method `padText`
+
+```silk
+pub effect fn padText(
+    self: &mut Formatter,
+    text: string
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes `text` with the width, fill, alignment, and precision of the options.
+
+#### When to use
+
+Use it in a `Display` implementation that writes one piece of text, so that your type pads
+and cuts like a string does. The `Display` implementation for `string` calls it.
+
+#### Details
+
+The precision is the maximum number of Unicode scalars to write, and the rest is cut. The
+width counts the scalars that are written. `Alignment.Default` puts the content on the left.
+The sign, zero padding, and alternate options do not apply.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
+<a id="Format.impl.padNumber"></a>
+
+### Method `padNumber`
+
+```silk
+pub effect fn padNumber(
+    self: &mut Formatter,
+    negative: bool,
+    prefix: string,
+    digits: string
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes the digits of a number with the sign, width, fill, alignment, and zero padding of the
+options.
+
+#### When to use
+
+Use it in a `Display` implementation for a number type, so that your type pads like the
+standard integers. Calculate the digits yourself, without a sign.
+
+#### Details
+
+The output is the sign, then `prefix`, then `digits`. The sign comes from `negative` and the
+sign rule. `prefix` is text such as `0x` that goes before the digits; use `""` for none. Zero
+padding puts the zeros between `prefix` and `digits`. `Alignment.Default` puts the content on
+the right. This operation ignores the precision.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
 <a id="Format.impl.display"></a>
 
 ### Associated function `display`
@@ -493,18 +559,14 @@ Writes `value` to the ambient `Writer` with `options`.
 #### Details
 
 For integers, the precision is a minimum digit count and turns off zero padding. For floats,
-the precision is the exact number of fractional digits, rounded half to even, and padding
-always uses the fill character. The standard implementations ignore `alternate` and `color`.
+the precision is the exact number of fractional digits, rounded half to even. For text, the
+precision is the maximum number of Unicode scalars, and the rest is cut. The standard
+implementations ignore `alternate` and `color`.
 
 #### Errors
 
 - `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
   failure stay written. Nothing is rolled back.
-
-#### Gotchas
-
-Strings, `NaN`, and `Infinity` ignore the width. To pad a string, write the padding yourself
-with [`Format.writeLeadingPadding`](#Format.impl.writeLeadingPadding) and [`Format.writeTrailingPadding`](#Format.impl.writeTrailingPadding).
 
 <a id="Format.impl.format"></a>
 
@@ -936,7 +998,8 @@ Where content goes inside a width that is larger than the content.
 
 ### Details
 
-For the standard `Display` implementations, `Default` is the same as `Right`.
+For the standard `Display` implementations, `Default` is `Right` for numbers and `Left` for
+text, `bool`, and `char`.
 
 <a id="Alignment.Default"></a>
 
@@ -946,8 +1009,8 @@ For the standard `Display` implementations, `Default` is the same as `Right`.
 Default
 ```
 
-Uses the default of the `Display` implementation. The standard implementations align to the
-right.
+Uses the default of the `Display` implementation. The standard implementations align numbers
+to the right and text to the left.
 
 <a id="Alignment.Left"></a>
 
@@ -1096,8 +1159,8 @@ implementations ignore it.
 pub zeroPad: bool
 ```
 
-If `true`, integers pad to the width with zeros after the sign instead of the fill. A
-precision turns this off.
+If `true`, numbers pad to the width with zeros after the sign instead of the fill. A
+precision turns this off for integers but not for floats.
 
 <a id="FormatOptions.precision"></a>
 
@@ -1113,7 +1176,8 @@ The number of digits for numbers.
 
 For integers, it is the minimum number of digits, with leading zeros. For floats, it is the
 exact number of fractional digits, rounded half to even. The result then does not always parse
-back to the same bits. `NaN` and `Infinity` ignore it.
+back to the same bits. `NaN` and `Infinity` ignore it. For text, it is the maximum number of
+Unicode scalars to write.
 
 <a id="FormatOptions.color"></a>
 
@@ -1567,12 +1631,12 @@ writes exactly that many fractional digits instead.
 #### Details
 
 The default output parses back to the same value with [`Format.f64Value`](#Format.impl.f64Value). Negative zero
-displays as `-0`. Sign, width, fill, and alignment apply.
+displays as `-0`. Sign, width, fill, alignment, and zero padding apply.
 
 #### Gotchas
 
 `NaN` displays as `NaN`, and infinity displays as `Infinity` with a sign from the sign rule.
-Both ignore width, fill, alignment, and precision. Floats never pad with zeros.
+Both ignore precision and pad with the fill character, never with zeros.
 
 <a id="f32.impl.Display"></a>
 
@@ -1596,13 +1660,13 @@ writes exactly that many fractional digits instead.
 #### Details
 
 The default output parses back to the same value with [`Format.f32Value`](#Format.impl.f32Value). Negative zero
-displays as `-0`. Sign, width, fill, and alignment apply. The digits come from the `f32`
-value, so they can differ from the digits of the nearest `f64`.
+displays as `-0`. Sign, width, fill, alignment, and zero padding apply. The digits come from
+the `f32` value, so they can differ from the digits of the nearest `f64`.
 
 #### Gotchas
 
 `NaN` displays as `NaN`, and infinity displays as `Infinity` with a sign from the sign rule.
-Both ignore width, fill, alignment, and precision. Floats never pad with zeros.
+Both ignore precision and pad with the fill character, never with zeros.
 
 <a id="string.impl.Display"></a>
 
@@ -1620,13 +1684,12 @@ impl<'text> Display for string<'text>
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the UTF-8 bytes of the string as they are.
+Writes the string with the width, fill, alignment, and precision of the options. See
+[`Format.padText`](#Format.impl.padText).
 
-#### Gotchas
+#### Details
 
-All options are ignored, including the width. To pad a string, use
-[`Format.writeLeadingPadding`](#Format.impl.writeLeadingPadding) and [`Format.writeTrailingPadding`](#Format.impl.writeTrailingPadding) around
-[`Format.writeText`](#Format.impl.writeText).
+The default alignment is left. A precision cuts the string to that many Unicode scalars.
 
 <a id="bool.impl.Display"></a>
 
@@ -1644,7 +1707,7 @@ impl Display for bool
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes `true` or `false`, padded to the requested width like the other primitives.
+Writes `true` or `false` as text, like a string. See [`Format.padText`](#Format.impl.padText).
 
 <a id="char.impl.Display"></a>
 
@@ -1662,8 +1725,7 @@ impl Display for char
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the character's UTF-8 encoding, padded to the requested width like the other
-primitives.
+Writes the character as text, like a one-scalar string. See [`Format.padText`](#Format.impl.padText).
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
