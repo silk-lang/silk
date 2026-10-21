@@ -141,8 +141,8 @@ its captured values but retains no caller lexical or provider loan. Stable packa
 may cross parking; a result cannot return a view into package-owned storage.
 
 **Boundary:** `LocalExecution` permits same-thread suspension, parking, and owner transfer. The
-package protocol itself is safe across threads (EXEC-009), but no handle is `Transferable`
-(THREAD-002), so no source operation moves one to another thread yet.
+package protocol itself is safe across threads (EXEC-009), but neither intrinsic handle is
+`Transferable` (THREAD-002). Only the `silk.execution` wrappers of EXEC-010 move to another thread.
 
 **Diagnostics:** Unsatisfied `Intrinsic.Detached` or `Intrinsic.NonParking` properties report
 `SEM0139` with the retained capture, provider, or parking path. Missing explicit ownership of a
@@ -297,5 +297,53 @@ each access to the plain one.
 
 **Evidence:** [ordinary source policy](../stdlib/silk/execution.silk), native corpus
 (`independent-execution-stale-generation-wake`).
+
+**Current compiler:** Aligned.
+
+### EXEC-010 — Transferable executions and Wakes are made with thread bounds
+
+**Status:** Confirmed
+
+`Execution.makeTransferable` is `Execution.make` with thread bounds (THREAD-001), and returns a
+`TransferableExecution<A>` instead of the intrinsic handle:
+
+| Input | Bound | Why |
+| --- | --- | --- |
+| Result `A` | `Transferable` | The body may complete on any thread that drives it. |
+| Body `F` | `Transferable` | Its captures move with the package. |
+| Endpoint state `O` and endpoint `R` | `Transferable + Concurrent` | Each signal runs the endpoint on the signaling thread. |
+
+The constructor records the mode in control word 1 before the handle leaves it. The body parks with
+`Execution.parkTransferable`, which passes a `TransferableWake`; `Execution.wakeTransferable`
+signals it from any thread under EXEC-009. `TransferableExecution<A>` is `Transferable` when `A`
+is, and `TransferableWake` always is; both assert it with an `impl` (THREAD-003).
+
+`TransferableExecution.local` returns the intrinsic handle for `Execution.drive`, and
+`TransferableExecution.adopt` wraps one again, such as the dormant handle `onSuspend` receives.
+Values the body creates itself carry no bound: Silk has no thread-local or mutable global storage,
+so only the body reaches them while it moves between threads.
+
+```silk,ignore
+fn register(wake: TransferableWake) -> Guard {
+  send(move wake) // to any thread, which calls Execution.wakeTransferable
+  return Guard {}
+}
+effect fn body() -> i32 {
+  run Execution.parkTransferable(register)
+  return 42
+}
+```
+
+**Boundary:** `adopt` and `parkTransferable` check the mode word, so a package made by
+`Execution.make` never gets a transferable handle or Wake. A plain `Wake` and the intrinsic handles
+stay local.
+
+**Diagnostics:** An input without its bound, or sending a `Wake` or `Intrinsic.Execution<A>`,
+reports `SEM0121`. Adopting, or parking transferably in, a package made by `Execution.make` is a
+fatal state trap.
+
+**Evidence:** [ordinary source policy](../stdlib/silk/execution.silk), native corpus
+(`transferable-execution-wake`, `transferable-execution-adopt-local`), invalid corpus
+(`transferable-execution-bounds`).
 
 **Current compiler:** Aligned.

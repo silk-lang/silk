@@ -15,6 +15,10 @@
 //! may be signaled from another thread: every transition is one compare-exchange of that word,
 //! and readiness is published before the endpoint runs (EXEC-009).
 //!
+//! Use [`makeTransferable`] for an Execution that a thread-capable owner moves between threads.
+//! Its handle is a [`TransferableExecution`], and its body parks with [`parkTransferable`], whose
+//! [`TransferableWake`] may be signaled from any thread (EXEC-010).
+//!
 //! # Gotchas
 //! `Execution` is affine. The readiness callback must be detached and non-parking. [`make`] can
 //! report package allocation refusal. Later private execution-stack growth is a fatal trap.
@@ -23,6 +27,7 @@
 //! `onSuspend`.
 
 import silk.allocator { Allocator, OutOfMemoryError }
+import silk.thread { Concurrent, Transferable }
 
 // Control word 0 holds the park generation times `PHASES` plus the readiness phase, so one
 // compare-exchange checks a Wake's generation and moves its phase together.
@@ -36,6 +41,11 @@ const REGISTERING: usize = 3
 const LATCHED: usize = 4
 const DORMANT: usize = 5
 const ELIGIBLE: usize = 6
+
+// Control word 1 records how the package was made. Only `makeTransferable` sets it, before the
+// handle leaves the constructor, so a set word proves the body and endpoint passed its bounds.
+const MODE: usize = 1
+const TRANSFERABLE: usize = 1
 
 /// The affine readiness authority for one parked generation of one Execution.
 ///
@@ -51,6 +61,73 @@ const ELIGIBLE: usize = 6
 pub struct Wake {
   reference: Intrinsic.ExecutionRef
   generation: usize
+}
+
+/// A Wake that may move to another thread and be signaled there.
+///
+/// # Details
+///
+/// [`Execution.parkTransferable`] passes the generation's only TransferableWake to its
+/// registration callback. [`Execution.wakeTransferable`] consumes it from any thread.
+///
+/// # Gotchas
+///
+/// It has the same lifetime rules as [`Wake`]: dropping it publishes nothing, and a retained one
+/// keeps the inert package allocation alive.
+pub struct TransferableWake {
+  wake: Wake
+}
+
+// Only `parkTransferable` builds one, and only for a package made by `makeTransferable`, whose
+// endpoint is Transferable and Concurrent, so the endpoint may run on the signaling thread.
+impl Transferable for TransferableWake {}
+
+/// The owner of an Execution made by [`Execution.makeTransferable`], which may move to another thread.
+///
+/// # Details
+///
+/// [`local`] gives back the `Intrinsic.Execution<A>` handle that [`Execution.drive`] takes, and
+/// [`adopt`] wraps a handle again, such as the dormant one `onSuspend` receives. The wrapper is
+/// `Transferable` when `A` is.
+///
+/// # Gotchas
+///
+/// Adopting a handle that [`Execution.make`] created is a fatal trap.
+pub struct TransferableExecution<A> {
+  execution: Intrinsic.Execution<A>
+}
+
+// The body, result and endpoint passed `makeTransferable`'s thread bounds, and the package
+// protocol is atomic (EXEC-009), so the handle may be driven and dropped on another thread.
+impl<A: Transferable> Transferable for TransferableExecution<A> {}
+
+impl<A> TransferableExecution<A> {
+  /// Wraps a handle to a package made by [`Execution.makeTransferable`].
+  ///
+  /// # Gotchas
+  ///
+  /// A handle made by [`Execution.make`] is a fatal state trap.
+  pub fn adopt(execution: Intrinsic.Execution<A>) -> TransferableExecution<A> {
+    let reference = Intrinsic.executionRefOf<A>(&execution)
+    if Intrinsic.executionLoad(&reference, MODE) != TRANSFERABLE { invalidState() }
+    return TransferableExecution<A> { execution: move execution }
+  }
+
+  /// Gives back the handle so the current thread can drive or drop it.
+  pub fn local(self: Self) -> Intrinsic.Execution<A> {
+    let TransferableExecution<A> { execution } = move self
+    return move execution
+  }
+
+  /// Notifies the fixed readiness endpoint for one `Initial` Execution exactly once.
+  ///
+  /// # Details
+  ///
+  /// This is [`Execution.notifyInitial`] for the wrapped handle.
+  pub fn notifyInitial(self: &mut Self) -> () {
+    Execution.notifyInitial<A>(&mut self.execution)
+    return ()
+  }
 }
 
 /// The owner of the execution lifecycle operations.
@@ -90,6 +167,33 @@ impl Execution {
       )
     }
     return absurd<Intrinsic.Execution<A>>()
+  }
+
+  /// Allocates one package whose handle and Wakes may move to other threads.
+  ///
+  /// # Details
+  ///
+  /// This is [`make`] with thread bounds. The body and result must be `Transferable`, because the
+  /// body may resume on any thread that drives it. The endpoint and its state must be
+  /// `Transferable` and `Concurrent`, because each [`TransferableWake`] runs the endpoint on the
+  /// thread that signals it. The body parks with [`parkTransferable`].
+  ///
+  /// # Gotchas
+  ///
+  /// Values the body creates itself need no bound: Silk has no thread-local or global storage, so
+  /// nothing outside the body can reach them while it moves between threads.
+  pub effect<'static> fn makeTransferable<
+    A: Transferable,
+    F: once Effect<'static; A> + Intrinsic.Detached + Transferable,
+    O: Intrinsic.Detached + Transferable + Concurrent,
+    R: fn<'static>(&O) -> () + Intrinsic.Detached + Intrinsic.NonParking + Transferable + Concurrent
+  >(body: F, readyState: O, onReady: R) -> TransferableExecution<A>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+    let execution = run Execution.make<A, F, O, R>(move body, move readyState, move onReady)
+    let reference = Intrinsic.executionRefOf<A>(&execution)
+    Intrinsic.executionStore(&reference, MODE, TRANSFERABLE)
+    return TransferableExecution<A> { execution: move execution }
   }
 
   /// Drives one `Initial`, `InitialReady`, or `Eligible` activation and transfers `branchState` to one outcome callback.
@@ -190,6 +294,47 @@ impl Execution {
     drop reference
     run Intrinsic.relinquish()
     drop guard
+    return ()
+  }
+
+  /// Relinquishes the currently Running Execution and passes a [`TransferableWake`] to `register`.
+  ///
+  /// # Details
+  ///
+  /// This is [`park`] for a body made by [`makeTransferable`]. The Wake may be sent to another
+  /// thread and signaled there with [`wakeTransferable`].
+  ///
+  /// # Gotchas
+  ///
+  /// Calling it from a body made by [`make`] is a fatal state trap, since that endpoint may not
+  /// run on another thread.
+  pub effect fn parkTransferable<
+    'env,
+    G,
+    F: once fn<'env>(TransferableWake) -> G + Intrinsic.NonParking
+  >(register: F) -> () {
+    let reference = run Intrinsic.executionCurrent()
+    if Intrinsic.executionLoad(&reference, MODE) != TRANSFERABLE { invalidState() }
+    let state = Intrinsic.executionLoad(&reference, STATE)
+    let generation = state / PHASES + 1
+    Intrinsic.executionStore(&reference, STATE, generation * PHASES + REGISTERING)
+    let wakeReference = run Intrinsic.executionCurrent()
+    let wake = Wake { reference: move wakeReference, generation: generation }
+    let guard = register(TransferableWake { wake: move wake })
+    drop reference
+    run Intrinsic.relinquish()
+    drop guard
+    return ()
+  }
+
+  /// Consumes one TransferableWake on any thread and makes its parked generation eligible.
+  ///
+  /// # Details
+  ///
+  /// This is [`wake`]; when it publishes readiness, the endpoint runs on the calling thread.
+  pub fn wakeTransferable(wake: TransferableWake) -> () {
+    let TransferableWake { wake: inner } = move wake
+    Execution.wake(move inner)
     return ()
   }
 
