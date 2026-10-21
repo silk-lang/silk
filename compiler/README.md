@@ -24,7 +24,7 @@ invalidates. It checks the package as `silk check` does, but in a store opened w
 `Semantic.update` and checks again. It prints no diagnostics; each step writes one line:
 
 ```text
-silk-replay step=1 kind=trivia module=silk/bytes.silk demands=376543 hits=375832 units-run=711 marked-outdated=469 graph-units=64792 graph-bytes=46662656 rejections=5 update-us=211 check-us=26868808
+silk-replay step=1 kind=trivia module=silk/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 rejections=5 update-us=238 check-us=904871
 ```
 
 `demands`, `hits`, `units-run` and `marked-outdated` are what that step added to the store's
@@ -55,6 +55,39 @@ assembled before the edit.
 For the standard library, assemble `fixtures/stdlib-root` as the `stdlib-root` CI job does and
 run `silk check --stdlib <that directory> --replay <checkout>/compiler/fixtures/replay/stdlib.toml`
 in it.
+
+### Replay budgets
+
+The `incremental` CI job replays both scripts and checks each step against
+`fixtures/replay/budgets.json` with `.github/scripts/check-replay-budgets.mjs`. An edit fails its
+budget when it runs more units or marks more outdated than the step allows, or when its demands
+exceed the allowed fraction of the initial check's. Those demands are the fixed cost of an
+update: the recheck walks every root again and hits nearly every unit it reaches. `update-us` is
+capped too, and the compiler script's rejection counts must match. The same job runs the
+standard library script with `--differential` and replays every corpus program with
+`.github/scripts/replay-corpus.mjs`, which adds a comment to each `main.silk` and removes it again
+and requires both stores to agree. The compiler replay runs without `--differential`, since two
+compiler stores need more memory than a CI runner has.
+
+The budgets allow twice the measured units (at least 20 more) and one and a half times the
+measured demand fraction. When a change moves a step's numbers for a good reason, replay the
+script and update its entry. Measured on 2026-10-21:
+
+| Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |
+| --- | --- | --- | --- | --- |
+| initial check | 132,048 | 15,869,737 | 64,550 | 2,185,506 |
+| trivia | 1 | 6.8% | 14 | 9.7% |
+| body | 2 | 6.8% | 15 | 9.7% |
+| header, same type | 529 | 16.0% | 657 | 17.2% |
+| add | 530 | 16.0% | 658 | 17.2% |
+| header, new type | 530 | 16.0% | 658 | 17.2% |
+| delete | 526 | 16.0% | 654 | 17.2% |
+| rename | 8 | 6.2% | 176 | 9.9% |
+
+The units that still rerun on a trivia edit are MIR lowerings, whose `module:line:column` site
+labels move with the lines. Header, add and delete edits rerun every transitive depender, since
+unit results have no early cutoff yet. On a 4-core x86_64 machine the compiler's first check took
+about 74 s and each edit's recheck 7 to 18 s, almost all of it the walk over every root.
 
 ## Check roots
 
