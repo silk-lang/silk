@@ -195,3 +195,38 @@ is the typed `SpawnError` carrying the `pthread_create` error number.
 (`native-thread-spawn-join`, `native-thread-cross-wake`).
 
 **Current compiler:** Aligned.
+
+## THREAD-006 — `silk.sync` shares values between native threads
+
+**Status:** Confirmed
+
+`Arc<T>` is a reference-counted handle whose count is atomic: `clone` adds a handle with a relaxed
+increment, and the last handle dropped, on any thread, drops the value after a release decrement and
+an acquire fence. `Arc.get` borrows the value for as long as the handle is borrowed. `Arc<T>` is
+`Transferable` and `Concurrent` when `T` is both. `Shared<T>` stays local to one thread.
+
+`Mutex<T>` gives one thread at a time exclusive access. `lock` returns a `MutexGuard` whose
+`get` and `getMut` borrow the value for as long as the guard is borrowed, and dropping the guard
+unlocks. The lock word is a futex (`Atomic.wait`, `Atomic.notifyOne`): an uncontended lock and
+unlock are one atomic operation each. `Mutex<T>` is `Transferable` and `Concurrent` when `T` is
+`Transferable`. `Parker` holds one wakeup token for its thread, and its `Unparker`s supply it from
+any thread, so an unpark before the park is not lost.
+
+```silk,ignore
+let total = run Arc<Mutex<i32>>.make(move mutex) |> Effect.provideMut<Allocator>(&mut allocator)
+let mine = total.clone()
+let worker = run NativeThread.spawn(fn() -> i32 { return addOne(move mine) })
+  |> Effect.provideMut<Allocator>(&mut allocator)
+```
+
+Each type keeps its shared state in its own allocation, reached through raw pointers computed while
+that allocation was fresh, and asserts its thread properties with an `impl` (THREAD-003). The
+references they return come from the anchored borrow `Pointer.borrow` (see the native pointer
+boundary), with the handle or guard as the anchor.
+
+**Boundary:** The targets of `Atomic.wait`. Locking a mutex again on the thread that holds it
+deadlocks. Reference cycles of `Arc` handles leak.
+
+**Evidence:** [synchronization](../stdlib/silk/sync.silk), native corpus (`sync-arc-mutex-parker`).
+
+**Current compiler:** Aligned.

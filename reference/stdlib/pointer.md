@@ -325,6 +325,48 @@ Unlike [`write`](#Pointer.impl.write), `T` need not be `Copy`. The storage takes
 The caller must prove that the pointer addresses live writable storage for `T`. A value
 still initialized there is overwritten without being dropped.
 
+<a id="Pointer.impl.borrow"></a>
+
+### Associated function `borrow`
+
+```silk
+pub unsafe fn borrow<'a, A, T>(anchor: &'a A, pointer: *const T) -> &'a T
+```
+
+Borrows the referent of a pointer for as long as the caller's loan of `anchor`.
+
+#### Details
+
+The result has the anchor's lifetime, so the referent stays borrowed, by the ordinary rules,
+exactly while the anchor is. A handle that owns shared storage through a pointer passes
+itself as the anchor, as `Arc.get` does.
+
+#### Gotchas
+
+The caller must prove that the pointer addresses an initialized `T` that stays valid for the
+anchor's loan and that nothing mutates during it except through atomic operations.
+
+<a id="Pointer.impl.borrowMut"></a>
+
+### Associated function `borrowMut`
+
+```silk
+pub unsafe fn borrowMut<'a, A, T>(anchor: &'a mut A, pointer: *mut T) -> &'a mut T
+```
+
+Borrows the referent of a pointer exclusively for as long as the caller's exclusive loan of
+`anchor`.
+
+#### Details
+
+A guard that holds a lock passes itself as the anchor, as `MutexGuard.get` does, so the
+reference cannot outlive the lock.
+
+#### Gotchas
+
+The caller must prove that the pointer addresses an initialized `T` that stays valid for the
+anchor's loan and that nothing else reads or writes during it.
+
 <a id="Pointer.impl.readUnaligned"></a>
 
 ### Associated function `readUnaligned`
