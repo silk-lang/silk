@@ -9,7 +9,8 @@ parsing.
 Use [`Format.display`](#Format.impl.display) to write one value with default options. Use [`Format.displayWith`](#Format.impl.displayWith) to
 write one value with a width, fill, sign, or precision. Use [`Format.format`](#Format.impl.format) to write a
 template such as `"{name} has {count}"` with values from a tuple or record. Implement
-[`Display`](#Display) to make your own type usable with all three.
+[`Display`](#Display) to make your own type usable with all three. Implement [`Debug`](#Debug) to show a value
+for a programmer with `{:?}`, [`Format.debug`](#Format.impl.debug), and [`Format.debugWith`](#Format.impl.debugWith).
 
 Use [`Format.i32Value`](#Format.impl.i32Value), [`Format.f64Value`](#Format.impl.f64Value), and the other `...Value` functions to read decimal
 text back into a number. They accept the default output of `Display` for the same type.
@@ -146,7 +147,7 @@ pub fn main() -> i32 {
 
 Import as `Format` with `import silk.format { Format }`.
 
-Public declarations: 12.
+Public declarations: 13.
 
 <a id="Format"></a>
 
@@ -581,6 +582,109 @@ precision is the maximum number of Unicode scalars, and the rest is cut. Integer
 - `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
   failure stay written. Nothing is rolled back.
 
+<a id="Format.impl.debug"></a>
+
+### Associated function `debug`
+
+```silk
+pub effect fn debug<T: Debug>(value: &T) -> () ! WriterError ? &mut Writer
+```
+
+Writes the [`Debug`](#Debug) form of `value` to the ambient `Writer` with
+[`Format.defaultOptions`](#Format.impl.defaultOptions).
+
+#### When to use
+
+Use it to show a value to a programmer, for example in a log or a test failure. Strings show
+with quotes and escapes, so you can see spaces and control characters.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
+<a id="Format.impl.debugWith"></a>
+
+### Associated function `debugWith`
+
+```silk
+pub effect fn debugWith<T: Debug>(
+    value: &T,
+    options: FormatOptions
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes the [`Debug`](#Debug) form of `value` to the ambient `Writer` with `options`.
+
+#### Details
+
+`alternate` selects the pretty form, with one field or element on each line and four spaces
+of indentation for each level. Numbers apply the other options as `Display` does.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
+<a id="Format.impl.debugFields"></a>
+
+### Associated function `debugFields`
+
+```silk
+pub effect fn debugFields<T>(
+    value: &T,
+    static name: string<'static>,
+    formatter: &mut Formatter
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes the visible fields of `value` in the [`Debug`](#Debug) form, after `name`.
+
+#### When to use
+
+Use it to implement `Debug` for your struct in one line:
+`return run Format.debugFields(self, "Point", &mut formatter)`.
+
+#### Details
+
+A struct with labeled fields writes `Point { x: 1, y: 2 }`. A struct with positional fields
+writes `Pair(1, 2)`. With no visible field, only `name` is written. The pretty form
+([`Format.alternate`](#Format.impl.alternate)) puts each field on its own line. Every field must implement `Debug`;
+the compiler checks this for each type that you call it with.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
+#### Gotchas
+
+Reflection sees fields from this module, so it shows only the `pub` fields of your type. To
+show private fields, write the `Debug` implementation by hand.
+
+<a id="Format.impl.debugList"></a>
+
+### Associated function `debugList`
+
+```silk
+pub effect fn debugList<T: Debug>(
+    values: &[T],
+    formatter: &mut Formatter
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes the elements of `values` in the [`Debug`](#Debug) form, as `[1, 2, 3]`.
+
+#### When to use
+
+Use it to implement `Debug` for a type that holds a sequence. The pretty form
+([`Format.alternate`](#Format.impl.alternate)) puts each element on its own line.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
 <a id="Format.impl.format"></a>
 
 ### Associated function `format`
@@ -617,7 +721,8 @@ options are, in this order and each optional:
 - `.` and a precision in decimal digits.
 - A type: `x` lowercase hexadecimal, `X` uppercase hexadecimal, `o` octal, `b` binary. These
   need an integer, and `#` adds the prefix `0x`, `0o`, or `0b`. `e` and `E` write a float in
-  scientific notation, such as `1.25e3`; these need a float.
+  scientific notation, such as `1.25e3`; these need a float. `?` writes the [`Debug`](#Debug)
+  form, and `#?` the pretty `Debug` form.
 
 The compiler parses the options and checks the template and the fields. A placeholder without
 options uses [`Format.defaultOptions`](#Format.impl.defaultOptions). `format` borrows `args`.
@@ -1526,6 +1631,48 @@ effect fn displayExponent(
 Writes the value in the notation that [`Format.style`](#Format.impl.style) selects. A style that is not
 `Style.LowerExp` or `Style.UpperExp` writes the normal form.
 
+<a id="Debug"></a>
+
+## `Debug`
+
+```silk
+pub interface Debug
+```
+
+A type that can write itself for a programmer to read, as `{:?}` in [`Format.format`](#Format.impl.format).
+
+### When to use
+
+Implement `Debug` to show a value in logs, test failures, and assertions. Unlike `Display`, the
+output shows the structure of the value: strings are quoted and escaped, and a struct shows
+its fields. For a struct, call [`Format.debugFields`](#Format.impl.debugFields); for a sequence, call
+[`Format.debugList`](#Format.impl.debugList).
+
+### Details
+
+The standard integers, floats, and `bool` write the same text as `Display`. `string` and
+`char` write quotes and escapes. `Option` and `Result` write the variant and its value, such as
+`Some(3)`. [`Format.alternate`](#Format.impl.alternate) selects the pretty form, which puts each field on its own
+line. Nested values share the formatter, so the pretty form indents at each level.
+
+<a id="Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(
+    self: &Self,
+    formatter: &mut Formatter
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes the `Debug` form of the value through the ambient mutable Writer.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
 <a id="NotANumber"></a>
 
 ## `NotANumber`
@@ -2143,6 +2290,317 @@ effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? 
 ```
 
 Writes the character as text, like a one-scalar string. See [`Format.padText`](#Format.impl.padText).
+
+<a id="string.impl.Debug"></a>
+
+## Implementation `Debug for string<'text>`
+
+```silk
+impl<'text> Debug for string<'text>
+```
+
+<a id="string.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the string in double quotes, with `\"`, `\\`, `\n`, `\r`, `\t`, `\0`, and
+`\u{..}` escapes, as Rust does. Characters above ASCII are written as they are.
+
+#### Gotchas
+
+The width, fill, and precision do not apply.
+
+<a id="char.impl.Debug"></a>
+
+## Implementation `Debug for char`
+
+```silk
+impl Debug for char
+```
+
+<a id="char.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the character in single quotes, with the escapes of `string` and `\'`.
+
+<a id="Option.impl.Debug"></a>
+
+## Implementation `Debug for Option<T>`
+
+```silk
+impl<T: Debug> Debug for Option<T>
+```
+
+<a id="Option.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `None`, or `Some(` and the `Debug` form of the value and `)`.
+
+<a id="Result.impl.Debug"></a>
+
+## Implementation `Debug for Result<T, E>`
+
+```silk
+impl<T: Debug, E: Debug> Debug for Result<T, E>
+```
+
+<a id="Result.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `Success(` or `Failure(`, the `Debug` form of the payload, and `)`.
+
+<a id="bool.impl.Debug"></a>
+
+## Implementation `Debug for bool`
+
+```silk
+impl Debug for bool
+```
+
+<a id="bool.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="u8.impl.Debug"></a>
+
+## Implementation `Debug for u8`
+
+```silk
+impl Debug for u8
+```
+
+<a id="u8.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="u16.impl.Debug"></a>
+
+## Implementation `Debug for u16`
+
+```silk
+impl Debug for u16
+```
+
+<a id="u16.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="u32.impl.Debug"></a>
+
+## Implementation `Debug for u32`
+
+```silk
+impl Debug for u32
+```
+
+<a id="u32.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="u64.impl.Debug"></a>
+
+## Implementation `Debug for u64`
+
+```silk
+impl Debug for u64
+```
+
+<a id="u64.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="usize.impl.Debug"></a>
+
+## Implementation `Debug for usize`
+
+```silk
+impl Debug for usize
+```
+
+<a id="usize.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="i8.impl.Debug"></a>
+
+## Implementation `Debug for i8`
+
+```silk
+impl Debug for i8
+```
+
+<a id="i8.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="i16.impl.Debug"></a>
+
+## Implementation `Debug for i16`
+
+```silk
+impl Debug for i16
+```
+
+<a id="i16.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="i32.impl.Debug"></a>
+
+## Implementation `Debug for i32`
+
+```silk
+impl Debug for i32
+```
+
+<a id="i32.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="i64.impl.Debug"></a>
+
+## Implementation `Debug for i64`
+
+```silk
+impl Debug for i64
+```
+
+<a id="i64.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="isize.impl.Debug"></a>
+
+## Implementation `Debug for isize`
+
+```silk
+impl Debug for isize
+```
+
+<a id="isize.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="f32.impl.Debug"></a>
+
+## Implementation `Debug for f32`
+
+```silk
+impl Debug for f32
+```
+
+<a id="f32.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
+
+<a id="f64.impl.Debug"></a>
+
+## Implementation `Debug for f64`
+
+```silk
+impl Debug for f64
+```
+
+<a id="f64.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the same text as `Display`.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
