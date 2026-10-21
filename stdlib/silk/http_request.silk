@@ -1,9 +1,111 @@
-//! Origin-bound HTTP request preparation with finite storage and explicit header policy.
+//! Check and write the head of an HTTP request before it is sent.
+//!
+//! # When to use
+//! Use [`fromUri`] or [`prepare`] to make a [`PreparedRequest`] for a direct connection to an
+//! origin. `silk.http_exchange` sends it. Use [`prepareForward`] and [`prepareConnect`] for a route
+//! from `silk.http_proxy`. Most programs use `silk.http_client` or `silk.http_fetch`, which call
+//! this module.
 //!
 //! # Details
-//! `prepare` owns the direct serialized head before an exchange can send bytes. The routed
-//! operations require a policy-selected proxy route. They derive the proxy peer and authentication
-//! from that route. All operations generate framing fields and reject conflicting caller fields.
+//! The [`HeaderPolicy`] adds `Host`, `User-Agent`, `Accept`, and `Authorization`. The [`BodyMode`]
+//! adds `Content-Length` or `Transfer-Encoding`. You cannot also give these fields, or `Expect` and
+//! `Connection`, in `headers`. Your other fields keep their order. The prepared request owns a copy
+//! of all its bytes. Nothing is sent and nothing is resolved here.
+//!
+//! # Errors
+//! - [`RequestError`] tells which check failed. Nothing was sent.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! By default, Basic credentials fail over plain HTTP with `InsecureBasic`. Set `basicSecurity` to
+//! `AllowInsecureBasic` only when you accept that the password is sent as plain text.
+//!
+//! # Examples
+//! ## Prepare a GET request
+//! ```silk
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.http { Header, Method, ValueError, Version }
+//! import silk.http_headers { Headers, Limits }
+//! import silk.http_request { BodyMode, HeaderPolicy, PreparedRequest, RequestError, fromUri }
+//! import silk.result { Result }
+//! import silk.uri { Uri }
+//! import silk.uri_reference { ParseError }
+//! import silk.usize
+//!
+//! fn limits() -> Limits {
+//!   return Limits {
+//!     maxMethodBytes: 64,
+//!     maxTargetBytes: 8192,
+//!     maxNameBytes: 256,
+//!     maxValueBytes: 8192,
+//!     maxFields: 32,
+//!     maxFieldBytes: 8192,
+//!     maxOwnedBytes: 16384,
+//!   }
+//! }
+//!
+//! fn check(actual: &[u8], expected: &[u8]) -> i32 {
+//!   let mut i = usize.ZERO
+//!   while i < actual.length && i < expected.length {
+//!     if actual[i] != expected[i] {
+//!       return 1
+//!     }
+//!     i = i + usize.ONE
+//!   }
+//!   if actual.length != expected.length {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! RequestError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let uri = match Uri.parse("http://example.com/a?b#frag") {
+//!     Result<Uri, ParseError>.Success { value } => value
+//!     Result<Uri, ParseError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let entries: [Header<'static>; 0] = []
+//!   let headers = match Headers.make(&entries, limits()) {
+//!     Result<Headers, ValueError>.Success { value } => value
+//!     Result<Headers, ValueError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let policy = HeaderPolicy.defaults()
+//!   let prepared = run fromUri(
+//!     &uri,
+//!     Version.Http11,
+//!     Method.get(),
+//!     &headers,
+//!     &policy,
+//!     BodyMode.Empty,
+//!     false,
+//!     limits(),
+//!     4096,
+//!     256
+//!   )
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // The fragment is not sent, and the policy adds Host, User-Agent, and Accept.
+//!   return check(
+//!     PreparedRequest.bytes(&prepared),
+//!     b"GET /a?b HTTP/1.1\r\nHost: example.com\r\nUser-Agent: silk-http/1\r\nAccept: */*\r\n\r\n"
+//!   )
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
 
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
@@ -26,61 +128,62 @@ import silk.uri {Uri}
 import silk.usize
 import silk.list {List}
 
-/// The exact request payload delimiter.
+/// How the request body is framed.
 pub union BodyMode {
-  /// Sends no request payload.
+  /// There is no body. No framing field is sent.
   Empty,
-  /// Sends exactly this many payload bytes.
+  /// The body has a known length. `Content-Length` is sent.
   KnownLength {
-    /// The exact payload length.
+    /// The length of the body, in bytes.
     pub length: u64,
   },
-  /// Sends HTTP/1.1 chunks and explicit trailers.
+  /// The body is sent in chunks, with trailers. `Transfer-Encoding: chunked` is sent. Only for
+  /// HTTP/1.1.
   Chunked,
 }
 
 impl Copy for BodyMode {}
 
-/// A generated field policy that distinguishes omission from a default.
+/// What to do with a field that the policy makes.
 pub union HeaderControl<'value> {
-  /// Generates the documented default value.
+  /// Send the default value. See [`HeaderPolicy`].
   Default,
-  /// Deliberately omits the field when the protocol permits it.
+  /// Do not send the field. HTTP/1.1 cannot omit `Host`.
   Omit,
-  /// Uses one explicit validated value.
+  /// Send this value.
   Value {
-    /// The caller-owned semantic field bytes.
+    /// The field value, without the spaces around it.
     pub value: &'value [u8],
   },
 }
 
 impl<'value> Copy for HeaderControl<'value> {}
 
-/// One explicit authorization source.
+/// The `Authorization` field to send.
 pub union Authorization<'value> {
-  /// Sends no generated authorization field.
+  /// Send no `Authorization` field.
   Absent,
-  /// Sends one explicit validated field value.
+  /// Send this value, such as `Bearer abc`.
   Value {
-    /// The complete authorization field value.
+    /// The whole field value.
     pub value: &'value [u8],
   },
-  /// Encodes caller-selected username and password bytes.
+  /// Send HTTP Basic credentials. See `silk.http_basic`.
   Basic {
-    /// Username bytes without colon or controls.
+    /// The username. It cannot have a colon or a control byte.
     pub username: &'value [u8],
-    /// Password bytes without controls.
+    /// The password. It cannot have a control byte.
     pub password: &'value [u8],
   },
 }
 
 impl<'value> Copy for Authorization<'value> {}
 
-/// Explicit permission to send Basic credentials without TLS.
+/// Whether Basic credentials can go over plain HTTP.
 pub enum BasicSecurity {
-  /// Rejects Basic credentials for a plaintext origin.
+  /// Basic credentials need HTTPS. Over plain HTTP, the request fails with `InsecureBasic`.
   RequireTls,
-  /// Permits plaintext Basic without changing HTTPS authentication.
+  /// Basic credentials can go over plain HTTP, where anyone on the path can read them.
   AllowInsecureBasic,
 }
 
@@ -99,26 +202,28 @@ union Admission<'configuration> {
 
 impl<'configuration> Copy for Admission<'configuration> {}
 
-/// Policy for generated request fields and connection persistence.
+/// The fields that the request adds. Start from [`HeaderPolicy.defaults`].
 pub struct HeaderPolicy<'value> {
-  /// Defaults to the normalized origin authority; HTTP/1.1 cannot omit it.
+  /// The `Host` field. The default is the authority of the origin, such as `example.com:8080`.
   pub host: HeaderControl<'value>
-  /// Defaults to `silk-http/1`.
+  /// The `User-Agent` field. The default is `silk-http/1`.
   pub userAgent: HeaderControl<'value>
-  /// Defaults to `*/*`.
+  /// The `Accept` field. The default is `*/*`.
   pub accept: HeaderControl<'value>
-  /// One optional explicit authorization source.
+  /// The `Authorization` field. The default is none.
   pub authorization: Authorization<'value>
-  /// Requires TLS for Basic unless explicitly overridden.
+  /// Whether Basic credentials can go over plain HTTP. The default is `RequireTls`.
   pub basicSecurity: BasicSecurity
-  /// Permits HTTP/1.0 keep-alive; HTTP/1.1 uses normal persistence.
+  /// When `true`, an HTTP/1.0 request sends `Connection: keep-alive`. HTTP/1.1 keeps the connection
+  /// by default.
   pub http10KeepAlive: bool
 }
 
 impl<'value> Copy for HeaderPolicy<'value> {}
 
 impl<'value> HeaderPolicy<'value> {
-  /// Returns generated defaults, absent authorization, and plaintext Basic rejection.
+  /// Returns the default policy: default `Host`, `User-Agent`, and `Accept`, no `Authorization`,
+  /// and `RequireTls`.
   pub fn defaults() -> HeaderPolicy<'value> {
     return HeaderPolicy<'value> {
       host: HeaderControl<'value>.Default,
@@ -131,46 +236,48 @@ impl<'value> HeaderPolicy<'value> {
   }
 }
 
-/// A precise preflight failure with no network side effects.
+/// The reason that a request was not prepared. Nothing was sent.
 pub union RequestError {
-  /// A shared HTTP value failed validation.
+  /// A method, target, or field is not valid.
   Value {
-    /// The original value failure.
+    /// The error from `silk.http`.
     pub error: ValueError,
   },
-  /// An origin could not be constructed or serialized.
+  /// The origin is not valid, or its authority does not fit.
   Origin {
-    /// The original origin failure.
+    /// The error from `silk.http_origin`.
     pub error: OriginError,
   },
-  /// Credentials failed strict Basic encoding.
+  /// The Basic credentials are not valid.
   Basic {
-    /// The credential failure, without credential bytes.
+    /// The error from `silk.http_basic`. It does not hold the credentials.
     pub error: BasicError,
   },
-  /// A caller field conflicts with generated policy.
+  /// `headers` has a field that the policy or the body mode makes, such as `Host` or
+  /// `Content-Length`.
   ConflictingHeader,
-  /// The explicit Host differs from the connection origin.
+  /// The `Host` value in the policy names another origin.
   ConflictingAuthority,
-  /// HTTP/1.1 cannot omit Host.
+  /// The policy omits `Host` in an HTTP/1.1 request.
   MissingHost,
-  /// The body or continue mode is unavailable for the selected version.
+  /// The body mode or `require100` does not work with the version. For example, HTTP/1.0 cannot
+  /// send chunks.
   InvalidBodyMode,
-  /// More than one authorization source was supplied.
+  /// There is more than one source of credentials.
   MultipleAuthorization,
-  /// Plaintext Basic lacks explicit permission.
+  /// Basic credentials would go over plain HTTP. See [`BasicSecurity`].
   InsecureBasic,
-  /// A direct request supplies proxy credentials.
+  /// A direct request has a `Proxy-Authorization` field. Proxy credentials come only from a route.
   ProxyAuthorization,
-  /// Credential bytes exceed the finite budget.
+  /// The credentials are longer than `maxCredentialBytes`.
   CredentialLimit,
-  /// Generated or copied fields exceed the configured finite count.
+  /// The request has more fields than the limits allow.
   HeaderLimit,
-  /// A direct request uses an absolute target for another origin.
+  /// A direct request has an absolute target for another origin.
   InvalidTarget,
 }
 
-/// One owned, origin-bound, preflighted head with unforgeable framing policy.
+/// A checked request head, written as bytes and ready to send. It owns its memory.
 pub struct PreparedRequest {
   storage: Bytes
   length: usize
@@ -182,38 +289,38 @@ pub struct PreparedRequest {
 }
 
 impl PreparedRequest {
-  /// Borrows the serialized request head until this owner is dropped.
+  /// Returns the bytes of the head, ending with the empty line.
   pub fn bytes<'a>(self: &'a Self) -> &'a [u8] {
     return Slice.view<u8>(Bytes.asSlice(&self.storage), usize.ZERO, self.length)
   }
-  /// Returns the logical request origin used for target, Host, and origin credentials.
+  /// Returns the origin that the request is for.
   pub fn origin(self: &Self) -> Origin {
     return self.logicalOriginValue
   }
-  /// Returns the physical peer on whose connection this request is admitted.
+  /// Returns the server to connect to. It is the origin, or the proxy for a routed request.
   pub fn physicalPeer(self: &Self) -> Origin {
     return self.physicalPeerValue
   }
-  /// Returns the admitted HTTP version.
+  /// Returns the HTTP version.
   pub fn version(self: &Self) -> Version {
     return self.versionValue
   }
-  /// Returns the exact selected body delimiter.
+  /// Returns how the body is framed.
   pub fn bodyMode(self: &Self) -> BodyMode {
     return self.bodyValue
   }
-  /// Returns whether the head contains the generated 100-continue expectation.
+  /// Returns `true` if the head has `Expect: 100-continue`.
   pub fn require100(self: &Self) -> bool {
     return self.continueValue
   }
 }
 
-/// Validates and serializes one request before any transport operation.
+/// Checks a request to `origin` and writes its head.
 ///
 /// # Details
-/// Caller fields preserve order. Host, User-Agent, Accept, framing, Expect, and Connection belong
-/// to policy and cannot also occur in `headers`. Output owns all borrowed input bytes.
-/// `maxHeadBytes` and `maxCredentialBytes` bound owned head and credential storage.
+/// Your fields in `headers` keep their order. When `require100` is `true`, the head has `Expect:
+/// 100-continue`, and the client waits for the server before it sends the body. `maxHeadBytes`
+/// limits the size of the head, and `maxCredentialBytes` the size of the credentials.
 pub effect fn prepare<'value>(
   origin: &Origin,
   version: Version,
@@ -244,14 +351,12 @@ pub effect fn prepare<'value>(
   )
 }
 
-/// Prepares one Forward route as an origin-bound absolute-form request for its plain proxy peer.
+/// Prepares a request for a `Forward` route, which sends it to a plain HTTP proxy.
 ///
 /// # Details
-///
-/// The sealed route is the only source of the physical peer and `Proxy-Authorization`. The
-/// original URI spelling is preserved except that user information and fragments are excluded and
-/// an empty path becomes `/`. Forward preparation always generates the logical-origin Host,
-/// including for HTTP/1.0.
+/// The target is the full URI, without user information and fragment, and an empty path becomes
+/// `/`. The route gives the proxy and its `Proxy-Authorization`. `Host` is always sent, also for
+/// HTTP/1.0.
 pub effect fn prepareForward<'configuration, 'value>(
   route: &Route<'configuration>,
   uri: &Uri<'value>,
@@ -326,13 +431,10 @@ pub effect fn prepareForward<'configuration, 'value>(
   )
 }
 
-/// Prepares the one body-free HTTP/1.1 CONNECT head admitted by a Tunnel route.
+/// Prepares the HTTP/1.1 `CONNECT` request for a `Tunnel` route.
 ///
-/// # Details
-///
-/// The authority-form target and Host are both derived from the route's normalized original
-/// origin and always include its effective port. Callers cannot supply fields, a body, a physical
-/// peer, or proxy credentials.
+/// The target and `Host` are `host:port` of the origin, always with the port. You cannot give
+/// fields, a body, or credentials. The route gives them.
 pub effect fn prepareConnect<'configuration>(
   route: &Route<'configuration>,
   limits: Limits,
@@ -996,7 +1098,8 @@ effect fn prepareCore<'configuration, 'value>(
   }
 }
 
-/// Converts a validated URI to an origin-form request with query and no fragment.
+/// Prepares a direct request for `uri`, like [`prepare`]. The origin and the target come from
+/// `uri`. The fragment is not sent.
 pub effect fn fromUri<'value>(
   uri: &Uri<'value>,
   version: Version,
