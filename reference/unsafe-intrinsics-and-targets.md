@@ -1181,8 +1181,10 @@ calling convention and external linkage, emits the fatal unwind guard, and recor
 
 **Status:** Confirmed
 
-Native artifacts retain direct external symbols for the linker. Foreign calls are unavailable on
-the current LLVM-to-Wasm target, under the same reachability rule as
+Native artifacts retain direct external symbols for the linker. LLVM-to-Wasm admits direct calls
+with scalar and address-space-zero pointer lanes and leaves their symbols undefined for final
+linkage; C statics, variadic tails and callback lanes stay unavailable there, under the same
+reachability rule as
 [TARGET-001](#target-001--intrinsic-availability-is-checked-only-for-the-selected-executable-closure).
 
 Parsing, importing, indexing, or retaining an uncalled foreign declaration does not reject a
@@ -1191,8 +1193,9 @@ reachable foreign function contributes exactly one external declaration to a nat
 unreachable one contributes nothing, as
 [TARGET-002](#target-002--unreachable-target-specific-primitives-have-no-artifact-cost) requires.
 
-**Boundary:** This does not grant WebAssembly an ambient linker or import convention. Foreign
-imports and exports are native-only during the LLVM-first phase.
+**Boundary:** This does not grant WebAssembly an ambient linker or import convention. An
+undefined Wasm symbol resolves only against objects named for final linkage, such as the source
+runtime; it never becomes a host import by default.
 
 **Diagnostics:** LLVM-wasm foreign calls and foreign exports on a non-native target report
 `SEM0193`, naming the symbol and requested target or surface, in the
@@ -1200,8 +1203,8 @@ imports and exports are native-only during the LLVM-first phase.
 does not suggest catching a failure or adding an unsafe block.
 
 **Current compiler:** Aligned. The executable origin collects reachable foreign calls beside
-intrinsic calls. Native LLVM emission declares their C ABI symbols and records deterministic
-metadata; LLVM-to-Wasm rejects the reachable operation before emission.
+intrinsic calls. LLVM emission declares their C ABI symbols and records deterministic metadata;
+LLVM-to-Wasm rejects a reachable C static, variadic tail or callback lane before emission.
 
 **Evidence:** foreign function specification,
 [C ABI classification](../bootstrap/packages/compiler/src/CAbi.ts).
