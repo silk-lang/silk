@@ -76,18 +76,22 @@ script and update its entry. Measured on 2026-10-21:
 | Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |
 | --- | --- | --- | --- | --- |
 | initial check | 132,048 | 15,869,737 | 64,550 | 2,185,506 |
-| trivia | 1 | 6.8% | 14 | 9.7% |
-| body | 2 | 6.8% | 15 | 9.7% |
-| header, same type | 529 | 16.0% | 657 | 17.2% |
-| add | 530 | 16.0% | 658 | 17.2% |
+| trivia | 531 | 16.0% | 684 | 17.2% |
+| body | 2 | 6.8% | 684 | 17.2% |
+| header, same type | 531 | 16.0% | 684 | 17.2% |
+| add | 535 | 16.0% | 688 | 17.2% |
 | header, new type | 530 | 16.0% | 658 | 17.2% |
-| delete | 526 | 16.0% | 654 | 17.2% |
+| delete | 531 | 16.0% | 684 | 17.2% |
 | rename | 8 | 6.2% | 176 | 9.9% |
 
-The units that still rerun on a trivia edit are MIR lowerings, whose `module:line:column` site
-labels move with the lines. Header, add and delete edits rerun every transitive depender, since
-unit results have no early cutoff yet. On a 4-core x86_64 machine the compiler's first check took
-about 74 s and each edit's recheck 7 to 18 s, almost all of it the walk over every root.
+Implementation heads and members store absolute spans, so their units observe where each span
+sits, and an edit that moves an `impl` reruns its heads. That is why the trivia edit, and the
+standard library's body edit, which changes a line's length above `impl` blocks, cost as much as
+a header edit: unit results have no early cutoff yet, so every transitive depender of a head
+reruns too. The units that rerun on a trivia edit away from any `impl` are MIR lowerings, whose
+`module:line:column` site labels move with the lines. On a 4-core x86_64 machine the compiler's
+first check took about 74 s and each edit's recheck 7 to 18 s, almost all of it the walk over
+every root.
 
 ## Check roots
 
