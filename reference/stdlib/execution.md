@@ -14,8 +14,10 @@ Construction obtains one combined package from the selected `Allocator`
 and does not start the Effect. The body representation, continuation, and fixed readiness
 endpoint remain private. A nested `Effect.suspend` transfers execution
 immediately. In contrast, [`park`](#Execution.impl.park) relinquishes the Execution until one [`Wake`](#Wake) makes it
-eligible. The readiness phase and the park generation are ordinary source policy kept in two
-package control words; the compiler only stores them.
+eligible. The readiness phase and the park generation are ordinary source policy kept together
+in one package control word; the compiler only loads, stores and compare-exchanges it. A Wake
+may be signaled from another thread: every transition is one compare-exchange of that word,
+and readiness is published before the endpoint runs (EXEC-009).
 
 ## Gotchas
 `Execution` is affine. The readiness callback must be detached and non-parking. [`make`](#Execution.impl.make) can
