@@ -164,3 +164,34 @@ pub fn main() -> i32 {
 **Diagnostics:** `SEM0121` at the use, naming the goal, such as `` `Shared<i32>: Transferable` ``.
 
 **Current compiler:** Aligned.
+
+## THREAD-005 — `silk.native_thread` runs a Transferable closure on a new native thread
+
+**Status:** Confirmed
+
+`NativeThread.spawn<T, F>(work: F) -> JoinHandle<T>` starts `work` on a new operating-system
+thread. `F` is a detached, `'static`, `Transferable` closure returning a `Transferable` `T`, so the
+closure owns everything it captures and nothing it holds is shared with the spawning thread.
+`JoinHandle.join` waits for the thread and returns the value.
+
+```silk,ignore
+let handle = run NativeThread.spawn(fn() -> i32 { return compute(move input) })
+  |> Effect.provideMut<Allocator>(&mut allocator)
+let value = handle.join()
+```
+
+Each thread drives its closure as the body of one transferable Execution package (EXEC-010), so one
+non-generic C entry point, passed to `pthread_create` with `threadCallbacks`, starts closures of any
+type. The start and result cells come from the selected `Allocator`.
+
+**Boundary:** Darwin and GNU libc targets only; other targets report a compile-time error at the
+use. Dropping an unjoined handle waits for the thread, since the handle owns the result storage the
+thread writes. A fatal trap on any thread ends the process.
+
+**Diagnostics:** A closure or result without its bound reports `SEM0121`. Thread creation failure
+is the typed `SpawnError` carrying the `pthread_create` error number.
+
+**Evidence:** [native threads](../stdlib/silk/native_thread.silk), native corpus
+(`native-thread-spawn-join`, `native-thread-cross-wake`).
+
+**Current compiler:** Aligned.

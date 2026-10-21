@@ -1,0 +1,202 @@
+//! Operating-system threads that run one Transferable closure and return its result.
+//!
+//! # When to use
+//! Use [`spawn`] to run independent work on a new native thread, and [`JoinHandle.join`] to wait
+//! for its result.
+//!
+//! # Details
+//! The closure and its result must be `Transferable`, and the closure must be detached: it owns
+//! everything it captures, so it borrows nothing from the spawning caller. Each thread runs its
+//! closure as the body of one transferable Execution package (EXEC-010), which is how one
+//! non-generic C entry point starts closures of any type. Threads use `pthread_create` on Darwin
+//! and GNU libc targets.
+//!
+//! # Gotchas
+//! Dropping a [`JoinHandle`] without joining waits for the thread, so the result storage it owns
+//! outlives every write to it. A fatal trap on any thread ends the whole process.
+//!
+//! # Examples
+//! ## Compute on another thread
+//! ```silk,ignore
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.native_thread { NativeThread, SpawnError }
+//!
+//! fn answer() -> i32 { return 42 }
+//!
+//! effect fn program() -> i32 ! OutOfMemoryError | SpawnError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let handle = run NativeThread.spawn(answer) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   return handle.join()
+//! }
+//! ```
+
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.box { Box }
+import silk.execution { Execution, TransferableExecution }
+import silk.ownership { Drop }
+import silk.pointer { Pointer }
+import silk.thread { Transferable }
+
+unsafe extern "C" fn pthread_create(
+  thread: *mut usize,
+  attributes: ?*const u8,
+  start: extern "C" fn(?*mut u8) -> ?*mut u8,
+  argument: ?*mut u8,
+) -> i32 with Intrinsic.foreign(threadCallbacks: ("start",))
+unsafe extern "C" fn pthread_join(thread: usize, result: ?*mut ?*mut u8) -> i32
+
+/// The thread could not be created, for example because a resource limit was reached.
+pub struct SpawnError {
+  /// The error number `pthread_create` returned.
+  pub code: i32
+}
+
+// The package a new thread drives, until the thread takes it.
+struct Waiting { execution: TransferableExecution<()> }
+struct Taken {}
+struct StartCell { state: Waiting | Taken }
+
+// The closure's result, written once by the thread before it ends.
+struct Pending {}
+struct Done<T> { value: T }
+struct ResultCell<T> { state: Pending | Done<T> }
+
+// The address of the result storage the joining handle owns, a `ResultCell<T>`. Only the thread
+// writes through it, and the handle reads only after `pthread_join` returns, which orders the two.
+struct ResultAddress<T> { pointer: *mut u8 }
+impl<T: Transferable> Transferable for ResultAddress<T> {}
+
+/// The owner of one running native thread and the storage for its result.
+///
+/// # Gotchas
+///
+/// Dropping a handle without calling [`join`] waits for the thread and drops its result.
+pub struct JoinHandle<T> {
+  thread: usize
+  joined: bool
+  start: Box<StartCell>
+  result: Box<ResultCell<T>>
+}
+
+impl<T> JoinHandle<T> {
+  /// Waits for the thread to finish and returns the value its closure produced.
+  pub fn join(self: Self) -> T {
+    let mut handle = move self
+    handle.wait()
+    let finished = Intrinsic.replace(handle.result.getMut()[0].state, Pending {})
+    return match move finished {
+      Pending nothing => unfinished<T>()
+      Done<T> { value } => move value
+    }
+  }
+
+  fn wait(self: &mut Self) -> () {
+    if self.joined { return () }
+    self.joined = true
+    if unsafe pthread_join(self.thread, Pointer.null<?*mut u8>()) != 0 { failedJoin() }
+    return ()
+  }
+}
+
+impl<T> Drop for JoinHandle<T> {
+  fn drop(self: &mut JoinHandle<T>) -> () {
+    self.wait()
+    return ()
+  }
+}
+
+/// The owner of native thread creation.
+pub struct NativeThread {}
+
+impl NativeThread {
+  /// Starts `work` on a new native thread and returns the handle that joins it.
+  ///
+  /// # Details
+  ///
+  /// The thread's start storage and result storage come from the selected `Allocator`. Creation
+  /// failure reports [`SpawnError`] and drops `work` without running it.
+  pub effect<'static> fn spawn<
+    T: 'static + Transferable,
+    F: 'static + once fn() -> T + Intrinsic.Detached + Transferable
+  >(work: F) -> JoinHandle<T>
+  ! OutOfMemoryError | SpawnError
+  ? &mut Allocator {
+    supportedTarget()
+    let handle = run startThread<T, F>(move work)
+    return move handle
+  }
+}
+
+// Native threads use `pthread_create`, which Darwin and GNU libc provide.
+fn supportedTarget() -> () {
+  static if Intrinsic.targetOperatingSystem() == "darwin" || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.profileText("libc") == "gnu") {
+    return ()
+  } else { compileError("Native threads require a Darwin or GNU libc target") }
+}
+
+// Allocates the result and start cells, packages `work`, and creates the thread.
+effect<'static> fn startThread<
+  T: 'static + Transferable,
+  F: 'static + once fn() -> T + Intrinsic.Detached + Transferable
+>(work: F) -> JoinHandle<T>
+! OutOfMemoryError | SpawnError
+? &mut Allocator {
+  let mut result = run Box<ResultCell<T>>.make(ResultCell<T> { state: Pending {} })
+  let cell = Pointer.fromMutRef(&mut result.getMut()[0])
+  let address = ResultAddress<T> { pointer: unsafe Intrinsic.pointerReinterpret<*mut ResultCell<T>, *mut u8>(cell) }
+  let execution = run Execution.makeTransferable(runWork<T, F>(move work, move address), (), ready)
+  let mut start = run Box<StartCell>.make(StartCell { state: Waiting { execution: move execution } })
+  let startCell = Pointer.fromMutRef(&mut start.getMut()[0])
+  let erased = unsafe Intrinsic.pointerReinterpret<*mut StartCell, *mut u8>(startCell)
+  let argument = unsafe Intrinsic.pointerRequalify<*mut u8, ?*mut u8>(erased)
+  let mut thread: usize = 0
+  let code = unsafe pthread_create(Pointer.fromMutRef(&mut thread), Pointer.null<u8>(), silkNativeThreadStart, argument)
+  if code != 0 { fail SpawnError { code: code } }
+  return JoinHandle<T> { thread: thread, joined: false, start: move start, result: move result }
+}
+
+// The thread body: run the closure and store its value where the handle will read it.
+effect fn runWork<T, F: once fn() -> T>(work: F, address: ResultAddress<T>) -> () {
+  let value = work()
+  unsafe {
+    let cell = Intrinsic.pointerReinterpret<*mut u8, *mut ResultCell<T>>(address.pointer)
+    Pointer.put<ResultCell<T>>(cell, ResultCell<T> { state: Done<T> { value: move value } })
+  }
+  return ()
+}
+
+fn ready(state: &()) -> () { return () }
+
+// The one C entry point every thread starts in. It takes the package out of the start cell, so
+// the handle's later drop of that cell finds it empty, and drives it to completion.
+export "C" fn silkNativeThreadStart(argument: ?*mut u8) -> ?*mut u8 {
+  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(argument)
+  let cell = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut StartCell>(present)
+  let taken = unsafe Pointer.take<StartCell>(cell)
+  unsafe { Pointer.put<StartCell>(cell, StartCell { state: Taken {} }) }
+  let StartCell { state } = move taken
+  match move state {
+    Waiting { execution } => run Execution.drive(execution.local(), (), completed, suspended)
+    Taken nothing => ()
+  }
+  return Pointer.null<u8>()
+}
+
+fn completed(state: (), value: ()) -> () { return () }
+
+// A closure body cannot park, so its package never suspends.
+fn suspended(state: (), execution: Intrinsic.Execution<()>) -> () {
+  let unreachable = 1 / 0
+  return ()
+}
+
+fn failedJoin() -> () {
+  let invalid = 1 / 0
+  return ()
+}
+
+fn unfinished<T>() -> T {
+  let boom = 1 / 0
+  return unfinished<T>()
+}
