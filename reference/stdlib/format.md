@@ -146,7 +146,7 @@ pub fn main() -> i32 {
 
 Import as `Format` with `import silk.format { Format }`.
 
-Public declarations: 11.
+Public declarations: 12.
 
 <a id="Format"></a>
 
@@ -616,7 +616,8 @@ options are, in this order and each optional:
 - A width in decimal digits.
 - `.` and a precision in decimal digits.
 - A type: `x` lowercase hexadecimal, `X` uppercase hexadecimal, `o` octal, `b` binary. These
-  need an integer, and `#` adds the prefix `0x`, `0o`, or `0b`.
+  need an integer, and `#` adds the prefix `0x`, `0o`, or `0b`. `e` and `E` write a float in
+  scientific notation, such as `1.25e3`; these need a float.
 
 The compiler parses the options and checks the template and the fields. A placeholder without
 options uses [`Format.defaultOptions`](#Format.impl.defaultOptions). `format` borrows `args`.
@@ -630,7 +631,7 @@ options uses [`Format.defaultOptions`](#Format.impl.defaultOptions). `format` bo
 
 One template cannot mix `{}` and `{name}`. A template with `{}` must use each tuple field
 exactly one time. A malformed template, a malformed option, a field that does not exist, or
-a base type such as `x` on a value that is not an integer is a compile error. The width and the precision are fixed in the template; to take them
+a type such as `x` on a value that it does not apply to is a compile error. The width and the precision are fixed in the template; to take them
 from a value, use [`Format.displayWith`](#Format.impl.displayWith). `Sign.Space` and `color` are available only
 through [`FormatOptions`](#FormatOptions).
 
@@ -691,14 +692,14 @@ effect fn render() -> ()
   run Format.format("{name} is {age} {{years}}. ", &user)
   let price = .{ item: "tea", cost: 2.5 }
   run Format.format("[{item:.<6}{cost:>6.2}] ", &price)
-  return run Format.format("{:#06x} {:b}", &(255, 5))
+  return run Format.format("{:#06x} {:b} {:.2e}", &(255, 5, 1234.5))
 }
 
 pub effect fn main() -> i32
   ! WriterError {
   let mut writer = CaptureWriter { bytes: [0; 64], length: 0 }
   run render() |> Effect.provideMut<Writer>(&mut writer)
-  if !holds(&writer, b"3 + 4 = 7. Ada is 36 {years}. [tea...  2.50] 0x00ff 101") {
+  if !holds(&writer, b"3 + 4 = 7. Ada is 36 {years}. [tea...  2.50] 0x00ff 101 1.23e3") {
     return 1
   }
   return 0
@@ -1126,8 +1127,9 @@ The base or notation that a number displays in.
 
 ### Details
 
-The standard integers use every style. Other standard types ignore it. With the alternate
-form, the integers write the prefix `0x`, `0o`, or `0b` before the digits.
+The standard integers use the base styles: `LowerHex`, `UpperHex`, `Octal`, and `Binary`. With
+the alternate form, they write the prefix `0x`, `0o`, or `0b` before the digits. The standard
+floats use `LowerExp` and `UpperExp`. Each standard type ignores the other styles.
 
 ### Gotchas
 
@@ -1183,6 +1185,28 @@ Binary
 ```
 
 Base 2.
+
+<a id="Style.LowerExp"></a>
+
+### `LowerExp`
+
+```silk
+LowerExp
+```
+
+Scientific notation with a lowercase `e`, such as `1.25e3`. The significand has one digit
+before the point. Without a precision, its digits are the shortest that parse back to the
+same bits. With a precision, it has that many fractional digits, rounded half to even.
+
+<a id="Style.UpperExp"></a>
+
+### `UpperExp`
+
+```silk
+UpperExp
+```
+
+Scientific notation with an uppercase `E`, such as `1.25E3`.
 
 <a id="FormatOptions"></a>
 
@@ -1452,7 +1476,7 @@ Implement it for your own integer type to use it with the `x`, `X`, `o`, and `b`
 
 [`Format.format`](#Format.impl.format) calls `displayRadix` for a placeholder with a base type, so a base type on a
 value that is not an integer is a compile error. The options carry the base in
-[`FormatOptions.style`](#FormatOptions.style).
+[`FormatOptions.style`](#FormatOptions.style). A style that is not a base, such as `Style.LowerExp`, is decimal.
 
 <a id="RadixDisplay.displayRadix"></a>
 
@@ -1465,7 +1489,42 @@ effect fn displayRadix(
   ) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in the base that [`Format.style`](#Format.impl.style) selects. `Style.Default` is decimal.
+Writes the value in the base that [`Format.style`](#Format.impl.style) selects. A style that is not a base is
+decimal.
+
+<a id="ExponentDisplay"></a>
+
+## `ExponentDisplay`
+
+```silk
+pub interface ExponentDisplay
+```
+
+A float type that can display in scientific notation.
+
+### When to use
+
+Implement it for your own float type to use it with the `e` and `E` types in
+[`Format.format`](#Format.impl.format). `f32` and `f64` implement it.
+
+### Details
+
+[`Format.format`](#Format.impl.format) calls `displayExponent` for a placeholder with `e` or `E`, so these types on a
+value that is not a float are a compile error.
+
+<a id="ExponentDisplay.displayExponent"></a>
+
+### Operation `displayExponent`
+
+```silk
+effect fn displayExponent(
+    self: &Self,
+    formatter: &mut Formatter
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes the value in the notation that [`Format.style`](#Format.impl.style) selects. A style that is not
+`Style.LowerExp` or `Style.UpperExp` writes the normal form.
 
 <a id="NotANumber"></a>
 
@@ -1955,12 +2014,29 @@ writes exactly that many fractional digits instead.
 #### Details
 
 The default output parses back to the same value with [`Format.f64Value`](#Format.impl.f64Value). Negative zero
-displays as `-0`. Sign, width, fill, alignment, and zero padding apply.
+displays as `-0`. `Style.LowerExp` and `Style.UpperExp` write scientific notation, such as
+`1.25e3`. Sign, width, fill, alignment, and zero padding apply.
 
 #### Gotchas
 
-`NaN` displays as `NaN`, and infinity displays as `Infinity` with a sign from the sign rule.
-Both ignore precision and pad with the fill character, never with zeros.
+`NaN` displays as `NaN`, and infinity displays as `Infinity` with a sign from the sign rule,
+in every style. Both ignore precision and pad with the fill character, never with zeros.
+
+<a id="f64.impl.ExponentDisplay"></a>
+
+## Implementation `ExponentDisplay for f64`
+
+```silk
+impl ExponentDisplay for f64
+```
+
+<a id="f64.impl.ExponentDisplay.displayExponent"></a>
+
+### Operation `displayExponent`
+
+```silk
+effect fn displayExponent(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="f32.impl.Display"></a>
 
@@ -1984,13 +2060,30 @@ writes exactly that many fractional digits instead.
 #### Details
 
 The default output parses back to the same value with [`Format.f32Value`](#Format.impl.f32Value). Negative zero
-displays as `-0`. Sign, width, fill, alignment, and zero padding apply. The digits come from
+displays as `-0`. `Style.LowerExp` and `Style.UpperExp` write scientific notation, such as
+`1.25e3`. Sign, width, fill, alignment, and zero padding apply. The digits come from
 the `f32` value, so they can differ from the digits of the nearest `f64`.
 
 #### Gotchas
 
-`NaN` displays as `NaN`, and infinity displays as `Infinity` with a sign from the sign rule.
-Both ignore precision and pad with the fill character, never with zeros.
+`NaN` displays as `NaN`, and infinity displays as `Infinity` with a sign from the sign rule,
+in every style. Both ignore precision and pad with the fill character, never with zeros.
+
+<a id="f32.impl.ExponentDisplay"></a>
+
+## Implementation `ExponentDisplay for f32`
+
+```silk
+impl ExponentDisplay for f32
+```
+
+<a id="f32.impl.ExponentDisplay.displayExponent"></a>
+
+### Operation `displayExponent`
+
+```silk
+effect fn displayExponent(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="string.impl.Display"></a>
 
