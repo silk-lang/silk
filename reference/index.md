@@ -92,7 +92,8 @@ not belong in a language rule unless a program can observe them.
 - [Doc comment style guide](documentation-style-guide.md) — required public comment coverage,
   standard sections, complete examples, symbol links, and ASD-STE100 writing rules.
 - [Lifetimes and elision](lifetimes.md) — named validity bounds, borrowed contents, header defaults,
-  quantified callable contracts, retained environments, and inspectable lifetime expansion.
+  quantified callable contracts, retained environments, region checking, and inspectable lifetime
+  expansion.
 - [Ownership and borrowing](ownership-and-borrowing.md) — Copy and affine values, moves, borrows,
   mutation, anonymous capture modes, cleanup, allocation lifecycles, and returned views.
 - [Allocation-backed local shared ownership](local-shared-ownership.md) — `Shared<T>` construction,

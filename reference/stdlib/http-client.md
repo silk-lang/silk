@@ -872,7 +872,7 @@ Returns the payload bytes, empty when there is no body.
 ### Method `contentType`
 
 ```silk
-pub fn contentType(self: &Self) -> Option<string>
+pub fn contentType(self: &Self) -> Option<string<'a>>
 ```
 
 Returns the payload's `Content-Type`, when there is a body.

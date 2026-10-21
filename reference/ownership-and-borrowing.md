@@ -35,7 +35,9 @@ the diagnostic a programmer should expect when that boundary is crossed.
 - A **loan** is the compiler's record that a place remains borrowed. The loan restricts conflicting
   access until the borrow ends.
 - A **lifetime** is a static validity region carried by a type. A concrete loan separately records
-  the borrowed place and the uses or cleanup that require it to remain valid.
+  the borrowed place and the uses or cleanup that require it to remain valid. Inside a body, a
+  region is a set of program points, and a loan stays in scope while its reference's region holds
+  the point ([LIFE-006](lifetimes.md#life-006--regions-are-sets-of-program-points)).
 - A **shared reference** `&T` permits read access to one `T`.
 - An **exclusive reference** `&mut T` permits sole read and mutation access to one `T`.
 - A **slice** is a borrowed runtime-length view: `&[T]` is shared and `&mut [T]` is exclusive.
@@ -406,9 +408,9 @@ exclusively. Compatible reads and additional shared borrows remain valid.
 **Boundary:** A shared reference does not own its referent and does not become responsible for its
 cleanup. Reading a Copy field through `&T` copies only that field; it does not copy the complete `T`.
 
-**Diagnostics:** Assignment through a shared reference reports `SEM0036`. A conflicting exclusive
-loan reports `OWN0010` for slices. Moving or dropping an owner while a longer shared loan is active
-reports `OWN0011` and relates the loan's origin.
+**Diagnostics:** Assignment through a shared reference reports `SEM0036`. An exclusive borrow that
+conflicts with the shared loan reports `OWN0010`. Moving or dropping an owner while a longer shared
+loan is active reports `OWN0011` and relates the loan's origin.
 
 **Evidence:** ownership specification,
 reference projection tests,
@@ -445,8 +447,8 @@ reference; only independent access paths are excluded. An exclusive loan is acti
 formed rather than having a separate reserved-but-not-yet-active phase.
 
 **Diagnostics:** Creating an exclusive slice borrow from an immutable root reports `SEM0057`.
-Overlapping an exclusive slice loan with any other loan reports `OWN0010`. Direct owner access while
-an exclusive loan remains active reports `OWN0011`.
+A borrow that overlaps an exclusive loan, or an exclusive borrow that overlaps any loan, reports
+`OWN0010`. Direct owner access while an exclusive loan remains active reports `OWN0011`.
 
 **Evidence:** ownership specification,
 reference projection tests,
@@ -658,9 +660,9 @@ expired view.
 
 **Diagnostics:** Forming an exclusive borrow from an immutable existing root reports `SEM0057`.
 Passing a fixed array directly where a slice is expected reports `SEM0059` and requires an explicit
-borrow. A temporary-derived view that escapes its hidden owner reports the applicable returned-view
-or stored-borrow diagnostic at the escape boundary. A view used after its temporary's hidden owner
-has ended reports `OWN0019` at that use.
+borrow. A temporary-derived view returned from the function, or stored where it must outlive a
+lifetime the caller chooses, reports `SEM0212` at the borrow. A view used after its temporary's
+hidden owner has ended reports `OWN0019` at that use.
 
 The compiler materializes temporary owners and retains indexed-place selectors through TIR and MIR.
 `SEM0056` remains appropriate only for operands that cannot denote or produce owned storage.
@@ -726,14 +728,16 @@ aggregate still needs an admitted `impl Copy`, and every realized field must sat
 
 **Boundary:** Moving an owner together with a reference into its own inline storage does not create
 a valid self-referential value. Exclusive borrowed storage remains affine, and a user `Drop` hook
-requires every observable borrowed component to remain valid through its invocation. Generic
-recursive cleanup keeps the same conservative obligation without inspecting hook bodies.
+requires every observable borrowed component to remain valid through its invocation. Cleanup of a
+type without a hook keeps alive only what its parts' cleanup observes (LIFE-005); this is decided
+from declarations, without inspecting hook bodies.
 Effect success and failure channels
 cannot yet carry dependent borrowed values. Callable and Effect environments retain their explicit
 environment bounds even when their public result channels contain no references.
 
-**Diagnostics:** Invalid validity escape reports `OWN0019` at the violating use or retention
-boundary. Conflicting access during a retained loan reports `OWN0010` or `OWN0011`.
+**Diagnostics:** A use after the referent's storage has ended reports `OWN0019` at that use. A
+retained loan of local storage that must outlive a lifetime the caller chooses reports `SEM0212` at
+its borrow. Conflicting access during a retained loan reports `OWN0010` or `OWN0011`.
 Named lifetime and elision failures follow [the lifetime reference](lifetimes.md).
 
 **Evidence:** lifetime requirements,
@@ -1012,12 +1016,15 @@ the owner is usable after the loop still depends on every path that reaches that
 condition is evaluated again on every iteration. A condition that consumes an outer owner therefore
 cannot silently establish a weaker repeating state. Reassigning only one field after moving the
 complete owner does not restore it. The replacement must initialize the complete binding under
-OWN-005. Loans created inside an iteration must also end or have one compatible continuing state
-before the next iteration.
+OWN-005. Loans follow the ordinary region rules around the back edge (LIFE-006): a loan of an
+iteration local that is still in scope when that local's storage ends is rejected at its next use.
+A `match place` refinement made before the loop does not survive a replacement of its subject
+inside the loop.
 
-**Diagnostics:** A repeating path that reaches the loop header with an owner missing or
-incompatibly borrowed reports `OWN0005`. A direct later use after an unconditional move reports the
-ordinary `OWN0001` use-after-move diagnostic.
+**Diagnostics:** A repeating path that reaches the loop header with an owner missing, or that
+replaces the subject of a `match place` refinement a later iteration uses, reports `OWN0005`. A loan
+that outlives an iteration's storage reports `OWN0019` at its next use. A direct later use after an
+unconditional move reports the ordinary `OWN0001` use-after-move diagnostic.
 
 **Evidence:** ownership specification,
 mutable-loop tests,
@@ -1238,6 +1245,28 @@ Dropping an uninvoked environment releases loans and cleans owned captures exact
 acquisition order. A consuming invocation transfers or cleans every owned capture exactly once; a
 second invocation cannot duplicate the environment.
 
+A body that stores what one capture carries where another capture reaches, such as a loan of a
+borrowed capture written into a captured holder, needs the first capture's region to outlive the
+second's. The body does not prove such a relation between regions its creator chooses; the creator
+proves it where it constructs the callable, as if each such store happened there. A captured
+exclusive reference the body reads or writes through is reached only through the loan of its
+referent that the construction takes. A body that stores a reborrow of that referent for the
+reference's own lifetime therefore makes that loan last as long. A relation that involves the
+callable's own parameter lifetimes is proved inside its body.
+
+```silk,ignore
+struct Slot<'a> { view: &'a i32 }
+
+fn invalid(slot: &mut Slot) -> () {
+  let count = 41
+  let mut store = fn() -> () { slot.view = &count }
+  store()
+}
+```
+
+Here the loan of `count` must outlive the caller's lifetime of `slot`'s view, so `invalid` reports
+`SEM0212` at its capture of `count`.
+
 **Boundary:** Invocation mode describes access to the retained environment, not ownership of newly
 supplied arguments. Copy moves remain reusable. A shared anonymous callable may satisfy a `mut fn`
 or `once fn` requirement, and a `mut fn` may satisfy a `once fn` requirement; the reverse
@@ -1245,7 +1274,7 @@ substitutions are invalid. Anonymous captures use the same escape, storage, and 
 other exact callable environments.
 
 **Diagnostics:** Conflicting access to a captured root reports the ordinary retained-loan
-diagnostic. A borrowed environment that escapes its root reports an ownership escape. Invoking a
+diagnostic, at the creator for a relation the body owes it. A borrowed environment that escapes its root reports an ownership escape. Invoking a
 consuming anonymous callable twice reports use after move, and supplying a derived consuming or
 exclusive mode where shared reusable access is required reports a callable-contract mismatch.
 
@@ -1378,9 +1407,9 @@ fn use(values: &mut [i32]) -> i32 {
 ```
 
 The exclusive capture lasts through `callback(41)`. Explicitly dropping the callback releases the
-capture and restores parent access before the following assignment. When the compiler can prove the
-callback has no later use, its capture loan may end at that last use without requiring source-level
-`drop`.
+capture and restores parent access before the following assignment. Without the `drop`, the
+capture loan ends after the callback's last use, because the callback's region holds only the
+points where it is live (LIFE-006).
 
 **Boundary:** A callable with a captured loan cannot escape its root owner. Moving the callable may
 transfer the loan to another local or aggregate, but it does not detach the loan from its original
@@ -1390,10 +1419,8 @@ root. Dropping an uninvoked callable ends its loans and cleans its owned capture
 Invoking an exclusive callable through shared access reports the callable-access diagnostic.
 Escaping the callable beyond a captured root reports an ownership escape at the boundary.
 
-**Current compiler:** Aligned. Capture loans retained by callable sections end after a statically
-proven last invocation or an explicit `drop`; Effect capture loans analogously end after their last
-run. A later non-invocation use that may store, move, or escape the callable prevents the earlier
-invocation from being treated as final.
+**Current compiler:** Aligned. A capture loan ends after the last use of the callable or Effect
+that retains it, or of any value it was moved or stored into, or at its explicit `drop`.
 
 **Evidence:** ownership specification,
 callable ownership tests,
@@ -1417,8 +1444,9 @@ fn prepare(values: &[i32]) -> Effect<i32> {
 ```
 
 `prepare` returns an Effect retaining a shared reborrow of `values`. No indexing occurs until the
-Effect runs, but the loan must remain valid from construction through the Effect's last possible
-run or drop.
+Effect runs, but the loan must remain valid from construction through the Effect's last run or
+explicit `drop`. An Effect left to its scope's cleanup holds its loans only through its last use,
+since that cleanup reads no borrowed capture.
 
 Effect service provision follows the same rule. Providing `&clock`, `&mut logger`, or `move
 provider` captures a shared loan, exclusive loan, or owner respectively; service providers do not
@@ -1898,7 +1926,7 @@ cannot strengthen into exclusive access. Effect successes and failures obey thes
 relationships, including when a short receiver borrow returns a longer externally backed view.
 
 **Diagnostics:** Ambiguous output elision reports `SEM0210`. A violated declared lifetime bound
-reports `SEM0212`; a result retaining expired local or temporary storage reports `OWN0019`.
+reports `SEM0212`, and so does a result that borrows local or temporary storage, at that borrow.
 
 **Evidence:** returned-value requirements,
 lifetime tests.
@@ -1923,10 +1951,13 @@ fn use() -> i32 {
 ```
 
 The shared loan lasts through `view`'s last use at `view[0]`. Mutation of `values` is valid
-afterward. Annotating a binding with a lifetime, including one of the enclosing function's lifetime
-parameters, constrains its type but does not extend its loan beyond its last use or the last use of
-a value retaining it. While a shared returned view remains live, its root cannot be mutated, moved, dropped, or
-borrowed exclusively. An exclusive returned view suspends every independent access to its root.
+afterward. Annotating a binding with an elided lifetime constrains its type but does not extend its
+loan beyond its last use or the last use of a value retaining it. Annotating it with one of the
+enclosing function's lifetime parameters or `'static` fixes that region, which the caller chooses:
+the loan then stays in scope from the borrow to the end of the body, and a borrow of local storage
+annotated that way reports `SEM0212`. While a shared returned view remains live, its root cannot be
+mutated, moved, dropped, or borrowed exclusively. An exclusive returned view suspends every
+independent access to its root.
 
 A temporary passed to a returned-view function gains a hidden owner in the caller:
 
@@ -1958,8 +1989,9 @@ its concrete loans. Dependent Effect success and failure values remain unsupport
 A wrapper may return the view again when its own declared result satisfies VIEW-001. No operation may detach a view from its root.
 
 **Diagnostics:** Conflicting source-owner access while the view remains live reports `OWN0011` and
-relates the view's origin. Returning or retaining a view beyond the validity of its source reports
-`OWN0019`; unsatisfied public outlives bounds report `SEM0212`.
+relates the view's origin. Using a view after its source's storage has ended reports `OWN0019` at
+that use. Returning a view of local storage, as `invalid` does, reports `SEM0212` at its borrow, as
+do unsatisfied public outlives bounds.
 
 **Evidence:** runtime-slice specification,
 returned-view ownership tests,

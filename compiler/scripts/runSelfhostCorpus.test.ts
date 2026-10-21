@@ -179,9 +179,9 @@ exit 2`,
 void it('records the per-reason borrow-check gap of a successful build', async () => {
   assert.deepStrictEqual(
     parseBorrowGap(
-      'SILK_GAP borrow-check: 3 bodies not borrow-checked (regions 2, stored-loans 1; native borrow checking is roadmap step 14)\n',
+      'SILK_GAP borrow-check: 3 bodies not borrow-checked (awaiting 3; native borrow checking is roadmap step 14)\n',
     ),
-    { total: 3, reasons: { regions: 2, 'stored-loans': 1 } },
+    { total: 3, reasons: { awaiting: 3 } },
   )
   assert.deepStrictEqual(
     parseBorrowGap(
