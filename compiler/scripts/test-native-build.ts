@@ -1046,6 +1046,14 @@ const program = Effect.gen(function* () {
   // manifest line.
   const locatedRefusals = [
     [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
+      /silk\.toml:6: build\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", translator = "t" }\n',
+      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator: only provenance "translated-public" names a translator/,
+    ],
+    [
       '[build]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
       /silk\.toml:9: build\.composition\.runtimes\.declaration is not a supported field/,
     ],
