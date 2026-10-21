@@ -878,6 +878,138 @@ const program = Effect.gen(function* () {
   )
   assert.equal(conflicting.status, 2, 'a named profile must conflict with --release')
   assert.equal(yield* fs.exists(marker), false)
+  // A multi-threaded wasm32 profile links one shared memory the host imports, with the profile's
+  // maximum, and runs its native threads as Workers under the stdlib's Node runner.
+  const threads = join(directory, 'threads')
+  yield* fs.makeDirectory(threads, { recursive: true })
+  yield* fs.writeFileString(
+    join(threads, 'silk.toml'),
+    '[package]\nname = "threads"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "256MiB"\n',
+  )
+  yield* fs.writeFileString(
+    join(threads, 'main.silk'),
+    [
+      'import silk.allocator { Allocator, OutOfMemoryError }',
+      'import silk.box { Box }',
+      'import silk.effect { Effect }',
+      'import silk.native_thread { NativeThread, SpawnError }',
+      'effect fn program() -> i32 ! OutOfMemoryError | SpawnError {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  let owned = run Box<i32>.make(20) |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  let first = run NativeThread.spawn(fn() -> i32 { return (move owned).into() + 1 })',
+      '    |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  let second = run NativeThread.spawn(fn() -> i32 { return 21 })',
+      '    |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  return first.join() + second.join()',
+      '}',
+      'effect fn recover(error: OutOfMemoryError | SpawnError) -> i32 { return -2 }',
+      'pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }',
+      '',
+    ].join('\n'),
+  )
+  const threaded = yield* invoke(
+    silk,
+    [
+      'build',
+      '--manifest-path',
+      join('threads', 'silk.toml'),
+      '--profile',
+      'web',
+      '--stdlib',
+      standardLibrary,
+    ],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(threaded.status, 0, threaded.stderr)
+  const threadedPath = join(threads, 'build/llvm/wasm32-unknown-unknown/web/threads')
+  const threadedModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
+  assert.deepEqual(
+    WebAssembly.Module.imports(threadedModule)
+      .map((entry) => `${entry.module}.${entry.name}`)
+      .sort(),
+    ['env.memory', 'wasi.thread-spawn'],
+  )
+  const threadedRun = yield* invoke(
+    process.execPath,
+    [join(standardLibrary, 'host/wasm-runner.mjs'), threadedPath],
+    directory,
+    process.env,
+  )
+  assert.equal(threadedRun.status, 42, threadedRun.stderr)
+  // Freed memory is reused: 100 threads with 1 MiB stacks and repeated list growth fit in 64 MiB.
+  const churn = join(directory, 'churn')
+  yield* fs.makeDirectory(churn, { recursive: true })
+  yield* fs.writeFileString(
+    join(churn, 'silk.toml'),
+    '[package]\nname = "churn"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "64MiB"\n',
+  )
+  yield* fs.writeFileString(
+    join(churn, 'main.silk'),
+    [
+      'import silk.allocator { Allocator, OutOfMemoryError }',
+      'import silk.effect { Effect }',
+      'import silk.list { List }',
+      'import silk.native_thread { NativeThread, SpawnError }',
+      'effect fn fill(count: i32) -> i32 ! OutOfMemoryError ? &mut Allocator {',
+      '  let mut values = List<i32>.make()',
+      '  let mut at: i32 = 0',
+      '  while at < count {',
+      '    run List<i32>.append(&mut values, at)',
+      '    at = at + 1',
+      '  }',
+      '  return at',
+      '}',
+      'effect fn refused(error: OutOfMemoryError) -> i32 { return 0 }',
+      'fn work() -> i32 {',
+      '  let mut local = Allocator.systemAllocatorProvider()',
+      '  return run Effect.catchAll(fill(1000) |> Effect.provideMut<Allocator>(&mut local), refused)',
+      '}',
+      'effect fn program() -> i32 ! OutOfMemoryError | SpawnError {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  let mut round: i32 = 0',
+      '  while round < 100 {',
+      '    let filled = run fill(10000) |> Effect.provideMut<Allocator>(&mut allocator)',
+      '    if filled != 10000 { return 1 }',
+      '    let worker = run NativeThread.spawn(fn() -> i32 { return work() })',
+      '      |> Effect.provideMut<Allocator>(&mut allocator)',
+      '    if worker.join() != 1000 { return 2 }',
+      '    round = round + 1',
+      '  }',
+      '  return 42',
+      '}',
+      'effect fn recover(error: OutOfMemoryError | SpawnError) -> i32 { return 3 }',
+      'pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }',
+      '',
+    ].join('\n'),
+  )
+  const churned = yield* invoke(
+    silk,
+    [
+      'build',
+      '--manifest-path',
+      join('churn', 'silk.toml'),
+      '--profile',
+      'web',
+      '--stdlib',
+      standardLibrary,
+    ],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(churned.status, 0, churned.stderr)
+  const churnRun = yield* invoke(
+    process.execPath,
+    [
+      join(standardLibrary, 'host/wasm-runner.mjs'),
+      join(churn, 'build/llvm/wasm32-unknown-unknown/web/churn'),
+    ],
+    directory,
+    process.env,
+  )
+  assert.equal(churnRun.status, 42, churnRun.stderr)
   // A profile's CPU features, large code model and static link reach Clang.
   const argumentLog = join(directory, 'clang-arguments')
   const recorder = join(directory, 'clang-recorder')
@@ -948,6 +1080,27 @@ const program = Effect.gen(function* () {
   // requirements and a deployment version on a target that is not Darwin are refused at their
   // manifest line.
   const locatedRefusals = [
+    [
+      '[build]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
+      /silk\.toml:9: build\.composition\.runtimes\.declaration is not a supported field/,
+    ],
+    [
+      '[build]\ncomposition = { components = [{ capability = "other", bindings = [] }] }\n',
+      /silk\.toml:6: build\.composition\.components\.capability = "other" is not supported by the native compiler/,
+    ],
+    ['[build]\nplatform-supply = { kind = "native", bogus = 1 }\n', /silk\.toml:6: build\.platform-supply\.bogus is not a supported field/],
+    [
+      '[profiles.u]\ntarget = "x86_64-unknown-linux-gnu"\nentry = { kind = "default", bogus = 1 }\n',
+      /silk\.toml:7: profiles\.u\.entry\.bogus is not a supported field/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1", bogus = 1 }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+      /silk\.toml:9: build\.bindings\.value\.bogus is not a supported field/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", bogus = 1 }\n',
+      /silk\.toml:10: build\.bindings\.origin\.bogus is not a supported field/,
+    ],
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
       '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
