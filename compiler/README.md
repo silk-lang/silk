@@ -78,7 +78,7 @@ script and update its entry. Measured on 2026-10-21:
 | initial check | 132,048 | 15,869,737 | 64,550 | 2,185,506 |
 | trivia | 3 | 6.8% | 16 | 9.7% |
 | body | 2 | 6.8% | 17 | 9.7% |
-| header, same type | 531 | 16.0% | 25 | 9.9% |
+| header, same type | 7 | 6.8% | 25 | 9.9% |
 | add | 532 | 16.0% | 660 | 17.2% |
 | header, new type | 6 | 6.8% | 19 | 9.7% |
 | delete | 528 | 16.0% | 656 | 17.2% |
@@ -91,8 +91,8 @@ every dependee it consumed kept its answer, judged by the answer fingerprints. A
 members store absolute spans, so an edit that moves an `impl` reruns its heads, but their answers
 hash without those spans and their dependers are verified. The units that rerun on a trivia edit
 are those heads and MIR lowerings, whose `module:line:column` site labels move with the lines.
-Adding or deleting a declaration, and the compiler's header edit, still rerun every depender:
-name lookups and checked bodies have no fingerprint yet. On a 4-core x86_64 machine the
+Adding or deleting a declaration still reruns every depender: name lookups have no fingerprint
+yet. On a 4-core x86_64 machine the
 compiler's first check took about 67 s and each edit's recheck 7 to 18 s, almost all of it the
 walk over every root.
 
