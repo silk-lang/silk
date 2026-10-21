@@ -264,3 +264,36 @@ store.
 **Evidence:** [work queues](../stdlib/silk/work_queue.silk), native corpus (`work-queue-threads`).
 
 **Current compiler:** Aligned.
+
+## THREAD-008 — `silk.thread_pool` runs tasks on a work-stealing pool of native threads
+
+**Status:** Confirmed
+
+`ThreadPool.make(workers)` starts the worker threads, and `pool()` returns a `Pool` handle.
+`Pool.spawn(task)` starts a closed, `Transferable`, `'static` lazy effect as a pool task and
+returns a `TaskHandle<A>`. `TaskHandle.join` parks the joining task until the result is ready.
+`Pool.block(task)` runs a task from an ordinary thread and sleeps that thread until it finishes.
+Dropping the `ThreadPool` stops and joins every worker and drops the tasks still unfinished.
+
+```silk,ignore
+let threads = run ThreadPool.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
+let pool = threads.pool()
+let total = run pool.block(Effect.result(split(pool.clone())))
+```
+
+Each task is packaged with `Execution.makeTransferable` (EXEC-010), so it can park on one worker
+and resume on another. Its readiness endpoint links the task's preallocated slot onto one shared
+ready list and wakes a sleeping worker; it never allocates. A worker moves a batch of ready tasks
+into its own `WorkDeque` (THREAD-007), and an idle worker steals from the others' deques before
+it sleeps on a `Parker`. A `Pool` is `Transferable` and `Concurrent`, so tasks capture it to spawn
+more tasks.
+
+**Boundary:** The targets of native threads and `Atomic.wait`. A task's effect has no
+requirements or errors, so a task returns its own failures as a value, for example with
+`Effect.result`. Waiting inside a task for anything other than a `TaskHandle` must park with
+`Execution.parkTransferable`; blocking the native thread holds up a whole worker. A task spawned
+after its pool was dropped is dropped unstarted, and its handle never finishes.
+
+**Evidence:** [thread pool](../stdlib/silk/thread_pool.silk), native corpus (`thread-pool-tasks`).
+
+**Current compiler:** Aligned.
