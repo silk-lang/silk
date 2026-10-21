@@ -1194,5 +1194,42 @@ Writes the string's UTF-8 bytes through the ambient mutable Writer.
 This operation borrows the string and does not allocate an intermediate `String`. If Writer
 fails, an accepted prefix remains written and the original `WriterError` is preserved.
 
+<a id="bool.impl.Display"></a>
+
+## Implementation `Display for bool`
+
+```silk
+impl Display for bool
+```
+
+<a id="bool.impl.Display.display"></a>
+
+### Operation `display`
+
+```silk
+effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `true` or `false`, padded to the requested width like the other primitives.
+
+<a id="char.impl.Display"></a>
+
+## Implementation `Display for char`
+
+```silk
+impl Display for char
+```
+
+<a id="char.impl.Display.display"></a>
+
+### Operation `display`
+
+```silk
+effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the character's UTF-8 encoding, padded to the requested width like the other
+primitives.
+
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
