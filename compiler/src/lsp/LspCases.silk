@@ -1,0 +1,258 @@
+//! The language server's framing and lifecycle, driven without threads or standard streams.
+
+import lsp.Framing as Framings { Frame }
+import lsp.Inbox { Incoming }
+import lsp.Server as Servers { Phase, Server, Step }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.json_scanner { JsonError }
+import silk.json_value { Json }
+import silk.slice { Slice }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import silk.writer { Writer, WriterError }
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+fn complete(frame: Frame, start: usize, length: usize) -> bool {
+  return match move frame {
+    Frame.Complete { start: found, length: counted } => found == start && counted == length
+    _ => false
+  }
+}
+
+fn incomplete(frame: Frame) -> bool {
+  return match move frame {
+    Frame.Incomplete => true
+    _ => false
+  }
+}
+
+fn malformed(frame: Frame) -> bool {
+  return match move frame {
+    Frame.Malformed => true
+    _ => false
+  }
+}
+
+test effect fn framesSplitOnTheirContentLength() -> ()
+  ! AssertionError<'static> {
+  let whole = b"Content-Length: 2\r\n\r\n{}Content-Length: 1\r\n"
+  run Testing.expect(
+    complete(Framings.next(whole), 21, 2),
+    "a frame ends after its content length, before the next header"
+  )
+  let typed = b"content-type: application/vscode-jsonrpc; charset=utf-8\r\nCONTENT-LENGTH:  3 \r\n\r\nnul"
+  run Testing.expect(
+    complete(Framings.next(typed), 80, 3),
+    "header names ignore case, other headers are skipped, and spaces surround the count"
+  )
+  run Testing.expect(
+    incomplete(Framings.next(b"Content-Len"))
+      && incomplete(Framings.next(b"Content-Length: 4\r\n\r\n{}")),
+    "a frame whose header or content is cut short waits for more input"
+  )
+  run Testing.expect(
+    malformed(Framings.next(b"Content-Type: x\r\n\r\n{}"))
+      && malformed(Framings.next(b"Content-Length: 2x\r\n\r\n{}"))
+      && malformed(Framings.next(b"Content-Length: \r\n\r\n")),
+    "a header block without a decimal content length is malformed"
+  )
+}
+
+test effect fn oversizedHeadersAreMalformed() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let padding = run Bytes.zeroed(Framings.HEADER_LIMIT + 1)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    malformed(Framings.next(Bytes.asSlice(&padding))),
+    "a header block past the limit cannot be resynchronized"
+  )
+}
+
+// Collects what the server writes, up to a fixed capacity.
+struct Captured {
+  bytes: Bytes
+  length: usize
+}
+
+impl Captured {
+  effect fn writeAll(self: &mut Self, bytes: &[u8]) -> ()
+    ! WriterError {
+    if bytes.length > Bytes.length(&self.bytes) - self.length {
+      fail Writer.failure()
+    }
+    let target = Bytes.asMutSlice(&mut self.bytes)
+    let mut at = usize.ZERO
+    while at < bytes.length {
+      target[self.length + at] = bytes[at]
+      at = at + 1
+    }
+    self.length = self.length + bytes.length
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> ()
+    ! WriterError {
+    return ()
+  }
+}
+
+impl Writer for Captured {
+  writeAll: Captured.writeAll
+
+  flush: Captured.flush
+}
+
+// Handles one message and reports whether the server continued after writing exactly `expected`,
+// or a frame whose content begins with `prefix`.
+effect fn answers(server: &mut Server, message: &[u8], expected: &[u8]) -> bool
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut Allocator {
+  return run written(&mut server.*, message, expected, false)
+}
+
+effect fn begins(server: &mut Server, message: &[u8], prefix: &[u8]) -> bool
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut Allocator {
+  return run written(&mut server.*, message, prefix, true)
+}
+
+effect fn written(server: &mut Server, message: &[u8], expected: &[u8], prefix: bool) -> bool
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut Allocator {
+  let value = run Json.parse(message)
+  let mut captured = Captured { bytes: run Bytes.zeroed(512), length: usize.ZERO }
+  let step = run Servers.handle(&mut server.*, Incoming.Message { value: move value })
+    |> Effect.provideMut<Writer>(&mut captured)
+  let mut start = usize.ZERO
+  let mut length = captured.length
+  if prefix {
+    let all = Bytes.asSlice(&captured.bytes)
+    while start < captured.length && all[start] != 123 {
+      start = start + 1
+    }
+    length = captured.length - start
+    if length > expected.length {
+      length = expected.length
+    }
+  }
+  let output = Slice.view<u8>(Bytes.asSlice(&captured.bytes), start, length)
+  return match move step {
+    Step.Continue => same(output, expected)
+    Step.Exit { .. } => false
+  }
+}
+
+effect fn exits(server: &mut Server, incoming: Incoming, status: i32) -> bool
+  ! JsonError | WriterError
+  ? &mut Allocator {
+  let mut captured = Captured { bytes: Bytes.make(), length: usize.ZERO }
+  let step = run Servers.handle(&mut server.*, move incoming)
+    |> Effect.provideMut<Writer>(&mut captured)
+  return match move step {
+    Step.Exit { status: found } => found == status && captured.length == usize.ZERO
+    Step.Continue => false
+  }
+}
+
+effect fn lifecycle() -> ()
+  ! AssertionError<'static> | JsonError | WriterError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut server = Servers.make()
+  let early = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\"}",
+    b"Content-Length: 90\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32002,\"message\":\"the server is not initialized\"}}"
+  )
+  let ignored = run answers(&mut server, b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}", b"")
+  run Testing.expect(
+    early && ignored,
+    "before initialize, requests fail as not initialized and notifications are dropped"
+  )
+  let initialized = run begins(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\",\"utf-8\"]}}}}",
+    b"{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\"},\"serverInfo\":{\"name\":\"silk\","
+  )
+  run Testing.expect(
+    initialized,
+    "initialize echoes the id and selects UTF-8 positions when the client offers them"
+  )
+  let again = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\"}",
+    b"Content-Length: 94\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32600,\"message\":\"the server is already initialized\"}}"
+  )
+  let unknown = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/hover\"}",
+    b"Content-Length: 99\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"the server does not handle this method\"}}"
+  )
+  run Testing.expect(
+    again && unknown,
+    "a second initialize is invalid and an unhandled method is not found"
+  )
+  let shutdown = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\"}",
+    b"Content-Length: 38\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}"
+  )
+  let refused = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"shutdown\"}",
+    b"Content-Length: 84\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32600,\"message\":\"the server is shut down\"}}"
+  )
+  run Testing.expect(
+    shutdown && refused,
+    "shutdown answers null once, and every later request is invalid"
+  )
+  let exit = run Json.parse(b"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}")
+  let clean = run exits(&mut server, Incoming.Message { value: move exit }, 0)
+  let mut abrupt = Servers.make()
+  let closed = run exits(&mut abrupt, Incoming.Closed, 1)
+  run Testing.expect(
+    clean && closed,
+    "exit after shutdown is status 0, and input that closes first is status 1"
+  )
+}
+
+test effect fn serverFollowsTheLifecycle() -> ()
+  ! AssertionError<'static> | JsonError | WriterError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run lifecycle() |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn unparsableMessagesGetAParseError() -> ()
+  ! AssertionError<'static> | JsonError | WriterError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut server = Servers.make()
+  let mut output = Captured {
+    bytes: run Bytes.zeroed(512) |> Effect.provideMut<Allocator>(&mut allocator),
+    length: usize.ZERO
+  }
+  let step = run Servers.handle(&mut server, Incoming.Unparsable)
+    |> Effect.provideMut<Writer>(&mut output)
+  let written = Slice.view<u8>(Bytes.asSlice(&output.bytes), usize.ZERO, output.length)
+  run Testing.expect(
+    same(
+      written,
+      b"Content-Length: 93\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"the message is not valid JSON\"}}"
+    ),
+    "a frame that is not JSON gets a parse error with a null id"
+  )
+}
