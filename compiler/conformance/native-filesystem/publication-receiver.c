@@ -107,6 +107,8 @@ int openat(int parent, const char *name, int flags, ...) {
     if (faults & FAIL_STAGE) { errno = ENOSPC; return -1; }
   }
   int fd = os_openat(parent, name, flags, mode);
+  // The provider may reuse a closed staging descriptor's number, such as to reopen the parent for fsync.
+  if (!staging && fd >= 0 && fd == stage_fd && stage_closed) stage_fd = -1;
   if (staging && fd >= 0) {
     stage_fd = fd;
     CHECK(fstat(fd, &staged_inode) == 0 && S_ISREG(staged_inode.st_mode));
@@ -448,6 +450,22 @@ static void modes_and_synchronization(void) {
   umask(old_umask);
 }
 
+// Homebrew's Linux sandbox and 0711 homes leave ancestors searchable but unreadable. Path walks
+// must only need search permission; fsync still reopens the leaf directory itself. A privileged
+// run bypasses the mode, so this only discriminates for an ordinary user.
+static void search_only_ancestor(void) {
+  case_name = "search-only-ancestor";
+  char opaque[PATH_MAX], inner[PATH_MAX], file[PATH_MAX];
+  path_at(opaque, root, "opaque"); path_at(inner, opaque, "inner"); path_at(file, inner, "search-only");
+  CHECK(mkdir(opaque, 0700) == 0 && mkdir(inner, 0700) == 0 && chmod(opaque, 0311) == 0);
+  CHECK(invoke(CREATE, "/opaque/inner/search-only", OLD, REPLACE, BUFFERED, 0) == 0);
+  CHECK(invoke(ATOMIC, "/opaque/inner/search-only", NEW, REPLACE, SYNCHRONIZED, 0) == 0 && directory_sync_calls == 1);
+  CHECK(invoke(SYNC_DIRECTORY, "/opaque/inner", "", 0, REPLACE, BUFFERED, 0) == 0 && directory_sync_calls == 1);
+  CHECK(chmod(opaque, 0700) == 0);
+  contents_at(inner, "search-only", NEW);
+  CHECK(unlink(file) == 0 && rmdir(inner) == 0 && rmdir(opaque) == 0);
+}
+
 struct observations { _Atomic unsigned old, newer, stopped, invalid; };
 static void complete_publication(void) {
   case_name = "real-readers-see-only-complete-old-or-new";
@@ -516,7 +534,8 @@ int main(void) {
   char sentinel[PATH_MAX]; path_at(sentinel, outside, "sentinel");
   int fd = open(sentinel, O_WRONLY | O_CREAT | O_EXCL, 0600); CHECK(fd >= 0); full_write(fd, OLD); CHECK(os_close(fd) == 0);
   existing_names(); concurrent_claims(); controlled_collision(); staging_collision(); before_publication_failures();
-  after_publication_failures(); confinement_and_kinds(); modes_and_synchronization(); complete_publication();
+  after_publication_failures(); confinement_and_kinds(); modes_and_synchronization(); search_only_ancestor();
+  complete_publication();
   case_name = "final-cleanup"; contents_at(outside, "sentinel", OLD); CHECK(staging_count() == 0); cleanup_tree(sandbox);
   puts("native publication: exclusive claims, collisions, real readers, failure phases, residuals, confinement, modes, fsync ordering passed");
   puts("durability limit: fsync success/order is exercised; hardware-cache flush and physical power-loss recovery are not proven");
