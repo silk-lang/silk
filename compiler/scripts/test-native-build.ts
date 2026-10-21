@@ -973,6 +973,27 @@ const program = Effect.gen(function* () {
   // requirements and a deployment version on a target that is not Darwin are refused at their
   // manifest line.
   const locatedRefusals = [
+    [
+      '[build]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
+      /silk\.toml:9: build\.composition\.runtimes\.declaration is not a supported field/,
+    ],
+    [
+      '[build]\ncomposition = { components = [{ capability = "other", bindings = [] }] }\n',
+      /silk\.toml:6: build\.composition\.components\.capability = "other" is not supported by the native compiler/,
+    ],
+    ['[build]\nplatform-supply = { kind = "native", bogus = 1 }\n', /silk\.toml:6: build\.platform-supply\.bogus is not a supported field/],
+    [
+      '[profiles.u]\ntarget = "x86_64-unknown-linux-gnu"\nentry = { kind = "default", bogus = 1 }\n',
+      /silk\.toml:7: profiles\.u\.entry\.bogus is not a supported field/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1", bogus = 1 }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+      /silk\.toml:9: build\.bindings\.value\.bogus is not a supported field/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", bogus = 1 }\n',
+      /silk\.toml:10: build\.bindings\.origin\.bogus is not a supported field/,
+    ],
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
       '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
