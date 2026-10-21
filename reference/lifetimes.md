@@ -111,7 +111,10 @@ impl lifetime and retains it in the operation contracts. It has the same relatio
 explicitly bound `impl<'data, A: Copy> ... for SliceStream<'data, A>`. Ordinary type arguments,
 bounds and conformance selection are unchanged; `Self` still denotes that fixed applied owner.
 
-Local type annotations instead infer body-scoped lifetimes from their uses and cleanup. Public
+Local type annotations instead infer body-scoped lifetimes from their uses and cleanup. A lifetime
+an annotation, a literal's type arguments or a call's generic arguments write is fixed, even when an
+argument beside it is inferred. For example, `PairWith<'a> {view: &src.t, extra: 1}` keeps its
+borrow for `'a`. Public
 relationships never depend on return bodies, setter histories, or which constructor happened to
 initialize a field.
 
@@ -135,7 +138,11 @@ editor action requirements.
 One outer `for<'call>` may quantify a callable contract. Each invocation must satisfy that contract
 for a fresh lifetime. `fn<'env>(...) -> ...` separately names how long the callable's retained
 captures remain valid; `mut` and `once` still express invocation access. A quantified signature may
-refer to surrounding lifetime and type parameters.
+refer to surrounding lifetime and type parameters. A callable parameter type that omits `fn<'env>`
+has a fresh environment lifetime, as any other elided input lifetime does (LIFE-003). For example,
+`use: once fn(&mut Frame<'o>) -> i32` accepts a callable whose captures only need to outlive the
+call, like Rust's `impl FnOnce(&mut Frame<'o>) -> i32`. The lifetimes its parameter and result types
+name are not obligations of its environment.
 
 ```silk
 fn identity<'call>(value: &'call i32) -> &'call i32 { return value }
