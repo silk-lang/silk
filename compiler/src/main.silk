@@ -853,7 +853,7 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 /// static library's final stage archives its compiled object beside the declared objects. Each
 /// refuses any other declared input; an intermediate stage takes no declared inputs.
 effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
-  target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], selectedClang: &Option<Bytes>) -> i32
+  profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], selectedClang: &Option<Bytes>) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
   let mut intermediate = run Bytes.copy(Path.rawBytes(output))
@@ -916,6 +916,11 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   run ChildProcess.addArgument(&mut process, optimizationFlag)
   if debug {
     run ChildProcess.addArgument(&mut process, b"-g")
+  }
+  let mut flag = usize.ZERO
+  while flag < profileFlags.length {
+    run ChildProcess.addArgument(&mut process, Bytes.asSlice(&profileFlags[flag]))
+    flag = flag + usize.ONE
   }
   // A link uses its resolved supply, never ambient SDK, sysroot or linker settings.
   if let Option<Supply>.Some {value: selected} = &supply.* {
@@ -1310,6 +1315,41 @@ fn profileProblemText(problem: ProfileProblem) -> &'static [u8] {
   }
 }
 
+// The Clang arguments of the profile facts LLVM text does not carry: each selected CPU feature, a
+// large code model, and for a linked executable a static, non-position-independent link.
+effect fn clangProfileFlags(profile: &InitialProfile, target: &Target, linked: bool) -> List<Bytes>
+! OutOfMemoryError ? &mut Allocator {
+  let mut flags = List<Bytes>.make()
+  let mut at = usize.ZERO
+  while at < Target.featureCount(target) {
+    let feature = Target.feature(target, at)
+    let selected = match move InitialProfile.contains(profile, b"cpu-features", feature) {
+      Option<bool>.Some {value} => value
+      Option<bool>.None => false
+    }
+    if selected {
+      let mut enabled = run Bytes.copy(b"+")
+      run Bytes.append(&mut enabled, feature)
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-Xclang"))
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-target-feature"))
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-Xclang"))
+      run List<Bytes>.append(&mut flags, move enabled)
+    }
+    at = at + usize.ONE
+  }
+  if let Option<&[u8]>.Some {value: model} = move InitialProfile.text(profile, b"code-model") {
+    if same(model, b"large") { run List<Bytes>.append(&mut flags, run Bytes.copy(b"-mcmodel=large")) }
+  }
+  if let Option<&[u8]>.Some {value: link} = move InitialProfile.text(profile, b"link") {
+    // A static executable is never position independent, so its code is not either.
+    if linked && same(link, b"static") {
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-static"))
+      run List<Bytes>.append(&mut flags, run Bytes.copy(b"-fno-pic"))
+    }
+  }
+  return move flags
+}
+
 effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, display: &Path, form: Form, stage: Stage, standardLibrary: Option<Path>, profile: InitialProfile, bindings: List<Supplied>, supplyRequest: &SupplyRequest, testing: bool, stats: bool, clang: &Option<Bytes>, heading: &Option<Bytes>) -> Compiled
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Types {
@@ -1335,6 +1375,7 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
     Option<&[u8]>.Some {value} => run Bytes.copy(value)
     Option<&[u8]>.None => Bytes.make()
   }
+  let profileFlags = run clangProfileFlags(&profile, &target, form == Form.Executable && stage == Stage.Final)
   let mut refused = Bytes.make()
   // Whether this build's `[<target>]` heading has been written before its diagnostics.
   let mut headed = false
@@ -1462,7 +1503,8 @@ effect fn build(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displ
       }
       let linking = Profiler.zone(b"compileIr")
       status = run compileIr(
-        &text, output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation), &target,
+        &text, output, form, stage, Bytes.asSlice(&optimization), debug, Bytes.asSlice(&relocation),
+        List<Bytes>.asSlice(&profileFlags), &target,
         &supply, ModuleSourceFiles.nativeLinkInputs(&sources), clang,
       )
       if status == 0 {
@@ -2055,11 +2097,9 @@ effect fn reportProject(problem: &ProjectError) -> () ! WriterError {
       run writeError(Path.rawBytes(&manifest))
       run writeError(b"\n")
     }
-    ProjectError.InvalidProfile {manifest: _, code, subject} => run reportProfile(code, Bytes.asSlice(&subject))
-    ProjectError.InvalidManifest {manifest, detail} => {
-      run writeError(b"Invalid Silk project manifest ")
-      run writeError(Path.rawBytes(&manifest))
-      run writeError(b": ")
+    ProjectError.InvalidProfile {manifest, line, code, subject} => run reportProfile(&manifest, line, code, Bytes.asSlice(&subject))
+    ProjectError.InvalidManifest {manifest, line, detail} => {
+      run writeManifestLocation(&manifest, line)
       run writeError(Bytes.asSlice(&detail))
       run writeError(b"\n")
     }
@@ -2366,12 +2406,43 @@ struct ProjectArtifact {
   path: Path
 }
 
-// Writes a refused profile or binding as the TypeScript `<code>: <subject>`.
-effect fn reportProfile(code: ProfileCode, subject: &[u8]) -> () ! WriterError {
-  run writeError(ProjectProfiles.codeName(code))
-  run writeError(b": ")
-  run writeError(subject)
-  run writeError(b"\n")
+// Writes `value` in decimal.
+effect fn writeDecimal(value: usize) -> () ! WriterError {
+  if value >= 10 { run writeDecimal(usize.divide(value, 10)) }
+  return run writeError(&[usize.toU8(48 + usize.remainder(value, 10))])
+}
+
+// Writes `Invalid Silk project manifest <manifest>:<line>: `, without the line when it is zero.
+effect fn writeManifestLocation(manifest: &Path, line: usize) -> () ! WriterError {
+  run writeError(b"Invalid Silk project manifest ")
+  run writeError(Path.rawBytes(manifest))
+  if line > usize.ZERO {
+    run writeError(b":")
+    run writeDecimal(line)
+  }
+  return run writeError(b": ")
+}
+
+// Writes a refused profile or binding of the manifest `manifest` at `line`: an unknown field or a
+// value the native compiler cannot honor yet in words, else the TypeScript `<code>: <subject>`.
+effect fn reportProfile(manifest: &Path, line: usize, code: ProfileCode, subject: &[u8]) -> () ! WriterError {
+  run writeManifestLocation(manifest, line)
+  match code {
+    ProfileCode.UnknownField => {
+      run writeError(subject)
+      run writeError(b" is not a supported field")
+    }
+    ProfileCode.NotNative => {
+      run writeError(subject)
+      run writeError(b" is not supported by the native compiler yet")
+    }
+    _ => {
+      run writeError(ProjectProfiles.codeName(code))
+      run writeError(b": ")
+      run writeError(subject)
+    }
+  }
+  return run writeError(b"\n")
 }
 
 // Writes the TypeScript refusal of `--release` with another `--optimization`.
@@ -2399,7 +2470,9 @@ effect fn projectPlans(project: &Project, options: &ProjectOptions, fallback: &[
             run writeError(Bytes.asSlice(&selector))
             run writeError(b"\n")
           }
-          PlanError.Profile {code, subject} => run reportProfile(code, Bytes.asSlice(&subject))
+          PlanError.Profile {code, subject, key} => {
+            run reportProfile(Projects.manifest(project), Projects.line(project, Bytes.asSlice(&key)), code, Bytes.asSlice(&subject))
+          }
           PlanError.InvalidProfileInput => run writeError(b"Invalid --profile-input JSON\n")
         }
         return Option<List<ProjectPlan>>.none()
@@ -3221,6 +3294,7 @@ effect fn packageTable<'a>(manifest: &Path, document: &'a TomlValue) -> &'a Toml
     Option<&TomlValue>.None => {
       fail ProjectError.InvalidManifest {
         manifest: run Path.fromBytes(Path.rawBytes(manifest)),
+        line: usize.ZERO,
         detail: run Bytes.copy(b"dependencies belong to a package, and this manifest has no [package] table"),
       }
     }
@@ -3308,7 +3382,7 @@ effect fn addedDependency(working: &Path, command: AddCommand) -> ()
   let packageName = match move Toml.asString(Toml.field(dependencyPackage, "name")) {
     Option<string>.Some {value} => String.utf8Bytes(value)
     Option<string>.None => {
-      fail ProjectError.InvalidManifest {manifest: move dependencyManifest, detail: run Bytes.copy(b"missing [package] name")}
+      fail ProjectError.InvalidManifest {manifest: move dependencyManifest, line: usize.ZERO, detail: run Bytes.copy(b"missing [package] name")}
     }
   }
   let named = match move name {
