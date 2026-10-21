@@ -125,6 +125,31 @@ The owner of native thread creation.
 impl NativeThread
 ```
 
+<a id="NativeThread.impl.processorCount"></a>
+
+### Associated function `processorCount`
+
+```silk
+pub fn processorCount() -> usize
+```
+
+The number of processors currently online, and at least one.
+
+#### Details
+
+This is a sizing hint for worker pools; the operating system may still run other work on
+those processors.
+
+<a id="NativeThread.impl.yieldNow"></a>
+
+### Associated function `yieldNow`
+
+```silk
+pub fn yieldNow() -> ()
+```
+
+Offers the rest of the current thread's time slice to other runnable threads.
+
 <a id="NativeThread.impl.spawn"></a>
 
 ### Associated function `spawn`

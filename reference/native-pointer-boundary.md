@@ -71,6 +71,17 @@ bound). Taking leaves the storage logically uninitialized: the caller must refil
 or drop it again, and putting over an initialized value does not drop that value. Together they
 move one owned value through storage that C code carries, such as a thread start argument.
 
+`Intrinsic.pointerBorrow<A, T>(anchor: &'a A, pointer: *const T) -> &'a T` and
+`Intrinsic.pointerBorrowMut<A, T>(anchor: &'a mut A, pointer: *mut T) -> &'a mut T` are the unsafe
+anchored borrows. The result is a reference to the pointer's referent with the anchor's lifetime,
+so ordinary borrow checking keeps the anchor borrowed, with the same access, exactly as long as the
+reference lives. The anchor names the loan and is not otherwise read. `Pointer.borrow` and
+`Pointer.borrowMut` expose them. The caller proves the referent is initialized and stays valid for
+the anchor's loan, and that the access is exclusive for the mutable form, or free of non-atomic
+writes for the shared one. A handle that owns storage through a raw pointer passes itself as the
+anchor, so `Arc.get` and `MutexGuard.getMut` return references that cannot outlive the handle or
+the lock.
+
 ## Native output storage
 
 Ordinary source owns `Uninitialized<T>` and `Initialized<T>` output states for Copy values. Private
