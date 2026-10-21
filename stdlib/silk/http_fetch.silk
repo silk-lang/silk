@@ -1,17 +1,40 @@
-//! Bounded one-shot HTTP delivery over redirects, content decoding, routing, and pooling.
+//! Send one HTTP request, follow redirects, decode the content, and deliver the body to a
+//! destination that you choose.
 //!
 //! # When to use
-//!
-//! Use the `toSink*` operations for sequential external delivery, `collect*` for bounded atomic
-//! in-memory results, and `discard*` for explicit bounded validation without retaining a body.
-//! Select the suffix matching the request body's replay authority.
+//! Use this module when you need more control than `silk.http_client`: a sink for a large body, a
+//! body that you stream, content decoding, a proxy, or a connection pool. Make a [`Fetch`] around a
+//! [`FetchClient`], such as the `Context` of `silk.http_fetch_native`. Then call one function for
+//! each request.
 //!
 //! # Details
+//! There are three destinations:
+//! - `toSink*` gives the body to a [`Sink`] in chunks, in order.
+//! - `collect*` reads the whole body into memory, up to `maxBodyBytes`, and returns it only if it
+//!   is complete.
+//! - `discard*` reads and checks the body, and keeps nothing.
 //!
-//! Fetch owns no transport policy. A [`FetchClient`] supplies routed or pooled attempts under one
-//! unchanged deadline, `silk.http_redirect` owns redirect and source authority, and
-//! `silk.http_exchange` owns response framing and content provenance. Every public destination is
-//! finite, and every completed result owns the metadata that outlives the live response.
+//! The suffix tells what the request body is:
+//! - `Empty`: no body.
+//! - `Bytes`: a byte slice. It is sent again after a redirect that keeps the body.
+//! - `OneShot`: a `BodyProducer` that can run only one time. A redirect that must send the body
+//!   again fails with `ReplayUnavailable`.
+//! - `Replay`: a factory that makes a new producer for each attempt.
+//!
+//! [`FetchOptions`] sets redirects, content decoding, the pool, the proxy, one deadline for the
+//! whole operation, and all limits. `silk.http_redirect` applies the redirect rules, and
+//! `silk.http_content` decodes the content.
+//!
+//! # Errors
+//! - [`FetchError`] tells the phase and the reason, with the status and the URI when they are
+//!   known, and how many body bytes the destination got.
+//! - `RedirectError`, `ExchangeError`, `ValueError`, and `BodyError` from the lower modules.
+//! - [`DestinationFailure`] when your [`Sink`] fails.
+//! - `OutOfMemoryError` if the `Allocator` fails.
+//!
+//! # Gotchas
+//! The deadline is not renewed between redirects or phases. The default [`FetchOptions`] do not
+//! follow redirects and do not decode content. Set `redirect` and `content` to change that.
 
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.buffered_input {BufferError}
@@ -68,261 +91,264 @@ import silk.uri {OwnedUri, Uri}
 import silk.usize
 import silk.zstd {ZstdError, ZstdLimits}
 
-/// Whether connection acquisition may use the compatible pool retained by the client context.
+/// Whether a connection can come from a pool.
 pub enum PoolMode {
-  /// Uses a compatible context pool when present and otherwise opens a fresh connection.
+  /// Use the pool of the client when it has one. Otherwise open a new connection.
   UseContextPool,
-  /// Always opens a fresh connection and never checks out or publishes through a pool.
+  /// Always open a new connection, and never put it in a pool.
   Fresh,
 }
 
-/// Whether acquisition uses configured routing or bypasses it for this operation.
+/// Whether the request uses the proxy policy of the client.
 pub enum ProxyMode {
-  /// Recomputes only the explicit client-context proxy policy for every redirect origin.
+  /// Use the proxy policy of the client. The route is selected again for each redirect.
   InheritContext,
-  /// Uses direct routing without environment lookup.
+  /// Connect directly to the origin, without a proxy. Environment variables are not read.
   Direct,
 }
 
-/// The one-shot operation phase associated with bounded fetch-owned context.
+/// The phase of a fetch in which an error occurred.
 pub enum FetchPhase {
-  /// Semantic URI admission or copying.
+  /// Checking or copying the URI.
   Uri,
-  /// Per-origin route selection.
+  /// Selecting the route for an origin.
   Route,
-  /// Pool checkout, resolution, connection, or TLS acquisition.
+  /// Getting a connection: the pool, name lookup, the connect, or TLS.
   Connect,
-  /// Request preparation or upload.
+  /// Preparing or sending the request.
   Request,
-  /// Redirect policy and intermediate-response handling.
+  /// Applying the redirect rules.
   Redirect,
-  /// Final response-head selection or copying.
+  /// Reading or copying the final response head.
   Head,
-  /// Content selection, decoding, framing, or trailer validation.
+  /// Decoding the content, the framing, or the trailers.
   Decode,
-  /// Sink, collection, or discard delivery.
+  /// Giving the body to the sink, the collection, or the discard.
   Destination,
-  /// Explicit response completion and reuse decision.
+  /// Completing the response and deciding if the connection can be used again.
   Finish,
 }
 
-/// The independent finite fetch resource that rejected a value.
+/// The fetch limit that was exceeded. See [`FetchReason.LimitExceeded`].
 pub enum FetchLimit {
-  /// Deframed representation input accepted by the content layer.
+  /// `maxEncodedBodyBytes`: the body bytes before decoding.
   EncodedBodyBytes,
-  /// Representation bytes successfully accepted by the destination.
+  /// `maxDeliveredBodyBytes`: the body bytes given to the destination.
   DeliveredBodyBytes,
-  /// URI, head, and trailer payload plus owned index storage.
+  /// `maxOwnedMetadataBytes`: the copies of the URI, the head, and the trailers.
   OwnedMetadataBytes,
-  /// The positive scratch buffer used for response delivery.
+  /// `maxBufferedBytes`: the read buffer.
   BufferedBytes,
-  /// Bytes retained by a collection destination.
+  /// The `maxBodyBytes` of a `collect*` function.
   CollectionBytes,
-  /// Bytes validated by a discard destination.
+  /// The `maxDiscardBytes` of a `discard*` function.
   DiscardBytes,
 }
 
-/// An owned isomorphic form of a content failure whose unsupported token cannot borrow the head.
+/// The reason that content decoding failed. It is a copy of the `silk.http_content` error that does
+/// not borrow the response.
 pub union FetchContentReason {
-  /// A content configuration or byte count exceeds its admitted range.
+  /// A content limit is not valid, or a byte count exceeded it.
   InvalidLimit {
-    /// The rejected configuration or byte class.
+    /// The limit.
     pub limit: ContentLimitKind,
-    /// The applicable maximum.
+    /// The value of the limit.
     pub allowed: u64,
-    /// The rejected value or count.
+    /// The value that was found.
     pub attempted: u64,
   },
-  /// A Content-Encoding element is empty or malformed.
+  /// An item in `Content-Encoding` is empty or not valid.
   CodingSyntax {
-    /// The exact location of the invalid token or byte.
+    /// Where the item is.
     pub position: CodingPosition,
   },
-  /// A valid coding name has no selected decoder; the exact token is independently owned.
+  /// A content coding has no decoder, for example `br`.
   UnsupportedCoding {
-    /// The token position in the original response.
+    /// Where the coding is.
     pub position: CodingPosition,
-    /// An owned copy of the exact unsupported token.
+    /// A copy of the coding name.
     pub token: Bytes,
   },
-  /// A partial response selected a nonidentity decoder.
+  /// A 206 partial response has a coding other than `identity`, which cannot be decoded.
   PartialResponse {
-    /// The first nonidentity coding in wire order.
+    /// The first coding that is not `identity`.
     pub position: CodingPosition,
   },
-  /// The response body is a protocol tunnel rather than a representation.
+  /// The response body is a tunnel, not content.
   Tunnel,
-  /// HTTP framing rejected the response body.
+  /// The body framing failed.
   Body {
-    /// The original body error, including committed wire progress.
+    /// The error from `silk.http_body`.
     pub error: BodyError,
   },
-  /// Buffered input or its transport failed.
+  /// Reading from the transport failed.
   Buffer {
-    /// The original buffer error and its transport cause.
+    /// The error, with its transport cause.
     pub error: BufferError,
   },
   /// Gzip or zlib decoding failed.
   Inflate {
-    /// The zero-based reverse application stage.
+    /// The decoding stage, from 0, counted from the last coding.
     pub stage: usize,
-    /// The original coding position in wire order.
+    /// The position of the coding in `Content-Encoding`, from 0.
     pub wireIndex: usize,
-    /// The exact inflate failure and decoder-call progress.
+    /// The error from `silk.inflate`.
     pub error: DecodeError,
   },
   /// Zstandard decoding failed.
   Zstandard {
-    /// The zero-based reverse application stage.
+    /// The decoding stage, from 0, counted from the last coding.
     pub stage: usize,
-    /// The original coding position in wire order.
+    /// The position of the coding in `Content-Encoding`, from 0.
     pub wireIndex: usize,
-    /// The exact Zstandard failure and decoder-call progress.
+    /// The error from `silk.zstd`.
     pub error: ZstdError,
   },
-  /// A finished coding stream had additional encoded bytes.
+  /// There were more bytes after the end of a compressed stream.
   TrailingEncodedData {
-    /// The zero-based reverse application stage.
+    /// The decoding stage, from 0, counted from the last coding.
     pub stage: usize,
-    /// The original coding position in wire order.
+    /// The position of the coding in `Content-Encoding`, from 0.
     pub wireIndex: usize,
   },
-  /// Checked content accounting overflowed.
+  /// A byte count overflowed.
   ArithmeticOverflow,
-  /// The content reader was already failed or abandoned.
+  /// The content reader had already failed or stopped.
   InvalidState,
 }
 
-/// Exact owned content-failure coordinates safe to return after the response head is released.
+/// A content decoding error, with byte counts. It owns its data.
 pub struct FetchContentError {
-  /// The owned failure category and original lower-level cause.
+  /// The reason.
   pub reason: FetchContentReason
-  /// Bytes written into the current provisional output chunk.
+  /// The bytes written to the current output chunk.
   pub written: usize
-  /// Cumulative deframed encoded bytes accepted.
+  /// The total encoded bytes read.
   pub totalEncoded: u64
-  /// Cumulative nonfinal decoder-stage output.
+  /// The total bytes from decoding stages before the last one.
   pub totalIntermediate: u64
-  /// Cumulative selected-representation output.
+  /// The total decoded bytes.
   pub totalDecoded: u64
 }
 
-/// A fetch-owned admission, limit, or unsupported-response reason.
+/// The reason of a [`FetchError`].
 pub union FetchReason {
-  /// One or more finite options are inconsistent or outside their admitted domain.
+  /// The [`FetchOptions`] are not valid. See [`FetchOptions.validate`].
   InvalidOptions,
-  /// The supplied HTTP connection limits failed their owning client's pre-contact admission.
+  /// The client rejected the HTTP limits in the options.
   InvalidHttpOptions {
-    /// The client's original pre-contact admission failure.
+    /// The error from the client.
     pub error: ExchangeError,
   },
-  /// HTTP value copying failed while Fetch owned the final-head boundary.
+  /// Copying an HTTP value failed.
   HttpValue {
-    /// The original HTTP value validation or copying failure.
+    /// The error from `silk.http`.
     pub error: ValueError,
   },
-  /// HTTP body or trailer validation failed after final-response selection.
+  /// The body or the trailers of the final response are not valid.
   HttpBody {
-    /// The original body or trailer validation failure.
+    /// The error from `silk.http_body`.
     pub error: BodyError,
   },
-  /// The streaming client failed inside Fetch's final-response delivery boundary.
+  /// The exchange failed while the body of the final response was read.
   HttpClient {
-    /// The original final-response client failure.
+    /// The error from `silk.http_exchange`.
     pub error: ExchangeError,
   },
-  /// Checked accounting cannot represent the required total.
+  /// A byte count overflowed.
   SizeOverflow,
-  /// A caller-defined sink rejected the current offered chunk.
+  /// Your sink rejected a chunk.
   DestinationRejected,
-  /// Content selection failed; borrowed coding tokens are copied into bounded owned storage.
+  /// Content decoding failed.
   Content {
-    /// The owned content failure, including coding coordinates and byte totals.
+    /// The content error.
     pub error: FetchContentError,
   },
-  /// One independent finite resource would exceed its inclusive limit.
+  /// A limit in [`FetchOptions`] or in the call was exceeded.
   LimitExceeded {
-    /// The resource whose bound was reached.
+    /// The limit.
     pub limit: FetchLimit,
-    /// The inclusive admitted maximum.
+    /// The value of the limit.
     pub allowed: u64,
-    /// The rejected cumulative value.
+    /// The value that was found.
     pub attempted: u64,
   },
-  /// The final response would require transferring duplex protocol authority.
+  /// The final response is 101 Switching Protocols, or a 2xx for `CONNECT`. Fetch cannot use the
+  /// connection after such a response.
   UnsupportedSwitchingResponse {
-    /// The final protocol-switching or successful CONNECT status.
+    /// The status of the response.
     pub status: Status,
   },
 }
 
-/// Safe independently owned failure context added by the one-shot boundary.
+/// The error from a fetch, with context. It owns its data.
 pub struct FetchError {
-  /// The operation phase that rejected the value or observed the failure.
+  /// The phase in which the error occurred.
   pub phase: FetchPhase
-  /// The stable fetch-owned failure category.
+  /// The reason.
   pub reason: FetchReason
-  /// Final status when it is known without retaining the response owner.
+  /// The status of the final response, when it is known.
   pub status: Option<Status>
-  /// Independently copied current URI when bounded context is available.
+  /// A copy of the current URI, when it is known.
   pub uri: Option<OwnedUri>
-  /// Bytes accepted by the destination before the failing operation.
+  /// The body bytes that the destination accepted before the error.
   pub deliveredBodyBytes: u64
-  /// Current chunk length offered to a failing destination, otherwise zero.
+  /// The length of the chunk that the destination rejected, or 0.
   pub offeredBodyBytes: usize
 }
 
-/// A typed sink failure paired with only fetch-known delivery progress.
+/// The error from your [`Sink`], with the context of the fetch.
 pub struct DestinationFailure<E> {
-  /// The original caller-defined sink failure.
+  /// The error from your sink.
   pub error: E
-  /// Bounded destination context excluding claims about partial external effects.
+  /// The context: the phase, the status, the URI, and the bytes delivered before the error.
   pub context: FetchError
 }
 
-/// Representation policy selected from the final wire response.
+/// How the content of the response was decoded.
 pub struct RepresentationMetadata {
-  /// The exact applied Raw or Decode plan and coding counts.
+  /// The decoding plan that was used: raw, or which codings were decoded.
   pub applied: AppliedPlan
-  /// Whether framing and every selected content stage completed successfully.
+  /// `true` when the framing and all decoding completed.
   pub completed: bool
-  /// Final delivered representation bytes, available only after completion.
+  /// The number of body bytes delivered, after completion.
   pub deliveredBytes: Option<u64>
 }
 
-/// Immutable owned header-only metadata lent before each body chunk.
+/// The head of the final response, and how its content is decoded. Your sink gets it with each
+/// chunk.
 pub struct ResponseMetadata {
-  /// The independently owned final URI.
+  /// The URI of the final response, after redirects.
   pub finalUri: OwnedUri
-  /// The independently owned final status, reason, and ordered wire headers.
+  /// The status, the reason, and the headers of the final response, as received.
   pub head: OwnedResponseHead
-  /// Content-plan provenance separate from unchanged wire headers.
+  /// How the content is decoded. The headers are not changed by decoding.
   pub representation: RepresentationMetadata
-  /// Counted URI and head payload plus owned index storage.
+  /// The memory of the URI and head copies, in bytes.
   pub ownedBytes: usize
 }
 
-/// One verified completed response without retained body bytes.
+/// The result of a complete response, without the body.
 pub struct FetchResult {
-  /// Final owned header metadata.
+  /// The final URI and head.
   pub metadata: ResponseMetadata
-  /// Final ordered trailers copied only after content completion.
+  /// The trailers of a chunked response, if any.
   pub trailers: Option<OwnedTrailers>
-  /// Number of redirects followed before this response.
+  /// The number of redirects that were followed.
   pub redirectCount: usize
-  /// Deframed encoded representation bytes accepted by the content layer.
+  /// The body bytes before decoding.
   pub encodedBodyBytes: u64
-  /// Representation bytes successfully accepted by the destination.
+  /// The body bytes that the destination accepted.
   pub deliveredBodyBytes: u64
-  /// URI, head, and trailer payload plus owned index storage.
+  /// The memory of the URI, head, and trailer copies, in bytes.
   pub ownedMetadataBytes: usize
 }
 
-/// One atomically published bounded in-memory response.
+/// The result of a `collect*` function: the response and its whole body.
 pub struct CollectedResponse {
-  /// The verified completed response metadata and counters.
+  /// The response without the body.
   pub result: FetchResult
-  /// The complete selected representation body.
+  /// The whole body, decoded as selected in the options.
   pub body: Bytes
 }
 
@@ -331,7 +357,8 @@ union RequestHeaders<'headers> {
   Borrowed {headers: Headers<'headers>},
 }
 
-/// A semantic request whose body authority is supplied by one source-specific operation.
+/// The method, URI, headers, and header policy of a request. The body comes from the function that
+/// you call.
 pub struct FetchRequest<'uri, 'method, 'headers, 'policy> {
   uriValue: Uri<'uri>
   methodValue: Method<'method>
@@ -345,7 +372,8 @@ pub struct FetchRequest<'uri, 'method, 'headers, 'policy> {
 }
 
 impl<'uri, 'method, 'headers, 'policy> FetchRequest<'uri, 'method, 'headers, 'policy> {
-  /// Constructs a semantic request while preserving its explicit method and ordered headers.
+  /// Returns a request. `continuePolicy` selects `Expect: 100-continue`. The limits apply to the
+  /// head that is sent. See `prepare` in `silk.http_request`.
   pub fn make(
     uri: Uri<'uri>,
     method: Method<'method>,
@@ -369,7 +397,8 @@ impl<'uri, 'method, 'headers, 'policy> FetchRequest<'uri, 'method, 'headers, 'po
       maxCredentialBytesValue: maxCredentialBytes,
     }
   }
-  /// Constructs GET with empty caller headers and the standard request policy and limits.
+  /// Returns a GET request for `uri`, with no headers, the default header policy, and the default
+  /// limits.
   pub fn get(uri: Uri<'uri>) -> Self {
     let limits = ClientLimits.defaults().head.values
     return FetchRequest<'uri, 'method, 'headers, 'policy> {
@@ -386,34 +415,35 @@ impl<'uri, 'method, 'headers, 'policy> FetchRequest<'uri, 'method, 'headers, 'po
   }
 }
 
-/// Finite one-shot policies admitted before route selection or transport contact.
+/// The settings of a fetch. Start from [`FetchOptions.defaults`].
 pub struct FetchOptions {
-  /// Redirect policy, including Manual or Follow behavior and intermediate-response bounds.
+  /// Whether and how to follow redirects. See `silk.http_redirect`.
   pub redirect: RedirectPolicy
-  /// Raw or decoded representation selection.
+  /// Whether to give the body raw or decoded. See `silk.http_content`.
   pub content: ContentMode
-  /// Compatible context-pool or forced-fresh acquisition.
+  /// Whether a connection can come from a pool.
   pub pool: PoolMode
-  /// Explicit client-context routing or forced direct routing.
+  /// Whether to use the proxy policy of the client.
   pub proxy: ProxyMode
-  /// One optional absolute operation deadline, never renewed between phases or hops.
+  /// One deadline on the `MonotonicClock` for the whole operation, including all redirects.
   pub deadline: Option<Instant>
-  /// Existing finite HTTP parser, framing, trailer, and transport-buffer limits.
+  /// The limits for the HTTP exchange: heads, framing, trailers, and buffers.
   pub http: ClientLimits
-  /// Existing finite content planning and codec limits.
+  /// The limits for content decoding.
   pub contentLimits: ContentLimits
-  /// Additional inclusive encoded representation allowance.
+  /// The maximum body bytes before decoding.
   pub maxEncodedBodyBytes: u64
-  /// Inclusive representation bytes accepted by any destination.
+  /// The maximum body bytes that any destination gets.
   pub maxDeliveredBodyBytes: u64
-  /// Inclusive owned URI, head, and trailer payload-plus-index allowance.
+  /// The maximum memory for the copies of the URI, the head, and the trailers.
   pub maxOwnedMetadataBytes: usize
-  /// Positive per-read response delivery scratch capacity.
+  /// The size of the read buffer for the body. It must not be 0.
   pub maxBufferedBytes: usize
 }
 
 impl FetchOptions {
-  /// Returns Manual, Raw, context-pool, inherited-route policy with finite standard limits.
+  /// Returns options that do not follow redirects, do not decode content, use the pool and proxy
+  /// policy of the client, have no deadline, and allow bodies of 16 MiB.
   pub fn defaults() -> FetchOptions {
     let maxBody = u64.toU64(16777216)
     return FetchOptions {
@@ -445,7 +475,8 @@ impl FetchOptions {
       maxBufferedBytes: 16384,
     }
   }
-  /// Checks local capacities and content configuration without allocation or provider access.
+  /// Checks that the options are consistent. It does not allocate or connect. Each fetch function
+  /// calls it first.
   pub fn validate(self: &Self) -> Result<(), FetchError> {
     if self.maxBufferedBytes == usize.ZERO {
       return Result<(), FetchError>.failResult(
@@ -470,26 +501,27 @@ impl FetchOptions {
   }
 }
 
-/// An owned target-neutral facade around one explicit acquisition context.
+/// A fetch client around a [`FetchClient`]. Make it with [`Fetch.make`], and pass it to the fetch
+/// functions.
 pub struct Fetch<C> {
   client: C
 }
 
 impl<C> Fetch<C> {
-  /// Seals one caller-supplied client context into a fetch facade.
+  /// Returns a fetch client that uses `client` to get connections.
   pub fn make(client: C) -> Fetch<C> {
     return Fetch<C> {client: move client}
   }
 }
 
-/// A sequential effectful destination whose metadata and current chunk loans cannot escape.
+/// A destination for the body chunks of a `toSink*` function.
 pub interface Sink<E, ?R> {
-  /// Accepts the complete offered chunk under the unchanged operation deadline.
+  /// Accepts one chunk of the body.
   ///
   /// # Details
-  ///
-  /// `deadline` is the original absolute fetch deadline. `None` permits an unbounded wait. The
-  /// callback must return before Fetch reads or offers another chunk.
+  /// `metadata` is the final response head. `deadline` is the deadline of the whole fetch, or
+  /// `None`. The fetch reads no more body until this call returns. The chunk and the metadata are
+  /// only borrowed for this call.
   effect<'call> fn write<'call>(
     sink: &mut Self,
     metadata: &'call ResponseMetadata,
@@ -498,13 +530,12 @@ pub interface Sink<E, ?R> {
   ) -> () ! E ? R
 }
 
-/// Target-neutral routed or pooled acquisition for one current redirect attempt.
+/// Gets a connection and runs one attempt of a request. A fetch calls it again for each redirect.
 ///
 /// # Details
-///
-/// Implementations admit options before contact, recompute routes for the current request URI, and
-/// lend exactly one scoped exchange. `deadline` is the unchanged operation deadline. `Fresh` never
-/// consults a pool, and `Direct` never consults configured or ambient proxy policy.
+/// An implementation checks the options before it connects, and selects the route for the current
+/// URI. With `Fresh`, it does not use a pool. With `Direct`, it does not use a proxy policy.
+/// `deadline` is the deadline of the whole fetch.
 pub interface FetchClient<
   'policy,
   RoutedP,
@@ -515,7 +546,7 @@ pub interface FetchClient<
   ?HandlerRequirements,
   ?AcquisitionRequirements,
 > {
-  /// Rebuilds and drives one scoped request under the selected acquisition modes.
+  /// Connects and runs one attempt of `request` with these limits and modes.
   effect fn withAttempt(
     client: &mut Self,
     request: AttemptRequest<'policy>,
@@ -1502,7 +1533,7 @@ effect fn admit(options: &FetchOptions) -> () ! FetchError {
   }
 }
 
-/// Executes a body-free request and sequentially offers the selected representation to `sink`.
+/// Sends a request with no body, and gives the body of the final response to `sink` in chunks.
 pub effect<'env> fn toSinkEmpty<
   'fetch,
   'uri,
@@ -1568,7 +1599,8 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes a body-free request and atomically publishes a bounded in-memory body.
+/// Sends a request with no body, and returns the body of the final response in memory. More than
+/// `maxBodyBytes` fails, and no partial body is returned.
 pub effect fn collectEmpty<
   'fetch,
   'uri,
@@ -1628,7 +1660,8 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes a body-free request and validates an explicitly bounded discarded representation.
+/// Sends a request with no body, and reads and checks the body of the final response without
+/// keeping it. More than `maxDiscardBytes` fails.
 pub effect fn discardEmpty<
   'fetch,
   'uri,
@@ -1840,7 +1873,8 @@ where
   }
 }
 
-/// Executes a repeatable byte-body request and sequentially offers the selected representation.
+/// Sends a request with the body `bytes`, and gives the body of the final response to `sink` in
+/// chunks.
 pub effect<'env> fn toSinkBytes<
   'fetch,
   'uri,
@@ -1910,7 +1944,8 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes a repeatable byte-body request and atomically publishes a bounded body.
+/// Sends a request with the body `bytes`, and returns the body of the final response in memory.
+/// More than `maxBodyBytes` fails, and no partial body is returned.
 pub effect fn collectBytes<
   'fetch,
   'uri,
@@ -1974,7 +2009,8 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes a repeatable byte-body request and validates bounded discarded content.
+/// Sends a request with the body `bytes`, and reads and checks the body of the final response
+/// without keeping it. More than `maxDiscardBytes` fails.
 pub effect fn discardBytes<
   'fetch,
   'uri,
@@ -2216,7 +2252,8 @@ where
   }
 }
 
-/// Executes an affine producer request and sequentially offers the selected representation.
+/// Sends a request whose body comes from `producer` one time, and gives the body of the final
+/// response to `sink` in chunks.
 pub effect<'env> fn toSinkOneShot<
   'fetch,
   'uri,
@@ -2299,7 +2336,8 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes an affine producer request and atomically publishes a bounded body.
+/// Sends a request whose body comes from `producer` one time, and returns the body of the final
+/// response in memory. More than `maxBodyBytes` fails, and no partial body is returned.
 pub effect<'env> fn collectOneShot<
   'fetch,
   'uri,
@@ -2370,7 +2408,8 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes an affine producer request and validates bounded discarded content.
+/// Sends a request whose body comes from `producer` one time, and reads and checks the body of the
+/// final response without keeping it. More than `maxDiscardBytes` fails.
 pub effect<'env> fn discardOneShot<
   'fetch,
   'uri,
@@ -2636,7 +2675,8 @@ where
   }
 }
 
-/// Executes a replay-factory request and sequentially offers the selected representation.
+/// Sends a request whose body comes from a new producer from `factory` for each attempt, and gives
+/// the body of the final response to `sink` in chunks.
 pub effect<'env> fn toSinkReplay<
   'fetch,
   'uri,
@@ -2727,7 +2767,9 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes a replay-factory request and atomically publishes a bounded body.
+/// Sends a request whose body comes from a new producer from `factory` for each attempt, and
+/// returns the body of the final response in memory. More than `maxBodyBytes` fails, and no partial
+/// body is returned.
 pub effect<'env> fn collectReplay<
   'fetch,
   'uri,
@@ -2806,7 +2848,8 @@ where
   return run withSemanticRequest<RoutedP, DirectP>(move request, move operation)
 }
 
-/// Executes a replay-factory request and validates bounded discarded content.
+/// Sends a request whose body comes from a new producer from `factory` for each attempt, and reads
+/// and checks the body of the final response without keeping it. More than `maxDiscardBytes` fails.
 pub effect<'env> fn discardReplay<
   'fetch,
   'uri,

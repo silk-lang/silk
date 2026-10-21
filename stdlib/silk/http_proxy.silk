@@ -1,10 +1,130 @@
-//! Bounded HTTP proxy policy, pure route selection, and owned CONNECT rejection metadata.
+//! Proxy settings for HTTP clients, and the choice of a route for each origin.
+//!
+//! # When to use
+//! Make a [`ProxyConfig`] with [`ProxyConfig.fromUri`] or [`ProxyConfig.make`]. Then call
+//! [`selectRoute`] for each origin. `silk.http_request` and `silk.http_exchange` use the [`Route`]
+//! to prepare and send the request.
 //!
 //! # Details
+//! [`selectRoute`] does not allocate or use the network. It returns:
+//! - `Direct` for an origin in the [`BypassPolicy`].
+//! - `Tunnel` for an HTTPS origin. The client sends `CONNECT` to the proxy, then does TLS with the
+//!   origin through the tunnel.
+//! - `Forward` for a plain HTTP origin. The client sends the request to the proxy with the full URI
+//!   as target.
 //!
-//! Proxy policy owns its prepared authentication token and exact-origin bypass entries. Selection
-//! does not allocate or use the network. A selected route supplies its configured authentication
-//! only through bounded output. CONNECT rejection copies have fixed field and owned-byte limits.
+//! The configuration owns its Basic token. A route writes the `Proxy-Authorization` value only into
+//! a buffer that you give. [`classifyConnect`] reads the response of the proxy to `CONNECT`.
+//!
+//! # Errors
+//! - [`ProxyError`] with a [`ProxyAdmissionError`] if a setting is not valid. It holds no
+//!   credentials.
+//! - [`ProxyError`] with the response head if the proxy rejects `CONNECT`.
+//!
+//! # Gotchas
+//! Only plain `http` proxies are supported. An `https` proxy URI fails with
+//! `UnsupportedProxyTransport`. Environment variables such as `HTTPS_PROXY` are not read.
+//!
+//! # Examples
+//! ## Select routes
+//! ```silk
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.http_origin { Origin, OriginError }
+//! import silk.http_proxy {
+//!   BypassPolicy,
+//!   ProxyAuth,
+//!   ProxyAuthContextId,
+//!   ProxyConfig,
+//!   ProxyConfigId,
+//!   ProxyError,
+//!   Route,
+//!   RouteMode,
+//!   selectRoute
+//! }
+//! import silk.option { Option }
+//! import silk.result { Result }
+//! import silk.uri { Uri }
+//! import silk.uri_reference { ParseError }
+//!
+//! fn origin(text: string<'static>) -> Origin {
+//!   let uri = match Uri.parse(text) {
+//!     Result<Uri, ParseError>.Success { value } => value
+//!     Result<Uri, ParseError>.Failure { error: _ } => {
+//!       let invalid = 1 / 0
+//!       return origin(text)
+//!     }
+//!   }
+//!   return match Origin.fromUri(&uri) {
+//!     Result<Origin, OriginError>.Success { value } => value
+//!     Result<Origin, OriginError>.Failure { error: _ } => {
+//!       let invalid = 1 / 0
+//!       return origin(text)
+//!     }
+//!   }
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError
+//!   ? &mut Allocator {
+//!   // The token is the Base64 of "user:pass".
+//!   let auth = match run ProxyAuth.preparedBasic(ProxyAuthContextId.make(1), b"dXNlcjpwYXNz") {
+//!     Result<ProxyAuth, ProxyError>.Success { value } => move value
+//!     Result<ProxyAuth, ProxyError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let local = [origin("http://localhost:8080")]
+//!   let bypass = match run BypassPolicy.copy(&local) {
+//!     Result<BypassPolicy, ProxyError>.Success { value } => move value
+//!     Result<BypassPolicy, ProxyError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!   let config = match ProxyConfig.fromUri(
+//!     ProxyConfigId.make(1),
+//!     "http://proxy.example:3128",
+//!     move auth,
+//!     move bypass,
+//!     4096,
+//!   ) {
+//!     Result<ProxyConfig, ProxyError>.Success { value } => move value
+//!     Result<ProxyConfig, ProxyError>.Failure { error: _ } => {
+//!       return 1
+//!     }
+//!   }
+//!
+//!   // HTTPS goes through a CONNECT tunnel, plain HTTP is forwarded, and the bypass origin is direct.
+//!   let secure = selectRoute(&config, origin("https://example.com/"))
+//!   let plain = selectRoute(&config, origin("http://example.com/"))
+//!   let direct = selectRoute(&config, origin("http://localhost:8080/"))
+//!   if Route.mode(&secure) != RouteMode.Tunnel || Route.mode(&plain) != RouteMode.Forward
+//!     || Route.mode(&direct) != RouteMode.Direct {
+//!     return 1
+//!   }
+//!   let mut header: [u8; 64] = [0; 64]
+//!   let length = match Route.writeProxyAuthorizationInto(&plain, &mut header) {
+//!     Option<usize>.Some { value } => value
+//!     Option<usize>.None => 0
+//!   }
+//!
+//!   // "Basic dXNlcjpwYXNz"
+//!   if length != 18 || header[0] != 66 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   return run Effect.catchAll(program(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+//! }
+//! ```
 
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.base64 {Base64, Base64Error}
@@ -27,109 +147,114 @@ import silk.u8
 import silk.usize
 import silk.list {List}
 
-/// The proxy value rejected during admission.
+/// The setting that is not valid.
 pub enum ProxyComponent {
-  /// The proxy URI text.
+  /// The proxy URI.
   ProxyUri,
-  /// The programmatic proxy endpoint.
+  /// The proxy host and port.
   ProxyEndpoint,
-  /// The prepared authentication token.
+  /// The Basic token.
   Authentication,
-  /// The exact-origin bypass policy.
+  /// The bypass list.
   Bypass,
-  /// The complete proxy configuration.
+  /// The configuration as a whole.
   Configuration,
-  /// A selected route used by the wrong operation or with a different origin.
+  /// A route that was used for the wrong operation, or for another origin.
   Route,
 }
 
-/// A bounded proxy configuration resource.
+/// A limit of a proxy configuration.
 pub enum ProxyLimit {
-  /// The maximum encoded authentication-token byte count.
+  /// The maximum length of the Basic token.
   AuthenticationBytes,
-  /// The maximum exact-origin bypass-entry count.
+  /// The maximum number of bypass origins, 64.
   BypassOrigins,
-  /// The maximum total owned configuration byte count.
+  /// The `maxOwnedConfigBytes` of the configuration.
   OwnedConfigurationBytes,
 }
 
-/// The reason proxy policy admission failed.
+/// The rule that failed.
 pub union ProxyReason {
-  /// The proxy URI has invalid syntax or a prohibited URI component.
+  /// The proxy URI is not valid, or has a part that is not allowed, such as a path or user
+  /// information.
   InvalidProxyUri,
-  /// The programmatic proxy endpoint has port zero.
+  /// The proxy port is 0.
   InvalidProxyPort,
-  /// The prepared Basic token is empty or is not canonical strict Base64.
+  /// The Basic token is empty, or is not canonical Base64.
   InvalidAuthentication,
-  /// The required owned byte count does not fit in `usize`.
+  /// A size does not fit in `usize`.
   SizeOverflow,
-  /// A resource exceeds its admitted maximum.
+  /// A value exceeded a limit.
   LimitExceeded {
-    /// The resource that exceeds its limit.
+    /// The limit.
     pub limit: ProxyLimit,
-    /// The inclusive admitted maximum.
+    /// The value of the limit.
     pub allowed: usize,
-    /// The rejected resource value.
+    /// The value that was found.
     pub attempted: usize,
   },
-  /// The proxy URI uses the unsupported `https` scheme.
+  /// The proxy URI uses `https`, which is not supported.
   UnsupportedProxyTransport,
-  /// The selected route mode or original origin is incompatible with the requested operation.
+  /// The route mode or its origin does not fit the operation.
   InvalidRoute,
 }
 
-/// A copyable proxy-policy admission failure containing no identity or credential bytes.
+/// The error for a setting that is not valid. It holds no credentials.
 pub struct ProxyAdmissionError {
-  /// The proxy value that failed admission.
+  /// The setting.
   pub component: ProxyComponent
-  /// The admission rule that failed.
+  /// The rule that failed.
   pub reason: ProxyReason
 }
 
-/// A typed proxy failure whose response variants own only bounded, nonsecret metadata.
+/// The error from proxy settings or from a `CONNECT` response.
 pub union ProxyError {
-  /// Configuration, route, or credential admission failed without retaining input bytes.
+  /// A setting or a route is not valid.
   Admission {
-    /// The structured copyable admission failure.
+    /// The error.
     pub error: ProxyAdmissionError,
   },
-  /// A complete CONNECT response exceeded the fixed owned-metadata budget.
+  /// The `CONNECT` response head is too large to copy.
   ProxyMetadataLimit,
-  /// A 407 response retaining status, reason, and ordered `Proxy-Authenticate` fields only.
+  /// The proxy answered 407. The copy keeps only the status, the reason, and the
+  /// `Proxy-Authenticate` fields.
   ProxyAuthenticationRequired {
-    /// The bounded independently owned response metadata.
+    /// The copy of the response head.
     pub response: OwnedResponseHead,
   },
-  /// Another final non-2xx response retaining status, reason, and all ordered fields.
+  /// The proxy answered with another status that is not 2xx. The copy keeps all fields.
   ProxyRejected {
-    /// The bounded independently owned response metadata.
+    /// The copy of the response head.
     pub response: OwnedResponseHead,
   },
-  /// Response classification was attempted before a final CONNECT response existed.
+  /// [`classifyConnect`] was called before a final response.
   InvalidConnectResponse,
 }
 
-/// An opaque configuration identity made from a caller-supplied nonsecret `u64`.
+/// A number that you choose to identify a configuration, for example in a pool key. It is not
+/// secret.
 pub struct ProxyConfigId { value: u64 }
 
-/// An opaque authentication-context identity made from a caller-supplied nonsecret `u64`.
+/// A number that you choose to identify a set of credentials, for example in a pool key. It is not
+/// secret.
 pub struct ProxyAuthContextId { value: u64 }
 
-/// Prepared proxy authentication owned by a proxy configuration.
+/// The credentials for the proxy.
 pub union ProxyAuth {
-  /// An authentication context that has no credential token.
+  /// No credentials.
   None { contextIdValue: ProxyAuthContextId },
-  /// An authentication context that owns a prepared Basic token.
+  /// A Basic token.
   Basic { contextIdValue: ProxyAuthContextId, tokenValue: Bytes },
 }
 
-/// A bounded list of exact normalized origins that bypass the proxy.
+/// The origins that do not use the proxy. An origin matches only with the same scheme, host, and
+/// port.
 pub struct BypassPolicy {
   originsValue: List<Origin>
   ownedBytesValue: usize
 }
 
-/// Immutable owned proxy configuration.
+/// The settings of a proxy: its host and port, its credentials, and the bypass list.
 pub struct ProxyConfig {
   idValue: ProxyConfigId
   proxyHostValue: Host
@@ -139,13 +264,13 @@ pub struct ProxyConfig {
   ownedBytesValue: usize
 }
 
-/// The route mode selected for one origin.
+/// How a request goes to an origin.
 pub enum RouteMode {
-  /// Contact the origin directly.
+  /// Directly to the origin.
   Direct,
-  /// Contact the proxy and use an absolute-form HTTP request.
+  /// To the proxy, with the full URI as target.
   Forward,
-  /// Contact the proxy and use CONNECT before origin TLS.
+  /// Through a `CONNECT` tunnel at the proxy, then TLS with the origin.
   Tunnel,
 }
 
@@ -156,32 +281,32 @@ struct RouteIdentity {
   proxyPort: Port
 }
 
-/// The pure route selected for one original HTTP origin.
+/// The route for one origin, from [`selectRoute`].
 pub union Route<'configuration> {
-  /// A route that contacts an exact bypass origin directly.
+  /// Go directly to an origin in the bypass list.
   Direct {
     identity: RouteIdentity,
     configuration: &'configuration ProxyConfig,
-    /// The original origin that matched bypass policy.
+    /// The origin.
     pub origin: Origin,
   },
-  /// A route that sends plaintext HTTP through the proxy.
+  /// Send plain HTTP through the proxy.
   Forward {
     identity: RouteIdentity,
     configuration: &'configuration ProxyConfig,
-    /// The original plaintext HTTP origin.
+    /// The plain HTTP origin.
     pub origin: Origin,
   },
-  /// A route that establishes a proxy tunnel for origin TLS.
+  /// Open a tunnel through the proxy for TLS with the origin.
   Tunnel {
     identity: RouteIdentity,
     configuration: &'configuration ProxyConfig,
-    /// The original HTTPS origin for TLS authentication.
+    /// The HTTPS origin. TLS checks its certificate.
     pub origin: Origin,
   },
 }
 
-/// Stable route identity for later pooling and redirect recomputation.
+/// A key that identifies a route, for example for a connection pool. It has no credentials.
 pub struct RouteKey {
   identity: RouteIdentity
   originValue: Origin
@@ -197,7 +322,7 @@ impl<'configuration> Copy for Route<'configuration> {}
 impl Copy for RouteKey {}
 
 impl ProxyError {
-  /// Returns the credential-free failure for an incompatible sealed route.
+  /// Returns the `InvalidRoute` error.
   pub fn invalidRoute() -> ProxyError {
     return failure(ProxyComponent.Route, ProxyReason.InvalidRoute)
   }
@@ -294,26 +419,27 @@ fn writeAuthentication(configuration: &ProxyConfig, output: &mut [u8]) -> Option
 }
 
 impl ProxyConfigId {
-  /// Preserves a caller-supplied nonsecret identity payload opaquely.
+  /// Returns the identity for `value`.
   pub fn make(value: u64) -> ProxyConfigId { return ProxyConfigId {value: value} }
-  /// Reports exact caller-payload equality without exposing the payload.
+  /// Returns `true` if the two identities have the same value.
   pub fn equals(self: &Self, other: &Self) -> bool { return self.value == other.value }
 }
 
 impl ProxyAuthContextId {
-  /// Preserves a caller-supplied nonsecret identity payload opaquely.
+  /// Returns the identity for `value`.
   pub fn make(value: u64) -> ProxyAuthContextId { return ProxyAuthContextId {value: value} }
-  /// Reports exact caller-payload equality without exposing the payload.
+  /// Returns `true` if the two identities have the same value.
   pub fn equals(self: &Self, other: &Self) -> bool { return self.value == other.value }
 }
 
 impl ProxyAuth {
-  /// Creates an authentication context with no credential bytes.
+  /// Returns credentials with no token.
   pub fn none(contextId: ProxyAuthContextId) -> ProxyAuth {
     return ProxyAuth.None {contextIdValue: contextId}
   }
 
-  /// Strictly validates and copies one nonempty prepared Basic token.
+  /// Checks and copies `token`, the Base64 of `user:password`. It must be canonical Base64, and at
+  /// most 4096 bytes.
   pub effect fn preparedBasic(
     contextId: ProxyAuthContextId,
     token: &[u8],
@@ -342,7 +468,7 @@ impl ProxyAuth {
     })
   }
 
-  /// Returns the caller-supplied authentication-context identity.
+  /// Returns the identity of the credentials.
   pub fn contextId(self: &Self) -> ProxyAuthContextId {
     return match & self.* {
       ProxyAuth.None {contextIdValue} => contextIdValue
@@ -350,7 +476,7 @@ impl ProxyAuth {
     }
   }
 
-  /// Returns retained credential bytes without exposing them.
+  /// Returns the length of the token, or 0.
   pub fn ownedBytes(self: &Self) -> usize {
     return match & self.* {
       ProxyAuth.None {contextIdValue} => usize.ZERO
@@ -360,7 +486,7 @@ impl ProxyAuth {
 }
 
 impl BypassPolicy {
-  /// Copies at most 64 exact normalized HTTP origins into immutable owned policy.
+  /// Copies up to 64 origins into a bypass list.
   pub effect fn copy(origins: &[Origin]) -> Result<BypassPolicy, ProxyError>
   ! OutOfMemoryError
   ? &mut Allocator {
@@ -391,7 +517,7 @@ impl BypassPolicy {
     })
   }
 
-  /// Reports exact scheme, normalized-host, and effective-port membership.
+  /// Returns `true` if `origin` has the same scheme, host, and port as an origin in the list.
   pub fn contains(self: &Self, origin: &Origin) -> bool {
     let values = List<Origin>.asSlice(&self.originsValue)
     let mut index = usize.ZERO
@@ -402,12 +528,13 @@ impl BypassPolicy {
     return false
   }
 
-  /// Returns copied bypass-entry storage size.
+  /// Returns the memory of the list, in bytes.
   pub fn ownedBytes(self: &Self) -> usize { return self.ownedBytesValue }
 }
 
 impl ProxyConfig {
-  /// Admits a plain programmatic proxy endpoint under a total owned-byte budget.
+  /// Returns a configuration for a proxy at `proxyHost` and `proxyPort`. The port cannot be 0.
+  /// `maxOwnedConfigBytes` limits the memory of the host, the token, and the bypass list.
   pub fn make(
     id: ProxyConfigId,
     proxyHost: Host,
@@ -453,7 +580,8 @@ impl ProxyConfig {
     })
   }
 
-  /// Parses only a plain `http` authority with no userinfo, path, query, or fragment.
+  /// Returns a configuration for the proxy in `text`, such as `http://proxy:3128`. The URI can have
+  /// only the `http` scheme, a host, and a port.
   pub fn fromUri<'text>(
     id: ProxyConfigId,
     text: string<'text>,
@@ -498,15 +626,15 @@ impl ProxyConfig {
     )
   }
 
-  /// Returns the caller-supplied configuration identity.
+  /// Returns the identity of the configuration.
   pub fn id(self: &Self) -> ProxyConfigId { return self.idValue }
-  /// Returns the caller-supplied authentication-context identity.
+  /// Returns the identity of the credentials.
   pub fn authContextId(self: &Self) -> ProxyAuthContextId { return ProxyAuth.contextId(&self.authenticationValue) }
-  /// Returns the checked proxy host.
+  /// Returns the proxy host.
   pub fn proxyHost(self: &Self) -> Host { return self.proxyHostValue }
-  /// Returns the checked nonzero proxy port.
+  /// Returns the proxy port.
   pub fn proxyPort(self: &Self) -> Port { return self.proxyPortValue }
-  /// Returns the copied host, token, and bypass-entry byte count.
+  /// Returns the memory of the configuration, in bytes.
   pub fn ownedBytes(self: &Self) -> usize { return self.ownedBytesValue }
 }
 
@@ -519,7 +647,8 @@ fn routeIdentity(config: &ProxyConfig) -> RouteIdentity {
   }
 }
 
-/// Purely selects Direct, Forward, or Tunnel for one original origin.
+/// Returns the route for `origin`: `Direct` for a bypass origin, `Tunnel` for HTTPS, and `Forward`
+/// for plain HTTP. It does not allocate or use the network.
 pub fn selectRoute<'configuration>(
   configuration: &'configuration ProxyConfig,
   origin: Origin,
@@ -558,14 +687,12 @@ fn connectMetadataLimits() -> Limits {
   }
 }
 
-/// Classifies a complete final CONNECT response into success or bounded rejection metadata.
+/// Reads the final response of the proxy to `CONNECT`.
 ///
 /// # Details
-///
-/// Any 2xx response is accepted. A 407 retains status, reason, and ordered duplicate
-/// `Proxy-Authenticate` fields only; other final non-2xx responses retain all ordered fields.
-/// Complete-head copy failures map to `ProxyMetadataLimit`, while allocation failure remains
-/// `OutOfMemoryError`. Call this only after the shared client's parser has returned a final head.
+/// A 2xx status succeeds. A 407 fails with `ProxyAuthenticationRequired`, and other statuses with
+/// `ProxyRejected`, with a copy of the head. If the head is too large to copy, it fails with
+/// `ProxyMetadataLimit`. Call it only after a final response head.
 pub effect fn classifyConnect(
   head: &ResponseHead,
 ) -> () ! ProxyError | OutOfMemoryError ? &mut Allocator {
@@ -603,7 +730,7 @@ pub effect fn classifyConnect(
 }
 
 impl<'configuration> Route<'configuration> {
-  /// Returns the selected route mode.
+  /// Returns the mode of the route.
   pub fn mode(self: &Self) -> RouteMode {
     return match & self.* {
       Route.Direct {identity, configuration, origin} => RouteMode.Direct
@@ -611,7 +738,7 @@ impl<'configuration> Route<'configuration> {
       Route.Tunnel {identity, configuration, origin} => RouteMode.Tunnel
     }
   }
-  /// Returns the original origin that policy evaluated.
+  /// Returns the origin that the route is for.
   pub fn originalOrigin(self: &Self) -> Origin {
     return match & self.* {
       Route.Direct {identity, configuration, origin} => origin
@@ -619,7 +746,7 @@ impl<'configuration> Route<'configuration> {
       Route.Tunnel {identity, configuration, origin} => origin
     }
   }
-  /// Returns the proxy host retained when policy selected the route.
+  /// Returns the proxy host.
   pub fn proxyHost(self: &Self) -> Host {
     return match & self.* {
       Route.Direct {identity, configuration, origin} => identity.proxyHost
@@ -627,7 +754,7 @@ impl<'configuration> Route<'configuration> {
       Route.Tunnel {identity, configuration, origin} => identity.proxyHost
     }
   }
-  /// Returns the proxy port retained when policy selected the route.
+  /// Returns the proxy port.
   pub fn proxyPort(self: &Self) -> Port {
     return match & self.* {
       Route.Direct {identity, configuration, origin} => identity.proxyPort
@@ -635,16 +762,11 @@ impl<'configuration> Route<'configuration> {
       Route.Tunnel {identity, configuration, origin} => identity.proxyPort
     }
   }
-  /// Returns the plaintext proxy peer retained by the sealed route.
+  /// Returns the proxy as a plain HTTP origin, the server to connect to.
   pub fn physicalPeer(self: &Self) -> Result<Origin, OriginError> {
     return Origin.make(Route.proxyHost(self), Route.proxyPort(self), false)
   }
-  /// Returns the complete configured `Proxy-Authorization` value length, or zero when absent.
-  ///
-  /// # Details
-  ///
-  /// The prepared token remains private; possessing a policy-selected route is the capability to
-  /// request its bounded wire representation.
+  /// Returns the length of the `Proxy-Authorization` value, or 0 if there are no credentials.
   pub fn proxyAuthorizationLength(self: &Self) -> usize {
     return match & self.* {
       Route.Direct {identity, configuration, origin} => authenticationLength(configuration)
@@ -652,8 +774,8 @@ impl<'configuration> Route<'configuration> {
       Route.Tunnel {identity, configuration, origin} => authenticationLength(configuration)
     }
   }
-  /// Writes the complete configured `Proxy-Authorization` value without exposing token storage.
-  /// Returns `None` without changing `output` when it is too small.
+  /// Writes the `Proxy-Authorization` value, such as `Basic dXNlcjpwYXNz`, to the start of
+  /// `output`, and returns its length. Returns `None` and writes nothing if `output` is too small.
   pub fn writeProxyAuthorizationInto(self: &Self, output: &mut [u8]) -> Option<usize> {
     let required = Route.proxyAuthorizationLength(self)
     if output.length < required {
@@ -674,7 +796,7 @@ impl<'configuration> Route<'configuration> {
       }
     }
   }
-  /// Returns the configuration identity retained when policy selected the route.
+  /// Returns the identity of the configuration.
   pub fn configId(self: &Self) -> ProxyConfigId {
     return match & self.* {
       Route.Direct {identity, configuration, origin} => identity.configId
@@ -682,7 +804,7 @@ impl<'configuration> Route<'configuration> {
       Route.Tunnel {identity, configuration, origin} => identity.configId
     }
   }
-  /// Returns the authentication-context identity retained when policy selected the route.
+  /// Returns the identity of the credentials.
   pub fn authContextId(self: &Self) -> ProxyAuthContextId {
     return match & self.* {
       Route.Direct {identity, configuration, origin} => identity.authContextId
@@ -690,7 +812,7 @@ impl<'configuration> Route<'configuration> {
       Route.Tunnel {identity, configuration, origin} => identity.authContextId
     }
   }
-  /// Returns a stable key without reading or formatting authentication bytes.
+  /// Returns the key of the route. It does not read the credentials.
   pub fn key(self: &Self) -> RouteKey {
     return RouteKey {
       identity: match & self.* {
@@ -702,7 +824,8 @@ impl<'configuration> Route<'configuration> {
       modeValue: Route.mode(self),
     }
   }
-  /// Recomputes policy for a new origin under the current immutable configuration.
+  /// Returns the route for another origin, with the same configuration, for example after a
+  /// redirect.
   pub fn recompute(self: &Self, origin: Origin) -> Route<'configuration> {
     return match & self.* {
       Route.Direct {identity, configuration, origin: previous} => selectRoute(configuration, origin)
@@ -713,11 +836,11 @@ impl<'configuration> Route<'configuration> {
 }
 
 impl RouteKey {
-  /// Returns the normalized original origin retained by this sealed route identity.
+  /// Returns the origin of the route.
   pub fn originalOrigin(self: &Self) -> Origin { return self.originValue }
-  /// Returns the selected route mode without exposing proxy configuration or credential bytes.
+  /// Returns the mode of the route.
   pub fn mode(self: &Self) -> RouteMode { return self.modeValue }
-  /// Compares route mode, original origin, proxy endpoint, and both opaque identities.
+  /// Returns `true` if the mode, the origin, the proxy, and the two identities are equal.
   pub fn equals(self: &Self, other: &Self) -> bool {
     return self.modeValue == other.modeValue
       && Origin.equals(&self.originValue, &other.originValue)
