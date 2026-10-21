@@ -18,10 +18,10 @@ text back into a number. They accept the default output of `Display` for the sam
 Output goes to the ambient `Writer` effect. A [`Formatter`](#Formatter) holds only the options. No operation
 in this module allocates, and none makes an intermediate `String`.
 
-Integers display as plain decimal. Finite floats display as the shortest decimal that parses
-back to the same bits, and negative zero displays as `-0`. If you set a precision, a float
-displays with exactly that many fractional digits, rounded half to even. That output does not
-always parse back to the same bits.
+Integers display in decimal, or in hexadecimal, octal, or binary with a [`Style`](#Style). Finite
+floats display as the shortest decimal that parses back to the same bits, and negative zero
+displays as `-0`. If you set a precision, a float displays with exactly that many fractional
+digits, rounded half to even. That output does not always parse back to the same bits.
 
 Width counts Unicode scalars, not UTF-8 bytes and not terminal columns. The compiler parses and
 checks templates, selects fields, and selects `Display` implementations, so a bad template is a
@@ -43,7 +43,7 @@ you display it, use `f64.isFinite` or `f32.isFinite`.
 ### Write a padded number and a template into a buffer
 ```silk
 import silk.effect { Effect }
-import silk.format { Alignment, Format, FormatOptions, Sign }
+import silk.format { Alignment, Format, FormatOptions, Sign, Style }
 import silk.option { Option }
 import silk.writer { Writer, WriterError }
 
@@ -99,6 +99,7 @@ effect fn render() -> ()
     zeroPad: false,
     precision: Option<usize>.none(),
     color: false,
+    style: Style.Default,
   }
   run Format.displayWith(&value, move options)
   let args = .{ name: "Ada", count: 3 }
@@ -145,7 +146,7 @@ pub fn main() -> i32 {
 
 Import as `Format` with `import silk.format { Format }`.
 
-Public declarations: 9.
+Public declarations: 11.
 
 <a id="Format"></a>
 
@@ -179,7 +180,7 @@ Returns the default [`FormatOptions`](#FormatOptions).
 #### Details
 
 The defaults are: no width, `Alignment.Default`, a space as fill, `Sign.NegativeOnly`, no
-alternate form, no zero padding, no precision, and no color. [`Format.display`](#Format.impl.display) uses these
+alternate form, no zero padding, no precision, no color, and `Style.Default`. [`Format.display`](#Format.impl.display) uses these
 options.
 
 <a id="Format.impl.make"></a>
@@ -256,6 +257,16 @@ pub fn sign(self: &Formatter) -> Sign
 
 Returns the sign rule for numbers.
 
+<a id="Format.impl.style"></a>
+
+### Method `style`
+
+```silk
+pub fn style(self: &Formatter) -> Style
+```
+
+Returns the style that selects the number base or notation.
+
 <a id="Format.impl.alternate"></a>
 
 ### Method `alternate`
@@ -268,8 +279,9 @@ Returns `true` if the options ask for the alternate form.
 
 #### Details
 
-The standard `Display` implementations ignore this flag. A `Display` implementation that you
-write can use it and must document what it changes.
+The standard integers write a base prefix (`0x`, `0o`, `0b`) in the alternate form of a
+[`Style`](#Style) other than `Style.Default`. A `Display` implementation that you write can use the
+flag and must document what it changes.
 
 <a id="Format.impl.zeroPad"></a>
 
@@ -560,8 +572,9 @@ Writes `value` to the ambient `Writer` with `options`.
 
 For integers, the precision is a minimum digit count and turns off zero padding. For floats,
 the precision is the exact number of fractional digits, rounded half to even. For text, the
-precision is the maximum number of Unicode scalars, and the rest is cut. The standard
-implementations ignore `alternate` and `color`.
+precision is the maximum number of Unicode scalars, and the rest is cut. Integers use
+`style` for the base and `alternate` for the base prefix. The standard implementations ignore
+`color`.
 
 #### Errors
 
@@ -602,6 +615,8 @@ options are, in this order and each optional:
 - `0` for zero padding.
 - A width in decimal digits.
 - `.` and a precision in decimal digits.
+- A type: `x` lowercase hexadecimal, `X` uppercase hexadecimal, `o` octal, `b` binary. These
+  need an integer, and `#` adds the prefix `0x`, `0o`, or `0b`.
 
 The compiler parses the options and checks the template and the fields. A placeholder without
 options uses [`Format.defaultOptions`](#Format.impl.defaultOptions). `format` borrows `args`.
@@ -614,8 +629,8 @@ options uses [`Format.defaultOptions`](#Format.impl.defaultOptions). `format` bo
 #### Gotchas
 
 One template cannot mix `{}` and `{name}`. A template with `{}` must use each tuple field
-exactly one time. A malformed template, a malformed option, or a field that does not exist
-is a compile error. The width and the precision are fixed in the template; to take them
+exactly one time. A malformed template, a malformed option, a field that does not exist, or
+a base type such as `x` on a value that is not an integer is a compile error. The width and the precision are fixed in the template; to take them
 from a value, use [`Format.displayWith`](#Format.impl.displayWith). `Sign.Space` and `color` are available only
 through [`FormatOptions`](#FormatOptions).
 
@@ -675,14 +690,15 @@ effect fn render() -> ()
   let user = .{ name: "Ada", age: 36 }
   run Format.format("{name} is {age} {{years}}. ", &user)
   let price = .{ item: "tea", cost: 2.5 }
-  return run Format.format("[{item:.<6}{cost:>6.2}]", &price)
+  run Format.format("[{item:.<6}{cost:>6.2}] ", &price)
+  return run Format.format("{:#06x} {:b}", &(255, 5))
 }
 
 pub effect fn main() -> i32
   ! WriterError {
   let mut writer = CaptureWriter { bytes: [0; 64], length: 0 }
   run render() |> Effect.provideMut<Writer>(&mut writer)
-  if !holds(&writer, b"3 + 4 = 7. Ada is 36 {years}. [tea...  2.50]") {
+  if !holds(&writer, b"3 + 4 = 7. Ada is 36 {years}. [tea...  2.50] 0x00ff 101") {
     return 1
   }
   return 0
@@ -1098,6 +1114,76 @@ Space
 
 Writes `-` for negative numbers and one space for other numbers, so columns of numbers align.
 
+<a id="Style"></a>
+
+## `Style`
+
+```silk
+pub enum Style
+```
+
+The base or notation that a number displays in.
+
+### Details
+
+The standard integers use every style. Other standard types ignore it. With the alternate
+form, the integers write the prefix `0x`, `0o`, or `0b` before the digits.
+
+### Gotchas
+
+A negative integer in a base other than decimal displays as its two's complement bits at the
+width of its type, with no sign, as in Rust: `-1` as `i8` in `LowerHex` is `ff`.
+
+<a id="Style.Default"></a>
+
+### `Default`
+
+```silk
+Default
+```
+
+Decimal for integers, and the normal form of other types.
+
+<a id="Style.LowerHex"></a>
+
+### `LowerHex`
+
+```silk
+LowerHex
+```
+
+Base 16 with the digits `0` to `9` and `a` to `f`.
+
+<a id="Style.UpperHex"></a>
+
+### `UpperHex`
+
+```silk
+UpperHex
+```
+
+Base 16 with the digits `0` to `9` and `A` to `F`.
+
+<a id="Style.Octal"></a>
+
+### `Octal`
+
+```silk
+Octal
+```
+
+Base 8.
+
+<a id="Style.Binary"></a>
+
+### `Binary`
+
+```silk
+Binary
+```
+
+Base 2.
+
 <a id="FormatOptions"></a>
 
 ## `FormatOptions`
@@ -1111,8 +1197,7 @@ The options that control how a value displays.
 ### Details
 
 [`Format.defaultOptions`](#Format.impl.defaultOptions) returns the defaults. To change some options, start from the defaults
-and set the fields you need. The standard `Display` implementations ignore `alternate` and
-`color`.
+and set the fields you need. The standard `Display` implementations ignore `color`.
 
 <a id="FormatOptions.width"></a>
 
@@ -1163,8 +1248,8 @@ How numbers that are not negative show a sign.
 pub alternate: bool
 ```
 
-Permission for a `Display` implementation to use its alternate form. The standard
-implementations ignore it.
+Permission for a `Display` implementation to use its alternate form. The standard integers
+use it to write a base prefix such as `0x`.
 
 <a id="FormatOptions.zeroPad"></a>
 
@@ -1204,6 +1289,16 @@ pub color: bool
 
 Permission, not a request, to write ANSI color codes. The standard implementations never write
 them.
+
+<a id="FormatOptions.style"></a>
+
+### Field `style`
+
+```silk
+pub style: Style
+```
+
+The base or notation for numbers.
 
 <a id="Formatter"></a>
 
@@ -1338,6 +1433,40 @@ Writes `self` to the ambient `Writer` with the options in `formatter`.
 - `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
   failure stay written. Nothing is rolled back.
 
+<a id="RadixDisplay"></a>
+
+## `RadixDisplay`
+
+```silk
+pub interface RadixDisplay
+```
+
+An integer type that can display in a base other than decimal.
+
+### When to use
+
+Implement it for your own integer type to use it with the `x`, `X`, `o`, and `b` types in
+[`Format.format`](#Format.impl.format). The standard integers implement it.
+
+### Details
+
+[`Format.format`](#Format.impl.format) calls `displayRadix` for a placeholder with a base type, so a base type on a
+value that is not an integer is a compile error. The options carry the base in
+[`FormatOptions.style`](#FormatOptions.style).
+
+<a id="RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(
+    self: &Self,
+    formatter: &mut Formatter
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes the value in the base that [`Format.style`](#Format.impl.style) selects. `Style.Default` is decimal.
+
 <a id="NotANumber"></a>
 
 ## `NotANumber`
@@ -1410,12 +1539,30 @@ impl Display for u8
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="u8.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for u8`
+
+```silk
+impl RadixDisplay for u8
+```
+
+<a id="u8.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="u16.impl.Display"></a>
 
@@ -1433,12 +1580,30 @@ impl Display for u16
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="u16.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for u16`
+
+```silk
+impl RadixDisplay for u16
+```
+
+<a id="u16.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="u32.impl.Display"></a>
 
@@ -1456,12 +1621,30 @@ impl Display for u32
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="u32.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for u32`
+
+```silk
+impl RadixDisplay for u32
+```
+
+<a id="u32.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="u64.impl.Display"></a>
 
@@ -1479,12 +1662,30 @@ impl Display for u64
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="u64.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for u64`
+
+```silk
+impl RadixDisplay for u64
+```
+
+<a id="u64.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="usize.impl.Display"></a>
 
@@ -1502,12 +1703,30 @@ impl Display for usize
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="usize.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for usize`
+
+```silk
+impl RadixDisplay for usize
+```
+
+<a id="usize.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="i8.impl.Display"></a>
 
@@ -1525,12 +1744,30 @@ impl Display for i8
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="i8.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for i8`
+
+```silk
+impl RadixDisplay for i8
+```
+
+<a id="i8.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="i16.impl.Display"></a>
 
@@ -1548,12 +1785,30 @@ impl Display for i16
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="i16.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for i16`
+
+```silk
+impl RadixDisplay for i16
+```
+
+<a id="i16.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="i32.impl.Display"></a>
 
@@ -1571,12 +1826,30 @@ impl Display for i32
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="i32.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for i32`
+
+```silk
+impl RadixDisplay for i32
+```
+
+<a id="i32.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="i64.impl.Display"></a>
 
@@ -1594,12 +1867,30 @@ impl Display for i64
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="i64.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for i64`
+
+```silk
+impl RadixDisplay for i64
+```
+
+<a id="i64.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="isize.impl.Display"></a>
 
@@ -1617,12 +1908,30 @@ impl Display for isize
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the value in decimal. Sign, precision, zero padding, width, fill, and alignment apply.
+Writes the value in the base of [`Format.style`](#Format.impl.style), decimal by default. Sign, precision, zero
+padding, width, fill, and alignment apply.
 
 #### Details
 
-The order is: leading fill, sign, zeros from the precision or from `zeroPad`, digits, trailing
-fill.
+The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
+digits, trailing fill. Only the alternate form writes a base prefix. A base other than
+decimal writes no sign; see [`Style`](#Style).
+
+<a id="isize.impl.RadixDisplay"></a>
+
+## Implementation `RadixDisplay for isize`
+
+```silk
+impl RadixDisplay for isize
+```
+
+<a id="isize.impl.RadixDisplay.displayRadix"></a>
+
+### Operation `displayRadix`
+
+```silk
+effect fn displayRadix(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
 
 <a id="f64.impl.Display"></a>
 
