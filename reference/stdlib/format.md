@@ -592,8 +592,19 @@ Use `format` when the text is known at compile time and each value implements [`
 - `{name}` takes the record field `name`.
 - `{{` writes `{` and `}}` writes `}`.
 
-The compiler checks the template and selects the fields. `format` borrows `args` and uses
-[`Format.defaultOptions`](#Format.impl.defaultOptions) for each value.
+A placeholder can set options after a colon, as in Rust: `{:>8}`, `{name:*^10.2}`. The
+options are, in this order and each optional:
+
+- A fill character and an alignment: `<` left, `^` center, `>` right. The fill needs an
+  alignment after it, so `{:*<6}` pads with `*`. Without a fill, the fill is a space.
+- `+` for `Sign.Always`. `-` is the default and changes nothing.
+- `#` for the alternate form.
+- `0` for zero padding.
+- A width in decimal digits.
+- `.` and a precision in decimal digits.
+
+The compiler parses the options and checks the template and the fields. A placeholder without
+options uses [`Format.defaultOptions`](#Format.impl.defaultOptions). `format` borrows `args`.
 
 #### Errors
 
@@ -603,8 +614,10 @@ The compiler checks the template and selects the fields. `format` borrows `args`
 #### Gotchas
 
 One template cannot mix `{}` and `{name}`. A template with `{}` must use each tuple field
-exactly one time. A malformed template or a field that does not exist is a compile error.
-Placeholders cannot set options such as a width.
+exactly one time. A malformed template, a malformed option, or a field that does not exist
+is a compile error. The width and the precision are fixed in the template; to take them
+from a value, use [`Format.displayWith`](#Format.impl.displayWith). `Sign.Space` and `color` are available only
+through [`FormatOptions`](#FormatOptions).
 
 #### Examples
 
@@ -660,14 +673,16 @@ effect fn render() -> ()
   let pair = (3, 4)
   run Format.format("{} + {} = 7. ", &pair)
   let user = .{ name: "Ada", age: 36 }
-  return run Format.format("{name} is {age} {{years}}", &user)
+  run Format.format("{name} is {age} {{years}}. ", &user)
+  let price = .{ item: "tea", cost: 2.5 }
+  return run Format.format("[{item:.<6}{cost:>6.2}]", &price)
 }
 
 pub effect fn main() -> i32
   ! WriterError {
   let mut writer = CaptureWriter { bytes: [0; 64], length: 0 }
   run render() |> Effect.provideMut<Writer>(&mut writer)
-  if !holds(&writer, b"3 + 4 = 7. Ada is 36 {years}") {
+  if !holds(&writer, b"3 + 4 = 7. Ada is 36 {years}. [tea...  2.50]") {
     return 1
   }
   return 0
