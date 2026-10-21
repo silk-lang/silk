@@ -909,13 +909,26 @@ const program = Effect.gen(function* () {
   const misspelled = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
   assert.equal(misspelled.status, 2, misspelled.stderr)
   assert.match(misspelled.stderr, /silk\.toml:6: packge is not a supported field/)
-  // A quoted profile name, an unknown composition field and a deployment version on a target
-  // that is not Darwin are refused at their manifest line.
+  // A quoted profile name, unknown composition fields (also inside its entries), its unsupported
+  // requirements and a deployment version on a target that is not Darwin are refused at their
+  // manifest line.
   const locatedRefusals = [
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
       '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
       /silk\.toml:6: build\.composition\.bogus is not a supported field/,
+    ],
+    [
+      '[build]\ncomposition = { runtimes = [\n  { name = "start", module = "silk/native_start_sync", bogus = 1 },\n], defaults = ["start"] }\n',
+      /silk\.toml:7: build\.composition\.runtimes\.bogus is not a supported field/,
+    ],
+    [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], retention = [{ module = "main", declaration = "main", extra = 1 }] }\n',
+      /silk\.toml:6: build\.composition\.retention\.extra is not a supported field/,
+    ],
+    [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], requirements = ["x"] }\n',
+      /silk\.toml:6: build\.composition\.requirements is not supported by the native compiler yet/,
     ],
     [
       '[profiles.d]\ntarget = "x86_64-unknown-linux-gnu"\ndeployment = "14.0"\n',
@@ -927,6 +940,7 @@ const program = Effect.gen(function* () {
     const locatedRefusal = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
     assert.equal(locatedRefusal.status, 2, locatedRefusal.stderr)
     assert.match(locatedRefusal.stderr, message)
+    assert.doesNotMatch(locatedRefusal.stderr, /ARTIFACT-001/)
   }
   // A refused `--profile-input` field is blamed on the flag, not on the manifest.
   yield* fs.writeFileString(join(tuned, 'silk.toml'), tunedHeader)
