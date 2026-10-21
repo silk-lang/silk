@@ -10,8 +10,10 @@
 //! and does not start the Effect. The body representation, continuation, and fixed readiness
 //! endpoint remain private. A nested `Effect.suspend` transfers execution
 //! immediately. In contrast, [`park`] relinquishes the Execution until one [`Wake`] makes it
-//! eligible. The readiness phase and the park generation are ordinary source policy kept in two
-//! package control words; the compiler only stores them.
+//! eligible. The readiness phase and the park generation are ordinary source policy kept together
+//! in one package control word; the compiler only loads, stores and compare-exchanges it. A Wake
+//! may be signaled from another thread: every transition is one compare-exchange of that word,
+//! and readiness is published before the endpoint runs (EXEC-009).
 //!
 //! # Gotchas
 //! `Execution` is affine. The readiness callback must be detached and non-parking. [`make`] can
@@ -22,9 +24,10 @@
 
 import silk.allocator { Allocator, OutOfMemoryError }
 
-// Control word 0 holds the readiness phase. Control word 1 holds the park generation.
-const PHASE: usize = 0
-const GENERATION: usize = 1
+// Control word 0 holds the park generation times `PHASES` plus the readiness phase, so one
+// compare-exchange checks a Wake's generation and moves its phase together.
+const STATE: usize = 0
+const PHASES: usize = 8
 
 const INITIAL: usize = 0
 const INITIAL_READY: usize = 1
@@ -33,7 +36,6 @@ const REGISTERING: usize = 3
 const LATCHED: usize = 4
 const DORMANT: usize = 5
 const ELIGIBLE: usize = 6
-const NOTIFYING: usize = 7
 
 /// The affine readiness authority for one parked generation of one Execution.
 ///
@@ -116,18 +118,27 @@ impl Execution {
     onSuspend: S
   ) -> () {
     let reference = Intrinsic.executionRefOf<A>(&execution)
-    let phase = Intrinsic.executionLoad(&reference, PHASE)
+    let state = Intrinsic.executionLoad(&reference, STATE)
+    let phase = state % PHASES
     if phase != INITIAL && phase != INITIAL_READY && phase != ELIGIBLE { invalidState() }
-    Intrinsic.executionStore(&reference, PHASE, RUNNING)
+    Intrinsic.executionStore(&reference, STATE, state - phase + RUNNING)
     run Intrinsic.executionDrive<A, D, C, S>(
       move execution,
       move branchState,
       move onComplete,
       move onSuspend
     )
-    // A signal latched during registration notifies once the owner holds the Execution again.
-    if Intrinsic.executionLive(&reference) && Intrinsic.executionLoad(&reference, PHASE) == LATCHED {
-      notifyReady(&reference)
+    // A parked body left its generation Registering. Its frames are stored and its owner holds it
+    // again, so it becomes Dormant now, or Eligible if a signal was latched meanwhile.
+    if Intrinsic.executionLive(&reference) {
+      let parked = Intrinsic.executionLoad(&reference, STATE)
+      let base = parked - parked % PHASES
+      if parked % PHASES == REGISTERING {
+        let observed = Intrinsic.executionCompareExchange(&reference, STATE, parked, base + DORMANT)
+        if observed == base + LATCHED { notifyReady(&reference, observed) }
+      } else if parked % PHASES == LATCHED {
+        notifyReady(&reference, parked)
+      }
     }
     return ()
   }
@@ -145,8 +156,7 @@ impl Execution {
   /// Execution has been driven, parked, completed, or destroyed, is a fatal state trap.
   pub fn notifyInitial<A>(execution: &mut Intrinsic.Execution<A>) -> () {
     let reference = Intrinsic.executionRefOf<A>(&execution.*)
-    if Intrinsic.executionLoad(&reference, PHASE) != INITIAL { invalidState() }
-    Intrinsic.executionStore(&reference, PHASE, INITIAL_READY)
+    if Intrinsic.executionCompareExchange(&reference, STATE, INITIAL, INITIAL_READY) != INITIAL { invalidState() }
     Intrinsic.executionNotify(&reference)
     return ()
   }
@@ -170,15 +180,13 @@ impl Execution {
     F: once fn<'env>(Wake) -> G + Intrinsic.NonParking
   >(register: F) -> () {
     let reference = run Intrinsic.executionCurrent()
-    let generation = Intrinsic.executionLoad(&reference, GENERATION) + 1
-    Intrinsic.executionStore(&reference, GENERATION, generation)
-    Intrinsic.executionStore(&reference, PHASE, REGISTERING)
+    // Only this body writes the word while it runs, and no Wake for the new generation exists yet.
+    let state = Intrinsic.executionLoad(&reference, STATE)
+    let generation = state / PHASES + 1
+    Intrinsic.executionStore(&reference, STATE, generation * PHASES + REGISTERING)
     let wakeReference = run Intrinsic.executionCurrent()
     let guard = register(Wake { reference: move wakeReference, generation: generation })
-    // A latched signal stays latched until drive returns the Execution to its owner.
-    if Intrinsic.executionLoad(&reference, PHASE) != LATCHED {
-      Intrinsic.executionStore(&reference, PHASE, DORMANT)
-    }
+    // The generation stays Registering, or Latched, until drive holds the relinquished Execution.
     drop reference
     run Intrinsic.relinquish()
     drop guard
@@ -201,22 +209,21 @@ impl Execution {
   pub fn wake(wake: Wake) -> () {
     let Wake { reference, generation } = move wake
     if !Intrinsic.executionLive(&reference) { return () }
-    if Intrinsic.executionLoad(&reference, GENERATION) != generation { return () }
-    let phase = Intrinsic.executionLoad(&reference, PHASE)
-    if phase == REGISTERING {
-      Intrinsic.executionStore(&reference, PHASE, LATCHED)
-    } else if phase == DORMANT {
-      notifyReady(&reference)
-    }
+    let base = generation * PHASES
+    let latching = Intrinsic.executionCompareExchange(&reference, STATE, base + REGISTERING, base + LATCHED)
+    if latching == base + REGISTERING { return () }
+    if latching == base + DORMANT { notifyReady(&reference, latching) }
     return ()
   }
 }
 
-// Driving a Notifying Execution traps, so the endpoint cannot reenter its own activation.
-fn notifyReady(reference: &Intrinsic.ExecutionRef) -> () {
-  Intrinsic.executionStore(reference, PHASE, NOTIFYING)
+// Publishes `Eligible` for the generation in `state`, then runs the endpoint. Readiness is visible
+// before the endpoint queues the Execution, so its next owner may drive it at once (EXEC-009).
+// Only the transition's winner notifies.
+fn notifyReady(reference: &Intrinsic.ExecutionRef, state: usize) -> () {
+  let eligible = state - state % PHASES + ELIGIBLE
+  if Intrinsic.executionCompareExchange(reference, STATE, state, eligible) != state { return () }
   Intrinsic.executionNotify(reference)
-  if Intrinsic.executionLive(reference) { Intrinsic.executionStore(reference, PHASE, ELIGIBLE) }
   return ()
 }
 
