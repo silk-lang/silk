@@ -116,10 +116,11 @@ record exact supply checks, object inspection, and execution evidence for each r
 
 ## Direct C calls in LLVM-to-Wasm storage components
 
-The retained LLVM-to-Wasm path admits direct C functions with address-space-zero
-data pointers, 32-bit integers, and void results for explicitly linked source
-runtime components. Other scalar classes, variadics, callbacks, foreign borrowed
-arguments, indirect C calls and foreign data are not admitted on this target.
+The LLVM-to-Wasm path admits direct C functions with scalar lanes, address-space-zero
+data pointers and void results. Narrow integers extend to 32 bits as the WebAssembly C ABI
+requires, and a data address converts exactly to and from the 32-bit `usize`. Variadics,
+callbacks, foreign borrowed arguments, indirect C calls and foreign data are not admitted on this
+target.
 This does not select an OS API or a JavaScript host import. Final linkage must
 resolve the declared symbols. Pointer reinterpretation has the same explicit
 alignment, initialization and lifetime obligations as on native targets.
