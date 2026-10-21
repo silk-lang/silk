@@ -1,0 +1,415 @@
+//! Hover, go to definition, inlay hints and signature help over one package's store.
+//!
+//! Each answer reads what the store already checked: the name at the cursor from `Names`, the
+//! narrowest checked expression's type, the header a declaration was written with and its doc
+//! comment. Offsets are byte offsets in the module's current text.
+
+import hir.Hir { Access, HirId, Module, Multiplicity, Node }
+import lexer.Span { Span }
+import lsp.Names as Names { CallAt, Inferred, NameAt, Named, Site, Typed }
+import semantic.DeclarationId { DeclarationId }
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.ModuleIndex { ModuleIndex }
+import semantic.Query { Cycle }
+import semantic.Semantic { Dependency, Semantic, StaticPort }
+import semantic.SourceIndex { AuthoredCursor, IndexedSource, RevisionMismatch }
+import semantic.Type { Argument, Type }
+import semantic.TypeText
+import semantic.Types { Types }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.list { List }
+import silk.option { Option }
+import silk.shared { Shared }
+import silk.slice { Slice }
+import silk.usize
+
+/// Markdown to show for the range `span` of the hovered document.
+pub struct Hover {
+  pub span: Span
+  pub text: Bytes
+}
+
+/// Where a name is defined: a span in `module`, whose current text is `text`.
+pub struct Destination {
+  pub module: ModuleId
+  pub span: Span
+  pub text: Bytes
+}
+
+/// A label to show just after byte `offset`.
+pub struct Hint {
+  pub offset: usize
+  pub label: Bytes
+}
+
+/// The signature of the call around the cursor, its parameters' labels, and the one the cursor
+/// is in.
+pub struct Help {
+  pub label: Bytes
+  pub parameters: List<Bytes>
+  pub documentation: Bytes
+  pub active: usize
+}
+
+/// What the cursor at `offset` of `module` names, or else the type of the expression under it.
+pub effect fn hover(store: &mut Semantic, module: &ModuleId, text: &[u8], offset: usize) -> Option<Hover>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let named = run Names.at(&mut store.*, module, offset)
+  let typed = run Names.typeAt(&mut store.*, module, offset)
+  if let Option<NameAt>.Some { value: found } = move named {
+    let written = slice(text, found.span)
+    let mut shown = Bytes.make()
+    match move found.named {
+      Named.Declaration { identity } => {
+        if let Option<Site>.Some { value: site } = move run Names.site(&mut store.*, &identity) {
+          run fence(&mut shown, Bytes.asSlice(&site.header))
+          if Bytes.length(&site.documentation) > usize.ZERO {
+            run Bytes.append(&mut shown, b"\n\n")
+            run Bytes.append(&mut shown, Bytes.asSlice(&site.documentation))
+          }
+        }
+      }
+      Named.Local { ty, .. } => {
+        let mut line = run Bytes.copy(written)
+        run Bytes.append(&mut line, b": ")
+        run spell(&mut store.*, &ty, &mut line)
+        run fence(&mut shown, Bytes.asSlice(&line))
+      }
+      Named.Field { .. } => {
+        let mut line = run Bytes.copy(written)
+        if let Option<Typed>.Some { value } = &typed {
+          run Bytes.append(&mut line, b": ")
+          run spell(&mut store.*, &value.ty, &mut line)
+        }
+        run fence(&mut shown, Bytes.asSlice(&line))
+      }
+      Named.Binder { .. } => {
+        run Bytes.append(&mut shown, b"type parameter `")
+        run Bytes.append(&mut shown, written)
+        run Bytes.append(&mut shown, b"`")
+      }
+      Named.Namespace { module: space } => {
+        run Bytes.append(&mut shown, b"module `")
+        run Bytes.append(&mut shown, Bytes.asSlice(&run TypeText.modulePath(&space)))
+        run Bytes.append(&mut shown, b"`")
+      }
+    }
+    if Bytes.length(&shown) > usize.ZERO {
+      return Option<Hover>.some(Hover { span: found.span, text: move shown })
+    }
+    return Option<Hover>.none()
+  }
+  if let Option<Typed>.Some { value } = move typed {
+    let mut line = Bytes.make()
+    run spell(&mut store.*, &value.ty, &mut line)
+    let mut shown = Bytes.make()
+    run fence(&mut shown, Bytes.asSlice(&line))
+    return Option<Hover>.some(Hover { span: value.span, text: move shown })
+  }
+  return Option<Hover>.none()
+}
+
+/// Where the name at `offset` of `module` is defined.
+pub effect fn definition(store: &mut Semantic, module: &ModuleId, text: &[u8], offset: usize) -> Option<Destination>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let found = match move run Names.at(&mut store.*, module, offset) {
+    Option<NameAt>.Some { value } => move value
+    Option<NameAt>.None => {
+      return Option<Destination>.none()
+    }
+  }
+  let mut declared = Option<DeclarationId>.none()
+  match move found.named {
+    Named.Declaration { identity } => {
+      declared = Option<DeclarationId>.some(move identity)
+    }
+    Named.Local { binder, .. } => {
+      return Option<Destination>.some(Destination { module: ModuleId.copy(module), span: binder, text: run Bytes.copy(text) })
+    }
+    Named.Binder { binder } => {
+      return Option<Destination>.some(Destination { module: ModuleId.copy(module), span: binder, text: run Bytes.copy(text) })
+    }
+    Named.Field { owner, .. } => {
+      declared = nominal(&owner)
+    }
+    Named.Namespace { .. } => ()
+  }
+  if let Option<DeclarationId>.Some { value: identity } = move declared {
+    if let Option<Site>.Some { value: site } = move run Names.site(&mut store.*, &identity) {
+      return Option<Destination>.some(Destination { module: move site.module, span: site.name, text: move site.text })
+    }
+  }
+  return Option<Destination>.none()
+}
+
+/// A `: Type` label after each binding of `module` whose type the source left to inference.
+pub effect fn hints(store: &mut Semantic, module: &ModuleId) -> List<Hint>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let inferred = run Names.inferred(&mut store.*, module)
+  let listed = List<Inferred>.asSlice(&inferred)
+  let mut hints = List<Hint>.make()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let mut label = run Bytes.copy(b": ")
+    run spell(&mut store.*, &listed[at].ty, &mut label)
+    run List<Hint>.append(&mut hints, Hint { offset: listed[at].end, label: move label })
+    at = at + usize.ONE
+  }
+  return move hints
+}
+
+/// The signature of the innermost call whose arguments hold `offset`.
+pub effect fn help(store: &mut Semantic, module: &ModuleId, offset: usize) -> Option<Help>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let call = match move run Names.callAt(&mut store.*, module, offset) {
+    Option<CallAt>.Some { value } => move value
+    Option<CallAt>.None => {
+      return Option<Help>.none()
+    }
+  }
+  let site = match move run Names.site(&mut store.*, &call.identity) {
+    Option<Site>.Some { value } => move value
+    Option<Site>.None => {
+      return Option<Help>.none()
+    }
+  }
+  let label = run oneLine(Bytes.asSlice(&site.header))
+  let mut parameters = List<Bytes>.make()
+  let spans = List<Span>.asSlice(&site.parameters)
+  let mut at = usize.ZERO
+  while at < spans.length {
+    run List<Bytes>.append(&mut parameters, run oneLine(slice(Bytes.asSlice(&site.text), spans[at])))
+    at = at + usize.ONE
+  }
+  let mut active = call.active
+  if call.receiver {
+    active = active + usize.ONE
+  }
+  return Option<Help>.some(Help { label: move label, parameters: move parameters, documentation: move site.documentation, active: active })
+}
+
+// The nominal declaration `ty` names, looking through references.
+fn nominal(ty: &Shared<Type>) -> Option<DeclarationId> {
+  return Shared<Type>.with<Option<DeclarationId>>(ty, fn(value: &Type) -> Option<DeclarationId> {
+    return match &value.* {
+      Type.Nominal { declaration, .. } => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+      Type.Reference { referent, .. } => nominal(&referent)
+      _ => Option<DeclarationId>.none()
+    }
+  })
+}
+
+// Appends `text` as a fenced Silk code block.
+effect fn fence(output: &mut Bytes, text: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run Bytes.append(&mut output.*, b"```silk\n")
+  run Bytes.append(&mut output.*, text)
+  run Bytes.append(&mut output.*, b"\n```")
+  return ()
+}
+
+// `text` with each run of whitespace folded to one space.
+effect fn oneLine(text: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut line = Bytes.make()
+  let mut space = false
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    if byte == 32 || byte == 9 || byte == 10 || byte == 13 {
+      space = Bytes.length(&line) > usize.ZERO
+    } else {
+      if space {
+        run Bytes.append(&mut line, b" ")
+        space = false
+      }
+      run Bytes.append(&mut line, &[byte])
+    }
+    at = at + usize.ONE
+  }
+  return move line
+}
+
+fn slice(text: &[u8], span: Span) -> &[u8] {
+  let mut end = span.end
+  if end > text.length {
+    end = text.length
+  }
+  let mut start = span.start
+  if start > end {
+    start = end
+  }
+  return Slice.view<u8>(text, start, end - start)
+}
+
+// Appends how an editor shows `ty`: short nominal names, references without their lifetimes, and
+// type parameters by their written names.
+effect fn spell(store: &mut Semantic, ty: &Shared<Type>, output: &mut Bytes) -> ()
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let copied = run Type.copy(ty)
+  match move copied {
+    Type.Primitive { name } => run Bytes.append(&mut output.*, Bytes.asSlice(&name))
+    Type.Unit => run Bytes.append(&mut output.*, b"()")
+    Type.Nominal { declaration, arguments, .. } => {
+      run Bytes.append(&mut output.*, Bytes.asSlice(&run DeclarationId.copySpelling(&declaration)))
+      let listed = List<Argument>.asSlice(&arguments)
+      let mut first = true
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if let Argument.Type { value } = &listed[at] {
+          if first {
+            run Bytes.append(&mut output.*, b"<")
+          } else {
+            run Bytes.append(&mut output.*, b", ")
+          }
+          first = false
+          run spell(&mut store.*, &value, &mut output.*)
+        }
+        at = at + usize.ONE
+      }
+      if !first {
+        run Bytes.append(&mut output.*, b">")
+      }
+    }
+    Type.Parameter { declaration, ordinal } => {
+      match move run binderName(&mut store.*, &declaration, ordinal) {
+        Option<Bytes>.Some { value } => run Bytes.append(&mut output.*, Bytes.asSlice(&value))
+        Option<Bytes>.None => run Bytes.append(&mut output.*, b"_")
+      }
+    }
+    Type.String { .. } => run Bytes.append(&mut output.*, b"string")
+    Type.Reference { referent, access, .. } => {
+      run Bytes.append(&mut output.*, b"&")
+      if access == Access.Mutable {
+        run Bytes.append(&mut output.*, b"mut ")
+      }
+      run spell(&mut store.*, &referent, &mut output.*)
+    }
+    Type.Slice { element, access, .. } => {
+      run Bytes.append(&mut output.*, b"&")
+      if access == Access.Mutable {
+        run Bytes.append(&mut output.*, b"mut ")
+      }
+      run Bytes.append(&mut output.*, b"[")
+      run spell(&mut store.*, &element, &mut output.*)
+      run Bytes.append(&mut output.*, b"]")
+    }
+    Type.Pointer { pointee, access, nullable, multiplicity, .. } => {
+      if nullable {
+        run Bytes.append(&mut output.*, b"?")
+      }
+      if multiplicity == Multiplicity.Many {
+        run Bytes.append(&mut output.*, b"[*]")
+      } else {
+        run Bytes.append(&mut output.*, b"*")
+      }
+      if access == Access.Mutable {
+        run Bytes.append(&mut output.*, b"mut ")
+      } else {
+        run Bytes.append(&mut output.*, b"const ")
+      }
+      run spell(&mut store.*, &pointee, &mut output.*)
+    }
+    Type.Array { element, extent } => {
+      run Bytes.append(&mut output.*, b"Array<")
+      run spell(&mut store.*, &element, &mut output.*)
+      run Bytes.append(&mut output.*, b", ")
+      run Bytes.append(&mut output.*, Bytes.asSlice(&extent))
+      run Bytes.append(&mut output.*, b">")
+    }
+    Type.Union { members } => {
+      let listed = List<Shared<Type>>.asSlice(&members)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO {
+          run Bytes.append(&mut output.*, b" | ")
+        }
+        run spell(&mut store.*, &listed[at], &mut output.*)
+        at = at + usize.ONE
+      }
+    }
+    Type.Callable { parameters, result, .. } => {
+      run Bytes.append(&mut output.*, b"fn(")
+      let listed = List<Shared<Type>>.asSlice(&parameters)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO {
+          run Bytes.append(&mut output.*, b", ")
+        }
+        run spell(&mut store.*, &listed[at], &mut output.*)
+        at = at + usize.ONE
+      }
+      run Bytes.append(&mut output.*, b") -> ")
+      run spell(&mut store.*, &result, &mut output.*)
+    }
+    _ => run Bytes.append(&mut output.*, b"_")
+  }
+  return ()
+}
+
+// The written name of the type parameter at `ordinal` in `declaration`'s binder list: its
+// generic binders in written order.
+effect fn binderName(store: &mut Semantic, declaration: &DeclarationId, ordinal: usize) -> Option<Bytes>
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, DeclarationId.moduleId(declaration)) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<Bytes>.none()
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return Option<Bytes>.none()
+    }
+  }
+  let hir = IndexedSource.authored(indexed)
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    if DeclarationId.equals(&declarations[at].identity, declaration) {
+      let local = declarations[at].local
+      if let Node.Declaration { header, .. } = Module.node(hir, local) {
+        if let Option<HirId>.Some { value: first } = move Module.declarationStart(hir, local) {
+          let mut seen = usize.ZERO
+          let mut node = first.index
+          while node <= header.index {
+            let mut name = Option<HirId>.none()
+            match Module.node(hir, HirId { index: node }) {
+              Node.TypeParameter { name: binder, .. } => {
+                name = Option<HirId>.some(binder)
+              }
+              Node.LifetimeParameter { name: binder, .. } => {
+                name = Option<HirId>.some(binder)
+              }
+              Node.RowParameter { name: binder } => {
+                name = Option<HirId>.some(binder)
+              }
+              _ => ()
+            }
+            if let Option<HirId>.Some { value: binder } = move name {
+              if seen == ordinal {
+                if let Node.Name { text } = Module.node(hir, binder) {
+                  return Option<Bytes>.some(run Bytes.copy(Module.text(hir, text)))
+                }
+                return Option<Bytes>.none()
+              }
+              seen = seen + usize.ONE
+            }
+            node = node + usize.ONE
+          }
+        }
+      }
+      return Option<Bytes>.none()
+    }
+    at = at + usize.ONE
+  }
+  return Option<Bytes>.none()
+}
