@@ -92,7 +92,8 @@ not belong in a language rule unless a program can observe them.
 - [Doc comment style guide](documentation-style-guide.md) — required public comment coverage,
   standard sections, complete examples, symbol links, and ASD-STE100 writing rules.
 - [Lifetimes and elision](lifetimes.md) — named validity bounds, borrowed contents, header defaults,
-  quantified callable contracts, retained environments, and inspectable lifetime expansion.
+  quantified callable contracts, retained environments, region checking, and inspectable lifetime
+  expansion.
 - [Ownership and borrowing](ownership-and-borrowing.md) — Copy and affine values, moves, borrows,
   mutation, anonymous capture modes, cleanup, allocation lifecycles, and returned views.
 - [Allocation-backed local shared ownership](local-shared-ownership.md) — `Shared<T>` construction,
@@ -125,6 +126,10 @@ not belong in a language rule unless a program can observe them.
   static specialization, including exact and opaque callable and Effect representations.
 - [Native pointer boundary](native-pointer-boundary.md) — qualified raw addresses, native output
   states, and independently checked C ABI behavior.
+- [Atomic memory operations](atomic-memory-operations.md) — the C++20 memory model, static
+  orderings, atomic loads, stores, read-modify-writes, compare-exchange, and fences.
+- [Thread properties](thread-properties.md) — the sealed `Transferable` and `Concurrent`
+  properties, their derivation from stored parts, and `impl` assertions for synchronized types.
 - [Unsafe code, intrinsics, and targets](unsafe-intrinsics-and-targets.md) — lexical unsafe
   acknowledgement, caller-owned unsafe contracts, sealed compiler primitives, and reachable target
   availability. Rules are confirmed.

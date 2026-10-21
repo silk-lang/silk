@@ -76,6 +76,21 @@ with its standard library beside it, and verifies the compiler's SHA-256 and rep
 Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Building programs
 needs Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
 
+With [Homebrew](https://brew.sh), which also installs Homebrew's LLVM and points `silk` at its Clang:
+
+```sh
+brew install silk-lang/tap/silk
+```
+
+With [mise](https://mise.jdx.dev), from the release archives:
+
+```sh
+mise use -g 'github:silk-lang/silk[version_prefix=v]'
+```
+
+Homebrew follows the same channel as the script. mise picks stable releases only; until the first
+one exists, use `github:silk-lang/silk[version_prefix=v,prerelease=true]` to get dev releases.
+
 ## Quick start
 
 ```sh
