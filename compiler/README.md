@@ -16,6 +16,17 @@ compiles it again.
 
 The build and test steps CI runs are in `.github/workflows/selfhost.yml`.
 
+## Check roots
+
+The language server checks one module or one declaration at a time, through
+`Semantic.checkModule` and `Semantic.checkDeclaration`, so an edit refreshes only the
+entries it reaches. `silk check --roots` checks the package as usual, then checks each of
+its modules again through `checkModule` (plus `Semantic.checkForeignConflicts`) and
+compares the two by module, code and span. It writes one
+`silk-check-roots only=package|roots <module> <code> <start>-<end>` line per rejection
+only one side reached, then `silk-check-roots modules=<count> rejections=<count>
+differences=<count>`, and fails the check when they differ.
+
 ## Profiling with Tracy
 
 `src/Profiler.silk` opens [Tracy](https://github.com/wolfpld/tracy) zones around the build

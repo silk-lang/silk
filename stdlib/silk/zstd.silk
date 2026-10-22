@@ -1,17 +1,58 @@
-//! Bounded, resumable Zstandard decoding into caller-owned byte slices.
+//! Decompress Zstandard data (RFC 8878) in steps, with fixed memory and limits that you set.
 //!
 //! # When to use
-//! Use [`Zstd`] for RFC 8878 files or HTTP zstd content. The decoder accepts all non-dictionary block modes.
-//! Use `Zstd.make` to allocate state, then [`step`] until the result reports `Finished`.
+//! Use [`Zstd`] to read `.zst` files or HTTP bodies with `Content-Encoding: zstd`. Make a decoder
+//! with [`Zstd.make`], and call [`Zstd.step`] until it returns `Finished`. This module does not
+//! compress.
 //!
 //! # Details
-//! Input and output are borrowed only for one call. State owns its history and scratch storage.
-//! Limits apply across all concatenated regular and skippable frames. A frame boundary is not end of input.
-//! The first final call fixes the input end. Later calls must supply its unconsumed suffix with final input set.
+//! The decoder supports all block types and all entropy modes, and more than one frame, including
+//! skippable frames. [`Zstd.make`] allocates all storage one time: the history window, three 128
+//! KiB staging buffers, and the entropy tables. [`Zstd.step`] does not allocate and keeps no borrow
+//! of your buffers. The [`ZstdLimits`] apply to the full input, across all frames.
+//!
+//! The end of a frame is not the end of the input. The decoder returns `Finished` only when the
+//! input is marked final, all of it is consumed, and each frame is complete.
+//!
+//! # Errors
+//! - `OutOfMemoryError` from [`Zstd.make`] if the `Allocator` fails.
+//! - [`ZstdError`] if the configuration is not valid, the data is not valid, a limit is exceeded,
+//!   or the calls do not follow the rules of [`Zstd.step`]. `reason` gives the cause and `offset`
+//!   the input position.
 //!
 //! # Gotchas
-//! Output is provisional until `Finished`: a later checksum or truncated trailer can invalidate earlier output.
-//! A failure is terminal. Drop the decoder to release its storage and construct another decoder for another stream.
+//! Output is not verified until `Finished`, because a checksum or a truncated frame can fail later.
+//! A failure is permanent: drop the decoder and make a new one for another stream. Dictionaries are
+//! not supported.
+//!
+//! # Examples
+//! ## Decode a frame with one raw block
+//! ```silk
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.result { Result }
+//! import silk.zstd { Zstd, ZstdError, ZstdLimits, ZstdProgress, ZstdStatus }
+//!
+//! pub effect fn main() -> i32
+//!   ! ZstdError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let mut decoder = run Zstd.make(ZstdLimits.make()) |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Magic number, a header for a 2-byte frame, a last raw block of 2 bytes, then "hi".
+//!   let input = b"\x28\xb5\x2f\xfd\x20\x02\x11\x00\x00hi"
+//!   let mut output: [u8; 16] = [0; 16]
+//!   return match Zstd.step(&mut decoder, &input, &mut output, true) {
+//!     Result<ZstdProgress, ZstdError>.Success { value } => {
+//!       if value.status != ZstdStatus.Finished || value.written != 2 || output[0] != 104
+//!         || output[1] != 105 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<ZstdProgress, ZstdError>.Failure { error: _ } => 1
+//!   }
+//! }
+//! ```
 
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.layout {Layout}
@@ -26,24 +67,28 @@ import silk.usize
 
 const BLOCK_CAPACITY: usize = 131072
 
-/// Resource limits for one complete concatenated input stream.
+/// The resource limits for one complete input, across all frames. [`ZstdLimits.make`] gives
+/// defaults.
 pub struct ZstdLimits {
-  /// Maximum consumed bytes, including headers, trailers, and skipped bytes.
+  /// The maximum number of input bytes to consume, with headers, checksums, and skippable frames.
   pub inputBytes: u64
-  /// Maximum decoded bytes across all regular frames.
+  /// The maximum number of decoded bytes, across all frames.
   pub outputBytes: u64
-  /// Maximum regular and skippable frame count combined.
+  /// The maximum number of frames, regular and skippable.
   pub frames: u64
-  /// Maximum skipped payload bytes across all skippable frames.
+  /// The maximum number of payload bytes in all skippable frames.
   pub skippableBytes: u64
-  /// Maximum advertised window and exact allocated history capacity.
+  /// The size of the history buffer that [`Zstd.make`] allocates. A frame that asks for a larger
+  /// window fails with `WindowLimit`. It must not be 0.
   pub windowBytes: usize
-  /// Maximum non-window workspace, including staging, state, and bounded entropy scratch.
+  /// The storage budget other than the window: staging buffers, decoder state, and entropy tables.
+  /// If it is too small, [`Zstd.make`] fails with `WorkspaceLimit`.
   pub workspaceBytes: usize
 }
 
 impl ZstdLimits {
-  /// Returns limits of 64 MiB input, 256 MiB output, 1024 frames, 8 MiB skipped bytes and window, and 1 MiB workspace.
+  /// Returns default limits: 64 MiB of input, 256 MiB of output, 1024 frames, 8 MiB of skippable
+  /// data, an 8 MiB window, and a 1 MiB workspace.
   pub fn make() -> Self {
     return ZstdLimits {
       inputBytes: 67108864,
@@ -56,91 +101,94 @@ impl ZstdLimits {
   }
 }
 
-/// The resource needed to continue, or successful end of the complete input.
+/// What the decoder needs after a successful step.
 pub enum ZstdStatus {
-  /// The supplied input is exhausted; supply more input or declare its end.
+  /// All given input is consumed. Call again with more input, or with `finalInput` set if there is
+  /// no more.
   NeedInput,
-  /// Pending decoded bytes need output space; supply a nonempty output slice.
+  /// The output buffer is full. Call again with an output buffer that is not empty, and the input
+  /// that was not consumed.
   NeedOutput,
-  /// Final input ended after complete frame and trailer validation.
+  /// The final input is consumed and each frame is complete and verified.
   Finished,
 }
 
-/// Exact progress made by one successful step.
+/// The result of one successful step.
 pub struct ZstdProgress {
-  /// Input bytes consumed by this call; resubmit only the remaining suffix.
+  /// The number of input bytes that this call consumed. Give only the rest of the input on the next
+  /// call.
   pub consumed: usize
-  /// Output bytes written by this call; only this prefix of the destination was changed.
+  /// The number of output bytes that this call wrote. Only this prefix of the output changed.
   pub written: usize
-  /// The required next resource or terminal completion.
+  /// What the decoder needs next.
   pub status: ZstdStatus
 }
 
-/// A precise category of decoder failure.
+/// The cause of a [`ZstdError`].
 pub enum ZstdReason {
-  /// No failure; used only by live internal state.
+  /// No failure. The decoder uses it internally. A returned error never has it.
   None,
-  /// Configuration cannot represent the required storage.
+  /// The window size is 0, or the total storage size does not fit in `usize`.
   InvalidConfiguration,
-  /// A call changes an established final input boundary or adds input after completion.
+  /// A call changes the final input after it was set, adds input after `Finished`, or uses a
+  /// decoder that lost its storage.
   InvalidState,
-  /// Input does not start with a regular or skippable frame magic number.
+  /// The input does not start with the magic number of a Zstandard frame or a skippable frame.
   InvalidMagic,
-  /// The reserved frame-header bit is set.
+  /// The reserved bit of a frame header is set.
   ReservedFrame,
   /// A block uses the reserved block type.
   ReservedBlock,
-  /// A block exceeds the frame block maximum or has an invalid size.
+  /// A block is larger than the frame allows, or its size is not valid.
   BlockSize,
-  /// Entropy data or a match sequence is invalid; inspect the block reason.
+  /// The entropy data or the sequences of a compressed block are not valid. `blockReason` gives
+  /// more detail.
   MalformedBlock,
-  /// A frame requests a nonzero dictionary ID.
+  /// A frame asks for a dictionary. Dictionaries are not supported.
   UnsupportedDictionary,
-  /// Final input ends before a complete stream is available.
+  /// The final input ends before the last frame is complete.
   Truncated,
-  /// The frame checksum differs from seed-zero XXH64 of its decoded bytes.
+  /// The frame checksum is not the XXH64 (seed 0) of the decoded bytes.
   Checksum,
-  /// Decoded frame length differs from its declared content size.
+  /// The decoded size of a frame is not the content size in its header.
   ContentSize,
-  /// Cumulative input exceeds its configured limit.
+  /// The consumed input would go over [`ZstdLimits.inputBytes`].
   InputLimit,
-  /// Cumulative decoded output exceeds its configured limit.
+  /// The decoded output would go over [`ZstdLimits.outputBytes`].
   OutputLimit,
-  /// The combined regular and skippable frame count exceeds its limit.
+  /// The number of frames would go over [`ZstdLimits.frames`].
   FrameLimit,
-  /// Cumulative skipped payload bytes exceed their limit.
+  /// The skippable payload would go over [`ZstdLimits.skippableBytes`].
   SkippableLimit,
-  /// The advertised frame window exceeds the configured history capacity.
+  /// A frame asks for a window larger than [`ZstdLimits.windowBytes`].
   WindowLimit,
-  /// The configured workspace budget cannot hold bounded decoder storage.
+  /// [`ZstdLimits.workspaceBytes`] is too small for the decoder storage.
   WorkspaceLimit,
 }
 
-/// A terminal decoding failure with exact progress and location.
+/// A decoding failure. It is permanent for the decoder.
 ///
-/// # Details
-///
-/// `consumed` and `written` describe this call, including progress before failure.
-/// Previously written bytes remain provisional. Repeated calls return the same reason and offset with zero progress.
+/// Each later call returns the same `reason` and `offset` with no progress. The output that earlier
+/// calls wrote is not valid.
 pub struct ZstdError {
-  /// The category that stopped decoding.
+  /// The cause of the failure.
   pub reason: ZstdReason
-  /// The compressed-block category, or `None` for framing and resource failures.
+  /// For `MalformedBlock`, the part of the block that is not valid. For other reasons, it is
+  /// `BlockReason.None`.
   pub blockReason: BlockReason
-  /// The cumulative consumed input position where failure was detected.
+  /// The input position where the decoder found the problem, counted from the start of the full
+  /// input.
   pub offset: u64
-  /// Input bytes consumed during this call before failure.
+  /// The number of input bytes that this call consumed before it failed.
   pub consumed: usize
-  /// Output bytes written during this call before failure.
+  /// The number of output bytes that this call wrote before it failed.
   pub written: usize
 }
 
-/// An owned, allocation-free-after-construction decoder for one concatenated stream.
+/// A Zstandard decoder for one complete input. It owns all its storage.
 ///
-/// # Details
-///
-/// The state releases all allocations when dropped. It retains neither input nor output borrows between calls.
-/// Each regular frame resets its history, entropy tables, and checksum, but cumulative limits do not reset.
+/// Dropping it releases the storage. Each regular frame starts with a new history, new entropy
+/// tables, and a new checksum, but the limits count across all frames.
 pub struct Zstd {
   metadata: Metadata
   storage: Option<Workspace>
@@ -188,13 +236,16 @@ struct Metadata {
 }
 
 impl Zstd {
-  /// Allocates exact bounded storage and creates a decoder for one complete input stream.
+  /// Returns a decoder that uses `limits`, with storage from the ambient `Allocator`.
   ///
-  /// # Details
+  /// It allocates the window, three 128 KiB staging buffers, and the entropy tables. [`Zstd.step`]
+  /// does not allocate.
   ///
-  /// Allocation uses the supplied `Allocator`. No allocation occurs during `step`.
-  /// Storage includes `windowBytes`, three 128 KiB staging buffers, and bounded state and entropy scratch.
-  /// A zero window or unrepresentable total size fails before allocation. Insufficient workspace reports `WorkspaceLimit`.
+  /// # Errors
+  /// - [`ZstdError`] with `WorkspaceLimit` if `workspaceBytes` is too small, or with
+  ///   `InvalidConfiguration` if `windowBytes` is 0 or the total size does not fit in `usize`.
+  ///   These checks come before the allocation.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
   pub effect fn make(limits: ZstdLimits) -> Self ! ZstdError | OutOfMemoryError ? &mut Allocator {
     let stateLayout = Layout.of<Zstd>()
     let workspace = BLOCK_CAPACITY * 3 + stateLayout.bytes + BlockState.workspaceBytes()
@@ -254,19 +305,19 @@ impl Zstd {
       ),
     }
   }
-  /// Consumes input and writes output until a resource is needed, input finishes, or a typed error occurs.
+  /// Decodes from `input` into `output` and returns how much it consumed and wrote.
   ///
-  /// # Details
+  /// On the next call, give only the input after the consumed prefix, and use only the written
+  /// prefix of the output. Set `finalInput` when `input` holds all remaining data. After that, each
+  /// call must set `finalInput` and give exactly the input that is not consumed yet. `NeedOutput`
+  /// with an empty output makes no progress.
   ///
-  /// Resubmit only `input[consumed..]` and use only `output[..written]` from each result.
-  /// A final call fixes the absolute input end. Later calls must supply the complete unconsumed suffix with `finalInput` true.
-  /// `NeedOutput` with an empty destination makes no output progress; provide a nonempty destination before retrying.
-  /// `NeedInput` exhausts the input. `Finished` validates all concatenated frames and permits only empty final retries.
+  /// # Errors
+  /// - [`ZstdError`] if the data is not valid, a [`ZstdLimits`] value would be exceeded, the final
+  ///   input ends early (`Truncated`), or the call changes the final input (`InvalidState`).
   ///
   /// # Gotchas
-  ///
-  /// Output can precede a checksum or truncation failure. Do not treat it as validated until `Finished`.
-  /// Failure poisons this state. Subsequent calls report the same failure location and make no progress.
+  /// Output is not verified until `Finished`. A failure is permanent for this decoder.
   pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], finalInput: bool) -> Result<
     ZstdProgress,
     ZstdError,

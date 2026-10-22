@@ -1,0 +1,593 @@
+//! The language server's framing and lifecycle, driven without threads or standard streams.
+
+import lsp.Features as Features { Edit, Fold, Symbol }
+import lsp.Framing as Framings { Frame }
+import lsp.Inbox { Incoming }
+import lsp.Message { PositionEncoding }
+import lsp.Server as Servers { Phase, Server, Step }
+import lsp.Workspace as Workspaces { Problem, Published, Workspace }
+import lsp.NamesCases
+import semantic.SourceUnit { SourceUnit }
+import semantic.Semantic { Statistics }
+import semantic.Target { Id as TargetId, Target }
+import semantic.Types { TypeTable, Types }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.list { List }
+import silk.option { Option }
+import silk.os_filesystem { OsFileSystem }
+import silk.json_scanner { JsonError }
+import silk.json_value { Json }
+import silk.slice { Slice }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+import silk.writer { Writer, WriterError }
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+fn complete(frame: Frame, start: usize, length: usize) -> bool {
+  return match move frame {
+    Frame.Complete { start: found, length: counted } => found == start && counted == length
+    _ => false
+  }
+}
+
+fn incomplete(frame: Frame) -> bool {
+  return match move frame {
+    Frame.Incomplete => true
+    _ => false
+  }
+}
+
+fn malformed(frame: Frame) -> bool {
+  return match move frame {
+    Frame.Malformed => true
+    _ => false
+  }
+}
+
+test effect fn framesSplitOnTheirContentLength() -> ()
+  ! AssertionError<'static> {
+  let whole = b"Content-Length: 2\r\n\r\n{}Content-Length: 1\r\n"
+  run Testing.expect(
+    complete(Framings.next(whole), 21, 2),
+    "a frame ends after its content length, before the next header"
+  )
+  let typed = b"content-type: application/vscode-jsonrpc; charset=utf-8\r\nCONTENT-LENGTH:  3 \r\n\r\nnul"
+  run Testing.expect(
+    complete(Framings.next(typed), 80, 3),
+    "header names ignore case, other headers are skipped, and spaces surround the count"
+  )
+  run Testing.expect(
+    incomplete(Framings.next(b"Content-Len"))
+      && incomplete(Framings.next(b"Content-Length: 4\r\n\r\n{}")),
+    "a frame whose header or content is cut short waits for more input"
+  )
+  run Testing.expect(
+    malformed(Framings.next(b"Content-Type: x\r\n\r\n{}"))
+      && malformed(Framings.next(b"Content-Length: 2x\r\n\r\n{}"))
+      && malformed(Framings.next(b"Content-Length: \r\n\r\n")),
+    "a header block without a decimal content length is malformed"
+  )
+}
+
+test effect fn oversizedHeadersAreMalformed() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let padding = run Bytes.zeroed(Framings.HEADER_LIMIT + 1)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  run Testing.expect(
+    malformed(Framings.next(Bytes.asSlice(&padding))),
+    "a header block past the limit cannot be resynchronized"
+  )
+}
+
+// Collects what the server writes, up to a fixed capacity.
+struct Captured {
+  bytes: Bytes
+  length: usize
+}
+
+impl Captured {
+  effect fn writeAll(self: &mut Self, bytes: &[u8]) -> ()
+    ! WriterError {
+    if bytes.length > Bytes.length(&self.bytes) - self.length {
+      fail Writer.failure()
+    }
+    let target = Bytes.asMutSlice(&mut self.bytes)
+    let mut at = usize.ZERO
+    while at < bytes.length {
+      target[self.length + at] = bytes[at]
+      at = at + 1
+    }
+    self.length = self.length + bytes.length
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> ()
+    ! WriterError {
+    return ()
+  }
+}
+
+impl Writer for Captured {
+  writeAll: Captured.writeAll
+
+  flush: Captured.flush
+}
+
+// Handles one message and reports whether the server continued after writing exactly `expected`,
+// or a frame whose content begins with `prefix`.
+effect fn answers(server: &mut Server, message: &[u8], expected: &[u8]) -> bool
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  return run written(&mut server.*, message, expected, false)
+}
+
+effect fn begins(server: &mut Server, message: &[u8], prefix: &[u8]) -> bool
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  return run written(&mut server.*, message, prefix, true)
+}
+
+effect fn written(server: &mut Server, message: &[u8], expected: &[u8], prefix: bool) -> bool
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let value = run Json.parse(message)
+  let mut captured = Captured { bytes: run Bytes.zeroed(512), length: usize.ZERO }
+  let step = run Servers.handle(&mut server.*, Incoming.Message { value: move value })
+    |> Effect.provideMut<Writer>(&mut captured)
+  let mut start = usize.ZERO
+  let mut length = captured.length
+  if prefix {
+    let all = Bytes.asSlice(&captured.bytes)
+    while start < captured.length && all[start] != 123 {
+      start = start + 1
+    }
+    length = captured.length - start
+    if length > expected.length {
+      length = expected.length
+    }
+  }
+  let output = Slice.view<u8>(Bytes.asSlice(&captured.bytes), start, length)
+  return match move step {
+    Step.Continue => same(output, expected)
+    Step.Exit { .. } => false
+  }
+}
+
+effect fn exits(server: &mut Server, incoming: Incoming, status: i32) -> bool
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let mut captured = Captured { bytes: Bytes.make(), length: usize.ZERO }
+  let step = run Servers.handle(&mut server.*, move incoming)
+    |> Effect.provideMut<Writer>(&mut captured)
+  return match move step {
+    Step.Exit { status: found } => found == status && captured.length == usize.ZERO
+    Step.Continue => false
+  }
+}
+
+fn emptyServer() -> Server {
+  return Servers.make(
+    Workspaces.make(Option<Path>.none(), Target.forId(TargetId.X8664UnknownLinuxGnu))
+  )
+}
+
+effect fn lifecycle() -> ()
+  ! AssertionError<'static> | JsonError | WriterError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let mut server = emptyServer()
+  let early = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"shutdown\"}",
+    b"Content-Length: 90\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32002,\"message\":\"the server is not initialized\"}}"
+  )
+  let ignored = run answers(&mut server, b"{\"jsonrpc\":\"2.0\",\"method\":\"initialized\"}", b"")
+  run Testing.expect(
+    early && ignored,
+    "before initialize, requests fail as not initialized and notifications are dropped"
+  )
+  let initialized = run begins(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"method\":\"initialize\",\"params\":{\"capabilities\":{\"general\":{\"positionEncodings\":[\"utf-16\",\"utf-8\"]}}}}",
+    b"{\"jsonrpc\":\"2.0\",\"id\":\"a\",\"result\":{\"capabilities\":{\"positionEncoding\":\"utf-8\",\"textDocumentSync\":{\"openClose\":true,\"change\":1},\"documentSymbolProvider\":true,\"foldingRangeProvider\":true,\"documentFormattingProvider\":true,\"hoverProvider\":true,\"definitionProvider\":true,\"inlayHintProvider\":true,\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}},\"serverInfo\":{\"name\":\"silk\","
+  )
+  run Testing.expect(
+    initialized,
+    "initialize echoes the id and selects UTF-8 positions when the client offers them"
+  )
+  let again = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\"}",
+    b"Content-Length: 94\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":2,\"error\":{\"code\":-32600,\"message\":\"the server is already initialized\"}}"
+  )
+  let unknown = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"textDocument/references\"}",
+    b"Content-Length: 99\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":3,\"error\":{\"code\":-32601,\"message\":\"the server does not handle this method\"}}"
+  )
+  run Testing.expect(
+    again && unknown,
+    "a second initialize is invalid and an unhandled method is not found"
+  )
+  let shutdown = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"shutdown\"}",
+    b"Content-Length: 38\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":4,\"result\":null}"
+  )
+  let refused = run answers(
+    &mut server,
+    b"{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"shutdown\"}",
+    b"Content-Length: 84\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":5,\"error\":{\"code\":-32600,\"message\":\"the server is shut down\"}}"
+  )
+  run Testing.expect(
+    shutdown && refused,
+    "shutdown answers null once, and every later request is invalid"
+  )
+  let exit = run Json.parse(b"{\"jsonrpc\":\"2.0\",\"method\":\"exit\"}")
+  let clean = run exits(&mut server, Incoming.Message { value: move exit }, 0)
+  let mut abrupt = emptyServer()
+  let closed = run exits(&mut abrupt, Incoming.Closed, 1)
+  run Testing.expect(
+    clean && closed,
+    "exit after shutdown is status 0, and input that closes first is status 1"
+  )
+}
+
+test effect fn serverFollowsTheLifecycle() -> ()
+  ! AssertionError<'static> | JsonError | WriterError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make(b"/") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut types = TypeTable.make()
+  return run lifecycle() |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+test effect fn unparsableMessagesGetAParseError() -> ()
+  ! AssertionError<'static> | JsonError | WriterError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make(b"/") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut types = TypeTable.make()
+  let mut server = emptyServer()
+  let mut output = Captured {
+    bytes: run Bytes.zeroed(512) |> Effect.provideMut<Allocator>(&mut allocator),
+    length: usize.ZERO
+  }
+  let step = run Servers.handle(&mut server, Incoming.Unparsable)
+    |> Effect.provideMut<Writer>(&mut output)
+    |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let written = Slice.view<u8>(Bytes.asSlice(&output.bytes), usize.ZERO, output.length)
+  run Testing.expect(
+    same(
+      written,
+      b"Content-Length: 93\r\n\r\n{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"the message is not valid JSON\"}}"
+    ),
+    "a frame that is not JSON gets a parse error with a null id"
+  )
+}
+
+test effect fn positionsCountTheNegotiatedUnits() -> ()
+  ! AssertionError<'static> {
+  // "é" is two UTF-8 bytes and one UTF-16 unit; the emoji is four bytes and two units.
+  let text = b"ab\n\xc3\xa9\xf0\x9f\x98\x80x"
+  let utf8 = Workspaces.locate(text, 9, PositionEncoding.Utf8)
+  let utf16 = Workspaces.locate(text, 9, PositionEncoding.Utf16)
+  let past = Workspaces.locate(text, 99, PositionEncoding.Utf16)
+  run Testing.expect(
+    utf8.line == 1 && utf8.character == 6 && utf16.line == 1 && utf16.character == 3
+      && past.line == 1
+      && past.character == 4,
+    "a column counts bytes in UTF-8, code units in UTF-16, and an offset past the end clamps"
+  )
+}
+
+fn absent(path: &Option<Bytes>) -> bool {
+  return match &path.* {
+    Option<Bytes>.Some { .. } => false
+    Option<Bytes>.None => true
+  }
+}
+
+test effect fn fileUrisDecodeToPaths() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let decoded = run Workspaces.filePath(b"file:///home/a%20b/main.silk")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let other = run Workspaces.filePath(b"untitled:Untitled-1")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let broken = run Workspaces.filePath(b"file:///a%2")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  let path = match &decoded {
+    Option<Bytes>.Some { value } => same(Bytes.asSlice(&value), b"/home/a b/main.silk")
+    Option<Bytes>.None => false
+  }
+  run Testing.expect(
+    path && absent(&other) && absent(&broken),
+    "a file URI decodes its escapes; other schemes and broken escapes name no path"
+  )
+}
+
+// The one notification a refresh published for `uri`, as its problem count, or usize.MAX.
+fn problemsFor(published: &List<Published>, uri: &[u8]) -> usize {
+  let listed = List<Published>.asSlice(published)
+  let mut found = usize.MAX
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at].uri), uri) {
+      if found != usize.MAX {
+        return usize.MAX
+      }
+      found = List<Problem>.length(&listed[at].problems)
+    }
+    at = at + usize.ONE
+  }
+  return found
+}
+
+fn units(statistics: &Option<Statistics>) -> usize {
+  return match &statistics.* {
+    Option<Statistics>.Some { value } => value.runs + value.demands
+    Option<Statistics>.None => usize.MAX
+  }
+}
+
+effect fn editing() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let parent = run Path.make("/tmp")
+  let temp = run FileSystem.temporaryDirectory(&parent, "silk-lsp-edit-")
+  let manifest = run Path.join(&temp.path, "silk.toml")
+  run FileSystem.writeFile(
+    &manifest,
+    b"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nroot = \"main.silk\"\n\n[build]\nartifact = \"object\"\n"
+  )
+  let main = run Path.join(&temp.path, "main.silk")
+  let body = b"pub fn main() -> i32 {\n  return 0\n}\n"
+  run FileSystem.writeFile(&main, body)
+  let mut uri = run Bytes.copy(b"file://")
+  run Bytes.append(&mut uri, Path.rawBytes(&main))
+  let document = Bytes.asSlice(&uri)
+
+  let mut workspace = Workspaces.make(
+    Option<Path>.none(),
+    Target.forId(TargetId.X8664UnknownLinuxGnu)
+  )
+  run workspace.open(document, 1, body)
+  run workspace.refresh()
+  let pending = run workspace.diagnostics(PositionEncoding.Utf8)
+  let before = workspace.statistics(document)
+  run Testing.expect(
+    units(&before) == 0 && problemsFor(&pending, document) == usize.MAX && workspace.busy(),
+    "opening a document in a package queues its module and publishes nothing before the check"
+  )
+  let checked = run settle(&mut workspace)
+  let first = workspace.statistics(document)
+  run Testing.expect(
+    problemsFor(&checked, document) == 0 && units(&first) > 0,
+    "the module's check runs semantic units and publishes the document's empty diagnostics"
+  )
+
+  // A trivia edit: a comment and blank lines, in two coalesced changes.
+  run workspace.change(document, 2, b"// note\npub fn main() -> i32 {\n  return 0\n}\n")
+  run workspace.change(document, 3, b"\n// note\n\npub fn main() -> i32 {\n  return 0\n}\n")
+  run workspace.refresh()
+  let trivia = run workspace.diagnostics(PositionEncoding.Utf8)
+  run Testing.expect(
+    problemsFor(&trivia, document) == usize.MAX && units(&workspace.statistics(document)) == units(&first),
+    "a refresh runs no semantic unit, and the edited document waits for its module's check"
+  )
+  let retyped = run settle(&mut workspace)
+  run Testing.expect(problemsFor(&retyped, document) == 0, "the checked document stays clean")
+
+  run workspace.change(document, 4, b"pub fn main() -> i32 {\n  return true\n}\n")
+  let wrong = run settle(&mut workspace)
+  run Testing.expect(
+    hasProblem(&wrong, document, 1, b"SEM0129"),
+    "a semantic error is published on its line once the module is checked"
+  )
+
+  run workspace.change(document, 5, b"pub fn main( -> i32 {\n  return true\n}\n")
+  run workspace.refresh()
+  let broken = run workspace.diagnostics(PositionEncoding.Utf8)
+  let listed = List<Published>.asSlice(&broken)
+  let mut located = false
+  if listed.length == 1 && List<Problem>.length(&listed[0].problems) > 0 {
+    let first = &List<Problem>.asSlice(&listed[0].problems)[0]
+    located = first.start.line == 0 && Bytes.length(&first.message) > 0
+      && !same(Bytes.asSlice(&first.code), b"SEM0129")
+  }
+  run Testing.expect(
+    located,
+    "a syntax error is published at once, and hides the module's semantic errors"
+  )
+
+  run workspace.close(document)
+  let closed = run workspace.diagnostics(PositionEncoding.Utf8)
+  run Testing.expect(problemsFor(&closed, document) == 0, "closing a document clears its diagnostics")
+  run FileSystem.release(move temp)
+  return ()
+}
+
+// Refreshes the workspace, checks every queued module, and takes the diagnostics owed.
+effect fn settle(workspace: &mut Workspace) -> List<Published>
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  run workspace.refresh()
+  while run workspace.work() {
+  }
+  return run workspace.diagnostics(PositionEncoding.Utf8)
+}
+
+// Whether the diagnostics published for `uri` include `code` on zero-based `line`.
+fn hasProblem(published: &List<Published>, uri: &[u8], line: usize, code: &[u8]) -> bool {
+  let listed = List<Published>.asSlice(published)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if same(Bytes.asSlice(&listed[at].uri), uri) {
+      let problems = List<Problem>.asSlice(&listed[at].problems)
+      let mut problem = usize.ZERO
+      while problem < problems.length {
+        if problems[problem].start.line == line && same(Bytes.asSlice(&problems[problem].code), code) {
+          return true
+        }
+        problem = problem + usize.ONE
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+test effect fn editsWaitForTheirModulesCheck() -> ()
+  ! AssertionError<'static> | FileError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make(b"/") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut types = TypeTable.make()
+  return run editing() |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+// Opens `text` as a document outside any package and returns its parsed workspace.
+effect fn opened(uri: &[u8], text: &[u8]) -> Workspace
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let mut workspace = Workspaces.make(
+    Option<Path>.none(),
+    Target.forId(TargetId.X8664UnknownLinuxGnu)
+  )
+  run workspace.open(uri, 1, text)
+  run workspace.refresh()
+  let published = run workspace.diagnostics(PositionEncoding.Utf8)
+  return move workspace
+}
+
+fn hasSymbol(symbols: &[Symbol], name: &[u8], kind: usize, parentKind: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < symbols.length {
+    if same(Bytes.asSlice(&symbols[at].name), name) && symbols[at].kind == kind {
+      let parent = symbols[at].parent
+      if parent == usize.MAX {
+        return parentKind == usize.ZERO
+      }
+      return symbols[parent].kind == parentKind
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn hasFold(folds: &[Fold], start: usize, end: usize, comment: bool) -> bool {
+  let mut at = usize.ZERO
+  while at < folds.length {
+    if folds[at].startLine == start && folds[at].endLine == end && folds[at].comment == comment {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+effect fn outlining() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let uri = b"untitled:outline"
+  let workspace = run opened(
+    uri,
+    b"// one\n// two\npub struct Point {\n  x: i32\n}\n\nimpl Point {\n  fn origin() -> Point {\n    return Point { x: 0 }\n  }\n}\n\npub fn main() -> i32 { return 0 }\n"
+  )
+  let unit = match move workspace.unit(uri) {
+    Option<&SourceUnit>.Some { value } => value
+    Option<&SourceUnit>.None => {
+      return run Testing.expect(false, "an open document is parsed once its diagnostics are taken")
+    }
+  }
+  let symbols = run Features.symbols(unit, PositionEncoding.Utf8)
+  let listed = List<Symbol>.asSlice(&symbols)
+  run Testing.expect(
+    listed.length == 4 && hasSymbol(listed, b"Point", 23, 0)
+      && hasSymbol(listed, b"impl Point", 5, 0)
+      && hasSymbol(listed, b"origin", 6, 5)
+      && hasSymbol(listed, b"main", 12, 0),
+    "the outline lists types, impls with their methods, and functions"
+  )
+  let first = &listed[0]
+  run Testing.expect(
+    first.start.line == 2 && first.end.line == 4 && first.selectionStart.line == 2,
+    "a symbol's range covers its declaration"
+  )
+  let folds = run Features.folds(unit)
+  let ranges = List<Fold>.asSlice(&folds)
+  run Testing.expect(
+    hasFold(ranges, 0, 1, true) && hasFold(ranges, 2, 3, false) && hasFold(ranges, 6, 9, false)
+      && hasFold(ranges, 7, 8, false)
+      && !hasFold(ranges, 12, 12, false),
+    "comment runs and multi-line bodies fold, keeping the closing brace visible"
+  )
+}
+
+test effect fn outlineAndFoldsComeFromSyntax() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make(b"/") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut types = TypeTable.make()
+  return run outlining() |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn edits(text: &[u8]) -> usize
+  ! OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let uri = b"untitled:format"
+  let workspace = run opened(uri, text)
+  if let Option<&SourceUnit>.Some { value } = move workspace.unit(uri) {
+    if let Option<List<Edit>>.Some { value: listed } = move run Features.format(
+      value,
+      PositionEncoding.Utf8
+    ) {
+      return List<Edit>.length(&listed)
+    }
+  }
+  return usize.MAX
+}
+
+effect fn formatting() -> ()
+  ! AssertionError<'static> | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let messy = run edits(b"pub fn main()->i32{return 0}\n")
+  let canonical = run edits(b"pub fn main() -> i32 {\n  return 0\n}\n")
+  let damaged = run edits(b"pub fn main( -> i32 {\n")
+  run Testing.expect(
+    messy == 1 && canonical == 0 && damaged == usize.MAX,
+    "formatting replaces a messy document whole, leaves a canonical one alone, and refuses damage"
+  )
+}
+
+test effect fn formattingReplacesTheWholeDocument() -> ()
+  ! AssertionError<'static> | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut files = run OsFileSystem.make(b"/") |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut types = TypeTable.make()
+  return run formatting() |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<Types>(&mut types)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

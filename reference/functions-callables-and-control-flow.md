@@ -656,8 +656,10 @@ fn countToThree() -> i32 {
 The condition is evaluated four times, the body three times, and the result is `3`. Body fallthrough
 or `continue` begins the next condition evaluation; `break` continues after the loop.
 
-**Boundary:** The condition must be `bool`; there is no integer or optional-value truthiness. The
-bootstrap language has no `for`, unconditional `loop`, labeled loop, or value-producing `break`.
+**Boundary:** The condition must be `bool`; there is no integer or optional-value truthiness. A
+loop that repeats while a value matches a pattern is the pattern loop `while let Pattern = expression
+{ body }` (see [PATT-022](patterns-and-destructuring.md#patt-022--while-let-repeats-while-one-refutable-pattern-matches)).
+The bootstrap language has no `for`, unconditional `loop`, labeled loop, or value-producing `break`.
 Equivalent iteration is expressed with `while` and explicit mutable state.
 
 Every path that repeats must restore a compatible ownership state for outer bindings. Iteration

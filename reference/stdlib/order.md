@@ -10,32 +10,49 @@ generic algorithm compares its type parameter, as sorting and binary search do.
 
 ## Details
 `&left < &right` means `Order.compare(&left, &right) == Ordering.Less` for the conformance of
-the operand type; `<=` tests `!= Ordering.Greater`, `>` tests `== Ordering.Greater`, and `>=`
-tests `!= Ordering.Less` (OP-009). Both operands are evaluated once, in written order. Concrete
-scalar operands always use the built-in comparison. A witness is selected during specialization;
-it creates no service requirement or runtime dispatch.
+the operand type (OP-009). The other operators use the same result:
+
+- `<=` tests `!= Ordering.Greater`.
+- `>` tests `== Ordering.Greater`.
+- `>=` tests `!= Ordering.Less`.
+
+The program evaluates each operand one time, in written order. Concrete scalar operands always
+use the built-in comparison. The compiler selects the conformance during specialization. It
+adds no service requirement and no runtime dispatch.
 
 ## Gotchas
-A witness must define a total order. The module cannot verify this law.
+A conformance must define a total order. The compiler does not check this rule. If the order is
+not total, sorting and binary search give incorrect results.
 
 ## Examples
 ### Order a user type
 ```silk
 import silk.order { Order, Ordering }
 
-struct Version { major: i32 minor: i32 }
+struct Version {
+  major: i32
+  minor: i32
+}
 
 fn compareVersions(left: &Version, right: &Version) -> Ordering {
   if left.major != right.major {
-    if left.major < right.major { return Ordering.Less }
+    if left.major < right.major {
+      return Ordering.Less
+    }
     return Ordering.Greater
   }
-  if left.minor < right.minor { return Ordering.Less }
-  if left.minor > right.minor { return Ordering.Greater }
+  if left.minor < right.minor {
+    return Ordering.Less
+  }
+  if left.minor > right.minor {
+    return Ordering.Greater
+  }
   return Ordering.Equal
 }
 
-impl Order for Version { compare: Version.compareVersions }
+impl Order for Version {
+  compare: Version.compareVersions
+}
 
 pub fn main() -> i32 {
   let old = Version { major: 1, minor: 4 }
@@ -43,7 +60,7 @@ pub fn main() -> i32 {
   if !(&old < &new) || &new <= &old {
     return 1
   }
-  return 42
+  return 0
 }
 ```
 
@@ -59,7 +76,11 @@ Public declarations: 2.
 pub type Ordering = Intrinsic.Ordering
 ```
 
-The result of comparing two values.
+The result of comparing two values: `Less`, `Equal`, or `Greater`.
+
+### Details
+
+`Less` means that the left operand comes first. [`Order`](#Order) conformances return this type.
 
 <a id="Order"></a>
 
@@ -71,10 +92,16 @@ pub type Order = Intrinsic.Order
 
 The interface behind `<`, `<=`, `>`, and `>=`.
 
+### Details
+
+A conformance `impl Order for T` gives the member
+`compare(left: &T, right: &T) -> Ordering`. The operators borrow both operands, so a comparison
+does not consume a value.
+
 ### Gotchas
 
-An implementation must define a total order: for any two values exactly one of `Less`, `Equal`,
-and `Greater` holds, consistently with every other comparison.
+A conformance must define a total order. For each two values, exactly one result is correct,
+and the results must agree with each other. The compiler does not check this rule.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
