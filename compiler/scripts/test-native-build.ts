@@ -91,6 +91,56 @@ const program = Effect.gen(function* () {
   const commandHelp = yield* invoke(silk, ['format', '--help'], directory)
   assert.equal(commandHelp.status, 0, commandHelp.stderr)
   assert.equal(commandHelp.stdout, 'usage: silk format [paths] [--check] [--manifest-path <path>]\n')
+  // `silk toolchain` prints its own usage for --help, -h and help alike.
+  const toolchainHelp = yield* invoke(silk, ['toolchain', 'help'], directory)
+  assert.equal(toolchainHelp.status, 0, toolchainHelp.stderr)
+  assert.match(toolchainHelp.stdout, /^usage: silk toolchain list \[--json\]\n/)
+  for (const flag of ['--help', '-h']) {
+    const helpedToolchain = yield* invoke(silk, ['toolchain', flag], directory)
+    assert.equal(helpedToolchain.status, 0, helpedToolchain.stderr)
+    assert.equal(helpedToolchain.stdout, toolchainHelp.stdout)
+  }
+  // Toolchain selection runs against a private home; nothing here downloads a release.
+  const toolchainHome = join(directory, 'toolchain-home')
+  yield* fs.makeDirectory(toolchainHome, { recursive: true })
+  const toolchainEnvironment: NodeJS.ProcessEnv = { ...process.env, HOME: toolchainHome }
+  for (const name of ['SILK_HOME', 'SILK_TOOLCHAIN', 'SILK_TOOLCHAIN_MIRROR', 'SILK_AUTO_INSTALL']) {
+    delete toolchainEnvironment[name]
+  }
+  // SILK_TOOLCHAIN=local selects the running compiler.
+  const localWhich = yield* invoke(silk, ['toolchain', 'which'], directory, {
+    ...toolchainEnvironment,
+    SILK_TOOLCHAIN: 'local',
+  })
+  assert.equal(localWhich.status, 0, localWhich.stderr)
+  assert.match(localWhich.stdout, /^\S+ \(selected by SILK_TOOLCHAIN\)\n\S+\n$/)
+  assert.equal(localWhich.stderr, '')
+  // `+<version>` must be a semantic version; anything else is a usage error, not a missing install.
+  const garbage = yield* invoke(silk, ['+garbage', 'check'], directory, toolchainEnvironment)
+  assert.equal(garbage.status, 2, garbage.stderr)
+  assert.equal(
+    garbage.stderr,
+    'silk: `+garbage` is not a Silk version; +<version> takes a semantic version such as +0.1.0-dev.6\n',
+  )
+  // A relative mirror is refused in the usual `silk toolchain:` form.
+  const relativeMirror = yield* invoke(silk, ['toolchain', 'install', '0.1.0'], directory, {
+    ...toolchainEnvironment,
+    SILK_TOOLCHAIN_MIRROR: 'mirror',
+  })
+  assert.equal(relativeMirror.status, 1, relativeMirror.stderr)
+  assert.equal(
+    relativeMirror.stderr,
+    'silk toolchain: SILK_TOOLCHAIN_MIRROR must be an absolute directory path\n',
+  )
+  // A HOME that does not exist is refused, and nothing is created below it.
+  const absentHome = join(directory, 'absent-home')
+  const homeless = yield* invoke(silk, ['toolchain', 'default', '0.1.0'], directory, {
+    ...toolchainEnvironment,
+    HOME: absentHome,
+  })
+  assert.equal(homeless.status, 1, homeless.stderr)
+  assert.match(homeless.stderr, /^silk toolchain: cannot find the toolchain directory; /)
+  assert.equal(yield* fs.exists(absentHome), false)
   // A command line that does not parse is a usage error, status 2, like format's and doc's.
   const unparsed = yield* invoke(silk, ['check', '--bogus'], directory)
   assert.equal(unparsed.status, 2, unparsed.stderr)
