@@ -6,9 +6,10 @@
 // Every step must appear in order with its budgeted kind and module. An edit's units run and units
 // marked outdated must stay within budget, and so must its demands, as a fraction of the initial
 // check's: rechecking walks every root again, so that walk is the fixed cost of an update and
-// grows with the workspace. Its `update-us` must stay within the entry's per-update limit, and a
-// budgeted rejection count must match exactly. A `--differential` log must also report
-// `differences=0` for every step. The initial check is only reported.
+// grows with the workspace. Its `update-us` must stay within the entry's per-update limit. A
+// budgeted rejection count must match exactly, and a budgeted `unchanged` count is a floor: that
+// many reruns must complete answers that hash equal to the ones they replace. A `--differential`
+// log must also report `differences=0` for every step. The initial check is only reported.
 import { readFileSync } from 'node:fs';
 
 const [logPath, budgetsPath, workspace] = process.argv.slice(2);
@@ -67,6 +68,9 @@ for (let at = 0; at < Math.min(steps.length, budgets.length); at += 1) {
       failures.push(`${label}: update-us=${step['update-us']} exceeds the per-update limit of ${entry.updateMicroseconds}`);
     }
   }
+  if ('unchanged' in budget && !(Number(step.unchanged) >= budget.unchanged)) {
+    failures.push(`${label}: unchanged=${step.unchanged} is under its floor of ${budget.unchanged}`);
+  }
   if ('rejections' in budget && Number(step.rejections) !== budget.rejections) {
     failures.push(`${label}: rejections=${step.rejections}, expected ${budget.rejections}`);
   }
@@ -74,12 +78,12 @@ for (let at = 0; at < Math.min(steps.length, budgets.length); at += 1) {
     failures.push(`${label}: the differential check reported differences=${differences.get(at)}`);
   }
   const limit = (value, max) => (at > 0 ? `${value} / ${max}` : value);
-  rows.push(`| ${at} | ${budget.kind} | ${limit(step['units-run'], budget.units)} | ${limit(step['marked-outdated'], budget.outdated)} | ${step.demands} (${limit(fraction.toFixed(3), budget.demandsFraction)}) | ${step.rejections} | ${step['update-us']} | ${step['check-us']} |`);
+  rows.push(`| ${at} | ${budget.kind} | ${limit(step['units-run'], budget.units)} | ${limit(step['marked-outdated'], budget.outdated)} | ${step.demands} (${limit(fraction.toFixed(3), budget.demandsFraction)}) | ${step.unchanged ?? '-'} | ${step.rejections} | ${step['update-us']} | ${step['check-us']} |`);
 }
 
 console.log(`Replay budgets for ${workspace} (measured / budget):\n`);
-console.log('| Step | Kind | Units run | Marked outdated | Demands (fraction of initial) | Rejections | Update us | Check us |');
-console.log('| --- | --- | --- | --- | --- | --- | --- | --- |');
+console.log('| Step | Kind | Units run | Marked outdated | Demands (fraction of initial) | Unchanged | Rejections | Update us | Check us |');
+console.log('| --- | --- | --- | --- | --- | --- | --- | --- | --- |');
 for (const row of rows) console.log(row);
 if (failures.length > 0) {
   console.error(`\n${failures.length} budget failure(s):`);
