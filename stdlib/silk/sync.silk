@@ -1,29 +1,34 @@
-//! Shared ownership and locking for values that several native threads use at once.
+//! Shared ownership, locks and thread parking for values that several native threads use.
 //!
 //! # When to use
-//! Use [`Arc`] to give several threads ownership of one value, [`Mutex`] to let them change it one
-//! at a time, and [`Parker`] to put a thread to sleep until another thread wakes it.
+//! - [`Arc`] gives several threads ownership of one value.
+//! - [`Mutex`] lets them change the value one thread at a time.
+//! - [`Parker`] puts a thread to sleep until another thread wakes it.
 //!
 //! # Details
-//! [`Arc`] counts its handles atomically, so cloning and dropping handles on different threads is
-//! safe; the last handle dropped, on whichever thread, drops the value. [`Mutex`] is a futex lock
-//! built on [`Atomic.wait`] and [`Atomic.notifyOne`]: an uncontended lock and unlock are one atomic
-//! operation each, and a contended lock sleeps in the operating system instead of spinning.
-//! [`Parker`] holds one wakeup token, so an unpark that arrives before the park is not lost.
+//! [`Arc`] counts its handles atomically. Thus threads can clone and drop handles at the same time.
+//! The last handle to drop, on any thread, drops the value.
 //!
-//! Each type keeps its shared state in its own allocation and reaches it through raw pointers it
-//! computed when that allocation was fresh. Handles and guards only copy those pointers, and every
-//! write to state other threads can see is atomic or made under the lock.
+//! [`Mutex`] is a futex lock on [`Atomic.wait`] and [`Atomic.notifyOne`]. An uncontended lock or
+//! unlock is one atomic operation. A contended lock sleeps in the operating system and does not
+//! spin.
+//!
+//! [`Parker`] holds one wakeup token. Thus an unpark that comes before the park is not lost.
+//!
+//! Each type keeps its shared state in its own allocation, and reaches it through raw pointers that
+//! it computed when that allocation was new. Handles and guards only copy those pointers. Each
+//! write to state that other threads can see is atomic or done under the lock.
 //!
 //! # Gotchas
-//! These types need the same targets as [`Atomic.wait`]: Darwin, GNU libc, or single-threaded
-//! WebAssembly. Unlike `Shared<T>`, an `Arc<T>` never detects reentrant access; it only hands out
-//! shared borrows, so mutation goes through a `Mutex` or atomics. Reference cycles of `Arc`
-//! handles leak.
+//! - These types need the same targets as [`Atomic.wait`]: Darwin on aarch64, Linux with GNU libc
+//!   on x86_64 or aarch64, and wasm32.
+//! - An `Arc<T>` gives only shared borrows. Change the value through a `Mutex` or atomics. Unlike
+//!   `Shared<T>`, `Arc<T>` does not detect reentrant access.
+//! - A reference cycle of `Arc` handles leaks.
 //!
 //! # Examples
-//! ## Count on several threads
-//! ```silk,ignore
+//! ## Count on two threads
+//! ```silk
 //! import silk.allocator { Allocator, OutOfMemoryError }
 //! import silk.effect { Effect }
 //! import silk.native_thread { NativeThread, SpawnError }
@@ -33,17 +38,79 @@
 //!   let mut guard = total.get().lock()
 //!   let value = guard.getMut()
 //!   value.* = value.* + 1
-//!   return value.*
+//!   return 0
 //! }
 //!
-//! effect fn program() -> i32 ! OutOfMemoryError | SpawnError {
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError {
 //!   let mut allocator = Allocator.systemAllocatorProvider()
 //!   let mutex = run Mutex<i32>.make(41) |> Effect.provideMut<Allocator>(&mut allocator)
 //!   let total = run Arc<Mutex<i32>>.make(move mutex) |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Each thread gets its own handle to the same mutex.
 //!   let mine = total.clone()
-//!   let worker = run NativeThread.spawn(fn() -> i32 { return addOne(move mine) })
+//!   let worker = run NativeThread.spawn(
+//!     fn() -> i32 {
+//!       return addOne(move mine)
+//!     }
+//!   )
 //!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!   if worker.join() != 0 {
+//!     return 1
+//!   }
+//!   let guard = total.get().lock()
+//!   if guard.get().* != 42 {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
+//! }
+//! ```
+//!
+//! ## Wait for another thread
+//! ```silk
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.native_thread { NativeThread, SpawnError }
+//! import silk.sync { Parker, Unparker }
+//!
+//! fn wake(unparker: Unparker) -> i32 {
+//!   unparker.unpark()
+//!   return 0
+//! }
+//!
+//! effect fn program() -> i32
+//!   ! OutOfMemoryError | SpawnError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let parker = run Parker.make() |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let unparker = parker.unparker()
+//!   let worker = run NativeThread.spawn(
+//!     fn() -> i32 {
+//!       return wake(move unparker)
+//!     }
+//!   )
+//!     |> Effect.provideMut<Allocator>(&mut allocator)
+//!
+//!   // Waits for the token. The worker can unpark before or after this call.
+//!   parker.park()
 //!   return worker.join()
+//! }
+//!
+//! effect fn failed<E>(error: E) -> i32 {
+//!   drop error
+//!   return 1
+//! }
+//!
+//! pub fn main() -> i32 {
+//!   return run Effect.catchAll(program(), failed)
 //! }
 //! ```
 
@@ -143,7 +210,7 @@ impl<T> Arc<T> {
     return unsafe Pointer.borrow(self, self.value)
   }
 
-  /// The number of handles at the moment of the read; other threads may change it at once.
+  /// Returns the number of handles at the time of the read. Other threads can change it at once.
   pub fn count(self: &Self) -> usize {
     return unsafe Atomic.load<usize>(self.counter, MemoryOrder.Relaxed)
   }
@@ -233,7 +300,7 @@ impl<T> Drop for Mutex<T> {
   }
 }
 
-/// Exclusive access to a locked [`Mutex`]'s value; dropping the guard unlocks it.
+/// Exclusive access to the value of a locked [`Mutex`]. Dropping the guard unlocks the mutex.
 pub struct MutexGuard<'a, T> {
   mutex: &'a Mutex<T>
 }
@@ -276,19 +343,18 @@ struct ParkState {
 /// A one-token sleep for the thread that owns it.
 ///
 /// # Details
-///
-/// [`park`] returns at once when a token is waiting and consumes it; otherwise it sleeps until an
-/// [`Unparker`] supplies one. Tokens do not accumulate: several unparks before one park wake it
-/// once. A `Parker` stays with its thread, and its [`Unparker`]s go to the threads that wake it.
+/// [`park`] returns at once if a token is waiting, and consumes it. If no token is waiting, it
+/// sleeps until an [`Unparker`] supplies one. Tokens do not add up: several unparks before one park
+/// wake it one time. A `Parker` stays with its thread. Its [`Unparker`]s go to the threads that
+/// wake it.
 ///
 /// # Gotchas
-///
-/// `park` may also return without a token, so callers recheck their own condition in a loop.
+/// `park` can also return with no token. Check your own condition again in a loop.
 pub struct Parker {
   handle: ParkHandle
 }
 
-/// The waking side of a [`Parker`], which any thread may hold.
+/// The waking side of a [`Parker`]. Any thread can hold one.
 pub struct Unparker {
   handle: ParkHandle
 }

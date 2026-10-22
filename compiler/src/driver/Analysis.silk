@@ -1,0 +1,234 @@
+//! Opens a program for semantic analysis: loads its sources, configures a semantic store and
+//! assembles the final profile. `silk build`, `silk check` and the language server share it; each
+//! reports a refusal its own way.
+
+import Profiler
+import driver.ModuleSources as ModuleSourceFiles {
+  InvalidBuildComposition,
+  InvalidSourceRoot,
+  MissingManifest,
+  MissingStandardLibrary,
+  ModuleSources,
+}
+import driver.NativeLinkInput { InvalidNativeLinkInput }
+import driver.Packages { InvalidDependency }
+import semantic.ExecutionStorage { ExecutionStorage }
+import semantic.FinalProfile { FinalProfile, Problem as ProfileProblem }
+import semantic.InitialProfile { InitialProfile }
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.ProfileAssembly { AssemblyProblem, assemble as assembleProfile }
+import semantic.ProfileBinding { BindingError, Supplied }
+import semantic.ProfileShape {
+  Problem as ShapeProblem,
+  Refusal as ShapeRefusal,
+  Registered,
+  registeredOrRefused as registeredShapes,
+}
+import semantic.Query { Cycle }
+import semantic.Rejection { Rejection }
+import semantic.Semantic {
+  ConflictingPackageSource,
+  RegistrationClosed,
+  Request as SemanticRequest,
+  Semantic,
+}
+import semantic.SourceIndex { RevisionMismatch }
+import semantic.Target { Target }
+import semantic.Types { Types }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.list { List }
+import silk.option { Option }
+import silk.result { Result }
+import silk.shared { Shared }
+import silk.toml_scanner { TomlError }
+
+/// A program ready for semantic analysis.
+pub struct Analysis {
+  pub sources: ModuleSources
+  pub store: Semantic
+  pub request: SemanticRequest
+  pub rootPackage: List<ModuleId>
+  pub identity: ModuleId
+  /// The selected runtime, absent for a library or object form without one.
+  pub runtime: Option<ModuleId>
+}
+
+/// Why the final profile could not be assembled.
+pub union Refusal {
+  /// A `param` declaration is rejected where it is written.
+  ParameterRejected { pub rejection: Shared<Rejection> },
+  /// A `param` declaration has an invalid shape.
+  Shape { pub problem: ShapeProblem },
+  /// A parameter's default is rejected where it is written.
+  DefaultRejected { pub rejection: Shared<Rejection> },
+  /// The assembled profile is invalid.
+  Profile { pub problem: ProfileProblem },
+  /// A supplied binding is refused.
+  Binding { pub error: BindingError },
+  /// The bindings do not match the profile input.
+  InputMismatch,
+}
+
+/// The program, or the store and sources read so far with why its profile was refused; their
+/// syntax errors are still worth reporting.
+pub union Opened {
+  Ready { pub analysis: Analysis },
+  /// The initial profile names no `libc` or no `artifact`.
+  InvalidProfile,
+  Refused { pub sources: ModuleSources, pub store: Semantic, pub refusal: Refusal },
+}
+
+/// Loads the program rooted at `sourcePath` (within `manifest`'s package when given), publishes
+/// every module reachable through imports, and assembles the final profile with `bindings`. A test
+/// analysis is rooted at the bundled runner. A revisable store, opened with `Semantic.make`, can
+/// later take a new revision through `Semantic.update`; otherwise the store is one-shot.
+pub effect fn open(
+  sourcePath: &Path,
+  manifest: Option<&Path>,
+  standardLibrary: Option<Path>,
+  profile: &InitialProfile,
+  bindings: List<Supplied>,
+  testing: bool,
+  revisable: bool,
+) -> Opened
+  ! FileError
+    | InvalidModulePath
+    | InvalidSourceRoot
+    | InvalidDependency
+    | MissingManifest
+    | InvalidBuildComposition
+    | MissingStandardLibrary
+    | InvalidNativeLinkInput
+    | TomlError
+    | RegistrationClosed
+    | ConflictingPackageSource
+    | Cycle
+    | RevisionMismatch
+    | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator | &mut Types {
+  let target = Target.forId(Target.id(InitialProfile.target(profile)))
+  let libc = match move InitialProfile.text(profile, b"libc") {
+    Option<&[u8]>.Some { value } => run Bytes.copy(value)
+    Option<&[u8]>.None => {
+      return Opened.InvalidProfile
+    }
+  }
+  let executable = match move InitialProfile.text(profile, b"artifact") {
+    Option<&[u8]>.Some { value } => same(value, b"executable")
+    Option<&[u8]>.None => {
+      return Opened.InvalidProfile
+    }
+  }
+  let mut sources = match move manifest {
+    Option<&Path>.Some { value } => run ModuleSourceFiles.makeInPackage(
+      sourcePath,
+      value,
+      move standardLibrary,
+      Target.name(&target),
+      Bytes.asSlice(&libc),
+      executable,
+      run InitialProfile.runtimeRequest(profile)
+    )
+    Option<&Path>.None => run ModuleSourceFiles.make(
+      sourcePath,
+      move standardLibrary,
+      Target.name(&target),
+      Bytes.asSlice(&libc),
+      executable,
+      run InitialProfile.runtimeRequest(profile)
+    )
+  }
+  let identity = ModuleId.copy(ModuleSourceFiles.entry(&sources))
+  let mut runtime = Option<ModuleId>.none()
+  if let Option<&ModuleId>.Some { value } = move ModuleSourceFiles.runtime(&sources) {
+    runtime = Option<ModuleId>.some(ModuleId.copy(value))
+  }
+  // A test build's application is the bundled runner; the source file is its discovery root.
+  let mut application = ModuleId.copy(&identity)
+  if testing {
+    application = run ModuleSourceFiles.module(&sources, b"silk/test_runner.silk")
+  }
+  // One build sees the whole program: every module reachable through imports from the build's
+  // roots is published before semantic analysis starts.
+  let loading = Profiler.zone(b"preloadProgram")
+  run ModuleSourceFiles.preloadProgram(&mut sources, &application)
+  drop loading
+  let rootPackage = run ModuleSourceFiles.loadedRootModules(&sources)
+  let revision = run ModuleSourceFiles.revision(&sources)
+  let mut store = Semantic.oneShot(move revision, target, Option<FinalProfile>.none())
+  if revisable {
+    store = Semantic.make(run ModuleSourceFiles.revision(&sources), target, Option<FinalProfile>.none())
+  }
+  Semantic.selectPackages(&mut store, run ModuleSourceFiles.packageGraph(&sources))
+  if let Option<&ExecutionStorage>.Some { value: storage } = move ModuleSourceFiles.executionStorage(&sources) {
+    Semantic.selectExecutionStorage(&mut store, run ExecutionStorage.copy(storage))
+  }
+  Semantic.selectRetention(&mut store, run ModuleSourceFiles.retention(&sources))
+  if testing {
+    Semantic.selectDiscovery(
+      &mut store,
+      ModuleId.copy(&identity),
+      run Bytes.copy(ModuleSourceFiles.moduleDirectory(&sources))
+    )
+    Semantic.selectDiscoveryExports(&mut store, run ModuleSourceFiles.exportedModules(&sources))
+  }
+  let mut request = SemanticRequest.forApplication(ModuleId.copy(&application))
+  run SemanticRequest.registerSchemaModule(&mut request, &identity)
+  let shapes = run registeredShapes(&mut store, &mut request, &target)
+  let assembled = match move shapes {
+    Result<Registered, ShapeRefusal>.Success { value } => run assembleProfile(
+      run InitialProfile.copy(profile),
+      &mut store,
+      &mut request,
+      &value,
+      move bindings
+    )
+    Result<Registered, ShapeRefusal>.Failure { error } => {
+      let refusal = match move error {
+        ShapeRefusal.Rejected { rejection } => Refusal.ParameterRejected { rejection: move rejection }
+        ShapeRefusal.Shape { problem } => Refusal.Shape { problem: problem }
+      }
+      return Opened.Refused { sources: move sources, store: move store, refusal: move refusal }
+    }
+  }
+  match move assembled {
+    Result<FinalProfile, AssemblyProblem>.Success { value } => {
+      run Semantic.reviseProfile(&mut store, Option<FinalProfile>.some(move value))
+    }
+    Result<FinalProfile, AssemblyProblem>.Failure { error } => {
+      let refusal = match move error {
+        AssemblyProblem.Default { rejection } => Refusal.DefaultRejected { rejection: move rejection }
+        AssemblyProblem.Profile { error: problem } => Refusal.Profile { problem: problem }
+        AssemblyProblem.Binding { error: refused } => Refusal.Binding { error: move refused }
+        AssemblyProblem.InputMismatch => Refusal.InputMismatch
+      }
+      return Opened.Refused { sources: move sources, store: move store, refusal: move refusal }
+    }
+  }
+  return Opened.Ready {
+    analysis: Analysis {
+      sources: move sources,
+      store: move store,
+      request: move request,
+      rootPackage: move rootPackage,
+      identity: move identity,
+      runtime: move runtime,
+    },
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at: usize = 0
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}

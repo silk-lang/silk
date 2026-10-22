@@ -1,7 +1,8 @@
 # Patterns and destructuring
 
 Patterns inspect existing value structure and introduce local bindings. Silk uses the same pattern
-grammar in exhaustive `match`, unconditional `let` destructuring, and conditional `if let`.
+grammar in exhaustive `match`, unconditional `let` destructuring, conditional `if let`, and the
+pattern loop `while let`.
 The surrounding construct decides whether a pattern must always match or provides a mismatch path.
 Scalar enums additionally provide a qualified, payload-free member pattern for exhaustive `match`.
 Nominal unions provide parent-qualified unit and named-field variant patterns in `match`, `let`, and
@@ -346,8 +347,9 @@ exhaustive matching specification.
 
 **Status:** Confirmed
 
-Initial destructuring is available in match arms, irrefutable local `let`, and refutable `if let`.
-Destructuring assignment, parameter patterns, `while let`, `let ... else`, aliases binding both a
+Initial destructuring is available in match arms, irrefutable local `let`, refutable `if let`, and
+the pattern loop `while let` (PATT-022).
+Destructuring assignment, parameter patterns, `let ... else`, aliases binding both a
 whole value and fields, pattern chains, and additional pattern operators remain unavailable.
 
 **Boundary:** These omissions do not reserve implementation-specific behavior or permit a parser to
@@ -580,3 +582,42 @@ ownership diagnostics while naming the complete hierarchical selection path.
 **Evidence:** nominal-union pattern specification,
 hierarchical matching tests,
 [match coverage rules](functions-callables-and-control-flow.md#match-003--match-coverage-is-exhaustive-and-guards-do-not-prove-coverage).
+
+## PATT-022 — `while let` repeats while one refutable pattern matches
+
+**Status:** Confirmed
+
+`while let Pattern = expression { body }` evaluates `expression` and tests `Pattern` before every
+possible iteration. On a match, it executes `body` with the pattern bindings and then tests again.
+On the first mismatch, the loop ends and execution continues after it. A mismatch on the first test
+executes the body zero times.
+
+```silk
+fn total(counter: &mut Counter) -> i32 {
+  let mut sum = 0
+  while let Option<i32>.Some { value } = move next(&mut counter.*) {
+    sum = sum + value
+  }
+  return sum
+}
+```
+
+The loop is exactly `while true { if let Pattern = expression { body } else { break } }`. Every
+`if let` rule applies to each test: the written access of `expression` (PATT-002), consumption on
+both outcomes (PATT-008), loans that end with the iteration (PATT-009), and harmless redundancy
+(PATT-010). The bindings are fresh locals of each iteration and are not visible after the loop.
+
+**Boundary:** `expression` is part of each iteration, so a `break` or `continue` inside it, such
+as in a `match` arm, targets this loop. This differs from the condition of a boolean `while`,
+which is evaluated in the surrounding transfer context (TRANSFER-001). The header has no `else`,
+pattern chain, or guard; an additional condition is an explicit `if` inside the body. A consuming
+`move` subject must be restored on every path that repeats (LOOP-001). Static bodies do not accept
+`while let`.
+
+**Diagnostics:** A malformed header receives a parser diagnostic local to the pattern, initializer,
+or `=` separator. A repeating path that leaves a consumed subject unavailable reports `OWN0005`.
+Pattern, field, binding, and ownership errors keep the ordinary codes of the equivalent `if let`.
+
+**Evidence:** [conditional patterns](#patt-007--if-let-tests-one-refutable-pattern),
+[loop ownership](functions-callables-and-control-flow.md#loop-001--while-is-a-boolean-pre-test-loop),
+pattern loop corpus programs.

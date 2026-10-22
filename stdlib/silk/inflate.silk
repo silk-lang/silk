@@ -1,66 +1,66 @@
-//! Bounded streaming decoding for raw DEFLATE, zlib, and gzip bytes.
+//! Decompress raw DEFLATE, zlib, and gzip data in steps, with fixed memory and limits that you set.
 //!
 //! # When to use
-//! Use [`Decoder`] to decode compressed input into caller-owned output buffers.
-//! Select [`Format`] explicitly. Use [`make`] to create state and [`step`] to decode bytes.
-//! Use [`reset`] to reuse a decoder for another independent stream.
-//! This module does not detect formats or encode data.
+//! Use a [`Decoder`] to read `.gz` files, zlib streams, or HTTP bodies with `Content-Encoding:
+//! gzip` or `deflate`. Choose the [`Format`] yourself, because the decoder does not detect it. Make
+//! a decoder with [`Decoder.make`], call [`Decoder.step`] until it returns `Finished`, and call
+//! [`Decoder.reset`] to decode another stream with the same storage. This module does not compress.
 //!
 //! # Details
-//! Construction acquires two bounded allocations: history and table storage.
-//! Steps and reset retain no borrowed buffers and allocate nothing.
-//! Limits count consumed input, emitted output, started members, and header bytes within each independent stream.
-//! Raw and zlib stop at the first stream boundary. Gzip accepts concatenated members and requires final input.
+//! [`Decoder.make`] allocates a 32 KiB history and the Huffman tables one time. Later calls do not
+//! allocate and do not keep a borrow of your buffers. Each call to [`Decoder.step`] takes the input
+//! that is not consumed yet and an output buffer, and returns a [`Progress`]: how many bytes it
+//! consumed and wrote, and what it needs next. The [`Limits`] apply to the full stream across all
+//! calls.
+//!
+//! Raw and zlib stop at the end of the first stream and leave the bytes after it unconsumed. Gzip
+//! accepts more than one member. It finishes only when the input is marked final and all input is
+//! consumed.
+//!
+//! # Errors
+//! - `OutOfMemoryError` from [`Decoder.make`] if the `Allocator` fails.
+//! - [`DecodeError`] if the data is not valid, a limit is too small, or the calls do not follow the
+//!   rules of [`Decoder.step`]. Its `kind` tells you the cause.
 //!
 //! # Gotchas
-//! Output is provisional until `Finished`. Discard all output after a decoding failure.
-//! Preset dictionaries are unsupported. A failed decoder rejects steps until a successful reset.
+//! Output is not verified until `Finished`, because the checksum comes at the end. If a step fails,
+//! discard all output of the stream. A failed decoder rejects each later step with `InvalidUse`
+//! until you call [`Decoder.reset`]. Zlib streams with a preset dictionary are not supported.
 //!
 //! # Examples
-//! ## Decode a stored block into a caller-owned buffer
+//! ## Decode a stored DEFLATE block
 //! ```silk
-//! import silk.allocator {Allocator, OutOfMemoryError}
-//! import silk.effect {Effect}
-//! import silk.inflate {Decoder, DecodeError, Format, Limits, Progress, Status}
-//! import silk.result {Result}
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.inflate { DecodeError, Decoder, Format, Limits, Progress, Status }
+//! import silk.result { Result }
 //!
-//! effect fn decode() -> i32 ! OutOfMemoryError | DecodeError {
+//! pub effect fn main() -> i32
+//!   ! OutOfMemoryError | DecodeError {
 //!   let mut allocator = Allocator.systemAllocatorProvider()
 //!   let limits = Limits {
-//!     maxInputBytes: 7,
-//!     maxOutputBytes: 2,
+//!     maxInputBytes: 1024,
+//!     maxOutputBytes: 1024,
 //!     maxMembers: 1,
 //!     maxHeaderBytes: 0,
-//!     maxMemoryBytes: 65536,
+//!     maxMemoryBytes: 65536
 //!   }
-//!   let creating = Decoder.make(Format.Raw, move limits)
+//!   let mut decoder = run Decoder.make(Format.Raw, move limits)
 //!     |> Effect.provideMut<Allocator>(&mut allocator)
-//!   let mut decoder = run creating
+//!
+//!   // A final stored block: header, length 2, its complement, then the bytes "hi".
 //!   let input = b"\x01\x02\x00\xfd\xffhi"
-//!   let mut output: [u8; 2] = [0, 0]
-//!   let result = Decoder.step(&mut decoder, &input, &mut output, true)
-//!   return match move result {
-//!     Result<Progress, DecodeError>.Success {value} => inspect(move value, &output)
-//!     Result<Progress, DecodeError>.Failure {error} => 99
+//!   let mut output: [u8; 16] = [0; 16]
+//!   return match Decoder.step(&mut decoder, &input, &mut output, true) {
+//!     Result<Progress, DecodeError>.Success { value } => {
+//!       if value.status != Status.Finished || value.written != 2 || output[0] != 104
+//!         || output[1] != 105 {
+//!         return 1
+//!       }
+//!       return 0
+//!     }
+//!     Result<Progress, DecodeError>.Failure { error: _ } => 1
 //!   }
-//! }
-//!
-//! fn inspect(progress: Progress, output: &[u8]) -> i32 {
-//!   if progress.status != Status.Finished || progress.consumed != 7 || progress.written != 2 {
-//!     return 1
-//!   }
-//!   if output[0] != 104 || output[1] != 105 {
-//!     return 2
-//!   }
-//!   return 0
-//! }
-//!
-//! effect fn recover(error: OutOfMemoryError | DecodeError) -> i32 {
-//!   return 99
-//! }
-//!
-//! pub fn main() -> i32 {
-//!   return run Effect.catchAll(decode(), recover)
 //! }
 //! ```
 
@@ -71,113 +71,117 @@ import silk.u8
 import silk.u32
 import silk.usize
 
-/// A conservative byte bound for decoder storage, owned tables, and temporary decoding state.
+/// The number of bytes of storage that a [`Decoder`] needs: 64 KiB.
 ///
-/// # Details
-///
-/// The bound excludes caller buffers and allocator metadata. A larger allowance does not increase storage.
+/// It counts the history, the tables, and the decoder state. It does not count your buffers or the
+/// overhead of the allocator. [`Limits.maxMemoryBytes`] must be at least this value. A larger value
+/// does not make the decoder use more memory.
 pub const MEMORY_BOUND: u64 = 65536
 
-/// The explicit compressed container format.
+/// The container format of the compressed data.
 pub enum Format {
-  /// One raw RFC 1951 DEFLATE stream.
+  /// One raw DEFLATE stream (RFC 1951) with no header or checksum.
   Raw,
-  /// One RFC 1950 zlib stream without a preset dictionary.
+  /// One zlib stream (RFC 1950): a 2-byte header, DEFLATE data, and an Adler-32 checksum. A preset
+  /// dictionary is not supported.
   Zlib,
-  /// An RFC 1952 gzip stream with one or more concatenated members.
+  /// Gzip data (RFC 1952): one or more members, each with a header, DEFLATE data, a CRC-32, and the
+  /// size.
   Gzip,
 }
 
-/// The next action required after a successful step.
+/// What the decoder needs after a successful step.
 pub enum Status {
-  /// Supply more input after discarding exactly the consumed prefix.
+  /// All given input is consumed. Call again with more input, or with `finalInput` set if there is
+  /// no more.
   NeedInput,
-  /// Supply another output buffer and resubmit the unconsumed input suffix.
+  /// The output buffer is full. Call again with a new output buffer and the input that was not
+  /// consumed.
   NeedOutput,
-  /// The selected container and its integrity checks are complete.
+  /// The stream is complete and its checksums are correct. Later steps return `Finished` and do
+  /// nothing.
   Finished,
 }
 
-/// Explicit cumulative resource allowances. Zero permits no units of that resource.
+/// The resource limits for one stream. Each limit counts across all calls and gzip members. A limit
+/// of 0 allows nothing.
 pub struct Limits {
-  /// The maximum total number of consumed compressed bytes.
+  /// The maximum number of compressed bytes to consume.
   pub maxInputBytes: u64
-  /// The maximum total number of emitted uncompressed bytes.
+  /// The maximum number of decompressed bytes to write.
   pub maxOutputBytes: u64
-  /// The maximum number of started members. Raw and zlib each count as one member.
+  /// The maximum number of gzip members. A raw or zlib stream is one member. It must not be 0.
   pub maxMembers: u64
-  /// The maximum total number of wrapper header bytes, including gzip optional fields and header CRC.
+  /// The maximum number of header bytes, with the optional gzip fields and the header CRC. A raw
+  /// stream has no header bytes.
   pub maxHeaderBytes: u64
-  /// The available decoder storage allowance. It must be at least [`MEMORY_BOUND`].
+  /// The storage that the decoder can use. It must be at least [`MEMORY_BOUND`].
   pub maxMemoryBytes: u64
 }
 
-/// Exact progress within one call and the next required action.
+/// The result of one successful step.
 pub struct Progress {
-  /// The input prefix consumed by this call.
+  /// The number of input bytes that this call consumed, from the start of the input.
   pub consumed: usize
-  /// The output prefix initialized by this call.
+  /// The number of output bytes that this call wrote, from the start of the output.
   pub written: usize
-  /// The next action required from the caller.
+  /// What the decoder needs next.
   pub status: Status
 }
 
-/// A decoding failure category or the resource allowance that was exceeded.
+/// The cause of a [`DecodeError`].
 pub enum ErrorKind {
-  /// A wrapper header violates its format.
+  /// A zlib or gzip header is not valid.
   InvalidHeader,
-  /// A wrapper requests a compression method other than DEFLATE.
+  /// The header names a compression method that is not DEFLATE.
   UnsupportedMethod,
-  /// A zlib header requests an unsupported preset dictionary.
+  /// The zlib header asks for a preset dictionary.
   UnsupportedDictionary,
-  /// A block type, stored length, or compressed symbol is invalid.
+  /// A block type, a stored block length, or a compressed symbol is not valid.
   InvalidBlock,
-  /// A Huffman alphabet or code-length repeat is invalid.
+  /// A Huffman code or a code-length repeat is not valid.
   InvalidHuffman,
-  /// A match refers outside initialized history or the declared window.
+  /// A back-reference points before the start of the output or outside the window.
   InvalidDistance,
-  /// Final input ends before a required field is complete.
+  /// The final input ends before the stream is complete.
   TruncatedInput,
-  /// A header or data checksum does not match.
+  /// A header CRC, CRC-32, or Adler-32 checksum is not correct.
   ChecksumMismatch,
-  /// A gzip member size does not match its trailer.
+  /// The size in a gzip trailer is not the size of the decoded member.
   SizeMismatch,
-  /// The decoder failed earlier or the final-input contract was violated.
+  /// The decoder failed before, or a call broke the rules of [`Decoder.step`] about final input.
   InvalidUse,
-  /// Consuming the next byte would exceed the input allowance.
+  /// The next input byte would go over [`Limits.maxInputBytes`].
   InputLimit,
-  /// Emitting the next byte would exceed the output allowance.
+  /// The next output byte would go over [`Limits.maxOutputBytes`].
   OutputLimit,
-  /// Starting a member would exceed the member allowance.
+  /// A new gzip member would go over [`Limits.maxMembers`], or the limit is 0.
   MemberLimit,
-  /// Consuming a header byte would exceed the header allowance.
+  /// The next header byte would go over [`Limits.maxHeaderBytes`].
   HeaderLimit,
-  /// Construction or reset cannot fit within the decoder storage allowance.
+  /// [`Limits.maxMemoryBytes`] is less than [`MEMORY_BOUND`].
   MemoryLimit,
 }
 
-/// A typed failure with exact progress for the failing call.
+/// A decoding failure, with the progress of the call before it failed.
 ///
 /// # Gotchas
-///
-/// The written prefix can contain provisional output. Discard the decoded stream after a step failure.
-/// A rejected reset leaves the original decoder and its output unchanged.
+/// The output that the call wrote is not valid. Discard all output of the stream after a failed
+/// step. A failed [`Decoder.reset`] does not change the decoder.
 pub struct DecodeError {
-  /// The failure category.
+  /// The cause of the failure.
   pub kind: ErrorKind
-  /// The input prefix consumed before failure in this call.
+  /// The number of input bytes that this call consumed before it failed.
   pub consumed: usize
-  /// The output prefix initialized before failure in this call.
+  /// The number of output bytes that this call wrote before it failed.
   pub written: usize
 }
 
-/// An owned, bounded decoder with no retained input or output borrow.
+/// A DEFLATE, zlib, or gzip decoder that owns its history and tables.
 ///
-/// # Details
-///
-/// Drop releases its history and table allocations. A finished decoder returns `Finished` with zero progress on later calls.
-/// A failed decoder rejects later steps with `InvalidUse`.
-/// A successful [`reset`] starts another independent stream with the same owned storage.
+/// Dropping it releases the storage. After `Finished`, each step returns `Finished` with no
+/// progress. After a failure, each step fails with `InvalidUse`. [`Decoder.reset`] starts a new
+/// stream with the same storage.
 pub struct Decoder {
   format: Format
   limits: Limits
@@ -229,12 +233,14 @@ pub struct Decoder {
 }
 
 impl Decoder {
-  /// Creates a decoder and acquires bounded history and table storage through the current allocator.
+  /// Returns a decoder for one stream in `format`, with storage from the ambient `Allocator`.
   ///
-  /// # Details
+  /// The first member counts against [`Limits.maxMembers`] at once.
   ///
-  /// Construction fails with `MemoryLimit` or `MemberLimit` before allocation if either allowance is insufficient.
-  /// Allocation failure is `OutOfMemoryError`. The first member counts at construction.
+  /// # Errors
+  /// - [`DecodeError`] with `MemoryLimit` if `maxMemoryBytes` is less than [`MEMORY_BOUND`], or
+  ///   with `MemberLimit` if `maxMembers` is 0. These checks come before the allocation.
+  /// - `OutOfMemoryError` if the `Allocator` fails.
   pub effect fn make(format: Format, limits: Limits) -> Decoder
   ! OutOfMemoryError | DecodeError
   ? &mut Allocator {
@@ -315,24 +321,18 @@ impl Decoder {
       hLength: 1,
     }
   }
-  /// Starts another independent stream with the existing decoder storage.
+  /// Starts a new stream in `format` with new `limits`, and keeps the storage of the decoder.
   ///
-  /// # When to use
+  /// Use it after a stream finishes or fails, or to stop a stream. It does not allocate. All
+  /// counters and the final-input state start again, and the first member counts at once.
   ///
-  /// Use after completion, failure, or abandonment to reuse storage without an allocator requirement.
-  ///
-  /// # Details
-  ///
-  /// Success replaces the format and limits and restores fresh stream behavior. Reset allocates nothing.
-  /// The first member counts immediately. Counters and final-input obligations start again for the new stream.
-  /// The memory allowance must cover [`MEMORY_BOUND`], and the member allowance must be nonzero.
-  /// These checks occur in that order before mutation. Rejection returns `MemoryLimit` or `MemberLimit` with zero progress.
-  /// A rejected reset leaves the decoder unchanged. An in-progress stream can continue.
+  /// # Errors
+  /// - `MemoryLimit` if `maxMemoryBytes` is less than [`MEMORY_BOUND`], then `MemberLimit` if
+  ///   `maxMembers` is 0. If it fails, the decoder does not change and a stream in progress can
+  ///   continue.
   ///
   /// # Gotchas
-  ///
-  /// Reset does not validate, reclaim, or erase previous output. Output from failed or abandoned streams remains provisional.
-  /// Reset does not securely erase the decoder storage.
+  /// It does not erase the earlier output or the history storage.
   pub fn reset(self: &mut Self, format: Format, limits: Limits) -> Result<(), DecodeError> {
     if limits.maxMemoryBytes < MEMORY_BOUND {
       return Result<(), DecodeError>.failResult(
@@ -400,20 +400,22 @@ impl Decoder {
     self.hLength = 1
     return Result<(), DecodeError>.succeed(())
   }
-  /// Decodes input into the supplied output buffer and returns exact per-call progress.
+  /// Decodes from `input` into `output` and returns how much it consumed and wrote.
   ///
-  /// # Details
+  /// On the next call, give only the input after the consumed prefix. You can give a new output
+  /// buffer of any length. Set `finalInput` when `input` holds all remaining data. After that, each
+  /// call must set `finalInput` and give exactly the input that is not consumed yet.
   ///
-  /// Resubmit only the unconsumed input suffix. Once `finalInput` is true, keep it true and preserve that suffix length.
-  /// The caller must preserve suffix contents. A later call can provide a new output buffer of any length.
-  /// Steps allocate nothing and retain no buffer borrow. An empty output returns `NeedOutput` when emission is required.
-  /// Raw and zlib leave trailing input unconsumed. Gzip waits for final exhaustion after a complete member.
+  /// If the output has no space and the decoder has bytes to write, it returns `NeedOutput`.
+  ///
+  /// # Errors
+  /// - [`DecodeError`] if the data is not valid, a [`Limits`] value would be exceeded, or the final
+  ///   input ends early (`TruncatedInput`). The limit checks occur before the byte or member that
+  ///   would go over the limit.
+  /// - `InvalidUse` if the decoder failed before, or the call changes the final input.
   ///
   /// # Gotchas
-  ///
-  /// Output remains provisional until `Finished`. A failure poisons the decoder; discard all output after failure.
-  /// Limits are cumulative across calls and gzip members until a successful [`reset`].
-  /// Checks occur before the excess byte or member is accepted.
+  /// Output is not verified until `Finished`. After a failure, discard all output of the stream.
   pub fn step(self: &mut Self, input: &[u8], output: &mut [u8], finalInput: bool) -> Result<
     Progress,
     DecodeError,
