@@ -5,38 +5,45 @@
 A work-stealing pool of native threads that runs lazy tasks in parallel.
 
 ## When to use
-Use [`ThreadPool.make`](#ThreadPool.impl.make) to start worker threads, then [`Pool.block`](#Pool.impl.block) to run a program on them
-from an ordinary thread. Tasks start more tasks with [`Pool.spawn`](#Pool.impl.spawn) and wait for one with
-[`TaskHandle.join`](#TaskHandle.impl.join).
+1. Call [`ThreadPool.make`](#ThreadPool.impl.make) to start the worker threads.
+2. Call [`Pool.block`](#Pool.impl.block) on a normal thread to run a program on the pool.
+3. In a task, start more tasks with [`Pool.spawn`](#Pool.impl.spawn) and wait for one with [`TaskHandle.join`](#TaskHandle.impl.join).
 
 ## Details
-Each task is a closed, `Transferable` lazy effect, packaged with `Execution.makeTransferable`,
-so it may start on one worker and resume on another after it parks. A ready task goes on one
-shared ready list. An idle worker moves a batch of ready tasks into its own [`WorkDeque`](./work-queue.md#WorkDeque), and
-workers with nothing to do steal from the others' deques before they sleep on a [`Parker`](./sync.md#Parker).
-Waking a parked task puts it back on the ready list and wakes a sleeping worker, so no worker
-spins.
+Each task is a closed, `Transferable` lazy effect, packaged with `Execution.makeTransferable`.
+Thus a task can start on one worker, park, and continue on a different worker.
 
-A [`Pool`](#Pool) is a cheap, `Transferable` handle that tasks capture to spawn more tasks. The
-[`ThreadPool`](#ThreadPool) owns the threads: dropping it stops and joins every worker and drops the tasks
-still unfinished.
+A ready task goes on one shared ready list. An idle worker moves a batch of ready tasks into its
+own `WorkDeque`. A worker with nothing to do steals from the deques of the other workers, and
+then sleeps on a `Parker`. When a parked task wakes, it goes back on the ready list and a
+sleeping worker wakes. Thus no worker spins.
+
+A [`Pool`](#Pool) is a small `Transferable` handle that tasks capture to start more tasks. The
+[`ThreadPool`](#ThreadPool) owns the threads. Dropping it stops and joins each worker, and drops the tasks
+that are not finished.
+
+## Errors
+[`ThreadPool.make`](#ThreadPool.impl.make) fails with `SpawnError` or `OutOfMemoryError`. [`Pool.spawn`](#Pool.impl.spawn) and
+[`Pool.block`](#Pool.impl.block) fail with `OutOfMemoryError`. A task is a closed effect, so wrap a task that can
+fail in `Effect.result` and get its failure as a value.
 
 ## Gotchas
-Task bodies and results must be `Transferable` and `'static`. Within a task, waiting for anything
-other than a [`TaskHandle`](#TaskHandle) must park with `Execution.parkTransferable`; blocking the native
-thread, as [`Pool.block`](#Pool.impl.block) does, holds up a whole worker. [`TaskHandle.join`](#TaskHandle.impl.join) may only be called
-from inside a pool task.
+- Task bodies and results must be `Transferable` and `'static`.
+- In a task, wait for anything other than a [`TaskHandle`](#TaskHandle) with `Execution.parkTransferable`. A
+  call that blocks the native thread, such as [`Pool.block`](#Pool.impl.block), holds up a whole worker.
+- Call [`TaskHandle.join`](#TaskHandle.impl.join) only from inside a pool task.
+- The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
 
 ## Examples
 ### Sum two halves in parallel
-```silk,ignore
+```silk
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
 import silk.native_thread { SpawnError }
 import silk.result { Result }
 import silk.thread_pool { Pool, ThreadPool }
 
-effect fn half(from: i64, to: i64) -> i64 {
+effect fn sumRange(from: i64, to: i64) -> i64 {
   let mut total: i64 = 0
   let mut at = from
   while at < to {
@@ -46,19 +53,41 @@ effect fn half(from: i64, to: i64) -> i64 {
   return total
 }
 
-effect fn both(pool: Pool) -> i64 ! OutOfMemoryError {
-  let low = run pool.spawn(half(0, 500))
-  let high = run half(500, 1001)
+// Runs the low half as a new task, and the high half in this task.
+effect fn both(pool: Pool) -> i64
+  ! OutOfMemoryError {
+  let low = run pool.spawn(sumRange(0, 500))
+  let high = run sumRange(500, 1001)
   let lowValue = run low.join()
   return lowValue + high
 }
 
-effect fn program() -> Result<i64, OutOfMemoryError> ! OutOfMemoryError | SpawnError {
+effect fn program() -> i32
+  ! OutOfMemoryError | SpawnError {
   let mut allocator = Allocator.systemAllocatorProvider()
   let threads = run ThreadPool.make(4) |> Effect.provideMut<Allocator>(&mut allocator)
   let pool = threads.pool()
+
   // A task is a closed effect, so its own failures come back as a value.
-  return run pool.block(Effect.result(both(pool.clone())))
+  let result = run pool.block(Effect.result(both(pool.clone())))
+  return match move result {
+    Result<i64, OutOfMemoryError>.Success { value } => {
+      if value != 500500 {
+        return 1
+      }
+      return 0
+    }
+    Result<i64, OutOfMemoryError>.Failure { error } => 1
+  }
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub fn main() -> i32 {
+  return run Effect.catchAll(program(), failed)
 }
 ```
 
@@ -99,8 +128,7 @@ pub effect fn join(self: Self) -> A
 Parks the calling task until this task finishes, then returns its result.
 
 #### Gotchas
-
-Only a pool task may join; anywhere else the park is a fatal state trap.
+Only a pool task can join. A join from any other place is a fatal state trap.
 
 <a id="Pool"></a>
 
@@ -141,8 +169,7 @@ pub effect<'env> fn spawn<
 Starts `task` as a new pool task and returns the handle that joins it.
 
 #### Details
-
-The task is ready at once and may start on any worker before this returns.
+The task is ready at once. It can start on any worker before this call returns.
 
 <a id="Pool.impl.block"></a>
 

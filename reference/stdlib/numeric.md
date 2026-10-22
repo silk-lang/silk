@@ -11,20 +11,31 @@ overflow, bitwise, or formatting operations.
 
 ## Details
 The helpers bound their type parameter with the operator interfaces of `silk.ops`, such as
-`T: Add<T, T>`. Witnesses are selected during specialization and create no Effect requirement,
-provider slot, or runtime dispatch.
+`T: Add<T, T>`. The compiler selects the conformance during specialization. A helper adds no
+effect requirement and no runtime dispatch.
 
 ## Gotchas
-The selected primitive operation keeps its ordinary overflow policy. Integer addition traps when
-the mathematical result is outside the selected type's range.
+Each helper keeps the overflow rule of the operator. Integer addition traps if the result is
+outside the range of the type.
 
 ## Examples
 ### Add values through one generic contract
 ```silk
 import silk.numeric { Numeric }
+import silk.ops { Add }
+
+fn total<T: Add<T, T>>(first: T, second: T, third: T) -> T {
+  let partial = Numeric.add<T>(move first, move second)
+  return Numeric.add<T>(move partial, move third)
+}
 
 pub fn main() -> i32 {
-  return Numeric.add<i32>(40, 2)
+  let small: u8 = total<u8>(1, 2, 3)
+  let large: i64 = total<i64>(40, 1, 1)
+  if small != 6 || large != 42 {
+    return 1
+  }
+  return 0
 }
 ```
 
@@ -40,12 +51,7 @@ Public declarations: 1.
 pub struct Numeric
 ```
 
-The owner of the generic numeric helpers.
-
-### Details
-
-This struct carries no data and is never constructed by the library. The helpers are inherent
-members declared in `impl Numeric`, reached through `import silk.numeric { Numeric }`.
+The owner type of the generic numeric helpers. It has no fields and is never constructed.
 
 <a id="Numeric.impl"></a>
 
@@ -63,11 +69,15 @@ impl Numeric
 pub fn add<T: Add<T, T>>(left: T, right: T) -> T
 ```
 
-Adds two values and traps if the selected integer type cannot represent the result.
+Returns `left + right` for any type `T` that has the `+` operator.
 
 #### When to use
 
-Use this function to call ordinary integer addition from generic code.
+Use `add` in generic code, or to pass addition as a named function.
+
+#### Gotchas
+
+For an integer type, the program traps if the sum is outside the range of `T`.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

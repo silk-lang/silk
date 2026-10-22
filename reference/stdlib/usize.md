@@ -10,14 +10,32 @@ integer for serialized data, protocols, and persistent identifiers whose range m
 between 32-bit and 64-bit targets.
 
 ## Details
-[`BITS`](#BITS) and [`MAX`](#MAX) follow the selected target. Ordinary arithmetic, narrowing conversions,
-division by zero, and invalid shift counts trap. `checked*` returns [`Option`](./option.md#Option), `wrapping*`
-computes modulo the target width, and `saturating*` clamps at [`MIN`](#MIN) or [`MAX`](#MAX).
+Each arithmetic operation has four forms with different overflow rules:
 
-[`ZERO`](#ZERO) and [`ONE`](#ONE) provide typed values where an uncontextualized literal would be `i32`.
-Decimal [`parse`](#parse) uses the target's range. Use [`Format`](./format.md#Format) with `Format.display` for defaults or
-`Format.displayWith` for explicit options. Both operations stream through a mutable `Writer`
-without `Allocator`.
+- The plain form, such as [`add`](#add), traps on overflow. Use it when overflow is a program error.
+- The `checked` form, such as [`checkedAdd`](#checkedAdd), returns `None` on overflow. Use it when input data
+  controls the operands.
+- The `wrapping` form, such as [`wrappingAdd`](#wrappingAdd), computes the result modulo two to the power of
+  [`BITS`](#BITS).
+- The `saturating` form, such as [`saturatingAdd`](#saturatingAdd), returns [`MIN`](#MIN) or [`MAX`](#MAX) on overflow.
+
+Division and remainder by zero trap. [`checkedDivide`](#checkedDivide) and [`checkedRemainder`](#checkedRemainder) return `None`.
+The shift count must be in the range 0 to `BITS - 1`. Otherwise, the program traps. A rotate
+reduces its count modulo [`BITS`](#BITS), so each count is valid. A right shift inserts zero bits.
+
+A `to` conversion, such as `toU8`, traps if the value is out of the range of the destination
+type. A `checkedTo` conversion returns `None` instead. Conversion to `f32` or `f64` rounds to
+the nearest value if the integer has more significant bits than the float.
+
+[`BITS`](#BITS), [`MIN`](#MIN), and [`MAX`](#MAX) depend on the target: 32 bits on `wasm32` and 64 bits on the
+other targets.
+
+Use [`ZERO`](#ZERO) and [`ONE`](#ONE) where a literal has no type context, because a literal without context
+is an `i32`.
+
+[`parse`](#parse) reads decimal text. A sign is not valid. To write a value as text, use
+`silk.format.Format.display` or `Format.displayWith` with a `Writer`. Neither needs an
+`Allocator`.
 
 ## Gotchas
 A value valid as usize on a 64-bit target can be out of range on a 32-bit target.
@@ -26,14 +44,32 @@ A value valid as usize on a 64-bit target can be out of range on a 32-bit target
 ### Keep a count within the target range
 ```silk
 import silk.option { Option }
-
 import silk.usize
 
 pub fn main() -> i32 {
   let next = usize.checkedAdd(usize.MAX, usize.ONE)
-  let recovered = move next
-    |> Option<usize>.unwrapOr(42)
-  return usize.toI32(recovered)
+  let recovered = move next |> Option<usize>.unwrapOr(42)
+  let result = usize.toI32(recovered)
+  if result != 42 {
+    return 1
+  }
+  return 0
+}
+```
+
+### Parse decimal text and reject invalid text
+```silk
+import silk.format { ParseError }
+import silk.result { Result }
+import silk.usize
+
+pub fn main() -> i32 {
+  let parsed = usize.parse("42") |> Result<usize, ParseError>.unwrapOr(0)
+  let invalid = usize.parse("4x2") |> Result<usize, ParseError>.unwrapOr(0)
+  if parsed != 42 || invalid != 0 {
+    return 1
+  }
+  return 0
 }
 ```
 
@@ -461,7 +497,8 @@ not less than [`BITS`](#BITS).
 pub fn rotateLeft(left: usize, right: usize) -> usize
 ```
 
-Rotates the bits of `left` left by `right` positions.
+Rotates the bits of `left` left by `right` positions. The count is reduced modulo [`BITS`](#BITS), so
+each count is valid.
 
 <a id="rotateRight"></a>
 
@@ -471,7 +508,8 @@ Rotates the bits of `left` left by `right` positions.
 pub fn rotateRight(left: usize, right: usize) -> usize
 ```
 
-Rotates the bits of `left` right by `right` positions.
+Rotates the bits of `left` right by `right` positions. The count is reduced modulo [`BITS`](#BITS), so
+each count is valid.
 
 <a id="wrappingAdd"></a>
 
@@ -602,7 +640,7 @@ when a zero divisor is input data.
 pub fn equals(left: usize, right: usize) -> bool
 ```
 
-Returns `true` when `left` and `right` are equal.
+Returns `true` if `left` and `right` are equal.
 
 <a id="notEquals"></a>
 
@@ -612,7 +650,7 @@ Returns `true` when `left` and `right` are equal.
 pub fn notEquals(left: usize, right: usize) -> bool
 ```
 
-Returns `true` when `left` and `right` are not equal.
+Returns `true` if `left` and `right` are not equal.
 
 <a id="lessThan"></a>
 
@@ -622,7 +660,7 @@ Returns `true` when `left` and `right` are not equal.
 pub fn lessThan(left: usize, right: usize) -> bool
 ```
 
-Returns `true` when `left` is less than `right`.
+Returns `true` if `left` is less than `right`.
 
 <a id="lessOrEqual"></a>
 
@@ -632,7 +670,7 @@ Returns `true` when `left` is less than `right`.
 pub fn lessOrEqual(left: usize, right: usize) -> bool
 ```
 
-Returns `true` when `left` is less than or equal to `right`.
+Returns `true` if `left` is less than or equal to `right`.
 
 <a id="greaterThan"></a>
 
@@ -642,7 +680,7 @@ Returns `true` when `left` is less than or equal to `right`.
 pub fn greaterThan(left: usize, right: usize) -> bool
 ```
 
-Returns `true` when `left` is greater than `right`.
+Returns `true` if `left` is greater than `right`.
 
 <a id="greaterOrEqual"></a>
 
@@ -652,7 +690,7 @@ Returns `true` when `left` is greater than `right`.
 pub fn greaterOrEqual(left: usize, right: usize) -> bool
 ```
 
-Returns `true` when `left` is greater than or equal to `right`.
+Returns `true` if `left` is greater than or equal to `right`.
 
 <a id="parse"></a>
 
@@ -662,12 +700,20 @@ Returns `true` when `left` is greater than or equal to `right`.
 pub fn parse(text: string) -> Result<usize, ParseError>
 ```
 
-Reads the complete text as an unsigned decimal `usize`.
+Returns the `usize` value of the decimal text `text`, or a `ParseError`.
 
 ### Details
 
-A failure contains `silk.format.NotANumber` for empty text, a sign, a non-digit, or trailing
-bytes. It contains `silk.format.OutOfRange` outside the target's `usize` range.
+The complete text must be one decimal number. This function does not skip spaces and does not
+accept digit separators.
+
+### Errors
+
+- `ParseError` with reason `silk.format.NotANumber` if `text` is empty, has a sign, contains a
+  byte that is not a digit, or has bytes after the number. `offset` gives the byte position
+  where the read stopped.
+- `ParseError` with reason `silk.format.OutOfRange` if the number is outside the range of
+  `usize` on the target.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
