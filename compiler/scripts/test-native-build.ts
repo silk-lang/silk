@@ -1212,6 +1212,26 @@ const program = Effect.gen(function* () {
   // manifest line.
   const locatedRefusals = [
     [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "", provenance = "literal" }\n',
+      /silk\.toml:10: InvalidInput: build\.bindings: origin\.source must be a non-empty string/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "x", provenance = "translated-public", translator = "" }\n',
+      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator must be a non-empty string/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\n[build.bindings.origin]\nsource = "env"\nprovenance = "secret"\n',
+      /silk\.toml:12: ForbiddenProvenance: build\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = 3\norigin = { source = "silk.toml", provenance = "literal" }\n',
+      /silk\.toml:9: InvalidInput: build\.bindings: value must be a table with a kind, such as \{ kind = "integer", value = "1" \}/,
+    ],
+    [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["main"] }\n',
+      /silk\.toml:6: build\.composition\.defaults entry "main" names no runtime in build\.composition\.runtimes; it lists "start"/,
+    ],
+    [
       '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [\n  { module = "m", declaration = "f" },\n] }] }\n',
       /silk\.toml:7: build\.composition\.components\.bindings entry has no operation/,
     ],
