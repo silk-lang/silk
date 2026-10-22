@@ -161,7 +161,14 @@ GitHub release, or from `$SILK_TOOLCHAIN_MIRROR/v<version>/` when set. Installat
 signature by the release key with the trusted comment `silk v<version> <archive>`, and a
 `bin/silk` whose SHA-256 matches the release's `native-seed.json`. The archive is unpacked into a
 hidden staging directory under `toolchains/` and renamed into place, so an interrupted install
-leaves no half-written toolchain. Network failures exit with status 4 and failed checks with 5.
+leaves no half-written toolchain. Installs hold an `flock` on `$SILK_HOME/.install.lock`, so two
+concurrent installs of a release download it once. Network failures exit with status 4 and failed
+checks with 5.
+
+`install` and `use` also take `latest`, the newest stable release (or the newest release while no
+stable one exists), and `dev`, the newest release of any kind. They read the GitHub release
+listing, retrying up to four times when it fails or comes back empty, and `use` pins the full
+version the alias named.
 
 ## Profiling with Tracy
 
