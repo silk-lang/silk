@@ -19,6 +19,8 @@ A write commits all bytes or produces WriterError. The source loop advances only
 
 An empty write succeeds without calling write or reading errno. Unbuffered stdout/stderr flush succeeds without a foreign operation. The providers borrow descriptors 1 and 2; they never close or release them.
 
+Standard error has one process-wide recursive lock: the lock of the C library's `stderr` stream, taken with `flockfile` and released with `funlockfile` (`stderr` on GNU, `__stderrp` on Darwin). Each `StderrWriter` write holds it for that write. `StderrWriter.lock(buffer)` returns a `LockedStderr` that holds it until the drop and collects writes in the caller's buffer; a write that does not fit is sent together with the buffered bytes in one `writev`, and the drop writes the rest and ignores a failure. `StderrWriter.print` formats one message under the lock into a 64-byte stack buffer. The lock orders only writes that take it; a direct `NativeDescriptor` write to descriptor 2 does not. Standard output has no lock.
+
 ## Input
 
 A nonempty read commits one actual transfer, retrying EINTR. Its positive count can be shorter than the buffer; bytes beyond the committed prefix retain their initialized values. Real native failure becomes StreamReadError after immediate native-error capture.
@@ -35,4 +37,4 @@ No standard-stream intrinsic, HostWrite TIR/MIR operation, reserved stream impor
 
 Pinned independent C fixtures verify all initial signatures, scalar layouts, constants and symbol names. Deterministic foreign-boundary fixtures distinguish interrupted/partial/zero-progress writes; empty operations; interrupted/short/failed reads; exact initialized prefixes and tails; zero-capacity reads; and permanent EOF latching. Existing shared native corpus cases prove real stdout/stderr and lexical/suspended provider behavior. Required debug/optimized native lanes compile, link, inspect and execute; absent supplies or skipped execution fail. LTO remains unsupported.
 
-Native application edges import `silk.os_writer` and construct `StdoutWriter.make()` or `StderrWriter.make()`. Stdout logging uses `silk.os_logger.StdoutLogger.make()`. The portable Writer and Logger service modules do not import these native providers or require platform selection. Provider failures are constructed with ordinary `Writer.failure()` and `Logger.failure(code)` operations.
+Native application edges import `silk.os_writer` and construct `StdoutWriter.make()` or `StderrWriter.make()`. Logging to standard error uses `silk.os_logger.StderrLogger.make()`, which writes `level: message` and a newline as one line under the standard error lock. Bare stdout logging uses `silk.os_logger.StdoutLogger.make()`. The portable Writer and Logger service modules do not import these native providers or require platform selection. Provider failures are constructed with ordinary `Writer.failure()` and `Logger.failure(code)` operations.

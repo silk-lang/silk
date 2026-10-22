@@ -1086,6 +1086,18 @@ const program = Effect.gen(function* () {
   // manifest line.
   const locatedRefusals = [
     [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [\n  { module = "m", declaration = "f" },\n] }] }\n',
+      /silk\.toml:7: build\.composition\.components\.bindings entry has no operation/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "env", provenance = "secret" }\n',
+      /silk\.toml:10: ForbiddenProvenance: build\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/,
+    ],
+    [
+      '[[build.bindings]]\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+      /silk\.toml:5: InvalidInput: build\.bindings: package is missing/,
+    ],
+    [
       '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
       /silk\.toml:6: build\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
     ],
