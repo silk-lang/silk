@@ -107,3 +107,103 @@ comparison, reports `SEM0239` at the call.
 **Current compiler:** Aligned.
 
 **Evidence:** `corpus/native/simd-core`, `corpus/native/simd-lane-index-trap`.
+
+## SIMD-004 — Wrapping, saturating, shift, and math lane operations
+
+**Status:** Confirmed
+
+```silk,ignore
+fn simdWrappingAdd<V>(left: V, right: V) -> V
+fn simdSaturatingAdd<V>(left: V, right: V) -> V
+fn simdShiftLeft<V>(vector: V, counts: V) -> V
+fn simdRotateLeft<V>(vector: V, counts: V) -> V
+fn simdMinimum<V>(left: V, right: V) -> V
+fn simdSqrt<V>(vector: V) -> V
+fn simdMulAdd<V>(left: V, right: V, addend: V) -> V
+```
+
+Each operation applies the scalar operation of the same name to each lane, or to each pair or
+triple of lanes in order.
+
+- `simdWrappingAdd`, `simdWrappingSubtract`, and `simdWrappingMultiply` take integer vectors and
+  wrap modulo the lane width. `simdSaturatingAdd` and `simdSaturatingSubtract` take integer vectors
+  and clamp to the lane type's range.
+- `simdShiftLeft` and `simdShiftRight` take integer vectors and shift each lane by the matching lane
+  of `counts`. A right shift is arithmetic for signed lanes and logical for unsigned lanes. Any count
+  at or above the lane width traps with `invalid shift count`, as the scalar shift does.
+  `simdRotateLeft` and `simdRotateRight` take the count modulo the lane width and never trap.
+- `simdMinimum` and `simdMaximum` take numeric vectors. A float lane that is NaN in either input
+  gives NaN, and `-0.0` orders below `0.0`.
+- `simdSqrt` and `simdMulAdd` take float vectors. `simdMulAdd` computes `left * right + addend`
+  with one rounding.
+
+A NaN that one of these operations produces is the canonical quiet NaN.
+
+**Boundary:** There is no saturating multiply or negate on vectors yet. Shift counts are per
+lane; a program shifts every lane by one amount with `simdSplat`.
+
+**Diagnostics:** A vector whose lane type the operation does not take reports `SEM0239` at the
+call.
+
+**Current compiler:** Aligned. The operations lower to LLVM vector instructions and the LLVM
+`sadd.sat`, `uadd.sat`, `fshl`, `fshr`, `smin`, `minimum`, `sqrt`, and `fma` intrinsics. A shift
+reduces its per-lane count check with `llvm.vector.reduce.or` before one branch.
+
+**Evidence:** `corpus/native/simd-ops`, `corpus/native/simd-shift-count-trap`,
+`corpus/invalid/simd-invalid-operation`.
+
+## SIMD-005 — Reductions, mask queries, memory, and conversions
+
+**Status:** Confirmed
+
+```silk,ignore
+fn simdReduceAdd<V>(vector: V) -> L
+fn simdMaskFirstSet<M>(mask: M) -> usize
+fn simdMaskToBits<M>(mask: M) -> u64
+fn simdLoad<V>(lanes: &[L], offset: usize) -> V
+fn simdStore<V>(lanes: &mut [L], offset: usize, vector: V)
+unsafe fn simdPointerLoad<V>(pointer: [*]const L) -> V
+fn simdConvert<From, To>(vector: From) -> To
+fn simdBitcast<From, To>(vector: From) -> To
+```
+
+Reductions combine every lane of a vector into one lane value:
+
+- `simdReduceAdd` adds the lanes of a numeric vector. An integer sum traps with
+  `arithmetic overflow` when the exact total does not fit the lane type. A float sum adds in lane
+  order from lane `0`, so it gives the same result on every target.
+- `simdReduceWrappingAdd` adds integer lanes modulo the lane width. `simdReduceAddUnordered` adds
+  float lanes in any order the target prefers, so its rounding may differ between targets.
+- `simdReduceMinimum` and `simdReduceMaximum` take numeric vectors, with the NaN rule of
+  `simdMinimum`. `simdReduceBitAnd`, `simdReduceBitOr`, and `simdReduceBitXor` take integer
+  vectors.
+
+Mask queries read a `mask<N>`: `simdMaskAny` and `simdMaskAll` test for some and for every set lane,
+`simdMaskCount` counts the set lanes, and `simdMaskFirstSet` gives the index of the lowest set lane
+or `N` when no lane is set. `simdMaskToBits` puts lane `i` in bit `i` of a `u64`, and
+`simdMaskFromBits` builds a mask from the low `N` bits and ignores the rest.
+
+`simdLoad` reads `N` lanes of a slice starting at `offset`, and `simdStore` writes them. Both trap
+with `slice range out of bounds` unless `offset + N` is at most the slice length; neither needs any
+alignment beyond the lane type's. `simdPointerLoad` and `simdPointerStore` are the unchecked forms:
+the pointer must address `N` valid lanes aligned to the lane type.
+
+`simdConvert` converts each lane to the lane type of `To` by the scalar numeric conversion, so it
+traps exactly where the scalar conversion traps: on an integer lane that does not fit and on a NaN
+or out-of-range float lane converted to an integer. Both vectors have the same lane count.
+`simdBitcast` reinterprets the bits of a vector as another vector type of the same total width, in
+lane order with lane `0` at the lowest address.
+
+**Boundary:** Memory operations, conversions, and bit casts take numeric vectors, not masks. A
+mask reaches memory through `simdToArray` or `simdMaskToBits`.
+
+**Diagnostics:** A vector or mask whose lane type the operation does not take, a conversion between
+different lane counts, or a bit cast between different widths reports `SEM0239` at the call.
+
+**Current compiler:** Aligned. Reductions lower to `llvm.vector.reduce.*`; only
+`simdReduceAddUnordered` carries the `reassoc` flag. An integer `simdReduceAdd` sums in lanes of
+twice the width, where no overflow is possible, and checks the total once.
+
+**Evidence:** `corpus/native/simd-ops`, `corpus/native/simd-reduce-overflow-trap`,
+`corpus/native/simd-load-range-trap`, `corpus/native/simd-convert-range-trap`,
+`corpus/invalid/simd-invalid-operation`.
