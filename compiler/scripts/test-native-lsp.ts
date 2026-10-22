@@ -1,9 +1,12 @@
 // A scripted language server session against one prebuilt native compiler: `silk lsp` starts,
-// answers the lifecycle requests one at a time with its input still open, and stops cleanly.
+// answers the lifecycle requests one at a time with its input still open, publishes syntax
+// diagnostics for an open document as it is edited, and stops cleanly.
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { resolve } from 'node:path'
+import { tmpdir } from 'node:os'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import * as Console from 'effect/Console'
 import * as Data from 'effect/Data'
@@ -88,6 +91,23 @@ const request = (session: Session, id: number, method: string, params?: unknown)
     return response
   })
 
+// Reads messages until the response to request `id`, and returns the notifications before it.
+const notificationsUntil = (session: Session, id: number) =>
+  Effect.gen(function* () {
+    const notifications: Array<Record<string, unknown>> = []
+    while (true) {
+      const message = yield* session.receive
+      if (message['id'] === id) return { response: message, notifications }
+      notifications.push(message)
+    }
+  })
+
+interface Diagnostics {
+  uri: string
+  version?: number
+  diagnostics: Array<{ range: { start: { line: number; character: number } }; code: string }>
+}
+
 const program = Effect.gen(function* () {
   const compiler = process.argv[2]
   assert.ok(compiler, 'usage: node test-native-lsp.ts <native-compiler>')
@@ -109,8 +129,64 @@ const program = Effect.gen(function* () {
   assert.equal(result.capabilities.positionEncoding, 'utf-8')
   assert.equal(result.serverInfo.name, 'silk')
   yield* session.send({ jsonrpc: '2.0', method: 'initialized', params: {} })
-  const unknown = yield* request(session, 3, 'textDocument/hover')
-  assert.equal((unknown['error'] as Record<string, unknown>)['code'], -32601)
+
+  // An open document in a package gets its syntax diagnostics once the inbox runs dry.
+  const directory = mkdtempSync(join(tmpdir(), 'silk-lsp-session-'))
+  yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(directory, { recursive: true })))
+  writeFileSync(
+    join(directory, 'silk.toml'),
+    '[package]\nname = "session"\nversion = "0.1.0"\nroot = "main.silk"\n',
+  )
+  const fixed = 'pub fn main() -> i32 {\n  return 0\n}\n'
+  writeFileSync(join(directory, 'main.silk'), fixed)
+  const uri = pathToFileURL(join(directory, 'main.silk')).href
+  const document = {
+    uri,
+    languageId: 'silk',
+    version: 1,
+    text: 'pub fn main( -> i32 {\n  return 0\n}\n',
+  }
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: { textDocument: document },
+  })
+  const opened = (yield* session.receive) as { method: string; params: Diagnostics }
+  assert.equal(opened.method, 'textDocument/publishDiagnostics', JSON.stringify(opened))
+  assert.equal(opened.params.uri, uri)
+  assert.equal(opened.params.version, 1)
+  assert.ok(opened.params.diagnostics.length > 0, JSON.stringify(opened))
+  assert.equal(opened.params.diagnostics[0]?.range.start.line, 0, JSON.stringify(opened))
+
+  // Edits are analyzed before the next request is answered.
+  for (const [version, text] of [
+    [2, '// still\n' + document.text],
+    [3, fixed],
+  ] as const) {
+    yield* session.send({
+      jsonrpc: '2.0',
+      method: 'textDocument/didChange',
+      params: { textDocument: { uri, version }, contentChanges: [{ text }] },
+    })
+  }
+  yield* session.send({ jsonrpc: '2.0', id: 3, method: 'textDocument/hover' })
+  const edited = yield* notificationsUntil(session, 3)
+  const last = edited.notifications.at(-1) as { params: Diagnostics } | undefined
+  assert.ok(last, 'edits publish diagnostics before the next response')
+  assert.equal(last.params.version, 3, JSON.stringify(edited.notifications))
+  assert.deepEqual(last.params.diagnostics, [], 'the fixed text has no syntax diagnostics')
+  assert.equal((edited.response['error'] as Record<string, unknown>)['code'], -32601)
+
+  // Closing a document clears its diagnostics.
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri } },
+  })
+  const cleared = (yield* session.receive) as { params: Diagnostics }
+  assert.equal(cleared.params.uri, uri)
+  assert.deepEqual(cleared.params.diagnostics, [])
+
   const shutdown = yield* request(session, 4, 'shutdown')
   assert.ok('result' in shutdown && shutdown['result'] === null, JSON.stringify(shutdown))
   yield* session.send({ jsonrpc: '2.0', method: 'exit' })
@@ -125,7 +201,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* closed.exited, 1, 'closed input stops the server with status 1')
 
   yield* Console.log(
-    'Native language server: scripted initialize, shutdown and exit session passed',
+    'Native language server: scripted lifecycle and document diagnostics session passed',
   )
 })
 
