@@ -1,51 +1,86 @@
-//! Owned TOML documents with ordered tables and distinct scalar kinds.
+//! Parse a TOML document into an owned tree of values, and read fields from it.
 //!
 //! # When to use
-//! Use [`Toml.parse`] to validate and own a complete TOML document, then borrow fields from
-//! its root table. Every allocation uses the ambient Allocator and partial trees drop on failure.
+//! Use [`Toml.parse`] to read a configuration file or any other complete TOML document. Read
+//! members with [`Toml.field`] and [`Toml.fieldAt`], array elements with [`Toml.item`], and text
+//! with [`Toml.asString`]. Use `silk.toml_codec` to convert a value to a number, a boolean, or an
+//! owned string, and `silk.toml_output` to write a tree back as TOML.
 //!
 //! # Details
-//! Tables keep key order. Numeric and date/time values keep their validated source text.
-//! String values contain decoded UTF-8 text.
+//! The parser follows TOML 1.1.0. Tables keep the order of the source. Integers, floats, dates, and
+//! times keep their validated source text, so no precision is lost. Strings are decoded to UTF-8
+//! text when the document is parsed. The root of a parsed document is always a [`Value.Table`]. If
+//! parsing fails, everything that was built is released.
+//!
+//! # Errors
+//! - `TomlError` if the input is not valid TOML, defines a key two times, defines a table that
+//!   conflicts with an earlier value, or nests more than `MAX_DEPTH` (64) arrays or inline tables.
+//!   `offset` gives the byte position of the problem.
+//! - `OutOfMemoryError` if the `Allocator` cannot supply the tree.
 //!
 //! # Gotchas
-//! A borrowed field cannot outlive its document. Use `silk.toml_output` to write the owned tree.
+//! A borrowed field or string cannot live longer than the [`Value`] that owns it. The read
+//! functions return `None` for a missing key and for a value of a different kind. They do not tell
+//! you which case occurred.
 //!
 //! # Examples
-//! ## Read a nested string
+//! ## Read a nested string and an array element
 //! ```silk
-//! import silk.allocator as Allocators {Allocator, OutOfMemoryError}
-//! import silk.effect as Effects {Effect}
-//! import silk.option as Options {Option}
-//! import silk.toml_scanner as Scanners {TomlError}
-//! import silk.toml_value as Values {Toml}
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.option { Option }
+//! import silk.toml_scanner { TomlError }
+//! import silk.toml_value { Toml, Value }
 //!
-//! effect fn read() -> i32 ! TomlError | OutOfMemoryError {
+//! pub effect fn main() -> i32
+//!   ! TomlError | OutOfMemoryError {
 //!   let mut allocator = Allocator.systemAllocatorProvider()
-//!   let document = run Toml.parse(b"[owner]\nname = \"Ada\"\n")
+//!   let source = b"tags = [\"fast\", \"small\"]\n\n[owner]\nname = \"Ada\"\n"
+//!   let document = run Toml.parse(source) |> Effect.provideMut<Allocator>(&mut allocator)
+//!   let name = Toml.field(&document, "owner") |> Toml.fieldAt("name") |> Toml.asString
+//!     |> Option<string>.unwrapOr("")
+//!   let tags = Toml.field(&document, "tags")
+//!   let second = match move tags {
+//!     Option<&Value>.Some { value } => Toml.item(value, 1) |> Toml.asString
+//!       |> Option<string>.unwrapOr("")
+//!     Option<&Value>.None => ""
+//!   }
+//!   if name != "Ada" || second != "small" {
+//!     return 1
+//!   }
+//!   return 0
+//! }
+//! ```
+//!
+//! ## Report the position of a syntax error
+//! ```silk
+//! import silk.allocator { Allocator, OutOfMemoryError }
+//! import silk.effect { Effect }
+//! import silk.toml_scanner { TomlError, TomlReason }
+//! import silk.toml_value { Toml }
+//!
+//! effect fn load() -> usize
+//!   ! TomlError | OutOfMemoryError {
+//!   let mut allocator = Allocator.systemAllocatorProvider()
+//!   let document = run Toml.parse(b"name = \"Ada\"\nname = \"Grace\"\n")
 //!     |> Effect.provideMut<Allocator>(&mut allocator)
-//!   let owner = Toml.field(&document, "owner")
-//!   let name = Toml.fieldAt(move owner, "name")
-//!     |> Toml.asString
-//!   return match move name {
-//!     Option<string>.Some {value} => {
-//!       if value == "Ada" {
-//!         return 0
-//!       }
-//!       return 1
-//!     }
-//!     Option<string>.None => {
-//!       return 2
-//!     }
+//!   return 0
+//! }
+//!
+//! effect fn offsetOf(error: TomlError | OutOfMemoryError) -> usize {
+//!   return match move error {
+//!     TomlError { reason: TomlReason.DuplicateKey, offset } => offset
+//!     _ => 0
 //!   }
 //! }
 //!
-//! effect fn recover(error: TomlError | OutOfMemoryError) -> i32 {
-//!   return 3
-//! }
-//!
 //! pub fn main() -> i32 {
-//!   return run Effect.catchAll(read(), recover)
+//!   // The second `name` starts at byte 13.
+//!   let offset = run Effect.catchAll(load(), offsetOf)
+//!   if offset != 13 {
+//!     return 1
+//!   }
+//!   return 0
 //! }
 //! ```
 
@@ -62,94 +97,102 @@ import silk.u8
 import silk.usize
 import silk.list { List }
 
-/// How a table was first defined. An inline table is closed to later document definitions.
+/// How a table got its first definition. The parser uses it to reject a later definition that TOML
+/// does not allow.
 pub enum TableKind {
-  /// A table created by a later header path.
+  /// A table that exists only because a header named a table inside it, such as `a` for `[a.b]`. A
+  /// later `[a]` header can still define it.
   Implicit,
-  /// A table created by a dotted key.
+  /// A table that a dotted key made, such as `a` for `a.b = 1`.
   Dotted,
-  /// A table defined by a header.
+  /// A table that a `[header]` defined. The root table also has this kind.
   Explicit,
-  /// A table defined inside braces and closed to later definitions.
+  /// A table written inside braces, such as `{ x = 1 }`. It is closed: no later line can add
+  /// members to it.
   Inline,
 }
 
-/// One ordered table member.
+/// One member of a table: a key and its value.
 pub struct TomlEntry {
-  /// The decoded member key.
+  /// The decoded key. Quotes and escapes are removed.
   pub key: String
-  /// The owned member value.
+  /// The value of the member.
   pub value: Value
 }
 
-/// Recursive storage shared by tables and arrays.
+/// One element of the child list of an array or a table. Arrays hold [`TomlChild.Item`] and tables
+/// hold [`TomlChild.Member`].
 pub union TomlChild {
-  /// An array element without a key.
+  /// An array element. It has no key.
   Item {
-    /// The owned element value.
+    /// The element.
     pub value: Value
   },
-  /// A table member with its key.
+  /// A table member.
   Member {
-    /// The owned key and value.
+    /// The key and value of the member.
     pub entry: TomlEntry
   },
 }
 
-/// An owned TOML value. Numeric and temporal spellings retain their validated source precision.
+/// An owned TOML value.
+///
+/// Integers, floats, dates, and times hold their source text, which the parser validated. Convert
+/// them with `silk.toml_codec`, or copy the text to keep the full precision.
 pub union Value {
-  /// A validated integer in its source spelling.
+  /// An integer, such as `42`, `-17`, `1_000`, or `0xff`.
   Integer {
-    /// The validated integer text.
+    /// The source text of the integer, with signs, prefixes, and underscores.
     pub text: String
   },
-  /// A validated float in its source spelling.
+  /// A float, such as `3.14`, `6e-3`, `inf`, or `nan`.
   Float {
-    /// The validated float text.
+    /// The source text of the float.
     pub text: String
   },
-  /// A TOML boolean.
+  /// `true` or `false`.
   Boolean {
-    /// The boolean value.
+    /// The boolean.
     pub value: bool
   },
-  /// A date and time with an explicit offset and retained precision.
+  /// A date and time with a UTC offset, such as `1979-05-27T07:32:00Z`.
   OffsetDateTime {
-    /// The validated source text.
+    /// The source text, with all fractional seconds.
     pub text: String
   },
-  /// A date and time without an offset and with retained precision.
+  /// A date and time without an offset, such as `1979-05-27T07:32:00`.
   LocalDateTime {
-    /// The validated source text.
+    /// The source text, with all fractional seconds.
     pub text: String
   },
-  /// A calendar date without a time.
+  /// A calendar date, such as `1979-05-27`.
   LocalDate {
-    /// The validated source text.
+    /// The source text.
     pub text: String
   },
-  /// A clock time without a date and with retained precision.
+  /// A time of day without a date, such as `07:32:00`.
   LocalTime {
-    /// The validated source text.
+    /// The source text, with all fractional seconds.
     pub text: String
   },
-  /// Decoded UTF-8 text.
+  /// A string. Escapes are decoded and the delimiters are removed.
   String {
-    /// The decoded text.
+    /// The decoded UTF-8 text.
     pub text: String
   },
-  /// Ordered values or an array of tables.
+  /// An array of values, or an array of tables that `[[header]]` lines made.
   Array {
-    /// The owned elements in source order.
+    /// The elements in source order. Each one is a [`TomlChild.Item`].
     pub values: Box<List<TomlChild>>,
-    /// Whether the array came from `[[table]]` headers.
+    /// `true` if `[[header]]` lines made the array. Such an array holds only tables, and a later
+    /// `key = [...]` cannot replace it.
     pub tables: bool
   },
-  /// Ordered key/value members.
+  /// A table of key and value members.
   Table {
-    /// The owned members in source order.
+    /// The members in source order. Each one is a [`TomlChild.Member`].
     pub entries: Box<List<TomlChild>>,
-    /// How the table was defined.
+    /// How the table got its first definition.
     pub kind: TableKind
   },
 }
@@ -159,15 +202,20 @@ struct KeyPart {
   offset: usize
 }
 
-/// Operations on complete owned TOML documents.
+/// Functions that parse and read TOML documents.
 pub struct Toml {}
 
 impl Toml {
-  /// Parses one complete UTF-8 document into an owned root table.
+  /// Parses a complete UTF-8 TOML document and returns its root table.
   ///
-  /// # Details
-  /// All allocations use the ambient allocator. Syntax errors include a reason and byte offset.
-  /// If parsing fails, the partial tree is released.
+  /// The parser first validates the full input with `TomlScanner.validate`, and then builds the
+  /// tree.
+  ///
+  /// # Errors
+  /// - `TomlError` if the input is not valid TOML 1.1.0, or if a key or table is defined in a way
+  ///   that TOML does not allow. `offset` is the byte position of the problem.
+  /// - `OutOfMemoryError` if the `Allocator` cannot supply the tree. Everything that was built is
+  ///   released.
   pub effect fn parse(bytes: &[u8]) -> Value ! TomlError | OutOfMemoryError ? &mut Allocator {
     let mut scanner = TomlScanner.make(bytes)
     let valid = TomlScanner.validate(&mut scanner)
@@ -226,7 +274,10 @@ impl Toml {
     fail problem(TomlReason.UnexpectedEnd, bytes.length)
   }
 
-  /// Borrows a table member by decoded key, or returns `None` for absence or another value kind.
+  /// Returns the member `name` of the table `self`.
+  ///
+  /// Returns `None` if the table has no member with that key, or if `self` is not a table. `name`
+  /// is the decoded key, without quotes.
   pub fn field<'a>(self: &'a Value, name: string) -> Option<&'a Value> {
     return match &self.* {
       Value.Table { entries, kind: _ } => {
@@ -237,7 +288,9 @@ impl Toml {
     }
   }
 
-  /// Borrows a nested table member through an optional value, or returns `None`.
+  /// Returns the member `name` of an optional table. Use it to chain lookups with `|>`.
+  ///
+  /// Returns `None` if `self` is `None`, or for the same cases as [`Toml.field`].
   pub fn fieldAt<'a>(self: Option<&'a Value>, name: string) -> Option<&'a Value> {
     return match move self {
       Option<&'a Value>.None => Option<&'a Value>.none()
@@ -245,7 +298,10 @@ impl Toml {
     }
   }
 
-  /// Borrows an array element, or returns None for an absent index or another value kind.
+  /// Returns the element at `index` of the array `self`. The first element has index 0.
+  ///
+  /// Returns `None` if `index` is out of range, or if `self` is not an array. In an array of
+  /// tables, each element is a [`Value.Table`].
   pub fn item<'a>(self: &'a Value, index: usize) -> Option<&'a Value> {
     return match &self.* {
       Value.Array { values, tables: _ } => {
@@ -261,7 +317,10 @@ impl Toml {
     }
   }
 
-  /// Borrows decoded UTF-8 string text, or returns `None` for another value kind.
+  /// Returns the decoded text of an optional string value.
+  ///
+  /// Returns `None` if `self` is `None` or is not a [`Value.String`]. The text borrows from the
+  /// value.
   pub fn asString<'a>(self: Option<&'a Value>) -> Option<string<'a>> {
     return match move self {
       Option<&'a Value>.None => Option<string<'a>>.none()
