@@ -1376,8 +1376,9 @@ const program = Effect.gen(function* () {
   )
   assert.equal(managedBuild.status, 0, managedBuild.stderr + managedBuild.stdout)
   // Members build in dependency order, whatever order `members` lists them in.
-  assert.match(managedBuild.stdout, /^Package greeting \(.*\)\n[\s\S]*^Package hello \(/m)
-  assert.match(managedBuild.stdout, /Workspace summary: 2 packages succeeded, 0 failed\n$/)
+  assert.match(managedBuild.stderr, /^Compiling greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
+  assert.match(managedBuild.stderr, /^Finished 2 packages in [^\n]*\n$/m)
+  assert.equal(managedBuild.stdout, '')
   const managedRun = yield* invoke(
     silk,
     ['run', '-p', 'hello', '--stdlib', standardLibrary],
@@ -1411,7 +1412,7 @@ const program = Effect.gen(function* () {
     join(managed, 'apps/hello'),
   )
   assert.equal(managedCheck.status, 0, managedCheck.stderr + managedCheck.stdout)
-  assert.match(managedCheck.stdout, /Workspace summary: 3 packages succeeded, 0 failed/)
+  assert.match(managedCheck.stderr, /^Finished 3 packages in /m)
   const unknownMember = yield* invoke(
     silk,
     ['build', '-p', 'nope', '--stdlib', standardLibrary],
@@ -1423,7 +1424,7 @@ const program = Effect.gen(function* () {
     /has no package named `nope`\nsilk: its members are: greeting, hello, other\n/,
   )
   // A member that cannot load its dependencies fails on its own; the others still run and the
-  // workspace summary is still written.
+  // workspace's final line is still written.
   const greetingManifest = join(managed, 'libs/greeting/silk.toml')
   const acyclic = yield* fs.readFileString(greetingManifest)
   yield* fs.writeFileString(
@@ -1433,8 +1434,8 @@ const program = Effect.gen(function* () {
   const cyclic = yield* invoke(silk, ['check', '--stdlib', standardLibrary], managed)
   assert.notEqual(cyclic.status, 0, 'a dependency cycle was checked')
   assert.match(cyclic.stderr, /form a cycle/)
-  assert.match(cyclic.stdout, /^Package other \(/m)
-  assert.match(cyclic.stdout, /Workspace summary: 1 package succeeded, 2 failed\n$/)
+  assert.match(cyclic.stderr, /^Checking other \(/m)
+  assert.match(cyclic.stderr, /^Failed 2 of 3 packages in [^\n]*\n$/m)
   yield* fs.writeFileString(greetingManifest, acyclic)
   // `format` and `doc` at the root cover every member.
   const managedFormat = yield* invoke(silk, ['format'], managed)
