@@ -761,7 +761,8 @@ const program = Effect.gen(function* () {
   assert.equal(rejected.status, 1, rejected.stderr)
   // The progress report heads standard error, so the target heading starts a later line.
   assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`, 'm'))
-  assert.match(rejected.stderr, /\/rejected\/src\/main\.silk:6:16: error\[SEM0037\]/)
+  // A human diagnostic names its file from the package directory.
+  assert.match(rejected.stderr, /^src\/main\.silk:6:16: error\[SEM0037\]/m)
   assert.match(rejected.stderr, /^Failed rejected in /m)
   assert.equal(rejected.stdout, '')
   // `build` heads its diagnostics with the target as `check` and `run` do, also for an import of
@@ -783,7 +784,7 @@ const program = Effect.gen(function* () {
   assert.equal(unknownModule.status, 1, unknownModule.stderr)
   assert.match(
     unknownModule.stderr,
-    new RegExp(`^\\[${hostTarget}\\]\n[^\n]*/unknown/src/main\\.silk:1:8: error\\[MOD0001\\]`, 'm'),
+    new RegExp(`^\\[${hostTarget}\\]\nsrc/main\\.silk:1:8: error\\[MOD0001\\]`, 'm'),
   )
   assert.match(unknownModule.stderr, /^Failed unknown in /m)
   // A package that cannot be loaded ends its load row as failed and still names itself on its
@@ -856,10 +857,34 @@ const program = Effect.gen(function* () {
     assert.equal(refused.status, 1, refused.stderr)
     assert.match(
       refused.stderr,
-      /\/synchronous\/src\/main\.silk:1:8: error\[SEM0225\] Entry point `main` has a result or requirement the selected runtime `silk\/native_start_sync` cannot start/,
+      /^src\/main\.silk:1:8: error\[SEM0225\] Entry point `main` has a result or requirement the selected runtime `silk\/native_start_sync` cannot start/m,
     )
     assert.doesNotMatch(refused.stderr, /native_start_sync\.silk:/)
   }
+  // A workspace member's diagnostics name their files from the workspace root, also when the
+  // member is built from its own directory; `--json` keeps the absolute path.
+  yield* fs.makeDirectory(join(directory, 'relative/broken/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'relative/silk.toml'), '[workspace]\nmembers = ["broken"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'relative/broken/silk.toml'),
+    '[package]\nname = "broken"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'relative/broken/src/main.silk'),
+    'pub fn main() -> i32 {\n  let x: i32 = true\n  return x\n}\n',
+  )
+  for (const working of ['relative', 'relative/broken']) {
+    const relative = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, working))
+    assert.equal(relative.status, 1, relative.stderr)
+    assert.match(relative.stderr, /^broken\/src\/main\.silk:2:16: error\[SEM0037\]/m)
+  }
+  const absolute = yield* invoke(
+    silk,
+    ['check', '--json', '--stdlib', standardLibrary],
+    join(directory, 'relative'),
+  )
+  assert.equal(absolute.status, 1, absolute.stderr)
+  assert.match(absolute.stderr, /"path":"\/[^"]*\/relative\/broken\/src\/main\.silk"/)
   // A runtime the package writes itself keeps its own errors: they are not blamed on a valid `main`.
   yield* fs.makeDirectory(join(directory, 'ownruntime/src/support'), { recursive: true })
   yield* fs.writeFileString(
