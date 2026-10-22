@@ -91,6 +91,10 @@ const program = Effect.gen(function* () {
   const commandHelp = yield* invoke(silk, ['format', '--help'], directory)
   assert.equal(commandHelp.status, 0, commandHelp.stderr)
   assert.equal(commandHelp.stdout, 'usage: silk format [paths] [--check] [--manifest-path <path>]\n')
+  // `run` lists the progress options it accepts.
+  const runHelp = yield* invoke(silk, ['run', '--help'], directory)
+  assert.equal(runHelp.status, 0, runHelp.stderr)
+  assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\]/)
   // A command line that does not parse is a usage error, status 2, like format's and doc's.
   const unparsed = yield* invoke(silk, ['check', '--bogus'], directory)
   assert.equal(unparsed.status, 2, unparsed.stderr)
@@ -675,6 +679,27 @@ const program = Effect.gen(function* () {
   assert.match(rejected.stderr, /\/rejected\/src\/main\.silk:6:16: error\[SEM0037\]/)
   assert.match(rejected.stderr, /^Failed rejected in /m)
   assert.equal(rejected.stdout, '')
+  // A package that cannot be loaded ends its load row as failed and still names itself on its
+  // final line.
+  yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unexported/silk.toml'),
+    '[package]\nname = "unexported"\nversion = "0.1.0"\nroot = "src/main.silk"\nexports = ["nope"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'unexported/src/main.silk'),
+    'pub fn main() -> i32 {\n  return 0\n}\n',
+  )
+  const unexported = yield* invoke(
+    silk,
+    ['check', '--stdlib', standardLibrary],
+    join(directory, 'unexported'),
+  )
+  assert.equal(unexported.status, 1, unexported.stderr)
+  assert.match(
+    unexported.stderr,
+    /^Checking unexported \([^\n]*\)\n  load     failed: 1 error +[0-9.ms ]+s\nsilk: invalid exports of unexported@0\.1\.0: nope is not a module of the package\nFailed unexported in /,
+  )
   const json = yield* invoke(
     silk,
     ['check', '--json', '--stdlib', standardLibrary],
@@ -827,7 +852,9 @@ const program = Effect.gen(function* () {
   )
   assert.equal(unstartedBuild.status, 2, unstartedBuild.stderr)
   assert.match(unstartedBuild.stderr, /no-such-clang \(from --clang\)/)
-  assert.match(unstartedBuild.stderr, /^  link     failed: /m)
+  // A link counts nothing, so its failed row has no detail after `failed`.
+  assert.match(unstartedBuild.stderr, /^  link     failed +[0-9.ms ]+s$/m)
+  assert.doesNotMatch(unstartedBuild.stderr, /failed:/)
   assert.match(unstartedBuild.stderr, /^Failed tested in /m)
   // A single-file test without a manifest is refused as a single-file build is.
   // The build directory has a manifest, so the manifest-less source lives in its own directory.
@@ -904,13 +931,14 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(released.status, 0, released.stderr)
-  // Each compilation names its artifact relative to the project; standard output stays empty.
+  // Each compilation names its artifact relative to the working directory, not the project;
+  // standard output stays empty.
   assert.equal(released.stdout, '')
   assert.match(released.stderr, new RegExp(`^Compiling greeting \\(${hostTarget}, release\\)\n`))
   assert.match(released.stderr, /^  codegen  [1-9][0-9,]* functions/m)
   assert.match(
     released.stderr,
-    new RegExp(`^Finished build/llvm/${hostTarget}/release/greeting in [0-9.ms ]+s\n$`, 'm'),
+    new RegExp(`^Finished greeting/build/llvm/${hostTarget}/release/greeting in [0-9.ms ]+s\n$`, 'm'),
   )
   assert.equal(
     yield* fs.exists(join(directory, 'greeting/build/llvm', hostTarget, 'release/greeting')),
@@ -1571,6 +1599,12 @@ const program = Effect.gen(function* () {
   // Members build in dependency order, whatever order `members` lists them in.
   assert.match(managedBuild.stderr, /^Compiling greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
   assert.match(managedBuild.stderr, /^Finished 2 packages in [^\n]*\n$/m)
+  // Each artifact is named from the working directory, the workspace root here, not its package.
+  assert.match(
+    managedBuild.stderr,
+    new RegExp(`^Finished build/llvm/${hostTarget}/debug/hello in `, 'm'),
+  )
+  assert.doesNotMatch(managedBuild.stderr, /^Finished \.\./m)
   assert.equal(managedBuild.stdout, '')
   const managedRun = yield* invoke(
     silk,
@@ -1582,6 +1616,20 @@ const program = Effect.gen(function* () {
   // With one executable member, `run` at the root runs it.
   const onlyRunnable = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, withClang)
   assert.equal(onlyRunnable.status, 7, onlyRunnable.stderr)
+  // `run` reports its build as `build` does, and a failed one ends with its `Failed` line on
+  // standard error; standard output is left to the program.
+  const unlinked = yield* invoke(
+    silk,
+    ['run', '-p', 'hello', '--stdlib', standardLibrary, '--clang', join(managed, 'no-such-clang')],
+    managed,
+    withClang,
+  )
+  assert.equal(unlinked.status, 2, unlinked.stderr)
+  assert.equal(unlinked.stdout, '')
+  assert.match(unlinked.stderr, /^Compiling hello \(/m)
+  assert.match(unlinked.stderr, /^  link     failed +[0-9.ms ]+s$/m)
+  assert.match(unlinked.stderr, /^Failed hello in /m)
+  assert.doesNotMatch(unlinked.stderr + unlinked.stdout, /Run summary/)
   const other = yield* invoke(silk, ['init', 'apps/other'], managed)
   assert.equal(other.status, 0, other.stderr)
   const unchosen = yield* invoke(silk, ['run', '--stdlib', standardLibrary], managed, {
