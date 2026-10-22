@@ -16,6 +16,86 @@ compiles it again.
 
 The build and test steps CI runs are in `.github/workflows/selfhost.yml`.
 
+## Edit replay
+
+`silk check --replay <script>` measures how much of a revisable semantic store an edit
+invalidates. It checks the package as `silk check` does, but in a store opened with
+`Semantic.make`, then applies each edit of the script to the store's revision, calls
+`Semantic.update` and checks again. It prints no diagnostics; each step writes one line:
+
+```text
+silk-replay step=1 kind=trivia module=silk/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 rejections=5 update-us=238 check-us=904871
+```
+
+`demands`, `hits`, `units-run` and `marked-outdated` are what that step added to the store's
+`Statistics`; `graph-units` and `graph-bytes` are the dependency graph's size after it.
+`rejections` counts the root package's rejections and every parsed module's syntax errors, and
+`update-us` and `check-us` are the wall time of `Semantic.update` and of the check. Step 0 is the
+first check. The `replayUpdate` and `replayCheck` Tracy zones cover the same spans.
+
+A script is a TOML file of `[[edit]]` tables applied in order. `kind` is `trivia`, `body`,
+`header-same-type`, `header-new-type`, `add`, `delete` or `rename`, and `module` is the edited
+module's path below the package's module directory. A rename names the new path in `to`; every
+other kind replaces `find`, which must occur exactly once in the module, with `replace`.
+`fixtures/replay` holds one script for the compiler and one for the standard library:
+
+```sh
+cd compiler && silk check --stdlib ../stdlib --replay fixtures/replay/compiler.toml
+```
+
+With `--differential`, each step also checks the same revision in a fresh `Semantic.oneShot`
+store and compares the two stores' rejections by module, code and span. It writes
+`silk-replay-differential step=<n> rejections=<count> differences=<count>`, after one
+`silk-replay-differential step=<n> only=revised|one-shot <module> <code> <start>-<end>` line per
+rejection only one store reached, and the replay exits with status 1 when any step differs. A
+difference is a reconciliation bug in the revisable store. The one-shot store gets the revisable
+store's final profile, so a step that edits a `param` declaration compares against the profile
+assembled before the edit.
+
+For the standard library, assemble `fixtures/stdlib-root` as the `stdlib-root` CI job does and
+run `silk check --stdlib <that directory> --replay <checkout>/compiler/fixtures/replay/stdlib.toml`
+in it.
+
+### Replay budgets
+
+The `incremental` CI job replays both scripts and checks each step against
+`fixtures/replay/budgets.json` with `.github/scripts/check-replay-budgets.mjs`. An edit fails its
+budget when it runs more units or marks more outdated than the step allows, or when its demands
+exceed the allowed fraction of the initial check's. Those demands are the fixed cost of an
+update: the recheck walks every root again and hits nearly every unit it reaches. `update-us` is
+capped too, and the compiler script's rejection counts must match. The same job runs the
+standard library script with `--differential` and replays every corpus program with
+`.github/scripts/replay-corpus.mjs`, which adds a comment to each `main.silk` and removes it again
+and requires both stores to agree. The compiler replay runs without `--differential`, since two
+compiler stores need more memory than a CI runner has.
+
+The budgets allow twice the measured units (at least 20 more) and one and a half times the
+measured demand fraction. When a change moves a step's numbers for a good reason, replay the
+script and update its entry. Measured on 2026-10-21:
+
+| Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |
+| --- | --- | --- | --- | --- |
+| initial check | 132,048 | 15,869,737 | 64,550 | 2,185,506 |
+| trivia | 3 | 6.8% | 16 | 9.7% |
+| body | 2 | 6.8% | 17 | 9.7% |
+| header, same type | 7 | 6.8% | 25 | 9.9% |
+| add | 532 | 16.0% | 660 | 17.2% |
+| header, new type | 6 | 6.8% | 19 | 9.7% |
+| delete | 528 | 16.0% | 656 | 17.2% |
+| rename | 8 | 6.2% | 176 | 9.9% |
+
+An update marks outdated every unit that consumed a change, directly or through another unit,
+and a demand then verifies an outdated unit before it reruns it: the unit stays current when
+every dependee it consumed kept its answer, judged by the answer fingerprints. A budgeted
+`verified` count is a floor on the units an edit confirms that way. Implementation heads and
+members store absolute spans, so an edit that moves an `impl` reruns its heads, but their answers
+hash without those spans and their dependers are verified. The units that rerun on a trivia edit
+are those heads and MIR lowerings, whose `module:line:column` site labels move with the lines.
+Adding or deleting a declaration still reruns every depender: name lookups have no fingerprint
+yet. On a 4-core x86_64 machine the
+compiler's first check took about 67 s and each edit's recheck 7 to 18 s, almost all of it the
+walk over every root.
+
 ## Check roots
 
 The language server checks one module or one declaration at a time, through
@@ -31,7 +111,7 @@ differences=<count>`, and fails the check when they differ.
 
 `src/Profiler.silk` opens [Tracy](https://github.com/wolfpld/tracy) zones around the build
 phases (`build`, `preloadProgram`, `buildArtifact`, `checkDeclarations`, `buildFrom`,
-`compileIr`), every semantic query provider run (named by its family, such as `Body`, `Signature`,
+`compileIr`, and `replayUpdate` and `replayCheck` for an edit replay), every semantic query provider run (named by its family, such as `Body`, `Signature`,
 `Mir` or `LlvmText`) and each `BorrowCheck`. Query and borrow-check zones carry the declaration
 they work on, such as `semantic/Semantic.lowerMir`, as zone text. Ordinary builds leave it off, so they declare and call
 nothing. To build an instrumented compiler at `.scratch/silk-tracy`:
