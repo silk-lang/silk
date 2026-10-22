@@ -201,7 +201,7 @@ const program = Effect.gen(function* () {
       params: { textDocument: { uri, version }, contentChanges: [{ text }] },
     })
   }
-  yield* session.send({ jsonrpc: '2.0', id: 3, method: 'textDocument/hover' })
+  yield* session.send({ jsonrpc: '2.0', id: 3, method: 'textDocument/references' })
   const edited = yield* notificationsUntil(session, 3)
   assert.equal((edited.response['error'] as Record<string, unknown>)['code'], -32601)
   const clean = yield* diagnosticsFor(session, uri, 3, edited.notifications)
@@ -223,6 +223,62 @@ const program = Effect.gen(function* () {
   const accepted = yield* diagnosticsFor(session, uri, 5, [])
   assert.deepEqual(accepted.diagnostics, [], 'the fixed text clears the type error')
 
+  // Hover, go to definition, inlay hints and signature help read the checked store.
+  const navigated = [
+    '/// Doubles a value.',
+    'fn twice(value: i32) -> i32 {',
+    '  return value + value',
+    '}',
+    'pub fn main() -> i32 {',
+    '  let doubled = twice(2)',
+    '  return doubled - 4',
+    '}',
+    '',
+  ].join('\n')
+  yield* change(session, uri, 6, navigated)
+  const navigable = yield* diagnosticsFor(session, uri, 6, [])
+  assert.deepEqual(navigable.diagnostics, [], JSON.stringify(navigable))
+  const call = { textDocument: { uri }, position: { line: 5, character: 17 } }
+  const hovered = yield* request(session, 10, 'textDocument/hover', call)
+  const shown = (hovered['result'] as { contents: { kind: string; value: string } }).contents
+  assert.equal(shown.kind, 'markdown')
+  assert.ok(shown.value.includes('fn twice(value: i32) -> i32'), JSON.stringify(hovered))
+  assert.ok(shown.value.includes('Doubles a value.'), 'a hover shows the doc comment')
+  const local = yield* request(session, 11, 'textDocument/hover', {
+    textDocument: { uri },
+    position: { line: 6, character: 10 },
+  })
+  assert.ok(
+    (local['result'] as { contents: { value: string } }).contents.value.includes('doubled: i32'),
+    JSON.stringify(local),
+  )
+  const defined = yield* request(session, 12, 'textDocument/definition', call)
+  assert.deepEqual(defined['result'], {
+    uri,
+    range: { start: { line: 1, character: 3 }, end: { line: 1, character: 8 } },
+  })
+  const hinted = yield* request(session, 13, 'textDocument/inlayHint', {
+    textDocument: { uri },
+    range: { start: { line: 0, character: 0 }, end: { line: 8, character: 0 } },
+  })
+  assert.deepEqual(hinted['result'], [
+    { position: { line: 5, character: 13 }, label: ': i32', kind: 1 },
+  ])
+  const helped = yield* request(session, 14, 'textDocument/signatureHelp', {
+    textDocument: { uri },
+    position: { line: 5, character: 22 },
+  })
+  const help = helped['result'] as {
+    signatures: Array<{ label: string; parameters: Array<{ label: string }> }>
+    activeParameter: number
+  }
+  assert.equal(help.signatures[0]?.label, 'fn twice(value: i32) -> i32', JSON.stringify(helped))
+  assert.deepEqual(help.signatures[0]?.parameters, [{ label: 'value: i32' }])
+  assert.equal(help.activeParameter, 0)
+  yield* change(session, uri, 7, fixed)
+  const restored = yield* diagnosticsFor(session, uri, 7, [])
+  assert.deepEqual(restored.diagnostics, [])
+
   // The syntax features read the document's latest text.
   const textDocument = { uri }
   const outline = yield* request(session, 5, 'textDocument/documentSymbol', { textDocument })
@@ -242,7 +298,7 @@ const program = Effect.gen(function* () {
     jsonrpc: '2.0',
     method: 'textDocument/didChange',
     params: {
-      textDocument: { uri, version: 6 },
+      textDocument: { uri, version: 8 },
       contentChanges: [{ text: 'pub fn main()->i32{return 0}\n' }],
     },
   })
@@ -287,7 +343,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* closed.exited, 1, 'closed input stops the server with status 1')
 
   yield* Console.log(
-    'Native language server: scripted lifecycle, syntax and semantic diagnostics, and syntax features session passed',
+    'Native language server: scripted lifecycle, syntax and semantic diagnostics, navigation, and syntax features session passed',
   )
 })
 
