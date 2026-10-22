@@ -391,6 +391,32 @@ length does not change.
 - `OutOfMemoryError` if `length + additional` overflows `usize`, or the `Allocator` cannot
   supply the new storage. The list does not change.
 
+<a id="List.impl.shrinkToFit"></a>
+
+### Method `shrinkToFit`
+
+```silk
+pub effect fn shrinkToFit(self: &mut Self) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Releases the capacity beyond the length.
+
+#### When to use
+
+Use `shrinkToFit` on a list that is complete and kept for a long time, so that the spare room
+left by doubling growth does not stay allocated.
+
+#### Details
+
+If the capacity equals the length, or the list is empty, this function does nothing.
+Otherwise, it moves the elements into storage for exactly the length. The length does not
+change.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
+  change.
+
 <a id="List.impl.sort"></a>
 
 ### Method `sort`
