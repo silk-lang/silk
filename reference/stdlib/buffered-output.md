@@ -199,9 +199,10 @@ does other work. Use [`BufferedOutput.writeAll`](#BufferedOutput.impl.writeAll) 
 #### Details
 
 If the buffer is full, this function first sends all pending bytes to the active `ByteDuplex`
-transport. Then it copies input bytes into the free space. If the buffer is empty and `input`
-is longer than [`BufferedOutput.capacity`](#BufferedOutput.impl.capacity), it does not copy: it gives `input` to one transport
-write and returns the count that the transport accepted. For a non-empty `input`, the result
+transport. Then it copies input bytes into the free space. If `input` is longer than
+[`BufferedOutput.capacity`](#BufferedOutput.impl.capacity), it does not copy: it gives the pending bytes and `input` to
+`ByteDuplex.writeSomeVectored`, or only `input` to `ByteDuplex.writeSome` when nothing is
+pending, until the transport accepts some input bytes, and returns their count. For a non-empty `input`, the result
 is at least 1. For an empty `input`, the result is 0 and the transport is not used.
 
 #### Errors

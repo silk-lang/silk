@@ -18,6 +18,10 @@ message, and a newline, such as `warning: disk 91% full`. It holds the standard 
 buffer of 64 bytes on the stack. Thus a short line is one system call, and the logger does not
 allocate.
 
+[`StderrLogger.make`](#StderrLogger.impl.make) colors the level name when standard error is a terminal, the `NO_COLOR`
+environment variable is not set or is empty, and `TERM` is not `dumb`. It checks once, at the
+first message. [`StderrLogger.withColor`](#StderrLogger.impl.withColor) turns color on or off without a check.
+
 [`StdoutLogger`](#StdoutLogger) formats each message directly to standard output. It adds no level, timestamp,
 or newline, has no lock, and does not allocate.
 
@@ -27,6 +31,8 @@ or newline, has no lock, and does not allocate.
 ## Gotchas
 - The providers exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 - A message template for [`StderrLogger`](#StderrLogger) must not end with a newline. The logger adds one.
+- [`StderrLogger.make`](#StderrLogger.impl.make) reads the environment at the first message. A change to `NO_COLOR` after
+  that has no effect on the same logger.
 
 ## Examples
 ### Log to standard error
@@ -84,7 +90,10 @@ A `Logger` provider that writes one line for each message to standard error, wit
 Each line is the level name (`trace`, `debug`, `info`, `warning`, or `error`), a colon and a
 space, the formatted message, and a newline. The logger holds the standard error lock of
 `silk.os_writer` for the whole line. Thus lines of different threads do not mix, also with
-`StderrWriter` writes. The logger has no state and does not allocate.
+`StderrWriter` writes. The logger does not allocate.
+
+With color, the level name has an ANSI color: `error` bold red, `warning` bold yellow, `info`
+green, `debug` blue, and `trace` cyan. The message has no color.
 
 ### Gotchas
 
@@ -106,7 +115,28 @@ impl StderrLogger
 pub fn make() -> StderrLogger
 ```
 
-Returns a logger. It does not write anything.
+Returns a logger that colors the level name when the terminal can show it. It does not write
+anything.
+
+#### Details
+
+At the first message, the logger uses color when standard error is a terminal, `NO_COLOR` is
+not set or is empty, and `TERM` is not `dumb`. Later messages use the same answer.
+
+<a id="StderrLogger.impl.withColor"></a>
+
+### Associated function `withColor`
+
+```silk
+pub fn withColor(enabled: bool) -> StderrLogger
+```
+
+Returns a logger that colors the level name when `enabled` is true, and never otherwise. It
+does not check the terminal or the environment.
+
+#### When to use
+
+Use it when the program has its own color setting, such as a `--color` flag.
 
 <a id="StderrLogger.impl.Logger"></a>
 

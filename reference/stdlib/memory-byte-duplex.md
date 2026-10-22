@@ -23,9 +23,10 @@ the read script is empty, reads return `End`. After `End`, reads return `End` an
 script.
 
 ## Gotchas
-Each write uses the next write event. If there are no more write events, or the output storage
-is full, the write fails with a `Provider` error, code 1 or 2. If the audit storage is full, the
-next operation fails with code 3. Make the storage large enough for the whole test.
+Each write uses the next write event. A vectored write is one write event that takes bytes from
+its slices in order. If there are no more write events, or the output storage is full, the
+write fails with a `Provider` error, code 1 or 2. If the audit storage is full, the next
+operation fails with code 3. Make the storage large enough for the whole test.
 
 This transport models a reliable byte stream only. It does not model packets, DNS, or
 certificates.
@@ -545,6 +546,14 @@ readSomeRaw: MemoryByteDuplex.read
 
 ```silk
 writeSomeRaw: MemoryByteDuplex.write
+```
+
+<a id="MemoryByteDuplex.impl.ByteDuplex.writeSomeVectoredRaw"></a>
+
+### Operation `writeSomeVectoredRaw`
+
+```silk
+writeSomeVectoredRaw: MemoryByteDuplex.writeVectored
 ```
 
 <a id="MemoryByteDuplex.impl.ByteDuplex.flushRaw"></a>

@@ -494,6 +494,14 @@ readSomeRaw: NativeRouteProvider.readBytes
 writeSomeRaw: NativeRouteProvider.writeBytes
 ```
 
+<a id="NativeRouteProvider.impl.ByteDuplex.writeSomeVectoredRaw"></a>
+
+### Operation `writeSomeVectoredRaw`
+
+```silk
+writeSomeVectoredRaw: NativeRouteProvider.writeBytesVectored
+```
+
 <a id="NativeRouteProvider.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`
