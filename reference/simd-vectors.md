@@ -207,3 +207,34 @@ twice the width, where no overflow is possible, and checks the total once.
 **Evidence:** `corpus/native/simd-ops`, `corpus/native/simd-reduce-overflow-trap`,
 `corpus/native/simd-load-range-trap`, `corpus/native/simd-convert-range-trap`,
 `corpus/invalid/simd-invalid-operation`.
+
+## SIMD-006 — Static shuffles pick lanes by constant indices
+
+**Status:** Confirmed
+
+```silk,ignore
+fn simdShuffle<V, R>(left: V, right: V, static indices: [usize; M]) -> R
+
+let reversed = Intrinsic.simdShuffle<simd<u32, 4>, simd<u32, 4>>(value, value, [3, 2, 1, 0])
+```
+
+`V` and `R` are vector or mask types with one lane type; `V` has `N` lanes and `R` has `M`. Lane `i`
+of the result is lane `indices[i]` of `left` when the index is below `N`, and lane
+`indices[i] - N` of `right` otherwise. A shuffle can widen, narrow, reverse, interleave, or
+broadcast lanes.
+
+`indices` is a static argument (STATIC-002): its value is known at compile time, so every
+shuffle lowers to one fixed lane permutation. A function forwards indices it takes as a `static`
+parameter.
+
+**Boundary:** There is no runtime-index shuffle (a table lookup); that belongs to the
+architecture intrinsics.
+
+**Diagnostics:** An index of `2N` or more, or vectors with different lane types, report `SEM0239`.
+An index array whose length is not `M` reports `SEM0031`, and a runtime value in `indices` reports
+`SEM0176`.
+
+**Current compiler:** Aligned. The call lowers to one LLVM `shufflevector` with a constant mask.
+
+**Evidence:** `corpus/native/simd-shuffle`, `corpus/invalid/simd-invalid-shuffle`,
+`corpus/invalid/simd-shuffle-runtime-index`.
