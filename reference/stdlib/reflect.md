@@ -47,7 +47,7 @@ pub fn main() -> i32 {
 
 Import as `Reflect` with `import silk.reflect { Reflect }`.
 
-Public declarations: 7.
+Public declarations: 9.
 
 <a id="namedKind"></a>
 
@@ -88,6 +88,27 @@ pub const anonymousPositionalKind: u8
 ```
 
 The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for an anonymous tuple with positional fields.
+
+<a id="arrayKind"></a>
+
+## `arrayKind`
+
+```silk
+pub const arrayKind: u8
+```
+
+The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for a fixed array, such as `[i32; 3]`. It has no fields.
+
+<a id="otherKind"></a>
+
+## `otherKind`
+
+```silk
+pub const otherKind: u8
+```
+
+The [`Reflect.typeKind`](#Reflect.impl.typeKind) result for every other type, such as `i32`, `string`, a slice, an
+enum, or a union. It has no fields.
 
 <a id="labeledFieldKind"></a>
 
@@ -177,7 +198,8 @@ pub static fn typeKind<Owner>(descriptor: Intrinsic.Type<Owner>) -> u8
 ```
 
 Returns the kind of type that `descriptor` describes: [`namedKind`](#namedKind), [`positionalKind`](#positionalKind),
-[`anonymousNamedKind`](#anonymousNamedKind), or [`anonymousPositionalKind`](#anonymousPositionalKind).
+[`anonymousNamedKind`](#anonymousNamedKind), [`anonymousPositionalKind`](#anonymousPositionalKind), [`arrayKind`](#arrayKind), or [`otherKind`](#otherKind). Every
+type has a kind, so a generic function can branch on the kind of its type parameter.
 
 <a id="Reflect.impl.fieldKind"></a>
 
