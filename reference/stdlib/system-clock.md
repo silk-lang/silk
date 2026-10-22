@@ -127,10 +127,14 @@ pub fn make(seconds: i64, nanoseconds: i64) -> Instant
 
 Returns the instant `seconds` plus `nanoseconds` nanoseconds.
 
+#### Details
+
+Whole seconds in `nanoseconds` move into the seconds, so `SystemClock.make(0, 5000000000)` is
+five seconds and `SystemClock.make(0, -1)` is one nanosecond before the origin.
+
 #### Gotchas
 
-`nanoseconds` must be from 0 to 999,999,999. Other values trap. They are not moved into the
-seconds.
+A total outside the `i64` seconds range traps with an integer overflow.
 
 <a id="SystemClock.impl.seconds"></a>
 

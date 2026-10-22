@@ -283,7 +283,7 @@ immediate operands, AES rounds and carry-less multiplication join the catalog wi
 kernels. There is no open escape hatch that names an arbitrary LLVM intrinsic.
 
 **Diagnostics:** A first operand outside the catalog reports `SEM0239`. A call whose target or
-CPU feature the profile does not select reports `SEM0240`.
+CPU feature the profile does not select reports `SEM0241`.
 
 **Current compiler:** Aligned. Each call lowers to one call of its LLVM target intrinsic.
 
