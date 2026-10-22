@@ -99,14 +99,16 @@ NaN lane holds only for `simdLanesNotEqual`. The ordering comparisons take numer
 `simdSelect` takes lane `i` of `chosen` where mask lane `i` is set and of `other` elsewhere.
 
 **Boundary:** These are compiler primitives in the sealed `Intrinsic` namespace (INTR-001). The
-`silk.simd` module will be the public API over them.
+`silk.simd` modules are the public API over them: one module per shape, such as `silk.simd.u8x16`
+for `simd<u8, 16>` and `silk.simd.mask16` for `mask<16>`, for every lane type at 128 and 256 bits.
 
 **Diagnostics:** A type argument that is not an admitted vector, or a mask for an ordering
 comparison, reports `SEM0239` at the call.
 
 **Current compiler:** Aligned.
 
-**Evidence:** `corpus/native/simd-core`, `corpus/native/simd-lane-index-trap`.
+**Evidence:** `corpus/native/simd-core`, `corpus/native/simd-lane-index-trap`,
+`corpus/native/simd-stdlib`.
 
 ## SIMD-004 — Wrapping, saturating, shift, and math lane operations
 
