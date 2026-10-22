@@ -288,7 +288,8 @@ export const run = Effect.fn('RepositoryCoverage.run')(function* ({
         const result = yield* NativeProcess.execute(
           compiler,
           ['build', source, '-o', ir, '--emit', 'llvm-ir', '--stdlib', join(repository, 'stdlib')],
-          { cwd: root, timeoutMs: 120000 },
+          // SILK_RECEIPTS selects the SILK_BUILD_ERROR records classify reads.
+          { cwd: root, timeoutMs: 120000, env: { ...process.env, SILK_RECEIPTS: '1' } },
         )
         yield* fs.writeFile(join(output, `${index}.stderr`), result.stderr)
         yield* fs.writeFile(join(output, `${index}.stdout`), result.stdout)

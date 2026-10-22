@@ -2,7 +2,7 @@
 import { strict as assert } from 'node:assert'
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { dirname, join, resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import * as Config from 'effect/Config'
 import * as Console from 'effect/Console'
@@ -99,6 +99,12 @@ const program = Effect.gen(function* () {
   const unknown = yield* invoke(silk, ['frobnicate'], directory)
   assert.equal(unknown.status, 2, unknown.stderr)
   assert.match(unknown.stderr, /^silk: unknown command `frobnicate`\n/)
+  // A path-like word that names no file reports that file, also as a usage error.
+  for (const missing of ['missing.silk', './frob']) {
+    const absent = yield* invoke(silk, [missing], directory)
+    assert.equal(absent.status, 2, absent.stderr)
+    assert.ok(absent.stderr.startsWith(`silk: no such source file \`${missing}\`;`), absent.stderr)
+  }
   // Exercise the linked changes library through the actual native entry point. No compiler,
   // standalone changes executable, Git, or other tool is available on this subprocess PATH.
   const releaseWorkspace = join(directory, 'release-workspace')
@@ -330,6 +336,33 @@ const program = Effect.gen(function* () {
   })
   assert.equal(receipted.status, 0, receipted.stderr)
   assert.match(receipted.stderr, /^SILK_GAP borrow-check: \d+ bodies not borrow-checked/m)
+  // The single-source `Compiled` line names the paths from the working directory, never with `../`
+  // steps relative to the source's directory, and an output outside it absolutely.
+  assert.match(linked.stdout, /^Compiled main\.silk -> program \(llvm, /)
+  const outsidePath = join(dirname(directory), `${basename(directory)}-outside.ll`)
+  const outside = yield* invoke(
+    silk,
+    [...argumentsFor(outsidePath), '--emit', 'llvm-ir'],
+    directory,
+  )
+  assert.equal(outside.status, 0, outside.stderr)
+  assert.ok(outside.stdout.startsWith(`Compiled main.silk -> ${outsidePath} (llvm, `), outside.stdout)
+  yield* fs.remove(outsidePath)
+  // A single-source rejection prints the human diagnostic; only SILK_RECEIPTS selects the
+  // SILK_BUILD_ERROR record the corpus harness parses.
+  yield* fs.writeFileString(join(directory, 'bad.silk'), 'pub fn main() -> i32 { return "x" }\n')
+  const badArguments = ['build', 'bad.silk', '-o', 'bad', '--stdlib', standardLibrary]
+  const human = yield* invoke(silk, badArguments, directory, { ...process.env, SILK_CLANG: clang })
+  assert.notEqual(human.status, 0)
+  assert.doesNotMatch(human.stderr, /SILK_BUILD_ERROR/)
+  assert.match(human.stderr, /SEM\d{4}/)
+  assert.match(human.stderr, /bad\.silk:1:/)
+  const machine = yield* invoke(silk, badArguments, directory, {
+    ...process.env,
+    SILK_CLANG: clang,
+    SILK_RECEIPTS: '1',
+  })
+  assert.match(machine.stderr, /^SILK_BUILD_ERROR=\{"code":"SEM\d{4}"/m)
   assert.deepEqual(
     yield* fs.readFile(captured),
     bytes,
@@ -448,6 +481,76 @@ const program = Effect.gen(function* () {
   )
   const wasmMain = new WebAssembly.Instance(wasmModule, {}).exports.main as () => number
   assert.equal(wasmMain(), 42)
+  // An adopted allocation's drop calls its reclaim function. wasm32 numbers functions by table
+  // index from 1, and an exported reclaim whose address is the module's first takes index 1, the
+  // value that once marked system storage: both drops must reach the reclaim, not `free`.
+  const adopted = join(directory, 'adopted')
+  yield* fs.makeDirectory(adopted, { recursive: true })
+  yield* fs.writeFileString(
+    join(adopted, 'silk.toml'),
+    '[package]\nname = "adopted"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(adopted, 'main.silk'),
+    [
+      'import silk.layout { Layout }',
+      'import silk.pointer { Pointer }',
+      '',
+      '// Counts every reclaim through the context address, a `usize` the program owns.',
+      'export "C" fn countReclaim(context: ?*mut u8) -> () {',
+      '  let present = unsafe Intrinsic.pointerRequalify<?*mut u8, *mut u8>(context)',
+      '  let counter = unsafe Intrinsic.pointerReinterpret<*mut u8, *mut usize>(present)',
+      '  unsafe { Pointer.write<usize>(counter, Pointer.read<usize>(counter) + 1) }',
+      '  return ()',
+      '}',
+      '',
+      '// Adopts two allocations over its own storage and drops them; both drops must reach `countReclaim`.',
+      'fn adoptTwice() -> usize {',
+      '  let mut first: u32 = 0',
+      '  let mut second: u32 = 0',
+      '  let mut count: usize = 0',
+      '  let counter = unsafe Intrinsic.pointerReinterpret<*mut usize, *mut u8>(Pointer.fromMutRef(&mut count))',
+      '  let reclaim: extern "C" fn(?*mut u8) -> () = countReclaim',
+      '  let at = unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(Pointer.fromMutRef(&mut first))',
+      '  let next = unsafe Intrinsic.pointerReinterpret<*mut u32, *mut u8>(Pointer.fromMutRef(&mut second))',
+      '  let one = unsafe Intrinsic.allocationAdopt(at, Layout { bytes: 4, alignment: 4 }, reclaim, counter)',
+      '  let two = unsafe Intrinsic.allocationAdopt(next, Layout { bytes: 4, alignment: 4 }, reclaim, counter)',
+      '  drop one',
+      '  drop two',
+      '  return count',
+      '}',
+      '',
+      '// Exported so the reclaim address is the first function address the module takes.',
+      'export "C" fn exercise() -> usize { return adoptTwice() }',
+      '',
+      'pub fn main() -> i32 {',
+      '  return 42',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const adoptedBuild = yield* invoke(
+    silk,
+    [
+      'build',
+      'main.silk',
+      '-o',
+      'adopted.wasm',
+      '--target',
+      'wasm32-unknown-unknown',
+      '--stdlib',
+      standardLibrary,
+    ],
+    adopted,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(adoptedBuild.status, 0, adoptedBuild.stderr)
+  const adoptedModule = new WebAssembly.Instance(
+    new WebAssembly.Module(yield* fs.readFile(join(adopted, 'adopted.wasm'))),
+    {},
+  )
+  const exercise = adoptedModule.exports.exercise as () => number
+  assert.equal(exercise(), 2, 'both adopted drops reach their reclaim function on wasm32')
   for (const selectors of [
     ['--emit', 'invalid'],
     ['--emit'],
@@ -747,6 +850,8 @@ const program = Effect.gen(function* () {
   for (const [entry, rule] of [
     ['{ object = "a.o", library = "m" }', /\[build\]\.native-link-inputs\[0\]: an entry is exactly one/],
     ['{ object = "/tmp/a.o" }', /object \/tmp\/a\.o must be a relative path below the manifest's directory/],
+    // Refused only when the link runs, yet named the same way.
+    ['{ framework = "Security" }', /\[build\]\.native-link-inputs\[0\]: framework Security links only on macOS targets/],
   ] as const) {
     yield* fs.writeFileString(
       join(unpackaged, 'silk.toml'),
@@ -980,6 +1085,62 @@ const program = Effect.gen(function* () {
     process.env,
   )
   assert.equal(churnRun.status, 42, churnRun.stderr)
+  // Arena allocations are adopted storage with their own reclaim function, which wasm32 places at
+  // table index 1: dropping two of them must reach that function, not `free` the chunk twice.
+  const arena = join(directory, 'arena')
+  yield* fs.makeDirectory(arena, { recursive: true })
+  yield* fs.writeFileString(
+    join(arena, 'silk.toml'),
+    '[package]\nname = "arena"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\n',
+  )
+  yield* fs.writeFileString(
+    join(arena, 'main.silk'),
+    [
+      'import silk.allocator { Allocator, OutOfMemoryError }',
+      'import silk.arena { Arena }',
+      'import silk.box { Box }',
+      'import silk.effect { Effect }',
+      'effect fn program() -> i32 ! OutOfMemoryError {',
+      '  let mut arena = Arena.make(Allocator.systemAllocatorProvider())',
+      '  let first = run Box<i32>.make(40) |> Effect.provideMut<Allocator>(&mut arena)',
+      '  let second = run Box<i32>.make(2) |> Effect.provideMut<Allocator>(&mut arena)',
+      '  let sum = Box<i32>.get(&first)[0] + Box<i32>.get(&second)[0]',
+      '  drop first',
+      '  drop second',
+      '  drop arena',
+      '  return sum',
+      '}',
+      'effect fn recover(error: OutOfMemoryError) -> i32 { return 3 }',
+      'pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }',
+      '',
+    ].join('\n'),
+  )
+  const arenaBuild = yield* invoke(
+    silk,
+    [
+      'build',
+      '--manifest-path',
+      join('arena', 'silk.toml'),
+      '--profile',
+      'web',
+      '--stdlib',
+      standardLibrary,
+    ],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(arenaBuild.status, 0, arenaBuild.stderr)
+  const arenaRun = yield* invoke(
+    process.execPath,
+    [
+      join(standardLibrary, 'host/wasm-runner.mjs'),
+      join(arena, 'build/llvm/wasm32-unknown-unknown/web/arena'),
+    ],
+    directory,
+    process.env,
+  )
+  assert.equal(arenaRun.status, 42, arenaRun.stderr)
   // A profile's CPU features, large code model and static link reach Clang.
   const argumentLog = join(directory, 'clang-arguments')
   const recorder = join(directory, 'clang-recorder')
@@ -1050,6 +1211,26 @@ const program = Effect.gen(function* () {
   // requirements and a deployment version on a target that is not Darwin are refused at their
   // manifest line.
   const locatedRefusals = [
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "", provenance = "literal" }\n',
+      /silk\.toml:10: InvalidInput: build\.bindings: origin\.source must be a non-empty string/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "x", provenance = "translated-public", translator = "" }\n',
+      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator must be a non-empty string/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\n[build.bindings.origin]\nsource = "env"\nprovenance = "secret"\n',
+      /silk\.toml:12: ForbiddenProvenance: build\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = 3\norigin = { source = "silk.toml", provenance = "literal" }\n',
+      /silk\.toml:9: InvalidInput: build\.bindings: value must be a table with a kind, such as \{ kind = "integer", value = "1" \}/,
+    ],
+    [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["main"] }\n',
+      /silk\.toml:6: build\.composition\.defaults entry "main" names no runtime in build\.composition\.runtimes; it lists "start"/,
+    ],
     [
       '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [\n  { module = "m", declaration = "f" },\n] }] }\n',
       /silk\.toml:7: build\.composition\.components\.bindings entry has no operation/,

@@ -150,6 +150,23 @@ export const verify = ({ catalog, rejection, lexical, staticExecution, reference
       issues.push(`Code.${member}: missing nonempty message template`)
   }
 
+  // A doc comment that opens with a code documents the member it precedes, which spells that code.
+  let documented
+  for (const line of (bodyOf(catalog, /^\s*pub enum Code\s*\{/m) ?? '').split('\n')) {
+    const doc = /^\s*\/\/\/\s*([A-Z]{3}[0-9]{4})\b/.exec(line)
+    if (doc !== null) {
+      if (documented !== undefined) issues.push(`${documented}: doc comment documents no Code member`)
+      documented = doc[1]
+      continue
+    }
+    const declared = /^\s*(\w+)\s*,/.exec(line)
+    if (declared === null) continue
+    if (documented !== undefined && spellings.get(declared[1] ?? '') !== documented)
+      issues.push(`Code.${declared[1]}: doc comment names ${documented}`)
+    documented = undefined
+  }
+  if (documented !== undefined) issues.push(`${documented}: doc comment documents no Code member`)
+
   const used = new Set()
   const checkCode = (owner, member) => {
     const code = spellings.get(member)
