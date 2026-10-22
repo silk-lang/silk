@@ -15,7 +15,10 @@ of one transferable `Execution` package (EXEC-010). Thus one non-generic C entry
 closures of any type.
 
 Threads use `pthread_create` on Darwin and GNU libc targets, and wasi-threads on wasm32 with
-`threading = "multi"`.
+`threading = "multi"`. A native thread gets an 8 MiB stack, the default main-thread stack on
+Darwin and Linux, so work that fits on the main thread fits on a spawned one. The platform's
+own thread default is smaller on Darwin (512 KiB). A wasm32 thread gets the 1 MiB stack its
+runtime gives every thread.
 
 ## Errors
 [`SpawnError`](#SpawnError) if the system cannot make the thread. `OutOfMemoryError` if the start or result
