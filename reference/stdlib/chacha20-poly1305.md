@@ -236,4 +236,6 @@ All checks come before the first write. On an error, `plaintext` does not change
 Authentication does not stop replay: an attacker can send an old valid message again.
 
 
+Category: Cryptography.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

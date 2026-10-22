@@ -528,4 +528,6 @@ borrowed for the execution of `program`. Every other requirement in `R` stays vi
 result.
 
 
+Category: Core.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

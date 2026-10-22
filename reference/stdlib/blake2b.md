@@ -126,4 +126,6 @@ pub fn hash(bytes: &[u8]) -> [u8; 64]
 Returns the 64-byte BLAKE2b digest of `bytes`.
 
 
+Category: Cryptography.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

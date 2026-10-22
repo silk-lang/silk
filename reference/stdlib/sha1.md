@@ -114,4 +114,6 @@ Returns the 20-byte SHA-1 digest of `bytes`.
 The program traps if `bytes` is longer than 2^64 - 1 bits.
 
 
+Category: Cryptography.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

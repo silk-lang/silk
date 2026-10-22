@@ -225,4 +225,6 @@ Use the slice to change bytes in place. The slice cannot change the length. The 
 rejects other uses of the value, such as [`Bytes.append`](#Bytes.impl.append), while the slice is live.
 
 
+Category: Collections.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -173,4 +173,6 @@ A nested access to the same value through any handle traps, also when both acces
 `with`.
 
 
+Category: Memory.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

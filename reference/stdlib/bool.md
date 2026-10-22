@@ -64,4 +64,6 @@ Returns `false` if `value` is `true`, and `true` if `value` is `false`. This fun
 same result as `!value`.
 
 
+Category: Core.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

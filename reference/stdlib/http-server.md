@@ -1539,4 +1539,6 @@ Call it one time. Trailers are sent only with `Chunked`. For other modes, give e
 - `InvalidState` if the response is already finished.
 
 
+Category: HTTP.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

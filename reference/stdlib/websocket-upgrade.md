@@ -1007,4 +1007,6 @@ It sends the status of [`rejectionStatus`](#rejectionStatus). For `UnsupportedVe
 `Sec-WebSocket-Version: 13`. Call it only before a 101 response starts.
 
 
+Category: HTTP.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

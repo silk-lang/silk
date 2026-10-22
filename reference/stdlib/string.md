@@ -479,4 +479,6 @@ pub struct ScalarStep
 One scalar that [`String.nextScalar`](#String.impl.nextScalar) read, with its byte position and the cursor after it.
 
 
+Category: Text.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -18,6 +18,13 @@ a comment, regenerate them with a native compiler built from this checkout:
 
 Selfhost CI fails when the committed pages differ from the generator's output.
 
+## Module categories
+
+Each module header ends with an `@category` line (see the style guide). Give a new module the
+category of the modules that it is used with. The current categories are: Numbers, Core, Text,
+Collections, Memory, Concurrency, Input and output, System, Data formats, Cryptography, TLS and
+certificates, HTTP, Networking, SIMD, Native platform, Testing, and Compiler support.
+
 ## Example evidence
 
 `silk doctest --stdlib` compiles each ordinary `silk` fence exactly as written. It adds no prelude or hidden

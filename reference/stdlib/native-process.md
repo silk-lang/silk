@@ -68,4 +68,6 @@ the child started, the call stops and waits for the child, closes the descriptor
 returns the first error. A trap does not clean up, and does not stop the child.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

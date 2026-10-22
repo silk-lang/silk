@@ -129,4 +129,6 @@ Returns 0 on success or the Linux error number. After `release`, drop does not t
 release the mapping again.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`.

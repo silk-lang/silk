@@ -482,4 +482,6 @@ A Wake for a dropped or completed Execution, or for an earlier generation, publi
 and only releases its package authority.
 
 
+Category: Concurrency.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

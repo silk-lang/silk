@@ -205,4 +205,6 @@ Part of the bytes can be written before a failure. Do not write all of them agai
 check.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`.

@@ -92,4 +92,6 @@ In the handler of an unhandled error, drop the error value before you call
 `Intrinsic.observeUnhandled`. That call returns 1, also when the report cannot be written.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

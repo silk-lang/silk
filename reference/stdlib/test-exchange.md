@@ -262,4 +262,6 @@ Appends the counts and the status, and returns the receipt bytes.
 In uncached mode the receipt is padded to exactly 256 bytes.
 
 
+Category: Testing.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

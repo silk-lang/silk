@@ -159,4 +159,6 @@ pub fn succeeded(self: &Self) -> bool
 Returns whether all fragments were written within the limits.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

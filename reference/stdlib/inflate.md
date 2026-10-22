@@ -592,4 +592,6 @@ Output is not verified until `Finished`, because the checksum comes at the end. 
 failure, discard all output of the stream.
 
 
+Category: Data formats.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -297,4 +297,6 @@ it. The count can be less than `buffer.length`, so loop until all bytes are writ
 call does not close the descriptor or keep the input.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`.

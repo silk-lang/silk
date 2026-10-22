@@ -2128,4 +2128,6 @@ Sends a request whose body comes from a new producer from `factory` for each att
 and checks the body of the final response without keeping it. More than `maxDiscardBytes` fails.
 
 
+Category: HTTP.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

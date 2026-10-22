@@ -275,4 +275,6 @@ pub effect fn closeDirectory(value: DirectoryHandle, operation: FileOperation) -
 Closes the directory stream one time.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

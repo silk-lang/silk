@@ -788,4 +788,6 @@ after the callback returns, fails, or is canceled.
 The scope closes the transport at the end but does not flush. Flush in the callback.
 
 
+Category: Input and output.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

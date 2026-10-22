@@ -39,4 +39,6 @@ pub effect fn main() -> i32 ? &mut HostInput
 Runs each selected test in order and returns the exit status (`0`, `1` or `2`).
 
 
+Category: Testing.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

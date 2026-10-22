@@ -219,4 +219,6 @@ Returns an exclusive slice of `length` slots, starting at slot `offset`.
 The caller must prove that the range is in bounds and that each slot in it is initialized.
 
 
+Category: Memory.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

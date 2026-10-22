@@ -288,4 +288,6 @@ fallback: A
 The value to return if `self` is a failure. It is dropped if `self` is a success.
 
 
+Category: Core.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

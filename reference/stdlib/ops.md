@@ -226,4 +226,6 @@ A conformance `impl Not<Output> for T` gives the member `not(value: T) -> Output
 expression `!value` calls it with the operand by value.
 
 
+Category: Core.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

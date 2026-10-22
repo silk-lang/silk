@@ -116,4 +116,6 @@ Releases one frame acquired from this state and removes its charge.
 The caller must finish semantic cleanup and stop every access before releasing the frame.
 
 
+Category: Concurrency.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-unknown-unknown`.

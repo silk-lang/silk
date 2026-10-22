@@ -218,4 +218,6 @@ Copies the start of the working directory to `output`, and returns its full leng
 bytes after the copy are not changed.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

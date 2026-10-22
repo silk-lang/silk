@@ -169,6 +169,27 @@ The summary names the concept. `# When to use` gives the selection rule and prin
 The module header does not replace member documentation. For example, the comment for `get` must
 still state its return shape and borrow behavior.
 
+### Module category
+
+End a module header with one `@category` line when the module belongs to a group of related
+modules. Put one blank `//!` line before it:
+
+```silk,ignore
+//! # See also
+//! Use the `silk.char` module when a value is a Unicode scalar rather than an arbitrary byte.
+//!
+//! @category Numbers
+```
+
+The category is a short name in title case, such as `Numbers`, `Collections`, or `HTTP`. Use a
+category that other modules already use when one fits. The documentation tools remove the line from
+the rendered text. `silk doc` writes the name as the module's `category` field, and
+`silk doc-reference` shows it in the index and on the module page, so a reader can find related
+modules together instead of in alphabetical order.
+
+The tag is recognized only on the last line of the header. Give every standard-library module a
+category.
+
 ## Links and related APIs
 
 Use a link when navigation helps the reader understand, select, or use the API. Do not link a name
