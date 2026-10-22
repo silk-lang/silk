@@ -281,7 +281,7 @@ lanes with portable code, so it is correct on every target.
 **Boundary:** A call is checked when its body is checked, like `compileError`, so code that can
 build for other profiles guards it with `static if Target.hasCpuFeature(...)`, or sits in a
 function compiled for the feature (SIMD-009). AES rounds and carry-less multiplication are
-SIMD-011. There is no open escape hatch that names an arbitrary LLVM intrinsic.
+SIMD-011, and the SHA-256 instructions SIMD-012. There is no open escape hatch that names an arbitrary LLVM intrinsic.
 
 **Diagnostics:** A first operand outside the catalog reports `SEM0239`. A call whose target or
 CPU feature the profile does not select reports `SEM0241`.
@@ -427,7 +427,8 @@ The x86 rounds take the operand order of the instructions: the state, then the r
 without tables. `silk.arch.x86` and `silk.arch.aarch64` wrap each operation on `u8x16` states and
 fall back to `silk.arch.aes` when the profile lacks the feature, like the SIMD-007 wrappers.
 
-**Boundary:** Key-generation assist and the SHA instructions are not in the catalog yet. The
+**Boundary:** Key-generation assist is not in the catalog yet. SIMD-012 adds the SHA-256
+instructions. The
 portable fallbacks run in constant time but are much slower than the instructions, so a program
 that encrypts much data selects a kernel at run time with `silk.cpu` (SIMD-008) and a function
 compiled for `aes` (SIMD-009).
@@ -439,3 +440,43 @@ when the profile and function do not select the feature.
 
 **Evidence:** `corpus/native/simd-crypto` (the FIPS 197 example block through every wrapper, the
 instructions themselves when the machine has them, and carry-less products).
+
+## SIMD-012 — SHA-256 instructions are architecture operations
+
+**Status:** Confirmed
+
+```silk,ignore
+unsafe fn rounds(cdgh: simd<u32, 4>, abef: simd<u32, 4>, wk: simd<u32, 4>) -> simd<u32, 4> with Intrinsic.machine(features: ("sha",)) {
+  return Intrinsic.x86Sha256Rounds2<simd<u32, 4>>(cdgh, abef, wk)
+}
+```
+
+The SIMD-007 catalog also holds the SHA-256 instructions, all on `u32x4`:
+
+| Operation                      | Operands | Target and feature | Instruction   |
+| ------------------------------ | -------- | ------------------ | ------------- |
+| `x86Sha256Rounds2`             | 3        | x86-64 `sha`       | `sha256rnds2` |
+| `x86Sha256Message1`            | 2        | x86-64 `sha`       | `sha256msg1`  |
+| `x86Sha256Message2`            | 2        | x86-64 `sha`       | `sha256msg2`  |
+| `aarch64Sha256Hash`            | 3        | AArch64 `sha2`     | `sha256h`     |
+| `aarch64Sha256Hash2`           | 3        | AArch64 `sha2`     | `sha256h2`    |
+| `aarch64Sha256ScheduleUpdate0` | 2        | AArch64 `sha2`     | `sha256su0`   |
+| `aarch64Sha256ScheduleUpdate1` | 3        | AArch64 `sha2`     | `sha256su1`   |
+
+The operands follow the instructions. `x86Sha256Rounds2` takes C, D, G and H, then A, B, E and F
+(each in lanes 3 to 0), then two message words plus round constants in lanes 0 and 1, which
+`sha256rnds2` reads from `xmm0`. `x86-64` gains the `sha` feature, which implies `sse2`, and
+`silk.cpu` detects it.
+
+`silk.arch.x86` and `silk.arch.aarch64` wrap each operation and fall back to portable code when
+the profile lacks the feature, like the SIMD-007 wrappers.
+
+**Boundary:** SHA-1 and SHA-512 instructions are not in the catalog yet.
+
+**Diagnostics:** As SIMD-007: `SEM0239` for a first operand outside the catalog and `SEM0241`
+when the profile and function do not select the feature.
+
+**Current compiler:** Aligned.
+
+**Evidence:** `corpus/native/simd-sha` (one SHA-256 block through both instruction flows, and the
+x86 instructions themselves when the machine has them).
