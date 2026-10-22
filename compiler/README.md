@@ -81,18 +81,18 @@ compiler stores need more memory than a CI runner has.
 
 The budgets allow twice the measured units (at least 20 more) and one and a half times the
 measured demand fraction. When a change moves a step's numbers for a good reason, replay the
-script and update its entry. Measured on 2026-10-21, add and delete on 2026-10-22:
+script and update its entry. Measured on 2026-10-22:
 
 | Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |
 | --- | --- | --- | --- | --- |
-| initial check | 132,048 | 15,869,737 | 64,550 | 2,185,506 |
-| trivia | 3 | 6.8% | 16 | 9.7% |
-| body | 2 | 6.8% | 17 | 9.7% |
-| header, same type | 7 | 6.8% | 25 | 9.9% |
-| add | 9 | 6.4% | 32 | 10.7% |
-| header, new type | 6 | 6.8% | 19 | 9.7% |
-| delete | 5 | 6.4% | 28 | 10.7% |
-| rename | 8 | 6.2% | 176 | 9.9% |
+| initial check | 146,118 | 16,780,544 | 68,944 | 2,303,049 |
+| trivia | 6 | 0.6% | 19 | 1.1% |
+| body | 5 | 0.6% | 20 | 1.1% |
+| header, same type | 10 | 0.6% | 31 | 1.6% |
+| add | 12 | 0.6% | 35 | 1.1% |
+| header, new type | 9 | 0.6% | 22 | 1.1% |
+| delete | 8 | 0.6% | 31 | 1.1% |
+| rename | 19 | 0.6% | 187 | 1.5% |
 
 An update marks outdated every unit that consumed a change, directly or through another unit,
 and a demand then verifies an outdated unit before it reruns it: the unit stays current when
@@ -103,9 +103,15 @@ hash without those spans and their dependers are verified. The units that rerun 
 are those heads and MIR lowerings, whose `module:line:column` site labels move with the lines.
 A call through a type or a receiver reads the owner's member of its own name (the
 `InherentMember` family, a projection of the owner's whole member list), so adding or deleting a
-method reruns only the member list and the projections of names that changed. On a 4-core x86_64 machine the
-compiler's first check took about 67 s and each edit's recheck 7 to 18 s, almost all of it the
-walk over every root.
+method reruns only the member list and the projections of names that changed.
+
+A revisable store keeps each module's declaration sweep and the escape check of the package's
+concrete bodies as units of the `ModuleCheck` family. They are no providers: `checkDeclarations`
+and `checkModule` run them and record the root demands and source reads they make, so a recheck
+verifies an unaffected module's sweep instead of walking its roots again, and reuses the escape
+check while every MIR answer it read is current. The escape check is one whole-program walk, so
+an edit that changes any MIR answer it reached (a trivia edit moves site labels) runs it again,
+and it is most of what a recheck costs.
 
 ## Check roots
 
