@@ -19,7 +19,8 @@ the system returned a count that is not valid.
 
 ## Gotchas
 - The caller keeps the descriptor open and controls access from other threads.
-- [`NativeDescriptor.writeAll`](#NativeDescriptor.impl.writeAll) can fail after part of the bytes were written.
+- [`NativeDescriptor.writeAll`](#NativeDescriptor.impl.writeAll) and [`NativeDescriptor.writeAllPair`](#NativeDescriptor.impl.writeAllPair) can fail after part of the
+  bytes were written.
 - The module is empty on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
   or aarch64.
 
@@ -160,6 +161,30 @@ zero if the system wrote nothing or returned a count that is not valid.
 
 #### Gotchas
 Part of `buffer` can be written before a failure. Do not write all of it again without a
+check.
+
+<a id="NativeDescriptor.impl.writeAllPair"></a>
+
+### Associated function `writeAllPair`
+
+```silk
+pub effect fn writeAllPair(fd: i32, first: &[u8], second: &[u8], error: &mut i32) -> bool
+```
+
+Writes all of `first` and then all of `second` to `fd`, and returns whether it succeeded.
+
+#### When to use
+Use it to send buffered bytes and a new slice together, without first copying the slice into
+the buffer.
+
+#### Details
+When both slices are not empty, the first system call is one `writev` of both. If it writes
+only part of the bytes, the rest goes out with [`NativeDescriptor.writeAll`](#NativeDescriptor.impl.writeAll). An empty slice
+adds no buffer to the call. On failure, `error` is the native error code, or zero if the system
+wrote nothing or returned a count that is not valid.
+
+#### Gotchas
+Part of the bytes can be written before a failure. Do not write all of them again without a
 check.
 
 
