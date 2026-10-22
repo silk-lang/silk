@@ -544,11 +544,13 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: sentinel },
   )
   assert.equal(checked.status, 0, checked.stderr)
-  assert.match(checked.stdout, new RegExp(`check ${hostTarget}: ok\n`))
-  assert.match(
-    checked.stdout,
-    new RegExp(`check ${foreign}: ok\nCheck summary: 2 succeeded, 0 failed\n$`),
-  )
+  // Each target reports its progress on standard error, as plain lines when that is not a terminal;
+  // standard output stays empty.
+  assert.equal(checked.stdout, '')
+  assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${hostTarget}\\)\n`))
+  assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${foreign}\\)\n`, 'm'))
+  assert.equal(checked.stderr.match(/^Finished greeting in /gm)?.length, 2, checked.stderr)
+  assert.doesNotMatch(checked.stderr, /\x1b/)
   assert.equal(yield* fs.exists(marker), false, 'check must not invoke Clang')
   yield* fs.makeDirectory(join(directory, 'rejected/src'), { recursive: true })
   yield* fs.writeFileString(
@@ -568,7 +570,8 @@ const program = Effect.gen(function* () {
   // The progress report heads standard error, so the target heading starts a later line.
   assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`, 'm'))
   assert.match(rejected.stderr, /\/rejected\/src\/main\.silk:6:16: error\[SEM0037\]/)
-  assert.match(rejected.stdout, new RegExp(`check ${hostTarget}: failed \\(exit 1\\)\n`))
+  assert.match(rejected.stderr, /^Failed rejected in /m)
+  assert.equal(rejected.stdout, '')
   const json = yield* invoke(
     silk,
     ['check', '--json', '--stdlib', standardLibrary],
@@ -721,7 +724,8 @@ const program = Effect.gen(function* () {
   )
   assert.equal(unstartedBuild.status, 2, unstartedBuild.stderr)
   assert.match(unstartedBuild.stderr, /no-such-clang \(from --clang\)/)
-  assert.match(unstartedBuild.stdout, /: failed \(exit 2\)\nBuild summary: 0 succeeded, 1 failed\n/)
+  assert.match(unstartedBuild.stderr, /^  link     failed: /m)
+  assert.match(unstartedBuild.stderr, /^Failed tested in /m)
   // A single-file test without a manifest is refused as a single-file build is.
   // The build directory has a manifest, so the manifest-less source lives in its own directory.
   const unpackaged = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-unpackaged-' })
@@ -795,13 +799,13 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(released.status, 0, released.stderr)
-  assert.match(released.stdout, /Build summary: 1 succeeded, 0 failed/)
-  // Each compilation names its source and artifact relative to the project, as `silk build` does.
+  // Each compilation names its artifact relative to the project; standard output stays empty.
+  assert.equal(released.stdout, '')
+  assert.match(released.stderr, new RegExp(`^Compiling greeting \\(${hostTarget}, release\\)\n`))
+  assert.match(released.stderr, /^  codegen  [1-9][0-9,]* functions/m)
   assert.match(
-    released.stdout,
-    new RegExp(
-      `^Compiled src/main\\.silk -> build/llvm/${hostTarget}/release/greeting \\(llvm, ${hostTarget}, [1-9][0-9]* symbols\\)\n`,
-    ),
+    released.stderr,
+    new RegExp(`^Finished build/llvm/${hostTarget}/release/greeting in [0-9.ms ]+s\n$`, 'm'),
   )
   assert.equal(
     yield* fs.exists(join(directory, 'greeting/build/llvm', hostTarget, 'release/greeting')),
