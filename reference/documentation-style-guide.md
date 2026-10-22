@@ -84,11 +84,48 @@ its public contract. This requirement includes:
 A module comment does not replace a member comment. A type comment does not replace a field or
 operation comment. Put each `///` block directly before its documented item.
 
-Write each public comment for a reader who can see only that comment and its example. Do not require
-the reader to open the module comment, type comment, or another member comment.
+## Each item carries its own description
 
-A link can provide more information. A link cannot contain required information. Repeat each
-precondition, failure mode, ownership rule, and safety rule that controls correct use.
+Editors show only the comment of the item under the cursor. Hover, completion, and signature help
+never show the module comment. Thus the description of an item must be in the comment of that item.
+
+- Put the purpose, selection rule, behavior, errors, and gotchas of a type, service, interface,
+  function, constant, field, or operation in its own `///` comment.
+- Use the `//!` module comment for an overview: the shared model, how the items work together, and
+  how to select this module. The module comment can repeat facts from item comments. It must not be
+  the only location of a fact that a user of an item needs.
+- When a module comment states a fact about one item, also state that fact in the comment of the
+  item.
+
+For example, if the module comment of `silk.box` says that a long chain of boxes uses one stack
+frame for each link, the `Box` comment and the `Box.into` comment must also say it.
+
+## Each comment is self-sufficient
+
+Write each comment for a reader who can see only that comment and its example. The reader has not
+seen the module comment, the type comment, or the comment of another item. Do not require the reader
+to open them.
+
+- Do not write “see above”, “see below”, “as described in the module documentation”, or “see the
+  type comment” instead of the facts.
+- Do not write “like [`other`]”, “the same as [`other`]”, or “the rules are the same as for
+  [`other`]” as the only statement of a behavior. State the behavior. Then you can add the link.
+- A link can provide more information. A link cannot contain required information. Repeat each
+  precondition, failure mode, ownership rule, and safety rule that controls correct use.
+- Repetition between related comments is correct. Each comment must be complete for its own item.
+
+Weak:
+
+```silk,ignore
+/// Like [`park`], but returns after `timeout` nanoseconds without a token.
+```
+
+Good:
+
+```silk,ignore
+/// Consumes a waiting token, or sleeps until a token arrives or `timeout` nanoseconds pass.
+/// Returns `true` if it consumed a token, or `false` if the time passed first.
+```
 
 Internal members can use shorter comments. Document the reason for a helper, an invariant, or a
 non-obvious constraint. Do not add a teaching comment to a trivial private operation.
@@ -593,6 +630,8 @@ Reject or revise a comment that:
 - omits documentation from a public member;
 - translates only the declaration into prose;
 - requires another comment to make the summary understandable;
+- refers the reader to another comment (“see above”, “like [`other`]”) instead of stating the facts;
+- leaves a fact about an item only in the module comment;
 - includes each optional heading without useful content;
 - does not comply with ASD-STE100;
 - describes an API as safe without a precise safety boundary;
@@ -636,6 +675,8 @@ publication.
 - [ ] The summary is one short, standalone paragraph.
 - [ ] Each public module starts with a complete `//!` header.
 - [ ] Each public member has its own doc comment.
+- [ ] Each fact that the module comment states about an item is also in the comment of that item.
+- [ ] Each comment is complete without the module comment or another item comment.
 - [ ] The comment explains the contract and does not restate the signature.
 - [ ] Optional sections are useful and use the standard order.
 - [ ] `# When to use` gives selection guidance.
