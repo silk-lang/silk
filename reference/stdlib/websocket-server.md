@@ -216,7 +216,7 @@ effect<'call> fn handleRequest<
   ? &mut Allocator | &mut MonotonicClock {
   let outcome = run withUpgrade<i32, UpgradeError, WebSocketError>(
     move request,
-    Limits.default(),
+    Limits.defaults(),
     Option<Instant>.none(),
     AcceptAll {},
     useChannel,
