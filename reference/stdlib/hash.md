@@ -154,6 +154,11 @@ The seed of a hash collection. Different seeds give different hashes and bucket 
 The same seed, keys, and operations give the same bucket order on each supported target. A seed
 does not use addresses, clocks, or random state. Make one with [`Hash.seed`](#Hash.impl.seed).
 
+### Gotchas
+
+The hash is deterministic. A seed does not protect against inputs that an attacker selects to
+make collisions.
+
 <a id="HashSeed.value"></a>
 
 ### Field `value`
@@ -182,6 +187,12 @@ pub interface HashKey
 
 The interface of a key type for `HashMap` and `HashSet`: an equality test and a seeded hash.
 
+### When to use
+
+Implement it for a type that is a key of a `HashMap` or an element of a `HashSet`. In the
+`hash` member, use [`Hash.mix`](#Hash.impl.mix) for the first integer field and [`Hash.combine`](#Hash.impl.combine) for each other
+field that `equals` compares. Use [`Word`](#Word) as a ready-made key for one `u64`.
+
 ### Details
 
 A conformance gives two members: `equals(left: &Self, right: &Self) -> bool` and `hash(value:
@@ -193,6 +204,9 @@ own seed.
 If `equals` returns `true` for two keys, `hash` must return the same value for both, for each
 seed. A collection cannot check this rule. If the rule is broken, a key in the collection can
 become impossible to find.
+
+The hash is deterministic. It does not protect against inputs that an attacker selects to make
+collisions.
 
 <a id="HashKey.equals"></a>
 

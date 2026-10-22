@@ -124,6 +124,30 @@ pub struct NativeHttp<'config>
 A native HTTP client. It holds the defaults for all requests: the base URL, headers, limits,
 and trust.
 
+### When to use
+
+Give it one time, near `main`, with `Effect.provideMut<Http>(&mut http)`. All code that
+requires `? &mut Http` then sends real requests over sockets and TLS.
+
+### Details
+
+The provider has its own clocks, random source, and trust store, so you give only an
+allocator. The defaults are a deadline of 30 seconds for each request, a response body of at
+most 16 MiB, up to 10 redirects, and the PEM bundle of the platform for HTTPS:
+`/etc/ssl/cert.pem` on macOS and `/etc/ssl/certs/ca-certificates.crt` on Linux. Each request
+opens a new HTTP/1.1 connection and sends `Accept-Encoding: identity`, so the body arrives as
+the server sent it.
+
+Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
+sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
+from HTTPS to HTTP fails. A redirect to another origin does not send `Authorization` and
+`Cookie`.
+
+### Gotchas
+
+The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the
+TCP connect. The macOS keychain is not used, only the PEM bundle.
+
 <a id="NativeHttp.impl"></a>
 
 ## Implementation `NativeHttp<'config>`
@@ -142,6 +166,13 @@ pub fn make() -> NativeHttp<'config>
 
 Returns a client with the default limits and the PEM bundle of the platform. It reads
 nothing yet.
+
+#### Details
+
+The defaults are a deadline of 30 seconds for each request, a response body of at most 16
+MiB, up to 10 redirects, and the PEM bundle `/etc/ssl/cert.pem` on macOS or
+`/etc/ssl/certs/ca-certificates.crt` on Linux. Use [`NativeHttp.fromEnvironment`](#NativeHttp.impl.fromEnvironment) to honor
+`SSL_CERT_FILE`.
 
 <a id="NativeHttp.impl.fromEnvironment"></a>
 

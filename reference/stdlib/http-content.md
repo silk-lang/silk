@@ -789,7 +789,8 @@ The reader had already failed or stopped.
 pub struct ContentError<'head>
 ```
 
-The error from content decoding, with the byte counts so far.
+The error from content decoding, with the reason and the byte counts so far. A coding error
+tells where the coding is in `Content-Encoding`.
 
 <a id="ContentError.reason"></a>
 
@@ -1198,6 +1199,13 @@ pub struct CodingPlan<'head, 'method, 'names>
 
 A checked plan to decode one response body. Use it one time.
 
+### Details
+
+With `Mode.Raw`, the body is returned as it was sent. With `Mode.Decode`, the codings in
+`Content-Encoding` (gzip, deflate, and Zstandard) are decoded in reverse order. A response can
+have at most four codings. [`CodingPlan.make`](#CodingPlan.impl.make) checks all limits and memory before the body is
+read.
+
 <a id="CodingPlan.impl"></a>
 
 ## Implementation `CodingPlan<'head, 'method, 'names>`
@@ -1462,7 +1470,12 @@ Decodes a body from wire bytes that you give, without I/O.
 
 ### Details
 The decoder owns its state. Bytes that `step` does not use, such as the next HTTP message, stay
-with you.
+with you. The decoder also removes the body framing, so give it the bytes after the head.
+
+### Gotchas
+Decoded bytes are not final until the state is `End`. A later checksum, trailer, or framing
+error can still fail. A step can return no bytes, so call it again until the state is `End`. It
+does not check that the body belongs to the head. `silk.http_exchange` does.
 
 <a id="DecodeProgress"></a>
 
@@ -1724,6 +1737,11 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
 ```
 
 Gives a [`ContentReader`](#ContentReader) for the body in `body` to `callback`, with the decoders of `plan`.
+
+### Gotchas
+
+Decoded bytes are not final until the body ends. A later checksum, trailer, or framing error can
+still fail.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

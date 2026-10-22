@@ -886,7 +886,28 @@ The original zero-based index of the first matching SAN.
 pub struct HttpsIdentity
 ```
 
-Pure HTTPS DNS-ID and IP-ID reference construction and verification.
+Checks that a server certificate is for the host name or IP address in an HTTPS URL (RFC 6125
+and RFC 9110).
+
+### When to use
+
+After certificate path validation succeeds, call [`HttpsIdentity.reference`](#HttpsIdentity.impl.reference) with the host of
+the URL, and then [`HttpsIdentity.verify`](#HttpsIdentity.impl.verify) with the subject alternative names of the leaf
+certificate. `silk.tls_client` does this for you.
+
+### Details
+
+DNS names compare without regard to ASCII case. A wildcard is allowed only as the full leftmost
+label of a certificate name, and it matches exactly one label: `*.example.com` matches
+`api.example.com`, but not `example.com` or `a.b.example.com`. An IP address matches only an IP
+SAN with the same bytes. Nothing allocates.
+
+### Gotchas
+
+Use the host from the URL, before DNS resolution. Never use a resolved address or a CNAME
+target. The common name (CN) is never used. Names with a trailing dot and Unicode names are
+rejected: convert an internationalized name to its `xn--` form first. A match does not prove
+that the chain is trusted.
 
 <a id="OriginHost.impl.Copy"></a>
 
@@ -1061,7 +1082,7 @@ does not match its IPv6-mapped form.
 
 #### Gotchas
 One SAN that is not valid fails the call, also when an earlier SAN matches. A match does not
-check the chain, the dates, or the TLS handshake.
+check the chain, the dates, or the TLS handshake. The common name (CN) is never used.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

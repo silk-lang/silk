@@ -7,18 +7,15 @@ and run cleanup.
 
 ## When to use
 An `Effect<A ! E ? R>` is a computation that can succeed with `A`, fail with a typed value `E`,
-and
-needs the providers `R`. Use [`map`](#Effect.impl.map) and [`flatMap`](#Effect.impl.flatMap) to continue after success. Use
-[`mapError`](#Effect.impl.mapError),
-[`catch`](#Effect.impl.catch), or [`catchAll`](#Effect.impl.catchAll) for typed failures. Use [`provide`](#Effect.impl.provide) or [`provideMut`](#Effect.impl.provideMut) to supply a
-service, and [`ensuring`](#Effect.impl.ensuring) for cleanup. For plain sequential code, direct `run` statements are
-often clearer than combinators.
+and needs the providers `R`. Use [`map`](#Effect.impl.map) and [`flatMap`](#Effect.impl.flatMap) to continue after success. Use
+[`mapError`](#Effect.impl.mapError), [`catch`](#Effect.impl.catch), or [`catchAll`](#Effect.impl.catchAll) for typed failures. Use [`provide`](#Effect.impl.provide) or [`provideMut`](#Effect.impl.provideMut)
+to supply a service, and [`ensuring`](#Effect.impl.ensuring) for cleanup. For plain sequential code, direct `run`
+statements are often clearer than combinators.
 
 ## Details
 Combinators are lazy. When code passes an effect to a combinator, the effect does not run. Most
 combinators take a `once Effect`, so that value runs at most one time. [`retry`](#Effect.impl.retry) takes a
-reusable
-effect because it can run the effect more than one time.
+reusable effect because it can run the effect more than one time.
 
 Sequential combinators stop at the first typed failure, unless a recovery operation handles it.
 The signatures show how the channels combine. Two steps usually give the unions `! E | F` and
@@ -336,14 +333,13 @@ Runs `protected` one time and returns its outcome as a [`Result`](./result.md#Re
 #### When to use
 
 Use `result` when the caller must keep, inspect, or store a failure as data, instead of
-letting it
-propagate. Use [`catchAll`](#Effect.impl.catchAll) when the caller only needs to recover to a success value.
+letting it propagate. Use [`catchAll`](#Effect.impl.catchAll) when the caller only needs to recover to a success
+value.
 
 #### Details
 
 The output effect has no typed failures. A success becomes `Result.Success` and a typed
-failure
-becomes `Result.Failure`. The output effect still needs the providers `R`.
+failure becomes `Result.Failure`. The output effect still needs the providers `R`.
 
 #### Gotchas
 
@@ -396,8 +392,7 @@ Runs `self` and transforms its success with `onSuccess` or its typed failure wit
 #### Details
 
 One callback runs, after `self` completes. `onSuccess` changes `A` to `B`. `onFailure` changes
-`E`
-to `F`, and the output effect fails with that `F`. The providers `R` stay required. A trap
+`E` to `F`, and the output effect fails with that `F`. The providers `R` stay required. A trap
 bypasses both callbacks.
 
 When diagnostic observation is active, the new failure keeps the original failure as its
@@ -419,8 +414,7 @@ Runs `self` and returns `onSuccess(value)` for its success value.
 #### When to use
 
 Use `map` when the next step is a plain function that cannot fail. Use [`flatMap`](#Effect.impl.flatMap) when the
-next
-step is an effect.
+next step is an effect.
 
 #### Details
 
@@ -443,14 +437,12 @@ Runs `self` and, if it fails, changes the typed failure with `onFailure`.
 #### When to use
 
 Use `mapError` to convert a failure into the failure type of the caller, or to add context to
-a
-failure. The output still fails. Use [`catchAll`](#Effect.impl.catchAll) to recover to a success.
+a failure. The output still fails. Use [`catchAll`](#Effect.impl.catchAll) to recover to a success.
 
 #### Details
 
 `onFailure` runs one time, only if `self` fails. Its result is the new failure. A success does
-not
-change. The new failure keeps the original failure as its diagnostic cause.
+not change. The new failure keeps the original failure as its diagnostic cause.
 
 <a id="Effect.impl.flatMap"></a>
 
@@ -468,8 +460,7 @@ Runs `self` and then runs the effect that `onSuccess` returns for the success va
 #### When to use
 
 Use `flatMap` to chain effects in a pipeline. Use direct `run` statements when named
-intermediate
-values make the code clearer.
+intermediate values make the code clearer.
 
 #### Details
 
@@ -478,8 +469,7 @@ and the providers of both steps (`R | S`). The success of the second effect is t
 success.
 
 The success value stays valid while the second effect runs and while it cleans up, also when
-it
-suspends or is cancelled. The output effect cannot escape the call scope.
+it suspends or is cancelled. The output effect cannot escape the call scope.
 
 <a id="Effect.impl.flatten"></a>
 
@@ -515,8 +505,7 @@ Runs `self` and then `other`, and returns both success values as a [`Pair`](#Pai
 #### Details
 
 The effects run in order, not in parallel. If `self` fails, `other` does not run. The output
-has
-the failures and providers of both effects. Read the values from `Pair.first` and
+has the failures and providers of both effects. Read the values from `Pair.first` and
 `Pair.second`.
 
 <a id="Effect.impl.zip3"></a>
@@ -536,8 +525,7 @@ Runs three effects in order and returns the three success values as a [`Triple`]
 #### Details
 
 The effects run from left to right, not in parallel. If one effect fails, the later effects do
-not
-run. The output has the failures and providers of all three effects.
+not run. The output has the failures and providers of all three effects.
 
 <a id="Effect.impl.tap"></a>
 
@@ -551,20 +539,17 @@ pub effect fn tap<'env, A, E, F, ?R, ?S>(
 ```
 
 Runs `self` and then runs the effect that `callback` returns. The success of that effect is
-the
-output success.
+the output success.
 
 #### When to use
 
 Use `tap` to do an effectful action with a value, such as a log message, and then continue
-with
-the value. The callback must return the value again.
+with the value. The callback must return the value again.
 
 #### Details
 
 `callback` receives the success value by move. It must produce a value of the same type `A`.
-If
-`self` fails, `callback` does not run. A failure of either step propagates.
+If `self` fails, `callback` does not run. A failure of either step propagates.
 
 <a id="Effect.impl.catchAll"></a>
 
@@ -582,19 +567,17 @@ Runs `self` and, if it fails, runs the effect that `onFailure` returns for the f
 #### When to use
 
 Use `catchAll` to recover from every typed failure of `self`. Use [`catch`](#Effect.impl.catch) to recover from
-one
-failure type and let the other failure types propagate.
+one failure type and let the other failure types propagate.
 
 #### Details
 
 `onFailure` runs one time, only if `self` fails, and receives the complete failure value. The
 output has no failures of `self`. It can fail only with the failures `F` of the recovery
-effect. A
-success of `self` bypasses `onFailure`. The output needs the providers of both paths.
+effect. A success of `self` bypasses `onFailure`. The output needs the providers of both
+paths.
 
 The failure value stays valid while the recovery effect runs and cleans up, also when it
-suspends
-or is cancelled.
+suspends or is cancelled.
 
 #### Gotchas
 
@@ -623,12 +606,9 @@ Use `catch` to recover from one failure type and let the other failures propagat
 #### Details
 
 Write the selected type as the first type argument, as in `Effect.catch<NotFound>(load(),
-handler)`.
-`S` must be one member of the failure union `E`. `onFailure` runs one time, only for a failure
-of
-type `S`. Other failures propagate unchanged, as `Without<E, S>`. The failures `F` of the
-recovery
-effect join the output. A success bypasses `onFailure`.
+handler)`. `S` must be one member of the failure union `E`. `onFailure` runs one time, only
+for a failure of type `S`. Other failures propagate unchanged, as `Without<E, S>`. The
+failures `F` of the recovery effect join the output. A success bypasses `onFailure`.
 
 #### Gotchas
 
@@ -646,14 +626,12 @@ pub effect fn ensuring<'env, A, E, ?R, ?S>(
 ```
 
 Runs `self` and then runs `finalizer`, for a success and for a typed failure. The outcome of
-`self`
-does not change.
+`self` does not change.
 
 #### When to use
 
 Use `ensuring` to release a resource or to record the end of an operation, whatever the
-outcome.
-Use [`ensuringNonParking`](#Effect.impl.ensuringNonParking) when cancellation must also run the finalizer.
+outcome. Use [`ensuringNonParking`](#Effect.impl.ensuringNonParking) when cancellation must also run the finalizer.
 
 #### Details
 
@@ -691,8 +669,7 @@ pub effect fn ensuringNonParking<
 ```
 
 Runs `self` and then runs `finalizer` on each exit: success, typed failure, and cancellation.
-The
-outcome of `self` does not change.
+The outcome of `self` does not change.
 
 #### When to use
 
@@ -703,14 +680,12 @@ Use this function when cancellation of a parked execution must release a scoped 
 
 The finalizer runs one time after success or typed failure, and also when an owner cancels a
 parked `Execution`. The providers stay valid until the finalizer completes. Nested finalizers
-run
-in reverse order.
+run in reverse order.
 
 #### Gotchas
 
 `finalizer` must be `Intrinsic.NonParking`, so it cannot suspend. It cannot fail (`! never`).
-A
-trap bypasses the finalizer and all `Drop` hooks.
+A trap bypasses the finalizer and all `Drop` hooks.
 
 <a id="Effect.impl.useReleaseNonParking"></a>
 
@@ -747,15 +722,13 @@ cancellation must release the resource before the frame is destroyed.
 #### Details
 
 The borrow for `use` ends before `release` starts. `release` runs one time. Nested calls
-release in
-reverse order. The outcome of `use` does not change.
+release in reverse order. The outcome of `use` does not change.
 
 #### Gotchas
 
 The effect that `release` returns must be `Intrinsic.NonParking` and cannot fail (`! never`).
 Recover a cleanup failure before you return the effect. A trap bypasses `release` and all
-`Drop`
-hooks.
+`Drop` hooks.
 
 <a id="Effect.impl.ifThenElse"></a>
 
@@ -775,16 +748,14 @@ Runs the effect of `onTrue` if `condition` is `true`, or the effect of `onFalse`
 #### When to use
 
 Use `ifThenElse` to select one of two effects in a pipeline. Use an `if` statement with `run`
-in
-plain sequential code.
+in plain sequential code.
 
 #### Details
 
 Each branch is a function that makes its effect. Only the selected function runs, so the other
 effect is never made. Code that is valid only under the condition is safe in its branch. The
 output has the failures and providers of both branches. Both branches must have the same
-success
-type.
+success type.
 
 The name is not `if` because `if` is a keyword.
 
@@ -804,9 +775,8 @@ Runs `self` and, after each typed failure, runs it again, at most `retries` more
 #### Details
 
 A success stops the attempts. If each attempt fails, the last failure propagates. Earlier
-failure
-values are dropped. A `retries` of 0 gives one attempt. `self` must be a reusable effect
-(`mut Effect`).
+failure values are dropped. A `retries` of 0 gives one attempt. `self` must be a reusable
+effect (`mut Effect`).
 
 #### Gotchas
 
@@ -835,8 +805,8 @@ Use [`provide`](#Effect.impl.provide), which has the same behavior. This name sh
 
 Write the selected requirement as the first type argument when the selection is not unique. A
 shared provider can satisfy only a shared requirement. The output does not need that
-requirement.
-The borrow ends when the effect completes, and the caller keeps ownership of `provider`.
+requirement. The borrow ends when the effect completes, and the caller keeps ownership of
+`provider`.
 
 <a id="Effect.impl.bindRequirementMut"></a>
 
@@ -859,9 +829,8 @@ Use [`provideMut`](#Effect.impl.provideMut) in ordinary code. It has the same be
 #### Details
 
 An exclusive provider can satisfy a shared or an exclusive requirement. The output does not
-need
-the exact requirement that was selected. For example, `&mut P` for a shared `&Logger` removes
-`&Logger`. The caller gets exclusive access back when the effect completes.
+need the exact requirement that was selected. For example, `&mut P` for a shared `&Logger`
+removes `&Logger`. The caller gets exclusive access back when the effect completes.
 
 <a id="Effect.impl.bindRequirementOwned"></a>
 
@@ -880,16 +849,13 @@ Satisfies one requirement of `self` with `provider`, which moves into the output
 #### When to use
 
 Use this function when the provider must live as long as the effect, for example when the
-caller
-returns the effect.
+caller returns the effect.
 
 #### Details
 
 An owned provider can satisfy a shared or an exclusive requirement. If `provider` is affine,
-the
-output effect can run one time. If `provider` is `Copy`, the effect keeps a copy and can run
-again.
-The provider is dropped with the effect. It is not returned.
+the output effect can run one time. If `provider` is `Copy`, the effect keeps a copy and can
+run again. The provider is dropped with the effect. It is not returned.
 
 <a id="Effect.impl.provide"></a>
 
@@ -908,8 +874,7 @@ Satisfies one shared requirement of `self` with a shared borrow of `provider`.
 #### When to use
 
 Use `provide` for a service that the computation only reads, such as a clock or a
-configuration.
-Use [`provideMut`](#Effect.impl.provideMut) when the service changes state.
+configuration. Use [`provideMut`](#Effect.impl.provideMut) when the service changes state.
 
 #### Details
 
@@ -939,17 +904,14 @@ Satisfies one requirement of `self` with an exclusive borrow of `provider`.
 #### When to use
 
 Use `provideMut` for a service that changes state, such as an allocator, a logger, or a
-counter.
-Use [`provide`](#Effect.impl.provide) for a read-only service.
+counter. Use [`provide`](#Effect.impl.provide) for a read-only service.
 
 #### Details
 
 The compiler selects the requirement by provider identity or by one unique service
-conformance.
-The order of requirements in the type is never used for selection. The output does not need
-the
-selected requirement. `provider` does not move, and the caller gets exclusive access back when
-the effect completes.
+conformance. The order of requirements in the type is never used for selection. The output
+does not need the selected requirement. `provider` does not move, and the caller gets
+exclusive access back when the effect completes.
 
 #### Gotchas
 
@@ -1013,16 +975,14 @@ provider.
 #### When to use
 
 Use `provideEffect` when the provider itself must be made by an effect, such as a connection
-that
-needs an allocator.
+that needs an allocator.
 
 #### Details
 
 `acquire` runs each time the output effect runs. Thus a [`retry`](#Effect.impl.retry) of the output makes a new
 provider for each attempt. The provider is dropped before the caller sees the outcome of
-`self`.
-The output needs the providers `Q` of `acquire`, and each requirement of `self` except the
-selected one.
+`self`. The output needs the providers `Q` of `acquire`, and each requirement of `self` except
+the selected one.
 
 #### Errors
 
@@ -1044,14 +1004,12 @@ Runs `deferred` through the stack-safe effect executor. The channels do not chan
 #### When to use
 
 Use `suspend` at a recursive or deeply chained boundary, so that deep recursion does not use
-the
-native call stack. Laziness alone does not need `suspend`.
+the native call stack. Laziness alone does not need `suspend`.
 
 #### Details
 
 `suspend` adds no allocator requirement and no allocation failure. The frames are on the
-execution
-stack of the compiler.
+execution stack of the compiler.
 
 #### Gotchas
 
@@ -1070,8 +1028,7 @@ Returns an effect that succeeds with `value` when it runs.
 #### Details
 
 The call evaluates `value` immediately and moves it into the effect. The effect has no
-failures
-and needs no providers. If `value` is affine, the effect can run one time.
+failures and needs no providers. If `value` is affine, the effect can run one time.
 
 <a id="Effect.impl.sleep"></a>
 
@@ -1086,14 +1043,12 @@ Waits `howLong` nanoseconds on the timeline of the active `MonotonicClock` provi
 #### Details
 
 The provider decides how to wait. A native provider blocks the thread. A test provider can
-advance
-virtual time.
+advance virtual time.
 
 #### Gotchas
 
 A duration of 0 returns without a wait. If the deadline is more than the clock can represent,
-the
-program traps.
+the program traps.
 
 <a id="Pair"></a>
 

@@ -198,6 +198,17 @@ pub union RequestTarget<'text>
 
 The target of a request, in one of its four forms.
 
+### Details
+
+Origin form is a path and query, such as `/search?q=silk`. Absolute form is a full URI, used
+with proxies. Authority form is `host:port`, used only with `CONNECT`. Asterisk form is `*`,
+used only with `OPTIONS`. Parsing keeps the spelling and the percent escapes of the input.
+
+### Gotchas
+
+A received target with a fragment (`#...`) fails. [`RequestTarget.fromUri`](#RequestTarget.impl.fromUri) drops the fragment
+of a URI, because a fragment is never sent.
+
 <a id="RequestTarget.Origin"></a>
 
 ### `Origin`

@@ -719,6 +719,15 @@ pub service Resolver
 
 The service that looks up domain names. [`Resolver.resolve`](#Resolver.impl.resolve) calls it only for domain names.
 
+### When to use
+Require `&mut Resolver` in code that connects by name, and call [`Resolver.resolve`](#Resolver.impl.resolve). Provide
+`silk.native_resolver.NativeSystemResolver` in a native program, or your own provider, for
+example in tests.
+
+### Gotchas
+For a domain name, the provider decides how to use the deadline. `NativeSystemResolver` cannot
+stop a lookup, so it returns `DeadlineUnsupported` for a domain request with a deadline.
+
 <a id="Resolver.resolveDomain"></a>
 
 ### Operation `resolveDomain`
@@ -756,7 +765,20 @@ pub effect fn resolve(request: &ResolveRequest) -> ResolvedEndpoints
 Returns the endpoints for `request`.
 
 A numeric host gives one endpoint, without the provider. A domain name calls
-[`Resolver.resolveDomain`](#Resolver.resolveDomain) on the provider.
+[`Resolver.resolveDomain`](#Resolver.resolveDomain) on the provider. The result keeps the order of the provider,
+removes exact duplicates, and keeps only the addresses of the [`FamilySelection`](#FamilySelection). It holds at
+most the `maxResults` of the request, and never more than 64.
+
+#### Errors
+- `NoAddress` if no address of the selected family remains.
+- `LimitExceeded` if there are more distinct endpoints than `maxResults`. The result is never
+  cut short.
+- `Timeout` if the deadline of a numeric request has passed.
+- Other [`ResolverError`](#ResolverError) values come from the provider.
+- `OutOfMemoryError` if the `Allocator` cannot supply the result.
+
+#### Gotchas
+`maxResults` limits only the result, not the work of the provider.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -47,6 +47,9 @@ pub struct FileHandle
 
 An open file. It owns its descriptor, and closes it one time.
 
+Close it with [`NativeFileSystem.closeFile`](#NativeFileSystem.impl.closeFile) to get a close error. A drop also closes it, and
+keeps an earlier error.
+
 <a id="DirectoryHandle"></a>
 
 ## `DirectoryHandle`
@@ -56,6 +59,9 @@ pub struct DirectoryHandle
 ```
 
 An open directory stream. It keeps a name that did not fit in the output, for the next call.
+
+It owns one open descriptor. Close it with [`NativeFileSystem.closeDirectory`](#NativeFileSystem.impl.closeDirectory) to get a close
+error. A drop also closes it, and keeps an earlier error.
 
 <a id="DirectoryHandle.impl.Drop"></a>
 
@@ -82,6 +88,19 @@ pub struct NativeFileSystem
 ```
 
 The file system functions. Each takes the root directory and a normalized path below it.
+
+### When to use
+`silk.os_filesystem` uses it. Application code uses the `FileSystem` effect from
+`silk.filesystem` instead.
+
+### Details
+Each operation starts at the root directory and opens each part of the path relative to its
+parent, without following symbolic links. So a path cannot leave the root. Each operation fails
+with `FileError`, with a portable reason and the native error code.
+
+### Gotchas
+- A call that a signal interrupts is made again, except `close`, which is never repeated.
+- The functions exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 <a id="NativeFileSystem.impl"></a>
 

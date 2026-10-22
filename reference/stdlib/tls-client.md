@@ -255,7 +255,8 @@ Returns the default policy, which sends no ALPN extension.
 pub struct ClientLimits
 ```
 
-Inclusive local resource policy for one client connection.
+Inclusive local resource policy for one client connection. The limits bound all memory and work
+of the client.
 
 <a id="ClientLimits.handshakeBodyBytes"></a>
 
@@ -491,7 +492,7 @@ Finite connection limits and nested certificate policies.
 pub enum Demand
 ```
 
-The next action or observable connection event.
+The next action or observable connection event of a [`Client`](#Client), in [`Progress.demand`](#Progress.demand).
 
 <a id="Demand.NeedInput"></a>
 
@@ -561,7 +562,8 @@ Both directions closed cleanly and no output remains.
 pub struct Progress
 ```
 
-Exact progress from one client driver operation.
+Exact progress from one [`Client`](#Client) operation: how many bytes it took or wrote, and the next
+[`Demand`](#Demand).
 
 <a id="Progress.consumed"></a>
 
@@ -1111,7 +1113,8 @@ The exact primitive failure.
 pub union TlsError
 ```
 
-A typed TLS client failure.
+A typed TLS client failure: an alert from the server, a protocol error, a certificate that
+fails, a limit, or a call in the wrong state. An error is permanent for the client.
 
 <a id="TlsError.PeerAlert"></a>
 
@@ -1479,8 +1482,26 @@ pub struct Client
 
 A TLS 1.3 client state machine that does no I/O.
 
-You move bytes between it and the transport. Each operation returns a [`Progress`](#Progress) with a `next`
-`Action` that tells you what to do next.
+### When to use
+Most programs use `silk.tls_connection`, which drives this client over a `ByteDuplex`. Use it
+directly when you need full control of the transport, for example in an event loop. Make it
+with [`Client.make`](#Client.impl.make), then move bytes between it and the transport until it reports
+`Authenticated`, and then read and write application data.
+
+### Details
+Each operation returns a [`Progress`](#Progress) with a [`Demand`](#Demand) that tells you what to do next. Output
+works in two steps: write [`Client.pendingOutput`](#Client.impl.pendingOutput) to the transport, and then call
+[`Client.ackWritten`](#Client.impl.ackWritten) with the number of bytes written. The client does not keep your buffers.
+[`ClientLimits`](#ClientLimits) bound all memory and work.
+
+It supports TLS 1.3 only, with the cipher suites ChaCha20-Poly1305, AES-128-GCM, and
+AES-256-GCM, and the key exchange groups X25519 and P-256. It checks the certificate chain
+against your `TrustSnapshot`, the host name of your `ReferenceIdentity`, the CertificateVerify
+signature, and the Finished message. It gives no application data before all checks pass.
+
+### Gotchas
+A [`TlsError`](#TlsError) is permanent for the client. Dropping the client does not send `close_notify`.
+Call [`Client.closeWrite`](#Client.impl.closeWrite) first. Secrets are not erased.
 
 <a id="Client.impl"></a>
 

@@ -96,7 +96,25 @@ The maximum output length: 8160 for SHA-256 and 12240 for SHA-384.
 pub struct HkdfSha256
 ```
 
-HKDF with SHA-256 as the hash. The PRK is 32 bytes and the output is at most 8160 bytes.
+HKDF with SHA-256 as the hash (RFC 5869). The PRK is 32 bytes and the output is at most 8160
+bytes.
+
+### When to use
+
+Use it to turn a shared secret, such as the result of an X25519 key exchange, into one or more
+keys of the length that you need. Give each key a different `info` label so that the keys are
+independent.
+
+### Details
+
+HKDF has two steps. `extract` mixes the input key material with a salt and returns a
+pseudorandom key (PRK). `expand` turns the PRK and an `info` label into output of any length up
+to 8160 bytes. Nothing allocates.
+
+### Gotchas
+
+HKDF is not for passwords. A password needs a slow function such as Argon2 or scrypt. The PRK is
+a secret and is not erased.
 
 <a id="HkdfSha256.impl"></a>
 
@@ -147,7 +165,25 @@ same bytes, and a shorter output is a prefix of a longer one.
 pub struct HkdfSha384
 ```
 
-HKDF with SHA-384 as the hash. The PRK is 48 bytes and the output is at most 12240 bytes.
+HKDF with SHA-384 as the hash (RFC 5869). The PRK is 48 bytes and the output is at most 12240
+bytes.
+
+### When to use
+
+Use it to turn a shared secret, such as the result of an X25519 key exchange, into one or more
+keys of the length that you need. Give each key a different `info` label so that the keys are
+independent.
+
+### Details
+
+HKDF has two steps. `extract` mixes the input key material with a salt and returns a
+pseudorandom key (PRK). `expand` turns the PRK and an `info` label into output of any length up
+to 12240 bytes. Nothing allocates.
+
+### Gotchas
+
+HKDF is not for passwords. A password needs a slow function such as Argon2 or scrypt. The PRK is
+a secret and is not erased.
 
 <a id="HkdfSha384.impl"></a>
 

@@ -136,6 +136,21 @@ pub struct RsaPublicKey
 An RSA public key with a 2048 to 4096-bit modulus and the exponent 65537. It owns a copy of the
 modulus.
 
+### When to use
+Use [`RsaPublicKey.verifyPss`](#RsaPublicKey.impl.verifyPss) to verify an RSA-PSS signature, for example a JSON Web Token with
+`PS256`. Use [`RsaPublicKey.verifyCertificate`](#RsaPublicKey.impl.verifyCertificate) to verify the signature of an X.509
+certificate. It cannot sign, encrypt, or decrypt.
+
+### Details
+Make one from its parts with [`RsaPublicKey.fromComponents`](#RsaPublicKey.impl.fromComponents), or from a certificate with
+[`RsaPublicKey.fromCertificateKey`](#RsaPublicKey.impl.fromCertificateKey). The functions hash the message, so give the message, not
+its digest.
+
+### Gotchas
+A valid signature proves only that the holder of the private key signed the message. It does
+not prove that you can trust the key. To check a certificate chain, use the `silk.trust_*`
+modules.
+
 <a id="RsaPublicKey.impl"></a>
 
 ## Implementation `RsaPublicKey`
@@ -233,7 +248,9 @@ profile of [`RsaPublicKey.verifyPss`](#RsaPublicKey.impl.verifyPss).
 #### Errors
 - `InvalidLength` if `unusedBits` is not 0.
 - `InvalidParameters` if the algorithm or its parameters are not supported.
-- The errors of [`RsaPublicKey.verifyPss`](#RsaPublicKey.impl.verifyPss).
+- `InvalidLength` if `signature` does not have the length of the modulus.
+- `MessageTooLong` if `message` is too long for SHA-256.
+- `InvalidSignature` if the signature does not match.
 
 #### Gotchas
 It checks only this one signature. It does not check the chain, the dates, or the names.

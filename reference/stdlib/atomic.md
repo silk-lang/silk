@@ -79,6 +79,12 @@ pub enum MemoryOrder
 
 The ordering constraint of one atomic operation.
 
+### Details
+
+The model is the C++20 model: an acquire load that reads a release store makes every write
+before that store visible after the load. The order is a static argument, so the operation and
+its ordering are fixed at compile time.
+
 <a id="MemoryOrder.Relaxed"></a>
 
 ### `Relaxed`
@@ -177,13 +183,28 @@ The value read instead of the expected one.
 pub struct Atomic
 ```
 
-The atomic operations over raw pointers.
+The atomic operations over raw pointers, with explicit memory orderings.
+
+### When to use
+
+Use these operations to build synchronization: counters, flags, lock words, and queues that
+several threads read and write at the same time. For most code, the types in `silk.sync` (`Arc`,
+`Mutex`, `Parker`) are easier and safer.
 
 ### Details
 
+Each operation is one indivisible access to a naturally aligned integer or data pointer.
 `T` is one of `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`, `i32`, `i64`, `isize`, or a data
 pointer for `load`, `store`, `swap`, and the compare-exchanges. The arithmetic and bitwise
 operations take integers only and wrap on overflow.
+
+### Gotchas
+
+- A plain access that races with any other access to the same location is undefined behavior,
+  also when the other access is atomic. Make every access to a shared location atomic, with the
+  same width.
+- All operations except [`Atomic.fence`](#Atomic.impl.fence) are unsafe. The caller proves that the pointer is live
+  and aligned.
 
 <a id="Atomic.impl"></a>
 
@@ -207,6 +228,8 @@ Reads the pointee atomically.
 
 The pointer must address live, initialized, naturally aligned storage for `T`. The order must
 be `Relaxed`, `Acquire`, or `SequentiallyConsistent`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.store"></a>
 
@@ -222,6 +245,8 @@ Writes `value` to the pointee atomically.
 
 The pointer must address live, naturally aligned, writable storage for `T`. The order must be
 `Relaxed`, `Release`, or `SequentiallyConsistent`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.swap"></a>
 
@@ -236,6 +261,8 @@ Replaces the pointee with `value` and returns the previous value.
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.compareExchange"></a>
 
@@ -254,6 +281,8 @@ must be `Relaxed`, `Acquire`, or `SequentiallyConsistent`.
 
 #### Safety
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.compareExchangeWeak"></a>
 
@@ -264,15 +293,22 @@ pub unsafe fn compareExchangeWeak<T: Copy>(pointer: *mut T, expected: T, desired
     static failure: MemoryOrder) -> CompareExchange<T>
 ```
 
-Like [`Atomic.compareExchange`](#Atomic.impl.compareExchange), but it can return `Observed` with a value equal to
-`expected`.
+Stores `desired` if the pointee equals `expected`. Otherwise it returns the value it read. It
+can also fail spuriously: return `Observed` with a value equal to `expected`.
+
+#### When to use
+Use it in a retry loop. Use [`Atomic.compareExchange`](#Atomic.impl.compareExchange) when one attempt must decide.
 
 #### Details
 This spurious failure lets a load-linked, store-conditional target use one attempt per call.
-Call it in a loop that retries on any observed value.
+Call it in a loop that retries on any observed value. `success` orders the exchange. `failure`
+orders the read when nothing is stored. `failure` must be `Relaxed`, `Acquire`, or
+`SequentiallyConsistent`.
 
 #### Safety
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.fetchAdd"></a>
 
@@ -287,6 +323,8 @@ Adds `value` to the pointee, wrapping on overflow, and returns the previous valu
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.fetchSubtract"></a>
 
@@ -301,6 +339,8 @@ Subtracts `value` from the pointee, wrapping on overflow, and returns the previo
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.fetchBitAnd"></a>
 
@@ -315,6 +355,8 @@ Stores the bitwise and of the pointee and `value`, and returns the previous valu
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.fetchBitOr"></a>
 
@@ -329,6 +371,8 @@ Stores the bitwise or of the pointee and `value`, and returns the previous value
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.fetchBitXor"></a>
 
@@ -343,6 +387,8 @@ Stores the bitwise exclusive or of the pointee and `value`, and returns the prev
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.fetchMinimum"></a>
 
@@ -357,6 +403,8 @@ Stores the smaller of the pointee and `value`, and returns the previous value.
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.fetchMaximum"></a>
 
@@ -371,6 +419,8 @@ Stores the larger of the pointee and `value`, and returns the previous value.
 #### Safety
 
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
+Every access to the same location that can happen at the same time must be atomic and have
+the same width.
 
 <a id="Atomic.impl.wait"></a>
 
@@ -390,6 +440,8 @@ The comparison and the sleep are one atomic step against [`Atomic.notifyOne`](#A
 `false` only when the timeout ended the wait. A `true` result tells nothing about the pointee,
 so check the condition again in a loop.
 
+It works on Darwin on aarch64, Linux with GNU libc on x86_64 or aarch64, and wasm32.
+
 #### Gotchas
 Single-threaded WebAssembly has no other thread to change the pointee. A wait that sleeps with
 no timeout traps, and a wait with a timeout returns `false` at once.
@@ -408,6 +460,12 @@ pub unsafe fn notifyOne(pointer: *const u32) -> ()
 
 Wakes at least one thread blocked in [`Atomic.wait`](#Atomic.impl.wait) on `pointer`, if any is.
 
+#### Details
+
+Store the new value before the notify. A waiter that has not yet slept sees the changed value
+and does not sleep, so the wakeup is never lost. It works on Darwin on aarch64, Linux with GNU
+libc on x86_64 or aarch64, and wasm32.
+
 #### Safety
 
 The pointer must address live, naturally aligned storage for a `u32`.
@@ -421,6 +479,12 @@ pub unsafe fn notifyAll(pointer: *const u32) -> ()
 ```
 
 Wakes every thread blocked in [`Atomic.wait`](#Atomic.impl.wait) on `pointer`.
+
+#### Details
+
+Store the new value before the notify. A waiter that has not yet slept sees the changed value
+and does not sleep, so the wakeup is never lost. It works on Darwin on aarch64, Linux with GNU
+libc on x86_64 or aarch64, and wasm32.
 
 #### Safety
 

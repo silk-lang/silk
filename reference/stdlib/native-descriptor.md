@@ -19,8 +19,8 @@ the system returned a count that is not valid.
 
 ## Gotchas
 - The caller keeps the descriptor open and controls access from other threads.
-- [`NativeDescriptor.writeAll`](#NativeDescriptor.impl.writeAll) and [`NativeDescriptor.writeAllGather`](#NativeDescriptor.impl.writeAllGather) can fail after part of the
-  bytes were written.
+- [`NativeDescriptor.writeAll`](#NativeDescriptor.impl.writeAll) and [`NativeDescriptor.writeAllGather`](#NativeDescriptor.impl.writeAllGather) can fail after part of
+  the bytes were written.
 - The module is empty on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
   or aarch64.
 
@@ -109,7 +109,22 @@ Returns the error code slot of the thread on Darwin. Read it at once after a fai
 pub struct NativeDescriptor
 ```
 
-Safe reads and writes on a descriptor that the caller owns.
+Safe reads and writes on a descriptor that the caller owns, for native providers.
+
+### When to use
+Use it to build a native provider, such as `silk.os_writer` or `silk.os_standard_input`.
+Application code uses the `Writer` and `StandardInput` effects instead.
+
+### Details
+One system call transfers at most 0x7ffff000 bytes. A call that a signal interrupts is made
+again. An empty buffer makes no system call. The functions never close the descriptor. Each
+function returns `false` on failure and writes the native error code to `error`, or 0 when the
+system returned a count that is not valid.
+
+### Gotchas
+- The caller keeps the descriptor open and controls access from other threads.
+- The type is empty on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
+  or aarch64.
 
 <a id="NativeDescriptor.impl"></a>
 

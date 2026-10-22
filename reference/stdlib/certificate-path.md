@@ -707,7 +707,13 @@ Checked arithmetic representation.
 pub struct ValidationError
 ```
 
-Owned scalar evidence for one failed validation call.
+The error of one failed [`CertificatePath.validate`](#CertificatePath.impl.validate) call.
+
+### Details
+
+`reason`, `location`, and `offset` tell what failed and where. When no path is valid, `reason`
+is `NoValidPath` and `detailReason` gives the first rejection. It owns its values and does not
+borrow the input.
 
 <a id="ValidationError.kind"></a>
 
@@ -811,6 +817,13 @@ A path that passed validation. It borrows the certificates and anchors that you 
 
 The intermediates are given as indexes into your list, from the leaf toward the anchor.
 
+### Gotchas
+
+A validated path does not authenticate a TLS connection by itself. Check the host name with
+`silk.https_identity`, and check the TLS CertificateVerify and Finished messages. Revocation
+(CRL and OCSP), certificate transparency, fetching missing intermediates, and browser root
+policies are not checked.
+
 <a id="ValidatedPath.impl"></a>
 
 ## Implementation `ValidatedPath<'a>`
@@ -888,7 +901,20 @@ Returns `NotChecked`, because path validation does not check revocation.
 pub struct CertificatePath
 ```
 
-Functions that validate certificate paths.
+Functions that validate the certificate chain of a TLS server, from its leaf certificate to a
+trust anchor.
+
+### When to use
+
+Call [`CertificatePath.validate`](#CertificatePath.impl.validate) with the certificates that a server sent and your
+`TrustAnchor` list, before you trust the server. `silk.tls_client` does this and the other
+TLS checks for you.
+
+### Gotchas
+
+A [`ValidatedPath`](#ValidatedPath) does not authenticate a TLS connection by itself. Revocation (CRL and OCSP),
+certificate transparency, fetching missing intermediates, and browser root policies are not
+checked.
 
 <a id="CertificatePath.impl"></a>
 
@@ -916,6 +942,11 @@ pub effect fn validate<'a>(
 
 Finds and checks a path from `leaf` through `intermediates` to one of `anchors`, at time `at`.
 
+At each step it tries the anchors first and then the intermediates, in the order that you
+gave them, and it backtracks when a candidate fails. It checks signatures, validity dates at
+`at`, basic constraints, key usage, path length, and DNS and IP name constraints. `limits`
+bound all work, so a hostile chain cannot make it run for long.
+
 It returns the first valid path that it finds. A candidate that fails does not stop the
 search, but each limit counts across the whole call. The result borrows `leaf`,
 `intermediates`, and `anchors`.
@@ -924,6 +955,12 @@ search, but each limit counts across the whole call. The result borrows `leaf`,
 - `Failure` with a [`ValidationError`](#ValidationError). If no path is valid, `reason` is `NoValidPath` and
   `detailReason` gives the first rejection.
 - `OutOfMemoryError` if the `Allocator` fails.
+
+#### Gotchas
+A valid path does not authenticate a TLS connection by itself. After it succeeds, check the
+host name with `silk.https_identity`, and check the TLS CertificateVerify and Finished
+messages. Revocation (CRL and OCSP), certificate transparency, fetching missing
+intermediates, and browser root policies are not checked.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

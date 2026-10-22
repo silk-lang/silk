@@ -239,7 +239,8 @@ IdleTimeout
 pub union PoolError
 ```
 
-The error of a pool operation.
+The error of a pool operation: a bad [`Config`](#Config), a full or closed pool, a key that the context
+does not accept, or an opening that ends after its deadline.
 
 <a id="PoolError.InvalidConfig"></a>
 
@@ -575,7 +576,8 @@ does not keep the deadline.
 pub interface PoolHandler<K, P, C, A, E, ?R>
 ```
 
-The code that uses a pool. See [`withPool`](#withPool).
+The code that uses a pool. [`withPool`](#withPool) lends the pool to it, and closes the pool when it
+returns, fails, or is cancelled.
 
 <a id="PoolHandler.handle"></a>
 
@@ -830,13 +832,22 @@ where &mut P provides &HttpTransport from &mut HttpTransport
 Makes a pool, lends it to `handler`, and closes it after.
 
 ### Details
-The pool allocates all `config.maxTotal` slots first. It closes when the handler returns, fails,
+The pool allocates all `config.maxTotal` slots first and then does not allocate. Each slot is
+opening, leased, or idle. The total of the three is at most `maxTotal`, and the total for one
+origin is at most `maxPerOrigin`. It closes when the handler returns, fails,
 or is cancelled. Closing closes all idle connections.
 
 ### Errors
 - `PoolError.InvalidConfig` if `config` is not valid.
 - `OutOfMemoryError` if the slots cannot be allocated.
 - The error of the handler.
+
+### Gotchas
+- Use the pool from one thread only. It does not use locks.
+- There is no wait queue. When the pool is full, a checkout fails at once with `PoolFull`.
+- Expired idle connections are closed only by a checkout, a return, or [`collect`](#collect). No
+  background task closes them.
+- There is no HTTP/2 and no WebSocket pooling.
 
 <a id="copyHandle"></a>
 
@@ -902,12 +913,24 @@ where
 Checks out one connection for `key`, and lends it to `handler`.
 
 ### Details
-The steps are in the module docs. To open a new connection, the context gets the earlier of
-`requestDeadline` and `acquisitionDeadline`. The handler uses `requestDeadline` for its
-exchanges.
+A checkout does these steps:
+1. It removes one expired idle connection, if there is one.
+2. It takes the idle connection with the same key that was returned last.
+3. If there is none, it reserves a slot. If the pool or the origin is at its limit, it evicts
+   the oldest idle connection. If no idle connection can be evicted, it fails with `PoolFull`.
+4. It opens a new connection with `PoolContext.acquire` if it reserved a slot.
+
+The handler gets the connection to use alone. `CheckoutResult.source` tells if the connection
+was reused or new. To open a new connection, the context gets the earlier of `requestDeadline`
+and `acquisitionDeadline`. The handler uses `requestDeadline` for its exchanges.
 
 After the handler returns, the connection goes back to the pool if it is eligible for reuse.
-Otherwise it is closed. If the handler fails or is cancelled, the connection is closed.
+Otherwise it is closed. If the handler fails or is cancelled, the connection is closed. If the
+idle list is full, the oldest idle connection is closed.
+
+### Gotchas
+There is no wait queue: when the pool is full, the checkout fails at once with `PoolFull`. The
+pool never sends a request again.
 
 ### Errors
 - `PoolError.ContextMismatch` if the context does not accept `key`.
@@ -926,6 +949,8 @@ where &mut P provides &HttpTransport from &mut HttpTransport
 ```
 
 Closes all idle connections that have expired. It reads the clock one time.
+
+Call it from time to time. No background task closes expired idle connections.
 
 <a id="close"></a>
 

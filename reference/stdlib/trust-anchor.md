@@ -37,6 +37,19 @@ pub struct TrustAnchor
 
 A CA certificate that you trust, with optional limits on chain length and names.
 
+### When to use
+Make one for each root CA that can start a certificate chain, and put the anchors in a
+`TrustSnapshot`. Use [`TrustAnchor.fromCertificate`](#TrustAnchor.impl.fromCertificate) to trust a certificate as it is. Use
+[`TrustAnchor.fromCertificateWithConstraints`](#TrustAnchor.impl.fromCertificateWithConstraints) to limit it more.
+
+### Details
+The anchor owns its certificate. The limits that you add are kept apart from the limits inside
+the certificate, and path validation applies both.
+
+### Gotchas
+Making an anchor gives a certificate full authority. It does not check the certificate, its
+self-signature, or its dates. Anchor only certificates that you trust.
+
 <a id="TrustAnchor.impl"></a>
 
 ## Implementation `TrustAnchor`

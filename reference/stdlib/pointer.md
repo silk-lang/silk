@@ -71,6 +71,21 @@ pub struct Pointer
 
 The owner type of the pointer operations. It has no fields and is never constructed.
 
+### When to use
+Use raw pointers at foreign function boundaries and in storage that native code owns. Inside
+Silk code, use references (`&T`, `&mut T`) and slices (`&[T]`). The compiler checks those, but
+it does not check raw pointers.
+
+### Details
+A pointer is `Copy`. It does not own its target, it does not borrow it, and it does not keep it
+alive. Making, comparing, and converting pointers is safe. Reading and writing through a
+pointer is `unsafe`.
+
+### Gotchas
+A pointer that is not null can still point to memory that was released or that is not
+initialized. Each `unsafe` operation lists what the caller must prove. If the caller is wrong,
+the behavior is undefined.
+
 <a id="Pointer.impl"></a>
 
 ## Implementation `Pointer`

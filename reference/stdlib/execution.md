@@ -142,8 +142,8 @@ A Wake that can move to another thread and be signaled there.
 registration callback. [`Execution.wakeTransferable`](#Execution.impl.wakeTransferable) consumes it on any thread.
 
 ### Gotchas
-The lifetime rules are the same as for [`Wake`](#Wake). Dropping it publishes nothing. A kept one keeps
-the inert package allocation alive.
+Dropping it publishes nothing. A kept one keeps the inert package allocation alive after the
+Execution is dropped, until it is consumed or dropped.
 
 <a id="TransferableWake.impl.Transferable"></a>
 
@@ -224,7 +224,13 @@ Notifies the fixed readiness endpoint for one `Initial` Execution exactly once.
 
 #### Details
 
-This is [`Execution.notifyInitial`](#Execution.impl.notifyInitial) for the wrapped handle.
+It changes the package to `InitialReady` before it invokes the endpoint. It is synchronous,
+does not park, and does not run the body. A later [`Execution.drive`](#Execution.impl.drive) starts the body.
+
+#### Gotchas
+
+The Execution must still be `Initial`. Calling this operation again, or calling it after the
+Execution has been driven, parked, completed, or destroyed, is a fatal state trap.
 
 <a id="Execution"></a>
 
@@ -234,9 +240,30 @@ This is [`Execution.notifyInitial`](#Execution.impl.notifyInitial) for the wrapp
 pub struct Execution
 ```
 
-The owner of the execution lifecycle operations.
+The owner of the execution lifecycle operations: lazy computations with their own storage,
+which an owner drives and resumes.
+
+### When to use
+
+This type is for schedulers and runtimes. Application code uses `silk.fiber` or
+`silk.thread_pool` instead. [`Execution.make`](#Execution.impl.make) packages a lazy `Effect` for a later owner to
+run. [`Execution.drive`](#Execution.impl.drive) runs the first activation, and each later activation after a wake.
+[`Execution.park`](#Execution.impl.park) in the body stops it until an external event calls [`Execution.wake`](#Execution.impl.wake). For
+an Execution that moves between threads, use [`Execution.makeTransferable`](#Execution.impl.makeTransferable).
 
 ### Details
+
+The life of an Execution:
+
+1. `Initial` after `make`. `notifyInitial` can mark it ready before the first drive.
+2. `drive` runs the body. It calls `onComplete` with the result, or `onSuspend` with the dormant
+   Execution if the body parked.
+3. In `park`, the body gives its one [`Wake`](#Wake) to a registration callback, and stops.
+4. `wake` makes the Execution eligible and calls the readiness endpoint. The owner then drives
+   it again.
+
+A nested `Effect.suspend` transfers execution at once. Only `park` gives up the Execution until
+a Wake.
 
 This struct carries no data and is never constructed by the library. Every operation is an
 inherent member declared in `impl Execution`, so `import silk.execution { Execution }` is the
@@ -270,9 +297,16 @@ Allocates one combined package and transfers the lazy body and fixed endpoint in
 
 #### Details
 
-The returned Execution is `Initial`. The body does not start during this call. Allocation refusal
-produces no Execution and leaves every input under ordinary Effect cleanup. Later private stack
-growth is a fatal trap and is not a `OutOfMemoryError`.
+The package comes from the selected `Allocator`. The body, the continuation and the fixed
+readiness endpoint stay private.
+The returned Execution is `Initial`. The body does not start during this call. Allocation
+refusal produces no Execution and leaves every input under ordinary Effect cleanup. Later
+private stack growth is a fatal trap and is not a `OutOfMemoryError`.
+
+#### Gotchas
+
+The Execution is affine. The readiness callback must be detached and non-parking. Dropping a
+dormant Execution cancels it.
 
 <a id="Execution.impl.makeTransferable"></a>
 
@@ -292,7 +326,9 @@ pub effect<'static> fn makeTransferable<
 Allocates one package whose handle and Wakes can move to other threads.
 
 #### Details
-This is [`make`](#Execution.impl.make) with thread bounds. The body and the result must be `Transferable`, because
+The returned Execution is `Initial`, the body does not start during this call, and allocation
+refusal produces no Execution. The body and
+the result must be `Transferable`, because
 the body can resume on any thread that drives it. The endpoint and its state must be
 `Transferable` and `Concurrent`, because each [`TransferableWake`](#TransferableWake) runs the endpoint on the
 thread that signals it. The body parks with [`parkTransferable`](#Execution.impl.parkTransferable).
@@ -333,7 +369,8 @@ The body starts its own diagnostic invocation. To keep an observer across parks,
 inside the body. The outcome callbacks run in the diagnostic context of the caller.
 
 #### Gotchas
-Driving a dormant, notifying, completed or destroyed Execution is a fatal state trap.
+Driving a dormant, notifying, completed or destroyed Execution is a fatal state trap. Only
+`onSuspend` gets the Execution back.
 
 <a id="Execution.impl.notifyInitial"></a>
 
@@ -396,8 +433,10 @@ pub effect fn parkTransferable<
 Gives up the running Execution and passes a [`TransferableWake`](#TransferableWake) to `register`.
 
 #### Details
-This is [`park`](#Execution.impl.park) for a body that [`makeTransferable`](#Execution.impl.makeTransferable) made. The Wake can go to another thread
-and be signaled there with [`wakeTransferable`](#Execution.impl.wakeTransferable).
+Use it in a body that [`makeTransferable`](#Execution.impl.makeTransferable) made. The registration callback receives the
+generation's only Wake, which can go to another thread and be signaled there with
+[`wakeTransferable`](#Execution.impl.wakeTransferable). A Wake signaled during registration is latched until [`drive`](#Execution.impl.drive) returns
+this Execution to its owner. The Wake invokes the fixed readiness endpoint at most one time.
 
 #### Gotchas
 A call from a body that [`make`](#Execution.impl.make) made is a fatal state trap, because that endpoint cannot run
@@ -414,7 +453,11 @@ pub fn wakeTransferable(wake: TransferableWake) -> ()
 Consumes one TransferableWake on any thread, and makes its parked generation eligible.
 
 #### Details
-This is [`wake`](#Execution.impl.wake). When it publishes readiness, the endpoint runs on the calling thread.
+A Wake signaled while its generation is still registering is latched until the owner receives
+the Execution back from [`drive`](#Execution.impl.drive). A Wake signaled while its generation is dormant makes the
+Execution eligible and invokes its fixed readiness endpoint on the calling thread. Signaling
+never drives the Execution. A Wake for a dropped or completed Execution, or for an earlier
+generation, publishes nothing.
 
 <a id="Execution.impl.wake"></a>
 

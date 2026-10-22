@@ -40,7 +40,11 @@ Public declarations: 18.
 pub struct Plan<'a>
 ```
 
-A cursor over one borrowed plan.
+A cursor over one borrowed plan file that the `silk test` driver wrote.
+
+### Gotchas
+It does not stop at the first error. After a failure it reads as empty, and [`failed`](#failed)
+stays true. Check [`failed`](#failed) or the `bool` results before a test body runs.
 
 <a id="Entry"></a>
 
@@ -72,7 +76,8 @@ pub fn openPlan<'a>(bytes: &'a [u8]) -> Plan<'a>
 
 Opens a plan and checks its magic, version, mode and nonce framing.
 
-If a check fails, the returned plan is already rejected. See [`failed`](#failed).
+If a check fails, the returned plan is already rejected: it reads as empty, and [`failed`](#failed)
+returns `true`.
 
 <a id="isPerTest"></a>
 

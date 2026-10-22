@@ -84,11 +84,19 @@ Public declarations: 2.
 pub struct LocalScheduler
 ```
 
-A reusable deterministic single-threaded Scheduler provider.
+A deterministic, single-threaded `Scheduler` provider for structured Fibers.
+
+### When to use
+
+Use [`LocalScheduler.execute`](#LocalScheduler.impl.execute) at the application entry to run one lazy program that uses the
+`Scheduler` and `MonotonicClock` services. For parallel work on several threads, use
+`silk.thread_pool`.
 
 ### Details
 
-Each call to [`execute`](#LocalScheduler.impl.execute) creates fresh task storage and readiness state.
+Each call to [`LocalScheduler.execute`](#LocalScheduler.impl.execute) makes new task storage, a FIFO ready queue, and a
+private timer source. A clock wait in a task parks only that task. When no task is ready, the
+driver waits on the parent `MonotonicClock` for the earliest timer.
 
 <a id="LocalScheduler.impl"></a>
 
@@ -154,7 +162,8 @@ Reports that no task is ready and no event registration remains while the root i
 
 ### Details
 
-[`execute`](#LocalScheduler.impl.execute) cancels and releases the incomplete task tree before it raises this error.
+[`LocalScheduler.execute`](#LocalScheduler.impl.execute) raises it when no task is ready, no timer is waiting, and the root is
+not finished. It cancels and releases the incomplete task tree before it raises this error.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

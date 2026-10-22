@@ -47,15 +47,26 @@ Public declarations: 2.
 pub service InsecureRandom
 ```
 
-The effect for a pseudorandom sequence that is not secure.
+The effect for a fast pseudorandom sequence that is not secure and repeats for the same seed.
+
+### When to use
+
+Require `&mut InsecureRandom` for simulations, games, shuffles in tests, and other uses where
+the same seed must give the same results. Provide [`InsecureRandom.seeded`](#InsecureRandom.impl.seeded) with a seed. Use
+`silk.random` for secrets.
 
 ### Details
 
-The provider owns its state. Each call moves only the provider of the current effect forward.
+A provider implements [`InsecureRandom.nextU64`](#InsecureRandom.nextU64). [`InsecureRandom.nextBool`](#InsecureRandom.impl.nextBool),
+[`InsecureRandom.below`](#InsecureRandom.impl.below), and [`InsecureRandom.fillBytes`](#InsecureRandom.impl.fillBytes) use it in a fixed way, so the results
+are the same on each target. The provider owns its state. Each call moves only the provider of
+the current effect forward.
 
 ### Gotchas
 
-Do not use it for secrets, keys, nonces, tokens, or protection against hash collisions.
+Do not use it for secrets, keys, nonces, tokens, passwords, or protection against hash
+collisions. The output is predictable: an observer who sees a few values can compute the next
+values.
 
 <a id="InsecureRandom.nextU64"></a>
 
@@ -145,7 +156,8 @@ A xoshiro256** generator. Make one with [`InsecureRandom.seeded`](#InsecureRando
 
 ### Details
 
-The sequence is the same on each target. It is not secure.
+The sequence is the same on each target. It is not secure: an observer who sees a few values
+can compute the next values.
 
 <a id="Xoshiro256StarStar.impl.InsecureRandom"></a>
 

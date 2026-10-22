@@ -7,7 +7,8 @@ A bump allocator over chunks it acquires from another allocator.
 ## When to use
 Provide an [`Arena`](#Arena) for `Allocator` when a phase of a program makes many allocations with
 similar lifetimes, such as building a tree that is dropped all at once. Every container that
-allocates through `Allocator`, such as `List`, `Bytes`, `Box` and `Shared`, works in it unchanged.
+allocates through `Allocator`, such as `List`, `Bytes`, `Box` and `Shared`, works in it
+unchanged.
 
 ## Details
 [`Arena`](#Arena) owns a child provider, passed to [`make`](#Arena.impl.make), and asks it for chunks. An allocation bumps
@@ -148,10 +149,30 @@ pub struct Arena<A>
 
 A bump allocator that provides `Allocator` from chunks of a child provider `A`.
 
+### When to use
+
+Provide an arena for `Allocator` when a phase of a program makes many allocations with similar
+lifetimes, such as building a tree that is dropped all at once. Every container that allocates
+through `Allocator`, such as `List`, `Bytes`, `Box` and `Shared`, works in it unchanged.
+
 ### Details
 
-The arena owns its child. Allocation failure is the child's: the arena fails with
-`OutOfMemoryError` only when the child refuses a chunk.
+The arena owns its child and asks it for chunks. An allocation bumps a cursor through the
+current chunk and calls nothing else. Each chunk counts its live allocations, so dropping an
+allocation is one atomic decrement and returns no memory by itself.
+
+An allocation never borrows its arena. Dropping or resetting the arena returns to the child at
+once each chunk that no live allocation points into. A chunk that still holds a live allocation
+is returned when its last allocation drops, on whichever thread drops it.
+
+Allocation failure is the child's: the arena fails with `OutOfMemoryError` only when the child
+refuses a chunk.
+
+### Gotchas
+
+Memory freed inside a chunk is not reused: a `List` that grows in an arena leaves each earlier
+buffer behind until the whole chunk is free. One long-lived allocation keeps its whole chunk
+alive. Requests larger than half a chunk get a chunk of their own.
 
 <a id="Arena.impl.Transferable"></a>
 
@@ -204,7 +225,12 @@ Stops allocating from the current chunk.
 #### Details
 
 Allocations made before the reset stay valid. Their chunk is returned to the child when the
-last of them drops, or now when none is alive.
+last of them drops, or now when none is alive. With `ArenaReset.RetainCapacity`, a current
+chunk that no allocation points into stays for the next allocations.
+
+#### Gotchas
+
+One long-lived allocation keeps its whole chunk alive after the reset.
 
 <a id="Arena.impl.available"></a>
 

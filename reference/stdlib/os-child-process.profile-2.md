@@ -15,7 +15,8 @@ by a signal, are normal outcomes. If a call fails, it releases its resources and
 child, so no zombie process stays.
 
 ## Errors
-`ProcessError` and `OutOfMemoryError`, as described in `silk.child_process`.
+- `ProcessError` if the child cannot start, the wait fails, or the output cannot be captured.
+- `OutOfMemoryError` if the `Allocator` cannot supply the request or the captured output.
 
 ## Gotchas
 - A call blocks the thread until the child ends.

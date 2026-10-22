@@ -448,7 +448,34 @@ impl Copy for MemoryByteDuplexAudit
 pub struct MemoryByteDuplex
 ```
 
-A scripted transport. Make one with [`MemoryByteDuplex.make`](#MemoryByteDuplex.impl.make) and provide it as `ByteDuplex`.
+A scripted `ByteDuplex` transport in memory, for tests of protocol code. Make one with
+[`MemoryByteDuplex.make`](#MemoryByteDuplex.impl.make) and provide it as `ByteDuplex`.
+
+### When to use
+Use it to test code that uses `silk.byte_duplex.ByteDuplex` without a network. A script controls
+what each read returns, how many bytes each write accepts, and when failures happen. After the
+test, check the bytes that the code wrote with [`MemoryByteDuplex.outbound`](#MemoryByteDuplex.impl.outbound) and the order of
+operations with [`MemoryByteDuplex.audit`](#MemoryByteDuplex.impl.audit).
+
+### Details
+[`MemoryByteDuplex.make`](#MemoryByteDuplex.impl.make) allocates everything one time. The operations do not allocate.
+
+Each event has a `readyAt` time on the active `MonotonicClock`. An operation waits until the
+event is ready. If the deadline comes first, the operation fails with `Timeout`. When an event
+time is equal to the deadline, the deadline wins.
+
+A read returns the bytes of the current `Data` event, as many as fit in the output slice. When
+the read script is empty, reads return `End`. After `End`, reads return `End` and do not use the
+script.
+
+### Gotchas
+Each write uses the next write event. A vectored write is one write event that takes bytes from
+its slices in order. If there are no more write events, or the output storage is full, the
+write fails with a `Provider` error, code 1 or 2. If the audit storage is full, the next
+operation fails with code 3. Make the storage large enough for the whole test.
+
+This transport models a reliable byte stream only. It does not model packets, DNS, or
+certificates.
 
 <a id="MemoryByteDuplex.impl"></a>
 

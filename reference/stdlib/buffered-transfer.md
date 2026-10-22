@@ -63,6 +63,12 @@ pub struct BufferedTransfer
 
 The owner type of the transfer operations. It has no fields and is never constructed.
 
+### When to use
+
+Use [`BufferedTransfer.transferAtMost`](#BufferedTransfer.impl.transferAtMost) or [`BufferedTransfer.transferExact`](#BufferedTransfer.impl.transferExact) inside
+`silk.buffered_duplex.withBufferedPairCapacity` to forward a body or a stream, for example in a
+proxy.
+
 <a id="BufferedTransfer.impl"></a>
 
 ## Implementation `BufferedTransfer`
@@ -92,13 +98,23 @@ Copies up to `limit` bytes from `source` to `destination`. It stops early if the
 
 #### Details
 
+It reads into the input buffer of `source` and offers those bytes to the output buffer of
+`destination`. It consumes from `source` only the bytes that `destination` accepted. If a write
+fails, the bytes that were not accepted stay unread in `source`. Nothing allocates.
 `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no time
 limit. It applies to each read and write.
 
 #### Errors
 
-- The read errors of `source` and the write errors of `destination`. `progress` and `accepted`
+- `BufferError.Terminal` if an earlier failure or a close made a session unusable.
+- `BufferError.ReadFailed` if a read of `source` fails, or `BufferError.WriteFailed` if a write
+  to `destination` fails. The failed session becomes terminal. `progress` and `accepted`
   include the bytes that this call already transferred.
+
+#### Gotchas
+
+The output buffer of `destination` can still hold bytes after the transfer. Flush `destination`
+when the transfer is complete.
 
 <a id="BufferedTransfer.impl.transferExact"></a>
 
@@ -119,11 +135,26 @@ where &mut SP provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock,
 
 Copies exactly `count` bytes from `source` to `destination`.
 
+#### Details
+
+It consumes from `source` only the bytes that `destination` accepted. If a write fails, the
+bytes that were not accepted stay unread in `source`. Nothing allocates. `deadline` is an
+absolute time on the active `MonotonicClock`. `Option.none()` means no time limit. It applies to
+each read and write.
+
 #### Errors
 
 - `BufferError.UnexpectedEnd` if the source ends first. `progress` gives the number of bytes
   that were transferred.
-- The errors of [`BufferedTransfer.transferAtMost`](#BufferedTransfer.impl.transferAtMost).
+- `BufferError.Terminal` if an earlier failure or a close made a session unusable.
+- `BufferError.ReadFailed` if a read of `source` fails, or `BufferError.WriteFailed` if a write
+  to `destination` fails. The failed session becomes terminal. `progress` and `accepted`
+  include the bytes that this call already transferred.
+
+#### Gotchas
+
+The output buffer of `destination` can still hold bytes after the transfer. Flush `destination`
+when the transfer is complete.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -161,7 +161,8 @@ Public declarations: 8.
 pub union TransportError
 ```
 
-The error of a transport operation, with its original cause.
+The error of a transport operation, with its original cause: `Plain` for a byte duplex error,
+`Secured` for a TLS error.
 
 <a id="TransportError.Plain"></a>
 
@@ -213,7 +214,15 @@ pub service HttpTransport
 
 Reads and writes the bytes of an HTTP connection.
 
-Call [`HttpTransport.readSome`](#HttpTransport.impl.readSome) and [`HttpTransport.writeSome`](#HttpTransport.impl.writeSome), not the raw operations.
+Call [`HttpTransport.readSome`](#HttpTransport.impl.readSome) and [`HttpTransport.writeSome`](#HttpTransport.impl.writeSome), not the raw operations. They
+check the counts of the provider: a count of zero, or more than the buffer, closes the transport
+and fails. Each operation gets an absolute deadline, and passes it to the provider unchanged.
+Use [`plain`](#plain) for a byte duplex, such as a TCP socket, or [`secured`](#secured) for a TLS connection.
+
+### Gotchas
+
+`close` closes the provider: the socket for [`plain`](#plain), the TLS connection for [`secured`](#secured). It
+does not flush. After `close`, each read, write, or flush fails with a `Closed` error.
 
 <a id="HttpTransport.readSomeRaw"></a>
 
@@ -255,7 +264,8 @@ Sends all bytes that writes accepted to the provider.
 effect fn close() -> () ! TransportError ? &mut HttpTransport with Intrinsic.nonParking()
 ```
 
-Closes the transport without waiting. A second call does nothing.
+Closes the transport without waiting. A second call does nothing. It does not flush. After it,
+each read, write, or flush fails with a `Closed` error.
 
 <a id="HttpTransport.impl"></a>
 
@@ -324,7 +334,8 @@ A transport over a TLS connection. Make it with [`secured`](#secured).
 pub fn plain<'provider, P>(provider: &'provider mut P) -> Plain<'provider, P>
 ```
 
-Uses the byte duplex `provider` as a transport. It does not allocate or do I/O.
+Uses the byte duplex `provider` as a transport. It does not allocate or do I/O. The caller keeps
+ownership of `provider`. Closing the transport closes the byte duplex.
 
 <a id="secured"></a>
 
@@ -334,7 +345,8 @@ Uses the byte duplex `provider` as a transport. It does not allocate or do I/O.
 pub fn secured<'provider, P>(provider: &'provider mut OwnedConnection<P>) -> Secured<'provider, P>
 ```
 
-Uses the TLS connection `provider` as a transport. It does not allocate or do I/O.
+Uses the TLS connection `provider` as a transport. It does not allocate or do I/O. The caller
+keeps ownership of `provider`. Closing the transport closes the TLS connection.
 
 <a id="Plain.impl"></a>
 

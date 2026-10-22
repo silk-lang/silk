@@ -52,7 +52,20 @@ Public declarations: 1.
 pub struct NativeClock
 ```
 
-The functions that read the system clocks and wait.
+The functions that read the system clocks and wait, for the native clock providers.
+
+### When to use
+`silk.os_system_clock` and `silk.os_monotonic_clock` use it. Application code uses those
+providers through the `SystemClock` and `MonotonicClock` effects, so a test can replace them.
+
+### Details
+Each read checks the result of the system.
+
+### Gotchas
+- A failed call or a bad result is a trap.
+- A wait blocks the whole thread. It does not let another fiber run.
+- A call fails to compile on targets other than Darwin on aarch64, and Linux with GNU libc on
+  x86_64 or aarch64.
 
 <a id="NativeClock.impl"></a>
 

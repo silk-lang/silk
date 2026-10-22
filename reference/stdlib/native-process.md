@@ -29,7 +29,12 @@ Public declarations: 1.
 pub struct NativeProcess
 ```
 
-The function that runs a child process.
+The function that runs a child process with the system calls, for the native `ChildProcess`
+provider.
+
+### When to use
+`silk.os_child_process` uses [`NativeProcess.execute`](#NativeProcess.impl.execute). Application code uses the
+`ChildProcess` effect from `silk.child_process` instead.
 
 <a id="NativeProcess.impl"></a>
 
@@ -58,7 +63,9 @@ of the request, or of the parent when it is empty. Its standard input is closed.
 to start is an error. An exit code that is not 0, and an end by a signal, are outcomes.
 
 #### Gotchas
-The call blocks. Do not wait for the child in other code.
+The call blocks the thread. Do not wait for the child in other code. If a step fails after
+the child started, the call stops and waits for the child, closes the descriptors, and then
+returns the first error. A trap does not clean up, and does not stop the child.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

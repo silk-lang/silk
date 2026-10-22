@@ -13,7 +13,8 @@ A host name without a deadline makes one `getaddrinfo` call. The result is copie
 of the system is freed one time, also on errors. Numeric hosts do not call the provider.
 
 ## Errors
-`ResolverError`, as described in `silk.resolver`.
+`ResolverError` if the host is not found, has no address of the selected family, or the lookup
+fails. A host name with a deadline fails with `DeadlineUnsupported`.
 
 ## Gotchas
 - A host name with a deadline fails with `DeadlineUnsupported` before the lookup. After
@@ -103,7 +104,20 @@ Public declarations: 1.
 pub struct NativeSystemResolver
 ```
 
-The native `Resolver` provider. It has no state.
+The native `Resolver` provider, with the `getaddrinfo` function of the system. It has no state.
+
+### When to use
+Provide it for `Resolver` in a native program when a blocking lookup is acceptable. Code that
+resolves uses `silk.resolver`, so a test can provide a fake.
+
+### Details
+A host name without a deadline makes one `getaddrinfo` call. The result is copied, and the list
+of the system is freed one time, also on errors. Numeric hosts do not call the provider.
+
+### Gotchas
+- A host name with a deadline fails with `DeadlineUnsupported` before the lookup. After
+  `getaddrinfo` starts, it cannot be cancelled or limited in time or memory.
+- The lookup blocks the thread. It does not let another fiber run.
 
 <a id="NativeSystemResolver.impl"></a>
 
@@ -122,6 +136,10 @@ pub fn make() -> NativeSystemResolver
 ```
 
 Returns a resolver. It does no lookup.
+
+#### Gotchas
+It fails to compile on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
+or aarch64.
 
 <a id="NativeSystemResolver.impl.Resolver"></a>
 

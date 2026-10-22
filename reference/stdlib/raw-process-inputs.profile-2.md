@@ -33,7 +33,15 @@ Public declarations: 1.
 pub struct ProcessInputs
 ```
 
-Borrowed argument and environment vectors, and a checked page size.
+Borrowed argument and environment vectors, and a checked page size, of a raw Linux process.
+
+### Details
+[`ProcessInputs.decode`](#ProcessInputs.impl.decode) reads them from the initial stack without allocation or copies.
+Arguments and environment entries stay NUL-terminated byte strings. The page size comes from
+`AT_PAGESZ`.
+
+### Gotchas
+The pointers own nothing. They stay valid only while the kernel stack image is live.
 
 <a id="ProcessInputs.impl"></a>
 

@@ -66,11 +66,27 @@ Public declarations: 2.
 pub struct HmacSha256
 ```
 
-A streaming HMAC-SHA-256 state that returns a 32-byte tag.
+A streaming HMAC-SHA-256 state (RFC 2104) that returns a 32-byte tag.
 
 Call [`HmacSha256.make`](#HmacSha256.impl.make) with the key, [`HmacSha256.update`](#HmacSha256.impl.update) for each part of the message, then
-[`HmacSha256.finish`](#HmacSha256.impl.finish). The state is a fixed-size value. It holds key material and is not erased
-when it is dropped.
+[`HmacSha256.finish`](#HmacSha256.impl.finish). For one message, use [`HmacSha256.authenticate`](#HmacSha256.impl.authenticate). The state is a
+fixed-size value. It holds key material and is not erased when it is dropped.
+
+### When to use
+
+Use it to prove that a message comes from someone who has a shared secret key and was not
+changed, for example to sign a webhook or a cookie. Use `silk.hkdf` to derive keys, and
+`silk.sha2` for a hash without a key.
+
+### Details
+
+Any key length is valid. A key longer than the block size (64 bytes) is hashed first. Nothing
+allocates.
+
+### Gotchas
+
+It computes tags, but it does not compare them. To check a received tag, compare all bytes in
+constant time. Do not use `==` or a loop that stops at the first difference.
 
 <a id="HmacSha256.impl"></a>
 
@@ -128,8 +144,8 @@ pub fn authenticate(key: &[u8], message: &[u8]) -> [u8; 32]
 
 Returns the 32-byte HMAC-SHA-256 tag of `message` with `key`.
 
-An empty key or message is valid. To check a received tag, compare it in constant time. See
-the module example.
+An empty key or message is valid. To check a received tag, compare all bytes in constant time.
+Do not use `==` or a loop that stops at the first difference.
 
 <a id="HmacSha384"></a>
 
@@ -139,11 +155,27 @@ the module example.
 pub struct HmacSha384
 ```
 
-A streaming HMAC-SHA-384 state that returns a 48-byte tag.
+A streaming HMAC-SHA-384 state (RFC 2104) that returns a 48-byte tag.
 
 Call [`HmacSha384.make`](#HmacSha384.impl.make) with the key, [`HmacSha384.update`](#HmacSha384.impl.update) for each part of the message, then
-[`HmacSha384.finish`](#HmacSha384.impl.finish). The state is a fixed-size value. It holds key material and is not erased
-when it is dropped.
+[`HmacSha384.finish`](#HmacSha384.impl.finish). For one message, use [`HmacSha384.authenticate`](#HmacSha384.impl.authenticate). The state is a
+fixed-size value. It holds key material and is not erased when it is dropped.
+
+### When to use
+
+Use it to prove that a message comes from someone who has a shared secret key and was not
+changed, for example to sign a webhook or a cookie. Use `silk.hkdf` to derive keys, and
+`silk.sha2` for a hash without a key.
+
+### Details
+
+Any key length is valid. A key longer than the block size (128 bytes) is hashed first. Nothing
+allocates.
+
+### Gotchas
+
+It computes tags, but it does not compare them. To check a received tag, compare all bytes in
+constant time. Do not use `==` or a loop that stops at the first difference.
 
 <a id="HmacSha384.impl"></a>
 
@@ -201,8 +233,8 @@ pub fn authenticate(key: &[u8], message: &[u8]) -> [u8; 48]
 
 Returns the 48-byte HMAC-SHA-384 tag of `message` with `key`.
 
-An empty key or message is valid. To check a received tag, compare it in constant time. See
-the module example.
+An empty key or message is valid. To check a received tag, compare all bytes in constant time.
+Do not use `==` or a loop that stops at the first difference.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

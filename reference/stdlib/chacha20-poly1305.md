@@ -146,7 +146,27 @@ The tag is not correct for the key, nonce, associated data, and ciphertext.
 pub struct ChaCha20Poly1305
 ```
 
-Functions that encrypt and decrypt with ChaCha20-Poly1305.
+Functions that encrypt and authenticate with ChaCha20-Poly1305 (RFC 8439).
+
+### When to use
+
+Use [`ChaCha20Poly1305.seal`](#ChaCha20Poly1305.impl.seal) to encrypt a message so that only holders of the key can read it
+and any change is detected. Use [`ChaCha20Poly1305.open`](#ChaCha20Poly1305.impl.open) to check and decrypt it. It is fast
+without AES hardware, and it is a cipher suite of TLS 1.3 and WireGuard.
+
+### Details
+
+The key is 32 bytes, the nonce is 12 bytes, and the tag is 16 bytes. The tag is separate from
+the ciphertext, so store or send both. The ciphertext has the same length as the plaintext.
+Nothing allocates. All checks come before the first write, and on any error the output buffers
+do not change.
+
+### Gotchas
+
+The same key and nonce must never encrypt two messages. If they do, an attacker can recover the
+XOR of the two plaintexts and forge tags. Authentication does not stop replay. The source code
+avoids branches on secret data, but it cannot promise constant time on every compiler and
+target, or that secrets are erased.
 
 <a id="ChaCha20Poly1305.impl"></a>
 
@@ -166,16 +186,25 @@ pub fn seal(key: &[u8], nonce: &[u8], aad: &[u8], plaintext: &[u8], ciphertext: 
 
 Encrypts `plaintext` into `ciphertext` and writes the 16-byte authentication tag to `tag`.
 
-`aad` is authenticated but not encrypted. `ciphertext` can be longer than `plaintext`. The
-bytes after the written prefix do not change.
+The key is 32 bytes and the nonce is 12 bytes. `aad` is authenticated but not encrypted. The
+ciphertext has the same length as `plaintext`. `ciphertext` can be longer than `plaintext`.
+The bytes after the written prefix do not change. Nothing allocates.
 
 #### Errors
-- `InvalidKey`, `InvalidNonce`, or `InvalidTag` for a wrong length.
+All checks come before the first write. On an error, `ciphertext` and `tag` do not change.
+The first failure in this order is returned:
+
+- `InvalidKey` if `key` is not 32 bytes.
+- `InvalidNonce` if `nonce` is not 12 bytes.
+- `InvalidTag` if `tag` is not 16 bytes.
 - `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
-- `LimitExceeded` if `plaintext` is too long.
+- `LimitExceeded` if `plaintext` is longer than 274877906880 bytes (2^32 blocks of 64 bytes).
 
 #### Gotchas
-Use a new nonce for each message under the same key. The function does not make one.
+Use a new nonce for each message under the same key. The function does not make one. If the
+same key and nonce encrypt two messages, an attacker can recover the XOR of the two plaintexts
+and forge tags. Use a counter, or 12 random bytes from `silk.random` for a small number of
+messages per key.
 
 <a id="ChaCha20Poly1305.impl.open"></a>
 
@@ -191,10 +220,20 @@ Checks `tag`, and if it is correct, decrypts `ciphertext` into `plaintext`.
 all 16 tag bytes before it writes `plaintext`. The bytes after the written prefix do not
 change.
 
+The key is 32 bytes, the nonce is 12 bytes, and the tag is 16 bytes. Nothing allocates.
+
 #### Errors
-- `AuthenticationFailed` if the tag is not correct. `plaintext` does not change.
-- `InvalidKey`, `InvalidNonce`, `InvalidTag`, `OutputTooSmall`, or `LimitExceeded` as for
-  [`ChaCha20Poly1305.seal`](#ChaCha20Poly1305.impl.seal).
+All checks come before the first write. On an error, `plaintext` does not change.
+
+- `InvalidKey` if `key` is not 32 bytes.
+- `InvalidNonce` if `nonce` is not 12 bytes.
+- `InvalidTag` if `tag` is not 16 bytes.
+- `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
+- `LimitExceeded` if `ciphertext` is longer than 274877906880 bytes.
+- `AuthenticationFailed` if the tag is not correct for the key, nonce, `aad`, and ciphertext.
+
+#### Gotchas
+Authentication does not stop replay: an attacker can send an old valid message again.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

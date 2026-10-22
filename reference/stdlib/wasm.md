@@ -47,6 +47,10 @@ pub fn swizzle(table: simd<u8, 16>, indices: simd<u8, 16>) -> simd<u8, 16>
 `i8x16.swizzle` (simd128): lane `i` is `table[indices[i]]`, or `0` when `indices[i]` is 16 or
 more.
 
+When the build targets wasm32 with the `simd128` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+WebAssembly cannot detect features at run time.
+
 <a id="relaxedSwizzle"></a>
 
 ## `relaxedSwizzle`
@@ -55,8 +59,13 @@ more.
 pub fn relaxedSwizzle(table: simd<u8, 16>, indices: simd<u8, 16>) -> simd<u8, 16>
 ```
 
-`i8x16.relaxed_swizzle` (relaxed-simd): [`swizzle`](#swizzle) for indices below 16. A lane whose index
-is 16 or more is unspecified and may differ between engines; the portable code makes it `0`.
+`i8x16.relaxed_swizzle` (relaxed-simd): lane `i` is `table[indices[i]]` when `indices[i]` is
+below 16. A lane whose index is 16 or more is unspecified and may differ between engines; the
+portable code makes it `0`. Use [`swizzle`](#swizzle) when such a lane must be `0`.
+
+When the build targets wasm32 with the `relaxed-simd` feature, it compiles to this one
+instruction. Otherwise it computes the same lanes with portable code, which is correct but
+slower. WebAssembly cannot detect features at run time.
 
 <a id="dot"></a>
 
@@ -69,6 +78,10 @@ pub fn dot(left: simd<i16, 8>, right: simd<i16, 8>) -> simd<i32, 4>
 `i32x4.dot_i16x8_s` (simd128): each lane of `left` times that of `right`, with each adjacent
 pair of products summed into one `i32` lane. The sum wraps only for four lanes of `-32768`.
 
+When the build targets wasm32 with the `simd128` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+WebAssembly cannot detect features at run time.
+
 <a id="narrowUnsigned"></a>
 
 ## `narrowUnsigned`
@@ -80,6 +93,10 @@ pub fn narrowUnsigned(left: simd<i16, 8>, right: simd<i16, 8>) -> simd<u8, 16>
 `i8x16.narrow_i16x8_u` (simd128): the lanes of `left`, then of `right`, each clamped to
 `0..=255`.
 
+When the build targets wasm32 with the `simd128` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+WebAssembly cannot detect features at run time.
+
 <a id="narrowSigned"></a>
 
 ## `narrowSigned`
@@ -90,6 +107,10 @@ pub fn narrowSigned(left: simd<i16, 8>, right: simd<i16, 8>) -> simd<i8, 16>
 
 `i8x16.narrow_i16x8_s` (simd128): the lanes of `left`, then of `right`, each clamped to the
 `i8` range.
+
+When the build targets wasm32 with the `simd128` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+WebAssembly cannot detect features at run time.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

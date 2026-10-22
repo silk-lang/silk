@@ -80,7 +80,20 @@ Public declarations: 1.
 pub struct NativeHostInput
 ```
 
-An owned copy of the arguments and the environment.
+An owned copy of the command-line arguments and the environment of the process.
+
+### When to use
+The native runtime captures one at start, and gives it to `main` as an `OsHostInput`. Use
+[`NativeHostInput.environmentSnapshot`](#NativeHostInput.impl.environmentSnapshot) in a library that gets no arguments, or
+[`NativeHostInput.capture`](#NativeHostInput.impl.capture) in a custom runtime.
+
+### Details
+A capture copies all bytes, so later lookups do not use the memory of the process. The
+working directory is read at each call, not captured.
+
+### Gotchas
+The capture functions are unsafe. The input vectors and their strings must stay readable and
+unchanged during the capture. No other code can change the environment at that time.
 
 <a id="NativeHostInput.impl"></a>
 

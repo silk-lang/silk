@@ -67,6 +67,15 @@ The owner type of the slot operations. It has no fields and is never constructed
 `import silk.slot { Slot }` gives access to `Slot.write` and the other operations. This struct
 is not the builtin `Slot<'storage, T>` place type that `silk.raw_buffer.RawBuffer.slot` returns.
 
+A slot is uninitialized or initialized, and does not record its state. The container must keep
+its own record of which slots are initialized. Each operation consumes the slot selection, so
+one selection cannot be used two times.
+
+### Gotchas
+
+A second [`Slot.write`](#Slot.impl.write) without a state change overwrites the earlier value and does not drop
+it, so that value leaks.
+
 <a id="Slot.impl"></a>
 
 ## Implementation `Slot`

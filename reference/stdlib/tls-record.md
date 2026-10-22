@@ -512,6 +512,16 @@ pub struct TlsRecordSender
 
 The send direction of a TLS record layer. It holds at most one encoded record.
 
+Most programs use `silk.tls_connection` or `silk.tls_client`, which use the record layer. Use it
+directly to build another TLS endpoint or a test tool. `makePlaintext` frames records without
+encryption, for the first handshake messages. `make` takes a traffic secret and encrypts with
+the [`CipherSuite`](#CipherSuite).
+
+It allocates a fixed buffer one time, when you make it. Write
+[`TlsRecordSender.pendingOutput`](#TlsRecordSender.impl.pendingOutput) to the transport, and then call
+[`TlsRecordSender.ackWritten`](#TlsRecordSender.impl.ackWritten) with the number of bytes that the transport took. A traffic key
+protects at most [`RECORDS_PER_EPOCH`](#RECORDS_PER_EPOCH) records.
+
 The protected form derives the key and IV from the traffic secret and starts at sequence number
 0. Records are not padded.
 
@@ -658,6 +668,10 @@ pub struct TlsRecordReceiver
 ```
 
 The receive direction of a TLS record layer. It holds at most one complete record.
+
+Most programs use `silk.tls_connection` or `silk.tls_client`, which use the record layer. Use it
+directly to build another TLS endpoint or a test tool. It allocates a fixed buffer one
+time, when you make it, and takes input in pieces with [`TlsRecordReceiver.feedInput`](#TlsRecordReceiver.impl.feedInput).
 
 It checks each header before it copies the body, and it gives you a record only after
 authentication and all content checks.

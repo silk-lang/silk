@@ -207,7 +207,8 @@ Returns a present `Option<T>` that owns `value`.
 
 #### Details
 
-This function moves `value` into the option. The caller can no longer use the original binding.
+This function moves `value` into the option. The caller can no longer use the original
+binding.
 
 <a id="Option.impl.map"></a>
 

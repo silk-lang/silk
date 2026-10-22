@@ -37,7 +37,21 @@ Public declarations: 6.
 pub struct RawLinux
 ```
 
-The scope for raw Linux kernel operations on the selected target.
+The scope for raw Linux kernel operations on the selected target, for programs built with no
+libc.
+
+### When to use
+Use it only in a raw Linux runtime, such as `silk.raw_start`. A hosted program uses the libc
+providers (`silk.os_*` and `silk.native_*`) instead.
+
+### Details
+It exists only on Linux on x86_64 or aarch64, with the `libc` profile set to `none`. A call
+returns the kernel word without change. A value from -4095 through -1 (as `usize`) is an
+error. [`RawLinux.error`](#RawLinux.impl.error) gives `0` for success, or the positive error number.
+
+### Gotchas
+- The calls do not read or set `errno`. They do not retry an interrupted call.
+- Each unsafe caller must prove the pointer, lifetime and resource contract of the syscall.
 
 <a id="RawLinux.impl"></a>
 

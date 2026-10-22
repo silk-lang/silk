@@ -56,6 +56,10 @@ Call [`Sha3_224.update`](#Sha3_224.impl.update) for each part of the message, th
 [`Sha3_224.hash`](#Sha3_224.impl.hash) when the full message is in one slice. The state is a fixed-size value and
 does not allocate.
 
+### Gotchas
+It is not Keccak-256 as Ethereum uses it: the padding is different, so the digests are
+different.
+
 <a id="Sha3_224.impl"></a>
 
 ## Implementation `Sha3_224`
@@ -118,6 +122,10 @@ A streaming SHA3-256 state that returns a 32-byte digest.
 Call [`Sha3_256.update`](#Sha3_256.impl.update) for each part of the message, then [`Sha3_256.finish`](#Sha3_256.impl.finish). Use
 [`Sha3_256.hash`](#Sha3_256.impl.hash) when the full message is in one slice. The state is a fixed-size value and
 does not allocate.
+
+### Gotchas
+It is not Keccak-256 as Ethereum uses it: the padding is different, so the digests are
+different.
 
 <a id="Sha3_256.impl"></a>
 
@@ -182,6 +190,10 @@ Call [`Sha3_384.update`](#Sha3_384.impl.update) for each part of the message, th
 [`Sha3_384.hash`](#Sha3_384.impl.hash) when the full message is in one slice. The state is a fixed-size value and
 does not allocate.
 
+### Gotchas
+It is not Keccak-256 as Ethereum uses it: the padding is different, so the digests are
+different.
+
 <a id="Sha3_384.impl"></a>
 
 ## Implementation `Sha3_384`
@@ -244,6 +256,10 @@ A streaming SHA3-512 state that returns a 64-byte digest.
 Call [`Sha3_512.update`](#Sha3_512.impl.update) for each part of the message, then [`Sha3_512.finish`](#Sha3_512.impl.finish). Use
 [`Sha3_512.hash`](#Sha3_512.impl.hash) when the full message is in one slice. The state is a fixed-size value and
 does not allocate.
+
+### Gotchas
+It is not Keccak-256 as Ethereum uses it: the padding is different, so the digests are
+different.
 
 <a id="Sha3_512.impl"></a>
 

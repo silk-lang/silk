@@ -166,6 +166,35 @@ pub struct Format
 The owner type of the formatting and parsing operations. It has no fields and is never
 constructed.
 
+### When to use
+
+Use [`Format.display`](#Format.impl.display) to write one value with default options, [`Format.displayWith`](#Format.impl.displayWith) to set a
+width, fill, sign, or precision, and [`Format.format`](#Format.impl.format) to write a template such as
+`"{name} has {count}"`. Use [`Format.debug`](#Format.impl.debug) to show a value for a programmer. Use
+[`Format.i32Value`](#Format.impl.i32Value), [`Format.f64Value`](#Format.impl.f64Value), and the other `...Value` functions to read decimal
+text back into a number. They accept the default `Display` output of the same type.
+
+### Details
+
+Output goes to the ambient `Writer` effect. No operation allocates, and none makes an
+intermediate `String`. Integers display in decimal, or in another base with a [`Style`](#Style). Finite
+floats display as the shortest decimal that parses back to the same bits, and negative zero
+displays as `-0`. With a precision, a float displays with exactly that many fractional digits,
+rounded half to even, and that output does not always parse back to the same bits. Width counts
+Unicode scalars, not UTF-8 bytes and not terminal columns. Numbers align to the right by
+default. Text, `bool`, and `char` align to the left by default.
+
+### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+- [`ParseError`](#ParseError) from the `...Value` parse functions.
+
+### Gotchas
+
+`NaN` and `Infinity` ignore precision and zero padding. To check that a float is finite before
+you display it, use `f64.isFinite` or `f32.isFinite`.
+
 <a id="Format.impl"></a>
 
 ## Implementation `Format`
@@ -187,8 +216,8 @@ Returns the default [`FormatOptions`](#FormatOptions).
 #### Details
 
 The defaults are: no width, `Alignment.Default`, a space as fill, `Sign.NegativeOnly`, no
-alternate form, no zero padding, no precision, no color, and `Style.Default`. [`Format.display`](#Format.impl.display) uses these
-options.
+alternate form, no zero padding, no precision, no color, and `Style.Default`.
+[`Format.display`](#Format.impl.display) uses these options.
 
 <a id="Format.impl.make"></a>
 
@@ -581,7 +610,13 @@ For integers, the precision is a minimum digit count and turns off zero padding.
 the precision is the exact number of fractional digits, rounded half to even. For text, the
 precision is the maximum number of Unicode scalars, and the rest is cut. Integers use
 `style` for the base and `alternate` for the base prefix. The standard implementations ignore
-`color`.
+`color`. Width counts Unicode scalars. Numbers align to the right by default. Text, `bool`,
+and `char` align to the left by default.
+
+#### Gotchas
+
+`NaN` and `Infinity` ignore precision and zero padding. With a precision, float output does
+not always parse back to the same bits.
 
 #### Errors
 
@@ -953,7 +988,8 @@ Reads all of `text` as a decimal `u8`.
 
 #### Details
 
-The rules are the same as for [`Format.unsignedValue`](#Format.impl.unsignedValue).
+`text` must contain only the digits `0` to `9`. Signs, spaces, and separators are not
+accepted. Leading zeros are accepted.
 
 #### Errors
 
@@ -974,7 +1010,8 @@ Reads all of `text` as a decimal `u16`.
 
 #### Details
 
-The rules are the same as for [`Format.unsignedValue`](#Format.impl.unsignedValue).
+`text` must contain only the digits `0` to `9`. Signs, spaces, and separators are not
+accepted. Leading zeros are accepted.
 
 #### Errors
 
@@ -995,7 +1032,8 @@ Reads all of `text` as a decimal `u32`.
 
 #### Details
 
-The rules are the same as for [`Format.unsignedValue`](#Format.impl.unsignedValue).
+`text` must contain only the digits `0` to `9`. Signs, spaces, and separators are not
+accepted. Leading zeros are accepted.
 
 #### Errors
 
@@ -1016,7 +1054,8 @@ Reads all of `text` as a decimal `u64`.
 
 #### Details
 
-The rules are the same as for [`Format.unsignedValue`](#Format.impl.unsignedValue).
+`text` must contain only the digits `0` to `9`. Signs, spaces, and separators are not
+accepted. Leading zeros are accepted.
 
 #### Errors
 
@@ -1037,7 +1076,8 @@ Reads all of `text` as a decimal `usize`.
 
 #### Details
 
-The rules are the same as for [`Format.unsignedValue`](#Format.impl.unsignedValue).
+`text` must contain only the digits `0` to `9`. Signs, spaces, and separators are not
+accepted. Leading zeros are accepted.
 
 #### Errors
 
@@ -1058,7 +1098,8 @@ Reads all of `text` as a decimal `i8`. One leading `-` is accepted.
 
 #### Details
 
-The rules are the same as for [`Format.signedValue`](#Format.impl.signedValue).
+Only the digits `0` to `9` and one leading `-` are accepted. The minimum value reads
+correctly. A leading `+`, spaces, and separators are not accepted.
 
 #### Errors
 
@@ -1079,7 +1120,8 @@ Reads all of `text` as a decimal `i16`. One leading `-` is accepted.
 
 #### Details
 
-The rules are the same as for [`Format.signedValue`](#Format.impl.signedValue).
+Only the digits `0` to `9` and one leading `-` are accepted. The minimum value reads
+correctly. A leading `+`, spaces, and separators are not accepted.
 
 #### Errors
 
@@ -1100,7 +1142,8 @@ Reads all of `text` as a decimal `i32`. One leading `-` is accepted.
 
 #### Details
 
-The rules are the same as for [`Format.signedValue`](#Format.impl.signedValue).
+Only the digits `0` to `9` and one leading `-` are accepted. The minimum value reads
+correctly. A leading `+`, spaces, and separators are not accepted.
 
 #### Errors
 
@@ -1121,7 +1164,8 @@ Reads all of `text` as a decimal `i64`. One leading `-` is accepted.
 
 #### Details
 
-The rules are the same as for [`Format.signedValue`](#Format.impl.signedValue).
+Only the digits `0` to `9` and one leading `-` are accepted. The minimum value reads
+correctly. A leading `+`, spaces, and separators are not accepted.
 
 #### Errors
 
@@ -1142,7 +1186,8 @@ Reads all of `text` as a decimal `isize`. One leading `-` is accepted.
 
 #### Details
 
-The rules are the same as for [`Format.signedValue`](#Format.impl.signedValue).
+Only the digits `0` to `9` and one leading `-` are accepted. The minimum value reads
+correctly. A leading `+`, spaces, and separators are not accepted.
 
 #### Errors
 
@@ -1470,6 +1515,7 @@ The options for one `Display` call.
 ### Details
 
 A `Formatter` holds options only. The output goes to the ambient `Writer`, not to the formatter.
+Width counts Unicode scalars, not UTF-8 bytes and not terminal columns.
 Read the options with [`Format.width`](#Format.impl.width), [`Format.sign`](#Format.impl.sign), and the other accessors.
 
 <a id="Display"></a>
@@ -1793,7 +1839,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="u8.impl.RadixDisplay"></a>
 
@@ -1834,7 +1881,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="u16.impl.RadixDisplay"></a>
 
@@ -1875,7 +1923,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="u32.impl.RadixDisplay"></a>
 
@@ -1916,7 +1965,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="u64.impl.RadixDisplay"></a>
 
@@ -1957,7 +2007,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="usize.impl.RadixDisplay"></a>
 
@@ -1998,7 +2049,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="i8.impl.RadixDisplay"></a>
 
@@ -2039,7 +2091,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="i16.impl.RadixDisplay"></a>
 
@@ -2080,7 +2133,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="i32.impl.RadixDisplay"></a>
 
@@ -2121,7 +2175,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="i64.impl.RadixDisplay"></a>
 
@@ -2162,7 +2217,8 @@ padding, width, fill, and alignment apply.
 
 The order is: leading fill, sign, base prefix, zeros from the precision or from `zeroPad`,
 digits, trailing fill. Only the alternate form writes a base prefix. A base other than
-decimal writes no sign; see [`Style`](#Style).
+decimal writes no sign: a negative value displays as its two's complement bits at the width
+of its type, as `-1` as `i8` in `LowerHex` is `ff`.
 
 <a id="isize.impl.RadixDisplay"></a>
 
@@ -2289,8 +2345,7 @@ impl<'text> Display for string<'text>
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the string with the width, fill, alignment, and precision of the options. See
-[`Format.padText`](#Format.impl.padText).
+Writes the string with the width, fill, alignment, and precision of the options.
 
 #### Details
 
@@ -2312,7 +2367,8 @@ impl Display for bool
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes `true` or `false` as text, like a string. See [`Format.padText`](#Format.impl.padText).
+Writes `true` or `false` as text, with the width, fill, and alignment of the options. The
+default alignment is left.
 
 <a id="char.impl.Display"></a>
 
@@ -2330,7 +2386,8 @@ impl Display for char
 effect fn display(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the character as text, like a one-scalar string. See [`Format.padText`](#Format.impl.padText).
+Writes the character as text, with the width, fill, and alignment of the options. The default
+alignment is left.
 
 <a id="string.impl.Debug"></a>
 
@@ -2425,7 +2482,8 @@ impl<T: Debug> Debug for List<T>
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the `Debug` form of each element, as `[1, 2, 3]`. See [`Format.debugList`](#Format.impl.debugList).
+Writes the `Debug` form of each element between `[` and `]`, separated by `, `, as
+`[1, 2, 3]`. The alternate form puts each element on its own line.
 
 <a id="bool.impl.Debug"></a>
 

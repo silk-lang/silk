@@ -143,11 +143,19 @@ The count of bytes, or end of input.
 pub service StandardInput
 ```
 
-The effect that reads standard input.
+The effect that reads raw bytes from standard input.
+
+### When to use
+
+Require `&mut StandardInput` in code that reads standard input, so a test can provide the bytes.
+To parse lines or other units, use `silk.buffered_input.BufferedInput.fillStandard`. Decode text
+after you read the bytes, so invalid UTF-8 does not lose data.
 
 ### Details
 
-A provider implements `read`. Callers use [`StandardInput.receive`](#StandardInput.impl.receive).
+A provider implements `read`. Callers use [`StandardInput.receive`](#StandardInput.impl.receive), which fills a prefix of the
+buffer and can return fewer bytes than the buffer length. End of input is a normal result, not
+an error. After it, no later read returns bytes.
 
 <a id="StandardInput.read"></a>
 

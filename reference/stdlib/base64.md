@@ -187,8 +187,9 @@ The cause of the failure.
 pub offset: Option<usize>
 ```
 
-For a decoding error, the position in the input. See [`Base64Reason`](#Base64Reason) for the value of each
-reason.
+For a decoding error, the position in the input: the bad byte for `InvalidByte` and
+`NonCanonicalPadBits`, the misplaced `=` or the input length for `InvalidPadding`, and the
+input length for `InvalidLength`.
 
 <a id="Base64Error.required"></a>
 
@@ -218,7 +219,26 @@ For `OutputTooSmall`, the length of the output that you gave.
 pub struct Base64
 ```
 
-Functions for strict standard Base64 with padding.
+Functions for strict standard Base64 with padding (RFC 4648).
+
+### When to use
+
+Use it when a protocol needs the standard alphabet (`A-Z`, `a-z`, `0-9`, `+`, `/`) with `=`
+padding, for example HTTP Basic authentication or a JSON field. Call [`Base64.encodedLength`](#Base64.impl.encodedLength)
+or [`Base64.decodedLength`](#Base64.impl.decodedLength) to get the exact size of the output, and then
+[`Base64.encodeInto`](#Base64.impl.encodeInto) or [`Base64.decodeInto`](#Base64.impl.decodeInto) to write it.
+
+### Details
+
+The functions do not allocate. They check all input and the size of the output before they
+write the first byte. A failure does not change the output. Decoding is strict. It rejects
+whitespace, the URL-safe characters `-` and `_`, missing or misplaced padding, and unused bits
+that are not zero.
+
+### Gotchas
+
+There is no MIME, PEM, URL-safe, unpadded, or streaming variant. Base64 is an encoding, not
+encryption.
 
 <a id="Base64.impl"></a>
 
@@ -256,6 +276,10 @@ Checks that `input` is strict Base64 and returns the number of bytes that it dec
 
 Returns 0 for empty input. Use it to size the output of [`Base64.decodeInto`](#Base64.impl.decodeInto).
 
+Decoding is strict. It rejects whitespace, the URL-safe characters `-` and `_`, missing or
+misplaced padding, and unused bits that are not zero, so each byte sequence has exactly one
+encoding.
+
 #### Errors
 - `InvalidLength`, `InvalidByte`, `InvalidPadding`, or `NonCanonicalPadBits` for the first
   problem in `input`, from left to right. `offset` gives its position.
@@ -290,6 +314,10 @@ Decodes the Base64 text `input` to the start of `output` and returns the number 
 written.
 
 The bytes of `output` after the written prefix do not change.
+
+Decoding is strict. It rejects whitespace, the URL-safe characters `-` and `_`, missing or
+misplaced padding, and unused bits that are not zero, so each byte sequence has exactly one
+encoding.
 
 #### Errors
 - `InvalidLength`, `InvalidByte`, `InvalidPadding`, or `NonCanonicalPadBits` if `input` is not

@@ -69,10 +69,19 @@ pub service Random
 
 The effect for random bytes that are safe for secrets.
 
+### When to use
+
+Require `&mut Random` for anything that an attacker must not guess: keys, nonces, tokens,
+passwords, and session IDs. For simulations, games, and tests that must repeat, use
+`silk.insecure_random`.
+
 ### Details
 
-A provider fills each requested byte. For an empty slice, it does nothing and does not use
-randomness. If it cannot get random bytes, it must stop the program.
+A provider implements [`Random.fillBytes`](#Random.fillBytes). [`Random.nextU64`](#Random.impl.nextU64), [`Random.nextBool`](#Random.impl.nextBool), and
+[`Random.below`](#Random.impl.below) use it, and the number of bytes that each one reads is fixed, so a test
+provider gives the same results each time. /// A provider fills each requested byte. For an
+empty slice, it does nothing and does not use randomness. If it cannot get random bytes, it must
+stop the program.
 
 <a id="Random.fillBytes"></a>
 

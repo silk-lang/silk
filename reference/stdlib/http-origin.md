@@ -75,7 +75,9 @@ Public declarations: 2.
 pub enum OriginError
 ```
 
-The reason that an origin is not valid, or that its text does not fit.
+The reason that an origin is not valid, or that its text does not fit: the scheme is not `http`
+or `https`, the URI has user information, the host or port is not valid, or the output is too
+small.
 
 <a id="OriginError.InvalidScheme"></a>
 

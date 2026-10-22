@@ -138,12 +138,28 @@ allocations, [`Metrics.live`](#Metrics.impl.live) traps.
 pub struct AllocationMetrics
 ```
 
-The counters for one provider.
+Allocation counters for one `Allocator` provider.
+
+### When to use
+
+Put one in your own `Allocator` provider when a test or a diagnostic needs to know how many
+allocations happened, how many are live, and the largest number that were live at one time. The
+provider calls [`Metrics.recordAcquire`](#Metrics.impl.recordAcquire) after each successful allocation and
+[`Metrics.recordRelease`](#Metrics.impl.recordRelease) after each release.
+
+### Details
+
+The compiler does not collect these counts. They belong to one provider, not to the process.
 
 ### Details
 
 `acquired` and `released` only increase. `peakLive` is the largest value of `acquired -
 released` after an allocation. [`Metrics.live`](#Metrics.impl.live) returns the current value.
+
+### Gotchas
+
+The counters do not identify allocations and do not check that each release matches an
+allocation. If there are more releases than allocations, [`Metrics.live`](#Metrics.impl.live) traps.
 
 <a id="AllocationMetrics.acquired"></a>
 

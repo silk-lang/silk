@@ -118,6 +118,11 @@ pub struct Limits
 
 The maximum sizes for a parser. The `values` limits also apply to each part of the head.
 
+### Gotchas
+
+`maxOwnedBytes` must hold `maxHeadBytes` plus 32 bytes for each field in `maxFields`. Check a
+value with [`validateLimits`](#validateLimits).
+
 <a id="Limits.maxHeadBytes"></a>
 
 ### Field `maxHeadBytes`
@@ -764,7 +769,8 @@ impl Copy for ParseReason
 pub struct ParseError
 ```
 
-The error from a parse. It tells which rule failed, and where.
+The error from a parse. It tells which rule failed, the part, the byte offset in the head, and
+how many bytes of the current call were used.
 
 <a id="ParseError.reason"></a>
 
@@ -841,6 +847,20 @@ pub struct RequestParser
 
 A parser for request heads that you feed in parts. Make it with [`RequestParser.make`](#RequestParser.impl.make).
 
+### Details
+
+`make` allocates all its memory. After that, `feed`, `head`, and `reset` do not allocate.
+`feed` returns how many bytes of the input it used, and stops after the empty line that ends
+the head. The bytes after the head, such as the body, stay with you. The head and its fields
+borrow the parser. Call `copy` to keep them after a `reset`. After an error, the parser stays
+failed until `reset`.
+
+### Gotchas
+
+The parser is strict. Lines must end with CRLF, and the start line uses one space between its
+parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
+the start line, and HTTP/0.9.
+
 <a id="ResponseParser"></a>
 
 ## `ResponseParser`
@@ -850,6 +870,20 @@ pub struct ResponseParser
 ```
 
 A parser for response heads that you feed in parts. Make it with [`ResponseParser.make`](#ResponseParser.impl.make).
+
+### Details
+
+`make` allocates all its memory. After that, `feed`, `head`, and `reset` do not allocate.
+`feed` returns how many bytes of the input it used, and stops after the empty line that ends
+the head. The bytes after the head, such as the body, stay with you. The head and its fields
+borrow the parser. Call `copy` to keep them after a `reset`. After an error, the parser stays
+failed until `reset`.
+
+### Gotchas
+
+The parser is strict. Lines must end with CRLF, and the start line uses one space between its
+parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
+the start line, and HTTP/0.9.
 
 <a id="RequestHead"></a>
 
@@ -1327,6 +1361,12 @@ pub effect fn parseRequest(
 Parses a request head from the start of `input`. The bytes after the head start at
 `progress.consumed` in the result.
 
+### Gotchas
+
+The parser is strict. Lines must end with CRLF, and the start line uses one space between its
+parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
+the start line, and HTTP/0.9.
+
 <a id="parseResponse"></a>
 
 ## `parseResponse`
@@ -1340,6 +1380,12 @@ pub effect fn parseResponse(
 
 Parses a response head from the start of `input`. The bytes after the head start at
 `progress.consumed` in the result.
+
+### Gotchas
+
+The parser is strict. Lines must end with CRLF, and the start line uses one space between its
+parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
+the start line, and HTTP/0.9.
 
 <a id="requestSerializedSize"></a>
 

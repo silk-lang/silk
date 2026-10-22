@@ -5,10 +5,12 @@
 Fibers: handles to child tasks, with typed outcomes and one observer each.
 
 ## When to use
-| Operation | Use it to | |---|---| | [`forkChild`](#Fiber.impl.forkChild) | Start structured child work under the
-current `Scheduler` | | [`join`](#Fiber.impl.join) | Wait for a child, and raise its failure in the current effect
-| | [`await`](#Fiber.impl.await) | Wait for a child, and get success, failure or cancellation as data | |
-[`yieldNow`](#Fiber.impl.yieldNow) | Let other ready tasks run before the current task continues |
+| Operation | Use it to |
+|---|---|
+| [`forkChild`](#Fiber.impl.forkChild) | Start structured child work under the current `Scheduler` |
+| [`join`](#Fiber.impl.join) | Wait for a child, and raise its failure in the current effect |
+| [`await`](#Fiber.impl.await) | Wait for a child, and get success, failure or cancellation as data |
+| [`yieldNow`](#Fiber.impl.yieldNow) | Let other ready tasks run before the current task continues |
 
 Run the root program with `silk.local_scheduler`, which provides the `Scheduler` service.
 
@@ -183,9 +185,23 @@ pub struct Fiber<A, E>
 
 An affine handle that observes one task result or cancellation.
 
+### When to use
+
+Get one from [`forkChild`](#Fiber.impl.forkChild), which starts structured child work under the current `Scheduler`.
+Use [`join`](#Fiber.impl.join) to wait for the child and raise its failure in the current effect, or [`await`](#Fiber.impl.await) to
+get success, failure or cancellation as data. Run the root program with
+`silk.local_scheduler`, which provides the `Scheduler` service.
+
 ### Details
 
-[`await`](#Fiber.impl.await) and [`join`](#Fiber.impl.join) consume the handle. Dropping the handle does not cancel its task.
+A Fiber has one completion observer. [`await`](#Fiber.impl.await) and [`join`](#Fiber.impl.join) consume the handle, so a Fiber has
+at most one waiter. The child body starts only when the scheduler drives it, not during the
+fork.
+
+### Gotchas
+
+Dropping the handle stops the observation. It does not cancel its task. The scheduler cancels
+unfinished children when the root finishes.
 
 <a id="Fiber.impl"></a>
 
@@ -461,14 +477,16 @@ providers.
 #### Details
 
 Preparation finishes its exclusive Scheduler dispatch before publication starts. Publication
-returns the Fiber only after the provider accepts the complete child. The provider records that
-acceptance and wakes the parent before it notifies the child's initial readiness. The child body
-starts only when the Scheduler later drives it.
+returns the Fiber only after the provider accepts the complete child. The provider records
+that acceptance and wakes the parent before it notifies the child's initial readiness. The
+child body starts only when the Scheduler later drives it.
 
 #### Gotchas
 
-Allocation refusal or task-identity exhaustion raises the exact preparation failure. Publication
-refusal raises `OutOfMemoryError`, returns no Fiber, and does not activate the child.
+Allocation refusal or task-identity exhaustion raises the exact preparation failure:
+`OutOfMemoryError` or `TaskIdExhaustedError`. Publication refusal raises `OutOfMemoryError`,
+returns no Fiber, and does not activate the child. Dropping the Fiber does not cancel the
+child. The scheduler cancels unfinished children when the root finishes.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

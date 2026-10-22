@@ -76,6 +76,15 @@ pub struct StdoutWriter
 
 A `Writer` for standard output.
 
+### Details
+It has no buffer. Each write writes all bytes to the descriptor, and flush does nothing. The
+process owns the descriptor, and the writer does not close it. `Writer.writeVectored` sends up
+to eight slices in one `writev` system call.
+
+### Gotchas
+Standard output has no lock. A program that writes to it from several threads controls the
+order itself.
+
 <a id="StderrWriter"></a>
 
 ## `StderrWriter`
@@ -89,7 +98,12 @@ A `Writer` for standard error.
 ### Details
 
 Each write takes the standard error lock for its duration. Thus one write never comes in the
-middle of a message that another thread holds with [`StderrWriter.lock`](#StderrWriter.impl.lock).
+middle of a message that another thread holds with [`StderrWriter.lock`](#StderrWriter.impl.lock). It has no buffer, and
+flush does nothing. The process owns the descriptor, and the writer does not close it.
+
+### Gotchas
+The lock orders only writes that take it. A direct write to descriptor 2, such as one from
+`silk.native_descriptor`, can come between the parts of a locked message.
 
 <a id="StdoutWriter.impl"></a>
 
@@ -150,8 +164,8 @@ the free part of `buffer` goes out at once, together with the buffered bytes in 
 call. Thus a buffer of 64 bytes gives one system call for most short lines. An empty `buffer`
 gives one system call for each write.
 
-The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go out
-before the bytes that the first [`LockedStderr`](#LockedStderr) still holds.
+The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go
+out before the bytes that the first [`LockedStderr`](#LockedStderr) still holds.
 
 #### Gotchas
 

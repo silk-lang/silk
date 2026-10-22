@@ -31,9 +31,12 @@ Public declarations: 1.
 pub struct Context<'configuration>
 ```
 
-The native connection context for `silk.http_fetch`.
+The native connection context for `silk.http_fetch`: it connects over sockets and TLS, with a
+proxy policy and an optional connection pool. Give it to `Fetch.make`.
 
 ### Details
+The context keeps one proxy policy. For each attempt, it selects the route again for the current
+URI before it connects.
 [`Context.make`](#Context.impl.make) does not allocate. [`Context.makeWithPool`](#Context.impl.makeWithPool) first makes the same context, then
 copies the pool handle. If the copy fails, no context is returned, and the pool handle stays
 valid.
@@ -79,7 +82,13 @@ Returns a context that can use connections from `pool`.
 
 #### Details
 The pool keeps its own transport, HTTP, TLS, ALPN, and trust settings. Each attempt checks
-that its route can use the pool before it connects.
+that its route can use the pool before it connects. The copied handle shares the slots and
+settings of the pool.
+
+#### Gotchas
+The native pool holds only direct TCP and Unix connections. When the proxy policy selects a
+proxy for an origin, the attempt does not use the pool, and fails instead of a direct
+connection. It never sends proxy credentials to a pooled direct connection.
 
 <a id="Context.impl.hasPool"></a>
 

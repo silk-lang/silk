@@ -108,7 +108,20 @@ The native `FileSystem` provider. It owns the bytes of its root directory.
 
 ### Details
 Each `Path` is resolved below the root. The root is never shown as a `Path`. An operation that
-would leave the root fails.
+would leave the root fails. The path `/` of the provider is the root, not the root of the
+host. The provider does not follow symbolic links below the root. New files get mode 0666,
+filtered by the umask of the process. Directory listings are sorted by the bytes of the
+paths. A native error becomes a `FileError` with a portable reason and the native code.
+
+### Gotchas
+- Trust the root and its parent directories. The confinement does not protect against a
+  process that renames those directories, changes mounts, or changes the temporary files of
+  `writeFileAtomic`.
+- `writeFile` and `createFile` can leave a partial file when a write fails. Use
+  `writeFileAtomic` when a reader must see the old file or the complete new file.
+- Synchronized writes use `fsync`, not `F_FULLFSYNC`, and do not promise that data survives a
+  power loss.
+- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 <a id="OsFileSystem.impl"></a>
 

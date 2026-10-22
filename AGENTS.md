@@ -48,6 +48,19 @@ behavior, data format, build artifact, or internal representation is a compatibi
 - Use `service` for runtime-provided Effect contracts and lexical provider replacement. Use
   `interface` for compile-time conformance and specialization only.
 
+## Doc comments
+
+Follow `reference/documentation-style-guide.md` for every `//!` and `///` comment. Two rules are
+easy to miss:
+
+- An item's own comment carries its description. Editors show only that comment on hover, never the
+  module comment. A module comment can give an overview, but each fact a user of a type, service,
+  function, field, or operation needs must also be in that item's comment.
+- Each comment is self-sufficient. Never assume the reader has seen another comment: no "see above",
+  "as described in the module docs", or "like [`other`]" in place of the facts.
+
+After changing stdlib doc comments, regenerate `reference/stdlib` with `doc-reference`; CI checks it.
+
 ## Keep tests cheap
 
 - Source-written compiler tests should finish within 1 s on Linux CI; aim for under 500 ms.

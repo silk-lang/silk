@@ -14,9 +14,8 @@ step that can also fail, and [`unwrapOr`](#Result.impl.unwrapOr) to get a plain 
 
 ## Details
 `Result<A, F>` is a union with the variants [`Success`](#Result.Success) and [`Failure`](#Result.Failure). Each combinator
-consumes
-the result. The selected value moves into the output. A value that the operation does not use is
-dropped.
+consumes the result. The selected value moves into the output. A value that the operation does
+not use is dropped.
 
 A `Result` is completed data. It does not run, it needs no provider, and it does not propagate.
 `Effect.result` runs an effect and gives its outcome as a `Result`.
@@ -162,8 +161,7 @@ Returns a successful `Result<A, F>` that owns `value`.
 #### Details
 
 Write both type arguments, as in `Result<i32, string<'static>>.succeed(1)`. No argument gives
-the
-compiler the failure type `F`.
+the compiler the failure type `F`.
 
 <a id="Result.impl.failResult"></a>
 
@@ -178,8 +176,8 @@ Returns a failed `Result<A, F>` that owns `error`.
 #### Details
 
 Write both type arguments, as in `Result<i32, string<'static>>.failResult("empty")`. No
-argument gives
-the compiler the success type `A`. The name is not `fail` because `fail` is a keyword.
+argument gives the compiler the success type `A`. The name is not `fail` because `fail` is a
+keyword.
 
 <a id="Result.impl.map"></a>
 
@@ -217,8 +215,7 @@ Returns `transform(error)` as a failure if `self` is a failure. Returns the same
 
 Use `mapError` to convert a failure into the failure type of the caller, or to add context to
 a failure. [`flatMap`](#Result.impl.flatMap) needs the same failure type in each step, so use `mapError` to align
-the
-types first.
+the types first.
 
 #### Details
 
@@ -278,8 +275,7 @@ or the unused fallback.
 #### Gotchas
 
 The failure value is dropped without a report. The caller evaluates `fallback` before the
-call,
-also when `self` is a success.
+call, also when `self` is a success.
 
 <a id="Result.impl.unwrapOr.fallback"></a>
 

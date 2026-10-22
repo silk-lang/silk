@@ -512,7 +512,27 @@ pub endObserved: bool
 pub struct BufferedInput
 ```
 
-A fixed-size input buffer. Make one with [`BufferedInput.make`](#BufferedInput.impl.make).
+A fixed-size input buffer for parsers that must look at bytes before they use them. Make one
+with [`BufferedInput.make`](#BufferedInput.impl.make).
+
+### When to use
+
+Use it to parse a protocol from a `ByteDuplex` transport or from `StandardInput`. For example,
+a parser can look for a line end with [`BufferedInput.peek`](#BufferedInput.impl.peek) and then remove only that line with
+[`BufferedInput.consume`](#BufferedInput.impl.consume). The bytes after the line stay in the buffer for the next step. In a
+scoped session that also writes, use `silk.buffered_duplex.BufferedDuplex`.
+
+### Details
+
+[`BufferedInput.make`](#BufferedInput.impl.make) allocates the buffer one time. No other operation allocates. When the
+transport ends, the end is recorded, and later fills do not read again. The bytes that were read
+before the end stay available. A transport failure makes the buffer terminal, and each later
+fill fails with `BufferError.Terminal`.
+
+### Gotchas
+
+A message that is longer than the capacity cannot be in the buffer at one time. Choose the
+capacity for the longest unit that the parser must see, such as the longest header line.
 
 <a id="BufferedInput.impl"></a>
 
@@ -695,7 +715,9 @@ count of 0 and does not read. `deadline` is an absolute time on the active `Mono
 
 #### Errors
 
-- The errors of [`BufferedInput.fill`](#BufferedInput.impl.fill).
+- `BufferError.Terminal` if an earlier failure made the buffer unusable.
+- `BufferError.ReadFailed` if a read fails. The buffer becomes terminal. `progress` gives the
+  bytes that this call added.
 
 <a id="BufferedInput.impl.readSomeStandard"></a>
 
@@ -718,7 +740,11 @@ count of 0 and does not read.
 
 #### Errors
 
-- The errors of [`BufferedInput.fillStandard`](#BufferedInput.impl.fillStandard).
+- `BufferError.Terminal` if an earlier failure made the buffer unusable.
+- `BufferError.InputFailed` if a read fails. The buffer becomes terminal. `progress` gives the
+  bytes that this call added.
+- `BufferError.InvalidReadCount` if the provider reports a count that is not possible. The
+  buffer becomes terminal.
 
 <a id="BufferedInput.impl.readExact"></a>
 
@@ -745,8 +771,9 @@ limit. It applies to each read.
 
 - `BufferError.UnexpectedEnd` if the transport ends first. `progress` gives the number of
   bytes that were copied into `output`.
-- The errors of [`BufferedInput.fill`](#BufferedInput.impl.fill). Their `progress` includes the bytes that this call
-  copied before the failure.
+- `BufferError.Terminal` if an earlier failure made the buffer unusable.
+- `BufferError.ReadFailed` if a read fails. The buffer becomes terminal. `progress` includes
+  the bytes that this call copied before the failure.
 
 <a id="BufferedInput.impl.discardAtMost"></a>
 
@@ -775,7 +802,9 @@ absolute time on the active `MonotonicClock`. `Option.none()` means no time limi
 
 #### Errors
 
-- The errors of [`BufferedInput.fill`](#BufferedInput.impl.fill).
+- `BufferError.Terminal` if an earlier failure made the buffer unusable.
+- `BufferError.ReadFailed` if a read fails. The buffer becomes terminal. `progress` gives the
+  bytes that this call added.
 
 <a id="BufferedInput.impl.discardExact"></a>
 
@@ -793,11 +822,18 @@ pub effect fn discardExact(
 
 Consumes and drops exactly `count` bytes.
 
+#### Details
+
+`deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no time
+limit.
+
 #### Errors
 
 - `BufferError.UnexpectedEnd` if the transport ends first. `progress` gives the number of
   bytes that were discarded.
-- The errors of [`BufferedInput.fill`](#BufferedInput.impl.fill).
+- `BufferError.Terminal` if an earlier failure made the buffer unusable.
+- `BufferError.ReadFailed` if a read fails. The buffer becomes terminal. `progress` gives the
+  bytes that this call added.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

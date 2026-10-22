@@ -123,6 +123,19 @@ pub interface Serialize
 
 A type that can write itself as one JSON value.
 
+### When to use
+Implement it for your type to write the type with `silk.json_value.Json.serialize`. The
+standard library implements it for `bool`, the integer types, `f32`, `f64`, strings,
+`Option<T>` (`null` when absent), and `List<T>` (an array).
+
+### Details
+An implementation for a struct usually writes an object with `silk.json_object.JsonObject`, or
+uses `silk.json_reflect.JsonReflect.write`.
+
+### Errors
+- `JsonError` when a value cannot be written, such as a float that is not finite. A float that
+  is not finite fails before any bytes are written.
+
 <a id="Serialize.serialize"></a>
 
 ### Operation `serialize`
@@ -144,6 +157,15 @@ pub interface Decode
 
 A type that can read itself from one JSON value without memory from an `Allocator`.
 
+### When to use
+Implement it for your type to read the type with `silk.json_value.Json.decode`. If the type
+needs memory, implement [`Deserialize`](#Deserialize) instead. The standard library implements it for `bool`,
+the integer types, `f32`, `f64`, and `Option<T>` of those (`null` when absent).
+
+### Gotchas
+`decode` reads exactly one value and leaves the next token, such as `,` or `]`, for the caller.
+The caller must check that the document ends.
+
 <a id="Decode.decode"></a>
 
 ### Operation `decode`
@@ -163,6 +185,19 @@ pub interface Deserialize
 ```
 
 A type that can read itself from one JSON value and can use memory from the `Allocator`.
+
+### When to use
+Implement it for your type to read the type with `silk.json_value.Json.deserialize`. The
+standard library implements it for `bool`, the integer types, `f32`, `f64`, strings,
+`Option<T>` (`null` when absent), and `List<T>`.
+
+### Details
+An implementation for a struct reads tokens from the `JsonScanner` and calls
+[`JsonCodec.deserializeOne`](#JsonCodec.impl.deserializeOne) for each field.
+
+### Gotchas
+`deserialize` reads exactly one value and leaves the next token, such as `,` or `]`, for the
+caller. The caller must check that the document ends.
 
 <a id="Deserialize.deserialize"></a>
 
@@ -202,7 +237,8 @@ impl JsonCodec
 pub fn decodeOne<T: Decode>(scanner: &mut JsonScanner) -> Result<T, JsonError>
 ```
 
-Reads one value of type `T` from `scanner` with its `Decode` implementation.
+Reads one value of type `T` from `scanner` with its `Decode` implementation. It leaves the
+next token unread.
 
 #### Errors
 
@@ -217,7 +253,8 @@ pub effect fn deserializeOne<T: Deserialize>(scanner: &mut JsonScanner)
     -> T ! JsonError | OutOfMemoryError ? &mut Allocator
 ```
 
-Reads one value of type `T` from `scanner` with its `Deserialize` implementation.
+Reads one value of type `T` from `scanner` with its `Deserialize` implementation. It leaves
+the next token unread.
 
 #### When to use
 

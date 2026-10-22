@@ -5,7 +5,8 @@
 Internal bounded zstd compressed-block decoding with retained entropy tables.
 
 ## Details
-Callers supply literal, output, and circular history storage. A failed decode invalidates the state.
+Callers supply literal, output, and circular history storage. A failed decode invalidates the
+state.
 
 Import as `BlockState` with `import silk.support.zstd_block { BlockState }`.
 
@@ -130,7 +131,8 @@ pub effect fn make() -> BlockState ! OutOfMemoryError ? &mut Allocator
 Allocates fresh entropy tables and sets the initial repeat offsets for one frame.
 
 #### Details
-The state owns five exact allocations and releases them when dropped. Decode and reset do not allocate.
+The state owns five exact allocations and releases them when dropped. Decode and reset do not
+allocate.
 
 <a id="BlockState.impl.reset"></a>
 
@@ -150,7 +152,8 @@ Restores fresh entropy tables and repeat offsets before a new frame.
 pub fn workspaceBytes() -> usize
 ```
 
-Returns a conservative byte bound for tables and transient algorithm scratch on supported targets.
+Returns a conservative byte bound for tables and transient algorithm scratch on supported
+targets.
 
 #### Details
 This bound excludes caller-owned compressed, literal, output, and history storage.
