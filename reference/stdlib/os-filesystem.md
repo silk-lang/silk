@@ -82,7 +82,7 @@ effect fn failed<E>(error: E) -> i32 {
 effect fn withFiles() -> i32
   ! FileError | OutOfMemoryError
   ? &mut Allocator {
-  let mut files = run OsFileSystem.make(b"/tmp")
+  let mut files = run OsFileSystem.make("/tmp")
   return run program() |> Effect.provideMut<FileSystem>(&mut files)
 }
 
@@ -144,11 +144,32 @@ impl OsFileSystem
 ### Associated function `make`
 
 ```silk
-pub effect fn make(root: &[u8]) -> OsFileSystem ! OutOfMemoryError ? &mut Allocator
+pub effect fn make(root: string) -> OsFileSystem ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns a provider with a copy of the text `root` as its root directory, such as `"/"` or
+`"/tmp"`. It does not open the directory.
+
+#### Errors
+`OutOfMemoryError` if the copy cannot be allocated.
+
+#### Gotchas
+`root` must be an absolute host path, not empty, with no NUL. Other values trap.
+
+<a id="OsFileSystem.impl.makeBytes"></a>
+
+### Associated function `makeBytes`
+
+```silk
+pub effect fn makeBytes(root: &[u8]) -> OsFileSystem ! OutOfMemoryError ? &mut Allocator
 ```
 
 Returns a provider with a copy of `root` as its root directory. It does not open the
-directory.
+directory. The bytes do not have to be valid UTF-8.
+
+#### When to use
+Use it for a root that you got from the host as bytes, such as the working directory from
+`HostInput.workingDirectory`.
 
 #### Errors
 `OutOfMemoryError` if the copy cannot be allocated.
