@@ -10,16 +10,25 @@
 //! a typed source input, or another unit's result. Each consumption is one edge, linked into its dependee's list of
 //! dependers and into its depender's list of consumed dependees.
 //!
-//! An update marks every depender of a changed source file outdated, and then every transitive
-//! depender of an outdated unit's result. Unit results carry no cutoff yet, so a unit that reruns
-//! always counts as changed, and every unit that consumed it, directly or not, would rerun after
-//! verifying it. Marking them outdated at once reruns exactly that set without verifying.
+//! An update marks every depender of a changed source file or input outdated, and then every
+//! transitive depender of an outdated unit's result. Outdated means unverified, not stale: the
+//! marking bounds which units a demand must verify, and every unit outside it stays current
+//! without a check.
+//!
+//! The graph counts revisions. A changed dependee records the revision it changed in, and a unit
+//! records the revision its answer was last verified in and the one it last changed in. A rerun
+//! whose answer has the same fingerprint as the one it replaces keeps its changed revision, so
+//! the units that read it can still be verified: an outdated unit is current again when no
+//! dependee changed after it was last verified, checking its dependees in the order it consumed
+//! them and bringing each unit result up to date first.
 //!
 //! # Gotchas
 //! Units use stable declaration handles. Semantic reconciliation observes handle survival before
 //! cache reuse; input changes seed this graph without a blanket changed-module sweep.
 
+import semantic.ContentHash {ContentHash}
 import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
 import silk.ownership {Copy}
 import silk.u32
 import silk.usize
@@ -55,6 +64,12 @@ struct UnitRecord {
   runId: u32
   // The traversal that last visited this unit.
   visited: u32
+  // The revisions in which the unit's answer was last verified and last changed.
+  verifiedAt: u32
+  changedAt: u32
+  // The exact hash of the unit's last completed answer, when it has one.
+  fingerprinted: bool
+  fingerprint: ContentHash
 }
 
 impl Copy for UnitRecord {}
@@ -71,6 +86,8 @@ struct DependeeRecord {
   kind: DependeeKind
   subject: u32
   module: u32
+  // The revision in which a source file or input last changed.
+  changedAt: u32
 }
 
 impl Copy for DependeeRecord {}
@@ -101,10 +118,14 @@ pub struct DependencyGraph {
   free: u32
   runs: u32
   traversals: u32
+  revision: u32
   pending: List<u32>
   edgesRecorded: usize
   edgesDeduplicated: usize
   markedOutdated: usize
+  fingerprinted: usize
+  unchanged: usize
+  verified: usize
 }
 
 /// The counters of one graph, for `silk build --stats`.
@@ -116,6 +137,12 @@ pub struct Counters {
   pub edgesRecorded: usize
   pub edgesDeduplicated: usize
   pub markedOutdated: usize
+  /// Completed runs whose answer has an exact fingerprint.
+  pub fingerprinted: usize
+  /// Reruns whose answer hashed equal to the answer they replaced.
+  pub unchanged: usize
+  /// Outdated units verified current without rerunning.
+  pub verified: usize
   /// Bytes held by the graph's tables, by capacity.
   pub bytes: usize
 }
@@ -133,16 +160,21 @@ pub fn make(recording: bool) -> DependencyGraph {
     free: u32.MAX,
     runs: 0,
     traversals: 0,
+    revision: 0,
     pending: List<u32>.make(),
     edgesRecorded: usize.ZERO,
     edgesDeduplicated: usize.ZERO,
     markedOutdated: usize.ZERO,
+    fingerprinted: usize.ZERO,
+    unchanged: usize.ZERO,
+    verified: usize.ZERO,
   }
 }
 
 effect fn unitSlot(graph: &mut DependencyGraph, unit: usize) -> () ! OutOfMemoryError ? &mut Allocator {
   while List.length(&graph.units) <= unit {
-    run List.append(&mut graph.units, UnitRecord {state: UnitState.Absent, firstEdge: u32.MAX, runId: u32.MAX, visited: 0})
+    run List.append(&mut graph.units, UnitRecord {state: UnitState.Absent, firstEdge: u32.MAX, runId: u32.MAX, visited: 0, verifiedAt: 0, changedAt: 0,
+      fingerprinted: false, fingerprint: ContentHash {high: 0, low: 0}})
   }
   return ()
 }
@@ -189,7 +221,7 @@ effect fn dependeeIndex(graph: &mut DependencyGraph, dependee: Dependee) -> usiz
   let module = match &dependee { Dependee.SourceInput {module, ..} => module _ => usize.ZERO }
   let created = List.length(&graph.dependees)
   run List.append(&mut graph.dependees, DependeeRecord {head: u32.MAX, lastUnit: u32.MAX, lastRun: u32.MAX,
-    kind: kind, subject: usize.toU32(table), module: usize.toU32(module)})
+    kind: kind, subject: usize.toU32(table), module: usize.toU32(module), changedAt: 0})
   if kind == DependeeKind.Input {
     while List.length(&graph.sourceInputs) <= table { run List.append(&mut graph.sourceInputs, u32.MAX) }
     List.set(&mut graph.sourceInputs, table, usize.toU32(created))
@@ -293,13 +325,43 @@ pub effect fn record(graph: &mut DependencyGraph, unit: usize, dependee: Depende
   return ()
 }
 
-/// Completes a run of `unit`: its result reflects the current revision.
-pub effect fn finishRun(graph: &mut DependencyGraph, unit: usize) -> () ! OutOfMemoryError ? &mut Allocator {
-  if !graph.recording { return () }
+/// Completes a run of `unit`: its result reflects the current revision. `fingerprint` is the
+/// exact hash of the answer, absent when the answer has none; it replaces the previous run's.
+/// Returns whether the previous run's answer had the same fingerprint, so this run changed nothing.
+pub effect fn finishRun(graph: &mut DependencyGraph, unit: usize, fingerprint: Option<ContentHash>) -> bool
+! OutOfMemoryError ? &mut Allocator {
+  if !graph.recording { return false }
   run unitSlot(&mut graph.*, unit)
+  let previous = List.get(&graph.units, unit)
+  let mut unchanged = false
+  let revision = graph.revision
   let mut units = List.asMutSlice(&mut graph.units)
   units[unit].state = UnitState.UpToDate
-  return ()
+  units[unit].verifiedAt = revision
+  match &fingerprint {
+    Option<ContentHash>.Some {value} => {
+      unchanged = previous.fingerprinted && ContentHash.equals(previous.fingerprint, value)
+      units[unit].fingerprinted = true
+      units[unit].fingerprint = value
+      graph.fingerprinted = graph.fingerprinted + usize.ONE
+    }
+    Option<ContentHash>.None => { units[unit].fingerprinted = false }
+  }
+  if unchanged {
+    graph.unchanged = graph.unchanged + usize.ONE
+  } else {
+    let mut changed = List.asMutSlice(&mut graph.units)
+    changed[unit].changedAt = revision
+  }
+  return unchanged
+}
+
+/// The fingerprint of `unit`'s last completed answer, absent when it has none.
+pub fn fingerprintOf(graph: &DependencyGraph, unit: usize) -> Option<ContentHash> {
+  if unit >= List.length(&graph.units) { return Option<ContentHash>.none() }
+  let record = List.get(&graph.units, unit)
+  if !record.fingerprinted { return Option<ContentHash>.none() }
+  return Option<ContentHash>.some(record.fingerprint)
 }
 
 /// The newest edge `unit` recorded, or `usize.MAX`.
@@ -356,6 +418,9 @@ pub effect fn inputChanged(graph: &mut DependencyGraph, input: usize, module: us
 effect fn changed(graph: &mut DependencyGraph, dependee: Dependee) -> () ! OutOfMemoryError ? &mut Allocator {
   let target = knownDependee(&graph.*, dependee)
   if target == usize.MAX { return () }
+  let revision = graph.revision
+  let mut stamped = List.asMutSlice(&mut graph.dependees)
+  stamped[target].changedAt = revision
   let mut edge = List.get(&graph.dependees, target).head
   while edge != u32.MAX {
     let current = List.get(&graph.edges, u32.toUsize(edge))
@@ -393,6 +458,36 @@ pub effect fn markOutdated(graph: &mut DependencyGraph, unit: usize) -> () ! Out
   return ()
 }
 
+/// Starts a new revision: dependees changed from now on change after every unit verified so far.
+pub fn beginRevision(graph: &mut DependencyGraph) -> () {
+  graph.revision = graph.revision + 1
+  return ()
+}
+
+/// Whether one edge of `unit` consumed a source file or input that changed after the unit was
+/// last verified. A unit result edge never has; its unit's changed revision decides instead.
+pub fn edgeChanged(graph: &DependencyGraph, unit: usize, edge: usize) -> bool {
+  let record = List.get(&graph.dependees, u32.toUsize(List.get(&graph.edges, edge).dependee))
+  if record.kind == DependeeKind.Result { return false }
+  return record.changedAt > List.get(&graph.units, unit).verifiedAt
+}
+
+/// Whether `dependee`'s answer changed after `unit` was last verified.
+pub fn resultChanged(graph: &DependencyGraph, unit: usize, dependee: usize) -> bool {
+  if dependee >= List.length(&graph.units) { return true }
+  return List.get(&graph.units, dependee).changedAt > List.get(&graph.units, unit).verifiedAt
+}
+
+/// Marks an outdated `unit` current: every dependee it consumed was verified unchanged.
+pub fn markVerified(graph: &mut DependencyGraph, unit: usize) -> () {
+  let revision = graph.revision
+  let mut units = List.asMutSlice(&mut graph.units)
+  units[unit].state = UnitState.UpToDate
+  units[unit].verifiedAt = revision
+  graph.verified = graph.verified + usize.ONE
+  return ()
+}
+
 /// Copies the graph's counters and table sizes.
 pub fn counters(graph: &DependencyGraph) -> Counters {
   let mut freeEdges = usize.ZERO
@@ -401,7 +496,7 @@ pub fn counters(graph: &DependencyGraph) -> Counters {
     freeEdges = freeEdges + usize.ONE
     edge = List.get(&graph.edges, u32.toUsize(edge)).next
   }
-  let bytes = List.capacity(&graph.units) * 16 + List.capacity(&graph.dependees) * 24
+  let bytes = List.capacity(&graph.units) * 48 + List.capacity(&graph.dependees) * 28
     + List.capacity(&graph.sourceInputs) * 4 + List.capacity(&graph.sourceFiles) * 4 + List.capacity(&graph.unitResults) * 4
     + List.capacity(&graph.edges) * 20
   return Counters {
@@ -412,6 +507,9 @@ pub fn counters(graph: &DependencyGraph) -> Counters {
     edgesRecorded: graph.edgesRecorded,
     edgesDeduplicated: graph.edgesDeduplicated,
     markedOutdated: graph.markedOutdated,
+    fingerprinted: graph.fingerprinted,
+    unchanged: graph.unchanged,
+    verified: graph.verified,
     bytes: bytes,
   }
 }
