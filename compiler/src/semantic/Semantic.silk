@@ -139,6 +139,7 @@ import semantic.DeclarationId {DeclarationId, OwnerStep}
 import semantic.SourceInputs as Inputs {SourceInputs, Selector as SourceSelector, Facet as SourceFacet}
 import semantic.DeclarationTable
 import semantic.StableKey
+import semantic.CacheImage
 import semantic.FinalProfile {Entry as ProfileEntry, FinalProfile}
 import semantic.InitialProfile {InitialProfile}
 import semantic.NativeAssembly
@@ -7708,6 +7709,150 @@ effect fn placeStableInput(resolver: &mut Resolver, bytes: &[u8]) -> Option<Plac
   }
   if handle == usize.MAX { return Option<PlacedInput>.none() }
   return Option<PlacedInput>.some(PlacedInput {module: ordinal, selector: StableKey.withHandle(move selector, handle)})
+}
+
+// Where a unit stands while a cache image is built: not yet reached, reached and not finished,
+// or unfit for the image because it reaches a unit that is not current or a leaf with no stable
+// form. Any other value is the unit's node.
+fn unreached() -> usize { return usize.MAX }
+fn entered() -> usize { return usize.MAX - usize.ONE }
+fn unfit() -> usize { return usize.MAX - 2 }
+
+// The image under construction, with the node or leaf each unit and dependee became.
+struct ImageBuild {
+  image: CacheImage.Image
+  nodes: List<usize>
+  files: List<usize>
+  inputs: List<usize>
+  // The module of each file leaf, for its digest once the walk ends.
+  fileModules: List<usize>
+}
+
+effect fn slotFor(slots: &mut List<usize>, at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  while List<usize>.length(&slots.*) <= at { run List<usize>.append(&mut slots.*, unreached()) }
+}
+
+// The leaf of one consumed file or input, added on first use, or `unfit` when it has no stable form.
+effect fn imageLeaf(resolver: &Resolver, build: &mut ImageBuild, dependee: Dependee) -> usize ! OutOfMemoryError ? &mut Allocator {
+  return match &dependee {
+    Dependee.SourceFile {module} => {
+      run slotFor(&mut build.files, module)
+      let known = List<usize>.get(&build.files, module)
+      if known != unreached() { return known }
+      let modules = List<ModuleId>.asSlice(&resolver.modules)
+      let mut key = Bytes.make()
+      run StableKey.module(&mut key, &modules[module])
+      let leaf = List<CacheImage.Leaf>.length(&build.image.leaves)
+      run List<CacheImage.Leaf>.append(&mut build.image.leaves, CacheImage.Leaf {input: false, key: move key,
+        digest: ContentHash {high: 0, low: 0}})
+      run List<usize>.append(&mut build.fileModules, module)
+      List<usize>.set(&mut build.files, module, leaf)
+      return leaf
+    }
+    Dependee.SourceInput {input, ..} => {
+      run slotFor(&mut build.inputs, input)
+      let known = List<usize>.get(&build.inputs, input)
+      if known != unreached() { return known }
+      let mut found = unfit()
+      if let Option<Bytes>.Some {value: key} = move run stableInput(&resolver.*, input) {
+        let values = List<Inputs.Input>.asSlice(&resolver.sourceInputs.inputs)
+        found = List<CacheImage.Leaf>.length(&build.image.leaves)
+        run List<CacheImage.Leaf>.append(&mut build.image.leaves, CacheImage.Leaf {input: true, key: move key,
+          digest: ContentHash.of(Bytes.asSlice(&values[input].value))})
+      }
+      List<usize>.set(&mut build.inputs, input, found)
+      return found
+    }
+    Dependee.UnitResult {..} => unfit()
+  }
+}
+
+// Adds every unit `root` reaches to the image, children first, and returns `root`'s node, or
+// `unfit` when it reaches a unit that is not current or a leaf with no stable form.
+effect fn imageUnit(resolver: &Resolver, build: &mut ImageBuild, root: usize) -> usize ! OutOfMemoryError ? &mut Allocator {
+  run slotFor(&mut build.nodes, root)
+  if List<usize>.get(&build.nodes, root) != unreached() { return List<usize>.get(&build.nodes, root) }
+  let mut stack = List<usize>.make()
+  run List<usize>.append(&mut stack, root)
+  List<usize>.set(&mut build.nodes, root, entered())
+  let mut edges = List<usize>.make()
+  while List<usize>.length(&stack) > usize.ZERO {
+    let unit = List<usize>.get(&stack, List<usize>.length(&stack) - usize.ONE)
+    // Enter the first child not reached yet; the unit finishes once every child has.
+    let mut pending = unreached()
+    let mut edge = Graph.firstEdgeOf(&resolver.graph, unit)
+    while edge != usize.MAX && pending == unreached() {
+      let consumed = Graph.dependeeOf(&resolver.graph, edge)
+      if let Dependee.UnitResult {unit: child} = &consumed {
+        run slotFor(&mut build.nodes, child)
+        if List<usize>.get(&build.nodes, child) == unreached() { pending = child }
+      }
+      edge = Graph.nextEdgeOf(&resolver.graph, edge)
+    }
+    if pending != unreached() {
+      List<usize>.set(&mut build.nodes, pending, entered())
+      run List<usize>.append(&mut stack, pending)
+      continue
+    }
+    let top = List<usize>.length(&stack) - usize.ONE
+    drop List<usize>.remove(&mut stack, top)
+    let mut fit = Graph.state(&resolver.graph, unit) == UnitState.UpToDate
+    edges = List<usize>.make()
+    edge = Graph.firstEdgeOf(&resolver.graph, unit)
+    while edge != usize.MAX && fit {
+      let dependee = Graph.dependeeOf(&resolver.graph, edge)
+      if let Dependee.UnitResult {unit: child} = &dependee {
+        let node = List<usize>.get(&build.nodes, child)
+        // A child still entered closes a cycle; neither is fit.
+        if node >= unfit() { fit = false } else { run List<usize>.append(&mut edges, CacheImage.nodeEdge(node)) }
+      } else {
+        let leaf = run imageLeaf(&resolver.*, &mut build.*, dependee)
+        if leaf == unfit() { fit = false } else { run List<usize>.append(&mut edges, CacheImage.leafEdge(leaf)) }
+      }
+      edge = Graph.nextEdgeOf(&resolver.graph, edge)
+    }
+    if fit {
+      let node = run CacheImage.addNode(&mut build.image, List<usize>.asSlice(&edges))
+      List<usize>.set(&mut build.nodes, unit, node)
+    } else {
+      List<usize>.set(&mut build.nodes, unit, unfit())
+    }
+  }
+  return List<usize>.get(&build.nodes, root)
+}
+
+// The answer of a module check root: whether it is a sweep (0) or an escape check (1), then the
+// concrete bodies it names.
+effect fn checkAnswer(kind: u64, concrete: &[DeclarationId]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut answer = Bytes.make()
+  run RuntimeEncoding.word(&mut answer, kind)
+  run RuntimeEncoding.word(&mut answer, usize.toU64(concrete.length))
+  let mut at = usize.ZERO
+  while at < concrete.length {
+    run StableKey.declaration(&mut answer, &concrete[at])
+    at = at + usize.ONE
+  }
+  return move answer
+}
+
+effect fn imageRoot(resolver: &Resolver, build: &mut ImageBuild, unit: usize, answer: Bytes) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let key = match move run stableUnit(&resolver.*, unit) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return () }
+  }
+  let node = run imageUnit(&resolver.*, &mut build.*, unit)
+  if node >= unfit() { return () }
+  run List<CacheImage.Root>.append(&mut build.image.roots, CacheImage.Root {key: move key, node: node, answer: move answer})
+}
+
+// The digest of one module's source bytes, or zero when the module has no source.
+effect fn sourceDigest(resolver: &mut Resolver, module: &ModuleId) -> ContentHash ! Cycle | OutOfMemoryError ? &mut Allocator {
+  let answer = run demandSource(&mut resolver.*, module)
+  if let Option<&IndexedSource>.Some {value: indexed} = move SourceIndex.source(&resolver.source, &answer, module) {
+    return ContentHash.of(SourceUnit.bytes(IndexedSource.sourceUnit(indexed)))
+  }
+  return ContentHash {high: 0, low: 0}
 }
 
 effect fn verifyUnit(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, unit: usize) -> bool
@@ -79289,6 +79434,66 @@ impl Semantic {
       Option<PlacedInput>.Some {value} => Inputs.find(&self.resolver.sourceInputs, value.module, &value.selector)
       Option<PlacedInput>.None => usize.MAX
     }
+  }
+  /// What decides this store's answers besides its sources, for a cache stamp: the target and,
+  /// when one is selected, the profile's identity.
+  pub effect fn stampIdentity(self: &Self) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+    let mut output = Bytes.make()
+    run RuntimeEncoding.field(&mut output, MachineTarget.name(&self.resolver.target))
+    if let Option<&FinalProfile>.Some {value} = move selectedProfile(&self.resolver) {
+      run RuntimeEncoding.field(&mut output, b"profile")
+      run FinalProfile.appendIdentity(value, &mut output)
+    } else {
+      run RuntimeEncoding.field(&mut output, b"no-profile")
+    }
+    return move output
+  }
+  /// The image of this store's module checks for a cache on disk: each current module sweep and
+  /// escape check that found nothing to report, as a root, with every unit and source read it
+  /// rests on. A check that reported anything is left out and runs again in the next process.
+  pub effect fn cacheImage(self: &mut Self) -> CacheImage.Image ! Cycle | OutOfMemoryError ? &mut Allocator {
+    let mut build = ImageBuild {image: CacheImage.make(), nodes: List<usize>.make(), files: List<usize>.make(),
+      inputs: List<usize>.make(), fileModules: List<usize>.make()}
+    let sweeps = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+    let mut at = usize.ZERO
+    while at < sweeps.length {
+      let memo = &sweeps[at]
+      at = at + usize.ONE
+      if List<Shared<Rejection>>.length(&memo.sweep.rejections) > usize.ZERO
+        || List<Shared<BackendGap>>.length(&memo.sweep.gaps) > usize.ZERO
+        || List<UncheckedDeclaration>.length(&memo.sweep.unchecked) > usize.ZERO
+        || List<DeferredStaticTemplate>.length(&memo.deferred) > usize.ZERO
+        || List<UncheckedBody>.length(&memo.unchecked) > usize.ZERO {
+        continue
+      }
+      let answer = run checkAnswer(0, List<DeclarationId>.asSlice(&memo.sweep.concrete))
+      run imageRoot(&self.resolver, &mut build, memo.unit, move answer)
+    }
+    let escapes = List<EscapeMemo>.asSlice(&self.escapeMemos)
+    at = usize.ZERO
+    while at < escapes.length {
+      let memo = &escapes[at]
+      at = at + usize.ONE
+      if List<Shared<Rejection>>.length(&memo.result.rejections) > usize.ZERO
+        || List<Shared<BackendGap>>.length(&memo.result.gaps) > usize.ZERO
+        || List<UncheckedDeclaration>.length(&memo.result.unchecked) > usize.ZERO {
+        continue
+      }
+      let answer = run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete))
+      run imageRoot(&self.resolver, &mut build, memo.unit, move answer)
+    }
+    // A file leaf's digest is of the bytes its module holds now, read once the walk is done.
+    let files = List<usize>.length(&build.fileModules)
+    let mut file = usize.ZERO
+    while file < files {
+      let module = resolvedModule(&self.resolver, List<usize>.get(&build.fileModules, file))
+      let leaf = List<usize>.get(&build.files, List<usize>.get(&build.fileModules, file))
+      let digest = run sourceDigest(&mut self.resolver, &module)
+      let mut leaves = List<CacheImage.Leaf>.asMutSlice(&mut build.image.leaves)
+      leaves[leaf].digest = digest
+      file = file + usize.ONE
+    }
+    return move build.image
   }
   /// How many emitted LLVM input subjects carry a content digest. A revisable store names every
   /// subject by its digest so a revision can re-find equal content; a one-shot store names none.

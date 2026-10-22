@@ -1,0 +1,287 @@
+//! The on-disk image of a semantic store's dependency graph, read back by a later process.
+//!
+//! # When to use
+//! A revisable store writes an [`Image`] after a check or build, and the next process reads it to
+//! learn which results it can reuse. [`encode`] and [`decode`] hold the file format; what goes in
+//! the image and how it is verified belong to `Semantic`.
+//!
+//! # Details
+//! An image holds leaves, nodes and roots. A leaf is one source file or source input in its stable
+//! form (`StableKey`) with the digest of what was read through it. A node is one unit; its edges
+//! name the leaves and earlier nodes it consumed, so nodes are listed children first and one pass
+//! verifies them all. A node is green when every leaf it reaches still reads the same: a later
+//! process compares source, never answers, so a node carries no fingerprint and no key. A root is
+//! a node whose answer the image holds, named by its stable key.
+//!
+//! The stamp names everything outside the sources that decides a result: the compiler build, the
+//! target and the profile. [`decode`] gives none for an image with another stamp, so an upgraded
+//! compiler starts cold instead of reading answers an older one wrote.
+//!
+//! # Gotchas
+//! Every count and index is an unsigned LEB128 varint, and every byte run is length-delimited.
+//! Malformed bytes decode to none, never a partial image.
+
+import semantic.ContentHash {ContentHash}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.list {List}
+import silk.option {Option}
+import silk.slice {Slice}
+import silk.u8
+import silk.u64
+import silk.usize
+
+// Changes whenever the layout below changes, so an image of an older layout decodes to none even
+// under the same stamp.
+const FORMAT: u64 = 1
+
+fn magic() -> &'static [u8] {
+  return b"silk-semantic-cache"
+}
+
+/// One source file or source input a node consumed, and the digest of what it read.
+pub struct Leaf {
+  /// Whether this is a source input; otherwise it is a whole source file.
+  pub input: bool
+  /// The stable bytes of the file's module, or of the input's module and selector.
+  pub key: Bytes
+  /// The digest of the file's bytes or of the input's captured value.
+  pub digest: ContentHash
+}
+
+/// A root: a node whose answer the image holds.
+pub struct Root {
+  /// The stable key of the root's unit.
+  pub key: Bytes
+  /// The root's node.
+  pub node: usize
+  /// The answer, in the encoding the root's family defines.
+  pub answer: Bytes
+}
+
+/// A dependency graph image. Node `n`'s edges are `edges[ends[n - 1]..ends[n]]`; an edge `e`
+/// names leaf `e / 2` when even and node `e / 2` when odd, and a node names only earlier nodes.
+pub struct Image {
+  pub leaves: List<Leaf>
+  pub ends: List<usize>
+  pub edges: List<usize>
+  pub roots: List<Root>
+}
+
+/// An empty image.
+pub fn make() -> Image {
+  return Image {leaves: List<Leaf>.make(), ends: List<usize>.make(), edges: List<usize>.make(), roots: List<Root>.make()}
+}
+
+/// The edge that names leaf `leaf`.
+pub fn leafEdge(leaf: usize) -> usize {
+  return leaf * 2
+}
+
+/// The edge that names node `node`.
+pub fn nodeEdge(node: usize) -> usize {
+  return node * 2 + usize.ONE
+}
+
+/// Whether `edge` names a node rather than a leaf.
+pub fn namesNode(edge: usize) -> bool {
+  return edge % 2 == usize.ONE
+}
+
+/// The leaf or node index `edge` names.
+pub fn target(edge: usize) -> usize {
+  return edge / 2
+}
+
+/// How many nodes the image holds.
+pub fn nodeCount(image: &Image) -> usize {
+  return List<usize>.length(&image.ends)
+}
+
+/// The edges of node `node`.
+pub fn edgesOf(image: &Image, node: usize) -> &[usize] {
+  let ends = List<usize>.asSlice(&image.ends)
+  let mut start = usize.ZERO
+  if node > usize.ZERO { start = ends[node - usize.ONE] }
+  return Slice.view<usize>(List<usize>.asSlice(&image.edges), start, ends[node] - start)
+}
+
+/// Appends a node with `edges` and returns its index. Each edge must name a leaf already added or
+/// an earlier node.
+pub effect fn addNode(image: &mut Image, edges: &[usize]) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < edges.length {
+    run List<usize>.append(&mut image.edges, edges[at])
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut image.ends, List<usize>.length(&image.edges))
+  return List<usize>.length(&image.ends) - usize.ONE
+}
+
+effect fn varint(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut rest = value
+  let mut buffer: [u8; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut length = usize.ZERO
+  while rest >= 128 {
+    buffer[length] = u64.toU8(u64.bitAnd(rest, 127) + 128)
+    rest = u64.shiftRight(rest, 7)
+    length = length + usize.ONE
+  }
+  buffer[length] = u64.toU8(rest)
+  return run Bytes.append(&mut output.*, Slice.view<u8>(&buffer, usize.ZERO, length + usize.ONE))
+}
+
+effect fn chunk(output: &mut Bytes, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut output.*, usize.toU64(value.length))
+  return run Bytes.append(&mut output.*, value)
+}
+
+effect fn digest(output: &mut Bytes, value: ContentHash) -> () ! OutOfMemoryError ? &mut Allocator {
+  run varint(&mut output.*, value.high)
+  return run varint(&mut output.*, value.low)
+}
+
+/// The bytes of `image` under `stamp`.
+pub effect fn encode(image: &Image, stamp: &[u8]) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run chunk(&mut output, magic())
+  run varint(&mut output, FORMAT)
+  run chunk(&mut output, stamp)
+  let leaves = List<Leaf>.asSlice(&image.leaves)
+  run varint(&mut output, usize.toU64(leaves.length))
+  let mut at = usize.ZERO
+  while at < leaves.length {
+    if leaves[at].input { run varint(&mut output, 1) } else { run varint(&mut output, 0) }
+    run chunk(&mut output, Bytes.asSlice(&leaves[at].key))
+    run digest(&mut output, leaves[at].digest)
+    at = at + usize.ONE
+  }
+  let nodes = nodeCount(image)
+  run varint(&mut output, usize.toU64(nodes))
+  at = usize.ZERO
+  while at < nodes {
+    let edges = edgesOf(image, at)
+    run varint(&mut output, usize.toU64(edges.length))
+    let mut edge = usize.ZERO
+    while edge < edges.length {
+      run varint(&mut output, usize.toU64(edges[edge]))
+      edge = edge + usize.ONE
+    }
+    at = at + usize.ONE
+  }
+  let roots = List<Root>.asSlice(&image.roots)
+  run varint(&mut output, usize.toU64(roots.length))
+  at = usize.ZERO
+  while at < roots.length {
+    run chunk(&mut output, Bytes.asSlice(&roots[at].key))
+    run varint(&mut output, usize.toU64(roots[at].node))
+    run chunk(&mut output, Bytes.asSlice(&roots[at].answer))
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+// A position in the bytes being decoded; a failed read leaves it failed.
+struct Cursor {
+  at: usize
+  failed: bool
+}
+
+fn readVarint(bytes: &[u8], cursor: &mut Cursor) -> u64 {
+  let mut value: u64 = 0
+  let mut shift: u64 = 0
+  while !cursor.failed {
+    if cursor.at >= bytes.length || shift > 63 {
+      cursor.failed = true
+      return 0
+    }
+    let byte = bytes[cursor.at]
+    cursor.at = cursor.at + usize.ONE
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(byte % 128), shift))
+    if byte < 128 { return value }
+    shift = shift + 7
+  }
+  return 0
+}
+
+// A count that cannot exceed the bytes left, since every counted item takes at least one byte.
+fn readCount(bytes: &[u8], cursor: &mut Cursor) -> usize {
+  let value = readVarint(bytes, &mut cursor.*)
+  if cursor.failed || value > usize.toU64(bytes.length - cursor.at) {
+    cursor.failed = true
+    return usize.ZERO
+  }
+  return u64.toUsize(value)
+}
+
+effect fn readRun(bytes: &[u8], cursor: &mut Cursor) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let length = readCount(bytes, &mut cursor.*)
+  if cursor.failed { return Bytes.make() }
+  let start = cursor.at
+  cursor.at = cursor.at + length
+  return run Bytes.copy(Slice.view<u8>(bytes, start, length))
+}
+
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// The image `bytes` hold, or none when they are not an image of this format written under
+/// `stamp`, or any index in them names something that does not precede it.
+pub effect fn decode(bytes: &[u8], stamp: &[u8]) -> Option<Image> ! OutOfMemoryError ? &mut Allocator {
+  let mut cursor = Cursor {at: usize.ZERO, failed: false}
+  let written = run readRun(bytes, &mut cursor)
+  if cursor.failed || !sameBytes(Bytes.asSlice(&written), magic()) { return Option<Image>.none() }
+  if readVarint(bytes, &mut cursor) != FORMAT || cursor.failed { return Option<Image>.none() }
+  let stamped = run readRun(bytes, &mut cursor)
+  if cursor.failed || !sameBytes(Bytes.asSlice(&stamped), stamp) { return Option<Image>.none() }
+  let mut image = make()
+  let leaves = readCount(bytes, &mut cursor)
+  let mut at = usize.ZERO
+  while at < leaves && !cursor.failed {
+    let kind = readVarint(bytes, &mut cursor)
+    let key = run readRun(bytes, &mut cursor)
+    let high = readVarint(bytes, &mut cursor)
+    let low = readVarint(bytes, &mut cursor)
+    if kind > 1 { cursor.failed = true }
+    run List<Leaf>.append(&mut image.leaves, Leaf {input: kind == 1, key: move key, digest: ContentHash {high: high, low: low}})
+    at = at + usize.ONE
+  }
+  let nodes = readCount(bytes, &mut cursor)
+  at = usize.ZERO
+  while at < nodes && !cursor.failed {
+    let count = readCount(bytes, &mut cursor)
+    let mut edge = usize.ZERO
+    while edge < count && !cursor.failed {
+      let value = readVarint(bytes, &mut cursor)
+      let named = u64.toUsize(u64.shiftRight(value, 1))
+      if u64.bitAnd(value, 1) == 1 {
+        if named >= at { cursor.failed = true }
+      } else if named >= leaves {
+        cursor.failed = true
+      }
+      run List<usize>.append(&mut image.edges, u64.toUsize(value))
+      edge = edge + usize.ONE
+    }
+    run List<usize>.append(&mut image.ends, List<usize>.length(&image.edges))
+    at = at + usize.ONE
+  }
+  let roots = readCount(bytes, &mut cursor)
+  at = usize.ZERO
+  while at < roots && !cursor.failed {
+    let key = run readRun(bytes, &mut cursor)
+    let node = u64.toUsize(readVarint(bytes, &mut cursor))
+    let answer = run readRun(bytes, &mut cursor)
+    if node >= nodes { cursor.failed = true }
+    run List<Root>.append(&mut image.roots, Root {key: move key, node: node, answer: move answer})
+    at = at + usize.ONE
+  }
+  if cursor.failed || cursor.at != bytes.length { return Option<Image>.none() }
+  return Option<Image>.some(move image)
+}
