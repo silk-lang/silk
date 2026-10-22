@@ -71,8 +71,10 @@ On macOS (Apple Silicon) or Linux (x86-64 or ARM64):
 curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 ```
 
-The script installs the latest stable release into `~/.silk/bin` (set `SILK_INSTALL` to change it),
-with its standard library beside it, and verifies the compiler's SHA-256 and reported version.
+The script installs the latest stable release as a toolchain in `~/.silk/toolchains/<version>`
+(set `SILK_HOME` to change `~/.silk`), links `~/.silk/bin/silk` to it and makes it the default.
+It verifies the compiler's SHA-256 and reported version, and the release signature when
+`minisign` is installed. Earlier toolchains stay installed beside it.
 Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Building programs
 needs Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
 
@@ -90,6 +92,31 @@ mise use -g 'github:silk-lang/silk[version_prefix=v]'
 
 Homebrew follows the same channel as the script. mise picks stable releases only; until the first
 one exists, use `github:silk-lang/silk[version_prefix=v,prerelease=true]` to get dev releases.
+
+### Toolchain versions
+
+A project pins its compiler with `silk-version` in `silk.toml`, under `[package]` or
+`[workspace]`. `silk` reads the pin and runs that toolchain from `~/.silk/toolchains`, so projects
+on different versions work side by side. Outside a pinned project it runs the default toolchain.
+
+```sh
+silk toolchain install 0.1.0-dev.6+0123456789ab   # download, verify and unpack a release
+silk toolchain use 0.1.0-dev.6+0123456789ab       # install it and pin the current project
+silk toolchain default 0.1.0-dev.6+0123456789ab   # the toolchain used outside pinned projects
+silk toolchain list                               # installed toolchains; which one is selected
+silk toolchain which                              # the toolchain selected here, and why
+silk +0.1.0-dev.6+0123456789ab build              # run one command with a given toolchain
+```
+
+When the pinned toolchain is missing, `silk` exits with status 3 and prints the
+`silk toolchain install` command that fixes it. Set `SILK_AUTO_INSTALL=1`, or
+`auto-install = true` in `~/.silk/settings.toml`, to install it automatically instead.
+The commands never prompt and report progress on standard error only; `list`, `which`, `install`
+and `use` take `--json` for machine-readable results.
+Exit statuses: 0 success, 1 failure, 2 usage, 3 toolchain not installed, 4 network, 5 verification.
+`SILK_TOOLCHAIN=<version>` overrides the selection for a shell, `SILK_TOOLCHAIN=local` keeps the
+`silk` you ran, and `SILK_TOOLCHAIN_MIRROR=<directory>` installs from a local copy of the release
+assets laid out as `v<version>/<asset>`. Homebrew and mise installs dispatch the same way.
 
 ## Quick start
 

@@ -7,12 +7,15 @@
 # Auto selection prefers stable and uses dev only before a stable release exists.
 # SILK_CHANNEL=dev follows published dev snapshots; drafts and bootstrap seeds are excluded.
 # The compiler's SHA-256, reported version and embedded change snapshot are checked before
-# installing `bin/silk` beside `lib/silk/stdlib` into `$SILK_INSTALL` (default `~/.silk`).
+# installing it as the toolchain `$SILK_HOME/toolchains/<version>` (`SILK_HOME` defaults to
+# `~/.silk`). `$SILK_HOME/bin/silk` links to it and `settings.toml` makes it the default, so
+# `silk` runs it outside projects and dispatches to a project's `silk-version` pin inside one.
+# Other toolchains stay installed; `silk toolchain list` shows them.
 # When minisign is installed, the archive's signature must verify against the release key below.
 # Downloads made by curl carry no macOS quarantine mark, so Gatekeeper lets the compiler run.
 #
 # Environment:
-#   SILK_INSTALL   install directory (default: ~/.silk)
+#   SILK_HOME      toolchain home (default: ~/.silk)
 #   SILK_RELEASE   exact release tag, such as v0.1.0-dev.2+a1b2c3d4e5f6
 #   SILK_CHANNEL   auto (default), stable, or dev; SILK_RELEASE selects an exact version
 #   GITHUB_TOKEN   optional; raises the GitHub API rate limit
@@ -21,7 +24,7 @@ set -eu
 repo=silk-lang/silk
 # The release signing key, also published as minisign.pub at the repository root.
 minisign_public_key=RWQefAo9Dbb8LrlLPaqWdRNlX5th2l7r+4WYhxRNbe5K5URDUht1XUDs
-install_dir=${SILK_INSTALL:-$HOME/.silk}
+silk_home=${SILK_HOME:-$HOME/.silk}
 release=${SILK_RELEASE:-}
 channel=${SILK_CHANNEL:-auto}
 
@@ -30,7 +33,7 @@ fail() {
   exit 1
 }
 
-for tool in curl tar uname mktemp cmp; do
+for tool in curl tar uname mktemp cmp ln; do
   command -v "$tool" > /dev/null 2>&1 || fail "this installer needs $tool"
 done
 
@@ -186,15 +189,33 @@ curl -fsSL -o "$tmp/changes-snapshot.toml" \
 cmp -s "$tmp/changes-snapshot.toml" "$tmp/unpacked/$top/lib/silk/changes-snapshot.toml" ||
   fail "the embedded change snapshot differs from the published release"
 
-# Replace only what an earlier install put there, so stale standard-library files go away.
-mkdir -p "$install_dir/bin" "$install_dir/lib"
-rm -rf "$install_dir/bin/silk" "$install_dir/lib/silk"
-mv "$tmp/unpacked/$top/bin/silk" "$install_dir/bin/silk"
-mv "$tmp/unpacked/$top/lib/silk" "$install_dir/lib/silk"
-chmod 0755 "$install_dir/bin/silk"
-printf '%s\n' "$release" > "$install_dir/release"
+# Stage beside the toolchains so the final rename stays on one file system. A reinstall replaces
+# the whole directory, so stale standard-library files go away.
+toolchains="$silk_home/toolchains"
+toolchain="$toolchains/$version"
+mkdir -p "$toolchains" "$silk_home/bin"
+staging="$toolchains/.install-$$"
+rm -rf "$staging"
+mv "$tmp/unpacked/$top" "$staging" || fail "cannot stage the toolchain in $toolchains"
+chmod 0755 "$staging/bin/silk"
+rm -rf "$toolchain"
+mv "$staging" "$toolchain" || fail "cannot move the toolchain into $toolchain"
 
-printf '\nInstalled %s to %s/bin/silk\n' "$("$install_dir/bin/silk" --version 2> /dev/null || echo silk)" "$install_dir"
+# Link `bin/silk` to the toolchain and make it the default, keeping `auto-install`.
+ln -sfn "$toolchain/bin/silk" "$silk_home/bin/silk" || fail "cannot link $silk_home/bin/silk"
+auto_install=
+if [ -f "$silk_home/settings.toml" ] &&
+  grep -Eq '^[[:space:]]*auto-install[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' "$silk_home/settings.toml"; then
+  auto_install='auto-install = true'
+fi
+{
+  printf '# Written by install.sh.\ndefault = "%s"\n' "$version"
+  [ -z "$auto_install" ] || printf '%s\n' "$auto_install"
+} > "$silk_home/settings.toml.$$"
+mv "$silk_home/settings.toml.$$" "$silk_home/settings.toml"
+
+printf '\nInstalled %s to %s\n' "$("$toolchain/bin/silk" --version 2> /dev/null || echo silk)" "$toolchain"
+printf 'It is the default toolchain; %s/bin/silk links to it.\n' "$silk_home"
 
 # Silk hands Clang textual LLVM IR. Clang 18 or newer reads it for ordinary programs; inline
 # assembly that reads or writes memory, as the no-libc Linux runtime uses, is emitted with LLVM 22's
@@ -218,7 +239,7 @@ else
 fi
 
 case ":$PATH:" in
-  *":$install_dir/bin:"*) ;;
+  *":$silk_home/bin:"*) ;;
   *)
     case "${SHELL:-}" in
       */zsh) rc='~/.zshrc' ;;
@@ -226,6 +247,6 @@ case ":$PATH:" in
       *) rc='your shell profile' ;;
     esac
     printf '\nAdd Silk to your PATH by adding this line to %s:\n\n' "$rc"
-    printf '  export PATH="%s/bin:$PATH"\n\n' "$install_dir"
+    printf '  export PATH="%s/bin:$PATH"\n\n' "$silk_home"
     ;;
 esac
