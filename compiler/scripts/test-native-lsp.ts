@@ -5,7 +5,7 @@
 // nested close to the parser's limit, where a thread with Darwin's default stack overflows.
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -169,11 +169,13 @@ const program = Effect.gen(function* () {
     capabilities: { general: { positionEncodings: ['utf-8', 'utf-16'] } },
   })
   const result = initialized['result'] as {
-    capabilities: { positionEncoding: string }
+    capabilities: { positionEncoding: string; experimental: { standardLibrary: string } }
     serverInfo: { name: string }
   }
   assert.equal(result.capabilities.positionEncoding, 'utf-8')
   assert.equal(result.serverInfo.name, 'silk')
+  // Clients send the server the library files it names in go to definition.
+  assert.equal(result.capabilities.experimental.standardLibrary, pathToFileURL(stdlib).href)
   yield* session.send({ jsonrpc: '2.0', method: 'initialized', params: {} })
 
   // An open document in a package gets its syntax diagnostics once the inbox runs dry.
@@ -290,8 +292,96 @@ const program = Effect.gen(function* () {
   assert.equal(help.signatures[0]?.label, 'fn twice(value: i32) -> i32', JSON.stringify(helped))
   assert.deepEqual(help.signatures[0]?.parameters, [{ label: 'value: i32' }])
   assert.equal(help.activeParameter, 0)
-  yield* change(session, uri, 7, fixed)
-  const restored = yield* diagnosticsFor(session, uri, 7, [])
+
+  // An import's module path and members hover and go to definition like any other name.
+  const imported = [
+    'import silk.option { Option }',
+    'pub fn main() -> i32 {',
+    '  let none = Option<i32>.none()',
+    '  return Option<i32>.unwrapOr(move none, 0)',
+    '}',
+    '',
+  ].join('\n')
+  yield* change(session, uri, 7, imported)
+  const importing = yield* diagnosticsFor(session, uri, 7, [])
+  assert.deepEqual(importing.diagnostics, [], JSON.stringify(importing))
+  const member = { textDocument: { uri }, position: { line: 0, character: 22 } }
+  const memberShown = yield* request(session, 15, 'textDocument/hover', member)
+  assert.ok(
+    (memberShown['result'] as { contents: { value: string } }).contents.value.includes(
+      'union Option<',
+    ),
+    JSON.stringify(memberShown),
+  )
+  const library = pathToFileURL(join(stdlib, 'silk', 'option.silk')).href
+  const memberDefined = (yield* request(session, 16, 'textDocument/definition', member))[
+    'result'
+  ] as {
+    uri: string
+    range: { start: { line: number; character: number } }
+  }
+  assert.equal(memberDefined.uri, library, JSON.stringify(memberDefined))
+  const path = { textDocument: { uri }, position: { line: 0, character: 13 } }
+  const pathShown = yield* request(session, 17, 'textDocument/hover', path)
+  assert.ok(
+    (pathShown['result'] as { contents: { value: string } }).contents.value.includes(
+      'module `silk.option`',
+    ),
+    JSON.stringify(pathShown),
+  )
+  const pathDefined = yield* request(session, 18, 'textDocument/definition', path)
+  assert.deepEqual(pathDefined['result'], {
+    uri: library,
+    range: { start: { line: 0, character: 0 }, end: { line: 0, character: 0 } },
+  })
+
+  // A standard-library file opened from there gets the same features, from the package that
+  // reads it.
+  const libraryText = readFileSync(join(stdlib, 'silk', 'option.silk'), 'utf8')
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: {
+      textDocument: {
+        uri: library,
+        languageId: 'silk',
+        version: 1,
+        text: libraryText,
+      },
+    },
+  })
+  const libraryChecked = yield* diagnosticsFor(session, library, 1, [])
+  assert.deepEqual(libraryChecked.diagnostics, [], JSON.stringify(libraryChecked))
+  const returned = libraryText
+    .split('\n')
+    .findIndex((line) => line.includes('fn none() -> Option<T>'))
+  const inLibrary = {
+    textDocument: { uri: library },
+    position: {
+      line: returned,
+      character: libraryText.split('\n')[returned]!.indexOf('Option') + 1,
+    },
+  }
+  const libraryShown = yield* request(session, 19, 'textDocument/hover', inLibrary)
+  assert.ok(
+    (libraryShown['result'] as { contents: { value: string } }).contents.value.includes(
+      'union Option<',
+    ),
+    JSON.stringify(libraryShown),
+  )
+  const libraryDefined = (yield* request(session, 20, 'textDocument/definition', inLibrary))[
+    'result'
+  ] as { uri: string }
+  assert.equal(libraryDefined.uri, library, JSON.stringify(libraryDefined))
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didClose',
+    params: { textDocument: { uri: library } },
+  })
+  yield* diagnosticsFor(session, library, undefined, [])
+
+  yield* change(session, uri, 8, fixed)
+  const restored = yield* diagnosticsFor(session, uri, 8, [])
   assert.deepEqual(restored.diagnostics, [])
 
   // The syntax features read the document's latest text.
@@ -313,7 +403,7 @@ const program = Effect.gen(function* () {
     jsonrpc: '2.0',
     method: 'textDocument/didChange',
     params: {
-      textDocument: { uri, version: 8 },
+      textDocument: { uri, version: 9 },
       contentChanges: [{ text: 'pub fn main()->i32{return 0}\n' }],
     },
   })
