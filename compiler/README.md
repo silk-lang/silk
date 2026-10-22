@@ -52,6 +52,16 @@ difference is a reconciliation bug in the revisable store. The one-shot store ge
 store's final profile, so a step that edits a `param` declaration compares against the profile
 assembled before the edit.
 
+With `SILK_REPLAY_RUNS` set, every edit step also writes one `silk-replay-run step=<n> <unit>`
+line per unit it ran, such as `Body silk/bytes.Bytes.append`, and one
+`silk-replay-stale step=<n> <unit> <- <dependee>` line per outdated unit that failed
+verification, naming the first dependee it found changed: another unit, a whole `file`, or an
+`input` by its module and selector. Count them to find what an edit fans out through:
+
+```sh
+SILK_REPLAY_RUNS=1 silk check ... --replay <script> | grep '^silk-replay-stale step=4 ' | sort | uniq -c
+```
+
 For the standard library, assemble `fixtures/stdlib-root` as the `stdlib-root` CI job does and
 run `silk check --stdlib <that directory> --replay <checkout>/compiler/fixtures/replay/stdlib.toml`
 in it.
@@ -71,7 +81,7 @@ compiler stores need more memory than a CI runner has.
 
 The budgets allow twice the measured units (at least 20 more) and one and a half times the
 measured demand fraction. When a change moves a step's numbers for a good reason, replay the
-script and update its entry. Measured on 2026-10-21:
+script and update its entry. Measured on 2026-10-21, add and delete on 2026-10-22:
 
 | Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |
 | --- | --- | --- | --- | --- |
@@ -79,9 +89,9 @@ script and update its entry. Measured on 2026-10-21:
 | trivia | 3 | 6.8% | 16 | 9.7% |
 | body | 2 | 6.8% | 17 | 9.7% |
 | header, same type | 7 | 6.8% | 25 | 9.9% |
-| add | 532 | 16.0% | 660 | 17.2% |
+| add | 9 | 6.4% | 32 | 10.7% |
 | header, new type | 6 | 6.8% | 19 | 9.7% |
-| delete | 528 | 16.0% | 656 | 17.2% |
+| delete | 5 | 6.4% | 28 | 10.7% |
 | rename | 8 | 6.2% | 176 | 9.9% |
 
 An update marks outdated every unit that consumed a change, directly or through another unit,
@@ -91,8 +101,9 @@ every dependee it consumed kept its answer, judged by the answer fingerprints. A
 members store absolute spans, so an edit that moves an `impl` reruns its heads, but their answers
 hash without those spans and their dependers are verified. The units that rerun on a trivia edit
 are those heads and MIR lowerings, whose `module:line:column` site labels move with the lines.
-Adding or deleting a declaration still reruns every depender: name lookups have no fingerprint
-yet. On a 4-core x86_64 machine the
+A call through a type or a receiver reads the owner's member of its own name (the
+`InherentMember` family, a projection of the owner's whole member list), so adding or deleting a
+method reruns only the member list and the projections of names that changed. On a 4-core x86_64 machine the
 compiler's first check took about 67 s and each edit's recheck 7 to 18 s, almost all of it the
 walk over every root.
 
