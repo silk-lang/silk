@@ -662,7 +662,9 @@ intrinsic boundary specification,
 
 The compiler-owned storage types are members of the sealed namespace and are spelled through it:
 
-- `Intrinsic.Allocation`: one affine owner of a raw allocation and its reclaim authority.
+- `Intrinsic.Allocation`: one affine owner of a raw allocation and its reclaim authority, released
+  to system storage or, when built by `Intrinsic.allocationAdopt`, through its own reclaim function
+  (ALLOC-002).
 - `Intrinsic.RawBuffer<T>`: typed raw storage owned independently of its allocator provider.
 - `Intrinsic.Slot<'storage, T>`: a lexical exclusive projection into one buffer element.
 

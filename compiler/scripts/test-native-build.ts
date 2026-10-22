@@ -544,11 +544,13 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: sentinel },
   )
   assert.equal(checked.status, 0, checked.stderr)
-  assert.match(checked.stdout, new RegExp(`check ${hostTarget}: ok\n`))
-  assert.match(
-    checked.stdout,
-    new RegExp(`check ${foreign}: ok\nCheck summary: 2 succeeded, 0 failed\n$`),
-  )
+  // Each target reports its progress on standard error, as plain lines when that is not a terminal;
+  // standard output stays empty.
+  assert.equal(checked.stdout, '')
+  assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${hostTarget}\\)\n`))
+  assert.match(checked.stderr, new RegExp(`^Checking greeting \\(${foreign}\\)\n`, 'm'))
+  assert.equal(checked.stderr.match(/^Finished greeting in /gm)?.length, 2, checked.stderr)
+  assert.doesNotMatch(checked.stderr, /\x1b/)
   assert.equal(yield* fs.exists(marker), false, 'check must not invoke Clang')
   yield* fs.makeDirectory(join(directory, 'rejected/src'), { recursive: true })
   yield* fs.writeFileString(
@@ -565,9 +567,11 @@ const program = Effect.gen(function* () {
     join(directory, 'rejected'),
   )
   assert.equal(rejected.status, 1, rejected.stderr)
-  assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`))
+  // The progress report heads standard error, so the target heading starts a later line.
+  assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`, 'm'))
   assert.match(rejected.stderr, /\/rejected\/src\/main\.silk:6:16: error\[SEM0037\]/)
-  assert.match(rejected.stdout, new RegExp(`check ${hostTarget}: failed \\(exit 1\\)\n`))
+  assert.match(rejected.stderr, /^Failed rejected in /m)
+  assert.equal(rejected.stdout, '')
   const json = yield* invoke(
     silk,
     ['check', '--json', '--stdlib', standardLibrary],
@@ -720,7 +724,8 @@ const program = Effect.gen(function* () {
   )
   assert.equal(unstartedBuild.status, 2, unstartedBuild.stderr)
   assert.match(unstartedBuild.stderr, /no-such-clang \(from --clang\)/)
-  assert.match(unstartedBuild.stdout, /: failed \(exit 2\)\nBuild summary: 0 succeeded, 1 failed\n/)
+  assert.match(unstartedBuild.stderr, /^  link     failed: /m)
+  assert.match(unstartedBuild.stderr, /^Failed tested in /m)
   // A single-file test without a manifest is refused as a single-file build is.
   // The build directory has a manifest, so the manifest-less source lives in its own directory.
   const unpackaged = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-unpackaged-' })
@@ -794,13 +799,13 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(released.status, 0, released.stderr)
-  assert.match(released.stdout, /Build summary: 1 succeeded, 0 failed/)
-  // Each compilation names its source and artifact relative to the project, as `silk build` does.
+  // Each compilation names its artifact relative to the project; standard output stays empty.
+  assert.equal(released.stdout, '')
+  assert.match(released.stderr, new RegExp(`^Compiling greeting \\(${hostTarget}, release\\)\n`))
+  assert.match(released.stderr, /^  codegen  [1-9][0-9,]* functions/m)
   assert.match(
-    released.stdout,
-    new RegExp(
-      `^Compiled src/main\\.silk -> build/llvm/${hostTarget}/release/greeting \\(llvm, ${hostTarget}, [1-9][0-9]* symbols\\)\n`,
-    ),
+    released.stderr,
+    new RegExp(`^Finished build/llvm/${hostTarget}/release/greeting in [0-9.ms ]+s\n$`, 'm'),
   )
   assert.equal(
     yield* fs.exists(join(directory, 'greeting/build/llvm', hostTarget, 'release/greeting')),
@@ -903,6 +908,78 @@ const program = Effect.gen(function* () {
     process.env,
   )
   assert.equal(threadedRun.status, 42, threadedRun.stderr)
+  // Freed memory is reused: 100 threads with 1 MiB stacks and repeated list growth fit in 64 MiB.
+  const churn = join(directory, 'churn')
+  yield* fs.makeDirectory(churn, { recursive: true })
+  yield* fs.writeFileString(
+    join(churn, 'silk.toml'),
+    '[package]\nname = "churn"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "64MiB"\n',
+  )
+  yield* fs.writeFileString(
+    join(churn, 'main.silk'),
+    [
+      'import silk.allocator { Allocator, OutOfMemoryError }',
+      'import silk.effect { Effect }',
+      'import silk.list { List }',
+      'import silk.native_thread { NativeThread, SpawnError }',
+      'effect fn fill(count: i32) -> i32 ! OutOfMemoryError ? &mut Allocator {',
+      '  let mut values = List<i32>.make()',
+      '  let mut at: i32 = 0',
+      '  while at < count {',
+      '    run List<i32>.append(&mut values, at)',
+      '    at = at + 1',
+      '  }',
+      '  return at',
+      '}',
+      'effect fn refused(error: OutOfMemoryError) -> i32 { return 0 }',
+      'fn work() -> i32 {',
+      '  let mut local = Allocator.systemAllocatorProvider()',
+      '  return run Effect.catchAll(fill(1000) |> Effect.provideMut<Allocator>(&mut local), refused)',
+      '}',
+      'effect fn program() -> i32 ! OutOfMemoryError | SpawnError {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  let mut round: i32 = 0',
+      '  while round < 100 {',
+      '    let filled = run fill(10000) |> Effect.provideMut<Allocator>(&mut allocator)',
+      '    if filled != 10000 { return 1 }',
+      '    let worker = run NativeThread.spawn(fn() -> i32 { return work() })',
+      '      |> Effect.provideMut<Allocator>(&mut allocator)',
+      '    if worker.join() != 1000 { return 2 }',
+      '    round = round + 1',
+      '  }',
+      '  return 42',
+      '}',
+      'effect fn recover(error: OutOfMemoryError | SpawnError) -> i32 { return 3 }',
+      'pub fn main() -> i32 { return run Effect.catchAll(program(), recover) }',
+      '',
+    ].join('\n'),
+  )
+  const churned = yield* invoke(
+    silk,
+    [
+      'build',
+      '--manifest-path',
+      join('churn', 'silk.toml'),
+      '--profile',
+      'web',
+      '--stdlib',
+      standardLibrary,
+    ],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(churned.status, 0, churned.stderr)
+  const churnRun = yield* invoke(
+    process.execPath,
+    [
+      join(standardLibrary, 'host/wasm-runner.mjs'),
+      join(churn, 'build/llvm/wasm32-unknown-unknown/web/churn'),
+    ],
+    directory,
+    process.env,
+  )
+  assert.equal(churnRun.status, 42, churnRun.stderr)
   // A profile's CPU features, large code model and static link reach Clang.
   const argumentLog = join(directory, 'clang-arguments')
   const recorder = join(directory, 'clang-recorder')
@@ -973,6 +1050,35 @@ const program = Effect.gen(function* () {
   // requirements and a deployment version on a target that is not Darwin are refused at their
   // manifest line.
   const locatedRefusals = [
+    [
+      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
+      /silk\.toml:6: build\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", translator = "t" }\n',
+      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator: only provenance "translated-public" names a translator/,
+    ],
+    [
+      '[build]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
+      /silk\.toml:9: build\.composition\.runtimes\.declaration is not a supported field/,
+    ],
+    [
+      '[build]\ncomposition = { components = [{ capability = "other", bindings = [] }] }\n',
+      /silk\.toml:6: build\.composition\.components\.capability = "other" is not supported by the native compiler/,
+    ],
+    ['[build]\nplatform-supply = { kind = "native", bogus = 1 }\n', /silk\.toml:6: build\.platform-supply\.bogus is not a supported field/],
+    [
+      '[profiles.u]\ntarget = "x86_64-unknown-linux-gnu"\nentry = { kind = "default", bogus = 1 }\n',
+      /silk\.toml:7: profiles\.u\.entry\.bogus is not a supported field/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1", bogus = 1 }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+      /silk\.toml:9: build\.bindings\.value\.bogus is not a supported field/,
+    ],
+    [
+      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", bogus = 1 }\n',
+      /silk\.toml:10: build\.bindings\.origin\.bogus is not a supported field/,
+    ],
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
       '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
@@ -1270,8 +1376,9 @@ const program = Effect.gen(function* () {
   )
   assert.equal(managedBuild.status, 0, managedBuild.stderr + managedBuild.stdout)
   // Members build in dependency order, whatever order `members` lists them in.
-  assert.match(managedBuild.stdout, /^Package greeting \(.*\)\n[\s\S]*^Package hello \(/m)
-  assert.match(managedBuild.stdout, /Workspace summary: 2 packages succeeded, 0 failed\n$/)
+  assert.match(managedBuild.stderr, /^Compiling greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
+  assert.match(managedBuild.stderr, /^Finished 2 packages in [^\n]*\n$/m)
+  assert.equal(managedBuild.stdout, '')
   const managedRun = yield* invoke(
     silk,
     ['run', '-p', 'hello', '--stdlib', standardLibrary],
@@ -1305,7 +1412,7 @@ const program = Effect.gen(function* () {
     join(managed, 'apps/hello'),
   )
   assert.equal(managedCheck.status, 0, managedCheck.stderr + managedCheck.stdout)
-  assert.match(managedCheck.stdout, /Workspace summary: 3 packages succeeded, 0 failed/)
+  assert.match(managedCheck.stderr, /^Finished 3 packages in /m)
   const unknownMember = yield* invoke(
     silk,
     ['build', '-p', 'nope', '--stdlib', standardLibrary],
@@ -1317,7 +1424,7 @@ const program = Effect.gen(function* () {
     /has no package named `nope`\nsilk: its members are: greeting, hello, other\n/,
   )
   // A member that cannot load its dependencies fails on its own; the others still run and the
-  // workspace summary is still written.
+  // workspace's final line is still written.
   const greetingManifest = join(managed, 'libs/greeting/silk.toml')
   const acyclic = yield* fs.readFileString(greetingManifest)
   yield* fs.writeFileString(
@@ -1327,8 +1434,8 @@ const program = Effect.gen(function* () {
   const cyclic = yield* invoke(silk, ['check', '--stdlib', standardLibrary], managed)
   assert.notEqual(cyclic.status, 0, 'a dependency cycle was checked')
   assert.match(cyclic.stderr, /form a cycle/)
-  assert.match(cyclic.stdout, /^Package other \(/m)
-  assert.match(cyclic.stdout, /Workspace summary: 1 package succeeded, 2 failed\n$/)
+  assert.match(cyclic.stderr, /^Checking other \(/m)
+  assert.match(cyclic.stderr, /^Failed 2 of 3 packages in [^\n]*\n$/m)
   yield* fs.writeFileString(greetingManifest, acyclic)
   // `format` and `doc` at the root cover every member.
   const managedFormat = yield* invoke(silk, ['format'], managed)
