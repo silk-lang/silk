@@ -130,8 +130,8 @@ not belong in a language rule unless a program can observe them.
   orderings, atomic loads, stores, read-modify-writes, compare-exchange, and fences.
 - [SIMD vectors](simd-vectors.md) — `simd<T, N>` and `mask<N>` values, lane-wise operators,
   whole-vector equality, lane operations, reductions, mask queries, vector memory access,
-  conversions, static shuffles, architecture operations, runtime CPU detection, and functions
-  compiled for extra CPU features.
+  conversions, static shuffles, architecture operations, runtime CPU detection, functions
+  compiled for extra CPU features, and vectors at the C boundary.
 - [Thread properties](thread-properties.md) — the sealed `Transferable` and `Concurrent`
   properties, their derivation from stored parts, and `impl` assertions for synchronized types.
 - [Unsafe code, intrinsics, and targets](unsafe-intrinsics-and-targets.md) — lexical unsafe

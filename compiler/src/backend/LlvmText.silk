@@ -771,6 +771,11 @@ fn passedIndirectly(kind: Representation) -> bool {
   return kind.lanes != usize.ZERO && (kind.lanes > 16 || kind.bits * kind.lanes > 128)
 }
 
+// Whether `function` is a C export shim, whose lanes follow the C ABI instead (SIMD-010).
+fn cExport(function: &MirFunction) -> bool {
+  return match &function.key { InstanceKey.Export {..} => true _ => false }
+}
+
 fn storageRepresentation(ty: &Shared<Type>, target: &Target, facts: Metrics) -> Representation {
   if facts.abi == Abi.Indirect {
     return Representation {aggregate: true, size: facts.size, bits: usize.ZERO,
@@ -1173,7 +1178,7 @@ effect fn emitOperand(
 }
 
 effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Target,
-  layouts: &TypeLayouts, operand: &Operand) -> Value ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
+  layouts: &TypeLayouts, operand: &Operand, foreign: bool) -> Value ! Gap | OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut place = Option<Address>.none()
   if let Operand.Copy {place: source} = &operand.* {
     place = Option<Address>.some(run emitPlace(&mut writer.*, function, target, layouts, &source))
@@ -1182,15 +1187,16 @@ effect fn emitArgument(writer: &mut Writer, function: &MirFunction, target: &Tar
     place = Option<Address>.some(run emitPlace(&mut writer.*, function, target, layouts, &source))
   }
   if let Option<Address>.Some {value: address} = move place {
-    if address.representation.aggregate || passedIndirectly(address.representation) {
+    if address.representation.aggregate || (!foreign && passedIndirectly(address.representation)) {
       return Value {scalar: Representation {aggregate: false, size: usize.ZERO,
         bits: u32.toUsize(Target.pointerBits(target)), signed: false, unit: false, pointer: true, floating: false, lanes: usize.ZERO},
         text: move address.text}
     }
   }
   let value = run emitOperand(&mut writer.*, function, target, layouts, operand)
-  // A wide vector argument is always a place, whose address the callee reads.
-  if passedIndirectly(value.scalar) {
+  // A wide vector argument is always a place, whose address a Silk callee reads; a C callee
+  // takes the vector itself.
+  if !foreign && passedIndirectly(value.scalar) {
     let owner = InstanceKey.identity(&function.key)
     fail Gap.relative(GapCode.TypedForm, &owner, Location.generated())
   }
@@ -3092,7 +3098,7 @@ effect fn emitReturn(
     run append(&mut writer.*, b"ret i1 0\n")
     return ()
   }
-  if kind.aggregate || passedIndirectly(kind) {
+  if kind.aggregate || (!cExport(function) && passedIndirectly(kind)) {
     let output = Address {ty: Shared<Type>.clone(&function.result), text: run Bytes.copy(b"%out"),
       alignment: resultLayout.alignment, representation: kind}
     run storeValue(&mut writer.*, &output, &value)
@@ -3594,7 +3600,7 @@ effect fn emitCallInner(
         fail Gap.relative(GapCode.CAbiVariadic, &owner, span)
       }
     } else {
-      value = run emitArgument(&mut writer.*, function, target, layouts, &values[index])
+      value = run emitArgument(&mut writer.*, function, target, layouts, &values[index], foreignIndex != usize.MAX)
     }
     // A unit argument has no lane: an internal callee declares no parameter for it (see `emit`).
     if value.scalar.unit && foreignIndex != usize.MAX {
@@ -3956,7 +3962,7 @@ effect fn emitEntrySlots(
     let input = move parameterName.text
     let mut addressName = Writer {text: Bytes.make(), next: usize.ZERO, symbol: Bytes.make(), constants: Bytes.make(), trap: Option<TrapReport>.none()}
     run localName(&mut addressName, local + usize.ONE)
-    if passedIndirectly(kind) {
+    if !cExport(function) && passedIndirectly(kind) {
       run copyBytes(&mut writer.*, Bytes.asSlice(&addressName.text), Bytes.asSlice(&input), parameterLayout.size)
       local = local + usize.ONE
       continue
@@ -4104,7 +4110,7 @@ pub effect fn emit(
   }
   run append(&mut writer, b"define ")
   if exported { run cExtension(&mut writer, result, target) }
-  let outward = result.aggregate || passedIndirectly(result)
+  let outward = result.aggregate || (!exported && passedIndirectly(result))
   if fallible { run append(&mut writer, b"i1") }
   else if outward { run append(&mut writer, b"void") }
   else { run typeName(&mut writer, result) }
@@ -4129,7 +4135,7 @@ pub effect fn emit(
       run append(&mut writer, b", ")
     }
     lanes = lanes + usize.ONE
-    if facts.abi == Abi.Indirect || passedIndirectly(lane) { run append(&mut writer, b"ptr") }
+    if facts.abi == Abi.Indirect || (!exported && passedIndirectly(lane)) { run append(&mut writer, b"ptr") }
     else { run typeName(&mut writer, lane) }
     run append(&mut writer, b" ")
     if exported { run cExtension(&mut writer, lane, target) }
@@ -4936,7 +4942,7 @@ effect fn emitSuspendingCall(
   let mut evaluated = List<Value>.make()
   let mut index = usize.ZERO
   while index < values.length {
-    let value = run emitArgument(&mut writer.*, function, target, layouts, &values[index])
+    let value = run emitArgument(&mut writer.*, function, target, layouts, &values[index], false)
     if !value.scalar.unit { run List<Value>.append(&mut evaluated, move value) }
     index = index + usize.ONE
   }
@@ -5040,9 +5046,20 @@ effect fn laneType(writer: &mut Writer, lane: &CAbi.Lane, declaration: &Shared<D
     Abi.Indirect => {
       fail Gap.fromSource(GapCode.CAbiAggregate, declaration, source)
     }
-    // Vector lanes cross the C boundary only once the vector ABI is supported (SIMD-001).
+    // A C vector is one first-class LLVM vector, which LLVM passes as the C compilers do (SIMD-010).
     Abi.Vector => {
-      fail Gap.fromSource(GapCode.CAbiAggregate, declaration, source)
+      let bits = Shared<Type>.with<usize>(&lane.ty, CAbi.vectorLaneBits)
+      if bits == usize.ZERO { fail Gap.fromSource(GapCode.CAbiAggregate, declaration, source) }
+      run append(&mut writer.*, b"<")
+      run decimal(&mut writer.*, Shared<Type>.with<usize>(&lane.ty, CAbi.vectorBits) / bits)
+      run append(&mut writer.*, b" x ")
+      if Shared<Type>.with<bool>(&lane.ty, CAbi.vectorFloating) {
+        if bits == 32 { run append(&mut writer.*, b"float") } else { run append(&mut writer.*, b"double") }
+      } else {
+        run append(&mut writer.*, b"i")
+        run decimal(&mut writer.*, bits)
+      }
+      return run append(&mut writer.*, b">")
     }
   }
   run append(&mut writer.*, b"i")
