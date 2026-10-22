@@ -233,6 +233,11 @@ effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> ()
 
 - [`WriterError`](#WriterError) at the first slice that fails. The slices before it are written.
 
+#### Gotchas
+
+The compiler does not yet support `writeEach` for a provider type with a lifetime parameter,
+such as `Filler<'a>`. Such a provider writes each slice in its own loop.
+
 <a id="Writer.impl.writeString"></a>
 
 ### Associated function `writeString`
