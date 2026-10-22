@@ -656,3 +656,34 @@ selector `K`. No compatibility alias is retained in this green-field codebase.
 
 **Evidence:** [current Effect standard library](../stdlib/silk/effect.silk),
 provider elaboration tests.
+
+## SERV-011 — A union may name a service for requirement rows
+
+**Status:** Confirmed
+
+A union declaration may name a service declared in the same module with `as service`:
+
+```silk
+service Maybe<?S> {}
+
+union Opt<T> as service Maybe {
+  None,
+  Some { value: T },
+}
+```
+
+In a requirement row, a selector, or `Without`, the union's name then stands for that service,
+applied to the same arguments: `&Opt<&Trace>` is the key `&Maybe<&Trace>`. Everywhere else the
+name is still the union. The alias reads only the union's own header, so a use of the key depends
+on that header and the service, as any other key does.
+
+`never` conforms to every service, since no value of it exists, and a call dispatched to a `never`
+provider is unreachable. This lets `Opt<never>.None` serve as an explicit absent provider.
+
+**Boundary:** Only a union names a service this way, only a service declared beside it, and at
+most one. A union without `as service` is never a requirement and reports `SEM0070` like any other
+non-service requirement.
+
+**Evidence:** `unionNamedServicesAreRequirementKeys` and
+`partialSourcePremisesAndNeverProvidersDecideProvision` semantic conformance cases,
+`unionNamesItsService` parser case.
