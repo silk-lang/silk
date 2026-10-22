@@ -1,0 +1,576 @@
+//! Live compilation progress on standard error.
+//!
+//! A build or check names its unit with a heading, then opens one phase at a time: `load`, `check`,
+//! `codegen` and `link`. Each phase counts its work and, when it ends, leaves one summary row with
+//! its time. Borrow checking runs inside the check and codegen walks, so its bodies and time are
+//! accumulated beside them and reported as a row of their own.
+//!
+//! On a terminal the open phase is one status line redrawn in place, at most every 50 ms. Otherwise
+//! each row is written once, as plain text, when its phase ends. An `off` reporter writes nothing
+//! and reads no clock, so the single-source form the corpus harness drives stays silent.
+
+import diagnostic.JsonText
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.i64
+import silk.native_clock { NativeClock }
+import silk.native_descriptor { NativeDescriptor }
+import silk.slice { Slice }
+import silk.system_clock { SystemClock }
+import silk.u64
+import silk.usize
+
+/// How progress reaches standard error.
+pub enum Display {
+  /// Nothing is written.
+  Off,
+  /// One line per finished phase, without escape codes.
+  Plain,
+  /// A status line redrawn in place, with color unless `color` is off.
+  Live,
+}
+
+/// A top-level phase of one compilation unit.
+pub enum Phase {
+  Load,
+  Check,
+  Codegen,
+  Link,
+}
+
+/// The progress of one compilation unit.
+pub struct Progress {
+  display: Display
+  color: bool
+
+  /// Whether only the final line is written.
+  quiet: bool
+
+  /// The terminal width the live line must fit in.
+  width: usize
+  phase: Phase
+  open: bool
+  count: usize
+  total: usize
+  subject: Bytes
+  started: u64
+  phaseStarted: u64
+  drawnAt: u64
+  frame: usize
+
+  /// Whether a live line is on screen, so the next write clears it first.
+  shown: bool
+  bodies: usize
+  borrowNanos: u64
+  borrowFrom: u64
+}
+
+// Redraws closer together than this are skipped.
+const redrawNanos: u64 = 50000000
+
+impl Progress {
+  /// A reporter that writes nothing.
+  pub fn off() -> Progress {
+    return Progress {
+      display: Display.Off,
+      color: false,
+      quiet: false,
+      width: 80,
+      phase: Phase.Load,
+      open: false,
+      count: 0,
+      total: 0,
+      subject: Bytes.make(),
+      started: 0,
+      phaseStarted: 0,
+      drawnAt: 0,
+      frame: 0,
+      shown: false,
+      bodies: 0,
+      borrowNanos: 0,
+      borrowFrom: 0,
+    }
+  }
+
+  /// Starts reporting one unit: writes `<verb> <name> (<detail>)`, such as
+  /// `Compiling hello (x86_64-unknown-linux-gnu, debug)`.
+  pub effect fn start(
+    display: Display,
+    color: bool,
+    width: usize,
+    quiet: bool,
+    verb: &[u8],
+    name: &[u8],
+    detail: &[u8]
+  ) -> Progress
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut progress = Progress.off()
+    if display == Display.Off {
+      return move progress
+    }
+    progress.display = display
+    progress.color = color && display == Display.Live
+    progress.width = width
+    progress.quiet = quiet
+    progress.started = run now()
+    if quiet {
+      return move progress
+    }
+    let mut line = Bytes.make()
+    if display == Display.Live {
+      run Bytes.append(&mut line, b"  ")
+    }
+    run Progress.paint(&progress, &mut line, b"\x1b[1;32m", verb)
+    run Bytes.append(&mut line, b" ")
+    run Progress.paint(&progress, &mut line, b"\x1b[1m", name)
+    if detail.length > usize.ZERO {
+      run Bytes.append(&mut line, b" ")
+      let mut wrapped = run Bytes.copy(b"(")
+      run Bytes.append(&mut wrapped, detail)
+      run Bytes.append(&mut wrapped, b")")
+      run Progress.paint(&progress, &mut line, b"\x1b[2m", Bytes.asSlice(&wrapped))
+    }
+    run Bytes.append(&mut line, b"\n")
+    run write(Bytes.asSlice(&line))
+    return move progress
+  }
+
+  /// Whether anything is written.
+  pub fn enabled(self: &Progress) -> bool {
+    return self.display != Display.Off
+  }
+
+  /// Opens `phase`, whose work is `total` items, or an unknown amount when `total` is zero. A phase
+  /// still open ends first, as `end` with no detail ends it.
+  pub effect fn begin(self: &mut Progress, phase: Phase, total: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display == Display.Off {
+      return ()
+    }
+    if self.open {
+      run Progress.end(&mut self.*, b"")
+    }
+    self.phase = phase
+    self.open = true
+    self.count = 0
+    self.total = total
+    Bytes.clear(&mut self.subject)
+    self.phaseStarted = run now()
+    run Progress.draw(&mut self.*)
+  }
+
+  /// Counts one finished item of the open phase.
+  pub effect fn advance(self: &mut Progress) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display == Display.Off {
+      return ()
+    }
+    self.count = self.count + usize.ONE
+    if self.display == Display.Live && run Progress.due(&self.*) {
+      run Progress.draw(&mut self.*)
+    }
+  }
+
+  /// Whether a redraw is due, so a caller builds the subject text only when it will be shown.
+  pub effect fn due(self: &Progress) -> bool {
+    if self.display != Display.Live {
+      return false
+    }
+    let current = run now()
+    return current - self.drawnAt >= redrawNanos
+  }
+
+  /// Names what the open phase is working on and redraws.
+  pub effect fn show(self: &mut Progress, subject: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display != Display.Live {
+      return ()
+    }
+    Bytes.clear(&mut self.subject)
+    run Bytes.append(&mut self.subject, subject)
+    run Progress.draw(&mut self.*)
+  }
+
+  /// Ends the open phase with a `✓` row described by `detail`, or by its count, such as
+  /// `97 modules`, when `detail` is empty.
+  pub effect fn end(self: &mut Progress, detail: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if detail.length > usize.ZERO {
+      return run Progress.close(&mut self.*, detail, true)
+    }
+    let counted = run Progress.counted(&self.*)
+    return run Progress.close(&mut self.*, Bytes.asSlice(&counted), true)
+  }
+
+  /// Ends the open phase with a `✗` row: its count and, when there are any, its `problems`.
+  pub effect fn refuse(self: &mut Progress, problems: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut detail = run Progress.counted(&self.*)
+    if problems > usize.ZERO {
+      if Bytes.length(&detail) > usize.ZERO {
+        run Bytes.append(&mut detail, b", ")
+      }
+      run Progress.appendCount(&mut detail, problems)
+      if problems == usize.ONE {
+        run Bytes.append(&mut detail, b" error")
+      } else {
+        run Bytes.append(&mut detail, b" errors")
+      }
+    }
+    return run Progress.close(&mut self.*, Bytes.asSlice(&detail), false)
+  }
+
+  /// Whether a phase is open.
+  pub fn running(self: &Progress) -> bool {
+    return self.open
+  }
+
+  /// Marks the start of one body's borrow check.
+  pub effect fn enterBorrowCheck(self: &mut Progress) -> () {
+    if self.display == Display.Off {
+      return ()
+    }
+    self.borrowFrom = run now()
+  }
+
+  /// Marks the end of the borrow check `enterBorrowCheck` started.
+  pub effect fn leaveBorrowCheck(self: &mut Progress) -> () {
+    if self.display == Display.Off {
+      return ()
+    }
+    self.bodies = self.bodies + usize.ONE
+    let current = run now()
+    self.borrowNanos = self.borrowNanos + (current - self.borrowFrom)
+  }
+
+  /// Writes the borrow-check row for the bodies checked so far, when there are any, and starts a
+  /// new count.
+  pub effect fn borrowRow(self: &mut Progress) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display == Display.Off || self.bodies == usize.ZERO {
+      return ()
+    }
+    let mut detail = Bytes.make()
+    run Progress.appendCount(&mut detail, self.bodies)
+    if self.bodies == usize.ONE {
+      run Bytes.append(&mut detail, b" body")
+    } else {
+      run Bytes.append(&mut detail, b" bodies")
+    }
+    let nanos = self.borrowNanos
+    run Progress.row(&mut self.*, b"borrow ", Bytes.asSlice(&detail), nanos, true)
+    self.bodies = 0
+    self.borrowNanos = 0
+  }
+
+  /// Clears the live line before other standard-error output, such as diagnostics.
+  pub effect fn clear(self: &mut Progress) -> () {
+    if self.shown {
+      run write(b"\r\x1b[2K")
+      self.shown = false
+    }
+  }
+
+  /// Writes the final line: `Finished <what> in <time>` or `Failed <what> in <time>`.
+  pub effect fn finish(self: &mut Progress, what: &[u8], succeeded: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display == Display.Off {
+      return ()
+    }
+    run Progress.clear(&mut self.*)
+    let mut line = Bytes.make()
+    let live = self.display == Display.Live
+    if succeeded {
+      if live {
+        run Bytes.append(&mut line, b"   ")
+      }
+      run Progress.paint(&self.*, &mut line, b"\x1b[1;32m", b"Finished")
+    } else {
+      if live {
+        run Bytes.append(&mut line, b"     ")
+      }
+      run Progress.paint(&self.*, &mut line, b"\x1b[1;31m", b"Failed")
+    }
+    run Bytes.append(&mut line, b" ")
+    run Bytes.append(&mut line, what)
+    run Bytes.append(&mut line, b" ")
+    run Progress.paint(&self.*, &mut line, b"\x1b[2m", b"in")
+    run Bytes.append(&mut line, b" ")
+    let mut elapsed = Bytes.make()
+    let current = run now()
+    run Progress.appendDuration(&mut elapsed, current - self.started)
+    run Progress.paint(&self.*, &mut line, b"\x1b[1m", Bytes.asSlice(&elapsed))
+    run Bytes.append(&mut line, b"\n")
+    run write(Bytes.asSlice(&line))
+    self.display = Display.Off
+  }
+
+  /// Appends `value` in decimal with comma thousands separators, as `4,812`.
+  pub effect fn appendCount(out: &mut Bytes, value: usize) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut digits = Bytes.make()
+    run JsonText.appendDecimal(&mut digits, value)
+    let text = Bytes.asSlice(&digits)
+    let mut at = usize.ZERO
+    while at < text.length {
+      if at > usize.ZERO && usize.remainder(text.length - at, 3) == usize.ZERO {
+        run Bytes.append(&mut out.*, b",")
+      }
+      run Bytes.append(&mut out.*, Slice.view<u8>(text, at, usize.ONE))
+      at = at + usize.ONE
+    }
+  }
+
+  /// Appends a duration in nanoseconds as `0.12s` below a minute and `2m 05s` from a minute on.
+  pub effect fn appendDuration(out: &mut Bytes, nanos: u64) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let hundredths = u64.divide(nanos, 10000000)
+    let seconds = u64.divide(hundredths, 100)
+    if seconds >= 60 {
+      run JsonText.appendDecimal(&mut out.*, u64.toUsize(u64.divide(seconds, 60)))
+      run Bytes.append(&mut out.*, b"m ")
+      let rest = u64.remainder(seconds, 60)
+      if rest < 10 {
+        run Bytes.append(&mut out.*, b"0")
+      }
+      run JsonText.appendDecimal(&mut out.*, u64.toUsize(rest))
+      return run Bytes.append(&mut out.*, b"s")
+    }
+    run JsonText.appendDecimal(&mut out.*, u64.toUsize(seconds))
+    run Bytes.append(&mut out.*, b".")
+    let fraction = u64.remainder(hundredths, 100)
+    if fraction < 10 {
+      run Bytes.append(&mut out.*, b"0")
+    }
+    run JsonText.appendDecimal(&mut out.*, u64.toUsize(fraction))
+    return run Bytes.append(&mut out.*, b"s")
+  }
+
+  /// The name a phase's rows and status line use, padded to one width.
+  pub fn phaseName(phase: Phase) -> &'static [u8] {
+    return match phase {
+      Phase.Load => b"load   "
+      Phase.Check => b"check  "
+      Phase.Codegen => b"codegen"
+      Phase.Link => b"link   "
+    }
+  }
+
+  // The open phase's count with its unit, such as `97 modules`; empty for a phase that counts nothing.
+  effect fn counted(self: &Progress) -> Bytes
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut text = Bytes.make()
+    let unit = unitName(self.phase, self.count != usize.ONE)
+    if unit.length == usize.ZERO {
+      return move text
+    }
+    run Progress.appendCount(&mut text, self.count)
+    run Bytes.append(&mut text, b" ")
+    run Bytes.append(&mut text, unit)
+    return move text
+  }
+
+  effect fn close(self: &mut Progress, detail: &[u8], succeeded: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display == Display.Off || !self.open {
+      return ()
+    }
+    self.open = false
+    let current = run now()
+    let name = Progress.phaseName(self.phase)
+    let nanos = current - self.phaseStarted
+    run Progress.row(&mut self.*, name, detail, nanos, succeeded)
+  }
+
+  // Writes one summary row: `✓ check    97 modules            1.91s`.
+  effect fn row(self: &mut Progress, name: &[u8], detail: &[u8], nanos: u64, succeeded: bool) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.quiet {
+      return ()
+    }
+    run Progress.clear(&mut self.*)
+    let mut line = Bytes.make()
+    if self.display == Display.Live {
+      run Bytes.append(&mut line, b"     ")
+      if succeeded {
+        run Progress.paint(&self.*, &mut line, b"\x1b[32m", b"\xE2\x9C\x93")
+      } else {
+        run Progress.paint(&self.*, &mut line, b"\x1b[31m", b"\xE2\x9C\x97")
+      }
+      run Bytes.append(&mut line, b" ")
+      run Progress.paint(&self.*, &mut line, b"\x1b[36m", name)
+      run Bytes.append(&mut line, b"  ")
+    } else {
+      run Bytes.append(&mut line, b"  ")
+      run Bytes.append(&mut line, name)
+      run Bytes.append(&mut line, b"  ")
+      if !succeeded {
+        run Bytes.append(&mut line, b"failed: ")
+      }
+    }
+    run Bytes.append(&mut line, detail)
+    let mut used = detail.length
+    if !succeeded && self.display != Display.Live {
+      used = used + 8
+    }
+    while used < 34 {
+      run Bytes.append(&mut line, b" ")
+      used = used + usize.ONE
+    }
+    let mut elapsed = Bytes.make()
+    run Progress.appendDuration(&mut elapsed, nanos)
+    run Progress.paint(&self.*, &mut line, b"\x1b[2m", Bytes.asSlice(&elapsed))
+    run Bytes.append(&mut line, b"\n")
+    run write(Bytes.asSlice(&line))
+    if self.open {
+      run Progress.draw(&mut self.*)
+    }
+  }
+
+  // Redraws the live line: spinner, phase, bar when the total is known, count, subject and elapsed
+  // time, cut to the terminal width.
+  effect fn draw(self: &mut Progress) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.display != Display.Live || !self.open || self.quiet {
+      return ()
+    }
+    let at = run now()
+    self.drawnAt = at
+    self.frame = self.frame + usize.ONE
+    let spinner = [
+      b"\xE2\xA0\x8B",
+      b"\xE2\xA0\x99",
+      b"\xE2\xA0\xB9",
+      b"\xE2\xA0\xB8",
+      b"\xE2\xA0\xBC",
+      b"\xE2\xA0\xB4",
+      b"\xE2\xA0\xA6",
+      b"\xE2\xA0\xA7",
+      b"\xE2\xA0\x87",
+      b"\xE2\xA0\x8F"
+    ]
+    let mut line = run Bytes.copy(b"\r\x1b[2K  ")
+    run Progress.paint(&self.*, &mut line, b"\x1b[33m", spinner[usize.remainder(self.frame, 10)])
+    run Bytes.append(&mut line, b" ")
+    let name = Progress.phaseName(self.phase)
+    run Progress.paint(&self.*, &mut line, b"\x1b[36m", name)
+
+    // Visible columns so far: two spaces, the spinner, a space and the phase name.
+    let mut columns = 4 + name.length
+    if self.total > usize.ZERO {
+      run Bytes.append(&mut line, b"  ")
+      let mut bounded = self.count
+      if bounded > self.total {
+        bounded = self.total
+      }
+      let filled = usize.divide(bounded * 22, self.total)
+      let mut cell = usize.ZERO
+      let mut bar = Bytes.make()
+      while cell < filled {
+        run Bytes.append(&mut bar, b"\xE2\x94\x81")
+        cell = cell + usize.ONE
+      }
+      run Progress.paint(&self.*, &mut line, b"\x1b[32m", Bytes.asSlice(&bar))
+      let mut rest = Bytes.make()
+      while cell < 22 {
+        run Bytes.append(&mut rest, b"\xE2\x94\x81")
+        cell = cell + usize.ONE
+      }
+      run Progress.paint(&self.*, &mut line, b"\x1b[2m", Bytes.asSlice(&rest))
+      columns = columns + 24
+    }
+    let unit = unitName(self.phase, self.count != usize.ONE || self.total > usize.ZERO)
+    if unit.length > usize.ZERO {
+      let mut counted = Bytes.make()
+      run Progress.appendCount(&mut counted, self.count)
+      if self.total > usize.ZERO {
+        run Bytes.append(&mut counted, b"/")
+        run Progress.appendCount(&mut counted, self.total)
+      }
+      run Bytes.append(&mut counted, b" ")
+      run Bytes.append(&mut counted, unit)
+      run Bytes.append(&mut line, b"  ")
+      run Progress.paint(&self.*, &mut line, b"\x1b[1m", Bytes.asSlice(&counted))
+      columns = columns + 2 + Bytes.length(&counted)
+    }
+    let mut elapsed = run Bytes.copy(b"  ")
+    run Progress.appendDuration(&mut elapsed, at - self.started)
+    columns = columns + Bytes.length(&elapsed)
+    let subject = Bytes.asSlice(&self.subject)
+    if subject.length > usize.ZERO && columns + 3 < self.width {
+      let room = self.width - columns - 3
+      run Bytes.append(&mut line, b"  ")
+      if subject.length <= room {
+        run Progress.paint(&self.*, &mut line, b"\x1b[2m", subject)
+      } else {
+        run Progress.paint(
+          &self.*,
+          &mut line,
+          b"\x1b[2m",
+          Slice.view<u8>(subject, usize.ZERO, room)
+        )
+      }
+    }
+    run Progress.paint(&self.*, &mut line, b"\x1b[2m", Bytes.asSlice(&elapsed))
+    run write(Bytes.asSlice(&line))
+    self.shown = true
+  }
+
+  // Appends `text` in the color `code` opens, when color is on.
+  effect fn paint(self: &Progress, line: &mut Bytes, code: &[u8], text: &[u8]) -> ()
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    if self.color {
+      run Bytes.append(&mut line.*, code)
+    }
+    run Bytes.append(&mut line.*, text)
+    if self.color {
+      run Bytes.append(&mut line.*, b"\x1b[0m")
+    }
+  }
+}
+
+// The unit a phase counts, singular and plural.
+fn unitName(phase: Phase, plural: bool) -> &'static [u8] {
+  if phase == Phase.Link {
+    return b""
+  }
+  if phase == Phase.Codegen {
+    if plural {
+      return b"functions"
+    }
+    return b"function"
+  }
+  if plural {
+    return b"modules"
+  }
+  return b"module"
+}
+
+// Monotonic nanoseconds.
+effect fn now() -> u64 {
+  let instant = run NativeClock.now(true)
+  return i64.toU64(SystemClock.seconds(&instant)) * 1000000000
+    + i64.toU64(SystemClock.nanoseconds(&instant))
+}
+
+// Writes to standard error; progress output never fails a build, so a failed write is dropped.
+effect fn write(bytes: &[u8]) -> () {
+  let mut error = 0
+  let written = run NativeDescriptor.writeAll(2, bytes, &mut error)
+  return ()
+}
