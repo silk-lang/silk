@@ -712,6 +712,8 @@ Use `format` when the text is known at compile time and each value implements [`
 #### Details
 
 - `{}` takes the next field of a tuple, in order.
+- `{1}` takes the tuple field `1`. The same field can show more than one time. `{}` counts
+  from field `0` and ignores the `{1}` placeholders, as in Rust.
 - `{name}` takes the record field `name`.
 - `{{` writes `{` and `}}` writes `}`.
 
@@ -723,8 +725,8 @@ options are, in this order and each optional:
 - `+` for `Sign.Always`. `-` is the default and changes nothing.
 - `#` for the alternate form.
 - `0` for zero padding.
-- A width in decimal digits.
-- `.` and a precision in decimal digits.
+- A width in decimal digits, or `1$` or `w$` to take it from the `usize` field `1` or `w`.
+- `.` and a precision in decimal digits, or `.1$` or `.p$` to take it from a `usize` field.
 - A type: `x` lowercase hexadecimal, `X` uppercase hexadecimal, `o` octal, `b` binary. These
   need an integer, and `#` adds the prefix `0x`, `0o`, or `0b`. `e` and `E` write a float in
   scientific notation, such as `1.25e3`; these need a float. `?` writes the [`Debug`](#Debug)
@@ -740,11 +742,12 @@ options uses [`Format.defaultOptions`](#Format.impl.defaultOptions). `format` bo
 
 #### Gotchas
 
-One template cannot mix `{}` and `{name}`. A template with `{}` must use each tuple field
-exactly one time. A malformed template, a malformed option, a field that does not exist, or
-a type such as `x` on a value that it does not apply to is a compile error. The width and the precision are fixed in the template; to take them
-from a value, use [`Format.displayWith`](#Format.impl.displayWith). `Sign.Space` and `color` are available only
-through [`FormatOptions`](#FormatOptions).
+One template cannot mix tuple fields and record fields: `{}`, `{1}`, and `1$` need a tuple,
+and `{name}` and `w$` need a record. A template with tuple fields must use each field at
+least one time, as a value, a width, or a precision. A malformed template, a malformed
+option, a field that does not exist, or a type such as `x` on a value that it does not apply
+to is a compile error. A width or precision field that is not a `usize` is a type error.
+`Sign.Space` and `color` are available only through [`FormatOptions`](#FormatOptions).
 
 #### Examples
 
@@ -812,11 +815,24 @@ effect fn render() -> ()
   return run Format.format("{:#06x} {:b} {:.2e}", &(255, 5, 1234.5))
 }
 
+effect fn reuse() -> ()
+  ! WriterError
+  ? &mut Writer {
+  let width: usize = 5
+  run Format.format("{0}-{1}-{0} ", &("ab", 7))
+  return run Format.format("[{name:>width$}]", &.{ name: "Ada", width: width })
+}
+
 pub effect fn main() -> i32
   ! WriterError {
   let mut writer = CaptureWriter { bytes: [0; 64], length: 0 }
   run render() |> Effect.provideMut<Writer>(&mut writer)
   if !holds(&writer, b"3 + 4 = 7. Ada is 36 {years}. [tea...  2.50] 0x00ff 101 1.23e3") {
+    return 1
+  }
+  let mut second = CaptureWriter { bytes: [0; 64], length: 0 }
+  run reuse() |> Effect.provideMut<Writer>(&mut second)
+  if !holds(&second, b"ab-7-ab [  Ada]") {
     return 1
   }
   return 0
@@ -1668,10 +1684,17 @@ its fields. For a struct, call [`Format.debugFields`](#Format.impl.debugFields);
 
 ### Details
 
-The standard integers, floats, and `bool` write the same text as `Display`. `string` and
-`char` write quotes and escapes. `Option` and `Result` write the variant and its value, such as
-`Some(3)`. [`Format.alternate`](#Format.impl.alternate) selects the pretty form, which puts each field on its own
+The standard integers and `bool` write the same text as `Display`. Floats also do, but a whole
+number ends in `.0`, as `1.0`. `string` and `char` write quotes and escapes. `Option` and
+`Result` write the variant and its value, such as `Some(3)`. `List` writes its elements, as
+`[1, 2, 3]`. [`Format.alternate`](#Format.impl.alternate) selects the pretty form, which puts each field on its own
 line. Nested values share the formatter, so the pretty form indents at each level.
+
+### Gotchas
+
+Slices, arrays, and anonymous tuples and records have no `Debug` implementation, because only a
+declared type can implement an interface. Write them with [`Format.debugList`](#Format.impl.debugList) and
+[`Format.debugFields`](#Format.impl.debugFields) with an empty name, which writes `(1, 2)` or `{ x: 1 }`.
 
 <a id="Debug.debug"></a>
 
@@ -2386,6 +2409,24 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 
 Writes `Success(` or `Failure(`, the `Debug` form of the payload, and `)`.
 
+<a id="List.impl.Debug"></a>
+
+## Implementation `Debug for List<T>`
+
+```silk
+impl<T: Debug> Debug for List<T>
+```
+
+<a id="List.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the `Debug` form of each element, as `[1, 2, 3]`. See [`Format.debugList`](#Format.impl.debugList).
+
 <a id="bool.impl.Debug"></a>
 
 ## Implementation `Debug for bool`
@@ -2600,7 +2641,8 @@ impl Debug for f32
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the same text as `Display`.
+Writes the same text as `Display`, but a whole number ends in `.0`, as `1.0` and `-0.0`, so
+that it reads as a float. A set precision writes the same text as `Display`.
 
 <a id="f64.impl.Debug"></a>
 
@@ -2618,7 +2660,8 @@ impl Debug for f64
 effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
 ```
 
-Writes the same text as `Display`.
+Writes the same text as `Display`, but a whole number ends in `.0`, as `1.0` and `-0.0`, so
+that it reads as a float. A set precision writes the same text as `Display`.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
