@@ -289,3 +289,33 @@ CPU feature the profile does not select reports `SEM0240`.
 
 **Evidence:** `corpus/native/simd-arch`, `corpus/invalid/simd-arch-unavailable`.
 
+
+## SIMD-008 — Runtime CPU detection reports a feature set
+
+**Status:** Confirmed
+
+```silk,ignore
+import silk.cpu { CpuFeatures }
+
+let machine = CpuFeatures.detect()
+if CpuFeatures.has(&machine, "avx2") { ... }
+```
+
+`silk.cpu` names a set of CPU features of the target architecture, spelled as in PROFILE-006.
+`CpuFeatures.selected()` is the set the profile selects. `CpuFeatures.detect()` asks the running
+machine and always contains the selected set: x86-64 Linux reads `cpuid` through ASSEMBLY-001
+and counts AVX and AVX-512 features only when `xgetbv` shows the operating system saves their
+registers; AArch64 Linux with GNU libc reads `getauxval(AT_HWCAP)` and `AT_HWCAP2`; AArch64 Darwin
+reads `sysctlbyname("hw.optional.*")`. wasm32 and profiles without those interfaces report the
+selected set. A name outside the target's catalog is never present.
+
+**Boundary:** Detection is a value, not a cached global, because Silk has no mutable global
+storage; a program detects once and keeps the result. A detected feature does not change
+`Target.hasCpuFeature` or admit SIMD-007 operations, so it selects between kernels that were
+each compiled for their features.
+
+**Diagnostics:** None. Detection cannot fail; an interface that is missing reports the selected set.
+
+**Current compiler:** Aligned.
+
+**Evidence:** `corpus/native/cpu-detect`; `silk.cpu` doctest.
