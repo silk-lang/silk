@@ -5,36 +5,44 @@
 The ordinary names for the sealed ownership properties `Copy` and `Drop`.
 
 ## When to use
-Import [`Copy`](#Copy) to bound a type parameter on duplication or to declare that a type duplicates
-without user code. Import [`Drop`](#Drop) to give an affine type a cleanup operation.
+Use [`Copy`](#Copy) to declare that a type duplicates on assignment, or as a bound on a type parameter
+that generic code duplicates. Use [`Drop`](#Drop) to give an affine type a cleanup operation that runs
+when a value goes out of scope.
 
 ## Details
 Both names are transparent `type` aliases (TYPE-004) of the compiler-sealed properties
 `Intrinsic.Copy` and `Intrinsic.Drop` (INTR-006). `impl Copy for Point {}` and
-`impl Intrinsic.Copy for Point {}` are the same conformance. Importing either name grants no
-privilege: the property's own rules (OWN-001, STRUCT-005) still decide which types may conform.
+`impl Intrinsic.Copy for Point {}` are the same conformance. An import of these names gives no
+special permission. The rules of each property (OWN-001, STRUCT-005) decide which types can
+conform.
 
 ## Gotchas
-The names are ordinary. A module that declares its own `Copy`, or a generic parameter named
-`Drop`, shadows the import like any other name.
+The names are ordinary names. A local declaration named `Copy`, or a type parameter named
+`Drop`, hides the import.
 
 ## Examples
 ### Duplicate a value through a bound
 ```silk
 import silk.ownership { Copy }
 
-struct Point { x: i32 y: i32 }
+struct Point {
+  x: i32
+  y: i32
+}
 
 impl Copy for Point {}
 
-fn twice<T: Copy>(value: T) -> i32 {
-  let first = value
-  let second = value
-  return 42
+fn pair<T: Copy>(value: T) -> [T; 2] {
+  // `value` is used two times. The `Copy` bound makes this legal.
+  return [value, value]
 }
 
 pub fn main() -> i32 {
-  return twice(Point { x: 1, y: 2 })
+  let points = pair(Point { x: 1, y: 2 })
+  if points[1].y != 2 {
+    return 1
+  }
+  return 0
 }
 ```
 
@@ -50,7 +58,13 @@ Public declarations: 2.
 pub type Copy = Intrinsic.Copy
 ```
 
-The sealed property of types whose values duplicate without user code.
+The property of types whose values duplicate on assignment, with no user code.
+
+### Details
+
+Declare it with an empty conformance, as in `impl Copy for Point {}`. A type can conform only if
+each of its fields is `Copy` and the type has no `Drop` conformance. Use `T: Copy` as a bound
+when generic code uses a value of type `T` more than one time.
 
 <a id="Drop"></a>
 
@@ -60,7 +74,17 @@ The sealed property of types whose values duplicate without user code.
 pub type Drop = Intrinsic.Drop
 ```
 
-The sealed property of affine types that run one cleanup operation when dropped.
+The property of affine types that run one cleanup operation when a value is dropped.
+
+### Details
+
+A conformance gives the member `drop(self: &mut Self) -> ()`. The member runs one time for each
+value, when the value goes out of scope or at an explicit `drop`. The member does not run for a
+value that was moved away. After the member returns, the fields of the value are dropped.
+
+### Gotchas
+
+A type with a `Drop` conformance cannot be `Copy`.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

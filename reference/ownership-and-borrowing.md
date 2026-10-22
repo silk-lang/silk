@@ -1826,9 +1826,10 @@ elements. A safe container's restricted `Drop` hook must destroy its initialized
 its buffer field cleans.
 
 **Boundary:** Layout validation occurs before allocation. Allocator implementations are ordinary
-service providers and receive no compiler privilege. Provider-dependent escaping allocation, such
-as an arena value whose validity borrows its arena, remains outside the bootstrap model until the
-language can express that relationship generally.
+service providers and receive no compiler privilege. An allocation whose validity borrows its
+provider, such as an arena value that dies with its arena, remains outside the model until the
+language can express that relationship generally. A provider that keeps its storage alive for each
+allocation it hands out instead uses ALLOC-002.
 
 **Diagnostics:** Invalid layouts are validation results rather than created allocations. Exhaustion
 is the typed failure `OutOfMemoryError`. Duplicate movement or cleanup reports ordinary ownership
@@ -1837,6 +1838,39 @@ diagnostics; unsafe buffer misuse reports the relevant unsafe-contract or owners
 **Evidence:** owned-allocation specification,
 allocation tests,
 allocation acceptance tests.
+
+### ALLOC-002 — An adopted allocation releases through its own reclaim function
+
+**Status:** Confirmed
+
+`Intrinsic.allocationAdopt` builds an allocation over storage a source provider already owns:
+
+```silk,ignore
+unsafe fn Intrinsic.allocationAdopt(
+  base: *mut u8,
+  layout: Layout,
+  reclaim: extern "C" fn(?*mut u8) -> (),
+  context: ?*mut u8,
+) -> Intrinsic.Allocation
+```
+
+The result is an ordinary `Intrinsic.Allocation`: it is affine, `Transferable` and `Sync`, and
+`RawBuffer`, `Shared` and Execution packages adopt it like any other. Dropping it calls
+`reclaim(context)` exactly once instead of releasing system storage. The allocation still borrows
+nothing, so the provider must keep the storage valid until that call, for example by counting the
+allocations that point into a chunk.
+
+**Boundary:** The caller proves that `base` addresses `layout.size` bytes aligned to
+`layout.alignment` that stay valid and unaliased until `reclaim` runs. `reclaim` must be a nonnull
+exported C address that is safe to call once from any thread, after the adopting call has returned.
+Like a `Drop` hook it must be synchronous and infallible; it runs inside drop glue, with no
+requirements and no Effect. It may drop other allocations, including the one its storage came from.
+
+**Diagnostics:** Calling it without `unsafe` reports the ordinary missing-acknowledgement
+diagnostic. A `reclaim` operand of any type other than `extern "C" fn(?*mut u8) -> ()` reports `SEM0012` at
+the call. A wrong layout or an early reclaim is unchecked undefined behavior.
+
+**Evidence:** allocation adoption tests.
 
 ### EFFECT-LIFE-001 — Effect execution cleans per-run state and preserves reusable captures
 
