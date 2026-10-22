@@ -417,6 +417,23 @@ const program = Effect.gen(function* () {
     SILK_RECEIPTS: '1',
   })
   assert.match(machine.stderr, /^SILK_BUILD_ERROR=\{"code":"SEM\d{4}"/m)
+  // A shuffle index out of range is refused with the range, not the vector shape rule (SEM0239).
+  yield* fs.writeFileString(
+    join(directory, 'shuffle.silk'),
+    'pub fn main() -> i32 {\n  let u = Intrinsic.simdSplat<simd<u32, 4>>(1)\n' +
+      '  let h = Intrinsic.simdShuffle<simd<u32, 4>, simd<u32, 4>>(u, u, [0, 1, 2, 8])\n  return 0\n}\n',
+  )
+  const shuffled = yield* invoke(
+    silk,
+    ['build', 'shuffle.silk', '-o', 'shuffle', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.notEqual(shuffled.status, 0)
+  assert.match(
+    shuffled.stderr,
+    /shuffle\.silk:3:67: error\[SEM0239\] Intrinsic\.simdShuffle needs 4 static lane indices, one per result lane, each below 8/,
+  )
   assert.deepEqual(
     yield* fs.readFile(captured),
     bytes,
@@ -535,6 +552,24 @@ const program = Effect.gen(function* () {
   )
   const wasmMain = new WebAssembly.Instance(wasmModule, {}).exports.main as () => number
   assert.equal(wasmMain(), 42)
+  // Clang's generic wasm CPU enables bulk memory only from Clang 19, and the runtime needs it: the
+  // compiler asks for it, so a Clang whose default leaves it off still builds the module.
+  const withoutBulkMemory = join(directory, 'clang-without-bulk-memory')
+  yield* fs.writeFileString(
+    withoutBulkMemory,
+    `#!/bin/sh\nexec ${quote(clang)} -mno-bulk-memory "$@"\n`,
+  )
+  yield* fs.chmod(withoutBulkMemory, 0o755)
+  const olderClang = yield* invoke(
+    silk,
+    [...argumentsFor('older.wasm'), '--target', 'wasm32-unknown-unknown'],
+    directory,
+    { ...process.env, SILK_CLANG: withoutBulkMemory },
+  )
+  assert.equal(olderClang.status, 0, olderClang.stderr)
+  const olderModule = new WebAssembly.Module(yield* fs.readFile(join(directory, 'older.wasm')))
+  const olderMain = new WebAssembly.Instance(olderModule, {}).exports.main as () => number
+  assert.equal(olderMain(), 42)
   // An adopted allocation's drop calls its reclaim function. wasm32 numbers functions by table
   // index from 1, and an exported reclaim whose address is the module's first takes index 1, the
   // value that once marked system storage: both drops must reach the reclaim, not `free`.
