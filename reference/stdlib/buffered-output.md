@@ -56,6 +56,12 @@ impl Writer for CountingWriter {
     ? &mut Writer {
     return ()
   }
+
+  effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Writer.writeEach(&mut self, vals)
+  }
 }
 
 pub effect fn main() -> i32
@@ -341,8 +347,8 @@ pub effect fn writeSomeWriter(self: &mut Self, input: &[u8]) -> usize
   ? &mut Writer
 ```
 
-Copies the longest prefix of `input` that fits into the buffer and returns its length. This
-function uses the active `Writer` provider and has no deadline.
+Accepts `input` into the buffer, or sends it to the active `Writer` together with the
+pending bytes, and returns the number of accepted bytes. This function has no deadline.
 
 #### When to use
 
@@ -352,16 +358,17 @@ of `input`.
 
 #### Details
 
-If the buffer is full, this function first sends all pending bytes in one `Writer.writeAll`
-call. If the buffer is empty and `input` is longer than [`BufferedOutput.capacity`](#BufferedOutput.impl.capacity), it does
-not copy: it sends all of `input` in one `Writer.writeAll` call. For a non-empty `input`, the
-result is at least 1.
+If `input` fits in the free part of the buffer, this function copies it. Otherwise it does not
+copy: it sends the pending bytes and then `input` in one `Writer.writeVectored` call, and the
+buffer is empty after it. If no bytes are pending, it sends `input` in one `Writer.writeAll`
+call. Thus the result is the length of `input` in every case. A provider such as
+`silk.os_writer.StdoutWriter` sends a vectored write in one system call.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure made the buffer terminal.
 - `BufferError.UnknownExternalTransfer` if the `Writer` fails. The buffer becomes terminal.
-  The destination can have received some of the pending bytes.
+  The destination can have received some of the pending bytes and of `input`.
 
 <a id="BufferedOutput.impl.writeAllWriter"></a>
 
@@ -373,8 +380,8 @@ pub effect fn writeAllWriter(self: &mut Self, input: &[u8]) -> ()
   ? &mut Writer
 ```
 
-Copies all of `input` into the buffer. This function uses the active `Writer` provider when the
-buffer is full.
+Accepts all of `input`. This function uses the active `Writer` provider when `input` does not
+fit in the buffer.
 
 #### When to use
 
@@ -385,15 +392,16 @@ Use `writeAllWriter` to buffer many small writes to a `Writer`, such as standard
 
 When this function returns, the buffer owns all of `input`, or the `Writer` already has
 them. The `Writer` does not necessarily have the buffered bytes yet. Call
-[`BufferedOutput.flushWriter`](#BufferedOutput.impl.flushWriter) to send them. A part of `input` that is longer than the buffer
-goes to the `Writer` directly, without a copy.
+[`BufferedOutput.flushWriter`](#BufferedOutput.impl.flushWriter) to send them. An `input` that does not fit in the free part of
+the buffer goes to the `Writer` without a copy, after the pending bytes, in one
+`Writer.writeVectored` call.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure made the buffer terminal.
 - `BufferError.UnknownExternalTransfer` if the `Writer` fails. The buffer becomes terminal.
   `progress` gives the number of `input` bytes that the buffer accepted before the failure.
-  The destination can have received some of the pending bytes.
+  The destination can have received some of the pending bytes and of `input`.
 
 <a id="BufferedOutput.impl.flushWriter"></a>
 

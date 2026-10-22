@@ -15,7 +15,7 @@
 //!
 //! # Gotchas
 //! - The caller keeps the descriptor open and controls access from other threads.
-//! - [`NativeDescriptor.writeAll`] and [`NativeDescriptor.writeAllPair`] can fail after part of the
+//! - [`NativeDescriptor.writeAll`] and [`NativeDescriptor.writeAllGather`] can fail after part of the
 //!   bytes were written.
 //! - The module is empty on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
 //!   or aarch64.
@@ -49,6 +49,7 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
 import silk.pointer { Pointer }
 import silk.slice { Slice }
 import silk.isize
+import silk.usize
 
 /// One buffer of a vectored write: the C `struct iovec`.
 extern "C" struct IoVector {
@@ -70,6 +71,27 @@ pub unsafe extern "C" fn read(fd: i32, buffer: ?[*]mut u8, count: usize) -> isiz
 pub unsafe extern "C" fn write(fd: i32, buffer: ?[*]const u8, count: usize) -> isize with Intrinsic.foreign(noCapture: ("buffer",))
 /// The C `isatty` function: returns 1 when `fd` is a terminal, else 0.
 pub unsafe extern "C" fn isatty(fd: i32) -> i32
+// Part `index` of a gathered write: `head` first, then each slice of `rest`.
+fn part<'a>(head: &'a [u8], rest: &[&'a [u8]], index: usize) -> &'a [u8] {
+  if index == 0 { return head }
+  return rest[index - 1]
+}
+
+fn emptyVectors() -> [IoVector; 8] {
+  let nothing: [u8; 0] = []
+  let base = Pointer.fromSlice<u8>(&nothing)
+  return [
+    IoVector { base: base, length: 0 },
+    IoVector { base: base, length: 0 },
+    IoVector { base: base, length: 0 },
+    IoVector { base: base, length: 0 },
+    IoVector { base: base, length: 0 },
+    IoVector { base: base, length: 0 },
+    IoVector { base: base, length: 0 },
+    IoVector { base: base, length: 0 },
+  ]
+}
+
 /// The C `writev` function: writes the `count` buffers of `vectors` to `fd` in order, as one write.
 ///
 /// # Gotchas
@@ -106,8 +128,10 @@ impl NativeDescriptor {
       let transferred = unsafe read(fd, pointer, requested)
       if transferred < 0 {
         let code = unsafe currentError()
-        if code != 4 { error.* = code
-return false }
+        if code != 4 {
+          error.* = code
+          return false
+        }
       } else {
         let received = isize.toUsize(transferred)
         if received > requested { return false }
@@ -147,8 +171,10 @@ return false }
       }
       if transferred < 0 {
         let code = unsafe currentError()
-        if code != 4 { error.* = code
-return false }
+        if code != 4 {
+          error.* = code
+          return false
+        }
       } else {
         let written = isize.toUsize(transferred)
         if written == 0 { return false }
@@ -159,54 +185,76 @@ return false }
     return true
   }
 
-  /// Writes all of `first` and then all of `second` to `fd`, and returns whether it succeeded.
+  /// Writes all of `head` and then all bytes of each slice of `rest` to `fd`, in order, and returns
+  /// whether it succeeded.
   ///
   /// # When to use
-  /// Use it to send buffered bytes and a new slice together, without first copying the slice into
-  /// the buffer.
+  /// Use it to send buffered bytes and new slices together, without first copying the slices into
+  /// the buffer. Pass an empty `head` when there is no buffer.
   ///
   /// # Details
-  /// When both slices are not empty, the first system call is one `writev` of both. If it writes
-  /// only part of the bytes, the rest goes out with [`NativeDescriptor.writeAll`]. An empty slice
-  /// adds no buffer to the call. On failure, `error` is the native error code, or zero if the system
-  /// wrote nothing or returned a count that is not valid.
+  /// Each system call is one `writev` of at most eight non-empty slices and at most 0x7ffff000
+  /// bytes. After a partial write, the next call starts at the first byte that was not written.
+  /// Empty slices add nothing to a call. A call that a signal interrupts is made again. On failure,
+  /// `error` is the native error code, or zero if the system wrote nothing or returned a count that
+  /// is not valid.
   ///
   /// # Gotchas
   /// Part of the bytes can be written before a failure. Do not write all of them again without a
   /// check.
-  pub effect fn writeAllPair(fd: i32, first: &[u8], second: &[u8], error: &mut i32) -> bool {
+  pub effect fn writeAllGather(fd: i32, head: &[u8], rest: &[&[u8]], error: &mut i32) -> bool {
     error.* = 0
-    if first.length == 0 { return run NativeDescriptor.writeAll(fd, second, &mut error) }
-    if second.length == 0 { return run NativeDescriptor.writeAll(fd, first, &mut error) }
-    // One request stays within the transfer bound; larger pairs go out one slice at a time.
-    if first.length > 2147479552 || second.length > 2147479552 - first.length {
-      let wroteFirst = run NativeDescriptor.writeAll(fd, first, &mut error)
-      if !wroteFirst { return false }
-      return run NativeDescriptor.writeAll(fd, second, &mut error)
-    }
-    let total = first.length + second.length
-    let vectors = [
-      IoVector { base: Pointer.fromSlice<u8>(first), length: first.length },
-      IoVector { base: Pointer.fromSlice<u8>(second), length: second.length },
-    ]
+    let count = rest.length + 1
+    let mut index: usize = 0
+    let mut offset: usize = 0
     while true {
-      let transferred = unsafe writev(fd, Pointer.fromSlice<IoVector>(&vectors), 2)
+      // Skip the parts that are complete or empty.
+      while index < count && offset == part(head, rest, index).length {
+        index = index + 1
+        offset = 0
+      }
+      if index == count { return true }
+      let mut vectors = emptyVectors()
+      let mut used: usize = 0
+      let mut total: usize = 0
+      let mut at = index
+      let mut from = offset
+      while at < count && used < 8 && total < 2147479552 {
+        let source = part(head, rest, at)
+        let mut length = source.length - from
+        if length > 2147479552 - total { length = 2147479552 - total }
+        if length != 0 {
+          vectors[used] = IoVector { base: Pointer.fromSlice<u8>(Slice.view<u8>(source, from, length)), length: length }
+          used = used + 1
+          total = total + length
+        }
+        at = at + 1
+        from = 0
+      }
+      let transferred = unsafe writev(fd, Pointer.fromSlice<IoVector>(&vectors), usize.toI32(used))
       if transferred < 0 {
         let code = unsafe currentError()
-        if code != 4 { error.* = code
-return false }
+        if code != 4 {
+          error.* = code
+          return false
+        }
       } else {
         let written = isize.toUsize(transferred)
         if written == 0 { return false }
         if written > total { return false }
-        if written < first.length {
-          let firstRest = Slice.view<u8>(first, written, first.length - written)
-          let wroteRest = run NativeDescriptor.writeAll(fd, firstRest, &mut error)
-          if !wroteRest { return false }
-          return run NativeDescriptor.writeAll(fd, second, &mut error)
+        // Move past the written bytes, part by part.
+        let mut remaining = written
+        while remaining != 0 {
+          let left = part(head, rest, index).length - offset
+          if remaining < left {
+            offset = offset + remaining
+            remaining = 0
+          } else {
+            remaining = remaining - left
+            index = index + 1
+            offset = 0
+          }
         }
-        let skipped = written - first.length
-        return run NativeDescriptor.writeAll(fd, Slice.view<u8>(second, skipped, second.length - skipped), &mut error)
       }
     }
     return false

@@ -18,6 +18,9 @@ between them.
 descriptor, and flush does nothing. The process owns the descriptors, and the providers do not
 close them.
 
+`Writer.writeVectored` sends several slices in one `writev` system call, up to eight slices for
+each call.
+
 Standard error has one lock for the whole process: the lock of the C library's `stderr` stream.
 Each [`StderrWriter`](#StderrWriter) write takes it for the duration of that write. [`StderrWriter.lock`](#StderrWriter.impl.lock) keeps
 it until the [`LockedStderr`](#LockedStderr) drops, and collects the writes in a small buffer that the caller
@@ -274,6 +277,14 @@ effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Write
 effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
 ```
 
+<a id="LockedStderr.impl.Writer.writeVectored"></a>
+
+### Operation `writeVectored`
+
+```silk
+effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &mut Writer
+```
+
 <a id="LockedStderr.impl.Drop"></a>
 
 ## Implementation `Drop for LockedStderr<'a>`
@@ -314,6 +325,14 @@ effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Write
 effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
 ```
 
+<a id="StdoutWriter.impl.Writer.writeVectored"></a>
+
+### Operation `writeVectored`
+
+```silk
+effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &mut Writer
+```
+
 <a id="StderrWriter.impl.Writer"></a>
 
 ## Implementation `Writer for StderrWriter`
@@ -336,6 +355,14 @@ effect fn writeAll(self: &mut Self, val: &[u8]) -> () ! WriterError ? &mut Write
 
 ```silk
 effect fn flush(self: &mut Self) -> () ! WriterError ? &mut Writer
+```
+
+<a id="StderrWriter.impl.Writer.writeVectored"></a>
+
+### Operation `writeVectored`
+
+```silk
+effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &mut Writer
 ```
 
 

@@ -12,9 +12,12 @@ format. The caller decides where the bytes go when it provides the writer. Use
 ## Details
 A function that needs a writer has `? &mut Writer` in its type. The caller supplies a provider
 with `Effect.provideMut<Writer>(&mut provider)`. A provider is any type that implements
-[`Writer.writeAll`](#Writer.writeAll) and [`Writer.flush`](#Writer.flush). `silk.os_writer` has `StdoutWriter` and
-`StderrWriter`. `silk.buffered_output` collects small writes into larger ones. A test can
-provide a writer that keeps the bytes in memory.
+[`Writer.writeAll`](#Writer.writeAll), [`Writer.writeVectored`](#Writer.writeVectored), and [`Writer.flush`](#Writer.flush). `silk.os_writer` has
+`StdoutWriter` and `StderrWriter`. `silk.buffered_output` collects small writes into larger
+ones. A test can provide a writer that keeps the bytes in memory.
+
+[`Writer.writeVectored`](#Writer.writeVectored) writes several slices as one. A provider with no faster way to do it
+implements it with [`Writer.writeEach`](#Writer.impl.writeEach), one `writeAll` for each slice.
 
 ## Errors
 - [`WriterError`](#WriterError) if the provider cannot complete a write or a flush. Bytes that the provider
@@ -40,6 +43,12 @@ impl Writer for CountingWriter {
     ? &mut Writer {
     self.count = self.count + value.length
     return ()
+  }
+
+  effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> ()
+    ! WriterError
+    ? &mut Writer {
+    return run Writer.writeEach(&mut self, vals)
   }
 
   effect fn flush(self: &mut Self) -> ()
@@ -99,8 +108,10 @@ The effect that receives output bytes.
 
 ### Details
 
-A provider implements [`Writer.writeAll`](#Writer.writeAll) and [`Writer.flush`](#Writer.flush). Code that writes calls them
-through the effect, as `run Writer.writeAll(bytes)`, and does not know which provider it uses.
+A provider implements [`Writer.writeAll`](#Writer.writeAll), [`Writer.writeVectored`](#Writer.writeVectored), and [`Writer.flush`](#Writer.flush).
+Code that writes calls them through the effect, as `run Writer.writeAll(bytes)`, and does not
+know which provider it uses. A provider with no faster way to write several slices implements
+`writeVectored` with [`Writer.writeEach`](#Writer.impl.writeEach).
 
 <a id="Writer.writeAll"></a>
 
@@ -111,6 +122,31 @@ effect fn writeAll(val: &[u8]) -> () ! WriterError ? &mut Writer
 ```
 
 Writes all of `val`. It returns only after the provider accepted every byte or failed.
+
+#### Errors
+
+- [`WriterError`](#WriterError) if the provider fails. Some bytes can be written before the failure.
+
+<a id="Writer.writeVectored"></a>
+
+### Operation `writeVectored`
+
+```silk
+effect fn writeVectored(vals: &[&[u8]]) -> () ! WriterError ? &mut Writer
+```
+
+Writes all bytes of each slice of `vals`, in order, as if they were one slice.
+
+#### When to use
+
+Use `writeVectored` for a message that is in several parts, such as a header and a body,
+without first copying the parts together.
+
+#### Details
+
+A provider can send all parts in one operation, such as one `writev` system call. A provider
+with no such operation implements it with [`Writer.writeEach`](#Writer.impl.writeEach), one `writeAll` for each part.
+Empty slices write nothing.
 
 #### Errors
 
@@ -167,6 +203,40 @@ a program that is about to exit.
 
 The error is lost. The result type is `A | ()`, so the caller cannot tell a failure from a
 successful `()`.
+
+<a id="Writer.impl.writeEach"></a>
+
+### Associated function `writeEach`
+
+```silk
+pub effect fn writeEach<P>(provider: &mut P, vals: &[&[u8]]) -> ()
+  ! WriterError
+  where &mut P provides &Writer from &mut Writer
+```
+
+Writes each slice of `vals` in order with the [`Writer.writeAll`](#Writer.writeAll) of `provider`.
+
+#### When to use
+
+Use `writeEach` to implement [`Writer.writeVectored`](#Writer.writeVectored) in a provider that has no faster way to
+write several slices:
+
+```silk,ignore
+effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> ()
+  ! WriterError
+  ? &mut Writer {
+  return run Writer.writeEach(&mut self, vals)
+}
+```
+
+#### Errors
+
+- [`WriterError`](#WriterError) at the first slice that fails. The slices before it are written.
+
+#### Gotchas
+
+The compiler does not yet support `writeEach` for a provider type with a lifetime parameter,
+such as `Filler<'a>`. Such a provider writes each slice in its own loop.
 
 <a id="Writer.impl.writeString"></a>
 
