@@ -192,7 +192,7 @@ them:
 
 | Target       | Features                                                                                                                                                                                                   |
 | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| x86-64       | `aes`, `avx`, `avx2`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512f`, `avx512vbmi`, `avx512vl`, `bmi`, `bmi2`, `cx16`, `f16c`, `fma`, `lzcnt`, `movbe`, `pclmul`, `popcnt`, `sse2`, `sse3`, `sse4.1`, `sse4.2`, `ssse3`, `xsave` |
+| x86-64       | `aes`, `avx`, `avx2`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512f`, `avx512vbmi`, `avx512vl`, `bmi`, `bmi2`, `cx16`, `f16c`, `fma`, `lzcnt`, `movbe`, `pclmul`, `popcnt`, `sha`, `sse2`, `sse3`, `sse4.1`, `sse4.2`, `ssse3`, `xsave` |
 | AArch64      | `aes`, `crc`, `crypto`, `dotprod`, `fp-armv8`, `fullfp16`, `i8mm`, `lse`, `neon`, `rdm`, `sha2`, `sha3`                                                                                                   |
 | wasm32       | `atomics`, `bulk-memory`, `mutable-globals`, `relaxed-simd`, `sign-ext`, `simd128`                                                                                                                         |
 
@@ -201,7 +201,7 @@ the named features, the features the CPU model guarantees and the architecture b
 x86-64; `fp-armv8` and `neon` on AArch64), closed under implication: on x86-64 each SSE level
 implies the one before it, `avx` implies `sse4.2`, `avx2`, `fma` and `f16c` imply `avx`, `avx512f`
 implies `avx2`, `fma` and `f16c`, the other AVX-512 features imply `avx512f` and `avx512vbmi` also
-implies `avx512bw`, and `aes` and `pclmul` imply `sse2`; on AArch64 `crypto` implies `aes` and
+implies `avx512bw`, and `aes`, `pclmul` and `sha` imply `sse2`; on AArch64 `crypto` implies `aes` and
 `sha2`, `sha3` implies `sha2`, the vector features imply `neon`, and `neon` and `fullfp16` imply
 `fp-armv8`; on wasm32 `relaxed-simd` implies `simd128`. `profileContains("cpu-features", f)`
 answers for the closed set.
@@ -210,5 +210,11 @@ The default CPU model is `x86-64` on x86-64 and `generic` elsewhere; it guarante
 baseline. x86-64 also admits the microarchitecture levels `x86-64-v2` (`cx16`, `popcnt`, `sse3`,
 `sse4.1`, `sse4.2`, `ssse3`), `x86-64-v3` (v2 with `avx`, `avx2`, `bmi`, `bmi2`, `f16c`, `fma`,
 `lzcnt`, `movbe`, `xsave`) and `x86-64-v4` (v3 with `avx512bw`, `avx512cd`, `avx512dq`, `avx512f`,
-`avx512vl`). A model other than the default is passed to Clang for tuning. No model reads the
-compiler host.
+`avx512vl`). A model other than the default is passed to Clang for tuning.
+
+In a manifest profile, `cpu.model = "native"` asks the machine that runs the compiler, through
+`silk.cpu`, and adds each catalog feature it has to `cpu.features`; the model stays the default.
+The frozen profile therefore names a concrete feature list, and two machines with the same
+features share caches. Only the compiler's own target can be native; another target with
+`native` is an unsupported combination of `cpu.model`. `InitialProfile.freeze` itself never
+reads the host.
