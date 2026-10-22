@@ -580,6 +580,20 @@ pub struct TomlScanner<'input>
 
 A scanner that borrows the complete source of one TOML document. It does not allocate.
 
+### When to use
+Most programs use `silk.toml_value`, which calls this scanner for them. Use it directly to check
+that a document is valid TOML without allocating, or to read tokens and their source spans, for
+example in an editor tool.
+
+### Details
+[`TomlScanner.validate`](#TomlScanner.impl.validate) checks the full syntax of TOML 1.1.0, but not that each key is defined
+one time. [`TomlScanner.next`](#TomlScanner.impl.next) returns one token at a time. Tokens hold a [`TomlSpan`](#TomlSpan) into the
+input, not a copy, and do not decode strings.
+
+### Gotchas
+[`TomlScanner.next`](#TomlScanner.impl.next) does not check that the tokens make a valid document. Call
+[`TomlScanner.validate`](#TomlScanner.impl.validate) first.
+
 <a id="TomlScanner.impl"></a>
 
 ## Implementation `TomlScanner<'input>`

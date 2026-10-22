@@ -883,7 +883,13 @@ More fields for the response, such as `WWW-Authenticate`.
 pub interface DecisionHandler<D, ?R>
 ```
 
-Decides if a handshake is accepted. See [`withUpgrade`](#withUpgrade).
+Decides if a WebSocket handshake is accepted. [`withUpgrade`](#withUpgrade) calls it with the [`Offer`](#Offer) after
+the request passed [`inspect`](#inspect), and checks the [`Decision`](#Decision) before any output.
+
+### Gotchas
+`Origin` is only a hint from the browser. It is not authentication. Check it in the decision if
+you need it. Extensions such as `permessage-deflate` are not supported, so an `Accept` with
+`extensions: true` fails with `UnsupportedNegotiation`.
 
 <a id="DecisionHandler.decide"></a>
 

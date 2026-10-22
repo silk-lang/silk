@@ -152,7 +152,8 @@ runner does. Use [`Testing.matches`](#Testing.impl.matches) to match the plain n
 
 #### Details
 
-The file rule is the same as for [`Testing.matches`](#Testing.impl.matches). `nameFilter` can occur anywhere in
+`fileFilter` must be equal to `path`, byte for byte. An empty `fileFilter` passes each file.
+`nameFilter` can occur anywhere in
 `module::name`, also across the `::` separator. The comparison ignores ASCII case.
 
 

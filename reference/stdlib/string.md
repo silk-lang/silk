@@ -105,7 +105,13 @@ Owned UTF-8 text. Dropping a `String` releases its storage.
 ### Details
 
 Get a borrowed `string` view with [`String.view`](#String.impl.view). A `String` is affine. Use [`String.copy`](#String.impl.copy) to
-make an independent copy of a view.
+make an independent copy of a view. A `String` always holds valid UTF-8. A failed
+[`String.append`](#String.impl.append) or [`String.appendOwned`](#String.impl.appendOwned) leaves the string unchanged.
+
+### Gotchas
+
+Traversal with [`String.nextScalar`](#String.impl.nextScalar) gives Unicode scalar values, not grapheme clusters, so one
+visible character can be more than one scalar.
 
 <a id="String.impl"></a>
 

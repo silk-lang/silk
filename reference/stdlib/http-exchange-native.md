@@ -343,8 +343,9 @@ The maximum number of connection attempts. It is 1 through 1024.
 pub deadline: Option<Instant>
 ```
 
-The absolute deadline for the whole operation, on the monotonic clock. See [`preflight`](#preflight) for
-host names.
+The absolute deadline for the whole operation, on the monotonic clock. It must be `None` when
+the host of the origin is a name, because the name lookup cannot stop at a deadline. Then the
+operation fails with `UnsupportedDeadline` before any I/O.
 
 <a id="Options.handshakeNanoseconds"></a>
 
@@ -808,9 +809,14 @@ pub fn preflightProxyRoute<'configuration>(route: &Route<'configuration>, option
 >
 ```
 
-Returns the peer that `route` connects to, after the same checks as [`preflight`](#preflight).
+Returns the peer that `route` connects to, and checks that a connection to it with `options` can
+start. It does no I/O.
 
 The peer is the origin for `Direct`, and the proxy for `Forward` and `Tunnel`.
+
+### Errors
+- `ProxyError` if `route` is not valid.
+- `UnsupportedDeadline` if the host of the peer is a name and `options.deadline` is set.
 
 <a id="NativeRedirectClient"></a>
 

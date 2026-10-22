@@ -489,7 +489,8 @@ Messages can be read and written.
 CloseSent
 ```
 
-The server sent Close, and waits for the Close of the client. See [`finishClose`](#finishClose).
+The server sent Close, and waits for the Close of the client. [`finishClose`](#finishClose) reads until it
+arrives.
 
 <a id="State.Closed"></a>
 
@@ -879,7 +880,13 @@ A read, write, or close failed.
 pub union WebSocketError
 ```
 
-The error of a WebSocket operation.
+The error of a WebSocket operation: the rule, limit, state, or transport error.
+
+### Details
+When a client frame breaks a rule, the session fails, and later calls fail with
+`PreviousFailure`. If there is a deadline that has not passed, the server first sends Close with
+a code: 1002 for a protocol error, 1003 for fragmentation, 1007 for bad UTF-8, and 1009 for a
+message that is too large. With no deadline, a failure closes the channel without a Close frame.
 
 <a id="WebSocketError.InvalidLimits"></a>
 
@@ -1659,15 +1666,26 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex,
   R in Without<R, ByteDuplex>
 ```
 
-Starts a session on `channel`, and lends it to `use`.
+Starts a WebSocket session on `channel`, and lends it to `use`.
+
+### When to use
+After `withUpgrade` of `silk.websocket_upgrade` accepts a handshake, it lends you the channel.
+Call `withServer` with it. In the callback, call [`readEvent`](#readEvent) in a loop, and answer with
+[`writeText`](#writeText) or [`writeBinary`](#writeBinary). To close from the server, call [`sendClose`](#sendClose), then
+[`finishClose`](#finishClose).
 
 ### Details
-`channel` comes from `silk.websocket_upgrade`. The limits are checked before any I/O. The
-channel is closed when `use` returns, fails, or is cancelled.
+Client frames must be masked. Server frames are not masked. /// `channel` comes from
+`silk.websocket_upgrade`. The limits are checked before any I/O. The channel is closed when
+`use` returns, fails, or is cancelled.
 
 ### Errors
 - `InvalidLimits` if a limit is zero.
 - The error of `use`.
+
+### Gotchas
+Fragmented messages, extensions, and compression are not supported. A fragmented message fails
+the session.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

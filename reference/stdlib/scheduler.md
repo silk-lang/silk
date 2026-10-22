@@ -412,9 +412,17 @@ pub service Scheduler
 
 A mutable service that prepares one child task for later atomic publication.
 
+### When to use
+
+Implement it to supply the task policy for `Fiber.forkChild`. Application code uses the Fiber
+operations and a provider such as `silk.local_scheduler`, not this protocol.
+
 ### Details
 
-Each task receives a distinct owned provider. `prepare` ends its exclusive provider access
+`prepare` allocates and prepares one child, but does not publish it. `Fiber.forkChild` registers
+the returned [`PendingPublication`](#PendingPublication) after the exclusive service dispatch ends, and parks until
+the driver accepts or rejects the child. Thus no executable value crosses the service boundary.
+/// Each task receives a distinct owned provider. `prepare` ends its exclusive provider access
 before the caller registers the returned publication data and parks for the response.
 
 <a id="Scheduler.prepare"></a>

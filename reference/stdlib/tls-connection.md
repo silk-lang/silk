@@ -248,7 +248,8 @@ You called [`OwnedConnection.close`](#OwnedConnection.impl.close). All later I/O
 pub union ConnectionError
 ```
 
-The error from authentication and from connection I/O.
+The error from authentication and from connection I/O: a TLS failure, a transport failure, or a
+timeout.
 
 <a id="ConnectionError.Tls"></a>
 
@@ -309,7 +310,8 @@ The handshake did not complete before its deadline.
 pub struct ConnectionOptions
 ```
 
-Timeouts for authentication. Start from [`ConnectionOptions.defaults`](#ConnectionOptions.impl.defaults).
+Timeouts for authentication: the handshake timeout and an optional external deadline. Start from
+[`ConnectionOptions.defaults`](#ConnectionOptions.impl.defaults).
 
 <a id="ConnectionOptions.handshakeTimeoutNanoseconds"></a>
 
@@ -362,7 +364,14 @@ An authenticated TLS client connection that owns its transport `P`.
 
 Get one from [`authenticateOwned`](#authenticateOwned), or borrow one in the [`withClient`](#withClient) callback. All I/O
 functions take an optional `deadline` on the `MonotonicClock`. Use `Option<Instant>.none()` to
-wait without a limit.
+wait without a limit. Use [`OwnedConnection.readSome`](#OwnedConnection.impl.readSome), [`OwnedConnection.writeSome`](#OwnedConnection.impl.writeSome), and
+[`OwnedConnection.flush`](#OwnedConnection.impl.flush) for application data.
+
+### Gotchas
+After an I/O error or a cancellation, the connection closes its transport, so that no partial
+buffer is sent again. [`OwnedConnection.shutdownWrite`](#OwnedConnection.impl.shutdownWrite) sends `close_notify` and closes the
+write direction. [`OwnedConnection.close`](#OwnedConnection.impl.close) closes at once, without `close_notify`. You must call
+[`OwnedConnection.close`](#OwnedConnection.impl.close) on a connection from [`authenticateOwned`](#authenticateOwned).
 
 <a id="OwnedConnection.impl"></a>
 
@@ -551,12 +560,19 @@ where
   CallbackRequirements in Without<CallbackRequirements, ByteDuplex>
 ```
 
-Authenticates like [`authenticateOwned`](#authenticateOwned), calls `callback` with the connection, and then closes
-it.
+Runs the TLS handshake over `provider`, calls `callback` with the authenticated connection, and
+then closes it.
+
+### When to use
+Use it to authenticate a server and use the connection inside one scope. Use
+[`authenticateOwned`](#authenticateOwned) when the connection must live longer, for example in a connection pool.
+Load the trust snapshot before you call it.
 
 ### Details
-The connection closes when the callback returns, fails, or is cancelled. Errors from that close
-are ignored. Call [`OwnedConnection.shutdownWrite`](#OwnedConnection.impl.shutdownWrite) in the callback to send `close_notify`.
+The function reads the `SystemClock` one time to check certificate dates, and uses the
+`MonotonicClock` for the timeouts in `options`. /// The connection closes when the callback
+returns, fails, or is cancelled. Errors from that close are ignored. Call
+[`OwnedConnection.shutdownWrite`](#OwnedConnection.impl.shutdownWrite) in the callback to send `close_notify`.
 
 ### Errors
 - `E` from the callback.

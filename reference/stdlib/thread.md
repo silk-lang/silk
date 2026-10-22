@@ -16,8 +16,11 @@ Both names are transparent `type` aliases (TYPE-004) of the compiler-sealed prop
 `Intrinsic.Transferable` and `Intrinsic.Concurrent` (THREAD-001). The compiler derives both from
 the stored parts of a type (THREAD-002):
 
-| Type | `Transferable` | `Concurrent` | |---|---|---| | Scalars, text, enums | Yes | Yes | |
-Raw pointers, `Shared<T>` | No | No | | `&T` | If `T` is `Concurrent` | If `T` is `Concurrent` |
+| Type | `Transferable` | `Concurrent` |
+|---|---|---|
+| Scalars, text, enums | Yes | Yes |
+| Raw pointers, `Shared<T>` | No | No |
+| `&T` | If `T` is `Concurrent` | If `T` is `Concurrent` |
 | Record, union, array, closure | If every stored part is | If every stored part is |
 
 ## Gotchas
@@ -62,6 +65,16 @@ pub type Transferable = Intrinsic.Transferable
 
 The sealed property of types whose values can move to another thread.
 
+### Details
+The compiler derives it from the stored parts of a type. Scalars, text, and enums have it. Raw
+pointers and `Shared<T>` do not. `&T` has it if `T` is `Concurrent`. A record, union, array, or
+closure has it if every stored part has it. Bound a type parameter on it when a value moves to
+another thread.
+
+### Gotchas
+`impl Transferable for T {}` is an unchecked assertion. The compiler does not look inside the
+type. The module that declares the type must synchronize the storage that the type reaches.
+
 <a id="Concurrent"></a>
 
 ## `Concurrent`
@@ -71,6 +84,15 @@ pub type Concurrent = Intrinsic.Concurrent
 ```
 
 The sealed property of types whose shared borrows several threads can use at the same time.
+
+### Details
+The compiler derives it from the stored parts of a type. Scalars, text, and enums have it. Raw
+pointers and `Shared<T>` do not. `&T` has it if `T` has it. A record, union, array, or closure
+has it if every stored part has it.
+
+### Gotchas
+`impl Concurrent for T {}` is an unchecked assertion. The compiler does not look inside the
+type. The module that declares the type must synchronize the storage that the type reaches.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

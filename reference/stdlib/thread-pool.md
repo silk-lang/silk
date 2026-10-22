@@ -207,11 +207,28 @@ Returns another handle to the same pool.
 pub struct ThreadPool
 ```
 
-The owner of a pool's worker threads.
+The owner of a pool's worker threads: a work-stealing pool of native threads that runs lazy
+tasks in parallel.
+
+### When to use
+
+Call [`ThreadPool.make`](#ThreadPool.impl.make) to start the worker threads, then [`Pool.block`](#Pool.impl.block) on a normal thread to
+run a program on the pool. In a task, start more tasks with [`Pool.spawn`](#Pool.impl.spawn) and wait for one with
+[`TaskHandle.join`](#TaskHandle.impl.join).
 
 ### Details
 
-Dropping it stops every worker, joins its thread, and drops the tasks still unfinished.
+Each task is a closed, `Transferable` lazy effect, so a task can start on one worker, park, and
+continue on a different worker. Idle workers steal work from each other and then sleep, so no
+worker spins. /// Dropping it stops every worker, joins its thread, and drops the tasks still
+unfinished.
+
+### Gotchas
+
+- Task bodies and results must be `Transferable` and `'static`.
+- A task is a closed effect, so wrap a task that can fail in `Effect.result` and get its failure
+  as a value.
+- The pool uses the system allocator for its own storage, not the `Allocator` of the caller.
 
 <a id="ThreadPool.impl"></a>
 

@@ -193,7 +193,8 @@ What to do with a field that the policy makes.
 Default
 ```
 
-Send the default value. See [`HeaderPolicy`](#HeaderPolicy).
+Send the default value: for `Host`, the authority of the origin; for `User-Agent`,
+`silk-http/1`; for `Accept`, `*/*`; for `Authorization`, no field.
 
 <a id="HeaderControl.Omit"></a>
 

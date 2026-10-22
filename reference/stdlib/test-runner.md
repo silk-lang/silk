@@ -11,10 +11,12 @@ a receipt (see `silk.test_exchange`).
 
 The host passes these options. Each takes one value:
 
-| Option | Meaning | |---|---| | `--file` | Run only the tests in the file with exactly this
-path | | `--filter` | Run only the tests whose `module::name` contains this text | |
-`--silk-test-plan` | Path of the plan file. Required. | | `--silk-test-result` | Path of the
-receipt file. Required. |
+| Option | Meaning |
+|---|---|
+| `--file` | Run only the tests in the file with exactly this path |
+| `--filter` | Run only the tests whose `module::name` contains this text |
+| `--silk-test-plan` | Path of the plan file. Required. |
+| `--silk-test-result` | Path of the receipt file. Required. |
 
 The runner checks the complete plan before any test body runs.
 
