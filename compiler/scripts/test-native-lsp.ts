@@ -314,6 +314,15 @@ const program = Effect.gen(function* () {
     JSON.stringify(memberShown),
   )
   const library = pathToFileURL(join(stdlib, 'silk', 'option.silk')).href
+  // The doc comment's code links point at the lines of what they name.
+  const documented = (memberShown['result'] as { contents: { value: string } }).contents.value
+  const optionLines = readFileSync(join(stdlib, 'silk', 'option.silk'), 'utf8').split('\n')
+  const someLine = optionLines.findIndex((line) => line.includes('pub fn some(')) + 1
+  assert.ok(documented.includes(`[\`some\`](${library}#L${someLine})`), documented)
+  // A union case resolves too, and nothing is left as a bare bracketed link.
+  const caseLine = optionLines.findIndex((line) => line.trim() === 'None,') + 1
+  assert.ok(documented.includes(`[\`None\`](${library}#L${caseLine})`), documented)
+  assert.ok(!/\[`[^`]*`\](?!\()/.test(documented), documented)
   const memberDefined = (yield* request(session, 16, 'textDocument/definition', member))[
     'result'
   ] as {
