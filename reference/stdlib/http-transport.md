@@ -540,6 +540,14 @@ readSomeRaw: Loan.readBytes
 writeSomeRaw: Loan.writeBytes
 ```
 
+<a id="Loan.impl.ByteDuplex.writeSomeVectoredRaw"></a>
+
+### Operation `writeSomeVectoredRaw`
+
+```silk
+writeSomeVectoredRaw: Loan.writeBytesVectored
+```
+
 <a id="Loan.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`

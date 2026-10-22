@@ -1877,6 +1877,14 @@ readSomeRaw: Connection.readConnection
 writeSomeRaw: Connection.writeConnection
 ```
 
+<a id="Connection.impl.ByteDuplex.writeSomeVectoredRaw"></a>
+
+### Operation `writeSomeVectoredRaw`
+
+```silk
+writeSomeVectoredRaw: Connection.writeConnectionVectored
+```
+
 <a id="Connection.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`

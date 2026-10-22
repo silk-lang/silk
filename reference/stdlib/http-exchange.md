@@ -1962,6 +1962,14 @@ readSomeRaw: TransferredTunnel.read
 writeSomeRaw: TransferredTunnel.write
 ```
 
+<a id="TransferredTunnel.impl.ByteDuplex.writeSomeVectoredRaw"></a>
+
+### Operation `writeSomeVectoredRaw`
+
+```silk
+writeSomeVectoredRaw: TransferredTunnel.writeVectored
+```
+
 <a id="TransferredTunnel.impl.ByteDuplex.flushRaw"></a>
 
 ### Operation `flushRaw`

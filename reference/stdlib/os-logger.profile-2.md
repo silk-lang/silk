@@ -18,6 +18,10 @@ message, and a newline, such as `warning: disk 91% full`. It holds the standard 
 buffer of 64 bytes on the stack. Thus a short line is one system call, and the logger does not
 allocate.
 
+`StderrLogger.make` colors the level name when standard error is a terminal, the `NO_COLOR`
+environment variable is not set or is empty, and `TERM` is not `dumb`. It checks once, at the
+first message. `StderrLogger.withColor` turns color on or off without a check.
+
 `StdoutLogger` formats each message directly to standard output. It adds no level, timestamp,
 or newline, has no lock, and does not allocate.
 
@@ -27,6 +31,8 @@ or newline, has no lock, and does not allocate.
 ## Gotchas
 - The providers exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 - A message template for `StderrLogger` must not end with a newline. The logger adds one.
+- `StderrLogger.make` reads the environment at the first message. A change to `NO_COLOR` after
+  that has no effect on the same logger.
 
 ## Examples
 ### Log to standard error

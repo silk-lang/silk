@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 #if defined(__APPLE__)
@@ -45,6 +46,8 @@ static int (*silk_getsockopt_signature)(int, int, int, void *, socklen_t *) = ge
 static int (*silk_setsockopt_signature)(int, int, int, const void *, socklen_t) = setsockopt;
 static ssize_t (*silk_recv_signature)(int, void *, size_t, int) = recv;
 static ssize_t (*silk_send_signature)(int, const void *, size_t, int) = send;
+_Static_assert(sizeof(struct iovec) == 16 && offsetof(struct iovec, iov_len) == 8, "Darwin iovec layout");
+static ssize_t (*silk_writev_signature)(int, const struct iovec *, int) = writev;
 static int (*silk_shutdown_signature)(int, int) = shutdown;
 static int (*silk_poll_signature)(struct pollfd *, nfds_t, int) = poll;
 static int (*silk_fcntl_signature)(int, int, ...) = fcntl;

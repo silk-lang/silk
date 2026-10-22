@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <unistd.h>
 #if defined(__linux__) && defined(__GLIBC__)
@@ -45,6 +46,12 @@ static int (*silk_getsockopt_signature)(int, int, int, void *, socklen_t *) = ge
 static int (*silk_setsockopt_signature)(int, int, int, const void *, socklen_t) = setsockopt;
 static ssize_t (*silk_recv_signature)(int, void *, size_t, int) = recv;
 static ssize_t (*silk_send_signature)(int, const void *, size_t, int) = send;
+_Static_assert(sizeof(struct iovec) == 16 && offsetof(struct iovec, iov_len) == 8, "GNU iovec layout");
+_Static_assert(sizeof(struct msghdr) == 56 && offsetof(struct msghdr, msg_namelen) == 8, "GNU msghdr size");
+_Static_assert(offsetof(struct msghdr, msg_iov) == 16 && offsetof(struct msghdr, msg_iovlen) == 24, "GNU msghdr vectors");
+_Static_assert(offsetof(struct msghdr, msg_control) == 32 && offsetof(struct msghdr, msg_controllen) == 40, "GNU msghdr control");
+_Static_assert(offsetof(struct msghdr, msg_flags) == 48 && sizeof(((struct msghdr *)0)->msg_iovlen) == 8, "GNU msghdr flags");
+static ssize_t (*silk_sendmsg_signature)(int, const struct msghdr *, int) = sendmsg;
 static int (*silk_shutdown_signature)(int, int) = shutdown;
 static int (*silk_poll_signature)(struct pollfd *, nfds_t, int) = poll;
 static int *(*silk_errno_signature)(void) = __errno_location;

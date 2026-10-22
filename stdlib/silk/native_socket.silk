@@ -560,6 +560,11 @@ extern "C" struct PollFd {
 extern "C" struct SockAddrStorage {
   words: [u64; 16]
 }
+// One buffer of a gathered send: the C `struct iovec`.
+extern "C" struct SocketVector {
+  base: ?[*]const u8
+  length: usize
+}
 
 const IPV4_FAMILY: i32 = 2
 
@@ -693,6 +698,7 @@ unsafe extern "C" fn __error() -> *mut i32
 unsafe extern "C" fn darwinCloseSocket(fd: i32) -> i32 as "close$NOCANCEL"
 unsafe extern "C" fn darwinPoll(fds: [*]mut PollFd, count: u32, timeout: i32) -> i32 as "poll" with Intrinsic.foreign(noCapture: ("fds",))
 unsafe extern "C" fn fcntl(fd: i32, command: i32, ...) -> i32
+unsafe extern "C" fn darwinWritev(fd: i32, vectors: ?[*]const SocketVector, count: i32) -> isize as "writev" with Intrinsic.foreign(noCapture: ("vectors",))
 unsafe extern "C" fn darwinAcceptSocket(fd: i32, address: *mut SockAddrStorage, length: *mut u32) -> i32 as "accept" with Intrinsic.foreign(noCapture: ("address", "length"))
 
 extern "C" struct GnuSockAddrV4 {
@@ -715,6 +721,17 @@ extern "C" struct GnuSockAddrUnix {
 unsafe extern "C" fn __errno_location() -> *mut i32
 unsafe extern "C" fn gnuCloseSocket(fd: i32) -> i32 as "close"
 unsafe extern "C" fn gnuPoll(fds: [*]mut PollFd, count: usize, timeout: i32) -> i32 as "poll" with Intrinsic.foreign(noCapture: ("fds",))
+// The C `struct msghdr` of GNU libc on 64-bit Linux.
+extern "C" struct GnuMessageHeader {
+  name: ?*mut u8
+  nameLength: u32
+  vectors: ?[*]const SocketVector
+  vectorCount: usize
+  control: ?*mut u8
+  controlLength: usize
+  flags: i32
+}
+unsafe extern "C" fn gnuSendMessage(fd: i32, message: ?[*]const GnuMessageHeader, flags: i32) -> isize as "sendmsg" with Intrinsic.foreign(noCapture: ("message",))
 unsafe extern "C" fn gnuAcceptSocket(fd: i32, address: *mut SockAddrStorage, length: *mut u32, flags: i32) -> i32 as "accept4" with Intrinsic.foreign(noCapture: ("address", "length"))
 
 unsafe fn currentError() -> i32 {
@@ -740,6 +757,39 @@ fn socketType() -> i32 {
 }
 fn sendFlags() -> i32 {
   static if Intrinsic.targetOperatingSystem() == "darwin" { return 0 } else { return 16384 }
+}
+fn emptySocketVectors() -> [SocketVector; 8] {
+  let nothing: [u8; 0] = []
+  let base = Pointer.fromSlice<u8>(&nothing)
+  return [
+    SocketVector {base: base, length: 0},
+    SocketVector {base: base, length: 0},
+    SocketVector {base: base, length: 0},
+    SocketVector {base: base, length: 0},
+    SocketVector {base: base, length: 0},
+    SocketVector {base: base, length: 0},
+    SocketVector {base: base, length: 0},
+    SocketVector {base: base, length: 0},
+  ]
+}
+// One `send` for one slice. Several slices go in one `writev` on Darwin, where the socket has
+// `SO_NOSIGPIPE`, and in one `sendmsg` with `MSG_NOSIGNAL` on Linux.
+unsafe fn sendVectors(fd: i32, vectors: &[SocketVector; 8], used: usize) -> isize {
+  if used == 1 { return unsafe send(fd, vectors[0].base, vectors[0].length, sendFlags()) }
+  static if Intrinsic.targetOperatingSystem() == "darwin" {
+    return unsafe darwinWritev(fd, Pointer.fromSlice<SocketVector>(vectors), usize.toI32(used))
+  } else {
+    let message = [GnuMessageHeader {
+      name: Pointer.null<u8>(),
+      nameLength: 0,
+      vectors: Pointer.fromSlice<SocketVector>(vectors),
+      vectorCount: used,
+      control: Pointer.null<u8>(),
+      controlLength: 0,
+      flags: 0,
+    }]
+    return unsafe gnuSendMessage(fd, Pointer.fromSlice<GnuMessageHeader>(&message), sendFlags())
+  }
 }
 fn unixCapacity() -> usize {
   static if Intrinsic.targetOperatingSystem() == "darwin" { return 104 } else { return 108 }
@@ -2520,65 +2570,101 @@ unsafe effect fn writeConnection(
 ) -> usize ! ByteIoError ? &mut MonotonicClock {
   static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
     if input.length == usize.ZERO { return usize.ZERO }
-    if connection.phaseValue == ConnectionPhase.WriteClosed || connection.phaseValue == ConnectionPhase.Closed || connection.phaseValue == ConnectionPhase.Connecting {
-      fail ByteDuplex.closed(ByteIoOperation.Write)
-    }
-    let mut requested = input.length
-    if requested > maxTransfer() { requested = maxTransfer() }
-    let pointer = Pointer.fromSlice<u8>(input)
-    let mut followedImmediateReadiness = false
-    while true {
-      run checkIoDeadline(&deadline, ByteIoOperation.Write)
-      let transferred = unsafe send(connection.descriptor.fd, pointer, requested, sendFlags())
-      if transferred > 0 {
-        let count = isize.toUsize(transferred)
-        if count > requested {
-          return run failInvalidTransfer(
-            &mut connection.*,
-            ByteIoOperation.Write,
-            count,
-            requested,
-          )
-        }
-        return count
-      }
-      if transferred == 0 {
-        return run failInvalidTransfer(
-          &mut connection.*,
-          ByteIoOperation.Write,
-          usize.ZERO,
-          requested,
-        )
-      }
-      let code = unsafe currentError()
-      if code == INTERRUPTED {
-        followedImmediateReadiness = false
-        run waitIo(&connection.options, &deadline, ByteIoOperation.Write)
-      } else {
-        if code == nativeAgain() {
-          if followedImmediateReadiness {
-            followedImmediateReadiness = false
-            run waitIo(&connection.options, &deadline, ByteIoOperation.Write)
-          } else {
-            run checkIoDeadline(&deadline, ByteIoOperation.Write)
-            let available = run readiness(
-              &mut connection.*,
-              WRITABLE,
-              false,
-              &deadline,
-              ByteIoOperation.Write,
-            )
-            followedImmediateReadiness = available == ReadinessOutcome.Immediate
-          }
-        } else {
-          return run failProvider(&mut connection.*, ByteIoOperation.Write, code)
-        }
-      }
-    }
-    return usize.ZERO
+    let parts = [input]
+    return run unsafe Connection.sendParts(&mut connection.*, &parts, move deadline)
   } else {
     compileError("NativeSocket requires a supported Darwin or GNU libc profile")
   }
+}
+
+unsafe effect fn writeConnectionVectored(
+  connection: &mut Connection,
+  inputs: &[&[u8]],
+  deadline: Option<Instant>,
+) -> usize ! ByteIoError ? &mut MonotonicClock {
+  static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArchitecture() == "aarch64" && Intrinsic.targetAbi() == "apple" && Intrinsic.profileText("libc") == "system") || (Intrinsic.targetOperatingSystem() == "linux" && Intrinsic.targetAbi() == "gnu" && Intrinsic.profileText("libc") == "gnu" && (Intrinsic.targetArchitecture() == "aarch64" || Intrinsic.targetArchitecture() == "x86_64")) {
+    return run unsafe Connection.sendParts(&mut connection.*, inputs, move deadline)
+  } else {
+    compileError("NativeSocket requires a supported Darwin or GNU libc profile")
+  }
+}
+
+// Sends at most eight non-empty slices of `inputs`, in order, in one system call, and returns the
+// count that the system accepted.
+unsafe effect fn sendParts(
+  connection: &mut Connection,
+  inputs: &[&[u8]],
+  deadline: Option<Instant>,
+) -> usize ! ByteIoError ? &mut MonotonicClock {
+  if connection.phaseValue == ConnectionPhase.WriteClosed || connection.phaseValue == ConnectionPhase.Closed || connection.phaseValue == ConnectionPhase.Connecting {
+    fail ByteDuplex.closed(ByteIoOperation.Write)
+  }
+  let mut vectors = emptySocketVectors()
+  let mut used: usize = 0
+  let mut requested: usize = 0
+  let mut index: usize = 0
+  while index < inputs.length && used < 8 && requested < maxTransfer() {
+    let source = inputs[index]
+    let mut length = source.length
+    if length > maxTransfer() - requested { length = maxTransfer() - requested }
+    if length != usize.ZERO {
+      vectors[used] = SocketVector {base: Pointer.fromSlice<u8>(source), length: length}
+      used = used + 1
+      requested = requested + length
+    }
+    index = index + 1
+  }
+  if used == 0 { return usize.ZERO }
+  let mut followedImmediateReadiness = false
+  while true {
+    run checkIoDeadline(&deadline, ByteIoOperation.Write)
+    let transferred = unsafe sendVectors(connection.descriptor.fd, &vectors, used)
+    if transferred > 0 {
+      let count = isize.toUsize(transferred)
+      if count > requested {
+        return run failInvalidTransfer(
+          &mut connection.*,
+          ByteIoOperation.Write,
+          count,
+          requested,
+        )
+      }
+      return count
+    }
+    if transferred == 0 {
+      return run failInvalidTransfer(
+        &mut connection.*,
+        ByteIoOperation.Write,
+        usize.ZERO,
+        requested,
+      )
+    }
+    let code = unsafe currentError()
+    if code == INTERRUPTED {
+      followedImmediateReadiness = false
+      run waitIo(&connection.options, &deadline, ByteIoOperation.Write)
+    } else {
+      if code == nativeAgain() {
+        if followedImmediateReadiness {
+          followedImmediateReadiness = false
+          run waitIo(&connection.options, &deadline, ByteIoOperation.Write)
+        } else {
+          run checkIoDeadline(&deadline, ByteIoOperation.Write)
+          let available = run readiness(
+            &mut connection.*,
+            WRITABLE,
+            false,
+            &deadline,
+            ByteIoOperation.Write,
+          )
+          followedImmediateReadiness = available == ReadinessOutcome.Immediate
+        }
+      } else {
+        return run failProvider(&mut connection.*, ByteIoOperation.Write, code)
+      }
+    }
+  }
+  return usize.ZERO
 }
 
 unsafe effect fn flushConnection(
@@ -2651,6 +2737,7 @@ unsafe effect fn closeByteConnection(connection: &mut Connection) -> () ! ByteIo
 impl ByteDuplex for Connection {
   readSomeRaw: Connection.readConnection
   writeSomeRaw: Connection.writeConnection
+  writeSomeVectoredRaw: Connection.writeConnectionVectored
   flushRaw: Connection.flushConnection
   shutdownWriteRaw: Connection.shutdownConnection
   closeRaw: Connection.closeByteConnection
