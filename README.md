@@ -102,6 +102,7 @@ on different versions work side by side. Outside a pinned project it runs the de
 ```sh
 silk toolchain install 0.1.0-dev.6+0123456789ab   # download, verify and unpack a release
 silk toolchain use 0.1.0-dev.6+0123456789ab       # install it and pin the current project
+silk toolchain use latest                         # pin the newest stable release (dev: newest of any kind)
 silk toolchain default 0.1.0-dev.6+0123456789ab   # the toolchain used outside pinned projects
 silk toolchain list                               # installed toolchains; which one is selected
 silk toolchain which                              # the toolchain selected here, and why

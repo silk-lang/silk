@@ -5,7 +5,8 @@
 //! `silk v<version> <archive>`, so a signature cannot vouch for another release or file, and its
 //! `bin/silk` must have the SHA-256 the release's `native-seed.json` names for the target. The
 //! archive unpacks into a hidden directory beside the store, which is renamed into place only once
-//! everything checks out, so an interrupted install never leaves a toolchain behind.
+//! everything checks out, so an interrupted install never leaves a toolchain behind. A lock file in
+//! the home keeps concurrent installs from downloading the same release twice.
 
 import driver.Minisign as Minisign { MinisignError, MinisignKey }
 import driver.TarArchive as TarArchive { TarError, TarMember, TarReader }
@@ -57,6 +58,13 @@ pub service HostFiles {
 
   /// Renames `from` to `to`, which must not exist; false when that fails.
   effect fn rename(from: &Path, to: &Path) -> bool ! OutOfMemoryError ? &mut HostFiles | &mut Allocator
+
+  /// Waits for and takes the exclusive lock on the file `path`, creating it when missing; false
+  /// when the lock cannot be taken. The lock lasts until `unlock` or the end of the process.
+  effect fn lock(path: &Path) -> bool ! OutOfMemoryError ? &mut HostFiles | &mut Allocator
+
+  /// Releases the lock `lock` took.
+  effect fn unlock() -> () ? &mut HostFiles
 }
 
 /// A finished install.
@@ -143,20 +151,38 @@ effect fn joined(parts: &[&[u8]]) -> Bytes
   return move text
 }
 
-/// The full version of the newest published release that `requested` names.
-pub effect fn resolve(requested: &[u8]) -> Bytes
-  ! InstallError | OutOfMemoryError
-  ? &mut ReleaseSource | &mut Allocator {
-  if contains(requested, 43) {
-    return run Bytes.copy(requested)
+/// Whether `requested` names a release by what it is rather than by version: `latest`, the newest
+/// stable release (the newest release of any kind while no stable release exists), or `dev`, the
+/// newest release of any kind.
+pub fn isAlias(requested: &[u8]) -> bool {
+  return same(requested, b"latest") || same(requested, b"dev")
+}
+
+// Whether `version` is a pre-release such as `0.1.0-dev.6+1aed5da1a342`.
+fn prerelease(version: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < version.length && version[at] != 43 {
+    if version[at] == 45 {
+      return true
+    }
+    at = at + usize.ONE
   }
-  let published = run ReleaseSource.releases()
+  return false
+}
+
+// The index of the newest of `candidates` that `requested` names, or of the newest stable one when
+// `stable` is set.
+fn newest(candidates: &[Bytes], requested: &[u8], stable: bool) -> Option<usize> {
+  let alias = isAlias(requested)
   let mut best = Option<usize>.none()
-  let candidates = List<Bytes>.asSlice(&published)
   let mut at = usize.ZERO
   while at < candidates.length {
     let candidate = Bytes.asSlice(&candidates[at])
-    if Toolchains.matches(requested, candidate) {
+    let mut named = Toolchains.matches(requested, candidate)
+    if alias {
+      named = !stable || !prerelease(candidate)
+    }
+    if named {
       let better = match &best {
         Option<usize>.Some { value } => Toolchains.compare(candidate, Bytes.asSlice(&candidates[value])) > 0
         Option<usize>.None => true
@@ -167,9 +193,31 @@ pub effect fn resolve(requested: &[u8]) -> Bytes
     }
     at = at + usize.ONE
   }
+  return move best
+}
+
+/// The full version of the newest published release that `requested` names: a version, with or
+/// without build metadata, or an alias (see `isAlias`).
+pub effect fn resolve(requested: &[u8]) -> Bytes
+  ! InstallError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut Allocator {
+  if contains(requested, 43) {
+    return run Bytes.copy(requested)
+  }
+  let published = run ReleaseSource.releases()
+  let candidates = List<Bytes>.asSlice(&published)
+  let mut best = newest(candidates, requested, same(requested, b"latest"))
+  if let Option<usize>.None = &best {
+    if same(requested, b"latest") {
+      best = newest(candidates, requested, false)
+    }
+  }
   return match move best {
     Option<usize>.Some { value } => run Bytes.copy(Bytes.asSlice(&candidates[value]))
     Option<usize>.None => {
+      if isAlias(requested) {
+        fail run stop(NETWORK, &[b"the release listing names no published Silk release"])
+      }
       fail run stop(1, &[b"no published Silk release is version ", requested])
     }
   }
@@ -384,7 +432,7 @@ effect fn stage(version: &[u8], target: &[u8], key: &MinisignKey, staging: &Path
 }
 
 /// Installs the release `requested` names for `target` into `home`, trusting the minisign public
-/// key `publicKey`. Installing a toolchain that is already installed changes nothing.
+/// key `publicKey`. `requested` is a version or an alias (see `isAlias`). Installing a toolchain that is already installed changes nothing.
 pub effect fn install(home: &Path, requested: &[u8], target: &[u8], publicKey: &[u8]) -> Installed
   ! InstallError | FileError | OutOfMemoryError
   ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
@@ -401,26 +449,50 @@ pub effect fn install(home: &Path, requested: &[u8], target: &[u8], publicKey: &
   if let Option<Bytes>.Some { value } = move run Toolchains.find(home, Bytes.asSlice(&version)) {
     return Installed { version: move value, changed: false }
   }
+
+  // One install at a time per home, so concurrent installs of a version download it once. The lock
+  // only saves work: when it cannot be taken, the final rename still keeps installs apart.
+  let lockFile = run Path.join(home, ".install.lock")
+  let locked = run HostFiles.lock(&lockFile)
+  let ran = run Effect.result(installUnlocked(home, Bytes.asSlice(&version), target, &key))
+  if locked {
+    run HostFiles.unlock()
+  }
+  return match move ran {
+    Result<Installed, InstallError | FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Installed, InstallError | FileError | OutOfMemoryError>.Failure { error } => {
+      fail move error
+    }
+  }
+}
+
+// Installs the full version `version`, unless an install that held the lock first already did.
+effect fn installUnlocked(home: &Path, version: &[u8], target: &[u8], key: &MinisignKey) -> Installed
+  ! InstallError | FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  if let Option<Bytes>.Some { value } = move run Toolchains.find(home, version) {
+    return Installed { version: move value, changed: false }
+  }
   let store = run Path.join(home, "toolchains")
   run FileSystem.createDirectoriesRecursively(&store)
   let staging = run FileSystem.createTemporaryDirectory(&store, b".install-")
-  let staged = run Effect.result(stage(Bytes.asSlice(&version), target, &key, &staging))
+  let staged = run Effect.result(stage(version, target, key, &staging))
   if let Result<(), InstallError | FileError | OutOfMemoryError>.Failure { error } = move staged {
     let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(&staging))
     drop cleaned
     fail move error
   }
-  let destination = run Toolchains.directory(home, Bytes.asSlice(&version))
+  let destination = run Toolchains.directory(home, version)
   // Temporary directories are private; an installed toolchain is readable like any program.
   let opened = run HostFiles.markExecutable(&staging)
   if !opened || !run HostFiles.rename(&staging, &destination) {
     let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(&staging))
     drop cleaned
     // Another install of the same version may have finished first.
-    if let Option<Bytes>.Some { value } = move run Toolchains.find(home, Bytes.asSlice(&version)) {
+    if let Option<Bytes>.Some { value } = move run Toolchains.find(home, version) {
       return Installed { version: move value, changed: false }
     }
     fail run stop(1, &[b"cannot move the new toolchain to ", Path.rawBytes(&destination)])
   }
-  return Installed { version: move version, changed: true }
+  return Installed { version: run Bytes.copy(version), changed: true }
 }

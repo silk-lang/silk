@@ -17,12 +17,15 @@ import silk.http_client_native { NativeHttp }
 import silk.json_scanner { JsonError }
 import silk.json_value { Json, JsonChild, Value }
 import silk.list { List }
+import silk.native_clock { NativeClock }
 import silk.option { Option }
 import silk.os_filesystem { OsFileSystem }
 import silk.result { Result }
 import silk.slice { Slice }
 import silk.string { String }
+import silk.system_clock { SystemClock }
 import silk.i32
+import silk.i64
 import silk.u16
 import silk.usize
 
@@ -30,6 +33,7 @@ const MAX_DOWNLOAD_BYTES: usize = 268435456
 const MAX_REDIRECTS: usize = 5
 const PAGE_SIZE: usize = 100
 const MAX_PAGES: usize = 20
+const ATTEMPTS: usize = 4
 
 /// The GitHub releases of `silk-lang/silk`.
 pub struct GitHubReleases {
@@ -139,6 +143,18 @@ effect fn appendNumber(text: &mut Bytes, value: i32) -> ()
   run Bytes.append(&mut text.*, &digit)
 }
 
+// Waits 1, 2 or 4 seconds before try `tries` + 1.
+effect fn pause(tries: usize) -> () {
+  let mut seconds = i64.toI64(1)
+  let mut at = usize.ONE
+  while at < tries {
+    seconds = seconds * 2
+    at = at + usize.ONE
+  }
+  let now = run NativeClock.now(true)
+  run NativeClock.waitUntil(SystemClock.make(SystemClock.seconds(&now) + seconds, SystemClock.nanoseconds(&now)))
+}
+
 impl GitHubReleases {
   effect fn get(self: &mut Self, url: &String) -> Response
     ! InstallError | OutOfMemoryError
@@ -160,56 +176,105 @@ impl GitHubReleases {
     }
   }
 
+  // Fetches page `number` of the listing and appends its versions to `published`: how many
+  // releases the page held, or the error of a failure that may pass, which a retry can outlast.
+  effect fn page(self: &mut Self, number: usize, published: &mut List<Bytes>) -> Result<usize, InstallError>
+    ! InstallError | OutOfMemoryError
+    ? &mut Allocator {
+    let mut url = run String.copy("https://api.github.com/repos/silk-lang/silk/releases?per_page=100&page=")
+    run String.append(&mut url, decimal(number))
+    let sent = run Effect.result(self.get(&url))
+    let response = match move sent {
+      Result<Response, InstallError | OutOfMemoryError>.Success { value } => move value
+      Result<Response, InstallError | OutOfMemoryError>.Failure { error } => match move error {
+        InstallError failed => {
+          return Result<usize, InstallError>.failResult(move failed)
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    let status = u16.toI32(response.status())
+    if status != 200 {
+      let mut message = run Bytes.copy(b"the GitHub release listing failed with HTTP status ")
+      run appendNumber(&mut message, status)
+      run Bytes.append(&mut message, b"; a full version such as 0.1.0-dev.6+1aed5da1a342 needs no listing")
+      let failed = InstallError { status: ToolchainInstall.NETWORK, message: move message }
+      if status >= 500 || status == 429 {
+        return Result<usize, InstallError>.failResult(move failed)
+      }
+      fail move failed
+    }
+    let parsed = run Effect.result(Json.parse(response.body()))
+    let document = match move parsed {
+      Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
+      Result<Value, JsonError | OutOfMemoryError>.Failure { error } => match move error {
+        JsonError invalid => {
+          return Result<usize, InstallError>.failResult(
+            run stop(ToolchainInstall.NETWORK, &[b"the GitHub release listing is not valid JSON"])
+          )
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    let mut count = usize.ZERO
+    if let Value.Array { values } = &document {
+      let boxed = Box<List<JsonChild>>.get(&values)
+      let items = List<JsonChild>.asSlice(&boxed[0])
+      count = items.length
+      let mut at = usize.ZERO
+      while at < items.length {
+        if let JsonChild.Item { value: release } = &items[at] {
+          if let Option<string>.Some { value: tag } = Json.asString(Json.field(&release, "tag_name")) {
+            let bytes = String.utf8Bytes(tag)
+            if bytes.length > usize.ONE && bytes[usize.ZERO] == 118 {
+              run List<Bytes>.append(&mut published.*, run Bytes.copy(Slice.view<u8>(bytes, usize.ONE, bytes.length - usize.ONE)))
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+    return Result<usize, InstallError>.succeed(count)
+  }
+
+  // The listing sometimes fails or comes back empty for a moment, so a page is fetched up to
+  // `ATTEMPTS` times, waiting 1, 2 and then 4 seconds between tries. An empty first page counts as a
+  // failure until the last try, since silk-lang/silk always has releases.
   effect fn releases(self: &mut Self) -> List<Bytes>
     ! InstallError | OutOfMemoryError
     ? &mut Allocator {
     let mut published = List<Bytes>.make()
-    let mut page = usize.ONE
-    while page <= MAX_PAGES {
-      let mut url = run String.copy("https://api.github.com/repos/silk-lang/silk/releases?per_page=100&page=")
-      run String.append(&mut url, decimal(page))
-      let response = run self.get(&url)
-      let status = u16.toI32(response.status())
-      if status != 200 {
-        let mut message = run Bytes.copy(b"the GitHub release listing failed with HTTP status ")
-        run appendNumber(&mut message, status)
-        run Bytes.append(&mut message, b"; a full version such as 0.1.0-dev.6+1aed5da1a342 needs no listing")
-        fail InstallError { status: ToolchainInstall.NETWORK, message: move message }
-      }
-      let parsed = run Effect.result(Json.parse(response.body()))
-      let document = match move parsed {
-        Result<Value, JsonError | OutOfMemoryError>.Success { value } => move value
-        Result<Value, JsonError | OutOfMemoryError>.Failure { error } => match move error {
-          JsonError invalid => {
-            fail run stop(ToolchainInstall.NETWORK, &[b"the GitHub release listing is not valid JSON"])
-          }
-          OutOfMemoryError exhausted => {
-            fail move exhausted
-          }
-        }
-      }
+    let mut number = usize.ONE
+    while number <= MAX_PAGES {
+      let mut tries = usize.ZERO
       let mut count = usize.ZERO
-      if let Value.Array { values } = &document {
-        let boxed = Box<List<JsonChild>>.get(&values)
-        let items = List<JsonChild>.asSlice(&boxed[0])
-        count = items.length
-        let mut at = usize.ZERO
-        while at < items.length {
-          if let JsonChild.Item { value: release } = &items[at] {
-            if let Option<string>.Some { value: tag } = Json.asString(Json.field(&release, "tag_name")) {
-              let bytes = String.utf8Bytes(tag)
-              if bytes.length > usize.ONE && bytes[usize.ZERO] == 118 {
-                run List<Bytes>.append(&mut published, run Bytes.copy(Slice.view<u8>(bytes, usize.ONE, bytes.length - usize.ONE)))
-              }
+      while true {
+        tries = tries + usize.ONE
+        let fetched = run self.page(number, &mut published)
+        let last = tries >= ATTEMPTS
+        match move fetched {
+          Result<usize, InstallError>.Success { value } => {
+            count = value
+            if count > usize.ZERO || number > usize.ONE || last {
+              break
             }
           }
-          at = at + usize.ONE
+          Result<usize, InstallError>.Failure { error } => {
+            if last {
+              fail move error
+            }
+          }
         }
+        run pause(tries)
       }
       if count < PAGE_SIZE {
         return move published
       }
-      page = page + usize.ONE
+      number = number + usize.ONE
     }
     return move published
   }
