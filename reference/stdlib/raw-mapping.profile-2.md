@@ -29,12 +29,18 @@ Public declarations: 1.
 pub struct Mapping
 ```
 
-One anonymous mapping that starts as zeros, and an aligned range inside it.
+One anonymous mapping from the Linux kernel that starts as zeros, and an aligned range inside
+it. It exists only on Linux on x86_64 and aarch64, with the `libc` profile set to `none`.
 
 ### Details
 
 Drop is automatic and releases the mapping. Use [`Mapping.release`](#Mapping.impl.release) to get the error from
-`munmap`.
+`munmap`. Errors are Linux error numbers, such as 22 for `EINVAL`.
+
+### Gotchas
+
+A raw pointer from [`Mapping.pointer`](#Mapping.impl.pointer) does not keep the mapping alive. If the program traps,
+the mapping is not always released.
 
 <a id="Mapping.impl.Drop"></a>
 

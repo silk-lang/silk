@@ -123,7 +123,8 @@ Public declarations: 11.
 pub union BodyMode
 ```
 
-How the request body is framed.
+How the request body is framed. It adds `Content-Length` or `Transfer-Encoding`, so you cannot
+also give these fields in `headers`.
 
 <a id="BodyMode.Empty"></a>
 
@@ -348,7 +349,13 @@ Basic credentials can go over plain HTTP, where anyone on the path can read them
 pub struct HeaderPolicy<'value>
 ```
 
-The fields that the request adds. Start from [`HeaderPolicy.defaults`](#HeaderPolicy.impl.defaults).
+The fields that the request adds: `Host`, `User-Agent`, `Accept`, and `Authorization`. Start
+from [`HeaderPolicy.defaults`](#HeaderPolicy.impl.defaults). You cannot also give these fields in `headers`.
+
+### Gotchas
+
+By default, Basic credentials fail over plain HTTP with `InsecureBasic`. Set `basicSecurity` to
+`AllowInsecureBasic` only when you accept that the password is sent as plain text.
 
 <a id="HeaderPolicy.host"></a>
 
@@ -620,6 +627,12 @@ pub struct PreparedRequest
 
 A checked request head, written as bytes and ready to send. It owns its memory.
 
+### When to use
+
+Make one with [`fromUri`](#fromUri) or [`prepare`](#prepare) for a direct connection to an origin, or with
+[`prepareForward`](#prepareForward) and [`prepareConnect`](#prepareConnect) for a route from `silk.http_proxy`. Send it with
+`silk.http_exchange`.
+
 <a id="PreparedRequest.impl"></a>
 
 ## Implementation `PreparedRequest`
@@ -711,7 +724,11 @@ pub effect fn prepare<'value>(
 Checks a request to `origin` and writes its head.
 
 ### Details
-Your fields in `headers` keep their order. When `require100` is `true`, the head has `Expect:
+The [`HeaderPolicy`](#HeaderPolicy) adds `Host`, `User-Agent`, `Accept`, and `Authorization`. The
+[`BodyMode`](#BodyMode) adds `Content-Length` or `Transfer-Encoding`. You cannot also give these fields, or
+`Expect` and `Connection`, in `headers`. The prepared request owns a copy of all its bytes.
+Nothing is sent and nothing is resolved here. Your fields in `headers` keep their order. When
+`require100` is `true`, the head has `Expect:
 100-continue`, and the client waits for the server before it sends the body. `maxHeadBytes`
 limits the size of the head, and `maxCredentialBytes` the size of the credentials.
 
@@ -779,8 +796,16 @@ pub effect fn fromUri<'value>(
 ) -> PreparedRequest ! RequestError | OutOfMemoryError ? &mut Allocator
 ```
 
-Prepares a direct request for `uri`, like [`prepare`](#prepare). The origin and the target come from
+Checks a direct request for `uri` and writes its head. The origin and the target come from
 `uri`. The fragment is not sent.
+
+### Details
+The [`HeaderPolicy`](#HeaderPolicy) adds `Host`, `User-Agent`, `Accept`, and `Authorization`, and the
+[`BodyMode`](#BodyMode) adds `Content-Length` or `Transfer-Encoding`. Your other fields in `headers` keep
+their order. Nothing is sent and nothing is resolved here.
+
+### Gotchas
+By default, Basic credentials fail over plain HTTP with `InsecureBasic`.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

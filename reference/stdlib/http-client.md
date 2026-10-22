@@ -461,6 +461,11 @@ pub struct HttpError
 
 One HTTP client failure.
 
+### Details
+
+`kind` tells what failed, `status` has the response status if one arrived, and `cause` keeps
+the error from the lower module.
+
 <a id="HttpError.kind"></a>
 
 ### Field `kind`
@@ -658,6 +663,17 @@ pub struct Request<'a>
 An HTTP request that you build with chained calls. Nothing is checked or sent until
 [`Http.send`](#Http.send).
 
+### Details
+
+Build it with chained calls, such as `Request.get("/repos").query("page", "2").bearer(token)`.
+Nothing is checked until [`Http.send`](#Http.send). Only [`Request.json`](#Request.impl.json) allocates.
+
+### Gotchas
+
+A request holds at most 8 path segments, 16 query parameters, and 32 headers. More fail at send
+time with `InvalidRequest`. [`Request.json`](#Request.impl.json) writes only the fields that are visible from your
+module.
+
 <a id="Request.impl"></a>
 
 ## Implementation `Request<'a>`
@@ -828,6 +844,10 @@ Serializes the visible fields of `value` as compact JSON and sends it as `applic
 `value` is a named or anonymous struct, such as `&.{ title: "Water plants" }`. Its fields are
 written in declaration order through their `Serialize` witnesses. The bytes are allocated
 from the ambient allocator.
+
+#### Gotchas
+
+Fields that are private to another module are not written.
 
 <a id="Request.impl.timeoutSeconds"></a>
 
@@ -1012,6 +1032,11 @@ pub struct Response
 
 A complete response: status, headers, and the whole body in memory.
 
+### Details
+
+A response with any status, also 4xx and 5xx, is a `Response`. Call [`Response.expectOk`](#Response.impl.expectOk) to
+make a status outside 200 to 299 an error.
+
 <a id="Response.impl"></a>
 
 ## Implementation `Response`
@@ -1182,6 +1207,12 @@ and TLS, and a test provider can return fixed responses. A provider can also wra
 provider, for example to add headers, logs, or retries, and forward with
 `Effect.provideMut<Http>`.
 
+### When to use
+
+Use it to call web APIs. Code that sends requests requires `? &mut Http`. The program gives a
+provider one time, near `main`: `NativeHttp` from `silk.http_client_native` for real requests,
+or a fake in tests. Use `silk.http_exchange` to stream bodies or to control the connection.
+
 <a id="Http.send"></a>
 
 ### Operation `send`
@@ -1191,6 +1222,19 @@ effect fn send(request: Request) -> Response ! HttpError | OutOfMemoryError ? &m
 ```
 
 Sends one request and returns the complete response, whatever its status.
+
+#### Details
+
+It checks the request first. A response with a 4xx or 5xx status is a success. Call
+`Response.expectOk` to make it an error.
+
+#### Errors
+
+- `HttpError` for all failures. Its `kind` tells what failed, `status` has the response
+  status if one arrived, and `cause` keeps the error from the lower module. A request with
+  more than 8 path segments, 16 query parameters, or 32 headers fails with
+  `InvalidRequest`.
+- `OutOfMemoryError` if the `Allocator` fails.
 
 <a id="Http.impl"></a>
 

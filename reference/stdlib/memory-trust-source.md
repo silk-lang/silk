@@ -63,7 +63,19 @@ Public declarations: 1.
 pub struct MemoryTrustSource
 ```
 
-A `TrustSource` provider that owns the current trust snapshot.
+A `TrustSource` provider that owns the current trust snapshot in memory.
+
+### When to use
+Use it when the program already has its trust anchors, for example from an embedded CA file, and
+in tests. Call [`MemoryTrustSource.replace`](#MemoryTrustSource.impl.replace) to change the trust for later loads, for example
+after a configuration reload.
+
+### Details
+Each load returns a copy of the current snapshot. Snapshots that were loaded before a
+replacement do not change.
+
+### Gotchas
+It does not read files, refresh, or remove duplicates.
 
 <a id="MemoryTrustSource.impl"></a>
 

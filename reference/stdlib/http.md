@@ -519,6 +519,11 @@ pub struct ValueError
 
 The error from checking an HTTP value. It tells which rule failed, and where.
 
+### Details
+
+`reason` gives the rule, `component` the part of the value, and `fieldIndex` and `offset` the
+position.
+
 <a id="ValueError.reason"></a>
 
 ### Field `reason`
@@ -626,6 +631,11 @@ pub struct Method<'text>
 ```
 
 An HTTP method, such as `GET`. It keeps its exact spelling, and is compared with case.
+
+### Details
+
+Any valid token is a method, so `get` and `GET` are different methods. It borrows its text. The
+`make` and `parse` functions check the token.
 
 <a id="Method.impl.Copy"></a>
 
@@ -888,6 +898,11 @@ pub struct Header<'value>
 ```
 
 An HTTP header field. It borrows its name and value, and keeps their exact bytes.
+
+### Gotchas
+
+[`Header.make`](#Header.impl.make) takes the value without the spaces around it on the wire. It rejects CR, LF,
+NUL, DEL, other control bytes, and leading or trailing spaces or tabs.
 
 <a id="Header.impl.Copy"></a>
 

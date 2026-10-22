@@ -64,7 +64,17 @@ Accepts one connection from `listener`, and serves it with `handler`.
 ### Details
 The accept waits until `acceptDeadline`, or with no limit if it is `None`. Then it calls
 `withConnection` of `silk.http_server` with `limits`. The socket is closed when the handler
-returns or fails.
+returns or fails. Call it in a loop. It serves one connection at a time, on the calling task,
+with no queue, router, supervisor, or background task. To serve connections at the same time,
+start tasks yourself.
+
+### Errors
+- `NativeSocketError` if the accept fails or the deadline passes.
+- `ServerError`, `BufferError`, and `OutOfMemoryError` from `silk.http_server`.
+- The error of the handler.
+
+### Gotchas
+It exists only on Darwin on aarch64, and on Linux with GNU libc on x86_64 or aarch64.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

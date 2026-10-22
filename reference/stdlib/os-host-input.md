@@ -69,6 +69,10 @@ pub struct OsHostInput
 
 The native `HostInput` provider. It owns a snapshot of the arguments and the environment.
 
+A native `main` that requires `&mut HostInput` gets one from `silk.native_start`. The
+arguments and the environment come from the snapshot, so they do not change. The working
+directory is read from the process at each call. Each result is a new owned copy.
+
 <a id="OsHostInput.impl"></a>
 
 ## Implementation `OsHostInput`

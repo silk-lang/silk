@@ -74,6 +74,15 @@ pub struct OsStandardInput
 The native `StandardInput` provider. The process owns the descriptor, and the provider does
 not close it.
 
+### Details
+Each read reads once from the descriptor, directly into your buffer, and returns the count
+that the system returned, which can be less than the buffer. After the system reports the
+end of input, later reads return the end without a system call.
+
+### Gotchas
+- An empty buffer returns a count of 0 without a read, also after the end of input.
+- A read waits until input arrives or ends.
+
 <a id="OsStandardInput.impl"></a>
 
 ## Implementation `OsStandardInput`

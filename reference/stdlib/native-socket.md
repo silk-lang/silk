@@ -701,7 +701,7 @@ The `errno` value.
 pub union NativeSocketError
 ```
 
-The error of a socket operation.
+The error of a socket operation: the rule that failed, the system error, or the deadline.
 
 <a id="NativeSocketError.AttemptsExhausted"></a>
 
@@ -1492,7 +1492,13 @@ Returns the path bytes.
 pub struct Connection
 ```
 
-An open socket connection. It provides `ByteDuplex`.
+An open socket connection. It provides `ByteDuplex`, so `silk.http_exchange`,
+`silk.http_server`, and `silk.buffered_duplex` can use it.
+
+### Details
+The socket is nonblocking. When it is not ready, an operation waits for the poll interval with
+`MonotonicClock`, then tries again. So an idle wait costs about one check for each interval. A
+flush means that the kernel accepted the bytes, not that the peer got them.
 
 <a id="Listener"></a>
 
@@ -1825,7 +1831,17 @@ pub effect fn connectResolved<'env, A, E, ?CallbackRequirements>(
 where CallbackRequirements in Without<CallbackRequirements, ByteDuplex>
 ```
 
-Connects as [`connectResolvedOwned`](#connectResolvedOwned), lends the connection to `callback`, and closes it after.
+Connects to the first of `endpoints` that accepts, lends the connection to `callback`, and
+closes it after, also on error or cancellation. A trap does not close it.
+
+### Errors
+- The error of `callback`.
+- `InvalidEndpoint` if `endpoints` is empty or longer than the attempt limit.
+- `AttemptsExhausted` if no endpoint accepts. It has the error of the last attempt.
+- `Timeout` if `deadline` passes. One deadline covers all attempts.
+
+### Gotchas
+With a deadline of `None`, the connect can wait forever.
 
 <a id="connectUnix"></a>
 
@@ -1843,7 +1859,13 @@ pub effect fn connectUnix<'env, A, E, ?CallbackRequirements>(
 where CallbackRequirements in Without<CallbackRequirements, ByteDuplex>
 ```
 
-Connects as [`connectUnixOwned`](#connectUnixOwned), lends the connection to `callback`, and closes it after.
+Connects to the Unix socket at `path`, lends the connection to `callback`, and closes it after,
+also on error or cancellation. A trap does not close it.
+
+### Errors
+- The error of `callback`.
+- `InvalidEndpoint` if `path` is not valid.
+- `Timeout` if `deadline` passes.
 
 <a id="Connection.impl-2"></a>
 

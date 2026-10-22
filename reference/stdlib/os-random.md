@@ -55,7 +55,16 @@ Public declarations: 1.
 pub struct OsRandom
 ```
 
-The native `Random` provider. It has no state. A failure is a trap.
+The native `Random` provider: secure random bytes from the operating system. It has no state.
+
+### Details
+Each fill gets bytes from `getrandom` on Linux and `arc4random_buf` on macOS. An empty buffer
+does nothing.
+
+### Gotchas
+- A failure of the source is a trap, because weak bytes are not safe. Part of the buffer can be
+  changed before the trap.
+- On Linux, it needs glibc 2.25 and Linux 3.17 or later.
 
 <a id="OsRandom.impl"></a>
 

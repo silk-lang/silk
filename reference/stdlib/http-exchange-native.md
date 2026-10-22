@@ -275,6 +275,16 @@ pub struct Options
 
 The settings of a native connection. Start from [`Options.defaults`](#Options.impl.defaults).
 
+### Details
+
+The deadline is absolute, and each step of a connection gets it unchanged: the check, the name
+resolution, the connect, and TLS.
+
+### Gotchas
+
+A host name with a deadline fails with `UnsupportedDeadline` before any contact, because
+resolution cannot stop at a deadline. An IP address with a deadline is accepted.
+
 <a id="Options.maximumAddresses"></a>
 
 ### Field `maximumAddresses`
@@ -552,7 +562,13 @@ connection keeps no deadline. Close it, or give it to another owner such as a po
 ### Errors
 - `NativeExchangeError.TrustRequired` if `origin` uses `https` and `preparedTrust` is none.
 - `NativeSocketError.Timeout` if the deadline has passed.
-- The errors of [`preflight`](#preflight), resolution, the socket, and TLS.
+- `UnsupportedDeadline` if the host of `origin` is a name and a deadline is set.
+- `ResolverError`, `NativeSocketError`, `ConnectionError`, and `IdentityError` from resolution,
+  the socket, TLS, and the certificate check.
+
+### Gotchas
+Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+targets, a call fails to compile.
 
 <a id="admitUnixRoute"></a>
 
@@ -587,8 +603,14 @@ pub effect fn acquireUnixOwned(
 Opens an HTTP or HTTPS connection to `origin` through the Unix socket at `path`, and returns it.
 
 ### Details
-`path` selects only the socket. For `https`, TLS checks the certificate against `origin`. The
-deadlines work as in [`acquireOwned`](#acquireOwned). The returned connection keeps no deadline.
+`path` selects only the socket. For `https`, it uses `preparedTrust`, and TLS checks the
+certificate against `origin`. The opening deadline is the earlier of `options.deadline` and
+`acquisitionDeadline`. The returned connection keeps no deadline. Close it, or give it to
+another owner such as a pool.
+
+### Gotchas
+Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+targets, a call fails to compile.
 
 <a id="withConnection"></a>
 
@@ -611,12 +633,23 @@ Opens a connection to `origin`, lends it to `handler`, and closes it after.
 
 ### Details
 For `https`, it loads trust from the `TrustSource` service before it connects, and checks the
-certificate against `origin`. A `Host` field never changes the identity that is checked.
+certificate against `origin`. A `Host` field never changes the identity that is checked. The
+deadline in `options` is absolute, and each step gets it unchanged. When the handler returns or
+fails, the connection is closed. Closing does not flush and does not send a TLS close message.
 
 ### Errors
-- The errors of [`preflight`](#preflight) and [`acquireOwned`](#acquireOwned).
+- `UnsupportedDeadline` if the host of `origin` is a name and `options.deadline` is set.
+- [`NativeExchangeError`](#NativeExchangeError) for options that are not valid, a deadline that cannot be honored,
+  missing trust, or a failed ALPN negotiation.
+- `ResolverError`, `NativeSocketError`, `ConnectionError`, and `IdentityError` from resolution,
+  the socket, TLS, and the certificate check.
+- `ExchangeError` from the HTTP connection.
 - `TrustSourceError` if trust cannot be loaded.
 - The error of the handler.
+
+### Gotchas
+Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+targets, a call fails to compile.
 
 <a id="withUnixConnection"></a>
 
@@ -640,7 +673,21 @@ closes it after.
 
 ### Details
 `path` selects only the socket. For `https`, it loads trust from the `TrustSource` service and
-checks the certificate against `origin`.
+checks the certificate against `origin`. The deadline in `options` is absolute, and each step
+gets it unchanged. When the handler returns or fails, the connection is closed. Closing does not
+flush and does not send a TLS close message.
+
+### Errors
+- [`NativeExchangeError`](#NativeExchangeError) for options that are not valid, a deadline that cannot be honored,
+  missing trust, or a failed ALPN negotiation.
+- `ResolverError`, `NativeSocketError`, `ConnectionError`, and `IdentityError` from resolution,
+  the socket, TLS, and the certificate check.
+- `TrustSourceError` if trust cannot be loaded.
+- `ExchangeError` and the error of the handler.
+
+### Gotchas
+Only Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64, are supported. On other
+targets, a call fails to compile.
 
 <a id="withProxyRoute"></a>
 

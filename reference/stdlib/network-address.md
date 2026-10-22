@@ -80,7 +80,8 @@ Public declarations: 12.
 pub enum AddressReason
 ```
 
-The rule that rejected an IP address. See [`AddressError.InvalidAddress`](#AddressError.InvalidAddress).
+The rule that rejected an IP address. [`AddressError.InvalidAddress`](#AddressError.InvalidAddress) carries it, with the byte
+offset where the check failed.
 
 <a id="AddressReason.Empty"></a>
 
@@ -170,7 +171,8 @@ The IPv6 text has `::` together with all 8 parts, so `::` replaces nothing.
 pub enum HostReason
 ```
 
-The rule that rejected a domain name. See [`AddressError.InvalidHost`](#AddressError.InvalidHost).
+The rule that rejected a domain name. [`AddressError.InvalidHost`](#AddressError.InvalidHost) carries it, with the byte
+offset where the check failed.
 
 <a id="HostReason.EmptyName"></a>
 
@@ -604,6 +606,9 @@ pub struct DomainHost
 A checked ASCII domain name, such as `example.com`. It keeps the spelling of its input, and
 compares without case.
 
+It stores the name in a fixed buffer of 253 bytes and does not allocate. Only plain ASCII names
+are accepted. Convert an internationalized name to its `xn--` form first.
+
 <a id="Host"></a>
 
 ## `Host`
@@ -1010,7 +1015,19 @@ impl DomainHost
 pub fn make(bytes: &[u8]) -> Result<DomainHost, AddressError>
 ```
 
-Checks `bytes` as a domain name and copies it. See [`HostReason`](#HostReason) for the rules.
+Checks `bytes` as a domain name and copies it.
+
+#### Details
+The name must be plain ASCII, 1 to 253 bytes, with labels of 1 to 63 bytes that do not begin
+or end with a hyphen. A label that starts with `xn--` must be valid Punycode. The last label
+must not be only digits.
+
+#### Errors
+- [`AddressError.InvalidHost`](#AddressError.InvalidHost) with a [`HostReason`](#HostReason) and the byte offset if a rule fails. A
+  trailing dot, as in `example.com.`, fails with `TrailingDot`.
+
+#### Gotchas
+Convert an internationalized name to its `xn--` form first.
 
 <a id="DomainHost.impl.bytes"></a>
 
@@ -1062,7 +1079,17 @@ Parses the host part of a URI.
 
 #### Details
 `[...]` is parsed as IPv6, decimal dotted text is parsed as IPv4, and all other text as a
-domain name. Give only the host, without user information or a port.
+domain name. Give only the host, without user information or a port. The result does not
+allocate. Give it to `silk.resolver` to get endpoints, and keep it to check the identity of
+an HTTPS server.
+
+#### Errors
+- [`AddressError`](#AddressError) with the rule that failed and the byte offset where it failed.
+
+#### Gotchas
+These forms fail: a trailing dot, percent escapes, an IPv6 zone such as `%eth0`, IPvFuture,
+user information, a port, non-ASCII names, and old IPv4 forms such as `127.1` or
+`0x7f.0.0.1`.
 
 <a id="Host.impl.numeric"></a>
 

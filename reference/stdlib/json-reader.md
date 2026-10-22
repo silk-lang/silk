@@ -69,11 +69,20 @@ The source bytes of a string, number, or literal token.
 pub struct JsonReader
 ```
 
-The state of one JSON document read from a `BufferedInput`.
+The state of one JSON document read from a `BufferedInput`, for documents that do not fit in one
+slice.
+
+### When to use
+
+Use it to read a large or streamed JSON document from a `ByteDuplex` transport, such as an HTTP
+body. When the whole document is in memory, use `silk.json_scanner.JsonScanner`.
 
 ### Details
 
-It keeps the position in the document between calls. After the document ends, each call returns
+Each call to [`JsonReader.next`](#JsonReader.impl.next) returns one checked token and copies its raw bytes into a
+scratch buffer that the caller gives. The reader does not keep a reference to the input or the
+scratch buffer between calls, and does not allocate. It keeps the position in the document
+between calls. After the document ends, each call returns
 `EndOfInput`.
 
 <a id="JsonReader.impl"></a>
@@ -123,6 +132,10 @@ each read.
 - `JsonError` with reason `TokenTooLarge` if the token does not fit in `scratch`. `offset` is
   the first byte of the token and `available` is the scratch size.
 - `BufferError` if the input fails, or `BufferError.Terminal` after an earlier error.
+
+#### Gotchas
+After an error, the reader cannot continue. Drop each token before the next call, because the
+token borrows `scratch`.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

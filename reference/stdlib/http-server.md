@@ -655,7 +655,8 @@ The number of 1xx responses for one request.
 pub union ServerError
 ```
 
-The error of a server operation, with its lower-level cause.
+The error of a server operation, with its lower-level cause: the head parser, the body framing,
+the buffer, or the header values. Most errors set the phase to `Failed`.
 
 <a id="ServerError.Head"></a>
 
@@ -955,6 +956,25 @@ pub struct Connection<'connection, 'transport, P>
 
 A server connection. [`withConnection`](#withConnection) lends it to a [`ConnectionHandler`](#ConnectionHandler).
 
+### Details
+
+The connection serves one request at a time. In the handler, call [`withRequest`](#withRequest) for each
+request, read the body with [`readSome`](#readSome), then answer with [`respond`](#respond), [`reject`](#reject),
+[`withUpgrade`](#withUpgrade), or [`withTunnel`](#withTunnel). The request, the body decoder, the response writer, and an
+upgraded channel are lent to callbacks, and cannot escape them. [`Connection.phase`](#Connection.impl.phase) tells what
+the connection can do next.
+
+The server adds the `Connection` field. It closes the connection after a response if the
+[`ReusePolicy`](#ReusePolicy) or the peer asks for it, the request body was not read to its end, the response
+body ends at close, the request count reached `maxRequestsPerConnection`, or the request is
+HTTP/1.0 and not a keep-alive request with `Http10KeepAlive`.
+
+### Gotchas
+
+When the scope ends, the connection closes at once. It does not flush or drain. Call
+[`finishConnection`](#finishConnection) for a graceful close. A request callback that returns without a response
+closes the connection.
+
 <a id="Connection.impl"></a>
 
 ## Implementation `Connection<'connection, 'transport, P>`
@@ -1062,6 +1082,11 @@ pub struct ResponseWriter<'writer, 'request, 'connection, 'transport, P>
 
 Writes the body of a final response. [`respond`](#respond) lends it to a callback.
 
+### Gotchas
+
+Call `finish` after the body. If the callback returns without it, or fails, the connection is
+closed after the request.
+
 <a id="ConnectionHandler"></a>
 
 ## `ConnectionHandler`
@@ -1070,7 +1095,8 @@ Writes the body of a final response. [`respond`](#respond) lends it to a callbac
 pub interface ConnectionHandler<P, A, E, ?R>
 ```
 
-The code that serves one connection. See [`withConnection`](#withConnection).
+The code that serves one connection. [`withConnection`](#withConnection) lends the connection to it. In it, call
+[`withRequest`](#withRequest) for each request. When it returns or fails, the transport is closed at once.
 
 <a id="ConnectionHandler.handle"></a>
 
@@ -1133,6 +1159,10 @@ fails, the transport is closed at once.
 - `ServerError` if `limits` is not valid.
 - `OutOfMemoryError` if the parsers or buffers cannot be allocated.
 - The error of the handler.
+
+### Gotchas
+When the handler returns, the connection closes at once. It does not flush or drain. Call
+[`finishConnection`](#finishConnection) in the handler for a graceful close.
 
 <a id="withRequest"></a>
 

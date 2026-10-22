@@ -90,6 +90,22 @@ pub struct NativeFileTrustSource
 A `TrustSource` provider that owns a root directory and a path to a PEM file below it. It does
 not cache snapshots.
 
+### When to use
+Provide it for `TrustSource` when your program uses one PEM bundle of CA certificates, for
+example `/etc/ssl/certs/ca-certificates.crt` on Debian or `/etc/ssl/cert.pem` on macOS.
+
+### Details
+Each `load` opens the file again, reads at most the input limit, closes it, and decodes it
+with `TrustSnapshot.fromAnnotatedPem`. Text outside the certificate blocks is allowed. A bad
+block fails the load. Each snapshot owns its anchors. The path is opened below the root
+without following symbolic links. Trust the root and its parent directories. To change the
+file, write a new file and rename it. A change in place can be read half way.
+
+### Gotchas
+- It does not look for a default file, read environment variables, or use the trust store of
+  the system (such as the macOS keychain). It does not check revocation.
+- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+
 <a id="NativeFileTrustSource.impl"></a>
 
 ## Implementation `NativeFileTrustSource`

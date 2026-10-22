@@ -112,7 +112,8 @@ The owner of one running native thread and the storage for its result.
 
 ### Gotchas
 
-Dropping a handle without calling [`join`](#JoinHandle.impl.join) waits for the thread and drops its result.
+Dropping a handle without calling [`JoinHandle.join`](#JoinHandle.impl.join) waits for the thread and drops its result.
+Thus the result storage that the handle owns lives longer than each write to it.
 
 <a id="JoinHandle.impl"></a>
 
@@ -157,6 +158,21 @@ pub struct NativeThread
 ```
 
 The owner of native thread creation.
+
+### When to use
+Use [`NativeThread.spawn`](#NativeThread.impl.spawn) to run independent work on a new operating-system thread, and
+[`JoinHandle.join`](#JoinHandle.impl.join) to wait for its result. For many small tasks, use `silk.thread_pool`.
+
+### Details
+The closure and its result must be `Transferable`. The closure must be detached: it owns all
+that it captures, and borrows nothing from the caller. Threads use `pthread_create` on Darwin
+and GNU libc targets, and wasi-threads on wasm32 with `threading = "multi"`. A native thread
+gets an 8 MiB stack, the default main-thread stack on Darwin and Linux, so work that fits on the
+main thread fits on a spawned one. A wasm32 thread gets the 1 MiB stack that its runtime gives
+every thread.
+
+### Gotchas
+A fatal trap on any thread ends the whole process.
 
 <a id="NativeThread.impl"></a>
 

@@ -118,6 +118,23 @@ The length is the number of elements in the list. The capacity is the number of 
 fit before the next growth. Dropping a list drops each element and then releases the storage. A
 list is affine. Copy it element by element if a second list is necessary.
 
+[`List.make`](#List.impl.make) does not allocate. The first growth allocates space for four elements, and each
+later growth doubles the capacity. Use [`List.reserve`](#List.impl.reserve) or [`List.reserveExact`](#List.impl.reserveExact) to allocate
+before a sequence of appends. Growth copies the elements into new storage before it releases the
+old storage, so a failed [`List.append`](#List.impl.append) or [`List.reserve`](#List.impl.reserve) leaves the list unchanged.
+[`List.remove`](#List.impl.remove), [`List.clear`](#List.impl.clear), and [`List.truncate`](#List.impl.truncate) drop the elements that they remove and
+keep the capacity.
+
+[`List.sort`](#List.impl.sort) is stable, works for elements that are not `Copy`, and allocates temporary
+storage. [`List.binarySearch`](#List.impl.binarySearch) needs a sorted list and returns the lowest index of equal
+elements.
+
+### Gotchas
+
+[`List.get`](#List.impl.get), [`List.set`](#List.impl.set), and [`List.remove`](#List.impl.remove) trap if the index is not less than the length.
+[`List.insert`](#List.impl.insert) traps if the index is more than the length. [`List.get`](#List.impl.get) copies the element, so
+it needs `T: Copy`. Use [`List.asSlice`](#List.impl.asSlice) to borrow an element that is not `Copy`.
+
 <a id="List.impl"></a>
 
 ## Implementation `List<T>`

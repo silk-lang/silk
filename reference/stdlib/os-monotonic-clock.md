@@ -70,6 +70,17 @@ pub struct OsMonotonicClock
 
 The native `MonotonicClock` provider. It has no state. A failure is a trap.
 
+### Details
+`waitUntil` blocks until the deadline. `waitFor` reads the clock one time, adds the duration,
+and then waits until that deadline.
+
+### Gotchas
+- An `Instant` from this clock means nothing to other clocks. Do not mix it with `SystemClock`
+  times.
+- A wait blocks the whole thread. It does not let another fiber run.
+- On Linux, the clock stops while the system sleeps, and needs glibc 2.17 or later. On macOS, it
+  counts the time of sleep.
+
 <a id="OsMonotonicClock.impl"></a>
 
 ## Implementation `OsMonotonicClock`

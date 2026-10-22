@@ -31,6 +31,15 @@ pub struct JsonArray
 
 The state of one open JSON array.
 
+### When to use
+Use it in a `Serialize` implementation to write a slice of values as a JSON array:
+`JsonArray.begin(options) |> JsonArray.items(&values) |> JsonArray.end`. Each value must
+implement `Serialize`. For a `List<T>`, `Json.serialize` already writes an array.
+
+### Details
+Each step returns an effect that the next step runs. The array keeps track of commas and of the
+depth. It does not allocate.
+
 <a id="JsonArray.impl"></a>
 
 ## Implementation `JsonArray`
@@ -71,8 +80,13 @@ Writes each element of `values` in order, with commas between them.
 
 #### Details
 
-It runs the effect of the step before it one time. If that step fails, this step writes
-nothing.
+The array operations form a chain with `|>`: `JsonArray.begin(options) |>
+JsonArray.items(&values) |> JsonArray.end`. It runs the effect of the step before it one time.
+If that step fails, this step writes nothing.
+
+#### Errors
+- `JsonError` from a value, or from the step before it.
+- `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
 
 <a id="JsonArray.impl.end"></a>
 
@@ -88,7 +102,13 @@ Writes `]` and completes the array.
 
 #### Details
 
-It runs the effect of the step before it one time. If that step fails, it does not write `]`.
+The array operations form a chain with `|>`: `JsonArray.begin(options) |>
+JsonArray.items(&values) |> JsonArray.end`. It runs the effect of the step before it one time.
+If that step fails, it does not write `]`.
+
+#### Errors
+- `JsonError` from the step before it.
+- `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

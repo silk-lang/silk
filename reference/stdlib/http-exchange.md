@@ -623,6 +623,11 @@ pub union ExchangeError
 
 The error from a connection or an exchange.
 
+### Details
+
+It keeps the error from the lower module: the head parser, the body framing, content decoding,
+or the transport. A step out of order fails with `InvalidState`.
+
 <a id="ExchangeError.Content"></a>
 
 ### `Content`
@@ -1054,6 +1059,24 @@ pub struct Connection<P>
 
 An HTTP/1 connection over the transport `P`. It keeps its buffers and the bytes that it read
 after the last response.
+
+### When to use
+
+Use it to stream a request or a response body, or to reuse a connection. Make one with
+[`makeOwned`](#makeOwned), [`withOwned`](#withOwned), or [`withConnected`](#withConnected), or let [`withRoute`](#withRoute) connect through a proxy
+route. Then call [`withExchange`](#withExchange) for each request. Most programs use `silk.http_client` or
+`silk.http_fetch` instead.
+
+### Details
+
+A connection runs one exchange at a time. In the callback of [`withExchange`](#withExchange), call the steps in
+order: [`send`](#send), then [`writeSome`](#writeSome) and [`finishRequest`](#finishRequest), then [`receive`](#receive) or [`receiveFinal`](#receiveFinal)
+and [`readSome`](#readSome) or [`readContentSome`](#readContentSome), then [`finishResponse`](#finishResponse).
+
+### Gotchas
+
+If an exchange callback fails or returns before the response is complete, the connection closes
+and is not used again. Nothing is flushed, drained, or sent again for you.
 
 <a id="Connection.impl"></a>
 
@@ -1621,8 +1644,22 @@ pub effect fn withExchange<'exchange, 'callback, P, A, E, ?R>(
 
 Runs one exchange of `request` on the connection, in `callback`.
 
-If the callback fails, or returns before the response is complete, the connection cannot run
-another exchange.
+In `callback`, call the steps in order:
+1. [`send`](#send) sends the head of a `PreparedRequest` from `silk.http_request`.
+2. [`writeSome`](#writeSome) sends the body, and [`finishRequest`](#finishRequest) ends it. Call [`finishRequest`](#finishRequest) also when
+   there is no body.
+3. [`receive`](#receive) or [`receiveFinal`](#receiveFinal) reads a response head. Then [`readSome`](#readSome) reads the body, or
+   [`beginContent`](#beginContent) and [`readContentSome`](#readContentSome) decode it.
+4. [`finishResponse`](#finishResponse) ends the response. The connection can then run the next exchange.
+
+[`Exchange.phase`](#Exchange.impl.phase) tells which step is next. A step out of order fails with `InvalidState`. A
+deadline in [`RequestOptions`](#RequestOptions) covers the whole exchange, and is never restarted.
+
+### Gotchas
+
+If the callback fails, or returns before the response is complete, the connection closes and
+cannot run another exchange. Nothing is flushed, drained, or sent again for you. A 4xx or 5xx
+status is not an error.
 
 <a id="send"></a>
 

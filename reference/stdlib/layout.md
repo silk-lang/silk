@@ -50,7 +50,8 @@ A byte size and an alignment that describe one block of memory.
 ### Details
 
 Make a layout with [`Layout.of`](#Layout.impl.of), [`Layout.make`](#Layout.impl.make), or [`Layout.repeat`](#Layout.impl.repeat). These functions make
-sure that `alignment` is a power of two. A struct literal does not check the fields.
+sure that `alignment` is a power of two and never zero. A struct literal does not check the
+fields. A layout only describes memory. It does not allocate or initialize memory.
 
 <a id="Layout.bytes"></a>
 

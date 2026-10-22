@@ -62,7 +62,23 @@ pub struct RawBuffer
 
 The owner type of the raw buffer operations. It has no fields and is never constructed.
 
+### When to use
+
+Application code uses `silk.list.List`, `silk.bytes.Bytes`, or `silk.box.Box`. Use these
+operations only when you implement a container that keeps its own record of capacity and of
+which slots are initialized.
+
 ### Details
+
+A `RawBuffer<T>` holds one allocation and a count of `T` slots. It does not record which slots
+are initialized. [`RawBuffer.slot`](#RawBuffer.impl.slot) and [`RawBuffer.fill`](#RawBuffer.impl.fill) check the count and trap outside it.
+The `unsafe` operations do not check.
+
+### Gotchas
+
+When a raw buffer is dropped, it releases its allocation but does not drop the values in it. A
+container must drop or take each initialized slot before it drops the buffer, or those values
+leak.
 
 This struct is not the builtin `RawBuffer<T>` storage type that [`RawBuffer.from`](#RawBuffer.impl.from) returns.
 

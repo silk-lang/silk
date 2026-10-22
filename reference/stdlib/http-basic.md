@@ -150,13 +150,18 @@ length.
 
 ### Details
 The function writes `username:password` to `scratch` first. Bytes that are not ASCII are copied
-without a change.
+without a change. You choose the character encoding of the credentials, usually UTF-8. Use
+[`encodedLength`](#encodedLength) to size `output`.
 
 ### Errors
 - `InvalidUsername` if `username` has a colon, a control byte, or DEL.
 - `InvalidPassword` if `password` has a control byte or DEL.
 - `ScratchTooSmall` or `OutputTooSmall` if a buffer is too small. Nothing is written to a buffer
   if the function fails.
+
+### Gotchas
+Basic credentials are not encrypted. Send them only over HTTPS. After the call, `scratch` holds
+the password as plain text. Overwrite it when you are done.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

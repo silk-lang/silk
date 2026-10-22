@@ -114,6 +114,15 @@ pub struct JsonObject
 
 The state of one open JSON object: its options and if a member was written.
 
+### When to use
+Use it in a `Serialize` implementation to write a struct as a JSON object. Start with
+[`JsonObject.begin`](#JsonObject.impl.begin), add members with [`JsonObject.field`](#JsonObject.impl.field) or [`JsonObject.fieldIfSome`](#JsonObject.impl.fieldIfSome), and
+finish with [`JsonObject.end`](#JsonObject.impl.end), in one `|>` chain.
+
+### Details
+Each step returns an effect that the next step runs, so the chain writes the members in order.
+The object keeps track of commas and of the depth. It does not allocate.
+
 <a id="JsonObject.impl"></a>
 
 ## Implementation `JsonObject`
@@ -190,6 +199,10 @@ The object operations form a chain with `|>`: `JsonObject.begin(options) |>
 JsonObject.field(...) |> JsonObject.end`. Each step takes the effect of the step before it and
 runs it one time. If an earlier step fails, this step writes nothing.
 
+#### Errors
+- `JsonError` from `value`.
+- `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
+
 <a id="JsonObject.impl.end"></a>
 
 ### Method `end`
@@ -208,6 +221,10 @@ writes a newline first.
 The object operations form a chain with `|>`: `JsonObject.begin(options) |>
 JsonObject.field(...) |> JsonObject.end`. Each step takes the effect of the step before it and
 runs it one time. If an earlier step fails, this step writes nothing.
+
+#### Errors
+- `JsonError` from an earlier step.
+- `WriterError` if the `Writer` fails. Bytes that it accepted before the failure stay written.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

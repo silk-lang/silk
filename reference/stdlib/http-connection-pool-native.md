@@ -150,7 +150,14 @@ Makes a pool for direct TCP and HTTPS connections, lends it to `handler`, and cl
 
 ### Details
 The pool copies `preparedTrust` with the `options.trust.snapshot` limits before the handler
-starts. `options.deadline` is not used. Give a deadline to each [`withConnection`](#withConnection) instead.
+starts, and each new HTTPS connection gets its own copy. `options.deadline` is not used. Give a
+deadline to each [`withConnection`](#withConnection) instead. The pool rules, such as limits, reuse, and expiry,
+are those of `silk.http_connection_pool.withPool`.
+
+### Gotchas
+The pool accepts only direct keys, and opens no proxy connections. Other keys fail with
+`PoolError.ContextMismatch` before any network contact. An HTTPS origin also fails with
+`PoolError.ContextMismatch` if `preparedTrust` is absent.
 
 ### Errors
 - `PoolError.InvalidConfig` if `config` is not valid.
@@ -270,7 +277,8 @@ back to the pool only if it is eligible for reuse.
 ### Errors
 - `PoolError.ContextMismatch` if the pool is a Unix pool. Nothing is sent.
 - `PoolError` for a full or closed pool, or an expired deadline.
-- The native errors of a new connection, and the error of the handler.
+- The native errors of a new connection (resolver, socket, TLS, identity, and trust errors),
+  and the error of the handler.
 
 <a id="withUnixConnection"></a>
 
@@ -310,13 +318,16 @@ where
 Checks out one connection to `origin` from a Unix pool, and lends it to `handler`.
 
 ### Details
-`path` and `origin` make the key. The deadlines work as in [`withConnection`](#withConnection).
+`path` and `origin` make the key. To open a new connection, the pool uses the earlier of
+`requestDeadline` and `acquisitionDeadline`. The handler uses `requestDeadline` for its
+exchanges. The connection goes back to the pool only if it is eligible for reuse.
 
 ### Errors
 - `PoolError.ContextMismatch` if `path` is not the path of the pool, or if the pool is a direct
   pool. Nothing is sent.
 - `PoolError` for a full or closed pool, or an expired deadline.
-- The native errors of a new connection, and the error of the handler.
+- The native errors of a new connection (resolver, socket, TLS, identity, and trust errors),
+  and the error of the handler.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -83,7 +83,7 @@ The largest number of arrays and objects that can be open at one time: 64.
 pub struct JsonSpan
 ```
 
-A range of bytes in the document.
+A range of bytes in the document. Offsets are from the start of the document.
 
 <a id="JsonSpan.offset"></a>
 
@@ -292,6 +292,9 @@ pub struct JsonError
 ```
 
 The error from a JSON operation: the reason and, when known, the position and buffer sizes.
+
+### Gotchas
+After a read error, the scanner or reader that returned it cannot continue.
 
 <a id="JsonError.reason"></a>
 
@@ -620,7 +623,15 @@ pub struct JsonScanState
 
 The state of a JSON scan that reads its input in pieces.
 
+### When to use
+
+Use it when the bytes arrive in pieces and you keep the parts of each token yourself. When the
+whole document is in one slice, use [`JsonScanner`](#JsonScanner).
+
 ### Details
+
+The scanner checks the full JSON grammar (RFC 8259) as it reads, including UTF-8 in strings and
+the nesting of arrays and objects, up to [`MAX_DEPTH`](#MAX_DEPTH) (64) levels.
 
 It does not keep a reference to the input. Call [`JsonScanState.step`](#JsonScanState.impl.step) with the rest of the
 current piece until it returns `NeedMore` or `EndOfInput`. After `NeedMore`, give it the next
@@ -635,6 +646,22 @@ pub struct JsonScanner<'input>
 ```
 
 A JSON scanner over a complete document in one slice. Make one with [`JsonScanner.make`](#JsonScanner.impl.make).
+
+### When to use
+Use it to read a document that is in one slice, token by token, without building a tree and
+without allocating. It is the input of `Deserialize` implementations. When the bytes arrive in
+pieces, use [`JsonScanState`](#JsonScanState). To read from a `BufferedInput`, use
+`silk.json_reader.JsonReader`. To get a tree, use `silk.json_value.Json.parse`.
+
+### Details
+The scanner checks the full JSON grammar (RFC 8259) as it reads, including UTF-8 in strings and
+the nesting of arrays and objects, up to [`MAX_DEPTH`](#MAX_DEPTH) (64) levels. A string or number token
+gives a [`JsonSpan`](#JsonSpan) in the source. Strings keep their source spelling. The token says if the
+string has escapes, so you can decode it with `silk.json_text.JsonText.decode` only when needed.
+
+### Gotchas
+The scanner does not check for duplicate keys. `silk.json_value.Json.parse` does. After an
+error, the scanner cannot continue. Make a new one.
 
 <a id="JsonScanState.impl"></a>
 

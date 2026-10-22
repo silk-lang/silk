@@ -47,8 +47,9 @@ The layout and depth limit for JSON output.
 
 ### Details
 
-Make one with [`JsonOptions.compact`](#JsonOptions.impl.compact) or [`JsonOptions.indented`](#JsonOptions.impl.indented). The writers make a child with
-[`JsonOptions.child`](#JsonOptions.impl.child) for each nested array or object.
+Make one with [`JsonOptions.compact`](#JsonOptions.impl.compact) or [`JsonOptions.indented`](#JsonOptions.impl.indented) and pass it to
+`Json.serialize` or `Json.writeWith`. The writers make a child with [`JsonOptions.child`](#JsonOptions.impl.child) for
+each nested array or object.
 
 <a id="JsonOptions.indent"></a>
 
@@ -97,6 +98,14 @@ pub struct JsonOutput
 ```
 
 The owner type of the low-level output operations. It has no fields and is never constructed.
+
+### When to use
+Use its operations only when you write JSON by hand, for example in a `Serialize`
+implementation that `JsonObject` cannot express.
+
+### Details
+Each operation writes to the `Writer` at once. It does not flush and does not allocate. If the
+`Writer` fails, the bytes that it accepted before the failure stay written.
 
 <a id="JsonOptions.impl"></a>
 
