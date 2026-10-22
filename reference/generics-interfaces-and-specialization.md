@@ -867,7 +867,7 @@ conformances bind the provider without adding a duplicated interface argument.
 **Evidence:** [current interface parser](../bootstrap/packages/compiler/src/Parser.ts),
 [current interface application](../bootstrap/packages/compiler/src/DeclarationFacts.ts).
 
-### INTF-002 — An interface contains compile-time operation contracts, not implementations
+### INTF-002 — An interface contains compile-time operation contracts and their defaults
 
 **Status:** Confirmed
 
@@ -885,17 +885,43 @@ interface Decoder<A, E, ?R> {
 row parameter. Calling the operation constructs exactly one Effect layer under the ordinary Effect
 rules; the interface does not flatten its success value.
 
-Interface operations have no bodies. Behavior is supplied by a conformance, either inline there or
-by mapping an actor function. A public interface exposes all of its operation names as one public
-contract; operations do not carry separate visibility modifiers.
+Behavior is supplied by a conformance, either inline there or by mapping an actor function. An
+operation may also write a body, which is its default: a conformance that omits the operation uses
+that body, and a conformance that implements the operation replaces it (IMPL-002). A default body is
+checked once, where the interface is declared, for any provider: it may call the interface's
+operations on `Self`, and it names only what the interface's module can name.
+
+```silk
+interface Shape {
+  fn area(value: &Self) -> i32
+  fn doubled(value: &Self) -> i32 {
+    return Shape.area(value) * 2
+  }
+}
+
+struct Square {
+  side: i32
+}
+
+impl Shape for Square {
+  fn area(value: &Self) -> i32 {
+    return value.side * value.side
+  }
+}
+```
+
+`Shape.doubled(&square)` runs the default with `Self = Square`. A public interface exposes all of
+its operation names as one public contract; operations do not carry separate visibility modifiers.
 
 An empty interface is valid. It proves a nominal compile-time property without inventing operations
 or runtime storage. Compiler-sealed properties such as Copy eligibility remain separate language
 properties and do not become ordinary empty interfaces.
 
 **Boundary:** An interface is not a struct, callable bundle, service slot, inherited base type, or
-namespace that can be reopened. It cannot declare fields, constants, mutable state, stored values,
-or default operation bodies in the first stable model.
+namespace that can be reopened. It cannot declare fields, constants, mutable state, or stored
+values. A default body is not a separate function: it has no name of its own, and calling the
+operation always selects the conformance's implementation, which is the default only when the
+conformance omits the operation.
 
 ```silk,ignore
 interface Invalid {
@@ -906,13 +932,16 @@ interface Invalid {
 A service reuses this operation model but receives the separate permission to appear in an Effect
 requirement row. An ordinary interface never creates that permission.
 
-**Diagnostics:** A field, constant, operation body, visibility modifier on an operation, or other
-unsupported member reports an invalid-interface-member diagnostic at that member. Duplicate
+**Diagnostics:** A field, constant, visibility modifier on an operation, or other unsupported
+member reports an invalid-interface-member diagnostic at that member. A default body reports its
+ordinary body diagnostics where it is written, whether or not any conformance uses it. Duplicate
 operation names report the later declaration and identify the first. Invalid function contracts
 retain their ordinary parameter, type, Effect-channel, and ownership diagnostics.
 
 **Current compiler:** Aligned. Ordinary and effect operation contracts share the same declaration
 facts for interfaces and services, including ordinary failure types and requirement-row binders.
+The operation list records which operations have a default, so editing a default body changes no
+contract, signature or witness table; only the instances of that body are checked again.
 
 **Evidence:** complete interface contracts,
 [service/interface boundary](requirements-and-services.md#serv-003--a-service-is-a-dependency-eligible-interface),
@@ -1301,7 +1330,8 @@ operations inline, by mapping, or through both forms in one conformance.
 
 **Status:** Confirmed
 
-Every operation declared by the interface must have one implementation in the conformance. A
+Every operation declared by the interface must have one implementation in the conformance, except
+an operation with a default body (INTF-002), which the conformance may omit to use that default. A
 conformance may define an inline operation body, map an existing actor function, or mix the two
 forms across different operations.
 
@@ -1330,7 +1360,8 @@ An inline operation name matches the interface operation directly. A mapped memb
 the interface operation and its right side names one existing actor function. Inline operations are
 scoped to the conformance and do not become members of the provider type or module namespace.
 
-**Boundary:** Missing, unknown, or duplicate operation implementations are invalid. A conformance
+**Boundary:** Missing implementations of operations without a default, and unknown or duplicate
+operation implementations, are invalid. A conformance
 cannot implement one operation both inline and through a mapping, and member order does not match an
 incorrect name by position.
 
