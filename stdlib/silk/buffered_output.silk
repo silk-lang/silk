@@ -11,8 +11,9 @@
 //!
 //! # Details
 //! When a write returns, the buffer owns the accepted bytes. The buffer sends pending bytes to the
-//! transport only when it is full or when the caller flushes it. A flush sends all pending bytes in
-//! order, one time each.
+//! transport only when it is full or when the caller flushes it. Input that is longer than the
+//! buffer is not copied: once the pending bytes are sent, it goes to the transport directly. A
+//! flush sends all pending bytes in order, one time each.
 //!
 //! A failed transport write or flush makes the buffer terminal. After that, each write and flush
 //! fails with `BufferError.Terminal`. The error reports exactly how many bytes the transport
@@ -164,7 +165,9 @@ impl BufferedOutput {
   /// # Details
   ///
   /// If the buffer is full, this function first sends all pending bytes to the active `ByteDuplex`
-  /// transport. Then it copies input bytes into the free space. For a non-empty `input`, the result
+  /// transport. Then it copies input bytes into the free space. If the buffer is empty and `input`
+  /// is longer than [`BufferedOutput.capacity`], it does not copy: it gives `input` to one transport
+  /// write and returns the count that the transport accepted. For a non-empty `input`, the result
   /// is at least 1. For an empty `input`, the result is 0 and the transport is not used.
   ///
   /// # Errors
@@ -181,14 +184,13 @@ impl BufferedOutput {
   ? &mut ByteDuplex | &mut MonotonicClock {
     if input.length == usize.ZERO { return usize.ZERO }
     if self.terminal { fail BufferError.Terminal }
-    compact(&mut self.*)
-    if self.end == self.capacityValue {
-      let drained = run drainPending(&mut self.*, &deadline)
-      drop drained
-      compact(&mut self.*)
+    let mut drained = usize.ZERO
+    if self.end == self.capacityValue { drained = run drainPending(&mut self.*, &deadline) }
+    // An empty buffer gains nothing from a copy of more than it holds: send the input directly.
+    if self.end == usize.ZERO && input.length > self.capacityValue {
+      return run writeDirect(&mut self.*, input, drained, &deadline)
     }
-    let available = self.capacityValue - self.end
-    let count = minimum(input.length, available)
+    let count = minimum(input.length, self.capacityValue - self.end)
     copyIn(&mut self.storage, self.end, input, count)
     self.end = self.end + count
     return count
@@ -204,9 +206,11 @@ impl BufferedOutput {
   ///
   /// # Details
   ///
-  /// When this function returns, the buffer owns all of `input`. The transport does not
-  /// necessarily have the bytes yet. Call [`BufferedOutput.flush`] to send them. `deadline` applies
-  /// to each transport write that this call makes.
+  /// When this function returns, the buffer owns all of `input`, or the transport already has
+  /// them. The transport does not necessarily have the buffered bytes yet. Call
+  /// [`BufferedOutput.flush`] to send them. A part of `input` that is longer than the buffer goes
+  /// to the transport directly, without a copy. `deadline` applies to each transport write that
+  /// this call makes.
   ///
   /// # Errors
   ///
@@ -369,7 +373,9 @@ impl BufferedOutput {
   /// # Details
   ///
   /// If the buffer is full, this function first sends all pending bytes in one `Writer.writeAll`
-  /// call. For a non-empty `input`, the result is at least 1.
+  /// call. If the buffer is empty and `input` is longer than [`BufferedOutput.capacity`], it does
+  /// not copy: it sends all of `input` in one `Writer.writeAll` call. For a non-empty `input`, the
+  /// result is at least 1.
   ///
   /// # Errors
   ///
@@ -381,11 +387,21 @@ impl BufferedOutput {
   ? &mut Writer {
     if input.length == usize.ZERO { return usize.ZERO }
     if self.terminal { fail BufferError.Terminal }
-    compact(&mut self.*)
     if self.end == self.capacityValue {
       let drained = run drainWriter(&mut self.*, usize.ZERO)
       drop drained
-      compact(&mut self.*)
+    }
+    // An empty buffer gains nothing from a copy of more than it holds: send the input directly.
+    if self.end == usize.ZERO && input.length > self.capacityValue {
+      let attempted = run Effect.result(Writer.writeAll(input))
+      match move attempted {
+        Result<(), WriterError>.Success {value} => { drop value }
+        Result<(), WriterError>.Failure {error} => {
+          self.terminal = true
+          fail BufferError.UnknownExternalTransfer {progress: usize.ZERO, error: move error}
+        }
+      }
+      return input.length
     }
     let count = minimum(input.length, self.capacityValue - self.end)
     copyIn(&mut self.storage, self.end, input, count)
@@ -403,8 +419,10 @@ impl BufferedOutput {
   ///
   /// # Details
   ///
-  /// When this function returns, the buffer owns all of `input`. The `Writer` does not
-  /// necessarily have the bytes yet. Call [`BufferedOutput.flushWriter`] to send them.
+  /// When this function returns, the buffer owns all of `input`, or the `Writer` already has
+  /// them. The `Writer` does not necessarily have the buffered bytes yet. Call
+  /// [`BufferedOutput.flushWriter`] to send them. A part of `input` that is longer than the buffer
+  /// goes to the `Writer` directly, without a copy.
   ///
   /// # Errors
   ///
@@ -506,6 +524,29 @@ effect fn drainPending(
   return written
 }
 
+// Sends a slice longer than the buffer past the empty buffer, in one transport write.
+effect fn writeDirect(
+  output: &mut BufferedOutput,
+  input: &[u8],
+  drained: usize,
+  deadline: &Option<Instant>,
+) -> usize
+! BufferError
+? &mut ByteDuplex | &mut MonotonicClock {
+  let attempted = run Effect.result(ByteDuplex.writeSome(input, copyDeadline(deadline)))
+  return match move attempted {
+    Result<usize, ByteIoError>.Success {value} => value
+    Result<usize, ByteIoError>.Failure {error} => {
+      output.terminal = true
+      fail BufferError.WriteFailed {
+        accepted: usize.ZERO,
+        drained: drained,
+        error: move error,
+      }
+    }
+  }
+}
+
 effect fn drainWriter(output: &mut BufferedOutput, prior: usize) -> usize
 ! BufferError
 ? &mut Writer {
@@ -535,37 +576,12 @@ effect fn drainWriter(output: &mut BufferedOutput, prior: usize) -> usize
   return prior
 }
 
-fn compact(output: &mut BufferedOutput) -> () {
-  if output.start == usize.ZERO { return () }
-  let pending = output.end - output.start
-  let mut index = usize.ZERO
-  while index < pending {
-    // Each index stays below `end - start`, so both reads and writes stay within 0..end. `make`
-    // zero-fills all `capacity` bytes, so every slot stays initialized, and `start <= end <=
-    // capacity` holds between operations.
-    unsafe {
-      let value = RawBuffer.read<u8>(&output.storage, output.start + index)
-      let mut destination = RawBuffer.viewMut<u8>(&mut output.storage, index, usize.ONE)
-      destination[usize.ZERO] = value
-      drop destination
-    }
-    index = index + usize.ONE
-  }
-  output.start = usize.ZERO
-  output.end = pending
-}
-
 // Every caller passes `start + count` within the storage's capacity and `count` within
 // `input.length`.
 fn copyIn(storage: &mut Intrinsic.RawBuffer<u8>, start: usize, input: &[u8], count: usize) -> () {
-  let mut index = usize.ZERO
-  while index < count {
-    // In bounds by the caller contract above; the zero fill at `make` keeps every byte initialized.
-    let mut destination = unsafe RawBuffer.viewMut<u8>(&mut storage.*, start + index, usize.ONE)
-    destination[usize.ZERO] = input[index]
-    drop destination
-    index = index + usize.ONE
-  }
+  // In bounds by the caller contract above. Bytes have no drop, so the overwritten slots leak
+  // nothing.
+  unsafe { return RawBuffer.copy<u8>(&mut storage.*, start, Slice.view<u8>(input, usize.ZERO, count), count) }
 }
 
 fn minimum(left: usize, right: usize) -> usize {
