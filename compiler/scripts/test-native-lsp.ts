@@ -1,7 +1,7 @@
 // A scripted language server session against one prebuilt native compiler: `silk lsp` starts,
 // answers the lifecycle requests one at a time with its input still open, publishes syntax
-// diagnostics for an open document as it is edited, answers the syntax features about it, and
-// stops cleanly.
+// diagnostics for an open document as it is edited and semantic diagnostics once its module is
+// checked, answers the syntax features about it, and stops cleanly.
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -32,11 +32,11 @@ interface Session {
 }
 
 // Starts `silk lsp` and reads framed responses as they arrive.
-const start = (silk: string) =>
+const start = (silk: string, stdlib: string) =>
   Effect.acquireRelease(
     Effect.try({
       try: (): Session => {
-        const child = spawn(silk, ['lsp'], { stdio: 'pipe' })
+        const child = spawn(silk, ['lsp', '--stdlib', stdlib], { stdio: 'pipe' })
         let pending = Buffer.alloc(0)
         const ready: Array<Record<string, unknown>> = []
         const waiting: Array<() => void> = []
@@ -109,13 +109,43 @@ interface Diagnostics {
   diagnostics: Array<{ range: { start: { line: number; character: number } }; code: string }>
 }
 
+// The diagnostics published for `uri` at `version` (`undefined` for a closed document), from the
+// notifications already read and then from the session.
+const diagnosticsFor = (
+  session: Session,
+  uri: string,
+  version: number | undefined,
+  read: Array<Record<string, unknown>>,
+) =>
+  Effect.gen(function* () {
+    const matches = (message: Record<string, unknown>) => {
+      if (message['method'] !== 'textDocument/publishDiagnostics') return false
+      const params = message['params'] as Diagnostics
+      return params.uri === uri && params.version === version
+    }
+    const found = read.findLast(matches)
+    if (found !== undefined) return found['params'] as Diagnostics
+    while (true) {
+      const message = yield* session.receive
+      if (matches(message)) return message['params'] as Diagnostics
+    }
+  })
+
+const change = (session: Session, uri: string, version: number, text: string) =>
+  session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: { textDocument: { uri, version }, contentChanges: [{ text }] },
+  })
+
 const program = Effect.gen(function* () {
   const compiler = process.argv[2]
   assert.ok(compiler, 'usage: node test-native-lsp.ts <native-compiler>')
   const silk = resolve(compiler)
+  const stdlib = resolve(new URL('../../stdlib', import.meta.url).pathname)
 
   // The whole lifecycle, each request answered before the next is sent.
-  const session = yield* start(silk)
+  const session = yield* start(silk, stdlib)
   const early = yield* request(session, 1, 'textDocument/hover')
   assert.deepEqual(early['error'], { code: -32002, message: 'the server is not initialized' })
   const initialized = yield* request(session, 2, 'initialize', {
@@ -159,7 +189,8 @@ const program = Effect.gen(function* () {
   assert.ok(opened.params.diagnostics.length > 0, JSON.stringify(opened))
   assert.equal(opened.params.diagnostics[0]?.range.start.line, 0, JSON.stringify(opened))
 
-  // Edits are analyzed before the next request is answered.
+  // Edits are analyzed before the next request is answered. The fixed text has no syntax errors,
+  // so its diagnostics wait for its module's semantic check, which runs once the inbox is dry.
   for (const [version, text] of [
     [2, '// still\n' + document.text],
     [3, fixed],
@@ -172,11 +203,25 @@ const program = Effect.gen(function* () {
   }
   yield* session.send({ jsonrpc: '2.0', id: 3, method: 'textDocument/hover' })
   const edited = yield* notificationsUntil(session, 3)
-  const last = edited.notifications.at(-1) as { params: Diagnostics } | undefined
-  assert.ok(last, 'edits publish diagnostics before the next response')
-  assert.equal(last.params.version, 3, JSON.stringify(edited.notifications))
-  assert.deepEqual(last.params.diagnostics, [], 'the fixed text has no syntax diagnostics')
   assert.equal((edited.response['error'] as Record<string, unknown>)['code'], -32601)
+  const clean = yield* diagnosticsFor(session, uri, 3, edited.notifications)
+  assert.deepEqual(clean.diagnostics, [], 'the fixed text has no diagnostics')
+
+  // A type error is published on its line once the module is checked, and clears when fixed.
+  const wrong = fixed.replace('return 0', 'return true')
+  yield* change(session, uri, 4, wrong)
+  const rejected = yield* diagnosticsFor(session, uri, 4, [])
+  assert.deepEqual(
+    rejected.diagnostics.map(({ range, code }) => ({ line: range.start.line, code })),
+    [{ line: 1, code: 'SEM0129' }],
+    JSON.stringify(rejected),
+  )
+  const counted = yield* request(session, 9, 'silk/statistics', { textDocument: { uri } })
+  const counters = counted['result'] as { demands: number; hits: number; runs: number }
+  assert.ok(counters.runs > 0 && counters.demands >= counters.hits, JSON.stringify(counted))
+  yield* change(session, uri, 5, fixed)
+  const accepted = yield* diagnosticsFor(session, uri, 5, [])
+  assert.deepEqual(accepted.diagnostics, [], 'the fixed text clears the type error')
 
   // The syntax features read the document's latest text.
   const textDocument = { uri }
@@ -197,7 +242,7 @@ const program = Effect.gen(function* () {
     jsonrpc: '2.0',
     method: 'textDocument/didChange',
     params: {
-      textDocument: { uri, version: 4 },
+      textDocument: { uri, version: 6 },
       contentChanges: [{ text: 'pub fn main()->i32{return 0}\n' }],
     },
   })
@@ -225,9 +270,8 @@ const program = Effect.gen(function* () {
     method: 'textDocument/didClose',
     params: { textDocument: { uri } },
   })
-  const cleared = (yield* session.receive) as { params: Diagnostics }
-  assert.equal(cleared.params.uri, uri)
-  assert.deepEqual(cleared.params.diagnostics, [])
+  const cleared = yield* diagnosticsFor(session, uri, undefined, messy.notifications)
+  assert.deepEqual(cleared.diagnostics, [])
 
   const shutdown = yield* request(session, 4, 'shutdown')
   assert.ok('result' in shutdown && shutdown['result'] === null, JSON.stringify(shutdown))
@@ -235,15 +279,15 @@ const program = Effect.gen(function* () {
   assert.equal(yield* session.exited, 0, 'exit after shutdown stops the server with status 0')
 
   // Exit without shutdown, and input that closes before exit, are both status 1.
-  const abrupt = yield* start(silk)
+  const abrupt = yield* start(silk, stdlib)
   yield* abrupt.send({ jsonrpc: '2.0', method: 'exit' })
   assert.equal(yield* abrupt.exited, 1, 'exit before shutdown is status 1')
-  const closed = yield* start(silk)
+  const closed = yield* start(silk, stdlib)
   yield* Effect.sync(() => closed.child.stdin.end())
   assert.equal(yield* closed.exited, 1, 'closed input stops the server with status 1')
 
   yield* Console.log(
-    'Native language server: scripted lifecycle, diagnostics and syntax features session passed',
+    'Native language server: scripted lifecycle, syntax and semantic diagnostics, and syntax features session passed',
   )
 })
 
