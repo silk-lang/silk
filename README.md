@@ -98,6 +98,8 @@ one exists, use `github:silk-lang/silk[version_prefix=v,prerelease=true]` to get
 A project pins its compiler with `silk-version` in `silk.toml`, under `[package]` or
 `[workspace]`. `silk` reads the pin and runs that toolchain from `~/.silk/toolchains`, so projects
 on different versions work side by side. Outside a pinned project it runs the default toolchain.
+In a workspace the `[workspace]` pin wins over the members' own, and `silk toolchain use` sets it
+and moves any member pins along with it.
 
 ```sh
 silk toolchain install 0.1.0-dev.6+0123456789ab   # download, verify and unpack a release
