@@ -7,7 +7,7 @@ The `Logger` effect: log messages with a level, a template, and values.
 ## When to use
 Require `&mut Logger` in code that logs, and call `Effect.logInfo`, `Effect.logWarning`, and the
 other `Effect.log...` functions. The program decides where the messages go when it provides the
-logger: `silk.os_logger.StdoutLogger` for a native program, or [`InMemoryLogger`](#InMemoryLogger) in a test.
+logger: `silk.os_logger.StderrLogger` for a native program, or [`InMemoryLogger`](#InMemoryLogger) in a test.
 
 ## Details
 Each call has a [`LogLevel`](#LogLevel), a template that is known at compile time, and a borrowed tuple or
