@@ -256,10 +256,11 @@ Makes each final response with a status outside 200 to 299 fail with a `Status` 
 ### Method `trustBundle`
 
 ```silk
-pub fn trustBundle(self: Self, path: &'config [u8]) -> NativeHttp<'config>
+pub fn trustBundle(self: Self, path: string<'config>) -> NativeHttp<'config>
 ```
 
-Uses the PEM bundle at this absolute path instead of the platform bundle.
+Uses the PEM bundle at the absolute path `path`, such as `"/etc/ssl/cert.pem"`, instead of
+the platform bundle.
 
 <a id="NativeHttp.impl.Http"></a>
 
