@@ -128,7 +128,9 @@ running compiler. When the selection is another installed toolchain, `silk` sets
 compiler never re-executes itself, `SILK_TOOLCHAIN=local` keeps the running compiler, a local
 `0.0.0` build follows only `+<version>`, and `silk toolchain` always runs in the compiler you
 started. A missing selection exits with status 3 and names the install command, unless
-`SILK_AUTO_INSTALL=1` or `auto-install = true` installs it first.
+`SILK_AUTO_INSTALL=1` or `auto-install = true` installs it first. For `silk lsp`, so editors that
+only spawn the server do not see it crash, a missing selection instead starts a server with no
+capabilities that answers `initialize`, shows the message as an error, and exits on `exit`.
 
 `silk toolchain install` downloads `silk-<version>-<target>.tar.gz` and its `.minisig` from the
 GitHub release, or from `$SILK_TOOLCHAIN_MIRROR/v<version>/` when set. Installation needs a valid
