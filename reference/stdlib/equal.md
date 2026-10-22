@@ -9,25 +9,31 @@ Implement [`Equal`](#Equal) when values of a type can be compared for equality w
 `T: Equal` bound when a generic function compares its type parameter.
 
 ## Details
-`&left == &right` means `Equal.equals(&left, &right)` for the conformance of the operand type,
-and `&left != &right` is its negation (OP-009). Operands are borrowed, so comparing never
-consumes a value. Concrete scalar and string operands always use the built-in operators.
+`&left == &right` means `Equal.equals(&left, &right)` for the conformance of the operand type.
+`&left != &right` is the negation (OP-009). The operators borrow both operands, so a comparison
+does not consume a value. Concrete scalar and string operands always use the built-in operators.
 
 ## Gotchas
-An implementation should be reflexive, symmetric, and transitive. Silk cannot check these laws.
+A conformance must be reflexive, symmetric, and transitive. The compiler does not check these
+rules. Generic code that uses `==` gives incorrect results if the rules are not true.
 
 ## Examples
 ### Compare two values of a user type
 ```silk
 import silk.equal { Equal }
 
-struct Point { x: i32 y: i32 }
+struct Point {
+  x: i32
+  y: i32
+}
 
 fn samePoint(left: &Point, right: &Point) -> bool {
   return left.x == right.x && left.y == right.y
 }
 
-impl Equal for Point { equals: Point.samePoint }
+impl Equal for Point {
+  equals: Point.samePoint
+}
 
 pub fn main() -> i32 {
   let first = Point { x: 1, y: 2 }
@@ -35,7 +41,7 @@ pub fn main() -> i32 {
   if &first != &second {
     return 1
   }
-  return 42
+  return 0
 }
 ```
 
@@ -52,6 +58,16 @@ pub type Equal = Intrinsic.Equal
 ```
 
 The interface behind `==` and `!=`.
+
+### Details
+
+A conformance `impl Equal for T` gives the member `equals(left: &T, right: &T) -> bool`. The
+operators borrow both operands, so a comparison does not consume a value.
+
+### Gotchas
+
+A conformance must be reflexive, symmetric, and transitive. The compiler does not check these
+rules.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

@@ -106,8 +106,8 @@ not belong in a language rule unless a program can observe them.
   selection, compile errors, value and mutation limits, deterministic diagnostics, target values,
   and the residual runtime boundary.
 - [Patterns and destructuring](patterns-and-destructuring.md) — one pattern language across exact
-  union-member matches, scalar enum member matches, irrefutable local destructuring, and
-  conditional `if let`.
+  union-member matches, scalar enum member matches, irrefutable local destructuring,
+  conditional `if let`, and the pattern loop `while let`.
 - [Values and types](values-and-types.md) — foundational scalars, duration literals, nominal structs, fixed
   arrays, lexical views, nominal and structural unions, scalar enums, precise inference, and
   compatibility.

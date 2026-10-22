@@ -5,22 +5,65 @@
 Atomic memory operations on raw pointers, with explicit memory orderings.
 
 ## When to use
-
 Use these operations to build synchronization: counters, flags, lock words, and queues that
-several threads read and write at once.
+several threads read and write at the same time. For most code, the types in `silk.sync` (`Arc`,
+`Mutex`, `Parker`) are easier and safer.
 
 ## Details
-
 Each operation is one indivisible access to a naturally aligned integer or data pointer. The
-[`MemoryOrder`](#MemoryOrder) argument is static, so an operation and its ordering are fixed at compile time.
-The model is the C++20 one: an acquire load that reads a release store makes every write before
-that store visible after the load.
+[`MemoryOrder`](#MemoryOrder) argument is static, so the operation and its ordering are fixed at compile time.
+The model is the C++20 model: an acquire load that reads a release store makes every write
+before that store visible after the load.
+
+[`Atomic.wait`](#Atomic.impl.wait), [`Atomic.notifyOne`](#Atomic.impl.notifyOne) and [`Atomic.notifyAll`](#Atomic.impl.notifyAll) are a futex: a thread sleeps
+until the value at an address changes. They work on Darwin on aarch64, Linux with GNU libc on
+x86_64 or aarch64, and wasm32.
 
 ## Gotchas
+- A plain access that races with any other access to the same location is undefined behavior,
+  also when the other access is atomic. Make every access to a shared location atomic, with the
+  same width.
+- All operations except [`Atomic.fence`](#Atomic.impl.fence) are unsafe. The caller proves that the pointer is live
+  and aligned.
 
-A plain access that races with any other access to the same location is undefined behavior,
-even when the other access is atomic. Every access to a shared location must be atomic, and
-all of them must use the same width.
+## Examples
+### Count and claim a flag
+```silk
+import silk.atomic { Atomic, CompareExchange, MemoryOrder }
+import silk.pointer { Pointer }
+
+// Claims a one-time flag. Only the first caller gets true.
+fn claim(flag: *mut u32) -> bool {
+  return match unsafe Atomic.compareExchange<u32>(
+    flag,
+    0,
+    1,
+    MemoryOrder.Acquire,
+    MemoryOrder.Relaxed
+  ) {
+    CompareExchange<u32>.Exchanged => true
+    CompareExchange<u32>.Observed { value } => false
+  }
+}
+
+pub fn main() -> i32 {
+  let mut hits: u64 = 0
+  let counter = Pointer.fromMutRef(&mut hits)
+
+  // fetchAdd returns the value before the add.
+  let before = unsafe Atomic.fetchAdd<u64>(counter, 5, MemoryOrder.Relaxed)
+  if before != 0 || unsafe Atomic.load<u64>(counter, MemoryOrder.Relaxed) != 5 {
+    return 1
+  }
+
+  let mut claimed: u32 = 0
+  let flag = Pointer.fromMutRef(&mut claimed)
+  if !claim(flag) || claim(flag) {
+    return 1
+  }
+  return 0
+}
+```
 
 Import as `Atomic` with `import silk.atomic { Atomic }`.
 
@@ -44,7 +87,7 @@ The ordering constraint of one atomic operation.
 Relaxed
 ```
 
-Atomicity only; orders nothing else.
+Atomicity only. It orders no other access.
 
 <a id="MemoryOrder.Acquire"></a>
 
@@ -74,7 +117,7 @@ A store that earlier reads and writes cannot move after.
 AcquireRelease
 ```
 
-Both acquire and release; for read-modify-write operations and fences.
+Both acquire and release. Use it for read-modify-write operations and fences.
 
 <a id="MemoryOrder.SequentiallyConsistent"></a>
 
@@ -203,15 +246,13 @@ pub unsafe fn compareExchange<T: Copy>(pointer: *mut T, expected: T, desired: T,
     static failure: MemoryOrder) -> CompareExchange<T>
 ```
 
-Stores `desired` when the pointee equals `expected`, or reports the value it held instead.
+Stores `desired` if the pointee equals `expected`. Otherwise it returns the value it read.
 
 #### Details
-
-`success` orders the exchange; `failure` orders the read when nothing is stored, and must be
-`Relaxed`, `Acquire`, or `SequentiallyConsistent`.
+`success` orders the exchange. `failure` orders the read when nothing is stored. `failure`
+must be `Relaxed`, `Acquire`, or `SequentiallyConsistent`.
 
 #### Safety
-
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
 
 <a id="Atomic.impl.compareExchangeWeak"></a>
@@ -223,15 +264,14 @@ pub unsafe fn compareExchangeWeak<T: Copy>(pointer: *mut T, expected: T, desired
     static failure: MemoryOrder) -> CompareExchange<T>
 ```
 
-Like [`Atomic.compareExchange`](#Atomic.impl.compareExchange), but may report `Observed` with a value equal to `expected`.
+Like [`Atomic.compareExchange`](#Atomic.impl.compareExchange), but it can return `Observed` with a value equal to
+`expected`.
 
 #### Details
-
-The spurious failure lets a load-linked, store-conditional target use one attempt per
-call. Call it in a loop that retries on any observed value.
+This spurious failure lets a load-linked, store-conditional target use one attempt per call.
+Call it in a loop that retries on any observed value.
 
 #### Safety
-
 The pointer must address live, initialized, naturally aligned, writable storage for `T`.
 
 <a id="Atomic.impl.fetchAdd"></a>
@@ -340,25 +380,23 @@ The pointer must address live, initialized, naturally aligned, writable storage 
 pub unsafe fn wait(pointer: *const u32, expected: u32, timeout: Option<u64>) -> bool
 ```
 
-Blocks while the pointee equals `expected`, until a notify, the timeout, or a spurious wakeup.
+Sleeps while the pointee equals `expected`, until a notify, the timeout, or a spurious wakeup.
 
 #### Details
-
 The comparison and the sleep are one atomic step against [`Atomic.notifyOne`](#Atomic.impl.notifyOne) and
-[`Atomic.notifyAll`](#Atomic.impl.notifyAll), so a notify after a store that changed the pointee is never lost.
-`timeout` is a relative bound in nanoseconds; `Option.None` waits without one. Returns
-`false` only when the timeout elapsed. A `true` result promises nothing about the pointee:
-callers recheck their condition in a loop.
+[`Atomic.notifyAll`](#Atomic.impl.notifyAll). Thus a notify after a store that changed the pointee is never lost.
+
+`timeout` is a relative bound in nanoseconds. `Option.None` waits with no bound. The result is
+`false` only when the timeout ended the wait. A `true` result tells nothing about the pointee,
+so check the condition again in a loop.
 
 #### Gotchas
-
-Single-threaded WebAssembly has no other thread to change the pointee, so a wait that would
-sleep without a timeout traps, and one with a timeout returns `false` at once.
+Single-threaded WebAssembly has no other thread to change the pointee. A wait that sleeps with
+no timeout traps, and a wait with a timeout returns `false` at once.
 
 #### Safety
-
-The pointer must address live, naturally aligned storage for a `u32` that every other access
-reads or writes atomically.
+The pointer must address live, naturally aligned storage for a `u32`. Every other access to it
+must be atomic.
 
 <a id="Atomic.impl.notifyOne"></a>
 
