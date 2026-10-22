@@ -1287,10 +1287,13 @@ const program = Effect.gen(function* () {
   const x86 = hostTarget.startsWith('x86_64-')
   const tuned = join(directory, 'tuned')
   yield* fs.makeDirectory(join(tuned, 'src'), { recursive: true })
-  yield* fs.writeFileString(
-    join(tuned, 'src/main.silk'),
-    'pub fn main() -> i32 {\n  return 0\n}\n',
-  )
+  // The profile's AVX passes an exported 256-bit vector in one register, which the default
+  // profile refuses at `silk check` (SEM0244).
+  const tunedMain = 'pub fn main() -> i32 {\n  return 0\n}\n'
+  const wideExport = x86
+    ? 'export "C" fn silk_tuned_wide(values: simd<f32, 8>) -> simd<f32, 8> { return values }\n\n'
+    : ''
+  yield* fs.writeFileString(join(tuned, 'src/main.silk'), `${wideExport}${tunedMain}`)
   const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nroot = "src/main.silk"\n'
   yield* fs.writeFileString(
     join(tuned, 'silk.toml'),
@@ -1315,6 +1318,15 @@ const program = Effect.gen(function* () {
     tuned,
   )
   assert.equal(tunedRun.status, 0, tunedRun.stderr)
+  if (x86) {
+    const untuned = yield* invoke(silk, ['check', '--stdlib', standardLibrary], tuned)
+    assert.equal(untuned.status, 1, untuned.stderr)
+    assert.match(
+      untuned.stderr,
+      /main\.silk:1:39: error\[SEM0244\] simd<f32, 8> crosses the C boundary in one vector register, which needs the CPU feature `avx`/,
+    )
+  }
+  yield* fs.writeFileString(join(tuned, 'src/main.silk'), tunedMain)
   // Profile fields the native build cannot honor yet, a profile artifact other than the one
   // [build].artifact requests, unknown manifest fields and reserved module names are refused
   // before anything is built, naming the manifest line.
