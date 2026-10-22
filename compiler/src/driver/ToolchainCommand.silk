@@ -1,0 +1,530 @@
+//! `silk toolchain`: lists, selects and removes installed Silk toolchains.
+//!
+//! Every subcommand runs without prompts, so agents, scripts and editors can drive it. Results go to
+//! standard output, `--json` gives them a stable machine-readable shape, and the exit status says
+//! what happened: 0 success, 1 a failed command, 2 a usage error, 3 the selected toolchain is not
+//! installed. Commands that would change nothing succeed without changing anything.
+
+import diagnostic.JsonText
+import driver.CommandPath
+import driver.Project as Projects
+import driver.Toolchains as Toolchains { Origin, Selection }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.list { List }
+import silk.option { Option }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.usize
+
+/// What the command runs with.
+pub struct Context {
+  /// The working directory.
+  pub working: Path
+
+  /// `$SILK_HOME`, or `None` when no home directory is known.
+  pub home: Option<Path>
+
+  /// The running compiler's version.
+  pub running: Bytes
+
+  /// The running compiler's executable, when it can be found.
+  pub runningExecutable: Option<Bytes>
+
+  /// The `SILK_TOOLCHAIN` value.
+  pub environment: Option<Bytes>
+}
+
+/// The exit status and the text for standard output and standard error.
+pub struct Outcome {
+  pub status: i32
+  pub output: Bytes
+  pub errors: Bytes
+}
+
+/// The exit status when the selected toolchain is not installed.
+pub const NOT_INSTALLED: i32 = 3
+
+/// `silk toolchain --help`.
+pub fn usage() -> &'static [u8] {
+  return b"usage: silk toolchain list [--json]\n       silk toolchain which [--json]\n       silk toolchain default <version>\n       silk toolchain uninstall <version>\n\nToolchains live in $SILK_HOME/toolchains (default ~/.silk). A project selects one with\nsilk-version in silk.toml; `silk +<version> <command>` and SILK_TOOLCHAIN override it.\nExit status: 0 success, 1 failure, 2 usage error, 3 selected toolchain not installed.\n"
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn outcome(status: i32, output: &[u8], errors: &[u8]) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Outcome { status: status, output: run Bytes.copy(output), errors: run Bytes.copy(errors) }
+}
+
+effect fn usageError(detail: &[u8]) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut errors = run Bytes.copy(b"silk toolchain: ")
+  run Bytes.append(&mut errors, detail)
+  run Bytes.append(&mut errors, b"\n")
+  run Bytes.append(&mut errors, usage())
+  return Outcome { status: 2, output: Bytes.make(), errors: move errors }
+}
+
+/// Runs `silk toolchain` with `arguments`, the words after `toolchain`.
+pub effect fn execute(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if arguments.length == usize.ZERO {
+    return run usageError(b"missing subcommand")
+  }
+  let name = Bytes.asSlice(&arguments[usize.ZERO])
+  if same(name, b"--help") || same(name, b"-h") || same(name, b"help") {
+    return run outcome(0, usage(), b"")
+  }
+  let mut json = false
+  let mut operands = List<&[u8]>.make()
+  let mut at = usize.ONE
+  while at < arguments.length {
+    let word = Bytes.asSlice(&arguments[at])
+    if same(word, b"--json") {
+      json = true
+    } else {
+      if word.length > usize.ZERO && word[usize.ZERO] == 45 {
+        let mut detail = run Bytes.copy(b"unknown option `")
+        run Bytes.append(&mut detail, word)
+        run Bytes.append(&mut detail, b"`")
+        return run usageError(Bytes.asSlice(&detail))
+      }
+      run List<&[u8]>.append(&mut operands, word)
+    }
+    at = at + usize.ONE
+  }
+  let given = List<&[u8]>.asSlice(&operands)
+  if same(name, b"list") {
+    if given.length != usize.ZERO {
+      return run usageError(b"list takes no operands")
+    }
+    return run list(context, json)
+  }
+  if same(name, b"which") {
+    if given.length != usize.ZERO {
+      return run usageError(b"which takes no operands")
+    }
+    return run which(context, json)
+  }
+  if same(name, b"default") {
+    if given.length != usize.ONE || json {
+      return run usageError(b"default takes one version")
+    }
+    return run setDefault(context, given[usize.ZERO])
+  }
+  if same(name, b"uninstall") {
+    if given.length != usize.ONE || json {
+      return run usageError(b"uninstall takes one version")
+    }
+    return run uninstall(context, given[usize.ZERO])
+  }
+  let mut detail = run Bytes.copy(b"unknown subcommand `")
+  run Bytes.append(&mut detail, name)
+  run Bytes.append(&mut detail, b"`")
+  return run usageError(Bytes.asSlice(&detail))
+}
+
+effect fn noHome() -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run outcome(
+    1,
+    b"",
+    b"silk toolchain: cannot find the toolchain directory; set SILK_HOME or HOME to an absolute path\n"
+  )
+}
+
+// The selection for the working directory.
+effect fn selection(context: &Context) -> Selection
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let environment = match &context.environment {
+    Option<Bytes>.Some { value } => Option<&[u8]>.some(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<&[u8]>.none()
+  }
+  let home = match &context.home {
+    Option<Path>.Some { value } => Option<&Path>.some(&value)
+    Option<Path>.None => Option<&Path>.none()
+  }
+  return run Toolchains.select(
+    &context.working,
+    Option<&[u8]>.none(),
+    move environment,
+    move home,
+    Bytes.asSlice(&context.running)
+  )
+}
+
+// Where the selection came from, in words: `package silk-version in /p/silk.toml`.
+effect fn because(selected: &Selection, text: &mut Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match selected.origin {
+    Origin.CommandLine => run Bytes.append(&mut text.*, b"selected with +<version>")
+    Origin.Environment => run Bytes.append(&mut text.*, b"selected by SILK_TOOLCHAIN")
+    Origin.Workspace => run Bytes.append(&mut text.*, b"workspace silk-version")
+    Origin.Package => run Bytes.append(&mut text.*, b"package silk-version")
+    Origin.Default => run Bytes.append(&mut text.*, b"default in settings.toml")
+    Origin.Running => run Bytes.append(&mut text.*, b"the running compiler")
+  }
+  if let Option<Path>.Some { value } = &selected.manifest {
+    run Bytes.append(&mut text.*, b" in ")
+    run Bytes.append(&mut text.*, Path.rawBytes(&value))
+  }
+}
+
+// The executable the selection runs, or `None` when it is not installed.
+effect fn located(context: &Context, selected: &Selection) -> Option<Bytes>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if Toolchains.matches(Bytes.asSlice(&selected.version), Bytes.asSlice(&context.running)) {
+    if let Option<Bytes>.Some { value } = &context.runningExecutable {
+      return Option<Bytes>.some(run Bytes.copy(Bytes.asSlice(&value)))
+    }
+  }
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return Option<Bytes>.none()
+    }
+  }
+  return match move run Toolchains.find(home, Bytes.asSlice(&selected.version)) {
+    Option<Bytes>.Some { value } => {
+      let path = run Toolchains.executable(home, Bytes.asSlice(&value))
+      return Option<Bytes>.some(run Bytes.copy(Path.rawBytes(&path)))
+    }
+    Option<Bytes>.None => Option<Bytes>.none()
+  }
+}
+
+/// `install` text naming the command that installs `version`.
+pub effect fn installCommand(version: &[u8]) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut command = run Bytes.copy(b"silk toolchain install ")
+  run Bytes.append(&mut command, version)
+  return move command
+}
+
+effect fn which(context: &Context, json: bool) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let selected = run selection(context)
+  let path = run located(context, &selected)
+  let running = Toolchains.matches(
+    Bytes.asSlice(&selected.version),
+    Bytes.asSlice(&context.running)
+  )
+  let install = run installCommand(Bytes.asSlice(&selected.version))
+  let mut output = Bytes.make()
+  if json {
+    run Bytes.append(&mut output, b"{\"version\":")
+    run JsonText.appendString(&mut output, Bytes.asSlice(&selected.version))
+    run Bytes.append(&mut output, b",\"origin\":")
+    run JsonText.appendString(&mut output, Toolchains.originName(selected.origin))
+    run Bytes.append(&mut output, b",\"manifest\":")
+    match &selected.manifest {
+      Option<Path>.Some { value } => run JsonText.appendString(&mut output, Path.rawBytes(&value))
+      Option<Path>.None => run Bytes.append(&mut output, b"null")
+    }
+    run Bytes.append(&mut output, b",\"installed\":")
+    match &path {
+      Option<Bytes>.Some { value } => run Bytes.append(&mut output, b"true,\"path\":")
+      Option<Bytes>.None => run Bytes.append(&mut output, b"false,\"path\":")
+    }
+    match &path {
+      Option<Bytes>.Some { value } => run JsonText.appendString(&mut output, Bytes.asSlice(&value))
+      Option<Bytes>.None => run Bytes.append(&mut output, b"null")
+    }
+    run Bytes.append(&mut output, b",\"running\":")
+    if running {
+      run Bytes.append(&mut output, b"true")
+    } else {
+      run Bytes.append(&mut output, b"false")
+    }
+    run Bytes.append(&mut output, b",\"install\":")
+    run JsonText.appendString(&mut output, Bytes.asSlice(&install))
+    run Bytes.append(&mut output, b"}\n")
+  } else {
+    run Bytes.append(&mut output, Bytes.asSlice(&selected.version))
+    run Bytes.append(&mut output, b" (")
+    run because(&selected, &mut output)
+    run Bytes.append(&mut output, b")\n")
+    if let Option<Bytes>.Some { value } = &path {
+      run Bytes.append(&mut output, Bytes.asSlice(&value))
+      run Bytes.append(&mut output, b"\n")
+    }
+  }
+  if let Option<Bytes>.None = &path {
+    let mut errors = run Bytes.copy(b"silk: Silk ")
+    run Bytes.append(&mut errors, Bytes.asSlice(&selected.version))
+    run Bytes.append(&mut errors, b" is not installed. Install it with: ")
+    run Bytes.append(&mut errors, Bytes.asSlice(&install))
+    run Bytes.append(&mut errors, b"\n")
+    return Outcome { status: NOT_INSTALLED, output: move output, errors: move errors }
+  }
+  return Outcome { status: 0, output: move output, errors: Bytes.make() }
+}
+
+effect fn appendFlag(output: &mut Bytes, name: &[u8], value: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run Bytes.append(&mut output.*, b",\"")
+  run Bytes.append(&mut output.*, name)
+  if value {
+    run Bytes.append(&mut output.*, b"\":true")
+  } else {
+    run Bytes.append(&mut output.*, b"\":false")
+  }
+}
+
+// Appends one toolchain to the list output.
+effect fn entry(
+  output: &mut Bytes,
+  json: bool,
+  first: bool,
+  version: &[u8],
+  path: &[u8],
+  selected: bool,
+  pinned: bool,
+  standard: bool,
+  running: bool
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if json {
+    if !first {
+      run Bytes.append(&mut output.*, b",")
+    }
+    run Bytes.append(&mut output.*, b"{\"version\":")
+    run JsonText.appendString(&mut output.*, version)
+    run Bytes.append(&mut output.*, b",\"path\":")
+    run JsonText.appendString(&mut output.*, path)
+    run appendFlag(&mut output.*, b"selected", selected)
+    run appendFlag(&mut output.*, b"pinned", pinned)
+    run appendFlag(&mut output.*, b"default", standard)
+    run appendFlag(&mut output.*, b"running", running)
+    run Bytes.append(&mut output.*, b"}")
+    return ()
+  }
+  if selected {
+    run Bytes.append(&mut output.*, b"* ")
+  } else {
+    run Bytes.append(&mut output.*, b"  ")
+  }
+  run Bytes.append(&mut output.*, version)
+  let mut tags = Bytes.make()
+  if pinned {
+    run Bytes.append(&mut tags, b", pinned here")
+  }
+  if standard {
+    run Bytes.append(&mut tags, b", default")
+  }
+  if running {
+    run Bytes.append(&mut tags, b", running")
+  }
+  if Bytes.length(&tags) > usize.ZERO {
+    let written = Bytes.asSlice(&tags)
+    run Bytes.append(&mut output.*, b"  (")
+    run Bytes.append(
+      &mut output.*,
+      Slice.view<u8>(written, usize.add(0, 2), written.length - usize.add(0, 2))
+    )
+    run Bytes.append(&mut output.*, b")")
+  }
+  run Bytes.append(&mut output.*, b"  ")
+  run Bytes.append(&mut output.*, path)
+  run Bytes.append(&mut output.*, b"\n")
+}
+
+effect fn list(context: &Context, json: bool) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let selected = run selection(context)
+  let version = Bytes.asSlice(&selected.version)
+  let pin = run Toolchains.pinned(&context.working)
+  let mut standard = Option<Bytes>.none()
+  let mut names = List<Bytes>.make()
+  if let Option<Path>.Some { value: home } = &context.home {
+    standard = run Toolchains.defaultVersion(&home)
+    names = run Toolchains.installed(&home)
+  }
+  let mut output = Bytes.make()
+  if json {
+    run Bytes.append(&mut output, b"{\"home\":")
+    match &context.home {
+      Option<Path>.Some { value } => run JsonText.appendString(&mut output, Path.rawBytes(&value))
+      Option<Path>.None => run Bytes.append(&mut output, b"null")
+    }
+    run Bytes.append(&mut output, b",\"toolchains\":[")
+  }
+  let mut first = true
+  let listed = List<Bytes>.asSlice(&names)
+  let running = Bytes.asSlice(&context.running)
+  let mut runningListed = false
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let name = Bytes.asSlice(&listed[at])
+    let isPinned = match &pin {
+      Option<Selection>.Some { value } => Toolchains.matches(Bytes.asSlice(&value.version), name)
+      Option<Selection>.None => false
+    }
+    let isDefault = match &standard {
+      Option<Bytes>.Some { value } => Toolchains.matches(Bytes.asSlice(&value), name)
+      Option<Bytes>.None => false
+    }
+    let isRunning = Toolchains.matches(running, name)
+    if isRunning {
+      runningListed = true
+    }
+    let mut path = Bytes.make()
+    if let Option<Path>.Some { value: home } = &context.home {
+      let executable = run Toolchains.executable(&home, name)
+      path = run Bytes.copy(Path.rawBytes(&executable))
+    }
+    run entry(
+      &mut output,
+      json,
+      first,
+      name,
+      Bytes.asSlice(&path),
+      Toolchains.matches(version, name),
+      isPinned,
+      isDefault,
+      isRunning
+    )
+    first = false
+    at = at + usize.ONE
+  }
+
+  // A compiler installed some other way (Homebrew, mise, a local build) still runs commands.
+  if !runningListed {
+    let mut path = Bytes.make()
+    if let Option<Bytes>.Some { value } = &context.runningExecutable {
+      path = run Bytes.copy(Bytes.asSlice(&value))
+    }
+    let isPinned = match &pin {
+      Option<Selection>.Some { value } => Toolchains.matches(Bytes.asSlice(&value.version), running)
+      Option<Selection>.None => false
+    }
+    let isDefault = match &standard {
+      Option<Bytes>.Some { value } => Toolchains.matches(Bytes.asSlice(&value), running)
+      Option<Bytes>.None => false
+    }
+    run entry(
+      &mut output,
+      json,
+      first,
+      running,
+      Bytes.asSlice(&path),
+      Toolchains.matches(version, running),
+      isPinned,
+      isDefault,
+      true
+    )
+  }
+  if json {
+    run Bytes.append(&mut output, b"]}\n")
+  }
+  return Outcome { status: 0, output: move output, errors: Bytes.make() }
+}
+
+effect fn setDefault(context: &Context, version: &[u8]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return run noHome()
+    }
+  }
+  if !Projects.isSemanticVersion(version) {
+    return run usageError(b"the version must be a semantic version such as 0.1.0-dev.6")
+  }
+  run Toolchains.setDefault(home, version)
+  let mut output = run Bytes.copy(b"Default toolchain: ")
+  run Bytes.append(&mut output, version)
+  run Bytes.append(&mut output, b"\n")
+  let mut errors = Bytes.make()
+  let installed = run Toolchains.find(home, version)
+  let running = Toolchains.matches(version, Bytes.asSlice(&context.running))
+  if let Option<Bytes>.None = &installed {
+    if !running {
+      run Bytes.append(&mut errors, b"silk toolchain: ")
+      run Bytes.append(&mut errors, version)
+      run Bytes.append(
+        &mut errors,
+        b" is not installed yet. Install it with: silk toolchain install "
+      )
+      run Bytes.append(&mut errors, version)
+      run Bytes.append(&mut errors, b"\n")
+    }
+  }
+  return Outcome { status: 0, output: move output, errors: move errors }
+}
+
+effect fn uninstall(context: &Context, version: &[u8]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return run noHome()
+    }
+  }
+  let name = match move run Toolchains.find(home, version) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      let mut output = run Bytes.copy(version)
+      run Bytes.append(&mut output, b" is not installed; nothing to remove\n")
+      return Outcome { status: 0, output: move output, errors: Bytes.make() }
+    }
+  }
+  let root = run Toolchains.directory(home, Bytes.asSlice(&name))
+
+  // The compiler `$SILK_HOME/bin/silk` links to stays, so `silk` keeps working.
+  let bin = run Path.join(home, "bin")
+  let link = run Path.join(&bin, "silk")
+  if let Option<Bytes>.Some { value: target } = move run CommandPath.canonical(
+    Path.rawBytes(&link)
+  ) {
+    let prefix = Path.rawBytes(&root)
+    let linked = Bytes.asSlice(&target)
+    if linked.length > prefix.length
+      && same(Slice.view<u8>(linked, usize.ZERO, prefix.length), prefix)
+      && linked[prefix.length] == 47 {
+      let mut errors = run Bytes.copy(b"silk toolchain: ")
+      run Bytes.append(&mut errors, Bytes.asSlice(&name))
+      run Bytes.append(&mut errors, b" is the compiler ")
+      run Bytes.append(&mut errors, Path.rawBytes(&link))
+      run Bytes.append(
+        &mut errors,
+        b" runs; install another release with install.sh before removing it\n"
+      )
+      return Outcome { status: 1, output: Bytes.make(), errors: move errors }
+    }
+  }
+  run FileSystem.removeDirectoryRecursively(&root)
+  let mut output = run Bytes.copy(b"Removed ")
+  run Bytes.append(&mut output, Bytes.asSlice(&name))
+  run Bytes.append(&mut output, b"\n")
+  return Outcome { status: 0, output: move output, errors: Bytes.make() }
+}
