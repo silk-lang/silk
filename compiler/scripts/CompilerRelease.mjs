@@ -322,7 +322,18 @@ export const publish = Effect.fn('CompilerRelease.publish')(function* ({
   if (ref && (ref.object.type !== 'commit' || ref.object.sha !== metadata.commit))
     return yield* invalid('Release tag points at different source')
   if (!ref)
-    yield* api(repository, 'git/refs', 'POST', { ref: `refs/tags/${tag}`, sha: metadata.commit })
+    yield* api(repository, 'git/refs', 'POST', {
+      ref: `refs/tags/${tag}`,
+      sha: metadata.commit,
+    }).pipe(
+      Effect.mapError(
+        (error) =>
+          new CompilerReleaseError({
+            reason: 'Conflict',
+            message: `${error.message}\nCould not create ${tag}. GITHUB_TOKEN may not tag a commit whose workflow files differ from main's head; set the RELEASE_DEPLOY_KEY secret (see .github/CI.md).`,
+          }),
+      ),
+    )
   const releases = yield* pages(repository, 'releases?per_page=100')
   let release = releases.find((entry) => entry.tag_name === tag)
   if (!release)
