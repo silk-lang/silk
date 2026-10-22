@@ -104,7 +104,7 @@ effect fn program() -> i32
       return 1
     }
   }
-  let offer = match move inspect(&head, Limits.default()) {
+  let offer = match move inspect(&head, Limits.defaults()) {
     Result<Offer, UpgradeError>.Success { value } => move value
     Result<Offer, UpgradeError>.Failure { error: _ } => {
       return 1
@@ -159,7 +159,7 @@ effect fn program() -> i32
       return 1
     }
   }
-  return match move inspect(&oldHead, Limits.default()) {
+  return match move inspect(&oldHead, Limits.defaults()) {
     Result<Offer, UpgradeError>.Success { value: _ } => 1
     Result<Offer, UpgradeError>.Failure { error } => {
       if rejectionStatus(&error) != 426 {
@@ -261,12 +261,12 @@ impl Copy for Limits
 impl Limits
 ```
 
-<a id="Limits.impl.default"></a>
+<a id="Limits.impl.defaults"></a>
 
-### Associated function `default`
+### Associated function `defaults`
 
 ```silk
-pub fn default() -> Limits
+pub fn defaults() -> Limits
 ```
 
 Returns the default limits: 32 protocols, 128 bytes for each protocol, 4096 extension bytes,
