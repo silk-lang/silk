@@ -201,7 +201,7 @@ const program = Effect.gen(function* () {
       params: { textDocument: { uri, version }, contentChanges: [{ text }] },
     })
   }
-  yield* session.send({ jsonrpc: '2.0', id: 3, method: 'textDocument/references' })
+  yield* session.send({ jsonrpc: '2.0', id: 3, method: 'textDocument/codeLens' })
   const edited = yield* notificationsUntil(session, 3)
   assert.equal((edited.response['error'] as Record<string, unknown>)['code'], -32601)
   const clean = yield* diagnosticsFor(session, uri, 3, edited.notifications)
