@@ -36,7 +36,7 @@ import semantic.Intrinsic as CheckedIntrinsic
 import semantic.SealedCore
 import semantic.SealedCore {Field as CoreField, Lifecycle}
 import semantic.StorageOperation {StorageOperation}
-import semantic.Intrinsic {MemoryOrder, Member as IntrinsicMember, Primitive as IntrinsicPrimitive}
+import semantic.Intrinsic {MemoryOrder, Member as IntrinsicMember, Primitive as IntrinsicPrimitive, VectorForm}
 import semantic.NativeAssembly
 import semantic.NativeAssembly {Memory as AssemblyMemory}
 import semantic.ScalarOperation {Code as ScalarCode, Scalar, ScalarOperation}
@@ -201,8 +201,9 @@ pub union Rvalue {
     pub failure: MemoryOrder,
     pub element: Shared<Type>,
   },
-  /// One SIMD vector operation (SIMD-003) over the vector type `ty`, with its operands in written
-  /// order. A lane index operand is already checked against the lane count.
+  /// One SIMD vector operation (SIMD-003) whose result is `ty`, with its operands in written order.
+  /// A lane index operand is already checked against the lane count, and a slice load or store is
+  /// already a pointer load or store of checked elements.
   Vector {pub primitive: IntrinsicPrimitive, pub operands: List<Operand>, pub ty: Shared<Type>},
 }
 
@@ -1539,6 +1540,8 @@ fn mayTrap(value: &Rvalue) -> bool {
     Rvalue.Binary {..} => true
     Rvalue.ScalarBinary {..} => true
     Rvalue.Convert {..} => true
+    // A checked integer lane sum traps when the total does not fit the lane type.
+    Rvalue.Vector {primitive, ..} => primitive == IntrinsicPrimitive.SimdReduceAdd
     _ => false
   }
 }
@@ -5269,9 +5272,10 @@ effect fn atomic(
   return Rvalue.Atomic {primitive: primitive, operands: move operands, success: success, failure: failure, element: move element}
 }
 
-// One SIMD vector operation over the call's vector type: its result, or its first argument's
-// type for a lane read, an array conversion and a lane comparison. A lane index is checked against
-// the lane count once every argument is evaluated, so the emitted lane access is in range.
+// One SIMD vector operation, whose result is `ty`. Integer lane arithmetic and the square root
+// reuse the scalar rvalues, which apply lane by lane; a conversion is the scalar conversion. A
+// lane index is checked against the lane count once every argument is evaluated, and a slice
+// load or store checks its lane range before it addresses the slice's elements.
 effect fn vector(
   builder: &mut Builder,
   body: &Shared<TypedBody>,
@@ -5282,19 +5286,26 @@ effect fn vector(
   origin: Origin,
 ) -> Rvalue ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let owner = InstanceKey.identity(&builder.function.key)
+  let form = match move CheckedIntrinsic.vectorForm(primitive) {
+    Option<VectorForm>.Some {value} => value
+    Option<VectorForm>.None => run unsupported(&owner, origin, GapCode.IntrinsicMember)
+  }
+  // The vector whose lane count bounds an index or a slice range.
   let mut over = Shared<Type>.clone(ty)
-  if primitive == IntrinsicPrimitive.SimdExtract || primitive == IntrinsicPrimitive.SimdToArray || CheckedIntrinsic.isLaneComparison(primitive) {
+  if form == VectorForm.Extract {
     over = match move run intrinsicArgumentType(&builder.*, body, callNode, usize.ZERO) {
       Option<Shared<Type>>.Some {value} => move value
       Option<Shared<Type>>.None => run unsupported(&owner, origin, GapCode.TypedForm)
     }
   }
-  let lanes = match move Type.vectorShape(&over) {
-    Option<ArrayShape>.Some {value} => value.length
-    Option<ArrayShape>.None => run unsupported(&owner, origin, GapCode.IntrinsicMember)
+  if form == VectorForm.Store {
+    over = match move run intrinsicArgumentType(&builder.*, body, callNode, 2) {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => run unsupported(&owner, origin, GapCode.TypedForm)
+    }
   }
-  let indexed = primitive == IntrinsicPrimitive.SimdExtract || primitive == IntrinsicPrimitive.SimdInsert
   let word = run storagePrimitive(b"usize")
+  let indexed = form == VectorForm.Extract || form == VectorForm.Insert || form == VectorForm.Load || form == VectorForm.Store
   let mut index = usize.MAX
   let mut operands = List<Operand>.make()
   let count = CheckedIntrinsic.arity(IntrinsicMember.Primitive {primitive: primitive})
@@ -5309,12 +5320,75 @@ effect fn vector(
     }
     at = at + usize.ONE
   }
-  if indexed {
-    let bound = Operand.Integer {decimal: run Type.extentText(lanes), negative: false, ty: Shared<Type>.clone(&word)}
-    let bounded = run storageCondition(&mut builder.*, InfixOperator.LessThan, Operand.Copy {place: place(index)}, move bound, origin)
-    run trapUnless(&mut builder.*, move bounded, TrapReason.IndexOutOfBounds, origin)
+  if !indexed {
+    let mut listed = move operands
+    if form == VectorForm.Binary {
+      if let Option<ScalarBinary>.Some {value: operation} = move vectorScalarBinary(primitive) {
+        let right = List<Operand>.remove(&mut listed, usize.ONE)
+        let left = List<Operand>.remove(&mut listed, usize.ZERO)
+        return Rvalue.ScalarBinary {operation: operation, left: move left, right: move right}
+      }
+    }
+    if primitive == IntrinsicPrimitive.SimdSqrt {
+      return Rvalue.ScalarUnary {operation: ScalarUnary.Sqrt, value: List<Operand>.remove(&mut listed, usize.ZERO)}
+    }
+    if primitive == IntrinsicPrimitive.SimdConvert {
+      return Rvalue.Convert {value: List<Operand>.remove(&mut listed, usize.ZERO), ty: Shared<Type>.clone(ty)}
+    }
+    return Rvalue.Vector {primitive: primitive, operands: move listed, ty: Shared<Type>.clone(ty)}
   }
-  return Rvalue.Vector {primitive: primitive, operands: move operands, ty: move over}
+  let shape = match move Type.vectorShape(&over) {
+    Option<ArrayShape>.Some {value} => move value
+    Option<ArrayShape>.None => run unsupported(&owner, origin, GapCode.IntrinsicMember)
+  }
+  let lanes = Operand.Integer {decimal: run Type.extentText(shape.length), negative: false, ty: Shared<Type>.clone(&word)}
+  if form == VectorForm.Extract || form == VectorForm.Insert {
+    let bounded = run storageCondition(&mut builder.*, InfixOperator.LessThan, Operand.Copy {place: place(index)}, move lanes, origin)
+    run trapUnless(&mut builder.*, move bounded, TrapReason.IndexOutOfBounds, origin)
+    return Rvalue.Vector {primitive: primitive, operands: move operands, ty: Shared<Type>.clone(ty)}
+  }
+  // `offset <= length` and then `N <= length - offset`, so the subtraction cannot wrap.
+  let mut listed = move operands
+  let descriptor = run operandPlace(&owner, List<Operand>.remove(&mut listed, usize.ZERO), origin)
+  let length = run storageValue(&mut builder.*, &word, Rvalue.SliceLength {place: run copyPlace(&descriptor)}, origin)
+  let starts = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, Operand.Copy {place: place(index)},
+    Operand.Copy {place: place(length)}, origin)
+  run trapUnless(&mut builder.*, move starts, TrapReason.SliceRangeOutOfBounds, origin)
+  let remaining = run storageValue(&mut builder.*, &word, Rvalue.Binary {operation: InfixOperator.Subtract,
+    left: Operand.Copy {place: place(length)}, right: Operand.Copy {place: place(index)}}, origin)
+  let fits = run storageCondition(&mut builder.*, InfixOperator.LessOrEqual, move lanes, Operand.Copy {place: place(remaining)}, origin)
+  run trapUnless(&mut builder.*, move fits, TrapReason.SliceRangeOutOfBounds, origin)
+  let mut access = Access.Shared
+  if form == VectorForm.Store { access = Access.Mutable }
+  let addressType = run Types.intern(Type.Pointer {pointee: Shared<Type>.clone(&shape.element), access: access,
+    nullable: true, multiplicity: Multiplicity.Many, alignment: Option<u64>.none()})
+  let data = run storageValue(&mut builder.*, &addressType, Rvalue.SliceData {place: move descriptor}, origin)
+  let element = run storageValue(&mut builder.*, &addressType, Rvalue.PointerOffset {pointer: Operand.Copy {place: place(data)},
+    index: Operand.Copy {place: place(index)}, element: Shared<Type>.clone(&shape.element)}, origin)
+  let mut addressed = List<Operand>.make()
+  run List<Operand>.append(&mut addressed, Operand.Copy {place: place(element)})
+  if form == VectorForm.Load {
+    return Rvalue.Vector {primitive: IntrinsicPrimitive.SimdPointerLoad, operands: move addressed, ty: Shared<Type>.clone(ty)}
+  }
+  run List<Operand>.append(&mut addressed, List<Operand>.remove(&mut listed, usize.ONE))
+  return Rvalue.Vector {primitive: IntrinsicPrimitive.SimdPointerStore, operands: move addressed, ty: Shared<Type>.clone(ty)}
+}
+
+// The scalar operation an integer vector primitive applies to each lane.
+fn vectorScalarBinary(primitive: IntrinsicPrimitive) -> Option<ScalarBinary> {
+  let operation = match primitive {
+    IntrinsicPrimitive.SimdWrappingAdd => ScalarBinary.WrappingAdd
+    IntrinsicPrimitive.SimdWrappingSubtract => ScalarBinary.WrappingSubtract
+    IntrinsicPrimitive.SimdWrappingMultiply => ScalarBinary.WrappingMultiply
+    IntrinsicPrimitive.SimdSaturatingAdd => ScalarBinary.SaturatingAdd
+    IntrinsicPrimitive.SimdSaturatingSubtract => ScalarBinary.SaturatingSubtract
+    IntrinsicPrimitive.SimdShiftLeft => ScalarBinary.ShiftLeft
+    IntrinsicPrimitive.SimdShiftRight => ScalarBinary.ShiftRight
+    IntrinsicPrimitive.SimdRotateLeft => ScalarBinary.RotateLeft
+    IntrinsicPrimitive.SimdRotateRight => ScalarBinary.RotateRight
+    _ => { return Option<ScalarBinary>.none() }
+  }
+  return Option<ScalarBinary>.some(operation)
 }
 
 // The memory ordering embedded as static intrinsic argument `index`.
