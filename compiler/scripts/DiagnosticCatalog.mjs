@@ -43,7 +43,7 @@ const bodyOf = (source, declaration) => {
 const escapes = { n: '\n', t: '\t' }
 
 const enumMembers = (source, name) => {
-  const body = bodyOf(source, new RegExp(`^\\s*pub enum ${name}\\s*\\{`, 'm'))
+  const body = bodyOf(source, new RegExp(`^\\s*pub enum (?:\\(\\w+\\) )?${name}\\s*\\{`, 'm'))
   return body === undefined ? [] : [...mask(body).matchAll(/\b(\w+)\s*,/g)].map((match) => match[1])
 }
 
@@ -152,7 +152,7 @@ export const verify = ({ catalog, rejection, lexical, staticExecution, reference
 
   // A doc comment that opens with a code documents the member it precedes, which spells that code.
   let documented
-  for (const line of (bodyOf(catalog, /^\s*pub enum Code\s*\{/m) ?? '').split('\n')) {
+  for (const line of (bodyOf(catalog, /^\s*pub enum (?:\(\w+\) )?Code\s*\{/m) ?? '').split('\n')) {
     const doc = /^\s*\/\/\/\s*([A-Z]{3}[0-9]{4})\b/.exec(line)
     if (doc !== null) {
       if (documented !== undefined) issues.push(`${documented}: doc comment documents no Code member`)
