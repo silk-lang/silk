@@ -9,8 +9,10 @@
 //! Syntax diagnostics come from parsing each changed document alone, so refreshing for them runs no
 //! semantic unit. Semantic diagnostics come from a work queue: each [`work`] step checks one module
 //! of a package with `Semantic.checkModule`, the modules of open documents first and then the rest
-//! of the package, so the server can answer requests between steps. A module's diagnostics are the
-//! rejections located in it, whichever module's check reached them.
+//! of the package, so the server can answer requests between steps. A module whose kept sweep no
+//! longer verifies is first prepared one declaration per step with `Semantic.prepareDeclaration`,
+//! so a request waits at most for one declaration rather than for a whole module. A module's
+//! diagnostics are the rejections located in it, whichever module's check reached them.
 
 import diagnostic.Report as Reports { RenderedDiagnostic }
 import driver.Analysis as Analyses { Analysis, Opened }
@@ -31,6 +33,7 @@ import lexer.Span { Span }
 import lsp.Message { PositionEncoding }
 import lsp.Navigation as Navigation { Destination, Help, Hint, Hover }
 import CompilerBug
+import semantic.DeclarationId { DeclarationId }
 import semantic.InitialProfile { InitialProfile, Problem as InitialProfileProblem }
 import semantic.ModuleId { InvalidModulePath, ModuleId }
 import semantic.Query { Cycle }
@@ -130,6 +133,11 @@ struct Package {
 
   // The modules waiting for a check, open documents' first.
   queue: List<ModuleId>
+
+  // The module being prepared one declaration per step, and its declarations not yet prepared.
+  // Its check follows the last one.
+  preparing: Option<ModuleId>
+  unprepared: List<DeclarationId>
   checked: List<Checked>
 
   // The modules whose diagnostics changed since they were last taken.
@@ -264,7 +272,7 @@ impl Workspace {
     let packages = List<Package>.asSlice(&self.packages)
     let mut at = usize.ZERO
     while at < packages.length {
-      if List<ModuleId>.length(&packages[at].queue) > usize.ZERO {
+      if List<ModuleId>.length(&packages[at].queue) > usize.ZERO || preparingOne(&packages[at]) {
         return true
       }
       at = at + usize.ONE
@@ -288,16 +296,17 @@ impl Workspace {
     return ()
   }
 
-  /// Checks the next queued module, if any, and answers whether it checked one.
+  /// Takes one step of the next queued module's check, if any, and answers whether it took one.
+  /// A step checks a module whose kept sweep still verifies, or lists, prepares one declaration
+  /// of, or finally checks a module that must be swept again.
   pub effect fn work(self: &mut Self) -> bool
     ! OutOfMemoryError
     ? &mut Allocator | &mut Types {
     let packages = List<Package>.asMutSlice(&mut self.packages)
     let mut at = usize.ZERO
     while at < packages.length {
-      if List<ModuleId>.length(&packages[at].queue) > usize.ZERO {
-        let module = List<ModuleId>.remove(&mut packages[at].queue, usize.ZERO)
-        run checkModule(&mut packages[at], move module)
+      if preparingOne(&packages[at]) || List<ModuleId>.length(&packages[at].queue) > usize.ZERO {
+        run step(&mut packages[at])
         return true
       }
       at = at + usize.ONE
@@ -764,6 +773,8 @@ effect fn refreshPackage(self: &mut Workspace, package: usize) -> ()
     at = at + usize.ONE
   }
   target.queue = move queue
+  target.preparing = Option<ModuleId>.none()
+  target.unprepared = List<DeclarationId>.make()
   let checked = List<Checked>.asMutSlice(&mut target.checked)
   at = usize.ZERO
   while at < checked.length {
@@ -806,6 +817,82 @@ fn listed(modules: &[ModuleId], module: &ModuleId) -> bool {
     at = at + usize.ONE
   }
   return false
+}
+
+// One step of the package's queued checks: the next declaration of the module being prepared,
+// that module's check once none is left, or else the next queued module, checked at once when its
+// kept sweep verifies and otherwise listed for preparation. A step the store cannot complete
+// leaves the module's check to report it.
+effect fn step(package: &mut Package) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  if preparingOne(&package.*) {
+    if List<DeclarationId>.length(&package.unprepared) > usize.ZERO {
+      let declaration = List<DeclarationId>.remove(&mut package.unprepared, usize.ZERO)
+      let prepared = run Effect.result(Semantic.prepareDeclaration(&mut package.store, &mut package.request, &declaration))
+      return run tolerated(move prepared)
+    }
+    let module = match Intrinsic.replace(package.preparing, Option<ModuleId>.none()) {
+      Option<ModuleId>.Some {value} => move value
+      Option<ModuleId>.None => CompilerBug.panic(b"a prepared module is named")
+    }
+    return run checkModule(&mut package.*, move module)
+  }
+  let module = List<ModuleId>.remove(&mut package.queue, usize.ZERO)
+  let current = run Effect.result(Semantic.moduleSweepCurrent(&mut package.store, &module))
+  let mut kept = false
+  match move current {
+    Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => {
+      kept = value
+    }
+    Result<bool, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      _ => ()
+    }
+  }
+  if kept {
+    return run checkModule(&mut package.*, move module)
+  }
+  let listed = run Effect.result(Semantic.moduleDeclarations(&mut package.store, &module))
+  match move listed {
+    Result<List<DeclarationId>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => {
+      package.unprepared = move value
+    }
+    Result<List<DeclarationId>, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      _ => {
+        package.unprepared = List<DeclarationId>.make()
+      }
+    }
+  }
+  package.preparing = Option<ModuleId>.some(move module)
+  return ()
+}
+
+// Whether a module of `package` is being prepared.
+fn preparingOne(package: &Package) -> bool {
+  if let Option<ModuleId>.Some { .. } = &package.preparing {
+    return true
+  }
+  return false
+}
+
+// Passes on only running out of memory; the module's check reports any other failure.
+effect fn tolerated(attempted: Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>) -> ()
+  ! OutOfMemoryError {
+  return match move attempted {
+    Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success { .. } => ()
+    Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      _ => ()
+    }
+  }
 }
 
 // Checks `module` and records its rejections. When they differ from the last check's, the module
@@ -1175,6 +1262,8 @@ effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, host: Target)
           semantic: true,
           stale: true,
           queue: List<ModuleId>.make(),
+          preparing: Option<ModuleId>.none(),
+          unprepared: List<DeclarationId>.make(),
           checked: List<Checked>.make(),
           dirty: List<ModuleId>.make(),
           shown: List<ModuleId>.make(),
@@ -1194,6 +1283,8 @@ effect fn openPackage(path: &[u8], standardLibrary: &Option<Path>, host: Target)
           semantic: false,
           stale: true,
           queue: List<ModuleId>.make(),
+          preparing: Option<ModuleId>.none(),
+          unprepared: List<DeclarationId>.make(),
           checked: List<Checked>.make(),
           dirty: List<ModuleId>.make(),
           shown: List<ModuleId>.make(),
