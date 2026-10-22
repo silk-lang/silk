@@ -729,6 +729,28 @@ const program = Effect.gen(function* () {
   assert.match(rejected.stderr, /\/rejected\/src\/main\.silk:6:16: error\[SEM0037\]/)
   assert.match(rejected.stderr, /^Failed rejected in /m)
   assert.equal(rejected.stdout, '')
+  // `build` heads its diagnostics with the target as `check` and `run` do, also for an import of
+  // a module that does not exist.
+  yield* fs.makeDirectory(join(directory, 'unknown/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unknown/silk.toml'),
+    '[package]\nname = "unknown"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'unknown/src/main.silk'),
+    'import nowhere.thing\n\npub fn main() -> i32 {\n  return 0\n}\n',
+  )
+  const unknownModule = yield* invoke(
+    silk,
+    ['build', '--stdlib', standardLibrary],
+    join(directory, 'unknown'),
+  )
+  assert.equal(unknownModule.status, 1, unknownModule.stderr)
+  assert.match(
+    unknownModule.stderr,
+    new RegExp(`^\\[${hostTarget}\\]\n[^\n]*/unknown/src/main\\.silk:1:8: error\\[MOD0001\\]`, 'm'),
+  )
+  assert.match(unknownModule.stderr, /^Failed unknown in /m)
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
