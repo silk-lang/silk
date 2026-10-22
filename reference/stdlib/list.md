@@ -24,7 +24,7 @@ elements.
 
 ## Gotchas
 [`List.get`](#List.impl.get), [`List.set`](#List.impl.set), and [`List.remove`](#List.impl.remove) trap if the index is not less than the length.
-The index of [`List.insert`](#List.impl.insert) must be at most the length. [`List.get`](#List.impl.get) copies the element, so
+[`List.insert`](#List.impl.insert) traps if the index is more than the length. [`List.get`](#List.impl.get) copies the element, so
 it needs `T: Copy`. Use [`List.asSlice`](#List.impl.asSlice) to borrow an element that is not `Copy`.
 
 ## Examples
@@ -244,9 +244,7 @@ in proportion to their number. `T` does not need to be `Copy`.
 
 #### Gotchas
 
-`index` must be less than or equal to [`List.length`](#List.impl.length). The function checks `index` only
-against the capacity. An `index` more than the length and less than the capacity makes the
-list hold uninitialized elements.
+If `index` is more than [`List.length`](#List.impl.length), the program traps.
 
 <a id="List.impl.get"></a>
 
