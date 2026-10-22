@@ -1,6 +1,7 @@
 // A scripted language server session against one prebuilt native compiler: `silk lsp` starts,
 // answers the lifecycle requests one at a time with its input still open, publishes syntax
-// diagnostics for an open document as it is edited, and stops cleanly.
+// diagnostics for an open document as it is edited, answers the syntax features about it, and
+// stops cleanly.
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -177,6 +178,47 @@ const program = Effect.gen(function* () {
   assert.deepEqual(last.params.diagnostics, [], 'the fixed text has no syntax diagnostics')
   assert.equal((edited.response['error'] as Record<string, unknown>)['code'], -32601)
 
+  // The syntax features read the document's latest text.
+  const textDocument = { uri }
+  const outline = yield* request(session, 5, 'textDocument/documentSymbol', { textDocument })
+  const symbols = outline['result'] as Array<{ name: string; kind: number; range: unknown }>
+  assert.deepEqual(
+    symbols.map(({ name, kind }) => ({ name, kind })),
+    [{ name: 'main', kind: 12 }],
+  )
+  const folding = yield* request(session, 6, 'textDocument/foldingRange', { textDocument })
+  assert.deepEqual(folding['result'], [{ startLine: 0, endLine: 1 }])
+  const canonical = yield* request(session, 7, 'textDocument/formatting', {
+    textDocument,
+    options: { tabSize: 2, insertSpaces: true },
+  })
+  assert.deepEqual(canonical['result'], [], 'a formatted document needs no edits')
+  yield* session.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didChange',
+    params: {
+      textDocument: { uri, version: 4 },
+      contentChanges: [{ text: 'pub fn main()->i32{return 0}\n' }],
+    },
+  })
+  yield* session.send({
+    jsonrpc: '2.0',
+    id: 8,
+    method: 'textDocument/formatting',
+    params: { textDocument, options: { tabSize: 2, insertSpaces: true } },
+  })
+  const messy = yield* notificationsUntil(session, 8)
+  assert.deepEqual(
+    messy.response['result'],
+    [
+      {
+        range: { start: { line: 0, character: 0 }, end: { line: 1, character: 0 } },
+        newText: fixed,
+      },
+    ],
+    'formatting replaces the whole document with its canonical text',
+  )
+
   // Closing a document clears its diagnostics.
   yield* session.send({
     jsonrpc: '2.0',
@@ -201,7 +243,7 @@ const program = Effect.gen(function* () {
   assert.equal(yield* closed.exited, 1, 'closed input stops the server with status 1')
 
   yield* Console.log(
-    'Native language server: scripted lifecycle and document diagnostics session passed',
+    'Native language server: scripted lifecycle, diagnostics and syntax features session passed',
   )
 })
 
