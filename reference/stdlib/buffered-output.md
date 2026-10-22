@@ -15,8 +15,9 @@ Each operation has two forms. The deadline form, such as `writeAll`, uses a
 
 ## Details
 When a write returns, the buffer owns the accepted bytes. The buffer sends pending bytes to the
-transport only when it is full or when the caller flushes it. A flush sends all pending bytes in
-order, one time each.
+transport only when it is full or when the caller flushes it. Input that is longer than the
+buffer is not copied: once the pending bytes are sent, it goes to the transport directly. A
+flush sends all pending bytes in order, one time each.
 
 A failed transport write or flush makes the buffer terminal. After that, each write and flush
 fails with `BufferError.Terminal`. The error reports exactly how many bytes the transport
@@ -192,7 +193,9 @@ does other work. Use [`BufferedOutput.writeAll`](#BufferedOutput.impl.writeAll) 
 #### Details
 
 If the buffer is full, this function first sends all pending bytes to the active `ByteDuplex`
-transport. Then it copies input bytes into the free space. For a non-empty `input`, the result
+transport. Then it copies input bytes into the free space. If the buffer is empty and `input`
+is longer than [`BufferedOutput.capacity`](#BufferedOutput.impl.capacity), it does not copy: it gives `input` to one transport
+write and returns the count that the transport accepted. For a non-empty `input`, the result
 is at least 1. For an empty `input`, the result is 0 and the transport is not used.
 
 #### Errors
@@ -225,9 +228,11 @@ Use `writeAll` for normal output through a `ByteDuplex` transport. Use
 
 #### Details
 
-When this function returns, the buffer owns all of `input`. The transport does not
-necessarily have the bytes yet. Call [`BufferedOutput.flush`](#BufferedOutput.impl.flush) to send them. `deadline` applies
-to each transport write that this call makes.
+When this function returns, the buffer owns all of `input`, or the transport already has
+them. The transport does not necessarily have the buffered bytes yet. Call
+[`BufferedOutput.flush`](#BufferedOutput.impl.flush) to send them. A part of `input` that is longer than the buffer goes
+to the transport directly, without a copy. `deadline` applies to each transport write that
+this call makes.
 
 #### Errors
 
@@ -348,7 +353,9 @@ of `input`.
 #### Details
 
 If the buffer is full, this function first sends all pending bytes in one `Writer.writeAll`
-call. For a non-empty `input`, the result is at least 1.
+call. If the buffer is empty and `input` is longer than [`BufferedOutput.capacity`](#BufferedOutput.impl.capacity), it does
+not copy: it sends all of `input` in one `Writer.writeAll` call. For a non-empty `input`, the
+result is at least 1.
 
 #### Errors
 
@@ -376,8 +383,10 @@ Use `writeAllWriter` to buffer many small writes to a `Writer`, such as standard
 
 #### Details
 
-When this function returns, the buffer owns all of `input`. The `Writer` does not
-necessarily have the bytes yet. Call [`BufferedOutput.flushWriter`](#BufferedOutput.impl.flushWriter) to send them.
+When this function returns, the buffer owns all of `input`, or the `Writer` already has
+them. The `Writer` does not necessarily have the buffered bytes yet. Call
+[`BufferedOutput.flushWriter`](#BufferedOutput.impl.flushWriter) to send them. A part of `input` that is longer than the buffer
+goes to the `Writer` directly, without a copy.
 
 #### Errors
 
