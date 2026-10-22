@@ -1,7 +1,8 @@
 // A scripted language server session against one prebuilt native compiler: `silk lsp` starts,
 // answers the lifecycle requests one at a time with its input still open, publishes syntax
 // diagnostics for an open document as it is edited and semantic diagnostics once its module is
-// checked, answers the syntax features about it, and stops cleanly.
+// checked, answers the syntax features about it, and stops cleanly. A last session checks code
+// nested close to the parser's limit, where a thread with Darwin's default stack overflows.
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -31,12 +32,19 @@ interface Session {
   readonly exited: Effect.Effect<number | null, SessionError>
 }
 
-// Starts `silk lsp` and reads framed responses as they arrive.
-const start = (silk: string, stdlib: string) =>
+// Starts `silk lsp` and reads framed responses as they arrive. With `smallStacks`, GNU libc gives
+// new threads a 512 KiB stack by default, as Darwin always does, so a thread that only fits the
+// platform default fails here as it would on macOS.
+const start = (silk: string, stdlib: string, smallStacks = false) =>
   Effect.acquireRelease(
     Effect.try({
       try: (): Session => {
-        const child = spawn(silk, ['lsp', '--stdlib', stdlib], { stdio: 'pipe' })
+        const child =
+          smallStacks && process.platform === 'linux'
+            ? spawn('sh', ['-c', 'ulimit -s 512 && exec "$0" lsp --stdlib "$1"', silk, stdlib], {
+                stdio: 'pipe',
+              })
+            : spawn(silk, ['lsp', '--stdlib', stdlib], { stdio: 'pipe' })
         let pending = Buffer.alloc(0)
         const ready: Array<Record<string, unknown>> = []
         const waiting: Array<() => void> = []
@@ -55,6 +63,12 @@ const start = (silk: string, stdlib: string) =>
           waiting.splice(0).forEach((wake) => wake())
         })
         const status = new Promise<number | null>((done) => child.on('exit', (code) => done(code)))
+        // Once its output closes, a server that will never answer fails the read at once.
+        let ended: string | undefined
+        child.on('close', (code, signal) => {
+          ended = `silk lsp stopped with ${signal ?? `status ${code}`}`
+          waiting.splice(0).forEach((wake) => wake())
+        })
         const within = <A>(promise: Promise<A>, what: string) =>
           Effect.tryPromise({
             try: () =>
@@ -70,6 +84,7 @@ const start = (silk: string, stdlib: string) =>
         const next = (): Promise<Record<string, unknown>> => {
           const first = ready.shift()
           if (first !== undefined) return Promise.resolve(first)
+          if (ended !== undefined) return Promise.reject(new Error(ended))
           return new Promise((wake) => waiting.push(() => wake(next())))
         }
         return {
@@ -342,8 +357,33 @@ const program = Effect.gen(function* () {
   yield* Effect.sync(() => closed.child.stdin.end())
   assert.equal(yield* closed.exited, 1, 'closed input stops the server with status 1')
 
+  // The compiler thread checks a chain of 119 operators, close to the deepest the parser accepts
+  // inside a function body. Ten were enough to overflow Darwin's 512 KiB thread default.
+  const deep = yield* start(silk, stdlib, true)
+  yield* request(deep, 1, 'initialize', { processId: null, rootUri: null, capabilities: {} })
+  yield* deep.send({ jsonrpc: '2.0', method: 'initialized', params: {} })
+  const chain = Array.from({ length: 120 }, (_, at) => `value == ${at}`).join(' || ')
+  const nested = `fn listed(value: i32) -> bool {\n  return ${chain}\n}\npub fn main() -> i32 {\n  if listed(3) {\n    return 0\n  }\n  return 1\n}\n`
+  writeFileSync(join(directory, 'main.silk'), nested)
+  yield* deep.send({
+    jsonrpc: '2.0',
+    method: 'textDocument/didOpen',
+    params: { textDocument: { uri, languageId: 'silk', version: 1, text: nested } },
+  })
+  // Text without syntax errors publishes its diagnostics once its module is checked.
+  const checked = yield* diagnosticsFor(deep, uri, 1, [])
+  assert.deepEqual(checked.diagnostics, [], JSON.stringify(checked))
+  const answered = yield* request(deep, 2, 'textDocument/documentSymbol', { textDocument: { uri } })
+  assert.deepEqual(
+    (answered['result'] as Array<{ name: string }>).map(({ name }) => name),
+    ['listed', 'main'],
+  )
+  yield* request(deep, 3, 'shutdown')
+  yield* deep.send({ jsonrpc: '2.0', method: 'exit' })
+  assert.equal(yield* deep.exited, 0, 'deeply nested code is checked without exhausting the stack')
+
   yield* Console.log(
-    'Native language server: scripted lifecycle, syntax and semantic diagnostics, navigation, and syntax features session passed',
+    'Native language server: scripted lifecycle, syntax and semantic diagnostics, navigation, syntax features, and deep nesting sessions passed',
   )
 })
 
