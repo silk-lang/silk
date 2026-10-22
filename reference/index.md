@@ -129,8 +129,8 @@ not belong in a language rule unless a program can observe them.
 - [Atomic memory operations](atomic-memory-operations.md) — the C++20 memory model, static
   orderings, atomic loads, stores, read-modify-writes, compare-exchange, and fences.
 - [SIMD vectors](simd-vectors.md) — `simd<T, N>` and `mask<N>` values, lane-wise operators,
-  whole-vector equality, lane operations, reductions, mask queries, vector memory access, and
-  conversions.
+  whole-vector equality, lane operations, reductions, mask queries, vector memory access,
+  conversions, and static shuffles.
 - [Thread properties](thread-properties.md) — the sealed `Transferable` and `Concurrent`
   properties, their derivation from stored parts, and `impl` assertions for synchronized types.
 - [Unsafe code, intrinsics, and targets](unsafe-intrinsics-and-targets.md) — lexical unsafe
