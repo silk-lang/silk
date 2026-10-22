@@ -44,33 +44,84 @@ esac
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 
-# Keep 404 distinct: authorization failures and network errors must not switch channels.
+# api PATH OUTPUT writes the response body to OUTPUT. A 404 returns 4 so callers can tell a
+# missing release apart from every other failure, which must never switch channels.
+# Network and server errors are retried; a rate limit fails and says when it resets.
 api() {
-  if [ -n "${GITHUB_TOKEN:-}" ]; then
-    status=$(curl -sS -o "$tmp/response.json" -w '%{http_code}' \
-      -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
-      "https://api.github.com/repos/$repo/$1") || fail "cannot reach the GitHub release API"
-  else
-    status=$(curl -sS -o "$tmp/response.json" -w '%{http_code}' \
-      -H 'Accept: application/vnd.github+json' \
-      "https://api.github.com/repos/$repo/$1") || fail "cannot reach the GitHub release API"
+  request=1
+  while :; do
+    if [ -n "${GITHUB_TOKEN:-}" ]; then
+      status=$(curl -sS -D "$tmp/headers" -o "$2" -w '%{http_code}' \
+        -H 'Accept: application/vnd.github+json' -H "Authorization: Bearer $GITHUB_TOKEN" \
+        "https://api.github.com/repos/$repo/$1") || status=000
+    else
+      status=$(curl -sS -D "$tmp/headers" -o "$2" -w '%{http_code}' \
+        -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/$repo/$1") || status=000
+    fi
+    case "$status" in
+      200) return 0 ;;
+      404) return 4 ;;
+      403 | 429)
+        rate_limited && fail_rate_limited
+        fail "GitHub release API returned HTTP $status for $1$(api_message "$2")"
+        ;;
+      000 | 5??)
+        if [ "$request" -ge 4 ]; then
+          [ "$status" != 000 ] || fail "cannot reach the GitHub release API"
+          fail "GitHub release API returned HTTP $status for $1; try again in a few minutes"
+        fi
+        sleep "$request"
+        request=$((request + 1))
+        ;;
+      *) fail "GitHub release API returned HTTP $status for $1$(api_message "$2")" ;;
+    esac
+  done
+}
+
+# GitHub reports both the primary limit (remaining 0) and secondary limits (retry-after).
+rate_limited() {
+  grep -Eiq '^x-ratelimit-remaining:[[:space:]]*0[[:space:]]*$|^retry-after:' "$tmp/headers"
+}
+
+fail_rate_limited() {
+  reset=$(tr -d '\r' < "$tmp/headers" | sed -n 's/^[Xx]-[Rr]ate[Ll]imit-[Rr]eset:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | tail -n 1)
+  retry_in=
+  if [ -n "$reset" ]; then
+    retry_in=$(( (reset - $(date +%s) + 59) / 60 ))
+    [ "$retry_in" -ge 1 ] || retry_in=1
+    retry_in=" for about $retry_in more minute$([ "$retry_in" = 1 ] || echo s)"
   fi
-  case "$status" in
-    200) cat "$tmp/response.json" ;;
-    404) return 4 ;;
-    *) fail "GitHub release API returned HTTP $status" ;;
-  esac
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    fail "GitHub API rate limit reached for this GITHUB_TOKEN$retry_in; try again later"
+  fi
+  fail "GitHub API rate limit reached for unauthenticated requests from this network$retry_in; try again later, or set GITHUB_TOKEN to raise the limit"
+}
+
+# The "message" field of a GitHub error response, for error reports.
+api_message() {
+  message=$(tr -d '\r\n' < "$1" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+  [ -z "$message" ] || printf ': %s' "$message"
 }
 
 select_dev() {
   : > "$tmp/dev-tags"
   page=1
   while :; do
-    listing=$(api "releases?per_page=100&page=$page") || fail "cannot discover dev releases"
-    printf '%s\n' "$listing" |
-      grep -Eo '"tag_name"[[:space:]]*:[[:space:]]*"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-dev\.[1-9][0-9]*\+[a-f0-9]{12}"' |
+    # GitHub's release listing sometimes answers 200 with an empty list, most often right after
+    # a release is published. An empty first page is retried rather than read as "no releases".
+    attempt=1
+    while :; do
+      api "releases?per_page=100&page=$page" "$tmp/listing.json" || fail "cannot list the releases of $repo"
+      count=$(grep -o '"tag_name"' "$tmp/listing.json" | wc -l | tr -d ' ')
+      [ "$count" = 0 ] && [ "$page" = 1 ] || break
+      [ "$attempt" -lt 5 ] ||
+        fail "GitHub keeps returning an empty release list for $repo; try again in a minute"
+      sleep "$attempt"
+      attempt=$((attempt + 1))
+    done
+    grep -Eo '"tag_name"[[:space:]]*:[[:space:]]*"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-dev\.[1-9][0-9]*\+[a-f0-9]{12}"' "$tmp/listing.json" |
       cut -d'"' -f4 | cut -c2- >> "$tmp/dev-tags" || true
-    count=$(printf '%s\n' "$listing" | grep -o '"tag_name"' | wc -l | tr -d ' ')
     [ "$count" -ge 100 ] || break
     page=$((page + 1))
   done
@@ -78,14 +129,14 @@ select_dev() {
   LC_ALL=C sort -t. -k1,1nr -k2,2nr -k3,3nr -k4,4nr "$tmp/dev-tags" > "$tmp/sorted-dev-tags"
   while IFS= read -r candidate; do
     encoded=$(printf '%s' "$candidate" | sed 's/+/%2B/g')
-    metadata=$(api "releases/tags/v$encoded") || fail "cannot inspect dev release v$candidate"
-    if printf '%s\n' "$metadata" | grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' &&
-      printf '%s\n' "$metadata" | grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*true'; then
+    api "releases/tags/v$encoded" "$tmp/metadata.json" || fail "cannot inspect dev release v$candidate"
+    if grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' "$tmp/metadata.json" &&
+      grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*true' "$tmp/metadata.json"; then
       release="v$candidate"
       return 0
     fi
   done < "$tmp/sorted-dev-tags"
-  fail "no published dev compiler release is available"
+  fail "$repo has no published dev compiler release"
 }
 
 sha256() {
@@ -121,26 +172,26 @@ esac
 
 if [ -n "$release" ]; then
   release_path=$(printf '%s' "$release" | sed 's/+/%2B/g')
-  metadata=$(api "releases/tags/$release_path") || fail "cannot find release $release"
+  api "releases/tags/$release_path" "$tmp/metadata.json" || fail "$repo has no release $release"
 elif [ "$channel" = dev ]; then
   select_dev
-elif metadata=$(api releases/latest); then
-  release=$(printf '%s\n' "$metadata" | grep -o '"tag_name": *"v[^"]*"' | cut -d'"' -f4) || true
+elif api releases/latest "$tmp/metadata.json"; then
+  release=$(grep -o '"tag_name": *"v[^"]*"' "$tmp/metadata.json" | cut -d'"' -f4) || true
   [ -n "$release" ] || fail "the latest release is not a v<version> compiler release"
-  printf '%s\n' "$metadata" | grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*false' ||
+  grep -Eq '"prerelease"[[:space:]]*:[[:space:]]*false' "$tmp/metadata.json" ||
     fail "the latest release is not stable"
   core=${release%%+*}
   case "$core" in *-*) fail "the latest release is not stable" ;; esac
 else
   status=$?
   [ "$status" = 4 ] && [ "$channel" = auto ] ||
-    fail "cannot find a stable compiler release; use SILK_CHANNEL=dev or SILK_RELEASE"
+    fail "$repo has no stable compiler release yet; use SILK_CHANNEL=dev or SILK_RELEASE"
   select_dev
 fi
-printf '%s\n' "$metadata" | grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' ||
+grep -Eq '"draft"[[:space:]]*:[[:space:]]*false' "$tmp/metadata.json" ||
   fail "draft releases cannot be installed"
 case "$release" in v[0-9]*) ;; *) fail "not a compiler release tag: $release" ;; esac
-reported_tag=$(printf '%s\n' "$metadata" | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4) || true
+reported_tag=$(grep -o '"tag_name": *"[^"]*"' "$tmp/metadata.json" | cut -d'"' -f4) || true
 [ "$reported_tag" = "$release" ] || fail "GitHub returned a different release tag"
 
 # The full version, including +commit metadata, names the archive and its top directory.
