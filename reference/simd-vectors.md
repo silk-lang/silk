@@ -34,7 +34,8 @@ bit per lane, lane `0` in the lowest bit, rounded up to whole bytes.
 ordinary names.
 
 **Boundary:** A mask is never written `simd<bool, N>`. A lane count is not a generic parameter: a
-library writes one declaration per shape. A vector does not cross a C boundary yet.
+library writes one declaration per shape. A vector crosses a C boundary as SIMD-010 describes; a
+mask does not.
 
 **Diagnostics:** A lane type, lane count, or width outside these rules reports `SEM0239` at the
 type. So does `simd<bool, N>`.
@@ -358,3 +359,37 @@ function's features.
 attribute.
 
 **Evidence:** `corpus/native/simd-function-features`, `corpus/invalid/simd-function-features-invalid`.
+
+## SIMD-010 — A vector crosses the C boundary in one vector register
+
+**Status:** Confirmed
+
+```silk,ignore
+unsafe extern "C" fn scale(values: simd<f32, 4>, factor: f32) -> simd<f32, 4>
+export "C" fn add(a: simd<i32, 4>, b: simd<i32, 4>) -> simd<i32, 4> { return a + b }
+```
+
+A `simd<T, N>` with integer or floating-point lanes of a fixed width (not `isize` or `usize`) may
+be a parameter or result of an `extern "C"` or `export "C"` function. It crosses the boundary the
+way the target's C compilers pass the vector type of the same lanes, such as `__m128`,
+`float32x4_t`, `v128_t` or a GNU `vector_size` type: in one vector register.
+
+| Target | Widths | CPU feature the profile selects |
+| --- | --- | --- |
+| x86-64 | 128 bits | `sse2` (always) |
+| x86-64 | 256 bits | `avx` |
+| x86-64 | 512 bits | `avx512f` |
+| AArch64 | 64 and 128 bits | `neon` (always) |
+| wasm32 | 128 bits | `simd128` |
+
+**Boundary:** A mask has no C type and does not cross. A callback pointer type takes no vector. The
+profile decides the register, not the function: a function compiled with `features` (SIMD-009) passes
+vectors to C like the rest of the program. A C static may hold a vector.
+
+**Diagnostics:** A vector in an imported C signature whose width the target's C ABI does not pass
+in a vector register, or that needs a CPU feature the profile does not select, reports `SEM0244`
+at the call. The same vector in an exported signature reports the `c-abi-vector` gap.
+
+**Current compiler:** Aligned.
+
+**Evidence:** `corpus/native/simd-c-vectors`, `corpus/invalid/simd-c-vectors-invalid`.
