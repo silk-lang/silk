@@ -19,6 +19,8 @@ A write commits all bytes or produces WriterError. The source loop advances only
 
 An empty write succeeds without calling write or reading errno. Unbuffered stdout/stderr flush succeeds without a foreign operation. The providers borrow descriptors 1 and 2; they never close or release them.
 
+Standard error has one process-wide recursive lock: the lock of the C library's `stderr` stream, taken with `flockfile` and released with `funlockfile` (`stderr` on GNU, `__stderrp` on Darwin). Each `StderrWriter` write holds it for that write. `StderrWriter.lock(buffer)` returns a `LockedStderr` that holds it until the drop and collects writes in the caller's buffer; a write that does not fit is sent together with the buffered bytes in one `writev`, and the drop writes the rest and ignores a failure. `StderrWriter.print` formats one message under the lock into a 64-byte stack buffer. The lock orders only writes that take it; a direct `NativeDescriptor` write to descriptor 2 does not. Standard output has no lock.
+
 ## Input
 
 A nonempty read commits one actual transfer, retrying EINTR. Its positive count can be shorter than the buffer; bytes beyond the committed prefix retain their initialized values. Real native failure becomes StreamReadError after immediate native-error capture.
