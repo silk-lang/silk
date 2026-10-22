@@ -1,0 +1,574 @@
+//! Completion over one package's store.
+//!
+//! A name being typed completes from what the module's syntax shows in scope: its declarations,
+//! its imports, and the parameters, bindings and generic parameters of the declarations around
+//! the cursor. That reads only the parsed module, so it works on a body that does not check yet
+//! and demands nothing.
+//!
+//! A name after `.` completes from what the receiver names. A checked expression's type answers
+//! first; in a half-typed body, which does not check, the receiver's binding is read from the
+//! syntax instead, through its written type, and a receiver that names a type or a module lists
+//! its static members or its public declarations.
+
+import hir.Hir { HirId, Module, Node, OwnerKind }
+import lexer.Span { Span }
+import lsp.Names as Names { Named, Typed }
+import semantic.DeclarationId { DeclarationId }
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.ModuleIndex { IndexedDeclaration, ModuleIndex }
+import semantic.Query { Cycle }
+import semantic.Semantic { Dependency, Semantic, StaticPort }
+import semantic.SourceIndex { AuthoredCursor, IndexedSource, RevisionMismatch }
+import semantic.SourceUnit { SourceUnit }
+import semantic.Type { Type }
+import semantic.Types { Types }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.list { List }
+import silk.option { Option }
+import silk.shared { Shared }
+import silk.slice { Slice }
+import silk.usize
+
+/// One completion: its label and the language server protocol's CompletionItemKind number.
+pub struct Item {
+  pub label: Bytes
+  pub kind: usize
+}
+
+// What a scan of the module's syntax found in scope.
+struct Scope {
+  items: List<Item>
+
+  // Import members, whose kinds depend on what they import.
+  imported: List<Bytes>
+}
+
+// What the syntax says about a receiver named by one identifier.
+struct Receiver {
+  // The written type of the receiver's binding, as path segments; empty when it has none.
+  annotation: List<Bytes>
+
+  // Whether a binding in scope declares the receiver.
+  bound: bool
+}
+
+/// The names in scope at `offset` of `module` that start with `prefix`, ignoring ASCII case.
+pub effect fn scope(store: &mut Semantic, module: &ModuleId, offset: usize, prefix: &[u8]) -> List<Item>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let found = match move run scan(&mut store.*, module, offset, prefix) {
+    Option<Scope>.Some { value } => move value
+    Option<Scope>.None => {
+      return List<Item>.make()
+    }
+  }
+  let mut items = move found.items
+  let imported = List<Bytes>.asSlice(&found.imported)
+  let mut at = usize.ZERO
+  while at < imported.length {
+    let name = Bytes.asSlice(&imported[at])
+    if !labeled(List<Item>.asSlice(&items), name) {
+      let kind = match move run Names.scoped(&mut store.*, module, name) {
+        Option<Named>.Some { value: Named.Declaration { identity } } => declarationKind(DeclarationId.kind(&identity), false)
+        Option<Named>.Some { value: Named.Namespace { .. } } => 9
+        _ => 18
+      }
+      run List<Item>.append(&mut items, Item { label: run Bytes.copy(name), kind: kind })
+    }
+    at = at + usize.ONE
+  }
+  return move items
+}
+
+/// The members of what the receiver ending just before the `.` at `dot` names, that start with
+/// `prefix`: a value's fields and methods, a type's static members and variants, or a module's
+/// public declarations.
+pub effect fn members(store: &mut Semantic, module: &ModuleId, text: &[u8], dot: usize, prefix: &[u8]) -> List<Item>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  if dot == usize.ZERO || dot > text.length {
+    return List<Item>.make()
+  }
+  // A checked expression ending at the dot.
+  if let Option<Typed>.Some { value: typed } = move run Names.typeAt(&mut store.*, module, dot - usize.ONE) {
+    if typed.span.end == dot {
+      if let Option<DeclarationId>.Some { value: owner } = move nominal(&typed.ty) {
+        return run membersOf(&mut store.*, module, &owner, true, prefix)
+      }
+    }
+  }
+  let mut start = dot
+  while start > usize.ZERO && identifierByte(text[start - usize.ONE]) {
+    start = start - usize.ONE
+  }
+  if start == dot {
+    return List<Item>.make()
+  }
+  let name = Slice.view<u8>(text, start, dot - start)
+
+  // A binding whose type is written.
+  let receiver = run receiverAt(&mut store.*, module, start, name)
+  if List<Bytes>.length(&receiver.annotation) > usize.ZERO {
+    if let Option<Named>.Some { value: Named.Declaration { identity } } = move run Names.pathNamed(
+      &mut store.*,
+      module,
+      List<Bytes>.asSlice(&receiver.annotation)
+    ) {
+      return run membersOf(&mut store.*, module, &identity, true, prefix)
+    }
+  }
+  if receiver.bound {
+    return List<Item>.make()
+  }
+
+  // A type or a module named at the top level.
+  return match move run Names.scoped(&mut store.*, module, name) {
+    Option<Named>.Some { value: Named.Declaration { identity } } => run membersOf(&mut store.*, module, &identity, false, prefix)
+    Option<Named>.Some { value: Named.Namespace { module: namespace } } => run exportsOf(&mut store.*, &namespace, prefix)
+    _ => List<Item>.make()
+  }
+}
+
+// The fields and methods of a value of `owner`'s type when `instance` is set, else its static
+// methods, variants and enum members. Private fields show only inside `owner`'s module.
+effect fn membersOf(store: &mut Semantic, from: &ModuleId, owner: &DeclarationId, instance: bool, prefix: &[u8]) -> List<Item>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut items = List<Item>.make()
+  let home = DeclarationId.moduleId(owner)
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, home) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return move items
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return move items
+    }
+  }
+  let hir = IndexedSource.authored(indexed)
+  let index = IndexedSource.moduleIndex(indexed)
+  let declarations = ModuleIndex.listDeclarations(index)
+  let kind = DeclarationId.kind(owner)
+  let inside = ModuleId.equals(home, from)
+  if let Option<usize>.Some { value: ordinal } = move ModuleIndex.ordinalOf(index, owner) {
+    let local = declarations[ordinal].local
+    let first = match move Module.declarationStart(hir, local) {
+      Option<HirId>.Some { value } => value
+      Option<HirId>.None => local
+    }
+    let mut node = first.index
+    while node < local.index {
+      match Module.node(hir, HirId { index: node }) {
+        Node.Field { name, isPublic, .. } => {
+          if instance && kind == OwnerKind.Struct && (isPublic || inside) {
+            run offer(&mut items, hir, name, 5, prefix)
+          }
+        }
+        Node.Variant { name, .. } => {
+          if !instance {
+            run offer(&mut items, hir, name, 20, prefix)
+          }
+        }
+        Node.EnumMember { name, .. } => {
+          if !instance {
+            run offer(&mut items, hir, name, 20, prefix)
+          }
+        }
+        _ => ()
+      }
+      node = node + usize.ONE
+    }
+  }
+
+  // Methods: functions of an `impl` named for the type.
+  let spelling = run DeclarationId.copySpelling(owner)
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    let identity = &declarations[at].identity
+    let count = DeclarationId.ownerCount(identity)
+    if count >= 2 && DeclarationId.kind(identity) == OwnerKind.Function
+      && DeclarationId.ownerKind(identity, count - 2) == OwnerKind.Implementation
+      && DeclarationId.ownerNamedAs(identity, count - 2, Bytes.asSlice(&spelling)) {
+      let name = run DeclarationId.copySpelling(identity)
+      if startsWith(Bytes.asSlice(&name), prefix) && !labeled(List<Item>.asSlice(&items), Bytes.asSlice(&name)) {
+        run List<Item>.append(&mut items, Item { label: move name, kind: 2 })
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move items
+}
+
+// The public top-level declarations of `module`.
+effect fn exportsOf(store: &mut Semantic, module: &ModuleId, prefix: &[u8]) -> List<Item>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut candidates = List<Item>.make()
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  if let Option<AuthoredCursor>.Some { value: cursor } = move run StaticPort.authoredCursor(&mut port, module) {
+    if let Option<&IndexedSource>.Some { value: indexed } = move StaticPort.sourceAtCursor(&port, &cursor) {
+      run topLevel(&mut candidates, ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed)), prefix)
+    }
+  }
+  let mut items = List<Item>.make()
+  let listed = List<Item>.asSlice(&candidates)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if run Names.exported(&mut store.*, module, Bytes.asSlice(&listed[at].label)) {
+      run List<Item>.append(&mut items, Item { label: run Bytes.copy(Bytes.asSlice(&listed[at].label)), kind: listed[at].kind })
+    }
+    at = at + usize.ONE
+  }
+  return move items
+}
+
+// What the syntax of `module` shows in scope at `offset`, starting with `prefix`.
+effect fn scan(store: &mut Semantic, module: &ModuleId, offset: usize, prefix: &[u8]) -> Option<Scope>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<Scope>.none()
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return Option<Scope>.none()
+    }
+  }
+  let hir = IndexedSource.authored(indexed)
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  let mut items = List<Item>.make()
+
+  // The innermost binders first, so a local shadows a declaration of the same name.
+  let count = Module.length(hir)
+  let mut node = count
+  while node > usize.ZERO {
+    node = node - usize.ONE
+    let id = HirId { index: node }
+    match Module.node(hir, id) {
+      Node.BindingStatement { name, .. } => {
+        if Module.span(hir, name).end <= offset && visible(hir, declarations, name, offset) {
+          run offer(&mut items, hir, name, 6, prefix)
+        }
+      }
+      Node.BindingPattern { name, .. } => {
+        if Module.span(hir, name).end <= offset && visible(hir, declarations, name, offset) {
+          run offer(&mut items, hir, name, 6, prefix)
+        }
+      }
+      Node.Parameter { name, .. } => {
+        if visible(hir, declarations, name, offset) {
+          run offer(&mut items, hir, name, 6, prefix)
+        }
+      }
+      Node.TypeParameter { name, .. } => {
+        if visible(hir, declarations, name, offset) {
+          run offer(&mut items, hir, name, 25, prefix)
+        }
+      }
+      _ => ()
+    }
+  }
+  run topLevel(&mut items, declarations, prefix)
+
+  let mut imported = List<Bytes>.make()
+  node = usize.ZERO
+  while node < count {
+    match Module.node(hir, HirId { index: node }) {
+      Node.ImportMember { name, alias } => {
+        let mut bound = name
+        if alias.present {
+          bound = alias.id
+        }
+        if let Node.Name { text } = Module.node(hir, bound) {
+          let spelled = Module.text(hir, text)
+          if startsWith(spelled, prefix) {
+            run List<Bytes>.append(&mut imported, run Bytes.copy(spelled))
+          }
+        }
+      }
+      Node.ImportHeader { path, alias, members, .. } => {
+        // An alias names the module; without one, an import that selects no members names it
+        // by its last segment.
+        let mut bound = Option<HirId>.none()
+        if alias.present {
+          bound = Option<HirId>.some(alias.id)
+        } else if !members.present {
+          if let Node.Path { segments } = Module.node(hir, path) {
+            if segments.length > usize.ZERO {
+              bound = Option<HirId>.some(Module.child(hir, segments, segments.length - usize.ONE))
+            }
+          }
+        }
+        if let Option<HirId>.Some { value } = move bound {
+          run offer(&mut items, hir, value, 9, prefix)
+        }
+      }
+      _ => ()
+    }
+    node = node + usize.ONE
+  }
+  return Option<Scope>.some(Scope { items: move items, imported: move imported })
+}
+
+// The written type of the binding of `name` in scope at `offset`.
+effect fn receiverAt(store: &mut Semantic, module: &ModuleId, offset: usize, name: &[u8]) -> Receiver
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut receiver = Receiver { annotation: List<Bytes>.make(), bound: false }
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return move receiver
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return move receiver
+    }
+  }
+  let hir = IndexedSource.authored(indexed)
+  let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+
+  // The nearest binder before the receiver wins, as the innermost does in a scan from the end.
+  let mut node = Module.length(hir)
+  while node > usize.ZERO {
+    node = node - usize.ONE
+    let mut binder = Option<HirId>.none()
+    let mut annotation = Option<HirId>.none()
+    let mut ordered = true
+    match Module.node(hir, HirId { index: node }) {
+      Node.BindingStatement { name: bound, annotation: written, .. } => {
+        binder = Option<HirId>.some(bound)
+        if written.present {
+          annotation = Option<HirId>.some(written.id)
+        }
+      }
+      Node.Parameter { name: bound, annotation: written, .. } => {
+        binder = Option<HirId>.some(bound)
+        annotation = Option<HirId>.some(written)
+        ordered = false
+      }
+      _ => ()
+    }
+    if let Option<HirId>.Some { value: bound } = move binder {
+      let span = Module.span(hir, bound)
+      if (!ordered || span.end <= offset) && spelled(hir, bound, name) && visible(hir, declarations, bound, offset) {
+        receiver.bound = true
+        if let Option<HirId>.Some { value: written } = move annotation {
+          run pathOf(hir, written, &mut receiver.annotation)
+        }
+        return move receiver
+      }
+    }
+  }
+  return move receiver
+}
+
+// The path a written type names, through references, pointers and applied arguments.
+effect fn pathOf(hir: &Module, ty: HirId, segments: &mut List<Bytes>) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut node = ty
+  let mut depth = usize.ZERO
+  while depth < 16 {
+    match Module.node(hir, node) {
+      Node.NamedType { path, .. } => {
+        if let Node.Path { segments: written } = Module.node(hir, path) {
+          let mut at = usize.ZERO
+          while at < written.length {
+            if let Node.Name { text } = Module.node(hir, Module.child(hir, written, at)) {
+              run List<Bytes>.append(&mut segments.*, run Bytes.copy(Module.text(hir, text)))
+            }
+            at = at + usize.ONE
+          }
+        }
+        return ()
+      }
+      Node.AppliedType { target, .. } => {
+        node = target
+      }
+      Node.ReferenceType { referent, .. } => {
+        node = referent
+      }
+      Node.PointerType { pointee, .. } => {
+        node = pointee
+      }
+      _ => {
+        return ()
+      }
+    }
+    depth = depth + usize.ONE
+  }
+  return ()
+}
+
+// The module's named top-level declarations that start with `prefix`.
+effect fn topLevel(items: &mut List<Item>, declarations: &[IndexedDeclaration], prefix: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    if let Option<usize>.None = &declarations[at].parent {
+      let kind = declarationKind(DeclarationId.kind(&declarations[at].identity), false)
+      if kind != usize.ZERO {
+        let name = run DeclarationId.copySpelling(&declarations[at].identity)
+        if Bytes.length(&name) > usize.ZERO && startsWith(Bytes.asSlice(&name), prefix)
+          && !labeled(List<Item>.asSlice(&items.*), Bytes.asSlice(&name)) {
+          run List<Item>.append(&mut items.*, Item { label: move name, kind: kind })
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Whether the binder `name` is in scope at `offset`: every declaration that holds it holds the
+// offset too.
+fn visible(hir: &Module, declarations: &[IndexedDeclaration], name: HirId, offset: usize) -> bool {
+  let span = Module.span(hir, name)
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    let whole = Module.span(hir, declarations[at].local)
+    let holdsName = whole.start <= span.start && span.end <= whole.end
+    let holdsOffset = whole.start <= offset && offset <= whole.end
+    if holdsName && !holdsOffset {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn offer(items: &mut List<Item>, hir: &Module, name: HirId, kind: usize, prefix: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Node.Name { text } = Module.node(hir, name) {
+    let spelled = Module.text(hir, text)
+    if spelled.length > usize.ZERO && startsWith(spelled, prefix) && !labeled(List<Item>.asSlice(&items.*), spelled) {
+      run List<Item>.append(&mut items.*, Item { label: run Bytes.copy(spelled), kind: kind })
+    }
+  }
+  return ()
+}
+
+fn spelled(hir: &Module, name: HirId, spelling: &[u8]) -> bool {
+  if let Node.Name { text } = Module.node(hir, name) {
+    let written = Module.text(hir, text)
+    if written.length != spelling.length {
+      return false
+    }
+    let mut at = usize.ZERO
+    while at < written.length {
+      if written[at] != spelling[at] {
+        return false
+      }
+      at = at + usize.ONE
+    }
+    return true
+  }
+  return false
+}
+
+// The CompletionItemKind of a declaration, or zero for one completion leaves out.
+fn declarationKind(kind: OwnerKind, nested: bool) -> usize {
+  return match kind {
+    OwnerKind.Function => functionKind(nested)
+    OwnerKind.Struct => 22
+    OwnerKind.Tuple => 22
+    OwnerKind.Enumeration => 13
+    OwnerKind.Union => 13
+    OwnerKind.Service => 7
+    OwnerKind.Interface => 8
+    OwnerKind.Role => 8
+    OwnerKind.Constant => 21
+    OwnerKind.PackageParameter => 21
+    OwnerKind.ModuleProperty => 10
+    OwnerKind.Alias => 22
+    OwnerKind.Static => 6
+    _ => 0
+  }
+}
+
+fn functionKind(nested: bool) -> usize {
+  if nested {
+    return 2
+  }
+  return 3
+}
+
+fn nominal(ty: &Shared<Type>) -> Option<DeclarationId> {
+  return Shared<Type>.with<Option<DeclarationId>>(ty, fn(value: &Type) -> Option<DeclarationId> {
+    return match &value.* {
+      Type.Nominal { declaration, .. } => Option<DeclarationId>.some(DeclarationId.copy(&declaration))
+      Type.Reference { referent, .. } => nominal(&referent)
+      _ => Option<DeclarationId>.none()
+    }
+  })
+}
+
+fn labeled(items: &[Item], label: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < items.length {
+    let existing = Bytes.asSlice(&items[at].label)
+    if existing.length == label.length && spells(existing, label) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn spells(left: &[u8], right: &[u8]) -> bool {
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Whether `text` starts with `prefix`, ignoring ASCII case.
+pub fn startsWith(text: &[u8], prefix: &[u8]) -> bool {
+  if prefix.length > text.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < prefix.length {
+    if lower(text[at]) != lower(prefix[at]) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+/// Whether `byte` can be part of an identifier.
+pub fn identifierByte(byte: u8) -> bool {
+  return byte == '_' || (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') || (byte >= '0' && byte <= '9')
+}
+
+fn lower(byte: u8) -> u8 {
+  if byte >= 'A' && byte <= 'Z' {
+    return byte + 32
+  }
+  return byte
+}

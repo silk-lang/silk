@@ -1,9 +1,11 @@
 //! JSON-RPC 2.0 messages: reading a decoded message's method and id, and writing framed responses.
 
 import ReleaseVersion
+import lsp.Completion { Item }
 import lsp.Features { Edit, Fold, Symbol }
 import lsp.Navigation { Help }
-import lsp.Workspace { Hinted, Location, Position, Problem, Published, Shown }
+import lsp.Workspace { Changed, Hinted, Location, Placed, Position, Problem, Published, Shown }
+import silk.allocator { Allocator, OutOfMemoryError }
 import silk.box { Box }
 import silk.bytes { Bytes }
 import silk.effect { Effect }
@@ -25,6 +27,7 @@ pub enum ErrorCode {
   InvalidRequest,
   MethodNotFound,
   ServerNotInitialized,
+  RequestFailed,
 }
 
 /// How positions count columns: UTF-8 bytes when the client offers it, else UTF-16 code units.
@@ -57,6 +60,14 @@ pub union Reply {
   Hints { pub hints: List<Hinted> },
   /// A `textDocument/signatureHelp` result.
   Signature { pub help: Help },
+  /// A `textDocument/references` result.
+  Locations { pub locations: List<Location> },
+  /// A `textDocument/rename` result: a workspace edit by document.
+  Renamed { pub changes: List<Changed> },
+  /// A `workspace/symbol` result.
+  Placements { pub symbols: List<Placed> },
+  /// A `textDocument/completion` result.
+  Completions { pub items: List<Item> },
   /// An error response.
   Failure { pub code: ErrorCode, pub message: string<'static> },
 }
@@ -130,6 +141,22 @@ pub fn position(message: &Value) -> Option<Position> {
   return Option<Position>.none()
 }
 
+/// The string `params.<field>` of a message, such as a rename's `newName`.
+pub fn parameter<'a>(message: &'a Value, field: string) -> Option<string<'a>> {
+  return Json.asString(Json.fieldAt(Json.field(message, "params"), field))
+}
+
+/// Whether a `textDocument/references` request asks for the declaration too.
+pub fn includesDeclaration(message: &Value) -> bool {
+  let found = Json.fieldAt(Json.fieldAt(Json.field(message, "params"), "context"), "includeDeclaration")
+  if let Option<&Value>.Some { value } = move found {
+    if let Value.Bool { value: included } = &value.* {
+      return included
+    }
+  }
+  return false
+}
+
 /// The message's `params.textDocument.version`, or zero when it has none.
 pub fn version(message: &Value) -> usize {
   let found = Json.asU64(
@@ -141,27 +168,64 @@ pub fn version(message: &Value) -> usize {
   }
 }
 
-/// The text of the last whole-document change in a `didChange` notification's `contentChanges`.
-pub fn changedText<'a>(message: &'a Value) -> Option<string<'a>> {
-  let changes = Json.fieldAt(Json.field(message, "params"), "contentChanges")
-  let mut text = Option<string<'a>>.none()
-  if let Option<&Value>.Some { value } = move changes {
+/// The entries of a `didChange` notification's `contentChanges`, in order: each replaces a range
+/// of the text the entries before it left, or the whole document when it has no range.
+pub effect fn changes(message: &Value) -> List<Change>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut found = List<Change>.make()
+  let entries = Json.fieldAt(Json.field(message, "params"), "contentChanges")
+  if let Option<&Value>.Some { value } = move entries {
     if let Value.Array { values } = &value.* {
       let listed = List<JsonChild>.asSlice(&Box<List<JsonChild>>.get(&values)[0])
       let mut at = usize.ZERO
       while at < listed.length {
         if let JsonChild.Item { value: item } = &listed[at] {
-          if let Option<string>.Some { value: whole } = move Json.asString(
-            Json.field(&item, "text")
-          ) {
-            text = Option<string<'a>>.some(whole)
+          if let Option<string>.Some { value: text } = move Json.asString(Json.field(&item, "text")) {
+            let start = positionIn(&item, "start")
+            let end = positionIn(&item, "end")
+            let mut change = Change {
+              whole: true,
+              start: Position { line: usize.ZERO, character: usize.ZERO },
+              end: Position { line: usize.ZERO, character: usize.ZERO },
+              text: run Bytes.copy(String.utf8Bytes(text)),
+            }
+            if let Option<Position>.Some { value: from } = move start {
+              if let Option<Position>.Some { value: to } = move end {
+                change.whole = false
+                change.start = from
+                change.end = to
+              }
+            }
+            run List<Change>.append(&mut found, move change)
           }
         }
         at = at + 1
       }
     }
   }
-  return move text
+  return move found
+}
+
+/// One entry of a `didChange` notification: `text` replaces the range from `start` to `end`, or
+/// the whole document when `whole` is set.
+pub struct Change {
+  pub whole: bool
+  pub start: Position
+  pub end: Position
+  pub text: Bytes
+}
+
+// The position `range.<end>` of one content change.
+fn positionIn(change: &Value, end: string) -> Option<Position> {
+  let line = Json.asU64(Json.fieldAt(Json.fieldAt(Json.field(change, "range"), end), "line"))
+  let character = Json.asU64(Json.fieldAt(Json.fieldAt(Json.field(change, "range"), end), "character"))
+  if let Option<u64>.Some { value: row } = move line {
+    if let Option<u64>.Some { value: column } = move character {
+      return Option<Position>.some(Position { line: u64.toUsize(row), character: u64.toUsize(column) })
+    }
+  }
+  return Option<Position>.none()
 }
 
 /// Writes one framed `textDocument/publishDiagnostics` notification.
@@ -260,6 +324,35 @@ effect fn writeSymbols(symbols: &[Symbol], parent: usize) -> ()
   return run Writer.writeAll(b"]")
 }
 
+effect fn writeLocation(location: &Location) -> ()
+  ! JsonError | WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"{\"uri\":")
+  run writeText(Bytes.asSlice(&location.uri))
+  run Writer.writeAll(b",\"range\":")
+  run writeRange(&location.start, &location.end)
+  return run Writer.writeAll(b"}")
+}
+
+effect fn writeEdits(edits: &[Edit]) -> ()
+  ! JsonError | WriterError
+  ? &mut Writer {
+  run Writer.writeAll(b"[")
+  let mut at = usize.ZERO
+  while at < edits.length {
+    if at > usize.ZERO {
+      run Writer.writeAll(b",")
+    }
+    run Writer.writeAll(b"{\"range\":")
+    run writeRange(&edits[at].start, &edits[at].end)
+    run Writer.writeAll(b",\"newText\":")
+    run writeText(Bytes.asSlice(&edits[at].text))
+    run Writer.writeAll(b"}")
+    at = at + usize.ONE
+  }
+  return run Writer.writeAll(b"]")
+}
+
 effect fn writeRange(start: &Position, end: &Position) -> ()
   ! WriterError
   ? &mut Writer {
@@ -321,8 +414,8 @@ effect fn content(id: &Value, reply: &Reply) -> ()
         PositionEncoding.Utf16 => run JsonOutput.writeString("utf-16")
       }
 
-      // Full text sync: every change notification carries the document's whole text.
-      run Writer.writeAll(b",\"textDocumentSync\":{\"openClose\":true,\"change\":1}")
+      // Incremental text sync: a change notification carries the ranges it replaces.
+      run Writer.writeAll(b",\"textDocumentSync\":{\"openClose\":true,\"change\":2}")
       run Writer.writeAll(
         b",\"documentSymbolProvider\":true,\"foldingRangeProvider\":true,\"documentFormattingProvider\":true"
       )
@@ -330,6 +423,8 @@ effect fn content(id: &Value, reply: &Reply) -> ()
         b",\"hoverProvider\":true,\"definitionProvider\":true,\"inlayHintProvider\":true"
       )
       run Writer.writeAll(b",\"signatureHelpProvider\":{\"triggerCharacters\":[\"(\",\",\"]}")
+      run Writer.writeAll(b",\"referencesProvider\":true,\"renameProvider\":true,\"workspaceSymbolProvider\":true")
+      run Writer.writeAll(b",\"completionProvider\":{\"triggerCharacters\":[\".\"]}")
       run Writer.writeAll(b"},\"serverInfo\":{\"name\":\"silk\",\"version\":")
       match String.fromUtf8(ReleaseVersion.value()) {
         Result<string, InvalidUtf8>.Success { value } => run JsonOutput.writeString(value)
@@ -384,23 +479,7 @@ effect fn content(id: &Value, reply: &Reply) -> ()
     Reply.Edits { edits } => {
       run Writer.writeAll(b",\"result\":")
       match &edits {
-        Option<List<Edit>>.Some { value } => {
-          run Writer.writeAll(b"[")
-          let listed = List<Edit>.asSlice(&value)
-          let mut at = usize.ZERO
-          while at < listed.length {
-            if at > usize.ZERO {
-              run Writer.writeAll(b",")
-            }
-            run Writer.writeAll(b"{\"range\":")
-            run writeRange(&listed[at].start, &listed[at].end)
-            run Writer.writeAll(b",\"newText\":")
-            run writeText(Bytes.asSlice(&listed[at].text))
-            run Writer.writeAll(b"}")
-            at = at + usize.ONE
-          }
-          run Writer.writeAll(b"]")
-        }
+        Option<List<Edit>>.Some { value } => run writeEdits(List<Edit>.asSlice(&value))
         Option<List<Edit>>.None => run Writer.writeAll(b"null")
       }
     }
@@ -412,11 +491,8 @@ effect fn content(id: &Value, reply: &Reply) -> ()
       run Writer.writeAll(b"}")
     }
     Reply.Located { location } => {
-      run Writer.writeAll(b",\"result\":{\"uri\":")
-      run writeText(Bytes.asSlice(&location.uri))
-      run Writer.writeAll(b",\"range\":")
-      run writeRange(&location.start, &location.end)
-      run Writer.writeAll(b"}")
+      run Writer.writeAll(b",\"result\":")
+      run writeLocation(&location)
     }
     Reply.Hints { hints } => {
       run Writer.writeAll(b",\"result\":[")
@@ -459,6 +535,70 @@ effect fn content(id: &Value, reply: &Reply) -> ()
       run writeDecimal(help.active)
       run Writer.writeAll(b"}")
     }
+    Reply.Locations { locations } => {
+      run Writer.writeAll(b",\"result\":[")
+      let listed = List<Location>.asSlice(&locations)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO {
+          run Writer.writeAll(b",")
+        }
+        run writeLocation(&listed[at])
+        at = at + usize.ONE
+      }
+      run Writer.writeAll(b"]")
+    }
+    Reply.Renamed { changes } => {
+      run Writer.writeAll(b",\"result\":{\"changes\":{")
+      let listed = List<Changed>.asSlice(&changes)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO {
+          run Writer.writeAll(b",")
+        }
+        run writeText(Bytes.asSlice(&listed[at].uri))
+        run Writer.writeAll(b":")
+        run writeEdits(List<Edit>.asSlice(&listed[at].edits))
+        at = at + usize.ONE
+      }
+      run Writer.writeAll(b"}}")
+    }
+    Reply.Placements { symbols } => {
+      run Writer.writeAll(b",\"result\":[")
+      let listed = List<Placed>.asSlice(&symbols)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO {
+          run Writer.writeAll(b",")
+        }
+        run Writer.writeAll(b"{\"name\":")
+        run writeText(Bytes.asSlice(&listed[at].name))
+        run Writer.writeAll(b",\"kind\":")
+        run writeDecimal(listed[at].kind)
+        run Writer.writeAll(b",\"location\":")
+        run writeLocation(&listed[at].location)
+        run Writer.writeAll(b"}")
+        at = at + usize.ONE
+      }
+      run Writer.writeAll(b"]")
+    }
+    Reply.Completions { items } => {
+      run Writer.writeAll(b",\"result\":{\"isIncomplete\":false,\"items\":[")
+      let listed = List<Item>.asSlice(&items)
+      let mut at = usize.ZERO
+      while at < listed.length {
+        if at > usize.ZERO {
+          run Writer.writeAll(b",")
+        }
+        run Writer.writeAll(b"{\"label\":")
+        run writeText(Bytes.asSlice(&listed[at].label))
+        run Writer.writeAll(b",\"kind\":")
+        run writeDecimal(listed[at].kind)
+        run Writer.writeAll(b"}")
+        at = at + usize.ONE
+      }
+      run Writer.writeAll(b"]}")
+    }
     Reply.Failure { code, message } => {
       run Writer.writeAll(b",\"error\":{\"code\":")
       run Writer.writeAll(codeText(code))
@@ -476,6 +616,7 @@ fn codeText(code: ErrorCode) -> &'static [u8] {
     ErrorCode.InvalidRequest => b"-32600"
     ErrorCode.MethodNotFound => b"-32601"
     ErrorCode.ServerNotInitialized => b"-32002"
+    ErrorCode.RequestFailed => b"-32803"
   }
 }
 

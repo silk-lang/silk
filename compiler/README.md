@@ -24,11 +24,15 @@ invalidates. It checks the package as `silk check` does, but in a store opened w
 `Semantic.update` and checks again. It prints no diagnostics; each step writes one line:
 
 ```text
-silk-replay step=1 kind=trivia module=silk/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 rejections=5 update-us=238 check-us=904871
+silk-replay step=1 kind=trivia module=silk/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 answers=68759 mir-functions=5927 rejections=5 update-us=238 check-us=904871
 ```
 
 `demands`, `hits`, `units-run` and `marked-outdated` are what that step added to the store's
-`Statistics`; `graph-units` and `graph-bytes` are the dependency graph's size after it.
+`Statistics`; `graph-units` and `graph-bytes` are the dependency graph's size after it, and
+`answers` and `mir-functions` the completed answers and lowered MIR functions the store holds.
+After each check the replay drops what the language server drops after each of its steps: the
+request's roots (`Request.forgetRoots`) and the lowered functions no answer names any more
+(`Semantic.releaseStaleMir`), which a unit that reruns has replaced.
 `rejections` counts the root package's rejections and every parsed module's syntax errors, and
 `update-us` and `check-us` are the wall time of `Semantic.update` and of the check. Step 0 is the
 first check. The `replayUpdate` and `replayCheck` Tracy zones cover the same spans.
@@ -37,7 +41,8 @@ A script is a TOML file of `[[edit]]` tables applied in order. `kind` is `trivia
 `header-same-type`, `header-new-type`, `add`, `delete` or `rename`, and `module` is the edited
 module's path below the package's module directory. A rename names the new path in `to`; every
 other kind replaces `find`, which must occur exactly once in the module, with `replace`.
-`fixtures/replay` holds one script for the compiler and one for the standard library:
+`fixtures/replay` holds one script for the compiler and two for the standard library, the
+second (`stdlib-long.toml`) twenty edits that add and remove one comment:
 
 ```sh
 cd compiler && silk check --stdlib ../stdlib --replay fixtures/replay/compiler.toml
@@ -51,6 +56,16 @@ rejection only one store reached, and the replay exits with status 1 when any st
 difference is a reconciliation bug in the revisable store. The one-shot store gets the revisable
 store's final profile, so a step that edits a `param` declaration compares against the profile
 assembled before the edit.
+
+With `SILK_REPLAY_RUNS` set, every edit step also writes one `silk-replay-run step=<n> <unit>`
+line per unit it ran, such as `Body silk/bytes.Bytes.append`, and one
+`silk-replay-stale step=<n> <unit> <- <dependee>` line per outdated unit that failed
+verification, naming the first dependee it found changed: another unit, a whole `file`, or an
+`input` by its module and selector. Count them to find what an edit fans out through:
+
+```sh
+SILK_REPLAY_RUNS=1 silk check ... --replay <script> | grep '^silk-replay-stale step=4 ' | sort | uniq -c
+```
 
 For the standard library, assemble `fixtures/stdlib-root` as the `stdlib-root` CI job does and
 run `silk check --stdlib <that directory> --replay <checkout>/compiler/fixtures/replay/stdlib.toml`
@@ -67,22 +82,24 @@ capped too, and the compiler script's rejection counts must match. The same job 
 standard library script with `--differential` and replays every corpus program with
 `.github/scripts/replay-corpus.mjs`, which adds a comment to each `main.silk` and removes it again
 and requires both stores to agree. The compiler replay runs without `--differential`, since two
-compiler stores need more memory than a CI runner has.
+compiler stores need more memory than a CI runner has. The long standard library script's
+entry has a `retention` budget instead: its `answers` and `mir-functions` may not grow from step
+2 to the last step, so what an edit replaces is released and a long session stays the same size.
 
-The budgets allow twice the measured units (at least 20 more) and one and a half times the
-measured demand fraction. When a change moves a step's numbers for a good reason, replay the
-script and update its entry. Measured on 2026-10-21:
+The budgets allow twice the measured units (at least 20 more) and about two and a half times
+the largest measured demand fraction. When a change moves a step's numbers for a good reason, replay the
+script and update its entry. Measured on 2026-10-22:
 
 | Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |
 | --- | --- | --- | --- | --- |
-| initial check | 132,048 | 15,869,737 | 64,550 | 2,185,506 |
-| trivia | 3 | 6.8% | 16 | 9.7% |
-| body | 2 | 6.8% | 17 | 9.7% |
-| header, same type | 7 | 6.8% | 25 | 9.9% |
-| add | 532 | 16.0% | 660 | 17.2% |
-| header, new type | 6 | 6.8% | 19 | 9.7% |
-| delete | 528 | 16.0% | 656 | 17.2% |
-| rename | 8 | 6.2% | 176 | 9.9% |
+| initial check | 146,118 | 16,780,544 | 68,944 | 2,303,049 |
+| trivia | 6 | 0.6% | 19 | 1.1% |
+| body | 5 | 0.6% | 20 | 1.1% |
+| header, same type | 10 | 0.6% | 31 | 1.6% |
+| add | 12 | 0.6% | 35 | 1.1% |
+| header, new type | 9 | 0.6% | 22 | 1.1% |
+| delete | 8 | 0.6% | 31 | 1.1% |
+| rename | 19 | 0.6% | 187 | 1.5% |
 
 An update marks outdated every unit that consumed a change, directly or through another unit,
 and a demand then verifies an outdated unit before it reruns it: the unit stays current when
@@ -91,10 +108,17 @@ every dependee it consumed kept its answer, judged by the answer fingerprints. A
 members store absolute spans, so an edit that moves an `impl` reruns its heads, but their answers
 hash without those spans and their dependers are verified. The units that rerun on a trivia edit
 are those heads and MIR lowerings, whose `module:line:column` site labels move with the lines.
-Adding or deleting a declaration still reruns every depender: name lookups have no fingerprint
-yet. On a 4-core x86_64 machine the
-compiler's first check took about 67 s and each edit's recheck 7 to 18 s, almost all of it the
-walk over every root.
+A call through a type or a receiver reads the owner's member of its own name (the
+`InherentMember` family, a projection of the owner's whole member list), so adding or deleting a
+method reruns only the member list and the projections of names that changed.
+
+A revisable store keeps each module's declaration sweep and the escape check of the package's
+concrete bodies as units of the `ModuleCheck` family. They are no providers: `checkDeclarations`
+and `checkModule` run them and record the root demands and source reads they make, so a recheck
+verifies an unaffected module's sweep instead of walking its roots again, and reuses the escape
+check while every MIR answer it read is current. The escape check is one whole-program walk, so
+an edit that changes any MIR answer it reached (a trivia edit moves site labels) runs it again,
+and it is most of what a recheck costs.
 
 ## Check roots
 

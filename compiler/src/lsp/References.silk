@@ -1,0 +1,604 @@
+//! Find references and rename over one package's store, and the declarations a workspace symbol
+//! search lists.
+//!
+//! A search starts from the name under the cursor: a declaration, or a local or generic parameter
+//! of one body. Only modules whose text spells the name are read, and in them only the written
+//! names that spell it are resolved, each as hover resolves it, so a search costs a byte scan of
+//! each module and the bodies that write the name, which the store has usually checked already.
+
+import hir.Hir { HirId, Module, Node }
+import lexer.Span { Span }
+import lsp.Features
+import lsp.Names as Names { NameAt, Named, Site }
+import semantic.DeclarationId { DeclarationId }
+import semantic.ModuleId { InvalidModulePath, ModuleId }
+import semantic.ModuleIndex { IndexedDeclaration, ModuleIndex }
+import semantic.Query { Cycle }
+import semantic.Semantic { Dependency, Semantic, StaticPort }
+import semantic.SourceIndex { AuthoredCursor, IndexedSource, RevisionMismatch }
+import semantic.SourceUnit { SourceUnit }
+import semantic.Types { Types }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.list { List }
+import silk.option { Option }
+import silk.slice { Slice }
+import silk.usize
+
+/// What a search looks for.
+pub union Sought {
+  /// A declaration, wherever it is named.
+  Declaration { pub identity: DeclarationId },
+  /// A local or generic parameter of a body in `module`, by its binder's span.
+  Local { pub module: ModuleId, pub binder: Span },
+}
+
+/// What a search looks for and the name it is written with.
+pub struct Target {
+  pub sought: Sought
+  pub spelling: Bytes
+}
+
+/// The places one module names a target, in source order, and the module's text.
+pub struct Found {
+  pub module: ModuleId
+  pub text: Bytes
+  pub spans: List<Span>
+}
+
+/// One declaration a workspace symbol search lists: its name, its SymbolKind number and the span
+/// of its name, or of its header when it writes no name.
+pub struct Declared {
+  pub name: Bytes
+  pub kind: usize
+  pub span: Span
+}
+
+/// The declarations of one module that a workspace symbol search lists, and the module's text.
+pub struct Listed {
+  pub text: Bytes
+  pub declared: List<Declared>
+}
+
+// The written names of one module that spell a target.
+struct Spelled {
+  text: Bytes
+
+  // Names in headers and bodies, each resolved as hover resolves it.
+  names: List<Candidate>
+
+  // Declarations whose own name spells it.
+  declared: List<DeclaredName>
+
+  // Import members that spell it, with the name each binds in the module.
+  imported: List<ImportedName>
+}
+
+struct Candidate {
+  span: Span
+
+  // Whether the name is a whole identifier expression, which reads module scope when its body's
+  // table holds no entry for it, as the type in `Point.make()` does.
+  expression: bool
+}
+
+struct DeclaredName {
+  span: Span
+  identity: DeclarationId
+}
+
+struct ImportedName {
+  span: Span
+  local: Bytes
+}
+
+/// What the name at `offset` of `module` refers to, as a search target: the name a body or header
+/// writes, a declaration's own name, an import member, or the binder of a local or generic
+/// parameter. Absent for a field, a namespace or a place that names nothing.
+pub effect fn target(store: &mut Semantic, module: &ModuleId, offset: usize) -> Option<Target>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  if let Option<NameAt>.Some { value: found } = move run Names.at(&mut store.*, module, offset) {
+    return match move found.named {
+      Named.Declaration { identity } => run declarationTarget(&mut store.*, move identity)
+      Named.Local { binder, .. } => run localTarget(&mut store.*, module, binder)
+      Named.Binder { binder } => run localTarget(&mut store.*, module, binder)
+      _ => Option<Target>.none()
+    }
+  }
+  if let Option<NameAt>.Some { value: declared } = move run Names.declaredAt(&mut store.*, module, offset) {
+    if let Named.Declaration { identity } = move declared.named {
+      return run declarationTarget(&mut store.*, move identity)
+    }
+  }
+
+  // An import member or a binder: what the module's other names that spell it resolve to.
+  let written = match move run writtenAt(&mut store.*, module, offset) {
+    Option<Span>.Some { value } => value
+    Option<Span>.None => {
+      return Option<Target>.none()
+    }
+  }
+  let spelled = match move run spelledIn(&mut store.*, module, written) {
+    Option<Spelled>.Some { value } => move value
+    Option<Spelled>.None => {
+      return Option<Target>.none()
+    }
+  }
+  let imports = List<ImportedName>.asSlice(&spelled.imported)
+  let mut at = usize.ZERO
+  while at < imports.length {
+    if imports[at].span.start == written.start {
+      if let Option<Named>.Some { value: Named.Declaration { identity } } = move run Names.scoped(
+        &mut store.*,
+        module,
+        Bytes.asSlice(&imports[at].local)
+      ) {
+        return run declarationTarget(&mut store.*, move identity)
+      }
+      return Option<Target>.none()
+    }
+    at = at + usize.ONE
+  }
+  let names = List<Candidate>.asSlice(&spelled.names)
+  at = usize.ZERO
+  while at < names.length {
+    if names[at].span.start != written.start {
+      if let Option<NameAt>.Some { value: use } = move run Names.at(&mut store.*, module, names[at].span.start) {
+        if let Option<Span>.Some { value: binder } = move binderOf(&use.named) {
+          if binder.start == written.start && binder.end == written.end {
+            return run localTarget(&mut store.*, module, binder)
+          }
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Target>.none()
+}
+
+/// Every place `modules` name `target`, its own declaration too when `declaration` is set.
+pub effect fn references(store: &mut Semantic, modules: &[ModuleId], target: &Target, declaration: bool) -> List<Found>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut found = List<Found>.make()
+  let spelling = Bytes.asSlice(&target.spelling)
+  let mut at = usize.ZERO
+  while at < modules.length {
+    let module = &modules[at]
+    let mut searched = true
+    if let Sought.Local { module: home, .. } = &target.sought {
+      searched = ModuleId.equals(&home, module)
+    }
+    if searched {
+      if let Option<Spelled>.Some { value: spelled } = move run spelled(&mut store.*, module, spelling) {
+        let spans = run referencesIn(&mut store.*, module, &spelled, target, declaration)
+        if List<Span>.length(&spans) > usize.ZERO {
+          run List<Found>.append(&mut found, Found { module: ModuleId.copy(module), text: move spelled.text, spans: move spans })
+        }
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+/// The declarations of `module` whose names hold `query`, ignoring ASCII case; every one for an
+/// empty query.
+pub effect fn declarations(store: &mut Semantic, module: &ModuleId, query: &[u8]) -> Option<Listed>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<Listed>.none()
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return Option<Listed>.none()
+    }
+  }
+  let hir = IndexedSource.authored(indexed)
+  let text = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
+  let listed = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  let mut declared = List<Declared>.make()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let nested = match &listed[at].parent {
+      Option<usize>.Some { .. } => true
+      Option<usize>.None => false
+    }
+    let kind = Features.symbolKind(DeclarationId.kind(&listed[at].identity), nested)
+    if kind != usize.ZERO {
+      let header = Module.span(hir, listed[at].header)
+      let name = run Features.symbolName(&listed[at].identity, text, header)
+      if holdsIgnoringCase(Bytes.asSlice(&name), query) {
+        let span = match move run Names.declarationName(hir, &listed[at]) {
+          Option<Span>.Some { value } => value
+          Option<Span>.None => header
+        }
+        run List<Declared>.append(&mut declared, Declared { name: move name, kind: kind, span: span })
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Listed>.some(Listed { text: run Bytes.copy(text), declared: move declared })
+}
+
+// The places in one module's spelled names that name `target`, in source order.
+effect fn referencesIn(store: &mut Semantic, module: &ModuleId, spelled: &Spelled, target: &Target, declaration: bool) -> List<Span>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut spans = List<Span>.make()
+  match &target.sought {
+    Sought.Declaration { identity } => {
+      if declaration {
+        let declared = List<DeclaredName>.asSlice(&spelled.declared)
+        let mut at = usize.ZERO
+        while at < declared.length {
+          if DeclarationId.equals(&declared[at].identity, &identity) {
+            run List<Span>.append(&mut spans, declared[at].span)
+          }
+          at = at + usize.ONE
+        }
+      }
+      let imports = List<ImportedName>.asSlice(&spelled.imported)
+      let mut at = usize.ZERO
+      while at < imports.length {
+        let named = run Names.scoped(&mut store.*, module, Bytes.asSlice(&imports[at].local))
+        if declares(&named, &identity) {
+          run List<Span>.append(&mut spans, imports[at].span)
+        }
+        at = at + usize.ONE
+      }
+      let names = List<Candidate>.asSlice(&spelled.names)
+      at = usize.ZERO
+      while at < names.length {
+        match move run Names.at(&mut store.*, module, names[at].span.start) {
+          Option<NameAt>.Some { value: use } => {
+            if let Named.Declaration { identity: used } = &use.named {
+              if DeclarationId.equals(&used, &identity) {
+                run List<Span>.append(&mut spans, names[at].span)
+              }
+            }
+          }
+          Option<NameAt>.None => {
+            if names[at].expression {
+              let named = run Names.scoped(&mut store.*, module, Bytes.asSlice(&target.spelling))
+              if declares(&named, &identity) {
+                run List<Span>.append(&mut spans, names[at].span)
+              }
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+    Sought.Local { binder, .. } => {
+      if declaration {
+        run List<Span>.append(&mut spans, binder)
+      }
+      let names = List<Candidate>.asSlice(&spelled.names)
+      let mut at = usize.ZERO
+      while at < names.length {
+        if names[at].span.start != binder.start {
+          if let Option<NameAt>.Some { value: use } = move run Names.at(&mut store.*, module, names[at].span.start) {
+            if let Option<Span>.Some { value: bound } = move binderOf(&use.named) {
+              if bound.start == binder.start && bound.end == binder.end {
+                run List<Span>.append(&mut spans, names[at].span)
+              }
+            }
+          }
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  sortSpans(List<Span>.asMutSlice(&mut spans))
+  return move spans
+}
+
+effect fn declarationTarget(store: &mut Semantic, identity: DeclarationId) -> Option<Target>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  // The name as its declaration writes it, which an alias at the cursor does not change.
+  let mut spelling = run DeclarationId.copySpelling(&identity)
+  if let Option<Site>.Some { value: site } = move run Names.site(&mut store.*, &identity) {
+    if site.name.end <= Bytes.length(&site.text) && site.name.start < site.name.end {
+      spelling = run Bytes.copy(Slice.view<u8>(Bytes.asSlice(&site.text), site.name.start, site.name.end - site.name.start))
+    }
+  }
+  if Bytes.length(&spelling) == usize.ZERO {
+    return Option<Target>.none()
+  }
+  return Option<Target>.some(Target { sought: Sought.Declaration { identity: move identity }, spelling: move spelling })
+}
+
+effect fn localTarget(store: &mut Semantic, module: &ModuleId, binder: Span) -> Option<Target>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<Target>.none()
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return Option<Target>.none()
+    }
+  }
+  let text = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
+  if binder.end > text.length || binder.start >= binder.end {
+    return Option<Target>.none()
+  }
+  return Option<Target>.some(Target {
+    sought: Sought.Local { module: ModuleId.copy(module), binder: binder },
+    spelling: run Bytes.copy(Slice.view<u8>(text, binder.start, binder.end - binder.start)),
+  })
+}
+
+// The span of the innermost written name at `offset` of `module`, end inclusive as `Names.at`
+// reads it.
+effect fn writtenAt(store: &mut Semantic, module: &ModuleId, offset: usize) -> Option<Span>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<Span>.none()
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return Option<Span>.none()
+    }
+  }
+  let hir = IndexedSource.authored(indexed)
+  let mut found = Option<Span>.none()
+  let mut width = usize.MAX
+  let count = Module.length(hir)
+  let mut at = usize.ZERO
+  while at < count {
+    let id = HirId { index: at }
+    if let Node.Name { .. } = Module.node(hir, id) {
+      let span = Module.span(hir, id)
+      if span.start <= offset && offset <= span.end && span.end - span.start < width {
+        found = Option<Span>.some(span)
+        width = span.end - span.start
+      }
+    }
+    at = at + usize.ONE
+  }
+  return move found
+}
+
+// The names of `module` spelled as the text at `written` is.
+effect fn spelledIn(store: &mut Semantic, module: &ModuleId, written: Span) -> Option<Spelled>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let text = match move run moduleText(&mut store.*, module) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return Option<Spelled>.none()
+    }
+  }
+  if written.end > Bytes.length(&text) || written.start >= written.end {
+    return Option<Spelled>.none()
+  }
+  let spelling = run Bytes.copy(Slice.view<u8>(Bytes.asSlice(&text), written.start, written.end - written.start))
+  return run spelled(&mut store.*, module, Bytes.asSlice(&spelling))
+}
+
+effect fn moduleText(store: &mut Semantic, module: &ModuleId) -> Option<Bytes>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<Bytes>.none()
+    }
+  }
+  return match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => Option<Bytes>.some(run Bytes.copy(SourceUnit.bytes(IndexedSource.sourceUnit(value))))
+    Option<&IndexedSource>.None => Option<Bytes>.none()
+  }
+}
+
+// The written names of `module` that spell `spelling`; absent when its text never spells it.
+effect fn spelled(store: &mut Semantic, module: &ModuleId, spelling: &[u8]) -> Option<Spelled>
+  ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let mut port = Semantic.staticPort(&mut store.*, &mut dependencies)
+  let cursor = match move run StaticPort.authoredCursor(&mut port, module) {
+    Option<AuthoredCursor>.Some { value } => move value
+    Option<AuthoredCursor>.None => {
+      return Option<Spelled>.none()
+    }
+  }
+  let indexed = match move StaticPort.sourceAtCursor(&port, &cursor) {
+    Option<&IndexedSource>.Some { value } => value
+    Option<&IndexedSource>.None => {
+      return Option<Spelled>.none()
+    }
+  }
+  let text = SourceUnit.bytes(IndexedSource.sourceUnit(indexed))
+  if spelling.length == usize.ZERO || !holds(text, spelling) {
+    return Option<Spelled>.none()
+  }
+  let hir = IndexedSource.authored(indexed)
+  let mut declared = List<DeclaredName>.make()
+  let listed = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if let Option<Span>.Some { value: name } = move run Names.declarationName(hir, &listed[at]) {
+      if spells(text, name, spelling) {
+        run List<DeclaredName>.append(&mut declared, DeclaredName { span: name, identity: DeclarationId.copy(&listed[at].identity) })
+      }
+    }
+    at = at + usize.ONE
+  }
+
+  // The arena is postorder, so a name's parent comes after it: one pass finds the names that
+  // imports and identifier expressions hold, a second classifies every name that spells it.
+  let mut imported = List<ImportedName>.make()
+  let mut skipped = List<usize>.make()
+  let mut expressions = List<usize>.make()
+  let count = Module.length(hir)
+  at = usize.ZERO
+  while at < count {
+    match Module.node(hir, HirId { index: at }) {
+      Node.ImportMember { name, alias } => {
+        let span = Module.span(hir, name)
+        if spells(text, span, spelling) {
+          let mut local = run Bytes.copy(spelling)
+          if alias.present {
+            let aliased = Module.span(hir, alias.id)
+            local = run Bytes.copy(Slice.view<u8>(text, aliased.start, aliased.end - aliased.start))
+          }
+          run List<ImportedName>.append(&mut imported, ImportedName { span: span, local: move local })
+        }
+        run List<usize>.append(&mut skipped, name.index)
+        if alias.present {
+          run List<usize>.append(&mut skipped, alias.id.index)
+        }
+      }
+      Node.IdentifierExpression { name, .. } => run List<usize>.append(&mut expressions, name.index)
+      _ => ()
+    }
+    at = at + usize.ONE
+  }
+  let mut names = List<Candidate>.make()
+  at = usize.ZERO
+  while at < count {
+    let id = HirId { index: at }
+    if let Node.Name { .. } = Module.node(hir, id) {
+      let span = Module.span(hir, id)
+      if spells(text, span, spelling) && !among(List<usize>.asSlice(&skipped), at) && !isDeclared(List<DeclaredName>.asSlice(&declared), span) {
+        run List<Candidate>.append(&mut names, Candidate { span: span, expression: among(List<usize>.asSlice(&expressions), at) })
+      }
+    }
+    at = at + usize.ONE
+  }
+  return Option<Spelled>.some(Spelled {
+    text: run Bytes.copy(text),
+    names: move names,
+    declared: move declared,
+    imported: move imported,
+  })
+}
+
+fn binderOf(named: &Named) -> Option<Span> {
+  return match &named.* {
+    Named.Local { binder, .. } => Option<Span>.some(binder)
+    Named.Binder { binder } => Option<Span>.some(binder)
+    _ => Option<Span>.none()
+  }
+}
+
+fn declares(named: &Option<Named>, identity: &DeclarationId) -> bool {
+  if let Option<Named>.Some { value: Named.Declaration { identity: found } } = &named.* {
+    return DeclarationId.equals(&found, identity)
+  }
+  return false
+}
+
+fn isDeclared(declared: &[DeclaredName], span: Span) -> bool {
+  let mut at = usize.ZERO
+  while at < declared.length {
+    if declared[at].span.start == span.start {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn among(indexes: &[usize], index: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < indexes.length {
+    if indexes[at] == index {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn spells(text: &[u8], span: Span, spelling: &[u8]) -> bool {
+  if span.end > text.length || span.end < span.start || span.end - span.start != spelling.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < spelling.length {
+    if text[span.start + at] != spelling[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn holds(text: &[u8], needle: &[u8]) -> bool {
+  let mut start = usize.ZERO
+  while start + needle.length <= text.length {
+    if text[start] == needle[0] && spells(text, Span { start: start, end: start + needle.length }, needle) {
+      return true
+    }
+    start = start + usize.ONE
+  }
+  return false
+}
+
+fn holdsIgnoringCase(text: &[u8], needle: &[u8]) -> bool {
+  let mut start = usize.ZERO
+  while start + needle.length <= text.length {
+    let mut same = true
+    let mut at = usize.ZERO
+    while same && at < needle.length {
+      same = lower(text[start + at]) == lower(needle[at])
+      at = at + usize.ONE
+    }
+    if same {
+      return true
+    }
+    start = start + usize.ONE
+  }
+  return false
+}
+
+fn lower(byte: u8) -> u8 {
+  if byte >= 'A' && byte <= 'Z' {
+    return byte + 32
+  }
+  return byte
+}
+
+// Insertion sort by start; a module names a target a handful of times.
+fn sortSpans(spans: &mut [Span]) -> () {
+  let mut at = usize.ONE
+  while at < spans.length {
+    let moving = spans[at]
+    let mut into = at
+    while into > usize.ZERO && spans[into - usize.ONE].start > moving.start {
+      spans[into] = spans[into - usize.ONE]
+      into = into - usize.ONE
+    }
+    spans[into] = moving
+    at = at + usize.ONE
+  }
+  return ()
+}

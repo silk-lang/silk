@@ -11,7 +11,8 @@
 // many reruns must complete answers that hash equal to the ones they replace. A budgeted `verified`
 // count is a floor too: that many outdated units must be confirmed current without rerunning. A
 // `--differential` log must also report `differences=0` for every step. The initial check is only
-// reported.
+// reported. An entry's `retention` bounds how much its `answers` and `mir-functions` may grow from
+// step `from` to the last step, so a long session releases what its edits replace.
 import { readFileSync } from 'node:fs';
 
 const [logPath, budgetsPath, workspace] = process.argv.slice(2);
@@ -84,6 +85,18 @@ for (let at = 0; at < Math.min(steps.length, budgets.length); at += 1) {
   }
   const limit = (value, max) => (at > 0 ? `${value} / ${max}` : value);
   rows.push(`| ${at} | ${budget.kind} | ${limit(step['units-run'], budget.units)} | ${limit(step['marked-outdated'], budget.outdated)} | ${step.demands} (${limit(fraction.toFixed(3), budget.demandsFraction)}) | ${step.unchanged ?? '-'} | ${step.verified ?? '-'} | ${step.rejections} | ${step['update-us']} | ${step['check-us']} |`);
+}
+
+const retention = entry.retention;
+if (retention && steps.length > retention.from) {
+  const first = steps[retention.from];
+  const last = steps[steps.length - 1];
+  for (const [key, name] of [['answers', 'answers'], ['mir-functions', 'mirFunctions']]) {
+    const growth = Number(last[key]) - Number(first[key]);
+    if (!(growth <= retention[name])) {
+      failures.push(`${key} grew by ${growth} from step ${retention.from} to step ${steps.length - 1}, over the retention budget of ${retention[name]}`);
+    }
+  }
 }
 
 console.log(`Replay budgets for ${workspace} (measured / budget):\n`);

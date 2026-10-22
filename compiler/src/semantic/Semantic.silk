@@ -414,6 +414,10 @@ pub enum Family {
   ImplementationHead,
   /// The published inherent members of one nominal owner across its module's inherent `impl`s.
   InherentMembers,
+  /// What one owner's inherent members say about one member name: a projection of
+  /// `InherentMembers` whose answer is unchanged when another member is added or removed, so its
+  /// readers do not rerun.
+  InherentMember,
   /// Every conformance head for one interface or service and one provider owner, read from only
   /// the modules permitted to own such a conformance.
   ConformanceHeads,
@@ -482,6 +486,10 @@ pub enum Family {
   EmissionInputs,
   /// One LLVM definition keyed by the complete immutable emission input content.
   LlvmText,
+  /// One module's declaration check in a revisable store. It is no provider: `checkModule` runs
+  /// it and records the root demands and source reads of its sweep against it, so a later check
+  /// of an unaffected module is verified instead of swept again.
+  ModuleCheck,
 }
 
 // The Tracy zone name of one query family's provider run.
@@ -502,6 +510,7 @@ fn familyZone(family: Family) -> &'static [u8] {
     Family.ImplementationShape => b"ImplementationShape"
     Family.ImplementationHead => b"ImplementationHead"
     Family.InherentMembers => b"InherentMembers"
+    Family.InherentMember => b"InherentMember"
     Family.ConformanceHeads => b"ConformanceHeads"
     Family.ImplementationMembers => b"ImplementationMembers"
     Family.Coherence => b"Coherence"
@@ -533,6 +542,7 @@ fn familyZone(family: Family) -> &'static [u8] {
     Family.PhaseOnly => b"PhaseOnly"
     Family.EmissionInputs => b"EmissionInputs"
     Family.LlvmText => b"LlvmText"
+    Family.ModuleCheck => b"ModuleCheck"
   }
 }
 
@@ -880,6 +890,8 @@ pub union Value {
   /// An owner's inherent members. A member that duplicates another or claims an owner item's name
   /// is not published; its anchored rejection is kept instead, and no winner is chosen.
   InherentMembers {pub members: List<Shared<DeclarationId>>, pub rejected: List<RejectedMember>},
+  /// The published inherent member of one name, or the rejection that keeps it unpublished.
+  InherentMember {pub published: Option<Shared<DeclarationId>>, pub rejected: Option<Shared<Rejection>>},
   /// The conformance heads relevant to one contract and provider owner; empty observes absence.
   ConformanceHeads {pub heads: List<Shared<ImplementationHead>>},
   /// A conformance `impl` is coherent. It proves no bound and admits no witness by itself.
@@ -1156,6 +1168,7 @@ fn declarationFamily(family: Family) -> bool {
     && family != Family.Layout
     && family != Family.PhaseOnly
     && family != Family.LlvmText
+    && family != Family.ModuleCheck
 }
 
 /// A successful fact, the key's own semantic rejection, or a dependency's forwarded failure.
@@ -1252,6 +1265,9 @@ pub struct Request {
   roots: List<Root>
   application: Option<ModuleId>
   schemaModules: List<ModuleId>
+  // Whether the request demanded a root, which closes registration even after its roots are
+  // forgotten.
+  demanded: bool
 }
 
 /// Registration cannot change after this request starts demanding facts.
@@ -1261,6 +1277,12 @@ pub struct RegistrationClosed {}
 pub struct ConflictingPackageSource {}
 
 /// One query event in demand order.
+/// An outdated unit a traced store reran, and the first dependee it found changed.
+pub struct StaleCause {
+  pub unit: usize
+  pub dependee: Dependee
+}
+
 pub struct Event {
   /// Whether the query started, hit a completed answer, or completed.
   pub kind: EventKind
@@ -2409,6 +2431,9 @@ struct Resolver {
   profiles: List<FinalProfile>
   profileSlot: usize
   mirValues: List<MirFunction>
+  // Which lowered functions `releaseStaleMir` emptied, by index, and how many.
+  mirReleased: List<bool>
+  mirReleasedCount: usize
   layoutValues: List<Shared<BackendLayout>>
   // The instance-text content of each layout value, encoded on first supply; empty until then.
   layoutContents: List<Bytes>
@@ -2461,12 +2486,18 @@ struct Resolver {
   // Query lifecycle events, recorded only by a traced store; every demand, hit included, adds one.
   tracing: bool
   events: List<Event>
+  // Why each outdated unit failed verification while the store is traced: the unit, then the
+  // dependee that changed.
+  staleCauses: List<StaleCause>
   // Never published; separates nested inference transactions within this resolver.
   nextInferenceId: usize
   // The checking frame of each body being checked, innermost last.
   bodies: List<BodyFrame>
   // Where a command-line build reports how far checking and emission have come; off otherwise.
   progress: Progress
+  // The module check unit whose root demands and reads are recorded while no provider runs, or
+  // `usize.MAX`. A provider's own unit records its demands as usual.
+  rootRecorder: usize
 }
 
 // One body being checked. Its channels are what a `run` or `fail` in the body may use (EFF-006,
@@ -2595,6 +2626,10 @@ pub struct Statistics {
   pub hits: usize
   /// The units run.
   pub runs: usize
+  /// The completed answers the store holds.
+  pub answers: usize
+  /// The lowered MIR functions the store holds and has not released.
+  pub mirFunctions: usize
   /// The graph a revisable store records; a one-shot store has none.
   pub graph: Option<GraphCounters>
 }
@@ -2610,6 +2645,154 @@ pub struct Semantic {
   query: Query<Answer, NoRejection>
   deferredTemplates: List<DeferredStaticTemplate>
   uncheckedRoot: List<UncheckedBody>
+  // The last completed sweep of each module and the last escape checks in a revisable store, by
+  // their `ModuleCheck` units.
+  moduleMemos: List<ModuleCheckMemo>
+  escapeMemos: List<EscapeMemo>
+}
+
+// What one module's sweep found, kept until its unit is no longer current.
+struct ModuleCheckMemo {
+  unit: usize
+  sweep: Sweep
+  deferred: List<DeferredStaticTemplate>
+  unchecked: List<UncheckedBody>
+}
+
+// The escape check of one list of concrete bodies, kept until its unit is no longer current.
+struct EscapeMemo {
+  unit: usize
+  concrete: List<DeclarationId>
+  result: DeclarationCheckResult
+}
+
+fn escapeMemoOf(memos: &[EscapeMemo], unit: usize) -> usize {
+  let mut at = usize.ZERO
+  while at < memos.length {
+    if memos[at].unit == unit { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
+}
+
+fn sameDeclarations(left: &[DeclarationId], right: &[DeclarationId]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if !DeclarationId.equals(&left[at], &right[at]) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn copyDeclarations(declarations: &[DeclarationId]) -> List<DeclarationId> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<DeclarationId>.make()
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    run List<DeclarationId>.append(&mut copied, DeclarationId.copy(&declarations[at]))
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn mergeRejections(into: &mut List<Shared<Rejection>>, rejections: &[Shared<Rejection>]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    run appendDeclarationRejection(&mut into.*, Shared<Rejection>.clone(&rejections[at]))
+    at = at + usize.ONE
+  }
+}
+
+effect fn mergeGaps(into: &mut List<Shared<BackendGap>>, gaps: &[Shared<BackendGap>]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < gaps.length {
+    run appendDeclarationGap(&mut into.*, Shared<BackendGap>.clone(&gaps[at]))
+    at = at + usize.ONE
+  }
+}
+
+// Adds a kept sweep's findings to `result` and its concrete bodies to `concrete`.
+effect fn mergeSweep(result: &mut DeclarationCheckResult, concrete: &mut List<DeclarationId>, sweep: &Sweep) -> () ! OutOfMemoryError ? &mut Allocator {
+  run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&sweep.rejections))
+  run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&sweep.gaps))
+  let unchecked = List<UncheckedDeclaration>.asSlice(&sweep.unchecked)
+  let mut at = usize.ZERO
+  while at < unchecked.length {
+    run List<UncheckedDeclaration>.append(&mut result.unchecked,
+      UncheckedDeclaration {identity: DeclarationId.copy(&unchecked[at].identity), borrow: unchecked[at].borrow})
+    at = at + usize.ONE
+  }
+  let bodies = List<DeclarationId>.asSlice(&sweep.concrete)
+  at = usize.ZERO
+  while at < bodies.length {
+    run List<DeclarationId>.append(&mut concrete.*, DeclarationId.copy(&bodies[at]))
+    at = at + usize.ONE
+  }
+}
+
+effect fn copyCheckResult(result: &DeclarationCheckResult) -> DeclarationCheckResult ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
+    unchecked: List<UncheckedDeclaration>.make()}
+  let rejections = List<Shared<Rejection>>.asSlice(&result.rejections)
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    run List<Shared<Rejection>>.append(&mut copied.rejections, Shared<Rejection>.clone(&rejections[at]))
+    at = at + usize.ONE
+  }
+  let gaps = List<Shared<BackendGap>>.asSlice(&result.gaps)
+  at = usize.ZERO
+  while at < gaps.length {
+    run List<Shared<BackendGap>>.append(&mut copied.gaps, Shared<BackendGap>.clone(&gaps[at]))
+    at = at + usize.ONE
+  }
+  let unchecked = List<UncheckedDeclaration>.asSlice(&result.unchecked)
+  at = usize.ZERO
+  while at < unchecked.length {
+    run List<UncheckedDeclaration>.append(&mut copied.unchecked,
+      UncheckedDeclaration {identity: DeclarationId.copy(&unchecked[at].identity), borrow: unchecked[at].borrow})
+    at = at + usize.ONE
+  }
+  return move copied
+}
+
+effect fn copyDeferred(deferred: &[DeferredStaticTemplate]) -> List<DeferredStaticTemplate> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<DeferredStaticTemplate>.make()
+  run appendDeferred(&mut copied, deferred)
+  return move copied
+}
+
+effect fn appendDeferred(into: &mut List<DeferredStaticTemplate>, deferred: &[DeferredStaticTemplate]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < deferred.length {
+    run List<DeferredStaticTemplate>.append(&mut into.*,
+      DeferredStaticTemplate {declaration: DeclarationId.copy(&deferred[at].declaration), reason: deferred[at].reason})
+    at = at + usize.ONE
+  }
+}
+
+effect fn copyUnchecked(unchecked: &[UncheckedBody]) -> List<UncheckedBody> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<UncheckedBody>.make()
+  run appendUnchecked(&mut copied, unchecked)
+  return move copied
+}
+
+effect fn appendUnchecked(into: &mut List<UncheckedBody>, unchecked: &[UncheckedBody]) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < unchecked.length {
+    run List<UncheckedBody>.append(&mut into.*,
+      UncheckedBody {module: ModuleId.copy(&unchecked[at].module), block: unchecked[at].block, reason: unchecked[at].reason})
+    at = at + usize.ONE
+  }
+}
+
+// The position of `unit`'s memo, or `usize.MAX`.
+fn memoOf(memos: &[ModuleCheckMemo], unit: usize) -> usize {
+  let mut at = usize.ZERO
+  while at < memos.length {
+    if memos[at].unit == unit { return at }
+    at = at + usize.ONE
+  }
+  return usize.MAX
 }
 
 /// An owned snapshot of one checked direct call's canonical selection.
@@ -4018,6 +4201,11 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       Value.ImplementationHead {head: other} => sameHead(&head, &other)
       _ => false
     }
+    Value.InherentMember {published, rejected} => match & right.* {
+      Value.InherentMember {published: other, rejected: otherRejected} => sameMemberOption(&published, &other)
+        && optionNone<Shared<Rejection>>(&rejected) && optionNone<Shared<Rejection>>(&otherRejected)
+      _ => false
+    }
     Value.InherentMembers {members, rejected} => match & right.* {
       Value.InherentMembers {members: other, rejected: otherRejected} => List<
         RejectedMember,
@@ -4227,6 +4415,7 @@ effect fn recordRoot(
   name: &[u8],
   answer: &Shared<Result<Answer, NoRejection>>,
 ) -> () ! OutOfMemoryError ? &mut Allocator {
+  request.demanded = true
   run List<Root>.append(
     &mut request.roots,
     Root {
@@ -4246,6 +4435,7 @@ impl Request {
       roots: List<Root>.make(),
       application: Option<ModuleId>.none(),
       schemaModules: List<ModuleId>.make(),
+      demanded: false,
     }
   }
   /// Creates a request whose sealed application import selects this canonical module.
@@ -4254,6 +4444,7 @@ impl Request {
       roots: List<Root>.make(),
       application: Option<ModuleId>.some(move application),
       schemaModules: List<ModuleId>.make(),
+      demanded: false,
     }
   }
   /// Borrows the application selected by this request's sealed application import.
@@ -4268,7 +4459,7 @@ impl Request {
   pub effect fn registerSchemaModule(self: &mut Self, id: &ModuleId) -> ()
   ! RegistrationClosed | ConflictingPackageSource | OutOfMemoryError
   ? &mut Allocator {
-    if List<Root>.length(&self.roots) != usize.ZERO {
+    if self.demanded {
       fail RegistrationClosed {}
     }
     let registered = List<ModuleId>.asSlice(&self.schemaModules)
@@ -4304,6 +4495,13 @@ impl Request {
       at = at + usize.ONE
     }
     return false
+  }
+  /// Drops the roots demanded so far and the answers they hold. A long-lived request, such as a
+  /// language server's, forgets them after each check so old answers do not accumulate.
+  /// Registration stays closed.
+  pub fn forgetRoots(self: &mut Self) -> () {
+    self.roots = List<Root>.make()
+    return ()
   }
   /// Returns the number of roots demanded through this request.
   pub fn rootCount(self: &Self) -> usize {
@@ -5444,8 +5642,8 @@ effect fn demandSource(resolver: &mut Resolver, module: &ModuleId) -> Shared<Res
 effect fn observedSource(resolver: &mut Resolver, module: &ModuleId, selector: SourceSelector) -> Shared<Result<SourceResult, NoRejection>>
 ! Cycle | OutOfMemoryError ? &mut Allocator {
   let answer = run demandSource(&mut resolver.*, module)
-  let count = List<Word>.length(&resolver.active)
-  if count > usize.ZERO && Graph.recording(&resolver.graph) {
+  let unit = recordingUnit(&resolver.*)
+  if unit != usize.MAX {
     let ordinal = run internModule(&mut resolver.*, module)
     // A known input keeps the value it was captured with; only a new one is captured.
     let mut input = Inputs.find(&resolver.sourceInputs, ordinal, &selector)
@@ -5460,15 +5658,23 @@ effect fn observedSource(resolver: &mut Resolver, module: &ModuleId, selector: S
     } else {
       drop selector
     }
-    let unit = u64.toUsize(List<Word>.get(&resolver.active, count - usize.ONE).value)
     run Graph.record(&mut resolver.graph, unit, Dependee.SourceInput {input: input, module: ordinal})
   }
   return move answer
 }
 
+// The unit a demand or source read is recorded against: the running provider's, else the module
+// check recording root demands, else none (`usize.MAX`). A one-shot store records nothing.
+fn recordingUnit(resolver: &Resolver) -> usize {
+  if !Graph.recording(&resolver.graph) { return usize.MAX }
+  let count = List<Word>.length(&resolver.active)
+  if count > usize.ZERO { return u64.toUsize(List<Word>.get(&resolver.active, count - usize.ONE).value) }
+  return resolver.rootRecorder
+}
+
 effect fn observedName(resolver: &mut Resolver, module: &ModuleId, name: &[u8], selection: bool) -> Shared<Result<SourceResult, NoRejection>>
 ! Cycle | OutOfMemoryError ? &mut Allocator {
-  if !Graph.recording(&resolver.graph) || List<Word>.length(&resolver.active) == usize.ZERO {
+  if recordingUnit(&resolver.*) == usize.MAX {
     return run demandSource(&mut resolver.*, module)
   }
   let spelling = run Bytes.copy(name)
@@ -5478,7 +5684,7 @@ effect fn observedName(resolver: &mut Resolver, module: &ModuleId, name: &[u8], 
 
 effect fn observedDeclaration(resolver: &mut Resolver, module: &ModuleId, position: usize, facet: SourceFacet) -> Shared<Result<SourceResult, NoRejection>>
 ! Cycle | OutOfMemoryError ? &mut Allocator {
-  if !Graph.recording(&resolver.graph) || List<Word>.length(&resolver.active) == usize.ZERO {
+  if recordingUnit(&resolver.*) == usize.MAX {
     return run demandSource(&mut resolver.*, module)
   }
   let answer = run demandSource(&mut resolver.*, module)
@@ -5499,7 +5705,7 @@ effect fn observedDeclaration(resolver: &mut Resolver, module: &ModuleId, positi
 effect fn observedMember(resolver: &mut Resolver, module: &ModuleId, position: usize, member: usize)
 -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let answer = run observedDeclaration(&mut resolver.*, module, position, SourceFacet.Alive)
-  if !Graph.recording(&resolver.graph) || List<Word>.length(&resolver.active) == usize.ZERO { return move answer }
+  if recordingUnit(&resolver.*) == usize.MAX { return move answer }
   let ordinal = knownModuleOrdinal(&resolver.*, module)
   let handle = DeclarationTable.cached(&resolver.declarations, ordinal, position)
   return run observedSource(&mut resolver.*, module, SourceSelector.Member {handle: handle, ordinal: member})
@@ -5508,7 +5714,7 @@ effect fn observedMember(resolver: &mut Resolver, module: &ModuleId, position: u
 effect fn observedSyntax(resolver: &mut Resolver, module: &ModuleId, id: HirId)
 -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let answer = run demandSource(&mut resolver.*, module)
-  if !Graph.recording(&resolver.graph) || List<Word>.length(&resolver.active) == usize.ZERO { return move answer }
+  if recordingUnit(&resolver.*) == usize.MAX { return move answer }
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
     if let Option<SourceSyntax.Subject>.Some {value: subject} = move run SourceSyntax.subject(value, id) {
       if subject.body { return run observedDeclaration(&mut resolver.*, module, subject.position, SourceFacet.Body) }
@@ -5523,7 +5729,7 @@ effect fn observedSyntax(resolver: &mut Resolver, module: &ModuleId, id: HirId)
 effect fn observedRange(resolver: &mut Resolver, module: &ModuleId, range: Range)
 -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let answer = run demandSource(&mut resolver.*, module)
-  if !Graph.recording(&resolver.graph) || List<Word>.length(&resolver.active) == usize.ZERO { return move answer }
+  if recordingUnit(&resolver.*) == usize.MAX { return move answer }
   let mut children = List<HirId>.make()
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, module) {
     let hir = IndexedSource.authored(value)
@@ -5552,10 +5758,9 @@ effect fn source(resolver: &mut Resolver, module: &ModuleId) -> Shared<
   Result<SourceResult, NoRejection>,
 > ! Cycle | OutOfMemoryError ? &mut Allocator {
   let answer = run demandSource(&mut resolver.*, module)
-  let count = List<Word>.length(&resolver.active)
+  let unit = recordingUnit(&resolver.*)
   // Only a recording graph needs the module's ordinal, which costs an interning lookup.
-  if count > usize.ZERO && Graph.recording(&resolver.graph) {
-    let unit = u64.toUsize(List<Word>.get(&resolver.active, count - usize.ONE).value)
+  if unit != usize.MAX {
     let ordinal = run internModule(&mut resolver.*, module)
     run Graph.record(&mut resolver.graph, unit, Dependee.SourceFile {module: ordinal})
   }
@@ -6588,6 +6793,7 @@ effect fn resolveOtherFamily(
     Family.ImplementationShape => run resolveImplementationShape(&mut resolver.*, &mut owner.*, key)
     Family.ImplementationHead => run resolveImplementationHead(&mut resolver.*, &mut owner.*, key)
     Family.InherentMembers => run resolveInherentMembers(&mut resolver.*, &mut owner.*, key)
+    Family.InherentMember => run resolveInherentMember(&mut resolver.*, &mut owner.*, key)
     Family.ConformanceHeads => run resolveConformanceHeads(&mut resolver.*, &mut owner.*, key)
     Family.ImplementationMembers => run resolveImplementationMembers(
       &mut resolver.*,
@@ -6626,6 +6832,7 @@ effect fn resolveOtherFamily(
     Family.PhaseOnly => run resolvePhaseOnly(&mut resolver.*, &mut owner.*, key)
     Family.EmissionInputs => run resolveEmissionInputs(&mut resolver.*, &mut owner.*, key)
     Family.LlvmText => run resolveLlvmText(&mut resolver.*, key)
+    Family.ModuleCheck => CompilerBug.panic(b"a module check runs in checkModule, never as a provider")
   }
 }
 
@@ -6903,6 +7110,7 @@ fn valueTag(value: &Value) -> u64 {
     Value.ProfileInput {..} => 23
     Value.LayoutUnsupported => 24
     Value.ImplementationMembers {..} => 25
+    Value.InherentMember {..} => 26
     _ => 0
   }
 }
@@ -6942,6 +7150,13 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
         fingerprintHead(&mut writer.*, selected)
         return ()
       })
+    }
+    Value.InherentMember {published, rejected} => {
+      if let Option<Shared<DeclarationId>>.Some {value: member} = &published {
+        AnswerFingerprint.word(&mut writer.*, 1)
+        AnswerFingerprint.sharedDeclaration(&mut writer.*, &member)
+      } else { AnswerFingerprint.word(&mut writer.*, 0) }
+      if let Option<Shared<Rejection>>.Some {..} = &rejected { AnswerFingerprint.incomplete(&mut writer.*) }
     }
     Value.InherentMembers {members, rejected} => {
       AnswerFingerprint.declarations(&mut writer.*, List<Shared<DeclarationId>>.asSlice(&members))
@@ -7238,6 +7453,9 @@ effect fn observeSuccessLocations(resolver: &mut Resolver, value: &Value) -> ()
     Value.ImplementationHead {head} => { run observeHeadLocations(&mut resolver.*, &head) }
     Value.Implementations {heads} => { run observeHeadsLocations(&mut resolver.*, List<Shared<ImplementationHead>>.asSlice(&heads)) }
     Value.ConformanceHeads {heads} => { run observeHeadsLocations(&mut resolver.*, List<Shared<ImplementationHead>>.asSlice(&heads)) }
+    Value.InherentMember {rejected, ..} => {
+      if let Option<Shared<Rejection>>.Some {value: rejection} = &rejected { run observeRejectionLocations(&mut resolver.*, &rejection) }
+    }
     Value.InherentMembers {rejected, ..} => {
       let listed = List<RejectedMember>.asSlice(&rejected)
       let mut at = usize.ZERO
@@ -7326,7 +7544,11 @@ effect fn demandRaw(
   ? &mut Allocator | &mut Types {
   run reconcileSources(&mut resolver.*)
   let word = run internKey(&mut resolver.*, key)
-  return run demandUnit(&mut resolver.*, &mut owner.*, key, word, span)
+  let answer = run demandUnit(&mut resolver.*, &mut owner.*, key, word, span)
+  if List<Word>.length(&resolver.active) == usize.ZERO && resolver.rootRecorder != usize.MAX {
+    run Graph.record(&mut resolver.graph, resolver.rootRecorder, Dependee.UnitResult {unit: u64.toUsize(word.value)})
+  }
+  return move answer
 }
 
 // Whether an outdated `unit` is current after all: no source file or input it consumed changed
@@ -7341,7 +7563,10 @@ effect fn verifyUnit(resolver: &mut Resolver, owner: &mut Query<Answer, NoReject
   let mut children = List<usize>.make()
   let mut edge = Graph.firstEdgeOf(&resolver.graph, unit)
   while edge != usize.MAX {
-    if Graph.edgeChanged(&resolver.graph, unit, edge) { return false }
+    if Graph.edgeChanged(&resolver.graph, unit, edge) {
+      if resolver.tracing { run List<StaleCause>.append(&mut resolver.staleCauses, StaleCause {unit: unit, dependee: Graph.dependeeOf(&resolver.graph, edge)}) }
+      return false
+    }
     let dependee = Graph.dependeeOf(&resolver.graph, edge)
     if let Dependee.UnitResult {unit: child} = &dependee {
       run List<usize>.append(&mut children, child)
@@ -7352,8 +7577,11 @@ effect fn verifyUnit(resolver: &mut Resolver, owner: &mut Query<Answer, NoReject
   let mut at = listed.length
   while at > usize.ZERO {
     at = at - usize.ONE
-    if !run bringCurrent(&mut resolver.*, &mut owner.*, listed[at]) { return false }
-    if Graph.resultChanged(&resolver.graph, unit, listed[at]) { return false }
+    let current = run bringCurrent(&mut resolver.*, &mut owner.*, listed[at])
+    if !current || Graph.resultChanged(&resolver.graph, unit, listed[at]) {
+      if resolver.tracing { run List<StaleCause>.append(&mut resolver.staleCauses, StaleCause {unit: unit, dependee: Dependee.UnitResult {unit: listed[at]}}) }
+      return false
+    }
   }
   return true
 }
@@ -7621,6 +7849,9 @@ effect fn demandChild(
   let module = resolvedModule(&resolver.*, key.module)
   let active = List<Word>.asSlice(&resolver.active)
   if active.length == usize.ZERO {
+    if resolver.rootRecorder != usize.MAX {
+      run Graph.record(&mut resolver.graph, resolver.rootRecorder, Dependee.UnitResult {unit: u64.toUsize(word.value)})
+    }
     run List<Dependency>.append(&mut dependencies.*, move edge)
     return move answer
   }
@@ -17269,6 +17500,66 @@ effect fn resolveInherentMembers(
   )
 }
 
+// Projects the owner's inherent member list onto the key's one name. The list changes whenever
+// a member is added or removed; this answer changes only when that name's member does.
+effect fn resolveInherentMember(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  key: Key,
+) -> Answer ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let listKey = Key {family: Family.InherentMembers, module: key.module, name: usize.ZERO, declaration: key.declaration,
+    member: usize.ZERO, external: false}
+  let listed = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, listKey, Span.make(usize.ZERO, usize.ZERO))
+  if let Option<Shared<Rejection>>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&listed, answerCause) {
+    return run memberRejected(move value, move dependencies)
+  }
+  let name = run resolvedName(&resolver.*, key.name)
+  let lookup = Shared<Result<Answer, NoRejection>>.with<InherentLookup>(&listed,
+    fn(answer: &Result<Answer, NoRejection>) -> InherentLookup { return inherentLookup(answer, Bytes.asSlice(&name)) })
+  let InherentLookup {published, rejected} = move lookup
+  return memberSuccess(Value.InherentMember {published: move published, rejected: move rejected}, move dependencies)
+}
+
+// The key of `ownerOrdinal`'s inherent member `name` in module `moduleOrdinal`.
+effect fn inherentMemberKey(resolver: &mut Resolver, moduleOrdinal: usize, ownerOrdinal: usize, name: &[u8]) -> Key
+! Cycle | OutOfMemoryError ? &mut Allocator {
+  let nameOrdinal = run internName(&mut resolver.*, name)
+  return run internDeclaration(&mut resolver.*, Key {family: Family.InherentMember, module: moduleOrdinal, name: nameOrdinal,
+    declaration: ownerOrdinal, member: usize.ZERO, external: false})
+}
+
+// What an `InherentMember` answer says; nothing when it failed.
+fn projectedMember(answer: &Result<Answer, NoRejection>) -> InherentLookup {
+  let mut lookup = InherentLookup {published: Option<Shared<DeclarationId>>.none(), rejected: Option<Shared<Rejection>>.none()}
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.InherentMember {published, rejected}} = &value.outcome {
+      if let Option<Shared<DeclarationId>>.Some {value: member} = &published {
+        lookup.published = Option<Shared<DeclarationId>>.some(Shared<DeclarationId>.clone(&member))
+      }
+      if let Option<Shared<Rejection>>.Some {value: rejection} = &rejected {
+        lookup.rejected = Option<Shared<Rejection>>.some(Shared<Rejection>.clone(&rejection))
+      }
+    }
+  }
+  return move lookup
+}
+
+fn sameMemberOption(left: &Option<Shared<DeclarationId>>, right: &Option<Shared<DeclarationId>>) -> bool {
+  return match &left.* {
+    Option<Shared<DeclarationId>>.Some {value} => match &right.* {
+      Option<Shared<DeclarationId>>.Some {value: other} => Shared<DeclarationId>.with<bool>(&value,
+        fn(first: &DeclarationId) -> bool { return Shared<DeclarationId>.with<bool>(&other, fn(second: &DeclarationId) -> bool { return DeclarationId.equals(first, second) }) })
+      Option<Shared<DeclarationId>>.None => false
+    }
+    Option<Shared<DeclarationId>>.None => match &right.* { Option<Shared<DeclarationId>>.None => true _ => false }
+  }
+}
+
+fn optionNone<T>(value: &Option<T>) -> bool {
+  return match &value.* { Option<T>.None => true _ => false }
+}
+
 // Resolve propagated diagnostic evidence, not the requesting instance's module.
 fn rejectionModuleOrdinal(resolver: &Resolver, diagnostic: &Shared<Rejection>) -> usize {
   return Shared<Rejection>.with<usize>(diagnostic, fn(value: &Rejection) -> usize {
@@ -18523,16 +18814,7 @@ effect fn mappedTarget(
           return Result<Shared<DeclarationId>, Shared<Rejection>>.failResult(move error)
         }
       }
-      let declarationAccess65Request = Key {
-        family: Family.InherentMembers,
-        module: ownerDeclaration.module,
-        name: usize.ZERO,
-        declaration: ownerDeclaration.ordinal,
-        member: usize.ZERO,
-        external: false,
-      }
-      let declarationAccess65 = run internDeclaration(&mut resolver.*, declarationAccess65Request)
-      let membersKey = declarationAccess65
+      let membersKey = run inherentMemberKey(&mut resolver.*, ownerDeclaration.module, ownerDeclaration.ordinal, functionName)
       let listed = run demandChild(
         &mut resolver.*,
         &mut owner.*,
@@ -18550,7 +18832,7 @@ effect fn mappedTarget(
       let lookup = Shared<Result<Answer, NoRejection>>.with<InherentLookup>(
         &listed,
         fn(answer: &Result<Answer, NoRejection>) -> InherentLookup {
-          return inherentLookup(answer, functionName)
+          return projectedMember(answer)
         },
       )
       let InherentLookup {published, rejected} = move lookup
@@ -61046,6 +61328,44 @@ effect fn flowParameters(named: &mut List<FlowParameter>, value: &Shared<Type>) 
   return complete
 }
 
+// Marks the lowered function `answer` names live, with the helpers lowered right after it.
+fn markLiveMir(resolver: &Resolver, live: &mut List<bool>, answer: &Shared<Result<Answer, NoRejection>>) -> () {
+  let index = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(answer, answerMirIndex) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return () }
+  }
+  let functions = List<MirFunction>.asSlice(&resolver.mirValues)
+  let mut marks = List<bool>.asMutSlice(&mut live.*)
+  if index >= marks.length { return () }
+  marks[index] = true
+  let mut at = index + usize.ONE
+  while at < marks.length {
+    if let InstanceKey.Helper {..} = &functions[at].key {
+      marks[at] = true
+      at = at + usize.ONE
+    } else {
+      return ()
+    }
+  }
+  return ()
+}
+
+// Drops what a lowered function holds, keeping its key so helper lookups still read it.
+fn emptyMir(function: &mut MirFunction) -> () {
+  function.parameters = List<Shared<Type>>.make()
+  function.locals = List<MirLocal>.make()
+  function.blocks = List<MirBlock>.make()
+  function.references = List<MirReference>.make()
+  function.externs = List<Shared<DeclarationId>>.make()
+  function.contexts = List<Mir.ContextText>.make()
+  function.traps = List<Mir.TrapSite>.make()
+  function.nonParking = List<MirNonParkingRun>.make()
+  function.cancels = List<Mir.Cancel>.make()
+  function.accesses = List<MirSharedAccess>.make()
+  function.escapes = List<MirEscapeSite>.make()
+  return ()
+}
+
 effect fn storeMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, function: MirFunction, dependencies: List<Dependency>) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
@@ -73288,15 +73608,7 @@ effect fn selectInherentReceiverCall(
       return Result<InherentCallChoice, Shared<Rejection>>.succeed(InherentCallChoice.Missing)
     }
   }
-  let declarationAccess221Request = Key {
-      family: Family.InherentMembers,
-      module: moduleOrdinal,
-      name: usize.ZERO,
-      declaration: ownerOrdinal,
-      member: usize.ZERO,
-      external: false,
-    }
-  let declarationAccess221 = run internDeclaration(&mut resolver.*, declarationAccess221Request)
+  let declarationAccess221 = run inherentMemberKey(&mut resolver.*, moduleOrdinal, ownerOrdinal, member)
   let own = run proofDemand(
     &mut resolver.*,
     &mut owner.*,
@@ -73316,7 +73628,7 @@ effect fn selectInherentReceiverCall(
   let lookup = Shared<Result<Answer, NoRejection>>.with<InherentLookup>(
     &own,
     fn(answer: &Result<Answer, NoRejection>) -> InherentLookup {
-      return inherentLookup(answer, member)
+      return projectedMember(answer)
     },
   )
   if let Option<Shared<Rejection>>.Some {value} = move lookup.rejected {
@@ -78054,6 +78366,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       profiles: List<FinalProfile>.make(),
       profileSlot: profileSlot,
       mirValues: List<MirFunction>.make(),
+      mirReleased: List<bool>.make(),
+      mirReleasedCount: usize.ZERO,
       layoutValues: List<Shared<BackendLayout>>.make(),
       layoutContents: List<Bytes>.make(),
       exportedObjects: List<ExportedObject>.make(),
@@ -78092,13 +78406,17 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       runs: usize.ZERO,
       tracing: tracing,
       events: List<Event>.make(),
+      staleCauses: List<StaleCause>.make(),
       nextInferenceId: usize.ZERO,
       bodies: List<BodyFrame>.make(),
       progress: Progress.off(),
+      rootRecorder: usize.MAX,
     },
     query: Query<Answer, NoRejection>.make(),
     deferredTemplates: List<DeferredStaticTemplate>.make(),
     uncheckedRoot: List<UncheckedBody>.make(),
+    moduleMemos: List<ModuleCheckMemo>.make(),
+    escapeMemos: List<EscapeMemo>.make(),
   }
 }
 
@@ -78302,7 +78620,49 @@ impl Semantic {
     if Graph.recording(&self.resolver.graph) {
       graph = Option<GraphCounters>.some(Graph.counters(&self.resolver.graph))
     }
-    return Statistics {demands: self.resolver.demands, hits: self.resolver.hits, runs: self.resolver.runs, graph: move graph}
+    return Statistics {demands: self.resolver.demands, hits: self.resolver.hits, runs: self.resolver.runs,
+      answers: Query<Answer, NoRejection>.length(&self.query),
+      mirFunctions: List<MirFunction>.length(&self.resolver.mirValues) - self.resolver.mirReleasedCount,
+      graph: move graph}
+  }
+  /// Empties every lowered MIR function that no completed answer of the store or root of
+  /// `request` names, with the helpers lowered after it, and returns how many it emptied. A unit
+  /// that reruns lowers its function again, so the old one is garbage once nothing names it. An
+  /// answer held anywhere else must not be read for its MIR afterwards.
+  pub effect fn releaseStaleMir(self: &mut Self, request: &Request) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let count = List<MirFunction>.length(&self.resolver.mirValues)
+    let mut live = List<bool>.make()
+    while List<bool>.length(&live) < count { run List<bool>.append(&mut live, false) }
+    let slots = Query<Answer, NoRejection>.slots(&self.query)
+    let mut slot = usize.ZERO
+    while slot < slots {
+      if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: answer} = move Query<Answer, NoRejection>.completed(&mut self.query, Word {value: usize.toU64(slot)}) {
+        markLiveMir(&self.resolver, &mut live, &answer)
+      }
+      slot = slot + usize.ONE
+    }
+    let roots = List<Root>.asSlice(&request.roots)
+    let mut at = usize.ZERO
+    while at < roots.length {
+      markLiveMir(&self.resolver, &mut live, &roots[at].answer)
+      at = at + usize.ONE
+    }
+    while List<bool>.length(&self.resolver.mirReleased) < count { run List<bool>.append(&mut self.resolver.mirReleased, false) }
+    let marks = List<bool>.asSlice(&live)
+    let mut released = usize.ZERO
+    let mut functions = List<MirFunction>.asMutSlice(&mut self.resolver.mirValues)
+    let mut freed = List<bool>.asMutSlice(&mut self.resolver.mirReleased)
+    at = usize.ZERO
+    while at < count {
+      if !marks[at] && !freed[at] {
+        emptyMir(&mut functions[at])
+        freed[at] = true
+        released = released + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    self.resolver.mirReleasedCount = self.resolver.mirReleasedCount + released
+    return released
   }
   /// Reports whether the unit that completed `answer` read the source of `module`, itself or
   /// through any unit it consumed. Only a revisable store records what its units read.
@@ -78522,6 +78882,46 @@ impl Semantic {
   pub fn eventLog(self: &Self) -> &[Event] {
     return List<Event>.asSlice(&self.resolver.events)
   }
+  /// Starts or stops recording query lifecycle events, and forgets those already recorded.
+  pub fn trace(self: &mut Self, on: bool) -> () {
+    self.resolver.tracing = on
+    List<Event>.truncate(&mut self.resolver.events, usize.ZERO)
+    List<StaleCause>.truncate(&mut self.resolver.staleCauses, usize.ZERO)
+  }
+  /// Why each outdated unit a traced store reran failed verification, in order.
+  pub fn staleCauses(self: &Self) -> &[StaleCause] {
+    return List<StaleCause>.asSlice(&self.resolver.staleCauses)
+  }
+  /// A dependee as a traced replay reports it: a unit's name, or a source input's module and selector.
+  pub effect fn dependeeName(self: &mut Self, dependee: Dependee) -> Bytes ! Cycle | OutOfMemoryError ? &mut Allocator {
+    return match &dependee {
+      Dependee.UnitResult {unit} => run Semantic.unitName(&mut self.*, unit)
+      Dependee.SourceFile {module} => {
+        let mut name = run Bytes.copy(b"file ")
+        run ModuleId.appendPath(&resolvedModule(&self.resolver, module), &mut name)
+        return move name
+      }
+      Dependee.SourceInput {input, module} => {
+        let mut name = run Bytes.copy(b"input ")
+        run ModuleId.appendPath(&resolvedModule(&self.resolver, module), &mut name)
+        run Bytes.append(&mut name, b" ")
+        let listed = List<Inputs.Input>.asSlice(&self.resolver.sourceInputs.inputs)
+        run Bytes.append(&mut name, Inputs.selectorName(&listed[input].selector))
+        return move name
+      }
+    }
+  }
+  /// A unit's family and, for a declaration family, the declaration's name: `Body foo.bar`.
+  pub effect fn unitName(self: &mut Self, unit: usize) -> Bytes ! Cycle | OutOfMemoryError ? &mut Allocator {
+    let selected = List<ScopedKey>.get(&self.resolver.keys, unit).key
+    let mut name = run Bytes.copy(familyZone(selected.family))
+    let subject = run zoneSubject(&mut self.resolver, selected)
+    if Bytes.length(&subject) > usize.ZERO {
+      run Bytes.append(&mut name, b" ")
+      run Bytes.append(&mut name, Bytes.asSlice(&subject))
+    }
+    return move name
+  }
   /// Borrows the source index provider starts, source reads and completions in demand order.
   pub fn sourceEvents(self: &Self) -> &[SourceEvent] {
     return SourceIndex.eventLog(&self.resolver.source)
@@ -78582,21 +78982,62 @@ impl Semantic {
       run appendCheckedModule(&mut modules, run internModule(&mut self.resolver, &rootPackage[rootAt]))
       rootAt = rootAt + usize.ONE
     }
+    if Graph.recording(&self.resolver.graph) {
+      return run Semantic.checkEachModule(&mut self.*, &mut request.*, List<usize>.asSlice(&modules), runtime)
+    }
     let mut sweep = Sweep.make()
     let mut moduleAt = usize.ZERO
     while moduleAt < List<usize>.length(&modules) {
       let moduleOrdinal = List<usize>.get(&modules, moduleAt)
       let module = resolvedModule(&self.resolver, moduleOrdinal)
       moduleAt = moduleAt + usize.ONE
-      if Progress.timing(&self.resolver.progress) || run Progress.due(&self.resolver.progress) {
-        let shown = run ModuleId.copyPath(&module)
-        run Progress.timeItem(&mut self.resolver.progress, Bytes.asSlice(&shown))
-        run Progress.show(&mut self.resolver.progress, Bytes.asSlice(&shown))
-      }
-      run Progress.advance(&mut self.resolver.progress)
+      run Semantic.showProgress(&mut self.*, &module)
       run Semantic.sweepModule(&mut self.*, &mut request.*, &module, moduleOrdinal, &Option<DeclarationId>.none(), &mut sweep)
     }
     return run Semantic.finishSweep(&mut self.*, &mut request.*, List<usize>.asSlice(&modules), runtime, move sweep)
+  }
+
+  effect fn showProgress(self: &mut Self, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
+    if Progress.timing(&self.resolver.progress) || run Progress.due(&self.resolver.progress) {
+      let shown = run ModuleId.copyPath(module)
+      run Progress.timeItem(&mut self.resolver.progress, Bytes.asSlice(&shown))
+      run Progress.show(&mut self.resolver.progress, Bytes.asSlice(&shown))
+    }
+    run Progress.advance(&mut self.resolver.progress)
+  }
+
+  // A revisable store's `checkDeclarations`: each module's kept sweep, which an unaffected module
+  // only verifies, then the foreign symbol claims of every module and the kept escape check of
+  // every concrete body. It reports the same rejections as one sweep of every module.
+  effect fn checkEachModule(self: &mut Self, request: &mut Request, modules: &[usize], runtime: &Option<ModuleId>)
+  -> DeclarationCheckResult
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    let mut result = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
+      unchecked: List<UncheckedDeclaration>.make()}
+    let mut deferred = List<DeferredStaticTemplate>.make()
+    let mut uncheckedBodies = List<UncheckedBody>.make()
+    let mut concrete = List<DeclarationId>.make()
+    let mut at = usize.ZERO
+    while at < modules.length {
+      let module = resolvedModule(&self.resolver, modules[at])
+      run Semantic.showProgress(&mut self.*, &module)
+      let found = run Semantic.keptSweep(&mut self.*, &mut request.*, &module, modules[at])
+      at = at + usize.ONE
+      let memos = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+      run mergeSweep(&mut result, &mut concrete, &memos[found].sweep)
+      run appendDeferred(&mut deferred, List<DeferredStaticTemplate>.asSlice(&memos[found].deferred))
+      run appendUnchecked(&mut uncheckedBodies, List<UncheckedBody>.asSlice(&memos[found].unchecked))
+    }
+    let mut conflicts = List<Shared<Rejection>>.make()
+    run Semantic.checkForeignClaims(&mut self.*, modules, runtime, &mut conflicts)
+    run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&conflicts))
+    let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, usize.MAX, List<DeclarationId>.asSlice(&concrete))
+    run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
+    run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
+    self.deferredTemplates = move deferred
+    self.uncheckedRoot = move uncheckedBodies
+    return move result
   }
 
   /// Checks one module of the root package as `checkDeclarations` checks each of its modules: its
@@ -78617,12 +79058,127 @@ impl Semantic {
     ? &mut Allocator | &mut Types {
     let zone = Profiler.zone(b"checkModule")
     run selectRequest(&mut self.resolver, &request.*)
+    let moduleOrdinal = run internModule(&mut self.resolver, module)
+    if !Graph.recording(&self.resolver.graph) {
+      self.deferredTemplates = List<DeferredStaticTemplate>.make()
+      self.uncheckedRoot = List<UncheckedBody>.make()
+      let mut sweep = Sweep.make()
+      run Semantic.sweepModule(&mut self.*, &mut request.*, module, moduleOrdinal, &Option<DeclarationId>.none(), &mut sweep)
+      return run Semantic.finishSweep(&mut self.*, &mut request.*, &[moduleOrdinal], runtime, move sweep)
+    }
+    // A revisable store keeps the sweep and the escape check as units, verified when unaffected.
+    let found = run Semantic.keptSweep(&mut self.*, &mut request.*, module, moduleOrdinal)
+    let mut result = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
+      unchecked: List<UncheckedDeclaration>.make()}
+    let mut concrete = List<DeclarationId>.make()
+    let memos = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+    run mergeSweep(&mut result, &mut concrete, &memos[found].sweep)
+    self.deferredTemplates = run copyDeferred(List<DeferredStaticTemplate>.asSlice(&memos[found].deferred))
+    self.uncheckedRoot = run copyUnchecked(List<UncheckedBody>.asSlice(&memos[found].unchecked))
+    let mut claims = List<Shared<Rejection>>.make()
+    run Semantic.checkForeignClaims(&mut self.*, &[moduleOrdinal], runtime, &mut claims)
+    run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&claims))
+    let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, moduleOrdinal, List<DeclarationId>.asSlice(&concrete))
+    run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
+    run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
+    return move result
+  }
+
+  // The memo of `module`'s sweep, run again unless its unit is current or verifies. Its root
+  // demands and source reads are recorded against its unit.
+  effect fn keptSweep(self: &mut Self, request: &mut Request, module: &ModuleId, moduleOrdinal: usize) -> usize
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: moduleOrdinal, name: usize.ZERO,
+      declaration: usize.MAX, member: usize.ZERO, external: false})
+    let unit = u64.toUsize(word.value)
+    let found = memoOf(List<ModuleCheckMemo>.asSlice(&self.moduleMemos), unit)
+    if found != usize.MAX {
+      if run Semantic.unitCurrent(&mut self.*, unit) { return found }
+      drop List<ModuleCheckMemo>.remove(&mut self.moduleMemos, found)
+    }
+    run Graph.startRun(&mut self.resolver.graph, unit)
+    self.resolver.runs = self.resolver.runs + usize.ONE
+    self.resolver.rootRecorder = unit
+    let attempted = run Effect.result(Semantic.sweepOnly(&mut self.*, &mut request.*, module, moduleOrdinal))
+    self.resolver.rootRecorder = usize.MAX
+    // A failed sweep keeps no memo, so the next check sweeps again whatever its unit's edges say.
+    let sweep = match move attempted {
+      Result<Sweep, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<Sweep, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+    drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
+    run List<ModuleCheckMemo>.append(&mut self.moduleMemos, ModuleCheckMemo {unit: unit, sweep: move sweep,
+      deferred: run copyDeferred(List<DeferredStaticTemplate>.asSlice(&self.deferredTemplates)),
+      unchecked: run copyUnchecked(List<UncheckedBody>.asSlice(&self.uncheckedRoot))})
+    return List<ModuleCheckMemo>.length(&self.moduleMemos) - usize.ONE
+  }
+
+  effect fn sweepOnly(self: &mut Self, request: &mut Request, module: &ModuleId, moduleOrdinal: usize) -> Sweep
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
     self.deferredTemplates = List<DeferredStaticTemplate>.make()
     self.uncheckedRoot = List<UncheckedBody>.make()
-    let moduleOrdinal = run internModule(&mut self.resolver, module)
     let mut sweep = Sweep.make()
     run Semantic.sweepModule(&mut self.*, &mut request.*, module, moduleOrdinal, &Option<DeclarationId>.none(), &mut sweep)
-    return run Semantic.finishSweep(&mut self.*, &mut request.*, &[moduleOrdinal], runtime, move sweep)
+    return move sweep
+  }
+
+  // The escapes of `concrete`, kept for one module's check or, for `usize.MAX`, for the whole
+  // root package's. They run again when the bodies differ or the unit neither is current nor
+  // verifies.
+  effect fn keptEscapes(self: &mut Self, request: &mut Request, scope: usize, concrete: &[DeclarationId]) -> DeclarationCheckResult
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    let mut module = scope
+    let mut whole = usize.ZERO
+    if scope == usize.MAX {
+      module = usize.ZERO
+      whole = usize.ONE
+    }
+    let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: usize.ONE,
+      declaration: usize.MAX, member: whole, external: false})
+    let unit = u64.toUsize(word.value)
+    let found = escapeMemoOf(List<EscapeMemo>.asSlice(&self.escapeMemos), unit)
+    if found != usize.MAX {
+      let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
+      if sameDeclarations(List<DeclarationId>.asSlice(&memos[found].concrete), concrete) && run Semantic.unitCurrent(&mut self.*, unit) {
+        let kept = List<EscapeMemo>.asSlice(&self.escapeMemos)
+        return run copyCheckResult(&kept[found].result)
+      }
+      drop List<EscapeMemo>.remove(&mut self.escapeMemos, found)
+    }
+    run Graph.startRun(&mut self.resolver.graph, unit)
+    self.resolver.runs = self.resolver.runs + usize.ONE
+    self.resolver.rootRecorder = unit
+    let attempted = run Effect.result(Semantic.declarationEscapes(&mut self.*, &mut request.*, concrete))
+    self.resolver.rootRecorder = usize.MAX
+    let result = match move attempted {
+      Result<DeclarationCheckResult, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
+      Result<DeclarationCheckResult, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} => { fail move error }
+    }
+    drop run Graph.finishRun(&mut self.resolver.graph, unit, Option<ContentHash>.none())
+    run List<EscapeMemo>.append(&mut self.escapeMemos, EscapeMemo {unit: unit, concrete: run copyDeclarations(concrete),
+      result: run copyCheckResult(&result)})
+    return move result
+  }
+
+  // Whether a kept unit reflects the current revision, verifying it when it is outdated.
+  effect fn unitCurrent(self: &mut Self, unit: usize) -> bool
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    // An update marks units outdated only once the store reconciles its sources.
+    run reconcileSources(&mut self.resolver)
+    if Graph.current(&self.resolver.graph, unit) {
+      self.resolver.hits = self.resolver.hits + usize.ONE
+      return true
+    }
+    if run verifyUnit(&mut self.resolver, &mut self.query, unit) {
+      Graph.markVerified(&mut self.resolver.graph, unit)
+      self.resolver.hits = self.resolver.hits + usize.ONE
+      return true
+    }
+    return false
   }
 
   /// Checks one active declaration: the facets its kind declares, its body, and the escapes of
@@ -78649,6 +79205,58 @@ impl Semantic {
     let mut sweep = Sweep.make()
     run Semantic.sweepModule(&mut self.*, &mut request.*, module, moduleOrdinal, &only, &mut sweep)
     return run Semantic.finishSweep(&mut self.*, &mut request.*, &[], &Option<ModuleId>.none(), move sweep)
+  }
+
+  /// Whether `module`'s kept sweep reflects the current revision, verifying it when it is
+  /// outdated, so `checkModule` would reuse it rather than sweep the module again. Only a
+  /// revisable store keeps sweeps.
+  pub effect fn moduleSweepCurrent(self: &mut Self, module: &ModuleId) -> bool
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    if !Graph.recording(&self.resolver.graph) { return false }
+    let moduleOrdinal = run internModule(&mut self.resolver, module)
+    let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: moduleOrdinal, name: usize.ZERO,
+      declaration: usize.MAX, member: usize.ZERO, external: false})
+    let unit = u64.toUsize(word.value)
+    if memoOf(List<ModuleCheckMemo>.asSlice(&self.moduleMemos), unit) == usize.MAX { return false }
+    return run Semantic.unitCurrent(&mut self.*, unit)
+  }
+
+  /// The declarations a check of `module` sweeps, in the order it sweeps them.
+  pub effect fn moduleDeclarations(self: &mut Self, module: &ModuleId) -> List<DeclarationId>
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    let listed = run Semantic.moduleChecks(&mut self.*, module, &Option<DeclarationId>.none())
+    let written = List<DeclarationCheck>.asSlice(&listed.declarations)
+    let mut declarations = List<DeclarationId>.make()
+    let mut at = usize.ZERO
+    while at < written.length {
+      run List<DeclarationId>.append(&mut declarations, DeclarationId.copy(&written[at].identity))
+      at = at + usize.ONE
+    }
+    return move declarations
+  }
+
+  /// Answers the queries a check of `declaration` demands, without the escape check and without
+  /// reporting, so a later `checkModule` of its module finds them answered. The language server
+  /// runs it one declaration per step to answer requests between them.
+  pub effect fn prepareDeclaration(self: &mut Self, request: &mut Request, declaration: &DeclarationId) -> ()
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    run selectRequest(&mut self.resolver, &request.*)
+    let deferred = Intrinsic.replace(self.deferredTemplates, List<DeferredStaticTemplate>.make())
+    let unchecked = Intrinsic.replace(self.uncheckedRoot, List<UncheckedBody>.make())
+    let module = DeclarationId.moduleId(declaration)
+    let moduleOrdinal = run internModule(&mut self.resolver, module)
+    let only = Option<DeclarationId>.some(DeclarationId.copy(declaration))
+    let mut sweep = Sweep.make()
+    let attempted = run Effect.result(Semantic.sweepModule(&mut self.*, &mut request.*, module, moduleOrdinal, &only, &mut sweep))
+    self.deferredTemplates = move deferred
+    self.uncheckedRoot = move unchecked
+    if let Result<(), Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Failure {error} = move attempted {
+      fail move error
+    }
+    return ()
   }
 
   /// The foreign symbol conflicts between modules of the root package, which no one module's
