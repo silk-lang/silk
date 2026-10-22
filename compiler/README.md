@@ -107,6 +107,36 @@ compares the two by module, code and span. It writes one
 only one side reached, then `silk-check-roots modules=<count> rejections=<count>
 differences=<count>`, and fails the check when they differ.
 
+## Toolchains
+
+Every `silk` is also a version manager. Installed toolchains live in `$SILK_HOME` (default
+`~/.silk`):
+
+```text
+~/.silk/
+  bin/silk                     link to the default toolchain's compiler (install.sh)
+  settings.toml                default = "<version>", optional auto-install = true
+  toolchains/<version>/bin/silk
+  toolchains/<version>/lib/silk/stdlib
+```
+
+A command selects a toolchain by the first of these that applies: `silk +<version>`,
+`SILK_TOOLCHAIN`, `silk-version` in the nearest `silk.toml` (the workspace that lists the package
+first, then the package; `0.0.0` means unpinned), `default` in `settings.toml`, and finally the
+running compiler. When the selection is another installed toolchain, `silk` sets
+`SILK_TOOLCHAIN` to it and replaces itself with that compiler, which then runs the command. A
+compiler never re-executes itself, `SILK_TOOLCHAIN=local` keeps the running compiler, a local
+`0.0.0` build follows only `+<version>`, and `silk toolchain` always runs in the compiler you
+started. A missing selection exits with status 3 and names the install command, unless
+`SILK_AUTO_INSTALL=1` or `auto-install = true` installs it first.
+
+`silk toolchain install` downloads `silk-<version>-<target>.tar.gz` and its `.minisig` from the
+GitHub release, or from `$SILK_TOOLCHAIN_MIRROR/v<version>/` when set. Installation needs a valid
+signature by the release key with the trusted comment `silk v<version> <archive>`, and a
+`bin/silk` whose SHA-256 matches the release's `native-seed.json`. The archive is unpacked into a
+hidden staging directory under `toolchains/` and renamed into place, so an interrupted install
+leaves no half-written toolchain. Network failures exit with status 4 and failed checks with 5.
+
 ## Profiling with Tracy
 
 `src/Profiler.silk` opens [Tracy](https://github.com/wolfpld/tracy) zones around the build
