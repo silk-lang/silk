@@ -24,11 +24,15 @@ invalidates. It checks the package as `silk check` does, but in a store opened w
 `Semantic.update` and checks again. It prints no diagnostics; each step writes one line:
 
 ```text
-silk-replay step=1 kind=trivia module=silk/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 rejections=5 update-us=238 check-us=904871
+silk-replay step=1 kind=trivia module=silk/bytes.silk demands=211352 hits=211338 units-run=14 marked-outdated=14 graph-units=64550 graph-bytes=46662656 answers=68759 mir-functions=5927 rejections=5 update-us=238 check-us=904871
 ```
 
 `demands`, `hits`, `units-run` and `marked-outdated` are what that step added to the store's
-`Statistics`; `graph-units` and `graph-bytes` are the dependency graph's size after it.
+`Statistics`; `graph-units` and `graph-bytes` are the dependency graph's size after it, and
+`answers` and `mir-functions` the completed answers and lowered MIR functions the store holds.
+After each check the replay drops what the language server drops after each of its steps: the
+request's roots (`Request.forgetRoots`) and the lowered functions no answer names any more
+(`Semantic.releaseStaleMir`), which a unit that reruns has replaced.
 `rejections` counts the root package's rejections and every parsed module's syntax errors, and
 `update-us` and `check-us` are the wall time of `Semantic.update` and of the check. Step 0 is the
 first check. The `replayUpdate` and `replayCheck` Tracy zones cover the same spans.
@@ -37,7 +41,8 @@ A script is a TOML file of `[[edit]]` tables applied in order. `kind` is `trivia
 `header-same-type`, `header-new-type`, `add`, `delete` or `rename`, and `module` is the edited
 module's path below the package's module directory. A rename names the new path in `to`; every
 other kind replaces `find`, which must occur exactly once in the module, with `replace`.
-`fixtures/replay` holds one script for the compiler and one for the standard library:
+`fixtures/replay` holds one script for the compiler and two for the standard library, the
+second (`stdlib-long.toml`) twenty edits that add and remove one comment:
 
 ```sh
 cd compiler && silk check --stdlib ../stdlib --replay fixtures/replay/compiler.toml
@@ -77,10 +82,12 @@ capped too, and the compiler script's rejection counts must match. The same job 
 standard library script with `--differential` and replays every corpus program with
 `.github/scripts/replay-corpus.mjs`, which adds a comment to each `main.silk` and removes it again
 and requires both stores to agree. The compiler replay runs without `--differential`, since two
-compiler stores need more memory than a CI runner has.
+compiler stores need more memory than a CI runner has. The long standard library script's
+entry has a `retention` budget instead: its `answers` and `mir-functions` may not grow from step
+2 to the last step, so what an edit replaces is released and a long session stays the same size.
 
-The budgets allow twice the measured units (at least 20 more) and one and a half times the
-measured demand fraction. When a change moves a step's numbers for a good reason, replay the
+The budgets allow twice the measured units (at least 20 more) and about two and a half times
+the largest measured demand fraction. When a change moves a step's numbers for a good reason, replay the
 script and update its entry. Measured on 2026-10-22:
 
 | Step | Compiler units | Compiler demands | Stdlib units | Stdlib demands |

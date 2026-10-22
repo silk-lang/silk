@@ -1170,6 +1170,9 @@ pub struct Request {
   roots: List<Root>
   application: Option<ModuleId>
   schemaModules: List<ModuleId>
+  // Whether the request demanded a root, which closes registration even after its roots are
+  // forgotten.
+  demanded: bool
 }
 
 /// Registration cannot change after this request starts demanding facts.
@@ -2321,6 +2324,9 @@ struct Resolver {
   profiles: List<FinalProfile>
   profileSlot: usize
   mirValues: List<MirFunction>
+  // Which lowered functions `releaseStaleMir` emptied, by index, and how many.
+  mirReleased: List<bool>
+  mirReleasedCount: usize
   layoutValues: List<Shared<BackendLayout>>
   // The instance-text content of each layout value, encoded on first supply; empty until then.
   layoutContents: List<Bytes>
@@ -2489,6 +2495,10 @@ pub struct Statistics {
   pub hits: usize
   /// The units run.
   pub runs: usize
+  /// The completed answers the store holds.
+  pub answers: usize
+  /// The lowered MIR functions the store holds and has not released.
+  pub mirFunctions: usize
   /// The graph a revisable store records; a one-shot store has none.
   pub graph: Option<GraphCounters>
 }
@@ -4273,6 +4283,7 @@ effect fn recordRoot(
   name: &[u8],
   answer: &Shared<Result<Answer, NoRejection>>,
 ) -> () ! OutOfMemoryError ? &mut Allocator {
+  request.demanded = true
   run List<Root>.append(
     &mut request.roots,
     Root {
@@ -4292,6 +4303,7 @@ impl Request {
       roots: List<Root>.make(),
       application: Option<ModuleId>.none(),
       schemaModules: List<ModuleId>.make(),
+      demanded: false,
     }
   }
   /// Creates a request whose sealed application import selects this canonical module.
@@ -4300,6 +4312,7 @@ impl Request {
       roots: List<Root>.make(),
       application: Option<ModuleId>.some(move application),
       schemaModules: List<ModuleId>.make(),
+      demanded: false,
     }
   }
   /// Borrows the application selected by this request's sealed application import.
@@ -4314,7 +4327,7 @@ impl Request {
   pub effect fn registerSchemaModule(self: &mut Self, id: &ModuleId) -> ()
   ! RegistrationClosed | ConflictingPackageSource | OutOfMemoryError
   ? &mut Allocator {
-    if List<Root>.length(&self.roots) != usize.ZERO {
+    if self.demanded {
       fail RegistrationClosed {}
     }
     let registered = List<ModuleId>.asSlice(&self.schemaModules)
@@ -4350,6 +4363,13 @@ impl Request {
       at = at + usize.ONE
     }
     return false
+  }
+  /// Drops the roots demanded so far and the answers they hold. A long-lived request, such as a
+  /// language server's, forgets them after each check so old answers do not accumulate.
+  /// Registration stays closed.
+  pub fn forgetRoots(self: &mut Self) -> () {
+    self.roots = List<Root>.make()
+    return ()
   }
   /// Returns the number of roots demanded through this request.
   pub fn rootCount(self: &Self) -> usize {
@@ -60788,6 +60808,44 @@ effect fn flowParameters(named: &mut List<FlowParameter>, value: &Shared<Type>) 
   return complete
 }
 
+// Marks the lowered function `answer` names live, with the helpers lowered right after it.
+fn markLiveMir(resolver: &Resolver, live: &mut List<bool>, answer: &Shared<Result<Answer, NoRejection>>) -> () {
+  let index = match move Shared<Result<Answer, NoRejection>>.with<Option<usize>>(answer, answerMirIndex) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return () }
+  }
+  let functions = List<MirFunction>.asSlice(&resolver.mirValues)
+  let mut marks = List<bool>.asMutSlice(&mut live.*)
+  if index >= marks.length { return () }
+  marks[index] = true
+  let mut at = index + usize.ONE
+  while at < marks.length {
+    if let InstanceKey.Helper {..} = &functions[at].key {
+      marks[at] = true
+      at = at + usize.ONE
+    } else {
+      return ()
+    }
+  }
+  return ()
+}
+
+// Drops what a lowered function holds, keeping its key so helper lookups still read it.
+fn emptyMir(function: &mut MirFunction) -> () {
+  function.parameters = List<Shared<Type>>.make()
+  function.locals = List<MirLocal>.make()
+  function.blocks = List<MirBlock>.make()
+  function.references = List<MirReference>.make()
+  function.externs = List<Shared<DeclarationId>>.make()
+  function.contexts = List<Mir.ContextText>.make()
+  function.traps = List<Mir.TrapSite>.make()
+  function.nonParking = List<MirNonParkingRun>.make()
+  function.cancels = List<Mir.Cancel>.make()
+  function.accesses = List<MirSharedAccess>.make()
+  function.escapes = List<MirEscapeSite>.make()
+  return ()
+}
+
 effect fn storeMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, function: MirFunction, dependencies: List<Dependency>) -> Answer
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
 ? &mut Allocator | &mut Types {
@@ -77555,6 +77613,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       profiles: List<FinalProfile>.make(),
       profileSlot: profileSlot,
       mirValues: List<MirFunction>.make(),
+      mirReleased: List<bool>.make(),
+      mirReleasedCount: usize.ZERO,
       layoutValues: List<Shared<BackendLayout>>.make(),
       layoutContents: List<Bytes>.make(),
       exportedObjects: List<ExportedObject>.make(),
@@ -77807,7 +77867,49 @@ impl Semantic {
     if Graph.recording(&self.resolver.graph) {
       graph = Option<GraphCounters>.some(Graph.counters(&self.resolver.graph))
     }
-    return Statistics {demands: self.resolver.demands, hits: self.resolver.hits, runs: self.resolver.runs, graph: move graph}
+    return Statistics {demands: self.resolver.demands, hits: self.resolver.hits, runs: self.resolver.runs,
+      answers: Query<Answer, NoRejection>.length(&self.query),
+      mirFunctions: List<MirFunction>.length(&self.resolver.mirValues) - self.resolver.mirReleasedCount,
+      graph: move graph}
+  }
+  /// Empties every lowered MIR function that no completed answer of the store or root of
+  /// `request` names, with the helpers lowered after it, and returns how many it emptied. A unit
+  /// that reruns lowers its function again, so the old one is garbage once nothing names it. An
+  /// answer held anywhere else must not be read for its MIR afterwards.
+  pub effect fn releaseStaleMir(self: &mut Self, request: &Request) -> usize ! OutOfMemoryError ? &mut Allocator {
+    let count = List<MirFunction>.length(&self.resolver.mirValues)
+    let mut live = List<bool>.make()
+    while List<bool>.length(&live) < count { run List<bool>.append(&mut live, false) }
+    let slots = Query<Answer, NoRejection>.slots(&self.query)
+    let mut slot = usize.ZERO
+    while slot < slots {
+      if let Option<Shared<Result<Answer, NoRejection>>>.Some {value: answer} = move Query<Answer, NoRejection>.completed(&mut self.query, Word {value: usize.toU64(slot)}) {
+        markLiveMir(&self.resolver, &mut live, &answer)
+      }
+      slot = slot + usize.ONE
+    }
+    let roots = List<Root>.asSlice(&request.roots)
+    let mut at = usize.ZERO
+    while at < roots.length {
+      markLiveMir(&self.resolver, &mut live, &roots[at].answer)
+      at = at + usize.ONE
+    }
+    while List<bool>.length(&self.resolver.mirReleased) < count { run List<bool>.append(&mut self.resolver.mirReleased, false) }
+    let marks = List<bool>.asSlice(&live)
+    let mut released = usize.ZERO
+    let mut functions = List<MirFunction>.asMutSlice(&mut self.resolver.mirValues)
+    let mut freed = List<bool>.asMutSlice(&mut self.resolver.mirReleased)
+    at = usize.ZERO
+    while at < count {
+      if !marks[at] && !freed[at] {
+        emptyMir(&mut functions[at])
+        freed[at] = true
+        released = released + usize.ONE
+      }
+      at = at + usize.ONE
+    }
+    self.resolver.mirReleasedCount = self.resolver.mirReleasedCount + released
+    return released
   }
   /// Reports whether the unit that completed `answer` read the source of `module`, itself or
   /// through any unit it consumed. Only a revisable store records what its units read.
