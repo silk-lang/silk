@@ -1267,9 +1267,25 @@ impl<T> Display for Box<T> {
 }
 ```
 
+A scalar, `string`, or slice can also be the provider. A slice provider is spelled `&'a [T]` or
+`&'a mut [T]`; the two access modes are separate providers, and the element type is an ordinary
+generic argument of the head. Such a conformance has no provider module, so only the interface's
+module can declare it.
+
+```silk,ignore
+impl<'a, T: Debug> Debug for &'a [T] {
+  // `self` is `& &[T]`; `self.*` is the slice.
+}
+```
+
+Where a reference is expected, such as the receiver `&Self` or a generic `&T` parameter, `&s` for
+a slice `s` borrows the slice itself and gives `& &[T]`. Anywhere else it reborrows the elements
+and gives `&[T]`.
+
 **Boundary:** `for` does not add another interface argument, and the provider need not appear in the
-interface's explicit arguments. A structural union, reference, anonymous callable contract, or
-interface value cannot own a conformance; the provider must have one canonical nominal identity.
+interface's explicit arguments. A structural union, reference, fixed array, anonymous tuple or
+record, anonymous callable contract, or interface value cannot own a conformance; the provider must
+have one canonical nominal identity, or be a scalar, `string`, or slice.
 
 **Diagnostics:** A missing, malformed, or non-nominal provider reports an invalid-provider
 diagnostic at the `for` type. Wrong interface-argument arity or kind reports the application error
