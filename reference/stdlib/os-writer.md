@@ -380,4 +380,6 @@ effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &
 ```
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

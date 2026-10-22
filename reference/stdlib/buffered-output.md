@@ -459,4 +459,6 @@ When this function returns, [`BufferedOutput.pending`](#BufferedOutput.impl.pend
   can have received some, all, or none of the pending bytes.
 
 
+Category: Input and output.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

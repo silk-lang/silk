@@ -100,4 +100,6 @@ effect fn getResolution(self: &mut Self) -> u64
 ```
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

@@ -256,4 +256,6 @@ profile of [`RsaPublicKey.verifyPss`](#RsaPublicKey.impl.verifyPss).
 It checks only this one signature. It does not check the chain, the dates, or the names.
 
 
+Category: Cryptography.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

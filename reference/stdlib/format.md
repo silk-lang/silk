@@ -2722,4 +2722,6 @@ Writes the same text as `Display`, but a whole number ends in `.0`, as `1.0` and
 that it reads as a float. A set precision writes the same text as `Display`.
 
 
+Category: Text.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

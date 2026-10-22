@@ -135,4 +135,6 @@ pub fn greaterOrEqual(left: char, right: char) -> bool
 Returns `true` if the code point of `left` is more than or equal to the code point of `right`.
 
 
+Category: Text.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

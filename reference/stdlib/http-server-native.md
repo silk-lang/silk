@@ -77,4 +77,6 @@ start tasks yourself.
 It exists only on Darwin on aarch64, and on Linux with GNU libc on x86_64 or aarch64.
 
 
+Category: HTTP.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.

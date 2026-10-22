@@ -26,4 +26,6 @@ Public declarations: 0.
 
 This module declares no public items.
 
+Category: HTTP.
+
 Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

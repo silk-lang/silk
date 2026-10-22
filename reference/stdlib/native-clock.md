@@ -116,4 +116,6 @@ If a signal interrupts the wait, it waits again for the same deadline.
 A negative deadline or a failed call is a trap. The wait does not let another fiber run.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

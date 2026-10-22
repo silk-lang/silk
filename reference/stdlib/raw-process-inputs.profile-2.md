@@ -132,4 +132,6 @@ is not less than [`ProcessInputs.envc`](#ProcessInputs.impl.envc).
 The original stack and strings must stay live. The pointer owns no storage.
 
 
+Category: Native platform.
+
 Profiles: `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu-no-libc`.
