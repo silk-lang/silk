@@ -128,6 +128,8 @@ not belong in a language rule unless a program can observe them.
   states, and independently checked C ABI behavior.
 - [Atomic memory operations](atomic-memory-operations.md) — the C++20 memory model, static
   orderings, atomic loads, stores, read-modify-writes, compare-exchange, and fences.
+- [SIMD vectors](simd-vectors.md) — `simd<T, N>` and `mask<N>` values, lane-wise operators,
+  whole-vector equality, and lane operations.
 - [Thread properties](thread-properties.md) — the sealed `Transferable` and `Concurrent`
   properties, their derivation from stored parts, and `impl` assertions for synchronized types.
 - [Unsafe code, intrinsics, and targets](unsafe-intrinsics-and-targets.md) — lexical unsafe
