@@ -1,0 +1,144 @@
+//! A store that adopts another store's cache image checks unchanged modules without sweeping
+//! them, sweeps a changed module again, and reports what a cold store reports.
+
+import semantic.CacheImage as CacheImage {Image}
+import semantic.ModuleId {InvalidModulePath, ModuleId}
+import semantic.Query { Cycle }
+import semantic.Rejection { Rejection }
+import semantic.Semantic { Adopted, Request, Semantic, Statistics }
+import semantic.SemanticCaseSupport { makeSemantic, module, present }
+import semantic.SourceIndex { RevisionMismatch }
+import semantic.SourceRevision { Revision }
+import semantic.Types { TypeTable, Types }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.shared { Shared }
+import silk.testing { AssertionError, Testing }
+import silk.usize
+
+fn library() -> string<'static> {
+  return """
+pub struct Point {pub x: i32, pub y: i32}
+pub fn origin() -> Point {
+  return Point { x: 0, y: 0 }
+}
+"""
+}
+
+fn application() -> string<'static> {
+  return """
+import shape { Point, origin }
+fn norm(point: &Point) -> i32 {
+  return point.x + point.y
+}
+pub fn main() -> i32 {
+  let first = origin()
+  return norm(&first)
+}
+"""
+}
+
+fn edited() -> string<'static> {
+  return """
+import shape { Point, origin }
+fn norm(point: &Point) -> i32 {
+  return point.x + point.z
+}
+pub fn main() -> i32 {
+  let first = origin()
+  return norm(&first)
+}
+"""
+}
+
+test effect fn adoptedChecksVerifyInsteadOfSweeping() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut typeTable = TypeTable.make()
+  return run adoptClaims() |> Effect.provideMut<Types>(&mut typeTable) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn storeOf(text: string<'static>) -> Semantic
+  ! InvalidModulePath | OutOfMemoryError
+  ? &mut Allocator {
+  let app = run module("app.silk")
+  let shape = run module("shape.silk")
+  let initial = run Revision.publish(&Revision.make(), &app, &run present(text))
+  let revision = run Revision.publish(&initial, &shape, &run present(library()))
+  return makeSemantic(move revision)
+}
+
+// Checks both modules and gives how many rejections they report.
+effect fn checkBoth(store: &mut Semantic, request: &mut Request) -> usize
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError
+  ? &mut Allocator | &mut Types {
+  let app = run module("app.silk")
+  let shape = run module("shape.silk")
+  let first = run Semantic.checkModule(&mut store.*, &mut request.*, &app, &Option<ModuleId>.none())
+  let second = run Semantic.checkModule(&mut store.*, &mut request.*, &shape, &Option<ModuleId>.none())
+  return List<Shared<Rejection>>.length(&first.rejections) + List<Shared<Rejection>>.length(&second.rejections)
+}
+
+effect fn adoptClaims() -> ()
+  ! InvalidModulePath | Cycle | RevisionMismatch | OutOfMemoryError | AssertionError<'static>
+  ? &mut Allocator | &mut Types {
+  let mut request = Request.make()
+  let mut cold = run storeOf(application())
+  let coldFound = run checkBoth(&mut cold, &mut request)
+  run Testing.expect(coldFound == usize.ZERO, "the program checks clean")
+  let coldRuns = Semantic.statistics(&cold).runs
+  let image = run Semantic.cacheImage(&mut cold)
+
+  // The same sources: every check is reused, and nothing reruns.
+  let mut warm = run storeOf(application())
+  let adopted = run Semantic.adoptCache(&mut warm, &request, &image, true)
+  run Testing.expect(adopted.roots == 4 && adopted.stale == usize.ZERO && adopted.changedLeaves == usize.ZERO,
+    "every clean check of unchanged sources is reused")
+  let warmFound = run checkBoth(&mut warm, &mut request)
+  run Testing.expect(warmFound == usize.ZERO, "a warm check reports what the cold one did")
+  run Testing.expect(Semantic.statistics(&warm).runs == usize.ZERO && coldRuns > usize.ZERO, "a warm check of unchanged sources runs nothing")
+
+  // An edited body: its module's sweep is stale and runs again, the other module is reused, and
+  // the warm store reports exactly what a cold store of the edit reports.
+  let mut changed = run storeOf(edited())
+  let partly = run Semantic.adoptCache(&mut changed, &request, &image, true)
+  run Testing.expect(partly.roots > usize.ZERO && partly.stale > usize.ZERO && partly.changedLeaves > usize.ZERO,
+    "an edit leaves only the checks resting on it stale")
+  let warmEdited = run checkBoth(&mut changed, &mut request)
+  let mut fresh = run storeOf(edited())
+  let coldEdited = run checkBoth(&mut fresh, &mut request)
+  run Testing.expect(warmEdited == coldEdited && coldEdited > usize.ZERO, "a partly warm check reports what a cold one does")
+  run Testing.expect(Semantic.statistics(&changed).runs < Semantic.statistics(&fresh).runs, "a partly warm check runs less")
+
+  // A revision of the warm store: an adopted check that the edit reaches sweeps again.
+  let app = run module("app.silk")
+  let shape = run module("shape.silk")
+  let initial = run Revision.publish(&Revision.make(), &app, &run present(edited()))
+  let revision = run Revision.publish(&initial, &shape, &run present(library()))
+  run Semantic.update(&mut warm, move revision)
+  let revised = run checkBoth(&mut warm, &mut request)
+  run Testing.expect(revised == coldEdited, "an edit after adoption reaches the adopted checks")
+
+  // An unlinked store, as a command line check makes: the checks it reuses rest on nothing in it,
+  // so the image it writes carries them from the image it read, and still names what they read.
+  let mut lone = run storeOf(edited())
+  let unlinked = run Semantic.adoptCache(&mut lone, &request, &image, false)
+  run Testing.expect(unlinked.roots > usize.ZERO && Semantic.carried(&lone).length == unlinked.roots,
+    "an unlinked store carries every check it reused")
+  let onceFound = run checkBoth(&mut lone, &mut request)
+  run Testing.expect(onceFound == coldEdited, "an unlinked partly warm check reports what a cold one does")
+  let mut rewritten = run Semantic.cacheImage(&mut lone)
+  run CacheImage.carry(&mut rewritten, &image, Semantic.carried(&lone))
+  let mut rereading = run storeOf(edited())
+  let reread = run Semantic.adoptCache(&mut rereading, &request, &rewritten, false)
+  run Testing.expect(reread.stale == usize.ZERO && reread.roots == List<CacheImage.Root>.length(&rewritten.roots)
+    && reread.roots >= unlinked.roots, "the carried checks are reused again")
+  let mut reverted = run storeOf(application())
+  run Testing.expect(List<CacheImage.Leaf>.length(&rewritten.leaves) > usize.ZERO, "a carried check still names the sources it read")
+  drop run Semantic.adoptCache(&mut reverted, &request, &rewritten, false)
+  let revertedFound = run checkBoth(&mut reverted, &mut request)
+  run Testing.expect(revertedFound == usize.ZERO, "a revert after carrying reports what a cold check does")
+  return ()
+}
