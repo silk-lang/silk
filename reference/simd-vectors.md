@@ -240,3 +240,52 @@ An index array whose length is not `M` reports `SEM0031`, and a runtime value in
 
 **Evidence:** `corpus/native/simd-shuffle`, `corpus/invalid/simd-invalid-shuffle`,
 `corpus/invalid/simd-shuffle-runtime-index`.
+
+## SIMD-007 — Architecture operations are typed, target-checked intrinsics
+
+**Status:** Confirmed
+
+```silk,ignore
+fn x86ShuffleBytes<V>(left: V, right: V) -> R
+
+let digits = Intrinsic.x86ShuffleBytes<simd<u8, 16>>(table, nibbles)
+```
+
+An architecture operation stands for one instruction that the portable operations do not
+express. Its type argument `V` is its first operand's vector type and selects one row of a closed
+catalog. The row fixes the other operand types, the result type `R`, the target architecture, the
+CPU feature (PROFILE-006), and the LLVM intrinsic the call lowers to:
+
+| Operation                   | First operand → result                                                  | Target and feature                  |
+| --------------------------- | ----------------------------------------------------------------------- | ----------------------------------- |
+| `x86ShuffleBytes`           | `u8x16` → `u8x16`; `u8x32` → `u8x32`                                    | x86-64 `ssse3`; `avx2`              |
+| `x86MultiplyAddBytes`       | `u8x16`, `i8x16` → `i16x8`; `u8x32`, `i8x32` → `i16x16`                 | x86-64 `ssse3`; `avx2`              |
+| `x86MultiplyAddWords`       | `i16x8` → `i32x4`; `i16x16` → `i32x8`                                   | x86-64 `sse2`; `avx2`               |
+| `x86PackUnsignedSaturate`   | `i16x8` → `u8x16`; `i16x16` → `u8x32`; `i32x4` → `u16x8`                | x86-64 `sse2`; `avx2`; `sse4.1`     |
+| `x86PackSignedSaturate`     | `i16x8` → `i8x16`; `i32x4` → `i16x8`                                    | x86-64 `sse2`                       |
+| `x86SumAbsoluteDifferences` | `u8x16` → `u64x2`; `u8x32` → `u64x4`                                    | x86-64 `sse2`; `avx2`               |
+| `aarch64TableLookup`        | `u8x16` → `u8x16`                                                       | AArch64 `neon`                      |
+| `aarch64DotProduct`         | `u32x4`, `u8x16`, `u8x16` → `u32x4`; `i32x4`, `i8x16`, `i8x16` → `i32x4` | AArch64 `dotprod`                   |
+| `aarch64PairwiseAdd`        | `u8x16`, `u16x8` or `u32x4` → the same                                  | AArch64 `neon`                      |
+| `wasmSwizzle`               | `u8x16` → `u8x16`                                                       | wasm32 `simd128`                    |
+| `wasmRelaxedSwizzle`        | `u8x16` → `u8x16`                                                       | wasm32 `relaxed-simd`               |
+| `wasmDot`                   | `i16x8` → `i32x4`                                                       | wasm32 `simd128`                    |
+| `wasmNarrowUnsigned`        | `i16x8` → `u8x16`                                                       | wasm32 `simd128`                    |
+| `wasmNarrowSigned`          | `i16x8` → `i8x16`                                                       | wasm32 `simd128`                    |
+
+`silk.arch.x86`, `silk.arch.aarch64` and `silk.arch.wasm` wrap each row in a function named for
+its instruction. A wrapper calls the operation inside `static if` and otherwise computes the same
+lanes with portable code, so it is correct on every target.
+
+**Boundary:** A call is checked when its body is checked, like `compileError`, so code that can
+build for other profiles guards it with `static if Target.hasCpuFeature(...)`. Operations with
+immediate operands, AES rounds and carry-less multiplication join the catalog with the crypto
+kernels. There is no open escape hatch that names an arbitrary LLVM intrinsic.
+
+**Diagnostics:** A first operand outside the catalog reports `SEM0239`. A call whose target or
+CPU feature the profile does not select reports `SEM0241`.
+
+**Current compiler:** Aligned. Each call lowers to one call of its LLVM target intrinsic.
+
+**Evidence:** `corpus/native/simd-arch`, `corpus/invalid/simd-arch-unavailable`.
+
