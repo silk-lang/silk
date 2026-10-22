@@ -656,3 +656,47 @@ selector `K`. No compatibility alias is retained in this green-field codebase.
 
 **Evidence:** [current Effect standard library](../stdlib/silk/effect.silk),
 provider elaboration tests.
+
+## SERV-011 — `&Option<&S>` is an optional service
+
+**Status:** Confirmed
+
+In a requirement row, a selector, or `Without`, the standard library `Option` names an optional
+service: `&Option<&Tracer>` is a key separate from `&Tracer`, and the effect runs with or without
+a provider of `Tracer`. Everywhere else `Option` is the ordinary union.
+
+```silk
+effect fn measure() -> i32 ? &Base | &Option<&Tracer> {
+  return run withSome<&Tracer>(plain(), traced())
+}
+```
+
+The compiler recognizes only the union `Option` of `silk/option.silk`. There it stands for the
+`OptionService` declared beside it, applied to the same arguments, so the key reads one stdlib
+header and nothing else. A union named `Option` in any other module is not a requirement.
+
+`withSome(absent, present)` runs `present` with the provider of `S` when one exists and `absent`
+otherwise. Both effects share the other requirements `R`, and `R` must not contain `S`. Only
+`present` may use `S`.
+
+`Option<P>` provides `Option<S>` when `&P` provides `S`. `Option<P>.some(provider)` is present. The
+explicit absent provider is `Option<never>.none()`: `never` conforms to every service, since no
+value of it exists, and a call dispatched to a `never` provider is unreachable. `provideSome<&S>`
+lifts a borrowed provider of `S` into a present one.
+
+```silk
+let none = Option<never>.none()
+let absent = run Effect.provide(measure(), &none)
+let present = run provideSome<&Tracer>(measure(), &offset)
+```
+
+**Boundary:** Absence is never implicit: every `Option<&S>` requirement needs an explicit present or
+absent provider before the Effect runs. A plain provider of `S` does not satisfy `&Option<&S>`.
+
+**Diagnostics:** A plain provider of `S` given for `Option<&S>` reports `SEM0123`, as any provider
+that conforms to no required key does. Diagnostics and types name the service, `OptionService`.
+
+**Evidence:** [option standard library](../stdlib/silk/option.silk),
+`standardOptionIsARequirementKey` and `partialSourcePremisesAndNeverProvidersDecideProvision`
+semantic conformance cases, `optional-service-provision` and `optional-service-plain-provider`
+corpus programs.
