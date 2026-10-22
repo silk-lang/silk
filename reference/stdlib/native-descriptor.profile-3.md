@@ -19,8 +19,8 @@ the system returned a count that is not valid.
 
 ## Gotchas
 - The caller keeps the descriptor open and controls access from other threads.
-- `NativeDescriptor.writeAll` and `NativeDescriptor.writeAllGather` can fail after part of the
-  bytes were written.
+- `NativeDescriptor.writeAll` and `NativeDescriptor.writeAllGather` can fail after part of
+  the bytes were written.
 - The module is empty on targets other than Darwin on aarch64, and Linux with GNU libc on x86_64
   or aarch64.
 

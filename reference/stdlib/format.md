@@ -187,8 +187,8 @@ Returns the default [`FormatOptions`](#FormatOptions).
 #### Details
 
 The defaults are: no width, `Alignment.Default`, a space as fill, `Sign.NegativeOnly`, no
-alternate form, no zero padding, no precision, no color, and `Style.Default`. [`Format.display`](#Format.impl.display) uses these
-options.
+alternate form, no zero padding, no precision, no color, and `Style.Default`.
+[`Format.display`](#Format.impl.display) uses these options.
 
 <a id="Format.impl.make"></a>
 

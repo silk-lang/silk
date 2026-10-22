@@ -91,9 +91,15 @@ An owned, normalized, absolute path.
 
 ### Details
 
-Each `Path` follows the rules in the module documentation, because the only way to make one is
-through [`Path.make`](#Path.impl.make), [`Path.fromBytes`](#Path.impl.fromBytes), [`Path.root`](#Path.impl.root), [`Path.join`](#Path.impl.join), or [`Path.resolve`](#Path.impl.resolve).
-`/` is the root of the `FileSystem` provider, which is not always the root of the host.
+Each `Path` starts with `/`, and it has no empty components, no `.` or `..` components, no NUL
+byte, and no trailing `/` (except the root `/` itself). The only way to make one is through
+[`Path.make`](#Path.impl.make), [`Path.fromBytes`](#Path.impl.fromBytes), [`Path.root`](#Path.impl.root), [`Path.join`](#Path.impl.join), or [`Path.resolve`](#Path.impl.resolve), which
+check these rules. `/` is the root of the `FileSystem` provider, which is not always the root
+of the host.
+
+A path is bytes, not text, because host paths do not have to be valid UTF-8. Use
+[`Path.rawBytes`](#Path.impl.rawBytes) to pass a path on without loss. [`Path.view`](#Path.impl.view) and [`Path.name`](#Path.impl.name) return text
+only for valid UTF-8.
 
 <a id="Path.impl"></a>
 
@@ -140,7 +146,8 @@ pass it back without changes.
 
 #### Details
 
-The same rules apply as for [`Path.make`](#Path.impl.make). The result can have no text view.
+`values` must start with `/`. Except for `/` itself, it must not end with `/`, and it must not
+contain NUL, empty components, `.`, or `..`. The result can have no text view.
 
 #### Errors
 
@@ -256,8 +263,8 @@ Use it for a name that you got as bytes, when the result must have a text view.
 
 #### Errors
 
-- `FileError` with reason `InvalidPath` if `fragment` is not valid UTF-8 or breaks the rules
-  of [`Path.join`](#Path.impl.join).
+- `FileError` with reason `InvalidPath` if `fragment` is not valid UTF-8, or if it is empty,
+  starts or ends with `/`, or contains NUL, empty components, `.`, or `..`.
 - `OutOfMemoryError` if the `Allocator` cannot supply the path.
 
 <a id="Path.impl.joinBytes"></a>
@@ -279,7 +286,8 @@ Use it for a name from a directory listing on the host, to keep the exact bytes.
 
 #### Errors
 
-- `FileError` with reason `InvalidPath` if `fragment` breaks the rules of [`Path.join`](#Path.impl.join).
+- `FileError` with reason `InvalidPath` if `fragment` is empty, starts or ends with `/`, or
+  contains NUL, empty components, `.`, or `..`.
 - `OutOfMemoryError` if the `Allocator` cannot supply the path.
 
 <a id="Path.impl.resolve"></a>
@@ -607,13 +615,38 @@ failed. Empty otherwise.
 pub service FileSystem
 ```
 
-The effect for file system operations.
+The effect for file system operations: whole-file reads and writes, atomic writes, directory
+listings, and temporary directories.
+
+### When to use
+
+Make a [`Path`](#Path), then require `&mut FileSystem` and call [`FileSystem.readFile`](#FileSystem.readFile),
+[`FileSystem.writeFile`](#FileSystem.writeFile), and the other operations. Use [`FileSystem.writeFileAtomic`](#FileSystem.writeFileAtomic) when a
+reader must never see a partly written file, such as for a configuration file. Use
+[`FileSystem.temporaryDirectory`](#FileSystem.impl.temporaryDirectory) for scratch space.
 
 ### Details
 
 Provide one with `Effect.provideMut<FileSystem>(&mut provider)`. Native programs use
 `silk.os_filesystem`. Each provider must use the portable error reasons, replace the whole file
-on [`FileSystem.writeFile`](#FileSystem.writeFile), and sort directory listings by path bytes.
+on [`FileSystem.writeFile`](#FileSystem.writeFile), and sort directory listings by path bytes, so they are the same on
+each host.
+
+### Errors
+
+- [`FileError`](#FileError) for each failed operation. It has the operation, a portable reason, and an
+  optional code from the provider. Recover by the reason: `NotFound`, `AlreadyExists`,
+  `PermissionDenied`, `InvalidPath`, `WrongType`, `NotEmpty`, `NoSpace`, `TooLarge`,
+  `Unsupported`, or `Other`.
+- [`AtomicWriteError`](#AtomicWriteError) from [`FileSystem.writeFileAtomic`](#FileSystem.writeFileAtomic).
+- `OutOfMemoryError` from operations that return owned paths or bytes.
+
+### Gotchas
+
+A temporary directory is not removed when it is dropped. Call [`FileSystem.release`](#FileSystem.impl.release) or
+[`FileSystem.releaseIgnored`](#FileSystem.impl.releaseIgnored). Operations on more than one path, such as
+[`FileSystem.writeFileWithParents`](#FileSystem.impl.writeFileWithParents), are not transactions. A failure can leave part of the work
+done.
 
 <a id="FileSystem.readFile"></a>
 
@@ -1266,7 +1299,7 @@ its owner.
 #### Details
 
 Nothing removes the directory until you call [`FileSystem.release`](#FileSystem.impl.release) or
-[`FileSystem.releaseIgnored`](#FileSystem.impl.releaseIgnored).
+[`FileSystem.releaseIgnored`](#FileSystem.impl.releaseIgnored). Dropping the owner does not remove it.
 
 #### Errors
 

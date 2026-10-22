@@ -65,6 +65,18 @@ pub struct CertificateBundle
 A list of decoded certificates in input order. It owns them, and duplicates stay as separate
 entries.
 
+### When to use
+
+Make one with [`CertificateBundle.decodePem`](#CertificateBundle.impl.decodePem) for a chain file, such as the `fullchain.pem` of a
+server, or with [`CertificateBundle.decodeAnnotatedPem`](#CertificateBundle.impl.decodeAnnotatedPem) for a CA bundle with comment lines
+between the blocks. For exactly one certificate, use `silk.certificate`.
+
+### Gotchas
+
+Decoding checks only the structure. It does not verify the signature, the chain, the names, or
+the dates. Use `silk.certificate_path` for that. The order is the order of the file, not a chain
+order.
+
 <a id="CertificateBundle.impl"></a>
 
 ## Implementation `CertificateBundle`
@@ -84,15 +96,20 @@ pub effect fn decodePem(input: &[u8], limits: DecodeLimits) -> Result<
   > ! OutOfMemoryError ? &mut Allocator
 ```
 
-Decodes all `CERTIFICATE` blocks of `input`.
+Decodes all `CERTIFICATE` blocks of `input`, such as a chain file, in input order.
 
 Only `CERTIFICATE` blocks and spaces, tabs, CR, and LF between them are allowed. The limits
 count the whitespace and each duplicate.
 
 #### Errors
 - `Failure` with a `DecodeError` for text outside the blocks, another label, a block that is
-  not valid, or a limit. No bundle is returned.
+  not valid, or a limit. No bundle is returned. `certificateIndex` tells which block failed.
 - `OutOfMemoryError` if the `Allocator` fails.
+
+#### Gotchas
+Decoding checks only the structure. It does not verify the signature, the chain, the names,
+or the dates. Use `silk.certificate_path` for that. The order is the order of the file, not a
+chain order.
 
 <a id="CertificateBundle.impl.decodeAnnotatedPem"></a>
 

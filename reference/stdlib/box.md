@@ -75,10 +75,21 @@ pub struct Box<T>
 
 An owner of one heap-allocated value of type `T`.
 
+### When to use
+
+Use a box when a type must contain itself, such as a tree node that owns child nodes. A field
+of type `Box<Node>` has a fixed size, so the compiler can lay out `Node`. Use [`make`](#Box.impl.make) to
+allocate, [`get`](#Box.impl.get) or [`getMut`](#Box.impl.getMut) to borrow the value, and [`into`](#Box.impl.into) to get the value back.
+
 ### Details
 
 The size of `Box<T>` does not depend on `T`, so a type can contain a box of itself. Dropping a
 box drops the value and then releases the allocation. A box is affine. It is not `Copy`.
+
+### Gotchas
+
+Dropping a chain of boxes uses one stack frame for each link. For a very long chain, take the
+links apart with [`into`](#Box.impl.into) in a loop.
 
 <a id="Box.impl"></a>
 
@@ -149,8 +160,9 @@ Moves the value out of the box, releases the allocation, and returns the value.
 
 #### When to use
 
-Use `into` when the caller needs the value itself, not a borrow. Use it in a loop to take apart
-a long chain of boxes without deep recursion.
+Use `into` when the caller needs the value itself, not a borrow. Use it in a loop to take
+apart a long chain of boxes without deep recursion. A plain drop of such a chain uses one
+stack frame for each link.
 
 <a id="Box.impl.Drop"></a>
 

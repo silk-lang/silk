@@ -43,6 +43,9 @@ pub fn subBytes(state: simd<u8, 16>) -> simd<u8, 16>
 
 SubBytes: each byte replaced by its AES S-box value.
 
+It computes each byte's inverse in GF(2^8) instead of reading a table, so its time does not
+depend on the data.
+
 <a id="inverseSubBytes"></a>
 
 ## `inverseSubBytes`
@@ -52,6 +55,9 @@ pub fn inverseSubBytes(state: simd<u8, 16>) -> simd<u8, 16>
 ```
 
 InvSubBytes: each byte replaced by its inverse S-box value.
+
+It computes each byte's inverse in GF(2^8) instead of reading a table, so its time does not
+depend on the data.
 
 <a id="shiftRows"></a>
 
@@ -63,6 +69,9 @@ pub fn shiftRows(state: simd<u8, 16>) -> simd<u8, 16>
 
 ShiftRows: row `r` rotated left by `r` columns.
 
+The state holds the AES state matrix column by column: lane `4 * c + r` is row `r` of column
+`c`, as in FIPS 197.
+
 <a id="inverseShiftRows"></a>
 
 ## `inverseShiftRows`
@@ -72,6 +81,9 @@ pub fn inverseShiftRows(state: simd<u8, 16>) -> simd<u8, 16>
 ```
 
 InvShiftRows: row `r` rotated right by `r` columns.
+
+The state holds the AES state matrix column by column: lane `4 * c + r` is row `r` of column
+`c`, as in FIPS 197.
 
 <a id="mixColumns"></a>
 
@@ -83,6 +95,9 @@ pub fn mixColumns(state: simd<u8, 16>) -> simd<u8, 16>
 
 MixColumns: each column multiplied by the AES MixColumns matrix.
 
+The state holds the AES state matrix column by column: lane `4 * c + r` is row `r` of column
+`c`, as in FIPS 197.
+
 <a id="inverseMixColumns"></a>
 
 ## `inverseMixColumns`
@@ -92,6 +107,9 @@ pub fn inverseMixColumns(state: simd<u8, 16>) -> simd<u8, 16>
 ```
 
 InvMixColumns: each column multiplied by the inverse MixColumns matrix.
+
+The state holds the AES state matrix column by column: lane `4 * c + r` is row `r` of column
+`c`, as in FIPS 197.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

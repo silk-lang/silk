@@ -47,6 +47,9 @@ pub fn tableLookup(table: simd<u8, 16>, indices: simd<u8, 16>) -> simd<u8, 16>
 
 `tbl` (NEON): lane `i` is `table[indices[i]]`, or `0` when `indices[i]` is 16 or more.
 
+Every AArch64 build has NEON, so on AArch64 it compiles to this one instruction. On another
+target it computes the same lanes with portable code, which is correct but slower.
+
 <a id="dotProduct"></a>
 
 ## `dotProduct`
@@ -58,6 +61,9 @@ pub fn dotProduct(sum: simd<u32, 4>, left: simd<u8, 16>, right: simd<u8, 16>) ->
 `udot` (dotprod): lane `i` of `sum` plus the products of bytes `4 * i` to `4 * i + 3` of
 `left` and `right`, wrapping.
 
+When the build targets AArch64 with the `dotprod` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+
 <a id="dotProductSigned"></a>
 
 ## `dotProductSigned`
@@ -66,7 +72,11 @@ pub fn dotProduct(sum: simd<u32, 4>, left: simd<u8, 16>, right: simd<u8, 16>) ->
 pub fn dotProductSigned(sum: simd<i32, 4>, left: simd<i8, 16>, right: simd<i8, 16>) -> simd<i32, 4>
 ```
 
-`sdot` (dotprod): [`dotProduct`](#dotProduct) over signed lanes.
+`sdot` (dotprod): lane `i` of `sum` plus the products of signed bytes `4 * i` to `4 * i + 3` of
+`left` and `right`, wrapping.
+
+When the build targets AArch64 with the `dotprod` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
 
 <a id="pairwiseAdd8"></a>
 
@@ -78,6 +88,9 @@ pub fn pairwiseAdd8(left: simd<u8, 16>, right: simd<u8, 16>) -> simd<u8, 16>
 
 `addp` (NEON): the wrapping sums of adjacent lane pairs of `left`, then of `right`.
 
+Every AArch64 build has NEON, so on AArch64 it compiles to this one instruction. On another
+target it computes the same lanes with portable code, which is correct but slower.
+
 <a id="pairwiseAdd16"></a>
 
 ## `pairwiseAdd16`
@@ -86,7 +99,10 @@ pub fn pairwiseAdd8(left: simd<u8, 16>, right: simd<u8, 16>) -> simd<u8, 16>
 pub fn pairwiseAdd16(left: simd<u16, 8>, right: simd<u16, 8>) -> simd<u16, 8>
 ```
 
-`addp` (NEON): [`pairwiseAdd8`](#pairwiseAdd8) over sixteen-bit lanes.
+`addp` (NEON): the wrapping sums of adjacent sixteen-bit lane pairs of `left`, then of `right`.
+
+Every AArch64 build has NEON, so on AArch64 it compiles to this one instruction. On another
+target it computes the same lanes with portable code, which is correct but slower.
 
 <a id="pairwiseAdd32"></a>
 
@@ -96,7 +112,10 @@ pub fn pairwiseAdd16(left: simd<u16, 8>, right: simd<u16, 8>) -> simd<u16, 8>
 pub fn pairwiseAdd32(left: simd<u32, 4>, right: simd<u32, 4>) -> simd<u32, 4>
 ```
 
-`addp` (NEON): [`pairwiseAdd8`](#pairwiseAdd8) over 32-bit lanes.
+`addp` (NEON): the wrapping sums of adjacent 32-bit lane pairs of `left`, then of `right`.
+
+Every AArch64 build has NEON, so on AArch64 it compiles to this one instruction. On another
+target it computes the same lanes with portable code, which is correct but slower.
 
 <a id="aesEncrypt"></a>
 
@@ -109,6 +128,9 @@ pub fn aesEncrypt(state: simd<u8, 16>, key: simd<u8, 16>) -> simd<u8, 16>
 `aese` (AES): `key` added to `state`, then ShiftRows and SubBytes. An encryption round is
 [`aesMixColumns`](#aesMixColumns) of this result.
 
+When the build targets AArch64 with the `aes` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+
 <a id="aesDecrypt"></a>
 
 ## `aesDecrypt`
@@ -118,6 +140,9 @@ pub fn aesDecrypt(state: simd<u8, 16>, key: simd<u8, 16>) -> simd<u8, 16>
 ```
 
 `aesd` (AES): `key` added to `state`, then InvShiftRows and InvSubBytes.
+
+When the build targets AArch64 with the `aes` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
 
 <a id="aesMixColumns"></a>
 
@@ -129,6 +154,9 @@ pub fn aesMixColumns(state: simd<u8, 16>) -> simd<u8, 16>
 
 `aesmc` (AES): AES MixColumns.
 
+When the build targets AArch64 with the `aes` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+
 <a id="aesInverseMixColumns"></a>
 
 ## `aesInverseMixColumns`
@@ -138,6 +166,9 @@ pub fn aesInverseMixColumns(state: simd<u8, 16>) -> simd<u8, 16>
 ```
 
 `aesimc` (AES): AES InvMixColumns.
+
+When the build targets AArch64 with the `aes` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
 
 <a id="sha256Hash"></a>
 
@@ -150,6 +181,9 @@ pub fn sha256Hash(abcd: simd<u32, 4>, efgh: simd<u32, 4>, wk: simd<u32, 4>) -> s
 `sha256h` (SHA2): four SHA-256 rounds over A..D in `abcd` and E..H in `efgh`, with the
 four message words plus round constants in `wk`. Returns the new A..D.
 
+When the build targets AArch64 with the `sha2` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+
 <a id="sha256Hash2"></a>
 
 ## `sha256Hash2`
@@ -160,6 +194,9 @@ pub fn sha256Hash2(efgh: simd<u32, 4>, abcd: simd<u32, 4>, wk: simd<u32, 4>) -> 
 
 `sha256h2` (SHA2): the same four rounds as [`sha256Hash`](#sha256Hash), with `efgh` first, returning
 the new E..H. Pass the A..D from before `sha256Hash`.
+
+When the build targets AArch64 with the `sha2` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
 
 <a id="sha256ScheduleUpdate0"></a>
 
@@ -172,6 +209,9 @@ pub fn sha256ScheduleUpdate0(left: simd<u32, 4>, right: simd<u32, 4>) -> simd<u3
 `sha256su0` (SHA2): the first step of the next four SHA-256 message words. With `W[0..3]`
 in `left` and `W[4]` in lane 0 of `right`, lane `i` is `W[i] + sigma0(W[i + 1])`.
 
+When the build targets AArch64 with the `sha2` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
+
 <a id="sha256ScheduleUpdate1"></a>
 
 ## `sha256ScheduleUpdate1`
@@ -182,6 +222,9 @@ pub fn sha256ScheduleUpdate1(partial: simd<u32, 4>, middle: simd<u32, 4>, last: 
 
 `sha256su1` (SHA2): the next four message words `W[16..19]`, from the
 [`sha256ScheduleUpdate0`](#sha256ScheduleUpdate0) result `partial`, `W[8..11]` in `middle` and `W[12..15]` in `last`.
+
+When the build targets AArch64 with the `sha2` feature, it compiles to this one instruction.
+Otherwise it computes the same lanes with portable code, which is correct but slower.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

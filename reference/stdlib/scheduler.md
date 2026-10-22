@@ -471,8 +471,8 @@ Use this provider operation after all child task storage and endpoints have been
 
 #### Details
 
-The parent mailbox, submission slot, and response must belong to the calling task. The prepared
-task remains unpublished and must not have received initial readiness.
+The parent mailbox, submission slot, and response must belong to the calling task. The
+prepared task remains unpublished and must not have received initial readiness.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

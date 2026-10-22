@@ -86,8 +86,8 @@ Fails with an [`AssertionError`](#AssertionError) that holds `message` if `condi
 
 #### Details
 
-If `condition` is `true`, this function does nothing. Write `message` as the expected fact, such
-as `"list is empty"`, so that a failure report reads as the broken expectation.
+If `condition` is `true`, this function does nothing. Write `message` as the expected fact,
+such as `"list is empty"`, so that a failure report reads as the broken expectation.
 
 #### Errors
 
@@ -147,8 +147,8 @@ name `module::name`.
 
 #### When to use
 
-Use this function in a custom runner that reports tests by qualified name, as the built-in runner
-does. Use [`Testing.matches`](#Testing.impl.matches) to match the plain name only.
+Use this function in a custom runner that reports tests by qualified name, as the built-in
+runner does. Use [`Testing.matches`](#Testing.impl.matches) to match the plain name only.
 
 #### Details
 

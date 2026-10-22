@@ -369,7 +369,8 @@ Returns the byte order of the target.
 pub static fn cpu() -> string<'static>
 ```
 
-Returns the name of the CPU model that the build selects, as written in the compilation profile.
+Returns the name of the CPU model that the build selects, as written in the compilation
+profile.
 
 <a id="Target.impl.deployment"></a>
 

@@ -150,8 +150,8 @@ the free part of `buffer` goes out at once, together with the buffered bytes in 
 call. Thus a buffer of 64 bytes gives one system call for most short lines. An empty `buffer`
 gives one system call for each write.
 
-The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go out
-before the bytes that the first [`LockedStderr`](#LockedStderr) still holds.
+The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go
+out before the bytes that the first [`LockedStderr`](#LockedStderr) still holds.
 
 #### Gotchas
 

@@ -11,10 +11,10 @@ write moved, such as HTTP or TLS. Most code uses it through `silk.buffered_duple
 `silk.writer.Writer` when each write must complete or fail as a whole.
 
 ## Details
-[`ByteDuplex.readSome`](#ByteDuplex.impl.readSome), [`ByteDuplex.writeSome`](#ByteDuplex.impl.writeSome), and [`ByteDuplex.writeSomeVectored`](#ByteDuplex.impl.writeSomeVectored) can
-move fewer bytes than the caller offers. A successful read or write of a non-empty slice moves at least one byte. The bytes after
-that count stay with the caller. `ReadTransfer.End` means that the peer ended the stream. It is
-not a message of the protocol.
+[`ByteDuplex.readSome`](#ByteDuplex.impl.readSome), [`ByteDuplex.writeSome`](#ByteDuplex.impl.writeSome), and [`ByteDuplex.writeSomeVectored`](#ByteDuplex.impl.writeSomeVectored) can move
+fewer bytes than the caller offers. A successful read or write of a non-empty slice moves at
+least one byte. The bytes after that count stay with the caller. `ReadTransfer.End` means that
+the peer ended the stream. It is not a message of the protocol.
 
 Each operation takes a deadline: an absolute time on the active `MonotonicClock`, or none.
 
@@ -107,6 +107,18 @@ pub union ByteIoError
 ```
 
 The error from a [`ByteDuplex`](#ByteDuplex) operation.
+
+### Details
+
+`Timeout` means that the deadline passed, `Closed` that the transport or its write direction is
+closed, and `Provider` that the transport failed for its own reason. `InvalidTransferCount`
+means that the provider reported a count that is not possible. The safe operation then closes
+the transport.
+
+### Gotchas
+
+After `InvalidTransferCount`, do not try again with the same buffer. If an operation is canceled
+during a transfer, it is not known how many bytes moved. Close the transport.
 
 <a id="ByteIoError.Timeout"></a>
 
@@ -268,15 +280,33 @@ The peer ended the stream. Later reads also return `End`.
 pub service ByteDuplex
 ```
 
-The effect for one two-way byte stream that the code uses alone.
+The effect for one two-way byte stream that the code uses alone, such as a TCP connection,
+with partial reads and writes and deadlines.
+
+### When to use
+
+Require `&mut ByteDuplex` in protocol code that must know exactly how many bytes each read and
+write moved, such as HTTP or TLS. Most code uses it through `silk.buffered_duplex`. Use
+`silk.writer.Writer` when each write must complete or fail as a whole.
 
 ### Details
+
+A read or write can move fewer bytes than the caller offers. A successful read or write of a
+non-empty slice moves at least one byte. `ReadTransfer.End` means that the peer ended the
+stream. Each operation takes a deadline: an absolute time on the active `MonotonicClock`, or
+none.
 
 A provider implements the `...Raw` operations. Callers use the safe operations with the same
 names without `Raw`: [`ByteDuplex.readSome`](#ByteDuplex.impl.readSome), [`ByteDuplex.writeSome`](#ByteDuplex.impl.writeSome),
 [`ByteDuplex.writeSomeVectored`](#ByteDuplex.impl.writeSomeVectored), [`ByteDuplex.flush`](#ByteDuplex.impl.flush), [`ByteDuplex.shutdownWrite`](#ByteDuplex.impl.shutdownWrite), and
-[`ByteDuplex.close`](#ByteDuplex.impl.close). A direct call to a `...Raw` operation is
-`unsafe`, because its count is not checked.
+[`ByteDuplex.close`](#ByteDuplex.impl.close). A direct call to a `...Raw` operation is `unsafe`, because its count is
+not checked.
+
+### Gotchas
+
+If a provider reports a count that is not possible, the safe operation closes the transport and
+fails with `InvalidTransferCount`. If an operation is canceled during a transfer, it is not
+known how many bytes moved. Close the transport.
 
 <a id="ByteDuplex.readSomeRaw"></a>
 
@@ -316,8 +346,8 @@ unsafe effect fn writeSomeVectoredRaw(
 ```
 
 The provider vectored write. It sends bytes from the slices of `inputs`, in order, as if they
-were one slice, and returns their count. The safe wrapper calls it only when the slices hold at
-least one byte.
+were one slice, and returns their count. The safe wrapper calls it only when the slices hold
+at least one byte.
 
 #### Details
 

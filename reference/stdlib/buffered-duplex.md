@@ -138,7 +138,15 @@ to the callback.
 ### Details
 
 The session has an input buffer and an output buffer. It borrows the transport for the duration
-of the callback.
+of the callback and cannot escape it. The scope closes the transport when the callback returns,
+fails, or is canceled. A transport failure makes the whole session terminal, and each later
+operation fails with `BufferError.Terminal`.
+
+### Gotchas
+
+The end of the scope does not flush. Bytes that are still pending are lost. Call
+[`BufferedDuplex.flush`](#BufferedDuplex.impl.flush) or [`BufferedDuplex.shutdownWrite`](#BufferedDuplex.impl.shutdownWrite) before the callback returns. If the
+program traps, the transport is not closed.
 
 <a id="BufferedContext"></a>
 
@@ -248,13 +256,17 @@ ends.
 
 #### Details
 
-It works like `BufferedInput.fill` on the input buffer of the session. `deadline` is an
-absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+If the input buffer already holds `minimum` bytes, it does not read. Each read asks for all
+free space, so the buffer can hold more than `minimum` bytes after the call. A `minimum` of 0
+never reads. `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()`
+means no time limit.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure or a close made the session unusable.
-- The errors of `BufferedInput.fill`. A transport failure makes the session terminal.
+- `BufferError.BufferTooSmall` if `minimum` is more than the input capacity.
+- `BufferError.ReadFailed` if a read fails. The session becomes terminal. `progress` gives the
+  bytes that this call added.
 
 <a id="BufferedDuplex.impl.readSome"></a>
 
@@ -275,13 +287,16 @@ Copies unread bytes into `output` and consumes them. Reads first if the input bu
 
 #### Details
 
-It works like `BufferedInput.readSome` on the input buffer of the session. `deadline` is an
-absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+The result is `ReadTransfer.Data` with a count from 1 to `output.length`, or
+`ReadTransfer.End` if the transport ended and the input buffer is empty. An empty `output`
+returns a count of 0 and does not read. `deadline` is an absolute time on the active
+`MonotonicClock`. `Option.none()` means no time limit.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure or a close made the session unusable.
-- The errors of `BufferedInput.readSome`. A transport failure makes the session terminal.
+- `BufferError.ReadFailed` if a read fails. The session becomes terminal. `progress` gives the
+  bytes that this call added.
 
 <a id="BufferedDuplex.impl.readExact"></a>
 
@@ -302,13 +317,16 @@ Fills all of `output` with the next input bytes and consumes them.
 
 #### Details
 
-It works like `BufferedInput.readExact` on the input buffer of the session. `deadline` is an
-absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+`deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no time
+limit. It applies to each read.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure or a close made the session unusable.
-- The errors of `BufferedInput.readExact`. A transport failure makes the session terminal.
+- `BufferError.UnexpectedEnd` if the transport ends first. `progress` gives the number of
+  bytes that were copied into `output`.
+- `BufferError.ReadFailed` if a read fails. The session becomes terminal. `progress` includes
+  the bytes that this call copied before the failure.
 
 <a id="BufferedDuplex.impl.discardAtMost"></a>
 
@@ -329,13 +347,14 @@ Consumes and drops up to `limit` input bytes. It stops early if the transport en
 
 #### Details
 
-It works like `BufferedInput.discardAtMost` on the input buffer of the session. `deadline` is
-an absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+The result gives the number of discarded bytes and if the transport ended. `deadline` is an
+absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure or a close made the session unusable.
-- The errors of `BufferedInput.discardAtMost`. A transport failure makes the session terminal.
+- `BufferError.ReadFailed` if a read fails. The session becomes terminal. `progress` gives the
+  bytes that this call added.
 
 <a id="BufferedDuplex.impl.discardExact"></a>
 
@@ -356,13 +375,16 @@ Consumes and drops exactly `count` input bytes.
 
 #### Details
 
-It works like `BufferedInput.discardExact` on the input buffer of the session. `deadline` is
-an absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+`deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no time
+limit.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure or a close made the session unusable.
-- The errors of `BufferedInput.discardExact`. A transport failure makes the session terminal.
+- `BufferError.UnexpectedEnd` if the transport ends first. `progress` gives the number of
+  bytes that were discarded.
+- `BufferError.ReadFailed` if a read fails. The session becomes terminal. `progress` gives the
+  bytes that this call added.
 
 <a id="BufferedDuplex.impl.writeSome"></a>
 
@@ -384,14 +406,18 @@ first if the buffer is full.
 
 #### Details
 
-It works like `BufferedOutput.writeSome` on the output buffer of the session. `deadline` is an
-absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+If `input` is longer than the output capacity, it does not copy: it sends the pending bytes
+and `input` to the transport until the transport accepts some input bytes. For a non-empty
+`input`, the result is at least 1. For an empty `input`, the result is 0 and the transport is
+not used. `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means
+no time limit.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure, a close, or [`BufferedDuplex.shutdownWrite`](#BufferedDuplex.impl.shutdownWrite)
   made output unusable.
-- The errors of `BufferedOutput.writeSome`. A transport failure makes the session terminal.
+- `BufferError.WriteFailed` if the transport fails or `deadline` passes. The session becomes
+  terminal. `drained` gives the number of pending bytes that the transport received.
 
 <a id="BufferedDuplex.impl.writeAll"></a>
 
@@ -412,14 +438,18 @@ Copies all of `input` into the output buffer, and sends pending bytes as the buf
 
 #### Details
 
-It works like `BufferedOutput.writeAll` on the output buffer of the session. `deadline` is an
-absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+When it returns, the output buffer owns all of `input`, or the transport already has them. The
+transport does not necessarily have the buffered bytes yet. Call [`BufferedDuplex.flush`](#BufferedDuplex.impl.flush) to
+send them. `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()`
+means no time limit. It applies to each transport write.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure, a close, or [`BufferedDuplex.shutdownWrite`](#BufferedDuplex.impl.shutdownWrite)
   made output unusable.
-- The errors of `BufferedOutput.writeAll`. A transport failure makes the session terminal.
+- `BufferError.WriteFailed` if the transport fails or `deadline` passes. The session becomes
+  terminal. `accepted` gives the number of `input` bytes that the buffer accepted before the
+  failure. `drained` gives the number of pending bytes that the transport received.
 
 <a id="BufferedDuplex.impl.writeVecAll"></a>
 
@@ -440,14 +470,18 @@ Copies each slice in `inputs` into the output buffer, in order.
 
 #### Details
 
-It works like `BufferedOutput.writeVecAll` on the output buffer of the session. `deadline` is
-an absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+Before it writes, it adds the lengths of all elements and checks the sum for overflow. The
+transport does not necessarily have the buffered bytes when it returns. `deadline` is an
+absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure, a close, or [`BufferedDuplex.shutdownWrite`](#BufferedDuplex.impl.shutdownWrite)
   made output unusable.
-- The errors of `BufferedOutput.writeVecAll`. A transport failure makes the session terminal.
+- `BufferError.LengthOverflow` if the sum of the element lengths overflows `usize`. Nothing is
+  written.
+- `BufferError.WriteFailed` if the transport fails or `deadline` passes. The session becomes
+  terminal. `accepted` counts the accepted bytes of all elements together.
 
 <a id="BufferedDuplex.impl.flush"></a>
 
@@ -467,14 +501,18 @@ Sends all pending bytes to the transport and then flushes the transport.
 
 #### Details
 
-It works like `BufferedOutput.flush` on the output buffer of the session. `deadline` is an
-absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+It sends pending bytes in order, one time each. When it returns, [`BufferedDuplex.pending`](#BufferedDuplex.impl.pending) is
+0. `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no
+   time
+limit. It applies to each transport operation.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure, a close, or [`BufferedDuplex.shutdownWrite`](#BufferedDuplex.impl.shutdownWrite)
   made output unusable.
-- The errors of `BufferedOutput.flush`. A transport failure makes the session terminal.
+- `BufferError.WriteFailed` if a transport write or the transport flush fails, or if
+  `deadline` passes. The session becomes terminal. `drained` gives the number of pending bytes
+  that the transport received.
 
 <a id="BufferedDuplex.impl.finish"></a>
 
@@ -490,18 +528,27 @@ pub effect fn finish(
   where &mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock
 ```
 
-Sends all pending bytes and flushes the transport. It is the same as [`BufferedDuplex.flush`](#BufferedDuplex.impl.flush).
+Sends all pending bytes to the transport and then flushes the transport.
+
+#### When to use
+
+Use it as the last write operation of the session. The end of the scope does not flush.
+[`BufferedDuplex.flush`](#BufferedDuplex.impl.flush) has the same behavior.
 
 #### Details
 
-It works like `BufferedOutput.finish` on the output buffer of the session. `deadline` is an
-absolute time on the active `MonotonicClock`. `Option.none()` means no time limit.
+It sends pending bytes in order, one time each. When it returns, [`BufferedDuplex.pending`](#BufferedDuplex.impl.pending) is
+0. `deadline` is an absolute time on the active `MonotonicClock`. `Option.none()` means no
+   time
+limit. It applies to each transport operation.
 
 #### Errors
 
 - `BufferError.Terminal` if an earlier failure, a close, or [`BufferedDuplex.shutdownWrite`](#BufferedDuplex.impl.shutdownWrite)
   made output unusable.
-- The errors of `BufferedOutput.finish`. A transport failure makes the session terminal.
+- `BufferError.WriteFailed` if a transport write or the transport flush fails, or if
+  `deadline` passes. The session becomes terminal. `drained` gives the number of pending bytes
+  that the transport received.
 
 <a id="BufferedDuplex.impl.shutdownWrite"></a>
 
@@ -664,7 +711,13 @@ and closes the transport at the end.
 ### When to use
 
 Use it instead of [`withBufferedCapacity`](#withBufferedCapacity) when the code that uses the session owns a value that
-can be used only one time. See [`BufferedContext`](#BufferedContext).
+can be used only one time. Implement [`BufferedContext`](#BufferedContext) for that value. `use` consumes the
+context and receives the session. The session cannot escape through the context or the result.
+
+### Details
+
+The capacities are checked before anything is allocated. The transport is closed one time, after
+`context.use` returns, fails, or is canceled. A failure of that close is ignored.
 
 ### Errors
 

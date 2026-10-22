@@ -631,7 +631,8 @@ The caller-supplied name/subtree comparison budget is exhausted.
 pub struct ProfileError
 ```
 
-An owned certificate-profile error with optional extension context and a stable byte offset.
+The error when a certificate does not fit the TLS server certificate profile, with the reason,
+the extension, and the byte offset of the problem. It owns its values.
 
 <a id="ProfileError.kind"></a>
 
@@ -847,7 +848,25 @@ impl Copy for ExtendedKeyUsage
 pub struct CertificateProfile<'a>
 ```
 
-One immutable borrowed semantic view over a complete decoded certificate.
+A checked view of one decoded certificate for the TLS server certificate profile, with its
+extensions.
+
+### When to use
+
+Make one with [`CertificateProfile.inspect`](#CertificateProfile.impl.inspect) to check one certificate for a role (leaf,
+intermediate, or anchor) and to read its basic constraints, key usage, and other extensions.
+`silk.certificate_path` does this for each certificate of a chain.
+
+### Details
+
+The profile is strict. Keys and signatures must be ECDSA P-256 with SHA-256, ECDSA P-384 with
+SHA-384, or RSA with SHA-256 (2048 to 4096 bits). An unknown critical extension or another
+algorithm is an error. The view borrows the certificate and does not allocate.
+
+### Gotchas
+
+A certificate that passes does not mean that you can trust it. The profile does not check
+dates, the chain, the host name, or revocation.
 
 <a id="CertificateProfile.impl.Copy"></a>
 
@@ -883,12 +902,17 @@ For a leaf or an intermediate, the inner and outer signature algorithms must mat
 supported. For an anchor, the signature, serial number, dates, and self-signature are not
 checked, because you chose to trust it.
 
+The profile is strict. Keys and signatures must be ECDSA P-256 with SHA-256, ECDSA P-384
+with SHA-384, or RSA with SHA-256 (2048 to 4096 bits). An unknown critical extension or
+another algorithm is an error. The result borrows `certificate` and does not allocate.
+
 #### Errors
 - `Failure` with a [`ProfileError`](#ProfileError) if the certificate does not fit the profile for the role
   or goes over `limits`.
 
 #### Gotchas
-It does not verify a signature or check dates.
+It does not verify a signature or check dates, the chain, the host name, or revocation. A
+certificate that passes does not mean that you can trust it.
 
 <a id="CertificateProfile.impl.certificate"></a>
 

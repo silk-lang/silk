@@ -180,7 +180,25 @@ changed, or a value is wrong.
 pub struct AesGcm
 ```
 
-Functions that encrypt and decrypt with AES-GCM.
+Functions that encrypt and authenticate with AES-128-GCM or AES-256-GCM (NIST SP 800-38D).
+
+### When to use
+
+Use [`AesGcm.seal`](#AesGcm.impl.seal) to encrypt a message so that only holders of the key can read it and any
+change is detected. Use [`AesGcm.open`](#AesGcm.impl.open) to check and decrypt it.
+
+### Details
+
+The key is 16 bytes (AES-128) or 32 bytes (AES-256), the nonce is 12 bytes, and the tag is 16
+bytes. The tag is separate from the ciphertext, so store or send both. The ciphertext has the
+same length as the plaintext. Nothing allocates. All checks come before the first write, and on
+any error the output buffers do not change.
+
+### Gotchas
+
+The same key and nonce must never encrypt two messages. If they do, an attacker can recover the
+XOR of the two plaintexts and forge tags. Authentication does not stop replay. The functions do
+not erase their copies of the key.
 
 <a id="AesGcm.impl"></a>
 
@@ -207,16 +225,26 @@ pub fn seal(
 
 Encrypts `plaintext` into `ciphertext` and writes the 16-byte authentication tag to `tag`.
 
-`aad` is authenticated but not encrypted. `ciphertext` can be longer than `plaintext`. The
-bytes after the written prefix do not change. The buffers must not overlap.
+The key is 16 bytes (AES-128) or 32 bytes (AES-256), and the nonce is 12 bytes. `aad` is
+authenticated but not encrypted. Use it for headers that must stay readable. The ciphertext
+has the same length as `plaintext`. `ciphertext` can be longer than `plaintext`. The bytes
+after the written prefix do not change. The buffers must not overlap. Nothing allocates.
 
 #### Errors
-- `InvalidKeyLength`, `InvalidNonceLength`, or `InvalidTagLength` for a wrong length.
+All checks come before the first write. On an error, `ciphertext` and `tag` do not change.
+
+- `InvalidKeyLength` if `key` is not 16 or 32 bytes.
+- `InvalidNonceLength` if `nonce` is not 12 bytes.
+- `InvalidTagLength` if `tag` is not 16 bytes.
 - `OutputTooSmall` if `ciphertext` is shorter than `plaintext`.
-- `LimitExceeded` if `plaintext` or `aad` is too long.
+- `LimitExceeded` if `plaintext` is longer than 2^36 - 32 bytes or `aad` is longer than
+  2^61 - 1 bytes.
 
 #### Gotchas
-Use a new nonce for each message under the same key. The function does not make one.
+Use a new nonce for each message under the same key. The function does not make one. If the
+same key and nonce encrypt two messages, an attacker can recover the XOR of the two
+plaintexts and forge tags. Use a counter, or 12 random bytes from `silk.random` for a small
+number of messages per key. The function does not erase its copy of the key.
 
 <a id="AesGcm.impl.open"></a>
 
@@ -235,13 +263,25 @@ pub fn open(
 
 Checks `tag`, and if it is correct, decrypts `ciphertext` into `plaintext`.
 
-`aad` must be the same bytes that were given to [`AesGcm.seal`](#AesGcm.impl.seal). The function checks all 16
-tag bytes before it writes `plaintext`. The bytes after the written prefix do not change.
+The key is 16 bytes (AES-128) or 32 bytes (AES-256), the nonce is 12 bytes, and the tag is 16
+bytes. `aad` must be the same bytes that were given to [`AesGcm.seal`](#AesGcm.impl.seal). The function checks
+all 16 tag bytes before it writes `plaintext`. The bytes after the written prefix do not
+change. Nothing allocates.
 
 #### Errors
-- `AuthenticationFailed` if the tag is not correct. `plaintext` does not change.
-- `InvalidKeyLength`, `InvalidNonceLength`, `InvalidTagLength`, `OutputTooSmall`, or
-  `LimitExceeded` as for [`AesGcm.seal`](#AesGcm.impl.seal).
+All checks come before the first write. On an error, `plaintext` does not change.
+
+- `AuthenticationFailed` if the tag is not correct for the key, nonce, `aad`, and ciphertext.
+- `InvalidKeyLength` if `key` is not 16 or 32 bytes.
+- `InvalidNonceLength` if `nonce` is not 12 bytes.
+- `InvalidTagLength` if `tag` is not 16 bytes.
+- `OutputTooSmall` if `plaintext` is shorter than `ciphertext`.
+- `LimitExceeded` if `ciphertext` is longer than 2^36 - 32 bytes or `aad` is longer than
+  2^61 - 1 bytes.
+
+#### Gotchas
+Authentication does not stop replay: an attacker can send an old valid message again. The
+function does not erase its copy of the key.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

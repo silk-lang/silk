@@ -65,6 +65,24 @@ pub struct CpuFeatures
 
 A set of CPU features of the target architecture.
 
+### When to use
+
+Use [`CpuFeatures.detect`](#CpuFeatures.impl.detect) when one binary must pick a faster kernel on machines that have a
+feature the build does not select. Use `Target.hasCpuFeature` with `static if` when the build
+itself selects the feature, which costs nothing at run time.
+
+### Details
+
+The names are spelled as in the compilation profile, such as `"avx2"`, `"dotprod"` or
+`"simd128"`. [`CpuFeatures.selected`](#CpuFeatures.impl.selected) is the set the build selects. [`CpuFeatures.detect`](#CpuFeatures.impl.detect) asks
+the machine and always includes the selected set.
+
+### Gotchas
+
+- A name from another architecture, or an unknown name, is never present.
+- A detected feature does not make `Target.hasCpuFeature` true. Code that uses the feature's
+  instructions must still be compiled for it.
+
 <a id="CpuFeatures.impl.Copy"></a>
 
 ## Implementation `Copy for CpuFeatures`
@@ -103,8 +121,21 @@ Returns the features of the running machine, which include [`CpuFeatures.selecte
 
 #### Details
 
-Each call asks the machine again. Where the machine cannot be asked, the result is the
-selected set.
+Each call asks the machine again:
+
+- x86-64 reads `cpuid`, and counts AVX and AVX-512 features only when the operating system
+  saves their registers (`xgetbv`).
+- AArch64 Linux with GNU libc reads `getauxval`. AArch64 Darwin reads `sysctlbyname`.
+- wasm32 cannot ask the engine, and other profiles cannot ask the system, so they report the
+  selected set.
+
+Silk has no mutable global storage, so the result is not cached. Call `detect` once at start
+and keep the value, for example in a service.
+
+#### Gotchas
+
+A detected feature does not make `Target.hasCpuFeature` true. Code that uses the feature's
+instructions must still be compiled for it.
 
 <a id="CpuFeatures.impl.has"></a>
 

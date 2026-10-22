@@ -289,9 +289,9 @@ Returns one UTF-8 byte from a committed message.
 
 #### Gotchas
 
-`eventIndex` must be less than [`length`](#Logger.impl.length). `byteIndex` must be less than
-[`messageLengthAt`](#Logger.impl.messageLengthAt) for that event. An unused event or invalid byte index traps. An event index
-of eight or more also traps.
+`eventIndex` must be less than [`length`](#Logger.impl.length). `byteIndex` must be less than [`messageLengthAt`](#Logger.impl.messageLengthAt)
+for that event. An unused event or invalid byte index traps. An event index of eight or more
+also traps.
 
 <a id="Logger.impl.attempts"></a>
 

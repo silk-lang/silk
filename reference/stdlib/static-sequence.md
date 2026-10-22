@@ -88,8 +88,8 @@ Returns a new sequence with the elements of `self` and then `value`.
 
 #### Details
 
-This function consumes `self`. To grow a sequence in a loop, assign the result back to the same
-binding, as in `result = StaticSequence.append<i32>(move result, 1)`.
+This function consumes `self`. To grow a sequence in a loop, assign the result back to the
+same binding, as in `result = StaticSequence.append<i32>(move result, 1)`.
 
 <a id="StaticSequence.impl.concat"></a>
 

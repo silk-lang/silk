@@ -367,7 +367,25 @@ Number of DER nodes traversed while validating the selected GeneralNames value.
 pub struct CertificateSan
 ```
 
-Operations that decode complete SAN values without allocation or identity matching.
+Operations that decode the subject alternative names (SAN) of a certificate: the DNS names and
+IP addresses that it is for.
+
+### When to use
+
+Use [`CertificateSan.decode`](#CertificateSan.impl.decode) to read the SAN list of a certificate, and pass the result to
+`HttpsIdentity.verify` to check a host name. Use [`CertificateSan.decodeValue`](#CertificateSan.impl.decodeValue) when you have
+only the DER of a GeneralNames value.
+
+### Details
+
+The functions write one `PresentedIdentity` for each name into storage that you give, in source
+order, and return how many they wrote. The names borrow the input. Nothing allocates. Forms
+other than DNS names and IP addresses are returned as `Other` with their raw bytes.
+
+### Gotchas
+
+After an error, the storage can hold some names. Do not use them. These functions check the
+encoding only. `HttpsIdentity.verify` checks DNS syntax and IP lengths.
 
 <a id="CertificateSan.impl"></a>
 
@@ -390,7 +408,8 @@ pub fn validateValue(
 
 Checks one DER GeneralNames value and returns the number of names, without storage.
 
-It does the same checks as [`CertificateSan.decodeValue`](#CertificateSan.impl.decodeValue).
+The DER structure and the encoding of each GeneralName are checked. Some ASN.1 types inside
+`otherName` and `x400Address` are not checked. Nothing allocates.
 
 #### Errors
 - `Failure` with a [`SanDecodeError`](#SanDecodeError) if the DER is not valid or a limit is exceeded.
@@ -417,7 +436,8 @@ Some ASN.1 types inside `otherName` and `x400Address` are not checked.
   limit is exceeded.
 
 #### Gotchas
-After an error, do not use `storage`.
+After an error, `storage` can hold some names. Do not use them. This function checks the
+encoding only. `HttpsIdentity.verify` checks DNS syntax and IP lengths.
 
 <a id="CertificateSan.impl.decode"></a>
 
@@ -433,14 +453,18 @@ pub fn decode<'a>(
 
 Finds the SAN extension of `certificate`, decodes it into `storage`, and returns a summary.
 
-If the certificate has no SAN extension, `present` is `false` and `count` is 0.
+If the certificate has no SAN extension, `present` is `false` and `count` is 0. The function
+writes one `PresentedIdentity` for each name into `storage`, in source order. The names
+borrow `certificate`. Nothing allocates. Forms other than DNS names and IP addresses are
+returned as `Other` with their raw bytes.
 
 #### Errors
 - `Failure` with a [`SanDecodeError`](#SanDecodeError) if there are two SAN extensions, the SAN is empty or not
   valid, `storage` is too small, or a limit is exceeded.
 
 #### Gotchas
-After an error, do not use `storage`.
+After an error, `storage` can hold some names. Do not use them. This function checks the
+encoding only. `HttpsIdentity.verify` checks DNS syntax and IP lengths.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.

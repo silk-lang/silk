@@ -46,7 +46,24 @@ Public declarations: 1.
 pub struct Blake2b512
 ```
 
-An incremental unkeyed BLAKE2b state with a 64-byte digest.
+An incremental unkeyed BLAKE2b state with a 64-byte digest (RFC 7693).
+
+### When to use
+
+Use it where a format names BLAKE2b with a 64-byte digest, such as prehashed minisign
+signatures. Use `silk.sha2` where a protocol names SHA-2. Use `silk.hash` only for collection
+keys. It is not a cryptographic hash.
+
+### Details
+
+Give input in parts with [`Blake2b512.update`](#Blake2b512.impl.update) and get the digest with [`Blake2b512.finish`](#Blake2b512.impl.finish),
+or hash one slice with [`Blake2b512.hash`](#Blake2b512.impl.hash). The state uses only inline storage and allocates no
+memory. The digest is the little-endian encoding of the final state words.
+
+### Gotchas
+
+Keyed hashing, salts, personalization and digest lengths other than 64 bytes are not supported.
+If an update makes the message longer than 2^128 - 1 bytes, the program traps.
 
 <a id="Blake2b512.impl"></a>
 
@@ -78,7 +95,10 @@ Adds `bytes` to this state in source order. An empty slice does not change the s
 
 #### Details
 A full block is compressed only when more input follows it, because the final block is
-compressed with the finalization flag.
+compressed with the finalization flag. It allocates no memory.
+
+#### Gotchas
+If an update makes the message longer than 2^128 - 1 bytes, the program traps.
 
 <a id="Blake2b512.impl.finish"></a>
 
@@ -89,6 +109,11 @@ pub fn finish(self: Self) -> [u8; 64]
 ```
 
 Consumes this state and returns its 64-byte digest.
+
+#### Gotchas
+
+The state is consumed, so the program cannot update or finish it again. Use
+[`Blake2b512.hash`](#Blake2b512.impl.hash) for one slice.
 
 <a id="Blake2b512.impl.hash"></a>
 

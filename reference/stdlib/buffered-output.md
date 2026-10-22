@@ -98,7 +98,22 @@ pub struct BufferedOutput
 
 A fixed-size buffer that holds output bytes until the transport receives them.
 
+### When to use
+
+Use it when a program makes many small writes to a byte transport and each transport write has
+a cost, such as a system call. Make the buffer with [`BufferedOutput.make`](#BufferedOutput.impl.make), write with
+[`BufferedOutput.writeAll`](#BufferedOutput.impl.writeAll), and end with [`BufferedOutput.finish`](#BufferedOutput.impl.finish).
+
+Each operation has two forms. The deadline form, such as `writeAll`, uses a
+`silk.byte_duplex.ByteDuplex` transport and a deadline. The `Writer` form, such as
+`writeAllWriter`, uses a `silk.writer.Writer` provider and has no deadline.
+
 ### Details
+
+The buffer sends pending bytes to the transport only when it is full or when the caller flushes
+it. Input that is longer than the buffer is not copied: once the pending bytes are sent, it goes
+to the transport directly. A failed transport write or flush makes the buffer terminal. After
+that, each write and flush fails with `BufferError.Terminal`.
 
 The buffer has one allocation of [`BufferedOutput.capacity`](#BufferedOutput.impl.capacity) bytes. The size does not change
 after [`BufferedOutput.make`](#BufferedOutput.impl.make). [`BufferedOutput.pending`](#BufferedOutput.impl.pending) gives the number of bytes that the
@@ -202,8 +217,9 @@ If the buffer is full, this function first sends all pending bytes to the active
 transport. Then it copies input bytes into the free space. If `input` is longer than
 [`BufferedOutput.capacity`](#BufferedOutput.impl.capacity), it does not copy: it gives the pending bytes and `input` to
 `ByteDuplex.writeSomeVectored`, or only `input` to `ByteDuplex.writeSome` when nothing is
-pending, until the transport accepts some input bytes, and returns their count. For a non-empty `input`, the result
-is at least 1. For an empty `input`, the result is 0 and the transport is not used.
+pending, until the transport accepts some input bytes, and returns their count. For a
+non-empty `input`, the result is at least 1. For an empty `input`, the result is 0 and the
+transport is not used.
 
 #### Errors
 
@@ -277,8 +293,8 @@ overflow. `deadline` applies to each transport write that this call makes.
 
 #### Errors
 
-- `BufferError.LengthOverflow` if the sum of the element lengths overflows `usize`. The function
-  writes nothing.
+- `BufferError.LengthOverflow` if the sum of the element lengths overflows `usize`. The
+  function writes nothing.
 - `BufferError.Terminal` if an earlier failure made the buffer terminal.
 - `BufferError.WriteFailed` if the transport fails or `deadline` passes. The buffer becomes
   terminal. `accepted` counts the accepted bytes of all elements together, not only the bytes
@@ -330,13 +346,25 @@ pub effect fn finish(
   ? &mut ByteDuplex | &mut MonotonicClock
 ```
 
-Sends all pending bytes to the transport and flushes it. This function has the same behavior as
-[`BufferedOutput.flush`](#BufferedOutput.impl.flush).
+Sends all pending bytes to the transport and then flushes the transport.
 
 #### When to use
 
 Use `finish` as the last operation on a buffer. The name shows that the output is complete.
-Dropping a buffer does not flush it.
+Dropping a buffer does not flush it. [`BufferedOutput.flush`](#BufferedOutput.impl.flush) has the same behavior.
+
+#### Details
+
+This function sends pending bytes in order, one time each, and then calls
+`ByteDuplex.flush`. When it returns, [`BufferedOutput.pending`](#BufferedOutput.impl.pending) is 0. `deadline` applies to
+each transport operation that this call makes.
+
+#### Errors
+
+- `BufferError.Terminal` if an earlier failure made the buffer terminal.
+- `BufferError.WriteFailed` if a transport write or the transport flush fails, or if
+  `deadline` passes. The buffer becomes terminal. `drained` gives the number of pending bytes
+  that the transport received.
 
 <a id="BufferedOutput.impl.writeSomeWriter"></a>
 
