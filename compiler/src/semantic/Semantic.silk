@@ -464,6 +464,10 @@ pub enum Family {
   Condition,
   /// The explicitly supplied, content-interned build profile.
   ProfileInput,
+  /// Whether one runtime function needs static residualization (`needsStaticResidualization`):
+  /// its own static markers, or a call to a static helper. Body checking, lowering and selection
+  /// all route on it, so the body's calls are resolved for it once.
+  StaticRouting,
   /// One checked ordinary function body.
   Body,
   /// The finite exact environment established by one complete ordinary opaque producer.
@@ -541,6 +545,7 @@ fn familyZone(family: Family) -> &'static [u8] {
     Family.Mir => b"Mir"
     Family.Layout => b"Layout"
     Family.PhaseOnly => b"PhaseOnly"
+    Family.StaticRouting => b"StaticRouting"
     Family.EmissionInputs => b"EmissionInputs"
     Family.LlvmText => b"LlvmText"
     Family.ModuleCheck => b"ModuleCheck"
@@ -919,6 +924,8 @@ pub union Value {
   Condition {pub holds: bool},
   /// Whether a type has no runtime layout (STATIC-009).
   PhaseOnly {pub holds: bool},
+  /// Whether a runtime function needs static residualization.
+  StaticRouting {pub holds: bool},
   /// A package parameter's checked declaration header.
   ParameterSchema {pub schema: Shared<ParameterSchema>},
   /// A reached registered default, checked at the declaration's resolved type.
@@ -4279,6 +4286,10 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       Value.PhaseOnly {holds: other} => holds == other
       _ => false
     }
+    Value.StaticRouting {holds} => match & right.* {
+      Value.StaticRouting {holds: other} => holds == other
+      _ => false
+    }
     Value.ProfileInput {slot} => match & right.* {
       Value.ProfileInput {slot: other} => slot == other
       _ => false
@@ -6822,6 +6833,7 @@ effect fn resolveOtherFamily(
     Family.Mir => run lowerMir(&mut resolver.*, &mut owner.*, key)
     Family.Layout => run resolveLayout(&mut resolver.*, &mut owner.*, key)
     Family.PhaseOnly => run resolvePhaseOnly(&mut resolver.*, &mut owner.*, key)
+    Family.StaticRouting => run resolveStaticRouting(&mut resolver.*, &mut owner.*, key)
     Family.EmissionInputs => run resolveEmissionInputs(&mut resolver.*, &mut owner.*, key)
     Family.LlvmText => run resolveLlvmText(&mut resolver.*, key)
     Family.ModuleCheck => CompilerBug.panic(b"a module check runs in checkModule, never as a provider")
@@ -7103,6 +7115,7 @@ fn valueTag(value: &Value) -> u64 {
     Value.LayoutUnsupported => 24
     Value.ImplementationMembers {..} => 25
     Value.InherentMember {..} => 26
+    Value.StaticRouting {..} => 27
     _ => 0
   }
 }
@@ -7202,6 +7215,7 @@ fn fingerprintValue(writer: &mut AnswerFingerprint.Writer, value: &Value) -> () 
     Value.Signature {signature} => { fingerprintSignature(&mut writer.*, &signature) }
     Value.Condition {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
     Value.PhaseOnly {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
+    Value.StaticRouting {holds} => { AnswerFingerprint.flag(&mut writer.*, holds) }
     Value.ProfileInput {slot} => { AnswerFingerprint.count(&mut writer.*, slot) }
     Value.LayoutUnsupported => {}
     _ => { AnswerFingerprint.incomplete(&mut writer.*) }
@@ -70713,10 +70727,54 @@ effect fn bodyHasStaticWork(hir: &Module, block: HirId) -> bool ! OutOfMemoryErr
 }
 
 // The single routing fact for a runtime function: true when it has static parameters, static
-// control or state, or calls a static helper whose result is embedded. Syntactic markers decide
-// first; only otherwise are the written callees' headers read. No callee runtime body is demanded
-// and no static arm is semantically inspected.
+// control or state, or calls a static helper whose result is embedded. Its `StaticRouting` unit
+// computes it once per declaration and revision.
 effect fn needsStaticResidualization(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>,
+  module: &ModuleId,
+  moduleOrdinal: usize,
+  declaration: usize,
+) -> Result<bool, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let routingRequest = Key {
+    family: Family.StaticRouting, module: moduleOrdinal, name: usize.ZERO,
+    declaration: declaration, member: usize.ZERO, external: false,
+  }
+  let routing = run internDeclaration(&mut resolver.*, routingRequest)
+  let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, routing, Span.make(usize.ZERO, usize.ZERO))
+  let rejected = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&answer, answerCause)
+  if let Option<Shared<Rejection>>.Some {value} = move rejected {
+    return Result<bool, Shared<Rejection>>.failResult(move value)
+  }
+  return Result<bool, Shared<Rejection>>.succeed(Shared<Result<Answer, NoRejection>>.with<bool>(&answer, staticRoutingHolds))
+}
+
+fn staticRoutingHolds(answer: &Result<Answer, NoRejection>) -> bool {
+  if let Result<Answer, NoRejection>.Success {value} = &answer.* {
+    if let Outcome.Success {value: Value.StaticRouting {holds}} = &value.outcome { return holds }
+  }
+  return false
+}
+
+effect fn resolveStaticRouting(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let declaration = declarationPosition(&resolver.*, key)
+  let module = resolvedModule(&resolver.*, key.module)
+  let computed = run computeStaticRouting(&mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, declaration)
+  return match move computed {
+    Result<bool, Shared<Rejection>>.Success {value} => memberSuccess(Value.StaticRouting {holds: value}, move dependencies)
+    Result<bool, Shared<Rejection>>.Failure {error} => run memberRejected(move error, move dependencies)
+  }
+}
+
+// Computes `needsStaticResidualization`. Syntactic markers decide first; only otherwise are the
+// written callees' headers read. No callee runtime body is demanded and no static arm is
+// semantically inspected.
+effect fn computeStaticRouting(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut List<Dependency>,
