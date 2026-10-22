@@ -565,7 +565,8 @@ const program = Effect.gen(function* () {
     join(directory, 'rejected'),
   )
   assert.equal(rejected.status, 1, rejected.stderr)
-  assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`))
+  // The progress report heads standard error, so the target heading starts a later line.
+  assert.match(rejected.stderr, new RegExp(`^\\[${hostTarget}\\]\n`, 'm'))
   assert.match(rejected.stderr, /\/rejected\/src\/main\.silk:6:16: error\[SEM0037\]/)
   assert.match(rejected.stdout, new RegExp(`check ${hostTarget}: failed \\(exit 1\\)\n`))
   const json = yield* invoke(

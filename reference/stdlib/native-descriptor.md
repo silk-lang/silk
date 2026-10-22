@@ -50,7 +50,7 @@ pub fn main() -> i32 {
 
 Import as `NativeDescriptor` with `import silk.native_descriptor { NativeDescriptor }`.
 
-Public declarations: 4.
+Public declarations: 5.
 
 <a id="read"></a>
 
@@ -79,6 +79,16 @@ The C `write` function: writes at most `count` bytes from `buffer` to `fd`.
 ### Gotchas
 `buffer` must have `count` readable bytes during the call. A positive result can be less than
 `count`. After a negative result, read the error code at once.
+
+<a id="isatty"></a>
+
+## `isatty`
+
+```silk
+pub unsafe extern "C" fn isatty(fd: i32) -> i32
+```
+
+The C `isatty` function: returns 1 when `fd` is a terminal, else 0.
 
 <a id="__error"></a>
 
@@ -122,6 +132,17 @@ Reads one time from `fd` into the start of `buffer`, and returns whether it succ
 On success, `count` is the number of bytes read. Zero means the end of input, or an empty
 `buffer`. On failure, `count` is zero and `error` is the native error code, or zero for a
 count that is not valid. Bytes after the count are not changed.
+
+<a id="NativeDescriptor.impl.isTerminal"></a>
+
+### Associated function `isTerminal`
+
+```silk
+pub effect fn isTerminal(fd: i32) -> bool
+```
+
+Returns whether `fd`, such as 2 for standard error, is a terminal. A closed descriptor, a
+pipe, a file, or a failed query answers false.
 
 <a id="NativeDescriptor.impl.writeAll"></a>
 
