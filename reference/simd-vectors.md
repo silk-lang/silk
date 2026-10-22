@@ -279,9 +279,9 @@ its instruction. A wrapper calls the operation inside `static if` and otherwise 
 lanes with portable code, so it is correct on every target.
 
 **Boundary:** A call is checked when its body is checked, like `compileError`, so code that can
-build for other profiles guards it with `static if Target.hasCpuFeature(...)`. Operations with
-immediate operands, AES rounds and carry-less multiplication join the catalog with the crypto
-kernels. There is no open escape hatch that names an arbitrary LLVM intrinsic.
+build for other profiles guards it with `static if Target.hasCpuFeature(...)`, or sits in a
+function compiled for the feature (SIMD-009). AES rounds and carry-less multiplication are
+SIMD-011. There is no open escape hatch that names an arbitrary LLVM intrinsic.
 
 **Diagnostics:** A first operand outside the catalog reports `SEM0239`. A call whose target or
 CPU feature the profile does not select reports `SEM0241`.
@@ -393,3 +393,49 @@ at the call. The same vector in an exported signature reports the `c-abi-vector`
 **Current compiler:** Aligned.
 
 **Evidence:** `corpus/native/simd-c-vectors`, `corpus/invalid/simd-c-vectors-invalid`.
+
+## SIMD-011 — AES rounds and carry-less multiplication are architecture operations
+
+**Status:** Confirmed
+
+```silk,ignore
+unsafe fn encrypt(block: simd<u64, 2>, key: simd<u64, 2>) -> simd<u64, 2> with Intrinsic.machine(features: ("aes",)) {
+  return Intrinsic.x86AesEncrypt<simd<u64, 2>>(block, key)
+}
+```
+
+The SIMD-007 catalog also holds the AES and carry-less multiplication instructions:
+
+| Operation                     | Operands → result      | Target and feature | Instruction                       |
+| ----------------------------- | ---------------------- | ------------------ | --------------------------------- |
+| `x86AesEncrypt`               | `u64x2`, `u64x2` → `u64x2` | x86-64 `aes`    | `aesenc`                          |
+| `x86AesEncryptLast`           | `u64x2`, `u64x2` → `u64x2` | x86-64 `aes`    | `aesenclast`                      |
+| `x86AesDecrypt`               | `u64x2`, `u64x2` → `u64x2` | x86-64 `aes`    | `aesdec`                          |
+| `x86AesDecryptLast`           | `u64x2`, `u64x2` → `u64x2` | x86-64 `aes`    | `aesdeclast`                      |
+| `x86AesInverseMixColumns`     | `u64x2` → `u64x2`      | x86-64 `aes`       | `aesimc`                          |
+| `x86CarrylessMultiply`        | `u64x2`, `u64x2` → `u64x2` | x86-64 `pclmul` | `pclmulqdq` with selector 0       |
+| `aarch64AesEncrypt`           | `u8x16`, `u8x16` → `u8x16` | AArch64 `aes`   | `aese`                            |
+| `aarch64AesDecrypt`           | `u8x16`, `u8x16` → `u8x16` | AArch64 `aes`   | `aesd`                            |
+| `aarch64AesMixColumns`        | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesmc`                           |
+| `aarch64AesInverseMixColumns` | `u8x16` → `u8x16`      | AArch64 `aes`      | `aesimc`                          |
+
+The x86 rounds take the operand order of the instructions: the state, then the round key.
+`x86CarrylessMultiply` multiplies lane 0 of each operand into a 128-bit product, low half in lane
+0; a program picks other halves with `simdShuffle` first.
+
+`silk.arch.aes` computes SubBytes, ShiftRows, MixColumns and their inverses with portable code,
+without tables. `silk.arch.x86` and `silk.arch.aarch64` wrap each operation on `u8x16` states and
+fall back to `silk.arch.aes` when the profile lacks the feature, like the SIMD-007 wrappers.
+
+**Boundary:** Key-generation assist and the SHA instructions are not in the catalog yet. The
+portable fallbacks run in constant time but are much slower than the instructions, so a program
+that encrypts much data selects a kernel at run time with `silk.cpu` (SIMD-008) and a function
+compiled for `aes` (SIMD-009).
+
+**Diagnostics:** As SIMD-007: `SEM0239` for a first operand outside the catalog and `SEM0241`
+when the profile and function do not select the feature.
+
+**Current compiler:** Aligned.
+
+**Evidence:** `corpus/native/simd-crypto` (the FIPS 197 example block through every wrapper, the
+instructions themselves when the machine has them, and carry-less products).
