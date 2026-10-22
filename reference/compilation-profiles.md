@@ -184,3 +184,31 @@ project default, then an explicitly supplied host fallback. Compiler and languag
 consume the same normalized model.
 
 Named entry/runtime selections expose their kind separately from their name. A named value spelled `default` remains distinct from the default request.
+
+## PROFILE-006 — CPU models and features
+
+Each target has a fixed catalog of CPU features, sorted by byte value and spelled as LLVM spells
+them:
+
+| Target       | Features                                                                                                                                                                                                   |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| x86-64       | `aes`, `avx`, `avx2`, `avx512bw`, `avx512cd`, `avx512dq`, `avx512f`, `avx512vbmi`, `avx512vl`, `bmi`, `bmi2`, `cx16`, `f16c`, `fma`, `lzcnt`, `movbe`, `pclmul`, `popcnt`, `sse2`, `sse3`, `sse4.1`, `sse4.2`, `ssse3`, `xsave` |
+| AArch64      | `aes`, `crc`, `crypto`, `dotprod`, `fp-armv8`, `fullfp16`, `i8mm`, `lse`, `neon`, `rdm`, `sha2`, `sha3`                                                                                                   |
+| wasm32       | `atomics`, `bulk-memory`, `mutable-globals`, `relaxed-simd`, `sign-ext`, `simd128`                                                                                                                         |
+
+A feature outside the target's catalog is an unsupported combination. The frozen feature set is
+the named features, the features the CPU model guarantees and the architecture baseline (`sse2` on
+x86-64; `fp-armv8` and `neon` on AArch64), closed under implication: on x86-64 each SSE level
+implies the one before it, `avx` implies `sse4.2`, `avx2`, `fma` and `f16c` imply `avx`, `avx512f`
+implies `avx2`, `fma` and `f16c`, the other AVX-512 features imply `avx512f` and `avx512vbmi` also
+implies `avx512bw`, and `aes` and `pclmul` imply `sse2`; on AArch64 `crypto` implies `aes` and
+`sha2`, `sha3` implies `sha2`, the vector features imply `neon`, and `neon` and `fullfp16` imply
+`fp-armv8`; on wasm32 `relaxed-simd` implies `simd128`. `profileContains("cpu-features", f)`
+answers for the closed set.
+
+The default CPU model is `x86-64` on x86-64 and `generic` elsewhere; it guarantees only the
+baseline. x86-64 also admits the microarchitecture levels `x86-64-v2` (`cx16`, `popcnt`, `sse3`,
+`sse4.1`, `sse4.2`, `ssse3`), `x86-64-v3` (v2 with `avx`, `avx2`, `bmi`, `bmi2`, `f16c`, `fma`,
+`lzcnt`, `movbe`, `xsave`) and `x86-64-v4` (v3 with `avx512bw`, `avx512cd`, `avx512dq`, `avx512f`,
+`avx512vl`). A model other than the default is passed to Clang for tuning. No model reads the
+compiler host.
