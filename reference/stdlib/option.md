@@ -46,9 +46,53 @@ pub fn main() -> i32 {
 }
 ```
 
+### Make a service optional
+An effect that requires `&Option<&S>` runs with or without a provider of `S`. See [`withSome`](#withSome).
+```silk
+import silk.effect { Effect }
+import silk.option { Option, provideSome, withSome }
+
+service Tracer {
+  effect fn trace(value: i32) -> i32 ? &Tracer
+}
+
+struct Offset {
+  amount: i32
+}
+
+impl Tracer for Offset {
+  effect fn trace(self: &Self, value: i32) -> i32 {
+    return value + self.amount
+  }
+}
+
+effect fn plain() -> i32 {
+  return 1
+}
+
+effect fn traced() -> i32 ? &Tracer {
+  return run Tracer.trace(1)
+}
+
+effect fn measure() -> i32 ? &Option<&Tracer> {
+  return run withSome<&Tracer>(plain(), traced())
+}
+
+pub fn main() -> i32 {
+  let offset = Offset {amount: 10}
+  let none = Option<never>.none()
+  let present = run provideSome<&Tracer>(measure(), &offset)
+  let absent = run Effect.provide(measure(), &none)
+  if present != 11 || absent != 1 {
+    return 1
+  }
+  return 0
+}
+```
+
 Import as `Option` with `import silk.option { Option }`.
 
-Public declarations: 1.
+Public declarations: 5.
 
 <a id="Option"></a>
 
@@ -70,6 +114,9 @@ Use `Option` as a return type when "no value" is a normal result and needs no re
 Create values with [`some`](#Option.impl.some) and [`none`](#Option.impl.none). Use [`map`](#Option.impl.map), [`flatMap`](#Option.impl.flatMap), and [`unwrapOr`](#Option.impl.unwrapOr) for the
 common cases. Use `match` when the two cases need different custom behavior. The option owns its
 value, so dropping a present option also drops the value.
+
+In a requirement row, `&Option<&S>` is an optional service: the effect runs with or without a
+provider of `S`. Branch on it with [`withSome`](#withSome).
 
 ### Examples
 
@@ -312,6 +359,172 @@ fallback: T
 ```
 
 The value to return if `self` is absent. It is dropped if `self` is present.
+
+<a id="OptionService"></a>
+
+## `OptionService`
+
+```silk
+pub service OptionService<?S>
+```
+
+The service that an `&Option<&S>` requirement names.
+
+### When to use
+
+Do not name this service in your code. Write `? &Option<&S>` in a requirement row and branch
+with [`withSome`](#withSome). Diagnostics name this service where they name the key.
+
+### Details
+
+`Option<&S>` is an ordinary requirement key, separate from `S`. An `Option<P>` provides it when
+`&P` provides `S`: `Option<P>.some(provider)` is present and `Option<P>.None` is absent. The
+explicit absent provider is `Option<never>.none()`, because `never` serves every service and has
+no values. [`provideSome`](#provideSome) lifts a borrowed provider of `S` into a present one.
+
+<a id="OptionService.select"></a>
+
+### Operation `select`
+
+```silk
+effect<'env> fn select<'env, A, E, ?R>(
+    absent: once Effect<'env; A ! E ? R>,
+    present: once Effect<'env; A ! E ? R | S>,
+  ) -> A ! E ? R | &OptionService<S>
+  where R in Without<R, S>
+```
+
+Runs `present` with the provider of `S` when one exists, otherwise runs `absent`.
+
+<a id="Option.impl.OptionService"></a>
+
+## Implementation `OptionService<S> for Option<P>`
+
+```silk
+impl<P, ?S> OptionService<S> for Option<P> where &P provides S from S
+```
+
+An `Option` serves an optional service: `Some` holds the provider and `None` has none.
+
+<a id="Option.impl.OptionService.select"></a>
+
+### Operation `select`
+
+```silk
+effect<'env> fn select<'env, A, E, ?R>(
+    self: &Self,
+    absent: once Effect<'env; A ! E ? R>,
+    present: once Effect<'env; A ! E ? R | S>,
+  ) -> A ! E ? R
+  where R in Without<R, S>
+```
+
+Runs `present` with the provider in `Some`, or runs `absent` for `None`.
+
+<a id="withSome"></a>
+
+## `withSome`
+
+```silk
+pub effect fn withSome<'env, ?S, A, E, ?R>(
+  absent: once Effect<'env; A ! E ? R>,
+  present: once Effect<'env; A ! E ? R | S>,
+) -> A ! E ? R | &OptionService<S>
+where R in Without<R, S>
+```
+
+Runs `present` when the optional service `S` has a provider, otherwise runs `absent`.
+
+### When to use
+
+Use this function inside an effect that requires `&Option<&S>`, where the work differs with
+and without `S`, for example optional tracing or metrics.
+
+### Details
+
+The type argument is the requirement entry, such as `withSome<&Tracer>`. The provider decides
+the branch at runtime with one tag check. The branch that does not run is dropped. Both branches
+share the other requirements `R`, which must not contain `S`, and only `present` may use `S`.
+
+### Gotchas
+
+A provider of `S` does not satisfy `&Option<&S>`. Provide `Option<P>.some(provider)`,
+`Option<never>.none()`, or use [`provideSome`](#provideSome).
+
+<a id="Present"></a>
+
+## `Present`
+
+```silk
+pub struct Present<'env, P>
+```
+
+A borrowed provider that always serves an optional service as present.
+
+### Details
+
+[`provideSome`](#provideSome) makes one for a single provision. Use `Option<P>` instead when the provider is
+owned or when presence is decided at runtime.
+
+<a id="Present.provider"></a>
+
+### Field `provider`
+
+```silk
+pub provider: &'env P
+```
+
+The borrowed provider of the optional service.
+
+<a id="Present.impl.OptionService"></a>
+
+## Implementation `OptionService<S> for Present<'env, P>`
+
+```silk
+impl<'env, P, ?S> OptionService<S> for Present<'env, P> where &'env P provides S from S
+```
+
+A `Present` always runs the present branch with its borrowed provider.
+
+<a id="Present.impl.OptionService.select"></a>
+
+### Operation `select`
+
+```silk
+effect<'run> fn select<'run, A, E, ?R>(
+    self: &Self,
+    absent: once Effect<'run; A ! E ? R>,
+    present: once Effect<'run; A ! E ? R | S>,
+  ) -> A ! E ? R
+  where R in Without<R, S>
+```
+
+Runs `present` with the borrowed provider and drops `absent`.
+
+<a id="provideSome"></a>
+
+## `provideSome`
+
+```silk
+pub effect fn provideSome<'env, ?S, A, P, E, ?R>(
+  program: once Effect<'env; A ! E ? R>,
+  provider: &'env P,
+) -> A ! E ? Without<R, OptionService<S>>
+where &Present<'env, P> provides OptionService<S> from R
+```
+
+Provides a borrowed provider of `S` to the optional requirement `&Option<S>` of `program`.
+
+### When to use
+
+Use this function when you have a provider of `S` and the effect requires `&Option<S>`. A
+provider of `S` does not satisfy `&Option<S>` without this explicit lift.
+
+### Details
+
+The type argument is the requirement entry, such as `provideSome<&Tracer>`. The provider stays
+borrowed for the execution of `program`. Every other requirement in `R` stays visible in the
+result.
 
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
