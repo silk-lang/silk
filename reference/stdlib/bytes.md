@@ -151,6 +151,16 @@ allocation for exactly `length + additional` bytes.
 - `OutOfMemoryError` if `length + additional` overflows `usize`, or the `Allocator` cannot
   supply the storage. The value does not change.
 
+<a id="Bytes.impl.capacity"></a>
+
+### Method `capacity`
+
+```silk
+pub fn capacity(self: &Self) -> usize
+```
+
+Returns the number of bytes the storage holds before the next append allocates.
+
 <a id="Bytes.impl.clear"></a>
 
 ### Method `clear`
