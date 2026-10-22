@@ -1,0 +1,504 @@
+//! Exact content hashes of semantic answers, for early cutoff across source revisions.
+//!
+//! # When to use
+//! Use a [`Writer`] to hash the parts of one completed answer. Two answers whose writers finish
+//! with equal hashes are interchangeable for every consumer, so a unit that reruns to an equal
+//! answer need not invalidate the units that read it.
+//!
+//! # Details
+//! The encoding is exact, not semantic: it follows every field in stored order, visibility and
+//! list order included, and never canonicalizes. Two equal answers always encode equally; two
+//! answers a consumer could tell apart never do, except by hash collision. A part this module
+//! cannot encode exactly makes the writer incomplete, and an incomplete writer finishes with no
+//! hash, which every caller treats as changed.
+//!
+//! # Gotchas
+//! Shared nodes are walked once per occurrence, so a writer stops at a node budget and becomes
+//! incomplete rather than walking a deeply shared graph for long.
+
+import hir.Hir {Access, CallableMode, Multiplicity}
+import semantic.ContentHash {ContentHash, Stream}
+import semantic.DeclarationId {DeclarationId}
+import semantic.ForeignContract {ForeignContract}
+import semantic.Lifetime {Intersection, Lifetime, Member as RegionMember}
+import semantic.ModuleId {ModuleId}
+import semantic.Type {AnonymousOccurrence, Argument, Composition, Outlives, Requirement, Row, RowParameter, RowSubtraction, Type}
+import silk.list {List}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.u8
+import silk.u64
+import silk.usize
+import silk.bytes {Bytes}
+
+/// The node budget of one writer: a resource control, not a limit on answer size.
+pub const nodeBudget: usize = 1048576
+
+/// A hash in progress over one answer's exact encoding.
+pub struct Writer {
+  stream: Stream
+  complete: bool
+  nodes: usize
+}
+
+/// Starts an empty, complete writer.
+pub fn writer() -> Writer {
+  return Writer {stream: ContentHash.stream(), complete: true, nodes: usize.ZERO}
+}
+
+/// Finishes the hash, or returns none when some part could not be encoded exactly.
+pub fn finish(writer: Writer) -> Option<ContentHash> {
+  if !writer.complete { return Option<ContentHash>.none() }
+  return Option<ContentHash>.some(ContentHash.finish(move writer.stream))
+}
+
+/// Marks the writer incomplete: its answer has a part with no exact encoding.
+pub fn incomplete(writer: &mut Writer) -> () {
+  writer.complete = false
+  return ()
+}
+
+/// Whether every part written so far was encoded exactly.
+pub fn isComplete(writer: &Writer) -> bool {
+  return writer.complete
+}
+
+/// Appends one word, little-endian.
+pub fn word(writer: &mut Writer, value: u64) -> () {
+  let mut at: u64 = 0
+  while at < 8 {
+    ContentHash.appendByte(&mut writer.stream, u64.toU8(u64.bitAnd(u64.shiftRight(value, at * 8), 255)))
+    at = at + 1
+  }
+  return ()
+}
+
+/// Appends one count or ordinal.
+pub fn count(writer: &mut Writer, value: usize) -> () {
+  word(&mut writer.*, usize.toU64(value))
+  return ()
+}
+
+/// Appends one flag.
+pub fn flag(writer: &mut Writer, value: bool) -> () {
+  if value { word(&mut writer.*, 1) } else { word(&mut writer.*, 0) }
+  return ()
+}
+
+/// Appends a length-prefixed byte string.
+pub fn text(writer: &mut Writer, value: &[u8]) -> () {
+  count(&mut writer.*, value.length)
+  ContentHash.append(&mut writer.stream, value)
+  return ()
+}
+
+// Counts one walked node, and reports whether the budget still allows walking it.
+fn enter(writer: &mut Writer) -> bool {
+  if !writer.complete { return false }
+  writer.nodes = writer.nodes + usize.ONE
+  if writer.nodes > nodeBudget {
+    writer.complete = false
+    return false
+  }
+  return true
+}
+
+/// Appends a module identity's three components.
+pub fn module(writer: &mut Writer, value: &ModuleId) -> () {
+  ModuleId.withComponents<()>(value, fn(origin: &[u8], package: &[u8], path: &[u8]) -> () {
+    text(&mut writer.*, origin)
+    text(&mut writer.*, package)
+    text(&mut writer.*, path)
+    return ()
+  })
+  return ()
+}
+
+/// Appends a declaration identity's complete content.
+pub fn declaration(writer: &mut Writer, value: &DeclarationId) -> () {
+  DeclarationId.withContent<()>(value, fn(content: &[u8]) -> () {
+    text(&mut writer.*, content)
+    return ()
+  })
+  return ()
+}
+
+/// Appends a shared declaration identity's complete content.
+pub fn sharedDeclaration(writer: &mut Writer, value: &Shared<DeclarationId>) -> () {
+  Shared<DeclarationId>.with<()>(value, fn(identity: &DeclarationId) -> () {
+    declaration(&mut writer.*, identity)
+    return ()
+  })
+  return ()
+}
+
+/// Appends a list of shared declaration identities in order.
+pub fn declarations(writer: &mut Writer, values: &[Shared<DeclarationId>]) -> () {
+  count(&mut writer.*, values.length)
+  let mut at = usize.ZERO
+  while at < values.length {
+    sharedDeclaration(&mut writer.*, &values[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn accessCode(access: Access) -> u64 {
+  return match access { Access.Shared => 0 Access.Mutable => 1 }
+}
+
+fn modeCode(mode: CallableMode) -> u64 {
+  return match mode { CallableMode.Shared => 0 CallableMode.Mutable => 1 CallableMode.Once => 2 }
+}
+
+fn compositionCode(operation: Composition) -> u64 {
+  return match operation {
+    Composition.CatchFailure => 0
+    Composition.BindShared => 1
+    Composition.BindExclusive => 2
+    Composition.BindOwned => 3
+    Composition.Finalize => 4
+    Composition.FinalizeNonParking => 5
+    Composition.UseRelease => 6
+    Composition.Observe => 7
+    Composition.Suspend => 8
+  }
+}
+
+/// Appends one lifetime: a scalar atom, or a meet's atoms in stored order.
+pub fn lifetime(writer: &mut Writer, value: &Shared<Lifetime>) -> () {
+  if !enter(&mut writer.*) { return () }
+  let isMeet = Shared<Lifetime>.with<bool>(value, fn(region: &Lifetime) -> bool {
+    return match &region.* { Lifetime.Meet {..} => true _ => false }
+  })
+  if isMeet {
+    word(&mut writer.*, 4)
+    let atoms = Lifetime.atomCount(value)
+    count(&mut writer.*, atoms)
+    let mut at = usize.ZERO
+    while at < atoms {
+      let atom = Lifetime.atomAt(value, at)
+      lifetime(&mut writer.*, &atom)
+      at = at + usize.ONE
+    }
+    return ()
+  }
+  Shared<Lifetime>.with<()>(value, fn(region: &Lifetime) -> () {
+    match &region.* {
+      Lifetime.Static => { word(&mut writer.*, 0) }
+      Lifetime.Parameter {declaration: owner, ordinal} => {
+        word(&mut writer.*, 1)
+        declaration(&mut writer.*, &owner)
+        count(&mut writer.*, ordinal)
+      }
+      Lifetime.Local {declaration: owner, ordinal, binder} => {
+        word(&mut writer.*, 2)
+        declaration(&mut writer.*, &owner)
+        count(&mut writer.*, ordinal)
+        count(&mut writer.*, binder)
+      }
+      Lifetime.Invocation {ordinal} => {
+        word(&mut writer.*, 3)
+        count(&mut writer.*, ordinal)
+      }
+      Lifetime.Supplied {ordinal} => {
+        word(&mut writer.*, 5)
+        count(&mut writer.*, ordinal)
+      }
+      Lifetime.Meet {..} => { incomplete(&mut writer.*) }
+    }
+    return ()
+  })
+  return ()
+}
+
+/// Appends lifetimes in order.
+pub fn lifetimes(writer: &mut Writer, values: &[Shared<Lifetime>]) -> () {
+  count(&mut writer.*, values.length)
+  let mut at = usize.ZERO
+  while at < values.length {
+    lifetime(&mut writer.*, &values[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Appends an environment's members in stored order.
+pub fn intersection(writer: &mut Writer, value: &Intersection) -> () {
+  let members = List<RegionMember>.asSlice(&value.members)
+  count(&mut writer.*, members.length)
+  let mut at = usize.ZERO
+  while at < members.length {
+    lifetime(&mut writer.*, &members[at].region)
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Appends a shared environment.
+pub fn sharedIntersection(writer: &mut Writer, value: &Shared<Intersection>) -> () {
+  Shared<Intersection>.with<()>(value, fn(environment: &Intersection) -> () {
+    intersection(&mut writer.*, environment)
+    return ()
+  })
+  return ()
+}
+
+/// Appends a row parameter.
+pub fn rowParameter(writer: &mut Writer, value: &RowParameter) -> () {
+  sharedDeclaration(&mut writer.*, &value.declaration)
+  count(&mut writer.*, value.ordinal)
+  return ()
+}
+
+/// Appends row parameters in order.
+pub fn rowParameters(writer: &mut Writer, values: &[RowParameter]) -> () {
+  count(&mut writer.*, values.length)
+  let mut at = usize.ZERO
+  while at < values.length {
+    rowParameter(&mut writer.*, &values[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn requirement(writer: &mut Writer, value: &Requirement) -> () {
+  ty(&mut writer.*, &value.capability)
+  optionalType(&mut writer.*, &value.roleType)
+  word(&mut writer.*, accessCode(value.access))
+  return ()
+}
+
+/// Appends a requirement row in stored order.
+pub fn row(writer: &mut Writer, value: &Shared<Row>) -> () {
+  if !enter(&mut writer.*) { return () }
+  Shared<Row>.with<()>(value, fn(selected: &Row) -> () {
+    let entries = List<Requirement>.asSlice(&selected.entries)
+    count(&mut writer.*, entries.length)
+    let mut at = usize.ZERO
+    while at < entries.length {
+      requirement(&mut writer.*, &entries[at])
+      at = at + usize.ONE
+    }
+    rowParameters(&mut writer.*, List<RowParameter>.asSlice(&selected.parameters))
+    let subtractions = List<RowSubtraction>.asSlice(&selected.subtractions)
+    count(&mut writer.*, subtractions.length)
+    at = usize.ZERO
+    while at < subtractions.length {
+      row(&mut writer.*, &subtractions[at].source)
+      row(&mut writer.*, &subtractions[at].removed)
+      at = at + usize.ONE
+    }
+    return ()
+  })
+  return ()
+}
+
+/// Appends one generic argument with its kind.
+pub fn argument(writer: &mut Writer, value: &Argument) -> () {
+  match &value.* {
+    Argument.Type {value: selected} => {
+      word(&mut writer.*, 0)
+      ty(&mut writer.*, &selected)
+    }
+    Argument.Lifetime {value: selected} => {
+      word(&mut writer.*, 1)
+      lifetime(&mut writer.*, &selected)
+    }
+    Argument.Row {value: selected} => {
+      word(&mut writer.*, 2)
+      row(&mut writer.*, &selected)
+    }
+  }
+  return ()
+}
+
+/// Appends generic arguments in order.
+pub fn arguments(writer: &mut Writer, values: &[Argument]) -> () {
+  count(&mut writer.*, values.length)
+  let mut at = usize.ZERO
+  while at < values.length {
+    argument(&mut writer.*, &values[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+/// Appends an optional type.
+pub fn optionalType(writer: &mut Writer, value: &Option<Shared<Type>>) -> () {
+  match &value.* {
+    Option<Shared<Type>>.Some {value: selected} => {
+      word(&mut writer.*, 1)
+      ty(&mut writer.*, &selected)
+    }
+    Option<Shared<Type>>.None => { word(&mut writer.*, 0) }
+  }
+  return ()
+}
+
+/// Appends types in order.
+pub fn typeList(writer: &mut Writer, values: &[Shared<Type>]) -> () {
+  count(&mut writer.*, values.length)
+  let mut at = usize.ZERO
+  while at < values.length {
+    ty(&mut writer.*, &values[at])
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+fn occurrence(writer: &mut Writer, value: &Shared<AnonymousOccurrence>) -> () {
+  Shared<AnonymousOccurrence>.with<()>(value, fn(selected: &AnonymousOccurrence) -> () {
+    sharedDeclaration(&mut writer.*, &selected.declaration)
+    count(&mut writer.*, selected.syntax)
+    flag(&mut writer.*, selected.positional)
+    let labels = List<Bytes>.asSlice(&selected.labels)
+    count(&mut writer.*, labels.length)
+    let mut at = usize.ZERO
+    while at < labels.length {
+      text(&mut writer.*, Bytes.asSlice(&labels[at]))
+      at = at + usize.ONE
+    }
+    return ()
+  })
+  return ()
+}
+
+/// Appends one type and everything it holds. Callable environments, schemas, origins and
+/// opaque representations hold applications and recipes this module does not encode, so they
+/// leave the writer incomplete.
+pub fn ty(writer: &mut Writer, value: &Shared<Type>) -> () {
+  if !enter(&mut writer.*) { return () }
+  Shared<Type>.with<()>(value, fn(node: &Type) -> () {
+    match &node.* {
+      Type.Primitive {name} => {
+        word(&mut writer.*, 0)
+        text(&mut writer.*, Bytes.asSlice(&name))
+      }
+      Type.Unit => { word(&mut writer.*, 1) }
+      Type.Nominal {declaration: identity, isPublic, arguments: applied} => {
+        word(&mut writer.*, 2)
+        declaration(&mut writer.*, &identity)
+        flag(&mut writer.*, isPublic)
+        arguments(&mut writer.*, List<Argument>.asSlice(&applied))
+      }
+      Type.Parameter {declaration: owner, ordinal} => {
+        word(&mut writer.*, 5)
+        declaration(&mut writer.*, &owner)
+        count(&mut writer.*, ordinal)
+      }
+      Type.String {lifetime: region} => {
+        word(&mut writer.*, 6)
+        lifetime(&mut writer.*, &region)
+      }
+      Type.Reference {referent, access, lifetime: region} => {
+        word(&mut writer.*, 7)
+        ty(&mut writer.*, &referent)
+        word(&mut writer.*, accessCode(access))
+        lifetime(&mut writer.*, &region)
+      }
+      Type.Slice {element, access, lifetime: region} => {
+        word(&mut writer.*, 8)
+        ty(&mut writer.*, &element)
+        word(&mut writer.*, accessCode(access))
+        lifetime(&mut writer.*, &region)
+      }
+      Type.Pointer {pointee, access, nullable, multiplicity, alignment} => {
+        word(&mut writer.*, 9)
+        ty(&mut writer.*, &pointee)
+        word(&mut writer.*, accessCode(access))
+        flag(&mut writer.*, nullable)
+        word(&mut writer.*, match multiplicity { Multiplicity.Single => 0 Multiplicity.Many => 1 })
+        match &alignment {
+          Option<u64>.Some {value: aligned} => {
+            word(&mut writer.*, 1)
+            word(&mut writer.*, aligned)
+          }
+          Option<u64>.None => { word(&mut writer.*, 0) }
+        }
+      }
+      Type.ForeignFunction {signature, behavior} => {
+        word(&mut writer.*, 26)
+        ty(&mut writer.*, &signature)
+        word(&mut writer.*, ForeignContract.code(behavior))
+      }
+      Type.Array {element, extent} => {
+        word(&mut writer.*, 10)
+        ty(&mut writer.*, &element)
+        text(&mut writer.*, Bytes.asSlice(&extent))
+      }
+      Type.Anonymous {occurrence: literal, members} => {
+        word(&mut writer.*, 15)
+        occurrence(&mut writer.*, &literal)
+        typeList(&mut writer.*, List<Shared<Type>>.asSlice(&members))
+      }
+      Type.TypeDescriptor {owner} => {
+        word(&mut writer.*, 14)
+        ty(&mut writer.*, &owner)
+      }
+      Type.Union {members} => {
+        word(&mut writer.*, 11)
+        typeList(&mut writer.*, List<Shared<Type>>.asSlice(&members))
+      }
+      Type.Without {source, removed} => {
+        word(&mut writer.*, 25)
+        ty(&mut writer.*, &source)
+        ty(&mut writer.*, &removed)
+      }
+      Type.CallableStage {base, contract, captures, remaining, suffixMode} => {
+        word(&mut writer.*, 17)
+        ty(&mut writer.*, &base)
+        ty(&mut writer.*, &contract)
+        typeList(&mut writer.*, List<Shared<Type>>.asSlice(&captures))
+        count(&mut writer.*, remaining)
+        word(&mut writer.*, modeCode(suffixMode))
+      }
+      Type.CallableView {representation, contract} => {
+        word(&mut writer.*, 19)
+        ty(&mut writer.*, &representation)
+        ty(&mut writer.*, &contract)
+      }
+      Type.Callable {mode, isUnsafe, environment, invocationBinders, invocationUse, invocationBounds, parameters, result} => {
+        word(&mut writer.*, 12)
+        word(&mut writer.*, modeCode(mode))
+        flag(&mut writer.*, isUnsafe)
+        sharedIntersection(&mut writer.*, &environment)
+        count(&mut writer.*, invocationBinders)
+        count(&mut writer.*, invocationUse)
+        let bounds = List<Outlives>.asSlice(&invocationBounds)
+        count(&mut writer.*, bounds.length)
+        let mut at = usize.ZERO
+        while at < bounds.length {
+          lifetime(&mut writer.*, &bounds[at].longer)
+          lifetime(&mut writer.*, &bounds[at].shorter)
+          at = at + usize.ONE
+        }
+        typeList(&mut writer.*, List<Shared<Type>>.asSlice(&parameters))
+        ty(&mut writer.*, &result)
+      }
+      Type.EffectComposite {operation, selector, parts, contract} => {
+        word(&mut writer.*, 23)
+        word(&mut writer.*, compositionCode(operation))
+        ty(&mut writer.*, &selector)
+        typeList(&mut writer.*, List<Shared<Type>>.asSlice(&parts))
+        ty(&mut writer.*, &contract)
+      }
+      Type.EffectJoin {contract, alternatives} => {
+        word(&mut writer.*, 24)
+        ty(&mut writer.*, &contract)
+        typeList(&mut writer.*, List<Shared<Type>>.asSlice(&alternatives))
+      }
+      Type.Effect {mode, environment, success, failure, requirements} => {
+        word(&mut writer.*, 13)
+        word(&mut writer.*, modeCode(mode))
+        sharedIntersection(&mut writer.*, &environment)
+        ty(&mut writer.*, &success)
+        ty(&mut writer.*, &failure)
+        row(&mut writer.*, &requirements)
+      }
+      _ => { incomplete(&mut writer.*) }
+    }
+    return ()
+  })
+  return ()
+}

@@ -1,0 +1,351 @@
+//! The syntax-only language features: document symbols, folding ranges and whole-document
+//! formatting. Each reads one document's parsed [`SourceUnit`] and needs no semantic store.
+
+import format.FormatError { FormatError }
+import format.SourceSyntax
+import format.SyntaxFormatter
+import hir.Hir { Module, OwnerKind }
+import lexer.Span { Span }
+import lexer.Token { Token, kind as tokenKind, span as tokenSpan }
+import lsp.Message { PositionEncoding }
+import lsp.Workspace as Workspaces { Position }
+import parser.Node { Node, NodeKind }
+import semantic.DeclarationId { DeclarationId }
+import semantic.ModuleIndex { IndexedDeclaration, ModuleIndex }
+import semantic.SourceUnit { SourceUnit }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.list { List }
+import silk.option { Option }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.usize
+import silk.writer { WriterError }
+
+/// One declaration of a document, flat; `parent` orders the outline.
+pub struct Symbol {
+  pub name: Bytes
+
+  /// The language server protocol's SymbolKind number.
+  pub kind: usize
+
+  /// The whole declaration.
+  pub start: Position
+  pub end: Position
+
+  /// The declaration's header, which the client selects and reveals.
+  pub selectionStart: Position
+  pub selectionEnd: Position
+
+  /// The index of the enclosing symbol in the same list, or usize.MAX at the top level.
+  pub parent: usize
+}
+
+/// One foldable run of whole lines; `comment` marks a run of comments.
+pub struct Fold {
+  pub startLine: usize
+  pub endLine: usize
+  pub comment: bool
+}
+
+/// A replacement of the text between two positions.
+pub struct Edit {
+  pub start: Position
+  pub end: Position
+  pub text: Bytes
+}
+
+/// The start of every line of a text, for locating many offsets in it.
+pub struct Lines {
+  starts: List<usize>
+}
+
+impl Lines {
+  /// Indexes the lines of `text`.
+  pub effect fn make(text: &[u8]) -> Lines
+    ! OutOfMemoryError
+    ? &mut Allocator {
+    let mut starts = List<usize>.make()
+    run List<usize>.append(&mut starts, usize.ZERO)
+    let mut at = usize.ZERO
+    while at < text.length {
+      if text[at] == 10 {
+        run List<usize>.append(&mut starts, at + usize.ONE)
+      }
+      at = at + usize.ONE
+    }
+    return Lines { starts: move starts }
+  }
+
+  /// The zero-based line holding byte `offset`.
+  pub fn line(self: &Self, offset: usize) -> usize {
+    let starts = List<usize>.asSlice(&self.starts)
+    let mut low = usize.ZERO
+    let mut high = starts.length
+
+    // The last line whose start is at or before `offset`.
+    while high - low > usize.ONE {
+      let middle = low + (high - low) / 2
+      if starts[middle] <= offset {
+        low = middle
+      } else {
+        high = middle
+      }
+    }
+    return low
+  }
+
+  /// The position of byte `offset` in `text`, clamped to its length.
+  pub fn position(self: &Self, text: &[u8], offset: usize, encoding: PositionEncoding) -> Position {
+    let mut bounded = offset
+    if bounded > text.length {
+      bounded = text.length
+    }
+    let line = self.line(bounded)
+    let start = List<usize>.asSlice(&self.starts)[line]
+    return Position { line: line, character: Workspaces.column(text, start, bounded, encoding) }
+  }
+}
+
+/// The document's declarations in source order, each after its enclosing declaration.
+pub effect fn symbols(unit: &SourceUnit, encoding: PositionEncoding) -> List<Symbol>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = SourceUnit.bytes(unit)
+  let lines = run Lines.make(text)
+  let index = run ModuleIndex.build(unit, false)
+  let declarations = index.listDeclarations()
+  let hir = &unit.authored
+
+  // The symbol each declaration became, or the nearest one it is nested in.
+  let mut emitted = List<usize>.make()
+  let mut symbols = List<Symbol>.make()
+  let mut at = usize.ZERO
+  while at < declarations.length {
+    let declared = &declarations[at]
+    let mut parent = usize.MAX
+    if let Option<usize>.Some { value: enclosing } = &declared.parent {
+      parent = List<usize>.asSlice(&emitted)[enclosing]
+    }
+    let kind = symbolKind(DeclarationId.kind(&declared.identity), parent != usize.MAX)
+    if kind == usize.ZERO {
+      run List<usize>.append(&mut emitted, parent)
+    } else {
+      let whole = Module.span(hir, declared.local)
+      let header = Module.span(hir, declared.header)
+      run List<Symbol>.append(
+        &mut symbols,
+        Symbol {
+          name: run symbolName(&declared.identity, text, header),
+          kind: kind,
+          start: lines.position(text, whole.start, encoding),
+          end: lines.position(text, whole.end, encoding),
+          selectionStart: lines.position(text, header.start, encoding),
+          selectionEnd: lines.position(text, header.end, encoding),
+          parent: parent,
+        }
+      )
+      run List<usize>.append(&mut emitted, List<Symbol>.length(&symbols) - usize.ONE)
+    }
+    at = at + usize.ONE
+  }
+  return move symbols
+}
+
+// The SymbolKind of a declaration, or zero for one the outline leaves out: imports, anonymous
+// callables and damage. A static arm is transparent; its declarations belong to its scope.
+fn symbolKind(kind: OwnerKind, nested: bool) -> usize {
+  return match kind {
+    OwnerKind.Function => functionKind(nested)
+    OwnerKind.Struct => 23
+    OwnerKind.Tuple => 23
+    OwnerKind.Enumeration => 10
+    OwnerKind.Union => 10
+    OwnerKind.Service => 11
+    OwnerKind.Interface => 11
+    OwnerKind.Role => 11
+    OwnerKind.Implementation => 5
+    OwnerKind.Constant => 14
+    OwnerKind.PackageParameter => 7
+    OwnerKind.ModuleProperty => 7
+    OwnerKind.Alias => 26
+    OwnerKind.Static => 13
+    _ => 0
+  }
+}
+
+// A method inside a type or `impl`, or a free function.
+fn functionKind(nested: bool) -> usize {
+  if nested {
+    return 6
+  }
+  return 12
+}
+
+// The declaration's own name, such as `impl Point` for an `impl`, or for an unnamed one the
+// first line of its header.
+effect fn symbolName(identity: &DeclarationId, text: &[u8], header: Span) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let last = identity.ownerCount() - usize.ONE
+  if identity.ownerNamed(last) {
+    let name = run identity.copyOwnerName(last)
+    if Bytes.length(&name) > usize.ZERO {
+      if DeclarationId.kind(identity) != OwnerKind.Implementation {
+        return move name
+      }
+      let mut labeled = run Bytes.copy(b"impl ")
+      run Bytes.append(&mut labeled, Bytes.asSlice(&name))
+      return move labeled
+    }
+  }
+  let mut end = header.start
+  while end < header.end && end < text.length && text[end] != 10 && end - header.start < 80 {
+    end = end + usize.ONE
+  }
+  while end > header.start && (text[end - usize.ONE] == 32 || text[end - usize.ONE] == 123) {
+    end = end - usize.ONE
+  }
+  return run Bytes.copy(Slice.view<u8>(text, header.start, end - header.start))
+}
+
+/// The document's foldable regions: every multi-line body, list or literal, and every run of two
+/// or more comment lines. A region ends on the line before its last, so a closing brace stays
+/// visible.
+pub effect fn folds(unit: &SourceUnit) -> List<Fold>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = SourceUnit.bytes(unit)
+  let lines = run Lines.make(text)
+  let mut folds = List<Fold>.make()
+  let nodes = List<Node>.asSlice(&unit.syntax.nodes)
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if foldable(nodes[at].kind) && nodes[at].span.end > nodes[at].span.start {
+      let first = lines.line(nodes[at].span.start)
+      let last = lines.line(nodes[at].span.end - usize.ONE)
+      if last > first + usize.ONE {
+        run List<Fold>.append(
+          &mut folds,
+          Fold { startLine: first, endLine: last - usize.ONE, comment: false }
+        )
+      } else if last == first + usize.ONE && !closes(text, nodes[at].span.end) {
+        run List<Fold>.append(&mut folds, Fold { startLine: first, endLine: last, comment: false })
+      }
+    }
+    at = at + usize.ONE
+  }
+
+  // Comment runs: comments on consecutive lines.
+  let tokens = List<Token>.asSlice(&unit.syntax.tokens)
+  let mut runStart = usize.MAX
+  let mut runEnd = usize.ZERO
+  at = usize.ZERO
+  while at < tokens.length {
+    if SourceSyntax.isComment(tokenKind(tokens[at])) {
+      let span = tokenSpan(tokens[at])
+      let first = lines.line(span.start)
+      if runStart != usize.MAX && first <= runEnd + usize.ONE {
+        runEnd = lines.line(span.end - usize.ONE)
+      } else {
+        run commentRun(&mut folds, runStart, runEnd)
+        runStart = first
+        runEnd = lines.line(span.end - usize.ONE)
+      }
+    }
+    at = at + usize.ONE
+  }
+  run commentRun(&mut folds, runStart, runEnd)
+  return move folds
+}
+
+effect fn commentRun(folds: &mut List<Fold>, start: usize, end: usize) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if start != usize.MAX && end > start {
+    run List<Fold>.append(&mut folds.*, Fold { startLine: start, endLine: end, comment: true })
+  }
+  return ()
+}
+
+// Reports whether the region ending at `end` ends with a closing bracket, whose line stays out of
+// the fold.
+fn closes(text: &[u8], end: usize) -> bool {
+  if end == usize.ZERO || end > text.length {
+    return false
+  }
+  let last = text[end - usize.ONE]
+  return last == 125 || last == 93 || last == 41
+}
+
+fn foldable(kind: NodeKind) -> bool {
+  return match kind {
+    NodeKind.Block => true
+    NodeKind.StructDeclaration => true
+    NodeKind.TupleDeclaration => true
+    NodeKind.EnumDeclaration => true
+    NodeKind.UnionDeclaration => true
+    NodeKind.ServiceDeclaration => true
+    NodeKind.InterfaceDeclaration => true
+    NodeKind.RoleDeclaration => true
+    NodeKind.ImplDeclaration => true
+    NodeKind.StaticConditionalDeclaration => true
+    NodeKind.ImportMemberList => true
+    NodeKind.ParameterList => true
+    NodeKind.ArgumentList => true
+    NodeKind.MatchExpression => true
+    NodeKind.StructLiteralExpression => true
+    NodeKind.ArrayLiteralExpression => true
+    _ => false
+  }
+}
+
+/// The edits that format the whole document: none when it is already formatted, and absent when
+/// it cannot be formatted, such as while it has syntax errors.
+pub effect fn format(unit: &SourceUnit, encoding: PositionEncoding) -> Option<List<Edit>>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let text = SourceUnit.bytes(unit)
+  let attempted = run Effect.result(SyntaxFormatter.format(text))
+  let formatted = match move attempted {
+    Result<Bytes, FormatError | OutOfMemoryError | WriterError>.Success { value } => move value
+    Result<Bytes, FormatError | OutOfMemoryError | WriterError>.Failure {
+      error
+    } => match move error {
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+      _ => {
+        return Option<List<Edit>>.none()
+      }
+    }
+  }
+  let mut edits = List<Edit>.make()
+  if !same(Bytes.asSlice(&formatted), text) {
+    let lines = run Lines.make(text)
+    run List<Edit>.append(
+      &mut edits,
+      Edit {
+        start: Position { line: usize.ZERO, character: usize.ZERO },
+        end: lines.position(text, text.length, encoding),
+        text: move formatted,
+      }
+    )
+  }
+  return Option<List<Edit>>.some(move edits)
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}

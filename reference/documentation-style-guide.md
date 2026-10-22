@@ -15,9 +15,10 @@ sections only when they teach useful information. Use this order:
 
 1. `# When to use`
 2. `# Details`
-3. `# Gotchas`
-4. `# Examples`
-5. `# See also`, for module comments only
+3. `# Errors`, for operations that can fail
+4. `# Gotchas`
+5. `# Examples`
+6. `# See also`, for module comments only
 
 The template is a menu, not a checklist. Omit an empty, repetitive, or speculative section.
 
@@ -34,6 +35,10 @@ content, and each example heading. Declaration comments use this form:
 /// # Details
 ///
 /// Explain the mental model, guarantees, options, or observable behavior.
+///
+/// # Errors
+///
+/// - `ExampleError.Reason` if one stable condition occurs. State the result for the caller.
 ///
 /// # Gotchas
 ///
@@ -53,7 +58,7 @@ content, and each example heading. Declaration comments use this form:
 ///   let result = move value
 ///     |> Option<i32>.unwrapOr(0)
 ///   if result != 2 {
-///     let mismatch = 1 / 0
+///     return 1
 ///   }
 ///   return 0
 /// }
@@ -277,6 +282,37 @@ lower-level mechanics. Include an implementation technique only when callers can
 Do not use `# Details` as a collection of unrelated facts. Put selection facts in `# When to use`.
 Put hazards and surprises in `# Gotchas`.
 
+## Errors
+
+`# Errors` lists each failure of an operation that has a failure channel (`!`) or that returns a
+`Result`. Use one list item for each failure value:
+
+- Start with the failure value as code, such as `BufferError.Terminal`.
+- State the stable condition that causes the failure.
+- State the observable state after the failure, such as partial progress, a terminal state, or no
+  change.
+
+Good:
+
+```silk,ignore
+/// # Errors
+///
+/// - `BufferError.Terminal` if an earlier failure made the buffer terminal.
+/// - `BufferError.WriteFailed` if the transport fails or `deadline` passes. The buffer becomes
+///   terminal. `accepted` gives the number of `input` bytes that the buffer accepted.
+```
+
+Weak:
+
+```silk,ignore
+/// # Errors
+///
+/// Fails on I/O errors.
+```
+
+Put a failure in `# Errors` and not in `# Gotchas`. Use `# Gotchas` for a trap that the failure
+channel does not show, such as a trap on an out-of-range index.
+
 ## Gotchas
 
 `# Gotchas` records concrete facts that can make reasonable code incorrect. It is not a required
@@ -337,10 +373,11 @@ Every complete-program example must:
 - use only public APIs;
 - contain all required imports, providers, declarations, and setup;
 - be a complete Silk program that the compiler accepts;
-- make its result observable with a return value, an assertion, or explicit expected output;
+- make its result observable with a return value, an assertion, or explicit expected output. In
+  `main`, return `1` when a check fails and `0` at the end;
 - show the distinctive behavior of the documented API;
 - pass `silk check` in documentation validation;
-- pass `silk format --check`; and
+- pass `silk format --check`, so the example text is the formatter output; and
 - run successfully when it has executable behavior.
 
 Every statement-sequence example must:
@@ -376,7 +413,6 @@ Preferred:
 
 ```silk
 import silk.usize
-
 import silk.list { List }
 
 pub fn main() -> i32 {
@@ -491,12 +527,10 @@ This comment documents `List.length`. The signature gives the remaining informat
 /// pub fn main() -> i32 {
 ///   let present = Option<i32>.some(7)
 ///   let absent = Option<i32>.none()
-///   let first = move present
-///     |> Option<i32>.unwrapOr(0)
-///   let second = move absent
-///     |> Option<i32>.unwrapOr(5)
+///   let first = move present |> Option<i32>.unwrapOr(0)
+///   let second = move absent |> Option<i32>.unwrapOr(5)
 ///   if first + second != 12 {
-///     let mismatch = 1 / 0
+///     return 1
 ///   }
 ///   return 0
 /// }
@@ -530,26 +564,21 @@ an owned value pipeline.
 ///
 /// ```silk
 /// import silk.allocator { Allocator, OutOfMemoryError }
-///
 /// import silk.effect { Effect }
-///
 /// import silk.usize
-///
 /// import silk.list { List }
 ///
-/// pub effect fn main() -> ()
-/// ! OutOfMemoryError {
+/// pub effect fn main() -> i32
+///   ! OutOfMemoryError {
 ///   let mut allocator = Allocator.systemAllocatorProvider()
 ///   let mut values = List<i32>.make()
-///   let first = run List<i32>.append(&mut values, 10)
-///     |> Effect.provideMut<Allocator>(&mut allocator)
-///   let second = run List<i32>.append(&mut values, 20)
-///     |> Effect.provideMut<Allocator>(&mut allocator)
+///   let first = run List<i32>.append(&mut values, 10) |> Effect.provideMut<Allocator>(&mut allocator)
+///   let second = run List<i32>.append(&mut values, 20) |> Effect.provideMut<Allocator>(&mut allocator)
 ///   let value = List<i32>.get(&values, usize.ONE)
 ///   if value != 20 {
-///     let mismatch = 1 / 0
+///     return 1
 ///   }
-///   return ()
+///   return 0
 /// }
 /// ```
 ````
