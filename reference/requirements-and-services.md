@@ -113,9 +113,47 @@ API value. Public libraries should follow the
 [receiver-first member convention](style-guide.md#style-002--operations-intrinsic-to-one-type-are-inherent-members-with-the-receiver-first)
 instead of accumulating their public behavior inside conformance bodies.
 
-**Boundary:** Every declared contract operation must have exactly one implementation. A member is
-invalid when its name is absent from the contract, when the same operation is supplied both inline
-and by mapping, or when its callable contract is incompatible with the declared operation.
+**Boundary:** Every declared contract operation must have exactly one implementation, except that a
+conformance may omit an operation that declares a default body and use that default (INTF-002). A
+member is invalid when its name is absent from the contract, when the same operation is supplied
+both inline and by mapping, or when its callable contract is incompatible with the declared
+operation.
+
+A service operation's default reaches its provider the way any caller does: through the Effect
+requirement the operation declares on its own service. It takes no receiver, so it calls the
+service's other operations with `run`, and those calls reach the same provider:
+
+```silk
+pub struct SinkError {
+  code: i32
+}
+
+service Sink {
+  effect fn put(value: u8) -> () ! SinkError ? &mut Sink
+  effect fn putAll(values: &[u8]) -> () ! SinkError ? &mut Sink {
+    let mut index: usize = 0
+    while index < values.length {
+      run Sink.put(values[index])
+      index = index + 1
+    }
+    return ()
+  }
+}
+
+struct Counter {
+  count: usize
+}
+
+impl Sink for Counter {
+  effect fn put(self: &mut Self, value: u8) -> () ! SinkError ? &mut Sink {
+    self.count = self.count + 1
+    return ()
+  }
+}
+```
+
+`Counter` uses the default `putAll`. A provider with a faster way to write several bytes implements
+`putAll` itself, and its implementation replaces the default.
 
 An inline function with a different name is not matched by position or inferred intent:
 
