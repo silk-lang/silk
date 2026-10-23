@@ -96,10 +96,10 @@ test('a project opened through a symbolic link builds', () => {
 
 // [what the newcomer did, program, pattern the first error must match]
 const unclear = [
-  ['called a method the type lacks', 'finding 32', 'import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.list { List }\n\neffect fn fill() -> () ! OutOfMemoryError ? &mut Allocator {\n  let mut list = List<i32>.make()\n  run list.push(1)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /push/],
-  ['used List without importing it', 'finding 32', 'struct Tags {\n  names: List<i32>\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /List/],
+  ['called a method the type lacks', null, 'import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.list { List }\n\neffect fn fill() -> () ! OutOfMemoryError ? &mut Allocator {\n  let mut list = List<i32>.make()\n  run list.push(1)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /push/],
+  ['used List without importing it', null, 'struct Tags {\n  names: List<i32>\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /List/],
   ['wrote a tuple return type', null, 'fn pair() -> (i32, i32) {\n  return (1, 2)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /tuple/],
-  ['saved the file with a byte order mark', 'finding 34', '﻿pub fn main() -> i32 {\n  return 0\n}\n', null],
+  ['saved the file with a byte order mark', null, '﻿pub fn main() -> i32 {\n  return 0\n}\n', null],
 ]
 
 for (const [what, finding, source, wanted] of unclear) {
