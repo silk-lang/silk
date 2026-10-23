@@ -1769,9 +1769,9 @@ one member, so an interface with such an operation never applies to a union.
 **Diagnostics:** A member without the interface reports `SEM0121` naming that member. An interface
 with an operation that cannot dispatch on the tag reports `SEM0121` naming the operation.
 
-**Current compiler:** Aligned for qualified and generic calls, such as `Describe.describe(&value)`
-and `Format.debug(&value)`. Method syntax on a union value, such as `value.describe()`, is not
-supported yet.
+**Current compiler:** Aligned. Qualified calls such as `Describe.describe(&value)`, generic calls,
+and method syntax such as `value.describe()` all dispatch on the tag. Method syntax finds the
+contract through the union's first canonical member and then proves the union's own conformance.
 
 ### INFER-001 — A binding keeps the precise type of its initializer
 
