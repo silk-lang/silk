@@ -742,6 +742,24 @@ const program = Effect.gen(function* () {
     SILK_CLANG: clang,
   })
   assert.equal(searched.status, 0, searched.stderr)
+  // A package manager can install the library itself as a symbolic link, and `--stdlib` can name one.
+  const linkedPrefix = join(directory, 'linked-prefix')
+  yield* fs.makeDirectory(join(linkedPrefix, 'bin'), { recursive: true })
+  yield* fs.makeDirectory(join(linkedPrefix, 'lib/silk'), { recursive: true })
+  yield* fs.copyFile(silk, join(linkedPrefix, 'bin/silk'))
+  yield* fs.chmod(join(linkedPrefix, 'bin/silk'), 0o755)
+  yield* fs.symlink(join(prefix, 'lib/silk/stdlib'), join(linkedPrefix, 'lib/silk/stdlib'))
+  const linkedLibrary = yield* invoke(join(linkedPrefix, 'bin/silk'), ['run'], join(directory, 'greeting'), {
+    ...process.env,
+    SILK_CLANG: clang,
+  })
+  assert.equal(linkedLibrary.status, 0, linkedLibrary.stderr)
+  const linkedArgument = yield* invoke(
+    silk,
+    ['check', '--stdlib', join(linkedPrefix, 'lib/silk/stdlib')],
+    join(directory, 'greeting'),
+  )
+  assert.equal(linkedArgument.status, 0, linkedArgument.stderr)
   // Without an installation beside it, the compiler still needs `--stdlib`.
   yield* fs.makeDirectory(join(directory, 'bare/bin'), { recursive: true })
   yield* fs.copyFile(silk, join(directory, 'bare/bin/silk'))
@@ -1209,6 +1227,24 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(threaded.status, 0, threaded.stderr)
+  // Clang 18 crashes on a threaded module or writes one the host rejects, so it is refused.
+  const eighteen = join(directory, 'clang-18')
+  yield* fs.writeFileString(
+    eighteen,
+    `#!/bin/sh\nif [ "$1" = --version ]; then echo 'Ubuntu clang version 18.1.3 (1ubuntu1)'; exit 0; fi\nexec ${quote(clang)} "$@"\n`,
+  )
+  yield* fs.chmod(eighteen, 0o755)
+  const tooOld = yield* invoke(
+    silk,
+    ['build', '--manifest-path', join('threads', 'silk.toml'), '--profile', 'web', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILK_CLANG: eighteen },
+  )
+  assert.equal(tooOld.status, 2, tooOld.stderr)
+  assert.match(
+    tooOld.stderr,
+    /^silk: a threaded wasm32 build needs Clang 19 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
+  )
   const threadedPath = join(threads, 'build/llvm/wasm32-unknown-unknown/web/threads')
   const threadedModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
   assert.deepEqual(
