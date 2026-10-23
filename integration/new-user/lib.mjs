@@ -2,7 +2,7 @@
 // sees Silk the way a fresh machine does: no ~/.silk, no settings, nothing on PATH but the
 // toolchain the test installed.
 import { spawnSync } from 'node:child_process'
-import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs'
+import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, linkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -94,8 +94,9 @@ export function addLocalSew(h) {
   if (hasSew(h) || sewBinary === '') return hasSew(h)
   copyFileSync(sewBinary, join(h.silkHome, 'bin/sew'))
   chmodSync(join(h.silkHome, 'bin/sew'), 0o755)
+  // install.sh makes bin/silk a second name (a hard link) for bin/sew.
   rmSync(join(h.silkHome, 'bin/silk'), { force: true })
-  symlinkSync('sew', join(h.silkHome, 'bin/silk'))
+  linkSync(join(h.silkHome, 'bin/sew'), join(h.silkHome, 'bin/silk'))
   return true
 }
 

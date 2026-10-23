@@ -24,7 +24,7 @@ Run one area with `node --test integration/new-user/workspace.test.mjs`.
 | `SILK_NEW_USER_RUN_ALL` | `1` also runs docs programs whose output the page does not show, and fails on a crash. |
 | `SILK_NEW_USER_MIRROR`, `SILK_NEW_USER_SECOND` | A `SILK_TOOLCHAIN_MIRROR` directory and a full version in it (not the one `install.sh` picks). They enable the tests that install a second toolchain. Without them those tests are skipped. |
 | `SILK_NEW_USER_TMP` | Where the throwaway homes go. Default: the system temp folder. |
-| `SILK_NEW_USER_SEW` | A local `sew` build to test before a release ships sew. After install.sh it is copied to `~/.silk/bin/sew` and `~/.silk/bin/silk` points at it. With sew present, `toolchain.test.mjs` is skipped and `sew.test.mjs` runs. |
+| `SILK_NEW_USER_SEW` | A local `sew` build to test before a release ships sew. After install.sh it is copied to `~/.silk/bin/sew` and `~/.silk/bin/silk` becomes a hard link to it, as install.sh does. Build sew with `--release`: a debug sew takes about 20 s to unpack a toolchain. With sew present, `toolchain.test.mjs` is skipped and `sew.test.mjs` runs. |
 | `SILK_NEW_USER_COMPILER` | A local `silk` binary to run instead of the installed release, through `SILK_TOOLCHAIN=local`, such as a build of main. It must sit at `<dir>/bin/silk` with the stdlib at `<dir>/lib/silk/stdlib`. install.sh still installs the release, so the install and toolchain tests keep testing that. |
 
 `HTTPS_PROXY` and `GITHUB_TOKEN` pass through to the installer.

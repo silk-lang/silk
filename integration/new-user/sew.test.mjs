@@ -6,6 +6,7 @@
 // SILK_NEW_USER_SECOND, as in toolchain.test.mjs.
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
+import { rmSync } from 'node:fs'
 import { addLocalSew, existsSync, freshHome, initPackage, install, join, read, sew, show, silk, userEnv, write } from './lib.mjs'
 import { startServer } from './lsp.mjs'
 
@@ -181,4 +182,53 @@ test('use a second version as the default, pin it, dispatch, and uninstall it', 
   const removed = sew(h, ['use', 'uninstall', second])
   assert.equal(removed.status, 0, show(removed))
   assert.ok(!existsSync(join(h.silkHome, 'toolchains', second)))
+})
+
+test('a mistyped sew command is answered by sew, with the command it meant', { skip, todo: 'finding 84' }, () => {
+  const h = home()
+  const result = sew(h, ['uze', h.version])
+  assert.equal(result.status, 2, show(result))
+  assert.match(result.stderr, /^sew: /, show(result))
+  assert.match(result.stderr, /sew use/, show(result))
+  assert.doesNotMatch(result.stderr, /toolchain/, show(result))
+})
+
+test('sew use repairs an installed version whose folder lost its compiler', { skip: skip || needsMirror, todo: 'finding 85' }, () => {
+  const h = home()
+  const installed = sew(h, ['use', second], withMirror(h))
+  assert.equal(installed.status, 0, show(installed))
+  const folder = join(h.silkHome, 'toolchains', second)
+  rmSync(join(folder, 'bin/silk'))
+  const missing = sew(h, [`+${second}`, '--version'], withMirror(h))
+  assert.equal(missing.status, 3, show(missing))
+  const repaired = sew(h, ['use', second], withMirror(h))
+  assert.equal(repaired.status, 0, show(repaired))
+  const ran = sew(h, [`+${second}`, '--version'], withMirror(h))
+  assert.equal(ran.status, 0, show(ran))
+})
+
+test('a member pin that disagrees with the workspace pin is reported', { skip, todo: 'finding 87' }, () => {
+  const h = home()
+  const created = sew(h, ['init', '--workspace', 'pins'])
+  assert.equal(created.status, 0, show(created))
+  const root = join(h.work, 'pins')
+  const member = sew(h, ['init', 'a'], { cwd: root })
+  assert.equal(member.status, 0, show(member))
+  const pinned = sew(h, ['set', h.version], { cwd: root })
+  assert.equal(pinned.status, 0, show(pinned))
+  const manifest = join(root, 'a/silk.toml')
+  write(manifest, read(manifest).replace(/^silk-version = .*$/m, 'silk-version = "0.3.0"'))
+  const which = sew(h, ['use', 'which'], { cwd: join(root, 'a') })
+  assert.match(`${which.stdout}${which.stderr}`, /0\.3\.0/, show(which))
+})
+
+test('the command sew set suggests after a change of version works', { skip: skip || needsMirror, todo: 'finding 88' }, () => {
+  const h = home()
+  const app = initPackage(h, 'hinted')
+  const set = sew(h, ['set', second], { cwd: app, ...withMirror(h) })
+  assert.equal(set.status, 0, show(set))
+  const hint = /See what changed since then: (silk changes since \S+)/.exec(set.stdout + set.stderr)
+  assert.ok(hint, show(set))
+  const followed = sew(h, ['+' + h.version, ...hint[1].split(' ').slice(1)], { cwd: app })
+  assert.equal(followed.status, 0, show(followed))
 })
