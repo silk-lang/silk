@@ -74,6 +74,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `fuzz/paths/` | `drive.py <binary> <seed> <count>` checks `Path.fromBytes`, `joinBytes`, `resolve` and `parent` against a model of the documented rules |
 | `fuzz/process/main.silk` | Child process cases: 40 MB of output on both pipes, odd arguments, an empty environment, signals, a closed stdout, 500 spawns |
 | `fuzz/http/attack.py` | Normal, odd and hostile requests against the guide 10 server on port 18080 (build it from the guide with `serve(18080, 100000)`), checking that it answers and stays up |
+| `fuzz/http-client/` | `server.py` answers each path on 127.0.0.1:18081 with a scripted, sometimes broken, response; `main.silk` reads a base line, a bundle line, then one URL per line from standard input and prints what `NativeHttp` made of each |
 | `fuzz/huge-sources.py <dir>` | Huge and malformed sources (deep nesting, 30,000 lets, binary garbage, a BOM); flags crashes and timeouts |
 | `node fuzz/lsp-edits.mjs <package> <seed> <steps> [burst]` | Random edits to the package's `src/main.silk` in `silk lsp`, with hover, completion, definition, symbols and formatting after each; compares diagnostics with `silk check` |
 
