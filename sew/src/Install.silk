@@ -59,6 +59,9 @@ pub service HostFiles {
   /// Renames `from` to `to` in one step, replacing a file at `to`; false when that fails.
   effect fn rename(from: &Path, to: &Path) -> bool ! OutOfMemoryError ? &mut HostFiles | &mut Allocator
 
+  /// Makes `to` a second name (a hard link) of the file `from`; false when that fails.
+  effect fn link(from: &Path, to: &Path) -> bool ! OutOfMemoryError ? &mut HostFiles | &mut Allocator
+
   /// Waits for and takes the exclusive lock on the file `path`, creating it when missing; false
   /// when the lock cannot be taken. The lock lasts until `unlock` or the end of the process.
   effect fn lock(path: &Path) -> bool ! OutOfMemoryError ? &mut HostFiles | &mut Allocator
@@ -390,10 +393,11 @@ effect fn unpack(archive: &[u8], top: &[u8], staging: &Path) -> Bytes
   fail run stop(VERIFICATION, &[b"the release archive is corrupt"])
 }
 
-// Downloads, verifies and unpacks `version` into `staging`.
-effect fn stage(version: &[u8], target: &[u8], key: &MinisignKey, staging: &Path) -> ()
-  ! InstallError | FileError | OutOfMemoryError
-  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+// Downloads `version`'s archive for `target`, checks its signature, and returns the unpacked tar
+// stream.
+effect fn verifiedArchive(version: &[u8], target: &[u8], key: &MinisignKey) -> Bytes
+  ! InstallError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut Allocator {
   let top = run joined(&[b"silk-", version, b"-", target])
   let archiveName = run joined(&[Bytes.asSlice(&top), b".tar.gz"])
   let signatureName = run joined(&[Bytes.asSlice(&archiveName), b".minisig"])
@@ -415,9 +419,17 @@ effect fn stage(version: &[u8], target: &[u8], key: &MinisignKey, staging: &Path
       &[b"the signature of ", Bytes.asSlice(&archiveName), b" belongs to a different release or file: ", comment]
     )
   }
+  return run gunzip(Bytes.asSlice(&archive))
+}
+
+// Downloads, verifies and unpacks `version` into `staging`.
+effect fn stage(version: &[u8], target: &[u8], key: &MinisignKey, staging: &Path) -> ()
+  ! InstallError | FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let top = run joined(&[b"silk-", version, b"-", target])
+  let unpacked = run verifiedArchive(version, target, key)
   let seed = run ReleaseSource.asset(version, b"native-seed.json")
   let digest = run seededDigest(Bytes.asSlice(&seed), target)
-  let unpacked = run gunzip(Bytes.asSlice(&archive))
   let compiler = run unpack(Bytes.asSlice(&unpacked), Bytes.asSlice(&top), staging)
   let actual = run sha256(Bytes.asSlice(&compiler))
   if !same(Bytes.asSlice(&actual), Bytes.asSlice(&digest)) {
@@ -492,4 +504,107 @@ effect fn installUnlocked(home: &Path, version: &[u8], target: &[u8], key: &Mini
     fail run stop(1, &[b"cannot move the new toolchain to ", Path.rawBytes(&destination)])
   }
   return Installed { version: run Bytes.copy(version), changed: true }
+}
+
+// The content of the file `relative` below `top/` in the tar stream `archive`, or `None`.
+effect fn member(archive: &[u8], top: &[u8], relative: &[u8]) -> Option<Bytes>
+  ! InstallError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut reader = TarArchive.reader(archive)
+  while true {
+    let next = match TarReader.next(&mut reader) {
+      Result<Option<TarMember>, TarError>.Success { value } => move value
+      Result<Option<TarMember>, TarError>.Failure { error } => {
+        fail run stop(VERIFICATION, &[b"the release archive is corrupt: ", TarArchive.describe(error)])
+      }
+    }
+    let found = match move next {
+      Option<TarMember>.Some { value } => move value
+      Option<TarMember>.None => {
+        return Option<Bytes>.none()
+      }
+    }
+    if let Option<Bytes>.Some { value: path } = move run below(&found, top) {
+      if !found.directory && same(Bytes.asSlice(&path), relative) {
+        return Option<Bytes>.some(run Bytes.copy(found.content))
+      }
+    }
+  }
+  return Option<Bytes>.none()
+}
+
+// Writes `program` as `staging/sew` with a hard link `staging/silk`, then renames both over the
+// names in `bin`. Each name always holds a whole program.
+effect fn replaceProgram(program: &[u8], staging: &Path, bin: &Path) -> ()
+  ! InstallError | FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let fresh = run Path.join(staging, "sew")
+  let twin = run Path.join(staging, "silk")
+  run FileSystem.writeFileWithParents(&fresh, program)
+  if !run HostFiles.markExecutable(&fresh) {
+    fail run stop(1, &[b"cannot make ", Path.rawBytes(&fresh), b" executable"])
+  }
+  if !run HostFiles.link(&fresh, &twin) {
+    fail run stop(1, &[b"cannot link ", Path.rawBytes(&twin), b" to ", Path.rawBytes(&fresh)])
+  }
+  let front = run Path.join(bin, "sew")
+  let proxy = run Path.join(bin, "silk")
+  if !run HostFiles.rename(&fresh, &front) {
+    fail run stop(1, &[b"cannot replace ", Path.rawBytes(&front)])
+  }
+  if !run HostFiles.rename(&twin, &proxy) {
+    fail run stop(1, &[b"cannot replace ", Path.rawBytes(&proxy)])
+  }
+}
+
+/// Replaces `home/bin/sew` and `home/bin/silk`, one program under two names, with the `bin/sew` of
+/// the newest published release for `target`: the newest stable release (the newest dev release
+/// while none is stable), or the newest release of any kind when `dev` is set. Nothing changes
+/// when that release is not newer than `running`, this sew's version. No toolchain is installed.
+pub effect fn updateSelf(home: &Path, running: &[u8], dev: bool, target: &[u8], publicKey: &[u8]) -> Installed
+  ! InstallError | FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let key = match Minisign.key(publicKey) {
+    Result<MinisignKey, MinisignError>.Success { value } => move value
+    Result<MinisignKey, MinisignError>.Failure { error } => {
+      fail run stop(1, &[b"the release key is invalid: ", Minisign.describe(error)])
+    }
+  }
+  let published = run ReleaseSource.releases()
+  let candidates = List<Bytes>.asSlice(&published)
+  let mut chosen = newest(candidates, b"latest", !dev)
+  let missing = match &chosen {
+    Option<usize>.Some { value } => false
+    Option<usize>.None => true
+  }
+  if missing {
+    chosen = newest(candidates, b"dev", false)
+  }
+  let version = match move chosen {
+    Option<usize>.Some { value } => run Bytes.copy(Bytes.asSlice(&candidates[value]))
+    Option<usize>.None => {
+      fail run stop(NETWORK, &[b"the release listing names no published Silk release"])
+    }
+  }
+  if Toolchains.compare(Bytes.asSlice(&version), running) <= 0 {
+    return Installed { version: move version, changed: false }
+  }
+  let top = run joined(&[b"silk-", Bytes.asSlice(&version), b"-", target])
+  let unpacked = run verifiedArchive(Bytes.asSlice(&version), target, &key)
+  let program = match move run member(Bytes.asSlice(&unpacked), Bytes.asSlice(&top), b"bin/sew") {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      fail run stop(1, &[b"Silk ", Bytes.asSlice(&version), b" has no sew; it was released before sew existed"])
+    }
+  }
+  let bin = run Path.join(home, "bin")
+  run FileSystem.createDirectoriesRecursively(&bin)
+  let staging = run FileSystem.createTemporaryDirectory(&bin, b".update-")
+  let replaced = run Effect.result(replaceProgram(Bytes.asSlice(&program), &staging, &bin))
+  let cleaned = run Effect.result(FileSystem.removeDirectoryRecursively(&staging))
+  drop cleaned
+  if let Result<(), InstallError | FileError | OutOfMemoryError>.Failure { error } = move replaced {
+    fail move error
+  }
+  return Installed { version: move version, changed: true }
 }

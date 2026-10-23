@@ -1,5 +1,6 @@
 #!/bin/sh
-# Installs a stable or dev Silk compiler release, or an explicitly selected version.
+# Installs sew, the Silk front door, with a stable or dev Silk release, or an explicitly selected
+# version.
 #
 #   curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 #
@@ -8,9 +9,10 @@
 # SILK_CHANNEL=dev follows published dev snapshots; drafts and bootstrap seeds are excluded.
 # The compiler's SHA-256, reported version and embedded change snapshot are checked before
 # installing it as the toolchain `$SILK_HOME/toolchains/<version>` (`SILK_HOME` defaults to
-# `~/.silk`). `$SILK_HOME/bin/silk` links to it and `settings.toml` makes it the default, so
-# `silk` runs it outside projects and dispatches to a project's `silk-version` pin inside one.
-# Other toolchains stay installed; `silk toolchain list` shows them.
+# `~/.silk`), and `settings.toml` makes it the default. The release's `bin/sew` is copied to
+# `$SILK_HOME/bin/sew`, with `$SILK_HOME/bin/silk` a second name for the same file: both run the
+# version a project's `silk-version` pins inside it, and the default outside. Other versions stay
+# installed; `sew use list` shows them. Releases from before sew link `bin/silk` to the compiler.
 # When minisign is installed, the archive's signature must verify against the release key below.
 # Downloads made by curl carry no macOS quarantine mark, so Gatekeeper lets the compiler run.
 #
@@ -252,8 +254,27 @@ chmod 0755 "$staging/bin/silk"
 rm -rf "$toolchain"
 mv "$staging" "$toolchain" || fail "cannot move the toolchain into $toolchain"
 
-# Link `bin/silk` to the toolchain and make it the default, keeping `auto-install`.
-ln -sfn "$toolchain/bin/silk" "$silk_home/bin/silk" || fail "cannot link $silk_home/bin/silk"
+# sew and its `silk` twin are real files beside the store, staged and renamed into place so each
+# name always holds a whole program. A release from before sew has none; `bin/silk` links to its
+# compiler instead.
+sew=
+if [ -f "$toolchain/bin/sew" ]; then
+  cp "$toolchain/bin/sew" "$silk_home/bin/.sew-$$" || fail "cannot copy sew to $silk_home/bin"
+  chmod 0755 "$silk_home/bin/.sew-$$"
+  [ "$("$silk_home/bin/.sew-$$" --version)" = "sew $version" ] || {
+    rm -f "$silk_home/bin/.sew-$$"
+    fail "sew does not report the requested version $version"
+  }
+  rm -f "$silk_home/bin/.silk-$$"
+  ln "$silk_home/bin/.sew-$$" "$silk_home/bin/.silk-$$" || fail "cannot link $silk_home/bin/silk to sew"
+  mv -f "$silk_home/bin/.sew-$$" "$silk_home/bin/sew" || fail "cannot install $silk_home/bin/sew"
+  mv -f "$silk_home/bin/.silk-$$" "$silk_home/bin/silk" || fail "cannot install $silk_home/bin/silk"
+  sew=$silk_home/bin/sew
+else
+  ln -sfn "$toolchain/bin/silk" "$silk_home/bin/silk" || fail "cannot link $silk_home/bin/silk"
+fi
+
+# Make the toolchain the default, keeping `auto-install`.
 auto_install=
 if [ -f "$silk_home/settings.toml" ] &&
   grep -Eq '^[[:space:]]*auto-install[[:space:]]*=[[:space:]]*true[[:space:]]*(#.*)?$' "$silk_home/settings.toml"; then
@@ -266,7 +287,13 @@ fi
 mv "$silk_home/settings.toml.$$" "$silk_home/settings.toml"
 
 printf '\nInstalled %s to %s\n' "$("$toolchain/bin/silk" --version 2> /dev/null || echo silk)" "$toolchain"
-printf 'It is the default toolchain; %s/bin/silk links to it.\n' "$silk_home"
+if [ -n "$sew" ]; then
+  printf 'It is the default Silk version. Installed sew to %s; %s/bin/silk is the same program.\n' "$sew" "$silk_home"
+  printf 'sew runs each project with the Silk version it pins: sew build, sew test, sew run.\n'
+  printf 'Update sew with: sew update self\n'
+else
+  printf 'It is the default toolchain; %s/bin/silk links to it. This release has no sew.\n' "$silk_home"
+fi
 
 # Silk hands Clang textual LLVM IR. Clang 18 or newer reads it for ordinary programs; inline
 # assembly that reads or writes memory, as the no-libc Linux runtime uses, is emitted with LLVM 22's
