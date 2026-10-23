@@ -14,7 +14,6 @@ export class CompilerReleaseError extends Data.TaggedError('CompilerReleaseError
 const invalid = (message) => Effect.fail(new CompilerReleaseError({ reason: 'Conflict', message }))
 export const managedBranch = 'release/compiler-stable'
 export const managedMarker = '<!-- silk-managed-stable-release -->'
-const reservationPrefix = 'refs/silk/compiler-dev-reservation/'
 const json = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))
 const command = Effect.fnUntraced(function* (executable, args, options = {}) {
   const result = yield* NativeProcess.execute(executable, args, options)
@@ -57,25 +56,29 @@ export const isManagedMerge = (pull, commit, repository) =>
   pull.body?.includes(managedMarker) &&
   pull.body.includes(headMarker(pull.head.sha))
 
-/** Internal refs survive deleted drafts without appearing as tags/releases; counters are global. */
-export const reservation = Effect.fn('CompilerRelease.reservation')(function* (refs, commit) {
+/**
+ * Dev counters come from the published tags: the next counter is one past the highest dev tag,
+ * and a commit that already has a dev tag keeps its counter. Main runs share one concurrency lock,
+ * so only one release can be in flight, and a run that fails before tagging consumes nothing.
+ */
+export const devCounter = Effect.fn('CompilerRelease.devCounter')(function* (tags, commit) {
   let maximum = 0
   let existing
-  for (const ref of refs) {
-    if (!ref.ref.startsWith(reservationPrefix)) continue
-    const suffix = ref.ref.slice(reservationPrefix.length)
-    if (!/^[1-9][0-9]*$/.test(suffix) || !Number.isSafeInteger(Number(suffix)))
-      return yield* invalid(`Malformed dev reservation: ${ref.ref}`)
-    const counter = Number(suffix)
+  for (const tag of tags) {
+    const match = /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+-dev\.([1-9][0-9]*)\+/.exec(tag.ref)
+    if (!match) continue
+    const counter = Number(match[1])
+    if (!Number.isSafeInteger(counter)) return yield* invalid(`Malformed dev tag: ${tag.ref}`)
     maximum = Math.max(maximum, counter)
-    if (ref.object.sha === commit) {
-      if (existing !== undefined) return yield* invalid('Commit has conflicting dev reservations')
+    if (tag.object?.sha === commit) {
+      if (existing !== undefined && existing !== counter)
+        return yield* invalid('Commit has conflicting dev tags')
       existing = counter
     }
   }
   if (existing === undefined && !Number.isSafeInteger(maximum + 1))
-    return yield* invalid('Dev reservation counter exhausted')
-  return { counter: existing ?? maximum + 1, exists: existing !== undefined }
+    return yield* invalid('Dev counter exhausted')
+  return existing ?? maximum + 1
 })
 
 export const plan = Effect.fn('CompilerRelease.plan')(function* ({
@@ -100,17 +103,8 @@ export const plan = Effect.fn('CompilerRelease.plan')(function* ({
   if (mode === 'dev' && published.some((release) => release.target_commitish === commit))
     return { mode: 'none' }
   if (mode === 'stable') return { mode }
-  const refs = yield* pages(
-    repository,
-    `git/matching-refs/${reservationPrefix.slice('refs/'.length)}?per_page=100`,
-  )
-  const selected = yield* reservation(refs, commit)
-  if (!selected.exists)
-    yield* api(repository, 'git/refs', 'POST', {
-      ref: `${reservationPrefix}${selected.counter}`,
-      sha: commit,
-    })
-  return { mode, counter: selected.counter }
+  const tags = yield* pages(repository, 'git/matching-refs/tags/v?per_page=100')
+  return { mode, counter: yield* devCounter(tags, commit) }
 })
 
 export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repository, compiler }) {

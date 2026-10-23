@@ -10,13 +10,13 @@ import { vi } from 'vitest'
 import * as NativeProcess from './NativeProcess.ts'
 import {
   assetIdentity,
+  devCounter,
   isManagedMerge,
   maintain,
   managedBranch,
   managedMarker,
   plan,
   publish,
-  reservation,
 } from './CompilerRelease.mjs'
 
 const require = createRequire(new URL('../../package.json', import.meta.url))
@@ -24,8 +24,8 @@ const { NodeServices } = await import(pathToFileURL(require.resolve('@effect/pla
 const commit = 'a'.repeat(40)
 const other = 'b'.repeat(40)
 const repository = 'silk-lang/silk'
-const ref = (counter, sha) => ({
-  ref: `refs/silk/compiler-dev-reservation/${counter}`,
+const tag = (counter, sha) => ({
+  ref: `refs/tags/v0.1.0-dev.${counter}+${sha.slice(0, 12)}`,
   object: { type: 'commit', sha },
 })
 const sealedDescription = (title, body) =>
@@ -58,25 +58,23 @@ const transport = Effect.fnUntraced(function* (handler) {
   )
 })
 
-it.effect(
-  'resumes a commit reservation and allocates above all prior counters, not release count',
-  () =>
-    Effect.gen(function* () {
-      const refs = [ref(2, commit), ref(19, other)]
-      assert.deepEqual(yield* reservation(refs, commit), { counter: 2, exists: true })
-      assert.deepEqual(yield* reservation(refs, 'c'.repeat(40)), { counter: 20, exists: false })
-      assert.deepEqual(yield* reservation([], commit), { counter: 1, exists: false })
-    }),
+it.effect('continues past the highest dev tag and keeps a tagged commit at its counter', () =>
+  Effect.gen(function* () {
+    const tags = [
+      tag(2, commit),
+      tag(19, other),
+      { ref: 'refs/tags/v0.1.0', object: { sha: other } },
+    ]
+    assert.strictEqual(yield* devCounter(tags, commit), 2)
+    assert.strictEqual(yield* devCounter(tags, 'c'.repeat(40)), 20)
+    assert.strictEqual(yield* devCounter([], commit), 1)
+  }),
 )
 
-it.effect('fails closed on conflicting or malformed durable reservation state', () =>
+it.effect('fails closed on conflicting or malformed dev tags', () =>
   Effect.gen(function* () {
-    for (const refs of [
-      [ref(2, commit), ref(3, commit)],
-      [ref('02', commit)],
-      [ref('9007199254740992', other)],
-    ]) {
-      const result = yield* Effect.result(reservation(refs, commit))
+    for (const tags of [[tag(2, commit), tag(3, commit)], [tag('9007199254740993', other)]]) {
+      const result = yield* Effect.result(devCounter(tags, commit))
       assert.isTrue(Result.isFailure(result))
       if (Result.isFailure(result)) assert.strictEqual(result.failure.reason, 'Conflict')
     }
@@ -121,7 +119,7 @@ it.effect(
     }).pipe(Effect.scoped),
 )
 
-it.effect('published commits are deduplicated, while drafts reuse their durable counter', () =>
+it.effect('published commits are deduplicated, while a tagged draft keeps its counter', () =>
   Effect.gen(function* () {
     let draft = false
     let writes = 0
@@ -135,7 +133,8 @@ it.effect('published commits are deduplicated, while drafts reuse their durable 
           return outcome([
             [{ draft, tag_name: 'v0.1.0-dev.7+aaaaaaaaaaaa', target_commitish: commit }],
           ])
-        if (path.includes('/git/matching-refs/')) return outcome([[ref(7, commit), ref(15, other)]])
+        if (path.includes('/git/matching-refs/tags/'))
+          return outcome([[tag(7, commit), tag(15, other)]])
         assert.fail(`Unexpected transport: ${args.join(' ')}`)
       }),
     )
@@ -151,35 +150,29 @@ it.effect('published commits are deduplicated, while drafts reuse their durable 
   }).pipe(Effect.scoped),
 )
 
-it.effect('reserves and resumes counters without creating public release tags', () =>
+it.effect('plans the next dev counter from tags without writing anything', () =>
   Effect.gen(function* () {
-    const refs = [ref(12, other)]
-    yield* transport((file, args, options) =>
+    const tags = [tag(12, other)]
+    let writes = 0
+    yield* transport((file, args) =>
       Effect.sync(() => {
         assert.strictEqual(file, 'gh')
         const path = args.find((value) => value.startsWith('repos/'))
-        if (args.includes('POST')) {
-          const value = JSON.parse(Buffer.from(options.input).toString())
-          assert.isFalse(refs.some((entry) => entry.ref === value.ref))
-          refs.push({ ref: value.ref, object: { type: 'commit', sha: value.sha } })
-          return outcome(refs.at(-1))
-        }
-        if (path.includes('/git/matching-refs/')) {
-          const prefix = `refs/${path.split('/git/matching-refs/')[1].split('?')[0]}`
-          return outcome([refs.filter((entry) => entry.ref.startsWith(prefix))])
-        }
+        if (args.includes('POST') || args.includes('DELETE')) writes++
+        if (path.includes('/git/matching-refs/tags/')) return outcome([tags])
         return outcome([[]])
       }),
     )
     const request = { repository, commit, mode: 'dev', event: 'workflow_dispatch' }
+    // A run that fails before tagging leaves nothing behind, so the retry gets the same counter.
     assert.deepEqual(yield* plan(request), { mode: 'dev', counter: 13 })
     assert.deepEqual(yield* plan(request), { mode: 'dev', counter: 13 })
+    tags.push(tag(13, commit))
     assert.deepEqual(yield* plan({ ...request, commit: 'c'.repeat(40) }), {
       mode: 'dev',
       counter: 14,
     })
-    assert.deepEqual(refs.filter((entry) => entry.ref.startsWith('refs/tags/')), [])
-    assert.deepEqual(refs, [ref(12, other), ref(13, commit), ref(14, 'c'.repeat(40))])
+    assert.strictEqual(writes, 0)
   }).pipe(Effect.scoped),
 )
 
