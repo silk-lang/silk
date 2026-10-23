@@ -138,7 +138,7 @@ Every `silk` is also a version manager. Installed toolchains live in `$SILK_HOME
 
 ```text
 ~/.silk/
-  bin/silk                     link to the default toolchain's compiler (install.sh)
+  bin/silk                     link to the default toolchain's compiler (install.sh, toolchain default)
   settings.toml                default = "<version>", optional auto-install = true
   toolchains/<version>/bin/silk
   toolchains/<version>/lib/silk/stdlib
@@ -165,8 +165,8 @@ leaves no half-written toolchain. Installs hold an `flock` on `$SILK_HOME/.insta
 concurrent installs of a release download it once. Network failures exit with status 4 and failed
 checks with 5.
 
-`install` and `use` also take `latest`, the newest stable release (or the newest release while no
-stable one exists), and `dev`, the newest release of any kind. They read the GitHub release
+`install` and `use` also take `latest`, the newest stable release, and `latest --dev` (or `dev`),
+the newest release of any kind. They read the GitHub release
 listing, retrying up to four times when it fails or comes back empty, and `use` pins the full
 version the alias named.
 
