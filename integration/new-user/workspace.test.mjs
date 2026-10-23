@@ -55,7 +55,7 @@ test('test at the root runs each member and summarizes', () => {
   assert.match(result.stdout, /Workspace summary: 2 packages succeeded, 0 failed/)
 })
 
-test('a filter that matches in one member succeeds', { todo: 'finding 4' }, () => {
+test('a filter that matches in one member succeeds', () => {
   const result = silk(h, ['test', '--no-cache', '--filter', 'adds'], { cwd: shop })
   assert.equal(result.status, 0, show(result))
 })

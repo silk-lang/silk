@@ -121,14 +121,14 @@ test('silk check, build, build --release and clean', () => {
   assert.ok(!existsSync(join(dir, 'build')))
 })
 
-test('silk clean with nothing to remove does not claim it removed something', { todo: 'finding 14' }, () => {
+test('silk clean with nothing to remove does not claim it removed something', () => {
   const dir = initPackage(h, fresh('clean'))
   const result = silk(h, ['clean'], { cwd: dir })
   assert.equal(result.status, 0)
   assert.doesNotMatch(result.stdout + result.stderr, /^Removed /m)
 })
 
-test('commands outside a package say how to make one', { todo: 'finding 17: the message says "create one" without naming silk init' }, () => {
+test('commands outside a package say how to make one', () => {
   for (const command of [['run'], ['build'], ['check']]) {
     const result = silk(h, command)
     assert.equal(result.status, 2)
@@ -136,14 +136,14 @@ test('commands outside a package say how to make one', { todo: 'finding 17: the 
   }
 })
 
-test('silk help and silk --help', { todo: 'finding 11: silk help is an unknown command' }, () => {
+test('silk help and silk --help', () => {
   const help = silk(h, ['--help'])
   assert.equal(help.status, 0)
   const word = silk(h, ['help'])
   assert.equal(word.status, 0, show(word))
 })
 
-test('an unknown flag is named in the error', { todo: 'finding 16: the global usage is printed instead' }, () => {
+test('an unknown flag is named in the error', () => {
   const dir = initPackage(h, fresh('flags'))
   for (const [command, flag] of [['check', '--relase'], ['build', '--bogus'], ['run', '--bogus'], ['test', '--filtr']]) {
     const result = silk(h, [command, flag], { cwd: dir })
@@ -175,7 +175,7 @@ test('silk format leaves a file with syntax errors alone', () => {
   assert.equal(read(join(dir, 'src/bad.silk')), 'fn broken( {\n')
 })
 
-test('silk format on a missing file says it is missing', { todo: 'finding 22' }, () => {
+test('silk format on a missing file says it is missing', () => {
   const dir = initPackage(h, fresh('missing'))
   const result = silk(h, ['format', 'nope.silk'], { cwd: dir })
   assert.notEqual(result.status, 0)

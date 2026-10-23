@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process'
 import { cpSync, mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { test } from 'node:test'
 import { initPackage, join, read, sh, sharedHome, show, silk, userEnv, write } from './lib.mjs'
+import { startServer, uriOf } from './lsp.mjs'
 
 const h = sharedHome()
 
@@ -215,7 +216,7 @@ test('a stack overflow says so instead of a bare segmentation fault', () => {
   assert.match(result.stderr, /stack overflow/i, show(result))
 })
 
-test('a small float rounded to a precision prints zeros, not a leading 1', { todo: 'finding 40' }, () => {
+test('a small float rounded to a precision prints zeros, not a leading 1', () => {
   const dir = initPackage(h, 'smallfloat')
   write(join(dir, 'src/main.silk'), `${logging}  let a: f64 = 0.000001
   let b: f64 = 0.000000006
@@ -240,7 +241,7 @@ test('checking a module with 100 log calls takes a few seconds at most', { todo:
   assert.ok(seconds < 3, `silk check took ${seconds.toFixed(1)} s`)
 })
 
-test('spawning a task that can fail names the call and the fix', { todo: 'finding 43' }, () => {
+test('spawning a task that can fail names the call and the fix', () => {
   const dir = initPackage(h, 'spawnfail')
   write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
@@ -287,7 +288,7 @@ pub effect fn main() -> i32
   assert.match(result.stderr, /offset/, show(result))
 })
 
-test('an if used as a value explains that if is a statement', { todo: 'finding 48' }, () => {
+test('an if used as a value explains that if is a statement', () => {
   const dir = initPackage(h, 'ifvalue')
   write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let found = true\n  let first = if found { 1 } else { 2 }\n  return first\n}\n')
   const result = silk(h, ['check'], { cwd: dir })
@@ -296,10 +297,54 @@ test('an if used as a value explains that if is a statement', { todo: 'finding 4
 })
 
 
-test('the native resolver finds localhost', { todo: 'finding 49' }, () => {
+test('the native resolver finds localhost', () => {
   const dir = initPackage(h, 'resolvelocal')
   write(join(dir, 'src/main.silk'), "import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.effect { Effect }\nimport silk.monotonic_clock { MonotonicClock }\nimport silk.native_resolver { NativeSystemResolver }\nimport silk.network_address { AddressError, Host, Port }\nimport silk.option { Option }\nimport silk.os_monotonic_clock { OsMonotonicClock }\nimport silk.result { Result }\nimport silk.resolver { FamilySelection, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError }\nimport silk.system_clock { Instant, SystemClock }\nimport silk.os_writer { StderrWriter }\n\nfn request(name: string, deadline: Option<Instant>) -> Option<ResolveRequest> {\n  let host = match Host.parse(name) {\n    Result<Host, AddressError>.Success { value } => value\n    Result<Host, AddressError>.Failure { error: _ } => {\n      return Option<ResolveRequest>.none()\n    }\n  }\n  return match ResolveRequest.make(host, Port.fromU16(443), FamilySelection.Any, 8, move deadline) {\n    Result<ResolveRequest, ResolverError>.Success { value } => Option<ResolveRequest>.some(\n      move value\n    )\n    Result<ResolveRequest, ResolverError>.Failure { error: _ } => Option<ResolveRequest>.none()\n  }\n}\n\n// Returns the number of endpoints of `name`. It blocks until the system lookup ends.\neffect fn countEndpoints(name: string) -> usize\n  ! ResolverError | OutOfMemoryError\n  ? &mut Resolver | &mut MonotonicClock | &mut Allocator {\n  let lookup = match request(name, Option<Instant>.none()) {\n    Option.Some { value } => move value\n    Option.None => {\n      return 0\n    }\n  }\n  let endpoints = run Resolver.resolve(&lookup)\n  return ResolvedEndpoints.length(&endpoints)\n}\n\npub fn main() -> i32 {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let mut resolver = NativeSystemResolver.make()\n  let mut clock = OsMonotonicClock.make()\n  let names: [string; 4] = [\"localhost\", \"127.0.0.1\", \"api.anthropic.com\", \"vm\"]\n  let mut i: usize = 0\n  while i < 4 {\n    let name = names[i]\n    let found = run Effect.result(countEndpoints(name))\n      |> Effect.provideMut<Resolver>(&mut resolver)\n      |> Effect.provideMut<MonotonicClock>(&mut clock)\n      |> Effect.provideMut<Allocator>(&mut allocator)\n    match move found {\n      Result.Success { value } => StderrWriter.print(\"{name}: {n} endpoints\\n\", &.{ name: name, n: value })\n      Result.Failure { error } => {\n        drop error\n        StderrWriter.print(\"{name}: failed\\n\", &.{ name: name })\n      }\n    }\n    i = i + 1\n  }\n  return 0\n}\n")
   const result = silk(h, ['run', '--quiet'], { cwd: dir })
   assert.equal(result.status, 0, show(result))
   assert.match(result.stderr, /localhost: 1 endpoints/, show(result))
+})
+
+test('a library with 600 tests builds and runs them all', { todo: 'finding 59' }, () => {
+  const dir = initPackage(h, 'manytests', ['--lib'])
+  let body = "import silk.testing { AssertionError, Testing }\n\npub fn twice(x: i32) -> i32 {\n  return x * 2\n}\n"
+  for (let i = 0; i < 600; i++) body += `\ntest effect fn case${i}() -> ()\n  ! AssertionError<'static> {\n  run Testing.expect(twice(${i}) == ${2 * i}, "twice ${i}")\n}\n`
+  write(join(dir, 'src/lib.silk'), body)
+  const result = silk(h, ['test', '--no-cache'], { cwd: dir })
+  assert.equal(result.status, 0, show(result))
+  assert.match(result.stdout, /Tests  600 passed, 0 failed/)
+})
+
+test('a call with too few arguments is reported as SEM0007', { todo: 'finding 61' }, () => {
+  const dir = initPackage(h, 'fewargs')
+  write(join(dir, 'src/main.silk'), 'fn add(a: i32, b: i32, c: i32) -> i32 {\n  return a + b + c\n}\n\npub fn main() -> i32 {\n  return add(2, 3)\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.match(result.stderr, /src\/main\.silk:6:10: error\[SEM0007\] Expected 3 arguments but received 2/, show(result))
+})
+
+test('in a workspace, the editor sees a saved change to another member', { todo: 'finding 62' }, async () => {
+  const root = join(h.work, 'lspshop')
+  for (const [args, cwd] of [[['init', '--workspace', 'lspshop'], h.work], [['init', '--lib', 'pricing'], root], [['init', 'store'], root], [['add', '../pricing'], join(root, 'store')]]) {
+    const result = silk(h, args, { cwd })
+    assert.equal(result.status, 0, show(result))
+  }
+  const store = join(root, 'store/src/main.silk')
+  const lib = join(root, 'pricing/src/lib.silk')
+  write(store, 'import pricing.lib { add }\n\npub fn main() -> i32 {\n  return add(2, 3) - 5\n}\n')
+  const server = startServer(h, root)
+  await server.initialize(root)
+  for (const file of [store, lib]) server.notify('textDocument/didOpen', { textDocument: { uri: uriOf(file), languageId: 'silk', version: 1, text: read(file) } })
+  assert.deepEqual(await server.diagnostics(uriOf(store), 120_000), [])
+  const hidden = read(lib).replace('pub fn add', 'fn add')
+  write(lib, hidden)
+  server.notify('textDocument/didChange', { textDocument: { uri: uriOf(lib), version: 2 }, contentChanges: [{ text: hidden }] })
+  server.notify('textDocument/didSave', { textDocument: { uri: uriOf(lib) } })
+  server.notify('textDocument/didChange', { textDocument: { uri: uriOf(store), version: 2 }, contentChanges: [{ text: read(store) + '\n' }] })
+  let codes = []
+  const deadline = Date.now() + 20_000
+  while (Date.now() < deadline && !codes.includes('SEM0015')) {
+    codes = (await server.diagnostics(uriOf(store), 20_000).catch(() => [])).map((diagnostic) => diagnostic.code)
+  }
+  await server.shutdown()
+  assert.ok(codes.includes('SEM0015'), JSON.stringify(codes))
 })
