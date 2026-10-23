@@ -48,6 +48,17 @@ behavior, data format, build artifact, or internal representation is a compatibi
 - Use `service` for runtime-provided Effect contracts and lexical provider replacement. Use
   `interface` for compile-time conformance and specialization only.
 
+## Text and bytes
+
+Use `string` for text and byte slices (`&[u8]`, `b"..."`) only for data that is not text or may
+not be UTF-8, such as file contents, wire formats, hashes, or raw host values.
+
+- A public API that takes or returns text, such as a name, a message, a flag, a version, or a path
+  written by the user, uses `string`. When callers also have the same value as host bytes, add a
+  second function with a `Bytes` suffix, as `Path.join` and `Path.joinBytes` do.
+- In code, tests, and doc examples, write text as a string literal. Write `b"..."` only where the
+  callee takes bytes.
+
 ## Doc comments
 
 Follow `reference/documentation-style-guide.md` for every `//!` and `///` comment. Two rules are
