@@ -9,9 +9,12 @@ Use [`HashMap`](#HashMap) to find a value by a key. The key type must implement 
 `silk.list.List` when the order of insertion matters, or when the code finds values by position.
 
 ## Details
-[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets. The map doubles
-the number of buckets before more than three quarters of them are in use. A failed growth leaves
-the entries, the length, and the bucket count unchanged.
+[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets. The map rebuilds
+its table before more than three quarters of the buckets are in use. A bucket stays in use after
+a removal, until the next rebuild. The rebuild doubles the number of buckets if the entries fill
+more than half of them. Otherwise it keeps the number and only clears the removed buckets, so a
+map that inserts and removes forever keeps a bucket count in proportion to its largest length. A
+failed growth leaves the entries, the length, and the bucket count unchanged.
 
 The same seed and the same operations give the same bucket order on each target. To visit each
 entry, scan the buckets from 0 to [`HashMap.bucketCount`](#HashMap.impl.bucketCount), test [`HashMap.occupiedAt`](#HashMap.impl.occupiedAt), and read
@@ -107,9 +110,12 @@ position.
 
 ### Details
 
-[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets. The map doubles
-the number of buckets before more than three quarters of them are in use. A failed growth leaves
-the entries, the length, and the bucket count unchanged.
+[`HashMap.make`](#HashMap.impl.make) does not allocate. The first insert allocates eight buckets. The map rebuilds
+its table before more than three quarters of the buckets are in use. A bucket stays in use after
+a removal, until the next rebuild. The rebuild doubles the number of buckets if the entries fill
+more than half of them. Otherwise it keeps the number and only clears the removed buckets, so a
+map that inserts and removes forever keeps a bucket count in proportion to its largest length. A
+failed growth leaves the entries, the length, and the bucket count unchanged.
 
 To visit each entry, scan the buckets from 0 to [`HashMap.bucketCount`](#HashMap.impl.bucketCount), test
 [`HashMap.occupiedAt`](#HashMap.impl.occupiedAt), and read [`HashMap.keyAt`](#HashMap.impl.keyAt) and [`HashMap.valueAt`](#HashMap.impl.valueAt). This order is the
