@@ -30,7 +30,17 @@ The server adds the `Connection` field. It closes the connection after a respons
 - The request is HTTP/1.0, and it is not a keep-alive request with `Http10KeepAlive`.
 
 For `Expect: 100-continue`, the first [`readSome`](#readSome) or [`discardRemaining`](#discardRemaining) sends `100 Continue`
-first. Another expectation makes [`Request.expectationRejected`](#Request.impl.expectationRejected) true.
+first, unless `maxInformationalResponses` is 0: then it reads the body without one. Another
+expectation makes [`Request.expectationRejected`](#Request.impl.expectationRejected) true.
+
+An HTTP/1.0 request can be answered with an HTTP/1.0 or an HTTP/1.1 response head, as RFC 9110
+allows; the response is not chunked, and the connection closes after it unless it is kept alive.
+
+A request that the server cannot read gets a bare response with no body before the error is
+returned and the connection closes: 400 for a malformed head or body framing, 413 for a body over
+the limits, 414 for a target over `maxTargetBytes`, 431 for header fields over the limits, 501
+for a transfer coding other than chunked, and 505 for a version other than HTTP/1.0 or HTTP/1.1.
+Nothing is sent when the input ends early.
 
 ## Errors
 [`ServerError`](#ServerError) keeps the cause from the lower layer: the head parser, the body framing, the
@@ -1201,6 +1211,8 @@ connection is set to close.
 - `InvalidState` if the phase is not `Ready`.
 - `Head` if the head is not valid, and `TruncatedHead` if the input ends in the head.
 - `Body` if the body framing of the request is not valid.
+
+Before a `Head` or `Body` error, the server sends a bare 4xx or 5xx response. See the module.
 - The error of the callback.
 
 <a id="readSome"></a>
@@ -1226,7 +1238,7 @@ It returns at least one byte, or zero at the end of the body. If the request has
 
 ### Errors
 - `UnsupportedExpectation` if [`Request.expectationRejected`](#Request.impl.expectationRejected) is true.
-- `Body` if the body breaks its framing.
+- `Body` if the body breaks its framing or a limit, after a bare 400 or 413 response.
 - `InvalidState` if the request is no longer active.
 
 <a id="discardRemaining"></a>
@@ -1345,8 +1357,9 @@ calls [`ResponseWriter.finish`](#ResponseWriter.impl.finish). If it does not, or
 request.
 
 ### Errors
-- `InvalidBodyMode` if the status is less than 200, the version is not the version of the
-  request, or `mode` does not fit the head and the status.
+- `InvalidBodyMode` if the status is less than 200, the version is neither the version of the
+  request nor HTTP/1.1, `mode` is `Chunked` for an HTTP/1.0 request, or `mode` does not fit the
+  head and the status.
 - `InvalidState` if the request is not active.
 - The error of the callback.
 
@@ -1377,8 +1390,8 @@ Sends a final response with no body, and closes the connection after it.
 It does not read the rest of the request body. Use it for errors such as 400, 413, or 417.
 
 ### Errors
-`InvalidBodyMode` if the status is less than 200, or the version is not the version of the
-request.
+`InvalidBodyMode` if the status is less than 200, or the version is neither the version of the
+request nor HTTP/1.1.
 
 <a id="withUpgrade"></a>
 

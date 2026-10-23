@@ -26,7 +26,17 @@
 //! - The request is HTTP/1.0, and it is not a keep-alive request with `Http10KeepAlive`.
 //!
 //! For `Expect: 100-continue`, the first [`readSome`] or [`discardRemaining`] sends `100 Continue`
-//! first. Another expectation makes [`Request.expectationRejected`] true.
+//! first, unless `maxInformationalResponses` is 0: then it reads the body without one. Another
+//! expectation makes [`Request.expectationRejected`] true.
+//!
+//! An HTTP/1.0 request can be answered with an HTTP/1.0 or an HTTP/1.1 response head, as RFC 9110
+//! allows; the response is not chunked, and the connection closes after it unless it is kept alive.
+//!
+//! A request that the server cannot read gets a bare response with no body before the error is
+//! returned and the connection closes: 400 for a malformed head or body framing, 413 for a body over
+//! the limits, 414 for a target over `maxTargetBytes`, 431 for header fields over the limits, 501
+//! for a transfer coding other than chunked, and 505 for a version other than HTTP/1.0 or HTTP/1.1.
+//! Nothing is sent when the input ends early.
 //!
 //! # Errors
 //! [`ServerError`] keeps the cause from the lower layer: the head parser, the body framing, the
@@ -344,6 +354,7 @@ import silk.http {
 }
 import silk.http_body {
   BodyError,
+  BodyReason,
   Completion,
   CompletionKind,
   Decoder,
@@ -361,6 +372,8 @@ import silk.http_head {
   HeaderIterator as ParsedHeaderIterator,
   Limits as HeadLimits,
   ParseError,
+  ParseLimitKind,
+  ParseReason,
   ProgressState as HeadProgressState,
   RequestHead,
   RequestParser,
@@ -813,6 +826,8 @@ where &'env mut P provides &ByteDuplex from &mut ByteDuplex,
 /// - `InvalidState` if the phase is not `Ready`.
 /// - `Head` if the head is not valid, and `TruncatedHead` if the input ends in the head.
 /// - `Body` if the body framing of the request is not valid.
+///
+/// Before a `Head` or `Body` error, the server sends a bare 4xx or 5xx response. See the module.
 /// - The error of the callback.
 pub effect fn withRequest<
   'request,
@@ -852,6 +867,39 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
   let admitted = run admitHead(&mut connection.*, &deadline)
   if !admitted { return Option<A>.none() }
   connection.requestCount = connection.requestCount + usize.ONE
+  let opened = run openRequest(&mut connection.*)
+  let mut request = match move opened {
+    OpenedRequest.Ready {decoder, facts} => Request {
+      connection: move connection,
+      decoder: move decoder,
+      facts: move facts,
+      informationalCount: usize.ZERO,
+      continueSent: false,
+      responseFinished: false,
+    }
+    OpenedRequest.Refused {error} => {
+      run refuse(&mut connection.*, bodyRefusal(&error), &deadline)
+      connection.phaseValue = ConnectionPhase.Failed
+      fail ServerError.Body {error: move error}
+    }
+  }
+  request.connection.phaseValue = ConnectionPhase.RequestActive
+  let value = run callback(&mut request)
+  settleRequest(&mut request)
+  return Option<A>.some(move value)
+}
+
+// The decoder and the facts of an admitted head, or the framing error that refuses it.
+union OpenedRequest {
+  Ready {decoder: Decoder, facts: RequestFacts},
+  Refused {error: BodyError},
+}
+
+// Selects the body framing of the admitted head. A framing error is returned, not raised, so that
+// the caller can answer it once the head is no longer borrowed.
+effect fn openRequest<'connection, 'transport, P>(
+  connection: &mut Connection<'connection, 'transport, P>,
+) -> OpenedRequest ! ServerError | OutOfMemoryError ? &mut Allocator {
   let head = match move RequestParser.head(&connection.requestParser) {
     Result.Failure {error} => {
       connection.phaseValue = ConnectionPhase.Failed
@@ -862,10 +910,7 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
   let policy = TrailerPolicy.defaultPolicy()
   let selected = selectRequest(head, policy)
   let selection = match move selected {
-    Result.Failure {error} => {
-      connection.phaseValue = ConnectionPhase.Failed
-      fail ServerError.Body {error: move error}
-    }
+    Result.Failure {error} => { return OpenedRequest.Refused {error: move error} }
     Result.Success {value} => move value
   }
   let framing = selection.framing()
@@ -873,25 +918,10 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
   // The consumed head cannot be admitted again if body storage acquisition fails.
   connection.phaseValue = ConnectionPhase.Failed
   let made = run Decoder.make(move selection, connection.limits.body, policy)
-  let decoder = match move made {
-    Result<Decoder, BodyError>.Failure {error} => {
-      connection.phaseValue = ConnectionPhase.Failed
-      fail ServerError.Body {error: move error}
-    }
-    Result<Decoder, BodyError>.Success {value} => move value
+  return match move made {
+    Result<Decoder, BodyError>.Failure {error} => OpenedRequest.Refused {error: move error}
+    Result<Decoder, BodyError>.Success {value} => OpenedRequest.Ready {decoder: move value, facts: facts}
   }
-  connection.phaseValue = ConnectionPhase.RequestActive
-  let mut request = Request {
-    connection: move connection,
-    decoder: move decoder,
-    facts: move facts,
-    informationalCount: usize.ZERO,
-    continueSent: false,
-    responseFinished: false,
-  }
-  let value = run callback(&mut request)
-  settleRequest(&mut request)
-  return Option<A>.some(move value)
 }
 
 effect fn admitHead<'connection, 'transport, P>(
@@ -909,6 +939,7 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
       drop input
       let progress = match move fed {
         Result.Failure {error} => {
+          run refuse(&mut connection.*, headRefusal(&error), deadline)
           connection.phaseValue = ConnectionPhase.Failed
           fail ServerError.Head {error: move error}
         }
@@ -968,7 +999,7 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
 ///
 /// # Errors
 /// - `UnsupportedExpectation` if [`Request.expectationRejected`] is true.
-/// - `Body` if the body breaks its framing.
+/// - `Body` if the body breaks its framing or a limit, after a bare 400 or 413 response.
 /// - `InvalidState` if the request is no longer active.
 pub effect fn readSome<'request, 'connection, 'transport, P>(
   request: &mut Request<'request, 'connection, 'transport, P>,
@@ -993,6 +1024,7 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
     let progress = match move stepped {
       Result<BodyProgress, BodyError>.Failure {error} => {
         run consumeBodyProgress(&mut request.*, error.consumed, error.totalWire)
+        run refuse(&mut request.connection.*, bodyRefusal(&error), &deadline)
         request.connection.phaseValue = ConnectionPhase.Failed
         fail ServerError.Body {error: move error}
       }
@@ -1317,6 +1349,11 @@ effect fn ensureContinue<'request, 'connection, 'transport, P>(
 ? &mut MonotonicClock
 where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
   if request.facts.expectation != ExpectationState.ContinuePending { return () }
+  // A server that sends no 1xx responses reads the body without `100 Continue`, as RFC 9110 allows.
+  if request.connection.limits.maxInformationalResponses == usize.ZERO {
+    request.facts.expectation = ExpectationState.None
+    return ()
+  }
   let attempted = match move usize.checkedAdd(request.informationalCount, usize.ONE) {
     Option.None => {
       fail ServerError.SizeOverflow
@@ -1406,8 +1443,9 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
 /// request.
 ///
 /// # Errors
-/// - `InvalidBodyMode` if the status is less than 200, the version is not the version of the
-///   request, or `mode` does not fit the head and the status.
+/// - `InvalidBodyMode` if the status is less than 200, the version is neither the version of the
+///   request nor HTTP/1.1, `mode` is `Chunked` for an HTTP/1.0 request, or `mode` does not fit the
+///   head and the status.
 /// - `InvalidState` if the request is not active.
 /// - The error of the callback.
 pub effect fn respond<
@@ -1440,7 +1478,10 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
     fail ServerError.InvalidState {phase: request.connection.phaseValue}
   }
   let status = head.status()
-  if Status.code(&status) < 200 || head.version() != request.facts.version {
+  if Status.code(&status) < 200 || !answersVersion(head.version(), request.facts.version) {
+    fail ServerError.InvalidBodyMode
+  }
+  if request.facts.version == Version.Http10 && match mode { BodyMode.Chunked => true _ => false } {
     fail ServerError.InvalidBodyMode
   }
   let close = selectClose(&request.*, mode, reuse)
@@ -1489,8 +1530,8 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
 /// It does not read the rest of the request body. Use it for errors such as 400, 413, or 417.
 ///
 /// # Errors
-/// `InvalidBodyMode` if the status is less than 200, or the version is not the version of the
-/// request.
+/// `InvalidBodyMode` if the status is less than 200, or the version is neither the version of the
+/// request nor HTTP/1.1.
 pub effect fn reject<
   'loan,
   'request: 'loan,
@@ -1510,7 +1551,7 @@ where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut Monoton
     fail ServerError.InvalidState {phase: request.connection.phaseValue}
   }
   let status = head.status()
-  if Status.code(&status) < 200 || head.version() != request.facts.version {
+  if Status.code(&status) < 200 || !answersVersion(head.version(), request.facts.version) {
     fail ServerError.InvalidBodyMode
   }
   let size = run normalizeResponse(&mut request.connection.*, head, true, false, false)
@@ -2211,6 +2252,68 @@ fn bufferAccepted(error: &BufferError) -> usize {
     BufferError.UnknownExternalTransfer {progress, error: cause} => progress
     _ => usize.ZERO
   }
+}
+
+// Whether a response of `response` answers a request of `request`: the same version, or HTTP/1.1,
+// the server's own version, for an HTTP/1.0 request (RFC 9110, section 6.2).
+fn answersVersion(response: Version, request: Version) -> bool {
+  return response == request || (request == Version.Http10 && response == Version.Http11)
+}
+
+// Sends `response`, a complete bare response, before the connection fails, so the client learns why
+// it closes. Nothing is sent when it is empty, and a failed write changes nothing.
+effect fn refuse<'connection, 'transport, P>(
+  connection: &mut Connection<'connection, 'transport, P>,
+  response: &[u8],
+  deadline: &Option<Instant>,
+) -> ()
+? &mut MonotonicClock
+where &'transport mut P provides &ByteDuplex from &mut ByteDuplex | &mut MonotonicClock {
+  if response.length == usize.ZERO { return () }
+  let written = run Effect.result(writeServerBytes(&mut connection.*, response, deadline))
+  if let Result<(), ServerError>.Success {value: _} = &written {
+    let flushed = run Effect.result(flushServer(&mut connection.*, deadline))
+    drop flushed
+  }
+  drop written
+  return ()
+}
+
+// The bare response for a request head that failed `error`, or nothing when the input ended.
+fn headRefusal(error: &ParseError) -> &'static [u8] {
+  return match error.reason {
+    ParseReason.Truncated => b""
+    ParseReason.UnsupportedVersion => b"HTTP/1.1 505 HTTP Version Not Supported\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    ParseReason.LimitExceeded {limit, allowed, attempted} => match limit {
+      ParseLimitKind.TargetBytes => b"HTTP/1.1 414 URI Too Long\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+      ParseLimitKind.HeadBytes => fieldsTooLarge()
+      ParseLimitKind.FieldLineBytes => fieldsTooLarge()
+      ParseLimitKind.Fields => fieldsTooLarge()
+      ParseLimitKind.NameBytes => fieldsTooLarge()
+      ParseLimitKind.ValueBytes => fieldsTooLarge()
+      ParseLimitKind.FieldBytes => fieldsTooLarge()
+      _ => badRequest()
+    }
+    _ => badRequest()
+  }
+}
+
+// The bare response for a request body that failed `error`, or nothing when the input ended.
+fn bodyRefusal(error: &BodyError) -> &'static [u8] {
+  return match error.reason {
+    BodyReason.Truncated => b""
+    BodyReason.LimitExceeded {limit, allowed, attempted} => b"HTTP/1.1 413 Content Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    BodyReason.UnsupportedTransferCoding => b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+    _ => badRequest()
+  }
+}
+
+fn badRequest() -> &'static [u8] {
+  return b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+}
+
+fn fieldsTooLarge() -> &'static [u8] {
+  return b"HTTP/1.1 431 Request Header Fields Too Large\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
 }
 
 effect fn writeServerBytes<'connection, 'transport, P>(

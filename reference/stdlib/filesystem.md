@@ -307,12 +307,13 @@ Returns the path that `relativeText` names when you start at `base`.
 
 Each `..` removes one component, `.` and empty text keep the current path, and other
 components are added. For example, `"../docs"` from `/workspace/app` gives `/workspace/docs`.
-It only computes the path. It does not access the file system, so it does not follow links.
+A single trailing `/` is ignored, so `"docs/"` gives the same path as `"docs"`. It only
+computes the path. It does not access the file system, so it does not follow links.
 
 #### Errors
 
 - `FileError` with reason `InvalidPath` if `relativeText` starts with `/`, contains NUL or an
-  empty component, or goes above the root.
+  empty component such as `"a//b"`, or goes above the root.
 - `OutOfMemoryError` if the `Allocator` cannot supply the path.
 
 <a id="Path.impl.parent"></a>
