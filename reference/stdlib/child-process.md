@@ -59,7 +59,7 @@ pub effect fn main() -> i32
   let mut provider = Completed {}
   let path = run Path.make("/usr/bin/git") |> Effect.provideMut<Allocator>(&mut allocator)
   let mut request = run ChildProcess.request(&path) |> Effect.provideMut<Allocator>(&mut allocator)
-  run ChildProcess.addArgument(&mut request, b"status")
+  run ChildProcess.addArgument(&mut request, "status")
     |> Effect.provideMut<Allocator>(&mut allocator)
   let outcome = run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut provider)
     |> Effect.provideMut<Allocator>(&mut allocator)
@@ -515,11 +515,38 @@ Returns a request to run `program` in `directory`, with no arguments and an empt
 ```silk
 pub effect fn addArgument(
     self: &mut ProcessRequest,
+    value: string
+  ) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds a copy of the text `value` as the next argument.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the storage. Do not use the request
+  again, because it can contain part of the argument.
+
+#### Gotchas
+
+`value` must not contain NUL.
+
+<a id="ChildProcess.impl.addArgumentBytes"></a>
+
+### Method `addArgumentBytes`
+
+```silk
+pub effect fn addArgumentBytes(
+    self: &mut ProcessRequest,
     value: &[u8]
   ) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
-Adds a copy of `value` as the next argument.
+Adds a copy of `value` as the next argument. The bytes do not have to be valid UTF-8.
+
+#### When to use
+
+Use it for an argument that you got as bytes, such as a host path from `Path.rawBytes` or a
+program argument, so you can pass it on without changes.
 
 #### Errors
 
@@ -537,12 +564,45 @@ Adds a copy of `value` as the next argument.
 ```silk
 pub effect fn setVariable(
     self: &mut ProcessRequest,
+    name: string,
+    value: string
+  ) -> () ! OutOfMemoryError ? &mut Allocator
+```
+
+Adds the environment entry `name=value`, where `name` and `value` are text.
+
+#### Details
+
+The environment of the request starts empty. This function does not read the environment of
+the caller. It does not check that `name` is a valid variable name.
+
+#### Errors
+
+- `OutOfMemoryError` if the `Allocator` cannot supply the storage. Do not use the request
+  again, because it can contain part of the entry.
+
+#### Gotchas
+
+`name` and `value` must not contain NUL.
+
+<a id="ChildProcess.impl.setVariableBytes"></a>
+
+### Method `setVariableBytes`
+
+```silk
+pub effect fn setVariableBytes(
+    self: &mut ProcessRequest,
     name: &[u8],
     value: &[u8]
   ) -> () ! OutOfMemoryError ? &mut Allocator
 ```
 
-Adds the environment entry `name=value`.
+Adds the environment entry `name=value`. The bytes do not have to be valid UTF-8.
+
+#### When to use
+
+Use it for a value that you got as bytes, such as a copy of a variable from `HostInput`, so
+you can pass it on without changes.
 
 #### Details
 

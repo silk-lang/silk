@@ -46,7 +46,7 @@ import silk.writer { Writer, WriterError }
 pub effect fn main() -> i32
   ! WriterError {
   let mut out = StdoutWriter.make()
-  run Writer.writeAll(b"Silk\n") |> Effect.provideMut<Writer>(&mut out)
+  run Writer.writeString("Silk\n") |> Effect.provideMut<Writer>(&mut out)
   return 0
 }
 ```
