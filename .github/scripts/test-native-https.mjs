@@ -5,6 +5,8 @@ import * as Config from 'effect/Config'
 import * as Effect from 'effect/Effect'
 import { execFileSync, spawn } from 'node:child_process'
 import { createServer } from 'node:https'
+import { createServer as createPlainServer } from 'node:http'
+import { connect } from 'node:net'
 import { once } from 'node:events'
 import {
   copyFileSync,
@@ -47,6 +49,7 @@ const run = (command, args, env = process.env) =>
   })
 let server
 let assetServer
+let proxy
 try {
   copyFileSync(
     join(root, 'compiler/conformance/native-https/main.silk'),
@@ -279,6 +282,52 @@ basicConstraints = critical,CA:TRUE
     else assert.equal(requested.length, before, `${label}: unauthenticated HTTP request escaped`)
     process.stdout.write(`native HTTPS ${process.platform}/${process.arch}: ${label} passed\n`)
   }
+  // HTTPS_PROXY: each connection is a CONNECT tunnel, TLS still checks the origin through it, and
+  // the proxy URL's user information becomes Proxy-Authorization. NO_PROXY bypasses the proxy.
+  const tunnels = []
+  proxy = createPlainServer((request, response) => response.writeHead(405).end())
+  proxy.on('connect', (request, client, head) => {
+    tunnels.push({ target: request.url, authorization: request.headers['proxy-authorization'] ?? '' })
+    const port = Number(request.url.slice(request.url.lastIndexOf(':') + 1))
+    const upstream = connect(port, '127.0.0.1', () => {
+      client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
+      upstream.write(head)
+      upstream.pipe(client)
+      client.pipe(upstream)
+    })
+    upstream.on('error', () => client.destroy())
+    client.on('error', () => upstream.destroy())
+  })
+  proxy.listen(0, '127.0.0.1')
+  await once(proxy, 'listening')
+  const proxyUrl = `http://user:pa%3Ass@127.0.0.1:${proxy.address().port}`
+  for (const [label, noProxy, tunnelled] of [
+    ['CONNECT tunnel through HTTPS_PROXY', '', true],
+    ['NO_PROXY bypasses HTTPS_PROXY', 'example.invalid, .localhost:1, localhost', false],
+  ]) {
+    const before = requested.length
+    const tunnelsBefore = tunnels.length
+    const result = await run(executable, [], {
+      ...process.env,
+      SILK_HTTPS_TEST_BASE: base,
+      SSL_CERT_FILE: join(directory, 'root.pem'),
+      HTTPS_PROXY: proxyUrl,
+      https_proxy: '',
+      ALL_PROXY: '',
+      NO_PROXY: noProxy,
+      no_proxy: '',
+    })
+    assert.equal(result.status, 0, `${label}: ${JSON.stringify(result)}`)
+    const made = tunnels.slice(tunnelsBefore)
+    if (tunnelled) {
+      assert.equal(made.length, requested.length - before, `${label}: ${JSON.stringify(made)}`)
+      for (const tunnel of made) {
+        assert.match(tunnel.target, /^localhost:\d+$/)
+        assert.equal(tunnel.authorization, `Basic ${Buffer.from('user:pa:ss').toString('base64')}`)
+      }
+    } else assert.deepEqual(made, [], label)
+    process.stdout.write(`native HTTPS ${process.platform}/${process.arch}: ${label} passed\n`)
+  }
   for (const status of [301, 303, 307, 308]) {
     routes.set(targetDownload, { ...redirect, status })
     const result = await run(executable, [], {
@@ -432,6 +481,10 @@ subjectAltName = DNS:localhost
   if (assetServer !== undefined) {
     assetServer.closeAllConnections()
     await new Promise((done) => assetServer.close(done))
+  }
+  if (proxy !== undefined) {
+    proxy.closeAllConnections()
+    await new Promise((done) => proxy.close(done))
   }
   rmSync(directory, { recursive: true, force: true })
 }

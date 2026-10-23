@@ -18,10 +18,11 @@ const compiler = resolve(
 const clang = await Effect.runPromise(Config.String('SILK_CLANG').pipe(Config.withDefault('clang')))
 const root = resolve(import.meta.dirname, '../..')
 const directory = mkdtempSync(join(realpathSync(tmpdir()), 'silk-native-http-client-'))
-const run = (command, args) =>
+const run = (command, args, env = process.env) =>
   new Promise((resolveRun, reject) => {
     const child = spawn(command, args, {
       cwd: root,
+      env,
       timeout: 120_000,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
@@ -54,6 +55,7 @@ const echo = (name) => (request, response, body) => {
       userAgent: header('user-agent'),
       acceptEncoding: header('accept-encoding'),
       authorization: header('authorization'),
+      proxyAuthorization: header('proxy-authorization'),
       cookie: header('cookie'),
       xDefault: header('x-default'),
       contentType: header('content-type'),
@@ -78,6 +80,7 @@ const handle = (routes) => (request, response) => {
 
 let main
 let other
+let proxy
 const timers = new Set()
 try {
   copyFileSync(
@@ -135,14 +138,28 @@ try {
   )
   const origin = await listen(main)
 
-  const result = await run(executable, [origin, otherOrigin])
+  // A forward proxy answers itself, so the echo shows the absolute target it received. NO_PROXY
+  // names 127.0.0.1, so the other server is reached directly.
+  proxy = createServer(handle([[/^\/echo$/, echo('proxy')]]))
+  const proxyOrigin = await listen(proxy)
+  const through = `http://localhost:${main.address().port}`
+  const result = await run(executable, [origin, otherOrigin, through], {
+    ...process.env,
+    HTTP_PROXY: proxyOrigin.replace('http://', 'http://user:pa%3Ass@'),
+    http_proxy: '',
+    ALL_PROXY: '',
+    NO_PROXY: 'example.invalid, 127.0.0.1',
+    no_proxy: '',
+  })
   assert.equal(result.status, 0, JSON.stringify(result))
   console.log('Native silk.http_client conformance passed')
 } finally {
   for (const timer of timers) clearTimeout(timer)
   main?.closeAllConnections?.()
   other?.closeAllConnections?.()
+  proxy?.closeAllConnections?.()
   main?.close()
   other?.close()
+  proxy?.close()
   rmSync(directory, { recursive: true, force: true })
 }
