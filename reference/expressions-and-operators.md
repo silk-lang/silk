@@ -303,9 +303,10 @@ ordinary parser so later syntax remains independently parseable.
 **Boundary:** This is an expression-child limit, not a token, syntax-node, type, pattern, statement,
 or declaration nesting limit. Separately, the compiler charges each active construct its native
 stack cost and reports `PAR0005` before a mix would exceed half of an 8 MB stack. Alone, 256
-grouped children, 499 chained infix operators, 167 field or index links in one postfix chain
-(`a.b.c`), 134 prefix operands, 100 nested calls, 71 method call links (`a.f().g()`), 62 nested
-array or tuple literals, 59 nested blocks and 44 nested `if` statements fit. Call-delimiter recovery bookkeeping does not change the expression
+grouped children or prefix operands, 1018 chained infix operators, 408 field or index links in one
+postfix chain (`a.b.c`), 291 method call links (`a.f().g()`), 204 nested calls, 170 nested array or
+tuple literals, 681 nested blocks, 454 nested `if` statements, 1355 `else if` links and 408 nested
+anonymous functions fit. Call-delimiter recovery bookkeeping does not change the expression
 depth. Parser implementation failures such as invalid token ordering remain defects: they are not
 caught or converted to `PAR0005`.
 
