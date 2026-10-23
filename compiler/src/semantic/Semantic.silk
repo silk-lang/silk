@@ -37187,6 +37187,9 @@ effect fn checkInferredCallArgument<'scope>(
         Consumption.PlaceBinding => { code = Option<RejectionCode>.some(RejectionCode.Unsupported) }
       }
       if let Option<RejectionCode>.Some {value} = move code {
+        if value == RejectionCode.ExplicitMoveRequired {
+          return Result<BodyNodeId, Shared<Rejection>>.failResult(run explicitMoveRejection(module, span, &actual))
+        }
         return run bodyRejection(&resolver.*, module, value, span)
       }
     }
@@ -45852,7 +45855,7 @@ effect fn storageCallable(resolver: &mut Resolver, owner: &mut Query<Answer, NoR
       Result<bool, Shared<Rejection>>.Success {value} => value
       Result<bool, Shared<Rejection>>.Failure {error} => { return Option<Shared<Rejection>>.some(move error) }
     }
-    if !copied { return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, RejectionCode.ExplicitMoveRequired, span)) }
+    if !copied { return Option<Shared<Rejection>>.some(run explicitMoveRejection(module, span, &ty)) }
   }
   return Option<Shared<Rejection>>.none()
 }
@@ -50996,6 +50999,9 @@ effect fn implicitAffineUse(resolver: &mut Resolver, owner: &mut Query<Answer, N
             Consumption.Borrowed => { if projected { code = RejectionCode.BorrowedExtraction } }
             _ => {}
           }
+          if code == RejectionCode.ExplicitMoveRequired {
+            return Option<Shared<Rejection>>.some(run explicitMoveRejection(module, span, &ty))
+          }
           return Option<Shared<Rejection>>.some(run reject(&resolver.*, module, code, span))
         }
       }
@@ -53738,6 +53744,21 @@ effect fn wrongArityRejection(resolver: &Resolver, module: &ModuleId, span: Span
   return run Shared<Rejection>.make(move diagnostic)
 }
 
+// A non-Copy value consumed without `move` (OWN0003). A `&mut` reference gets its own template:
+// lending it again with `&mut r` is usually the fix, the reborrow Rust makes implicitly.
+effect fn explicitMoveRejection(module: &ModuleId, span: Span, ty: &Shared<Type>) -> Shared<Rejection>
+! OutOfMemoryError ? &mut Allocator {
+  let mut diagnostic = run makeRejection(RejectionCode.ExplicitMoveRequired, module, span)
+  let exclusive = Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool {
+    return match &value.* { Type.Reference {access, ..} => access == Access.Mutable _ => false }
+  })
+  if exclusive {
+    diagnostic.arguments = List<MessageArgument>.make()
+    run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"template"), value: run Bytes.copy(b"1")})
+  }
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
 // A value-type mismatch, carrying the `expected` and `actual` type text when its code's template
 // spells exactly the declared type and the value's type and both have exact spellings.
 effect fn typeMismatchRejection(
@@ -54190,6 +54211,9 @@ effect fn transferCallableReturn(resolver: &mut Resolver, owner: &mut Query<Answ
         return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module, RejectionCode.Unsupported, span))
       }
     }
+  }
+  if code == RejectionCode.ExplicitMoveRequired {
+    return Result<BodyNodeId, Shared<Rejection>>.failResult(run explicitMoveRejection(module, span, &actual))
   }
   return Result<BodyNodeId, Shared<Rejection>>.failResult(run reject(&resolver.*, module, code, span))
 }
@@ -58901,6 +58925,47 @@ union StatementList {
   Failed {error: Shared<Rejection>},
 }
 
+// A typed `let` whose initializer alone failed, which still declares its binding.
+struct RecoveredBinding {
+  name: HirId
+  symbol: Symbol
+  mutable: bool
+  ty: Shared<Type>
+}
+
+// The binding a failed `let x: T = ...` still declares when only its initializer failed: `x` has its
+// written type, so the statements after it read a `T` and report their own errors instead of
+// failing silently. Only a type that holds no view qualifies, as its local needs nothing of the
+// initializer's regions; none for any other statement or failure.
+effect fn recoveredTypedBinding(resolver: &Resolver, module: &ModuleId, cursor: &AuthoredCursor, caller: &DeclarationId,
+  annotations: &[ResolvedAnnotation], statement: HirId, failure: &Shared<Rejection>, contractBody: bool, staticBody: bool)
+-> Option<RecoveredBinding> ! RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  if let Node.BindingStatement {name, mutable, isStatic, annotation, initializer} = run bodyNode(&resolver.source, cursor, statement) {
+    if isStatic || !annotation.present { return Option<RecoveredBinding>.none() }
+    let symbol = match run bodyNode(&resolver.source, cursor, name) {
+      Node.Name {text} => text
+      _ => { return Option<RecoveredBinding>.none() }
+    }
+    let written = run bodySpan(&resolver.source, cursor, initializer)
+    let failed = Shared<Rejection>.with<Span>(failure, fn(value: &Rejection) -> Span { return value.span })
+    if failed.start < written.start || failed.end > written.end { return Option<RecoveredBinding>.none() }
+    let declared = match move run bindingAnnotationType(resolver, module, cursor, annotations, annotation.id, contractBody, staticBody) {
+      Result<Shared<Type>, Shared<Rejection>>.Success {value} => move value
+      Result<Shared<Type>, Shared<Rejection>>.Failure {error} => {
+        drop error
+        return Option<RecoveredBinding>.none()
+      }
+    }
+    let elided = run elidedLifetimeOwner(caller)
+    let mentions = run typeMentionsOwner(&declared, &elided)
+    if mentions || Shared<Type>.with<bool>(&declared, Type.holdsView) {
+      return Option<RecoveredBinding>.none()
+    }
+    return Option<RecoveredBinding>.some(RecoveredBinding {name: name, symbol: symbol, mutable: mutable, ty: move declared})
+  }
+  return Option<RecoveredBinding>.none()
+}
+
 effect fn checkStatements(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -58931,8 +58996,9 @@ effect fn checkStatements(
   // In a runtime body, a failed statement does not stop the list: the statements after it are
   // still checked, and the list is recovered once they are, with its last failure. Each earlier
   // failure is recorded before the next statement records its own, so the body keeps source order.
-  // A failed `let` binds nothing, and a statement that fails only by reading what it would have
-  // bound fails silently (`UnavailableBinding`).
+  // A failed `let` binds nothing, unless only the initializer of a typed `let` failed, and a
+  // statement that fails only by reading what it would have bound fails silently
+  // (`UnavailableBinding`).
   let mut pending = Option<Shared<Rejection>>.none()
   let mut last = Option<Shared<Rejection>>.none()
   let mut silent = Option<Shared<Rejection>>.none()
@@ -58987,9 +59053,22 @@ effect fn checkStatements(
           List<Symbol>.truncate(&mut bindings.*, bindingMark)
           truncateFrameOccurrences(&mut resolver.*, occurrenceMark)
           run List<BodyNodeId>.append(&mut statements.*, BodyNodeId {index: List<BodyNode>.length(&nodes.*)})
-          let resumes = writtenResumes(&resolver.source, cursor, span)
+          let typed = run recoveredTypedBinding(&resolver.*, module, cursor, caller, annotations, statement, &error,
+            contractBody, staticBody)
+          let mut resumes = writtenResumes(&resolver.source, cursor, span)
+          // A path past a recovered binding would read a local that holds nothing.
+          if let Option<RecoveredBinding>.Some {..} = &typed { resumes = false }
           run List<BodyNode>.append(&mut nodes.*, BodyNode {origin: run originAt(cursor, statement, span), kind: BodyNodeKind.Recovered {resumes: resumes}})
-          run recordFailedStatement(&mut resolver.*, module, span)
+          match move typed {
+            Option<RecoveredBinding>.Some {value: binding} => {
+              run List<BodyLocal>.append(&mut locals.*, BodyLocal {
+                origin: run originAt(cursor, statement, run bodySpan(&resolver.source, cursor, binding.name)),
+                ty: move binding.ty, mutable: binding.mutable, meetDepth: Option<usize>.none(), written: true,
+              })
+              run List<Symbol>.append(&mut bindings.*, binding.symbol)
+            }
+            Option<RecoveredBinding>.None => { run recordFailedStatement(&mut resolver.*, module, span) }
+          }
           if dependentFailure(&error) {
             silent = Option<Shared<Rejection>>.some(move error)
           } else {
