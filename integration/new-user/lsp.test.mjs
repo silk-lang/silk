@@ -138,17 +138,6 @@ test('hover on a type used as a qualifier shows its doc comment', { todo: 'findi
   assert.match(hover?.contents?.value ?? '', /A `Logger` provider/)
 })
 
-test('hover works in a function that logs a string returned by a call', { todo: 'finding 26' }, async () => {
-  const text = program.replace('let loudness = shout()', 'let loudness = name()').replace('fn total(', 'fn name() -> string {\n  return "x"\n}\n\nfn total(')
-  await change(text)
-  try {
-    const hover = await server.request('textDocument/hover', at(text, 'Effect.log', 8))
-    assert.match(hover?.contents?.value ?? '', /pub effect fn log/)
-  } finally {
-    await change(program)
-  }
-})
-
 test('a missing pinned toolchain still starts a server that explains it', async () => {
   const other = initPackage(h, 'editor-unpinned')
   const manifest = join(other, 'silk.toml')

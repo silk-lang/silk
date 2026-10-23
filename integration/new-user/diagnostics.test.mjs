@@ -65,6 +65,12 @@ test('a template that is not a literal says it must be static', { todo: 'finding
   assert.doesNotMatch(result.errors[0] ?? '', /SEM0176/, show(result))
 })
 
+test('returning a literal as plain string suggests string<\'static>', { todo: 'finding 27' }, () => {
+  const result = check('fn noun() -> string {\n  return "task"\n}\npub fn main() -> i32 { return 0 }\n')
+  assert.match(result.errors[0] ?? '', /error\[SEM0210\]/, show(result))
+  assert.match(result.errors[0] ?? '', /'static/, show(result))
+})
+
 test('a type mismatch on a call result names both types', { todo: 'finding 21' }, () => {
   const result = check('fn total() -> i32 { return 1 }\npub fn main() -> i32 {\n  let s: string = total()\n  return 0\n}\n')
   assert.match(result.errors[0] ?? '', /expected string.* received i32|string.*i32/, show(result))
