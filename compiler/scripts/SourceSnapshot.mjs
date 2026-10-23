@@ -13,10 +13,13 @@ import { isVersion } from './SemVer.mjs'
 
 export class SourceSnapshotError extends Data.TaggedError('SourceSnapshotError') {}
 const invalid = (message) => Effect.fail(new SourceSnapshotError({ message }))
-export const roots = ['changes', 'compiler', 'silk.toml', 'stdlib']
+export const roots = ['changes', 'compiler', 'sew', 'silk.toml', 'stdlib', 'tomledit']
 /** The compiler package, its source dependencies, and their workspace configuration. */
 export const isCompilerInput = (path) =>
-  path === 'silk.toml' || path.startsWith('compiler/') || path.startsWith('changes/')
+  path === 'silk.toml' ||
+  path.startsWith('compiler/') ||
+  path.startsWith('changes/') ||
+  path.startsWith('tomledit/')
 const requiredFiles = [
   'silk.toml',
   'compiler/silk.toml',
@@ -410,7 +413,8 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
         else if (!expected.has(path)) return yield* invalid(`Unrecorded snapshot input: ${path}`)
       },
     )
-    for (const root of roots) yield* walk(root)
+    // A revision from before a root existed has no files below it.
+    for (const root of roots) if (yield* fs.exists(join(directory, root))) yield* walk(root)
     const ordered = [...receipt.files].sort(compare)
     if (
       ordered.some((file, index) => file !== receipt.files[index]) ||

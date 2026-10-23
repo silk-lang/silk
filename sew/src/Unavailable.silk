@@ -1,0 +1,360 @@
+//! A language server for when no compiler can serve: `silk lsp` in a project whose pinned toolchain
+//! is not installed. Editors that only spawn `silk lsp` would otherwise see a crashed server, so
+//! this one answers `initialize` with no capabilities, shows why as an error message, and then
+//! follows the protocol until the client exits.
+//!
+//! Messages are framed as the language server base protocol frames them: a header block naming the
+//! content length, a blank line, then that many content bytes.
+
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.json_output { JsonOutput }
+import silk.json_scanner { JsonError }
+import silk.json_value { Json, Value }
+import silk.option { Option }
+import silk.os_standard_input { OsStandardInput }
+import silk.os_writer { StdoutWriter }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.standard_input { ReadOutcome, StandardInput, StreamReadError }
+import silk.string { InvalidUtf8, String }
+import silk.u8
+import silk.usize
+import silk.writer { Writer, WriterError }
+
+const READ_SIZE: usize = 65536
+
+// The longest header block read before a stream is refused as malformed.
+const HEADER_LIMIT: usize = 4096
+
+// What the start of an input buffer holds.
+union Frame {
+  // The buffer ends before the next message does.
+  Incomplete,
+  // One whole message: its content is the `length` bytes from `start`.
+  Complete { start: usize, length: usize },
+  // The header block names no usable content length.
+  Malformed,
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The offset of the `\r\n\r\n` that ends the header block.
+fn headerEnd(pending: &[u8]) -> Option<usize> {
+  let mut at = usize.ZERO
+  while at + 3 < pending.length {
+    if pending[at] == 13 && pending[at + 1] == 10 && pending[at + 2] == 13 && pending[at + 3] == 10 {
+      return Option<usize>.some(at)
+    }
+    at = at + 1
+  }
+  return Option<usize>.none()
+}
+
+// The offset of the `\r\n` that ends the header line starting at `line`, or `end`.
+fn lineEnd(pending: &[u8], line: usize, end: usize) -> usize {
+  let mut at = line
+  while at + 1 < end {
+    if pending[at] == 13 && pending[at + 1] == 10 {
+      return at
+    }
+    at = at + 1
+  }
+  return end
+}
+
+fn asciiLower(value: u8) -> u8 {
+  if value >= 65 && value <= 90 {
+    return value + 32
+  }
+  return value
+}
+
+fn namesContentLength(pending: &[u8], start: usize, stop: usize) -> bool {
+  let name = b"content-length"
+  if stop - start <= name.length || pending[start + name.length] != 58 {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < name.length {
+    if asciiLower(pending[start + at]) != name[at] {
+      return false
+    }
+    at = at + 1
+  }
+  return true
+}
+
+// Reads the decimal after the colon, allowing spaces around it.
+fn contentLength(pending: &[u8], start: usize, stop: usize) -> Option<usize> {
+  let mut at = start
+  while at < stop && pending[at] == 32 {
+    at = at + 1
+  }
+  let mut value = usize.ZERO
+  let mut digits = usize.ZERO
+  while at < stop && pending[at] >= 48 && pending[at] <= 57 {
+    let digit = u8.toUsize(pending[at] - 48)
+    if value > (usize.MAX - digit) / 10 {
+      return Option<usize>.none()
+    }
+    value = value * 10 + digit
+    digits = digits + 1
+    at = at + 1
+  }
+  while at < stop && pending[at] == 32 {
+    at = at + 1
+  }
+  if digits == usize.ZERO || at != stop {
+    return Option<usize>.none()
+  }
+  return Option<usize>.some(value)
+}
+
+// Finds the first message in `pending`. Header names compare without case; every header but
+// `Content-Length` is ignored.
+fn next(pending: &[u8]) -> Frame {
+  let end = match headerEnd(pending) {
+    Option<usize>.Some { value } => value
+    Option<usize>.None => {
+      if pending.length > HEADER_LIMIT {
+        return Frame.Malformed
+      }
+      return Frame.Incomplete
+    }
+  }
+  if end > HEADER_LIMIT {
+    return Frame.Malformed
+  }
+  let mut length = Option<usize>.none()
+  let mut line = usize.ZERO
+  while line < end {
+    let stop = lineEnd(pending, line, end)
+    if namesContentLength(pending, line, stop) {
+      match contentLength(pending, line + b"content-length".length + 1, stop) {
+        Option<usize>.Some { value } => {
+          length = Option<usize>.some(value)
+        }
+        Option<usize>.None => {
+          return Frame.Malformed
+        }
+      }
+    }
+    line = stop + 2
+  }
+  let start = end + 4
+  return match move length {
+    Option<usize>.None => Frame.Malformed
+    Option<usize>.Some { value } => {
+      if pending.length - start < value {
+        return Frame.Incomplete
+      }
+      return Frame.Complete { start: start, length: value }
+    }
+  }
+}
+
+// Counts the bytes written through it.
+struct Counter {
+  length: usize
+}
+
+impl Counter {
+  effect fn writeAll(self: &mut Self, bytes: &[u8]) -> ()
+    ! WriterError {
+    self.length = self.length + bytes.length
+    return ()
+  }
+
+  effect fn flush(self: &mut Self) -> ()
+    ! WriterError {
+    return ()
+  }
+}
+
+impl Writer for Counter {
+  writeAll: Counter.writeAll
+
+  flush: Counter.flush
+}
+
+effect fn writeDecimal(value: usize) -> ()
+  ! WriterError
+  ? &mut Writer {
+  let mut divisor: usize = 1
+  while value / divisor >= 10 {
+    divisor = divisor * 10
+  }
+  while divisor > 0 {
+    run Writer.writeAll(Slice.view<u8>(b"0123456789", value / divisor % 10, 1))
+    divisor = divisor / 10
+  }
+  return ()
+}
+
+effect fn writeText(text: &[u8]) -> ()
+  ! WriterError
+  ? &mut Writer {
+  return match String.fromUtf8(text) {
+    Result<string, InvalidUtf8>.Success { value } => run JsonOutput.writeString(value)
+    Result<string, InvalidUtf8>.Failure { error: _ } => run Writer.writeAll(b"\"\"")
+  }
+}
+
+// What one message says: a result for the request `id`, an error for it, or the error message the
+// server shows.
+union Reply {
+  Initialized,
+  Null,
+  Failure { code: &'static [u8], message: &'static [u8] },
+  Shown,
+}
+
+effect fn content(id: &Value, reply: &Reply, reason: &[u8]) -> ()
+  ! JsonError | WriterError
+  ? &mut Writer {
+  let shown = match &reply.* {
+    Reply.Shown => true
+    _ => false
+  }
+  if shown {
+    run Writer.writeAll(
+      b"{\"jsonrpc\":\"2.0\",\"method\":\"window/showMessage\",\"params\":{\"type\":1,\"message\":"
+    )
+    run writeText(reason)
+    return run Writer.writeAll(b"}}")
+  }
+  run Writer.writeAll(b"{\"jsonrpc\":\"2.0\",\"id\":")
+  run Json.write(id)
+  match &reply.* {
+    Reply.Initialized => run Writer.writeAll(b",\"result\":{\"capabilities\":{},\"serverInfo\":{\"name\":\"sew\"}}}")
+    Reply.Null => run Writer.writeAll(b",\"result\":null}")
+    Reply.Failure { code, message } => {
+      run Writer.writeAll(b",\"error\":{\"code\":")
+      run Writer.writeAll(code)
+      run Writer.writeAll(b",\"message\":")
+      run writeText(message)
+      run Writer.writeAll(b"}}")
+    }
+    Reply.Shown => {}
+  }
+}
+
+// Writes one framed message. The content is written twice, once to count its bytes for the
+// header and once for real, so nothing is buffered.
+effect fn send(id: &Value, reply: &Reply, reason: &[u8]) -> ()
+  ! JsonError | WriterError
+  ? &mut Writer {
+  let mut counter = Counter { length: usize.ZERO }
+  run content(id, reply, reason) |> Effect.provideMut<Writer>(&mut counter)
+  run Writer.writeAll(b"Content-Length: ")
+  run writeDecimal(counter.length)
+  run Writer.writeAll(b"\r\n\r\n")
+  run content(id, reply, reason)
+  return run Writer.flush()
+}
+
+fn names(message: &Value, name: &[u8]) -> bool {
+  return match Json.asString(Json.field(message, "method")) {
+    Option<string>.Some { value } => same(String.utf8Bytes(value), name)
+    Option<string>.None => false
+  }
+}
+
+/// Serves until the client sends `exit` or closes the input, showing `reason` once the client has
+/// initialized. Returns 0 after `shutdown` then `exit`, as the protocol asks, and 1 otherwise.
+pub effect fn serve(reason: &[u8]) -> i32
+  ! JsonError | WriterError | OutOfMemoryError
+  ? &mut StandardInput | &mut Writer | &mut Allocator {
+  let mut pending = Bytes.make()
+  let mut chunk = run Bytes.zeroed(READ_SIZE)
+  let mut shutDown = false
+  while true {
+    match next(Bytes.asSlice(&pending)) {
+      Frame.Complete { start, length } => {
+        let message = Slice.view<u8>(Bytes.asSlice(&pending), start, length)
+        let decoded = run Effect.result(Json.parse(message))
+        match move decoded {
+          Result<Value, JsonError | OutOfMemoryError>.Success { value } => {
+            if names(&value, b"exit") {
+              if shutDown {
+                return 0
+              }
+              return 1
+            }
+            if let Option<&Value>.Some { value: id } = Json.field(&value, "id") {
+              if names(&value, b"initialize") {
+                run send(id, &Reply.Initialized, reason)
+                run send(id, &Reply.Shown, reason)
+              } else if names(&value, b"shutdown") {
+                shutDown = true
+                run send(id, &Reply.Null, reason)
+              } else {
+                run send(
+                  id,
+                  &Reply.Failure { code: b"-32601", message: b"the selected Silk toolchain is not installed" },
+                  reason
+                )
+              }
+            }
+          }
+          Result<Value, JsonError | OutOfMemoryError>.Failure { error } => match move error {
+            JsonError invalid => {
+              run send(&Value.Null, &Reply.Failure { code: b"-32700", message: b"the message is not JSON" }, reason)
+            }
+            OutOfMemoryError exhausted => {
+              fail move exhausted
+            }
+          }
+        }
+        let rest = Slice.view<u8>(Bytes.asSlice(&pending), start + length, Bytes.length(&pending) - start - length)
+        pending = run Bytes.copy(rest)
+      }
+      Frame.Incomplete => {
+        let read = run Effect.result(StandardInput.read(Bytes.asMutSlice(&mut chunk)))
+        let count = match move read {
+          Result<ReadOutcome, StreamReadError>.Success { value } => StandardInput.count(&value)
+          Result<ReadOutcome, StreamReadError>.Failure { error: _ } => 0
+        }
+        if count == 0 {
+          return 1
+        }
+        run Bytes.append(&mut pending, Slice.view<u8>(Bytes.asSlice(&chunk), 0, count))
+      }
+      Frame.Malformed => {
+        return 1
+      }
+    }
+  }
+  return 1
+}
+
+/// Serves `reason` over standard input and output: the exit status of `serve`, or 1 when the
+/// streams fail.
+pub effect fn serveStandard(reason: &[u8]) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut input = OsStandardInput.make()
+  let mut output = StdoutWriter.make()
+  let served = run Effect.result(
+    serve(reason) |> Effect.provideMut<StandardInput>(&mut input)
+      |> Effect.provideMut<Writer>(&mut output)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  return match move served {
+    Result<i32, JsonError | WriterError | OutOfMemoryError>.Success { value } => value
+    Result<i32, JsonError | WriterError | OutOfMemoryError>.Failure { error: _ } => 1
+  }
+}
