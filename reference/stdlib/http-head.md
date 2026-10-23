@@ -29,6 +29,7 @@ The head and its fields borrow the parser. Call `copy` to keep them after a `res
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
 parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
 before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 ## Examples
 ### Parse a response head
@@ -540,7 +541,7 @@ InvalidStartLine
 ```
 
 The start line does not have the form `METHOD SP target SP version` or `version SP status SP
-reason`.
+reason`, or `version SP status` with no reason.
 
 <a id="ParseReason.UnsupportedVersion"></a>
 
@@ -861,6 +862,7 @@ failed until `reset`.
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
 parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
 before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="ResponseParser"></a>
 
@@ -885,6 +887,7 @@ failed until `reset`.
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
 parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
 before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="RequestHead"></a>
 
@@ -1367,6 +1370,7 @@ Parses a request head from the start of `input`. The bytes after the head start 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
 parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
 before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="parseResponse"></a>
 
@@ -1387,6 +1391,7 @@ Parses a response head from the start of `input`. The bytes after the head start
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
 parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
 before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="requestSerializedSize"></a>
 
