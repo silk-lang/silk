@@ -138,6 +138,13 @@ test('hover on a type used as a qualifier shows its doc comment', { todo: 'findi
   assert.match(hover?.contents?.value ?? '', /A `Logger` provider/)
 })
 
+test('importing a name the module lacks is reported on the import line', { todo: 'finding 31' }, async () => {
+  const broken = program.replace('import silk.logger { LogError }', 'import silk.logger { LogError, Nope }')
+  const diagnostics = await change(broken)
+  await change(program)
+  assert.ok(diagnostics.some((diagnostic) => diagnostic.code === 'SEM0014' && diagnostic.range.start.line === 1), JSON.stringify(diagnostics))
+})
+
 test('a missing pinned toolchain still starts a server that explains it', async () => {
   const other = initPackage(h, 'editor-unpinned')
   const manifest = join(other, 'silk.toml')
