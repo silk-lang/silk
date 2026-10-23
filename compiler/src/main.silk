@@ -907,16 +907,54 @@ effect fn writeError(bytes: &[u8]) -> () ! WriterError {
 /// linker. An object's final stage merges declared objects and archives by a relocatable link; a
 /// static library's final stage archives its compiled object beside the declared objects. Each
 /// refuses any other declared input; an intermediate stage takes no declared inputs.
+///
+/// Two commands that build one package at once write the same `output`, so each makes its files in a
+/// new directory of its own beside it, renames the finished output over `output`, and removes the
+/// directory.
 effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool, relocation: &[u8],
   profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput], selectedClang: &Option<Bytes>,
   progress: &mut Progress) -> i32
 ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
-  let mut intermediate = run Bytes.copy(Path.rawBytes(output))
+  let parent = match move run Path.parent(output) {
+    Option<Path>.Some {value} => move value
+    Option<Path>.None => run Path.fromBytes(Path.rawBytes(output))
+  }
+  let scratch = run FileSystem.createTemporaryDirectory(&parent, b".silk-")
+  let use = effect fn(resource: &mut Path) -> i32
+  ! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
+  ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+    return run compileIrIn(&resource.*, ir, output, form, stage, optimization, debug, relocation, profileFlags, target, supply,
+      linkInputs, selectedClang, &mut progress.*)
+  }
+  let release = effect fn(resource: &mut Path) -> () ? &mut FileSystem | &mut Allocator {
+    let removed = run Effect.result(FileSystem.removeDirectoryRecursively(&resource.*))
+    drop removed
+    return ()
+  }
+  return run Effect.useReleaseNonParking(move scratch, move use, move release)
+}
+
+// Compiles as `compileIr` does, with the intermediate files in `scratch` under the output's name,
+// which Clang records in the object.
+effect fn compileIrIn(scratch: &Path, ir: &Bytes, output: &Path, form: Form, stage: Stage, optimization: &[u8], debug: bool,
+  relocation: &[u8], profileFlags: &[Bytes], target: &Target, supply: &Option<Supply>, linkInputs: &[NativeLinkInput],
+  selectedClang: &Option<Bytes>, progress: &mut Progress) -> i32
+! FileError | ProcessError | HostInputError | InvalidNativeLinkInput | OutOfMemoryError | WriterError
+? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator {
+  let outputName = Path.rawBytes(output)
+  let mut nameStart = outputName.length
+  while nameStart > usize.ZERO && outputName[nameStart - usize.ONE] != 47 { nameStart = nameStart - usize.ONE }
+  // The output itself is made here too, then renamed over `output`.
+  let mut stem = run Bytes.copy(Path.rawBytes(scratch))
+  run Bytes.append(&mut stem, b"/")
+  run Bytes.append(&mut stem, Slice.view<u8>(outputName, nameStart, outputName.length - nameStart))
+  let staged = run Path.fromBytes(Bytes.asSlice(&stem))
+  let mut intermediate = run Bytes.copy(Bytes.asSlice(&stem))
   run Bytes.append(&mut intermediate, b".silk.ll")
   let irPath = run Path.fromBytes(Bytes.asSlice(&intermediate))
-  // A static library's single compiled member is written beside the archive, then removed.
-  let mut memberBytes = run Bytes.copy(Path.rawBytes(output))
+  // A static library's single compiled member is written beside the IR, then removed.
+  let mut memberBytes = run Bytes.copy(Bytes.asSlice(&stem))
   run Bytes.append(&mut memberBytes, b".silk.o")
   let member = run Path.fromBytes(Bytes.asSlice(&memberBytes))
   let mut named = Option<&[u8]>.none()
@@ -948,7 +986,7 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
   let archive = final && form == Form.StaticLibrary
   // A wasm32 executable links freestanding: no libc, no entry, and the source runtime beside the IR.
   let freestanding = linked && same(Target.objectFormat(target), b"wasm")
-  let mut runtimeBytes = run Bytes.copy(Path.rawBytes(output))
+  let mut runtimeBytes = run Bytes.copy(Bytes.asSlice(&stem))
   run Bytes.append(&mut runtimeBytes, b".silk-runtime.c")
   let runtimePath = run Path.fromBytes(Bytes.asSlice(&runtimeBytes))
   if freestanding {
@@ -1035,7 +1073,7 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
     // `rcsD`: replace members, create the archive, write its symbol index, and zero member times.
     let mut request = run NativeToolchain.archiver(&clang)
     run ChildProcess.addArgument(&mut request, "rcsD")
-    run ChildProcess.addArgumentBytes(&mut request, Path.rawBytes(output))
+    run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&stem))
     run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&memberBytes))
     let mut declared = usize.ZERO
     while declared < linkInputs.length {
@@ -1044,7 +1082,7 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
     }
     archiver = Option<ProcessRequest>.some(move request)
   } else {
-    run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(output))
+    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&stem))
   }
   if final && !archive {
     // Declared inputs precede the C libraries so their own references to libc and libm resolve.
@@ -1101,9 +1139,18 @@ effect fn compileIr(ir: &Bytes, output: &Path, form: Form, stage: Stage, optimiz
     }
     if compiled != 0 { return compiled }
     if let Option<ProcessRequest>.Some {value: archiving} = &archiver {
-      // A stale archive would keep members this build no longer produces.
-      run removeQuietly(output)
-      return run submitted(&archiving, &mut progress.*)
+      let archived = run submitted(&archiving, &mut progress.*)
+      if archived != 0 { return archived }
+    }
+    // One rename, so a command running `output` meanwhile finds the old file or the new one.
+    let mut host = NativeHostFiles.at(b"/")
+    let published = run HostFiles.rename(&staged, output) |> Effect.provideMut<HostFiles>(&mut host)
+    if !published {
+      run Progress.clear(&mut progress.*)
+      run writeError(b"silk: cannot write ")
+      run writeError(Path.rawBytes(output))
+      run writeError(b"\n")
+      return 2
     }
     return 0
   }
