@@ -107,7 +107,7 @@ export const plan = Effect.fn('CompilerRelease.plan')(function* ({
   return { mode, counter: yield* devCounter(tags, commit) }
 })
 
-export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repository, sew }) {
+export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repository, tool }) {
   const fs = yield* FileSystem.FileSystem
   const pending = (yield* fs.readDirectory('compiler/.changes')).filter((name) =>
     name.endsWith('.md'),
@@ -180,9 +180,9 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
     }
     if (parents[0] === base) preparedHead = oldHead
   }
-  yield* command(sew, ['change', '--dir', 'compiler', 'version'])
+  yield* command(tool, ['change', '--dir', 'compiler', 'version'])
   const release = yield* json(
-    yield* command(sew, ['change', '--dir', 'compiler', 'release', '--json']),
+    yield* command(tool, ['change', '--dir', 'compiler', 'release', '--json']),
   )
   if (release.prerelease !== false) return yield* invalid('Managed release PR must be stable')
   yield* command('git', [
@@ -401,7 +401,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         `mode=${result.mode}\ncounter=${result.counter ?? ''}\n`,
         { flag: 'a' },
       )
-    } else if (operation === 'maintain') yield* maintain({ repository, sew: args[0] })
+    } else if (operation === 'maintain') yield* maintain({ repository, tool: args[0] })
     else if (operation === 'publish')
       yield* publish({ repository, snapshot: args[0], directory: args[1], files: args.slice(2) })
     else if (operation === 'verify-build') yield* verifyBuild(args[0], args[1])

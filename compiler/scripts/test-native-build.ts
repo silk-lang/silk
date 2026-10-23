@@ -114,7 +114,7 @@ const program = Effect.gen(function* () {
   const runHelp = yield* invoke(silk, ['run', '--help'], directory)
   assert.equal(runHelp.status, 0, runHelp.stderr)
   assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\]/)
-  // Toolchains belong to sew, not the compiler: `silk toolchain` and `+<version>` are unknown here.
+  // Toolchains belong to the silk tool, not the compiler: `silk toolchain` and `+<version>` are unknown here.
   const toolchain = yield* invoke(silk, ['toolchain'], directory)
   assert.equal(toolchain.status, 2, toolchain.stderr)
   assert.match(toolchain.stderr, /^silk: unknown command `toolchain`\n/)
@@ -139,21 +139,21 @@ const program = Effect.gen(function* () {
     assert.equal(absent.status, 2, absent.stderr)
     assert.ok(absent.stderr.startsWith(`silk: no such source file \`${missing}\`;`), absent.stderr)
   }
-  // Release notes belong to sew (`sew change`), not the compiler.
+  // Release notes belong to the silk tool (`silk change`), not the compiler.
   const changes = yield* invoke(silk, ['changes'], directory)
   assert.equal(changes.status, 2, changes.stderr)
   assert.match(changes.stderr, /^silk: unknown command `changes`\n/)
-  // Build sew with the compiler under test and exercise its linked changes library through
+  // Build the silk tool with the compiler under test and exercise its linked changes library through
   // the native entry point. No compiler, Git, or other tool is available on this subprocess PATH.
-  const sew = join(directory, 'sew')
-  const sewBuild = yield* invoke(
+  const tool = join(directory, 'silk')
+  const toolBuild = yield* invoke(
     silk,
-    ['build', 'src/main.silk', '-o', sew, '--stdlib', standardLibrary],
-    join(repository, 'sew'),
+    ['build', 'src/main.silk', '-o', tool, '--stdlib', standardLibrary],
+    join(repository, 'tool'),
     { ...process.env, SILK_CLANG: clang },
     600_000,
   )
-  assert.equal(sewBuild.status, 0, sewBuild.stderr)
+  assert.equal(toolBuild.status, 0, toolBuild.stderr)
   const releaseWorkspace = join(directory, 'release-workspace')
   const releaseMember = join(releaseWorkspace, 'compiler')
   const releaseNested = join(releaseMember, 'src/nested')
@@ -175,18 +175,18 @@ const program = Effect.gen(function* () {
     ['change', '--help'],
     ['change', '--dir', 'compiler', '--help'],
   ]) {
-    const help = yield* invoke(sew, args, releaseWorkspace, changesEnvironment)
+    const help = yield* invoke(tool, args, releaseWorkspace, changesEnvironment)
     assert.equal(help.status, 0, help.stderr)
-    assert.match(help.stdout, /sew change \[--dir PATH\] patch\|minor\|major/)
+    assert.match(help.stdout, /silk change \[--dir PATH\] patch\|minor\|major/)
     assert.equal(help.stderr, '')
   }
-  const missingDirectory = yield* invoke(sew,
+  const missingDirectory = yield* invoke(tool,
     ['change', '--dir'],
     releaseWorkspace,
     changesEnvironment,
   )
   assert.equal(missingDirectory.status, 1)
-  assert.match(missingDirectory.stderr, /sew change: --dir requires/)
+  assert.match(missingDirectory.stderr, /silk change: --dir requires/)
   assert.doesNotMatch(missingDirectory.stderr, /\.lock/, 'an argument error writes nothing to recover')
   for (const args of [
     ['patch', 'Must not create a workspace release'],
@@ -194,17 +194,17 @@ const program = Effect.gen(function* () {
     ['version'],
     ['recover'],
   ]) {
-    const refused = yield* invoke(sew, ['change', ...args], releaseWorkspace, changesEnvironment)
+    const refused = yield* invoke(tool, ['change', ...args], releaseWorkspace, changesEnvironment)
     assert.equal(refused.status, 1)
-    assert.match(refused.stderr, /sew change: .*virtual workspace/)
+    assert.match(refused.stderr, /silk change: .*virtual workspace/)
     assert.equal(refused.stdout, '')
   }
   assert.equal(yield* fs.exists(join(releaseWorkspace, '.changes')), false)
   assert.equal(yield* fs.readFileString(join(releaseWorkspace, 'silk.toml')), workspaceManifest)
   const summary = 'Use native release commands'
   const migration =
-    'Replace "silk changes" with "sew change".\nKeep release records in version control.'
-  const addedChange = yield* invoke(sew,
+    'Replace "silk changes" with "silk change".\nKeep release records in version control.'
+  const addedChange = yield* invoke(tool,
     ['change', 'minor', summary, '--migration', migration],
     releaseNested,
     changesEnvironment,
@@ -215,7 +215,7 @@ const program = Effect.gen(function* () {
   const [pendingChange] = pendingChanges
   assert.ok(pendingChange)
   assert.match(pendingChange, /^[0-9a-f]{32}\.md$/)
-  const preview = yield* invoke(sew,
+  const preview = yield* invoke(tool,
     ['change', '--dir', 'compiler', 'status', '--tag', 'beta'],
     releaseWorkspace,
     changesEnvironment,
@@ -223,7 +223,7 @@ const program = Effect.gen(function* () {
   assert.equal(preview.status, 0, preview.stderr)
   assert.match(preview.stdout, /native-release: 1\.0\.0 -> 1\.1\.0-beta\.1/)
   assert.match(yield* fs.readFileString(join(releaseMember, 'silk.toml')), /version = "1.0.0"/)
-  const prereleased = yield* invoke(sew,
+  const prereleased = yield* invoke(tool,
     ['change', '--dir', 'compiler', 'version', '--tag', 'beta'],
     releaseWorkspace,
     changesEnvironment,
@@ -239,7 +239,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(archive, releaseArchive.replace(summary, correctedSummary))
   yield* fs.writeFileString(join(releaseMember, 'CHANGELOG.md'), 'Manual notes must disappear.\n')
   // Publication reads corrected TOML, not the hand-edited derived Markdown.
-  const betaPublication = yield* invoke(sew,
+  const betaPublication = yield* invoke(tool,
     ['change', 'release', '--json'],
     releaseNested,
     changesEnvironment,
@@ -253,7 +253,7 @@ const program = Effect.gen(function* () {
   assert.ok(beta.notes.includes(correctedSummary))
   assert.ok(beta.notes.includes(migration))
   assert.ok(!beta.notes.includes('Manual notes'))
-  const promoted = yield* invoke(sew, ['change', 'version'], releaseNested, changesEnvironment)
+  const promoted = yield* invoke(tool, ['change', 'version'], releaseNested, changesEnvironment)
   assert.equal(promoted.status, 0, promoted.stderr)
   assert.match(yield* fs.readFileString(join(releaseMember, 'silk.toml')), /version = "1.1.0"/)
   const changelog = yield* fs.readFileString(join(releaseMember, 'CHANGELOG.md'))
@@ -266,7 +266,7 @@ const program = Effect.gen(function* () {
   )
   assert.match(stableArchive, /\nfrom = "1\.1\.0-beta\.1"\nversion = "1\.1\.0"\n/)
   assert.ok(stableArchive.includes(correctedSummary))
-  const stablePublication = yield* invoke(sew,
+  const stablePublication = yield* invoke(tool,
     ['change', 'release', '--json'],
     releaseNested,
     changesEnvironment,
@@ -316,7 +316,7 @@ const program = Effect.gen(function* () {
       '--json',
     ],
   ]) {
-    const history = yield* invoke(sew, args, releaseWorkspace, changesEnvironment)
+    const history = yield* invoke(tool, args, releaseWorkspace, changesEnvironment)
     assert.equal(history.status, 0, history.stderr)
     assert.equal(history.stderr, '')
     assert.deepEqual(yield* decodeJson(history.stdout), expectedHistory)
@@ -324,10 +324,10 @@ const program = Effect.gen(function* () {
   // A writer interrupted before its ready marker leaves a lock but no applied changes.
   const releaseLock = join(releaseMember, '.changes/.lock')
   yield* fs.makeDirectory(releaseLock)
-  const locked = yield* invoke(sew, ['change', 'status'], releaseNested, changesEnvironment)
+  const locked = yield* invoke(tool, ['change', 'status'], releaseNested, changesEnvironment)
   assert.equal(locked.status, 1)
-  assert.match(locked.stderr, /sew change .*recover/)
-  const recovered = yield* invoke(sew,
+  assert.match(locked.stderr, /silk change .*recover/)
+  const recovered = yield* invoke(tool,
     ['change', '--dir', 'compiler', 'recover'],
     releaseWorkspace,
     changesEnvironment,
@@ -2425,7 +2425,7 @@ const program = Effect.gen(function* () {
   yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
   yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+[1-9]\d+ functions\s/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, sew change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))
