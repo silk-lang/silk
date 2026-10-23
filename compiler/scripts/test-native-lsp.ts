@@ -439,8 +439,17 @@ const program = Effect.gen(function* () {
     range: { start: { line: 5, character: 11 }, end: { line: 5, character: 16 } },
   })
 
-  yield* change(session, uri, 9, fixed)
-  const restored = yield* diagnosticsFor(session, uri, 9, [])
+  // An import of a name its module lacks is reported on the import, as `silk check` reports it.
+  yield* change(session, uri, 9, 'import silk.list { Nope }\n' + fixed)
+  const missing = yield* diagnosticsFor(session, uri, 9, [])
+  assert.deepEqual(
+    missing.diagnostics.map(({ range, code }) => ({ line: range.start.line, code })),
+    [{ line: 0, code: 'SEM0014' }],
+    JSON.stringify(missing),
+  )
+
+  yield* change(session, uri, 10, fixed)
+  const restored = yield* diagnosticsFor(session, uri, 10, [])
   assert.deepEqual(restored.diagnostics, [])
 
   // The syntax features read the document's latest text.
@@ -462,7 +471,7 @@ const program = Effect.gen(function* () {
     jsonrpc: '2.0',
     method: 'textDocument/didChange',
     params: {
-      textDocument: { uri, version: 10 },
+      textDocument: { uri, version: 11 },
       contentChanges: [{ text: 'pub fn main()->i32{return 0}\n' }],
     },
   })
