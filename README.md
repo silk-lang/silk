@@ -71,10 +71,11 @@ On macOS (Apple Silicon) or Linux (x86-64 or ARM64):
 curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 ```
 
-The script installs the latest stable release as a toolchain in `~/.silk/toolchains/<version>`
-(set `SILK_HOME` to change `~/.silk`), links `~/.silk/bin/silk` to it and makes it the default.
-It verifies the compiler's SHA-256 and reported version, and the release signature when
-`minisign` is installed. Earlier toolchains stay installed beside it.
+The script installs the latest stable release in `~/.silk/toolchains/<version>` (set `SILK_HOME`
+to change `~/.silk`) and makes it your default. It also installs [sew](sew), the command you
+type for Silk, as `~/.silk/bin/sew`, with `~/.silk/bin/silk` a second name for it. It verifies the
+compiler's SHA-256 and reported version, and the release signature when `minisign` is installed.
+Earlier versions stay installed beside it.
 Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Building programs
 needs Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
 
@@ -93,46 +94,43 @@ mise use -g 'github:silk-lang/silk[version_prefix=v]'
 Homebrew follows the same channel as the script. mise picks stable releases only; until the first
 one exists, use `github:silk-lang/silk[version_prefix=v,prerelease=true]` to get dev releases.
 
-### Toolchain versions
+### Silk versions
 
-A project pins its compiler with `silk-version` in `silk.toml`, under `[package]` or
-`[workspace]`. `silk` reads the pin and runs that toolchain from `~/.silk/toolchains`, so projects
-on different versions work side by side. Outside a pinned project it runs the default toolchain.
-In a workspace the `[workspace]` pin wins over the members' own, and `silk toolchain use` sets it
-and moves any member pins along with it.
+A project pins its Silk version with `silk-version` in `silk.toml`, under `[package]` or
+`[workspace]`. sew reads the pin and runs that version from `~/.silk/toolchains`, so projects on
+different versions work side by side. Outside a pinned project it runs your default version. In a
+workspace the `[workspace]` pin wins over the members' own, and `sew set` sets it and moves any
+member pins along with it.
 
 ```sh
-silk toolchain install 0.1.0-dev.6+0123456789ab   # download, verify and unpack a release
-silk toolchain use 0.1.0-dev.6+0123456789ab       # install it and pin the current project
-silk toolchain use latest                         # pin the newest stable release (--dev: include dev releases)
-silk toolchain default 0.1.0-dev.6+0123456789ab   # used outside pinned projects; ~/.silk/bin/silk runs it
-silk toolchain list                               # installed toolchains; which one is selected
-silk toolchain which                              # the toolchain selected here, and why
-silk +0.1.0-dev.6+0123456789ab build              # run one command with a given toolchain
+sew use                     # install the version this project pins
+sew use 0.1.0-dev.11        # install a version and make it your default
+sew set latest              # pin this project to the newest stable release (--dev: include dev releases)
+sew use list                # installed versions, and which one is selected here
+sew use which               # the version selected here, and why
+sew +0.1.0-dev.11 build     # run one command with an installed version
+sew update self             # update sew itself
 ```
 
-When the pinned toolchain is missing, `silk` exits with status 3 and prints the
-`silk toolchain install` command that fixes it. Set `SILK_AUTO_INSTALL=1`, or
+Every other command, such as `sew build` or `sew test`, runs unchanged in the selected version;
+`silk build` does the same. When the pinned version is missing, the command exits with status 3
+and names the `sew use` command that fixes it. Set `SILK_AUTO_INSTALL=1`, or
 `auto-install = true` in `~/.silk/settings.toml`, to install it automatically instead.
-The commands never prompt and report progress on standard error only; `list`, `which`, `install`
-and `use` take `--json` for machine-readable results.
-Exit statuses: 0 success, 1 failure, 2 usage, 3 toolchain not installed, 4 network, 5 verification.
-`SILK_TOOLCHAIN=<version>` overrides the selection for a shell, `SILK_TOOLCHAIN=local` keeps the
-`silk` you ran, and `SILK_TOOLCHAIN_MIRROR=<directory>` installs from a local copy of the release
-assets laid out as `v<version>/<asset>`. Homebrew and mise installs dispatch the same way.
+`SILK_TOOLCHAIN=<version>` overrides the selection for a shell. See [sew/README.md](sew) for
+the rest. Homebrew and mise install a compiler as `silk` without sew.
 
 ## Quick start
 
 ```sh
-silk init hello && cd hello
-silk run
+sew init hello && cd hello
+sew run
 ```
 
 ```console
 Hello, world!
 ```
 
-`silk init` writes a `silk.toml` and a `src/main.silk`. Even "hello world" names what it needs:
+`sew init` writes a `silk.toml` and a `src/main.silk`. Even "hello world" names what it needs:
 
 ```silk
 import silk.effect { Effect }
@@ -356,12 +354,15 @@ times. It also has to run a shared corpus of 443 programs with exactly the expec
 | ------------------------- | ---------------------------------------------------------- |
 | [`compiler/`](compiler)   | The compiler, written in Silk                              |
 | [`changes/`](changes)     | Changes, release versions, migration notes, and changelogs |
+| [`sew/`](sew)             | sew, the front door: Silk versions and forwarding          |
+| [`tomledit/`](tomledit)   | Comment-preserving `silk.toml` edits, shared by both       |
 | [`stdlib/`](stdlib)       | The standard library                                       |
 | [`reference/`](reference) | The language reference and the generated stdlib reference  |
 | [`corpus/`](corpus)       | The shared acceptance corpus                               |
 | [`examples/`](examples)   | Larger example programs                                    |
 
-The root `silk.toml` defines a native workspace containing `compiler` and `changes`. Members
+The root `silk.toml` defines a native workspace containing `compiler`, `changes`, `sew` and
+`tomledit`. Members
 share the root `build/` directory; the root is not itself a package. Select a member explicitly
 from the root, for example `silk build --manifest-path compiler/silk.toml --stdlib stdlib` or
 `silk changes --dir compiler status`. Release operations affect one package at a time.
