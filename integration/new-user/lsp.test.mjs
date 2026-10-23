@@ -1,7 +1,7 @@
 // `silk lsp` as an editor starts it: from PATH, in the project folder, with no arguments.
 import { strict as assert } from 'node:assert'
 import { after, before, test } from 'node:test'
-import { initPackage, join, read, sharedHome, silk, write } from './lib.mjs'
+import { compiler, initPackage, join, read, sharedHome, silk, write } from './lib.mjs'
 import { positionOf, startServer, uriOf } from './lsp.mjs'
 
 const h = sharedHome()
@@ -122,7 +122,7 @@ test('an edit that breaks the code publishes the error, and fixing it clears it'
   }
 })
 
-test('hover still works in a function that has an error elsewhere in it', { todo: 'finding 19' }, async () => {
+test('hover still works in a function that has an error elsewhere in it', async () => {
   const broken = program.replace('let numbers: [i32; 3] = [1, 2, 3]', 'let oops = nope\n  let numbers: [i32; 3] = [1, 2, 3]')
   await change(broken)
   try {
@@ -133,19 +133,19 @@ test('hover still works in a function that has an error elsewhere in it', { todo
   }
 })
 
-test('hover on a type used as a qualifier shows its doc comment', { todo: 'finding 20' }, async () => {
+test('hover on a type used as a qualifier shows its doc comment', async () => {
   const hover = await server.request('textDocument/hover', at(program, 'StdoutLogger.make', 3))
   assert.match(hover?.contents?.value ?? '', /A `Logger` provider/)
 })
 
-test('importing a name the module lacks is reported on the import line', { todo: 'finding 31' }, async () => {
+test('importing a name the module lacks is reported on the import line', async () => {
   const broken = program.replace('import silk.logger { LogError }', 'import silk.logger { LogError, Nope }')
   const diagnostics = await change(broken)
   await change(program)
   assert.ok(diagnostics.some((diagnostic) => diagnostic.code === 'SEM0014' && diagnostic.range.start.line === 1), JSON.stringify(diagnostics))
 })
 
-test('a missing pinned toolchain still starts a server that explains it', async () => {
+test('a missing pinned toolchain still starts a server that explains it', { skip: compiler === '' ? false : 'SILK_NEW_USER_COMPILER bypasses the pin' }, async () => {
   const other = initPackage(h, 'editor-unpinned')
   const manifest = join(other, 'silk.toml')
   write(manifest, read(manifest).replace(/^silk-version = .*$/m, 'silk-version = "0.3.0"'))

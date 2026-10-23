@@ -1,9 +1,11 @@
 // Stability checks found by the stability rounds: parser and type-check corners, symbolic links,
-// and incremental rebuilds that must give the same answer as a clean build.
+// incremental rebuilds that must give the same answer as a clean build, hung tests, concurrent
+// builds and stack overflows.
 import { strict as assert } from 'node:assert'
+import { spawn } from 'node:child_process'
 import { cpSync, mkdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { test } from 'node:test'
-import { initPackage, join, read, sharedHome, show, silk, write } from './lib.mjs'
+import { initPackage, join, read, sh, sharedHome, show, silk, userEnv, write } from './lib.mjs'
 
 const h = sharedHome()
 
@@ -22,7 +24,7 @@ function runValue(body) {
   return silk(h, ['run', '--quiet'], { cwd: dir })
 }
 
-test('a literal sum on the left of == takes the other operand\'s type', { todo: 'finding 28' }, () => {
+test('a literal sum on the left of == takes the other operand\'s type', () => {
   const result = runValue('  let x: i64 = 3\n  let v = (1 + 2) == x')
   assert.equal(result.status, 0, show(result))
   assert.equal(result.stdout, 'true\n')
@@ -34,7 +36,7 @@ test('a literal sum on the right of == takes the other operand\'s type', () => {
   assert.equal(result.stdout, 'true\n')
 })
 
-test('a < b && c > (d) parses as two comparisons', { todo: 'finding 29' }, () => {
+test('a < b && c > (d) parses as two comparisons', () => {
   const result = runValue('  let x: i64 = 3\n  let y: i64 = 4\n  let v = x < y && y > (x + 1)')
   assert.equal(result.status, 0, show(result))
   assert.equal(result.stdout, 'false\n')
@@ -67,7 +69,7 @@ test('two dependents reach one library through differently spelled paths', () =>
   assert.equal(result.status, 0, show(result))
 })
 
-test('a dependency reached through a symbolic link builds', { todo: 'finding 30' }, () => {
+test('a dependency reached through a symbolic link builds', () => {
   const root = join(h.work, 'linked-dependency')
   library(root)
   symlinkSync('d', join(root, 'dlink'))
@@ -76,7 +78,7 @@ test('a dependency reached through a symbolic link builds', { todo: 'finding 30'
   assert.equal(result.status, 0, show(result))
 })
 
-test('a source module that is a symbolic link builds', { todo: 'finding 30' }, () => {
+test('a source module that is a symbolic link builds', () => {
   const dir = initPackage(h, 'linked-module')
   write(join(h.work, 'shared/helper.silk'), 'pub fn seven() -> i32 {\n  return 7\n}\n')
   symlinkSync('../../shared/helper.silk', join(dir, 'src/helper.silk'))
@@ -96,12 +98,12 @@ test('a project opened through a symbolic link builds', () => {
 const unclear = [
   ['called a method the type lacks', 'finding 32', 'import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.list { List }\n\neffect fn fill() -> () ! OutOfMemoryError ? &mut Allocator {\n  let mut list = List<i32>.make()\n  run list.push(1)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /push/],
   ['used List without importing it', 'finding 32', 'struct Tags {\n  names: List<i32>\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /List/],
-  ['wrote a tuple return type', 'finding 33', 'fn pair() -> (i32, i32) {\n  return (1, 2)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /tuple/],
+  ['wrote a tuple return type', null, 'fn pair() -> (i32, i32) {\n  return (1, 2)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /tuple/],
   ['saved the file with a byte order mark', 'finding 34', '﻿pub fn main() -> i32 {\n  return 0\n}\n', null],
 ]
 
 for (const [what, finding, source, wanted] of unclear) {
-  test(`a newcomer who ${what} is told what to fix`, { todo: finding }, () => {
+  test(`a newcomer who ${what} is told what to fix`, { todo: finding ?? undefined }, () => {
     const dir = initPackage(h, `unclear${unclear.findIndex((entry) => entry[0] === what)}`)
     write(join(dir, 'src/main.silk'), source)
     const result = silk(h, ['check', '--quiet'], { cwd: dir })
@@ -177,4 +179,38 @@ ${logging}  let a = area(Point { x: 3, y: 4 })
   }
   // The edits really changed the output, so the comparison above tested something.
   assert.match(seen.at(-1), /: 12 37 20$/, seen.join('\n'))
+})
+
+test('a test that never finishes is stopped and named, and the others still report', { todo: 'finding 37' }, () => {
+  const dir = initPackage(h, 'spinning')
+  write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n\ntest fn quick() {\n  let x: i64 = 1\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n')
+  // Bounded here so a hang fails the test instead of the suite; the spinning test process is
+  // cleaned up afterwards.
+  const result = sh(h, 'timeout 120 silk test --no-cache; status=$?; pkill -f "debug/spinning" || true; exit $status', { cwd: dir })
+  assert.notEqual(result.status, 124, `silk test hung\n${show(result)}`)
+  assert.match(result.stdout + result.stderr, /main::spins[\s\S]*(time|took|timeout)/i, show(result))
+  assert.match(result.stdout + result.stderr, /main::quick\s+PASS/, show(result))
+})
+
+test('two builds of one package at the same time both succeed', { todo: 'finding 38' }, async () => {
+  const dir = initPackage(h, 'together')
+  const failures = []
+  for (let round = 0; round < 4; round++) {
+    rmSync(join(dir, 'build'), { recursive: true, force: true })
+    const results = await Promise.all([['build', '--quiet'], ['run', '--quiet']].map((args) => new Promise((done) => {
+      const child = spawn('silk', args, { cwd: dir, env: userEnv(h) })
+      let stderr = ''
+      child.stderr.on('data', (chunk) => (stderr += chunk))
+      child.on('close', (status) => done({ status, stderr }))
+    })))
+    for (const result of results) if (result.status !== 0) failures.push(result.stderr)
+  }
+  assert.deepEqual(failures, [])
+})
+
+test('a stack overflow says so instead of a bare segmentation fault', { todo: 'finding 39' }, () => {
+  const dir = initPackage(h, 'deep')
+  write(join(dir, 'src/main.silk'), 'fn deep(n: i64) -> i64 {\n  if n == 0 {\n    return 0\n  }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  if deep(100000000) == 0 {\n    return 1\n  }\n  return 0\n}\n')
+  const result = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.match(result.stderr, /stack overflow/i, show(result))
 })

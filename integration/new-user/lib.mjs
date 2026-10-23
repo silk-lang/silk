@@ -21,7 +21,7 @@ const installer = process.env.SILK_NEW_USER_INSTALLER ?? join(repoRoot, 'install
 // <dir>/bin/silk with its stdlib at <dir>/lib/silk/stdlib. Commands then run it through
 // SILK_TOOLCHAIN=local instead of the installed release. install.sh still runs, so the
 // install and toolchain tests keep testing the release.
-const compiler = process.env.SILK_NEW_USER_COMPILER ?? ''
+export const compiler = process.env.SILK_NEW_USER_COMPILER ?? ''
 
 // Release to install, as a tag. Empty means "whatever install.sh picks", like a new user.
 export const release = process.env.SILK_RELEASE ?? ''

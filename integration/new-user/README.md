@@ -65,6 +65,8 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `fuzz/compare.sh <generator> <seed> <dir>` | Generates a program and its expected output with a generator below, runs it in debug and release, and prints `MISMATCH` for any difference |
 | `fuzz/arithmetic.py` | i64 arithmetic, comparisons, loops, arrays, structs and helper functions, with a Python reference |
 | `fuzz/collections.py` | Random operations on `HashMap`, `HashSet` and `List`, with a Python model |
+| `fuzz/trees.py` | Expression trees in `Box`-based unions, evaluated by reference, by a `mut fn` visitor and by consuming the tree, with a Python reference |
+| `fuzz/format-roundtrip.sh <package> <dir>` | Formats a copy of a package that checks clean, then checks the result is stable, still checks, and runs with the same output |
 | `fuzz/huge-sources.py <dir>` | Huge and malformed sources (deep nesting, 30,000 lets, binary garbage, a BOM); flags crashes and timeouts |
 | `node fuzz/lsp-edits.mjs <package> <seed> <steps> [burst]` | Random edits to the package's `src/main.silk` in `silk lsp`, with hover, completion, definition, symbols and formatting after each; compares diagnostics with `silk check` |
 

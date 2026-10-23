@@ -30,7 +30,7 @@ test('silk init --lib makes a library with a passing test', () => {
   assert.match(result.stdout, /Tests  1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 1 discovered\)/)
 })
 
-test('plain silk test runs the tests', { todo: 'finding 2: needs --no-cache' }, () => {
+test('plain silk test runs the tests', () => {
   const result = silk(h, ['test'], { cwd: library() })
   assert.equal(result.status, 0, show(result))
 })
@@ -44,14 +44,14 @@ test('a failing assertion fails the run with its message', () => {
   assert.match(result.stdout, /Tests  1 passed, 1 failed/)
 })
 
-test('a failing assertion prints no unhandled-error trace', { todo: 'finding 3' }, () => {
+test('a failing assertion prints no unhandled-error trace', () => {
   const dir = library()
   write(join(dir, 'src/lib.silk'), read(join(dir, 'src/lib.silk')) + failing)
   const result = silk(h, ['test', '--no-cache'], { cwd: dir })
   assert.doesNotMatch(result.stderr, /unhandled error/)
 })
 
-test('a test that traps fails, the rest still run, and the run exits 1', { todo: 'finding 1: the runner dies and silk test exits 0' }, () => {
+test('a test that traps fails, the rest still run, and the run exits 1', () => {
   const dir = library()
   write(join(dir, 'src/lib.silk'), read(join(dir, 'src/lib.silk')) + trapping + '\ntest fn runsAfterTheTrap() {}\n')
   const result = silk(h, ['test', '--no-cache'], { cwd: dir })
