@@ -198,8 +198,13 @@ fatal trap: division by zero
   at app.main (src/app.silk:14)
 ```
 
+A stack overflow on the main thread of a hosted native program is a trap too. Its report is
+`fatal trap: stack overflow` without frames, written from a separate signal stack; another invalid
+memory access reports `fatal trap: segmentation fault`. The process then ends with the signal.
+
 **Boundary:** Corrupted memory or a violated unsafe contract may prevent a complete report. Silk
-guarantees neither a portable numeric trap status nor structured cleanup after the trap.
+guarantees neither a portable numeric trap status nor structured cleanup after the trap. A stack
+overflow on a thread other than the main thread has no signal stack and may end without a report.
 
 **Diagnostics:** A compile-time trap in required constant evaluation is a source diagnostic. A
 runtime trap is abnormal termination and must not be reported as an unhandled typed error.
