@@ -184,7 +184,7 @@ test('use a second version as the default, pin it, dispatch, and uninstall it', 
   assert.ok(!existsSync(join(h.silkHome, 'toolchains', second)))
 })
 
-test('a mistyped sew command is answered by sew, with the command it meant', { skip, todo: 'finding 84' }, () => {
+test('a mistyped sew command is answered by sew, with the command it meant', { skip }, () => {
   const h = home()
   const result = sew(h, ['uze', h.version])
   assert.equal(result.status, 2, show(result))
@@ -193,7 +193,7 @@ test('a mistyped sew command is answered by sew, with the command it meant', { s
   assert.doesNotMatch(result.stderr, /toolchain/, show(result))
 })
 
-test('sew use repairs an installed version whose folder lost its compiler', { skip: skip || needsMirror, todo: 'finding 85' }, () => {
+test('sew use repairs an installed version whose folder lost its compiler', { skip: skip || needsMirror }, () => {
   const h = home()
   const installed = sew(h, ['use', second], withMirror(h))
   assert.equal(installed.status, 0, show(installed))
@@ -207,7 +207,7 @@ test('sew use repairs an installed version whose folder lost its compiler', { sk
   assert.equal(ran.status, 0, show(ran))
 })
 
-test('a member pin that disagrees with the workspace pin is reported', { skip, todo: 'finding 87' }, () => {
+test('a member pin that disagrees with the workspace pin is reported', { skip }, () => {
   const h = home()
   const created = sew(h, ['init', '--workspace', 'pins'])
   assert.equal(created.status, 0, show(created))

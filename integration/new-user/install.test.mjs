@@ -1,6 +1,6 @@
 // Installing Silk the way the Install page says: the install script into an empty home.
 import { strict as assert } from 'node:assert'
-import { lstatSync, readlinkSync } from 'node:fs'
+import { lstatSync, readlinkSync, statSync } from 'node:fs'
 import { test } from 'node:test'
 import { existsSync, freshHome, install, join, read, show, silk } from './lib.mjs'
 
@@ -10,13 +10,19 @@ test('install.sh installs a toolchain, links bin/silk and makes it the default',
   assert.equal(result.status, 0, show(result))
   assert.match(result.stdout, /^Installed silk v(\S+) to .*\/\.silk\/toolchains\/\S+$/m)
   const version = /^Installed silk v(\S+)/m.exec(result.stdout)[1]
-  assert.match(result.stdout, /It is the default toolchain/)
+  const withSew = existsSync(join(h.silkHome, 'toolchains', version, 'bin/sew'))
+  assert.match(result.stdout, withSew ? /It is the default Silk version\. Installed sew to / : /It is the default toolchain/)
   // The home's bin is not on the user's PATH yet, so the script says which line to add.
   assert.match(result.stdout, /Add Silk to your PATH by adding this line to/)
 
   const link = join(h.silkHome, 'bin/silk')
-  assert.ok(lstatSync(link).isSymbolicLink(), 'bin/silk is a link')
-  assert.equal(readlinkSync(link), join(h.silkHome, 'toolchains', version, 'bin/silk'))
+  if (withSew) {
+    // A release with sew: bin/silk is a second name for bin/sew, not a link to the compiler.
+    assert.equal(statSync(link).ino, statSync(join(h.silkHome, 'bin/sew')).ino, 'bin/silk and bin/sew are one file')
+  } else {
+    assert.ok(lstatSync(link).isSymbolicLink(), 'bin/silk is a link')
+    assert.equal(readlinkSync(link), join(h.silkHome, 'toolchains', version, 'bin/silk'))
+  }
   assert.ok(existsSync(join(h.silkHome, 'toolchains', version, 'lib/silk/stdlib')), 'stdlib beside the compiler')
   assert.match(read(join(h.silkHome, 'settings.toml')), new RegExp(`^default = "${version.replaceAll('+', '\\+')}"$`, 'm'))
 

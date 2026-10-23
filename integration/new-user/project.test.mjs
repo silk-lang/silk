@@ -286,3 +286,21 @@ pub effect fn main() -> i32
   assert.match(ran.stderr, /fatal trap: index out of bounds/, show(ran))
   assert.match(ran.stderr, /at main\.main \(main:10:\d+\)/, show(ran))
 })
+
+// The install page supports Clang 18 and newer. Each Clang found in the usual Debian and Ubuntu
+// place, or named in SILK_NEW_USER_CLANGS (separated by colons), builds the same program.
+const clangs = (process.env.SILK_NEW_USER_CLANGS ?? '').split(':').filter((path) => path !== '')
+for (const dir of existsSync('/usr/lib') ? readdirSync('/usr/lib') : []) {
+  const match = /^llvm-(\d+)$/.exec(dir)
+  if (match && Number(match[1]) >= 18 && existsSync(`/usr/lib/${dir}/bin/clang`)) clangs.push(`/usr/lib/${dir}/bin/clang`)
+}
+
+test('a release build works with every supported Clang', { skip: clangs.length === 0 ? 'no Clang 18 or newer found' : false, todo: 'finding 95' }, () => {
+  const dir = initPackage(h, fresh('clangs'))
+  for (const clang of clangs) {
+    for (const flags of [[], ['--release']]) {
+      const result = silk(h, ['run', '--quiet', '--clang', clang, ...flags], { cwd: dir })
+      assert.equal(result.status, 0, `${clang} ${flags.join(' ')}\n${show(result)}`)
+    }
+  }
+})

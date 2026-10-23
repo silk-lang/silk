@@ -92,7 +92,7 @@ function manyTests(count, broken = -1) {
 
 const seconds = (start) => Number(process.hrtime.bigint() - start) / 1e9
 
-test('after an edit, the second silk test reuses the test build', { todo: 'finding 90' }, () => {
+test('after an edit, the second silk test reuses the test build', () => {
   const dir = library()
   write(join(dir, 'src/lib.silk'), manyTests(200))
   const cold = silk(h, ['test'], { cwd: dir })
@@ -116,14 +116,14 @@ test('silk doctest runs the examples, so an example that returns 1 fails', { tod
   assert.match(checked.stdout, /FAILED/, show(checked))
 })
 
-test('silk doctest in a package needs no flags', { todo: 'finding 92' }, () => {
+test('silk doctest in a package needs no flags', () => {
   const dir = library()
   const checked = silk(h, ['doctest'], { cwd: dir })
   assert.notEqual(checked.status, 2, show(checked))
   assert.doesNotMatch(checked.stderr, /pass --input/, show(checked))
 })
 
-test('a doc example imports a package with a hyphen in its name the way a dependent does', { todo: 'finding 93' }, () => {
+test('a doc example imports a package with a hyphen in its name the way a dependent does', () => {
   const dir = initPackage(h, `doc-${++serial}`, ['--lib'])
   const name = dir.split('/').at(-1).replaceAll('-', '_')
   write(join(dir, 'src/lib.silk'), `/// Six times \`radius\`.\n///\n/// \`\`\`silk\n/// import ${name}.lib { circumference }\n///\n/// pub fn main() -> i32 {\n///   return circumference(2) - 12\n/// }\n/// \`\`\`\npub fn circumference(radius: i32) -> i32 {\n  return radius * 6\n}\n`)
