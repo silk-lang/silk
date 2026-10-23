@@ -2382,8 +2382,43 @@ const program = Effect.gen(function* () {
   assert.equal(refused.status, 2, refused.stderr)
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
+  // A debug build compiles each module's codegen unit to an object of its own, cached by its text,
+  // so a rebuild after an edit to one module recompiles that module's unit alone.
+  const split = join(directory, 'split')
+  yield* fs.makeDirectory(join(split, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(split, 'silk.toml'),
+    '[package]\nname = "split"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  const helperSource = (value: number) => `pub fn value() -> i32 {\n  return ${value}\n}\n`
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(3))
+  yield* fs.writeFileString(
+    join(split, 'src/main.silk'),
+    'import helper\n\npub fn main() -> i32 {\n  return helper.value() + 4\n}\n',
+  )
+  const splitEnvironment = { ...process.env, SILK_CLANG: clang }
+  const unitObjects = join(split, `build/llvm/${hostTarget}/debug/split.units`)
+  const objectNames = Effect.fnUntraced(function* () {
+    const names = yield* fs.readDirectory(unitObjects)
+    return names.filter((name) => name.endsWith('.o')).sort()
+  })
+  const splitRun = Effect.fnUntraced(function* (expected: number) {
+    const ran = yield* invoke(silk, ['run', '--stdlib', standardLibrary], split, splitEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  })
+  yield* splitRun(7)
+  const coldObjects = yield* objectNames()
+  assert.ok(coldObjects.length > 2, `expected an object per module, found ${coldObjects.join(', ')}`)
+  yield* splitRun(7)
+  assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
+  yield* splitRun(9)
+  const editedObjects = yield* objectNames()
+  const compiled = editedObjects.filter((name) => !coldObjects.includes(name))
+  assert.equal(compiled.length, 1, `an edit to one module compiles one unit, added ${compiled.join(', ')}`)
+  assert.equal(editedObjects.length, coldObjects.length + 1)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, native changes release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, native changes release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))
