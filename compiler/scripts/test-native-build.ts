@@ -1001,6 +1001,28 @@ const program = Effect.gen(function* () {
   )
   assert.equal(unmatchedTests.status, 1, unmatchedTests.stderr)
   assert.match(unmatchedTests.stderr, /no tests matched/)
+  // A test past its --timeout and a test that overflows the stack each fail with a report naming
+  // why, and the remaining tests still run.
+  yield* fs.makeDirectory(join(directory, 'stuck/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'stuck/silk.toml'),
+    '[package]\nname = "stuck"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'stuck/src/main.silk'),
+    'fn deep(n: i64) -> i64 {\n  if n == 0 { return 0 }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest fn overflows() {\n  let depth = deep(100000000)\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n\ntest fn zFinishes() {\n}\n',
+  )
+  const stuckTests = yield* invoke(
+    silk,
+    ['test', '--stdlib', standardLibrary, '--timeout', '1'],
+    join(directory, 'stuck'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(stuckTests.status, 1, stuckTests.stderr)
+  assert.match(stuckTests.stderr, /^fatal trap: stack overflow$/m)
+  assert.match(stuckTests.stderr, /the test did not finish within 1 s/)
+  assert.match(stuckTests.stdout, /main::zFinishes\n {4}PASS/)
+  assert.match(stuckTests.stdout, /1 passed, 2 failed/)
   // Package commands take --clang as they honor SILK_CLANG, and a Clang that cannot start fails
   // the target with the usual per-target and summary lines.
   const clangTests = yield* invoke(

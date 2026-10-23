@@ -201,6 +201,11 @@ requiring the failure payload to implement a reporting interface. A fatal trap s
 runner process without cleanup, but it does not end the run: the host reports the trapping test as
 failed and starts a new runner process that continues with the next selected test.
 
+Each test has a time limit, 60 seconds unless `--timeout <seconds>` sets another; `--timeout 0`
+removes it. A test that outlives its limit ends the runner process like a trap: `silk test` reports
+that the test did not finish within the limit, fails it, and continues with the next selected test.
+The limit needs a native target with a C library; elsewhere tests have none.
+
 Tests must close their service requirements and provide any scheduler or execution owner they need.
 The bundled runner supplies no hidden provider or scheduler. This can require a test to wrap its
 body in local provision or a nested Effect. Exact callable requirement rows remain available so a
