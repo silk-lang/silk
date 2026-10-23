@@ -54,6 +54,7 @@ import backend.DropGlue {
   Variant as GlueVariant,
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
+import backend.UnionDispatch {Arm as DispatchArm, UnionDispatch}
 import backend.CodegenUnits
 import backend.CodegenUnits {CodegenUnit, Defined}
 import backend.Mir
@@ -673,6 +674,9 @@ pub union ConformanceEvidence {
   Declared {pub bound: Constraint},
   /// A coherent concrete implementation, with its head binders matched to the goal.
   Concrete {pub head: Shared<ImplementationHead>, pub bindings: List<Binding>},
+  /// A structural union provider whose every member conforms; each member's own steps precede
+  /// this one, and a call dispatches on the receiver's tag to the member's witness.
+  Union,
 }
 
 /// One goal and the evidence that discharged it.
@@ -69208,6 +69212,164 @@ effect fn exportShim(
   return run storeMir(&mut resolver.*, &mut owner.*, move shim, move evidence)
 }
 
+// Whether `instance` runs an interface operation itself under a structural union `Self`: the
+// witness a union provider selects (UNION-003).
+effect fn unionDispatched(instance: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if let InstanceKey.Function {..} = &instance.* {
+    let application = run InstanceKey.selected(instance)
+    if let SpecializationTarget.Operation {provider, operation, implementation, ..} = &application.target {
+      return DeclarationId.equals(&operation, &implementation) && Shared<Type>.with<bool>(&provider, unionType)
+    }
+  }
+  return false
+}
+
+// The dispatch body of a union operation instance: one arm per member calls that member's witness.
+struct DispatchTarget {
+  contract: Shared<Type>
+  provider: Shared<Type>
+}
+
+effect fn dispatchGap(code: GapCode, identity: &Shared<DeclarationId>) -> Value ! OutOfMemoryError ? &mut Allocator {
+  return Value.Unsupported {gap: run Shared<BackendGap>.make(BackendGap.make(code, identity, Span.make(usize.ZERO, usize.ZERO)))}
+}
+
+effect fn resolveUnionDispatchMir(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key,
+  instance: InstanceKey, identity: &Shared<DeclarationId>, observing: bool) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let span = Span.make(usize.ZERO, usize.ZERO)
+  let application = run InstanceKey.selected(&instance)
+  let target = match &application.target {
+    SpecializationTarget.Operation {contract, provider, ..} => DispatchTarget {contract: Shared<Type>.clone(&contract),
+      provider: Shared<Type>.clone(&provider)}
+    _ => { return memberSuccess(run dispatchGap(GapCode.WitnessOperand, identity), move dependencies) }
+  }
+  let contract = move target.contract
+  let provider = move target.provider
+  let operation = DeclarationId.copy(Application.bodyDeclaration(&application))
+  let module = ModuleId.copy(DeclarationId.moduleId(&operation))
+  let signature = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies, Key {family: Family.Signature,
+    module: key.module, name: usize.ZERO, declaration: key.declaration, member: usize.ZERO, external: false}, span)
+  if let Option<Shared<Rejection>>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(
+    &signature, answerCause) {
+    return run memberRejected(move value, move dependencies)
+  }
+  let bindings = run Application.bindings(&application)
+  let noProjections = List<RuntimeProjection>.make()
+  let projections = List<RuntimeProjection>.asSlice(&noProjections)
+  let mut parameters = List<Shared<Type>>.make()
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&signature, signatureParameterCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let written = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&signature,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameterAt(answer, at) })
+    match move written {
+      Option<Shared<Type>>.Some {value} => {
+        run List<Shared<Type>>.append(&mut parameters, run RuntimeType.applyBindings(&value, List<Binding>.asSlice(&bindings), projections))
+      }
+      Option<Shared<Type>>.None => { return memberSuccess(run dispatchGap(GapCode.SignatureForm, identity), move dependencies) }
+    }
+    at = at + usize.ONE
+  }
+  let writtenResult = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(&signature, signatureResult) {
+    Option<Shared<Type>>.Some {value} => move value
+    Option<Shared<Type>>.None => { return memberSuccess(run dispatchGap(GapCode.SignatureForm, identity), move dependencies) }
+  }
+  let result = run RuntimeType.applyBindings(&writtenResult, List<Binding>.asSlice(&bindings), projections)
+  let writtenFailure = run signatureFailure(&signature)
+  let failure = run Type.applyBindings(&writtenFailure, List<Binding>.asSlice(&bindings), true)
+  let fails = !Shared<Type>.with<bool>(&failure, neverType)
+  let own = run instanceProviders(&instance)
+  let addresses = run providerAddresses(List<ProviderEntry>.asSlice(&own))
+  // Tags number the canonical physical members.
+  let members = match move run Type.canonicalUnionMembers(&provider) {
+    Option<List<Shared<Type>>>.Some {value} => move value
+    Option<List<Shared<Type>>>.None => { return memberSuccess(run dispatchGap(GapCode.WitnessOperand, identity), move dependencies) }
+  }
+  let listed = List<Shared<Type>>.asSlice(&members)
+  let mut arms = List<DispatchArm>.make()
+  let mut request = Request.make()
+  at = usize.ZERO
+  while at < listed.length {
+    let selected = run resolveWitnessApplication(&mut resolver.*, &mut owner.*, &mut request, &mut dependencies, true,
+      &contract, &listed[at], &operation, &module, span)
+    let witness = match move selected {
+      Result<ResolvedWitness, Shared<Rejection>>.Success {value} => move value
+      Result<ResolvedWitness, Shared<Rejection>>.Failure {error} => { return run mirRejection(identity, move error, move dependencies) }
+    }
+    // Each operand passes unchanged: a member witness that borrows a by-value operand is not admitted.
+    let passes = List<OperandPass>.asSlice(&witness.operands)
+    let mut pass = usize.ZERO
+    while pass < passes.length {
+      if let OperandPass.Borrow {..} = &passes[pass] { return memberSuccess(run dispatchGap(GapCode.WitnessOperand, identity), move dependencies) }
+      pass = pass + usize.ONE
+    }
+    let closed = run Application.applyBindings(&witness.application, List<Binding>.asSlice(&bindings))
+    let unbound = List<BoundProvider>.make()
+    let served = match move run rowProviders(&mut resolver.*, &mut owner.*, &mut dependencies, &closed,
+      List<ProviderEntry>.asSlice(&own), List<BoundProvider>.asSlice(&unbound), span) {
+      Result<RowProviders, PreparationFailure>.Success {value} => move value
+      Result<RowProviders, PreparationFailure>.Failure {error} => { return run preparationQueryAnswer(identity, move error, move dependencies) }
+    }
+    let mut sources = List<usize>.make()
+    let given = List<MirProviderSource>.asSlice(&served.sources)
+    let mut source = usize.ZERO
+    while source < given.length {
+      match &given[source] {
+        MirProviderSource.Own {index} => { run List<usize>.append(&mut sources, index) }
+        _ => { return memberSuccess(run dispatchGap(GapCode.EffectForm, identity), move dependencies) }
+      }
+      source = source + usize.ONE
+    }
+    let mut calleeKey = Result<InstanceKey, CanonicalizationFailure>.failResult(CanonicalizationFailure.Resource)
+    if List<ProviderEntry>.length(&served.entries) != usize.ZERO {
+      calleeKey = run InstanceKey.withProviders(move closed, move served.entries)
+    } else {
+      calleeKey = run InstanceKey.function(move closed)
+    }
+    let callee = match move calleeKey {
+      Result<InstanceKey, CanonicalizationFailure>.Success {value} => move value
+      Result<InstanceKey, CanonicalizationFailure>.Failure {error: reason} => {
+        return run preparationQueryAnswer(identity, PreparationFailure.Canonicalization {reason: reason}, move dependencies)
+      }
+    }
+    // The member witness's failure must be this operation's own; a narrower one is not admitted yet.
+    let calleeFailure = match move run witnessFailureType(&mut resolver.*, &mut owner.*, &mut dependencies, &callee, span) {
+      Option<Shared<Type>>.Some {value} => move value
+      Option<Shared<Type>>.None => { return memberSuccess(run dispatchGap(GapCode.SignatureForm, identity), move dependencies) }
+    }
+    let memberFails = !Shared<Type>.with<bool>(&calleeFailure, neverType)
+    if memberFails && !sameReusableType(&calleeFailure, &failure) {
+      return memberSuccess(run dispatchGap(GapCode.WitnessOperand, identity), move dependencies)
+    }
+    run List<DispatchArm>.append(&mut arms, DispatchArm {tag: at, member: Shared<Type>.clone(&listed[at]), callee: move callee,
+      providers: move sources, fails: memberFails})
+    at = at + usize.ONE
+  }
+  let function = run UnionDispatch.lower(UnionDispatch {key: move instance, result: move result, parameters: move parameters,
+    providers: move addresses, failure: move failure, fails: fails, count: listed.length, arms: move arms}, observing)
+  return run storeMir(&mut resolver.*, &mut owner.*, move function, move dependencies)
+}
+
+// The declared failure of the instance `callee` runs, under its application.
+effect fn witnessFailureType(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  callee: &InstanceKey, span: Span) -> Option<Shared<Type>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let application = run InstanceKey.selected(callee)
+  let location = match move run locationOfInstance(&mut resolver.*, callee) {
+    Option<InstanceLocation>.Some {value} => value
+    Option<InstanceLocation>.None => { return Option<Shared<Type>>.none() }
+  }
+  let signatureKey = run internDeclaration(&mut resolver.*, Key {family: Family.Signature, module: location.module,
+    name: usize.ZERO, declaration: location.declaration, member: usize.ZERO, external: false})
+  let signature = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, signatureKey, span)
+  if Shared<Result<Answer, NoRejection>>.with<bool>(&signature, hasRejection) { return Option<Shared<Type>>.none() }
+  let declared = run signatureFailure(&signature)
+  let bindings = run Application.bindings(&application)
+  return Option<Shared<Type>>.some(run Type.applyBindings(&declared, List<Binding>.asSlice(&bindings), true))
+}
+
 effect fn lowerMir(
   resolver: &mut Resolver,
   owner: &mut Query<Answer, NoRejection>,
@@ -69251,6 +69413,9 @@ effect fn lowerMir(
         List<Dependency>.make(),
       )
     }
+  }
+  if run unionDispatched(&instance) {
+    return run resolveUnionDispatchMir(&mut resolver.*, &mut owner.*, key, move instance, &identity, observing)
   }
   // Typed origins count from the declaration's anchor; MIR keeps them relative and reads them
   // back against it only for a diagnostic, a gap or an observed trap label.
@@ -74377,6 +74542,12 @@ effect fn proveGoal(
     List<ConformanceGoal>.truncate(&mut chain.*, mark)
     return Option<Shared<Rejection>>.none()
   }
+  if Shared<Type>.with<bool>(&goal.provider, unionType) {
+    let failed = run proveUnionGoal(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, nested, avoid,
+      goal, declared, siteModule, siteSpan, &mut chain.*, &mut steps.*)
+    List<ConformanceGoal>.truncate(&mut chain.*, mark)
+    return move failed
+  }
   let contractModuleOrdinal = declaringModuleOrdinal(&resolver.*, &goal.contract)
   if contractModuleOrdinal == usize.MAX {
     fail InvalidModulePath {}
@@ -74741,6 +74912,191 @@ effect fn proveGoal(
   return Option<Shared<Rejection>>.none()
 }
 
+// The members of a structural union, in canonical order; none for any other type.
+effect fn unionMembers(provider: &Shared<Type>) -> List<Shared<Type>> ! OutOfMemoryError ? &mut Allocator {
+  let mut members = List<Shared<Type>>.make()
+  let count = Shared<Type>.with<usize>(provider, fn(value: &Type) -> usize {
+    return match &value.* { Type.Union {members: listed} => List<Shared<Type>>.length(&listed) _ => usize.ZERO }
+  })
+  let mut at = usize.ZERO
+  while at < count {
+    let member = Shared<Type>.with<Shared<Type>>(provider, fn(value: &Type) -> Shared<Type> {
+      if let Type.Union {members: listed} = &value.* { return Shared<Type>.clone(&List<Shared<Type>>.asSlice(&listed)[at]) }
+      return Shared<Type>.clone(provider)
+    })
+    run List<Shared<Type>>.append(&mut members, move member)
+    at = at + usize.ONE
+  }
+  return move members
+}
+
+fn referenceTo(value: &Type, referent: &Shared<Type>) -> bool {
+  if let Type.Reference {referent: written, ..} = &value.* { return sameReusableType(&written, referent) }
+  return false
+}
+
+// A structural union conforms to a reference-only contract when each member does (UNION-003).
+// Every operation receives `self` through a reference and names `Self` nowhere else, so a call
+// dispatches on the receiver's tag to its member's witness with the same remaining operands.
+// Each member's proof records its own steps first; the union's step comes last.
+effect fn proveUnionGoal(
+  resolver: &mut Resolver,
+  owner: &mut Query<Answer, NoRejection>,
+  request: &mut Request,
+  dependencies: &mut List<Dependency>,
+  nested: bool,
+  avoid: &Option<Shared<DeclarationId>>,
+  goal: &ConformanceGoal,
+  declared: &[Constraint],
+  siteModule: &ModuleId,
+  siteSpan: Span,
+  chain: &mut List<ConformanceGoal>,
+  steps: &mut List<ConformanceStep>,
+) -> Option<Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+? &mut Allocator | &mut Types {
+  let members = run unionMembers(&goal.provider)
+  let listed = List<Shared<Type>>.asSlice(&members)
+  if listed.length == usize.ZERO {
+    return Option<Shared<Rejection>>.some(run missingConformance(siteModule, siteSpan, goal))
+  }
+  let contractModuleOrdinal = declaringModuleOrdinal(&resolver.*, &goal.contract)
+  if contractModuleOrdinal == usize.MAX {
+    return Option<Shared<Rejection>>.some(run missingConformance(siteModule, siteSpan, goal))
+  }
+  let contractModule = resolvedModule(&resolver.*, contractModuleOrdinal)
+  let contractPosition = match move run ordinalOfProvider(&mut resolver.*, &contractModule, &goal.contract) {
+    Option<usize>.Some {value} => value
+    Option<usize>.None => { return Option<Shared<Rejection>>.some(run missingConformance(siteModule, siteSpan, goal)) }
+  }
+  let operationsKey = run internDeclaration(&mut resolver.*, Key {family: Family.Operations, module: contractModuleOrdinal,
+    name: usize.ZERO, declaration: contractPosition, member: usize.ZERO, external: false})
+  let operations = run proofDemand(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, operationsKey,
+    siteSpan, nested)
+  if let Option<Shared<Rejection>>.Some {value} = move Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(
+    &operations, answerCause) {
+    return Option<Shared<Rejection>>.some(move value)
+  }
+  // Each operation is read under the union and under one member: a parameter, result or failure
+  // that differs between the two names `Self`.
+  let contractKey = run internApplication(&mut resolver.*, &goal.contract)
+  let unionKey = run internApplication(&mut resolver.*, &goal.provider)
+  let memberKey = run internApplication(&mut resolver.*, &listed[usize.ZERO])
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&operations, listedOperationCount)
+  let mut at = usize.ZERO
+  while at < count {
+    let operation = match move Shared<Result<Answer, NoRejection>>.with<Option<Shared<DeclarationId>>>(&operations,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<DeclarationId>> { return listedOperation(answer, at) }) {
+      Option<Shared<DeclarationId>>.Some {value} => move value
+      Option<Shared<DeclarationId>>.None => { return Option<Shared<Rejection>>.some(run missingConformance(siteModule, siteSpan, goal)) }
+    }
+    let position = match move run ordinalOfIdentity(&mut resolver.*, &contractModule, &operation) {
+      Option<usize>.Some {value} => value
+      Option<usize>.None => { return Option<Shared<Rejection>>.some(run missingConformance(siteModule, siteSpan, goal)) }
+    }
+    let underUnionKey = run internDeclaration(&mut resolver.*, Key {family: Family.AppliedOperation,
+      module: contractModuleOrdinal, name: contractKey, declaration: position, member: unionKey, external: false})
+    let underUnion = run proofDemand(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, underUnionKey,
+      siteSpan, nested)
+    let underMemberKey = run internDeclaration(&mut resolver.*, Key {family: Family.AppliedOperation,
+      module: contractModuleOrdinal, name: contractKey, declaration: position, member: memberKey, external: false})
+    let underMember = run proofDemand(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, underMemberKey,
+      siteSpan, nested)
+    if !run dispatchableOperation(&underUnion, &underMember, &goal.provider) {
+      return Option<Shared<Rejection>>.some(run undispatchableUnion(siteModule, siteSpan, goal, &operation))
+    }
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < listed.length {
+    let memberGoal = ConformanceGoal {contract: Shared<Type>.clone(&goal.contract), provider: Shared<Type>.clone(&listed[at])}
+    let failed = run proveGoal(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, nested, avoid,
+      &memberGoal, declared, siteModule, siteSpan, &mut chain.*, &mut steps.*)
+    if let Option<Shared<Rejection>>.Some {value} = move failed {
+      return Option<Shared<Rejection>>.some(move value)
+    }
+    at = at + usize.ONE
+  }
+  run List<ConformanceStep>.append(&mut steps.*, ConformanceStep {goal: copyGoal(goal), evidence: ConformanceEvidence.Union})
+  return Option<Shared<Rejection>>.none()
+}
+
+// SEM0121 for a union provider and a contract whose `operation` cannot dispatch on the tag.
+effect fn undispatchableUnion(module: &ModuleId, span: Span, goal: &ConformanceGoal, operation: &Shared<DeclarationId>)
+  -> Shared<Rejection> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut diagnostic = run makeRejection(RejectionCode.MissingConformance, module, span)
+  let provider = run unionText(&goal.provider)
+  if let Option<Bytes>.Some {value: contract} = move run TypeText.display(&goal.contract) {
+    let mut text = run Bytes.copy(b"`")
+    run Bytes.append(&mut text, Bytes.asSlice(&provider))
+    run Bytes.append(&mut text, b": ")
+    run Bytes.append(&mut text, Bytes.asSlice(&contract))
+    run Bytes.append(&mut text, b"`")
+    let name = Shared<DeclarationId>.with<DeclarationId>(operation, DeclarationId.copy)
+    let spelling = run DeclarationId.copySpelling(&name)
+    let mut detail = run Bytes.copy(b"a union takes an interface only when each operation receives `self` by reference and names `Self` nowhere else, and `")
+    run Bytes.append(&mut detail, Bytes.asSlice(&spelling))
+    run Bytes.append(&mut detail, b"` does not")
+    run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"goal"), value: move text})
+    run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"detail"), value: move detail})
+  }
+  return run Shared<Rejection>.make(move diagnostic)
+}
+
+// A union's members joined by ` | `, each as TypeText shows it.
+effect fn unionText(provider: &Shared<Type>) -> Bytes ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<Bytes>.Some {value} = move run TypeText.display(provider) { return move value }
+  let members = run unionMembers(provider)
+  let listed = List<Shared<Type>>.asSlice(&members)
+  let mut text = Bytes.make()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if at > usize.ZERO { run Bytes.append(&mut text, b" | ") }
+    if let Option<Bytes>.Some {value} = move run TypeText.display(&listed[at]) { run Bytes.append(&mut text, Bytes.asSlice(&value)) }
+    at = at + usize.ONE
+  }
+  return move text
+}
+
+// Whether one operation, read under the union and under one member, receives `self` through a
+// reference to the union and names `Self` in no other parameter, its result or its failure.
+effect fn dispatchableOperation(underUnion: &Shared<Result<Answer, NoRejection>>,
+  underMember: &Shared<Result<Answer, NoRejection>>, provider: &Shared<Type>) -> bool
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if Shared<Result<Answer, NoRejection>>.with<bool>(underUnion, hasRejection)
+    || Shared<Result<Answer, NoRejection>>.with<bool>(underMember, hasRejection) {
+    return false
+  }
+  let count = Shared<Result<Answer, NoRejection>>.with<usize>(underUnion, signatureParameterCount)
+  if count == usize.ZERO || count != Shared<Result<Answer, NoRejection>>.with<usize>(underMember, signatureParameterCount) {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < count {
+    let unionParameter = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(underUnion,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameterAt(answer, at) })
+    let memberParameter = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(underMember,
+      fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameterAt(answer, at) })
+    if at == usize.ZERO {
+      let receiver = match move unionParameter { Option<Shared<Type>>.Some {value} => move value _ => { return false } }
+      if !Shared<Type>.with<bool>(&receiver, fn(value: &Type) -> bool { return referenceTo(value, provider) }) {
+        return false
+      }
+    } else if !sameTypeOption(&unionParameter, &memberParameter) {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  let unionResult = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(underUnion, signatureResult)
+  let memberResult = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(underMember, signatureResult)
+  if !sameTypeOption(&unionResult, &memberResult) {
+    return false
+  }
+  let unionFailure = run signatureFailure(underUnion)
+  let memberFailure = run signatureFailure(underMember)
+  return sameReusableType(&unionFailure, &memberFailure)
+}
+
 struct ResolvedWitness {
   application: Application
   operands: List<OperandPass>
@@ -74943,6 +75299,18 @@ effect fn completedWitnessApplication(resolver: &mut Resolver, owner: &mut Query
   module: &ModuleId, span: Span) -> Result<ResolvedWitness, Shared<Rejection>>
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let operation = DeclarationId.copyShared(&recipe.operation)
+  // A union provider's witness is the operation itself under `Self := U`; its instance dispatches
+  // on the receiver's tag (UNION-003), so every operand passes as written.
+  if Shared<Type>.with<bool>(&recipe.provider, unionType) {
+    let application = run unionOperationApplication(recipe, &operation)
+    let mut operands = List<OperandPass>.make()
+    let mut at = usize.ZERO
+    while at < CallableWitness.argumentCount(recipe) {
+      run List<OperandPass>.append(&mut operands, OperandPass.Value)
+      at = at + usize.ONE
+    }
+    return Result<ResolvedWitness, Shared<Rejection>>.succeed(ResolvedWitness {application: move application, operands: move operands})
+  }
   let selected = run resolveWitnessApplication(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*,
     true, &recipe.contract, &recipe.provider, &operation, module, span)
   let witness = match move selected {
@@ -74973,6 +75341,52 @@ effect fn completedWitnessApplication(resolver: &mut Resolver, owner: &mut Query
   }
   let application = run Application.applyBindings(&witness.application, List<Binding>.asSlice(&invocation))
   return Result<ResolvedWitness, Shared<Rejection>>.succeed(ResolvedWitness {application: move application, operands: move witness.operands})
+}
+
+// The application of interface operation `operation` itself: its own binders take the
+// invocation's assignments, and its interface's binders take the contract's arguments and then
+// the provider as `Self`.
+effect fn unionOperationApplication(recipe: &WitnessRecipe, operation: &DeclarationId) -> Application
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut arguments = List<Argument>.make()
+  let mut ordinals = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < CallableWitness.bindingCount(recipe) {
+    let binding = CallableWitness.bindingAt(recipe, at)
+    let own = Shared<DeclarationId>.with<bool>(&binding.declaration, fn(value: &DeclarationId) -> bool {
+      return DeclarationId.equals(value, operation)
+    })
+    if own {
+      run List<Argument>.append(&mut arguments, move binding.value)
+      run List<usize>.append(&mut ordinals, binding.ordinal)
+    }
+    at = at + usize.ONE
+  }
+  let mut enclosing = List<Argument>.make()
+  let mut enclosingOrdinals = List<usize>.make()
+  let mut count = Shared<Type>.with<usize>(&recipe.contract, applicationLength)
+  if count == usize.MAX { count = usize.ZERO }
+  at = usize.ZERO
+  while at < count {
+    let argument = Shared<Type>.with<Option<Argument>>(&recipe.contract, fn(value: &Type) -> Option<Argument> {
+      return applicationArgument(value, at)
+    })
+    if let Option<Argument>.Some {value} = move argument {
+      run List<usize>.append(&mut enclosingOrdinals, List<Argument>.length(&enclosing))
+      run List<Argument>.append(&mut enclosing, move value)
+    }
+    at = at + usize.ONE
+  }
+  run List<usize>.append(&mut enclosingOrdinals, List<Argument>.length(&enclosing))
+  run List<Argument>.append(&mut enclosing, Argument.Type {value: Shared<Type>.clone(&recipe.provider)})
+  let contractOwner = run DeclarationId.enclosing(operation, DeclarationId.ownerCount(operation) - usize.ONE)
+  let mut scopes = List<ScopeBinding>.make()
+  run List<ScopeBinding>.append(&mut scopes, ScopeBinding {owner: run Shared<DeclarationId>.make(move contractOwner),
+    arguments: move enclosing, argumentOrdinals: move enclosingOrdinals})
+  let target = SpecializationTarget.Operation {contract: Shared<Type>.clone(&recipe.contract),
+    provider: Shared<Type>.clone(&recipe.provider), operation: DeclarationId.copy(operation), implementation: DeclarationId.copy(operation)}
+  return Application {target: move target, arguments: move arguments,
+    argumentOrdinals: move ordinals, scopes: move scopes, statics: List<StaticSlot>.make()}
 }
 
 struct WitnessEntry {

@@ -1732,6 +1732,47 @@ and uncovered members. Ownership diagnostics still apply when moving an affine p
 [compatibility implementation](../bootstrap/packages/compiler/src/TypeCompatibility.ts),
 [match narrowing](functions-callables-and-control-flow.md#match-004--matching-narrows-only-inside-the-selected-arm).
 
+### UNION-003 — A union takes a reference-only interface that every member implements
+
+**Status:** Confirmed
+
+A structural union conforms to an interface when every member conforms to it and every operation
+of the interface receives `self` through `&Self` or `&mut Self` and names `Self` in no other
+parameter, its result or its failure. A call on the union runs the active member's operation with
+the remaining arguments unchanged.
+
+```silk
+import silk.allocator { OutOfMemoryError }
+import silk.format { Format }
+import silk.json_scanner { JsonError, JsonReason }
+import silk.writer { Writer, WriterError }
+
+fn failure(flag: bool) -> JsonError | OutOfMemoryError {
+  if flag {
+    return JsonError.at(JsonReason.UnexpectedByte, 3)
+  }
+  return OutOfMemoryError {}
+}
+
+effect fn report() -> () ! WriterError ? &mut Writer {
+  return run Format.format("{:?}\n", &(failure(true), ))
+}
+```
+
+`JsonError | OutOfMemoryError` is `Debug` because both members are, so `{:?}` prints the active
+member's `Debug` form. A generic bound such as `T: Debug` accepts the union the same way.
+
+**Boundary:** The union never owns an implementation and no `impl` may name it (IMPL-001). An
+operation that takes `self` by value, returns `Self`, or takes a second `Self` operand cannot pick
+one member, so an interface with such an operation never applies to a union.
+
+**Diagnostics:** A member without the interface reports `SEM0121` naming that member. An interface
+with an operation that cannot dispatch on the tag reports `SEM0121` naming the operation.
+
+**Current compiler:** Aligned for qualified and generic calls, such as `Describe.describe(&value)`
+and `Format.debug(&value)`. Method syntax on a union value, such as `value.describe()`, is not
+supported yet.
+
 ### INFER-001 — A binding keeps the precise type of its initializer
 
 **Status:** Confirmed
