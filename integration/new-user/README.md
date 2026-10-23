@@ -77,7 +77,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `fuzz/http-client/` | `server.py` answers each path on 127.0.0.1:18081 with a scripted, sometimes broken, response; `main.silk` reads a base line, a bundle line, then one URL per line from standard input and prints what `NativeHttp` made of each |
 | `fuzz/huge-sources.py <dir>` | Huge and malformed sources (deep nesting, 30,000 lets, binary garbage, a BOM); flags crashes and timeouts |
 | `node fuzz/lsp-edits.mjs <package> <seed> <steps> [burst]` | Random edits to the package's `src/main.silk` in `silk lsp`, with hover, completion, definition, symbols and formatting after each; compares diagnostics with `silk check` |
-| `node fuzz/lsp-modules.mjs <empty dir> <seed> <steps>` | Writes a three-module package, then makes random edits to the two imported modules in `silk lsp` and checks every open file's diagnostics against `silk check` (`LSP_TRACE=1` prints each publish) |
+| `node fuzz/lsp-modules.mjs <empty dir> <seed> <steps>` | Writes a three-module package, then makes random edits to the two imported modules in `silk lsp` and checks every open file's diagnostics against `silk check` (`LSP_TRACE=1` prints each publish). Like the tests, it runs the `silk` on PATH under `$HOME/.silk/bin` unless `SILK_NEW_USER_COMPILER` is set |
 
 For example, 100 arithmetic programs, three at a time:
 

@@ -145,6 +145,19 @@ test('importing a name the module lacks is reported on the import line', async (
   assert.ok(diagnostics.some((diagnostic) => diagnostic.code === 'SEM0014' && diagnostic.range.start.line === 1), JSON.stringify(diagnostics))
 })
 
+test('a missing import member is still reported when the file has other errors', async () => {
+  const other = initPackage(h, 'editor-two-errors')
+  const file = join(other, 'src/main.silk')
+  write(file, 'import silk.list { Nope }\n\npub fn main() -> i32 {\n  return missing()\n}\n')
+  const lone = startServer(h, other)
+  await lone.initialize(other)
+  lone.notify('textDocument/didOpen', { textDocument: { uri: uriOf(file), languageId: 'silk', version: 1, text: read(file) } })
+  const diagnostics = await lone.diagnostics(uriOf(file), 120_000)
+  await lone.shutdown()
+  const codes = diagnostics.map((diagnostic) => `${diagnostic.range.start.line + 1}:${diagnostic.code}`)
+  assert.deepEqual(codes.sort(), ['1:SEM0014', '4:SEM0004'])
+})
+
 test('a missing pinned toolchain still starts a server that explains it', { skip: compiler === '' ? false : 'SILK_NEW_USER_COMPILER bypasses the pin' }, async () => {
   const other = initPackage(h, 'editor-unpinned')
   const manifest = join(other, 'silk.toml')

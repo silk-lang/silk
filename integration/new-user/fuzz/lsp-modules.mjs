@@ -129,7 +129,7 @@ for (let step = 0; step < steps; step++) {
   // Compare the importer files only: their diagnostics depend on the edited module.
   for (const name of Object.keys(uris)) if (name !== target) got.push(...lspCodes(name, latest[name]))
   // SEM0014 (import of a missing member) never reaches the editor: finding 31.
-  const wantOthers = want.filter((c) => !c.startsWith(target + ':') && !c.endsWith(':SEM0014')).sort()
+  const wantOthers = want.filter((c) => !c.startsWith(target + ':')).sort()
   got.sort()
   if (JSON.stringify(wantOthers) !== JSON.stringify(got)) {
     mismatches++
