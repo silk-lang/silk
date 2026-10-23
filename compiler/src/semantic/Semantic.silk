@@ -54,6 +54,8 @@ import backend.DropGlue {
   Variant as GlueVariant,
 }
 import backend.InstanceKey {HelperRole, InstanceKey, ProviderEntry}
+import backend.CodegenUnits
+import backend.CodegenUnits {CodegenUnit, Defined}
 import backend.Mir
 import backend.MirVerification
 import backend.MirVerification {UseAfterDrop}
@@ -384,6 +386,7 @@ import silk.u32
 import silk.usize
 import silk.u64
 import silk.list {List}
+import silk.slice {Slice}
 
 /// The semantic fact selected by a query key.
 pub enum Family {
@@ -960,7 +963,9 @@ pub union Value {
 pub union BackendBuild {
   /// `unchecked` counts the emitted definitions and the unemitted checked root bodies not
   /// borrow-checked, per `uncheckedReason`.
-  Module {pub text: Bytes, pub unchecked: List<usize>, pub plan: EmissionPlan},
+  /// `units` holds the same definitions split into codegen units when the store selected them
+  /// ([`Semantic.selectCodegenUnits`]), and is empty otherwise.
+  Module {pub text: Bytes, pub unchecked: List<usize>, pub plan: EmissionPlan, pub units: List<CodegenUnit>},
   Unsupported {pub gaps: List<Shared<BackendGap>>},
   /// Source refusals, in the order the walk reached them, with every gap reached beside them.
   /// A refused instance contributes no references, so the walk continues past it and reports
@@ -2454,6 +2459,8 @@ struct Resolver {
   emissionInputs: List<EmissionInputs>
   llvmInputs: List<LlvmInput>
   llvmValues: List<InstanceDefinition>
+  // Whether an assembled module is also split into codegen units.
+  codegenUnits: bool
   // Each interned table below keeps its lookup beside it, so interning never scans the table.
   modules: List<ModuleId>
   moduleLookup: InternIndex
@@ -79702,6 +79709,7 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       emissionInputs: List<EmissionInputs>.make(),
       llvmInputs: List<LlvmInput>.make(),
       llvmValues: List<InstanceDefinition>.make(),
+      codegenUnits: false,
       modules: List<ModuleId>.make(),
       moduleLookup: InternIndex.make(),
       declarations: DeclarationTable.make(),
@@ -80573,6 +80581,12 @@ impl Semantic {
     return run Semantic.finishSweep(&mut self.*, &mut request.*, List<usize>.asSlice(&modules), runtime, move sweep)
   }
 
+  /// Selects whether `buildArtifact` also splits its module into codegen units
+  /// (`BackendBuild.Module.units`), so the driver can compile and cache each unit's object apart.
+  pub fn selectCodegenUnits(self: &mut Self, split: bool) -> () {
+    self.resolver.codegenUnits = split
+  }
+
   effect fn showProgress(self: &mut Self, module: &ModuleId) -> () ! OutOfMemoryError ? &mut Allocator {
     if Progress.timing(&self.resolver.progress) || run Progress.due(&self.resolver.progress) {
       let shown = run ModuleId.copyPath(module)
@@ -80593,7 +80607,6 @@ impl Semantic {
       unchecked: List<UncheckedDeclaration>.make()}
     let mut deferred = List<DeferredStaticTemplate>.make()
     let mut uncheckedBodies = List<UncheckedBody>.make()
-    let mut concrete = List<DeclarationId>.make()
     let mut at = usize.ZERO
     while at < modules.length {
       let module = resolvedModule(&self.resolver, modules[at])
@@ -80601,22 +80614,63 @@ impl Semantic {
       let found = run Semantic.keptSweep(&mut self.*, &mut request.*, &module, modules[at])
       at = at + usize.ONE
       let memos = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+      let mut concrete = List<DeclarationId>.make()
       run mergeSweep(&mut result, &mut concrete, &memos[found].sweep)
       run appendDeferred(&mut deferred, List<DeferredStaticTemplate>.asSlice(&memos[found].deferred))
       run appendUnchecked(&mut uncheckedBodies, List<UncheckedBody>.asSlice(&memos[found].unchecked))
+      // Each module keeps the escapes of its own bodies, so an edit reruns its module's walk alone.
+      let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, modules[at - usize.ONE], modules, List<DeclarationId>.asSlice(&concrete))
+      run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
+      run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
     }
     let mut conflicts = List<Shared<Rejection>>.make()
     run Semantic.checkForeignClaims(&mut self.*, modules, runtime, &mut conflicts)
     run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&conflicts))
-    // A whole check's escapes are kept per first module, so a runtime's check and its root
-    // package's check keep one memo each instead of replacing each other's.
-    let mut first = usize.ZERO
-    if modules.length > usize.ZERO { first = modules[0] }
-    let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, first, true, List<DeclarationId>.asSlice(&concrete))
-    run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
-    run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
     self.deferredTemplates = move deferred
     self.uncheckedRoot = move uncheckedBodies
+    return move result
+  }
+
+  /// The rejections `checkDeclarations` would report from one escape walk over every concrete body
+  /// of `rootPackage`, instead of each module's own walk, which stops at the plain bodies of the
+  /// package's other modules. `silk check --roots` compares the two; nothing is kept.
+  pub effect fn wholePackageCheck(
+    self: &mut Self,
+    request: &mut Request,
+    rootPackage: &[ModuleId],
+    runtime: &Option<ModuleId>,
+  ) -> DeclarationCheckResult
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    run selectRequest(&mut self.resolver, &request.*)
+    let mut modules = List<usize>.make()
+    let mut rootAt = usize.ZERO
+    while rootAt < rootPackage.length {
+      run appendCheckedModule(&mut modules, run internModule(&mut self.resolver, &rootPackage[rootAt]))
+      rootAt = rootAt + usize.ONE
+    }
+    if !Graph.recording(&self.resolver.graph) {
+      return run Semantic.checkDeclarations(&mut self.*, &mut request.*, rootPackage, runtime)
+    }
+    let mut result = DeclarationCheckResult {rejections: List<Shared<Rejection>>.make(), gaps: List<Shared<BackendGap>>.make(),
+      unchecked: List<UncheckedDeclaration>.make()}
+    let mut concrete = List<DeclarationId>.make()
+    let listed = List<usize>.asSlice(&modules)
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let module = resolvedModule(&self.resolver, listed[at])
+      let found = run Semantic.keptSweep(&mut self.*, &mut request.*, &module, listed[at])
+      let memos = List<ModuleCheckMemo>.asSlice(&self.moduleMemos)
+      run mergeSweep(&mut result, &mut concrete, &memos[found].sweep)
+      at = at + usize.ONE
+    }
+    let mut conflicts = List<Shared<Rejection>>.make()
+    run Semantic.checkForeignClaims(&mut self.*, listed, runtime, &mut conflicts)
+    run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&conflicts))
+    let escapes = run Semantic.declarationEscapes(&mut self.*, &mut request.*, List<DeclarationId>.asSlice(&concrete),
+      &Option<WalkBoundary>.none())
+    run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
+    run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
     return move result
   }
 
@@ -80658,7 +80712,7 @@ impl Semantic {
     let mut claims = List<Shared<Rejection>>.make()
     run Semantic.checkForeignClaims(&mut self.*, &[moduleOrdinal], runtime, &mut claims)
     run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&claims))
-    let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, moduleOrdinal, false, List<DeclarationId>.asSlice(&concrete))
+    let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, moduleOrdinal, &[], List<DeclarationId>.asSlice(&concrete))
     run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
     run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
     return move result
@@ -80706,16 +80760,37 @@ impl Semantic {
     return move sweep
   }
 
-  // The escapes of `concrete`, kept for one module's check or, when `wholeCheck`, for a whole
-  // check whose first module is `module`. They run again when the bodies differ or the unit
-  // neither is current nor verifies.
-  effect fn keptEscapes(self: &mut Self, request: &mut Request, module: usize, wholeCheck: bool, concrete: &[DeclarationId]) -> DeclarationCheckResult
+  // The escapes of `concrete`, the concrete bodies of `module`, kept for its check. They run again
+  // when the bodies differ or the unit neither is current nor verifies. The walk leaves the plain
+  // bodies of the other modules `checked` lists, and of the application's package, to their own
+  // checks (`WalkBoundary`), so it rests on this module's bodies and what they instantiate, not
+  // on the whole program. Its key names the `checked` modules, since a module that leaves them is
+  // walked here again.
+  effect fn keptEscapes(self: &mut Self, request: &mut Request, module: usize, checked: &[usize], concrete: &[DeclarationId]) -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
-    let mut whole = usize.ZERO
-    if wholeCheck { whole = usize.ONE }
+    let own = resolvedModule(&self.resolver, module)
+    let mut package = ModuleId.copy(&own)
+    if self.resolver.currentApplication != usize.MAX { package = resolvedModule(&self.resolver, self.resolver.currentApplication) }
+    // The application's own modules are always left to their own checks, so only the checked
+    // modules of other packages name the unit: adding or renaming a module of the package keeps
+    // every other module's unit.
+    let mut others = List<ModuleId>.make()
+    let mut lookup = InternIndex.make()
+    let mut digest: u64 = 0
+    let mut at = usize.ZERO
+    while at < checked.length {
+      let listed = resolvedModule(&self.resolver, checked[at])
+      at = at + usize.ONE
+      if ModuleId.samePackage(&listed, &package) { continue }
+      digest = Hash.mix(&Hash.seed(digest), ModuleId.hash(&listed))
+      run InternIndex.record(&mut lookup, ModuleId.hash(&listed))
+      run List<ModuleId>.append(&mut others, move listed)
+    }
+    let mut member = usize.ZERO
+    if List<ModuleId>.length(&others) > usize.ZERO { member = u64.toUsize(u64.shiftRight(digest, 1)) }
     let word = run internKey(&mut self.resolver, Key {family: Family.ModuleCheck, module: module, name: usize.ONE,
-      declaration: usize.MAX, member: whole, external: false})
+      declaration: usize.MAX, member: member, external: false})
     let unit = u64.toUsize(word.value)
     let found = escapeMemoOf(List<EscapeMemo>.asSlice(&self.escapeMemos), unit)
     if found != usize.MAX {
@@ -80731,7 +80806,9 @@ impl Semantic {
     self.resolver.runs = self.resolver.runs + usize.ONE
     self.checkRuns = self.checkRuns + usize.ONE
     self.resolver.rootRecorder = unit
-    let attempted = run Effect.result(Semantic.declarationEscapes(&mut self.*, &mut request.*, concrete))
+    let boundary = Option<WalkBoundary>.some(WalkBoundary {package: move package, own: move own, checked: move others,
+      lookup: move lookup})
+    let attempted = run Effect.result(Semantic.declarationEscapes(&mut self.*, &mut request.*, concrete, &boundary))
     self.resolver.rootRecorder = usize.MAX
     let result = match move attempted {
       Result<DeclarationCheckResult, Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError>.Success {value} => move value
@@ -80899,7 +80976,8 @@ impl Semantic {
     let safety = run Semantic.declarationEscapes(
       &mut self.*,
       &mut request.*,
-      List<DeclarationId>.asSlice(&sweep.concrete)
+      List<DeclarationId>.asSlice(&sweep.concrete),
+      &Option<WalkBoundary>.none()
     )
     let found = List<Shared<Rejection>>.asSlice(&safety.rejections)
     let mut at = usize.ZERO
@@ -81439,7 +81517,8 @@ impl Semantic {
   effect fn declarationEscapes(
     self: &mut Self,
     request: &mut Request,
-    declarations: &[DeclarationId]
+    declarations: &[DeclarationId],
+    boundary: &Option<WalkBoundary>,
   ) -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
@@ -81456,6 +81535,11 @@ impl Semantic {
     let mut certified = List<Application>.make()
     let mut certifiedLookup = InternIndex.make()
     let mut cleanupAnswers = List<CleanupAnswer>.make()
+    // Plain bodies a bounded walk left to their own module's check, walked after all only when a
+    // callback boundary needs the whole call graph below it (`localSharedEscapes`).
+    let mut left = List<BackendVisit>.make()
+    let mut bounded = false
+    if let Option<WalkBoundary>.Some {..} = &boundary.* { bounded = true }
     let mut at = usize.ZERO
     while at < declarations.length {
       let declaration = &declarations[at]
@@ -81501,7 +81585,15 @@ impl Semantic {
         }
       }
     }
-    while List<BackendVisit>.length(&pending) > usize.ZERO {
+    while true {
+      // A bounded walk that reached a callback access walks the bodies it left after all.
+      if List<BackendVisit>.length(&pending) == usize.ZERO {
+        if !bounded || List<BackendVisit>.length(&left) == usize.ZERO || !anyCallbackAccess(List<SuspensionSummary>.asSlice(&summaries)) {
+          break
+        }
+        bounded = false
+        pending = Intrinsic.replace(left, List<BackendVisit>.make())
+      }
       let visit = match move List<BackendVisit>.pop(&mut pending) {
         Option<BackendVisit>.Some { value } => move value
         _ => {
@@ -81535,6 +81627,15 @@ impl Semantic {
       // remain foreign edges, exactly as in the executable walk; no MIR body is fabricated.
       if run foreignDeclaration(&mut self.resolver, &instance) {
         continue
+      }
+      if bounded {
+        if let Option<WalkBoundary>.Some {value: walk} = &boundary.* {
+          if run walkedElsewhere(&walk, &instance) {
+            run List<BackendVisit>.append(&mut left, BackendVisit.Enter {key: move instance, edge: move entered.edge,
+              span: entered.span, module: move entered.module, cleanup: move entered.cleanup, requester: move entered.requester})
+            continue
+          }
+        }
       }
       let mut leave = false
       if let Option<Shared<Application>>.Some { .. } = move InstanceKey.application(&instance) {
@@ -84865,12 +84966,15 @@ effect fn assembleEmissionChecked(
   }
   let mut text = run LlvmText.declarations(&resolver.target)
   run appendEmissionDeclarations(&mut text, &bound)
+  let header = run Bytes.copy(Bytes.asSlice(&text))
   let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
+  let mut definedObjects = Bytes.make()
   let mut object = usize.ZERO
   while object < objects.length {
-    run Bytes.append(&mut text, Bytes.asSlice(&objects[object].definition))
+    run Bytes.append(&mut definedObjects, Bytes.asSlice(&objects[object].definition))
     object = object + usize.ONE
   }
+  run Bytes.append(&mut text, Bytes.asSlice(&definedObjects))
   let order = run emissionOrder(&plan)
   let unchecked = run appendResolvedDefinitions(
     resolver,
@@ -84879,8 +84983,120 @@ effect fn assembleEmissionChecked(
     List<usize>.asSlice(&order),
     &mut text,
   )
-  run appendRetained(&plan, roots, &mut text)
-  return BackendBuild.Module {text: move text, unchecked: move unchecked, plan: move plan}
+  let mut retained = Bytes.make()
+  run appendRetained(&plan, roots, &mut retained)
+  run Bytes.append(&mut text, Bytes.asSlice(&retained))
+  let mut units = List<CodegenUnit>.make()
+  if resolver.codegenUnits {
+    run Bytes.append(&mut definedObjects, Bytes.asSlice(&retained))
+    units = run assembleUnits(resolver, reached, &plan, List<usize>.asSlice(&order), Bytes.asSlice(&header), Bytes.asSlice(&definedObjects))
+  }
+  return BackendBuild.Module {text: move text, unchecked: move unchecked, plan: move plan, units: move units}
+}
+
+// The codegen units of an assembled module: one per module whose instances it defines, in the
+// order of that module's first definition, then one of `tail`, the exported objects and the
+// retained-root array, when there are any. Every unit starts with `header`. A definitions unit
+// declares each exported object and each function of another unit its text names, then holds its
+// definitions in emission order, so a unit's text changes only when its own definitions or the
+// signatures it names do.
+effect fn assembleUnits(resolver: &Resolver, reached: &[CollectedText], plan: &EmissionPlan, order: &[usize], header: &[u8],
+  tail: &[u8]) -> List<CodegenUnit> ! OutOfMemoryError ? &mut Allocator {
+  let inputs = List<InstanceDefinition>.asSlice(&resolver.llvmValues)
+  let identities = List<EmissionIdentity>.asSlice(&plan.identities)
+  let mut modules = List<ModuleId>.make()
+  let mut moduleLookup = InternIndex.make()
+  // The unit of each definition in emission order.
+  let mut placed = List<usize>.make()
+  let mut symbols = List<Bytes>.make()
+  let mut declarations = List<Bytes>.make()
+  let mut owners = List<usize>.make()
+  let mut symbolLookup = InternIndex.make()
+  let mut at = usize.ZERO
+  while at < order.length {
+    let identity = &identities[order[at]]
+    let owner = InstanceKey.identity(&reached[identity.representative].key)
+    let declaration = DeclarationId.copyShared(&owner)
+    let module = DeclarationId.moduleId(&declaration)
+    let mut unit = InternIndex.first(&moduleLookup, ModuleId.hash(module))
+    while unit != usize.MAX && !ModuleId.equals(&List<ModuleId>.asSlice(&modules)[unit], module) {
+      unit = InternIndex.after(&moduleLookup, unit)
+    }
+    if unit == usize.MAX {
+      unit = List<ModuleId>.length(&modules)
+      run List<ModuleId>.append(&mut modules, ModuleId.copy(module))
+      run InternIndex.record(&mut moduleLookup, ModuleId.hash(module))
+    }
+    run List<usize>.append(&mut placed, unit)
+    let defined = run CodegenUnits.defined(Bytes.asSlice(&inputs[reached[identity.representative].index].text))
+    let mut found = move defined
+    while List<Defined>.length(&found) > usize.ZERO {
+      let entry = List<Defined>.remove(&mut found, usize.ZERO)
+      run InternIndex.record(&mut symbolLookup, InternIndex.hashBytes(0, Bytes.asSlice(&entry.symbol)))
+      run List<Bytes>.append(&mut symbols, move entry.symbol)
+      run List<Bytes>.append(&mut declarations, move entry.declaration)
+      run List<usize>.append(&mut owners, unit)
+    }
+    at = at + usize.ONE
+  }
+  let mut externals = Bytes.make()
+  let objects = List<ExportedObject>.asSlice(&resolver.exportedObjects)
+  at = usize.ZERO
+  while at < objects.length {
+    run Bytes.append(&mut externals, Bytes.asSlice(&objects[at].external))
+    at = at + usize.ONE
+  }
+  let unitCount = List<ModuleId>.length(&modules)
+  // The unit, plus one, whose declarations last listed each symbol.
+  let mut listed = List<usize>.make()
+  while List<usize>.length(&listed) < List<Bytes>.length(&symbols) { run List<usize>.append(&mut listed, usize.ZERO) }
+  let mut units = List<CodegenUnit>.make()
+  let mut unit = usize.ZERO
+  while unit < unitCount + usize.ONE {
+    let mut body = Bytes.make()
+    if unit < unitCount {
+      at = usize.ZERO
+      while at < order.length {
+        if List<usize>.get(&placed, at) == unit {
+          let identity = &identities[order[at]]
+          run Bytes.append(&mut body, Bytes.asSlice(&inputs[reached[identity.representative].index].text))
+          run Bytes.append(&mut body, b"\n")
+        }
+        at = at + usize.ONE
+      }
+    } else {
+      if tail.length == usize.ZERO { break }
+      run Bytes.append(&mut body, tail)
+    }
+    let mut text = run Bytes.copy(header)
+    if unit < unitCount { run Bytes.append(&mut text, Bytes.asSlice(&externals)) }
+    let written = Bytes.asSlice(&body)
+    let mut scan = usize.ZERO
+    while scan < written.length {
+      if written[scan] != 64 {
+        scan = scan + usize.ONE
+        continue
+      }
+      let end = CodegenUnits.nameEnd(written, scan + usize.ONE)
+      let name = Slice.view<u8>(written, scan + usize.ONE, end - scan - usize.ONE)
+      scan = end
+      let mut symbol = InternIndex.first(&symbolLookup, InternIndex.hashBytes(0, name))
+      while symbol != usize.MAX {
+        if same(Bytes.asSlice(&List<Bytes>.asSlice(&symbols)[symbol]), name) {
+          if List<usize>.get(&owners, symbol) != unit && List<usize>.get(&listed, symbol) != unit + usize.ONE {
+            List<usize>.set(&mut listed, symbol, unit + usize.ONE)
+            run Bytes.append(&mut text, Bytes.asSlice(&List<Bytes>.asSlice(&declarations)[symbol]))
+          }
+          break
+        }
+        symbol = InternIndex.after(&symbolLookup, symbol)
+      }
+    }
+    run Bytes.append(&mut text, written)
+    run List<CodegenUnit>.append(&mut units, CodegenUnit {text: move text})
+    unit = unit + usize.ONE
+  }
+  return move units
 }
 
 // Marks every retained root's definition used (ARTIFACT-003), so neither the optimizer nor the
@@ -85047,6 +85263,88 @@ struct SuspensionSummary {
   callbacks: List<CallbackBoundary>
   accesses: List<CallbackBoundary>
   escapes: List<SummaryEscape>
+}
+
+// Where a module's escape walk stops: at the plain instance of a declaration in another module of
+// `package`'s package or of `checked`, which that module's own escape check walks from its
+// concrete bodies.
+struct WalkBoundary {
+  // A module of the package whose modules check their own bodies: the application's, else `own`.
+  package: ModuleId
+  // The module whose concrete bodies the walk starts from.
+  own: ModuleId
+  // The other modules this check walks from their own bodies, by `ModuleId.hash` in `lookup`.
+  checked: List<ModuleId>
+  lookup: InternIndex
+}
+
+// Whether a walk bounded by `walk` leaves `instance` to another module's escape check.
+effect fn walkedElsewhere(walk: &WalkBoundary, instance: &InstanceKey) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let identity = match &instance.* {
+    InstanceKey.Function {..} => InstanceKey.identity(instance)
+    _ => { return false }
+  }
+  let declaration = DeclarationId.copyShared(&identity)
+  let module = DeclarationId.moduleId(&declaration)
+  if ModuleId.equals(module, &walk.own) { return false }
+  if !ModuleId.samePackage(module, &walk.package) {
+    let listed = List<ModuleId>.asSlice(&walk.checked)
+    let mut at = InternIndex.first(&walk.lookup, ModuleId.hash(module))
+    while at != usize.MAX && !ModuleId.equals(&listed[at], module) { at = InternIndex.after(&walk.lookup, at) }
+    if at == usize.MAX { return false }
+  }
+  // Only the declaration's own plain instance is a body its module walks; an instance with type,
+  // static or provider arguments is walked here. Lifetime arguments and a method's owner scopes
+  // that bind none leave it plain.
+  if let Option<Shared<List<ProviderEntry>>>.Some {value: providers} = InstanceKey.providers(instance) {
+    let provided = Shared<List<ProviderEntry>>.with<bool>(&providers, fn(value: &List<ProviderEntry>) -> bool {
+      return List<ProviderEntry>.length(value) > usize.ZERO
+    })
+    if provided { return false }
+  }
+  return match InstanceKey.application(instance) {
+    Option<Shared<Application>>.Some {value} => Shared<Application>.with<bool>(&value, fn(application: &Application) -> bool {
+      return plainApplication(application)
+    })
+    Option<Shared<Application>>.None => false
+  }
+}
+
+// Whether `application` supplies only lifetimes, which leave the body its module walks unchanged.
+fn plainApplication(application: &Application) -> bool {
+  if List<StaticSlot>.length(&application.statics) > usize.ZERO || !onlyLifetimes(List<Argument>.asSlice(&application.arguments)) {
+    return false
+  }
+  let scopes = List<ScopeBinding>.asSlice(&application.scopes)
+  let mut at = usize.ZERO
+  while at < scopes.length {
+    if !onlyLifetimes(List<Argument>.asSlice(&scopes[at].arguments)) { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn onlyLifetimes(arguments: &[Argument]) -> bool {
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    match &arguments[at] {
+      Argument.Lifetime {..} => {}
+      _ => { return false }
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether any reached body hands a local shared access to a callback, whose escapes
+// `localSharedEscapes` finds by walking every body the callback reaches.
+fn anyCallbackAccess(summaries: &[SuspensionSummary]) -> bool {
+  let mut at = usize.ZERO
+  while at < summaries.length {
+    if List<CallbackBoundary>.length(&summaries[at].accesses) > usize.ZERO { return true }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 impl SuspensionSummary {
