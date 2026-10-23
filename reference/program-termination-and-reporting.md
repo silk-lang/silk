@@ -198,6 +198,9 @@ fatal trap: division by zero
   at app.main (src/app.silk:14)
 ```
 
+A trap inside a task that an Execution runs, such as a Fiber child, reports the same way to the
+observer of the code driving it.
+
 A stack overflow on the main thread of a hosted native program is a trap too. Its report is
 `fatal trap: stack overflow` without frames, written from a separate signal stack; another invalid
 memory access reports `fatal trap: segmentation fault`. The process then ends with the signal.
