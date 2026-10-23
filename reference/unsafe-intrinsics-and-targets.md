@@ -1150,15 +1150,15 @@ A foreign call retains its ordinary externally linked C symbol and classified si
 Unannotated calls access externally reachable memory conservatively. Only the explicit sealed [foreign contract](foreign-call-contracts.md) supplies narrower memory, capture, alias or no-return assertions. Raw pointers cross as address lanes; address-taken Silk roots are still reloaded after each call. Ordinary foreign data/error-state reads stay ordinary loads, with no recognized accessor names, global volatility or hardware fences.
 
 Link inputs are compiler-generated objects followed by the ordered structured inputs the project
-manifest names. The optional `[build]` table's `native-link-inputs` array accepts object paths,
+manifest names. The optional `[native]` table's `link` array accepts object paths,
 static-archive paths, named libraries with an explicit static or dynamic mode, search paths, and
 Apple frameworks. Paths are resolved relative to the manifest and may not escape the project; a
 name with a path separator, whitespace, NUL, or leading `-` is rejected. Arbitrary linker flags
 stay out of source and manifest.
 
 ```toml
-[build]
-native-link-inputs = [
+[native]
+link = [
   { search-path = "vendor/lib" },
   { library = "m", mode = "dynamic" },
   { static-archive = "vendor/libsupport.a" },
