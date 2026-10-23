@@ -214,3 +214,28 @@ test('a stack overflow says so instead of a bare segmentation fault', { todo: 'f
   const result = silk(h, ['run', '--quiet'], { cwd: dir })
   assert.match(result.stderr, /stack overflow/i, show(result))
 })
+
+test('a small float rounded to a precision prints zeros, not a leading 1', { todo: 'finding 40' }, () => {
+  const dir = initPackage(h, 'smallfloat')
+  write(join(dir, 'src/main.silk'), `${logging}  let a: f64 = 0.000001
+  let b: f64 = 0.000000006
+  let c: f64 = 1.0e-7
+  run Effect.log("{a:.3} {b:.2} {c:+.11}\\n", &.{ a: a, b: b, c: c }) |> Effect.provideMut(&mut logger)
+}
+`)
+  const result = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.equal(result.status, 0, show(result))
+  assert.equal(result.stdout, '0.000 0.00 +0.00000010000\n')
+})
+
+test('checking a module with 100 log calls takes a few seconds at most', { todo: 'finding 41' }, () => {
+  const dir = initPackage(h, 'manylogs')
+  let body = ''
+  for (let i = 0; i < 100; i++) body += `  run Effect.log("line ${i}: {v}\\n", &.{ v: ${i} }) |> Effect.provideMut(&mut logger)\n`
+  write(join(dir, 'src/main.silk'), `${logging}${body}}\n`)
+  const start = Date.now()
+  const result = silk(h, ['check'], { cwd: dir })
+  const seconds = (Date.now() - start) / 1000
+  assert.equal(result.status, 0, show(result))
+  assert.ok(seconds < 3, `silk check took ${seconds.toFixed(1)} s`)
+})

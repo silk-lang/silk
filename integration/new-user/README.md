@@ -67,6 +67,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `fuzz/collections.py` | Random operations on `HashMap`, `HashSet` and `List`, with a Python model |
 | `fuzz/trees.py` | Expression trees in `Box`-based unions, evaluated by reference, by a `mut fn` visitor and by consuming the tree, with a Python reference |
 | `fuzz/format-roundtrip.sh <package> <dir>` | Formats a copy of a package that checks clean, then checks the result is stable, still checks, and runs with the same output |
+| `fuzz/numfmt/run.sh <seed> <dir>` | Prints the same values with the same format specs from Silk and from Rust (`rustc` needed), and reports any line that differs |
 | `fuzz/huge-sources.py <dir>` | Huge and malformed sources (deep nesting, 30,000 lets, binary garbage, a BOM); flags crashes and timeouts |
 | `node fuzz/lsp-edits.mjs <package> <seed> <steps> [burst]` | Random edits to the package's `src/main.silk` in `silk lsp`, with hover, completion, definition, symbols and formatting after each; compares diagnostics with `silk check` |
 
