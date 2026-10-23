@@ -24,6 +24,7 @@ Run one area with `node --test integration/new-user/workspace.test.mjs`.
 | `SILK_NEW_USER_RUN_ALL` | `1` also runs docs programs whose output the page does not show, and fails on a crash. |
 | `SILK_NEW_USER_MIRROR`, `SILK_NEW_USER_SECOND` | A `SILK_TOOLCHAIN_MIRROR` directory and a full version in it (not the one `install.sh` picks). They enable the tests that install a second toolchain. Without them those tests are skipped. |
 | `SILK_NEW_USER_TMP` | Where the throwaway homes go. Default: the system temp folder. |
+| `SILK_NEW_USER_COMPILER` | A local `silk` binary to run instead of the installed release, through `SILK_TOOLCHAIN=local`, such as a build of main. It must sit at `<dir>/bin/silk` with the stdlib at `<dir>/lib/silk/stdlib`. install.sh still installs the release, so the install and toolchain tests keep testing that. |
 
 `HTTPS_PROXY` and `GITHUB_TOKEN` pass through to the installer.
 
@@ -34,8 +35,10 @@ A mirror holds one `v<version>/` folder per release, with the release's assets: 
 `docs-samples.mjs` builds every program in the docs (a ` ```silk ` block with a `main`) as `src/main.silk` of a fresh package. Where the page shows what the program prints, it compares the output. Where the page shows the errors it fails with, it compares code, line, column and message. It also reports which programs `silk format` would change.
 
 ```sh
-node integration/new-user/docs-samples.mjs ../docs [--filter book/07] [--run-all] [--json results.json]
+node integration/new-user/docs-samples.mjs ../docs [--filter book/07] [--run-all] [--release] [--json results.json]
 ```
+
+`--run-all` also runs programs whose output the page does not show, and flags crashes. `--release` runs every program in debug and release too, and flags any difference (`release-differs`).
 
 Excerpts that lean on the rest of the page are retried with the page's imports. Labelled files (`` `src/helper.silk`: ``, `` `silk.toml`: ``) become part of the same package. The few programs that need more than that, such as a C object or a running server, are listed in `contextual` with the reason.
 
@@ -50,4 +53,23 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `workspace.test.mjs` | Workspaces: init, build order, `-p`, test summary, format, doc, clean, manifest mistakes |
 | `diagnostics.test.mjs` | Common first-program mistakes and the error each gets, and `silk check --json` |
 | `lsp.test.mjs` | `silk lsp` as an editor starts it: diagnostics, hover, definition, completion, formatting, symbols, a missing toolchain |
-| `docs.test.mjs` | `docs-samples.mjs` as a test, one subtest per program |
+| `docs.test.mjs` | `docs-samples.mjs` as a test, one subtest per program, plus the guides whose blocks make one whole program, built in debug and release |
+| `stability.test.mjs` | Parser and typing corners, symbolic links, dependency diamonds, and warm rebuilds after edits matching clean builds |
+
+## Fuzzers
+
+`fuzz/` holds tools for the stability rounds. They are not tests: run them by hand, with the `silk` you want to test first on PATH (or `SILK_TOOLCHAIN=local` and a local build).
+
+| Tool | Does |
+| --- | --- |
+| `fuzz/compare.sh <generator> <seed> <dir>` | Generates a program and its expected output with a generator below, runs it in debug and release, and prints `MISMATCH` for any difference |
+| `fuzz/arithmetic.py` | i64 arithmetic, comparisons, loops, arrays, structs and helper functions, with a Python reference |
+| `fuzz/collections.py` | Random operations on `HashMap`, `HashSet` and `List`, with a Python model |
+| `fuzz/huge-sources.py <dir>` | Huge and malformed sources (deep nesting, 30,000 lets, binary garbage, a BOM); flags crashes and timeouts |
+| `node fuzz/lsp-edits.mjs <package> <seed> <steps> [burst]` | Random edits to the package's `src/main.silk` in `silk lsp`, with hover, completion, definition, symbols and formatting after each; compares diagnostics with `silk check` |
+
+For example, 100 arithmetic programs, three at a time:
+
+```sh
+seq 1 100 | xargs -P3 -I{} integration/new-user/fuzz/compare.sh integration/new-user/fuzz/arithmetic.py {} /tmp/fuzz
+```

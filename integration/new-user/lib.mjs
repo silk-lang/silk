@@ -17,6 +17,12 @@ export const docsRoot = process.env.SILK_NEW_USER_DOCS ?? ''
 // (the published one is https://raw.githubusercontent.com/silk-lang/silk/main/install.sh).
 const installer = process.env.SILK_NEW_USER_INSTALLER ?? join(repoRoot, 'install.sh')
 
+// SILK_NEW_USER_COMPILER is a local silk binary, for example a build of main, laid out as
+// <dir>/bin/silk with its stdlib at <dir>/lib/silk/stdlib. Commands then run it through
+// SILK_TOOLCHAIN=local instead of the installed release. install.sh still runs, so the
+// install and toolchain tests keep testing the release.
+const compiler = process.env.SILK_NEW_USER_COMPILER ?? ''
+
 // Release to install, as a tag. Empty means "whatever install.sh picks", like a new user.
 export const release = process.env.SILK_RELEASE ?? ''
 
@@ -49,6 +55,10 @@ export function userEnv(h, extra = {}) {
     PATH: `${join(h.silkHome, 'bin')}:${process.env.PATH}`,
     LANG: 'C.UTF-8',
     TERM: 'dumb',
+  }
+  if (compiler !== '') {
+    env.PATH = `${dirname(compiler)}:${env.PATH}`
+    env.SILK_TOOLCHAIN = 'local'
   }
   for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'GITHUB_TOKEN', 'SILK_CLANG']) {
     if (process.env[key] !== undefined) env[key] = process.env[key]

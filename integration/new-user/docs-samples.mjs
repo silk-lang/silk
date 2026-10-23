@@ -2,9 +2,10 @@
 // builds and runs each one in its own package the way a reader would after pasting it into
 // `src/main.silk`, and compares the output with the block the page shows after `silk run`.
 //
-//   node integration/new-user/docs-samples.mjs <docs checkout> [--filter <text>] [--run-all] [--json <file>]
+//   node integration/new-user/docs-samples.mjs <docs checkout> [--filter <text>] [--run-all] [--release] [--json <file>]
 //
 // --run-all also runs the programs whose output the page does not show, and fails on a crash.
+// --release also runs each of those with --release and fails when the result differs from debug.
 //
 // Exit status 1 when any sample fails to check or prints something other than the page says.
 import { spawn } from 'node:child_process'
@@ -125,6 +126,7 @@ export function collect(docs, filter = '') {
 }
 
 let runAll = false
+let compareRelease = false
 
 function run(h, args, cwd, timeout = 120_000) {
   return new Promise((done) => {
@@ -217,6 +219,13 @@ async function checkSample(h, sample, index) {
     if (ran.signal !== null || /fatal trap|unhandled error|Segmentation/.test(ran.stderr)) {
       return { ...sample, outcome: 'crashed', detail: `exit ${ran.status}${ran.signal ? `, ${ran.signal}` : ''}\n${ran.stdout}${ran.stderr}`.trimEnd() }
     }
+    if (compareRelease) {
+      const release = await run(h, ['run', '--quiet', '--release'], folder, 60_000)
+      const strip = (text) => text.split('\n').filter((line) => !/^Finished /.test(line)).join('\n')
+      if (release.status !== ran.status || release.signal !== ran.signal || release.stdout !== ran.stdout || strip(release.stderr) !== strip(ran.stderr)) {
+        return { ...sample, outcome: 'release-differs', detail: `debug: exit ${ran.status}${ran.signal ? `, ${ran.signal}` : ''}\n${ran.stdout}${strip(ran.stderr)}\nrelease: exit ${release.status}${release.signal ? `, ${release.signal}` : ''}\n${release.stdout}${strip(release.stderr)}`.trimEnd() }
+      }
+    }
     return { ...sample, outcome: 'ran', status: ran.status }
   }
   const ran = await run(h, ['run', '--quiet', ...runArguments(sample.expected.command)], folder)
@@ -242,10 +251,11 @@ function unknownOnly(stderr) {
 
 const code = (line) => /error\[(\w+)\]/.exec(line)[1]
 
-export const failing = (result) => ['check-failed', 'output-differs', 'errors-differ', 'crashed'].includes(result.outcome)
+export const failing = (result) => ['check-failed', 'output-differs', 'errors-differ', 'crashed', 'release-differs'].includes(result.outcome)
 
-export async function checkAll(docs, { filter = '', jobs = Math.max(1, cpus().length - 1), all = false } = {}) {
-  runAll = all
+export async function checkAll(docs, { filter = '', jobs = Math.max(1, cpus().length - 1), all = false, release = false } = {}) {
+  runAll = all || release
+  compareRelease = release
   const h = sharedHome()
   const samples = collect(docs, filter)
   const results = new Array(samples.length)
@@ -261,14 +271,56 @@ export async function checkAll(docs, { filter = '', jobs = Math.max(1, cpus().le
   return results
 }
 
+// Guides whose code blocks, in order, make up one whole program. A reader who pastes every block
+// into src/main.silk must get a program that builds, in debug and release, and prints what the
+// guide's `silk run` shows.
+export const wholeGuides = [
+  'guides/01-text-and-formatting.md',
+  'guides/05-child-processes.md',
+  'guides/12-cryptography.md',
+  'guides/13-json-and-toml.md',
+  'guides/14-encodings-and-compression.md',
+  'guides/15-no-libc-linux-and-webassembly.md',
+]
+
+// The program a guide assembles to: every top-level block (indented ones are excerpts of a body),
+// imports first and each import once.
+export function guideProgram(page) {
+  const blocks = fences(page).filter((block) => block.lang === 'silk' && !/^\s/.test(block.text))
+  const imports = [...new Set(blocks.flatMap((block) => block.text.match(/^import .*$/gm) ?? []))]
+  const rest = blocks.map((block) => block.text.replace(/^import .*\n?/gm, '').trim()).filter((text) => text !== '')
+  return `${imports.join('\n')}\n\n${rest.join('\n\n')}\n`
+}
+
+// The output the guide shows for `silk run`: the last plain block right after an sh block that runs it.
+export function guideOutput(page) {
+  const blocks = fences(page)
+  let shown
+  blocks.forEach((block, index) => {
+    if (block.lang === 'sh' && /^silk run\b/m.test(block.text) && isOutput(blocks[index + 1])) shown = expectedOutput(blocks[index + 1].text)
+  })
+  return shown
+}
+
+export async function checkGuide(docs, id) {
+  const h = sharedHome()
+  const page = read(join(docs, 'content', id))
+  const folder = join(h.work, `guide-${id.replace(/\W+/g, '-')}`)
+  write(join(folder, 'silk.toml'), '[package]\nname = "guide"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
+  write(join(folder, 'src/main.silk'), guideProgram(page))
+  const debug = await run(h, ['run', '--quiet'], folder)
+  const release = await run(h, ['run', '--quiet', '--release'], folder)
+  return { shown: guideOutput(page), debug, release }
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
   const [docs, ...rest] = process.argv.slice(2)
   if (docs === undefined) {
-    console.error('usage: docs-samples.mjs <docs checkout> [--filter <text>] [--json <file>]')
+    console.error('usage: docs-samples.mjs <docs checkout> [--filter <text>] [--run-all] [--release] [--json <file>]')
     process.exit(2)
   }
   const option = (flag) => (rest.includes(flag) ? rest[rest.indexOf(flag) + 1] : undefined)
-  const results = await checkAll(docs, { filter: option('--filter') ?? '', all: rest.includes('--run-all') })
+  const results = await checkAll(docs, { filter: option('--filter') ?? '', all: rest.includes('--run-all'), release: rest.includes('--release') })
   const failed = results.filter(failing)
   for (const result of results) {
     const mark = failing(result) ? 'FAIL' : 'ok  '
