@@ -699,6 +699,9 @@ struct WorldPosition { x: i32 }
 and type. A zero-field struct such as `struct End {}` is an ordinary nominal marker type.
 
 Every field has one explicit type, fields are ordered by declaration, and field names are unique.
+Fields are separated by commas, as the fields of a union variant are, and a trailing comma is
+allowed. A field list separated by line breaks alone is still accepted for now; a later version
+requires the commas.
 Structs and fields are private by default; `pub` exposes them under the module visibility rules.
 
 **Boundary:** Silk has no shape-based struct compatibility. A public contract cannot expose a
