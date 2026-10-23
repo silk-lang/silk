@@ -44,7 +44,11 @@ A command selects a version by the first of these that applies: `sew +<version>`
 first, then the package; `0.0.0` means unpinned), and `default` in `settings.toml`. sew then
 replaces itself with that version's `bin/silk`, passing the arguments unchanged (without
 `+<version>`) and setting `SILK_TOOLCHAIN` to the full version and `SILK_HOME`. sew never parses
-a forwarded command's flags.
+a forwarded command's flags. A first word one edit away from `use`, `set` or `update`, and from
+every compiler command, is answered by sew with a suggestion instead of being forwarded.
+
+A workspace's pin covers its members. When a member's own `silk-version` names another version,
+sew prints a note naming both manifests and runs the workspace's version.
 
 When nothing selects a version, or the selected one is not installed, sew exits with status 3 and
 names the command that fixes it, unless `SILK_AUTO_INSTALL=1` or `auto-install = true` installs it
@@ -64,7 +68,9 @@ release key with the trusted comment `silk v<version> <archive>`, and a `bin/sil
 matches the release's `native-seed.json`. The archive is unpacked into a hidden staging directory
 under `toolchains/` and renamed into place, so an interrupted install leaves nothing half written.
 Installs hold an `flock` on `$SILK_HOME/.install.lock`, so two concurrent installs of a release
-download it once.
+download it once. The install holding the lock also removes staging directories that interrupted
+installs left behind. A version directory without `bin/silk` does not count as installed: `sew use`
+replaces it, and `sew use uninstall` removes it.
 
 `latest` names the newest stable release and `dev` (or `latest --dev`) the newest release of any
 kind. They read the GitHub release listing, retrying up to four times when it fails or comes back
