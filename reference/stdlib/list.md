@@ -377,8 +377,8 @@ capacity by doubling until the elements fit. The length does not change.
 
 #### Errors
 
-- `OutOfMemoryError` if the `Allocator` cannot supply the new storage. The list does not
-  change.
+- `OutOfMemoryError` if `length + additional` overflows `usize`, or the `Allocator` cannot
+  supply the new storage. The list does not change.
 
 <a id="List.impl.reserveExact"></a>
 
