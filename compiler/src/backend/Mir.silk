@@ -15,6 +15,7 @@ import backend.RuntimeType {Projection as RuntimeProjection}
 import backend.Layout {Layout}
 import semantic.Specialization {Application, Edge}
 import semantic.RuntimeEncoding
+import semantic.StaticConstant
 import semantic.StaticValue
 import semantic.StaticValue {FloatType as StaticFloatType, Sign as StaticSign, Value as StaticData}
 import hir.FloatingLiteral
@@ -977,6 +978,8 @@ struct Builder {
   cancelScopes: List<CancelScope>
   // Set while a cancel landing is lowered: its calls run to completion, so they record no exit.
   landing: bool
+  // The published value of each constant this body reads.
+  constants: List<ConstantValue>
 }
 
 // A failure slot held across the calls lowered now. `cleanup` is its type when the slot still owns
@@ -1275,7 +1278,25 @@ fn foreignHandleIndex(identities: &[Shared<DeclarationId>], declaration: &Declar
   return Option<usize>.none()
 }
 
-fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
+// One constant's published value, read by every runtime body node that names the constant.
+pub struct ConstantValue {
+  pub declaration: Shared<DeclarationId>
+  pub value: Shared<StaticData>
+}
+
+// The value published for one constant, when the lowering was given it.
+fn constantValue(constants: &[ConstantValue], declaration: &Shared<DeclarationId>) -> Option<Shared<StaticData>> {
+  let mut at = usize.ZERO
+  while at < constants.length {
+    if StaticValue.sameDeclaration(&constants[at].declaration, declaration) { return Option<Shared<StaticData>>.some(Shared<StaticData>.clone(&constants[at].value)) }
+    at = at + usize.ONE
+  }
+  return Option<Shared<StaticData>>.none()
+}
+
+// A constant read is typed by the constant's declared type alone; its value comes from
+// `constants`, which the lowering's preparation demanded. Without it the read is unsupported.
+fn view(body: &Shared<TypedBody>, id: BodyNodeId, constants: &[ConstantValue]) -> View {
   return Shared<TypedBody>.with<View>(
     body,
     fn(bodyValue: &TypedBody) -> View {
@@ -1283,6 +1304,10 @@ fn view(body: &Shared<TypedBody>, id: BodyNodeId) -> View {
       let origin = nodes[id.index].origin
       return match & nodes[id.index].kind {
         BodyNodeKind.Expression {ty, form} => match & form {
+          BodyExpression.Constant {declaration} => match move constantValue(constants, &declaration) {
+            Option<Shared<StaticData>>.Some {value} => View.Embedded {value: move value, ty: Shared<Type>.clone(&ty), origin: origin}
+            Option<Shared<StaticData>>.None => View.Unsupported {origin: origin}
+          }
           BodyExpression.Integer {literal} => View.Integer {
             ty: Shared<Type>.clone(&ty),
             literal: literal,
@@ -3946,8 +3971,8 @@ effect fn embeddedOperand(value: &Shared<StaticData>, ty: Shared<Type>) -> Optio
 
 // Materializes one embedded static value at its use: a scalar as a constant, text as a descriptor
 // over its immutable program-lifetime bytes, a scalar enum as its representation integer typed by
-// the enum, and a fixed array element by element into a fresh aggregate. Anything else is None,
-// an explicit gap.
+// the enum, and a fixed array or cleanup-free struct field by field into a fresh aggregate.
+// Anything else is None, an explicit gap.
 effect fn materializeEmbedded(builder: &mut Builder, value: &Shared<StaticData>, ty: &Shared<Type>, origin: Origin) -> Option<Operand>
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let scalar = run embeddedOperand(value, Shared<Type>.clone(ty))
@@ -3971,9 +3996,10 @@ effect fn materializeEmbedded(builder: &mut Builder, value: &Shared<StaticData>,
     })
     return Option<Operand>.some(Operand.Integer {decimal: run magnitudeText(magnitude), negative: negative, ty: Shared<Type>.clone(ty)})
   }
-  let element = match move Type.arrayShape(ty) {
-    Option<ArrayShape>.Some {value: shape} => move shape.element
-    Option<ArrayShape>.None => { return Option<Operand>.none() }
+  let array = Type.arrayShape(ty)
+  let isStruct = Shared<StaticData>.with<bool>(value, StaticValue.isStruct)
+  if !isStruct {
+    if let Option<ArrayShape>.None = &array { return Option<Operand>.none() }
   }
   let count = Shared<StaticData>.with<usize>(value, fn(data: &StaticData) -> usize {
     return match & data.* { StaticData.Aggregate {fields, ..} => List<Shared<StaticData>>.length(&fields) _ => usize.ZERO }
@@ -3988,7 +4014,17 @@ effect fn materializeEmbedded(builder: &mut Builder, value: &Shared<StaticData>,
       Option<Shared<StaticData>>.Some {value: selected} => move selected
       Option<Shared<StaticData>>.None => { return Option<Operand>.none() }
     }
-    let operand = match move run materializeEmbedded(&mut builder.*, &found, &element, origin) {
+    // An array element has the array's element type. A struct field is typed by its own value at
+    // its runtime representation: an aggregate carries its type, a scalar enum is stored as its
+    // representation integer, and the field's place has that layout.
+    let fieldType = match &array {
+      Option<ArrayShape>.Some {value: shape} => Shared<Type>.clone(&shape.element)
+      Option<ArrayShape>.None => match move run representationType(&found) {
+        Option<Shared<Type>>.Some {value: selected} => move selected
+        Option<Shared<Type>>.None => { return Option<Operand>.none() }
+      }
+    }
+    let operand = match move run materializeEmbedded(&mut builder.*, &found, &fieldType, origin) {
       Option<Operand>.Some {value: selected} => move selected
       Option<Operand>.None => { return Option<Operand>.none() }
     }
@@ -3998,6 +4034,44 @@ effect fn materializeEmbedded(builder: &mut Builder, value: &Shared<StaticData>,
   let output = run temporary(&mut builder.*, ty, origin)
   run assign(&mut builder.*, place(output), Rvalue.Aggregate {fields: move fields}, origin)
   return Option<Operand>.some(Operand.Move {place: place(output)})
+}
+
+// The runtime representation type of one embedded struct field's value: an aggregate's own type,
+// a scalar's primitive, `char`, unit, `'static` text, or a scalar enum's representation integer.
+effect fn representationType(value: &Shared<StaticData>) -> Option<Shared<Type>> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let aggregate = Shared<StaticData>.with<Option<Shared<Type>>>(value, fn(data: &StaticData) -> Option<Shared<Type>> {
+    return match & data.* {
+      StaticData.Aggregate {ty, ..} => Option<Shared<Type>>.some(Shared<Type>.clone(&ty))
+      _ => Option<Shared<Type>>.none()
+    }
+  })
+  if let Option<Shared<Type>>.Some {..} = &aggregate { return move aggregate }
+  let kind = Shared<StaticData>.with<usize>(value, fn(data: &StaticData) -> usize {
+    return match & data.* {
+      StaticData.Unit => 1
+      StaticData.Text {..} => 2
+      StaticData.Character {..} => 3
+      StaticData.Boolean {..} => 4
+      _ => 0
+    }
+  })
+  if kind == 1 { return Option<Shared<Type>>.some(run Types.intern(Type.Unit)) }
+  if kind == 2 { return Option<Shared<Type>>.some(run Types.intern(Type.String {lifetime: run Shared<Lifetime>.make(Lifetime.Static)})) }
+  let name = Shared<StaticData>.with<&'static [u8]>(value, fn(data: &StaticData) -> &'static [u8] {
+    return match & data.* {
+      StaticData.Character {..} => b"char"
+      StaticData.Boolean {..} => b"bool"
+      StaticData.Integer {ty: integer, ..} => StaticConstant.integerName(integer)
+      StaticData.Enum {representation, ..} => StaticConstant.integerName(representation)
+      StaticData.Float {ty: width, ..} => {
+        if width == StaticFloatType.F32 { return b"f32" }
+        return b"f64"
+      }
+      _ => b""
+    }
+  })
+  if name.length == usize.ZERO { return Option<Shared<Type>>.none() }
+  return Option<Shared<Type>>.some(run Types.intern(Type.Primitive {name: run Bytes.copy(name)}))
 }
 
 // Lowers each child of an aggregate expression, in order, into its field value.
@@ -5277,9 +5351,10 @@ effect fn atomic(
     run List<Operand>.append(&mut operands, move lowered)
     at = at + usize.ONE
   }
-  let success = run intrinsicOrder(&owner, body, callNode, start, origin)
+  let constants = List<ConstantValue>.asSlice(&builder.constants)
+  let success = run intrinsicOrder(&owner, body, constants, callNode, start, origin)
   let mut failure = success
-  if CheckedIntrinsic.orderingCount(selected) == 2 { failure = run intrinsicOrder(&owner, body, callNode, start + usize.ONE, origin) }
+  if CheckedIntrinsic.orderingCount(selected) == 2 { failure = run intrinsicOrder(&owner, body, constants, callNode, start + usize.ONE, origin) }
   let mut element = run Types.intern(Type.Unit)
   if start != usize.ZERO {
     let pointer = match move run intrinsicArgumentType(&builder.*, body, callNode, usize.ZERO) {
@@ -5339,7 +5414,7 @@ effect fn vector(
     let mut shuffled = List<Operand>.make()
     run List<Operand>.append(&mut shuffled, run intrinsicArgument(&mut builder.*, body, hir, callNode, usize.ZERO, origin))
     run List<Operand>.append(&mut shuffled, run intrinsicArgument(&mut builder.*, body, hir, callNode, usize.ONE, origin))
-    let indices = run shuffleIndices(&owner, body, callNode, origin)
+    let indices = run shuffleIndices(&owner, body, List<ConstantValue>.asSlice(&builder.constants), callNode, origin)
     let listed = List<u64>.asSlice(&indices)
     let mut lane = usize.ZERO
     while lane < listed.length {
@@ -5434,21 +5509,28 @@ fn vectorScalarBinary(primitive: IntrinsicPrimitive) -> Option<ScalarBinary> {
   return Option<ScalarBinary>.some(operation)
 }
 
+// The static value of one intrinsic argument node: a selected embedded value, or the published
+// value of a constant it reads.
+fn staticArgument(body: &Shared<TypedBody>, constants: &[ConstantValue], child: BodyNodeId) -> Option<Shared<StaticData>> {
+  return Shared<TypedBody>.with<Option<Shared<StaticData>>>(body, fn(value: &TypedBody) -> Option<Shared<StaticData>> {
+    return match &TypedBody.nodeSlice(value)[child.index].kind {
+      BodyNodeKind.Expression {form: BodyExpression.Embedded {value: data}, ..} => Option<Shared<StaticData>>.some(Shared<StaticData>.clone(&data))
+      BodyNodeKind.Expression {form: BodyExpression.Constant {declaration}, ..} => constantValue(constants, &declaration)
+      _ => Option<Shared<StaticData>>.none()
+    }
+  })
+}
+
 // The memory ordering embedded as static intrinsic argument `index`.
 // The checked static lane indices of a shuffle, its third argument (SIMD-006).
-effect fn shuffleIndices(owner: &Shared<DeclarationId>, body: &Shared<TypedBody>, callNode: BodyNodeId, origin: Origin) -> List<u64>
+effect fn shuffleIndices(owner: &Shared<DeclarationId>, body: &Shared<TypedBody>, constants: &[ConstantValue], callNode: BodyNodeId,
+  origin: Origin) -> List<u64>
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let child = match move childAt(body, callNode, 2) {
     Option<BodyNodeId>.Some {value} => value
     Option<BodyNodeId>.None => run unsupported(owner, origin, GapCode.MissingCallArgument)
   }
-  let embedded = Shared<TypedBody>.with<Option<Shared<StaticData>>>(body, fn(value: &TypedBody) -> Option<Shared<StaticData>> {
-    return match &TypedBody.nodeSlice(value)[child.index].kind {
-      BodyNodeKind.Expression {form: BodyExpression.Embedded {value: data}, ..} => Option<Shared<StaticData>>.some(Shared<StaticData>.clone(&data))
-      _ => Option<Shared<StaticData>>.none()
-    }
-  })
-  let data = match move embedded {
+  let data = match move staticArgument(body, constants, child) {
     Option<Shared<StaticData>>.Some {value} => move value
     Option<Shared<StaticData>>.None => run unsupported(owner, origin, GapCode.IntrinsicMember)
   }
@@ -5481,25 +5563,23 @@ effect fn shuffleIndices(owner: &Shared<DeclarationId>, body: &Shared<TypedBody>
   return move indices
 }
 
-effect fn intrinsicOrder(owner: &Shared<DeclarationId>, body: &Shared<TypedBody>, callNode: BodyNodeId, index: usize,
-  origin: Origin) -> MemoryOrder
+effect fn intrinsicOrder(owner: &Shared<DeclarationId>, body: &Shared<TypedBody>, constants: &[ConstantValue], callNode: BodyNodeId,
+  index: usize, origin: Origin) -> MemoryOrder
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
   let child = match move childAt(body, callNode, index) {
     Option<BodyNodeId>.Some {value} => value
     Option<BodyNodeId>.None => run unsupported(owner, origin, GapCode.MissingCallArgument)
   }
-  let order = Shared<TypedBody>.with<Option<MemoryOrder>>(body, fn(value: &TypedBody) -> Option<MemoryOrder> {
-    return match &TypedBody.nodeSlice(value)[child.index].kind {
-      BodyNodeKind.Expression {form: BodyExpression.Embedded {value: data}, ..} => Shared<StaticData>.with<Option<MemoryOrder>>(&data,
-        fn(selected: &StaticData) -> Option<MemoryOrder> {
-          return match &selected.* {
-            StaticData.Text {bytes} => CheckedIntrinsic.memoryOrder(Bytes.asSlice(&bytes))
-            _ => Option<MemoryOrder>.none()
-          }
-        })
-      _ => Option<MemoryOrder>.none()
-    }
-  })
+  let order = match move staticArgument(body, constants, child) {
+    Option<Shared<StaticData>>.Some {value: data} => Shared<StaticData>.with<Option<MemoryOrder>>(&data,
+      fn(selected: &StaticData) -> Option<MemoryOrder> {
+        return match &selected.* {
+          StaticData.Text {bytes} => CheckedIntrinsic.memoryOrder(Bytes.asSlice(&bytes))
+          _ => Option<MemoryOrder>.none()
+        }
+      })
+    Option<Shared<StaticData>>.None => Option<MemoryOrder>.none()
+  }
   return match move order {
     Option<MemoryOrder>.Some {value} => value
     Option<MemoryOrder>.None => run unsupported(owner, origin, GapCode.IntrinsicMember)
@@ -6978,7 +7058,19 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Shared<Typ
     held: List<HeldFailure>.make(),
     cancelScopes: List<CancelScope>.make(),
     landing: false,
+    constants: run copyConstants(List<ConstantValue>.asSlice(&creator.constants)),
   }
+}
+
+effect fn copyConstants(values: &[ConstantValue]) -> List<ConstantValue> ! OutOfMemoryError ? &mut Allocator {
+  let mut copied = List<ConstantValue>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run List<ConstantValue>.append(&mut copied, ConstantValue {
+      declaration: Shared<DeclarationId>.clone(&values[at].declaration), value: Shared<StaticData>.clone(&values[at].value)})
+    at = at + usize.ONE
+  }
+  return move copied
 }
 
 // Lowers one erased package helper. Its one parameter addresses the package as erased bytes; it
@@ -9731,7 +9823,7 @@ effect fn lowerStatement(builder: &mut Builder, body: &Shared<TypedBody>, hir: &
 // branches ends its surrounding block, so unreachable checked calls contribute no proof demand.
 effect fn collectCallNodes(body: &Shared<TypedBody>, id: BodyNodeId, output: &mut List<BodyNodeId>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
-  let selected = view(body, id)
+  let selected = view(body, id, &[])
   match move selected {
     View.Call {node, count, ..} => {
       let mut at = usize.ZERO
@@ -10052,6 +10144,7 @@ impl MirFunction {
     anchor: &Anchor,
     observing: bool,
     suspending: Option<List<InstanceKey>>,
+    constants: List<ConstantValue>,
   ) -> Lowered ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
     let application = run InstanceKey.selected(&key)
     let bindings = run Application.bindings(&application)
@@ -10166,6 +10259,7 @@ impl MirFunction {
       held: List<HeldFailure>.make(),
       cancelScopes: List<CancelScope>.make(),
       landing: false,
+      constants: move constants,
     }
     let first = run block(&mut builder, origin)
     resume(&mut builder, first)
@@ -10203,7 +10297,7 @@ effect fn instanceNodeType(builder: &Builder, body: &Shared<TypedBody>, id: Body
 effect fn instanceView(builder: &Builder, body: &Shared<TypedBody>, id: BodyNodeId) -> View
 ! OutOfMemoryError
 ? &mut Allocator | &mut Types {
-  let selected = view(body, id)
+  let selected = view(body, id, List<ConstantValue>.asSlice(&builder.constants))
   let bindings = List<Binding>.asSlice(&builder.bindings)
   let projections = List<RuntimeProjection>.asSlice(&builder.projections)
   return match move selected {

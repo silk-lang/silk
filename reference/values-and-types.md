@@ -595,14 +595,16 @@ string type diagnostics.
 
 ## Constant values
 
-### CONST-001 — A constant has an explicit primitive type and one static initializer
+### CONST-001 — A constant has an explicit type and one static initializer
 
 **Status:** Confirmed
 
 A `const` declaration requires a type annotation. Its type is `bool`, `char`, a supported integer
-or floating-point primitive, or `string`. Its initializer is a statically evaluated expression that
-must produce exactly the declared type for the selected target. Constants do not infer their type
-or hold aggregate values.
+or floating-point primitive, `string`, a fixed array of such types, or a nominal type whose value
+static evaluation admits: a scalar enum or a cleanup-free struct
+([STATIC-005](static-evaluation.md#static-005--static-values-are-reusable-data-not-observable-compile-time-storage)).
+Its initializer is a statically evaluated expression that must produce exactly the declared type
+for the selected target. Constants do not infer their type.
 
 ```silk
 pub const limit: i32 = 2
@@ -610,24 +612,36 @@ const ratio: f64 = 1.5
 const enabled: bool = true
 const separator: char = ','
 const pattern: string = r"\d+"
+const squares: [u32; 4] = [0, 1, 4, 9]
+
+struct Point {
+  pub x: i32
+  pub y: i32
+}
+
+pub const ORIGIN: Point = Point {x: 0, y: 0}
 ```
 
 A constant initializer may call static functions and may depend on another statically evaluated
-constant. Its selected value lowers as an immediate value with no runtime initializer, storage,
-call, or cleanup. It has no address and cannot be borrowed, assigned, or moved.
+constant. A constant is a value, not a place: each read produces a fresh value of the declared
+type, embedded with no runtime initializer, call, or cleanup. Reading a constant whose type is not
+`Copy` is allowed any number of times; each read is a separate owned value. A field or element of
+a constant reads as part of that value. A constant has no address of its own: it cannot be
+assigned or mutably borrowed, and whether two reads share storage is unobservable.
 
-**Boundary:** Type inference, aggregates, ordinary function calls, Effects, service requirements,
-borrows, unsafe operations, and observable allocations are unavailable in constant initialization.
-A wrong result type, dependency cycle, selected-target range failure, or static evaluation failure
-exposes no usable constant value.
+**Boundary:** Type inference, Drop types, owners of allocated memory, references, raw pointers,
+tuples, records, unions, generic parameters, ordinary function calls, Effects, service
+requirements, unsafe operations, and observable allocations are unavailable in constant
+initialization. A wrong result type, dependency cycle, selected-target range failure, or static
+evaluation failure exposes no usable constant value.
 
-**Diagnostics:** A declaration outside the primitive constant contract reports `SEM0086` at the
+**Diagnostics:** A declaration outside the constant type contract reports `SEM0086` at the
 declaration. An operation unavailable during static initialization reports `SEM0176`; selected
 compile errors, cycles, and static-evaluation limits retain their diagnostic and trace.
 
 **Evidence:** typed constant requirements,
 [static evaluation](static-evaluation.md),
-[constant analysis](../bootstrap/packages/compiler/src/ExpressionAnalysis.ts).
+[constant admission](../compiler/src/semantic/StaticConstant.silk).
 
 ### CONST-002 — Target facts are ordinary statically evaluated source constants
 
@@ -655,9 +669,9 @@ source provenance without claiming one target-selected value. Each concrete targ
 publishes exactly one canonical value before residual runtime analysis.
 
 **Boundary:** `Target` is an ordinary import alias, not a compiler-recognized spelling. Source may
-compute another primitive constant through static functions, but target selection cannot remain as
-a dynamic runtime query and cannot initialize an aggregate constant. A selected target constant may
-be used at runtime only as its embedded ordinary immediate value.
+compute another constant, including an array or struct constant, from target facts through static
+functions, but target selection cannot remain as a dynamic runtime query. A selected target
+constant may be used at runtime only as its embedded ordinary value.
 
 **Diagnostics:** An absent import or member uses the ordinary name-resolution diagnostic. A target
 fact at the wrong declared type reports `SEM0086`. A target query that would survive as runtime work
