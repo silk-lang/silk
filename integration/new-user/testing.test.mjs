@@ -23,7 +23,7 @@ test fn trapsOnPurpose() {
 
 test('silk init --lib makes a library with a passing test', () => {
   const dir = library()
-  assert.match(read(join(dir, 'silk.toml')), /root = "src\/lib\.silk"\nsource-root = "src"\nexports = \["lib"\]\n\n\[build\]\nartifact = "static-library"/)
+  assert.match(read(join(dir, 'silk.toml')), /kind = "library"\nexports = \["lib"\]\n$/)
   const result = silk(h, ['test', '--no-cache'], { cwd: dir })
   assert.equal(result.status, 0, show(result))
   assert.match(result.stdout, /  lib::addsTwoNumbers\n    PASS /)

@@ -924,20 +924,37 @@ MODULE-001. A package's own imports keep the source-root rule of MODULE-003.
 
 ```toml
 [package]
-name = "silk-json"
+name = "silk_json"
 version = "0.2.0"
-source-root = "src"
+kind = "library"
 ```
 
-The source root is `[package].source-root` when the manifest names one, else the directory of
-`[package].root`. A package that is only ever a dependency needs no `root`, but it must name a
-`source-root`.
+The source root is `[package].source`, `src` when the manifest omits it. The root module is
+`[package].main` below the source root, by default `main.silk`, or `lib.silk` for a library kind.
+`[package].kind` is `executable` (the default), `library` (Silk source for other packages, which a
+build checks and makes no artifact for), `static-library`, `shared-library` or `object`. The version
+defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits and
+`_`; `self` and `silk` are reserved. `sew` names the toolchain's own package, and no dependency
+may take that name.
+
+Until the seed compiler reads this layout, a manifest may still write the earlier spellings:
+`[package].root` (a manifest-relative entry whose directory is the source root),
+`[package].source-root`, `[build].artifact`, `[build].native-link-inputs`, `[build].platform-supply`
+and `[build].composition`, and a name may hold `-`. A manifest that writes a field in both spellings
+is refused.
+
+`[package]` also accepts publishing metadata that builds never read: `description`, `license`,
+`repository`, `homepage` and `readme` as strings, `authors` and `keywords` as arrays of strings.
+`[tool.<name>]` belongs to other tools and is never validated. `[changes]` belongs to
+`silk changes`. Tables and fields a later release will read are refused as not supported yet:
+`[dev-dependencies]`, `[target]`, `[lints]`, `[test]`, `[bench]`, `[bin]` and `[package].include`.
 
 **Boundary:** The identity is logical. Two checkouts of the same package at different host paths
 have the same identity, and a module's identity never contains a host path.
 
-**Diagnostics:** A manifest without a name, a version, or a source root is an invalid-manifest error
-from the build, not a Silk source diagnostic.
+**Diagnostics:** A manifest without a name, with a version that is not a semantic version, or with a
+root module outside its source root is an invalid-manifest error from the build, not a Silk source
+diagnostic.
 
 **Evidence:** [native package sources](../compiler/src/driver/ModuleSources.silk),
 [native manifest decoding](../compiler/src/driver/Project.silk).
@@ -951,8 +968,8 @@ code uses; `path` names the directory holding that package's manifest, relative 
 
 ```toml
 [dependencies]
-json = { path = "../silk-json" }
-syntax = { path = "../tools/syntax", package = "silk-syntax" }
+json = { path = "../silk_json" }
+syntax = { path = "../tools/syntax", package = "silk_syntax" }
 ```
 
 ```silk
@@ -961,7 +978,7 @@ import syntax.Parser as P
 import model.User
 ```
 
-`json.Value` names module `Value` below the source root of `silk-json`. `model.User` still names this
+`json.Value` names module `Value` below the source root of `silk_json`. `model.User` still names this
 package's own `model/User.silk`, because `model` is not a dependency name. A dependency's modules
 resolve their own imports against that package's source root and its own `[dependencies]`.
 
@@ -969,15 +986,22 @@ The module identity is the dependency's package identity and its path below that
 root; the dependency name plays no role. Two packages that depend on the same package share its
 modules and declarations, whatever names they give it.
 
-**Boundary:** A dependency name must be an identifier other than `silk` or `Intrinsic`. When
-`package` is present it must equal the dependency's `[package].name`. Dependencies are not
-transitive: a package imports only the packages its own manifest lists. Packages cannot depend on
-each other in a cycle. Only `path` dependencies exist; a dependency on a registry or a repository is
-outside the language for now.
+A dependency's `[package].silk-version` names the release line it was written for. A compiler
+builds it when the versions share a release line under the caret rule: before 1.0 the same minor
+version and an equal or later patch, so `0.3.2` accepts 0.3.2 through 0.3.x but never 0.4; from 1.0
+the same major version and an equal or later minor and patch. A prerelease such as a dev release
+matches only itself, and a prerelease compiler builds only dependencies written for it. A local
+`0.0.0` compiler builds every dependency.
+
+**Boundary:** A dependency name must be an identifier other than `silk`, `Intrinsic`, `self` or
+`sew`. When `package` is present it must equal the dependency's `[package].name`. Dependencies are
+not transitive: a package imports only the packages its own manifest lists. Packages cannot depend
+on each other in a cycle. Only `path` dependencies exist; `git`, `url`, `version`, `tag`, `rev`,
+`branch`, `hash`, `optional` and `workspace` are reserved and refused as not supported yet.
 
 **Diagnostics:** An invalid dependency name, a missing or unreadable dependency manifest, a
-`package` name that does not match, and a package cycle are invalid-manifest errors that name the
-dependency. A path below a dependency with no exact module reports `MOD0001` like any other import.
+`package` name that does not match, a dependency written for another release line, and a package
+cycle are invalid-manifest errors that name the dependency. A path below a dependency with no exact module reports `MOD0001` like any other import.
 
 **Evidence:** [native package graph](../compiler/src/semantic/PackageGraph.silk),
 [package dependency loading](../compiler/src/driver/Packages.silk),
@@ -1044,9 +1068,9 @@ other packages.
 
 ```toml
 [package]
-name = "silk-json"
+name = "silk_json"
 version = "0.2.0"
-source-root = "src"
+kind = "library"
 exports = ["Value", "Parser"]
 ```
 

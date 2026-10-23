@@ -187,7 +187,7 @@ test('path dependencies with silk add and silk remove', () => {
   write(join(lib, 'src/lib.silk'), '/// Counts the spaces in `text`.\npub fn countSpaces(text: &[u8]) -> i32 {\n  let mut count = 0\n  let mut at: usize = 0\n  while at < text.length {\n    if text[at] == \' \' { count = count + 1 }\n    at = at + 1\n  }\n  return count\n}\n', )
   // initPackage made an executable; turn it into the library `silk init --lib` would make.
   const manifest = join(lib, 'silk.toml')
-  write(manifest, read(manifest).replace('root = "src/main.silk"', 'root = "src/lib.silk"\nsource-root = "src"\nexports = ["lib"]\n\n[build]\nartifact = "static-library"'))
+  write(manifest, read(manifest) + 'kind = "library"\nexports = ["lib"]\n')
   const app = initPackage(h, fresh('app'))
   const dependency = lib.split('/').at(-1).replaceAll('-', '_')
   const added = silk(h, ['add', `../${lib.split('/').at(-1)}`], { cwd: app })

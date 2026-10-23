@@ -24,8 +24,8 @@ test('init inside a workspace registers members', () => {
 test('build at the root builds every member in dependency order', () => {
   const result = silk(h, ['build'], { cwd: shop })
   assert.equal(result.status, 0, show(result))
-  assert.ok(result.stderr.indexOf('Compiling pricing') < result.stderr.indexOf('Compiling store'))
-  assert.match(result.stderr, /Finished build\/llvm\/\S+\/debug\/libpricing\.a in /)
+  assert.ok(result.stderr.indexOf('Checking pricing') < result.stderr.indexOf('Compiling store'))
+  assert.match(result.stderr, /Checking pricing [^\n]*\n(?:.*\n)*?Finished pricing in /)
   assert.match(result.stderr, /Finished build\/llvm\/\S+\/debug\/store in /)
 })
 
