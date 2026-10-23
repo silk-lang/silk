@@ -1,5 +1,6 @@
-// One release archive per target: the native compiler as `bin/silk` and the standard library at
-// `lib/silk/stdlib`, the layout an installed `silk` finds its library in without `--stdlib`.
+// One release archive per target: the native compiler as `bin/silk`, sew as `bin/sew`, and the
+// standard library at `lib/silk/stdlib`, the layout an installed `silk` finds its library in
+// without `--stdlib`.
 import { createRequire } from 'node:module'
 import { join, resolve, sep } from 'node:path'
 import { parseArgs } from 'node:util'
@@ -28,6 +29,9 @@ export type Entry =
 export interface ArchiveOptions {
   /** The native compiler executable, installed as `bin/silk`. */
   readonly compiler: string
+  /** The sew executable built from the same sources, installed as `bin/sew`. Releases from
+   * before sew, such as the bootstrap's n0, have none. */
+  readonly sew?: string | undefined
   /** The standard-library root, installed as `lib/silk/stdlib`. */
   readonly standardLibrary: string
   /** The target triple the compiler runs on, named in the archive. */
@@ -146,6 +150,16 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
       bytes: yield* fs.readFile(options.compiler),
       executable: true,
     },
+    ...(options.sew === undefined
+      ? []
+      : [
+          {
+            _tag: 'File' as const,
+            path: `${top}/bin/sew`,
+            bytes: yield* fs.readFile(options.sew),
+            executable: true,
+          },
+        ]),
     { _tag: 'Directory', path: `${top}/lib` },
     { _tag: 'Directory', path: `${top}/lib/silk` },
     ...library,
@@ -171,13 +185,14 @@ export const write = Effect.fn('ReleaseArchive.write')(function* (options: Archi
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const usage =
-    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> --stdlib <directory> --target <triple> --output <directory> --version <version> [--snapshot <TOML-file>]'
+    'usage: node compiler/scripts/ReleaseArchive.ts --compiler <silk> [--sew <sew>] --stdlib <directory> --target <triple> --output <directory> --version <version> [--snapshot <TOML-file>]'
   const cli = Effect.gen(function* () {
     const { values } = yield* Effect.try({
       try: () =>
         parseArgs({
           options: {
             compiler: { type: 'string' },
+            sew: { type: 'string' },
             stdlib: { type: 'string' },
             target: { type: 'string' },
             output: { type: 'string' },
@@ -191,6 +206,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       return yield* new ReleaseArchiveError({ message: usage })
     const path = yield* write({
       compiler: resolve(values.compiler),
+      sew: values.sew === undefined ? undefined : resolve(values.sew),
       standardLibrary: resolve(values.stdlib),
       target: values.target,
       version: values.version,
