@@ -23,7 +23,7 @@ test fn trapsOnPurpose() {
 
 test('silk init --lib makes a library with a passing test', () => {
   const dir = library()
-  assert.match(read(join(dir, 'silk.toml')), /root = "src\/lib\.silk"\nsource-root = "src"\nexports = \["lib"\]\n\n\[build\]\nartifact = "static-library"/)
+  assert.match(read(join(dir, 'silk.toml')), /\nkind = "library"\nexports = \["lib"\]\n$/)
   const result = silk(h, ['test', '--no-cache'], { cwd: dir })
   assert.equal(result.status, 0, show(result))
   assert.match(result.stdout, /  lib::addsTwoNumbers\n    PASS /)
@@ -78,4 +78,57 @@ test('SEM0218 for a test with parameters', () => {
   const result = silk(h, ['check'], { cwd: dir })
   assert.equal(result.status, 1)
   assert.match(result.stderr, /error\[SEM0218\]/)
+})
+
+// Many small tests, as a package grows them.
+function manyTests(count, broken = -1) {
+  let text = "import silk.testing { AssertionError, Testing }\n\n"
+  for (let i = 0; i < count; i++) {
+    const want = i === broken ? i + 2 : i + 1
+    text += `test effect fn t${i}() -> ()\n  ! AssertionError<'static> {\n  run Testing.expect(${i} + 1 == ${want}, "sum")\n}\n\n`
+  }
+  return text
+}
+
+const seconds = (start) => Number(process.hrtime.bigint() - start) / 1e9
+
+test('after an edit, the second silk test reuses the test build', { todo: 'finding 90' }, () => {
+  const dir = library()
+  write(join(dir, 'src/lib.silk'), manyTests(200))
+  const cold = silk(h, ['test'], { cwd: dir })
+  assert.equal(cold.status, 0, show(cold))
+  write(join(dir, 'src/lib.silk'), manyTests(200, 5))
+  const edited = silk(h, ['test'], { cwd: dir })
+  assert.equal(edited.status, 1, show(edited))
+  const start = process.hrtime.bigint()
+  const again = silk(h, ['test'], { cwd: dir })
+  assert.equal(again.status, 1, show(again))
+  assert.ok(seconds(start) < 1.5, `the unchanged rerun took ${seconds(start)} s`)
+})
+
+test('silk doctest runs the examples, so an example that returns 1 fails', { todo: 'finding 92' }, () => {
+  const dir = initPackage(h, `doc-${++serial}`, ['--lib'])
+  write(join(dir, 'src/lib.silk'), `/// Six times \`radius\`.\n///\n/// \`\`\`silk\n/// import lib { circumference }\n///\n/// pub fn main() -> i32 {\n///   return circumference(2) - 11\n/// }\n/// \`\`\`\npub fn circumference(radius: i32) -> i32 {\n  return radius * 6\n}\n`)
+  const doc = silk(h, ['doc'], { cwd: dir })
+  assert.equal(doc.status, 0, show(doc))
+  const checked = silk(h, ['doctest', '-i', 'build/documentation.json', '--source-root', 'src'], { cwd: dir })
+  assert.equal(checked.status, 1, show(checked))
+  assert.match(checked.stdout, /FAILED/, show(checked))
+})
+
+test('silk doctest in a package needs no flags', { todo: 'finding 92' }, () => {
+  const dir = library()
+  const checked = silk(h, ['doctest'], { cwd: dir })
+  assert.notEqual(checked.status, 2, show(checked))
+  assert.doesNotMatch(checked.stderr, /pass --input/, show(checked))
+})
+
+test('a doc example imports a package with a hyphen in its name the way a dependent does', { todo: 'finding 93' }, () => {
+  const dir = initPackage(h, `doc-${++serial}`, ['--lib'])
+  const name = dir.split('/').at(-1).replaceAll('-', '_')
+  write(join(dir, 'src/lib.silk'), `/// Six times \`radius\`.\n///\n/// \`\`\`silk\n/// import ${name}.lib { circumference }\n///\n/// pub fn main() -> i32 {\n///   return circumference(2) - 12\n/// }\n/// \`\`\`\npub fn circumference(radius: i32) -> i32 {\n  return radius * 6\n}\n`)
+  const doc = silk(h, ['doc'], { cwd: dir })
+  assert.equal(doc.status, 0, show(doc))
+  const checked = silk(h, ['doctest', '-i', 'build/documentation.json', '--source-root', 'src'], { cwd: dir })
+  assert.equal(checked.status, 0, show(checked))
 })

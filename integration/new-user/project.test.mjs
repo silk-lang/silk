@@ -53,7 +53,7 @@ test('silk init makes a package that runs and prints Hello, world!', () => {
   const dir = join(h.work, name)
   assert.deepEqual(readdirSync(dir).sort(), ['.gitignore', 'silk.toml', 'src'])
   assert.equal(read(join(dir, '.gitignore')), '/build/\n')
-  assert.match(read(join(dir, 'silk.toml')), new RegExp(`^\\[package\\]\\nname = "${name}"\\nversion = "0.1.0"\\nsilk-version = "[^"]+"\\nroot = "src/main.silk"\\n$`))
+  assert.match(read(join(dir, 'silk.toml')), new RegExp(`^\\[package\\]\\nname = "${name}"\\nversion = "0.1.0"\\nsilk-version = "[^"]+"\\n$`))
 
   const ran = silk(h, ['run'], { cwd: dir })
   assert.equal(ran.status, 0, show(ran))
@@ -183,11 +183,8 @@ test('silk format on a missing file says it is missing', () => {
 })
 
 test('path dependencies with silk add and silk remove', () => {
-  const lib = initPackage(h, fresh('text-utils'))
-  write(join(lib, 'src/lib.silk'), '/// Counts the spaces in `text`.\npub fn countSpaces(text: &[u8]) -> i32 {\n  let mut count = 0\n  let mut at: usize = 0\n  while at < text.length {\n    if text[at] == \' \' { count = count + 1 }\n    at = at + 1\n  }\n  return count\n}\n', )
-  // initPackage made an executable; turn it into the library `silk init --lib` would make.
-  const manifest = join(lib, 'silk.toml')
-  write(manifest, read(manifest).replace('root = "src/main.silk"', 'root = "src/lib.silk"\nsource-root = "src"\nexports = ["lib"]\n\n[build]\nartifact = "static-library"'))
+  const lib = initPackage(h, fresh('text-utils'), ['--lib'])
+  write(join(lib, 'src/lib.silk'), '/// Counts the spaces in `text`.\npub fn countSpaces(text: &[u8]) -> i32 {\n  let mut count = 0\n  let mut at: usize = 0\n  while at < text.length {\n    if text[at] == \' \' { count = count + 1 }\n    at = at + 1\n  }\n  return count\n}\n')
   const app = initPackage(h, fresh('app'))
   const dependency = lib.split('/').at(-1).replaceAll('-', '_')
   const added = silk(h, ['add', `../${lib.split('/').at(-1)}`], { cwd: app })
@@ -254,7 +251,7 @@ function brokenDependency(stem) {
   return { lib, app }
 }
 
-test('an error inside a dependency is reported in the dependency file', { todo: 'finding 82' }, () => {
+test('an error inside a dependency is reported in the dependency file', () => {
   const { app } = brokenDependency('dep-error')
   const checked = silk(h, ['check'], { cwd: app })
   assert.notEqual(checked.status, 0, show(checked))
@@ -262,7 +259,7 @@ test('an error inside a dependency is reported in the dependency file', { todo: 
   assert.doesNotMatch(checked.stderr, /main\.silk:4/, show(checked))
 })
 
-test('an error in a dependency function the app does not call still fails the build', { todo: 'finding 82' }, () => {
+test('an error in a dependency function the app does not call still fails the build', () => {
   const { lib, app } = brokenDependency('dep-unused')
   write(join(lib, 'src/lib.silk'), read(join(lib, 'src/lib.silk')).replace('return s == 1', 'return s'))
   const checked = silk(h, ['check'], { cwd: app })

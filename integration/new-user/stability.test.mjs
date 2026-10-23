@@ -412,7 +412,7 @@ test('a long postfix chain is refused with PAR0005, not a crash', () => {
   }
 })
 
-test('an index out of bounds inside a fiber reports the trap like the main task does', { todo: 'finding 73' }, () => {
+test('an index out of bounds inside a fiber reports the trap like the main task does', () => {
   const dir = initPackage(h, 'fibertrap')
   write(join(dir, 'src/main.silk'), `import silk.allocator { OutOfMemoryError }
 import silk.effect { Effect }
@@ -449,7 +449,7 @@ pub effect fn main() -> i32
   }
 })
 
-test('a HashMap that inserts and removes one key at a time keeps a small table', { todo: 'finding 79' }, () => {
+test('a HashMap that inserts and removes one key at a time keeps a small table', () => {
   const dir = initPackage(h, 'map-churn')
   write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
@@ -479,7 +479,7 @@ pub effect fn main() -> i32
   assert.equal(ran.status, 0, show(ran))
 })
 
-test('let _ = names drop as the way to discard a value', { todo: 'finding 78' }, () => {
+test('let _ = names drop as the way to discard a value', () => {
   const dir = initPackage(h, 'let-underscore')
   write(join(dir, 'src/main.silk'), 'fn value() -> i32 {\n  return 1\n}\n\npub fn main() -> i32 {\n  let _ = value()\n  return 0\n}\n')
   const checked = silk(h, ['check'], { cwd: dir })
