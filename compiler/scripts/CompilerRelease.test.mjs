@@ -316,7 +316,6 @@ const maintenanceFixture = Effect.fnUntraced(function* () {
         state.pull = { ...state.pull, ...patch }
         return outcome(state.pull)
       }
-      if (file === 'gh' && args[0] === 'workflow') return outcome('')
       throw new Error(`Unexpected process: ${file} ${args}`)
     }),
   )

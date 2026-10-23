@@ -249,16 +249,8 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
       base: 'main',
       draft: true,
     })
-  // GITHUB_TOKEN pushes/PR updates do not produce normal workflow events.
-  yield* command('gh', [
-    'workflow',
-    'run',
-    'selfhost.yml',
-    '--repo',
-    repository,
-    '--ref',
-    managedBranch,
-  ])
+  // The stable merge reruns every native gate on main, so the managed branch is verified only
+  // when someone dispatches selfhost.yml on it (see .github/CI.md), not after every refresh.
 })
 
 /** Timing/runner/run-id fields are observational; all source, compiler and IR identities are immutable. */
