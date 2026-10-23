@@ -92,6 +92,7 @@ import silk.http_exchange {
 }
 import silk.http_exchange_native as ExchangeNative
 import silk.http_exchange_native {NativeExchangeError, NativeRouteProvider, NativeTransport, Options}
+import silk.certificate_path {ValidationError, ValidationReason}
 import silk.http_headers {Headers, Limits as HeaderLimits}
 import silk.http_origin {Origin}
 import silk.http_proxy {
@@ -119,6 +120,7 @@ import silk.result {Result}
 import silk.slice {Slice}
 import silk.string {String}
 import silk.system_clock {Instant, SystemClock}
+import silk.tls_client {CertificateIdentityFailure, TlsError}
 import silk.tls_connection {ConnectionError}
 import silk.trust_snapshot {TrustSnapshot, TrustSourceError}
 import silk.trust_source {TrustSource}
@@ -753,7 +755,7 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
     }
     let mut location = Option<String>.none()
     if isRedirect(status) {
-      location = Option<String>.some(run redirectLocation(&head))
+      location = run redirectLocation(&head)
     }
     let mut body = Bytes.make()
     let mut scratch = run Bytes.zeroed(16384)
@@ -774,7 +776,9 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
     return Received {status: status, head: move head, body: move body, location: move location}
   }
 
-  effect fn redirectLocation(head: &OwnedResponseHead) -> String ! HttpError | OutOfMemoryError ? &mut Allocator {
+  // A redirect without a `Location` field has nowhere to go, so it is returned as the response
+  // (RFC 9110 section 15.4).
+  effect fn redirectLocation(head: &OwnedResponseHead) -> Option<String> ! HttpError | OutOfMemoryError ? &mut Allocator {
     let view = head.view()
     let mut fields = view.headers().iter()
     let mut selected = Option<&[u8]>.none()
@@ -794,13 +798,13 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
     }
     let bytes = match move selected {
       Option.Some {value} => value
-      Option.None => { fail redirectFailure("The redirect has no Location header.") }
+      Option.None => { return Option<String>.none() }
     }
     if bytes.length == usize.ZERO || bytes.length > 8192 {
       fail redirectFailure("The redirect Location must contain 1 to 8192 bytes.")
     }
     return match move run String.copyUtf8(bytes) {
-      Result.Success {value} => move value
+      Result.Success {value} => Option<String>.some(move value)
       Result.Failure {error} => { fail redirectFailure("The redirect Location is not UTF-8.") }
     }
   }
@@ -1137,6 +1141,60 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
     }
   }
 
+  // The message names the most common reasons a handshake fails, so a program that prints only
+  // `HttpError.message` still says what went wrong. The full error stays in `HttpCause.Tls`.
+  fn tlsMessage(failure: &ConnectionError) -> string<'static> {
+    return match &failure.* {
+      ConnectionError.Tls {error} => match &error {
+        TlsError.PeerAlert {code} => alertMessage(code)
+        TlsError.ProtocolViolation {reason} => "The server broke the TLS 1.3 protocol during the handshake."
+        TlsError.CertificateDecode {error: decode} => "The server certificate could not be decoded."
+        TlsError.CertificatePath {error: path} => pathMessage(&path)
+        TlsError.CertificateIdentity {error: identity} => match &identity {
+          CertificateIdentityFailure.Match {error: matched} => "The server certificate is not valid for this host name."
+          _ => "The names in the server certificate could not be read."
+        }
+        TlsError.CertificateVerify {error: verify} => "The server's TLS signature did not verify against its certificate key."
+        TlsError.UnsupportedProfile => "The server chose a TLS cipher suite, key exchange group, or signature algorithm that is not supported."
+        TlsError.HandshakeTruncated => "The server closed the connection during the TLS handshake."
+        TlsError.LimitExceeded {kind, limit} => "The server's TLS handshake exceeds a configured limit."
+        _ => "The TLS connection failed."
+      }
+      ConnectionError.Io {error} => "The connection failed during the TLS handshake."
+      _ => "The TLS connection failed."
+    }
+  }
+
+  fn alertMessage(code: u8) -> string<'static> {
+    // protocol_version (70) is what a server without TLS 1.3 sends; handshake_failure (40) and
+    // insufficient_security (71) mean no offered algorithm was acceptable.
+    if code == 70 { return "The server does not support TLS 1.3." }
+    if code == 40 || code == 71 {
+      return "The server rejected the TLS handshake: it may not support TLS 1.3 or the offered algorithms."
+    }
+    if code == 112 { return "The server does not recognize the requested host name." }
+    if code == 120 { return "The server requires an application protocol other than HTTP/1.1." }
+    return "The server ended the TLS handshake with an alert."
+  }
+
+  fn pathMessage(failure: &ValidationError) -> string<'static> {
+    let mut reason = failure.reason
+    if reason == ValidationReason.NoValidPath {
+      if let Option.Some {value} = &failure.detailReason { reason = value }
+    }
+    if reason == ValidationReason.InvalidTime { return "The server certificate has expired or is not yet valid." }
+    if reason == ValidationReason.NoIssuer || reason == ValidationReason.IssuerMismatch {
+      return "The server certificate is not signed by a trusted root."
+    }
+    if reason == ValidationReason.UnsupportedAlgorithm || reason == ValidationReason.UnsupportedParameters
+      || reason == ValidationReason.InvalidKey {
+      return "The server certificate uses a key or signature algorithm that is not supported."
+    }
+    if reason == ValidationReason.InvalidSignature { return "A signature in the server certificate chain is not valid." }
+    if reason == ValidationReason.InvalidUsage { return "The server certificate is not allowed for TLS server authentication." }
+    return "The server certificate chain is not valid."
+  }
+
   effect fn classify(error: ProxyError | RequestError | ExchangeError | NativeExchangeError | ResolverError | NativeSocketError | ConnectionError | IdentityError | TrustSourceError) -> never ! HttpError {
     return match move error {
       ProxyError failure => match move failure {
@@ -1181,7 +1239,7 @@ static if (Intrinsic.targetOperatingSystem() == "darwin" && Intrinsic.targetArch
         ConnectionError.HandshakeTimeout => {
           fail HttpError.caused(HttpErrorKind.Timeout, "The TLS handshake did not finish before the deadline.", HttpCause.Tls {error: move failure})
         }
-        _ => { fail HttpError.caused(HttpErrorKind.Tls, "The TLS connection failed.", HttpCause.Tls {error: move failure}) }
+        _ => { fail HttpError.caused(HttpErrorKind.Tls, tlsMessage(&failure), HttpCause.Tls {error: move failure}) }
       }
       IdentityError failure => {
         fail HttpError.caused(HttpErrorKind.Tls, "The server name cannot be checked against its certificate.", HttpCause.Identity {error: move failure})

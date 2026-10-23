@@ -27,8 +27,8 @@ The head and its fields borrow the parser. Call `copy` to keep them after a `res
 
 ## Gotchas
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
 
 ## Examples
 ### Parse a response head
@@ -650,7 +650,8 @@ A field has a space or a tab between its name and the `:`.
 ObsFold
 ```
 
-A field line starts with a space or a tab. Folded lines are not accepted.
+A field line starts with a space or a tab. Requests do not accept folded lines; a response
+accepts one only after its first field, and joins it to that field with spaces.
 
 <a id="ParseReason.MissingHost"></a>
 
@@ -858,8 +859,8 @@ failed until `reset`.
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
 
 <a id="ResponseParser"></a>
 
@@ -882,8 +883,8 @@ failed until `reset`.
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
 
 <a id="RequestHead"></a>
 
@@ -1364,8 +1365,8 @@ Parses a request head from the start of `input`. The bytes after the head start 
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
 
 <a id="parseResponse"></a>
 
@@ -1384,8 +1385,8 @@ Parses a response head from the start of `input`. The bytes after the head start
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
 
 <a id="requestSerializedSize"></a>
 
