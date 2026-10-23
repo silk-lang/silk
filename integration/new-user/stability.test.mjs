@@ -368,7 +368,7 @@ function generatedPackage(name, modules, functions) {
 
 const checkSeconds = (result) => Number(/^  check +\d+ modules? +([\d.]+)s$/m.exec(result.stderr)?.[1] ?? NaN)
 
-test('a one-line edit in one module of a big package rechecks far less than a cold check', { todo: 'finding 66' }, () => {
+test('a one-line edit in one module of a big package rechecks far less than a cold check', () => {
   const dir = generatedPackage('bigedit', 10, 90)
   rmSync(join(dir, 'build'), { recursive: true, force: true })
   const cold = silk(h, ['check'], { cwd: dir })
@@ -379,21 +379,21 @@ test('a one-line edit in one module of a big package rechecks far less than a co
   assert.ok(checkSeconds(edited) < checkSeconds(cold) / 4, `cold ${checkSeconds(cold)} s, after editing main ${checkSeconds(edited)} s`)
 })
 
-test('a comma between struct fields says fields are separated by newlines', { todo: 'finding 68' }, () => {
+test('commas between struct fields are accepted, as in union variants', () => {
   const dir = initPackage(h, 'structcomma')
-  write(join(dir, 'src/main.silk'), 'struct P {\n  x: i32,\n  y: i32\n}\n\npub fn main() -> i32 {\n  return 0\n}\n')
-  const result = silk(h, ['check'], { cwd: dir })
-  assert.match(result.stderr, /src\/main\.silk:2:9: error\[PAR0002\].*(newline|line)/, show(result))
+  write(join(dir, 'src/main.silk'), 'struct P {\n  x: i32,\n  y: i32,\n}\n\npub fn main() -> i32 {\n  let p = P { x: 40, y: 2 }\n  return p.x + p.y\n}\n')
+  const result = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.equal(result.status, 42, show(result))
 })
 
-test('passing a &mut binding to a call suggests lending it again with &mut', { todo: 'finding 69' }, () => {
+test('passing a &mut binding to a call suggests lending it again with &mut', () => {
   const dir = initPackage(h, 'reborrowhint')
   write(join(dir, 'src/main.silk'), 'fn bump(v: &mut i32) -> () {\n  v.* = v.* + 1\n}\n\npub fn main() -> i32 {\n  let mut n: i32 = 0\n  let r = &mut n\n  bump(r)\n  bump(r)\n  return n - 2\n}\n')
   const result = silk(h, ['check'], { cwd: dir })
   assert.match(result.stderr, /error\[OWN0003\].*&mut r/, show(result))
 })
 
-test('an error in a typed let does not hide later errors that use the binding', { todo: 'finding 67' }, () => {
+test('an error in a typed let does not hide later errors that use the binding', () => {
   const dir = initPackage(h, 'typedlet')
   write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let a: i32 = "s"\n  let b: bool = true\n  let d = a + b\n  return 0\n}\n')
   const result = silk(h, ['check'], { cwd: dir })
@@ -401,7 +401,7 @@ test('an error in a typed let does not hide later errors that use the binding', 
   assert.match(result.stderr, /4:\d+: error\[SEM0135\]/, show(result))
 })
 
-test('a long postfix chain is refused with PAR0005, not a crash', { todo: 'finding 72' }, () => {
+test('a long postfix chain is refused with PAR0005, not a crash', () => {
   const dir = initPackage(h, 'postfixchain')
   for (const [name, link] of [['field', '.inner'], ['method', '.f()'], ['index', '[0]']]) {
     write(join(dir, 'src/main.silk'), `fn f(v: i32) -> i32 {\n  return v\n}\n\npub fn main() -> i32 {\n  let b: i32 = 0\n  return b${link.repeat(1000)}\n}\n`)
@@ -447,4 +447,42 @@ pub effect fn main() -> i32
     const result = silk(h, ['run', '--quiet', ...flags], { cwd: dir })
     assert.match(result.stderr, /fatal trap: index out of bounds\n  at main\.bad \(main:12:10\)/, `${flags.join(' ') || 'debug'}: ${show(result)}`)
   }
+})
+
+test('a HashMap that inserts and removes one key at a time keeps a small table', { todo: 'finding 79' }, () => {
+  const dir = initPackage(h, 'map-churn')
+  write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.hash { Hash, Word }
+import silk.hash_map { HashMap }
+import silk.usize
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut map = HashMap<Word, i64>.make(Hash.seed(17))
+  let mut i: u64 = 0
+  while i < 100000 {
+    drop run HashMap<Word, i64>.insert(&mut map, Hash.word(i), 1)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+    drop HashMap<Word, i64>.remove(&mut map, Hash.word(i))
+    i = i + 1
+  }
+  // The map never holds more than one entry.
+  if HashMap<Word, i64>.bucketCount(&map) > 64 {
+    return 1
+  }
+  return 0
+}
+`)
+  const ran = silk(h, ['run', '--quiet', '--release'], { cwd: dir })
+  assert.equal(ran.status, 0, show(ran))
+})
+
+test('let _ = names drop as the way to discard a value', { todo: 'finding 78' }, () => {
+  const dir = initPackage(h, 'let-underscore')
+  write(join(dir, 'src/main.silk'), 'fn value() -> i32 {\n  return 1\n}\n\npub fn main() -> i32 {\n  let _ = value()\n  return 0\n}\n')
+  const checked = silk(h, ['check'], { cwd: dir })
+  assert.match(checked.stderr, /main\.silk:6:\d+: error\[SEM0087\]/, show(checked))
+  assert.match(checked.stderr, /drop/, show(checked))
 })

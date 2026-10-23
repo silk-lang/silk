@@ -239,3 +239,53 @@ test('runtime traps report the kind and place and exit 132', () => {
     assert.match(ran.stderr, new RegExp(`fatal trap: ${kind}\\n  at main\\.main \\(main:\\d+:\\d+\\)`))
   }
 })
+
+// A library with one error that only shows when the app calls into it, and one in a function nobody
+// calls. Both are the library's errors and belong to its file.
+function brokenDependency(stem) {
+  const lib = initPackage(h, fresh(`${stem}-lib`), ['--lib'])
+  write(join(lib, 'src/lib.silk'), 'pub fn sum(a: i32, b: i32) -> i32 {\n  let s = a + b\n  return s == 1\n}\n\nfn unused() -> i32 {\n  return true\n}\n')
+  const app = initPackage(h, fresh(`${stem}-app`))
+  const name = lib.split('/').at(-1)
+  const added = silk(h, ['add', `../${name}`], { cwd: app })
+  assert.equal(added.status, 0, show(added))
+  const dependency = name.replaceAll('-', '_')
+  write(join(app, 'src/main.silk'), `import ${dependency}.lib { sum }\n\npub fn main() -> i32 {\n  return sum(40, 2)\n}\n`)
+  return { lib, app }
+}
+
+test('an error inside a dependency is reported in the dependency file', { todo: 'finding 82' }, () => {
+  const { app } = brokenDependency('dep-error')
+  const checked = silk(h, ['check'], { cwd: app })
+  assert.notEqual(checked.status, 0, show(checked))
+  assert.match(checked.stderr, /lib\.silk:3:\d+: error\[SEM0129\]/, show(checked))
+  assert.doesNotMatch(checked.stderr, /main\.silk:4/, show(checked))
+})
+
+test('an error in a dependency function the app does not call still fails the build', { todo: 'finding 82' }, () => {
+  const { lib, app } = brokenDependency('dep-unused')
+  write(join(lib, 'src/lib.silk'), read(join(lib, 'src/lib.silk')).replace('return s == 1', 'return s'))
+  const checked = silk(h, ['check'], { cwd: app })
+  assert.notEqual(checked.status, 0, show(checked))
+  assert.match(checked.stderr, /lib\.silk:7:\d+: error\[SEM0129\]/, show(checked))
+})
+
+test('List.get past the end traps as an index out of bounds at the caller', { todo: 'finding 80' }, () => {
+  const dir = initPackage(h, fresh('list-get'))
+  write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.list { List }
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut values = List<i32>.make()
+  run List<i32>.append(&mut values, 10) |> Effect.provideMut<Allocator>(&mut allocator)
+  return List<i32>.get(&values, 5)
+}
+`)
+  const ran = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.ok(ran.signal === 'SIGILL' || ran.status === 132, show(ran))
+  assert.match(ran.stderr, /fatal trap: index out of bounds/, show(ran))
+  assert.match(ran.stderr, /at main\.main \(main:10:\d+\)/, show(ran))
+})
