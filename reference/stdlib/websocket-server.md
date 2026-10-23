@@ -21,9 +21,10 @@ client. Client frames must be masked. Server frames are not masked. The channel 
 the callback of [`withServer`](#withServer) ends.
 
 When a client frame breaks a rule, the session fails, and later calls fail with
-`PreviousFailure`. If there is a deadline that has not passed, the server first sends Close with
-a code: 1002 for a protocol error, 1003 for fragmentation, 1007 for bad UTF-8, and 1009 for a
-message that is too large.
+`PreviousFailure`. Unless the deadline has passed, the server first sends Close with a code:
+1002 for a protocol error, 1003 for fragmentation, 1007 for bad UTF-8, and 1009 for a message
+that is too large for the limits or the buffer. With no deadline, it allows that Close one
+second.
 
 ## Errors
 [`WebSocketError`](#WebSocketError) tells the rule, limit, state, or transport error.
@@ -31,7 +32,6 @@ message that is too large.
 ## Gotchas
 - Fragmented messages, extensions, and compression are not supported. A fragmented message fails
   the session.
-- With no deadline, a failure closes the channel without a Close frame.
 - If a message is larger than your buffer, the session fails with `BufferTooSmall`. Give a
   buffer of `maxMessageBytes`.
 
@@ -884,9 +884,10 @@ The error of a WebSocket operation: the rule, limit, state, or transport error.
 
 ### Details
 When a client frame breaks a rule, the session fails, and later calls fail with
-`PreviousFailure`. If there is a deadline that has not passed, the server first sends Close with
-a code: 1002 for a protocol error, 1003 for fragmentation, 1007 for bad UTF-8, and 1009 for a
-message that is too large. With no deadline, a failure closes the channel without a Close frame.
+`PreviousFailure`. Unless the deadline has passed, the server first sends Close with a code:
+1002 for a protocol error, 1003 for fragmentation, 1007 for bad UTF-8, and 1009 for a message
+that is too large for the limits or the buffer. With no deadline, it allows that Close one
+second.
 
 <a id="WebSocketError.InvalidLimits"></a>
 
