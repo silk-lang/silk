@@ -1714,15 +1714,21 @@ its fields. For a struct, call [`Format.debugFields`](#Format.impl.debugFields);
 
 The standard integers and `bool` write the same text as `Display`. Floats also do, but a whole
 number ends in `.0`, as `1.0`. `string` and `char` write quotes and escapes. `Option` and
-`Result` write the variant and its value, such as `Some(3)`. `List` writes its elements, as
-`[1, 2, 3]`. [`Format.alternate`](#Format.impl.alternate) selects the pretty form, which puts each field on its own
-line. Nested values share the formatter, so the pretty form indents at each level.
+`Result` write the variant and its value, such as `Some(3)`. `List` and slices write their
+elements, as `[1, 2, 3]`. [`Format.alternate`](#Format.impl.alternate) selects the pretty form, which puts each field on
+its own line. Nested values share the formatter, so the pretty form indents at each level.
+
+A fixed array and an anonymous tuple or record cannot implement `Debug`. They still have a
+`Debug` form wherever the type is known as a field: as a `{:?}` argument of [`Format.format`](#Format.impl.format)
+and as a field that [`Format.debugFields`](#Format.impl.debugFields) writes. An array writes `[1, 2]`, an anonymous tuple
+`(1, "a")`, and an anonymous record `{ x: 1 }`.
 
 ### Gotchas
 
-Slices, arrays, and anonymous tuples and records have no `Debug` implementation, because only a
-declared type can implement an interface. Write them with [`Format.debugList`](#Format.impl.debugList) and
-[`Format.debugFields`](#Format.impl.debugFields) with an empty name, which writes `(1, 2)` or `{ x: 1 }`.
+[`Format.debug`](#Format.impl.debug) and a `T: Debug` bound still need a `Debug` implementation, so an array or an
+anonymous tuple cannot be passed to `Format.debug` or held in an `Option` or a `List` that
+writes its `Debug` form. Pass it as a `{:?}` argument instead, as
+`Format.format("{:?}", &(values, ))`, or write a slice of an array with `&values`.
 
 <a id="Debug.debug"></a>
 
@@ -2447,6 +2453,42 @@ effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &m
 ```
 
 Writes `Success(` or `Failure(`, the `Debug` form of the payload, and `)`.
+
+<a id="a.impl.Debug"></a>
+
+## Implementation `Debug for &'a [T]`
+
+```silk
+impl<'a, T: Debug> Debug for &'a [T]
+```
+
+<a id="a.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the `Debug` form of each element, as `[1, 2, 3]`. See [`Format.debugList`](#Format.impl.debugList).
+
+<a id="a.impl.Debug-2"></a>
+
+## Implementation `Debug for &'a mut [T]`
+
+```silk
+impl<'a, T: Debug> Debug for &'a mut [T]
+```
+
+<a id="a.impl.Debug.debug-2"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the `Debug` form of each element, as `[1, 2, 3]`. See [`Format.debugList`](#Format.impl.debugList).
 
 <a id="List.impl.Debug"></a>
 
