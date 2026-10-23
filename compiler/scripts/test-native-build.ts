@@ -624,7 +624,7 @@ const program = Effect.gen(function* () {
     ['--emit'],
     ['--emit', 'llvm-ir', '--emit', 'llvm-ir'],
     ['--emit', 'final', '--emit', 'llvm-ir'],
-    // The artifact form is the manifest's `[build].artifact`; `--emit` names only a stage.
+    // The artifact form is the manifest's `[package].kind`; `--emit` names only a stage.
     ['--emit', 'executable'],
     ['--target', foreign],
     ['--emit', 'llvm-ir', '--target', 'no-such-target'],
@@ -1412,12 +1412,12 @@ const program = Effect.gen(function* () {
   }
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), tunedMain)
   // Profile fields the native build cannot honor yet, a profile artifact other than the one
-  // [build].artifact requests, unknown manifest fields and reserved module names are refused
+  // [package].kind requests, unknown manifest fields and reserved module names are refused
   // before anything is built, naming the manifest line.
   const refusedProfiles = [
     ['sanitizers = ["address"]', /silk\.toml:7: profiles\.p\.sanitizers is not supported by the native compiler yet/],
     ['unwind = "native"', /silk\.toml:7: profiles\.p\.unwind = "native" is not supported by the native compiler yet/],
-    ['artifact = "object"', /silk\.toml:7: UnsupportedCombination: profiles\.p\.artifact = "object" differs from \[build\]\.artifact = "executable"/],
+    ['artifact = "object"', /silk\.toml:7: UnsupportedCombination: profiles\.p\.artifact = "object" differs from \[package\]\.kind = "executable"/],
     ['opt = "speed"', /silk\.toml:7: profiles\.p\.opt is not a supported field/],
   ] as const
   for (const [field, message] of refusedProfiles) {
@@ -1800,7 +1800,8 @@ const program = Effect.gen(function* () {
   )
   assert.equal(managedBuild.status, 0, managedBuild.stderr + managedBuild.stdout)
   // Members build in dependency order, whatever order `members` lists them in.
-  assert.match(managedBuild.stderr, /^Compiling greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
+  // A library member is only checked; it makes no artifact of its own.
+  assert.match(managedBuild.stderr, /^Checking greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
   assert.match(managedBuild.stderr, /^Finished 2 packages in [^\n]*\n$/m)
   // Each artifact is named from the working directory, the workspace root here, not its package.
   assert.match(
