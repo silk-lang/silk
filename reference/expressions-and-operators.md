@@ -287,8 +287,10 @@ the programmer to bind, return, compose, or explicitly drop it.
 
 The outer expression starts at depth zero. Beginning a direct child expression adds one active
 edge: grouped contents, prefix and infix operands, pipeline targets, indexes, arguments, container
-elements, aggregate initializers, and `match` children all count. Parser-layer transitions that
-still describe the same expression do not add depth. Sequential siblings derive independently
+elements, aggregate initializers, and `match` children all count. The operands of one
+left-associative infix chain such as `a + b + c` are siblings: the chain adds one edge for each
+operand it starts, not one per operator. Parser-layer transitions that still describe the same
+expression do not add depth. Sequential siblings derive independently
 from their common parent, so finishing one argument or element does not consume another sibling's
 budget.
 
@@ -301,8 +303,9 @@ ordinary parser so later syntax remains independently parseable.
 **Boundary:** This is an expression-child limit, not a token, syntax-node, type, pattern, statement,
 or declaration nesting limit. Separately, the compiler charges each active construct its native
 stack cost and reports `PAR0005` before a mix would exceed half of an 8 MB stack. Alone, 256
-grouped children or 256 chained infix operators fit, as do 134 prefix operands, 100 nested calls,
-62 nested array or tuple literals, 59 nested blocks and 44 nested `if` statements. Call-delimiter recovery bookkeeping does not change the expression
+grouped children, 499 chained infix operators, 167 field or index links in one postfix chain
+(`a.b.c`), 134 prefix operands, 100 nested calls, 71 method call links (`a.f().g()`), 62 nested
+array or tuple literals, 59 nested blocks and 44 nested `if` statements fit. Call-delimiter recovery bookkeeping does not change the expression
 depth. Parser implementation failures such as invalid token ordering remain defects: they are not
 caught or converted to `PAR0005`.
 
