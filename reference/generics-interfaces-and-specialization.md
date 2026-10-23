@@ -1322,7 +1322,9 @@ and gives `&[T]`.
 **Boundary:** `for` does not add another interface argument, and the provider need not appear in the
 interface's explicit arguments. A structural union, reference, fixed array, anonymous tuple or
 record, anonymous callable contract, or interface value cannot own a conformance; the provider must
-have one canonical nominal identity, or be a scalar, `string`, or slice.
+have one canonical nominal identity, or be a scalar, `string`, or slice. A union still conforms to
+an interface its members all implement when the interface only reads `self` through a reference
+([UNION-003](values-and-types.md#union-003--a-union-takes-a-reference-only-interface-that-every-member-implements)).
 
 **Diagnostics:** A missing, malformed, or non-nominal provider reports an invalid-provider
 diagnostic at the `for` type. Wrong interface-argument arity or kind reports the application error
