@@ -13,8 +13,9 @@ The provider has its own clocks, random source, and trust store, so you give onl
 The defaults are a deadline of 30 seconds for each request, a response body of at most 16 MiB,
 up to 10 redirects, and the PEM bundle of the platform for HTTPS: `/etc/ssl/cert.pem` on macOS
 and `/etc/ssl/certs/ca-certificates.crt` on Linux. [`NativeHttp.fromEnvironment`](#NativeHttp.impl.fromEnvironment) uses the file
-in `SSL_CERT_FILE` when it is set. Each request opens a new HTTP/1.1 connection and sends
-`Accept-Encoding: identity`, so the body arrives as the server sent it.
+in `SSL_CERT_FILE` when it is set, and the proxies in `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+and `NO_PROXY`. Each request opens a new HTTP/1.1 connection and sends `Accept-Encoding:
+identity`, so the body arrives as the server sent it.
 
 Redirects follow the Fetch standard. After 303, and after 301 or 302 for a POST, the client
 sends a GET without a body. After 307 and 308, it sends the same method and body. A redirect
@@ -23,7 +24,8 @@ from HTTPS to HTTP fails. A redirect to another origin does not send `Authorizat
 
 ## Gotchas
 The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the TCP
-connect. The macOS keychain is not used, only the PEM bundle.
+connect. The macOS keychain is not used, only the PEM bundle. [`NativeHttp.make`](#NativeHttp.impl.make) reads no
+environment variables, so it never uses a proxy. Only `http://` proxies are supported.
 
 ## Examples
 ### Set up the client
@@ -146,7 +148,8 @@ from HTTPS to HTTP fails. A redirect to another origin does not send `Authorizat
 ### Gotchas
 
 The deadline covers the TLS handshake and the HTTP exchange, but not the name lookup and the
-TCP connect. The macOS keychain is not used, only the PEM bundle.
+TCP connect. The macOS keychain is not used, only the PEM bundle. [`NativeHttp.make`](#NativeHttp.impl.make) reads no
+environment variables, so it never uses a proxy. Only `http://` proxies are supported.
 
 <a id="NativeHttp.impl"></a>
 
@@ -184,11 +187,28 @@ pub effect fn fromEnvironment() -> NativeHttp<'config>
     ? &mut HostInput | &mut Allocator
 ```
 
-Makes a client that uses `SSL_CERT_FILE` as its PEM bundle when that variable is set.
+Makes a client that uses `SSL_CERT_FILE` as its PEM bundle and the proxy variables when they
+are set.
 
 #### Details
 
-A relative path is resolved against the working directory. An empty value fails.
+A relative `SSL_CERT_FILE` is resolved against the working directory. An empty value fails.
+
+HTTPS requests go through `HTTPS_PROXY`, then `https_proxy`, `ALL_PROXY`, and `all_proxy`,
+the first one that is set and not empty. Plain HTTP requests go through `HTTP_PROXY`, then
+`http_proxy`, `ALL_PROXY`, and `all_proxy`. HTTPS uses a `CONNECT` tunnel, so TLS still
+checks the server certificate. A proxy URL such as `http://user:pass@proxy:3128` sends Basic
+credentials to the proxy. A URL without a scheme is read as `http://`.
+
+`NO_PROXY` or `no_proxy` lists hosts that are reached directly, separated by commas. An entry
+matches the host and its subdomains, so `example.com` and `.example.com` both match
+`api.example.com`. A port in an entry is ignored, and `*` matches every host. An address
+range such as `10.0.0.0/8` matches nothing; list the addresses instead.
+
+#### Errors
+
+A proxy URL that is not valid fails with `InvalidUrl`. Only `http://` proxies are supported,
+so an `https://` or `socks5://` proxy URL fails too.
 
 <a id="NativeHttp.impl.baseUrl"></a>
 
@@ -256,10 +276,11 @@ Makes each final response with a status outside 200 to 299 fail with a `Status` 
 ### Method `trustBundle`
 
 ```silk
-pub fn trustBundle(self: Self, path: &'config [u8]) -> NativeHttp<'config>
+pub fn trustBundle(self: Self, path: string<'config>) -> NativeHttp<'config>
 ```
 
-Uses the PEM bundle at this absolute path instead of the platform bundle.
+Uses the PEM bundle at the absolute path `path`, such as `"/etc/ssl/cert.pem"`, instead of
+the platform bundle.
 
 <a id="NativeHttp.impl.Http"></a>
 

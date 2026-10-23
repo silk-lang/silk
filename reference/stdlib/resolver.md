@@ -106,7 +106,7 @@ impl MonotonicClock for FixedMonotonic {
 
 effect fn program() -> i32
   ! ResolverError | OutOfMemoryError {
-  let host = match Host.parse(b"example.com") {
+  let host = match Host.parse("example.com") {
     Result<Host, AddressError>.Success { value } => value
     Result<Host, AddressError>.Failure { error: _ } => {
       return 1

@@ -923,7 +923,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'tested/src/util/check.silk'),
-    'import silk.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n',
+    'import silk.testing { AssertionError, Testing }\n\npub fn half(value: i32) -> i32 {\n  return value / 2\n}\n\ntest effect fn halvesEvenly() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(84) == 42, "84 halves to 42")\n}\n\ntest effect fn failsOnPurpose() -> () ! AssertionError<\'static> {\n  run Testing.expect(half(3) == 2, "integer division truncates")\n}\n\ntest fn dividesByZero() -> () {\n  let zero: i32 = 0\n  let quotient = half(2) / zero\n}\n',
   )
   const selectedTests = yield* invoke(
     silk,
@@ -944,20 +944,27 @@ const program = Effect.gen(function* () {
   assert.match(selectedTests.stdout, /util\/check::halvesEvenly\n/)
   assert.match(
     selectedTests.stdout,
-    /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 3 discovered\)/,
+    /1 passed, 0 failed \(0 cached, 1 executed, 1 selected, 4 discovered\)/,
   )
   assert.equal(
     yield* fs.exists(join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested')),
     true,
   )
+  // No test result is stored yet, so a plain `silk test` runs every selected test.
   const failedTests = yield* invoke(
     silk,
-    ['test', '--no-cache', '--stdlib', standardLibrary],
+    ['test', '--stdlib', standardLibrary],
     join(directory, 'tested'),
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(failedTests.status, 1, failedTests.stderr)
-  assert.match(failedTests.stdout, /2 passed, 1 failed/)
+  // A test that traps fails, and the tests after it still run.
+  assert.match(failedTests.stderr, /fatal trap: division by zero/)
+  assert.match(
+    failedTests.stdout,
+    /util\/check::dividesByZero\n {4}FAIL {2}stopped the test process\n(.*\n)*  util\/check::halvesEvenly\n {4}PASS/,
+  )
+  assert.match(failedTests.stdout, /2 passed, 2 failed \(0 cached, 4 executed, 4 selected, 4 discovered\)/)
   // A selection that matches no test verified nothing, so it fails.
   const unmatchedTests = yield* invoke(
     silk,
@@ -1027,19 +1034,14 @@ const program = Effect.gen(function* () {
     assert.match(refusedInput.stderr, /silk: invalid native link input: .*silk\.toml: /)
     assert.match(refusedInput.stderr, rule)
   }
-  for (const selection of [['--root', 'main.silk'], ['--file', 'src/util/check.txt'], []]) {
+  for (const selection of [['--root', 'main.silk'], ['--file', 'src/util/check.txt']]) {
     const refusedTests = yield* invoke(
       silk,
-      [
-        'test',
-        '--stdlib',
-        standardLibrary,
-        ...(selection.length === 0 ? [] : ['--no-cache', ...selection]),
-      ],
+      ['test', '--stdlib', standardLibrary, ...selection],
       join(directory, 'tested'),
       { ...process.env, SILK_CLANG: sentinel },
     )
-    assert.equal(refusedTests.status, 2, `test accepted ${selection.join(' ') || 'a cached run'}`)
+    assert.equal(refusedTests.status, 2, `test accepted ${selection.join(' ')}`)
   }
   assert.equal(yield* fs.exists(marker), false)
   const repeated = yield* invoke(silk, ['init', 'greeting'], directory)
@@ -1790,6 +1792,16 @@ const program = Effect.gen(function* () {
   )
   assert.equal(managedTest.status, 0, managedTest.stderr + managedTest.stdout)
   assert.match(managedTest.stdout, /addsTwoNumbers/)
+  // A filter passes when it matches a test in any member, even if other members match none.
+  const filteredWorkspace = yield* invoke(
+    silk,
+    ['test', '--workspace', '--filter', 'addsTwo', '--stdlib', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(filteredWorkspace.status, 0, filteredWorkspace.stderr + filteredWorkspace.stdout)
+  assert.match(filteredWorkspace.stdout, /addsTwoNumbers/)
+  assert.doesNotMatch(filteredWorkspace.stderr, /no tests matched/)
   // From a member directory, `--workspace` selects every member.
   const managedCheck = yield* invoke(
     silk,

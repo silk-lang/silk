@@ -45,6 +45,10 @@ When an error is handled, its nodes go back to the pool. When an error is not ha
 observer writes it with a `NativeReport`. If the pool is empty, the report still has the
 error name and its origin, but frames and causes can be missing.
 
+The report leaves out caller frames from the standard library (module paths that start with
+`silk/`), such as the runtime's own `Effect.flatMap`. The origin line is always written, also
+when the error was created in the standard library.
+
 ### Gotchas
 - The observer does not close the descriptor of the report, and does not end the process.
 - An unhandled error gives status 1, also when the report cannot be written.

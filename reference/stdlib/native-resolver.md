@@ -37,7 +37,7 @@ import silk.result { Result }
 import silk.resolver { FamilySelection, ResolveRequest, ResolvedEndpoints, Resolver, ResolverError }
 import silk.system_clock { Instant, SystemClock }
 
-fn request(name: &[u8], deadline: Option<Instant>) -> Option<ResolveRequest> {
+fn request(name: string, deadline: Option<Instant>) -> Option<ResolveRequest> {
   let host = match Host.parse(name) {
     Result<Host, AddressError>.Success { value } => value
     Result<Host, AddressError>.Failure { error: _ } => {
@@ -53,7 +53,7 @@ fn request(name: &[u8], deadline: Option<Instant>) -> Option<ResolveRequest> {
 }
 
 // Returns the number of endpoints of `name`. It blocks until the system lookup ends.
-effect fn countEndpoints(name: &[u8]) -> usize
+effect fn countEndpoints(name: string) -> usize
   ! ResolverError | OutOfMemoryError
   ? &mut Resolver | &mut MonotonicClock | &mut Allocator {
   let lookup = match request(name, Option<Instant>.none()) {
@@ -72,7 +72,7 @@ pub fn main() -> i32 {
   let mut clock = OsMonotonicClock.make()
 
   // A host name with a deadline fails before the lookup starts.
-  let limited = match request(b"example.com", Option<Instant>.some(SystemClock.make(1, 0))) {
+  let limited = match request("example.com", Option<Instant>.some(SystemClock.make(1, 0))) {
     Option.Some { value } => move value
     Option.None => {
       return 1

@@ -14,7 +14,7 @@ import silk.network_address {AddressError, Host, Port}
 import silk.result {Result}
 
 pub fn main() -> i32 {
-  let host = Host.parse(b"[2001:db8::1]")
+  let host = Host.parse("[2001:db8::1]")
   let port = Port.make(443)
   return match move host {
     Result<Host, AddressError>.Failure {error} => 1

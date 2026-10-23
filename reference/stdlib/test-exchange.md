@@ -23,6 +23,11 @@ integers are little-endian. There are two modes:
 A receipt starts with the magic `SLKTRCP1`, the version, the mode, the nonce of the plan, and
 the SHA-256 of the complete plan. It ends with the counts and the status.
 
+A progress record lets the host continue a run after a test traps. It is exactly 48 bytes: the
+magic `SLKTPRG1`, the ordinal of the test that is starting, then the cached, executed, passed
+and failed counts before that test. The runner writes one before each test body runs, so after
+an abnormal exit the record names the test that stopped the process.
+
 ## Gotchas
 - A [`Plan`](#Plan) does not stop at the first error. After a failure it reads as empty, and [`failed`](#failed)
   stays true. Check [`failed`](#failed) or the `bool` results before a test body runs.
@@ -30,7 +35,7 @@ the SHA-256 of the complete plan. It ends with the counts and the status.
 
 Import as `TestExchange` with `import silk.test_exchange as TestExchange`.
 
-Public declarations: 18.
+Public declarations: 21.
 
 <a id="Plan"></a>
 
@@ -55,6 +60,70 @@ pub struct Entry<'a>
 ```
 
 One borrowed per-test catalog entry.
+
+<a id="Progress"></a>
+
+## `Progress`
+
+```silk
+pub struct Progress
+```
+
+A run's position when a test started: the catalog ordinal of that test and the counts before it.
+
+### Details
+The runner writes it with [`progressRecord`](#progressRecord) before each test body runs. After the process
+stops abnormally, [`readProgress`](#readProgress) reads it back, and a new runner continues after that test.
+
+<a id="Progress.ordinal"></a>
+
+### Field `ordinal`
+
+```silk
+pub ordinal: u64
+```
+
+The catalog ordinal of the test that was starting.
+
+<a id="Progress.cachedCount"></a>
+
+### Field `cachedCount`
+
+```silk
+pub cachedCount: u64
+```
+
+The cached passes before that test.
+
+<a id="Progress.executed"></a>
+
+### Field `executed`
+
+```silk
+pub executed: u64
+```
+
+The tests executed before that test.
+
+<a id="Progress.passed"></a>
+
+### Field `passed`
+
+```silk
+pub passed: u64
+```
+
+The tests that passed before that test, cached passes included.
+
+<a id="Progress.failedCount"></a>
+
+### Field `failedCount`
+
+```silk
+pub failedCount: u64
+```
+
+The tests that failed before that test.
 
 <a id="Receipt"></a>
 
@@ -260,6 +329,33 @@ pub effect fn finishReceipt(
 Appends the counts and the status, and returns the receipt bytes.
 
 In uncached mode the receipt is padded to exactly 256 bytes.
+
+<a id="progressRecord"></a>
+
+## `progressRecord`
+
+```silk
+pub effect fn progressRecord(progress: &Progress) -> Bytes ! OutOfMemoryError ? &mut Allocator
+```
+
+Returns the 48-byte progress record of `progress`.
+
+### Details
+The record is the magic `SLKTPRG1`, then the ordinal and the four counts as 8-byte
+little-endian integers.
+
+<a id="readProgress"></a>
+
+## `readProgress`
+
+```silk
+pub fn readProgress(bytes: &[u8]) -> Option<Progress>
+```
+
+Reads a progress record that [`progressRecord`](#progressRecord) wrote.
+
+### Details
+It returns `None` unless `bytes` is exactly one record with the `SLKTPRG1` magic.
 
 
 Category: Testing.

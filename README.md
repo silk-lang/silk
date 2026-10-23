@@ -104,8 +104,8 @@ and moves any member pins along with it.
 ```sh
 silk toolchain install 0.1.0-dev.6+0123456789ab   # download, verify and unpack a release
 silk toolchain use 0.1.0-dev.6+0123456789ab       # install it and pin the current project
-silk toolchain use latest                         # pin the newest stable release (dev: newest of any kind)
-silk toolchain default 0.1.0-dev.6+0123456789ab   # the toolchain used outside pinned projects
+silk toolchain use latest                         # pin the newest stable release (--dev: include dev releases)
+silk toolchain default 0.1.0-dev.6+0123456789ab   # used outside pinned projects; ~/.silk/bin/silk runs it
 silk toolchain list                               # installed toolchains; which one is selected
 silk toolchain which                              # the toolchain selected here, and why
 silk +0.1.0-dev.6+0123456789ab build              # run one command with a given toolchain
@@ -240,7 +240,7 @@ test effect fn reportsTheTimeLeft() -> () ! AssertionError<'static> | Expired | 
 ```
 
 ```console
-$ silk test --no-cache
+$ silk test
   main::reportsTheTimeLeft
     PASS  19 us
 

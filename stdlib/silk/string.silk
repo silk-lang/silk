@@ -92,9 +92,13 @@ import silk.char
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.option { Option }
 import silk.result { Result }
+import silk.arch.aarch64
+import silk.arch.wasm
+import silk.arch.x86
 import silk.simd
 import silk.simd.mask16
 import silk.simd.u8x16
+import silk.target { Arch, Target }
 import silk.u32
 import silk.u8
 import silk.usize
@@ -422,7 +426,105 @@ fn continuation(value: u8) -> bool {
 
 /// Returns the first byte offset at which UTF-8 validation fails, or None for complete valid text.
 fn firstInvalidUtf8(values: &[u8]) -> Option<usize> {
-  let mut index = usize.ZERO
+  // Targets with a sixteen-lane byte table lookup check whole blocks at once.
+  static if (Target.arch() == Arch.X86_64 && Target.hasCpuFeature("ssse3")) || (Target.arch() == Arch.Aarch64 && Target.hasCpuFeature("neon")) || (Target.arch() == Arch.Wasm32 && Target.hasCpuFeature("simd128")) {
+    return firstInvalidUtf8Blocks(values)
+  }
+  return firstInvalidUtf8From(values, usize.ZERO)
+}
+
+// Lane `i` is `table[indices[i]]`; every index is below sixteen.
+fn nibbleLookup(table: simd<u8, 16>, indices: simd<u8, 16>) -> simd<u8, 16> {
+  static if Target.arch() == Arch.X86_64 {
+    return x86.shuffleBytes(table, indices)
+  }
+  static if Target.arch() == Arch.Aarch64 {
+    return aarch64.tableLookup(table, indices)
+  }
+  return wasm.swizzle(table, indices)
+}
+
+// Validates sixteen bytes at a time with the lookup method of Keiser and Lemire ("Validating
+// UTF-8 In Less Than One Instruction Per Byte"). Three table lookups on the high and low nibbles
+// of each byte and the high nibble of the next flag every error that two bytes can show; a
+// separate check catches missing third and fourth bytes. A block only says whether an error is
+// near, so the scalar loop finds its exact offset, starting at the character that begins at or
+// before the previous block, since an error can belong to a sequence that started there.
+fn firstInvalidUtf8Blocks(values: &[u8]) -> Option<usize> {
+  // Error bits: 1 too short, 2 too long, 4 overlong 3, 8 too large, 16 surrogate, 32 overlong 2,
+  // 64 too large 1000 or overlong 4, 128 two continuations.
+  let firstHigh = u8x16.fromArray([2, 2, 2, 2, 2, 2, 2, 2, 128, 128, 128, 128, 33, 1, 21, 73])
+  let firstLow = u8x16.fromArray([231, 163, 131, 131, 139, 203, 203, 203, 203, 203, 203, 203, 203, 219, 203, 203])
+  let secondHigh = u8x16.fromArray([1, 1, 1, 1, 1, 1, 1, 1, 230, 174, 186, 186, 1, 1, 1, 1])
+  // Bytes that still need a continuation when they end a block: a lead in the last lane, a
+  // three- or four-byte lead in the second to last, a four-byte lead in the third to last.
+  let incompleteLimit = u8x16.fromArray([255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 239, 223, 191])
+  let four = u8x16.splat(byte(4))
+  let lowNibble = u8x16.splat(byte(15))
+  let high = u8x16.splat(byte(128))
+  let zero = u8x16.splat(byte(0))
+  let mut previous = zero
+  let mut previousIncomplete = zero
+  let mut at = usize.ZERO
+  while at + 16 <= values.length {
+    let input = u8x16.load(values, at)
+    let mut error = previousIncomplete
+    if mask16.any(u8x16.lanesGreaterOrEqual(input, high)) {
+      let previous1 = u8x16.shuffle(previous, input, [15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30])
+      let previous2 = u8x16.shuffle(previous, input, [14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29])
+      let previous3 = u8x16.shuffle(previous, input, [13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28])
+      let special = nibbleLookup(firstHigh, u8x16.shiftRight(previous1, four)) & nibbleLookup(firstLow, previous1 & lowNibble) & nibbleLookup(secondHigh, u8x16.shiftRight(input, four))
+      // A byte two after a three- or four-byte lead, or three after a four-byte lead, must be a
+      // continuation; the two-continuations bit in `special` says it is one.
+      let third = u8x16.saturatingSubtract(previous2, u8x16.splat(byte(96)))
+      let fourth = u8x16.saturatingSubtract(previous3, u8x16.splat(byte(112)))
+      error = ((third | fourth) & high) ^ special
+      previousIncomplete = u8x16.saturatingSubtract(input, incompleteLimit)
+    } else {
+      previousIncomplete = zero
+    }
+    if u8x16.reduceBitOr(error) != byte(0) {
+      let mut start = usize.ZERO
+      if at >= 16 {
+        start = characterStart(values, at - 16)
+      }
+      return firstInvalidUtf8From(values, start)
+    }
+    previous = input
+    at = at + 16
+  }
+  return firstInvalidUtf8From(values, characterStart(values, at))
+}
+
+// Where to resume byte-by-byte validation at `offset`, when the characters before it have been
+// checked except for a sequence that may run into `offset`: the nearest lead byte up to three
+// bytes back when its sequence reaches `offset`, else `offset` itself.
+fn characterStart(values: &[u8], offset: usize) -> usize {
+  let mut back = usize.ONE
+  while back <= 3 && back <= offset {
+    let lead = values[offset - back]
+    if continuation(lead) == false {
+      let mut width = usize.ONE
+      if lead >= byte(240) {
+        width = 4
+      } else if lead >= byte(224) {
+        width = 3
+      } else if lead >= byte(192) {
+        width = 2
+      }
+      if width > back {
+        return offset - back
+      }
+      return offset
+    }
+    back = back + usize.ONE
+  }
+  return offset
+}
+
+// Validates from `start`, which must begin a character after valid text.
+fn firstInvalidUtf8From(values: &[u8], start: usize) -> Option<usize> {
+  let mut index = start
   while index < values.length {
     let first = values[index]
     if first < byte(128) {

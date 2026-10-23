@@ -82,7 +82,7 @@ effect fn failed<E>(error: E) -> i32 {
 effect fn withFiles() -> i32
   ! FileError | OutOfMemoryError
   ? &mut Allocator {
-  let mut files = run OsFileSystem.make(b"/tmp")
+  let mut files = run OsFileSystem.make("/tmp")
   return run program() |> Effect.provideMut<FileSystem>(&mut files)
 }
 

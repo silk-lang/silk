@@ -41,7 +41,7 @@ effect fn program() -> i32
   ? &mut Allocator {
   let path = run Path.make("/bin/echo")
   let mut request = run ChildProcess.request(&path)
-  run ChildProcess.addArgument(&mut request, b"hi")
+  run ChildProcess.addArgument(&mut request, "hi")
   let mut provider = OsChildProcess.make()
   let outcome = run ChildProcess.submit(&request) |> Effect.provideMut<ChildProcess>(&mut provider)
   let code = match ChildProcess.exitCode(&outcome) {

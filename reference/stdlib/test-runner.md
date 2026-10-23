@@ -17,8 +17,15 @@ The host passes these options. Each takes one value:
 | `--filter` | Run only the tests whose `module::name` contains this text |
 | `--silk-test-plan` | Path of the plan file. Required. |
 | `--silk-test-result` | Path of the receipt file. Required. |
+| `--silk-test-progress` | Path of the progress file. Optional. |
 
 The runner checks the complete plan before any test body runs.
+
+With `--silk-test-progress`, the runner writes a progress record (see `silk.test_exchange`)
+before each test body runs, and removes the file when every test has finished. If the file
+already holds a record when the runner starts, the test it names stopped an earlier runner
+process, for example with a trap. The runner then reports that test as failed, skips the tests
+before it, and continues with the next one, so its summary and receipt count the whole run.
 
 ## Errors
 The exit status is `0` if all selected tests pass, `1` if a test fails, and `2` for a usage

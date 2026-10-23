@@ -13,8 +13,15 @@
 //! | `--filter` | Run only the tests whose `module::name` contains this text |
 //! | `--silk-test-plan` | Path of the plan file. Required. |
 //! | `--silk-test-result` | Path of the receipt file. Required. |
+//! | `--silk-test-progress` | Path of the progress file. Optional. |
 //!
 //! The runner checks the complete plan before any test body runs.
+//!
+//! With `--silk-test-progress`, the runner writes a progress record (see `silk.test_exchange`)
+//! before each test body runs, and removes the file when every test has finished. If the file
+//! already holds a record when the runner starts, the test it names stopped an earlier runner
+//! process, for example with a trap. The runner then reports that test as failed, skips the tests
+//! before it, and continues with the next one, so its summary and receipt count the whole run.
 //!
 //! # Errors
 //! The exit status is `0` if all selected tests pass, `1` if a test fails, and `2` for a usage
@@ -31,6 +38,7 @@ import silk.host_input { HostInput, HostInputError }
 import silk.monotonic_clock { MonotonicClock }
 import silk.os_filesystem { OsFileSystem }
 import silk.os_monotonic_clock { OsMonotonicClock }
+import silk.option { Option }
 import silk.os_writer { StdoutWriter }
 import silk.result { Result }
 import silk.sha2 { Sha256 }
@@ -79,16 +87,14 @@ effect fn writeAssertion(message: string) -> () ! WriterError ? &mut Writer {
   return run Writer.writeString("\n")
 }
 
-// A failed expectation reports its message under the test's name, then the failure's origin and
-// callers.
+// A failed expectation reports only its message under the test's name. The runner handles the
+// failure, so it is not reported as an unhandled error.
 effect fn assertionFailed(error: AssertionError<'static>) -> bool {
   let mut writer = StdoutWriter.make()
   let written = writeAssertion(Testing.assertionMessage(&error))
     |> Effect.provideMut<Writer>(&mut writer)
   run Effect.catchAll(move written, ignoreWriteFailure)
   drop error
-  let status = Intrinsic.observeUnhandled()
-  drop status
   return false
 }
 
@@ -191,11 +197,36 @@ fn selectedCount<'file, 'name>(fileFilter: string<'file>, nameFilter: string<'na
   return selected
 }
 
+// Records that the test at `ordinal` is starting, after the given counts, so that a later runner can
+// continue after it if it stops the process.
+effect fn recordProgress(path: &Option<Path>, progress: TestExchange.Progress) -> ()
+! OutOfMemoryError | FileError
+? &mut Allocator | &mut FileSystem {
+  if let Option<Path>.Some { value } = &path.* {
+    let record = run TestExchange.progressRecord(&progress)
+    run FileSystem.writeFile(&value, Bytes.asSlice(&record))
+  }
+  return ()
+}
+
+// The record an earlier runner left in the progress file, or `None` when there is none.
+effect fn resumedProgress(path: &Option<Path>) -> Option<TestExchange.Progress> ? &mut FileSystem | &mut Allocator {
+  if let Option<Path>.Some { value } = &path.* {
+    let read = run Effect.result(FileSystem.readFile(&value))
+    if let Result<Bytes, FileError | OutOfMemoryError>.Success { value: bytes } = &read {
+      return TestExchange.readProgress(Bytes.asSlice(&bytes))
+    }
+    drop read
+  }
+  return Option<TestExchange.Progress>.none()
+}
+
 effect fn runSelected<'file, 'name>(
   fileFilter: string<'file>,
   nameFilter: string<'name>,
   planBytes: &[u8],
   resultPath: &Path,
+  progressPath: Option<Path>,
 ) -> i32
 ! OutOfMemoryError | FileError | WriterError
 ? &mut Allocator | &mut FileSystem | &mut Writer {
@@ -216,13 +247,27 @@ effect fn runSelected<'file, 'name>(
   let mut executed: u64 = 0
   let mut passed: u64 = 0
   let mut failed: u64 = 0
+  // The test that stopped an earlier runner failed; the tests before it already ran there.
+  let mut resumed = false
+  let mut stopped: u64 = 0
+  if let Option<TestExchange.Progress>.Some { value } = run resumedProgress(&progressPath) {
+    resumed = true
+    stopped = value.ordinal
+    cached = value.cachedCount
+    executed = value.executed + 1
+    passed = value.passed
+    failed = value.failedCount + 1
+  }
   let mut clock = OsMonotonicClock.make()
   let started = run MonotonicClock.now()
     |> Effect.provideMut<MonotonicClock>(&mut clock)
   static for descriptor in Intrinsic.tests() {
     let declaration = String.utf8Bytes(Intrinsic.testInfo(descriptor).identity)
     let entry = TestExchange.readEntry(&mut plan, ordinal, declaration)
-    if Testing.matchesQualified(
+    if resumed && ordinal <= stopped {
+      // The earlier runner already wrote this test's name; its trap report followed.
+      if ordinal == stopped { run Writer.writeString("    FAIL  stopped the test process\n") }
+    } else if Testing.matchesQualified(
       Intrinsic.testInfo(descriptor).path,
       Intrinsic.testInfo(descriptor).module,
       Intrinsic.testInfo(descriptor).name,
@@ -245,6 +290,9 @@ effect fn runSelected<'file, 'name>(
         cached = cached + 1
         passed = passed + 1
       } else {
+        run recordProgress(&progressPath, TestExchange.Progress {
+          ordinal: ordinal, cachedCount: cached, executed: executed, passed: passed, failedCount: failed,
+        })
         let body = Intrinsic.testFunction(descriptor)
         let testStarted = run MonotonicClock.now()
           |> Effect.provideMut<MonotonicClock>(&mut clock)
@@ -271,6 +319,11 @@ effect fn runSelected<'file, 'name>(
     }
     drop entry
     ordinal = ordinal + 1
+  }
+  // The file is missing when no test body ran.
+  if let Option<Path>.Some { value } = &progressPath {
+    let removed = run Effect.result(FileSystem.removeFile(&value))
+    drop removed
   }
   let summary = .{
     discovered: discovered,
@@ -327,6 +380,7 @@ effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
   let mut nameIndex = usize.ZERO
   let mut planIndex = usize.ZERO
   let mut resultIndex = usize.ZERO
+  let mut progressIndex = usize.ZERO
   let mut index = usize.ONE
   while index < values.length {
     let option = match move argumentText(values, index) {
@@ -346,7 +400,11 @@ effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
           if Intrinsic.stringEqualsExact(option, "--silk-test-result") {
             resultIndex = index + usize.ONE
           } else {
-            return 2
+            if Intrinsic.stringEqualsExact(option, "--silk-test-progress") {
+              progressIndex = index + usize.ONE
+            } else {
+              return 2
+            }
           }
         }
       }
@@ -371,12 +429,21 @@ effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
     Result<string, InvalidUtf8>.Failure { error } => { drop error return 2 }
   }
   let mut allocator = Allocator.systemAllocatorProvider()
-  let mut fileSystem = run OsFileSystem.make(b"/")
+  let mut fileSystem = run OsFileSystem.make("/")
     |> Effect.provideMut<Allocator>(&mut allocator)
   let planPath = run Path.make(planText)
     |> Effect.provideMut<Allocator>(&mut allocator)
   let resultPath = run Path.make(resultText)
     |> Effect.provideMut<Allocator>(&mut allocator)
+  let mut progressPath = Option<Path>.none()
+  if progressIndex != usize.ZERO {
+    let progressText = match move argumentText(values, progressIndex) {
+      Result<string, InvalidUtf8>.Success { value } => move value
+      Result<string, InvalidUtf8>.Failure { error } => { drop error return 2 }
+    }
+    progressPath = Option<Path>.some(run Path.make(progressText)
+      |> Effect.provideMut<Allocator>(&mut allocator))
+  }
   let metadata = run FileSystem.stat(&planPath)
     |> Effect.provideMut<FileSystem>(&mut fileSystem)
   let planLength = match move metadata {
@@ -389,7 +456,7 @@ effect fn executeArguments<'arguments>(values: &'arguments [Bytes]) -> i32
     |> Effect.provideMut<Allocator>(&mut allocator)
   let planBytes = run reading
   let mut writer = StdoutWriter.make()
-  return run runSelected(fileFilter, nameFilter, Bytes.asSlice(&planBytes), &resultPath)
+  return run runSelected(fileFilter, nameFilter, Bytes.asSlice(&planBytes), &resultPath, move progressPath)
     |> Effect.provideMut<Allocator>(&mut allocator)
     |> Effect.provideMut<FileSystem>(&mut fileSystem)
     |> Effect.provideMut<Writer>(&mut writer)

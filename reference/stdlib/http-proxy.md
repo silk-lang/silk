@@ -27,7 +27,8 @@ a buffer that you give. [`classifyConnect`](#classifyConnect) reads the response
 
 ## Gotchas
 Only plain `http` proxies are supported. An `https` proxy URI fails with
-`UnsupportedProxyTransport`. Environment variables such as `HTTPS_PROXY` are not read.
+`UnsupportedProxyTransport`. This module reads no environment variables;
+`NativeHttp.fromEnvironment` in `silk.http_client_native` reads `HTTPS_PROXY` and the others.
 
 ## Examples
 ### Select routes
@@ -564,7 +565,8 @@ a buffer that you give.
 ### Gotchas
 
 Only plain `http` proxies are supported. An `https` proxy URI fails with
-`UnsupportedProxyTransport`. Environment variables such as `HTTPS_PROXY` are not read.
+`UnsupportedProxyTransport`. This module reads no environment variables;
+`NativeHttp.fromEnvironment` in `silk.http_client_native` reads `HTTPS_PROXY` and the others.
 
 <a id="RouteMode"></a>
 

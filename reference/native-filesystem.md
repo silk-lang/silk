@@ -26,7 +26,7 @@ initialized storage. A copied name outlives the next readdir; its borrowed origi
 
 ## Paths and confinement
 
-OsFileSystem.make copies an absolute byte root and performs no I/O. The root must be nonempty
+OsFileSystem.make copies an absolute text root and OsFileSystem.makeBytes an absolute byte root; neither performs I/O. The root must be nonempty
 and NUL-free. Portable paths reject embedded NUL, dot/dot-dot and malformed normalized components.
 Path.rawBytes and Path.joinBytes preserve byte identity, including directory names. The underlying
 filesystem can still reject a byte name (for example, APFS rejects invalid UTF-8); that native
