@@ -239,3 +239,50 @@ test('checking a module with 100 log calls takes a few seconds at most', { todo:
   assert.equal(result.status, 0, show(result))
   assert.ok(seconds < 3, `silk check took ${seconds.toFixed(1)} s`)
 })
+
+test('spawning a task that can fail names the call and the fix', { todo: 'finding 43' }, () => {
+  const dir = initPackage(h, 'spawnfail')
+  write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.native_thread { SpawnError }
+import silk.thread_pool { Pool, ThreadPool }
+
+effect fn work(pool: Pool, n: i64) -> i64
+  ! OutOfMemoryError {
+  if n < 2 {
+    return n
+  }
+  let left = run pool.spawn(work(pool.clone(), n - 1))
+  let leftValue = run left.join()
+  return leftValue + n
+}
+
+pub fn main() -> i32 {
+  return 0
+}
+`)
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.notEqual(result.status, 0, show(result))
+  assert.match(result.stderr, /spawn/, show(result))
+  assert.match(result.stderr, /Effect\.result/, show(result))
+})
+
+test('an unhandled error prints its fields, not only its type', { todo: 'finding 44' }, () => {
+  const dir = initPackage(h, 'unhandledjson')
+  write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.json_scanner { JsonError }
+import silk.json_value { Json }
+
+pub effect fn main() -> i32
+  ! JsonError | OutOfMemoryError {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let document = run Json.parse(b"{\\"a\\":1,\\"a\\":2}")
+    |> Effect.provideMut<Allocator>(&mut allocator)
+  return 0
+}
+`)
+  const result = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.equal(result.status, 1, show(result))
+  assert.match(result.stderr, /offset/, show(result))
+})
