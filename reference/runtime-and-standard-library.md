@@ -1359,7 +1359,7 @@ suite, group, optional ALPN, leaf DER, selected path indices and anchor, validat
 revocation status, and SAN match. There is no caller-supplied boolean authentication token.
 
 The selected profile offers the three TLS 1.3 AEAD suites, X25519 with bounded P-256 retry, ECDSA
-P-256/SHA-256 and RSA-PSS-RSAE/SHA-256 CertificateVerify, empty initial client-certificate decline,
+P-256/SHA-256, ECDSA P-384/SHA-384, and RSA-PSS-RSAE/SHA-256 CertificateVerify, empty initial client-certificate decline,
 bounded ticket discard, traffic-key updates before epoch exhaustion, and strict close-notify and
 truncation handling. Typed failures preserve certificate decode, path, identity, and signature
 causes. This is a deliberately selected TLS 1.3 and certificate profile, not complete browser Web
