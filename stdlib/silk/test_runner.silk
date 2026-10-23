@@ -176,58 +176,88 @@ effect fn writeResult(passed: bool, nanoseconds: i64) -> () ! WriterError ? &mut
   return run Writer.writeString("\n")
 }
 
-fn discoveredCount() -> u64 {
-  let mut discovered: u64 = 0
-  static for descriptor in Intrinsic.tests() { discovered = discovered + 1 }
-  return discovered
+// One discovered test's metadata, read from its descriptor once.
+struct CatalogTest {
+  identity: string<'static>
+  path: string<'static>
+  module: string<'static>
+  name: string<'static>
 }
 
-fn catalogDigest() -> [u8; 32] {
+fn catalogTest<F>(static descriptor: Intrinsic.Test<F>) -> CatalogTest {
+  return CatalogTest {
+    identity: Intrinsic.testInfo(descriptor).identity,
+    path: Intrinsic.testInfo(descriptor).path,
+    module: Intrinsic.testInfo(descriptor).module,
+    name: Intrinsic.testInfo(descriptor).name,
+  }
+}
+
+// Every discovered test's metadata in catalog order. Each test adds one call to this loop, so the
+// runner's generated code grows linearly with the test count; everything else runs over this list.
+effect fn catalog() -> List<CatalogTest> ! OutOfMemoryError ? &mut Allocator {
+  let mut tests = List<CatalogTest>.make()
+  static for descriptor in Intrinsic.tests() { run List<CatalogTest>.append(&mut tests, catalogTest(descriptor)) }
+  return move tests
+}
+
+fn catalogDigest(tests: &[CatalogTest]) -> [u8; 32] {
   let mut state = Sha256.make()
-  let mut ordinal: u64 = 0
-  static for descriptor in Intrinsic.tests() {
-    let identity = Intrinsic.testInfo(descriptor).identity
-    TestExchange.updateCatalogDigest(&mut state, ordinal, String.utf8Bytes(identity))
-    ordinal = ordinal + 1
+  let mut index = usize.ZERO
+  while index < tests.length {
+    TestExchange.updateCatalogDigest(&mut state, usize.toU64(index), String.utf8Bytes(tests[index].identity))
+    index = index + usize.ONE
   }
   return state.finish()
 }
 
-fn validatePlan(bytes: &[u8], discovered: u64) -> i32 {
+fn validatePlan(bytes: &[u8], tests: &[CatalogTest]) -> i32 {
+  let discovered = usize.toU64(tests.length)
   let mut plan = TestExchange.openPlan(bytes)
   if TestExchange.isPerTest(&plan) {
     if !TestExchange.beginPerTest(&mut plan, discovered) { return 11 }
-    let mut ordinal: u64 = 0
-    static for descriptor in Intrinsic.tests() {
-      let identity = Intrinsic.testInfo(descriptor).identity
-      let entry = TestExchange.readEntry(&mut plan, ordinal, String.utf8Bytes(identity))
+    let mut index = usize.ZERO
+    while index < tests.length {
+      let entry = TestExchange.readEntry(&mut plan, usize.toU64(index), String.utf8Bytes(tests[index].identity))
       drop entry
       if TestExchange.failed(&plan) { return 12 }
-      ordinal = ordinal + 1
+      index = index + usize.ONE
     }
     if TestExchange.finishPerTest(&mut plan) { return 0 }
     return 13
   }
   if TestExchange.isUncached(&plan) {
-    let digest = catalogDigest()
+    let digest = catalogDigest(tests)
     if TestExchange.validateUncached(&mut plan, &digest, discovered) { return 0 }
     return 21
   }
   return 1
 }
 
-fn selectedCount<'file, 'name>(fileFilter: string<'file>, nameFilter: string<'name>) -> u64 {
-  let mut selected: u64 = 0
-  static for descriptor in Intrinsic.tests() {
-    if Testing.matchesQualified(
-      Intrinsic.testInfo(descriptor).path,
-      Intrinsic.testInfo(descriptor).module,
-      Intrinsic.testInfo(descriptor).name,
-      fileFilter,
-      nameFilter,
-    ) { selected = selected + 1 }
+// Which tests the filters select, in catalog order.
+effect fn selection<'file, 'name>(
+  tests: &[CatalogTest],
+  fileFilter: string<'file>,
+  nameFilter: string<'name>,
+) -> List<bool> ! OutOfMemoryError ? &mut Allocator {
+  let mut selected = List<bool>.make()
+  let mut index = usize.ZERO
+  while index < tests.length {
+    let matched = Testing.matchesQualified(tests[index].path, tests[index].module, tests[index].name, fileFilter, nameFilter)
+    run List<bool>.append(&mut selected, matched)
+    index = index + usize.ONE
   }
-  return selected
+  return move selected
+}
+
+fn selectedCount(selected: &[bool]) -> u64 {
+  let mut count: u64 = 0
+  let mut index = usize.ZERO
+  while index < selected.length {
+    if selected[index] { count = count + 1 }
+    index = index + usize.ONE
+  }
+  return count
 }
 
 // Records that the test at `ordinal` is starting, after the given counts, so that a later runner can
@@ -254,6 +284,112 @@ effect fn resumedProgress(path: &Option<Path>) -> Option<TestExchange.Progress> 
   return Option<TestExchange.Progress>.none()
 }
 
+// The state of one run as it walks the catalog.
+struct Session<'plan> {
+  tests: List<CatalogTest>
+  selected: List<bool>
+  plan: TestExchange.Plan<'plan>
+  // The plan entry of the test at `ordinal`, once `beginTest` has read it.
+  entry: TestExchange.Entry<'plan>
+  receipt: TestExchange.Receipt
+  progressPath: Option<Path>
+  clock: OsMonotonicClock
+  testStarted: Instant
+  limit: u32
+  perTest: bool
+  // The test that stopped an earlier runner failed; the tests before it already ran there.
+  resumed: bool
+  stopped: u64
+  ordinal: u64
+  cached: u64
+  executed: u64
+  passed: u64
+  failed: u64
+}
+
+// Reports the next catalog test and returns whether its body should run now. A cached, filtered,
+// or already finished test is handled here and returns false.
+effect fn beginTest(session: &mut Session) -> bool
+! OutOfMemoryError | FileError | WriterError
+? &mut Allocator | &mut FileSystem | &mut Writer {
+  let ordinal = session.ordinal
+  let index = u64.toUsize(ordinal)
+  let declaration = String.utf8Bytes(List<CatalogTest>.asSlice(&session.tests)[index].identity)
+  session.entry = TestExchange.readEntry(&mut session.plan, ordinal, declaration)
+  if session.resumed && ordinal <= session.stopped {
+    // The earlier runner already wrote this test's name; its trap report followed.
+    if ordinal == session.stopped { run Writer.writeString("    FAIL  stopped the test process\n") }
+    session.ordinal = ordinal + 1
+    return false
+  }
+  if !List<bool>.asSlice(&session.selected)[index] {
+    session.ordinal = ordinal + 1
+    return false
+  }
+  let module = List<CatalogTest>.asSlice(&session.tests)[index].module
+  let name = List<CatalogTest>.asSlice(&session.tests)[index].name
+  let identity = .{module: module, name: name}
+  run Format.format("  {module}::{name}\n", &identity)
+  if session.perTest && TestExchange.cached(&session.entry) {
+    run Writer.writeString("    CACHED\n")
+    run TestExchange.appendResult(
+      &mut session.receipt,
+      ordinal,
+      declaration,
+      TestExchange.executionIdentity(&session.entry),
+      0,
+    )
+    session.cached = session.cached + 1
+    session.passed = session.passed + 1
+    session.ordinal = ordinal + 1
+    return false
+  }
+  run recordProgress(&session.progressPath, TestExchange.Progress {
+    ordinal: ordinal, cachedCount: session.cached, executed: session.executed, passed: session.passed,
+    failedCount: session.failed,
+  })
+  session.testStarted = run MonotonicClock.now()
+    |> Effect.provideMut<MonotonicClock>(&mut session.clock)
+  setAlarm(session.limit)
+  return true
+}
+
+// Records the outcome of the test body that `beginTest` started.
+effect fn endTest(session: &mut Session, ok: bool) -> ()
+! OutOfMemoryError | WriterError
+? &mut Allocator | &mut Writer {
+  setAlarm(0)
+  let testFinished = run MonotonicClock.now()
+    |> Effect.provideMut<MonotonicClock>(&mut session.clock)
+  run writeResult(ok, elapsedNanoseconds(&session.testStarted, &testFinished))
+  session.executed = session.executed + 1
+  if ok { session.passed = session.passed + 1 } else { session.failed = session.failed + 1 }
+  let ordinal = session.ordinal
+  if session.perTest {
+    let mut disposition: u8 = 2
+    if ok { disposition = 1 }
+    let declaration = String.utf8Bytes(List<CatalogTest>.asSlice(&session.tests)[u64.toUsize(ordinal)].identity)
+    run TestExchange.appendResult(
+      &mut session.receipt,
+      ordinal,
+      declaration,
+      TestExchange.executionIdentity(&session.entry),
+      disposition,
+    )
+  }
+  session.ordinal = ordinal + 1
+  return ()
+}
+
+// Runs one test body. Each test gets its own copy of this function, so the code generated for a
+// test does not depend on how many other tests there are.
+fn invokeTest<F>(static descriptor: Intrinsic.Test<F>) -> bool {
+  let body = Intrinsic.testFunction(descriptor)
+  let value = body()
+  let provider = selectOutcome(&value)
+  return completeTest(move value, move provider)
+}
+
 effect fn runSelected<'file, 'name>(
   fileFilter: string<'file>,
   nameFilter: string<'name>,
@@ -264,26 +400,26 @@ effect fn runSelected<'file, 'name>(
 ) -> i32
 ! OutOfMemoryError | FileError | WriterError
 ? &mut Allocator | &mut FileSystem | &mut Writer {
-  let discovered = discoveredCount()
-  if validatePlan(planBytes, discovered) != 0 { return 2 }
+  let tests = run catalog()
+  let discovered = usize.toU64(tests.length())
+  if validatePlan(planBytes, List<CatalogTest>.asSlice(&tests)) != 0 { return 2 }
   let opened = TestExchange.openPlan(planBytes)
   let perTest = TestExchange.isPerTest(&opened)
   drop opened
-  let selected = selectedCount(fileFilter, nameFilter)
-  let mut receipt = run TestExchange.beginReceipt(planBytes, perTest, selected)
+  let chosen = run selection(List<CatalogTest>.asSlice(&tests), fileFilter, nameFilter)
+  let selected = selectedCount(List<bool>.asSlice(&chosen))
+  let receipt = run TestExchange.beginReceipt(planBytes, perTest, selected)
   let mut plan = TestExchange.openPlan(planBytes)
   if perTest {
     let began = TestExchange.beginPerTest(&mut plan, discovered)
     drop began
   }
-  let mut ordinal: u64 = 0
+  let mut resumed = false
+  let mut stopped: u64 = 0
   let mut cached: u64 = 0
   let mut executed: u64 = 0
   let mut passed: u64 = 0
   let mut failed: u64 = 0
-  // The test that stopped an earlier runner failed; the tests before it already ran there.
-  let mut resumed = false
-  let mut stopped: u64 = 0
   if let Option<TestExchange.Progress>.Some { value } = run resumedProgress(&progressPath) {
     resumed = true
     stopped = value.ordinal
@@ -295,82 +431,43 @@ effect fn runSelected<'file, 'name>(
   let mut clock = OsMonotonicClock.make()
   let started = run MonotonicClock.now()
     |> Effect.provideMut<MonotonicClock>(&mut clock)
+  let mut session = Session {
+    tests: move tests,
+    selected: move chosen,
+    plan: move plan,
+    entry: TestExchange.uncachedEntry(planBytes),
+    receipt: move receipt,
+    progressPath: move progressPath,
+    clock: move clock,
+    testStarted: SystemClock.make(SystemClock.seconds(&started), SystemClock.nanoseconds(&started)),
+    limit: limit,
+    perTest: perTest,
+    resumed: resumed,
+    stopped: stopped,
+    ordinal: 0,
+    cached: cached,
+    executed: executed,
+    passed: passed,
+    failed: failed,
+  }
   static for descriptor in Intrinsic.tests() {
-    let declaration = String.utf8Bytes(Intrinsic.testInfo(descriptor).identity)
-    let entry = TestExchange.readEntry(&mut plan, ordinal, declaration)
-    if resumed && ordinal <= stopped {
-      // The earlier runner already wrote this test's name; its trap report followed.
-      if ordinal == stopped { run Writer.writeString("    FAIL  stopped the test process\n") }
-    } else if Testing.matchesQualified(
-      Intrinsic.testInfo(descriptor).path,
-      Intrinsic.testInfo(descriptor).module,
-      Intrinsic.testInfo(descriptor).name,
-      fileFilter,
-      nameFilter,
-    ) {
-      let module = Intrinsic.testInfo(descriptor).module
-      let name = Intrinsic.testInfo(descriptor).name
-      let identity = .{module: module, name: name}
-      run Format.format("  {module}::{name}\n", &identity)
-      if perTest && TestExchange.cached(&entry) {
-        run Writer.writeString("    CACHED\n")
-        run TestExchange.appendResult(
-          &mut receipt,
-          ordinal,
-          declaration,
-          TestExchange.executionIdentity(&entry),
-          0,
-        )
-        cached = cached + 1
-        passed = passed + 1
-      } else {
-        run recordProgress(&progressPath, TestExchange.Progress {
-          ordinal: ordinal, cachedCount: cached, executed: executed, passed: passed, failedCount: failed,
-        })
-        let body = Intrinsic.testFunction(descriptor)
-        let testStarted = run MonotonicClock.now()
-          |> Effect.provideMut<MonotonicClock>(&mut clock)
-        setAlarm(limit)
-        let value = body()
-        let provider = selectOutcome(&value)
-        let ok = completeTest(move value, move provider)
-        setAlarm(0)
-        let testFinished = run MonotonicClock.now()
-          |> Effect.provideMut<MonotonicClock>(&mut clock)
-        run writeResult(ok, elapsedNanoseconds(&testStarted, &testFinished))
-        executed = executed + 1
-        if ok { passed = passed + 1 } else { failed = failed + 1 }
-        if perTest {
-          let mut disposition: u8 = 2
-          if ok { disposition = 1 }
-          run TestExchange.appendResult(
-            &mut receipt,
-            ordinal,
-            declaration,
-            TestExchange.executionIdentity(&entry),
-            disposition,
-          )
-        }
-      }
-    }
-    drop entry
-    ordinal = ordinal + 1
+    if run beginTest(&mut session) { run endTest(&mut session, invokeTest(descriptor)) }
   }
   // The file is missing when no test body ran.
-  if let Option<Path>.Some { value } = &progressPath {
+  if let Option<Path>.Some { value } = &session.progressPath {
     let removed = run Effect.result(FileSystem.removeFile(&value))
     drop removed
   }
   let summary = .{
     discovered: discovered,
     selected: selected,
-    cached: cached,
-    executed: executed,
-    passed: passed,
-    failed: failed,
+    cached: session.cached,
+    executed: session.executed,
+    passed: session.passed,
+    failed: session.failed,
   }
   let finished = run MonotonicClock.now()
-    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<MonotonicClock>(&mut session.clock)
   run Writer.writeString("\n")
   run Format.format(
     "Tests  {passed} passed, {failed} failed ({cached} cached, {executed} executed, {selected} selected, {discovered} discovered)\n",
@@ -380,15 +477,15 @@ effect fn runSelected<'file, 'name>(
   run writeDuration(elapsedNanoseconds(&started, &finished))
   run Writer.writeString("\n")
   let mut status: u32 = 1
-  if failed == 0 { status = 0 }
+  if session.failed == 0 { status = 0 }
   let bytes = run TestExchange.finishReceipt(
-    move receipt,
+    move session.receipt,
     discovered,
     selected,
-    cached,
-    executed,
-    passed,
-    failed,
+    session.cached,
+    session.executed,
+    session.passed,
+    session.failed,
     status,
   )
   run FileSystem.writeFile(resultPath, Bytes.asSlice(&bytes))
