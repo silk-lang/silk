@@ -2390,8 +2390,31 @@ const program = Effect.gen(function* () {
   const compiled = editedObjects.filter((name) => !coldObjects.includes(name))
   assert.equal(compiled.length, 1, `an edit to one module compiles one unit, added ${compiled.join(', ')}`)
   assert.equal(editedObjects.length, coldObjects.length + 1)
+  // A rebuild replays the record the last build left in the cache: an edit to a body lowers only
+  // the instances it touched, and an edit that changes what the program reaches walks it again.
+  // Either way the executable is the one a cold build links. A string constant holding `@` names
+  // nothing, so the unit still declares the helper it calls.
+  const executable = join(split, `build/llvm/${hostTarget}/debug/split`)
+  const replayed = Effect.fnUntraced(function* (helper: string, expected: number, lowered: RegExp) {
+    yield* fs.writeFileString(join(split, 'src/helper.silk'), helper)
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], split, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    assert.match(built.stdout + built.stderr, lowered)
+    yield* splitRun(expected)
+    const warm = yield* fs.readFile(executable)
+    yield* fs.remove(join(split, 'build'), { recursive: true })
+    yield* splitRun(expected)
+    assert.deepEqual(yield* fs.readFile(executable), warm, 'a replayed build links the executable a cold build links')
+  })
+  yield* fs.writeFileString(
+    join(split, 'src/main.silk'),
+    'import helper\n\npub fn main() -> i32 {\n  let marker = b"ptr @"\n  if marker.length == 5 { return helper.value() + 4 }\n  return 0\n}\n',
+  )
+  yield* splitRun(9)
+  yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
+  yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+[1-9]\d+ functions\s/)
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, native changes release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, native changes release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))

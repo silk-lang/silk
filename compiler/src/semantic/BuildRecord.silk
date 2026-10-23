@@ -1,0 +1,245 @@
+//! The record of one successful build walk, which a later process replays instead of lowering
+//! every reached instance again.
+//!
+//! # When to use
+//! A revisable store writes a [`Record`] beside its cache image after a build that walked the whole
+//! program, and an [`InstanceText`] for each instance it emitted. The next build of the same roots
+//! reads them back: an instance whose units are still green is taken from its saved definition
+//! without its key, and only the stale ones are lowered. What a replay must verify lives in
+//! `Semantic`; this module holds the format.
+//!
+//! # Details
+//! An entry names one reached key by its `InstanceKey.exactIdentity`, so two entries are the same
+//! application exactly when their keys were. Entries are in walk order. A root entry's parent is
+//! `usize.MAX` and its position is its root's index; any other entry was first reached through
+//! reference `position` of its parent's MIR, or, when `requested`, as NonParking target
+//! `position` of that MIR's summary, so a green parent's MIR, which reads as it did, leads to the
+//! entry's key again. An alias shares the definition of an earlier entry, as region
+//! patterns of one application share one backend instance, and holds no references.
+//!
+//! Every word is big-endian and every byte run is length-delimited, as `StableKey` reads them.
+//! Malformed bytes decode to none.
+
+import backend.InstanceText {InstanceText}
+import backend.LlvmText
+import semantic.ContentHash {ContentHash}
+import semantic.RuntimeEncoding as Encoding
+import semantic.StableKey
+import semantic.TypedBody {BorrowStatus}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.list {List}
+import silk.option {Option}
+import silk.u64
+import silk.usize
+
+// Changes whenever the layout below changes.
+const FORMAT: u64 = 2
+
+/// One reference of an owning entry's MIR, in the MIR's order.
+pub struct Reference {
+  /// The entry the reference reaches.
+  pub target: usize
+  /// The exact bytes of the reference's edge, as `Edge.recordBytes` writes them.
+  pub edge: Bytes
+}
+
+/// One reached instance.
+pub struct Entry {
+  /// The key's `InstanceKey.exactIdentity`.
+  pub exact: Bytes
+  /// The key's `InstanceKey.runtimeHash`.
+  pub hash: u64
+  /// The key's `EmissionPlan.familyName`.
+  pub family: u64
+  /// The key's declaration, as `StableKey.declaration` writes it.
+  pub declaration: Bytes
+  /// The entry this one was first reached from, or `usize.MAX` for a root.
+  pub parent: usize
+  /// The reference of the parent's MIR that first reached this entry, or the root's index.
+  pub position: usize
+  /// Whether `position` is instead a NonParking target the parent's MIR names, which the walk
+  /// entered because nothing reached it (see `Semantic.requestedTarget`).
+  pub requested: bool
+  /// The earlier entry whose definition this one shares, or `usize.MAX` when it has its own.
+  pub alias: usize
+  /// The references of this entry's MIR; empty for an alias.
+  pub references: List<Reference>
+  /// The digest of what the program-wide checks read from this entry's MIR, without spans.
+  pub summary: ContentHash
+}
+
+/// One successful build walk.
+pub struct Record {
+  /// Whether the walk lowered MIR that observes diagnostics.
+  pub observing: bool
+  /// The `InstanceKey.exactIdentity` of each root, in root order.
+  pub roots: List<Bytes>
+  pub entries: List<Entry>
+}
+
+/// An empty record.
+pub fn make(observing: bool) -> Record {
+  return Record {observing: observing, roots: List<Bytes>.make(), entries: List<Entry>.make()}
+}
+
+/// The bytes of `record`.
+pub effect fn encode(record: &Record) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run Encoding.word(&mut output, FORMAT)
+  if record.observing { run Encoding.word(&mut output, 1) } else { run Encoding.word(&mut output, 0) }
+  let roots = List<Bytes>.asSlice(&record.roots)
+  run Encoding.word(&mut output, usize.toU64(roots.length))
+  let mut at = usize.ZERO
+  while at < roots.length {
+    run Encoding.field(&mut output, Bytes.asSlice(&roots[at]))
+    at = at + usize.ONE
+  }
+  let entries = List<Entry>.asSlice(&record.entries)
+  run Encoding.word(&mut output, usize.toU64(entries.length))
+  at = usize.ZERO
+  while at < entries.length {
+    let entry = &entries[at]
+    run Encoding.field(&mut output, Bytes.asSlice(&entry.exact))
+    run Encoding.word(&mut output, entry.hash)
+    run Encoding.word(&mut output, entry.family)
+    run Encoding.field(&mut output, Bytes.asSlice(&entry.declaration))
+    run Encoding.word(&mut output, usize.toU64(entry.parent))
+    run Encoding.word(&mut output, usize.toU64(entry.position))
+    if entry.requested { run Encoding.word(&mut output, 1) } else { run Encoding.word(&mut output, 0) }
+    run Encoding.word(&mut output, usize.toU64(entry.alias))
+    let references = List<Reference>.asSlice(&entry.references)
+    run Encoding.word(&mut output, usize.toU64(references.length))
+    let mut reference = usize.ZERO
+    while reference < references.length {
+      run Encoding.word(&mut output, usize.toU64(references[reference].target))
+      run Encoding.field(&mut output, Bytes.asSlice(&references[reference].edge))
+      reference = reference + usize.ONE
+    }
+    run Encoding.word(&mut output, entry.summary.high)
+    run Encoding.word(&mut output, entry.summary.low)
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+// A word that must name a position below `limit` or be `usize.MAX`; marks the reader failed
+// otherwise.
+fn readIndex(bytes: &[u8], reader: &mut StableKey.Reader, limit: usize) -> usize {
+  let value = StableKey.readWord(bytes, &mut reader.*)
+  if value == usize.toU64(usize.MAX) { return usize.MAX }
+  if value >= usize.toU64(limit) {
+    // Reading past the end of no bytes marks the reader failed.
+    drop StableKey.readWord(b"", &mut reader.*)
+    return usize.MAX
+  }
+  return u64.toUsize(value)
+}
+
+/// Reads a record [`encode`] wrote, or none when the bytes are not one. A parent or alias names
+/// an earlier entry and a reference names any entry, or the record is refused.
+pub effect fn decode(bytes: &[u8]) -> Option<Record> ! OutOfMemoryError ? &mut Allocator {
+  let mut reader = StableKey.reader()
+  if StableKey.readWord(bytes, &mut reader) != FORMAT { return Option<Record>.none() }
+  let observing = StableKey.readWord(bytes, &mut reader) == 1
+  let mut record = make(observing)
+  let rootCount = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) || rootCount > usize.toU64(bytes.length) { return Option<Record>.none() }
+  let mut at: u64 = 0
+  while at < rootCount {
+    let root = StableKey.readField(bytes, &mut reader)
+    if StableKey.failed(&reader) { return Option<Record>.none() }
+    run List<Bytes>.append(&mut record.roots, run Bytes.copy(StableKey.view(bytes, root)))
+    at = at + 1
+  }
+  let entryCount = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) || entryCount > usize.toU64(bytes.length) { return Option<Record>.none() }
+  let total = u64.toUsize(entryCount)
+  let mut entry = usize.ZERO
+  while entry < total {
+    let exact = StableKey.readField(bytes, &mut reader)
+    let hash = StableKey.readWord(bytes, &mut reader)
+    let family = StableKey.readWord(bytes, &mut reader)
+    let declaration = StableKey.readField(bytes, &mut reader)
+    let parent = readIndex(bytes, &mut reader, entry)
+    let position = u64.toUsize(StableKey.readWord(bytes, &mut reader))
+    let requested = StableKey.readWord(bytes, &mut reader)
+    let alias = readIndex(bytes, &mut reader, entry)
+    let referenceCount = StableKey.readWord(bytes, &mut reader)
+    if StableKey.failed(&reader) || referenceCount > usize.toU64(bytes.length) || requested > 1 || (requested == 1 && parent == usize.MAX) {
+      return Option<Record>.none()
+    }
+    let mut references = List<Reference>.make()
+    let mut reference: u64 = 0
+    while reference < referenceCount {
+      let target = readIndex(bytes, &mut reader, total)
+      let edge = StableKey.readField(bytes, &mut reader)
+      if StableKey.failed(&reader) || target == usize.MAX { return Option<Record>.none() }
+      run List<Reference>.append(&mut references, Reference {target: target, edge: run Bytes.copy(StableKey.view(bytes, edge))})
+      reference = reference + 1
+    }
+    let high = StableKey.readWord(bytes, &mut reader)
+    let low = StableKey.readWord(bytes, &mut reader)
+    if StableKey.failed(&reader) { return Option<Record>.none() }
+    run List<Entry>.append(&mut record.entries, Entry {exact: run Bytes.copy(StableKey.view(bytes, exact)), hash: hash, family: family,
+      declaration: run Bytes.copy(StableKey.view(bytes, declaration)), parent: parent, position: position,
+      requested: requested == 1, alias: alias,
+      references: move references, summary: ContentHash {high: high, low: low}})
+    entry = entry + usize.ONE
+  }
+  if !StableKey.finished(bytes, &reader) { return Option<Record>.none() }
+  return Option<Record>.some(move record)
+}
+
+/// The bytes of one emitted definition.
+pub effect fn encodeDefinition(definition: &InstanceText) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = Bytes.make()
+  run Encoding.word(&mut output, FORMAT)
+  run Encoding.field(&mut output, Bytes.asSlice(&definition.encoding))
+  run Encoding.field(&mut output, Bytes.asSlice(&definition.symbol))
+  run Encoding.field(&mut output, Bytes.asSlice(&definition.text))
+  let foreign = List<LlvmText.Declaration>.asSlice(&definition.foreign)
+  run Encoding.word(&mut output, usize.toU64(foreign.length))
+  let mut at = usize.ZERO
+  while at < foreign.length {
+    run Encoding.field(&mut output, Bytes.asSlice(&foreign[at].contract))
+    run Encoding.field(&mut output, Bytes.asSlice(&foreign[at].symbol))
+    run Encoding.field(&mut output, Bytes.asSlice(&foreign[at].text))
+    at = at + usize.ONE
+  }
+  let borrow: u64 = match definition.borrow {
+    BorrowStatus.Checked => 0
+    BorrowStatus.Awaiting => 1
+  }
+  run Encoding.word(&mut output, borrow)
+  return move output
+}
+
+/// Reads a definition [`encodeDefinition`] wrote, or none when the bytes are not one.
+pub effect fn decodeDefinition(bytes: &[u8]) -> Option<InstanceText> ! OutOfMemoryError ? &mut Allocator {
+  let mut reader = StableKey.reader()
+  if StableKey.readWord(bytes, &mut reader) != FORMAT { return Option<InstanceText>.none() }
+  let encoding = StableKey.readField(bytes, &mut reader)
+  let symbol = StableKey.readField(bytes, &mut reader)
+  let text = StableKey.readField(bytes, &mut reader)
+  let count = StableKey.readWord(bytes, &mut reader)
+  if StableKey.failed(&reader) || count > usize.toU64(bytes.length) { return Option<InstanceText>.none() }
+  let mut foreign = List<LlvmText.Declaration>.make()
+  let mut at: u64 = 0
+  while at < count {
+    let contract = StableKey.readField(bytes, &mut reader)
+    let named = StableKey.readField(bytes, &mut reader)
+    let written = StableKey.readField(bytes, &mut reader)
+    if StableKey.failed(&reader) { return Option<InstanceText>.none() }
+    run List<LlvmText.Declaration>.append(&mut foreign, LlvmText.Declaration {contract: run Bytes.copy(StableKey.view(bytes, contract)),
+      symbol: run Bytes.copy(StableKey.view(bytes, named)), text: run Bytes.copy(StableKey.view(bytes, written))})
+    at = at + 1
+  }
+  let borrowWord = StableKey.readWord(bytes, &mut reader)
+  if !StableKey.finished(bytes, &reader) || borrowWord > 1 { return Option<InstanceText>.none() }
+  let mut borrow = BorrowStatus.Checked
+  if borrowWord == 1 { borrow = BorrowStatus.Awaiting }
+  return Option<InstanceText>.some(InstanceText {encoding: run Bytes.copy(StableKey.view(bytes, encoding)),
+    symbol: run Bytes.copy(StableKey.view(bytes, symbol)), text: run Bytes.copy(StableKey.view(bytes, text)), foreign: move foreign,
+    borrow: borrow})
+}
