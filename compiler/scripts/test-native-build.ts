@@ -1647,6 +1647,24 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(packaged.status, 42, packaged.stderr)
+  // A dependency's declarations are checked where they are written, even one the app never calls.
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/scale.silk'),
+    'import util.digits { base }\n\npub fn scale(value: i32) -> i32 {\n  return value * base()\n}\n\nfn unused() -> i32 {\n  return true\n}\n',
+  )
+  const broken = yield* invoke(
+    silk,
+    ['check', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.notEqual(broken.status, 0, 'an error in an uncalled dependency function was not reported')
+  assert.match(broken.stderr, /numbers\/src\/scale\.silk:8:10: error\[SEM0129\]/)
+  assert.doesNotMatch(broken.stderr, /main\.silk/)
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/scale.silk'),
+    'import util.digits { base }\n\npub fn scale(value: i32) -> i32 {\n  return value * base()\n}\n',
+  )
   // A module the dependency's manifest does not export stays internal to it.
   yield* fs.writeFileString(
     join(directory, 'packaged/app/peek.silk'),
