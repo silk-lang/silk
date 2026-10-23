@@ -166,7 +166,7 @@ test('a missing pinned toolchain still starts a server that explains it', { skip
   const init = await lone.initialize(other)
   assert.deepEqual(Object.keys(init.capabilities ?? {}).filter((key) => key !== 'positionEncoding'), [])
   const shown = await lone.waitFor((message) => message.method === 'window/showMessage', 'showMessage')
-  assert.match(shown.params.message, /silk toolchain install 0\.3\.0/)
+  assert.match(shown.params.message, /silk toolchain install 0\.3\.0|sew use/)
   const exited = await lone.shutdown()
   assert.equal(exited.code, 0)
   assert.equal(silk(h, ['--version']).status, 0)

@@ -5,7 +5,7 @@
 // version in it to install; without them the tests that install a second version are skipped.
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { freshHome, initPackage, install, join, read, show, silk, userEnv, write } from './lib.mjs'
+import { freshHome, hasSew, initPackage, install, join, read, sewBinary, show, silk, userEnv, write } from './lib.mjs'
 
 const mirror = process.env.SILK_NEW_USER_MIRROR
 const second = process.env.SILK_NEW_USER_SECOND
@@ -19,9 +19,14 @@ function home() {
   return h
 }
 
+// A release that ships sew has no `silk toolchain`; sew.test.mjs covers versions then.
+const probe = freshHome()
+const probed = install(probe)
+const replaced = sewBinary !== '' || (probed.status === 0 && hasSew(probe)) ? 'sew replaces silk toolchain; see sew.test.mjs' : false
+
 const withMirror = (h, extra = {}) => ({ env: userEnv(h, { SILK_TOOLCHAIN_MIRROR: mirror, ...extra }) })
 
-test('toolchain list and which describe the installed default', () => {
+test('toolchain list and which describe the installed default', { skip: replaced }, () => {
   const h = home()
   const list = silk(h, ['toolchain', 'list'])
   assert.equal(list.status, 0, show(list))
@@ -32,7 +37,7 @@ test('toolchain list and which describe the installed default', () => {
   assert.equal(which.installed, true)
 })
 
-test('toolchain help works in every spelling', () => {
+test('toolchain help works in every spelling', { skip: replaced }, () => {
   const h = home()
   for (const spelling of [['toolchain', 'help'], ['toolchain', '--help'], ['toolchain', '-h']]) {
     const result = silk(h, spelling)
@@ -41,7 +46,7 @@ test('toolchain help works in every spelling', () => {
   }
 })
 
-test('silk init pins the running version, and commands dispatch on the pin', () => {
+test('silk init pins the running version, and commands dispatch on the pin', { skip: replaced }, () => {
   const h = home()
   const app = initPackage(h, 'app')
   assert.match(read(join(app, 'silk.toml')), new RegExp(`silk-version = "${h.version.replaceAll('+', '\\+')}"`))
@@ -49,7 +54,7 @@ test('silk init pins the running version, and commands dispatch on the pin', () 
   assert.equal(which.origin, 'package')
 })
 
-test('a pin that is not installed stops with exit 3 and names the install command', () => {
+test('a pin that is not installed stops with exit 3 and names the install command', { skip: replaced }, () => {
   const h = home()
   const app = initPackage(h, 'app')
   const manifest = join(app, 'silk.toml')
@@ -61,7 +66,7 @@ test('a pin that is not installed stops with exit 3 and names the install comman
   }
 })
 
-test('an invalid pin is a manifest error', () => {
+test('an invalid pin is a manifest error', { skip: replaced }, () => {
   const h = home()
   const app = initPackage(h, 'app')
   const manifest = join(app, 'silk.toml')
@@ -71,14 +76,14 @@ test('an invalid pin is a manifest error', () => {
   assert.match(result.stderr, /package\.silk-version must be a valid semantic version/)
 })
 
-test('toolchain use outside a package says to run silk init', () => {
+test('toolchain use outside a package says to run silk init', { skip: replaced }, () => {
   const h = home()
   const result = silk(h, ['toolchain', 'use', h.version])
   assert.equal(result.status, 1, show(result))
   assert.match(result.stderr, /no silk\.toml here or above; run `silk init` first/)
 })
 
-test('toolchain use 0.0.0 explains that 0.0.0 cannot be pinned', { todo: 'finding 12: the message calls 0.0.0 not a semantic version' }, () => {
+test('toolchain use 0.0.0 explains that 0.0.0 cannot be pinned', { skip: replaced, todo: 'finding 12: the message calls 0.0.0 not a semantic version' }, () => {
   const h = home()
   const app = initPackage(h, 'app')
   const result = silk(h, ['toolchain', 'use', '0.0.0'], { cwd: app })
@@ -87,7 +92,7 @@ test('toolchain use 0.0.0 explains that 0.0.0 cannot be pinned', { todo: 'findin
   assert.match(result.stderr, /0\.0\.0/)
 })
 
-test('uninstall refuses the toolchain bin/silk runs, and ignores unknown versions', () => {
+test('uninstall refuses the toolchain bin/silk runs, and ignores unknown versions', { skip: replaced }, () => {
   const h = home()
   const refused = silk(h, ['toolchain', 'uninstall', h.version])
   assert.equal(refused.status, 1, show(refused))
@@ -96,14 +101,14 @@ test('uninstall refuses the toolchain bin/silk runs, and ignores unknown version
   assert.match(unknown.stdout, /0\.5\.0 is not installed; nothing to remove/)
 })
 
-test('+version rejects garbage', () => {
+test('+version rejects garbage', { skip: replaced }, () => {
   const h = home()
   const result = silk(h, ['+garbage', '--version'])
   assert.equal(result.status, 2)
   assert.match(result.stderr, /`\+garbage` is not a Silk version/)
 })
 
-test('install, pin, dispatch and uninstall a second version', { skip: needsMirror }, () => {
+test('install, pin, dispatch and uninstall a second version', { skip: replaced || needsMirror }, () => {
   const h = home()
   const installed = silk(h, ['toolchain', 'install', second], withMirror(h))
   assert.equal(installed.status, 0, show(installed))
@@ -127,7 +132,7 @@ test('install, pin, dispatch and uninstall a second version', { skip: needsMirro
   assert.match(autoInPackage.stderr, /installing Silk .* \(auto-install is on\)/)
 })
 
-test('latest and dev resolve through the mirror', { skip: needsMirror }, () => {
+test('latest and dev resolve through the mirror', { skip: replaced || needsMirror }, () => {
   const h = home()
   for (const alias of ['latest', 'dev']) {
     const result = silk(h, ['toolchain', 'install', alias], withMirror(h))
@@ -139,7 +144,7 @@ test('latest and dev resolve through the mirror', { skip: needsMirror }, () => {
   assert.match(read(join(app, 'silk.toml')), /silk-version = "\d+\.\d+\.\d+[^"]*\+[0-9a-f]+"/, 'use latest pins a full version')
 })
 
-test('toolchain default switches the version used outside packages', { skip: needsMirror }, () => {
+test('toolchain default switches the version used outside packages', { skip: replaced || needsMirror }, () => {
   const h = home()
   assert.equal(silk(h, ['toolchain', 'install', second], withMirror(h)).status, 0)
   const switched = silk(h, ['toolchain', 'default', second])
@@ -147,7 +152,7 @@ test('toolchain default switches the version used outside packages', { skip: nee
   assert.equal(silk(h, ['--version']).stdout.trim(), `silk v${second}`)
 })
 
-test('toolchain default repoints bin/silk so the old default can be uninstalled', { skip: needsMirror, todo: 'known: default does not repoint ~/.silk/bin/silk yet' }, () => {
+test('toolchain default repoints bin/silk so the old default can be uninstalled', { skip: replaced || needsMirror, todo: 'known: default does not repoint ~/.silk/bin/silk yet' }, () => {
   const h = home()
   assert.equal(silk(h, ['toolchain', 'install', second], withMirror(h)).status, 0)
   assert.equal(silk(h, ['toolchain', 'default', second]).status, 0)
@@ -155,7 +160,7 @@ test('toolchain default repoints bin/silk so the old default can be uninstalled'
   assert.equal(removed.status, 0, show(removed))
 })
 
-test('toolchain install of a partial version honors HTTPS_PROXY', { todo: 'finding 6: the release listing connects directly' }, () => {
+test('toolchain install of a partial version honors HTTPS_PROXY', { skip: replaced, todo: 'finding 6: the release listing connects directly' }, () => {
   // Only meaningful on a machine whose direct egress is blocked and HTTPS_PROXY is set.
   if (process.env.HTTPS_PROXY === undefined) return
   const h = home()

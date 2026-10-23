@@ -24,6 +24,7 @@ Run one area with `node --test integration/new-user/workspace.test.mjs`.
 | `SILK_NEW_USER_RUN_ALL` | `1` also runs docs programs whose output the page does not show, and fails on a crash. |
 | `SILK_NEW_USER_MIRROR`, `SILK_NEW_USER_SECOND` | A `SILK_TOOLCHAIN_MIRROR` directory and a full version in it (not the one `install.sh` picks). They enable the tests that install a second toolchain. Without them those tests are skipped. |
 | `SILK_NEW_USER_TMP` | Where the throwaway homes go. Default: the system temp folder. |
+| `SILK_NEW_USER_SEW` | A local `sew` build to test before a release ships sew. After install.sh it is copied to `~/.silk/bin/sew` and `~/.silk/bin/silk` points at it. With sew present, `toolchain.test.mjs` is skipped and `sew.test.mjs` runs. |
 | `SILK_NEW_USER_COMPILER` | A local `silk` binary to run instead of the installed release, through `SILK_TOOLCHAIN=local`, such as a build of main. It must sit at `<dir>/bin/silk` with the stdlib at `<dir>/lib/silk/stdlib`. install.sh still installs the release, so the install and toolchain tests keep testing that. |
 
 `HTTPS_PROXY` and `GITHUB_TOKEN` pass through to the installer.
@@ -47,6 +48,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | File | Covers |
 | --- | --- |
 | `install.test.mjs` | `install.sh`: layout, default, reinstall, bad tag and channel |
+| `sew.test.mjs` | sew: `sew use`, `use list`/`which`/`uninstall`, `sew set`, `+version`, the `silk` proxy, exit 3 and the editor message for a missing pin, `sew update` |
 | `toolchain.test.mjs` | `silk toolchain`, pins, exit 3 for a missing pin, `+version`, auto-install, `latest` and `dev` |
 | `project.test.mjs` | `silk init`, run with arguments and exit status, check, build, clean, format, `silk add` and `silk remove`, modules, runtime traps, CLI messages |
 | `testing.test.mjs` | `silk test`: passing, failing and trapping tests, `--filter` |

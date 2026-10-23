@@ -2,7 +2,7 @@
 // sees Silk the way a fresh machine does: no ~/.silk, no settings, nothing on PATH but the
 // toolchain the test installed.
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -22,6 +22,11 @@ const installer = process.env.SILK_NEW_USER_INSTALLER ?? join(repoRoot, 'install
 // SILK_TOOLCHAIN=local instead of the installed release. install.sh still runs, so the
 // install and toolchain tests keep testing the release.
 export const compiler = process.env.SILK_NEW_USER_COMPILER ?? ''
+
+// SILK_NEW_USER_SEW is a local sew binary, for testing sew before a release ships it. After
+// install.sh, sewHome() copies it to ~/.silk/bin/sew and points ~/.silk/bin/silk at it, the
+// layout a release with sew installs.
+export const sewBinary = process.env.SILK_NEW_USER_SEW ?? ''
 
 // Release to install, as a tag. Empty means "whatever install.sh picks", like a new user.
 export const release = process.env.SILK_RELEASE ?? ''
@@ -77,6 +82,25 @@ export function install(h, extra = {}) {
 export function sh(h, line, { cwd = h.work, env = userEnv(h), input, timeout = 600_000 } = {}) {
   const result = spawnSync('sh', ['-c', line], { cwd, env, input, timeout, encoding: 'utf8' })
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', signal: result.signal }
+}
+
+// Whether this home has sew, from the release or from SILK_NEW_USER_SEW.
+export function hasSew(h) {
+  return existsSync(join(h.silkHome, 'bin/sew'))
+}
+
+// Adds SILK_NEW_USER_SEW to an installed home when the release did not ship sew.
+export function addLocalSew(h) {
+  if (hasSew(h) || sewBinary === '') return hasSew(h)
+  copyFileSync(sewBinary, join(h.silkHome, 'bin/sew'))
+  chmodSync(join(h.silkHome, 'bin/sew'), 0o755)
+  rmSync(join(h.silkHome, 'bin/silk'), { force: true })
+  symlinkSync('sew', join(h.silkHome, 'bin/silk'))
+  return true
+}
+
+export function sew(h, args, options = {}) {
+  return sh(h, ['sew', ...args].map(quote).join(' '), options)
 }
 
 export function silk(h, args, options = {}) {
