@@ -13,9 +13,7 @@ import { isVersion } from './SemVer.mjs'
 
 export class SourceSnapshotError extends Data.TaggedError('SourceSnapshotError') {}
 const invalid = (message) => Effect.fail(new SourceSnapshotError({ message }))
-// The workspace lists sew as a member, so its manifest must exist, but sew's sources are not
-// compiler inputs.
-export const roots = ['changes', 'compiler', 'sew/silk.toml', 'silk.toml', 'stdlib', 'tomledit']
+export const roots = ['changes', 'compiler', 'sew', 'silk.toml', 'stdlib', 'tomledit']
 /** The compiler package, its source dependencies, and their workspace configuration. */
 export const isCompilerInput = (path) =>
   path === 'silk.toml' ||
@@ -23,6 +21,10 @@ export const isCompilerInput = (path) =>
   path.startsWith('compiler/') ||
   path.startsWith('changes/') ||
   path.startsWith('tomledit/')
+// The release archive's `bin/sew` is built from the same snapshot. Only its manifest, which the
+// workspace needs, is a compiler input.
+const isSnapshotInput = (path) =>
+  isCompilerInput(path) || path.startsWith('stdlib/') || path.startsWith('sew/')
 const requiredFiles = [
   'silk.toml',
   'compiler/silk.toml',
@@ -112,6 +114,8 @@ const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))
 const projectionPath = 'projection.json'
 const snapshotPath = 'compiler/changes-snapshot.toml'
 const versionPath = 'compiler/src/ReleaseVersion.silk'
+// sew reports the release version too, from a copy of the compiler's generated version module.
+const sewVersionPath = 'sew/src/ReleaseVersion.silk'
 const within = (parent, child) => {
   const path = relative(resolve(parent), resolve(child))
   return path === '' || (!path.startsWith('..') && !isAbsolute(path))
@@ -239,6 +243,9 @@ export const projectSnapshot = Effect.fn('SourceSnapshot.projectSnapshot')(
     if (problem) return yield* invalid(problem)
     if (original.files.some(({ path }) => path === snapshotPath))
       return yield* invalid('Committed base already contains release snapshot metadata')
+    const sewVersion = original.files.some(({ path }) => path === sewVersionPath)
+    if (sewVersion && (yield* fs.readFileString(join(base, sewVersionPath))) !== baseVersionSource)
+      return yield* invalid(`${sewVersionPath} must match ${versionPath}`)
     const material = {
       baseDigest: original.normalizedDigest,
       baseArchiveSha256: original.archiveSha256,
@@ -255,6 +262,7 @@ export const projectSnapshot = Effect.fn('SourceSnapshot.projectSnapshot')(
       [versionPath, snapshot.versionSource],
       [snapshotPath, snapshot.toml],
     ])
+    if (sewVersion) overlay.set(sewVersionPath, snapshot.versionSource)
     const files = []
     for (const file of original.files) {
       const target = join(directory, file.path)
@@ -390,7 +398,7 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
         file.path
           .split('/')
           .some((component) => component === '..' || component === '.' || component === '') ||
-        !(isCompilerInput(file.path) || file.path.startsWith('stdlib/')) ||
+        !isSnapshotInput(file.path) ||
         !['100644', '100755'].includes(file.mode) ||
         !/^[a-f0-9]{64}$/.test(file.sha256) ||
         expected.has(file.path)
@@ -449,6 +457,8 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
         ['compiler/silk.toml', snapshot.manifest],
         [versionPath, snapshot.versionSource],
       ])
+      const sewVersion = baseFiles.find(({ path }) => path === sewVersionPath)
+      if (sewVersion) overlays.set(sewVersionPath, snapshot.versionSource)
       const projected = baseFiles.map((file) => ({
         ...file,
         sha256: overlays.has(file.path) ? hash(overlays.get(file.path)) : file.sha256,
@@ -461,6 +471,7 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
         baseFiles.find(({ path }) => path === 'compiler/silk.toml')?.sha256 !==
           hash(baseManifest) ||
         baseFiles.find(({ path }) => path === versionPath)?.sha256 !== hash(baseVersionSource) ||
+        (sewVersion !== undefined && sewVersion.sha256 !== hash(baseVersionSource)) ||
         fileDigest(baseFiles) !== projection.baseDigest ||
         material.baseDigest !== projection.baseDigest ||
         material.baseArchiveSha256 !== projection.baseArchiveSha256 ||

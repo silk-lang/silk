@@ -19,7 +19,7 @@ const directory = Effect.acquireRelease(
   (root) => Effect.sync(() => rmSync(root, { recursive: true, force: true })),
 )
 
-it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibly', () =>
+it.effect('installs the compiler as bin/silk and sew as bin/sew beside lib/silk/stdlib, reproducibly', () =>
   Effect.gen(function* () {
     const root = yield* directory
     const fs = yield* FileSystem.FileSystem
@@ -35,10 +35,12 @@ it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibl
     writeFileSync(join(root, 'stdlib/manifest.json'), '{}\n')
     writeFileSync(join(root, 'stdlib', deep, 'option.silk'), 'pub union Option {}\n')
     writeFileSync(join(root, 'compiler'), '#!/bin/sh\necho silk\n')
+    writeFileSync(join(root, 'sew'), '#!/bin/sh\necho sew\n')
     mkdirSync(join(root, 'first'))
     mkdirSync(join(root, 'second'))
     const options = {
       compiler: join(root, 'compiler'),
+      sew: join(root, 'sew'),
       standardLibrary: join(root, 'stdlib'),
       target: 'x86_64-unknown-linux-gnu',
       version: '1.2.3-rc.2+release.build',
@@ -59,6 +61,9 @@ it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibl
     assert.deepStrictEqual(yield* fs.readDirectory(join(top, 'lib/silk')), ['stdlib'])
     assert.strictEqual(readFileSync(join(top, 'bin/silk'), 'utf8'), '#!/bin/sh\necho silk\n')
     assert.strictEqual(statSync(join(top, 'bin/silk')).mode & 0o777, 0o755)
+    assert.deepStrictEqual((yield* fs.readDirectory(join(top, 'bin'))).sort(), ['sew', 'silk'])
+    assert.strictEqual(readFileSync(join(top, 'bin/sew'), 'utf8'), '#!/bin/sh\necho sew\n')
+    assert.strictEqual(statSync(join(top, 'bin/sew')).mode & 0o777, 0o755)
     assert.strictEqual(statSync(join(top, 'lib/silk/stdlib/manifest.json')).mode & 0o777, 0o644)
     assert.strictEqual(
       readFileSync(join(top, 'lib/silk/stdlib', deep, 'option.silk'), 'utf8'),
@@ -104,6 +109,7 @@ it.effect('rejects malformed versions before reading inputs or writing archive p
       const result = yield* Effect.result(
         ReleaseArchive.write({
           compiler: join(root, 'missing-compiler'),
+          sew: join(root, 'missing-sew'),
           standardLibrary: join(root, 'missing-stdlib'),
           target: 'aarch64-apple-darwin',
           version,
@@ -122,9 +128,11 @@ it.effect('requires an explicit CLI version and preserves foreign compiler bytes
     const fs = yield* FileSystem.FileSystem
     const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-archive-cli-' })
     const compiler = join(root, 'foreign-compiler')
+    const sew = join(root, 'foreign-sew')
     const standardLibrary = join(root, 'stdlib')
     const output = join(root, 'output')
     yield* fs.writeFileString(compiler, 'foreign executable bytes, not a host program')
+    yield* fs.writeFileString(sew, 'foreign sew bytes')
     yield* fs.makeDirectory(standardLibrary)
     yield* fs.writeFileString(join(standardLibrary, 'i32.silk'), 'pub let ZERO = 0\n')
     yield* fs.makeDirectory(output)
@@ -137,6 +145,8 @@ it.effect('requires an explicit CLI version and preserves foreign compiler bytes
       fileURLToPath(new URL('./ReleaseArchive.ts', import.meta.url)),
       '--compiler',
       compiler,
+      '--sew',
+      sew,
       '--stdlib',
       standardLibrary,
       '--target',
@@ -168,6 +178,12 @@ it.effect('requires an explicit CLI version and preserves foreign compiler bytes
     ])
     assert.strictEqual(unpacked.status, 0, unpacked.stderr.toString())
     assert.strictEqual(unpacked.stdout.toString(), 'foreign executable bytes, not a host program')
+    const front = yield* NativeProcess.execute('tar', [
+      '-xzOf',
+      archive,
+      'silk-2.3.5-beta.0+build.007-aarch64-apple-darwin/bin/sew',
+    ])
+    assert.strictEqual(front.stdout.toString(), 'foreign sew bytes')
     const metadata = yield* NativeProcess.execute('tar', [
       '-xzOf',
       archive,
