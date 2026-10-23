@@ -139,6 +139,24 @@ OutputTooSmall
 
 The output buffer is too small. Nothing was written.
 
+<a id="OriginError.impl.Debug"></a>
+
+## Implementation `Debug for OriginError`
+
+```silk
+impl Debug for OriginError
+```
+
+<a id="OriginError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidScheme`.
+
 <a id="Origin"></a>
 
 ## `Origin`

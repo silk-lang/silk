@@ -283,6 +283,24 @@ TokenTooLarge
 
 A token does not fit in the buffer that the caller gave for it.
 
+<a id="JsonReason.impl.Debug"></a>
+
+## Implementation `Debug for JsonReason`
+
+```silk
+impl Debug for JsonReason
+```
+
+<a id="JsonReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `UnexpectedByte`.
+
 <a id="JsonError"></a>
 
 ## `JsonError`
@@ -335,6 +353,24 @@ pub available: Option<usize>
 ```
 
 For `TokenTooLarge`, the buffer size that was available.
+
+<a id="JsonError.impl.Debug"></a>
+
+## Implementation `Debug for JsonError`
+
+```silk
+impl Debug for JsonError
+```
+
+<a id="JsonError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `JsonError { reason: ..., offset: ..., ... }`.
 
 <a id="JsonError.impl"></a>
 

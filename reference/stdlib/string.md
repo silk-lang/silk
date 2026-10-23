@@ -113,6 +113,24 @@ make an independent copy of a view. A `String` always holds valid UTF-8. A faile
 Traversal with [`String.nextScalar`](#String.impl.nextScalar) gives Unicode scalar values, not grapheme clusters, so one
 visible character can be more than one scalar.
 
+<a id="String.impl.Debug"></a>
+
+## Implementation `Debug for String`
+
+```silk
+impl Debug for String
+```
+
+<a id="String.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the text as a quoted string, like a `string`.
+
 <a id="String.impl"></a>
 
 ## Implementation `String`
@@ -453,6 +471,24 @@ pub offset: usize
 ```
 
 The zero-based position of the first byte that is not valid UTF-8.
+
+<a id="InvalidUtf8.impl.Debug"></a>
+
+## Implementation `Debug for InvalidUtf8`
+
+```silk
+impl Debug for InvalidUtf8
+```
+
+<a id="InvalidUtf8.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `InvalidUtf8 { offset: ... }`.
 
 <a id="ScalarCursor"></a>
 

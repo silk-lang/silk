@@ -80,6 +80,24 @@ pub struct StreamReadError
 
 The error when a standard input provider cannot complete a read.
 
+<a id="StreamReadError.impl.Debug"></a>
+
+## Implementation `Debug for StreamReadError`
+
+```silk
+impl Debug for StreamReadError
+```
+
+<a id="StreamReadError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `StreamReadError`.
+
 <a id="Filled"></a>
 
 ## `Filled`

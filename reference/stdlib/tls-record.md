@@ -472,6 +472,24 @@ KeyUsageExhausted
 
 The traffic key protected [`RECORDS_PER_EPOCH`](#RECORDS_PER_EPOCH) records. Install a new key.
 
+<a id="RecordError.impl.Debug"></a>
+
+## Implementation `Debug for RecordError`
+
+```silk
+impl Debug for RecordError
+```
+
+<a id="RecordError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidSecretLength { ... }`.
+
 <a id="RecordView"></a>
 
 ## `RecordView`

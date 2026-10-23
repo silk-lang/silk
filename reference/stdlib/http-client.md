@@ -231,6 +231,24 @@ Decode
 
 The response body could not be decoded as requested.
 
+<a id="HttpErrorKind.impl.Debug"></a>
+
+## Implementation `Debug for HttpErrorKind`
+
+```silk
+impl Debug for HttpErrorKind
+```
+
+<a id="HttpErrorKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidUrl`.
+
 <a id="HttpCause"></a>
 
 ## `HttpCause`
@@ -451,6 +469,24 @@ pub error: InvalidUtf8
 
 The decoding failure.
 
+<a id="HttpCause.impl.Debug"></a>
+
+## Implementation `Debug for HttpCause`
+
+```silk
+impl Debug for HttpCause
+```
+
+<a id="HttpCause.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `None`.
+
 <a id="HttpError"></a>
 
 ## `HttpError`
@@ -505,6 +541,24 @@ pub cause: HttpCause
 ```
 
 The lower-level error, when there is one.
+
+<a id="HttpError.impl.Debug"></a>
+
+## Implementation `Debug for HttpError`
+
+```silk
+impl Debug for HttpError
+```
+
+<a id="HttpError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `HttpError { kind: ..., message: ..., ... }`.
 
 <a id="HttpError.impl"></a>
 

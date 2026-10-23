@@ -221,6 +221,24 @@ ResourceLimit
 
 An inclusive caller-supplied resource or work bound is exceeded.
 
+<a id="ValidationClass.impl.Debug"></a>
+
+## Implementation `Debug for ValidationClass`
+
+```silk
+impl Debug for ValidationClass
+```
+
+<a id="ValidationClass.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidInput`.
+
 <a id="ValidationReason"></a>
 
 ## `ValidationReason`
@@ -441,6 +459,24 @@ SizeOverflow
 
 A checked length or counter sum is not representable.
 
+<a id="ValidationReason.impl.Debug"></a>
+
+## Implementation `Debug for ValidationReason`
+
+```silk
+impl Debug for ValidationReason
+```
+
+<a id="ValidationReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `UnsupportedVersion`.
+
 <a id="ValidationLocation"></a>
 
 ## `ValidationLocation`
@@ -518,6 +554,24 @@ The validation call rather than one certificate.
 ```silk
 impl Copy for ValidationLocation
 ```
+
+<a id="ValidationLocation.impl.Debug"></a>
+
+## Implementation `Debug for ValidationLocation`
+
+```silk
+impl Debug for ValidationLocation
+```
+
+<a id="ValidationLocation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Leaf`.
 
 <a id="ValidationLimit"></a>
 
@@ -699,6 +753,24 @@ Arithmetic
 
 Checked arithmetic representation.
 
+<a id="ValidationLimit.impl.Debug"></a>
+
+## Implementation `Debug for ValidationLimit`
+
+```silk
+impl Debug for ValidationLimit
+```
+
+<a id="ValidationLimit.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `PeerCertificates`.
+
 <a id="ValidationError"></a>
 
 ## `ValidationError`
@@ -784,6 +856,24 @@ pub offset: usize
 ```
 
 Byte offset in the relevant certificate or configured constraint input.
+
+<a id="ValidationError.impl.Debug"></a>
+
+## Implementation `Debug for ValidationError`
+
+```silk
+impl Debug for ValidationError
+```
+
+<a id="ValidationError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ValidationError { kind: ..., reason: ..., ... }`.
 
 <a id="RevocationStatus"></a>
 

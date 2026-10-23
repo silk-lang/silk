@@ -172,6 +172,24 @@ AuthenticationFailed
 The tag is not correct for the key, nonce, associated data, and ciphertext. The message was
 changed, or a value is wrong.
 
+<a id="AesGcmError.impl.Debug"></a>
+
+## Implementation `Debug for AesGcmError`
+
+```silk
+impl Debug for AesGcmError
+```
+
+<a id="AesGcmError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidKeyLength`.
+
 <a id="AesGcm"></a>
 
 ## `AesGcm`

@@ -88,6 +88,24 @@ pub maximum: usize
 
 The maximum output length: 8160 for SHA-256 and 12240 for SHA-384.
 
+<a id="OutputTooLongError.impl.Debug"></a>
+
+## Implementation `Debug for OutputTooLongError`
+
+```silk
+impl Debug for OutputTooLongError
+```
+
+<a id="OutputTooLongError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `OutputTooLongError { requested: ..., maximum: ... }`.
+
 <a id="HkdfSha256"></a>
 
 ## `HkdfSha256`

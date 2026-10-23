@@ -58,6 +58,24 @@ An owned sequence of bytes. Dropping it releases its storage.
 The length is the number of bytes in the value. The length grows with [`Bytes.append`](#Bytes.impl.append). The
 capacity of the storage is not part of the public contract.
 
+<a id="Bytes.impl.Debug"></a>
+
+## Implementation `Debug for Bytes`
+
+```silk
+impl Debug for Bytes
+```
+
+<a id="Bytes.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes each byte as a number, as `[104, 105]`, like a `&[u8]`.
+
 <a id="Bytes.impl"></a>
 
 ## Implementation `Bytes`

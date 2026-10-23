@@ -165,6 +165,24 @@ Reports that no task is ready and no event registration remains while the root i
 [`LocalScheduler.execute`](#LocalScheduler.impl.execute) raises it when no task is ready, no timer is waiting, and the root is
 not finished. It cancels and releases the incomplete task tree before it raises this error.
 
+<a id="StalledError.impl.Debug"></a>
+
+## Implementation `Debug for StalledError`
+
+```silk
+impl Debug for StalledError
+```
+
+<a id="StalledError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `StalledError`.
+
 
 Category: Concurrency.
 

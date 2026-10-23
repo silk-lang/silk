@@ -124,6 +124,24 @@ OutputTooSmall
 
 The output buffer cannot hold the whole value. See [`encodedLength`](#encodedLength).
 
+<a id="BasicError.impl.Debug"></a>
+
+## Implementation `Debug for BasicError`
+
+```silk
+impl Debug for BasicError
+```
+
+<a id="BasicError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidUsername`.
+
 <a id="encodedLength"></a>
 
 ## `encodedLength`

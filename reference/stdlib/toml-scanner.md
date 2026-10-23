@@ -286,6 +286,24 @@ DepthExceeded
 
 More than [`MAX_DEPTH`](#MAX_DEPTH) arrays or inline tables are nested.
 
+<a id="TomlReason.impl.Debug"></a>
+
+## Implementation `Debug for TomlReason`
+
+```silk
+impl Debug for TomlReason
+```
+
+<a id="TomlReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `UnexpectedByte`.
+
 <a id="TomlError"></a>
 
 ## `TomlError`
@@ -316,6 +334,24 @@ pub offset: usize
 
 The byte position of the problem in the input. Errors that are not tied to a source position,
 such as codec errors, use 0.
+
+<a id="TomlError.impl.Debug"></a>
+
+## Implementation `Debug for TomlError`
+
+```silk
+impl Debug for TomlError
+```
+
+<a id="TomlError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `TomlError { reason: ..., offset: ... }`.
 
 <a id="TomlScalarKind"></a>
 

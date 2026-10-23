@@ -204,6 +204,24 @@ pub error: ConnectionError
 
 The error of the TLS connection.
 
+<a id="TransportError.impl.Debug"></a>
+
+## Implementation `Debug for TransportError`
+
+```silk
+impl Debug for TransportError
+```
+
+<a id="TransportError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Plain { ... }`.
+
 <a id="HttpTransport"></a>
 
 ## `HttpTransport`

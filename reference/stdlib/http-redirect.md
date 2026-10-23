@@ -520,6 +520,24 @@ Body
 
 The request body.
 
+<a id="RedirectComponent.impl.Debug"></a>
+
+## Implementation `Debug for RedirectComponent`
+
+```silk
+impl Debug for RedirectComponent
+```
+
+<a id="RedirectComponent.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Policy`.
+
 <a id="RedirectLimit"></a>
 
 ## `RedirectLimit`
@@ -589,6 +607,24 @@ HistoryBytes
 ```
 
 `maxHistoryBytes`.
+
+<a id="RedirectLimit.impl.Debug"></a>
+
+## Implementation `Debug for RedirectLimit`
+
+```silk
+impl Debug for RedirectLimit
+```
+
+<a id="RedirectLimit.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `PolicyNames`.
 
 <a id="RedirectReason"></a>
 
@@ -778,6 +814,24 @@ A body producer sent another length or framing than its `mode` said.
 impl Copy for RedirectReason
 ```
 
+<a id="RedirectReason.impl.Debug"></a>
+
+## Implementation `Debug for RedirectReason`
+
+```silk
+impl Debug for RedirectReason
+```
+
+<a id="RedirectReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidPolicy`.
+
 <a id="RedirectContext"></a>
 
 ## `RedirectContext`
@@ -828,6 +882,24 @@ pub nextUri: Option<OwnedUri>
 
 A copy of the next URI, when it is known.
 
+<a id="RedirectContext.impl.Debug"></a>
+
+## Implementation `Debug for RedirectContext`
+
+```silk
+impl Debug for RedirectContext
+```
+
+<a id="RedirectContext.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `RedirectContext { hop: ..., status: ..., ... }`.
+
 <a id="RedirectError"></a>
 
 ## `RedirectError`
@@ -871,6 +943,24 @@ pub context: RedirectContext
 ```
 
 The URIs and the status.
+
+<a id="RedirectError.impl.Debug"></a>
+
+## Implementation `Debug for RedirectError`
+
+```silk
+impl Debug for RedirectError
+```
+
+<a id="RedirectError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `RedirectError { component: ..., reason: ..., ... }`.
 
 <a id="Request"></a>
 

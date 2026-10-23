@@ -98,6 +98,24 @@ Close
 
 A close of the whole transport.
 
+<a id="ByteIoOperation.impl.Debug"></a>
+
+## Implementation `Debug for ByteIoOperation`
+
+```silk
+impl Debug for ByteIoOperation
+```
+
+<a id="ByteIoOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Read`.
+
 <a id="ByteIoError"></a>
 
 ## `ByteIoError`
@@ -230,6 +248,24 @@ pub code: i32
 ```
 
 A code that the provider defines, such as an `errno` value.
+
+<a id="ByteIoError.impl.Debug"></a>
+
+## Implementation `Debug for ByteIoError`
+
+```silk
+impl Debug for ByteIoError
+```
+
+<a id="ByteIoError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Timeout { ... }`.
 
 <a id="ReadTransfer"></a>
 

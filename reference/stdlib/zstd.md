@@ -429,6 +429,24 @@ WorkspaceLimit
 
 [`ZstdLimits.workspaceBytes`](#ZstdLimits.workspaceBytes) is too small for the decoder storage.
 
+<a id="ZstdReason.impl.Debug"></a>
+
+## Implementation `Debug for ZstdReason`
+
+```silk
+impl Debug for ZstdReason
+```
+
+<a id="ZstdReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `None`.
+
 <a id="ZstdError"></a>
 
 ## `ZstdError`
@@ -493,6 +511,24 @@ pub written: usize
 ```
 
 The number of output bytes that this call wrote before it failed.
+
+<a id="ZstdError.impl.Debug"></a>
+
+## Implementation `Debug for ZstdError`
+
+```silk
+impl Debug for ZstdError
+```
+
+<a id="ZstdError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ZstdError { reason: ..., blockReason: ..., ... }`.
 
 <a id="Zstd"></a>
 

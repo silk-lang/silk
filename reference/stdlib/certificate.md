@@ -216,6 +216,24 @@ ResourceLimit
 
 The input goes over a [`DecodeLimits`](#DecodeLimits) value or a size that the target can hold.
 
+<a id="DecodeClass.impl.Debug"></a>
+
+## Implementation `Debug for DecodeClass`
+
+```silk
+impl Debug for DecodeClass
+```
+
+<a id="DecodeClass.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Malformed`.
+
 <a id="DecodeReason"></a>
 
 ## `DecodeReason`
@@ -496,6 +514,24 @@ SizeOverflow
 
 A length, a tag number, or an allocation size does not fit in `usize`.
 
+<a id="DecodeReason.impl.Debug"></a>
+
+## Implementation `Debug for DecodeReason`
+
+```silk
+impl Debug for DecodeReason
+```
+
+<a id="DecodeReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `EmptyInput`.
+
 <a id="DecodeOffsetSpace"></a>
 
 ## `DecodeOffsetSpace`
@@ -526,6 +562,24 @@ Der
 
 The offset is a position in the DER of the PEM block at `certificateIndex`, after Base64
 decoding.
+
+<a id="DecodeOffsetSpace.impl.Debug"></a>
+
+## Implementation `Debug for DecodeOffsetSpace`
+
+```silk
+impl Debug for DecodeOffsetSpace
+```
+
+<a id="DecodeOffsetSpace.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Input`.
 
 <a id="CertificateVersion"></a>
 
@@ -639,6 +693,24 @@ The position of the byte or tag that failed, or the position where missing data 
 ```silk
 impl Copy for DecodeError
 ```
+
+<a id="DecodeError.impl.Debug"></a>
+
+## Implementation `Debug for DecodeError`
+
+```silk
+impl Debug for DecodeError
+```
+
+<a id="DecodeError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `DecodeError { kind: ..., reason: ..., ... }`.
 
 <a id="CertificateTime"></a>
 

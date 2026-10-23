@@ -69,6 +69,24 @@ The failure when an allocator cannot supply the requested storage.
 A failed request never returns part of an allocation. Each operation that makes owned storage,
 such as `List.push` or `Box.make`, can fail with this error.
 
+<a id="OutOfMemoryError.impl.Debug"></a>
+
+## Implementation `Debug for OutOfMemoryError`
+
+```silk
+impl Debug for OutOfMemoryError
+```
+
+<a id="OutOfMemoryError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `OutOfMemoryError`.
+
 <a id="Allocator"></a>
 
 ## `Allocator`

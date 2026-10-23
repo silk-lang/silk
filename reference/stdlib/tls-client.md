@@ -685,6 +685,24 @@ EndInput
 
 Transport input end.
 
+<a id="ClientOperation.impl.Debug"></a>
+
+## Implementation `Debug for ClientOperation`
+
+```silk
+impl Debug for ClientOperation
+```
+
+<a id="ClientOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `FeedInput`.
+
 <a id="ProtocolReason"></a>
 
 ## `ProtocolReason`
@@ -804,6 +822,24 @@ InternalState
 ```
 
 The client reached an impossible private transition.
+
+<a id="ProtocolReason.impl.Debug"></a>
+
+## Implementation `Debug for ProtocolReason`
+
+```silk
+impl Debug for ProtocolReason
+```
+
+<a id="ProtocolReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Record`.
 
 <a id="TlsLimitKind"></a>
 
@@ -1005,6 +1041,24 @@ CertificateProfile
 
 The configured semantic certificate-profile policy.
 
+<a id="TlsLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for TlsLimitKind`
+
+```silk
+impl Debug for TlsLimitKind
+```
+
+<a id="TlsLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `HandshakeBodyBytes`.
+
 <a id="CertificateIdentityFailure"></a>
 
 ## `CertificateIdentityFailure`
@@ -1054,6 +1108,24 @@ pub error: IdentityError
 ```
 
 The complete HTTPS identity failure.
+
+<a id="CertificateIdentityFailure.impl.Debug"></a>
+
+## Implementation `Debug for CertificateIdentityFailure`
+
+```silk
+impl Debug for CertificateIdentityFailure
+```
+
+<a id="CertificateIdentityFailure.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Decode { ... }`.
 
 <a id="CertificateVerifyFailure"></a>
 
@@ -1124,6 +1196,24 @@ pub error: RsaError
 ```
 
 The exact primitive failure.
+
+<a id="CertificateVerifyFailure.impl.Debug"></a>
+
+## Implementation `Debug for CertificateVerifyFailure`
+
+```silk
+impl Debug for CertificateVerifyFailure
+```
+
+<a id="CertificateVerifyFailure.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Ecdsa { ... }`.
 
 <a id="TlsError"></a>
 
@@ -1375,6 +1465,24 @@ NoApplicationProtocol
 ```
 
 The server omits a required ALPN selection or selects a protocol that was not offered.
+
+<a id="TlsError.impl.Debug"></a>
+
+## Implementation `Debug for TlsError`
+
+```silk
+impl Debug for TlsError
+```
+
+<a id="TlsError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `PeerAlert { ... }`.
 
 <a id="CertificateVerifyFailure.impl.Copy"></a>
 

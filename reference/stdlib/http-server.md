@@ -418,6 +418,24 @@ Failed
 
 A protocol or transport error occurred. No more I/O is allowed.
 
+<a id="ConnectionPhase.impl.Debug"></a>
+
+## Implementation `Debug for ConnectionPhase`
+
+```silk
+impl Debug for ConnectionPhase
+```
+
+<a id="ConnectionPhase.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Ready`.
+
 <a id="BodyMode"></a>
 
 ## `BodyMode`
@@ -656,6 +674,24 @@ InformationalResponses
 ```
 
 The number of 1xx responses for one request.
+
+<a id="ServerLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for ServerLimitKind`
+
+```silk
+impl Debug for ServerLimitKind
+```
+
+<a id="ServerLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InformationalResponses`.
 
 <a id="ServerError"></a>
 
@@ -898,6 +934,24 @@ TruncatedHead
 
 The input ended in the middle of a request head.
 
+<a id="ServerError.impl.Debug"></a>
+
+## Implementation `Debug for ServerError`
+
+```silk
+impl Debug for ServerError
+```
+
+<a id="ServerError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Head { ... }`.
+
 <a id="WriteProgress"></a>
 
 ## `WriteProgress`
@@ -955,6 +1009,24 @@ The total framed body bytes of the response so far, with chunk framing.
 ```silk
 impl Copy for WriteProgress
 ```
+
+<a id="WriteProgress.impl.Debug"></a>
+
+## Implementation `Debug for WriteProgress`
+
+```silk
+impl Debug for WriteProgress
+```
+
+<a id="WriteProgress.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `WriteProgress { consumed: ..., buffered: ..., ... }`.
 
 <a id="Connection"></a>
 
