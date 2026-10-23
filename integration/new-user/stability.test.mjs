@@ -181,7 +181,7 @@ ${logging}  let a = area(Point { x: 3, y: 4 })
   assert.match(seen.at(-1), /: 12 37 20$/, seen.join('\n'))
 })
 
-test('a test that never finishes is stopped and named, and the others still report', { todo: 'finding 37' }, () => {
+test('a test that never finishes is stopped and named, and the others still report', () => {
   const dir = initPackage(h, 'spinning')
   write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n\ntest fn quick() {\n  let x: i64 = 1\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n')
   // Bounded here so a hang fails the test instead of the suite; the spinning test process is
@@ -192,7 +192,7 @@ test('a test that never finishes is stopped and named, and the others still repo
   assert.match(result.stdout + result.stderr, /main::quick\s+PASS/, show(result))
 })
 
-test('two builds of one package at the same time both succeed', { todo: 'finding 38' }, async () => {
+test('two builds of one package at the same time both succeed', async () => {
   const dir = initPackage(h, 'together')
   const failures = []
   for (let round = 0; round < 4; round++) {
@@ -208,7 +208,7 @@ test('two builds of one package at the same time both succeed', { todo: 'finding
   assert.deepEqual(failures, [])
 })
 
-test('a stack overflow says so instead of a bare segmentation fault', { todo: 'finding 39' }, () => {
+test('a stack overflow says so instead of a bare segmentation fault', () => {
   const dir = initPackage(h, 'deep')
   write(join(dir, 'src/main.silk'), 'fn deep(n: i64) -> i64 {\n  if n == 0 {\n    return 0\n  }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  if deep(100000000) == 0 {\n    return 1\n  }\n  return 0\n}\n')
   const result = silk(h, ['run', '--quiet'], { cwd: dir })
