@@ -305,7 +305,7 @@ test('the native resolver finds localhost', () => {
   assert.match(result.stderr, /localhost: 1 endpoints/, show(result))
 })
 
-test('a library with 600 tests builds and runs them all', { todo: 'finding 59' }, () => {
+test('a library with 600 tests builds and runs them all', () => {
   const dir = initPackage(h, 'manytests', ['--lib'])
   let body = "import silk.testing { AssertionError, Testing }\n\npub fn twice(x: i32) -> i32 {\n  return x * 2\n}\n"
   for (let i = 0; i < 600; i++) body += `\ntest effect fn case${i}() -> ()\n  ! AssertionError<'static> {\n  run Testing.expect(twice(${i}) == ${2 * i}, "twice ${i}")\n}\n`
@@ -322,7 +322,7 @@ test('a call with too few arguments is reported as SEM0007', { todo: 'finding 61
   assert.match(result.stderr, /src\/main\.silk:6:10: error\[SEM0007\] Expected 3 arguments but received 2/, show(result))
 })
 
-test('in a workspace, the editor sees a saved change to another member', { todo: 'finding 62' }, async () => {
+test('in a workspace, the editor sees a saved change to another member', async () => {
   const root = join(h.work, 'lspshop')
   for (const [args, cwd] of [[['init', '--workspace', 'lspshop'], h.work], [['init', '--lib', 'pricing'], root], [['init', 'store'], root], [['add', '../pricing'], join(root, 'store')]]) {
     const result = silk(h, args, { cwd })
@@ -347,4 +347,56 @@ test('in a workspace, the editor sees a saved change to another member', { todo:
   }
   await server.shutdown()
   assert.ok(codes.includes('SEM0015'), JSON.stringify(codes))
+})
+
+// A package of `modules` modules with `functions` functions each, all reachable from main.
+function generatedPackage(name, modules, functions) {
+  const dir = initPackage(h, name)
+  for (let m = 0; m < modules; m++) {
+    let text = `pub struct Point {\n  pub x: i64\n  pub y: i64\n}\n\npub union Shape {\n  Circle {\n    pub radius: i64\n  },\n  Rect {\n    pub width: i64,\n    pub height: i64\n  },\n  Empty\n}\n`
+    for (let f = 0; f < functions; f++) {
+      text += `\npub fn f${f}(seed: i64) -> i64 {\n  let point = Point { x: seed + ${f}, y: seed * 2 }\n  let shape = match seed % 3 {\n    0 => Shape.Circle { radius: point.x }\n    1 => Shape.Rect { width: point.x, height: point.y }\n    _ => Shape.Empty\n  }\n  let value = match move shape {\n    Shape.Circle { radius } => radius * 3\n    Shape.Rect { width, height } => width * height\n    Shape.Empty => ${f}\n  }\n  return value % 1000\n}\n`
+    }
+    text += `\npub fn all(seed: i64) -> i64 {\n  let mut total: i64 = 0\n${Array.from({ length: functions }, (_, f) => `  total = total + f${f}(seed)\n`).join('')}  return total\n}\n`
+    write(join(dir, `src/gen/m${m}.silk`), text)
+  }
+  const imports = Array.from({ length: modules }, (_, m) => `import gen.m${m} as M${m}\n`).join('')
+  const sum = Array.from({ length: modules }, (_, m) => `M${m}.all(1)`).join(' + ')
+  write(join(dir, 'src/main.silk'), `${imports}\npub fn main() -> i32 {\n  let total: i64 = ${sum}\n  if total > 0 {\n    return 0\n  }\n  return 1\n}\n`)
+  return dir
+}
+
+const checkSeconds = (result) => Number(/^  check +\d+ modules? +([\d.]+)s$/m.exec(result.stderr)?.[1] ?? NaN)
+
+test('a one-line edit in one module of a big package rechecks far less than a cold check', { todo: 'finding 66' }, () => {
+  const dir = generatedPackage('bigedit', 10, 90)
+  rmSync(join(dir, 'build'), { recursive: true, force: true })
+  const cold = silk(h, ['check'], { cwd: dir })
+  assert.equal(cold.status, 0, show(cold))
+  write(join(dir, 'src/main.silk'), read(join(dir, 'src/main.silk')).replace('return 1\n', 'return 2\n'))
+  const edited = silk(h, ['check'], { cwd: dir })
+  assert.equal(edited.status, 0, show(edited))
+  assert.ok(checkSeconds(edited) < checkSeconds(cold) / 4, `cold ${checkSeconds(cold)} s, after editing main ${checkSeconds(edited)} s`)
+})
+
+test('a comma between struct fields says fields are separated by newlines', { todo: 'finding 68' }, () => {
+  const dir = initPackage(h, 'structcomma')
+  write(join(dir, 'src/main.silk'), 'struct P {\n  x: i32,\n  y: i32\n}\n\npub fn main() -> i32 {\n  return 0\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.match(result.stderr, /src\/main\.silk:2:9: error\[PAR0002\].*(newline|line)/, show(result))
+})
+
+test('passing a &mut binding to a call suggests lending it again with &mut', { todo: 'finding 69' }, () => {
+  const dir = initPackage(h, 'reborrowhint')
+  write(join(dir, 'src/main.silk'), 'fn bump(v: &mut i32) -> () {\n  v.* = v.* + 1\n}\n\npub fn main() -> i32 {\n  let mut n: i32 = 0\n  let r = &mut n\n  bump(r)\n  bump(r)\n  return n - 2\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.match(result.stderr, /error\[OWN0003\].*&mut r/, show(result))
+})
+
+test('an error in a typed let does not hide later errors that use the binding', { todo: 'finding 67' }, () => {
+  const dir = initPackage(h, 'typedlet')
+  write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let a: i32 = "s"\n  let b: bool = true\n  let d = a + b\n  return 0\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.match(result.stderr, /2:16: error\[SEM0037\]/, show(result))
+  assert.match(result.stderr, /4:\d+: error\[SEM0135\]/, show(result))
 })
