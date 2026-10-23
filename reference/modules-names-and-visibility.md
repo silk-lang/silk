@@ -934,7 +934,8 @@ The source root is `[package].source`, `src` when the manifest omits it. The roo
 `[package].kind` is `executable` (the default), `library` (Silk source for other packages, which a
 build checks and makes no artifact for), `static-library`, `shared-library` or `object`. The version
 defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits and
-`_`; `self`, `sew` and `silk` are reserved.
+`_`; `self` and `silk` are reserved. `sew` names the toolchain's own package, and no dependency
+may take that name.
 
 Until the seed compiler reads this layout, a manifest may still write the earlier spellings:
 `[package].root` (a manifest-relative entry whose directory is the source root),
