@@ -1720,7 +1720,7 @@ const program = Effect.gen(function* () {
     SILK_CLANG: clang,
   })
   assert.equal(virtualRoot.status, 8, virtualRoot.stderr)
-  assert.match(virtualRoot.stderr, /Skipping math: it has no package\.root/)
+  assert.match(virtualRoot.stderr, /Skipping math: its root module \(\[package\]\.main\) is missing/)
   yield* fs.makeDirectory(join(workspace, 'libs/empty'), { recursive: true })
   const unmanifested = yield* invoke(
     silk,
