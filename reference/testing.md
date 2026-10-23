@@ -197,7 +197,9 @@ test CLI requirements.
 The bundled runner identifies each selected test before invoking it, waits for that invocation and
 its structured cleanup, and then starts the next test. An ordinary unit return or a successful
 unit Effect passes. A typed failure fails that test and permits the runner to continue without
-requiring the failure payload to implement a reporting interface. A fatal trap remains fatal.
+requiring the failure payload to implement a reporting interface. A fatal trap still ends the
+runner process without cleanup, but it does not end the run: the host reports the trapping test as
+failed and starts a new runner process that continues with the next selected test.
 
 Tests must close their service requirements and provide any scheduler or execution owner they need.
 The bundled runner supplies no hidden provider or scheduler. This can require a test to wrap its
@@ -227,8 +229,8 @@ The runner identifies each selected test, prints elapsed time for each executed 
 cached passes without invoking them, and reports discovered, selected, cached, executed, passed,
 and failed counts plus total run time. A cached pass contributes to `cached` and `passed`, but not
 `executed`. Completed runs return 0 when all selected tests pass, including zero selected tests;
-they return 1 when a typed test failure occurs. Runner or cache-exchange operational failures
-return 2. Abnormal termination remains abnormal.
+they return 1 when a typed test failure or a trapping test occurs. Runner or cache-exchange
+operational failures return 2. Abnormal termination outside a test body remains abnormal.
 
 **Boundary:** The runner has no parallelism, retries, sharding, isolation, watch mode, shared
 fixtures, or configurable hosts.

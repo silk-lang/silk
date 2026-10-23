@@ -240,7 +240,7 @@ test effect fn reportsTheTimeLeft() -> () ! AssertionError<'static> | Expired | 
 ```
 
 ```console
-$ silk test --no-cache
+$ silk test
   main::reportsTheTimeLeft
     PASS  19 us
 
