@@ -2474,6 +2474,10 @@ struct Resolver {
   // Header fingerprints of signature content, by module, declaration and source revision.
   headerFingerprints: List<HeaderFingerprint>
   headerFingerprintLookup: InternIndex
+  // Whether each static function's body reads its argument values, by module, declaration and
+  // source revision.
+  staticReads: List<StaticReads>
+  staticReadsLookup: InternIndex
   backendInstances: List<BackendInstance>
   backendInstanceLookup: InternIndex
   // Semantic applications of selected bodies; a Body key's member is one plus this index.
@@ -51697,7 +51701,6 @@ effect fn checkInvocationOnce<'scope>(
         }
         return Result<BodyNodeId, Shared<Rejection>>.failResult(run Shared<Rejection>.make(move diagnostic))
       }
-      if CheckedIntrinsic.sequencePending(member) { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
       if CallArguments.length(arguments) != intrinsicArity(member) {
         return run bodyRejection(&resolver.*, module, RejectionCode.CallArity, span)
       }
@@ -71725,6 +71728,94 @@ effect fn bodyHasStaticWork(hir: &Module, block: HirId) -> bool ! OutOfMemoryErr
   return false
 }
 
+// Whether checking the static function at `declaration` reads its argument values. Only static
+// control and static bindings consult them while the body is checked, nested callables included,
+// so a body without any checks once for all argument values; execution still receives each call's
+// values. A body that cannot be read is assumed to read them. The answer is kept per source
+// revision, since every interpreted call asks it.
+effect fn staticBodyReadsValues(resolver: &mut Resolver, module: &ModuleId, declaration: usize) -> bool
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator {
+  let moduleOrdinal = run internModule(&mut resolver.*, module)
+  let sourceAnswer = run observedDeclaration(&mut resolver.*, module, declaration, SourceFacet.Body)
+  let mut reads = true
+  let mut fresh = Option<StaticReads>.none()
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
+    let index = IndexedSource.moduleIndex(indexed)
+    let revision = ModuleIndex.sourceRevision(index)
+    let known = cachedReads(&resolver.*, moduleOrdinal, declaration, revision)
+    if known != usize.MAX {
+      reads = List<StaticReads>.asSlice(&resolver.staticReads)[known].reads
+    } else {
+      let declarations = ModuleIndex.listDeclarations(index)
+      if declaration < declarations.length {
+        let hir = IndexedSource.authored(indexed)
+        if let Node.Declaration {body, ..} = Module.node(hir, declarations[declaration].local) {
+          if let Node.CallableBody {block} = Module.node(hir, body) {
+            if block.present { reads = run staticWorkAnywhere(hir, block.id) }
+          }
+        }
+      }
+      fresh = Option<StaticReads>.some(StaticReads {module: moduleOrdinal, declaration: declaration, revision: revision, reads: reads})
+    }
+  }
+  if let Option<StaticReads>.Some {value: entry} = move fresh {
+    run List<StaticReads>.append(&mut resolver.staticReads, move entry)
+    run InternIndex.record(&mut resolver.staticReadsLookup, headerKey(moduleOrdinal, declaration))
+  }
+  return reads
+}
+
+// Whether one static function's body reads its argument values while checked, valid for the
+// source revision it was read from.
+struct StaticReads {
+  module: usize
+  declaration: usize
+  revision: usize
+  reads: bool
+}
+
+// The cached entry for the static function at `declaration` read from `revision`, or `usize.MAX`.
+fn cachedReads(resolver: &Resolver, module: usize, declaration: usize, revision: usize) -> usize {
+  let cached = List<StaticReads>.asSlice(&resolver.staticReads)
+  let mut at = InternIndex.first(&resolver.staticReadsLookup, headerKey(module, declaration))
+  while at != usize.MAX {
+    if cached[at].module == module && cached[at].declaration == declaration && cached[at].revision == revision {
+      return at
+    }
+    at = InternIndex.after(&resolver.staticReadsLookup, at)
+  }
+  return usize.MAX
+}
+
+// Whether any static control or static binding is written under `root`, including inside nested
+// callables.
+effect fn staticWorkAnywhere(hir: &Module, root: HirId) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut pending = List<HirId>.make()
+  let mut owned = List<HirId>.make()
+  run List<HirId>.append(&mut pending, root)
+  while List<HirId>.length(&pending) > usize.ZERO {
+    let last = List<HirId>.length(&pending) - usize.ONE
+    let id = List<HirId>.remove(&mut pending, last)
+    match Module.node(hir, id) {
+      Node.StaticConditionalStatement {..} => { return true }
+      Node.StaticForStatement {..} => { return true }
+      Node.BindingStatement {isStatic, ..} => {
+        if isStatic { return true }
+      }
+      _ => ()
+    }
+    let storage = move owned
+    owned = run collectOwnedChildren(hir, id, move storage)
+    let children = List<HirId>.asSlice(&owned)
+    let mut at = usize.ZERO
+    while at < children.length {
+      run List<HirId>.append(&mut pending, children[at])
+      at = at + usize.ONE
+    }
+  }
+  return false
+}
+
 // The single routing fact for a runtime function: true when it has static parameters, static
 // control or state, or calls a static helper whose result is embedded. Its `StaticRouting` unit
 // computes it once per declaration and revision.
@@ -79162,10 +79253,13 @@ impl<'source> StaticPort<'source> {
     if let Option<usize>.Some {value: ordinal} = move selected {
       let mut selectedApplication = run Application.copy(application)
       let mut statics = List<StaticSlot>.make()
-      let mut at = usize.ZERO
-      while at < arguments.length {
-        run List<StaticSlot>.append(&mut statics, StaticSlot {ordinal: at, value: StaticValue.copy(&arguments[at])})
-        at = at + usize.ONE
+      // A body whose checking never reads its argument values is checked once for all of them.
+      if run staticBodyReadsValues(&mut self.resolver.*, module, ordinal) {
+        let mut at = usize.ZERO
+        while at < arguments.length {
+          run List<StaticSlot>.append(&mut statics, StaticSlot {ordinal: at, value: StaticValue.copy(&arguments[at])})
+          at = at + usize.ONE
+        }
       }
       selectedApplication.statics = move statics
       let member = run internSelectedApplication(&mut self.resolver.*, &selectedApplication)
@@ -79716,6 +79810,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       erasedHandleLookup: InternIndex.make(),
       headerFingerprints: List<HeaderFingerprint>.make(),
       headerFingerprintLookup: InternIndex.make(),
+      staticReads: List<StaticReads>.make(),
+      staticReadsLookup: InternIndex.make(),
       backendInstances: List<BackendInstance>.make(),
       backendInstanceLookup: InternIndex.make(),
       originPlans: List<CallableOrigin.Plan>.make(),
