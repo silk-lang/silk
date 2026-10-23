@@ -70,6 +70,10 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `fuzz/numfmt/run.sh <seed> <dir>` | Prints the same values with the same format specs from Silk and from Rust (`rustc` needed), and reports any line that differs |
 | `fuzz/hashes/` | Every hash and HMAC in the stdlib against Python's hashlib, on 326 input sizes fed in uneven pieces (build `main.silk`, then `diff.sh <binary>`) |
 | `fuzz/json/`, `fuzz/toml/` | `main.silk` parses standard input and writes it back; `drive.py <binary> <seed> <count>` sends random and broken documents and compares with Python's json or tomllib |
+| `fuzz/inflate/`, `fuzz/zstd/` | `main.silk` decodes standard input (one leading format byte) in uneven pieces; `drive.py <binary> <seed> <count>` sends streams and corrupted copies from Python's zlib or the `zstandard` package (`pip install zstandard`) and compares |
+| `fuzz/paths/` | `drive.py <binary> <seed> <count>` checks `Path.fromBytes`, `joinBytes`, `resolve` and `parent` against a model of the documented rules |
+| `fuzz/process/main.silk` | Child process cases: 40 MB of output on both pipes, odd arguments, an empty environment, signals, a closed stdout, 500 spawns |
+| `fuzz/http/attack.py` | Normal, odd and hostile requests against the guide 10 server on port 18080 (build it from the guide with `serve(18080, 100000)`), checking that it answers and stays up |
 | `fuzz/huge-sources.py <dir>` | Huge and malformed sources (deep nesting, 30,000 lets, binary garbage, a BOM); flags crashes and timeouts |
 | `node fuzz/lsp-edits.mjs <package> <seed> <steps> [burst]` | Random edits to the package's `src/main.silk` in `silk lsp`, with hover, completion, definition, symbols and formatting after each; compares diagnostics with `silk check` |
 
