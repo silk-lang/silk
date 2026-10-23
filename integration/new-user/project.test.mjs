@@ -217,7 +217,7 @@ test('modules in subfolders import by path', () => {
   assert.equal(ran.status, 42, show(ran))
 })
 
-test('a misspelled module path hints at the right case', { todo: 'finding 24' }, () => {
+test('a misspelled module path hints at the right case', () => {
   const dir = initPackage(h, fresh('casing'))
   write(join(dir, 'src/util/Math.silk'), 'pub fn twice(x: i32) -> i32 { return x * 2 }\n')
   write(join(dir, 'src/main.silk'), 'import util.math { twice }\npub fn main() -> i32 { return twice(21) }\n')

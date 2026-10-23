@@ -315,7 +315,7 @@ test('a library with 600 tests builds and runs them all', () => {
   assert.match(result.stdout, /Tests  600 passed, 0 failed/)
 })
 
-test('a call with too few arguments is reported as SEM0007', { todo: 'finding 61' }, () => {
+test('a call with too few arguments is reported as SEM0007', () => {
   const dir = initPackage(h, 'fewargs')
   write(join(dir, 'src/main.silk'), 'fn add(a: i32, b: i32, c: i32) -> i32 {\n  return a + b + c\n}\n\npub fn main() -> i32 {\n  return add(2, 3)\n}\n')
   const result = silk(h, ['check'], { cwd: dir })
@@ -399,4 +399,52 @@ test('an error in a typed let does not hide later errors that use the binding', 
   const result = silk(h, ['check'], { cwd: dir })
   assert.match(result.stderr, /2:16: error\[SEM0037\]/, show(result))
   assert.match(result.stderr, /4:\d+: error\[SEM0135\]/, show(result))
+})
+
+test('a long postfix chain is refused with PAR0005, not a crash', { todo: 'finding 72' }, () => {
+  const dir = initPackage(h, 'postfixchain')
+  for (const [name, link] of [['field', '.inner'], ['method', '.f()'], ['index', '[0]']]) {
+    write(join(dir, 'src/main.silk'), `fn f(v: i32) -> i32 {\n  return v\n}\n\npub fn main() -> i32 {\n  let b: i32 = 0\n  return b${link.repeat(1000)}\n}\n`)
+    const result = silk(h, ['check'], { cwd: dir })
+    assert.equal(result.signal, null, `${name} chain: ${show(result)}`)
+    assert.equal(result.status, 1, `${name} chain: ${show(result)}`)
+    assert.match(result.stderr, /error\[PAR0005\]/, `${name} chain: ${show(result)}`)
+  }
+})
+
+test('an index out of bounds inside a fiber reports the trap like the main task does', { todo: 'finding 73' }, () => {
+  const dir = initPackage(h, 'fibertrap')
+  write(join(dir, 'src/main.silk'), `import silk.allocator { OutOfMemoryError }
+import silk.effect { Effect }
+import silk.fiber { Fiber, Cancelled }
+import silk.local_scheduler { LocalScheduler, StalledError }
+import silk.monotonic_clock { MonotonicClock }
+import silk.os_monotonic_clock { OsMonotonicClock }
+import silk.scheduler { Scheduler, TaskIdExhaustedError }
+
+effect fn bad(index: usize) -> i32 {
+  run Fiber.yieldNow()
+  let values: [i32; 2] = [1, 2]
+  return values[index]
+}
+
+effect fn root() -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled
+  ? &mut Scheduler | &mut MonotonicClock {
+  let child = run Fiber<i32, never>.forkChild(bad(7))
+  return run Fiber.join(move child)
+}
+
+pub effect fn main() -> i32
+  ! OutOfMemoryError | TaskIdExhaustedError | Cancelled | StalledError {
+  let mut scheduler = LocalScheduler.make()
+  let mut clock = OsMonotonicClock.make()
+  return run LocalScheduler.execute(&mut scheduler, root())
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+}
+`)
+  for (const flags of [[], ['--release']]) {
+    const result = silk(h, ['run', '--quiet', ...flags], { cwd: dir })
+    assert.match(result.stderr, /fatal trap: index out of bounds\n  at main\.bad \(main:12:10\)/, `${flags.join(' ') || 'debug'}: ${show(result)}`)
+  }
 })
