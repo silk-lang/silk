@@ -84,9 +84,27 @@ const program = Effect.gen(function* () {
   assert.ok(emittedVersion !== undefined && isVersion(emittedVersion), versioned.stdout)
   const helped = yield* invoke(silk, ['--help'], directory)
   assert.equal(helped.status, 0, helped.stderr)
-  assert.match(helped.stdout, /usage: silk build/)
-  assert.match(helped.stdout, /silk changes/)
-  assert.match(helped.stdout, /silk doc-reference \[--stdlib-root <directory>\] --output/)
+  // The overview leads with the project commands, one line each.
+  assert.match(helped.stdout, /^usage: silk <command> \[options\]\n\nProject commands:\n {2}init /)
+  assert.match(helped.stdout, /\n {2}changes /)
+  assert.match(helped.stdout, /\n {2}doc-reference /)
+  // `silk help` prints the same overview, and `silk help <command>` that command's synopsis.
+  const helpCommand = yield* invoke(silk, ['help'], directory)
+  assert.equal(helpCommand.status, 0, helpCommand.stderr)
+  assert.equal(helpCommand.stdout, helped.stdout)
+  const helpFormat = yield* invoke(silk, ['help', 'format'], directory)
+  assert.equal(helpFormat.status, 0, helpFormat.stderr)
+  assert.equal(helpFormat.stdout, 'usage: silk format [paths] [--check] [--manifest-path <path>]\n')
+  const helpDocReference = yield* invoke(silk, ['help', 'doc-reference'], directory)
+  assert.equal(helpDocReference.status, 0, helpDocReference.stderr)
+  assert.match(helpDocReference.stdout, /^usage: silk doc-reference \[--stdlib-root <directory>\] --output/)
+  // The project form of `build` comes before the single-file form.
+  const helpBuild = yield* invoke(silk, ['help', 'build'], directory)
+  assert.equal(helpBuild.status, 0, helpBuild.stderr)
+  assert.match(helpBuild.stdout, /^usage: silk build \[--manifest-path <path>\].*\n {7}silk build <source> -o <output>/)
+  const helpUnknown = yield* invoke(silk, ['help', 'frobnicate'], directory)
+  assert.equal(helpUnknown.status, 2, helpUnknown.stderr)
+  assert.match(helpUnknown.stderr, /^silk: unknown command `frobnicate`\nusage: silk <command>/)
   // `silk <command> --help` prints that command's lines of the usage.
   const commandHelp = yield* invoke(silk, ['format', '--help'], directory)
   assert.equal(commandHelp.status, 0, commandHelp.stderr)
@@ -148,7 +166,14 @@ const program = Effect.gen(function* () {
   // A command line that does not parse is a usage error, status 2, like format's and doc's.
   const unparsed = yield* invoke(silk, ['check', '--bogus'], directory)
   assert.equal(unparsed.status, 2, unparsed.stderr)
-  assert.match(unparsed.stderr, /usage: silk build/)
+  assert.match(unparsed.stderr, /^silk check: unknown option `--bogus`\nusage: silk check /)
+  // A misspelled option is named with the closest one the command takes.
+  const relase = yield* invoke(silk, ['check', '--relase'], directory)
+  assert.equal(relase.status, 2, relase.stderr)
+  assert.match(relase.stderr, /^silk check: unknown option `--relase`; did you mean `--release`\?\n/)
+  const combined = yield* invoke(silk, ['init', '--lib', '--workspace'], directory)
+  assert.equal(combined.status, 2, combined.stderr)
+  assert.match(combined.stderr, /^silk init: `--lib` and `--workspace` cannot be combined/)
   // A lone word that names no file is a mistyped command, not a source to dump.
   const unknown = yield* invoke(silk, ['frobnicate'], directory)
   assert.equal(unknown.status, 2, unknown.stderr)
@@ -679,8 +704,10 @@ const program = Effect.gen(function* () {
   assert.equal(cleaned.status, 0, cleaned.stderr)
   assert.equal(yield* fs.exists(join(directory, 'build')), false)
   assert.equal(yield* fs.exists(join(directory, 'main.silk')), true)
+  assert.match(cleaned.stdout, /^Removed \S+build\n$/)
   const recleaned = yield* invoke(silk, ['clean'], directory)
   assert.equal(recleaned.status, 0, recleaned.stderr)
+  assert.match(recleaned.stdout, /^Nothing to clean: \S+build does not exist\n$/)
   // `init` writes a project whose generated entry `run` builds and runs.
   const initialized = yield* invoke(silk, ['init', 'greeting'], directory)
   assert.equal(initialized.status, 0, initialized.stderr)
