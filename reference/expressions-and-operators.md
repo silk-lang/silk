@@ -299,7 +299,10 @@ it leaves the owning comma, closing delimiter, statement boundary, or declaratio
 ordinary parser so later syntax remains independently parseable.
 
 **Boundary:** This is an expression-child limit, not a token, syntax-node, type, pattern, statement,
-or declaration nesting limit. Call-delimiter recovery bookkeeping does not change the expression
+or declaration nesting limit. Separately, the compiler charges each active construct its native
+stack cost and reports `PAR0005` before a mix would exceed half of an 8 MB stack. Alone, 256
+grouped children or 256 chained infix operators fit, as do 134 prefix operands, 100 nested calls,
+62 nested array or tuple literals, 59 nested blocks and 44 nested `if` statements. Call-delimiter recovery bookkeeping does not change the expression
 depth. Parser implementation failures such as invalid token ordering remain defects: they are not
 caught or converted to `PAR0005`.
 
