@@ -389,8 +389,58 @@ const program = Effect.gen(function* () {
   })
   yield* diagnosticsFor(session, library, undefined, [])
 
-  yield* change(session, uri, 8, fixed)
-  const restored = yield* diagnosticsFor(session, uri, 8, [])
+  // A body with an error still answers for the statements around it, and a type written as a
+  // value's qualifier hovers and goes to definition like its declaration.
+  const broken = [
+    '/// Counts spaces.',
+    'fn countSpaces(text: &[u8]) -> i32 {',
+    '  return 0',
+    '}',
+    '/// Writes nowhere.',
+    'pub struct Quiet {}',
+    'impl Quiet {',
+    '  pub fn make() -> Quiet {',
+    '    return Quiet {}',
+    '  }',
+    '}',
+    'pub fn main() -> i32 {',
+    '  let quiet = Quiet.make()',
+    '  let oops = nope',
+    '  return countSpaces(b"a b")',
+    '}',
+    '',
+  ].join('\n')
+  yield* change(session, uri, 8, broken)
+  const unknown = yield* diagnosticsFor(session, uri, 8, [])
+  assert.deepEqual(
+    unknown.diagnostics.map(({ range, code }) => ({ line: range.start.line, code })),
+    [{ line: 13, code: 'SEM0006' }],
+    JSON.stringify(unknown),
+  )
+  const afterError = { textDocument: { uri }, position: { line: 14, character: 12 } }
+  const spaces = (yield* request(session, 21, 'textDocument/hover', afterError))['result'] as {
+    contents: { value: string }
+  } | null
+  assert.ok(spaces?.contents.value.includes('Counts spaces.'), JSON.stringify(spaces))
+  const spacesAt = yield* request(session, 22, 'textDocument/definition', afterError)
+  assert.deepEqual(spacesAt['result'], {
+    uri,
+    range: { start: { line: 1, character: 3 }, end: { line: 1, character: 14 } },
+  })
+  const qualifier = { textDocument: { uri }, position: { line: 12, character: 15 } }
+  const quiet = (yield* request(session, 23, 'textDocument/hover', qualifier))['result'] as {
+    contents: { value: string }
+  } | null
+  assert.ok(quiet?.contents.value.includes('pub struct Quiet'), JSON.stringify(quiet))
+  assert.ok(quiet?.contents.value.includes('Writes nowhere.'), JSON.stringify(quiet))
+  const quietAt = yield* request(session, 24, 'textDocument/definition', qualifier)
+  assert.deepEqual(quietAt['result'], {
+    uri,
+    range: { start: { line: 5, character: 11 }, end: { line: 5, character: 16 } },
+  })
+
+  yield* change(session, uri, 9, fixed)
+  const restored = yield* diagnosticsFor(session, uri, 9, [])
   assert.deepEqual(restored.diagnostics, [])
 
   // The syntax features read the document's latest text.
@@ -412,7 +462,7 @@ const program = Effect.gen(function* () {
     jsonrpc: '2.0',
     method: 'textDocument/didChange',
     params: {
-      textDocument: { uri, version: 9 },
+      textDocument: { uri, version: 10 },
       contentChanges: [{ text: 'pub fn main()->i32{return 0}\n' }],
     },
   })
