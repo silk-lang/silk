@@ -975,11 +975,15 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(failedTests.status, 1, failedTests.stderr)
-  // A test that traps fails, and the tests after it still run.
-  assert.match(failedTests.stderr, /fatal trap: division by zero/)
+  // A test that traps fails with its report under its name, and the tests after it still run.
   assert.match(
     failedTests.stdout,
-    /util\/check::dividesByZero\n {4}FAIL {2}stopped the test process\n(.*\n)*  util\/check::halvesEvenly\n {4}PASS/,
+    /util\/check::dividesByZero\n {4}fatal trap: division by zero\n(.*\n)* {4}FAIL {2}stopped the test process\n(.*\n)*  util\/check::halvesEvenly\n {4}PASS/,
+  )
+  // A failed expectation names where it failed.
+  assert.match(
+    failedTests.stdout,
+    /util\/check::failsOnPurpose\n {4}assertion failed: integer division truncates\n {6}at [^\n]*failsOnPurpose \([^\n]*:12:3\)\n {4}FAIL/,
   )
   assert.match(failedTests.stdout, /2 passed, 2 failed \(0 cached, 4 executed, 4 selected, 4 discovered\)/)
   // A selection that matches no test verified nothing, so it fails.
