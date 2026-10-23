@@ -13,10 +13,13 @@ import { isVersion } from './SemVer.mjs'
 
 export class SourceSnapshotError extends Data.TaggedError('SourceSnapshotError') {}
 const invalid = (message) => Effect.fail(new SourceSnapshotError({ message }))
-export const roots = ['changes', 'compiler', 'sew', 'silk.toml', 'stdlib', 'tomledit']
+// The workspace lists sew as a member, so its manifest must exist, but sew's sources are not
+// compiler inputs.
+export const roots = ['changes', 'compiler', 'sew/silk.toml', 'silk.toml', 'stdlib', 'tomledit']
 /** The compiler package, its source dependencies, and their workspace configuration. */
 export const isCompilerInput = (path) =>
   path === 'silk.toml' ||
+  path === 'sew/silk.toml' ||
   path.startsWith('compiler/') ||
   path.startsWith('changes/') ||
   path.startsWith('tomledit/')
