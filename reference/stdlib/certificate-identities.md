@@ -179,6 +179,24 @@ ResourceLimit
 
 Input, traversal, or descriptor storage exceeds a budget.
 
+<a id="SanDecodeClass.impl.Debug"></a>
+
+## Implementation `Debug for SanDecodeClass`
+
+```silk
+impl Debug for SanDecodeClass
+```
+
+<a id="SanDecodeClass.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Malformed`.
+
 <a id="SanDecodeReason"></a>
 
 ## `SanDecodeReason`
@@ -279,6 +297,24 @@ Depth
 
 DER depth exceeds its budget or the hard ceiling of 32.
 
+<a id="SanDecodeReason.impl.Debug"></a>
+
+## Implementation `Debug for SanDecodeReason`
+
+```silk
+impl Debug for SanDecodeReason
+```
+
+<a id="SanDecodeReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidDer`.
+
 <a id="SanDecodeError"></a>
 
 ## `SanDecodeError`
@@ -318,6 +354,24 @@ pub offset: usize
 ```
 
 The failed DER offset. Extension-list failures use zero.
+
+<a id="SanDecodeError.impl.Debug"></a>
+
+## Implementation `Debug for SanDecodeError`
+
+```silk
+impl Debug for SanDecodeError
+```
+
+<a id="SanDecodeError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `SanDecodeError { kind: ..., reason: ..., ... }`.
 
 <a id="SanDecodeSummary"></a>
 

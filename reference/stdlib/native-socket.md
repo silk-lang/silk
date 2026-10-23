@@ -343,6 +343,24 @@ Close
 
 `close`.
 
+<a id="NativeSocketOperation.impl.Debug"></a>
+
+## Implementation `Debug for NativeSocketOperation`
+
+```silk
+impl Debug for NativeSocketOperation
+```
+
+<a id="NativeSocketOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Socket`.
+
 <a id="ListenerPhase"></a>
 
 ## `ListenerPhase`
@@ -403,6 +421,24 @@ PollInterval
 
 The poll interval is not 1 nanosecond through 1 second.
 
+<a id="ListenOptionsReason.impl.Debug"></a>
+
+## Implementation `Debug for ListenOptionsReason`
+
+```silk
+impl Debug for ListenOptionsReason
+```
+
+<a id="ListenOptionsReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `KernelBacklog`.
+
 <a id="ListenOptionsError"></a>
 
 ## `ListenOptionsError`
@@ -432,6 +468,24 @@ pub value: u64
 ```
 
 The value that you gave.
+
+<a id="ListenOptionsError.impl.Debug"></a>
+
+## Implementation `Debug for ListenOptionsError`
+
+```silk
+impl Debug for ListenOptionsError
+```
+
+<a id="ListenOptionsError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ListenOptionsError { reason: ..., value: ... }`.
 
 <a id="InvalidBindReason"></a>
 
@@ -483,6 +537,24 @@ AbstractPath
 
 The path is an abstract socket address, which is not supported.
 
+<a id="InvalidBindReason.impl.Debug"></a>
+
+## Implementation `Debug for InvalidBindReason`
+
+```silk
+impl Debug for InvalidBindReason
+```
+
+<a id="InvalidBindReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `EmptyPath`.
+
 <a id="ConnectOptionsReason"></a>
 
 ## `ConnectOptionsReason`
@@ -513,6 +585,24 @@ MaxAttempts
 
 The attempt limit is not 1 through 1024.
 
+<a id="ConnectOptionsReason.impl.Debug"></a>
+
+## Implementation `Debug for ConnectOptionsReason`
+
+```silk
+impl Debug for ConnectOptionsReason
+```
+
+<a id="ConnectOptionsReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `PollInterval`.
+
 <a id="ConnectOptionsError"></a>
 
 ## `ConnectOptionsError`
@@ -542,6 +632,24 @@ pub value: u64
 ```
 
 The value that you gave.
+
+<a id="ConnectOptionsError.impl.Debug"></a>
+
+## Implementation `Debug for ConnectOptionsError`
+
+```silk
+impl Debug for ConnectOptionsError
+```
+
+<a id="ConnectOptionsError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ConnectOptionsError { reason: ..., value: ... }`.
 
 <a id="InvalidEndpointReason"></a>
 
@@ -623,6 +731,24 @@ AbstractPath
 
 The path is an abstract socket address, which is not supported.
 
+<a id="InvalidEndpointReason.impl.Debug"></a>
+
+## Implementation `Debug for InvalidEndpointReason`
+
+```silk
+impl Debug for InvalidEndpointReason
+```
+
+<a id="InvalidEndpointReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `EmptyEndpoints`.
+
 <a id="AttemptFailure"></a>
 
 ## `AttemptFailure`
@@ -692,6 +818,24 @@ pub errno: i32
 ```
 
 The `errno` value.
+
+<a id="AttemptFailure.impl.Debug"></a>
+
+## Implementation `Debug for AttemptFailure`
+
+```silk
+impl Debug for AttemptFailure
+```
+
+<a id="AttemptFailure.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `ConnectionRefused`.
 
 <a id="NativeSocketError"></a>
 
@@ -1072,6 +1216,24 @@ pub errno: i32
 ```
 
 The `errno` value.
+
+<a id="NativeSocketError.impl.Debug"></a>
+
+## Implementation `Debug for NativeSocketError`
+
+```silk
+impl Debug for NativeSocketError
+```
+
+<a id="NativeSocketError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `AttemptsExhausted { ... }`.
 
 <a id="NativeSocket"></a>
 

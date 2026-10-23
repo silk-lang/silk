@@ -345,6 +345,14 @@ A `Drop` hook that cleanup selects is such a witness. When dropping a `Box<State
 no larger than before, so the second drop is admitted even though `Node<i32>` is not part of
 `State<i32>`.
 
+A recursive application may also change a type argument to a type that lies within the owned
+structure of the earlier one: a field of it, a field of one of its fields, or a part of such a type.
+`Debug` for `Option<Line>` calls the generic helper `Format.debugField` for a `Line`; when `Line`
+writes its field `weight: Option<i32>`, the same helper runs for `Option<i32>`, which lies inside
+`Line`. The owned structure of a type is finite, because a declaration unfolds beneath itself only
+at a strictly smaller application, and the active path never repeats an exact application, so these
+re-entries stay finite.
+
 **Boundary:** Ordinary polymorphic recursion that changes a type argument is outside the stable
 model. Witness delegation that grows a type argument along a recursive call cycle is also invalid:
 

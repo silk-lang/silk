@@ -72,6 +72,24 @@ Output
 
 The decoded block exceeds the supplied output storage.
 
+<a id="BlockReason.impl.Debug"></a>
+
+## Implementation `Debug for BlockReason`
+
+```silk
+impl Debug for BlockReason
+```
+
+<a id="BlockReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `None`.
+
 <a id="BlockError"></a>
 
 ## `BlockError`
@@ -101,6 +119,24 @@ pub offset: usize
 ```
 
 The local compressed byte position.
+
+<a id="BlockError.impl.Debug"></a>
+
+## Implementation `Debug for BlockError`
+
+```silk
+impl Debug for BlockError
+```
+
+<a id="BlockError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `BlockError { reason: ..., offset: ... }`.
 
 <a id="BlockState"></a>
 

@@ -184,6 +184,24 @@ pub offset: usize
 
 The position of the `%`, from the start of the input.
 
+<a id="DecodeError.impl.Debug"></a>
+
+## Implementation `Debug for DecodeError`
+
+```silk
+impl Debug for DecodeError
+```
+
+<a id="DecodeError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `DecodeError { offset: ... }`.
+
 <a id="Decoded"></a>
 
 ## `Decoded`

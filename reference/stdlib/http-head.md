@@ -412,6 +412,24 @@ LineEnding
 
 A line ending.
 
+<a id="ParseComponent.impl.Debug"></a>
+
+## Implementation `Debug for ParseComponent`
+
+```silk
+impl Debug for ParseComponent
+```
+
+<a id="ParseComponent.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Parser`.
+
 <a id="ParseLimitKind"></a>
 
 ## `ParseLimitKind`
@@ -521,6 +539,24 @@ OwnedBytes
 ```
 
 `maxOwnedBytes`: the memory of the parser.
+
+<a id="ParseLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for ParseLimitKind`
+
+```silk
+impl Debug for ParseLimitKind
+```
+
+<a id="ParseLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `HeadBytes`.
 
 <a id="ParseReason"></a>
 
@@ -763,6 +799,24 @@ head.
 impl Copy for ParseReason
 ```
 
+<a id="ParseReason.impl.Debug"></a>
+
+## Implementation `Debug for ParseReason`
+
+```silk
+impl Debug for ParseReason
+```
+
+<a id="ParseReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidStartLine`.
+
 <a id="ParseError"></a>
 
 ## `ParseError`
@@ -823,6 +877,24 @@ pub fieldIndex: Option<usize>
 ```
 
 The position of the field, from 0, when the error is in a field.
+
+<a id="ParseError.impl.Debug"></a>
+
+## Implementation `Debug for ParseError`
+
+```silk
+impl Debug for ParseError
+```
+
+<a id="ParseError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ParseError { reason: ..., component: ..., ... }`.
 
 <a id="validateLimits"></a>
 

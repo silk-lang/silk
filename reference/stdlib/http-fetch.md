@@ -204,6 +204,24 @@ Finish
 
 Completing the response and deciding if the connection can be used again.
 
+<a id="FetchPhase.impl.Debug"></a>
+
+## Implementation `Debug for FetchPhase`
+
+```silk
+impl Debug for FetchPhase
+```
+
+<a id="FetchPhase.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Uri`.
+
 <a id="FetchLimit"></a>
 
 ## `FetchLimit`
@@ -273,6 +291,24 @@ DiscardBytes
 ```
 
 The `maxDiscardBytes` of a `discard*` function.
+
+<a id="FetchLimit.impl.Debug"></a>
+
+## Implementation `Debug for FetchLimit`
+
+```silk
+impl Debug for FetchLimit
+```
+
+<a id="FetchLimit.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `EncodedBodyBytes`.
 
 <a id="FetchContentReason"></a>
 
@@ -575,6 +611,24 @@ InvalidState
 
 The content reader had already failed or stopped.
 
+<a id="FetchContentReason.impl.Debug"></a>
+
+## Implementation `Debug for FetchContentReason`
+
+```silk
+impl Debug for FetchContentReason
+```
+
+<a id="FetchContentReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidLimit { ... }`.
+
 <a id="FetchContentError"></a>
 
 ## `FetchContentError`
@@ -634,6 +688,24 @@ pub totalDecoded: u64
 ```
 
 The total decoded bytes.
+
+<a id="FetchContentError.impl.Debug"></a>
+
+## Implementation `Debug for FetchContentError`
+
+```silk
+impl Debug for FetchContentError
+```
+
+<a id="FetchContentError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `FetchContentError { reason: ..., written: ..., ... }`.
 
 <a id="FetchReason"></a>
 
@@ -836,6 +908,24 @@ pub status: Status
 
 The status of the response.
 
+<a id="FetchReason.impl.Debug"></a>
+
+## Implementation `Debug for FetchReason`
+
+```silk
+impl Debug for FetchReason
+```
+
+<a id="FetchReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidOptions`.
+
 <a id="FetchError"></a>
 
 ## `FetchError`
@@ -911,6 +1001,24 @@ pub offeredBodyBytes: usize
 
 The length of the chunk that the destination rejected, or 0.
 
+<a id="FetchError.impl.Debug"></a>
+
+## Implementation `Debug for FetchError`
+
+```silk
+impl Debug for FetchError
+```
+
+<a id="FetchError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `FetchError { phase: ..., reason: ..., ... }`.
+
 <a id="DestinationFailure"></a>
 
 ## `DestinationFailure`
@@ -940,6 +1048,24 @@ pub context: FetchError
 ```
 
 The context: the phase, the status, the URI, and the bytes delivered before the error.
+
+<a id="DestinationFailure.impl.Debug"></a>
+
+## Implementation `Debug for DestinationFailure<E>`
+
+```silk
+impl<E: Debug> Debug for DestinationFailure<E>
+```
+
+<a id="DestinationFailure.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `DestinationFailure { error: ..., context: ... }`.
 
 <a id="RepresentationMetadata"></a>
 

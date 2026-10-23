@@ -320,6 +320,24 @@ The byte offset of the coding, or the bad byte, in the field value.
 impl Copy for CodingPosition
 ```
 
+<a id="CodingPosition.impl.Debug"></a>
+
+## Implementation `Debug for CodingPosition`
+
+```silk
+impl Debug for CodingPosition
+```
+
+<a id="CodingPosition.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `CodingPosition { wireIndex: ..., fieldIndex: ..., ... }`.
+
 <a id="Limits"></a>
 
 ## `Limits`
@@ -479,6 +497,24 @@ DecodedBytes
 ```
 
 `maxDecoded`.
+
+<a id="ContentLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for ContentLimitKind`
+
+```silk
+impl Debug for ContentLimitKind
+```
+
+<a id="ContentLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `CodingDepth`.
 
 <a id="ContentReason"></a>
 
@@ -781,6 +817,24 @@ InvalidState
 
 The reader had already failed or stopped.
 
+<a id="ContentReason.impl.Debug"></a>
+
+## Implementation `Debug for ContentReason<'head>`
+
+```silk
+impl<'head> Debug for ContentReason<'head>
+```
+
+<a id="ContentReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidLimit { ... }`.
+
 <a id="ContentError"></a>
 
 ## `ContentError`
@@ -841,6 +895,24 @@ pub totalDecoded: u64
 ```
 
 The total decoded bytes written.
+
+<a id="ContentError.impl.Debug"></a>
+
+## Implementation `Debug for ContentError<'head>`
+
+```silk
+impl<'head> Debug for ContentError<'head>
+```
+
+<a id="ContentError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ContentError { reason: ..., written: ..., ... }`.
 
 <a id="ContentProgressState"></a>
 

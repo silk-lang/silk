@@ -192,6 +192,24 @@ pub maximum: u64
 
 The largest accepted length in bytes.
 
+<a id="LabelError.impl.Debug"></a>
+
+## Implementation `Debug for LabelError`
+
+```silk
+impl Debug for LabelError
+```
+
+<a id="LabelError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `LabelLength { ... }`.
+
 <a id="TlsHkdfSha256"></a>
 
 ## `TlsHkdfSha256`

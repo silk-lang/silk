@@ -398,6 +398,24 @@ pub struct Cancelled
 
 A Fiber outcome that reports structured task cancellation.
 
+<a id="Cancelled.impl.Debug"></a>
+
+## Implementation `Debug for Cancelled`
+
+```silk
+impl Debug for Cancelled
+```
+
+<a id="Cancelled.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `Cancelled`.
+
 <a id="PreparedFiber"></a>
 
 ## `PreparedFiber`

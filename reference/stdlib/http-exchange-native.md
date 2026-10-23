@@ -225,6 +225,24 @@ pub error: ConnectionError
 
 The TLS error.
 
+<a id="NativeExchangeError.impl.Debug"></a>
+
+## Implementation `Debug for NativeExchangeError`
+
+```silk
+impl Debug for NativeExchangeError
+```
+
+<a id="NativeExchangeError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidConnectOptions`.
+
 <a id="AlpnPolicy"></a>
 
 ## `AlpnPolicy`

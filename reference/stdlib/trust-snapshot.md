@@ -200,6 +200,24 @@ InputBytes
 
 The size of a file that a native trust source reads.
 
+<a id="TrustLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for TrustLimitKind`
+
+```silk
+impl Debug for TrustLimitKind
+```
+
+<a id="TrustLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `AnchorCount`.
+
 <a id="TrustConfigurationReason"></a>
 
 ## `TrustConfigurationReason`
@@ -250,6 +268,24 @@ PathBytes
 
 A root file path is too long.
 
+<a id="TrustConfigurationReason.impl.Debug"></a>
+
+## Implementation `Debug for TrustConfigurationReason`
+
+```silk
+impl Debug for TrustConfigurationReason
+```
+
+<a id="TrustConfigurationReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `EmptyRoot`.
+
 <a id="TrustFileOperation"></a>
 
 ## `TrustFileOperation`
@@ -289,6 +325,24 @@ Close
 ```
 
 Closing the trust file.
+
+<a id="TrustFileOperation.impl.Debug"></a>
+
+## Implementation `Debug for TrustFileOperation`
+
+```silk
+impl Debug for TrustFileOperation
+```
+
+<a id="TrustFileOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Open`.
 
 <a id="TrustSourceError"></a>
 
@@ -399,6 +453,24 @@ pub error: FileError
 ```
 
 The file error.
+
+<a id="TrustSourceError.impl.Debug"></a>
+
+## Implementation `Debug for TrustSourceError`
+
+```silk
+impl Debug for TrustSourceError
+```
+
+<a id="TrustSourceError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Decode { ... }`.
 
 <a id="TrustSnapshot"></a>
 

@@ -163,6 +163,24 @@ CompressionWithoutOmission
 
 The IPv6 text has `::` together with all 8 parts, so `::` replaces nothing.
 
+<a id="AddressReason.impl.Debug"></a>
+
+## Implementation `Debug for AddressReason`
+
+```silk
+impl Debug for AddressReason
+```
+
+<a id="AddressReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Empty`.
+
 <a id="HostReason"></a>
 
 ## `HostReason`
@@ -284,6 +302,24 @@ NumericFinalLabel
 
 The last label has only digits, so the name looks like an IPv4 address.
 
+<a id="HostReason.impl.Debug"></a>
+
+## Implementation `Debug for HostReason`
+
+```silk
+impl Debug for HostReason
+```
+
+<a id="HostReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `EmptyName`.
+
 <a id="UnsupportedHostForm"></a>
 
 ## `UnsupportedHostForm`
@@ -353,6 +389,24 @@ UriDelimiter
 ```
 
 The input has `/`, `?`, or `#`. Give only the host.
+
+<a id="UnsupportedHostForm.impl.Debug"></a>
+
+## Implementation `Debug for UnsupportedHostForm`
+
+```silk
+impl Debug for UnsupportedHostForm
+```
+
+<a id="UnsupportedHostForm.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `IpvFuture`.
 
 <a id="AddressError"></a>
 
@@ -503,6 +557,24 @@ pub available: usize
 ```
 
 The length of the buffer that you gave.
+
+<a id="AddressError.impl.Debug"></a>
+
+## Implementation `Debug for AddressError`
+
+```silk
+impl Debug for AddressError
+```
+
+<a id="AddressError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidAddress { ... }`.
 
 <a id="Ipv4Address"></a>
 

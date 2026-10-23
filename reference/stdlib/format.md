@@ -147,7 +147,7 @@ pub fn main() -> i32 {
 
 Import as `Format` with `import silk.format { Format }`.
 
-Public declarations: 13.
+Public declarations: 14.
 
 <a id="Format"></a>
 
@@ -714,6 +714,95 @@ Writes the elements of `values` in the [`Debug`](#Debug) form, as `[1, 2, 3]`.
 
 Use it to implement `Debug` for a type that holds a sequence. The pretty form
 ([`Format.alternate`](#Format.impl.alternate)) puts each element on its own line.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
+<a id="Format.impl.debugRecord"></a>
+
+### Associated function `debugRecord`
+
+```silk
+pub effect fn debugRecord(
+    name: string,
+    formatter: &mut Formatter
+  ) -> DebugRecord ! WriterError ? &mut Writer
+```
+
+Starts the [`Debug`](#Debug) form of a value with labeled fields by writing `name`.
+
+#### When to use
+
+Use it to implement `Debug` by hand when [`Format.debugFields`](#Format.impl.debugFields) does not fit: the type has
+private fields, or it is a union with fields in a variant. Write each field with
+[`Format.debugField`](#Format.impl.debugField) and end with [`Format.debugFinish`](#Format.impl.debugFinish). This one leaves out a secret:
+
+```silk
+import silk.format { Debug, Format, Formatter }
+import silk.writer { Writer, WriterError }
+
+struct Account {
+  pub name: string
+  secret: string
+}
+
+impl Debug for Account {
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let mut record = run Format.debugRecord("Account", &mut formatter)
+    run Format.debugField(&mut record, "name", &self.name, &mut formatter)
+    return run Format.debugFinish(record, &mut formatter)
+  }
+}
+
+pub fn main() -> i32 {
+  let account = Account { name: "ada", secret: "hunter2" }
+  return 0
+}
+```
+
+It writes `Account { name: "ada" }`. A record with no field writes only its name. The pretty
+form ([`Format.alternate`](#Format.impl.alternate)) puts each field on its own line.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
+<a id="Format.impl.debugField"></a>
+
+### Associated function `debugField`
+
+```silk
+pub effect fn debugField<T: Debug>(
+    record: &mut DebugRecord,
+    label: string,
+    value: &T,
+    formatter: &mut Formatter
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Writes one field of a record that [`Format.debugRecord`](#Format.impl.debugRecord) started, as `label: value`.
+
+#### Errors
+
+- `WriterError` if the ambient `Writer` fails. The bytes that the writer accepted before the
+  failure stay written. Nothing is rolled back.
+
+<a id="Format.impl.debugFinish"></a>
+
+### Associated function `debugFinish`
+
+```silk
+pub effect fn debugFinish(
+    record: DebugRecord,
+    formatter: &mut Formatter
+  ) -> () ! WriterError ? &mut Writer
+```
+
+Ends a record that [`Format.debugRecord`](#Format.impl.debugRecord) started. It writes the closing `}` when the record
+has a field.
 
 #### Errors
 
@@ -1506,6 +1595,25 @@ A `Formatter` holds options only. The output goes to the ambient `Writer`, not t
 Width counts Unicode scalars, not UTF-8 bytes and not terminal columns.
 Read the options with [`Format.width`](#Format.impl.width), [`Format.sign`](#Format.impl.sign), and the other accessors.
 
+<a id="DebugRecord"></a>
+
+## `DebugRecord`
+
+```silk
+pub struct DebugRecord
+```
+
+A record that a hand-written [`Debug`](#Debug) implementation is writing. Start one with
+[`Format.debugRecord`](#Format.impl.debugRecord).
+
+<a id="DebugRecord.impl.Copy"></a>
+
+## Implementation `Copy for DebugRecord`
+
+```silk
+impl Copy for DebugRecord
+```
+
 <a id="Display"></a>
 
 ## `Display`
@@ -1769,6 +1877,24 @@ pub offset: usize
 The byte offset of the first character that is not accepted. It is the length of the text if a
 digit is missing at the end.
 
+<a id="NotANumber.impl.Debug"></a>
+
+## Implementation `Debug for NotANumber`
+
+```silk
+impl Debug for NotANumber
+```
+
+<a id="NotANumber.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `NotANumber { offset: ... }`.
+
 <a id="OutOfRange"></a>
 
 ## `OutOfRange`
@@ -1779,6 +1905,24 @@ pub struct OutOfRange
 
 The reason for a [`ParseError`](#ParseError) when the text is a number but the value does not fit the target
 type.
+
+<a id="OutOfRange.impl.Debug"></a>
+
+## Implementation `Debug for OutOfRange`
+
+```silk
+impl Debug for OutOfRange
+```
+
+<a id="OutOfRange.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `OutOfRange`.
 
 <a id="ParseError"></a>
 
@@ -1803,6 +1947,24 @@ pub reason: NotANumber | OutOfRange
 ```
 
 Why the text was not accepted.
+
+<a id="ParseError.impl.Debug"></a>
+
+## Implementation `Debug for ParseError`
+
+```silk
+impl Debug for ParseError
+```
+
+<a id="ParseError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the reason, as `ParseError { reason: NotANumber { offset: 2 } }`.
 
 <a id="u8.impl.Display"></a>
 

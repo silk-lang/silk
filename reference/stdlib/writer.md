@@ -90,6 +90,24 @@ pub struct WriterError
 The error when a `Writer` provider cannot complete a write or a flush. Make one with
 [`Writer.failure`](#Writer.impl.failure).
 
+<a id="WriterError.impl.Debug"></a>
+
+## Implementation `Debug for WriterError`
+
+```silk
+impl Debug for WriterError
+```
+
+<a id="WriterError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the message, as `WriterError { message: "..." }`.
+
 <a id="Writer"></a>
 
 ## `Writer`

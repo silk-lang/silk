@@ -225,6 +225,24 @@ TooManyResults
 
 `maxResults` is more than 64.
 
+<a id="ResolverInputReason.impl.Debug"></a>
+
+## Implementation `Debug for ResolverInputReason`
+
+```silk
+impl Debug for ResolverInputReason
+```
+
+<a id="ResolverInputReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `ZeroResults`.
+
 <a id="NativeResolverOperation"></a>
 
 ## `NativeResolverOperation`
@@ -244,6 +262,24 @@ GetAddrInfo
 ```
 
 The `getaddrinfo` call.
+
+<a id="NativeResolverOperation.impl.Debug"></a>
+
+## Implementation `Debug for NativeResolverOperation`
+
+```silk
+impl Debug for NativeResolverOperation
+```
+
+<a id="NativeResolverOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `GetAddrInfo`.
 
 <a id="NativeResultReason"></a>
 
@@ -294,6 +330,24 @@ ShortAddress
 ```
 
 A native address is shorter than its family requires.
+
+<a id="NativeResultReason.impl.Debug"></a>
+
+## Implementation `Debug for NativeResultReason`
+
+```silk
+impl Debug for NativeResultReason
+```
+
+<a id="NativeResultReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `NullChain`.
 
 <a id="ResolverError"></a>
 
@@ -504,6 +558,24 @@ pub errno: Option<i32>
 ```
 
 The `errno` value, when the code is `EAI_SYSTEM`.
+
+<a id="ResolverError.impl.Debug"></a>
+
+## Implementation `Debug for ResolverError`
+
+```silk
+impl Debug for ResolverError
+```
+
+<a id="ResolverError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidInput { ... }`.
 
 <a id="ResolveRequest"></a>
 

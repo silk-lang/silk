@@ -440,6 +440,24 @@ pub code: i32
 
 The operation code.
 
+<a id="FileOperation.impl.Debug"></a>
+
+## Implementation `Debug for FileOperation`
+
+```silk
+impl Debug for FileOperation
+```
+
+<a id="FileOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the code, such as `ReadFile`, or the code when it has no name.
+
 <a id="FileReason"></a>
 
 ## `FileReason`
@@ -460,6 +478,24 @@ pub code: i32
 ```
 
 The reason code.
+
+<a id="FileReason.impl.Debug"></a>
+
+## Implementation `Debug for FileReason`
+
+```silk
+impl Debug for FileReason
+```
+
+<a id="FileReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the code, such as `NotFound`, or the code when it has no name.
 
 <a id="FileError"></a>
 
@@ -496,6 +532,25 @@ pub reason: FileReason
 ```
 
 The portable reason. Use it to decide how to recover.
+
+<a id="FileError.impl.Debug"></a>
+
+## Implementation `Debug for FileError`
+
+```silk
+impl Debug for FileError
+```
+
+<a id="FileError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `FileError { operation: ReadFile, reason: NotFound, providerCode: 2 }`.
+It leaves out `providerCode` when there is none.
 
 <a id="PublicationPolicy"></a>
 
@@ -607,6 +662,24 @@ pub stagingName: Bytes
 
 The name of the temporary file that is still in the destination directory if the removal
 failed. Empty otherwise.
+
+<a id="AtomicWriteError.impl.Debug"></a>
+
+## Implementation `Debug for AtomicWriteError`
+
+```silk
+impl Debug for AtomicWriteError
+```
+
+<a id="AtomicWriteError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `AtomicWriteError { published: ..., cause: ..., ... }`.
 
 <a id="FileSystem"></a>
 

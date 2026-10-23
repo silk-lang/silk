@@ -125,6 +125,24 @@ InvalidSignature
 
 The signature does not match the message and the key.
 
+<a id="RsaError.impl.Debug"></a>
+
+## Implementation `Debug for RsaError`
+
+```silk
+impl Debug for RsaError
+```
+
+<a id="RsaError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidKey`.
+
 <a id="RsaPublicKey"></a>
 
 ## `RsaPublicKey`

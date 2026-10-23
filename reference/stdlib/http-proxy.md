@@ -205,6 +205,24 @@ Route
 
 A route that was used for the wrong operation, or for another origin.
 
+<a id="ProxyComponent.impl.Debug"></a>
+
+## Implementation `Debug for ProxyComponent`
+
+```silk
+impl Debug for ProxyComponent
+```
+
+<a id="ProxyComponent.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `ProxyUri`.
+
 <a id="ProxyLimit"></a>
 
 ## `ProxyLimit`
@@ -244,6 +262,24 @@ OwnedConfigurationBytes
 ```
 
 The `maxOwnedConfigBytes` of the configuration.
+
+<a id="ProxyLimit.impl.Debug"></a>
+
+## Implementation `Debug for ProxyLimit`
+
+```silk
+impl Debug for ProxyLimit
+```
+
+<a id="ProxyLimit.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `AuthenticationBytes`.
 
 <a id="ProxyReason"></a>
 
@@ -356,6 +392,24 @@ InvalidRoute
 
 The route mode or its origin does not fit the operation.
 
+<a id="ProxyReason.impl.Debug"></a>
+
+## Implementation `Debug for ProxyReason`
+
+```silk
+impl Debug for ProxyReason
+```
+
+<a id="ProxyReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidProxyUri`.
+
 <a id="ProxyAdmissionError"></a>
 
 ## `ProxyAdmissionError`
@@ -385,6 +439,24 @@ pub reason: ProxyReason
 ```
 
 The rule that failed.
+
+<a id="ProxyAdmissionError.impl.Debug"></a>
+
+## Implementation `Debug for ProxyAdmissionError`
+
+```silk
+impl Debug for ProxyAdmissionError
+```
+
+<a id="ProxyAdmissionError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ProxyAdmissionError { component: ..., reason: ... }`.
 
 <a id="ProxyError"></a>
 
@@ -478,6 +550,24 @@ InvalidConnectResponse
 ```
 
 [`classifyConnect`](#classifyConnect) was called before a final response.
+
+<a id="ProxyError.impl.Debug"></a>
+
+## Implementation `Debug for ProxyError`
+
+```silk
+impl Debug for ProxyError
+```
+
+<a id="ProxyError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Admission { ... }`.
 
 <a id="ProxyConfigId"></a>
 

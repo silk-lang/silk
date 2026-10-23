@@ -403,6 +403,24 @@ Extensions
 
 `Sec-WebSocket-Extensions` is not valid.
 
+<a id="ValidationReason.impl.Debug"></a>
+
+## Implementation `Debug for ValidationReason`
+
+```silk
+impl Debug for ValidationReason
+```
+
+<a id="ValidationReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Request`.
+
 <a id="LimitKind"></a>
 
 ## `LimitKind`
@@ -473,6 +491,24 @@ SizeOverflow
 
 A size does not fit in `usize`.
 
+<a id="LimitKind.impl.Debug"></a>
+
+## Implementation `Debug for LimitKind`
+
+```silk
+impl Debug for LimitKind
+```
+
+<a id="LimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Protocols`.
+
 <a id="DecisionReason"></a>
 
 ## `DecisionReason`
@@ -513,6 +549,24 @@ Status
 ```
 
 A `Reject` status is less than 200.
+
+<a id="DecisionReason.impl.Debug"></a>
+
+## Implementation `Debug for DecisionReason`
+
+```silk
+impl Debug for DecisionReason
+```
+
+<a id="DecisionReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Protocol`.
 
 <a id="UpgradeError"></a>
 
@@ -633,6 +687,24 @@ pub error: ValueError
 ```
 
 The value error.
+
+<a id="UpgradeError.impl.Debug"></a>
+
+## Implementation `Debug for UpgradeError`
+
+```silk
+impl Debug for UpgradeError
+```
+
+<a id="UpgradeError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Validation { ... }`.
 
 <a id="Offer"></a>
 

@@ -126,6 +126,24 @@ The error when a logger provider cannot log a message.
 It has a code that the provider defines. Get it with [`Logger.errorCode`](#Logger.impl.errorCode). The same code can
 mean different things for different providers.
 
+<a id="LogError.impl.Debug"></a>
+
+## Implementation `Debug for LogError`
+
+```silk
+impl Debug for LogError
+```
+
+<a id="LogError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the code, as `LogError { code: ... }`.
+
 <a id="Logger"></a>
 
 ## `Logger`

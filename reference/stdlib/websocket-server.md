@@ -461,6 +461,24 @@ Arithmetic
 
 A size does not fit in its type.
 
+<a id="LimitKind.impl.Debug"></a>
+
+## Implementation `Debug for LimitKind`
+
+```silk
+impl Debug for LimitKind
+```
+
+<a id="LimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `MessageBytes`.
+
 <a id="State"></a>
 
 ## `State`
@@ -511,6 +529,24 @@ Failed
 ```
 
 An error ended the session. All later frame operations fail.
+
+<a id="State.impl.Debug"></a>
+
+## Implementation `Debug for State`
+
+```silk
+impl Debug for State
+```
+
+<a id="State.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Open`.
 
 <a id="Operation"></a>
 
@@ -591,6 +627,24 @@ FinishClose
 ```
 
 [`finishClose`](#finishClose).
+
+<a id="Operation.impl.Debug"></a>
+
+## Implementation `Debug for Operation`
+
+```silk
+impl Debug for Operation
+```
+
+<a id="Operation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `ReadEvent`.
 
 <a id="ProtocolReason"></a>
 
@@ -692,6 +746,24 @@ CloseCode
 
 A Close frame has a code that is not allowed.
 
+<a id="ProtocolReason.impl.Debug"></a>
+
+## Implementation `Debug for ProtocolReason`
+
+```silk
+impl Debug for ProtocolReason
+```
+
+<a id="ProtocolReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `MaskRequired`.
+
 <a id="Utf8Component"></a>
 
 ## `Utf8Component`
@@ -721,6 +793,24 @@ CloseReason
 ```
 
 The reason of a Close frame.
+
+<a id="Utf8Component.impl.Debug"></a>
+
+## Implementation `Debug for Utf8Component`
+
+```silk
+impl Debug for Utf8Component
+```
+
+<a id="Utf8Component.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Text`.
 
 <a id="CloseDataReason"></a>
 
@@ -752,6 +842,24 @@ ReasonTooLarge
 
 The reason has more than 123 bytes.
 
+<a id="CloseDataReason.impl.Debug"></a>
+
+## Implementation `Debug for CloseDataReason`
+
+```silk
+impl Debug for CloseDataReason
+```
+
+<a id="CloseDataReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Code`.
+
 <a id="CloseLimitKind"></a>
 
 ## `CloseLimitKind`
@@ -781,6 +889,24 @@ Bytes
 ```
 
 `maxCloseBytes`.
+
+<a id="CloseLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for CloseLimitKind`
+
+```silk
+impl Debug for CloseLimitKind
+```
+
+<a id="CloseLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Frames`.
 
 <a id="Failure"></a>
 
@@ -871,6 +997,24 @@ Transport
 ```
 
 A read, write, or close failed.
+
+<a id="Failure.impl.Debug"></a>
+
+## Implementation `Debug for Failure`
+
+```silk
+impl Debug for Failure
+```
+
+<a id="Failure.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Protocol`.
 
 <a id="WebSocketError"></a>
 
@@ -1198,6 +1342,24 @@ pub error: ByteIoError
 ```
 
 The transport error.
+
+<a id="WebSocketError.impl.Debug"></a>
+
+## Implementation `Debug for WebSocketError`
+
+```silk
+impl Debug for WebSocketError
+```
+
+<a id="WebSocketError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidLimits { ... }`.
 
 <a id="ControlPayload"></a>
 

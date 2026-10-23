@@ -437,6 +437,24 @@ MemoryLimit
 
 [`Limits.maxMemoryBytes`](#Limits.maxMemoryBytes) is less than [`MEMORY_BOUND`](#MEMORY_BOUND).
 
+<a id="ErrorKind.impl.Debug"></a>
+
+## Implementation `Debug for ErrorKind`
+
+```silk
+impl Debug for ErrorKind
+```
+
+<a id="ErrorKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidHeader`.
+
 <a id="DecodeError"></a>
 
 ## `DecodeError`
@@ -480,6 +498,24 @@ pub written: usize
 ```
 
 The number of output bytes that this call wrote before it failed.
+
+<a id="DecodeError.impl.Debug"></a>
+
+## Implementation `Debug for DecodeError`
+
+```silk
+impl Debug for DecodeError
+```
+
+<a id="DecodeError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `DecodeError { kind: ..., consumed: ..., ... }`.
 
 <a id="Decoder"></a>
 

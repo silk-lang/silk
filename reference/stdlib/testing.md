@@ -53,6 +53,24 @@ The failure of a [`Testing.expect`](#Testing.impl.expect) check. It holds the me
 
 Read the message with [`Testing.assertionMessage`](#Testing.impl.assertionMessage).
 
+<a id="AssertionError.impl.Debug"></a>
+
+## Implementation `Debug for AssertionError<'message>`
+
+```silk
+impl<'message> Debug for AssertionError<'message>
+```
+
+<a id="AssertionError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the message, as `AssertionError { message: "..." }`.
+
 <a id="Testing"></a>
 
 ## `Testing`

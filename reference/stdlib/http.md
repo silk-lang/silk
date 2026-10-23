@@ -219,6 +219,24 @@ Metadata
 
 A list in a field such as `Connection`, `Content-Encoding`, or `Transfer-Encoding`.
 
+<a id="ValueComponent.impl.Debug"></a>
+
+## Implementation `Debug for ValueComponent`
+
+```silk
+impl Debug for ValueComponent
+```
+
+<a id="ValueComponent.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Version`.
+
 <a id="LimitKind"></a>
 
 ## `LimitKind`
@@ -308,6 +326,24 @@ UniqueField
 ```
 
 A field must occur at most one time, but it occurred more times.
+
+<a id="LimitKind.impl.Debug"></a>
+
+## Implementation `Debug for LimitKind`
+
+```silk
+impl Debug for LimitKind
+```
+
+<a id="LimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `MethodBytes`.
 
 <a id="ValueReason"></a>
 
@@ -509,6 +545,24 @@ The length of the buffer that you gave.
 impl Copy for ValueReason
 ```
 
+<a id="ValueReason.impl.Debug"></a>
+
+## Implementation `Debug for ValueReason`
+
+```silk
+impl Debug for ValueReason
+```
+
+<a id="ValueReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidToken`.
+
 <a id="ValueError"></a>
 
 ## `ValueError`
@@ -564,6 +618,24 @@ pub offset: usize
 
 The byte offset in the part where the rule failed.
 
+<a id="ValueError.impl.Debug"></a>
+
+## Implementation `Debug for ValueError`
+
+```silk
+impl Debug for ValueError
+```
+
+<a id="ValueError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ValueError { reason: ..., component: ..., ... }`.
+
 <a id="Version"></a>
 
 ## `Version`
@@ -593,6 +665,24 @@ Http11
 ```
 
 HTTP/1.1.
+
+<a id="Version.impl.Debug"></a>
+
+## Implementation `Debug for Version`
+
+```silk
+impl Debug for Version
+```
+
+<a id="Version.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Http10`.
 
 <a id="Version.impl"></a>
 
@@ -850,6 +940,24 @@ An HTTP status code from 100 to 599. Codes without a name, such as 299, are kept
 ```silk
 impl Copy for Status
 ```
+
+<a id="Status.impl.Debug"></a>
+
+## Implementation `Debug for Status`
+
+```silk
+impl Debug for Status
+```
+
+<a id="Status.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the code, as `Status { code: 404 }`.
 
 <a id="Status.impl"></a>
 
@@ -1218,6 +1326,24 @@ pub struct OwnedResponseHead
 
 A response head that owns its memory. Get a [`ResponseHead`](#ResponseHead) from it with
 [`OwnedResponseHead.view`](#OwnedResponseHead.impl.view).
+
+<a id="OwnedResponseHead.impl.Debug"></a>
+
+## Implementation `Debug for OwnedResponseHead`
+
+```silk
+impl Debug for OwnedResponseHead
+```
+
+<a id="OwnedResponseHead.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the version and the status, as `OwnedResponseHead { version: Http11, status: Status { code: 407 } }`. It leaves out the reason phrase and the headers.
 
 <a id="OwnedResponseHead.impl"></a>
 
