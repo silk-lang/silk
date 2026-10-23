@@ -74,7 +74,8 @@ libc. It is deliberately synchronous.
 
 - Domain plus `Some(deadline)` fails `DeadlineUnsupported` before clock sampling, allocation, query
   construction, or libc work.
-- Domain plus `None` makes exactly one blocking `getaddrinfo` call using a root-terminated name,
+- Domain plus `None` makes exactly one blocking `getaddrinfo` call using the name as admitted (not
+  root-terminated, so hosts-file names such as `localhost` resolve and the system's search rules apply),
   decimal service, explicit address family, stream socket, TCP protocol, and numeric-service hint.
 - Every successful non-null addrinfo chain has one move-only owner. It is released exactly once
   after success or any later typed failure, including invalid shape, result-limit exhaustion, and

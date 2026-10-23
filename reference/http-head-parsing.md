@@ -90,10 +90,15 @@ reason. Status codes are limited to 100–599. Field names must meet the shared 
 must touch `:` directly. Values preserve interior bytes and trim only surrounding SP and HTAB.
 Original field case, order, duplicates, empty values, and permitted response obs-text are preserved.
 
-The parser rejects leading blank lines, bare LF, CR not followed by LF, obs-fold, whitespace before a
-colon, invalid controls, HTTP/0.9, and `ICY`. HTTP/1.1 requests require exactly one syntactically valid
-Host field. For an absolute-form target, the target authority remains effective even when Host names
+The parser rejects leading blank lines, bare LF, CR not followed by LF, obs-fold in requests,
+whitespace before a colon, invalid controls, HTTP/0.9, and `ICY`. HTTP/1.1 requests require exactly
+one syntactically valid Host field. For an absolute-form target, the target authority remains effective even when Host names
 a different authority.
+
+As RFC 9112 section 5.2 requires of a client, a response field folded onto following lines (obs-fold)
+is accepted: each fold, the CRLF and the whitespace that starts the next line, becomes spaces, and the
+joined value counts against the value and field-byte limits. A response line that starts with
+whitespace before any field still fails `ObsFold`.
 
 `ParseError` identifies the reason, syntactic component, absolute head offset, exact valid prefix
 consumed from the failing call, and a field ordinal when applicable. `LimitExceeded` additionally

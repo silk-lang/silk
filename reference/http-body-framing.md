@@ -165,7 +165,8 @@ Trailer fields use the strict HTTP field grammar: a nonempty token name immediat
 bytes and records remain separate from the initial head, so trailers cannot change framing or
 retroactively alter an authentication decision.
 
-`TrailerPolicy.defaultPolicy()` admits only `Content-Digest` and `Repr-Digest`.
+`TrailerPolicy.defaultPolicy()` admits only `Content-Digest` and `Repr-Digest` as received trailer
+fields, and lets a `Trailer` header declare any name that is not statically forbidden.
 `TrailerPolicy.fromNames` creates an explicit allowlist and rejects invalid tokens and the
 statically forbidden names below:
 
@@ -177,6 +178,10 @@ statically forbidden names below:
 
 During selection and streaming, a field named by the initial `Connection` header is also forbidden
 even when it appears in an explicit application allowlist.
+
+A received trailer field that the policy does not admit is discarded: the body still completes and
+the field is absent from the trailers. Its bytes still count toward the trailer byte limit. A
+statically forbidden field, a field named by `Connection`, and a malformed trailer line still fail.
 
 The same policy validates Trailer declarations, received trailers, and emitted trailers.
 
