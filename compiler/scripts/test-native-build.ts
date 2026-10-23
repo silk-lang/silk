@@ -1990,6 +1990,52 @@ const program = Effect.gen(function* () {
   const cleanedByPath = yield* invoke(silk, ['clean', '--manifest-path', manifest], directory)
   assert.equal(cleanedByPath.status, 0, cleanedByPath.stderr)
   assert.equal(yield* fs.exists(join(directory, 'greeting/build')), false)
+  // Dependency paths and source files may go through symbolic links, as /tmp does on macOS.
+  const throughLinks = join(directory, 'through-links')
+  yield* fs.makeDirectory(join(throughLinks, 'real/shared/src'), { recursive: true })
+  yield* fs.makeDirectory(join(throughLinks, 'app/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(throughLinks, 'real/shared/silk.toml'),
+    '[package]\nname = "shared"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["numbers"]\n',
+  )
+  yield* fs.writeFileString(
+    join(throughLinks, 'real/shared/src/numbers.silk'),
+    'pub fn six() -> i32 { return 6 }\n',
+  )
+  yield* fs.writeFileString(
+    join(throughLinks, 'real/helper.silk'),
+    'pub fn one() -> i32 { return 1 }\n',
+  )
+  yield* fs.symlink('real', join(throughLinks, 'via'))
+  yield* fs.symlink('../../real/helper.silk', join(throughLinks, 'app/src/helper.silk'))
+  yield* fs.writeFileString(
+    join(throughLinks, 'app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nshared = { path = "../via/shared" }\n',
+  )
+  yield* fs.writeFileString(
+    join(throughLinks, 'app/src/main.silk'),
+    'import helper { one }\nimport shared.numbers { six }\npub fn main() -> i32 { return one() + six() }\n',
+  )
+  const linkedRun = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(throughLinks, 'app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(linkedRun.status, 7, linkedRun.stderr)
+  // A source file that cannot be read is named.
+  yield* fs.symlink('../../real/missing.silk', join(throughLinks, 'app/src/gone.silk'))
+  yield* fs.writeFileString(
+    join(throughLinks, 'app/src/main.silk'),
+    'import gone { x }\npub fn main() -> i32 { return 0 }\n',
+  )
+  const dangling = yield* invoke(
+    silk,
+    ['check', '--stdlib', standardLibrary],
+    join(throughLinks, 'app'),
+  )
+  assert.equal(dangling.status, 1, dangling.stderr)
+  assert.match(dangling.stderr, /^silk: cannot read \S+\/app\/src\/gone\.silk$/m)
   // An object form needs no `main` and no runtime: the application's C exports are its roots.
   const library = join(directory, 'library')
   yield* fs.makeDirectory(join(library, 'src'), { recursive: true })
