@@ -1,0 +1,367 @@
+//! The files one build read, recorded so that a later run can see, without building, that the
+//! build would read the same and reuse its output.
+//!
+//! # Details
+//! A [`Recorder`] is the filesystem a build runs on. It forwards each operation to the host
+//! filesystem and notes each file the build read with the digest of its contents, each `stat`
+//! with its answer, and each directory listing with a digest of its entries. Writes are not
+//! noted, nor is anything at or below a file or directory the build made. [`encode`] stores the
+//! notes after a key that names everything else the output depends on, such as the compiler,
+//! profile and toolchain, and [`unchanged`] checks a stored record against the host filesystem.
+//!
+//! The record is `SLKBINP1`, the key, the payload, then the notes, each field framed with its
+//! byte length as an 8-byte little-endian integer.
+
+import semantic.ContentHash {ContentHash}
+import silk.allocator { Allocator, OutOfMemoryError, SystemAllocator }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { AtomicWriteError, DirectoryEntry, DirectoryInfo, Durability, FileError, FileInfo, FileSystem, Path, PublicationPolicy }
+import silk.list { List }
+import silk.option { Option }
+import silk.os_filesystem { OsFileSystem }
+import silk.result { Result }
+import silk.i32
+import silk.slice { Slice }
+import silk.u64
+import silk.u8
+import silk.usize
+
+const READ: u8 = 1
+
+const STAT: u8 = 2
+
+const LISTING: u8 = 3
+
+// One note. For a read, `first` and `second` are the content digest, or both zero after a failed
+// read. For a stat, `first` is 0 after a failure, 1 for a file and 2 for a directory, and `second`
+// is a file's length. For a listing, they are the digest of the entries, or both zero after a
+// failure.
+struct Note {
+  kind: u8
+  path: Bytes
+  first: u64
+  second: u64
+}
+
+/// A host filesystem that notes what the build reads.
+pub struct Recorder {
+  native: OsFileSystem
+  allocator: SystemAllocator
+  notes: List<Note>
+  // Files and directories the build made itself. They are outputs, so operations on them are not
+  // noted: a temporary directory gets a new name each time.
+  produced: List<Bytes>
+  // False once a note could not be kept; an incomplete record is never stored.
+  complete: bool
+}
+
+/// A recorder over the host filesystem.
+pub effect fn recorder() -> Recorder ! OutOfMemoryError ? &mut Allocator {
+  let native = run OsFileSystem.make("/")
+  return Recorder {native: move native, allocator: Allocator.systemAllocatorProvider(), notes: List<Note>.make(), produced: List<Bytes>.make(), complete: true}
+}
+
+/// Whether every operation the build ran could be noted.
+pub fn complete(recorder: &Recorder) -> bool { return recorder.complete }
+
+effect fn appendNote(notes: &mut List<Note>, kind: u8, path: &Path, first: u64, second: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Note>.asSlice(&notes.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    if listed[at].kind == kind && same(Bytes.asSlice(&listed[at].path), Path.rawBytes(path)) {
+      // The first answer is what the build saw first; a later different answer means the input
+      // changed during the build, which the stored first answer already detects next time.
+      return ()
+    }
+    at = at + usize.ONE
+  }
+  return run List<Note>.append(&mut notes.*, Note {kind: kind, path: run Bytes.copy(Path.rawBytes(path)), first: first, second: second})
+}
+
+// Whether `path` is `prefix` or lies below it.
+fn within(path: &[u8], prefix: &[u8]) -> bool {
+  if path.length < prefix.length || !same(Slice.view<u8>(path, usize.ZERO, prefix.length), prefix) { return false }
+  return path.length == prefix.length || path[prefix.length] == 47
+}
+
+effect fn note(recorder: &mut Recorder, kind: u8, path: &Path, first: u64, second: u64) -> () {
+  let produced = List<Bytes>.asSlice(&recorder.produced)
+  let mut at = usize.ZERO
+  while at < produced.length {
+    if within(Path.rawBytes(path), Bytes.asSlice(&produced[at])) { return () }
+    at = at + usize.ONE
+  }
+  let appended = run Effect.result(appendNote(&mut recorder.notes, kind, path, first, second)
+    |> Effect.provideMut<Allocator>(&mut recorder.allocator))
+  if let Result<(), OutOfMemoryError>.Failure {error} = move appended {
+    drop error
+    recorder.complete = false
+  }
+  return ()
+}
+
+effect fn produce(recorder: &mut Recorder, path: &Path) -> () {
+  let appended = run Effect.result(appendProduced(&mut recorder.produced, path)
+    |> Effect.provideMut<Allocator>(&mut recorder.allocator))
+  if let Result<(), OutOfMemoryError>.Failure {error} = move appended {
+    drop error
+    recorder.complete = false
+  }
+  return ()
+}
+
+effect fn appendProduced(produced: &mut List<Bytes>, path: &Path) -> () ! OutOfMemoryError ? &mut Allocator {
+  return run List<Bytes>.append(&mut produced.*, run Bytes.copy(Path.rawBytes(path)))
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn statNote(answer: &(FileInfo | DirectoryInfo)) -> Note {
+  return match &answer.* {
+    FileInfo {byteLength} => Note {kind: STAT, path: Bytes.make(), first: 1, second: usize.toU64(byteLength)}
+    DirectoryInfo {} => Note {kind: STAT, path: Bytes.make(), first: 2, second: 0}
+  }
+}
+
+// The digest of a listing: each entry's path and kind in listed order.
+fn listingDigest(entries: &List<DirectoryEntry>) -> ContentHash {
+  let listed = List<DirectoryEntry>.asSlice(entries)
+  let mut stream = ContentHash.stream()
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let path = Path.rawBytes(&listed[at].path)
+    ContentHash.append(&mut stream, path)
+    ContentHash.appendByte(&mut stream, 0)
+    ContentHash.appendByte(&mut stream, i32.toU8(listed[at].kind.code))
+    at = at + usize.ONE
+  }
+  return ContentHash.finish(move stream)
+}
+
+impl FileSystem for Recorder {
+  effect fn readFile(self: &mut Self, path: &Path) -> Bytes ! FileError | OutOfMemoryError ? &mut Allocator {
+    let read = run Effect.result(FileSystem.readFile(path) |> Effect.provideMut<FileSystem>(&mut self.native))
+    let value = match move read {
+      Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+      Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => {
+        run note(&mut self.*, READ, path, 0, 0)
+        match move error {
+          FileError failure => { fail move failure }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    let digest = ContentHash.of(Bytes.asSlice(&value))
+    run note(&mut self.*, READ, path, digest.high, digest.low)
+    return move value
+  }
+  effect fn writeFile(self: &mut Self, path: &Path, bytes: &[u8]) -> () ! FileError {
+    run produce(&mut self.*, path)
+    return run FileSystem.writeFile(path, bytes) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn createFile(self: &mut Self, path: &Path, bytes: &[u8]) -> () ! FileError {
+    run FileSystem.createFile(path, bytes) |> Effect.provideMut<FileSystem>(&mut self.native)
+    return run produce(&mut self.*, path)
+  }
+  effect fn writeFileAtomic(self: &mut Self, path: &Path, bytes: &[u8], policy: PublicationPolicy, durability: Durability) -> () ! AtomicWriteError {
+    run produce(&mut self.*, path)
+    return run FileSystem.writeFileAtomic(path, bytes, move policy, move durability) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn syncDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.syncDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn stat(self: &mut Self, path: &Path) -> FileInfo | DirectoryInfo ! FileError {
+    let answer = run Effect.result(FileSystem.stat(path) |> Effect.provideMut<FileSystem>(&mut self.native))
+    let value = match move answer {
+      Result<FileInfo | DirectoryInfo, FileError>.Success {value} => move value
+      Result<FileInfo | DirectoryInfo, FileError>.Failure {error} => {
+        run note(&mut self.*, STAT, path, 0, 0)
+        fail move error
+      }
+    }
+    let observed = statNote(&value)
+    run note(&mut self.*, STAT, path, observed.first, observed.second)
+    return move value
+  }
+  effect fn listDirectory(self: &mut Self, path: &Path) -> List<DirectoryEntry> ! FileError | OutOfMemoryError ? &mut Allocator {
+    let listed = run Effect.result(FileSystem.listDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.native))
+    let value = match move listed {
+      Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+      Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => {
+        run note(&mut self.*, LISTING, path, 0, 0)
+        match move error {
+          FileError failure => { fail move failure }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+    let digest = listingDigest(&value)
+    run note(&mut self.*, LISTING, path, digest.high, digest.low)
+    return move value
+  }
+  effect fn createDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    // Only a directory this call made is an output; an existing one may hold inputs.
+    run FileSystem.createDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+    return run produce(&mut self.*, path)
+  }
+  effect fn removeFile(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.removeFile(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn removeDirectory(self: &mut Self, path: &Path) -> () ! FileError {
+    return run FileSystem.removeDirectory(path) |> Effect.provideMut<FileSystem>(&mut self.native)
+  }
+  effect fn createTemporaryDirectory(self: &mut Self, parent: &Path, prefix: &[u8]) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+    let made = run FileSystem.createTemporaryDirectory(parent, prefix) |> Effect.provideMut<FileSystem>(&mut self.native)
+    run produce(&mut self.*, &made)
+    return move made
+  }
+}
+
+effect fn appendWord(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut index = usize.ZERO
+  while index < 8 {
+    let byte = [u64.toU8(u64.bitAnd(u64.shiftRight(value, usize.toU64(index * 8)), 255))]
+    run Bytes.append(&mut output.*, &byte)
+    index = index + usize.ONE
+  }
+  return ()
+}
+
+effect fn appendField(output: &mut Bytes, value: &[u8]) -> () ! OutOfMemoryError ? &mut Allocator {
+  run appendWord(&mut output.*, usize.toU64(value.length))
+  return run Bytes.append(&mut output.*, value)
+}
+
+/// The record of `recorder`'s notes under `key`, carrying `payload` for the caller.
+pub effect fn encode(key: &[u8], payload: &[u8], recorder: &Recorder) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let mut output = run Bytes.copy(b"SLKBINP1")
+  run appendField(&mut output, key)
+  run appendField(&mut output, payload)
+  let notes = List<Note>.asSlice(&recorder.notes)
+  run appendWord(&mut output, usize.toU64(notes.length))
+  let mut at = usize.ZERO
+  while at < notes.length {
+    let kind = [notes[at].kind]
+    run Bytes.append(&mut output, &kind)
+    run appendField(&mut output, Bytes.asSlice(&notes[at].path))
+    run appendWord(&mut output, notes[at].first)
+    run appendWord(&mut output, notes[at].second)
+    at = at + usize.ONE
+  }
+  return move output
+}
+
+// A cursor over a stored record. A read past the end leaves `failed` set and reads as empty.
+struct Reader<'a> {
+  bytes: &'a [u8]
+  at: usize
+  failed: bool
+}
+
+fn readWord(reader: &mut Reader) -> u64 {
+  if reader.failed || reader.bytes.length - reader.at < 8 {
+    reader.failed = true
+    return 0
+  }
+  let mut value: u64 = 0
+  let mut index = usize.ZERO
+  while index < 8 {
+    value = u64.bitOr(value, u64.shiftLeft(u8.toU64(reader.bytes[reader.at + index]), usize.toU64(index * 8)))
+    index = index + usize.ONE
+  }
+  reader.at = reader.at + 8
+  return value
+}
+
+fn readField<'a>(reader: &mut Reader<'a>) -> &'a [u8] {
+  let length = readWord(&mut reader.*)
+  if reader.failed || u64.toUsize(length) > reader.bytes.length - reader.at {
+    reader.failed = true
+    return Slice.view<u8>(reader.bytes, usize.ZERO, usize.ZERO)
+  }
+  let start = reader.at
+  reader.at = reader.at + u64.toUsize(length)
+  return Slice.view<u8>(reader.bytes, start, u64.toUsize(length))
+}
+
+fn readByte(reader: &mut Reader) -> u8 {
+  if reader.failed || reader.at >= reader.bytes.length {
+    reader.failed = true
+    return 0
+  }
+  let value = reader.bytes[reader.at]
+  reader.at = reader.at + usize.ONE
+  return value
+}
+
+// Whether the host filesystem still answers one note the way it did.
+effect fn holds(kind: u8, path: &Path, first: u64, second: u64) -> bool ? &mut FileSystem | &mut Allocator {
+  if kind == READ {
+    let read = run Effect.result(FileSystem.readFile(path))
+    if let Result<Bytes, FileError | OutOfMemoryError>.Success {value} = &read {
+      let digest = ContentHash.of(Bytes.asSlice(&value))
+      return digest.high == first && digest.low == second && (first != 0 || second != 0)
+    }
+    drop read
+    return first == 0 && second == 0
+  }
+  if kind == STAT {
+    let answer = run Effect.result(FileSystem.stat(path))
+    if let Result<FileInfo | DirectoryInfo, FileError>.Success {value} = &answer {
+      let observed = statNote(&value)
+      return observed.first == first && observed.second == second
+    }
+    drop answer
+    return first == 0
+  }
+  if kind == LISTING {
+    let listed = run Effect.result(FileSystem.listDirectory(path))
+    if let Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} = &listed {
+      let digest = listingDigest(&value)
+      return digest.high == first && digest.low == second
+    }
+    drop listed
+    return first == 0 && second == 0
+  }
+  return false
+}
+
+/// The payload of `record` when it was stored under `key` and every input it notes still reads
+/// the same, otherwise none.
+pub effect fn unchanged(record: &[u8], key: &[u8]) -> Option<Bytes> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  if record.length < 8 || !same(Slice.view<u8>(record, usize.ZERO, 8), b"SLKBINP1") { return Option<Bytes>.none() }
+  let mut reader = Reader {bytes: record, at: 8, failed: false}
+  let stored = readField(&mut reader)
+  if reader.failed || !same(stored, key) { return Option<Bytes>.none() }
+  let payload = readField(&mut reader)
+  let count = readWord(&mut reader)
+  let mut at: u64 = 0
+  while at < count && !reader.failed {
+    let kind = readByte(&mut reader)
+    let text = readField(&mut reader)
+    let first = readWord(&mut reader)
+    let second = readWord(&mut reader)
+    if reader.failed { return Option<Bytes>.none() }
+    let path = run Effect.result(Path.fromBytes(text))
+    let located = match move path {
+      Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+      Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError failure => { drop failure return Option<Bytes>.none() }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    if !run holds(kind, &located, first, second) { return Option<Bytes>.none() }
+    at = at + 1
+  }
+  if reader.failed || reader.at != record.length { return Option<Bytes>.none() }
+  return Option<Bytes>.some(run Bytes.copy(payload))
+}
