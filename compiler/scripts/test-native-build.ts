@@ -832,6 +832,24 @@ const program = Effect.gen(function* () {
     new RegExp(`^\\[${hostTarget}\\]\nsrc/main\\.silk:1:8: error\\[MOD0001\\]`, 'm'),
   )
   assert.match(unknownModule.stderr, /^Failed unknown in /m)
+  // Module paths match file names exactly, also where the filesystem ignores case; an import that
+  // differs from a file only in letter case names the file's spelling.
+  yield* fs.makeDirectory(join(directory, 'casing/src/util'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'casing/silk.toml'),
+    '[package]\nname = "casing"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(join(directory, 'casing/src/util/Math.silk'), 'pub fn twice(value: i32) -> i32 {\n  return value * 2\n}\n')
+  yield* fs.writeFileString(
+    join(directory, 'casing/src/main.silk'),
+    'import util.math { twice }\n\npub fn main() -> i32 {\n  return twice(0)\n}\n',
+  )
+  const casing = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'casing'))
+  assert.equal(casing.status, 1, casing.stderr)
+  assert.match(
+    casing.stderr,
+    /^src\/main\.silk:1:8: error\[MOD0001\] Unknown module util\.math\n  note: did you mean `util\.Math`\? Module paths match file names exactly, including letter case$/m,
+  )
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
