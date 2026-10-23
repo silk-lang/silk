@@ -288,3 +288,29 @@ an operational status 2 and publishes no results.
 
 **Evidence:** test-result cache requirements,
 cached CLI workflow.
+
+### TEST-009 — An unchanged project reuses its built runner
+
+**Status:** Confirmed
+
+`silk test` records, beside the runner it builds, every file the build read with a digest of its
+contents, every file or directory it looked for, and every directory it listed. The next run
+compares that record with the files on disk. When nothing in it changed, and the compiler, profile,
+discovery root, and toolchain settings (`--clang`, `SILK_CLANG`, `SILK_LLVM_AR`, `PATH`,
+`SDKROOT`, `DEVELOPER_DIR`) are the same, the run reuses the runner without building. `--file` and
+`--filter` select tests in the runner, so a filtered rerun reuses it too.
+
+```sh
+silk test                  # builds the runner and runs every test
+silk test --filter parser  # reuses the runner when no source changed
+```
+
+**Boundary:** A run with profile bindings never reuses a runner, because bindings may hold secrets
+that are not written to disk. Files that only the native toolchain reads, such as system libraries
+and headers, are not part of the record. Adding a file to a directory the build listed counts as a
+change even when no import names it. `--no-cache` does not affect this reuse (TEST-008).
+
+**Diagnostics:** None. A record that is missing, unreadable, or written by another compiler only
+means the runner is built again.
+
+**Evidence:** test runner reuse requirements, cached CLI workflow.

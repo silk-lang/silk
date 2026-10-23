@@ -63,6 +63,7 @@ import driver.ToolchainSources as ToolchainSources {GitHubReleases, MirrorReleas
 import driver.NativeHostFiles as HostFileAccess {NativeHostFiles}
 import driver.Analysis as Analyses {Analysis, Opened, Refusal}
 import driver.CheckRoots
+import driver.BuildInputs
 import driver.CacheStamp
 import driver.SemanticCache as SemanticCache {CacheFile}
 import driver.ProjectCommand as ProjectCommands {Add as AddCommand, Build as BuildCommand, Check as CheckCommand, Clean as CleanCommand, Init as InitCommand, InvalidProjectCommand, Options as ProjectOptions, Remove as RemoveCommand, Run as RunCommand, Test as TestCommand}
@@ -115,7 +116,9 @@ import backend.Gap {Code as GapCode, Gap, Source as GapSource}
 import backend.InstanceKey {InstanceKey}
 import backend.WasmRuntime
 import lexer.Span {Span}
+import semantic.ContentHash {ContentHash}
 import semantic.DeclarationId {DeclarationId}
+import semantic.RuntimeEncoding
 import semantic.Rejection as Rejections {MessageArgument, RelatedSite, Rejection, RejectionCode}
 import silk.shared {Shared}
 import silk.u8
@@ -2286,6 +2289,128 @@ effect fn reportRejection(sources: &ModuleSources, diagnostic: &Shared<Rejection
   return status
 }
 
+// The key a reused test runner must have been built under: the compiler, the profile, the roots
+// and paths the build starts from, and the toolchain settings it reads from the environment. Every
+// file the build reads is checked separately (`BuildInputs`). There is none, so nothing is reused,
+// for a compiler without an identity or a build with profile bindings, which may hold secrets that
+// must not reach the disk.
+effect fn testBuildKey(sourcePath: &Path, manifest: &Option<&Path>, output: &Path, display: &Path, standardLibrary: &Option<Path>,
+  profile: &InitialProfile, bindings: &List<Supplied>, clang: &Option<Bytes>) -> Option<Bytes>
+! HostInputError | OutOfMemoryError ? &mut FileSystem | &mut HostInput | &mut Allocator {
+  if List<Supplied>.length(bindings) != usize.ZERO { return Option<Bytes>.none() }
+  let compiler = match move run CacheStamp.compiler() {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<Bytes>.none() }
+  }
+  let mut key = run Bytes.copy(b"silk-test-runner-1")
+  run RuntimeEncoding.field(&mut key, Bytes.asSlice(&compiler))
+  let mut identity = Bytes.make()
+  run InitialProfile.appendIdentity(profile, &mut identity)
+  run RuntimeEncoding.field(&mut key, Bytes.asSlice(&identity))
+  run RuntimeEncoding.field(&mut key, Path.rawBytes(sourcePath))
+  run RuntimeEncoding.field(&mut key, Path.rawBytes(output))
+  run RuntimeEncoding.field(&mut key, Path.rawBytes(display))
+  match &manifest.* {
+    Option<&Path>.Some {value} => run RuntimeEncoding.field(&mut key, Path.rawBytes(value))
+    Option<&Path>.None => run RuntimeEncoding.field(&mut key, b"")
+  }
+  match &standardLibrary.* {
+    Option<Path>.Some {value} => run RuntimeEncoding.field(&mut key, Path.rawBytes(&value))
+    Option<Path>.None => run RuntimeEncoding.field(&mut key, b"")
+  }
+  match &clang.* {
+    Option<Bytes>.Some {value} => run RuntimeEncoding.field(&mut key, Bytes.asSlice(&value))
+    Option<Bytes>.None => run RuntimeEncoding.field(&mut key, b"")
+  }
+  let variables = ["SILK_CLANG", "SILK_LLVM_AR", "PATH", "SDKROOT", "DEVELOPER_DIR"]
+  let mut at = usize.ZERO
+  while at < 5 {
+    match move run HostInput.variableNamed(variables[at]) {
+      Option<Bytes>.Some {value} => {
+        run RuntimeEncoding.field(&mut key, b"=")
+        run RuntimeEncoding.field(&mut key, Bytes.asSlice(&value))
+      }
+      Option<Bytes>.None => run RuntimeEncoding.field(&mut key, b"")
+    }
+    at = at + usize.ONE
+  }
+  return Option<Bytes>.some(move key)
+}
+
+// What a reused runner needs besides its executable: the digest of that executable, then the
+// catalog identities in order.
+effect fn testBuildPayload(executable: &[u8], identities: &List<Bytes>) -> Bytes ! OutOfMemoryError ? &mut Allocator {
+  let digest = ContentHash.of(executable)
+  let mut payload = Bytes.make()
+  run RuntimeEncoding.word(&mut payload, digest.high)
+  run RuntimeEncoding.word(&mut payload, digest.low)
+  let listed = List<Bytes>.asSlice(identities)
+  run RuntimeEncoding.word(&mut payload, usize.toU64(listed.length))
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run RuntimeEncoding.field(&mut payload, Bytes.asSlice(&listed[at]))
+    at = at + usize.ONE
+  }
+  return move payload
+}
+
+// The big-endian word `RuntimeEncoding.word` wrote at `offset`.
+fn readWord(bytes: &[u8], offset: usize) -> u64 {
+  let mut value: u64 = 0
+  let mut at = usize.ZERO
+  while at < 8 {
+    value = u64.bitOr(u64.shiftLeft(value, 8), u8.toU64(bytes[offset + at]))
+    at = at + usize.ONE
+  }
+  return value
+}
+
+// The catalog of the runner at `output` when the record beside it shows that a build under `key`
+// would read exactly what the one that made it read, and the runner is the one it made.
+effect fn reusedTests(record: &Path, key: &Option<Bytes>, output: &Path) -> Option<List<Bytes>>
+! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let expected = match &key.* {
+    Option<Bytes>.Some {value} => Bytes.asSlice(&value)
+    Option<Bytes>.None => { return Option<List<Bytes>>.none() }
+  }
+  let stored = match move run Effect.result(FileSystem.readFile(record)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return Option<List<Bytes>>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let payload = match move run BuildInputs.unchanged(Bytes.asSlice(&stored), expected) {
+    Option<Bytes>.Some {value} => move value
+    Option<Bytes>.None => { return Option<List<Bytes>>.none() }
+  }
+  let executable = match move run Effect.result(FileSystem.readFile(output)) {
+    Result<Bytes, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => { drop failure return Option<List<Bytes>>.none() }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let digest = ContentHash.of(Bytes.asSlice(&executable))
+  let bytes = Bytes.asSlice(&payload)
+  if bytes.length < 24 || readWord(bytes, 0) != digest.high || readWord(bytes, 8) != digest.low { return Option<List<Bytes>>.none() }
+  let count = readWord(bytes, 16)
+  let mut identities = List<Bytes>.make()
+  let mut at: usize = 24
+  let mut index: u64 = 0
+  while index < count {
+    if bytes.length - at < 8 { return Option<List<Bytes>>.none() }
+    let length = u64.toUsize(readWord(bytes, at))
+    at = at + 8
+    if length > bytes.length - at { return Option<List<Bytes>>.none() }
+    run List<Bytes>.append(&mut identities, run Bytes.copy(Slice.view<u8>(bytes, at, length)))
+    at = at + length
+    index = index + 1
+  }
+  if at != bytes.length { return Option<List<Bytes>>.none() }
+  return Option<List<Bytes>>.some(move identities)
+}
+
 // One invocation nonce: no two runs share a plan, so a stale receipt never binds a new run.
 effect fn testNonce(output: &[u8], digest: &[u8]) -> [u8; 32] {
   let mut clock = OsSystemClock.make()
@@ -2324,11 +2449,38 @@ effect fn test(sourcePath: &Path, manifest: Option<&Path>, output: &Path, displa
   bindings: List<Supplied>, filter: Option<Bytes>, file: Option<Bytes>, timeout: &Option<Bytes>, clang: &Option<Bytes>, matched: &mut bool) -> i32
 ! ApplicationError | FileError | ProcessError | HostInputError | InvalidModulePath | InvalidSourceRoot | InvalidDependency | MissingManifest | InvalidBuildComposition | MissingStandardLibrary | InvalidNativeLinkInput | TomlError | RegistrationClosed | ConflictingPackageSource | Cycle | RevisionMismatch | OutOfMemoryError | WriterError
 ? &mut FileSystem | &mut ChildProcess | &mut HostInput | &mut Allocator | &mut Writer | &mut Types {
-  let mut silent = Progress.off()
-  let built = run build(sourcePath, move manifest, output, display, Form.Executable, Stage.Final, move standardLibrary, move profile, Option<usize>.none(), move bindings, request, true, false, clang, &Option<Bytes>.none(), &mut silent)
-  let identities = match move built {
-    Compiled.Finished {status} => { return status }
-    Compiled.Tests {identities} => move identities
+  // An unchanged project reuses the runner it built last time, whatever the filters select.
+  let mut recordBytes = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut recordBytes, b".inputs")
+  let recordPath = run Path.fromBytes(Bytes.asSlice(&recordBytes))
+  let key = run testBuildKey(sourcePath, &manifest, output, display, &standardLibrary, &profile, &bindings, clang)
+  let mut identities = List<Bytes>.make()
+  if let Option<List<Bytes>>.Some {value} = move run reusedTests(&recordPath, &key, output) {
+    identities = move value
+  } else {
+    run removeQuietly(&recordPath)
+    let mut recorder = run BuildInputs.recorder()
+    let mut silent = Progress.off()
+    let built = run build(sourcePath, move manifest, output, display, Form.Executable, Stage.Final, move standardLibrary, move profile, Option<usize>.none(), move bindings, request, true, false, clang, &Option<Bytes>.none(), &mut silent)
+      |> Effect.provideMut<FileSystem>(&mut recorder)
+    let catalog = match move built {
+      Compiled.Finished {status} => { return status }
+      Compiled.Tests {identities: listed} => move listed
+    }
+    if let Option<Bytes>.Some {value: stamped} = &key {
+      if BuildInputs.complete(&recorder) {
+        let executable = run Effect.result(FileSystem.readFile(output))
+        if let Result<Bytes, FileError | OutOfMemoryError>.Success {value} = &executable {
+          let payload = run testBuildPayload(Bytes.asSlice(&value), &catalog)
+          let record = run BuildInputs.encode(Bytes.asSlice(&stamped), Bytes.asSlice(&payload), &recorder)
+          // Without the record the next run builds again; it never changes this run.
+          let written = run Effect.result(FileSystem.writeFile(&recordPath, Bytes.asSlice(&record)))
+          drop written
+        }
+        drop executable
+      }
+    }
+    identities = move catalog
   }
   let digest = TestRun.catalogDigest(List<Bytes>.asSlice(&identities))
   let nonce = run testNonce(Path.rawBytes(output), &digest)
