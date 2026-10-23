@@ -292,5 +292,5 @@ test('an if used as a value explains that if is a statement', { todo: 'finding 4
   write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  let found = true\n  let first = if found { 1 } else { 2 }\n  return first\n}\n')
   const result = silk(h, ['check'], { cwd: dir })
   assert.notEqual(result.status, 0, show(result))
-  assert.match(result.stderr, /statement/, show(result))
+  assert.match(result.stderr, /`?if`? is a statement/i, show(result))
 })
