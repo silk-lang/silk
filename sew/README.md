@@ -1,7 +1,8 @@
 # sew
 
 sew is the one command people type for Silk. It owns what must behave the same in every project:
-Silk versions (`sew use`, `sew set`) and sew itself (`sew update self`). Every other command,
+Silk versions (`sew use`, `sew set`), release notes (`sew change`) and sew itself
+(`sew update self`). Every other command,
 `sew build`, `sew test`, `sew lsp` and anything sew does not know, runs unchanged in the Silk
 version the directory selects. The same program run as `silk` has no commands of its own and
 forwards everything, so editors, scripts and habit reach the pinned compiler too.
@@ -16,7 +17,12 @@ sew use which              # the version selected here, and why
 sew use uninstall 0.1.0-dev.11
 sew +0.1.0-dev.11 build    # run one command with an installed version
 sew update self            # update sew (--dev: to the newest dev release)
+sew change minor "Reads now return a future."   # record a change for the next release
 ```
+
+`sew change` also plans, cuts and queries releases (`status`, `version`, `release`, `snapshot`,
+`since`, `recover`; see `sew change --help` and the repository README). It reads the `[release]`
+table of `silk.toml`, or `[changes]`, its earlier spelling.
 
 `list`, `which`, `use` and `set` take `--json`. The commands never prompt and report progress on
 standard error. Exit statuses: 0 success, 1 failure, 2 usage or configuration error, 3 version

@@ -147,35 +147,35 @@ pub effect fn main() -> ()
 
 ## Changes and releases
 
-The native CLI includes `silk changes`, implemented in the [`changes/`](changes) Silk package.
-From a package directory:
+`sew change` records release notes and cuts releases. It is implemented in the [`changes/`](changes)
+Silk package and reads the `[release]` table of `silk.toml`. From a package directory:
 
 ```sh
-silk changes add minor "Reads now return a future." --migration "Await read()."
-silk changes status
-silk changes version --tag beta
-silk changes version
-silk changes release --json
-silk changes since 0.1.0 --json
+sew change minor "Reads now return a future." --migration "Await read()."
+sew change status
+sew change version --tag beta
+sew change version
+sew change release --json
+sew change since 0.1.0 --json
 ```
 
 Each contribution gets its own `.changes/<random>.md`, avoiding shared changelog edits in PRs.
 Migration guidance is optional, but missing guidance is reported as unknown impact. Releases
 consume pending changes, update the package version, and write authoritative
 `.changes/releases/<version>.toml` records. `CHANGELOG.md` is regenerated from those records
-with a warning that manual edits will be overwritten. An optional `[changes].version-file`
+with a warning that manual edits will be overwritten. An optional `[release].version-file`
 generates a Silk module exposing the package's version in the same recovery transaction.
 Commit the records, changelog, manifest, generated module, and consumed-file deletions together.
 `release` checks the prepared release and exports its notes and metadata for a publisher.
 These commands do not commit, tag, publish, or access Git.
 
-`silk changes since` selects compiler upgrades from the project's `package.silk-version`.
+`sew change since` selects compiler upgrades from the project's `package.silk-version`.
 `since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
 selects an exact target. Published queries compare immutable `changes-snapshot.toml` release
 assets, including pending notes that actually shipped in a dev release—not today's open changes.
 Unchanged notes are deduplicated across dev-to-stable promotion; edited migration guidance is
 shown again as updated. `--source PATH` supports offline checkouts and snapshot files.
-See [`compiler/README.md`](compiler/README.md#native-changes) for discovery and trust settings.
+`sew change --help` lists the discovery and trust settings.
 
 The compiler uses this flow itself. A maintained draft release PR collects pending changes;
 merging it publishes stable after the native gates pass. Daily or manually triggered dev releases
@@ -365,7 +365,7 @@ The root `silk.toml` defines a native workspace containing `compiler`, `changes`
 `tomledit`. Members
 share the root `build/` directory; the root is not itself a package. Select a member explicitly
 from the root, for example `silk build --manifest-path compiler/silk.toml --stdlib stdlib` or
-`silk changes --dir compiler status`. Release operations affect one package at a time.
+`sew change --dir compiler status`. Release operations affect one package at a time.
 
 ## Contributing
 

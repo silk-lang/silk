@@ -18,20 +18,14 @@ export const roots = ['changes', 'compiler', 'sew', 'silk.toml', 'stdlib', 'toml
 export const isCompilerInput = (path) =>
   path === 'silk.toml' ||
   path === 'sew/silk.toml' ||
+  path === 'changes/silk.toml' ||
   path.startsWith('compiler/') ||
-  path.startsWith('changes/') ||
   path.startsWith('tomledit/')
-// The release archive's `bin/sew` is built from the same snapshot. Only its manifest, which the
-// workspace needs, is a compiler input.
+// The release archive's `bin/sew` is built from the same snapshot, with `changes/` as its
+// dependency. Only their manifests, which the workspace needs, are compiler inputs.
 const isSnapshotInput = (path) =>
-  isCompilerInput(path) || path.startsWith('stdlib/') || path.startsWith('sew/')
-const requiredFiles = [
-  'silk.toml',
-  'compiler/silk.toml',
-  'compiler/src/main.silk',
-  'changes/silk.toml',
-  'changes/src/Command.silk',
-]
+  isCompilerInput(path) || path.startsWith('stdlib/') || path.startsWith('sew/') || path.startsWith('changes/')
+const requiredFiles = ['silk.toml', 'compiler/silk.toml', 'compiler/src/main.silk']
 const completeClosure = (files) =>
   requiredFiles.every((required) => files.some(({ path }) => path === required)) &&
   files.some(({ path }) => path.startsWith('stdlib/'))
@@ -145,7 +139,7 @@ const validateProjection = (snapshot, sourceCommit, baseManifest, baseVersionSou
     snapshot.tag !== `v${snapshot.version}` ||
     snapshot.prerelease !== snapshot.version.split('+')[0].includes('-') ||
     snapshot.versionFile !== 'src/ReleaseVersion.silk' ||
-    !/^\[changes\][ \t]*\r?\n(?:(?!^\[)[\s\S])*?^version-file[ \t]*=[ \t]*(['"])src\/ReleaseVersion\.silk\1[ \t]*(?:#.*)?$/m.test(
+    !/^\[(?:release|changes)\][ \t]*\r?\n(?:(?!^\[)[\s\S])*?^version-file[ \t]*=[ \t]*(['"])src\/ReleaseVersion\.silk\1[ \t]*(?:#.*)?$/m.test(
       baseManifest,
     )
   )
