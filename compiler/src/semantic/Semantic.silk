@@ -2486,6 +2486,10 @@ struct Resolver {
   // source revision.
   staticReads: List<StaticReads>
   staticReadsLookup: InternIndex
+  // Per module, family selector and source revision: declaration ordinals or names a whole-module
+  // scan found, so a query asked once per type or per call does not rescan the module.
+  moduleScans: List<ModuleScan>
+  moduleScanLookup: InternIndex
   backendInstances: List<BackendInstance>
   backendInstanceLookup: InternIndex
   // Semantic applications of selected bodies; a Body key's member is one plus this index.
@@ -18111,19 +18115,37 @@ effect fn resolveInherentMembers(
   // Only this module can declare the owner's inherent members; a rejected head publishes none.
   let mut writtenImplementations = List<usize>.make()
   let answer = run observedSource(&mut resolver.*, &module, SourceSelector.Inherents)
+  let mut fresh = Option<ModuleScan>.none()
   if let Option<&IndexedSource>.Some {value} = move sourceOf(&resolver.*, &answer, &module) {
     let index = IndexedSource.moduleIndex(value)
-    let declarations = ModuleIndex.listDeclarations(index)
-    let hir = IndexedSource.authored(value)
-    let mut at = ModuleIndex.firstEnclosed(index, usize.MAX)
-    while at != usize.MAX {
-      if isImplementationHeader(hir, &declarations[at]) && !isConformanceHeader(hir, &declarations[at])
-        && topLevel(&declarations[at]) {
-        run List<usize>.append(&mut writtenImplementations, at)
+    let revision = ModuleIndex.sourceRevision(index)
+    // Every owner of the module asks this; the module's inherent heads are scanned once per revision.
+    let known = cachedScan(&resolver.*, key.module, ModuleScanKind.InherentImplementations, revision)
+    if known != usize.MAX {
+      let found = List<usize>.asSlice(&List<ModuleScan>.asSlice(&resolver.moduleScans)[known].ordinals)
+      let mut at = usize.ZERO
+      while at < found.length {
+        run List<usize>.append(&mut writtenImplementations, found[at])
+        at = at + usize.ONE
       }
-      at = ModuleIndex.nextEnclosed(index, at)
+    } else {
+      let declarations = ModuleIndex.listDeclarations(index)
+      let hir = IndexedSource.authored(value)
+      let mut scanned = List<usize>.make()
+      let mut at = ModuleIndex.firstEnclosed(index, usize.MAX)
+      while at != usize.MAX {
+        if isImplementationHeader(hir, &declarations[at]) && !isConformanceHeader(hir, &declarations[at])
+          && topLevel(&declarations[at]) {
+          run List<usize>.append(&mut writtenImplementations, at)
+          run List<usize>.append(&mut scanned, at)
+        }
+        at = ModuleIndex.nextEnclosed(index, at)
+      }
+      fresh = Option<ModuleScan>.some(ModuleScan {module: key.module, kind: ModuleScanKind.InherentImplementations,
+        revision: revision, ordinals: move scanned, names: List<Bytes>.make()})
     }
   }
+  if let Option<ModuleScan>.Some {value: entry} = move fresh { run recordScan(&mut resolver.*, move entry) }
   drop answer
   let selectedImplementations = run selectedDeclarations(
     &mut resolver.*, &mut owner.*, &mut dependencies, &module, List<usize>.asSlice(&writtenImplementations),
@@ -21240,9 +21262,11 @@ effect fn dropHookWritten(
   let listed = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, listKey, span)
   let failed = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&listed, answerCause)
   if let Option<Shared<Rejection>>.Some {value} = move failed { return Result<bool, Shared<Rejection>>.failResult(move value) }
-  let count = Shared<Result<Answer, NoRejection>>.with<usize>(&listed, implementationCount)
-  let mut at = usize.ZERO
-  while at < count {
+  // Only heads whose provider is `identity` can be its hook.
+  let ownerHash = DeclarationId.hash(identity)
+  let mut at = Shared<Result<Answer, NoRejection>>.with<usize>(&listed,
+    fn(answer: &Result<Answer, NoRejection>) -> usize { return firstOwnedHead(answer, ownerHash) })
+  while at != usize.MAX {
     let candidate = Shared<Result<Answer, NoRejection>>.with<Option<Shared<ImplementationHead>>>(
       &listed, fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<ImplementationHead>> {
         return implementationAt(answer, at)
@@ -21253,7 +21277,8 @@ effect fn dropHookWritten(
         return Result<bool, Shared<Rejection>>.succeed(true)
       }
     }
-    at = at + usize.ONE
+    at = Shared<Result<Answer, NoRejection>>.with<usize>(&listed,
+      fn(answer: &Result<Answer, NoRejection>) -> usize { return nextOwnedHead(answer, at) })
   }
   return Result<bool, Shared<Rejection>>.succeed(false)
 }
@@ -27613,6 +27638,9 @@ effect fn environmentShortenedBinders(
     Option<SignatureFacts>.Some {value} => move value
     Option<SignatureFacts>.None => { return () }
   }
+  // Collecting the offered loans reads every borrow of the body, so it waits until some binder
+  // could take them.
+  if !run anyEnvironmentCandidate(signature, fresh, List<Binding>.asSlice(&inferred.*), explicit) { return () }
   let mut offered = List<Shared<Lifetime>>.make()
   let mut argument = usize.ZERO
   while argument < arguments.length {
@@ -27656,6 +27684,31 @@ effect fn environmentShortenedBinders(
     at = at + usize.ONE
   }
   return ()
+}
+
+// Whether any inferred binder passes the shape checks `environmentShortenedBinders` makes before
+// it consults the body: the call's own binder, defaulted to static, not written, and an
+// environment binder of the signature.
+effect fn anyEnvironmentCandidate(signature: &Shared<Result<Answer, NoRejection>>, fresh: &DeclarationId,
+  bindings: &[Binding], explicit: &[usize]) -> bool ! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < bindings.length {
+    let ordinal = bindings[at].ordinal
+    let own = Shared<DeclarationId>.with<bool>(&bindings[at].declaration, fn(declared: &DeclarationId) -> bool {
+      return DeclarationId.equals(declared, fresh)
+    })
+    let defaulted = match &bindings[at].value {
+      Argument.Lifetime {value} => Shared<Lifetime>.with<bool>(&value, staticLifetime)
+      _ => false
+    }
+    if own && defaulted && !fixedOrdinal(explicit, ordinal)
+      && Shared<Result<Answer, NoRejection>>.with<bool>(signature,
+        fn(answer: &Result<Answer, NoRejection>) -> bool { return signatureEnvironmentBinder(answer, ordinal) }) {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
 }
 
 // Appends each region of `ty` lent only by borrows of storage the caller's body owns
@@ -75826,38 +75879,94 @@ effect fn appendInterfaceNames(
   names: &mut List<VisibleName>,
 ) -> () ! Cycle | OutOfMemoryError ? &mut Allocator {
   let answer = run observedSource(&mut resolver.*, module, SourceSelector.VisibleNames {namespaces: false, external: external})
+  let mut scanKind = ModuleScanKind.InterfaceNames
+  if external { scanKind = ModuleScanKind.ExternalInterfaceNames }
+  let mut fresh = Option<ModuleScan>.none()
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &answer, module) {
     let index = IndexedSource.moduleIndex(indexed)
-    let candidates = ModuleIndex.listCandidates(index)
-    let declarations = ModuleIndex.listDeclarations(index)
-    let hir = IndexedSource.authored(indexed)
-    let mut at = usize.ZERO
-    while at < candidates.length {
-      let candidate = &candidates[at]
-      if (!external || candidate.isPublic) && candidate.kind != CandidateKind.ImportModule {
-        let mut possible = candidate.kind == CandidateKind.ImportMember
-        if candidate.kind == CandidateKind.Declaration && candidate.declaration < declarations.length {
-          if let Node.InterfaceHeader {..} = Module.node(
-            hir,
-            declarations[candidate.declaration].header,
-          ) {
-            possible = true
+    let revision = ModuleIndex.sourceRevision(index)
+    let known = cachedScan(&resolver.*, moduleOrdinal, scanKind, revision)
+    if known != usize.MAX {
+      let found = List<Bytes>.asSlice(&List<ModuleScan>.asSlice(&resolver.moduleScans)[known].names)
+      let mut at = usize.ZERO
+      while at < found.length {
+        run List<VisibleName>.append(&mut names.*,
+          VisibleName {module: moduleOrdinal, name: run Bytes.copy(Bytes.asSlice(&found[at])), external: external})
+        at = at + usize.ONE
+      }
+    } else {
+      let candidates = ModuleIndex.listCandidates(index)
+      let declarations = ModuleIndex.listDeclarations(index)
+      let hir = IndexedSource.authored(indexed)
+      let mut scanned = List<Bytes>.make()
+      let mut at = usize.ZERO
+      while at < candidates.length {
+        let candidate = &candidates[at]
+        if (!external || candidate.isPublic) && candidate.kind != CandidateKind.ImportModule {
+          let mut possible = candidate.kind == CandidateKind.ImportMember
+          if candidate.kind == CandidateKind.Declaration && candidate.declaration < declarations.length {
+            if let Node.InterfaceHeader {..} = Module.node(
+              hir,
+              declarations[candidate.declaration].header,
+            ) {
+              possible = true
+            }
+          }
+          if possible {
+            run List<VisibleName>.append(
+              &mut names.*,
+              VisibleName {
+                module: moduleOrdinal,
+                name: run Bytes.copy(Bytes.asSlice(&candidate.name)),
+                external: external,
+              },
+            )
+            run List<Bytes>.append(&mut scanned, run Bytes.copy(Bytes.asSlice(&candidate.name)))
           }
         }
-        if possible {
-          run List<VisibleName>.append(
-            &mut names.*,
-            VisibleName {
-              module: moduleOrdinal,
-              name: run Bytes.copy(Bytes.asSlice(&candidate.name)),
-              external: external,
-            },
-          )
-        }
+        at = at + usize.ONE
       }
-      at = at + usize.ONE
+      fresh = Option<ModuleScan>.some(ModuleScan {module: moduleOrdinal, kind: scanKind, revision: revision,
+        ordinals: List<usize>.make(), names: move scanned})
     }
   }
+  if let Option<ModuleScan>.Some {value: entry} = move fresh { run recordScan(&mut resolver.*, move entry) }
+  return ()
+}
+
+// What one whole-module scan found, valid for the source revision it read.
+struct ModuleScan {
+  module: usize
+  kind: ModuleScanKind
+  revision: usize
+  ordinals: List<usize>
+  names: List<Bytes>
+}
+
+enum ModuleScanKind { InterfaceNames, ExternalInterfaceNames, InherentImplementations }
+
+fn scanKey(module: usize, kind: ModuleScanKind) -> u64 {
+  let mut tag: usize = 0
+  if kind == ModuleScanKind.ExternalInterfaceNames { tag = 1 }
+  if kind == ModuleScanKind.InherentImplementations { tag = 2 }
+  return headerKey(module, tag)
+}
+
+// The cached scan of `kind` over `module` read from `revision`, or `usize.MAX`.
+fn cachedScan(resolver: &Resolver, module: usize, kind: ModuleScanKind, revision: usize) -> usize {
+  let cached = List<ModuleScan>.asSlice(&resolver.moduleScans)
+  let mut at = InternIndex.first(&resolver.moduleScanLookup, scanKey(module, kind))
+  while at != usize.MAX {
+    if cached[at].module == module && cached[at].kind == kind && cached[at].revision == revision { return at }
+    at = InternIndex.after(&resolver.moduleScanLookup, at)
+  }
+  return usize.MAX
+}
+
+effect fn recordScan(resolver: &mut Resolver, entry: ModuleScan) -> () ! OutOfMemoryError ? &mut Allocator {
+  let key = scanKey(entry.module, entry.kind)
+  run List<ModuleScan>.append(&mut resolver.moduleScans, move entry)
+  run InternIndex.record(&mut resolver.moduleScanLookup, key)
   return ()
 }
 
@@ -80125,6 +80234,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       headerFingerprintLookup: InternIndex.make(),
       staticReads: List<StaticReads>.make(),
       staticReadsLookup: InternIndex.make(),
+      moduleScans: List<ModuleScan>.make(),
+      moduleScanLookup: InternIndex.make(),
       backendInstances: List<BackendInstance>.make(),
       backendInstanceLookup: InternIndex.make(),
       originPlans: List<CallableOrigin.Plan>.make(),
