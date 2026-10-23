@@ -1,6 +1,6 @@
 // One prebuilt native compiler exercises its private request/build routes together.
 import { strict as assert } from 'node:assert'
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -2058,6 +2058,35 @@ const program = Effect.gen(function* () {
   )
   assert.equal(dangling.status, 1, dangling.stderr)
   assert.match(dangling.stderr, /^silk: cannot read \S+\/app\/src\/gone\.silk$/m)
+  // Two commands that build one package at once keep their intermediate files apart, and the
+  // run finds a whole executable however the other command's link is going.
+  const together = join(directory, 'together')
+  yield* fs.makeDirectory(join(together, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(together, 'silk.toml'),
+    '[package]\nname = "together"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(join(together, 'src/main.silk'), 'pub fn main() -> i32 { return 5 }\n')
+  const started = (args: ReadonlyArray<string>) =>
+    new Promise<{ status: number | null; stderr: string }>((settle) => {
+      const child = spawn(silk, [...args, '--stdlib', standardLibrary], {
+        cwd: together,
+        env: { ...process.env, SILK_CLANG: clang },
+      })
+      let stderr = ''
+      child.stderr.on('data', (chunk) => (stderr += chunk))
+      child.on('close', (status) => settle({ status, stderr }))
+    })
+  for (let round = 0; round < 4; round += 1) {
+    yield* fs.remove(join(together, 'build'), { recursive: true, force: true })
+    const [built, ran] = yield* Effect.promise(() =>
+      Promise.all([started(['build']), started(['run', '--quiet'])]),
+    )
+    assert.equal(built.status, 0, built.stderr)
+    assert.equal(ran.status, 5, ran.stderr)
+  }
+  const leftover = yield* fs.readDirectory(join(together, 'build/llvm', hostTarget, 'debug'))
+  assert.deepEqual(leftover.filter((name) => name.startsWith('.silk-')), [])
   // An object form needs no `main` and no runtime: the application's C exports are its roots.
   const library = join(directory, 'library')
   yield* fs.makeDirectory(join(library, 'src'), { recursive: true })
