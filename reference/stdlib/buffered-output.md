@@ -56,12 +56,6 @@ impl Writer for CountingWriter {
     ? &mut Writer {
     return ()
   }
-
-  effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> ()
-    ! WriterError
-    ? &mut Writer {
-    return run Writer.writeEach(&mut self, vals)
-  }
 }
 
 pub effect fn main() -> i32
