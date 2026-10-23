@@ -89,6 +89,33 @@ pub fn make(fd: i32, byteLimit: usize, frameLimit: usize) -> NativeReport
 Returns a report that writes to `fd`, with at most `byteLimit` bytes and `frameLimit` caller
 frames. It does not allocate.
 
+<a id="NativeReport.impl.indented"></a>
+
+### Associated function `indented`
+
+```silk
+pub fn indented(fd: i32, byteLimit: usize, frameLimit: usize, indent: string<'static>) -> NativeReport
+```
+
+Returns a report like [`NativeReport.make`](#NativeReport.impl.make) that starts each line with `indent`. The
+indent counts toward the byte limit.
+
+#### When to use
+Use it to nest a report under other output, such as a failed test under the test's name.
+
+<a id="NativeReport.impl.restart"></a>
+
+### Method `restart`
+
+```silk
+pub fn restart(self: &mut Self) -> ()
+```
+
+Starts a new report on the same descriptor, with the full byte and frame limits again.
+
+#### When to use
+Use it when one report writer serves several reports, such as one for each failed test.
+
 <a id="NativeReport.impl.unhandled"></a>
 
 ### Method `unhandled`
