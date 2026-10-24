@@ -940,7 +940,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(directory, 'staticspec/silk.toml'), '[workspace]\nmembers = ["app", "spec"]\n')
   yield* fs.writeFileString(
     join(directory, 'staticspec/spec/silk.toml'),
-    '[package]\nname = "spec"\nversion = "0.1.0"\nsource-root = "."\nexports = ["sized"]\n',
+    '[package]\nname = "spec"\nversion = "0.1.0"\nsource = "."\nexports = ["sized"]\n',
   )
   yield* fs.writeFileString(
     join(directory, 'staticspec/spec/sized.silk'),
@@ -948,7 +948,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'staticspec/app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nspec = { path = "../spec" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nspec = { path = "../spec" }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'staticspec/app/src/main.silk'),
@@ -970,7 +970,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'unclosed/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unclosed/silk.toml'),
-    '[package]\nname = "unclosed"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "unclosed"\nversion = "0.1.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'unclosed/src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n')
   const unclosed = yield* invoke(
