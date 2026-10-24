@@ -45,12 +45,12 @@ const fixture = Effect.fnUntraced(function* () {
   yield* put('silk.toml', '[workspace]\nmembers = ["compiler", "tomledit"]\noutput-dir = "build"\n')
   yield* put(
     'tomledit/silk.toml',
-    '[package]\nname = "tomledit"\nversion = "0.1.0"\nroot = "src/Command.silk"\n',
+    '[package]\nname = "tomledit"\nversion = "0.1.0"\nmain = "Command.silk"\n',
   )
   yield* put('tomledit/src/Command.silk', 'pub fn value() -> i32 { return 2 }\n')
   yield* put(
     'compiler/silk.toml',
-    '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\ntomledit = { path = "../tomledit" }\n\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
+    '[package]\nname = "silk-compiler"\nversion = "0.1.0"\nmain = "main.silk"\n\n[dependencies]\ntomledit = { path = "../tomledit" }\n\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
   )
   yield* put('compiler/src/main.silk', main)
   yield* put(
@@ -61,7 +61,7 @@ const fixture = Effect.fnUntraced(function* () {
   yield* put('stdlib/silk/i32.silk', 'pub let ZERO = 0\n')
   yield* put(
     'tool/silk.toml',
-    '[package]\nname = "silk-tool"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "silk-tool"\nversion = "0.1.0"\n',
   )
   yield* put(
     'tool/src/ReleaseVersion.silk',
@@ -256,7 +256,7 @@ it.effect(
         { prerelease: false },
         { versionFile: '../changes/src/Command.silk' },
         { versionFile: 'src/main.silk' },
-        { manifest: native.manifest.replace('src/main.silk', 'src/other.silk') },
+        { manifest: native.manifest.replace('main = "main.silk"', 'main = "other.silk"') },
         { versionSource: `${native.versionSource}// extra source\n` },
         { toml: native.toml.replace(f.revision, 'f'.repeat(40)) },
         { toml: native.toml.replace('kind = "dev"', 'kind = "stable"') },

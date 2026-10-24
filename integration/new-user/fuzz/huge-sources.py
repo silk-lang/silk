@@ -46,7 +46,7 @@ for n in (50, 100, 150):
 for name, data in cases.items():
     if only and name not in only: continue
     d=os.path.join(W,name); shutil.rmtree(d, ignore_errors=True); os.makedirs(d+'/src')
-    open(d+'/silk.toml','w').write('[package]\nname = "h"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
+    open(d+'/silk.toml','w').write('[package]\nname = "h"\nversion = "0.1.0"\n')
     open(d+'/src/main.silk','wb').write(data)
     t=time.time()
     try:
