@@ -12,12 +12,16 @@ complete profile additionally contains every resolved package parameter and its 
 complete, validated profile can enter ordinary specialization or backend work. Failed bootstrap
 returns diagnostics and publishes no partial profile.
 
-The four initial canonical targets are `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
-`aarch64-unknown-linux-gnu` and `wasm32-unknown-unknown`. Each has a versioned machine description
+The canonical targets are `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `wasm32-unknown-unknown`, `wasm32-wasip1`, and `wasm32-wasip2`. Each has a versioned machine description
 with architecture, operating system, ABI, object format, endianness, primitive widths and
 alignments, address spaces, stack alignment, supported CPU features and toolchain class. Target
 selection is independent of the host. Only an application edge can explicitly supply host facts
 when neither a request nor a selected project profile names a target.
+
+The WASI command targets use `libc = "none"`, static linking and relocation, and single threading.
+Preview 2 final executables are components; intermediate artifacts use the WebAssembly core ABI.
+See [WASI targets](wasi.md) for the command runtime and host-tool requirements.
 
 The profile separates these domains:
 
@@ -174,7 +178,7 @@ The sealed `Intrinsic` namespace exposes static-only `targetArchitecture`, `targ
 `targetPointerBits` and `targetPointerAlignment` return `u32`. Individual logical build domains are
 queried through static-only `profileText(key: string) -> string`, `profileFlag(key: string) -> bool`
 and `profileContains(key: string, value: string) -> bool`. Keys are closed compiler-owned domain
-names: text keys are `cpu`, `deployment`, `libc`, `artifact`, `entry-kind`, `entry-name`, `link`, `code-model`,
+names: text keys are `target` (the canonical target name), `cpu`, `deployment`, `libc`, `artifact`, `entry-kind`, `entry-name`, `link`, `code-model`,
 `relocation`, `optimization`, `safety`, `threading`, `unwind`, `runtime-kind`, `runtime-name`; flag key is `debug`;
 set keys are `cpu-features` and `sanitizers`. Invalid keys are structured static diagnostics.
 Ordinary Silk wrappers own nominal domain enums and ergonomic operations. Package parameters are

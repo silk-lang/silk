@@ -40,7 +40,12 @@ The standalone WebAssembly default is `silk/wasm_start`. Its C export is `main()
 Execution and accepts integer, unit, or requirement-free Effect-unit results. It installs no native
 host-input provider or diagnostic reporter and publishes no `silk_main` adapter.
 
-Both source runtimes require a NonParking application body. Nested transfers complete inside their
+The WASI command default is `silk/wasi_start`. Its `_start() -> ()` export owns an Execution and
+accepts integer, unit, or Effects producing either result, with no requirements or one mutable
+HostInput requirement. It supplies an owned snapshot of WASI arguments and environment, finishes
+cleanup, then exits through WASI. See [WASI targets](wasi.md).
+
+These source runtimes require a NonParking application body. Nested transfers complete inside their
 Execution; external parking requires a custom source runtime with an explicit scheduling policy.
 An unexpected suspended completion is handled as a startup failure rather than silently completing.
 
@@ -58,6 +63,7 @@ Unhandled typed failure and startup failure return status one. Unit and Effect s
 an ordinary integer result is the returned status.
 
 Standalone Wasm drops an unhandled typed-failure payload and returns one without host reporting.
+WASI startup follows the same failure policy and passes status one to the host's exit operation.
 Fatal traps remain abnormal termination and promise no cleanup; without a lexical source observer,
 Wasm retains bare machine traps. A custom source composition may define its own status and reporting
 policy using the same ordinary Effect, ownership, observer, and foreign-boundary operations.
@@ -75,6 +81,9 @@ resolve remaining requirements through ordinary source providers, or select a cu
 source performs the required composition. Standalone Wasm defaults require a closed application
 Effect and do not provide native services.
 
+WASI default startup supplies HostInput. Filesystem, stream, clock, and random services use explicit
+WASI providers; access remains subject to the capabilities granted by the host.
+
 Runtime-none and library artifacts may retain ordinary functions with their own signatures; they
 have no implicit application execution or entry-result conversion. Foreign export contracts still
 apply independently at the C boundary.
@@ -91,6 +100,10 @@ multi-threaded profile instead imports a shared memory and also exports `wasi_th
 (THREAD-009 in [thread properties](thread-properties.md)). Raw Linux startup instead selects its
 source `_start`, reads the validated initial stack, calls the application, and terminates through
 the kernel; see [raw Linux](raw-linux.md).
+
+WASI Preview 1 exports `_start` and imports `wasi_snapshot_preview1` operations. Preview 2 links
+that core ABI with the standard command adapter into a component exporting `wasi:cli/run`.
+The adapter and application share the core module's allocator through `cabi_realloc`.
 
 Custom runtimes define their own C exports and loader entry according to the selected artifact and
 target contracts. The compiler preserves those exports and validates their ABI, while source calls

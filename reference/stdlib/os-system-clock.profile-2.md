@@ -15,7 +15,7 @@ Each call reads the real-time clock of the system. A failure of the clock is a t
 - This clock can go back when the system time is set. Use `silk.os_monotonic_clock` to measure
   durations.
 - On Linux, it needs glibc 2.17 or later.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The provider exists on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 ## Examples
 ### Read the time

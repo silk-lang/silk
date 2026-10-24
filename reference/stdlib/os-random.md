@@ -9,15 +9,14 @@ Provide [`OsRandom`](#OsRandom) for `Random` in a native program, for keys, nonc
 test, provide a fake that returns fixed bytes.
 
 ## Details
-Each fill gets bytes from the secure random source of the system: `getrandom` on Linux and
-`arc4random_buf` on macOS. An empty buffer does nothing.
+Each fill gets bytes from the secure random source of the system: `random_get` on WASI,
+`getrandom` on Linux, and `arc4random_buf` on macOS. An empty buffer does nothing.
 
 ## Gotchas
 - A failure of the source is a trap, because weak bytes are not safe. Part of the buffer can be
   changed before the trap.
 - On Linux, it needs glibc 2.25 and Linux 3.17 or later.
-- [`OsRandom.make`](#OsRandom.impl.make) fails to compile on targets other than Darwin on aarch64, and Linux with GNU
-  libc on x86_64 or aarch64.
+- [`OsRandom.make`](#OsRandom.impl.make) fails to compile on targets other than WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 ## Examples
 ### Make a random key
@@ -58,7 +57,7 @@ pub struct OsRandom
 The native `Random` provider: secure random bytes from the operating system. It has no state.
 
 ### Details
-Each fill gets bytes from `getrandom` on Linux and `arc4random_buf` on macOS. An empty buffer
+Each fill gets bytes from `random_get` on WASI, `getrandom` on Linux, and `arc4random_buf` on macOS. An empty buffer
 does nothing.
 
 ### Gotchas
@@ -103,4 +102,4 @@ effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> ()
 
 Category: Native platform.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
