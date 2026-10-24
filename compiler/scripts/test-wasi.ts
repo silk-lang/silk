@@ -122,7 +122,7 @@ const program = Effect.gen(function* () {
     assert.match(tested.stdout.toString(), /2 passed, 0 failed/)
     yield* fs.writeFileString(
       join(directory, 'main.silk'),
-      'pub fn main() -> () {}\ntest fn timesOut() -> () { while true {} }\ntest fn traps() -> () { let bad = 1 / 0 }\ntest fn zAfterTrap() -> () {}\n',
+      'pub fn main() -> () {}\ntest fn timesOut() -> () { while true {} }\ntest fn traps() -> () { Intrinsic.trap("WASI test trap") }\ntest fn zAfterTrap() -> () {}\n',
     )
     const trapped = yield* invoke(compiler, [
       'test',

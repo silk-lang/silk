@@ -82,6 +82,27 @@ writes for the shared one. A handle that owns storage through a raw pointer pass
 anchor, so `Arc.get` and `MutexGuard.getMut` return references that cannot outlive the handle or
 the lock.
 
+## Stack frames and stack storage
+
+`Intrinsic.frameAddress() -> [*]const u8` is the safe runtime observation of the running function's
+stack frame. On native targets it is the machine frame address; on `wasm32` it is the frame in the
+linear-memory stack, and a function that keeps nothing in linear memory shares its caller's address.
+Every supported stack grows down, so each frame of a still-running caller is at the same or a
+higher address. The result is valid for comparison and for unsafe reads only while that frame is
+live. Inlining can place the call in its caller's frame. `Stack.frameAddress` exposes it.
+
+`Intrinsic.stackAllocate<T>(count: usize) -> [*]mut T` is the unsafe dynamic stack allocation. The
+storage holds `count` uninitialized elements of `T` at its natural alignment and stays valid until
+the running function returns. A frame-based instance releases it at a suspension too, so it must not
+be used across one. A byte count that does not fit `usize` traps with `arithmetic overflow`. The
+caller proves that the storage fits the stack that the running thread has left; storage past the
+end of the stack is undefined behavior, not a stack-overflow trap. Values written to the storage
+are never dropped. Repeated calls in one function keep growing its frame, so a loop should allocate
+through a callee that returns. `Stack.withStorage` is that callee: it passes the storage to a
+callback and releases it when the callback returns.
+
+Both are runtime operations; a static body cannot call them.
+
 ## Native output storage
 
 Ordinary source owns `Uninitialized<T>` and `Initialized<T>` output states for Copy values. Private

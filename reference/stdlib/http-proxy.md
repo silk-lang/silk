@@ -56,14 +56,14 @@ fn origin(text: string<'static>) -> Origin {
   let uri = match Uri.parse(text) {
     Result<Uri, ParseError>.Success { value } => value
     Result<Uri, ParseError>.Failure { error: _ } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return origin(text)
     }
   }
   return match Origin.fromUri(&uri) {
     Result<Origin, OriginError>.Success { value } => value
     Result<Origin, OriginError>.Failure { error: _ } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return origin(text)
     }
   }
