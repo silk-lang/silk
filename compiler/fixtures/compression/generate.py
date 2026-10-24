@@ -102,5 +102,56 @@ def lzma_cases():
     write_case('lzma-decode', source + FOOTER)
 
 
+def lzma2_cases():
+    header = HEADER.replace('import silk.lzma {Lzma}', 'import silk.lzma2 {Lzma2}').replace('Lzma.decode(input,', 'Lzma2.decode(input,').replace('move limits)', '4096, move limits)')
+    source = header
+    def packed(data):
+        return lzma.compress(data, format=lzma.FORMAT_RAW, filters=[{'id': lzma.FILTER_LZMA2, 'dict_size': 4096}])
+    cases = [(b'', 0), (b'a', 1), (b'abacabadabacaba!', 200), (bytes(range(256)), 16), (b'a', 2100000)]
+    for index, (pattern, repeat) in enumerate(cases):
+        data = pattern * repeat
+        source += f'  if !run verify({literal(packed(data))}, {literal(pattern)}, {len(data)}) {{ return {index+1} }}\n'
+    data = b'abcabcabcabcabc' + b'\0'
+    wire = packed(data * 10)
+    assert wire[0] >= 224
+    # Fresh independent models can reuse dictionary history: the preceding byte and position
+    # match the encoder's initial context (zero byte, position divisible by sixteen).
+    stored = bytes([1, 0, 15]) + bytes(16)
+    with_props = bytes([wire[0] - 32]) + wire[1:]
+    with_state = bytes([wire[0] - 64]) + wire[1:5] + wire[6:]
+    continued = wire[:-1] + with_state
+    assert lzma.decompress(continued, format=lzma.FORMAT_RAW, filters=[{'id': lzma.FILTER_LZMA2, 'dict_size': 4096}]) == data * 20
+    source += f'  if !run verify({literal(continued)}, {literal(data)}, 320) {{ return 10 }}\n'
+    source += f'  if !run verify({literal(wire[:-1] + with_props)}, {literal(data)}, 320) {{ return 11 }}\n'
+    source += f'  if !run verify({literal(wire[:-1] + wire)}, {literal(data)}, 320) {{ return 12 }}\n'
+    # Stored chunks, including a chunk without a dictionary reset.
+    source += f'  if !run verify({literal(bytes([1,0,1,65,66,2,0,1,65,66,0]))}, b"AB", 4) {{ return 13 }}\n'
+    # Stored then compressed with new properties; the prefix and decoded bytes are all zero.
+    zeros = packed(bytes(160))
+    stored_compressed = stored + bytes([zeros[0]-32]) + zeros[1:]
+    source += f'  if !run verify({literal(stored_compressed)}, b"\\x00", 176) {{ return 14 }}\n'
+    source += f'  let wire = {literal(wire)}\n'
+    source += """  let mut cut: usize = 0
+  while cut < wire.length {
+    if !run rejects(Slice.view<u8>(wire, 0, cut), DecodeLimits.make(), DecodeReason.TruncatedInput) { return 20 }
+    cut = cut + 1
+  }
+"""
+    bad = [(b'\x02\x00\x00A\0', 'InvalidData'), (b'\x03', 'InvalidData'), (with_props, 'InvalidData'),
+           (stored + with_state, 'InvalidData'), (wire[:5]+b'\xff'+wire[6:], 'InvalidHeader'),
+           (wire+b'\0', 'TrailingData'), (stored + b'\x80' + wire[1:5] + wire[6:], 'InvalidData')]
+    for index, (value, reason) in enumerate(bad):
+        source += f'  if !run rejects({literal(value)}, DecodeLimits.make(), DecodeReason.{reason}) {{ return {21+index} }}\n'
+    source += """  let mut limits = DecodeLimits.make()
+  limits.maxOutputBytes = 159
+  if !run rejects(wire, move limits, DecodeReason.OutputLimit) { return 30 }
+  let mut workspace = DecodeLimits.make()
+  workspace.maxWorkspaceBytes = 0
+  if !run rejects(wire, move workspace, DecodeReason.WorkspaceLimit) { return 31 }
+"""
+    write_case('lzma2-decode', source + FOOTER)
+
+
 if __name__ == '__main__':
     lzma_cases()
+    lzma2_cases()
