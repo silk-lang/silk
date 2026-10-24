@@ -49,6 +49,8 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | --- | --- |
 | `install.test.mjs` | `install.sh`: layout, default, reinstall, bad tag and channel |
 | `tool.test.mjs` | The silk tool: `silk use`, `use list`/`which`/`uninstall`, `silk set`, `+version`, forwarding to silkc, exit 3 and the editor message for a missing pin, `silk update` |
+| `targets.test.mjs` | Targets and profiles: `--target`, cross-target objects, release and named profiles, `cpu.features`, static linking, every refused profile field and combination, `--profile-input`, a wasm32 module under node |
+| `params.test.mjs` | Package parameters: defaults, `where`, project and profile bindings and their precedence, declaration and binding errors, `static if` on a parameter |
 | `toolchain.test.mjs` | `silk toolchain`, pins, exit 3 for a missing pin, `+version`, auto-install, `latest` and `dev` |
 | `project.test.mjs` | `silk init`, run with arguments and exit status, check, build, clean, format, `silk add` and `silk remove`, modules, runtime traps, CLI messages |
 | `testing.test.mjs` | `silk test`: passing, failing and trapping tests, `--filter` |
