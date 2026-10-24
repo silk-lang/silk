@@ -28,10 +28,10 @@ behavior, data format, build artifact, or internal representation is a compatibi
   Selfhost CI runs it too. `pnpm format` and `pnpm lint` (Oxfmt, Oxlint) are optional local
   helpers that CI no longer runs.
 - `main` is the only integration branch. A pull request merges when its required checks pass on its
-  exact head: `Focused Linux Silk`. CI never starts on a branch push: when the branch is ready,
-  merge `main` into it, push, and dispatch Selfhost CI on it as `.github/CI.md` describes. If a
-  check fails, fix the cause, push the new head, and dispatch again; report the exact failure and
-  whether it predates the change.
+  exact head: `Focused Linux Silk`. Selfhost CI runs on every push to a pull request into `main`
+  (a newer push cancels the older run); a stack head or a branch without such a PR is dispatched
+  as `.github/CI.md` describes. If a check fails, fix the cause and push the new head; report the
+  exact failure and whether it predates the change.
 - Open a draft PR as soon as there is a coherent commit, and reuse the task's PR. Run the cheapest
   relevant checks locally; do not rerun the CI-covered suite as handoff ceremony.
 - Never edit `compiler/borrow-check-gap.txt` by hand: after a corpus run, write it with
