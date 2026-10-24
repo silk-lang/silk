@@ -226,3 +226,36 @@ test('a missing package name says it is missing', { todo: 'finding 125' }, () =>
   const result = manifest('[package]\nversion = "0.1.0"\n')
   assert.match(result.stderr, /package\.name is missing|missing package\.name|needs a name/, show(result))
 })
+
+// A first test, written from the Testing page.
+const testing = 'import silk.testing { AssertionError, Testing }\n\n'
+test('a run inside a plain test fn says to make it an effect fn', { todo: 'finding 126' }, () => {
+  const result = check(`${testing}test fn adds() {\n  run Testing.expect(1 + 1 == 2, "1 + 1 is 2")\n}\n`)
+  assert.match(result.stderr, /effect fn/, show(result))
+})
+
+test('a failure row on a plain fn says to make it an effect fn', { todo: 'finding 126' }, () => {
+  const result = check(`${testing}test fn adds() -> () ! AssertionError<'static> {\n  run Testing.expect(true, "x")\n}\n`)
+  assert.match(result.stderr, /SEM0062\].*effect fn/, show(result))
+})
+
+for (const [name, source, reason] of [
+  ['a parameter', 'test fn withParam(x: i32) {\n}\n', /param/i],
+  ['a bool result', 'test fn adds() -> bool {\n  return true\n}\n', /\(\)|bool/],
+  ['a type parameter', 'test fn g<T>() {\n}\n', /type parameter|generic/i],
+]) {
+  test(`a test fn with ${name} says what a test may not have`, { todo: 'finding 126' }, () => {
+    const result = check(source)
+    const line = errors(result).find((l) => l.includes('[SEM0218]')) ?? ''
+    assert.ok(line !== '', show(result))
+    assert.match(line.replace(/^.*?\] /, ''), reason, show(result))
+  })
+}
+
+test('a failing first test names its message and line', () => {
+  const dir = initPackage(h, `beginner-${++serial}`)
+  write(join(dir, 'src/main.silk'), `${testing}fn add(a: i32, b: i32) -> i32 {\n  return a + b\n}\n\ntest effect fn adds() ! AssertionError<'static> {\n  run Testing.expect(add(2, 2) == 5, "2 + 2 is 5")\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`)
+  const result = silk(h, ['test'], { cwd: dir })
+  assert.equal(result.status, 1, show(result))
+  assert.match(result.stdout + result.stderr, /main::adds\n\s+assertion failed: 2 \+ 2 is 5\n\s+at main\.adds \(main:8:3\)\n\s+FAIL/, show(result))
+})
