@@ -23,8 +23,8 @@ rules. Generic code that uses `==` gives incorrect results if the rules are not 
 import silk.equal { Equal }
 
 struct Point {
-  x: i32
-  y: i32
+  x: i32,
+  y: i32,
 }
 
 fn samePoint(left: &Point, right: &Point) -> bool {

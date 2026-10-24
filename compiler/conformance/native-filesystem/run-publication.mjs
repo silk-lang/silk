@@ -31,7 +31,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(output, { recursive: true })
   yield* fs.writeFileString(
     path.join(output, 'silk.toml'),
-    '[package]\nname = "native-publication-conformance"\nversion = "0.1.0"\nroot = "publication-fixture.silk"\n\n[build]\nartifact = "object"\n',
+    '[package]\nname = "native-publication-conformance"\nversion = "0.1.0"\nsource = "."\nmain = "publication-fixture.silk"\nkind = "object"\n',
   )
   yield* fs.copyFile(
     path.join(directory, 'publication-fixture.silk'),

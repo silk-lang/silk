@@ -125,7 +125,7 @@ reflect over, serialize, or generically format the payload's fields.
 
 ```silk
 pub struct NotFoundError {
-  resourceId: i32
+  resourceId: i32,
 }
 ```
 
