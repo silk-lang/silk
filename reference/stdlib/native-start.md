@@ -13,11 +13,13 @@ on x86_64 or aarch64. You do not call it.
 - `i32`, the exit status.
 - `()`, for status 0.
 - An effect that returns `i32` or `()`, and that can require `&mut HostInput`. The runtime gives
-  an `OsHostInput` with the arguments and the environment of the process.
+  an `OsHostInput` with the arguments and the environment of the process. Each error of the
+  effect must implement `Debug`.
 
 Other requirements, such as `&mut Allocator`, must be provided by your code. An unhandled error
 prints a report to standard error and returns status 1. The report has at most 4096 bytes and 32
-frames.
+frames, and ends with an `unhandled value:` line that holds the error's `Debug` form, cut to
+1024 bytes.
 
 ## Gotchas
 - There is no scheduler or event loop. If `main` parks, the program fails with status 1. Make
