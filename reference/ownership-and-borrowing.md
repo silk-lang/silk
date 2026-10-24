@@ -74,8 +74,8 @@ it explicitly requests Copy conformance:
 import silk.ownership {Copy}
 
 pub struct Point {
-  pub x: i32
-  pub y: i32
+  pub x: i32,
+  pub y: i32,
 }
 
 impl Copy for Point {}
@@ -203,7 +203,7 @@ initialized siblings remain usable. Moving a Copy field explicitly also leaves a
 
 ```silk
 struct Token { kind: i32 }
-struct Envelope { token: Token code: i32 }
+struct Envelope { token: Token, code: i32 }
 
 fn take(envelope: Envelope) -> Token {
   let code = envelope.code
@@ -960,8 +960,8 @@ owned cleanup obligations of that arm.
 ```silk
 struct Payload { value: i32 }
 struct Box {
-  payload: Payload
-  code: i32
+  payload: Payload,
+  code: i32,
 }
 
 fn take(box: Box) -> Payload {

@@ -63,14 +63,16 @@ mkdir "$stage/compiler/tracy"
 "${AR:-$(dirname "$clang")/llvm-ar}" rcs "$stage/compiler/tracy/libsilk_tracy.a" \
   "$stage/compiler/tracy/silk_tracy.o" "$stage/compiler/tracy/TracyClient.o"
 
-# `[build]` is the manifest's last table, so appended keys extend it.
+# The compiler's manifest links nothing natively, so an appended `[native]` table adds Tracy.
 manifest="$stage/compiler/silk.toml"
-if [ "$(grep '^\[' "$manifest" | tail -n 1)" != '[build]' ]; then
-  echo "Expected [build] to be the last table of compiler/silk.toml" >&2
+if grep -q '^\[native\]' "$manifest"; then
+  echo "Expected compiler/silk.toml to have no [native] table" >&2
   exit 1
 fi
 {
-  echo 'native-link-inputs = ['
+  echo
+  echo '[native]'
+  echo 'link = ['
   echo '  { static-archive = "tracy/libsilk_tracy.a" },'
   for library in "${system[@]}"; do
     echo "  { library = \"$library\", mode = \"dynamic\" },"

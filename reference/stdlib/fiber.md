@@ -93,7 +93,7 @@ import silk.os_monotonic_clock { OsMonotonicClock }
 import silk.scheduler { Scheduler, TaskIdExhaustedError }
 
 struct Invalid {
-  code: i32
+  code: i32,
 }
 
 effect fn check(value: i32) -> i32

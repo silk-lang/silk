@@ -28,7 +28,7 @@ reports an error. The compiler does not use the expected result type to select a
 import silk.ops { Add }
 
 struct Meters {
-  value: i32
+  value: i32,
 }
 
 fn addMeters(left: Meters, right: Meters) -> Meters {
