@@ -904,7 +904,11 @@ const program = Effect.gen(function* () {
   const fiberRoot = (body: string) =>
     'import silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.logger { Logger, LogError }\nimport silk.monotonic_clock { MonotonicClock }\nimport silk.allocator { OutOfMemoryError }\nimport silk.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.string { String }\n\n' +
     `effect fn root<'text>(title: string<'text>) -> () ! OutOfMemoryError | TaskIdExhaustedError ? &mut Scheduler | &mut MonotonicClock {\n  ${body}\n  drop fiber\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`
-  const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp }> = [
+  // A method call that borrows its receiver names the receiver, not the method.
+  const boardRoot = (body: string) =>
+    'struct Board {\n  pub items: [i32; 2],\n  pub count: usize,\n}\n\nimpl Board {\n  fn add(self: &mut Self, value: i32) -> usize {\n    self.items[0] = value\n    return self.count\n  }\n\n  fn first(self: &Self) -> &i32 {\n    return &self.items[0]\n  }\n}\n\n' +
+    `pub fn main() -> i32 {\n  ${body}\n  return 0\n}\n`
+  const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp; errors?: number }> = [
     {
       name: 'fiberlogger',
       files: {
@@ -963,6 +967,26 @@ const program = Effect.gen(function* () {
       files: { 'main.silk': 'pub fn main() -> i32 {\n  var x = 0\n  x = x + 1\n  return x\n}\n' },
       pattern: /error\[PAR0010\] `var` is not a Silk keyword; declare a binding you reassign with `let mut`/,
     },
+    {
+      name: 'receivermut',
+      files: { 'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  drop board.add(1)') },
+      pattern: /error\[SEM0057\] `board` is not mutable; declare it with `mut`, as in `let mut board`/,
+    },
+    {
+      name: 'receiverloan',
+      files: {
+        'main.silk': boardRoot('let mut board = Board { items: [0, 0], count: 0 }\n  let first = &board.items[0]\n  drop board.add(1)\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0010\] A mutable borrow of `board` conflicts with an earlier shared borrow of it/,
+    },
+    {
+      name: 'receiverreferent',
+      files: {
+        'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  let first = board.first()\n  drop board\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0019\] `first` is used after `board`, which it borrows, ended or was replaced/,
+      errors: 2,
+    },
   ]
   for (const entry of subjects) {
     yield* fs.makeDirectory(join(directory, entry.name, 'src/geo'), { recursive: true })
@@ -976,7 +1000,7 @@ const program = Effect.gen(function* () {
     const refused = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, entry.name))
     assert.equal(refused.status, 1, refused.stderr)
     assert.match(refused.stderr, entry.pattern)
-    assert.equal(refused.stderr.match(/error\[/g)?.length, 1, refused.stderr)
+    assert.equal(refused.stderr.match(/error\[/g)?.length, entry.errors ?? 1, refused.stderr)
   }
   // A workspace member's diagnostics name their files from the workspace root, also when the
   // member is built from its own directory; `--json` keeps the absolute path.
