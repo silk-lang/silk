@@ -273,7 +273,9 @@ impl Debug for DecodeReason
 ### Operation `debug`
 
 ```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
 ```
 
 Writes the symbolic reason for a decoding failure.
@@ -291,7 +293,9 @@ impl Debug for DecodeError
 ### Operation `debug`
 
 ```silk
-effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+effect fn debug(self: &Self, formatter: &mut Formatter) -> ()
+    ! WriterError
+    ? &mut Writer
 ```
 
 Writes the failure reason and progress offsets.

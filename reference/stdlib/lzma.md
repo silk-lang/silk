@@ -42,7 +42,8 @@ impl Lzma
 
 ```silk
 pub effect fn decode(input: &[u8], output: &mut [u8], limits: DecodeLimits) -> Decoded
-  ! OutOfMemoryError | DecodeError ? &mut Allocator
+    ! OutOfMemoryError | DecodeError
+    ? &mut Allocator
 ```
 
 Decodes one 13-byte-header LZMA-alone stream into the start of `output`.
