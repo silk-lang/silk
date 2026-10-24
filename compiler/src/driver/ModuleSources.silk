@@ -1,9 +1,11 @@
 //! Demand-driven filesystem publication into immutable per-module compiler inputs.
 
 import driver.CommandPath
+import driver.ImportSummaries as Summaries {ImportSummaries, Summary as ImportSummary}
 import driver.ManifestFields
 import driver.NativeLinkInput as NativeLinkInputs {InvalidNativeLinkInput, NativeLinkInput}
 import driver.Packages as PackageSources {InvalidDependency, Packages}
+import semantic.ContentHash {ContentHash}
 import semantic.ExecutionStorage {Binding as StorageBinding, ExecutionStorage}
 import semantic.ModuleId {InvalidModulePath, ModuleId}
 import semantic.InitialProfile {Selection as RuntimeRequest}
@@ -11,6 +13,7 @@ import semantic.ModuleIndex {ModuleIndex}
 import semantic.PackageGraph {PackageGraph}
 import semantic.Retention {Root as RetentionRoot}
 import semantic.SealedOperators
+import semantic.Semantic {Semantic}
 import semantic.SourceUnit {SourceUnit}
 import semantic.SourceIndex {Event, EventKind}
 import semantic.SourceRevision {Observation, Revision}
@@ -84,6 +87,11 @@ pub struct ModuleSources {
   listings: List<Listing>,
   /// The units `preload` parsed, until `takeParsed` hands them to a store.
   parsed: List<SourceUnit>,
+  // The imports of files read before, which spare `preload` the parse of an unchanged file.
+  summaries: Option<ImportSummaries>,
+  // The modules the last load read and found to declare no foreign claim, for a store's
+  // `offerClaimFree`.
+  claimFree: List<ModuleId>,
 }
 
 /// The existing filesystem provider selected for one canonical source request.
@@ -858,6 +866,8 @@ effect fn assemble(source: &Path, located: PackageRoot, standardLibrary: Option<
     revision: move revision,
     attempted: move attempted,
     parsed: List<SourceUnit>.make(),
+    summaries: Option<ImportSummaries>.none(),
+    claimFree: List<ModuleId>.make(),
     listings: List<Listing>.make(),
   }
 }
@@ -1262,6 +1272,13 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
     Option<Bytes>.Some {value} => run SealedOperators.members(Bytes.asSlice(&value))
     Option<Bytes>.None => List<Bytes>.make()
   }
+  if let Option<ImportSummaries>.Some {value: summaries} = &mut self.summaries {
+    let catalog = match &sealedContent {
+      Option<Bytes>.Some {value} => ContentHash.of(Bytes.asSlice(&value))
+      Option<Bytes>.None => ContentHash {high: 0, low: 0}
+    }
+    Summaries.selectCatalog(&mut summaries, catalog)
+  }
   let mut pending = List<ModuleId>.make()
   let mut at = usize.ZERO
   while at < roots.length {
@@ -1271,6 +1288,7 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
   // Only the latest load's units wait for a store, so a caller that never takes them holds one
   // program's parse at most.
   List<SourceUnit>.clear(&mut self.parsed)
+  List<ModuleId>.clear(&mut self.claimFree)
   let mut scanned = List<ModuleId>.make()
   while List<ModuleId>.length(&pending) > usize.ZERO {
     let module = List<ModuleId>.remove(&mut pending, usize.ZERO)
@@ -1278,14 +1296,24 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
     run List<ModuleId>.append(&mut scanned, ModuleId.copy(&module))
     let content = run publish(&mut self.*, &module, &sealedContent)
     if let Option<Bytes>.Some {value: bytes} = move content {
-      let unit = run SourceUnit.parse(&module, Revision.revisionNumber(&self.revision), move bytes)
-      if SealedOperators.referenced(&unit.syntax, List<Bytes>.asSlice(&sealedNames)) {
+      // A file whose bytes a summary names writes the imports it wrote then, and the store parses
+      // it when it first reads it.
+      let mut digest = ContentHash {high: 0, low: 0}
+      let mut found = Option<ImportSummary>.none()
+      if let Option<ImportSummaries>.Some {value: summaries} = &mut self.summaries {
+        digest = ContentHash.of(Bytes.asSlice(&bytes))
+        found = run Summaries.find(&mut summaries, digest)
+      }
+      let summary = match move found {
+        Option<ImportSummary>.Some {value} => move value
+        Option<ImportSummary>.None => run parsedSummary(&mut self.*, &module, move bytes, digest, List<Bytes>.asSlice(&sealedNames))
+      }
+      if !summary.claims { run List<ModuleId>.append(&mut self.claimFree, ModuleId.copy(&module)) }
+      if summary.sealed {
         // The path is fixed and compiler-owned; sourceLocation never consults the project tree.
         run List<ModuleId>.append(&mut pending, run PackageGraph.target(&self.graph, &module, SealedOperators.path()))
       }
-      let index = run ModuleIndex.build(&unit, false)
-      let paths = run ModuleIndex.importPaths(&index, &unit)
-      let written = List<Bytes>.asSlice(&paths)
+      let written = List<Bytes>.asSlice(&summary.paths)
       let mut pathAt = usize.ZERO
       while pathAt < written.length {
         if SealedOperators.isPath(Bytes.asSlice(&written[pathAt])) {
@@ -1304,10 +1332,45 @@ pub effect fn preload(self: &mut ModuleSources, roots: &[ModuleId]) -> ()
         }
         pathAt = pathAt + usize.ONE
       }
-      run List<SourceUnit>.append(&mut self.parsed, move unit)
     }
   }
   return ()
+}
+
+// Parses `module`'s `bytes` for `preload`, which hands the unit to the store, and records the
+// imports it writes. A file with a diagnostic is parsed on every load, so its syntax errors are
+// reported whether or not anything else reads it.
+effect fn parsedSummary(self: &mut ModuleSources, module: &ModuleId, bytes: Bytes, digest: ContentHash, sealedNames: &[Bytes])
+  -> ImportSummary ! OutOfMemoryError ? &mut Allocator {
+  let unit = run SourceUnit.parse(module, Revision.revisionNumber(&self.revision), move bytes)
+  let sealed = SealedOperators.referenced(&unit.syntax, sealedNames)
+  let index = run ModuleIndex.build(&unit, false)
+  let paths = run ModuleIndex.importPaths(&index, &unit)
+  let claims = Semantic.claimsForeignSymbols(&unit.authored, &index)
+  if let Option<ImportSummaries>.Some {value: summaries} = &mut self.summaries {
+    if SourceUnit.diagnosticCount(&unit) == usize.ZERO {
+      run Summaries.add(&mut summaries, digest, sealed, claims, List<Bytes>.asSlice(&paths))
+    }
+  }
+  run List<SourceUnit>.append(&mut self.parsed, move unit)
+  return ImportSummary {digest: digest, sealed: sealed, claims: claims, paths: move paths}
+}
+
+/// Lets `preload` take a file's imports from `summaries` instead of parsing it, and record the
+/// imports of each file it parses there.
+pub fn useSummaries(self: &mut ModuleSources, summaries: ImportSummaries) -> () {
+  self.summaries = Option<ImportSummaries>.some(move summaries)
+}
+
+/// Takes the summaries [`useSummaries`] gave, with what the last load recorded.
+pub fn takeSummaries(self: &mut ModuleSources) -> Option<ImportSummaries> {
+  return Intrinsic.replace(self.summaries, Option<ImportSummaries>.none())
+}
+
+/// Takes the modules the last load found to declare no foreign claim, for a store's
+/// `offerClaimFree`.
+pub fn takeClaimFree(self: &mut ModuleSources) -> List<ModuleId> {
+  return Intrinsic.replace(self.claimFree, List<ModuleId>.make())
 }
 
 /// Takes the units `preload` parsed, for a store's `offerParsed`.
