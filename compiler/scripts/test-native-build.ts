@@ -1047,6 +1047,8 @@ const program = Effect.gen(function* () {
     yield* fs.exists(join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested')),
     true,
   )
+  const runnerRecord = join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested.inputs')
+  const firstRecord = yield* fs.readFile(runnerRecord)
   // No test result is stored yet, so a plain `silk test` runs every selected test.
   const failedTests = yield* invoke(
     silk,
@@ -1055,6 +1057,9 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(failedTests.status, 1, failedTests.stderr)
+  // The first build's record already describes the unchanged project, so this run reused its
+  // runner and left the record as it was.
+  assert.deepEqual(yield* fs.readFile(runnerRecord), firstRecord, 'the second test run reuses the runner')
   // A test that traps fails with its report under its name, and the tests after it still run.
   assert.match(
     failedTests.stdout,
