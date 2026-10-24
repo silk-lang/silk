@@ -13,25 +13,19 @@ import { isVersion } from './SemVer.mjs'
 
 export class SourceSnapshotError extends Data.TaggedError('SourceSnapshotError') {}
 const invalid = (message) => Effect.fail(new SourceSnapshotError({ message }))
-export const roots = ['changes', 'compiler', 'sew', 'silk.toml', 'stdlib', 'tomledit']
+export const roots = ['changes', 'compiler', 'silk.toml', 'stdlib', 'tomledit', 'tool']
 /** The compiler package, its source dependencies, and their workspace configuration. */
 export const isCompilerInput = (path) =>
   path === 'silk.toml' ||
-  path === 'sew/silk.toml' ||
+  path === 'tool/silk.toml' ||
+  path === 'changes/silk.toml' ||
   path.startsWith('compiler/') ||
-  path.startsWith('changes/') ||
   path.startsWith('tomledit/')
-// The release archive's `bin/sew` is built from the same snapshot. Only its manifest, which the
-// workspace needs, is a compiler input.
+// The release archive's `bin/silk`, the silk tool, is built from the same snapshot, with `changes/` as its
+// dependency. Only their manifests, which the workspace needs, are compiler inputs.
 const isSnapshotInput = (path) =>
-  isCompilerInput(path) || path.startsWith('stdlib/') || path.startsWith('sew/')
-const requiredFiles = [
-  'silk.toml',
-  'compiler/silk.toml',
-  'compiler/src/main.silk',
-  'changes/silk.toml',
-  'changes/src/Command.silk',
-]
+  isCompilerInput(path) || path.startsWith('stdlib/') || path.startsWith('tool/') || path.startsWith('changes/')
+const requiredFiles = ['silk.toml', 'compiler/silk.toml', 'compiler/src/main.silk']
 const completeClosure = (files) =>
   requiredFiles.every((required) => files.some(({ path }) => path === required)) &&
   files.some(({ path }) => path.startsWith('stdlib/'))
@@ -114,8 +108,9 @@ const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))
 const projectionPath = 'projection.json'
 const snapshotPath = 'compiler/changes-snapshot.toml'
 const versionPath = 'compiler/src/ReleaseVersion.silk'
-// sew reports the release version too, from a copy of the compiler's generated version module.
-const sewVersionPath = 'sew/src/ReleaseVersion.silk'
+// The silk tool reports the release version too, from a copy of the compiler's generated version
+// module.
+const toolVersionPath = 'tool/src/ReleaseVersion.silk'
 const within = (parent, child) => {
   const path = relative(resolve(parent), resolve(child))
   return path === '' || (!path.startsWith('..') && !isAbsolute(path))
@@ -145,7 +140,7 @@ const validateProjection = (snapshot, sourceCommit, baseManifest, baseVersionSou
     snapshot.tag !== `v${snapshot.version}` ||
     snapshot.prerelease !== snapshot.version.split('+')[0].includes('-') ||
     snapshot.versionFile !== 'src/ReleaseVersion.silk' ||
-    !/^\[changes\][ \t]*\r?\n(?:(?!^\[)[\s\S])*?^version-file[ \t]*=[ \t]*(['"])src\/ReleaseVersion\.silk\1[ \t]*(?:#.*)?$/m.test(
+    !/^\[(?:release|changes)\][ \t]*\r?\n(?:(?!^\[)[\s\S])*?^version-file[ \t]*=[ \t]*(['"])src\/ReleaseVersion\.silk\1[ \t]*(?:#.*)?$/m.test(
       baseManifest,
     )
   )
@@ -243,9 +238,9 @@ export const projectSnapshot = Effect.fn('SourceSnapshot.projectSnapshot')(
     if (problem) return yield* invalid(problem)
     if (original.files.some(({ path }) => path === snapshotPath))
       return yield* invalid('Committed base already contains release snapshot metadata')
-    const sewVersion = original.files.some(({ path }) => path === sewVersionPath)
-    if (sewVersion && (yield* fs.readFileString(join(base, sewVersionPath))) !== baseVersionSource)
-      return yield* invalid(`${sewVersionPath} must match ${versionPath}`)
+    const toolVersion = original.files.some(({ path }) => path === toolVersionPath)
+    if (toolVersion && (yield* fs.readFileString(join(base, toolVersionPath))) !== baseVersionSource)
+      return yield* invalid(`${toolVersionPath} must match ${versionPath}`)
     const material = {
       baseDigest: original.normalizedDigest,
       baseArchiveSha256: original.archiveSha256,
@@ -262,7 +257,7 @@ export const projectSnapshot = Effect.fn('SourceSnapshot.projectSnapshot')(
       [versionPath, snapshot.versionSource],
       [snapshotPath, snapshot.toml],
     ])
-    if (sewVersion) overlay.set(sewVersionPath, snapshot.versionSource)
+    if (toolVersion) overlay.set(toolVersionPath, snapshot.versionSource)
     const files = []
     for (const file of original.files) {
       const target = join(directory, file.path)
@@ -457,8 +452,8 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
         ['compiler/silk.toml', snapshot.manifest],
         [versionPath, snapshot.versionSource],
       ])
-      const sewVersion = baseFiles.find(({ path }) => path === sewVersionPath)
-      if (sewVersion) overlays.set(sewVersionPath, snapshot.versionSource)
+      const toolVersion = baseFiles.find(({ path }) => path === toolVersionPath)
+      if (toolVersion) overlays.set(toolVersionPath, snapshot.versionSource)
       const projected = baseFiles.map((file) => ({
         ...file,
         sha256: overlays.has(file.path) ? hash(overlays.get(file.path)) : file.sha256,
@@ -471,7 +466,7 @@ export const verifySnapshot = Effect.fn('SourceSnapshot.verifySnapshot')(
         baseFiles.find(({ path }) => path === 'compiler/silk.toml')?.sha256 !==
           hash(baseManifest) ||
         baseFiles.find(({ path }) => path === versionPath)?.sha256 !== hash(baseVersionSource) ||
-        (sewVersion !== undefined && sewVersion.sha256 !== hash(baseVersionSource)) ||
+        (toolVersion !== undefined && toolVersion.sha256 !== hash(baseVersionSource)) ||
         fileDigest(baseFiles) !== projection.baseDigest ||
         material.baseDigest !== projection.baseDigest ||
         material.baseArchiveSha256 !== projection.baseArchiveSha256 ||

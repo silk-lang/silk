@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs sew, the Silk front door, with a stable or dev Silk release, or an explicitly selected
+# Installs silk, the Silk front door, with a stable or dev Silk release, or an explicitly selected
 # version.
 #
 #   curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
@@ -9,10 +9,11 @@
 # SILK_CHANNEL=dev follows published dev snapshots; drafts and bootstrap seeds are excluded.
 # The compiler's SHA-256, reported version and embedded change snapshot are checked before
 # installing it as the toolchain `$SILK_HOME/toolchains/<version>` (`SILK_HOME` defaults to
-# `~/.silk`), and `settings.toml` makes it the default. The release's `bin/sew` is copied to
-# `$SILK_HOME/bin/sew`, with `$SILK_HOME/bin/silk` a second name for the same file: both run the
-# version a project's `silk-version` pins inside it, and the default outside. Other versions stay
-# installed; `sew use list` shows them. Releases from before sew link `bin/silk` to the compiler.
+# `~/.silk`), and `settings.toml` makes it the default. The release's compiler is `bin/silkc`; its
+# `bin/silk`, the silk tool, is installed as `$SILK_HOME/bin/silk`, and runs the version a project's
+# `silk-version` pins inside it and the default outside. Other versions stay installed;
+# `silk use list` shows them. Releases from before the compiler was renamed `silkc` hold the
+# compiler as `bin/silk`, and `$SILK_HOME/bin/silk` links to it.
 # When minisign is installed, the archive's signature must verify against the release key below.
 # Downloads made by curl carry no macOS quarantine mark, so Gatekeeper lets the compiler run.
 #
@@ -220,8 +221,12 @@ else
 fi
 mkdir "$tmp/unpacked"
 tar -xzf "$tmp/$archive" -C "$tmp/unpacked" || fail "cannot unpack $archive"
-[ -f "$tmp/unpacked/$top/bin/silk" ] && [ -d "$tmp/unpacked/$top/lib/silk/stdlib" ] ||
-  fail "$archive does not hold bin/silk and lib/silk/stdlib"
+# The compiler is `bin/silkc`, beside the silk tool `bin/silk`; earlier releases hold only the
+# compiler, as `bin/silk`.
+compiler=bin/silkc
+[ -f "$tmp/unpacked/$top/$compiler" ] || compiler=bin/silk
+[ -f "$tmp/unpacked/$top/$compiler" ] && [ -d "$tmp/unpacked/$top/lib/silk/stdlib" ] ||
+  fail "$archive does not hold bin/silkc and lib/silk/stdlib"
 
 # Every compiler release publishes a verified per-target pin; never silently skip verification.
 curl -fsSL -o "$tmp/native-seed.json" \
@@ -230,9 +235,9 @@ curl -fsSL -o "$tmp/native-seed.json" \
 expected=$(tr -d ' \t\r\n' < "$tmp/native-seed.json" | grep -o "\"$target\":{[^}]*}" |
   grep -o '"sha256":"[0-9a-f]*"' | cut -d'"' -f4) || true
 [ -n "$expected" ] || fail "native-seed.json of $release names no compiler for $target"
-actual=$(sha256 "$tmp/unpacked/$top/bin/silk")
-[ "$actual" = "$expected" ] || fail "bin/silk has SHA-256 $actual, but $release names $expected"
-[ "$("$tmp/unpacked/$top/bin/silk" --version)" = "silk v$version" ] ||
+actual=$(sha256 "$tmp/unpacked/$top/$compiler")
+[ "$actual" = "$expected" ] || fail "$compiler has SHA-256 $actual, but $release names $expected"
+[ "$("$tmp/unpacked/$top/$compiler" --version)" = "silk v$version" ] ||
   fail "the compiler does not report the requested version $version"
 [ -f "$tmp/unpacked/$top/lib/silk/changes-snapshot.toml" ] ||
   fail "the compiler archive has no published change snapshot"
@@ -250,29 +255,33 @@ mkdir -p "$toolchains" "$silk_home/bin"
 staging="$toolchains/.install-$$"
 rm -rf "$staging"
 mv "$tmp/unpacked/$top" "$staging" || fail "cannot stage the toolchain in $toolchains"
-chmod 0755 "$staging/bin/silk"
+chmod 0755 "$staging/$compiler"
+# The toolchain keeps only the compiler; the tool moves to `$SILK_HOME/bin`.
+tool=
+if [ "$compiler" = bin/silkc ] && [ -f "$staging/bin/silk" ]; then
+  tool="$tmp/silk"
+  mv "$staging/bin/silk" "$tool" || fail "cannot stage the silk tool"
+  chmod 0755 "$tool"
+fi
 rm -rf "$toolchain"
 mv "$staging" "$toolchain" || fail "cannot move the toolchain into $toolchain"
 
-# sew and its `silk` twin are real files beside the store, staged and renamed into place so each
-# name always holds a whole program. A release from before sew has none; `bin/silk` links to its
-# compiler instead.
-sew=
-if [ -f "$toolchain/bin/sew" ]; then
-  cp "$toolchain/bin/sew" "$silk_home/bin/.sew-$$" || fail "cannot copy sew to $silk_home/bin"
-  chmod 0755 "$silk_home/bin/.sew-$$"
-  [ "$("$silk_home/bin/.sew-$$" --version)" = "sew $version" ] || {
-    rm -f "$silk_home/bin/.sew-$$"
-    fail "sew does not report the requested version $version"
+# The tool is a real file beside the store, staged and renamed into place so the name always holds
+# a whole program. Its first command runs the installed compiler, which checks that it forwards.
+# A release from before the rename has no tool; `bin/silk` links to its compiler instead. The
+# `bin/sew` an earlier release installed goes either way.
+if [ -n "$tool" ]; then
+  cp "$tool" "$silk_home/bin/.silk-$$" || fail "cannot copy silk to $silk_home/bin"
+  chmod 0755 "$silk_home/bin/.silk-$$"
+  [ "$(SILK_HOME="$silk_home" SILK_TOOLCHAIN="$version" "$silk_home/bin/.silk-$$" --version)" = "silk v$version" ] || {
+    rm -f "$silk_home/bin/.silk-$$"
+    fail "the silk tool does not run the installed compiler $version"
   }
-  rm -f "$silk_home/bin/.silk-$$"
-  ln "$silk_home/bin/.sew-$$" "$silk_home/bin/.silk-$$" || fail "cannot link $silk_home/bin/silk to sew"
-  mv -f "$silk_home/bin/.sew-$$" "$silk_home/bin/sew" || fail "cannot install $silk_home/bin/sew"
   mv -f "$silk_home/bin/.silk-$$" "$silk_home/bin/silk" || fail "cannot install $silk_home/bin/silk"
-  sew=$silk_home/bin/sew
 else
-  ln -sfn "$toolchain/bin/silk" "$silk_home/bin/silk" || fail "cannot link $silk_home/bin/silk"
+  ln -sfn "$toolchain/$compiler" "$silk_home/bin/silk" || fail "cannot link $silk_home/bin/silk"
 fi
+rm -f "$silk_home/bin/sew"
 
 # Make the toolchain the default, keeping `auto-install`.
 auto_install=
@@ -286,13 +295,13 @@ fi
 } > "$silk_home/settings.toml.$$"
 mv "$silk_home/settings.toml.$$" "$silk_home/settings.toml"
 
-printf '\nInstalled %s to %s\n' "$("$toolchain/bin/silk" --version 2> /dev/null || echo silk)" "$toolchain"
-if [ -n "$sew" ]; then
-  printf 'It is the default Silk version. Installed sew to %s; %s/bin/silk is the same program.\n' "$sew" "$silk_home"
-  printf 'sew runs each project with the Silk version it pins: sew build, sew test, sew run.\n'
-  printf 'Update sew with: sew update self\n'
+printf '\nInstalled %s to %s\n' "$("$toolchain/$compiler" --version 2> /dev/null || echo silk)" "$toolchain"
+if [ -n "$tool" ]; then
+  printf 'It is the default Silk version. Installed the silk tool to %s/bin/silk.\n' "$silk_home"
+  printf 'silk runs each project with the Silk version it pins: silk build, silk test, silk run.\n'
+  printf 'Update the tool with: silk update self\n'
 else
-  printf 'It is the default toolchain; %s/bin/silk links to it. This release has no sew.\n' "$silk_home"
+  printf 'It is the default toolchain; %s/bin/silk links to its compiler. This release has no silk tool.\n' "$silk_home"
 fi
 
 # Silk hands Clang textual LLVM IR. Clang 18 or newer reads it for ordinary programs; inline

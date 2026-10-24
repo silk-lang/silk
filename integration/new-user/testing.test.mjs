@@ -40,7 +40,7 @@ test('a failing assertion fails the run with its message', () => {
   write(join(dir, 'src/lib.silk'), read(join(dir, 'src/lib.silk')) + failing)
   const result = silk(h, ['test', '--no-cache'], { cwd: dir })
   assert.equal(result.status, 1, show(result))
-  assert.match(result.stdout, /  lib::failsOnPurpose\n    assertion failed: 2 \+ 2 is 5\n    FAIL /)
+  assert.match(result.stdout, /  lib::failsOnPurpose\n    assertion failed: 2 \+ 2 is 5\n      at lib\.failsOnPurpose \(lib:\d+:\d+\)\n    FAIL /)
   assert.match(result.stdout, /Tests  1 passed, 1 failed/)
 })
 
@@ -49,6 +49,24 @@ test('a failing assertion prints no unhandled-error trace', { todo: 'finding 3' 
   write(join(dir, 'src/lib.silk'), read(join(dir, 'src/lib.silk')) + failing)
   const result = silk(h, ['test', '--no-cache'], { cwd: dir })
   assert.doesNotMatch(result.stderr, /unhandled error/)
+})
+
+test('an unhandled error in a test is reported under the test with its call path', () => {
+  const dir = library()
+  write(join(dir, 'src/lib.silk'), read(join(dir, 'src/lib.silk')) + `
+struct Broken {}
+
+effect fn breaks() -> () ! Broken {
+  fail Broken {}
+}
+
+test effect fn failsWithError() -> () ! Broken {
+  run breaks()
+}
+`)
+  const result = silk(h, ['test', '--no-cache'], { cwd: dir })
+  assert.equal(result.status, 1, show(result))
+  assert.match(result.stdout, /  lib::failsWithError\n    unhandled error: lib\.Broken\n      at lib\.breaks \(lib:\d+:\d+\)\n      at lib\.failsWithError \(lib:\d+:\d+\)\n    FAIL /)
 })
 
 test('a test that traps fails, the rest still run, and the run exits 1', { todo: 'finding 1: the runner dies and silk test exits 0' }, () => {

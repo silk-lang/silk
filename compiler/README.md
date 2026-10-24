@@ -133,9 +133,9 @@ differences=<count>`, and fails the check when they differ.
 
 ## Toolchains
 
-The compiler knows nothing about Silk versions: it runs itself. [sew](../sew) chooses and installs
-versions and forwards each command to the selected compiler with `SILK_TOOLCHAIN` and `SILK_HOME`
-set.
+The compiler, `silkc` in a release, knows nothing about Silk versions: it runs itself. The
+[silk tool](../tool) chooses and installs versions and forwards each command to the selected
+compiler with `SILK_TOOLCHAIN` and `SILK_HOME` set.
 
 ## Profiling with Tracy
 

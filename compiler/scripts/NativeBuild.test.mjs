@@ -38,21 +38,21 @@ const fixture = Effect.fnUntraced(
         const snapshot = join(root, 'snapshot')
         const inputs = [
           [
-            'changes/silk.toml',
-            '[package]\nname = "changeset"\nversion = "0.1.0"\nroot = "src/Command.silk"\n',
-          ],
-          ['changes/src/Command.silk', 'pub fn value() -> i32 { return 2 }'],
-          [
             'compiler/silk.toml',
-            '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nchangeset = { path = "../changes" }\n\n[changes]\nversion-file = "src/ReleaseVersion.silk"\n',
+            '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\ntomledit = { path = "../tomledit" }\n\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
           ],
           [
             'compiler/src/ReleaseVersion.silk',
             'pub fn value() -> &\'static [u8] {\n  return b"0.1.0"\n}\n',
           ],
           ['compiler/src/main.silk', 'pub fn main() -> i32 { return 0 }'],
-          ['silk.toml', '[workspace]\nmembers = ["compiler", "changes"]\noutput-dir = "build"\n'],
+          ['silk.toml', '[workspace]\nmembers = ["compiler", "tomledit"]\noutput-dir = "build"\n'],
           ['stdlib/silk/i32.silk', 'pub fn identity(value: i32) -> i32 { return value }'],
+          [
+            'tomledit/silk.toml',
+            '[package]\nname = "tomledit"\nversion = "0.1.0"\nroot = "src/Command.silk"\n',
+          ],
+          ['tomledit/src/Command.silk', 'pub fn value() -> i32 { return 2 }'],
         ]
         const files = inputs.map(([path, bytes]) => {
           const target = join(snapshot, path)
@@ -259,16 +259,18 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         assert.deepStrictEqual(
           result.inputs.compiler.files.map(({ path }) => path),
           [
-            'changes/silk.toml',
-            'changes/src/Command.silk',
             'compiler/silk.toml',
             'compiler/src/ReleaseVersion.silk',
             'compiler/src/main.silk',
             'silk.toml',
+            'tomledit/silk.toml',
+            'tomledit/src/Command.silk',
           ],
         )
         assert.deepStrictEqual(
-          [...result.inputs.compiler.files, ...result.inputs.stdlib.files],
+          [...result.inputs.compiler.files, ...result.inputs.stdlib.files].sort((left, right) =>
+            left.path < right.path ? -1 : 1,
+          ),
           manifest.files,
         )
         assert.deepStrictEqual(
@@ -581,8 +583,8 @@ sleep 60`,
       })
       for (const path of [
         'compiler/src/main.silk',
-        'changes/src/Command.silk',
-        'changes/silk.toml',
+        'tomledit/src/Command.silk',
+        'tomledit/silk.toml',
         'silk.toml',
       ]) {
         yield* fixture(function* ({ options }) {

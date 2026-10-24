@@ -127,7 +127,7 @@ export const exclusion = (path: string) => {
   if (path.startsWith('compiler/fixtures/'))
     return 'Lexer/parser input or the separately gated stdlib-root fixture.'
   if (path.startsWith('corpus/')) return 'Native corpus program or module; measured by the corpus.'
-  if (path.startsWith('sew/') || path.startsWith('tomledit/'))
+  if (path.startsWith('tool/') || path.startsWith('tomledit/'))
     return 'Package sources and cases; covered by their own package tests with N1.'
   return undefined
 }
