@@ -2452,14 +2452,28 @@ const program = Effect.gen(function* () {
   yield* splitRun(7)
   const coldObjects = yield* objectNames()
   assert.ok(coldObjects.length > 2, `expected an object per module, found ${coldObjects.join(', ')}`)
+  // The cache keeps each module's LLVM text as a file of its own beside the image, named by its
+  // digest, so an unchanged rebuild finds every module's text where the last build left it.
+  const packNames = Effect.fnUntraced(function* () {
+    const cache = join(split, 'build/cache')
+    const folders = (yield* fs.readDirectory(cache)).filter((name) => name.endsWith('.packs'))
+    assert.equal(folders.length, 1, `expected one pack folder, found ${folders.join(', ')}`)
+    return (yield* fs.readDirectory(join(cache, folders[0]))).sort()
+  })
+  const coldPacks = yield* packNames()
+  assert.ok(coldPacks.length > 2, `expected a pack per module, found ${coldPacks.join(', ')}`)
   yield* splitRun(7)
   assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
+  assert.deepEqual(yield* packNames(), coldPacks, 'an unchanged rebuild keeps every pack')
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   yield* splitRun(9)
   const editedObjects = yield* objectNames()
   const compiled = editedObjects.filter((name) => !coldObjects.includes(name))
   assert.equal(compiled.length, 1, `an edit to one module compiles one unit, added ${compiled.join(', ')}`)
   assert.equal(editedObjects.length, coldObjects.length + 1)
+  const editedPacks = yield* packNames()
+  assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
+  assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
   // A rebuild replays the record the last build left in the cache: an edit to a body lowers only
   // the instances it touched, and an edit that changes what the program reaches walks it again.
   // Either way the executable is the one a cold build links. A string constant holding `@` names

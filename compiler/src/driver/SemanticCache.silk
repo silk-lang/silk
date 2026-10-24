@@ -11,8 +11,14 @@
 //! profile, so builds that alternate between profiles each keep their own file warm. The image
 //! inside is stamped with the compiler too ([`CacheStamp`]), and another compiler's file reads as
 //! empty and is replaced.
+//!
+//! A build's definitions are kept beside the file rather than in its image: each module's
+//! definitions are one pack body (see `BuildRecord.Pack`), a file of
+//! `<output>/cache/semantic-<digest>.packs` named by the hex of its own digest.
 
+import backend.CodegenUnits {CodegenUnit}
 import driver.CacheStamp
+import semantic.BuildRecord
 import semantic.CacheImage
 import semantic.ContentHash {ContentHash}
 import semantic.Semantic {Adopted, Request, Semantic}
@@ -21,17 +27,20 @@ import semantic.Types {Types}
 import silk.allocator {Allocator, OutOfMemoryError}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
-import silk.filesystem {AtomicWriteError, FileError, FileSystem, Path}
+import silk.filesystem {AtomicWriteError, DirectoryEntry, FileError, FileSystem, Path}
 import silk.list {List}
 import silk.option {Option}
 import silk.result {Result}
 import silk.u64
+import silk.u8
 import silk.usize
 
 /// One store's cache file: where it lives, the stamp its image is written under, and what the
 /// store reused from it.
 pub struct CacheFile {
   path: Path
+  // The directory of the pack bodies beside it.
+  packs: Path
   stamp: Bytes
   /// What the store reused from the file it read; nothing when it read none.
   pub adopted: Adopted
@@ -56,8 +65,10 @@ effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &
 
 /// Opens the cache file of `store` below `output` and adopts what it still holds. `compiler` is
 /// the running compiler's identity, from `CacheStamp.compiler`. `linked` is whether the store
-/// will be revised, as `Semantic.adoptCache` takes it.
-pub effect fn open(store: &mut Semantic, request: &Request, output: &Path, compiler: &[u8], linked: bool) -> Option<CacheFile>
+/// will be revised, as `Semantic.adoptCache` takes it. A store that will build reads the pack
+/// bodies too (`building`), which `Semantic.offerPacks` takes.
+pub effect fn open(store: &mut Semantic, request: &Request, output: &Path, compiler: &[u8], linked: bool, building: bool)
+  -> Option<CacheFile>
   ! Cycle | OutOfMemoryError ? &mut FileSystem | &mut Allocator | &mut Types {
   let stamp = run CacheStamp.stamp(&store.*, compiler)
   let identity = run Semantic.stampIdentity(&store.*)
@@ -75,6 +86,18 @@ pub effect fn open(store: &mut Semantic, request: &Request, output: &Path, compi
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
+  run Bytes.append(&mut name, b".packs")
+  let packs = match move run Effect.result(Path.joinBytes(output, Bytes.asSlice(&name))) {
+    Result<Path, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<Path, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return Option<CacheFile>.none()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  if building { Semantic.offerPacks(&mut store.*, run readPacks(&packs)) }
   let mut adopted = Adopted {roots: usize.ZERO, stale: usize.ZERO, nodes: usize.ZERO, changedLeaves: usize.ZERO}
   let mut kept = Option<CacheImage.Image>.none()
   let attempted = run Effect.result(FileSystem.readFile(&path))
@@ -90,7 +113,7 @@ pub effect fn open(store: &mut Semantic, request: &Request, output: &Path, compi
       OutOfMemoryError exhausted => { fail move exhausted }
     }
   }
-  return Option<CacheFile>.some(CacheFile {path: move path, stamp: move stamp, adopted: move adopted, read: move kept})
+  return Option<CacheFile>.some(CacheFile {path: move path, packs: move packs, stamp: move stamp, adopted: move adopted, read: move kept})
 }
 
 /// Writes `store`'s image to its cache file, with the checks and build definitions it reused
@@ -138,4 +161,137 @@ effect fn write(path: &Path, bytes: &[u8]) -> () ! FileError | AtomicWriteError 
     run FileSystem.createDirectoriesRecursively(&directory)
   }
   return run FileSystem.writeFileAtomic(path, bytes, FileSystem.replaceExisting(), FileSystem.buffered())
+}
+
+// Each pack body in `directory`, by the digest its name gives; a file named otherwise is left out.
+effect fn readPacks(directory: &Path) -> List<BuildRecord.PackBody> ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let mut bodies = List<BuildRecord.PackBody>.make()
+  let entries = match move run Effect.result(FileSystem.listDirectory(directory)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return move bodies
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let found = List<DirectoryEntry>.asSlice(&entries)
+  let mut at = usize.ZERO
+  while at < found.length {
+    let path = &found[at].path
+    at = at + usize.ONE
+    if let Option<ContentHash>.Some {value: digest} = packDigest(Path.rawBytes(path)) {
+      match move run Effect.result(FileSystem.readFile(path)) {
+        Result<Bytes, FileError | OutOfMemoryError>.Success {value: bytes} => {
+          run List<BuildRecord.PackBody>.append(&mut bodies, BuildRecord.PackBody {digest: digest, bytes: move bytes})
+        }
+        Result<Bytes, FileError | OutOfMemoryError>.Failure {error} => match move error {
+          FileError failure => { drop failure }
+          OutOfMemoryError exhausted => { fail move exhausted }
+        }
+      }
+    }
+  }
+  return move bodies
+}
+
+// The digest a pack file's path names: its last component, 32 lowercase hex digits.
+fn packDigest(path: &[u8]) -> Option<ContentHash> {
+  if path.length < 32 { return Option<ContentHash>.none() }
+  let start = path.length - 32
+  if start > usize.ZERO && path[start - usize.ONE] != 47 { return Option<ContentHash>.none() }
+  let mut high: u64 = 0
+  let mut low: u64 = 0
+  let mut at = usize.ZERO
+  while at < 32 {
+    let byte = path[start + at]
+    let mut digit: u64 = 16
+    if byte >= 48 && byte <= 57 { digit = u8.toU64(byte - 48) }
+    if byte >= 97 && byte <= 102 { digit = u8.toU64(byte - 87) }
+    if digit == 16 { return Option<ContentHash>.none() }
+    if at < 16 { high = high * 16 + digit } else { low = low * 16 + digit }
+    at = at + usize.ONE
+  }
+  return Option<ContentHash>.some(ContentHash {high: high, low: low})
+}
+
+// The path of the pack body with `digest` in `directory`.
+effect fn packPath(directory: &Path, digest: ContentHash) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut name = Bytes.make()
+  run appendHex(&mut name, digest.high)
+  run appendHex(&mut name, digest.low)
+  return run Path.joinBytes(directory, Bytes.asSlice(&name))
+}
+
+/// Writes the body of each unit a build assembled that the pack directory lacks, before [`save`]
+/// writes an image that names them. Best effort, as [`save`] is: a body that cannot be written
+/// leaves its definitions to be lowered again.
+pub effect fn storePacks(file: &CacheFile, units: &[CodegenUnit]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let created = run Effect.result(FileSystem.createDirectoriesRecursively(&file.packs))
+  match move created {
+    Result<(), FileError | OutOfMemoryError>.Success {..} => {}
+    Result<(), FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let mut at = usize.ZERO
+  while at < units.length {
+    let unit = &units[at]
+    at = at + usize.ONE
+    if unit.stored { continue }
+    let written = run Effect.result(storePack(&file.packs, unit))
+    match move written {
+      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Success {..} => {}
+      Result<(), FileError | AtomicWriteError | OutOfMemoryError>.Failure {error} => match move error {
+        FileError failure => { drop failure }
+        AtomicWriteError failure => { drop failure }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+  }
+}
+
+effect fn storePack(directory: &Path, unit: &CodegenUnit) -> () ! FileError | AtomicWriteError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let path = run packPath(directory, unit.digest)
+  if run FileSystem.exists(&path) { return () }
+  return run FileSystem.writeFileAtomic(&path, Bytes.asSlice(&unit.body), FileSystem.replaceExisting(), FileSystem.buffered())
+}
+
+/// Removes every pack body no unit of `units`, the last build's, names, once [`save`] wrote the
+/// image that names only those.
+pub effect fn prunePacks(file: &CacheFile, units: &[CodegenUnit]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let entries = match move run Effect.result(FileSystem.listDirectory(&file.packs)) {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let found = List<DirectoryEntry>.asSlice(&entries)
+  let mut at = usize.ZERO
+  while at < found.length {
+    let path = &found[at].path
+    at = at + usize.ONE
+    let mut named = false
+    if let Option<ContentHash>.Some {value: digest} = packDigest(Path.rawBytes(path)) {
+      let mut unit = usize.ZERO
+      while unit < units.length && !named {
+        named = ContentHash.equals(units[unit].digest, digest)
+        unit = unit + usize.ONE
+      }
+    }
+    if !named {
+      let removed = run Effect.result(FileSystem.removeFile(path))
+      drop removed
+    }
+  }
 }
