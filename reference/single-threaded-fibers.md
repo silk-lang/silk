@@ -36,7 +36,7 @@ import silk.system_clock { SystemClock }
 import silk.system_clock { Instant }
 
 struct ParentClock {
-  mark: Instant
+  mark: Instant,
 }
 
 effect fn parentNow(self: &mut ParentClock) -> Instant {

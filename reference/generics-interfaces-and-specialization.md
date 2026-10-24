@@ -49,7 +49,7 @@ declaration, ordinal, and kind—not its source spelling alone.
 
 ```silk
 struct Box<T> {
-  value: T
+  value: T,
 }
 
 fn identity<T>(value: T) -> T {
@@ -113,8 +113,8 @@ normalized arguments.
 
 ```silk
 struct Pair<A, B> {
-  first: A
-  second: B
+  first: A,
+  second: B,
 }
 
 fn first(pair: Pair<i32, bool>) -> i32 {
@@ -381,8 +381,8 @@ remainder from its supplied field initializers and declared parameter constraint
 
 ```silk,ignore
 struct Pair<A, B> {
-  first: A
-  second: B
+  first: A,
+  second: B,
 }
 
 let inferred = Pair {
@@ -404,8 +404,8 @@ The same parameter appearing in several fields contributes one shared constraint
 
 ```silk,ignore
 struct Same<T> {
-  left: T
-  right: T
+  left: T,
+  right: T,
 }
 
 Same { left: 1, right: 2 }    // Same<i32>
@@ -491,8 +491,8 @@ that writes no owner leaves nothing to choose.
 
 ```silk
 struct Pair<A, B> {
-  left: A
-  right: B
+  left: A,
+  right: B,
 }
 
 impl<A, B> Pair<A, B> {
@@ -512,7 +512,7 @@ invalid.
 ```silk,ignore
 let prefixed = Maybe.some<i32>(1)    // invalid: T belongs to Maybe
 let listed = Maybe.pair<bool>(1, true) // invalid: pair names T; write Maybe<i32>.pair<bool>
-struct Pair<A, B> { first: A second: B }
+struct Pair<A, B> { first: A, second: B }
 let partial = Pair<i32>.make(1, true) // invalid: Pair<i32> is incomplete
 ```
 
@@ -539,11 +539,11 @@ the declared use contract.
 
 ```silk
 struct Parser<F: fn(i32) -> i32> {
-  parse: F
+  parse: F,
 }
 
 struct Deferred<F: once Effect<i32>> {
-  operation: F
+  operation: F,
 }
 ```
 
@@ -908,7 +908,7 @@ interface Shape {
 }
 
 struct Square {
-  side: i32
+  side: i32,
 }
 
 impl Shape for Square {
@@ -1559,7 +1559,7 @@ The conformance exists for a concrete provider only when every applied bound can
 
 ```silk,ignore
 struct Box<T> {
-  value: T
+  value: T,
 }
 
 impl<T: Display> Display for Box<T> {
@@ -1715,6 +1715,10 @@ reaches a concrete base conformance.
 // Valid: T is structurally contained by Box<T>.
 impl<T: Display> Display for Box<T> { /* ... */ }
 ```
+
+The parts of an `Effect` type in the provider, such as its success and error types, are structural
+parts too, so `impl<'env, E: Debug> Outcome<Effect<'env; i32 ! E>> for Runner<Effect<'env; i32 ! E>>`
+descends.
 
 The compiler proves termination from the declaration itself. It does not use a recursion-depth
 limit, solver fuel, source order, or the set of currently reachable concrete calls.

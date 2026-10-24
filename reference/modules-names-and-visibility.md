@@ -710,7 +710,7 @@ A public type may use private representation types behind private fields:
 struct Storage { value: i32 }
 
 pub struct Counter {
-  storage: Storage
+  storage: Storage,
 }
 ```
 
@@ -860,7 +860,7 @@ module that spells them imports them:
 ```silk
 import silk.ownership { Copy }
 
-struct Point { x: i32 y: i32 }
+struct Point { x: i32, y: i32 }
 
 impl Copy for Point {}
 
@@ -936,11 +936,9 @@ build checks and makes no artifact for), `static-library`, `shared-library` or `
 defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits and
 `_`; `self`, `silk` and `silkc` are reserved.
 
-Until the seed compiler reads this layout, a manifest may still write the earlier spellings:
-`[package].root` (a manifest-relative entry whose directory is the source root),
-`[package].source-root`, `[build].artifact`, `[build].native-link-inputs`, `[build].platform-supply`
-and `[build].composition`, and a name may hold `-`. A manifest that writes a field in both spellings
-is refused.
+The earlier spellings `[package].root`, `[package].source-root`, `[build].artifact`,
+`[build].native-link-inputs`, `[build].platform-supply` and `[build].composition` are refused at
+their line, naming the field that replaced each. A name may still hold `-`, its earlier spelling.
 
 `[package]` also accepts publishing metadata that builds never read: `description`, `license`,
 `repository`, `homepage` and `readme` as strings, `authors` and `keywords` as arrays of strings.

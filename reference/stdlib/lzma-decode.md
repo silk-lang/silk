@@ -192,7 +192,8 @@ Reads a little-endian integer of at most eight bytes.
 
 ```silk
 pub effect fn configure(self: &mut Self, property: u32, lzma2: bool, workspace: usize) -> ()
-  ! OutOfMemoryError ? &mut Allocator
+    ! OutOfMemoryError
+    ? &mut Allocator
 ```
 
 Validates properties and resets all probability models within the workspace limit.
