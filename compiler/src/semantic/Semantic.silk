@@ -2850,6 +2850,24 @@ effect fn mergeRejections(into: &mut List<Shared<Rejection>>, rejections: &[Shar
   }
 }
 
+// Adds the rejections a walk from the runtime's roots found outside the runtime module itself. The
+// runtime's own refusals are checked against the entry separately, which reports a `main` the
+// runtime cannot start in place of the runtime body that fails to start it.
+effect fn appendOutsideRuntime(into: &mut List<Shared<Rejection>>, rejections: &[Shared<Rejection>], runtime: &Option<ModuleId>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut at = usize.ZERO
+  while at < rejections.length {
+    let inside = match &runtime.* {
+      Option<ModuleId>.Some {value: selected} => Shared<Rejection>.with<bool>(&rejections[at], fn(value: &Rejection) -> bool {
+        return ModuleId.equals(&value.module, &selected)
+      })
+      Option<ModuleId>.None => false
+    }
+    if !inside { run appendDeclarationRejection(&mut into.*, Shared<Rejection>.clone(&rejections[at])) }
+    at = at + usize.ONE
+  }
+}
+
 effect fn mergeGaps(into: &mut List<Shared<BackendGap>>, gaps: &[Shared<BackendGap>]) -> () ! OutOfMemoryError ? &mut Allocator {
   let mut at = usize.ZERO
   while at < gaps.length {
@@ -2945,6 +2963,8 @@ fn memoOf(memos: &[ModuleCheckMemo], unit: usize) -> usize {
 /// An owned snapshot of one checked direct call's canonical selection.
 pub struct StaticCall {
   pub application: Application,
+  // Whether the call's receiver, the subject of its callee, is its first argument.
+  pub receiver: bool,
 }
 
 /// A short loan of an active semantic query for static call resolution.
@@ -34628,7 +34648,7 @@ effect fn checkReceiverCall<'scope>(
     &Option<Shared<Type>>.none(), RejectionCode.TypeMismatch,
     constraints,
     contractBody,
-    false,
+    staticBody,
     unsafeAllowed,
   )
   let receiverNode = match move checkedReceiver {
@@ -52042,12 +52062,18 @@ effect fn checkInvocation<'scope>(
     cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, expression, input,
     expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed, callAcknowledged, valueConstruction, promised)
   let checked = run pipelinePrecedenceNote(&resolver.source, cursor, input, move first)
+  // A static body has no callable values, so its pipeline into a call section is the direct call.
+  let staticPipeline = staticBody && match &checked {
+    Result<BodyNodeId, Shared<Rejection>>.Failure {error} => Shared<Rejection>.with<bool>(&error,
+      fn(value: &Rejection) -> bool { return value.code == RejectionCode.StaticPhaseViolation })
+    _ => false
+  }
   let undetermined = match &checked {
     Result<BodyNodeId, Shared<Rejection>>.Failure {error} => Shared<Rejection>.with<bool>(&error,
       fn(value: &Rejection) -> bool { return value.code == RejectionCode.TypeArgumentInference })
     _ => false
   }
-  if !undetermined || !input.pipeline { return move checked }
+  if !(undetermined || staticPipeline) || !input.pipeline { return move checked }
   let piped = match input.arguments {
     CallArguments.Single {expression: value} => value
     _ => { return move checked }
@@ -52057,9 +52083,19 @@ effect fn checkInvocation<'scope>(
       callee: callee, generics: generics, arguments: CallArguments.Piped {input: piped, range: rest}, pipeline: false}
     _ => { return move checked }
   }
+  // `input |> f()` names no argument of its own, as at run time, where it calls `f` with none.
+  if let CallArguments.Piped {range: rest, ..} = direct.arguments {
+    if staticPipeline && rest.length == usize.ZERO {
+      return run bodyRejection(&resolver.*, module, RejectionCode.RedundantCall, run bodySpan(&resolver.source, cursor, input.callee))
+    }
+  }
   let retried = run checkInvocationOnce(&mut resolver.*, &mut owner.*, &mut request.*, &mut dependencies.*, module,
     cursor, caller, &mut statementScope.*, calls, &mut nodes.*, &mut signatures.*, &mut requiredBodies.*, input.callee, direct,
     expected, mismatchCode, constraints, contractBody, staticBody, unsafeAllowed, callAcknowledged, valueConstruction, promised)
+  if staticPipeline {
+    if let Result<BodyNodeId, Shared<Rejection>>.Success {..} = &retried { return move retried }
+    return move checked
+  }
   let handler = match &retried {
     Result<BodyNodeId, Shared<Rejection>>.Failure {error} => Shared<Rejection>.with<bool>(&error,
       fn(value: &Rejection) -> bool { return value.code == RejectionCode.InvalidEffectHandler })
@@ -52877,6 +52913,8 @@ effect fn checkDeclarationCallForm<'scope>(
   let staticCount = Shared<Result<Answer, NoRejection>>.with<usize>(&target.signature, signatureStaticCount,
   )
   let mut suppliedStatics = Option<Shared<List<StaticSlot>>>.none()
+  // Static field operands reflected again at the owner regions this call's other operands supply.
+  let mut retypedStatics = List<StaticSlot>.make()
   if staticCount > usize.ZERO {
     // A receiver call cannot supply static arguments yet: an explicit gap, never a dropped value.
     if receiverCount != usize.ZERO { return run bodyRejection(&resolver.*, module, RejectionCode.Unsupported, span) }
@@ -52929,7 +52967,7 @@ Option<Shared<StaticData>>,
       )
       Option<Shared<List<StaticSlot>>>.None => Option<Shared<StaticData>>.none()
     }
-    if let Option<Shared<StaticData>>.Some {value: supplied} = move staticValue {
+    if let Option<Shared<StaticData>>.Some {value: original} = move staticValue {
       // Static operands participate in the same exact call inference as runtime operands.
       // Their canonical type is evidence; their value remains solely in the application.
       let argumentId = run bodyArgument(&resolver.source, cursor, arguments, at - receiverCount)
@@ -52948,6 +52986,12 @@ Option<Shared<StaticData>>,
       }
       let pattern = run Type.applyBindings(&declared, List<Binding>.asSlice(&inferred), true)
       let compared = run Type.applyBindings(&pattern, List<Binding>.asSlice(&bodyBindings), true)
+      let mut supplied = move original
+      let regioned = run regionedStaticField(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &compared, &supplied, argumentSpan)
+      if let Option<Shared<StaticData>>.Some {value: retyped} = move regioned {
+        run List<StaticSlot>.append(&mut retypedStatics, StaticSlot {ordinal: at + firstSupplied, value: StaticValue.copy(&retyped)})
+        supplied = move retyped
+      }
       if Type.hasOpenParameters(&compared) {
         let evidence = match move run staticArgumentType(&mut resolver.*, &mut owner.*, &mut dependencies.*, &supplied, argumentSpan) {
           Option<Shared<Type>>.Some {value} => move value
@@ -53450,6 +53494,17 @@ Option<Shared<StaticData>>,
     }
     if let Option<Shared<List<StaticSlot>>>.Some {value: slots} = &suppliedStatics {
       application.statics = run copySharedStaticSlots(&slots)
+      let retyped = List<StaticSlot>.asSlice(&retypedStatics)
+      let held = List<StaticSlot>.asMutSlice(&mut application.statics)
+      let mut slotAt = usize.ZERO
+      while slotAt < held.length {
+        let mut retypedAt = usize.ZERO
+        while retypedAt < retyped.length {
+          if retyped[retypedAt].ordinal == held[slotAt].ordinal { held[slotAt].value = StaticValue.copy(&retyped[retypedAt].value) }
+          retypedAt = retypedAt + usize.ONE
+        }
+        slotAt = slotAt + usize.ONE
+      }
     }
     if run Type.containsOpaque(&ty, &target.declaration) {
       ty = run Type.finishOpaqueApplication(&ty, &application)
@@ -54420,28 +54475,43 @@ effect fn modeBeforeTypeName(module: &ModuleId, span: Span, segments: &[Bytes], 
 
 // A value-type mismatch, carrying the `expected` and `actual` type text when its code's template
 // spells exactly the declared type and the value's type and both have exact spellings.
-// Writes two mismatched types as `TypeText.mismatch` does, spelling each type parameter of the
-// innermost declaration body's own source as it is written there.
-effect fn namedMismatch(resolver: &Resolver, expected: &Shared<Type>, actual: &Shared<Type>, wanted: &mut Bytes,
-  offered: &mut Bytes) -> bool ! OutOfMemoryError ? &mut Allocator {
+// Appends the `expected` and `actual` text of two mismatched types as `TypeText.mismatch` writes
+// them, spelling each type parameter of the innermost declaration body's own source as it is
+// written there, with a note for each such parameter that it stands for any type; false, adding
+// nothing, when either type has no exact spelling.
+effect fn appendNamedMismatch(resolver: &Resolver, expected: &Shared<Type>, actual: &Shared<Type>,
+  arguments: &mut List<MessageArgument>) -> bool ! OutOfMemoryError ? &mut Allocator {
   let mut names = List<TypeText.Named>.make()
+  let mut notes = List<Bytes>.make()
   let mut known = usize.ZERO
   while true {
-    wanted.* = Bytes.make()
-    offered.* = Bytes.make()
-    if run TypeText.mismatchNamed(expected, actual, &mut names, &mut wanted.*, &mut offered.*) { return true }
+    let mut wanted = Bytes.make()
+    let mut offered = Bytes.make()
+    if run TypeText.mismatchNamed(expected, actual, &mut names, &mut wanted, &mut offered) {
+      run List<MessageArgument>.append(&mut arguments.*, MessageArgument {name: run Bytes.copy(b"expected"), value: move wanted})
+      run List<MessageArgument>.append(&mut arguments.*, MessageArgument {name: run Bytes.copy(b"actual"), value: move offered})
+      let written = List<Bytes>.asSlice(&notes)
+      let mut at = usize.ZERO
+      while at < written.length {
+        run List<MessageArgument>.append(&mut arguments.*, MessageArgument {name: run Bytes.copy(b"note"),
+          value: run Bytes.copy(Bytes.asSlice(&written[at]))})
+        at = at + usize.ONE
+      }
+      return true
+    }
     // Each pass meets at most one unspelled parameter per type, so retry while one is found.
     let count = List<TypeText.Named>.length(&names)
     if count == known { return false }
-    if !run spellParameters(resolver, &mut names) { return false }
+    if !run spellParameters(resolver, &mut names, &mut notes) { return false }
     known = count
   }
   return false
 }
 
-// Fills each unspelled entry of `names` from the source of the innermost declaration body; false
-// when one has no spelling there, such as a parameter of a declaration in another module.
-effect fn spellParameters(resolver: &Resolver, names: &mut List<TypeText.Named>) -> bool
+// Fills each unspelled entry of `names` from the source of the innermost declaration body, adding
+// a note to `notes` for each; false when one has no spelling there, such as a parameter of a
+// declaration in another module.
+effect fn spellParameters(resolver: &Resolver, names: &mut List<TypeText.Named>, notes: &mut List<Bytes>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   let bodies = List<BodyFrame>.asSlice(&resolver.bodies)
   let mut at = bodies.length
@@ -54449,7 +54519,7 @@ effect fn spellParameters(resolver: &Resolver, names: &mut List<TypeText.Named>)
     at = at - usize.ONE
     if let Option<AuthoredCursor>.Some {value} = &bodies[at].naming {
       if let Option<&IndexedSource>.Some {value: indexed} = move SourceIndex.sourceAtCursor(&resolver.source, &value) {
-        return run spellParametersIn(indexed, &mut names.*)
+        return run spellParametersIn(indexed, &mut names.*, &mut notes.*)
       }
       return false
     }
@@ -54458,8 +54528,9 @@ effect fn spellParameters(resolver: &Resolver, names: &mut List<TypeText.Named>)
   return false
 }
 
-// Fills the unspelled entries of `names` from the generic parameters written in `indexed`.
-effect fn spellParametersIn(indexed: &IndexedSource, names: &mut List<TypeText.Named>) -> bool
+// Fills the unspelled entries of `names` from the generic parameters written in `indexed`, adding
+// a note to `notes` for each, such as "`T` is a type parameter of `wrap`, so it can be any type".
+effect fn spellParametersIn(indexed: &IndexedSource, names: &mut List<TypeText.Named>, notes: &mut List<Bytes>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
   let index = IndexedSource.moduleIndex(indexed)
   let declarations = ModuleIndex.listDeclarations(index)
@@ -54475,6 +54546,10 @@ effect fn spellParametersIn(indexed: &IndexedSource, names: &mut List<TypeText.N
       let generics = writtenGenerics(hir, Module.node(hir, declarations[ordinal].header))
       if listed[entry].ordinal >= generics.length { return false }
       let parameter = Module.node(hir, Module.child(hir, generics, listed[entry].ordinal))
+      let bounded = match parameter {
+        Node.TypeParameter {bounds, ..} => bounds.length > usize.ZERO
+        _ => false
+      }
       let spelled = match parameter {
         Node.TypeParameter {name, ..} => match Module.node(hir, name) {
           Node.Name {text} => run Bytes.copy(Module.text(hir, text))
@@ -54483,6 +54558,19 @@ effect fn spellParametersIn(indexed: &IndexedSource, names: &mut List<TypeText.N
         _ => Bytes.make()
       }
       if Bytes.length(&spelled) == usize.ZERO { return false }
+      let owner = run DeclarationId.copySpelling(&listed[entry].declaration)
+      if Bytes.length(&owner) > usize.ZERO {
+        let mut note = run Bytes.copy(b"`")
+        run Bytes.append(&mut note, Bytes.asSlice(&spelled))
+        run Bytes.append(&mut note, b"` is a type parameter of `")
+        run Bytes.append(&mut note, Bytes.asSlice(&owner))
+        if bounded {
+          run Bytes.append(&mut note, b"`, so it can be any type that meets its bounds")
+        } else {
+          run Bytes.append(&mut note, b"`, so it can be any type")
+        }
+        run List<Bytes>.append(&mut notes.*, move note)
+      }
       listed[entry].spelling = move spelled
     }
     entry = entry + usize.ONE
@@ -54510,12 +54598,7 @@ effect fn typeMismatchRejection(
   let lifetimeAware = code == RejectionCode.TypeMismatch || code == RejectionCode.ReturnTypeMismatch
     || code == RejectionCode.AssignmentTypeMismatch || code == RejectionCode.StructFieldTypeMismatch
   if lifetimeAware && List<MessageArgument>.length(&diagnostic.arguments) == usize.ZERO {
-    let mut expectedText = Bytes.make()
-    let mut actualText = Bytes.make()
-    if run namedMismatch(resolver, expected, actual, &mut expectedText, &mut actualText) {
-      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"expected"), value: move expectedText})
-      run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"actual"), value: move actualText})
-    }
+    let named = run appendNamedMismatch(resolver, expected, actual, &mut diagnostic.arguments)
   }
   return run Shared<Rejection>.make(move diagnostic)
 }
@@ -57285,6 +57368,39 @@ effect fn staticArgumentType(resolver: &mut Resolver, owner: &mut Query<Answer, 
   return run embeddedType(&mut resolver.*, &mut owner.*, &mut dependencies.*, value, span)
 }
 
+// A field capability names its owner with the regions its reflection was written at, such as the
+// call regions of `Reflect.fields<Greet>()`, while the call's runtime operands supply the owner's
+// regions here. A member is selected by its owner's identity and ordinal, never by a region, so a
+// capability whose owner differs from the parameter's only in regions is the same capability,
+// reflected again at that owner. None when the operand is no such capability.
+effect fn regionedStaticField(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
+  dependencies: &mut List<Dependency>, module: &ModuleId, parameter: &Shared<Type>, supplied: &Shared<StaticData>, span: Span)
+-> Option<Shared<StaticData>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let field = match move Shared<StaticData>.with<Option<StaticValue.FieldParts>>(supplied, StaticValue.fieldParts) {
+    Option<StaticValue.FieldParts>.Some {value} => move value
+    Option<StaticValue.FieldParts>.None => { return Option<Shared<StaticData>>.none() }
+  }
+  let written = match move Shared<Type>.with<Option<CheckedIntrinsic.FieldTypes>>(&field.ty, CheckedIntrinsic.fieldTypes) {
+    Option<CheckedIntrinsic.FieldTypes>.Some {value} => move value
+    Option<CheckedIntrinsic.FieldTypes>.None => { return Option<Shared<StaticData>>.none() }
+  }
+  let wanted = match move Shared<Type>.with<Option<CheckedIntrinsic.FieldTypes>>(parameter, CheckedIntrinsic.fieldTypes) {
+    Option<CheckedIntrinsic.FieldTypes>.Some {value} => move value
+    Option<CheckedIntrinsic.FieldTypes>.None => { return Option<Shared<StaticData>>.none() }
+  }
+  if Type.hasOpenParameters(&wanted.owner) || run Type.equalsShared(&wanted.owner, &written.owner) { return Option<Shared<StaticData>>.none() }
+  if !run Type.runtimeEqualsShared(&wanted.owner, &written.owner) { return Option<Shared<StaticData>>.none() }
+  let member = match move run checkedReflectedMember(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &wanted.owner, &field, span) {
+    Result<CheckedRecordMember, Shared<Rejection>>.Success {value} => move value
+    Result<CheckedRecordMember, Shared<Rejection>>.Failure {error} => {
+      drop error
+      return Option<Shared<StaticData>>.none()
+    }
+  }
+  return run StaticValue.retypedField(supplied, run CheckedIntrinsic.fieldType(&wanted.owner, &member.ty))
+}
+
 effect fn originComparedType(resolver: &Resolver, value: &Shared<Type>) -> Shared<Type>
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let phase = privateOriginPhase(resolver)
@@ -57366,12 +57482,7 @@ effect fn matchCallArgument(
       let code = valueMismatchCode(&offeredType, &wantedType, mismatchCode)
       let mut diagnostic = run makeRejection(code, module, span)
       if code == RejectionCode.TypeMismatch {
-        let mut expectedText = Bytes.make()
-        let mut actualText = Bytes.make()
-        if run namedMismatch(resolver, &shown, &offeredType, &mut expectedText, &mut actualText) {
-          run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"expected"), value: move expectedText})
-          run List<MessageArgument>.append(&mut diagnostic.arguments, MessageArgument {name: run Bytes.copy(b"actual"), value: move actualText})
-        }
+        let named = run appendNamedMismatch(resolver, &shown, &offeredType, &mut diagnostic.arguments)
       }
       return Option<Shared<Rejection>>.some(run Shared<Rejection>.make(move diagnostic))
     }
@@ -80863,12 +80974,14 @@ impl<'source> StaticPort<'source> {
       Option<Anchor>.Some {value} => move value
       Option<Anchor>.None => { return Option<StaticCall>.none() }
     }
+    let mut receiver = false
     let selected = Shared<TypedBody>.with<Option<Shared<Application>>>(body, fn(checked: &TypedBody) -> Option<Shared<Application>> {
       let nodes = TypedBody.nodeSlice(checked)
       let mut at = usize.ZERO
       while at < nodes.length {
         if at >= window.start && at - window.start < window.length && Anchor.hir(&anchor, nodes[at].origin.node).index == syntax.index {
-          if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {application, ..}, ..} = &nodes[at].kind {
+          if let BodyNodeKind.Expression {form: BodyExpression.DirectCall {application, receiverPass, ..}, ..} = &nodes[at].kind {
+            if let Option<BodyReceiverPass>.Some {..} = &receiverPass { receiver = true }
             return Option<Shared<Application>>.some(Shared<Application>.clone(&application))
           }
         }
@@ -80877,7 +80990,7 @@ impl<'source> StaticPort<'source> {
       return Option<Shared<Application>>.none()
     })
     if let Option<Shared<Application>>.Some {value} = move selected {
-      return Option<StaticCall>.some(StaticCall {application: run Application.copyShared(&value)})
+      return Option<StaticCall>.some(StaticCall {application: run Application.copyShared(&value), receiver: receiver})
     }
     return Option<StaticCall>.none()
   }
@@ -82492,6 +82605,62 @@ impl Semantic {
     }
     return move build.image
   }
+  /// Adds to `image`, once `CacheImage.carry` has copied into it what this store reused, the root of
+  /// each escape check a replay made current (`replayEscapes`). The root rests on the walk's record
+  /// and on the root of every entry the record names, so it stays green while a replay would
+  /// agree again, and the next check takes it without replaying. A check whose record or entries
+  /// `image` lacks is left out, and replays again.
+  pub effect fn imageReplayedChecks(self: &Self, image: &mut CacheImage.Image) -> () ! OutOfMemoryError ? &mut Allocator {
+    let memos = List<EscapeMemo>.asSlice(&self.escapeMemos)
+    let mut replayed = List<usize>.make()
+    let mut at = usize.ZERO
+    while at < memos.length {
+      if let Option<CapturedBuild>.Some {value: captured} = &memos[at].captured {
+        if captured.carriedRecord != usize.MAX { run List<usize>.append(&mut replayed, at) }
+      }
+      at = at + usize.ONE
+    }
+    if List<usize>.length(&replayed) == usize.ZERO { return () }
+    // Each root key's first root, which the replayed checks' nodes name.
+    let mut keys = ExactSet.make()
+    let mut nodes = List<usize>.make()
+    let roots = List<CacheImage.Root>.asSlice(&image.roots)
+    at = usize.ZERO
+    while at < roots.length {
+      if run ExactSet.add(&mut keys, Bytes.asSlice(&roots[at].key)) { run List<usize>.append(&mut nodes, roots[at].node) }
+      at = at + usize.ONE
+    }
+    let picked = List<usize>.asSlice(&replayed)
+    at = usize.ZERO
+    while at < picked.length {
+      let memo = &memos[picked[at]]
+      at = at + usize.ONE
+      let stable = match move run stableUnit(&self.resolver, memo.unit) {
+        Option<Bytes>.Some {value} => move value
+        Option<Bytes>.None => { continue }
+      }
+      if let Option<CapturedBuild>.Some {value: captured} = &memo.captured {
+        let mut edges = List<usize>.make()
+        let record = ExactSet.find(&keys, Bytes.asSlice(&run escapeRecordKey(Bytes.asSlice(&stable))))
+        if record == usize.MAX { continue }
+        run List<usize>.append(&mut edges, CacheImage.nodeEdge(List<usize>.get(&nodes, record)))
+        let entries = List<BuildRecord.Entry>.asSlice(&captured.record.entries)
+        let mut whole = true
+        let mut entry = usize.ZERO
+        while entry < entries.length && whole {
+          if entries[entry].leaf == 0 {
+            let found = ExactSet.find(&keys, Bytes.asSlice(&run escapeEntryKey(Bytes.asSlice(&entries[entry].exact))))
+            if found == usize.MAX { whole = false } else { run List<usize>.append(&mut edges, CacheImage.nodeEdge(List<usize>.get(&nodes, found))) }
+          }
+          entry = entry + usize.ONE
+        }
+        if !whole { continue }
+        let node = run CacheImage.addNode(&mut image.*, List<usize>.asSlice(&edges))
+        run List<CacheImage.Root>.append(&mut image.roots, CacheImage.Root {key: move stable, node: node,
+          answer: run checkAnswer(1, List<DeclarationId>.asSlice(&memo.concrete))})
+      }
+    }
+  }
   // Writes each escape walk record a check here captured, with a root on the MIR of each entry a
   // walk here lowered. A record a replay took from the image this store read, each record no check
   // here replaced, and the green entries those records name that no walk here lowered stay in
@@ -82671,9 +82840,18 @@ impl Semantic {
       run appendDeferred(&mut deferred, List<DeferredStaticTemplate>.asSlice(&memos[found].deferred))
       run appendUnchecked(&mut uncheckedBodies, List<UncheckedBody>.asSlice(&memos[found].unchecked))
       // Each module keeps the escapes of its own bodies, so an edit reruns its module's walk alone.
-      let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, modules[at - usize.ONE], modules, List<DeclarationId>.asSlice(&concrete))
+      let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, modules[at - usize.ONE], modules, List<DeclarationId>.asSlice(&concrete), false)
       run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
       run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
+    }
+    let entries = run Semantic.runtimeRoots(&mut self.*, runtime, modules)
+    if List<DeclarationId>.length(&entries) > usize.ZERO {
+      if let Option<ModuleId>.Some {value: selected} = &runtime.* {
+        let runtimeOrdinal = run internModule(&mut self.resolver, &selected)
+        let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, runtimeOrdinal, modules, List<DeclarationId>.asSlice(&entries), true)
+        run appendOutsideRuntime(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections), runtime)
+        run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
+      }
     }
     let mut conflicts = List<Shared<Rejection>>.make()
     run Semantic.checkForeignClaims(&mut self.*, modules, runtime, &mut conflicts)
@@ -82681,6 +82859,60 @@ impl Semantic {
     self.deferredTemplates = move deferred
     self.uncheckedRoot = move uncheckedBodies
     return move result
+  }
+
+  // The bound of a walk from the runtime's roots, as `keptEscapes` sets it for the runtime module.
+  effect fn runtimeBoundary(self: &mut Self, runtime: &Option<ModuleId>) -> Option<WalkBoundary> ! OutOfMemoryError ? &mut Allocator {
+    let own = match &runtime.* {
+      Option<ModuleId>.Some {value} => ModuleId.copy(&value)
+      Option<ModuleId>.None => { return Option<WalkBoundary>.none() }
+    }
+    let mut package = ModuleId.copy(&own)
+    if self.resolver.currentApplication != usize.MAX { package = resolvedModule(&self.resolver, self.resolver.currentApplication) }
+    return Option<WalkBoundary>.some(WalkBoundary {package: move package, own: move own, checked: List<ModuleId>.make(),
+      lookup: InternIndex.make(), staticsOnly: true})
+  }
+
+  // The C exports of the selected runtime, which a build walks the program from, unless the
+  // runtime is itself a checked module. An effect `main` that requires a provider is open, so no
+  // concrete body of the package reaches it; walking these roots too, bounded to the entry module
+  // and instances with static arguments (`WalkBoundary.staticsOnly`), reaches a library body that
+  // a static argument of `main` selects, and `silk check` reports what `silk build` would.
+  effect fn runtimeRoots(self: &mut Self, runtime: &Option<ModuleId>, modules: &[usize]) -> List<DeclarationId>
+    ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
+    ? &mut Allocator | &mut Types {
+    let mut roots = List<DeclarationId>.make()
+    let selected = match &runtime.* {
+      Option<ModuleId>.Some {value} => ModuleId.copy(&value)
+      Option<ModuleId>.None => { return move roots }
+    }
+    let ordinal = run internModule(&mut self.resolver, &selected)
+    let mut at = usize.ZERO
+    while at < modules.length {
+      if modules[at] == ordinal { return move roots }
+      at = at + usize.ONE
+    }
+    let listed = match move run exportCandidates(&mut self.resolver, &selected) {
+      Option<List<ExportCandidate>>.Some {value} => move value
+      Option<List<ExportCandidate>>.None => { return move roots }
+    }
+    let mut conditions = List<Dependency>.make()
+    let candidates = List<ExportCandidate>.asSlice(&listed)
+    at = usize.ZERO
+    while at < candidates.length {
+      let candidate = &candidates[at]
+      at = at + usize.ONE
+      let active = run available(&mut self.resolver, &mut self.query, &mut conditions, &selected, candidate.declaration, candidate.span)
+      let present = match &active {
+        Result<bool, Shared<Rejection>>.Success {value} => value
+        Result<bool, Shared<Rejection>>.Failure {..} => false
+      }
+      if !present { continue }
+      if let Option<DeclarationId>.Some {value} = move run declarationAt(&mut self.resolver, &selected, candidate.declaration) {
+        run List<DeclarationId>.append(&mut roots, move value)
+      }
+    }
+    return move roots
   }
 
   /// The rejections `checkDeclarations` would report from one escape walk over every concrete body
@@ -82764,7 +82996,7 @@ impl Semantic {
     let mut claims = List<Shared<Rejection>>.make()
     run Semantic.checkForeignClaims(&mut self.*, &[moduleOrdinal], runtime, &mut claims)
     run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&claims))
-    let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, moduleOrdinal, &[], List<DeclarationId>.asSlice(&concrete))
+    let escapes = run Semantic.keptEscapes(&mut self.*, &mut request.*, moduleOrdinal, &[], List<DeclarationId>.asSlice(&concrete), false)
     run mergeRejections(&mut result.rejections, List<Shared<Rejection>>.asSlice(&escapes.rejections))
     run mergeGaps(&mut result.gaps, List<Shared<BackendGap>>.asSlice(&escapes.gaps))
     return move result
@@ -82818,7 +83050,8 @@ impl Semantic {
   // checks (`WalkBoundary`), so it rests on this module's bodies and what they instantiate, not
   // on the whole program. Its key names the `checked` modules, since a module that leaves them is
   // walked here again.
-  effect fn keptEscapes(self: &mut Self, request: &mut Request, module: usize, checked: &[usize], concrete: &[DeclarationId]) -> DeclarationCheckResult
+  effect fn keptEscapes(self: &mut Self, request: &mut Request, module: usize, checked: &[usize], concrete: &[DeclarationId], staticsOnly: bool)
+  -> DeclarationCheckResult
     ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError
     ? &mut Allocator | &mut Types {
     let own = resolvedModule(&self.resolver, module)
@@ -82884,7 +83117,7 @@ impl Semantic {
     }
     self.resolver.rootRecorder = unit
     let boundary = Option<WalkBoundary>.some(WalkBoundary {package: move package, own: move own, checked: move others,
-      lookup: move lookup})
+      lookup: move lookup, staticsOnly: staticsOnly})
     let mut capture = BuildCapture.walk()
     let attempted = run Effect.result(Semantic.capturedEscapes(&mut self.*, &mut request.*, concrete, &boundary, &mut capture, guard))
     self.resolver.rootRecorder = usize.MAX
@@ -83062,12 +83295,19 @@ impl Semantic {
     let mut rejections = move sweep.rejections
     let mut gaps = move sweep.gaps
     run Semantic.checkForeignClaims(&mut self.*, modules, runtime, &mut rejections)
-    let safety = run Semantic.declarationEscapes(
+    let mut safety = run Semantic.declarationEscapes(
       &mut self.*,
       &mut request.*,
       List<DeclarationId>.asSlice(&sweep.concrete),
       &Option<WalkBoundary>.none()
     )
+    let entries = run Semantic.runtimeRoots(&mut self.*, runtime, modules)
+    if List<DeclarationId>.length(&entries) > usize.ZERO {
+      let bound = run Semantic.runtimeBoundary(&mut self.*, runtime)
+      let entered = run Semantic.declarationEscapes(&mut self.*, &mut request.*, List<DeclarationId>.asSlice(&entries), &bound)
+      run appendOutsideRuntime(&mut safety.rejections, List<Shared<Rejection>>.asSlice(&entered.rejections), runtime)
+      run mergeGaps(&mut safety.gaps, List<Shared<BackendGap>>.asSlice(&entered.gaps))
+    }
     let found = List<Shared<Rejection>>.asSlice(&safety.rejections)
     let mut at = usize.ZERO
     while at < found.length {
@@ -85663,6 +85903,12 @@ impl Semantic {
     }
     run Progress.begin(&mut self.resolver.progress, ProgressPhase.Check, checked.length)
     let mut checked = run Semantic.checkDeclarations(&mut self.*, &mut request.*, checked, &exempt)
+    // A syntax error, even one the parser recovered from, rejects the build before any emission.
+    let mut syntax = run Semantic.syntaxRejections(&self.*)
+    if List<Shared<Rejection>>.length(&syntax) > usize.ZERO {
+      let first = List<Shared<Rejection>>.remove(&mut syntax, usize.ZERO)
+      return BackendBuild.Rejected {first: move first, further: move syntax, gaps: List<Shared<BackendGap>>.make()}
+    }
     if List<Shared<Rejection>>.length(&checked.rejections) > usize.ZERO {
       let first = List<Shared<Rejection>>.remove(&mut checked.rejections, usize.ZERO)
       return BackendBuild.Rejected {
@@ -87016,13 +87262,11 @@ impl Semantic {
     let mut needed = List<bool>.make()
     let mut mirs = List<usize>.make()
     let mut rested = List<CapturedEntry>.make()
-    let mut staleCount = usize.ZERO
     at = usize.ZERO
     while at < entries.length {
       let mut held = usize.MAX
       if entries[at].leaf == 0 { held = EscapeImage.entryRoot(&self.escapeImage, Bytes.asSlice(&entries[at].exact)) }
       let outdated = entries[at].leaf == 0 && held == usize.MAX
-      if outdated { staleCount = staleCount + usize.ONE }
       run List<bool>.append(&mut stale, outdated)
       run List<bool>.append(&mut needed, outdated)
       run List<usize>.append(&mut mirs, usize.MAX)
@@ -87087,7 +87331,8 @@ impl Semantic {
           carried: usize.MAX})
       }
     }
-    if staleCount > usize.ZERO { self.freshEscapes = true }
+    // The check this replay makes current has no root in the image read (`imageReplayedChecks`).
+    self.freshEscapes = true
     return Option<CapturedBuild>.some(CapturedBuild {record: move record, entries: move rested, guard: usize.MAX,
       carriedRecord: recordRoot})
   }
@@ -88639,6 +88884,11 @@ struct WalkBoundary {
   // The other modules this check walks from their own bodies, by `ModuleId.hash` in `lookup`.
   checked: List<ModuleId>,
   lookup: InternIndex,
+  // A walk from the runtime's roots enters `own`, the toolchain bodies that start `main`, the
+  // application's entry module and instances with static arguments only: those are what no
+  // module's own check reaches through an open `main`, and the rest of the program is left to the
+  // modules' checks.
+  staticsOnly: bool,
 }
 
 // Whether a walk bounded by `walk` leaves `instance` to another module's escape check.
@@ -88650,6 +88900,15 @@ effect fn walkedElsewhere(walk: &WalkBoundary, instance: &InstanceKey) -> bool !
   let declaration = DeclarationId.copyShared(&identity)
   let module = DeclarationId.moduleId(&declaration)
   if ModuleId.equals(module, &walk.own) { return false }
+  if walk.staticsOnly {
+    if ModuleId.equals(module, &walk.package) || toolchainModule(module) { return false }
+    return match InstanceKey.application(instance) {
+      Option<Shared<Application>>.Some {value} => Shared<Application>.with<bool>(&value, fn(application: &Application) -> bool {
+        return List<StaticSlot>.length(&application.statics) == usize.ZERO
+      })
+      Option<Shared<Application>>.None => true
+    }
+  }
   if !ModuleId.samePackage(module, &walk.package) {
     let listed = List<ModuleId>.asSlice(&walk.checked)
     let mut at = InternIndex.first(&walk.lookup, ModuleId.hash(module))
@@ -90133,15 +90392,21 @@ struct BackendRequest {
 }
 
 // The requester of the instances a body of `module` reaches when `entered` at `span` of
-// `enteredModule`: inherited through toolchain bodies from the first authored call outside the
-// toolchain, and none for a body outside the toolchain, whose own references are the requests.
+// `enteredModule`: the first authored call outside the toolchain that led into the toolchain or
+// into another package, inherited through every body of the toolchain or of a package other than
+// the requester's, and none for a body of the requester's own package, whose own references are
+// the requests. A `compileError` that a library selects for its caller's static arguments, several
+// library calls deep, is then reported at the caller's call.
 fn successorRequester(requester: &Option<RelatedSite>, enteredModule: &ModuleId, span: Span, module: &ModuleId)
 -> Option<RelatedSite> {
-  if !toolchainModule(module) { return Option<RelatedSite>.none() }
   if let Option<RelatedSite>.Some {value} = &requester.* {
-    return Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&value.module), span: value.span})
+    if toolchainModule(module) || !ModuleId.samePackage(&value.module, module) {
+      return Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(&value.module), span: value.span})
+    }
+    return Option<RelatedSite>.none()
   }
   if toolchainModule(enteredModule) || span.end == usize.ZERO { return Option<RelatedSite>.none() }
+  if !toolchainModule(module) && ModuleId.samePackage(enteredModule, module) { return Option<RelatedSite>.none() }
   return Option<RelatedSite>.some(RelatedSite {module: ModuleId.copy(enteredModule), span: span})
 }
 

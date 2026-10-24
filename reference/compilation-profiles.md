@@ -98,7 +98,14 @@ optional element type, array length/element type, and record fields are checked 
 Callable values, runtime handles, resources, opaque identities and ambient capabilities are not
 configuration values.
 
-The portable binding transport uses tagged objects:
+A manifest writes values under `[config]` (project tier) and a profile's `config` (override tier).
+A key is the root module's path and the parameter's name, as `main.limit = 42` or
+`net.http.retries = 3` for `net/http.silk`, in the manifest's own package. The value is plain TOML
+with no tags: an integer, a boolean, a string, or an array of them; an inline table inside an array
+is a record. Assembly checks it against the declared type, and a refusal names the manifest line of
+its key. Every manifest value has `literal` provenance.
+
+`--profile-input` and other tools use the portable binding transport, which tags each value:
 
 | Kind    | Transport                                                                       |
 | ------- | ------------------------------------------------------------------------------- |
@@ -175,9 +182,12 @@ read by declaration identity, not through arbitrary library-field key lookup. No
 `Profile` or `Intrinsic.targetProfile` operation exists.
 
 A manifest selects its default with `build.profile`; `[profiles.<name>]` contains logical profile
-inputs and `bindings`. `build.bindings` contains project-tier bindings. A profile that names no
-`target` builds for the host. Profile fields are kebab-case (`code-model`, `max-memory`); the earlier
-`codeModel` and `maxMemory` are still read, and `--profile-input` JSON keeps them. Without a table
+inputs and `config`. `[config]` contains project-tier package parameter values, keyed by the root
+module's path and the parameter's name (`main.limit = 42`) and written as plain TOML that is checked
+against the parameter's declared type. A profile's `config` holds override-tier values. A profile
+that names no `target` builds for the host. Profile fields are kebab-case (`code-model`,
+`max-memory`); the earlier `codeModel`, `maxMemory` and `bindings` are refused, naming the current
+spelling. `--profile-input` JSON keeps `codeModel`, `maxMemory` and tagged `bindings`. Without a table
 of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
 built-in profiles for the host. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
