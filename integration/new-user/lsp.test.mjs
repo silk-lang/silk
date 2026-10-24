@@ -72,6 +72,20 @@ test('hover shows the signature and doc comment of stdlib, own-package and local
   assert.match(await value('StdoutLogger }', 2), /pub struct StdoutLogger/)
 })
 
+// Editors show the same hover on a declaration as on its uses.
+test('hover on a declaration shows it, as on its uses', { todo: 'finding 127' }, async () => {
+  const value = async (needle, offset) => (await server.request('textDocument/hover', at(program, needle, offset)))?.contents?.value ?? ''
+  assert.match(await value('fn total(', 4), /fn total\(values: &\[i32\]\) -> i32/)
+  assert.match(await value('let mut sum = 0', 9), /sum/)
+  assert.match(await value('values: &[i32]'), /values/)
+})
+
+test('hover on a primitive type says what it is', { todo: 'finding 127' }, async () => {
+  const value = async (needle, offset) => (await server.request('textDocument/hover', at(program, needle, offset)))?.contents?.value ?? ''
+  assert.match(await value('-> i32 {', 4), /i32/)
+  assert.match(await value('at: usize', 5), /usize/)
+})
+
 test('definition opens the declaring file, stdlib included', async () => {
   const local = await server.request('textDocument/definition', at(program, 'total(&numbers)'))
   assert.equal(local.uri, uri())

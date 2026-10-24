@@ -167,7 +167,7 @@ for (const [name, body, code] of [
   ['a constant remainder by zero', 'return 1 % 0', 'SEM0248'],
   ['a constant overflow', 'let x: i32 = 2147483647 + 1\n  return x', 'SEM0247'],
 ]) {
-  test(`${name} is refused by silk check`, { todo: 'finding 123 (#2316)' }, () => {
+  test(`${name} is refused by silk check`, () => {
     const result = check(`pub fn main() -> i32 {\n  ${body}\n}\n`)
     assert.match(result.stderr, new RegExp(`error\\[${code}\\]`), show(result))
   })
@@ -229,12 +229,12 @@ test('a missing package name says it is missing', { todo: 'finding 125' }, () =>
 
 // A first test, written from the Testing page.
 const testing = 'import silk.testing { AssertionError, Testing }\n\n'
-test('a run inside a plain test fn says to make it an effect fn', { todo: 'finding 126' }, () => {
+test('a run inside a plain test fn says to make it an effect fn', () => {
   const result = check(`${testing}test fn adds() {\n  run Testing.expect(1 + 1 == 2, "1 + 1 is 2")\n}\n`)
   assert.match(result.stderr, /effect fn/, show(result))
 })
 
-test('a failure row on a plain fn says to make it an effect fn', { todo: 'finding 126' }, () => {
+test('a failure row on a plain fn says to make it an effect fn', () => {
   const result = check(`${testing}test fn adds() -> () ! AssertionError<'static> {\n  run Testing.expect(true, "x")\n}\n`)
   assert.match(result.stderr, /SEM0062\].*effect fn/, show(result))
 })
@@ -244,7 +244,7 @@ for (const [name, source, reason] of [
   ['a bool result', 'test fn adds() -> bool {\n  return true\n}\n', /\(\)|bool/],
   ['a type parameter', 'test fn g<T>() {\n}\n', /type parameter|generic/i],
 ]) {
-  test(`a test fn with ${name} says what a test may not have`, { todo: 'finding 126' }, () => {
+  test(`a test fn with ${name} says what a test may not have`, () => {
     const result = check(source)
     const line = errors(result).find((l) => l.includes('[SEM0218]')) ?? ''
     assert.ok(line !== '', show(result))
