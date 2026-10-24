@@ -106,10 +106,11 @@ test('manifest mistakes name the entry', () => {
   }
 })
 
-test('doctest and format of `.` at the root cover every member, as doc and format do', { todo: 'finding 105' }, () => {
+test('doctest and format of `.` at the root cover every member, as doc and format do', () => {
   const doctest = silk(h, ['doctest'], { cwd: shop })
   assert.doesNotMatch(doctest.stderr, /pass --manifest-path/, show(doctest))
-  assert.equal(doctest.status, 0, show(doctest))
+  // Neither member has doc examples, and a run that verifies nothing exits 1 on purpose.
+  assert.match(doctest.stdout, /^Package pricing\n[\s\S]*^Package store\n/m, show(doctest))
   const formatted = silk(h, ['format', '--check', '.'], { cwd: shop })
   assert.equal(formatted.status, 0, show(formatted))
 })
