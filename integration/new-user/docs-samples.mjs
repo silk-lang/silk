@@ -20,8 +20,8 @@ import { freshHome, install, read, sharedHome, silk, userEnv, write } from './li
 // package made with `silk add`, or a library with no `main`. The scenario tests cover these flows.
 const contextual = new Map([
   ['reference/26-unsafe-code-and-c-interop.md:291', 'links a C object built by hand'],
-  ['projects/08-build-outputs-and-native-linking.md:156', 'links a C object built by hand'],
-  ['projects/04-dependencies.md:43', 'needs the text-utils package from `silk add`'],
+  ['projects/08-build-outputs-and-native-linking.md:157', 'links a C object built by hand'],
+  ['projects/04-dependencies.md:42', 'needs the text-utils package from `silk add`'],
   ['tools/05-writing-documentation.md:88', 'a library module, shown for its doc comments'],
   ['tools/06-doc-tests-and-reference-generation.md:80', 'a library module, shown for its doc tests'],
   ['guides/09-http-client.md:21', 'talks to a local HTTP server'],
@@ -179,7 +179,7 @@ async function check(h, sample, index) {
 async function checkSample(h, sample, index) {
   const name = 'demo'
   const folder = join(h.work, `sample${index}`, name)
-  write(join(folder, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\nroot = "src/main.silk"\n${sample.manifest === undefined ? '' : `\n${sample.manifest}\n`}`)
+  write(join(folder, 'silk.toml'), `[package]\nname = "${name}"\nversion = "0.1.0"\n${sample.manifest === undefined ? '' : `\n${sample.manifest}\n`}`)
   write(join(folder, 'src/main.silk'), `${sample.source}\n`)
   for (const [label, text] of Object.entries(sample.files)) {
     // `/home/you/<package>/...` is a package beside the sample's own `demo` folder.
@@ -306,7 +306,7 @@ export async function checkGuide(docs, id) {
   const h = sharedHome()
   const page = read(join(docs, 'content', id))
   const folder = join(h.work, `guide-${id.replace(/\W+/g, '-')}`)
-  write(join(folder, 'silk.toml'), '[package]\nname = "guide"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
+  write(join(folder, 'silk.toml'), '[package]\nname = "guide"\nversion = "0.1.0"\n')
   write(join(folder, 'src/main.silk'), guideProgram(page))
   const debug = await run(h, ['run', '--quiet'], folder)
   const release = await run(h, ['run', '--quiet', '--release'], folder)
