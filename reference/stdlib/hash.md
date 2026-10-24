@@ -29,8 +29,8 @@ collisions.
 import silk.hash { Hash, HashKey, HashSeed }
 
 struct Point {
-  x: u64
-  y: u64
+  x: u64,
+  y: u64,
 }
 
 fn pointEquals(left: &Point, right: &Point) -> bool {

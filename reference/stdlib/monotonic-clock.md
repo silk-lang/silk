@@ -31,7 +31,7 @@ import silk.monotonic_clock { MonotonicClock }
 import silk.system_clock { Instant, SystemClock }
 
 struct VirtualClock {
-  mark: Instant
+  mark: Instant,
 }
 
 impl MonotonicClock for VirtualClock {

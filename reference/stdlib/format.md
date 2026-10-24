@@ -49,8 +49,8 @@ import silk.option { Option }
 import silk.writer { Writer, WriterError }
 
 struct CaptureWriter {
-  bytes: [u8; 64]
-  length: usize
+  bytes: [u8; 64],
+  length: usize,
 }
 
 impl Writer for CaptureWriter {
@@ -744,8 +744,8 @@ import silk.format { Debug, Format, Formatter }
 import silk.writer { Writer, WriterError }
 
 struct Account {
-  pub name: string
-  secret: string
+  pub name: string,
+  secret: string,
 }
 
 impl Debug for Account {
@@ -877,8 +877,8 @@ import silk.format { Format }
 import silk.writer { Writer, WriterError }
 
 struct CaptureWriter {
-  bytes: [u8; 64]
-  length: usize
+  bytes: [u8; 64],
+  length: usize,
 }
 
 impl Writer for CaptureWriter {
@@ -1645,8 +1645,8 @@ import silk.format { Display, Format, Formatter }
 import silk.writer { Writer, WriterError }
 
 struct CaptureWriter {
-  bytes: [u8; 64]
-  length: usize
+  bytes: [u8; 64],
+  length: usize,
 }
 
 impl Writer for CaptureWriter {
@@ -1684,8 +1684,8 @@ fn holds(writer: &CaptureWriter, expected: &[u8]) -> bool {
 }
 
 struct Point {
-  x: i32
-  y: i32
+  x: i32,
+  y: i32,
 }
 
 effect fn showPoint(self: &Point, formatter: &mut Formatter) -> ()
