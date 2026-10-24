@@ -933,6 +933,56 @@ const program = Effect.gen(function* () {
     assert.match(refused.stderr, /SEM0052/)
     assert.doesNotMatch(refused.stderr, /SEM0225/)
   }
+  // A library's static `compileError`, selected by a call from a `main` that requires a provider,
+  // is reported by check as by build, at the user's call with the library's site as a note.
+  yield* fs.makeDirectory(join(directory, 'staticspec/app/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'staticspec/spec'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'staticspec/silk.toml'), '[workspace]\nmembers = ["app", "spec"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/spec/silk.toml'),
+    '[package]\nname = "spec"\nversion = "0.1.0"\nsource = "."\nexports = ["sized"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/spec/sized.silk'),
+    'pub fn sized(static n: i64) -> i64 {\n  static if n > 3 { compileError("size too big") }\n  return n\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nspec = { path = "../spec" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/app/src/main.silk'),
+    'import silk.host_input { HostInput }\nimport spec.sized { sized }\n\npub effect fn main() -> i32\n  ? &mut HostInput {\n  if sized(5) != 5 { return 1 }\n  return 0\n}\n',
+  )
+  for (const command of ['check', 'build']) {
+    const refused = yield* invoke(
+      silk,
+      [command, '--stdlib', standardLibrary],
+      join(directory, 'staticspec/app'),
+    )
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(
+      refused.stderr,
+      /^app\/src\/main\.silk:6:6: error\[SEM0177\] size too big\n {2}note: spec\/sized\.silk:2:21: related location$/m,
+    )
+  }
+  // A syntax error the parser recovered from fails the check phase of a build, before codegen.
+  yield* fs.makeDirectory(join(directory, 'unclosed/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unclosed/silk.toml'),
+    '[package]\nname = "unclosed"\nversion = "0.1.0"\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unclosed/src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n')
+  const unclosed = yield* invoke(
+    silk,
+    ['build', '--stdlib', standardLibrary, '--progress', 'plain'],
+    join(directory, 'unclosed'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(unclosed.status, 1, unclosed.stderr)
+  assert.match(unclosed.stderr, /^ {2}check {4}failed: 1 module, 1 error/m)
+  assert.match(unclosed.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
+  assert.doesNotMatch(unclosed.stderr, /codegen/)
   // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
   // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
   // the status 1, and a selection outside the source root is refused before anything is built.
