@@ -68,7 +68,7 @@ import silk.uri_reference { ParseError }
 
 // A transport that answers with fixed bytes and accepts all writes.
 struct ScriptedTransport {
-  memory: MemoryByteDuplex
+  memory: MemoryByteDuplex,
 }
 
 impl HttpTransport for ScriptedTransport {

@@ -37,7 +37,7 @@ program traps.
 import silk.effect { Effect }
 
 struct Problem {
-  code: i32
+  code: i32,
 }
 
 effect fn read(value: i32) -> i32
@@ -80,7 +80,7 @@ service Clock {
 }
 
 struct FixedClock {
-  value: i32
+  value: i32,
 }
 
 impl Clock for FixedClock {
@@ -109,7 +109,7 @@ pub fn main() -> i32 {
 import silk.effect { Effect }
 
 struct Problem {
-  fallback: i32
+  fallback: i32,
 }
 
 effect fn load() -> i32
@@ -354,7 +354,7 @@ import silk.effect { Effect }
 import silk.result { Result }
 
 struct Problem {
-  code: i32
+  code: i32,
 }
 
 effect fn load() -> i32
@@ -930,7 +930,7 @@ service Counter {
 }
 
 struct Counting {
-  value: i32
+  value: i32,
 }
 
 effect fn next(self: &mut Counting) -> i32 {

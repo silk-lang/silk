@@ -30,8 +30,8 @@ not total, sorting and binary search give incorrect results.
 import silk.order { Order, Ordering }
 
 struct Version {
-  major: i32
-  minor: i32
+  major: i32,
+  minor: i32,
 }
 
 fn compareVersions(left: &Version, right: &Version) -> Ordering {

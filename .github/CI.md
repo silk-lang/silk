@@ -1,18 +1,21 @@
 # Running CI on a branch
 
-Selfhost CI (`.github/workflows/selfhost.yml`) does not run on branch pushes or pull request
-events. `main` still runs it on every push and on the nightly schedule. A branch runs it only when
-someone dispatches the workflow on that branch, so push as often as you like and trigger CI once the
-branch is ready for review or merge.
+Selfhost CI (`.github/workflows/selfhost.yml`) runs on every push to a pull request into `main`; a
+newer push cancels the PR's older run. `main` runs it on every push and on the nightly schedule.
+A branch without a pull request into `main`, such as the head of a stack, runs it only when
+someone dispatches the workflow on that branch (below).
 
-A main push skips the gate when a fully green dispatch run of the merged PR's head tested exactly
-the tree the merge produced, so bringing `main` into a PR right before merging saves a whole run.
+A main push skips the gate when a fully green pull request or dispatch run of the merged PR's head
+tested exactly the tree the merge produced. A pull request run tests the PR merged into `main`, so
+it matches as long as `main` has not moved since that run.
 
 The managed release PR (`release/compiler-stable`) is refreshed after every main push but not
 verified. Merging it runs every gate on `main` before publishing, so dispatch the workflow on it
 only when you want a verdict ahead of the merge.
 
-## Before you trigger
+## Dispatching a run
+
+Before you trigger:
 
 - Commit and push everything. The run tests the branch head as pushed.
 - Merge `main` into the branch first when the run is meant to gate the merge. The run tests the
