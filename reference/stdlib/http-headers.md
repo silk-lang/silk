@@ -42,7 +42,7 @@ fn field(name: string<'static>, bytes: &'static [u8]) -> Header<'static> {
   return match Header.make(name, bytes, limits()) {
     Result<Header, ValueError>.Success { value } => value
     Result<Header, ValueError>.Failure { error: _ } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return field(name, bytes)
     }
   }
