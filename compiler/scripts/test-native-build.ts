@@ -1989,6 +1989,43 @@ const program = Effect.gen(function* () {
   assert.equal(managedDoc.status, 0, managedDoc.stderr + managedDoc.stdout)
   assert.equal(yield* fs.exists(join(managed, 'build/documentation/greeting.json')), true)
   assert.equal(yield* fs.exists(join(managed, 'build/documentation/hello.json')), true)
+  // `format .` and `doctest` at the root also cover every member; a member with no examples
+  // passes while another has some.
+  const managedFormatDot = yield* invoke(silk, ['format', '--check', '.'], managed)
+  assert.equal(managedFormatDot.status, 0, managedFormatDot.stderr + managedFormatDot.stdout)
+  assert.match(managedFormatDot.stdout, /apps\/hello\/src\/main\.silk: unchanged/)
+  assert.match(managedFormatDot.stdout, /libs\/greeting\/src\//)
+  const greetingLibrary = join(managed, 'libs/greeting/src/lib.silk')
+  const greetingSource = yield* fs.readFileString(greetingLibrary)
+  yield* fs.writeFileString(
+    greetingLibrary,
+    greetingSource +
+      [
+        '',
+        '/// Two times `value`.',
+        '///',
+        '/// ```silk',
+        '/// import greeting.lib { twice }',
+        '///',
+        '/// pub fn main() -> i32 {',
+        '///   return twice(2) - 4',
+        '/// }',
+        '/// ```',
+        'pub fn twice(value: i32) -> i32 {',
+        '  return value * 2',
+        '}',
+        '',
+      ].join('\n'),
+  )
+  const managedDoctest = yield* invoke(
+    silk,
+    ['doctest', '--stdlib-root', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(managedDoctest.status, 0, managedDoctest.stderr + managedDoctest.stdout)
+  assert.match(managedDoctest.stdout, /^Package greeting\n[^\n]*libs\/greeting\/src\/lib\.silk:\d+ \(byte \d+\): PASSED\n/m)
+  assert.match(managedDoctest.stdout, /^Package hello\n/m)
   const oneFile = yield* invoke(
     silk,
     ['doc', '--stdlib-root', standardLibrary, '--output', 'x.json'],

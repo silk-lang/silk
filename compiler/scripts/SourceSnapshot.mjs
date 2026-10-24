@@ -140,7 +140,7 @@ const validateProjection = (snapshot, sourceCommit, baseManifest, baseVersionSou
     snapshot.tag !== `v${snapshot.version}` ||
     snapshot.prerelease !== snapshot.version.split('+')[0].includes('-') ||
     snapshot.versionFile !== 'src/ReleaseVersion.silk' ||
-    !/^\[(?:release|changes)\][ \t]*\r?\n(?:(?!^\[)[\s\S])*?^version-file[ \t]*=[ \t]*(['"])src\/ReleaseVersion\.silk\1[ \t]*(?:#.*)?$/m.test(
+    !/^\[release\][ \t]*\r?\n(?:(?!^\[)[\s\S])*?^version-file[ \t]*=[ \t]*(['"])src\/ReleaseVersion\.silk\1[ \t]*(?:#.*)?$/m.test(
       baseManifest,
     )
   )

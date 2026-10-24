@@ -24,7 +24,8 @@ Run one area with `node --test integration/new-user/workspace.test.mjs`.
 | `SILK_NEW_USER_RUN_ALL` | `1` also runs docs programs whose output the page does not show, and fails on a crash. |
 | `SILK_NEW_USER_MIRROR`, `SILK_NEW_USER_SECOND` | A `SILK_TOOLCHAIN_MIRROR` directory and a full version in it (not the one `install.sh` picks). They enable the tests that install a second toolchain. Without them those tests are skipped. |
 | `SILK_NEW_USER_TMP` | Where the throwaway homes go. Default: the system temp folder. |
-| `SILK_NEW_USER_COMPILER` | A local `silk` binary to run instead of the installed release, through `SILK_TOOLCHAIN=local`, such as a build of main. It must sit at `<dir>/bin/silk` with the stdlib at `<dir>/lib/silk/stdlib`. install.sh still installs the release, so the install and toolchain tests keep testing that. |
+| `SILK_NEW_USER_COMPILER` | A local compiler to run instead of the installed release, such as a build of main. It must sit at `<dir>/bin/silkc` with the stdlib at `<dir>/lib/silk/stdlib`. Each home gets a copy as the version `0.0.0-local`, selected with `SILK_TOOLCHAIN`. install.sh still installs the release, so the install and toolchain tests keep testing that. |
+| `SILK_NEW_USER_TOOL` | A local `silk` tool to run instead of the one install.sh installs, such as a build of `tool/`. |
 
 `HTTPS_PROXY` and `GITHUB_TOKEN` pass through to the installer.
 
@@ -46,8 +47,8 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 
 | File | Covers |
 | --- | --- |
-| `install.test.mjs` | `install.sh`: layout, default, reinstall, bad tag and channel |
-| `toolchain.test.mjs` | `silk toolchain`, pins, exit 3 for a missing pin, `+version`, auto-install, `latest` and `dev` |
+| `install.test.mjs` | `install.sh`: the tool and toolchain layout, default, reinstall, bad tag and channel |
+| `toolchain.test.mjs` | `silk use` and `silk set`, pins, exit 3 for a missing pin, `+version`, auto-install, `latest` and `dev` |
 | `project.test.mjs` | `silk init`, run with arguments and exit status, check, build, clean, format, `silk add` and `silk remove`, modules, runtime traps, CLI messages |
 | `testing.test.mjs` | `silk test`: passing, failing and trapping tests, `--filter` |
 | `workspace.test.mjs` | Workspaces: init, build order, `-p`, test summary, format, doc, clean, manifest mistakes |
@@ -58,7 +59,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 
 ## Fuzzers
 
-`fuzz/` holds tools for the stability rounds. They are not tests: run them by hand, with the `silk` you want to test first on PATH (or `SILK_TOOLCHAIN=local` and a local build).
+`fuzz/` holds tools for the stability rounds. They are not tests: run them by hand, with the `silk` you want to test first on PATH (or `SILK_TOOLCHAIN` naming an installed local build).
 
 | Tool | Does |
 | --- | --- |
