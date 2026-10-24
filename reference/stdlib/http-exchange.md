@@ -593,7 +593,9 @@ impl Limits
 pub fn defaults() -> Limits
 ```
 
-Returns the default limits: 16 MiB bodies, 64 KiB heads, and 128 requests for each connection.
+Returns the default limits: 16 MiB bodies, 256 KiB heads with field values up to 64 KiB, and
+128 requests for each connection. Servers send long values: GitHub's release downloads
+answer with a `Content-Security-Policy` of over 9 KiB.
 
 <a id="RequestOptions.impl"></a>
 

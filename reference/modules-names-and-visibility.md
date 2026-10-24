@@ -945,7 +945,7 @@ is refused.
 `[package]` also accepts publishing metadata that builds never read: `description`, `license`,
 `repository`, `homepage` and `readme` as strings, `authors` and `keywords` as arrays of strings.
 `[tool.<name>]` belongs to other tools and is never validated. `[release]` belongs to
-`silk change`; `[changes]`, its earlier spelling, is still accepted. Tables and fields a later release will read are refused as not supported yet:
+`silk change`. Tables and fields a later release will read are refused as not supported yet:
 `[dev-dependencies]`, `[target]`, `[lints]`, `[test]`, `[bench]`, `[bin]` and `[package].include`.
 
 **Boundary:** The identity is logical. Two checkouts of the same package at different host paths

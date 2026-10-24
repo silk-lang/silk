@@ -1716,6 +1716,10 @@ reaches a concrete base conformance.
 impl<T: Display> Display for Box<T> { /* ... */ }
 ```
 
+The parts of an `Effect` type in the provider, such as its success and error types, are structural
+parts too, so `impl<'env, E: Debug> Outcome<Effect<'env; i32 ! E>> for Runner<Effect<'env; i32 ! E>>`
+descends.
+
 The compiler proves termination from the declaration itself. It does not use a recursion-depth
 limit, solver fuel, source order, or the set of currently reachable concrete calls.
 
