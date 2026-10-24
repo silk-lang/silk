@@ -2498,7 +2498,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(escapes, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(escapes, 'silk.toml'),
-    '[package]\nname = "escapes"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "escapes"\nversion = "0.1.0"\nmain = "main.silk"\n',
   )
   yield* fs.writeFileString(
     join(escapes, 'src/main.silk'),
