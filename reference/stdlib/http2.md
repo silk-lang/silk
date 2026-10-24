@@ -15,6 +15,49 @@ Streams can progress independently. Field blocks remain contiguous on the wire.
 Use prior knowledge on cleartext transports. On TLS, select `h2` with ALPN before creating this
 connection. The obsolete HTTP/1.1 Upgrade handshake is not part of RFC 9113.
 
+## Examples
+### Queue two requests on one connection
+```silk
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.effect { Effect }
+import silk.hpack { Field }
+import silk.http2 { Connection, Limits, Role }
+import silk.http2_frame { ProtocolError }
+import silk.u32
+import silk.usize
+
+effect fn requests() -> i32
+  ! ProtocolError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut connection = run Connection.make(Role.Client, Limits.defaults())
+  let fields = [
+    Field { name: b":method", value: b"GET", sensitive: false },
+    Field { name: b":scheme", value: b"https", sensitive: false },
+    Field { name: b":authority", value: b"example.com", sensitive: false },
+    Field { name: b":path", value: b"/", sensitive: false }
+  ]
+  let first = run Connection.open(&mut connection, &fields, true)
+  let second = run Connection.open(&mut connection, &fields, true)
+
+  // Send these queued bytes over the authenticated h2 transport.
+  let wire = Connection.output(&connection)
+  if first != 1 || second != 3 || wire.length < 24 {
+    return 1
+  }
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 1
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(requests(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
+```
+
 Import as `Connection` with `import silk.http2 { Connection }`.
 
 Public declarations: 5.
@@ -147,7 +190,7 @@ Maximum unsent wire bytes. Drain output before queuing more application data.
 pub push: bool
 ```
 
-Whether a client accepts server push. Servers ignore this field.
+Whether a client accepts push for the exact authority and scheme of the associated request. Servers ignore this field.
 
 <a id="Limits.impl.Copy"></a>
 

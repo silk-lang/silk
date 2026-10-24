@@ -86,6 +86,20 @@ pub effect fn flush(self: &mut Self, deadline: Option<Instant>) -> ()
 
 Sends all queued protocol bytes and flushes the transport with the caller's absolute deadline.
 
+<a id="Driver.impl.close"></a>
+
+### Method `close`
+
+```silk
+pub effect fn close(self: &mut Self, deadline: Option<Instant>, drainBytes: usize) -> ()
+    ! ProtocolError | TransportError | OutOfMemoryError
+    ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random
+```
+
+Flushes output, drains at most `drainBytes` incoming bytes, and closes the transport.
+Give a finite deadline after GOAWAY so unread socket data does not discard the shutdown frame.
+Drain failures stop draining. Flush and close failures are returned after the close attempt.
+
 <a id="Driver.impl.next"></a>
 
 ### Method `next`
