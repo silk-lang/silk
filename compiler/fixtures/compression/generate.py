@@ -152,6 +152,113 @@ def lzma2_cases():
     write_case('lzma2-decode', source + FOOTER)
 
 
+
+def vli(value):
+    result = bytearray()
+    while value >= 128:
+        result.append((value & 127) | 128)
+        value >>= 7
+    return bytes(result + bytes([value]))
+
+
+def read_vli(data, at):
+    value = 0
+    shift = 0
+    while True:
+        byte = data[at]
+        at += 1
+        value |= (byte & 127) << shift
+        if byte < 128:
+            return value, at
+        shift += 7
+
+
+def xz_index(records):
+    import zlib
+    data = b'\0' + vli(len(records)) + b''.join(vli(packed) + vli(unpacked) for packed, unpacked in records)
+    data += bytes(-len(data) % 4)
+    return data + zlib.crc32(data).to_bytes(4, 'little')
+
+
+def xz_footer(index, check):
+    import zlib
+    data = (len(index) // 4 - 1).to_bytes(4, 'little') + bytes([0, check])
+    return zlib.crc32(data).to_bytes(4, 'little') + data + b'YZ'
+
+
+def xz_parts(wire):
+    size = (int.from_bytes(wire[-8:-4], 'little') + 1) * 4
+    start = len(wire) - 12 - size
+    count, at = read_vli(wire, start + 1)
+    assert count == 1
+    packed, at = read_vli(wire, at)
+    unpacked, at = read_vli(wire, at)
+    return wire[12:start], (packed, unpacked)
+
+
+def xz_cases():
+    import zlib
+    header = HEADER.replace('import silk.lzma {Lzma}', 'import silk.xz {Xz}').replace('Lzma.decode', 'Xz.decode')
+    source = header
+    def packed(data, check=4):
+        return lzma.compress(data, format=lzma.FORMAT_XZ, check=check, filters=[{'id': lzma.FILTER_LZMA2, 'dict_size': 4096}])
+    for index, check in enumerate([0, 1, 4, 10]):
+        wire = packed(b'XZ data! ' * 100, check)
+        source += f'  if !run verify({literal(wire)}, b"XZ data! ", 900) {{ return {index+1} }}\n'
+    empty = packed(b'')
+    source += f'  if !run verify({literal(empty)}, b"", 0) {{ return 5 }}\n'
+    wire = packed(b'XZ data! ' * 100)
+    source += f'  if !run verify({literal(empty + bytes(4) + wire + bytes(8) + wire + bytes(4))}, b"XZ data! ", 1800) {{ return 6 }}\n'
+    block, record = xz_parts(wire)
+    index = xz_index([record, record])
+    multi = wire[:12] + block + block + index + xz_footer(index, 4)
+    assert lzma.decompress(multi) == b'XZ data! ' * 200
+    source += f'  if !run verify({literal(multi)}, b"XZ data! ", 1800) {{ return 7 }}\n'
+    old_header_size = (block[0] + 1) * 4
+    compressed_size = record[0] - old_header_size - 8
+    header_data = b'\0\xc0' + vli(compressed_size) + vli(900) + b'\x21\x01\x00'
+    header_data += bytes(-len(header_data) % 4)
+    header_data = bytes([len(header_data) // 4]) + header_data[1:]
+    new_header = header_data + zlib.crc32(header_data).to_bytes(4, 'little')
+    sized_block = new_header + block[old_header_size:]
+    sized_record = (record[0] + len(new_header) - old_header_size, record[1])
+    index = xz_index([sized_record])
+    sized = wire[:12] + sized_block + index + xz_footer(index, 4)
+    assert lzma.decompress(sized) == b'XZ data! ' * 100
+    source += f'  if !run verify({literal(sized)}, b"XZ data! ", 900) {{ return 8 }}\n'
+    source += f'  let wire = {literal(wire)}\n'
+    source += '''  let mut cut: usize = 0
+  while cut < wire.length {
+    if !run rejects(Slice.view<u8>(wire, 0, cut), DecodeLimits.make(), DecodeReason.TruncatedInput) { return 10 }
+    cut = cut + 1
+  }
+'''
+    def mutated(offset, value):
+        return wire[:offset] + bytes([value]) + wire[offset + 1:]
+    def flags(value):
+        data = bytes([0, value])
+        return wire[:6] + data + zlib.crc32(data).to_bytes(4, 'little') + wire[12:]
+    bad_index = xz_index([(record[0] + 1, record[1])])
+    bad_footer = wire[:-12] + xz_footer(xz_index([record]), 1)
+    bad = [(mutated(0, 0), 'InvalidHeader'), (flags(2), 'UnsupportedCheck'), (flags(0x14), 'InvalidHeader'),
+           (mutated(8, wire[8] ^ 1), 'ChecksumMismatch'),
+           (mutated(12 + old_header_size - 1, block[old_header_size-1] ^ 1), 'ChecksumMismatch'),
+           (wire[:12] + block[:-1] + bytes([block[-1] ^ 1]) + wire[12+len(block):], 'ChecksumMismatch'),
+           (wire[:12] + block + bad_index + xz_footer(bad_index, 4), 'InvalidSize'),
+           (bad_footer, 'InvalidHeader'), (wire + b'\0', 'InvalidData'), (mutated(13, 1), 'UnsupportedFilter')]
+    for index, (value, reason) in enumerate(bad):
+        source += f'  if !run rejects({literal(value)}, DecodeLimits.make(), DecodeReason.{reason}) {{ return {11+index} }}\n'
+    source += '''  let mut limits = DecodeLimits.make()
+  limits.maxOutputBytes = 899
+  if !run rejects(wire, move limits, DecodeReason.OutputLimit) { return 30 }
+  let mut dictionary = DecodeLimits.make()
+  dictionary.maxDictionaryBytes = 4095
+  if !run rejects(wire, move dictionary, DecodeReason.DictionaryLimit) { return 31 }
+'''
+    write_case('xz-decode', source + FOOTER)
+
+
 if __name__ == '__main__':
     lzma_cases()
     lzma2_cases()
+    xz_cases()
