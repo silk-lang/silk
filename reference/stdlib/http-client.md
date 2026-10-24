@@ -269,6 +269,36 @@ None
 
 No lower-level error.
 
+<a id="HttpCause.Provider"></a>
+
+### `Provider`
+
+```silk
+Provider
+```
+
+An HTTP host interface failed with a provider-specific error code.
+
+<a id="HttpCause.Provider.provider"></a>
+
+#### Field `provider`
+
+```silk
+pub provider: string<'static>
+```
+
+The host interface identifying the code's domain.
+
+<a id="HttpCause.Provider.code"></a>
+
+#### Field `code`
+
+```silk
+pub code: u32
+```
+
+The host's error code, such as a WASI HTTP error variant ordinal.
+
 <a id="HttpCause.Uri"></a>
 
 ### `Uri`

@@ -7,6 +7,7 @@ import * as Console from 'effect/Console'
 import * as Effect from 'effect/Effect'
 import * as FileSystem from 'effect/FileSystem'
 import * as NativeProcess from './NativeProcess.ts'
+import * as WasiComponents from './test-wasi-components.ts'
 
 const program = Effect.gen(function* () {
   const [compilerArg, clangArg, toolDirectoryArg] = process.argv.slice(2)
@@ -216,8 +217,9 @@ const program = Effect.gen(function* () {
       )
     }
   }
+  yield* WasiComponents.verify(compiler, clang, tools, repo, directory)
   yield* Console.log(
-    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, run, test, doctest, emission stages, and atomic publication passed',
+    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, sockets, DNS, HTTP client/server, WIT composition, run, test, doctest, emission stages, and atomic publication passed',
   )
 })
 await Effect.runPromise(program.pipe(Effect.scoped, Effect.provide(NodeServices.layer)))

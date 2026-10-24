@@ -5,14 +5,43 @@ import semantic.ContentHash { ContentHash }
 import semantic.RuntimeEncoding
 import driver.NativeToolchain
 import driver.ProcessImage
+import driver.Project as Projects { Project }
 import silk.allocator { Allocator, OutOfMemoryError }
 import silk.bytes { Bytes }
 import silk.child_process { ChildProcess, ProcessRequest, ProcessError }
-import silk.filesystem { FileError, FileSystem, Path }
+import silk.filesystem { DirectoryEntry, DirectoryInfo, FileInfo, FileError, FileSystem, Path }
 import silk.host_input { HostInput, HostInputError }
 import silk.option { Option }
 import silk.list { List }
+import silk.string { String }
+import silk.toml_scanner { TomlError }
+import silk.toml_value { Toml }
 import silk.writer { Writer, WriterError }
+
+/// The WIT package and world whose canonical ABI describes a component's core module.
+pub struct World {
+  pub wit: Option<Path>,
+  pub name: Bytes,
+}
+
+/// Selects the bundled WASI interfaces unless the package declares `[component].wit` and `world`.
+pub effect fn world(project: &Project, library: &Option<Path>) -> World
+  ! FileError | TomlError | OutOfMemoryError
+  ? &mut Allocator {
+  let document = run Projects.document(project)
+  if let Option<string>.Some {value: wit} = move Toml.asString(Toml.fieldAt(Toml.field(&document, "component"), "wit")) {
+    let name = Option<string>.unwrapOr(Toml.asString(Toml.fieldAt(Toml.field(&document, "component"), "world")), "")
+    return World {wit: Option<Path>.some(run CommandPath.resolve(Projects.directory(project), String.utf8Bytes(wit))), name: run Bytes.copy(String.utf8Bytes(name))}
+  }
+  return run commandWorld(library)
+}
+
+/// The bundled command world used by command applications and generated test runners.
+pub effect fn commandWorld(library: &Option<Path>) -> World ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut wit = Option<Path>.none()
+  if let Option<Path>.Some {value: root} = &library.* { wit = Option<Path>.some(run Path.join(&root, "wit")) }
+  return World {wit: move wit, name: run Bytes.copy(b"command")}
+}
 
 /// Resolves an explicit tool override or a tool on PATH.
 pub effect fn tool(variable: string, fallback: &[u8]) -> Option<Path>
@@ -37,7 +66,7 @@ pub effect fn tool(variable: string, fallback: &[u8]) -> Option<Path>
 
 /// Builds a Preview 2 command component from a Preview 1 core module.
 /// The command adapter comes from `SILK_WASI_ADAPTER`; `SILK_WASM_TOOLS` selects wasm-tools.
-pub effect fn component(core: &Path, output: &Path) -> i32
+pub effect fn component(core: &Path, output: &Path, world: &World, command: bool) -> i32
   ! FileError | HostInputError | OutOfMemoryError | ProcessError | WriterError
   ? &mut HostInput | &mut FileSystem | &mut ChildProcess | &mut Allocator {
   let executable = match move run tool("SILK_WASM_TOOLS", b"wasm-tools") {
@@ -47,29 +76,68 @@ pub effect fn component(core: &Path, output: &Path) -> i32
       return 2
     }
   }
-  let adapter = match move run HostInput.variableNamed("SILK_WASI_ADAPTER") {
-    Option<Bytes>.Some { value } => move value
-    Option<Bytes>.None => {
+  let mut adapterVariable = "SILK_WASI_REACTOR_ADAPTER"
+  if command { adapterVariable = "SILK_WASI_ADAPTER" }
+  let adapter = run HostInput.variableNamed(adapterVariable)
+  if command {
+    if let Option<Bytes>.None = &adapter {
       run report(
         "silk: wasm32-wasip2 needs SILK_WASI_ADAPTER pointing to wasi_snapshot_preview1.command.wasm\n"
       )
       return 2
     }
   }
-  let adapterPath = run canonicalInput(Bytes.asSlice(&adapter))
+  let mut embeddedName = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut embeddedName, b".typed-core.wasm")
+  let embedded = run Path.fromBytes(Bytes.asSlice(&embeddedName))
+  let mut input = core
+  if let Option<Path>.Some {value: wit} = &world.wit {
+    run recordWit(&wit)
+    let mut embed = run NativeToolchain.request(&executable)
+    run ChildProcess.addArgument(&mut embed, "component")
+    run ChildProcess.addArgument(&mut embed, "embed")
+    run ChildProcess.addArgumentBytes(&mut embed, Path.rawBytes(&wit))
+    run ChildProcess.addArgumentBytes(&mut embed, Path.rawBytes(core))
+    run ChildProcess.addArgument(&mut embed, "--world")
+    run ChildProcess.addArgumentBytes(&mut embed, Bytes.asSlice(&world.name))
+    run ChildProcess.addArgument(&mut embed, "-o")
+    run ChildProcess.addArgumentBytes(&mut embed, Path.rawBytes(&embedded))
+    let result = run ChildProcess.submit(&embed)
+    run reportBytes(ChildProcess.errorBytes(&result))
+    let status = Option<i32>.unwrapOr(ChildProcess.exitCode(&result), 2)
+    if status != 0 { return status }
+    input = &embedded
+  }
   let mut process = run NativeToolchain.request(&executable)
   run ChildProcess.addArgument(&mut process, "component")
   run ChildProcess.addArgument(&mut process, "new")
-  run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(core))
-  run ChildProcess.addArgument(&mut process, "--adapt")
-  let mut adaptation = run Bytes.copy(b"wasi_snapshot_preview1=")
-  run Bytes.append(&mut adaptation, Path.rawBytes(&adapterPath))
-  run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&adaptation))
+  run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(input))
+  if let Option<Bytes>.Some {value: path} = &adapter {
+    let adapterPath = run canonicalInput(Bytes.asSlice(&path))
+    run ChildProcess.addArgument(&mut process, "--adapt")
+    let mut adaptation = run Bytes.copy(b"wasi_snapshot_preview1=")
+    run Bytes.append(&mut adaptation, Path.rawBytes(&adapterPath))
+    run ChildProcess.addArgumentBytes(&mut process, Bytes.asSlice(&adaptation))
+  }
   run ChildProcess.addArgument(&mut process, "-o")
   run ChildProcess.addArgumentBytes(&mut process, Path.rawBytes(output))
   let result = run ChildProcess.submit(&process)
   run reportBytes(ChildProcess.errorBytes(&result))
   return Option<i32>.unwrapOr(ChildProcess.exitCode(&result), 2)
+}
+
+// wasm-tools reads WIT outside the compiler's FileSystem service. Read the same tree through the
+// service so test-runner reuse observes additions, removals, and edits to component dependencies.
+effect fn recordWit(path: &Path) -> () ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  match move run FileSystem.stat(path) {
+    FileInfo {byteLength: _} => { let bytes = run FileSystem.readFile(path) drop bytes }
+    DirectoryInfo {} => {
+      let entries = run FileSystem.listDirectory(path)
+      let listed = List<DirectoryEntry>.asSlice(&entries)
+      let mut at: usize = 0
+      while at < listed.length { run recordWit(&listed[at].path) at = at + 1 }
+    }
+  }
 }
 
 /// Starts a WASI command using Wasmtime. The guest receives `working` as `/`, or the current
@@ -169,7 +237,7 @@ effect fn canonicalInput(path: &[u8]) -> Path
   return run Path.fromBytes(Bytes.asSlice(&resolved))
 }
 
-/// The canonical paths and content digests of the component builder and command adapter.
+/// The canonical paths and content digests of the component builder and selected adapters.
 /// A changed executable, adapter, or symbolic-link destination changes the test-build identity.
 pub effect fn identity() -> Bytes
   ! FileError | HostInputError | OutOfMemoryError
@@ -198,6 +266,14 @@ pub effect fn identity() -> Bytes
     run RuntimeEncoding.word(&mut result, digest.high)
     run RuntimeEncoding.word(&mut result, digest.low)
     at = at + 1
+  }
+  if let Option<Bytes>.Some {value: reactor} = move run HostInput.variableNamed("SILK_WASI_REACTOR_ADAPTER") {
+    let path = run canonicalInput(Bytes.asSlice(&reactor))
+    let bytes = run FileSystem.readFile(&path)
+    let digest = ContentHash.of(Bytes.asSlice(&bytes))
+    run RuntimeEncoding.field(&mut result, Path.rawBytes(&path))
+    run RuntimeEncoding.word(&mut result, digest.high)
+    run RuntimeEncoding.word(&mut result, digest.low)
   }
   return move result
 }

@@ -90,3 +90,5 @@ The alternative of treating raw pointer formation as a borrow is rejected: JUL-1
 ## Supplied interfaces
 
 Embedders pass ABI JSON snapshots in `Driver.CompileRequest.foreignInterfaces`, with a `SourceFile` identity for each supplied file. Schema 2 is strict and includes normalized contracts. The driver compares all supplied records with one another and with the reachable C inventory before invoking tools or reusing cached emission. A mismatch uses SEM0192 and relates the source declaration and supplied file; malformed/obsolete records use SEM0188. Missing interfaces do not authorize guesses about object-code behavior. Supplied interface bytes participate in the backend cache key. This API does not discover platform supplies or infer interfaces from linker inputs.
+
+WebAssembly function imports additionally accept literal `module` and `name` linkage properties; see [WASI and WIT linkage](wasi.md#custom-wit-worlds-imports-and-exports). They do not narrow the foreign memory or lifetime contract.

@@ -178,7 +178,7 @@ The sealed `Intrinsic` namespace exposes static-only `targetArchitecture`, `targ
 `targetPointerBits` and `targetPointerAlignment` return `u32`. Individual logical build domains are
 queried through static-only `profileText(key: string) -> string`, `profileFlag(key: string) -> bool`
 and `profileContains(key: string, value: string) -> bool`. Keys are closed compiler-owned domain
-names: text keys are `cpu`, `deployment`, `libc`, `artifact`, `entry-kind`, `entry-name`, `link`, `code-model`,
+names: text keys are `target` (the canonical target name), `cpu`, `deployment`, `libc`, `artifact`, `entry-kind`, `entry-name`, `link`, `code-model`,
 `relocation`, `optimization`, `safety`, `threading`, `unwind`, `runtime-kind`, `runtime-name`; flag key is `debug`;
 set keys are `cpu-features` and `sanitizers`. Invalid keys are structured static diagnostics.
 Ordinary Silk wrappers own nominal domain enums and ergonomic operations. Package parameters are

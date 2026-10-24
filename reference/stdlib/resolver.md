@@ -469,6 +469,26 @@ SystemResources
 
 The system did not have the resources, such as memory, for the lookup.
 
+<a id="ResolverError.Provider"></a>
+
+### `Provider`
+
+```silk
+Provider
+```
+
+A host resolver failed with a provider-specific code, such as a WASI network error ordinal.
+
+<a id="ResolverError.Provider.code"></a>
+
+#### Field `code`
+
+```silk
+pub code: i32
+```
+
+The code reported by the provider. Its provider module defines the domain.
+
 <a id="ResolverError.LimitExceeded"></a>
 
 ### `LimitExceeded`
