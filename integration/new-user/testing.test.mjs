@@ -107,12 +107,11 @@ test('after an edit, the second silk test reuses the test build', () => {
   assert.ok(seconds(start) < 1.5, `the unchanged rerun took ${seconds(start)} s`)
 })
 
-test('silk doctest runs the examples, so an example that returns 1 fails', { todo: 'finding 92' }, () => {
+// With --input an example is only checked; bare `silk doctest` in a package runs it.
+test('silk doctest runs the examples, so an example that returns 1 fails', () => {
   const dir = initPackage(h, `doc-${++serial}`, ['--lib'])
   write(join(dir, 'src/lib.silk'), `/// Six times \`radius\`.\n///\n/// \`\`\`silk\n/// import lib { circumference }\n///\n/// pub fn main() -> i32 {\n///   return circumference(2) - 11\n/// }\n/// \`\`\`\npub fn circumference(radius: i32) -> i32 {\n  return radius * 6\n}\n`)
-  const doc = silk(h, ['doc'], { cwd: dir })
-  assert.equal(doc.status, 0, show(doc))
-  const checked = silk(h, ['doctest', '-i', 'build/documentation.json', '--source-root', 'src'], { cwd: dir })
+  const checked = silk(h, ['doctest'], { cwd: dir })
   assert.equal(checked.status, 1, show(checked))
   assert.match(checked.stdout, /FAILED/, show(checked))
 })

@@ -487,14 +487,14 @@ test('let _ = names drop as the way to discard a value', () => {
   assert.match(checked.stderr, /drop/, show(checked))
 })
 
-test('an effect call that is never run says to write run or drop', { todo: 'finding 96' }, () => {
+test('an effect call that is never run says to write run or drop', () => {
   const dir = initPackage(h, 'effect-not-run')
   write(join(dir, 'src/main.silk'), 'effect fn greet() -> () {\n  return ()\n}\n\npub effect fn main() -> () {\n  greet()\n}\n')
   const checked = silk(h, ['check'], { cwd: dir })
   assert.match(checked.stderr, /main\.silk:6:3: error\[SEM0087\] .*never run.*`run`/, show(checked))
 })
 
-test('a pipe compared without parentheses hints at the precedence of |>', { todo: 'finding 97' }, () => {
+test('a pipe compared without parentheses hints at the precedence of |>', () => {
   const dir = initPackage(h, 'pipe-precedence')
   write(join(dir, 'src/main.silk'), 'fn add(a: i32, b: i32) -> i32 {\n  return a + b\n}\n\npub fn main() -> i32 {\n  if 1 |> add(2) != 3 {\n    return 1\n  }\n  return 0\n}\n')
   const checked = silk(h, ['check'], { cwd: dir })
