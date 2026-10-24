@@ -103,9 +103,9 @@ export function hasTool(h) {
   return existsSync(front) && !lstatSync(front).isSymbolicLink()
 }
 
-// Adds SILK_NEW_USER_TOOL to an installed home when the release did not ship the tool.
+// Puts SILK_NEW_USER_TOOL at ~/.silk/bin/silk of an installed home, over the release's own tool.
 export function addLocalTool(h) {
-  if (hasTool(h) || toolBinary === '') return hasTool(h)
+  if (toolBinary === '') return hasTool(h)
   const front = join(h.silkHome, 'bin/silk')
   rmSync(front, { force: true })
   copyFileSync(toolBinary, front)
