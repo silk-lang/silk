@@ -92,7 +92,7 @@ def main():
     source += '  return 0\n}\n'
     with tempfile.TemporaryDirectory(prefix='silk-compression-') as directory:
         project = Path(directory)
-        (project / 'silk.toml').write_text('[package]\nname = "compression-interop"\nversion = "0.0.0"\nroot = "main.silk"\n')
+        (project / 'silk.toml').write_text('[package]\nname = "compression-interop"\nversion = "0.0.0"\nsource = "."\nmain = "main.silk"\n')
         (project / 'main.silk').write_text(source)
         subprocess.run([str(args.silk.resolve()), 'build', str(project / 'main.silk'), '-o', str(project / 'probe'), '--stdlib', str(ROOT / 'stdlib'), '--clang', str(args.clang.resolve())], check=True)
         result = subprocess.run([str(project / 'probe')], capture_output=True, check=True)
