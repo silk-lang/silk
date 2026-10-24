@@ -27,7 +27,7 @@ import silk.random { Random }
 
 // A test provider. Never use it for secrets.
 struct Scripted {
-  filled: usize
+  filled: usize,
 }
 
 impl Random for Scripted {
