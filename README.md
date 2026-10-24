@@ -327,7 +327,7 @@ It includes:
   formatting, and checked arithmetic for every scalar type.
 - **Systems:** files, child processes, sockets, clocks, randomness, single-threaded fibers and
   schedulers, and WebAssembly start-up.
-- **Data:** JSON and TOML, Base64, URIs, and Zstandard and DEFLATE/gzip decoding.
+- **Data:** JSON and TOML, Base64, URIs, LZMA/LZMA2, XZ, and Zstandard decoding, and DEFLATE/zlib/gzip encoding and decoding.
 - **Network:** an HTTP client and server, a WebSocket server, connection pooling, and TLS with X.509
   certificate path validation.
 - **Crypto:** SHA-1, SHA-2 and SHA-3, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, and ECDSA
