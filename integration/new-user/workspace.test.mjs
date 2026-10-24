@@ -1,6 +1,7 @@
 // The Workspaces page: one root, two members, commands from the root and from a member.
 import { strict as assert } from 'node:assert'
 import { before, test } from 'node:test'
+import { rmSync } from 'node:fs'
 import { existsSync, join, read, sharedHome, show, silk, write } from './lib.mjs'
 
 const h = sharedHome()
@@ -104,4 +105,36 @@ test('manifest mistakes name the entry', () => {
   } finally {
     write(manifest, original)
   }
+})
+
+// A library's roots are its exports, so a test module that no export imports is never loaded.
+test('a library module that no export imports is still checked and its tests run', { todo: 'finding 104' }, () => {
+  const extra = join(shop, 'pricing/src/pricing_tests.silk')
+  write(extra, 'import silk.testing { AssertionError, Testing }\n\ntest effect fn neverFound() -> ()\n  ! AssertionError<\'static> {\n  run Testing.expect(1 == 1, "one is one")\n}\n\nfn broken() -> i32 {\n  return "no"\n}\n')
+  try {
+    const checked = silk(h, ['check'], { cwd: shop })
+    assert.notEqual(checked.status, 0, `the type error in pricing_tests.silk is reported\n${show(checked)}`)
+    write(extra, read(extra).replace(/\nfn broken[\s\S]*$/, ''))
+    const tested = silk(h, ['test', '--no-cache', '-p', 'pricing'], { cwd: shop })
+    assert.match(tested.stdout, /neverFound/, show(tested))
+  } finally {
+    rmSync(extra)
+  }
+})
+
+test('doctest and format of `.` at the root cover every member, as doc and format do', { todo: 'finding 105' }, () => {
+  const doctest = silk(h, ['doctest'], { cwd: shop })
+  assert.doesNotMatch(doctest.stderr, /pass --manifest-path/, show(doctest))
+  assert.equal(doctest.status, 0, show(doctest))
+  const formatted = silk(h, ['format', '--check', '.'], { cwd: shop })
+  assert.equal(formatted.status, 0, show(formatted))
+})
+
+test('silk add of a workspace root says which members it could add', { todo: 'finding 106' }, () => {
+  const outside = join(h.work, 'outside-app')
+  assert.equal(silk(h, ['init', 'outside-app'], { cwd: h.work }).status, 0)
+  const added = silk(h, ['add', shop], { cwd: outside })
+  assert.notEqual(added.status, 0)
+  assert.match(added.stdout + added.stderr, /workspace/, show(added))
+  assert.match(added.stdout + added.stderr, /pricing/, show(added))
 })

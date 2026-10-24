@@ -87,6 +87,19 @@ test('completion after a type offers its functions', async () => {
   for (const label of ['log', 'provideMut', 'result']) assert.ok(labels.includes(label), `${label} in ${labels.join(', ')}`)
 })
 
+// While typing, the file has just `Status.` with nothing after the dot yet.
+test('completion right after typing a union type and a dot offers its variants', async () => {
+  const withUnion = `${program}\nunion Status {\n  Open,\n  Done { day: u32 },\n}\n\nfn opened() -> Status {\n  return Status.\n}\n`
+  await change(withUnion)
+  try {
+    const result = await server.request('textDocument/completion', at(withUnion, 'Status.\n', 7))
+    const labels = (result.items ?? result).map((item) => item.label)
+    for (const label of ['Open', 'Done']) assert.ok(labels.includes(label), `${label} in ${labels.join(', ')}`)
+  } finally {
+    await change(program)
+  }
+})
+
 test('formatting matches silk format', async () => {
   const messy = program.replace('fn total(values: &[i32]) -> i32 {', 'fn   total(values:&[i32])->i32{')
   await change(messy)

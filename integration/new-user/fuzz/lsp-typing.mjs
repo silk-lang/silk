@@ -38,6 +38,12 @@ let current = before
 const slowest = { completion: 0, hover: 0 }
 let requests = 0
 const startAll = Date.now()
+// If the server dies, the text typed so far goes to SILK_LSP_TYPING_DUMP (default lsp-typing-crash.silk).
+process.on('uncaughtException', (error) => {
+  writeFileSync(process.env.SILK_LSP_TYPING_DUMP ?? 'lsp-typing-crash.silk', current + after)
+  console.error(`stopped after ${current.length - before.length} typed characters\n${error.stack}`)
+  process.exit(1)
+})
 for (const ch of typed) {
   const position = endOf(current)
   current += ch
