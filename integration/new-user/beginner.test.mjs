@@ -162,10 +162,16 @@ for (const [name, source, reason] of [
   })
 }
 
-test('a constant division by zero is refused by silk check', { todo: 'finding 123' }, () => {
-  const result = check('pub fn main() -> i32 {\n  return 1 / 0\n}\n')
-  assert.match(result.stderr, /error\[/, show(result))
-})
+for (const [name, body, code] of [
+  ['a constant division by zero', 'return 1 / 0', 'SEM0248'],
+  ['a constant remainder by zero', 'return 1 % 0', 'SEM0248'],
+  ['a constant overflow', 'let x: i32 = 2147483647 + 1\n  return x', 'SEM0247'],
+]) {
+  test(`${name} is refused by silk check`, { todo: 'finding 123 (#2316)' }, () => {
+    const result = check(`pub fn main() -> i32 {\n  ${body}\n}\n`)
+    assert.match(result.stderr, new RegExp(`error\\[${code}\\]`), show(result))
+  })
+}
 
 test('an out-of-range literal names the value and the range', () => {
   const result = check('pub fn main() -> i32 {\n  let x: u8 = 300\n  return 0\n}\n')
