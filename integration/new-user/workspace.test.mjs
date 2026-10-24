@@ -115,7 +115,7 @@ test('doctest and format of `.` at the root cover every member, as doc and forma
   assert.equal(formatted.status, 0, show(formatted))
 })
 
-test('silk add of a workspace root says which members it could add', { todo: 'finding 106' }, () => {
+test('silk add of a workspace root says which members it could add', () => {
   const outside = join(h.work, 'outside-app')
   assert.equal(silk(h, ['init', 'outside-app'], { cwd: h.work }).status, 0)
   const added = silk(h, ['add', shop], { cwd: outside })
