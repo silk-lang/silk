@@ -50,7 +50,7 @@ test('toolchain help works in every spelling', () => {
   }
 })
 
-test('--help after a tool command prints the help', { todo: 'fixed on main after 0.1.0-dev.14' }, () => {
+test('--help after a tool command prints the help', () => {
   const h = home()
   for (const spelling of [['use', '--help'], ['set', '-h'], ['update', '--help']]) {
     const result = silk(h, spelling)
@@ -96,7 +96,7 @@ test('toolchain use outside a package says to run silk init', () => {
   assert.match(result.stderr, /no silk\.toml here or above; start a project with `silk init`/)
 })
 
-test('toolchain use 0.0.0 explains that 0.0.0 cannot be pinned', { todo: 'finding 12: the message calls 0.0.0 not a semantic version' }, () => {
+test('toolchain use 0.0.0 explains that 0.0.0 cannot be pinned', () => {
   const h = home()
   const app = initPackage(h, 'app')
   const result = silk(h, ['set', '0.0.0'], { cwd: app })
@@ -176,7 +176,7 @@ test('toolchain default repoints bin/silk so the old default can be uninstalled'
   assert.equal(removed.status, 0, show(removed))
 })
 
-test('toolchain install of a partial version honors HTTPS_PROXY', { todo: 'finding 6: the release listing connects directly' }, () => {
+test('toolchain install of a partial version honors HTTPS_PROXY', () => {
   // Only meaningful on a machine whose direct egress is blocked and HTTPS_PROXY is set.
   if (process.env.HTTPS_PROXY === undefined) return
   const h = home()

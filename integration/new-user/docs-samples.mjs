@@ -19,11 +19,11 @@ import { freshHome, install, read, sharedHome, silk, userEnv, write } from './li
 // Programs that need more than the page's labelled files: a C object, a running server, another
 // package made with `silk add`, or a library with no `main`. The scenario tests cover these flows.
 const contextual = new Map([
-  ['reference/26-unsafe-code-and-c-interop.md:291', 'links a C object built by hand'],
+  ['reference/26-unsafe-code-and-c-interop.md:323', 'links a C object built by hand'],
   ['projects/08-build-outputs-and-native-linking.md:157', 'links a C object built by hand'],
   ['projects/04-dependencies.md:42', 'needs the text-utils package from `silk add`'],
   ['tools/05-writing-documentation.md:88', 'a library module, shown for its doc comments'],
-  ['tools/06-doc-tests-and-reference-generation.md:80', 'a library module, shown for its doc tests'],
+  ['tools/06-doc-tests-and-reference-generation.md:87', 'a library module, shown for its doc tests'],
   ['guides/09-http-client.md:21', 'talks to a local HTTP server'],
   ['guides/16-testing-with-providers.md:112', 'a test module beside the package'],
 ])

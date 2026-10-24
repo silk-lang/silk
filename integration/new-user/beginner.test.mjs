@@ -121,3 +121,53 @@ for (const [code, files, source, want] of [
     assert.match(result.stderr, want, show(result))
   })
 }
+
+// Runtime traps a beginner hits. The language's own traps name the reason and the user's line.
+function run(source) {
+  const dir = initPackage(h, `beginner-${++serial}`)
+  write(join(dir, 'src/main.silk'), source)
+  return silk(h, ['run', '--quiet'], { cwd: dir })
+}
+
+for (const [name, source, reason, at] of [
+  ['an index out of range', 'fn at(i: usize) -> i32 {\n  let a = [1, 2, 3]\n  return a[i]\n}\n\npub fn main() -> i32 {\n  return at(5)\n}\n', 'index out of bounds', 'main.at (main:3:10)'],
+  ['an i32 overflow', 'fn add(a: i32, b: i32) -> i32 {\n  return a + b\n}\n\npub fn main() -> i32 {\n  return add(2147483647, 1)\n}\n', 'arithmetic overflow', 'main.add (main:2:10)'],
+  ['a u8 underflow', 'fn sub(a: u8, b: u8) -> u8 {\n  return a - b\n}\n\npub fn main() -> i32 {\n  let x = sub(1, 2)\n  return 0\n}\n', 'arithmetic overflow', 'main.sub (main:2:10)'],
+  ['a division by zero', 'fn div(a: i32, b: i32) -> i32 {\n  return a / b\n}\n\npub fn main() -> i32 {\n  return div(1, 0)\n}\n', 'division by zero', 'main.div (main:2:10)'],
+  ['a remainder by zero', 'fn m(a: i32, b: i32) -> i32 {\n  return a % b\n}\n\npub fn main() -> i32 {\n  return m(1, 0)\n}\n', 'division by zero', 'main.m (main:2:10)'],
+  ['MIN / -1', 'fn div(a: i32, b: i32) -> i32 {\n  return a / b\n}\n\npub fn main() -> i32 {\n  return div(-2147483647 - 1, -1)\n}\n', 'arithmetic overflow', 'main.div (main:2:10)'],
+]) {
+  test(`${name} traps with its reason and line`, () => {
+    const result = run(source)
+    assert.notEqual(result.status, 0, show(result))
+    assert.ok(result.stderr.includes(`fatal trap: ${reason}\n  at ${at}`), show(result))
+  })
+}
+
+test('unbounded recursion reports a stack overflow', () => {
+  const result = run('fn r(n: i64) -> i64 {\n  return r(n + 1) + 1\n}\n\npub fn main() -> i32 {\n  let x = r(0)\n  return 0\n}\n')
+  assert.match(result.stderr, /fatal trap: stack overflow/, show(result))
+})
+
+// Like List.get since #2278: the stdlib function names the reason, and the frame is the caller's.
+for (const [name, source, reason] of [
+  ['i32.toUsize(-1)', 'import silk.i32\n\nfn conv(x: i32) -> usize {\n  return i32.toUsize(x)\n}\n\npub fn main() -> i32 {\n  let y = conv(-1)\n  return 0\n}\n', /i32\.toUsize: .*negative|i32\.toUsize: .*fit/],
+  ['u32.toU8(300)', 'import silk.u32\n\nfn conv(x: u32) -> u8 {\n  return u32.toU8(x)\n}\n\npub fn main() -> i32 {\n  let y = conv(300)\n  return 0\n}\n', /u32\.toU8: .*fit/],
+  ['String.slice past the end', 'import silk.string { String }\n\nfn cut(s: string) -> string {\n  return String.slice(s, 2, 10)\n}\n\npub fn main() -> i32 {\n  let t = cut("abc")\n  return 0\n}\n', /String\.slice: /],
+]) {
+  test(`${name} traps with the stdlib reason at the caller's line`, { todo: 'finding 122' }, () => {
+    const result = run(source)
+    assert.match(result.stderr, reason, show(result))
+    assert.match(result.stderr, /at main\.(conv|cut) \(main:4:/, show(result))
+  })
+}
+
+test('a constant division by zero is refused by silk check', { todo: 'finding 123' }, () => {
+  const result = check('pub fn main() -> i32 {\n  return 1 / 0\n}\n')
+  assert.match(result.stderr, /error\[/, show(result))
+})
+
+test('an out-of-range literal names the value and the range', { todo: 'finding 123' }, () => {
+  const result = check('pub fn main() -> i32 {\n  let x: u8 = 300\n  return 0\n}\n')
+  assert.match(result.stderr, /SEM0002\].*300.*(255|u8)/, show(result))
+})

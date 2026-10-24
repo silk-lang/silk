@@ -159,7 +159,7 @@ test('silk help lists the version commands', { skip }, () => {
   }
 })
 
-test('the old silk toolchain command points at silk use', { skip, todo: 'finding 100' }, () => {
+test('the old silk toolchain command points at silk use', { skip }, () => {
   const h = home()
   const result = silk(h, ['toolchain', 'list'])
   assert.notEqual(result.status, 0)
