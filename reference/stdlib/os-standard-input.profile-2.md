@@ -19,7 +19,7 @@ input, the provider remembers it. Later reads return the end without a system ca
 ## Gotchas
 - An empty buffer returns a count of 0 without a read, also after the end of input.
 - A read waits until input arrives or ends.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The provider exists on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 ## Examples
 ### Read standard input

@@ -27,6 +27,8 @@ kept. A synchronized atomic write calls `fsync` on the file before the rename, a
 directory after it. `syncDirectory` also uses `fsync`. These do not use `F_FULLFSYNC`, and do
 not promise that data survives a power loss.
 
+On WASI, roots name preopened guest directories. The host controls rights, file permissions, and synchronization support.
+
 Directory listings are sorted by the bytes of the paths. A native error becomes a `FileError`
 with a portable reason and the native code.
 
@@ -42,7 +44,7 @@ with a portable reason and the native code.
   that renames those directories, changes mounts, or changes the temporary files.
 - After `writeFileAtomic` fails with a published error, the new contents are visible. Do not
   write again without a check.
-- The provider exists only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The provider exists on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 
 ## Examples
 ### Write and read a file in a temporary directory

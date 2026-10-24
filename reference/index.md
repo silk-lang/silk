@@ -179,3 +179,5 @@ documentation remain separate from this reference.
 - [ECDSA P-256 verification](ecdsa-p256-verification.md) — borrowed messages, strict DER and retained certificate parameter policy.
 
 - [Native socket listeners](native-socket-listeners.md) — scoped nonblocking TCP and pathname-Unix listeners with bounded accept polling.
+
+- [WASI targets](wasi.md): command modules and components, host services, and build tools.

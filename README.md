@@ -337,7 +337,9 @@ It includes:
 
 Native hosts are Apple Silicon macOS (`aarch64-apple-darwin`), x86-64 Linux
 (`x86_64-unknown-linux-gnu`) and ARM64 Linux (`aarch64-unknown-linux-gnu`). WebAssembly
-(`wasm32-unknown-unknown`) is an output target.
+(`wasm32-unknown-unknown`) is a freestanding output target. WASI commands target
+`wasm32-wasip1` (core modules) or `wasm32-wasip2` (components). See the
+[WASI guide](reference/wasi.md) for build tools, runtime commands, and host services.
 
 ## Status
 

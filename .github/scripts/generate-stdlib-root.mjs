@@ -25,6 +25,7 @@ const startup = new Set([
   'silk/native_start_sync',
   'silk/raw_start',
   'silk/wasm_start',
+  'silk/wasi_start',
 ])
 for (const module of startup) {
   if (!modules.includes(module)) throw new Error(`Missing startup module ${module}`)
