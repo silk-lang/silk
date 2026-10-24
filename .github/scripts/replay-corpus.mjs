@@ -44,7 +44,7 @@ async function replay({ kind, name }) {
   mkdirSync(directory);
   cpSync(join(source, 'main.silk'), join(directory, 'main.silk'));
   if (existsSync(join(source, 'imports'))) cpSync(join(source, 'imports'), directory, { recursive: true });
-  writeFileSync(join(directory, 'silk.toml'), '[package]\nname = "replay-corpus"\nversion = "0.1.0"\nroot = "main.silk"\n');
+  writeFileSync(join(directory, 'silk.toml'), '[package]\nname = "replay-corpus"\nversion = "0.1.0"\nsource = "."\n');
   const text = readFileSync(join(directory, 'main.silk'), 'utf8');
   const line = text.split('\n').find((candidate) => candidate.trim() !== '' && !candidate.startsWith(' ')
     && text.split(`${candidate}\n`).length === 2);

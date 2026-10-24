@@ -3,7 +3,7 @@
 # with the `silk` on PATH in debug and release, and prints a MISMATCH line for each difference.
 generator=$1; seed=$2; w=$3/p$seed
 mkdir -p "$w/src"
-printf '[package]\nname = "fz"\nversion = "0.1.0"\nroot = "src/main.silk"\n' > "$w/silk.toml"
+printf '[package]\nname = "fz"\nversion = "0.1.0"\n' > "$w/silk.toml"
 python3 -I "$generator" "$seed" "$w/src/main.silk" "$w/expected.txt"
 for mode in debug release; do
   flag=""; [ $mode = release ] && flag=--release
