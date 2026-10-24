@@ -40,7 +40,8 @@ test('a failing assertion fails the run with its message', () => {
   write(join(dir, 'src/lib.silk'), read(join(dir, 'src/lib.silk')) + failing)
   const result = silk(h, ['test', '--no-cache'], { cwd: dir })
   assert.equal(result.status, 1, show(result))
-  assert.match(result.stdout, /  lib::failsOnPurpose\n    assertion failed: 2 \+ 2 is 5\n    FAIL /)
+  // Since #2262 the failure names the line of the failing expect (finding 94).
+  assert.match(result.stdout, /  lib::failsOnPurpose\n    assertion failed: 2 \+ 2 is 5\n      at lib\.failsOnPurpose \(lib:\d+:\d+\)\n    FAIL /)
   assert.match(result.stdout, /Tests  1 passed, 1 failed/)
 })
 

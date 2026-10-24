@@ -80,6 +80,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `fuzz/huge-sources.py <dir>` | Huge and malformed sources (deep nesting, 30,000 lets, binary garbage, a BOM); flags crashes and timeouts |
 | `node fuzz/lsp-edits.mjs <package> <seed> <steps> [burst]` | Random edits to the package's `src/main.silk` in `silk lsp`, with hover, completion, definition, symbols and formatting after each; compares diagnostics with `silk check` |
 | `node fuzz/lsp-modules.mjs <empty dir> <seed> <steps>` | Writes a three-module package, then makes random edits to the two imported modules in `silk lsp` and checks every open file's diagnostics against `silk check` (`LSP_TRACE=1` prints each publish). Like the tests, it runs the `silk` on PATH under `$HOME/.silk/bin` unless `SILK_NEW_USER_COMPILER` is set |
+| `node fuzz/lsp-typing.mjs <package> <file to type> [start file with @@]` | Types a file into `silk lsp` one character at a time, as an editor does (an incremental change per key, a completion request after each identifier character), at the `@@` marker of the start file. Prints the slowest completion and hover, and whether the final diagnostics match `silk check`. Set `SILK_NEW_USER_COMPILER` as for the tests |
 
 For example, 100 arithmetic programs, three at a time:
 
