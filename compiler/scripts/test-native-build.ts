@@ -2490,8 +2490,63 @@ const program = Effect.gen(function* () {
   yield* splitRun(9)
   yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
   yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+[1-9]\d+ functions\s/)
+  // A check replays the escape walks the last check left in the cache. A callback's call into
+  // another module of the package is walked below the callback, so an edit there that adds a `run`
+  // is reported as a cold check reports it, and an edit that keeps what the walk reads reports
+  // nothing.
+  const escapes = join(directory, 'escapes')
+  yield* fs.makeDirectory(join(escapes, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(escapes, 'silk.toml'),
+    '[package]\nname = "escapes"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(escapes, 'src/main.silk'),
+    [
+      'import helper',
+      'import silk.allocator {Allocator, OutOfMemoryError}',
+      'import silk.effect {Effect}',
+      'import silk.result {Result}',
+      'import silk.shared {Shared}',
+      '',
+      'fn use(value: &mut i32) -> i32 {',
+      '  return helper.compute() + value.*',
+      '}',
+      '',
+      'effect fn start() -> i32 ! OutOfMemoryError ? &mut Allocator {',
+      '  let shared = run Shared<i32>.make(41)',
+      '  return shared.withMut(use)',
+      '}',
+      '',
+      'pub fn main() -> i32 {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  return match move run Effect.result(start() |> Effect.provideMut<Allocator>(&mut allocator)) {',
+      '    Result<i32, OutOfMemoryError>.Success {value} => value',
+      '    Result<i32, OutOfMemoryError>.Failure {..} => 1',
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const escapeReports = (output: string) => output.split('\n').filter((line) => /(error|warning)\[/.test(line)).join('\n')
+  const escapeCheck = Effect.fnUntraced(function* (helper: string, expected: string) {
+    yield* fs.writeFileString(join(escapes, 'src/helper.silk'), helper)
+    const warm = yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+    yield* fs.remove(join(escapes, 'build'), { recursive: true })
+    const cold = yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+    assert.equal(escapeReports(warm.stdout + warm.stderr), escapeReports(cold.stdout + cold.stderr), 'a warm check reports what a cold check reports')
+    assert.equal(warm.status, cold.status, warm.stderr)
+    assert.match(escapeReports(cold.stdout + cold.stderr), new RegExp(expected))
+    // Leave a cache for the next edit.
+    yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+  })
+  const computing = (body: string) => `effect fn tick() -> () {\n  return ()\n}\n\npub fn compute() -> i32 {\n${body}}\n`
+  yield* escapeCheck(computing('  return 1\n'), '^$')
+  yield* escapeCheck(computing('  return 2\n'), '^$')
+  yield* escapeCheck(computing('  run tick()\n  return 1\n'), 'helper\\.silk:6:3: error\\[OWN0016\\]')
+  yield* escapeCheck(computing('  return 3\n'), '^$')
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))

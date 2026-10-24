@@ -2,7 +2,7 @@
 // sees Silk the way a fresh machine does: no ~/.silk, no settings, nothing on PATH but the
 // toolchain the test installed.
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
+import { copyFileSync, cpSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -17,11 +17,14 @@ export const docsRoot = process.env.SILK_NEW_USER_DOCS ?? ''
 // (the published one is https://raw.githubusercontent.com/silk-lang/silk/main/install.sh).
 const installer = process.env.SILK_NEW_USER_INSTALLER ?? join(repoRoot, 'install.sh')
 
-// SILK_NEW_USER_COMPILER is a local silk binary, for example a build of main, laid out as
-// <dir>/bin/silk with its stdlib at <dir>/lib/silk/stdlib. Commands then run it through
-// SILK_TOOLCHAIN=local instead of the installed release. install.sh still runs, so the
-// install and toolchain tests keep testing the release.
+// SILK_NEW_USER_COMPILER is a local compiler, for example a build of main, laid out as
+// <dir>/bin/silkc with its stdlib at <dir>/lib/silk/stdlib. Each home gets a copy as the toolchain
+// `0.0.0-local`, and commands select it with SILK_TOOLCHAIN. SILK_NEW_USER_TOOL is a local silk
+// tool to run instead of the installed one. install.sh still runs, so the install and toolchain
+// tests keep testing the release.
 const compiler = process.env.SILK_NEW_USER_COMPILER ?? ''
+const tool = process.env.SILK_NEW_USER_TOOL ?? ''
+export const localVersion = '0.0.0-local'
 
 // Release to install, as a tag. Empty means "whatever install.sh picks", like a new user.
 export const release = process.env.SILK_RELEASE ?? ''
@@ -57,13 +60,32 @@ export function userEnv(h, extra = {}) {
     TERM: 'dumb',
   }
   if (compiler !== '') {
-    env.PATH = `${dirname(compiler)}:${env.PATH}`
-    env.SILK_TOOLCHAIN = 'local'
+    localToolchain(h)
+    env.SILK_TOOLCHAIN = localVersion
+  }
+  if (tool !== '') {
+    const bin = join(h.root, 'tool')
+    if (!existsSync(join(bin, 'silk'))) {
+      mkdirSync(bin, { recursive: true })
+      copyFileSync(tool, join(bin, 'silk'))
+    }
+    env.PATH = `${bin}:${env.PATH}`
   }
   for (const key of ['HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE', 'CURL_CA_BUNDLE', 'GITHUB_TOKEN', 'SILK_CLANG']) {
     if (process.env[key] !== undefined) env[key] = process.env[key]
   }
   return { ...env, ...extra }
+}
+
+// Copies SILK_NEW_USER_COMPILER into the home's store. The tool only runs regular files, so the
+// compiler is copied rather than linked.
+function localToolchain(h) {
+  const root = join(h.silkHome, 'toolchains', localVersion)
+  if (existsSync(join(root, 'bin/silkc'))) return
+  const from = dirname(dirname(compiler))
+  mkdirSync(join(root, 'bin'), { recursive: true })
+  copyFileSync(compiler, join(root, 'bin/silkc'))
+  cpSync(join(from, 'lib/silk/stdlib'), join(root, 'lib/silk/stdlib'), { recursive: true })
 }
 
 export function install(h, extra = {}) {

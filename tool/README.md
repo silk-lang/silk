@@ -21,7 +21,7 @@ silk change minor "Reads now return a future."   # record a change for the next 
 
 `silk change` also plans, cuts and queries releases (`status`, `version`, `release`, `snapshot`,
 `since`, `recover`; see `silk change --help` and the repository README). It reads the `[release]`
-table of `silk.toml`, or `[changes]`, its earlier spelling.
+table of `silk.toml`.
 
 `silk help` lists the project commands and the tool's own; `silk help <command>` of a project
 command is the compiler's. `silk --version` is forwarded too, so it reports the Silk version the
