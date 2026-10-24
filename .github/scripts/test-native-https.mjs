@@ -57,7 +57,7 @@ try {
   )
   writeFileSync(
     join(directory, 'silk.toml'),
-    `[package]\nname = "native-https-test"\nversion = "0.0.0"\nroot = "main.silk"\n[dependencies]\nchangeset = { path = ${JSON.stringify(join(root, 'changes'))} }\n`,
+    `[package]\nname = "native-https-test"\nversion = "0.0.0"\nsource = "."\n[dependencies]\nchangeset = { path = ${JSON.stringify(join(root, 'changes'))} }\n`,
   )
   const executable = join(directory, 'https-test')
   const build = await run(compiler, [
