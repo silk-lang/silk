@@ -1,0 +1,372 @@
+//! Loopback interoperability fixture for Node's nghttp2 client and server and h2spec.
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.hpack { Field }
+import silk.host_input { HostInput, HostInputError }
+import silk.http2 { Connection, Event, Limits, Role }
+import silk.http2_connection as Http2Connection
+import silk.http2_connection { Driver }
+import silk.http2_frame { ProtocolError }
+import silk.http_transport as Transport
+import silk.http_transport { HttpTransport, TransportError }
+import silk.monotonic_clock { MonotonicClock }
+import silk.list { List }
+import silk.native_thread { NativeThread, JoinHandle, SpawnError }
+import silk.slice { Slice }
+import silk.native_socket as Sockets
+import silk.native_socket {
+  Connection as NativeConnection,
+  Accepted,
+  AcceptedView,
+  ConnectOptions,
+  ListenOptions,
+  Listener,
+  NativeSocketError
+}
+import silk.network_address { Endpoint, IpAddress, Ipv4Address, Port }
+import silk.option { Option }
+import silk.os_monotonic_clock { OsMonotonicClock }
+import silk.os_random { OsRandom }
+import silk.random { Random }
+import silk.result { Result }
+import silk.string { String }
+import silk.system_clock { Instant, SystemClock }
+import silk.os_system_clock { OsSystemClock }
+import silk.filesystem { Path, FileError }
+import silk.https_identity { ReferenceIdentity }
+import silk.native_file_trust_source { NativeFileTrustSource }
+import silk.trust_source { TrustSource }
+import silk.trust_snapshot { TrustLoadLimits, TrustSourceError }
+import silk.tls_client { ClientConfig, ClientLimits, AlpnConfig, AlpnProtocol }
+import silk.tls_connection as Tls
+import silk.tls_connection { OwnedConnection, ConnectionError, ConnectionOptions }
+import silk.u8
+import silk.u16
+import silk.u32
+import silk.usize
+
+struct Pending {
+  stream: u32,
+  offset: usize,
+}
+
+effect fn serve() -> i32
+  ! ProtocolError | TransportError | OutOfMemoryError
+  ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut driver = run Driver.make(Role.Server, Limits.defaults())
+  let mut pending = List<Pending>.make()
+  while true {
+    let mut index: usize = 0
+    while index < List.length(&pending) {
+      let mut item = List.remove(&mut pending, index)
+      let conn = Driver.connection(&mut driver)
+      let body = b"hello"
+      let written = run Connection.sendData(
+        &mut conn.*,
+        item.stream,
+        Slice.view(body, item.offset, 5 - item.offset),
+        false
+      )
+      item.offset = item.offset + written
+      if item.offset == 5 {
+        let trailer = [Field { name: b"x-finished", value: b"yes", sensitive: false }]
+        run Connection.sendHeaders(&mut conn.*, item.stream, &trailer, true)
+      } else {
+        run List.insert(&mut pending, index, move item)
+        index = index + 1
+      }
+    }
+    let attempted = run Effect.result(Driver.next(&mut driver, Option<Instant>.none()))
+    let event = match move attempted {
+      Result.Success { value } => move value
+      Result.Failure { error } => {
+        let now = run MonotonicClock.now()
+        let deadline = MonotonicClock.deadlineAfter(&now, 100000000)
+        drop run Effect.result(
+          Driver.close(&mut driver, Option<Instant>.some(move deadline), 65536)
+        )
+        fail move error
+      }
+    }
+    match move event {
+      Option.None => {
+        return 0
+      }
+      Option.Some { value } => match move value {
+        Event.Headers { stream, fields, endStream } => {
+          let entries = List.asSlice(&fields)
+          let mut isRequest = false
+          let mut head = false
+          let mut field: usize = 0
+          while field < entries.length {
+            let name = Bytes.asSlice(&entries[field].name)
+            let value = Bytes.asSlice(&entries[field].value)
+            if name.length == 7 && name[0] == 58 && name[1] == 109 {
+              isRequest = true
+              head = value.length == 4 && value[0] == 72
+            }
+            field = field + 1
+          }
+          if isRequest {
+            let response = [
+              Field { name: b":status", value: b"200", sensitive: false },
+              Field { name: b"content-length", value: b"5", sensitive: false },
+              Field { name: b"x-silk", value: b"http2", sensitive: false }
+            ]
+            let conn = Driver.connection(&mut driver)
+            run Connection.sendHeaders(&mut conn.*, stream, &response, head)
+            if !head {
+              run List.append(&mut pending, Pending { stream: stream, offset: 0 })
+            }
+          }
+        }
+        Event.Data { stream, bytes, endStream } => {
+          let conn = Driver.connection(&mut driver)
+          run Connection.release(&mut conn.*, stream, usize.toU32(Bytes.length(&bytes)))
+        }
+        Event.Reset { stream, code } => {
+          removePending(&mut pending, stream)
+        }
+        Event.StreamError { stream, code } => {
+          removePending(&mut pending, stream)
+        }
+        Event.Goaway { lastStream, code, debug } => {
+          return 0
+        }
+        _ => {}
+      }
+    }
+  }
+}
+
+fn removePending(pending: &mut List<Pending>, stream: u32) -> () {
+  let mut index: usize = 0
+  while index < List.length(&pending.*) {
+    if List.asSlice(&pending.*)[index].stream == stream {
+      drop List.remove(&mut pending.*, index)
+    } else {
+      index = index + 1
+    }
+  }
+}
+
+fn worker(incoming: Accepted) -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  let mut random = OsRandom.make()
+  return run Effect.catchAll(Sockets.withAccepted(move incoming, accepted), failed)
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}
+
+effect fn accepted<'call>(view: &'call mut AcceptedView<'call>) -> i32
+  ! ProtocolError | TransportError | OutOfMemoryError
+  ? &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut transport = Transport.plain(&mut view.connection.*)
+  return run serve() |> Effect.provideMut<HttpTransport>(&mut transport)
+}
+
+effect fn request() -> i32
+  ! ProtocolError | TransportError | OutOfMemoryError
+  ? &mut HttpTransport | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let mut driver = run Driver.make(Role.Client, Limits.defaults())
+  let paths = [b"/alpha", b"/beta", b"/large"]
+  let mut index: usize = 0
+  while index < 3 {
+    let fields = [
+      Field { name: b":method", value: b"GET", sensitive: false },
+      Field { name: b":scheme", value: b"http", sensitive: false },
+      Field { name: b":authority", value: b"localhost", sensitive: false },
+      Field { name: b":path", value: paths[index], sensitive: false }
+    ]
+    let conn = Driver.connection(&mut driver)
+    let id = run Connection.open(&mut conn.*, &fields, true)
+    if id != usize.toU32(index * 2 + 1) {
+      return 11
+    }
+    index = index + 1
+  }
+  let mut lengths: [usize; 3] = [0, 0, 0]
+  let mut finished: usize = 0
+  while finished < 3 {
+    let event = run Driver.next(&mut driver, Option<Instant>.none())
+    match move event {
+      Option.None => {
+        return 12
+      }
+      Option.Some { value } => match move value {
+        Event.Headers { stream, fields, endStream } => {
+          if endStream {
+            finished = finished + 1
+          }
+        }
+        Event.Data { stream, bytes, endStream } => {
+          if stream == 0 || stream > 5 {
+            return 13
+          }
+          let slot = u32.toUsize(stream / 2)
+          lengths[slot] = lengths[slot] + Bytes.length(&bytes)
+          if endStream {
+            finished = finished + 1
+          }
+          let conn = Driver.connection(&mut driver)
+          run Connection.release(&mut conn.*, stream, usize.toU32(Bytes.length(&bytes)))
+        }
+        Event.Reset { stream, code } => {
+          return 14
+        }
+        Event.StreamError { stream, code } => {
+          return 15
+        }
+        _ => {}
+      }
+    }
+  }
+  if lengths[0] != 5 || lengths[1] != 4 || lengths[2] != 100000 {
+    return 16
+  }
+  let conn = Driver.connection(&mut driver)
+  run Connection.shutdown(&mut conn.*, 0, b"")
+  drop conn
+  run Driver.flush(&mut driver, Option<Instant>.none())
+  return 0
+}
+
+fn tlsConfig<'a>(protocols: &'a [AlpnProtocol<'a>]) -> ClientConfig<'a> {
+  return ClientConfig<'a> {
+    reference: ReferenceIdentity<'a>.Dns { bytes: b"localhost" },
+    alpn: AlpnConfig<'a>.Offered { protocols: protocols, required: true },
+    limits: ClientLimits.defaults()
+  }
+}
+
+effect fn program() -> i32
+  ! FileError
+    | TrustSourceError
+    | ConnectionError
+    | SpawnError
+    | HostInputError
+    | NativeSocketError
+    | ProtocolError
+    | TransportError
+    | OutOfMemoryError
+  ? &mut SystemClock | &mut HostInput | &mut MonotonicClock | &mut Allocator | &mut Random {
+  let portBytes = match move run HostInput.argument(1) {
+    Option.Some { value } => move value
+    Option.None => {
+      return 17
+    }
+  }
+  let mut port: u16 = 0
+  let data = Bytes.asSlice(&portBytes)
+  let mut index: usize = 0
+  while index < data.length {
+    if data[index] < 48 || data[index] > 57 {
+      return 18
+    }
+    port = port * 10 + u8.toU16(data[index] - 48)
+    index = index + 1
+  }
+  let address = Endpoint.make(
+    IpAddress.V4 { value: Ipv4Address.fromOctets([127, 0, 0, 1]) },
+    Port.fromU16(port)
+  )
+  let mode = run HostInput.argument(2)
+  let server = match &mode {
+    Option.Some { value } => Bytes.length(&value) == 6
+    Option.None => false
+  }
+  if server {
+    let mut listener = run Sockets.listen(address, ListenOptions.defaults())
+    let mut workers = List<JoinHandle<i32>>.make()
+    while true {
+      let incoming = run Sockets.accept(&mut listener, Option<Instant>.none())
+
+      let handle = run NativeThread.spawn(
+        fn() -> i32 {
+          return worker(move incoming)
+        }
+      )
+      run List.append(&mut workers, move handle)
+      if List.length(&workers) > 512 {
+        drop List.remove(&mut workers, 0)
+      }
+    }
+  }
+  let addresses = [address]
+  let mut socket = run Sockets.connectResolvedOwned(
+    &addresses,
+    ConnectOptions.defaults(),
+    Option<Instant>.none()
+  )
+  let secure = match &mode {
+    Option.Some { value } => Bytes.length(&value) == 3
+    Option.None => false
+  }
+  if secure {
+    let bundle = match move run HostInput.argument(3) {
+      Option.Some { value } => move value
+      Option.None => {
+        return 20
+      }
+    }
+    let pathBytes = Bytes.asSlice(&bundle)
+    let mut separator: usize = 0
+    let mut cursor: usize = 0
+    while cursor < pathBytes.length {
+      if pathBytes[cursor] == 47 {
+        separator = cursor
+      }
+      cursor = cursor + 1
+    }
+    let path = run Path.fromBytes(Slice.view(pathBytes, separator, pathBytes.length - separator))
+    let mut source = run NativeFileTrustSource.make(Slice.view(pathBytes, 0, separator), &path)
+    let trust = run TrustSource.load(TrustLoadLimits.defaults())
+      |> Effect.provideMut<TrustSource>(&mut source)
+    let protocols = [Http2Connection.protocol()]
+    let config = tlsConfig(&protocols)
+    let mut secured = run Tls.authenticateOwned(
+      move socket,
+      &config,
+      move trust,
+      ConnectionOptions.defaults()
+    )
+    match move OwnedConnection.authentication(&secured) {
+      Option.Some { value } => {
+        run Http2Connection.requireAlpn(&value)
+      }
+      Option.None => {
+        return 21
+      }
+    }
+    let mut transport = Transport.secured(&mut secured)
+    let outcome = run request() |> Effect.provideMut<HttpTransport>(&mut transport)
+    drop transport
+    run OwnedConnection.close(&mut secured)
+    return outcome
+  }
+  let mut transport = Transport.plain(&mut socket)
+  let outcome = run request() |> Effect.provideMut<HttpTransport>(&mut transport)
+  drop transport
+  run NativeConnection.close(&mut socket)
+  return outcome
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 99
+}
+
+pub effect fn main() -> i32
+  ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut clock = OsMonotonicClock.make()
+  let mut random = OsRandom.make()
+  let mut system = OsSystemClock.make()
+  return run Effect.catchAll(program(), failed) |> Effect.provideMut<SystemClock>(&mut system)
+    |> Effect.provideMut<Random>(&mut random)
+    |> Effect.provideMut<MonotonicClock>(&mut clock)
+    |> Effect.provideMut<Allocator>(&mut allocator)
+}

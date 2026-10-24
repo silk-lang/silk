@@ -1,0 +1,191 @@
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.hpack { Field, Header }
+import silk.http2 { Connection, Event, Limits, Role }
+import silk.http2_frame { ProtocolError }
+import silk.list { List }
+import silk.slice { Slice }
+import silk.u32
+import silk.usize
+
+struct Counts {
+  headers: usize,
+  data: usize,
+  bytes: usize,
+  ends: usize,
+  pushes: usize,
+  resets: usize,
+}
+
+effect fn deliver(source: &mut Connection, target: &mut Connection, release: bool) -> Counts
+  ! ProtocolError | OutOfMemoryError
+  ? &mut Allocator {
+  let wire = run Bytes.copy(Connection.output(&source.*))
+  run Connection.consumeOutput(&mut source.*, Bytes.length(&wire))
+  let bytes = Bytes.asSlice(&wire)
+  let mut offset: usize = 0
+  let mut counts = Counts { headers: 0, data: 0, bytes: 0, ends: 0, pushes: 0, resets: 0 }
+
+  // One-byte fragments exercise every frame, preface, integer, and field boundary.
+  while offset < bytes.length {
+    let progress = run Connection.receive(&mut target.*, Slice.view(bytes, offset, 1))
+    if progress.consumed != 1 {
+      fail ProtocolError { code: 99, stream: 0 }
+    }
+    offset = offset + progress.consumed
+    match move progress.event {
+      Event.Headers { stream, fields, endStream } => {
+        counts.headers = counts.headers + 1
+        if endStream {
+          counts.ends = counts.ends + 1
+        }
+      }
+      Event.Data { stream, bytes: body, endStream } => {
+        counts.data = counts.data + 1
+        counts.bytes = counts.bytes + Bytes.length(&body)
+        if endStream {
+          counts.ends = counts.ends + 1
+        }
+        if release {
+          run Connection.release(&mut target.*, stream, usize.toU32(Bytes.length(&body)))
+        }
+      }
+      Event.Push { stream, promised, fields } => {
+        counts.pushes = counts.pushes + 1
+      }
+      Event.Reset { stream, code } => {
+        counts.resets = counts.resets + 1
+      }
+      Event.StreamError { stream, code } => {
+        fail ProtocolError { code: code, stream: stream }
+      }
+      _ => {}
+    }
+  }
+  return move counts
+}
+
+fn largeFields<'a>(value: &'a [u8]) -> [Field<'a>; 5] {
+  return [
+    Field<'a> { name: b":method", value: b"GET", sensitive: false },
+    Field<'a> { name: b":scheme", value: b"https", sensitive: false },
+    Field<'a> { name: b":authority", value: b"example.com", sensitive: false },
+    Field<'a> { name: b":path", value: b"/", sensitive: false },
+    Field<'a> { name: b"x-large", value: value, sensitive: true }
+  ]
+}
+
+effect fn test() -> i32
+  ! ProtocolError | OutOfMemoryError
+  ? &mut Allocator {
+  let mut limits = Limits.defaults()
+  limits.push = true
+  limits.windowBytes = 5
+  let mut clientLimits = limits
+  clientLimits.streams = 1
+  let mut client = run Connection.make(Role.Client, clientLimits)
+  let mut server = run Connection.make(Role.Server, limits)
+  drop run deliver(&mut client, &mut server, true)
+  drop run deliver(&mut server, &mut client, true)
+  drop run deliver(&mut client, &mut server, true)
+  run Connection.settingsTimeout(&mut client)
+  run Connection.settingsTimeout(&mut server)
+  let get = [
+    Field { name: b":method", value: b"GET", sensitive: false },
+    Field { name: b":scheme", value: b"https", sensitive: false },
+    Field { name: b":authority", value: b"example.com", sensitive: false },
+    Field { name: b":path", value: b"/", sensitive: false }
+  ]
+  let first = run Connection.open(&mut client, &get, true)
+  let second = run Connection.open(&mut client, &get, true)
+  if first != 1 || second != 3 {
+    return 1
+  }
+  let requests = run deliver(&mut client, &mut server, true)
+  if requests.headers != 2 || requests.ends != 2 {
+    return 2
+  }
+  let promised = run Connection.push(&mut server, first, &get)
+  if promised != 2 {
+    return 3
+  }
+  let interim = [Field { name: b":status", value: b"103", sensitive: false }]
+  let final = [
+    Field { name: b":status", value: b"200", sensitive: false },
+    Field { name: b"content-length", value: b"10", sensitive: false }
+  ]
+  let empty = [Field { name: b":status", value: b"204", sensitive: false }]
+  run Connection.sendHeaders(&mut server, first, &interim, false)
+  run Connection.sendHeaders(&mut server, first, &final, false)
+  run Connection.sendHeaders(&mut server, second, &empty, true)
+  run Connection.sendHeaders(&mut server, promised, &empty, true)
+  let sentFirst = run Connection.sendData(&mut server, first, b"0123456789", true)
+  if sentFirst != 5 {
+    return 4
+  }
+  let stalled = run Connection.sendData(&mut server, first, b"56789", true)
+  if stalled != 0 {
+    return 5
+  }
+  let responses = run deliver(&mut server, &mut client, false)
+  if responses.pushes != 1 || responses.headers != 4 || responses.bytes != 5
+    || responses.ends != 2 {
+    return 6
+  }
+  run Connection.release(&mut client, first, 5)
+  drop run deliver(&mut client, &mut server, true)
+  let sentLast = run Connection.sendData(&mut server, first, b"56789", false)
+  if sentLast != 5 {
+    return 7
+  }
+  let trailers = [Field { name: b"x-checksum", value: b"ok", sensitive: false }]
+  run Connection.sendHeaders(&mut server, first, &trailers, true)
+  let ending = run deliver(&mut server, &mut client, true)
+  if ending.bytes != 5 || ending.headers != 1 || ending.ends != 1 {
+    return 8
+  }
+  drop run deliver(&mut client, &mut server, true)
+
+  // A header block larger than a frame uses CONTINUATION and the same HPACK context.
+  let large = run Bytes.zeroed(20000)
+  let mut text = run Bytes.copy(Bytes.asSlice(&large))
+  let writable = Bytes.asMutSlice(&mut text)
+  let mut index: usize = 0
+  while index < writable.length {
+    writable[index] = 120
+    index = index + 1
+  }
+  drop writable
+  let huge = largeFields(Bytes.asSlice(&text))
+  let third = run Connection.open(&mut client, &huge, true)
+  let hugeRequest = run deliver(&mut client, &mut server, true)
+  if hugeRequest.headers != 1 {
+    return 9
+  }
+  run Connection.reset(&mut server, third, 8)
+  let reset = run deliver(&mut server, &mut client, true)
+  if reset.resets != 1 {
+    return 10
+  }
+  run Connection.ping(&mut client, b"12345678")
+  drop run deliver(&mut client, &mut server, true)
+  drop run deliver(&mut server, &mut client, true)
+  run Connection.shutdown(&mut server, 0, b"done")
+  drop run deliver(&mut server, &mut client, true)
+  run Connection.shutdown(&mut client, 0, b"")
+  drop run deliver(&mut client, &mut server, true)
+  run Connection.finishInput(&mut client)
+  run Connection.finishInput(&mut server)
+  return 0
+}
+
+effect fn failed<E>(error: E) -> i32 {
+  drop error
+  return 99
+}
+
+pub fn main() -> i32 {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  return run Effect.catchAll(test(), failed) |> Effect.provideMut<Allocator>(&mut allocator)
+}
