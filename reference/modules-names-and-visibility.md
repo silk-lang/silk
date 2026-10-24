@@ -934,8 +934,7 @@ The source root is `[package].source`, `src` when the manifest omits it. The roo
 `[package].kind` is `executable` (the default), `library` (Silk source for other packages, which a
 build checks and makes no artifact for), `static-library`, `shared-library` or `object`. The version
 defaults to `0.0.0`. A name starts with a lowercase letter and holds lowercase letters, digits and
-`_`; `self` and `silk` are reserved. `sew` names the toolchain's own package, and no dependency
-may take that name.
+`_`; `self`, `silk` and `silkc` are reserved.
 
 Until the seed compiler reads this layout, a manifest may still write the earlier spellings:
 `[package].root` (a manifest-relative entry whose directory is the source root),
@@ -993,8 +992,8 @@ the same major version and an equal or later minor and patch. A prerelease such 
 matches only itself, and a prerelease compiler builds only dependencies written for it. A local
 `0.0.0` compiler builds every dependency.
 
-**Boundary:** A dependency name must be an identifier other than `silk`, `Intrinsic`, `self` or
-`sew`. When `package` is present it must equal the dependency's `[package].name`. Dependencies are
+**Boundary:** A dependency name must be an identifier other than `silk`, `silkc`, `Intrinsic`
+or `self`. When `package` is present it must equal the dependency's `[package].name`. Dependencies are
 not transitive: a package imports only the packages its own manifest lists. Packages cannot depend
 on each other in a cycle. Only `path` dependencies exist; `git`, `url`, `version`, `tag`, `rev`,
 `branch`, `hash`, `optional` and `workspace` are reserved and refused as not supported yet.
