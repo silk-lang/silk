@@ -1,6 +1,7 @@
 // Hovers and jumps to the definition at every identifier of one file, as a reader moving the mouse
 // over a program would. Reports server errors, slow answers, and identifiers that get no hover.
 // Usage: node fuzz/lsp-hover-sweep.mjs <package dir> <file relative to it>
+// SWEEP_VERBOSE=1 prints each identifier that gets no hover.
 // The server is `silk lsp` from $HOME/.silk/bin; see lsp-modules.mjs for making it a local build.
 import { startServer, uriOf } from '../lsp.mjs'
 import { readFileSync } from 'node:fs'
@@ -42,6 +43,7 @@ for (const spot of spots) {
       if (method === 'textDocument/hover' && !(result?.contents?.value)) {
         empty++
         missing.set(spot.name, (missing.get(spot.name) ?? 0) + 1)
+        if (process.env.SWEEP_VERBOSE) console.log(`no hover ${spot.name} ${spot.row + 1}:${spot.column}: ${lines[spot.row].trim()}`)
       }
     } catch (error) {
       errors++

@@ -73,14 +73,14 @@ test('hover shows the signature and doc comment of stdlib, own-package and local
 })
 
 // Editors show the same hover on a declaration as on its uses.
-test('hover on a declaration shows it, as on its uses', { todo: 'finding 127' }, async () => {
+test('hover on a declaration shows it, as on its uses', async () => {
   const value = async (needle, offset) => (await server.request('textDocument/hover', at(program, needle, offset)))?.contents?.value ?? ''
   assert.match(await value('fn total(', 4), /fn total\(values: &\[i32\]\) -> i32/)
   assert.match(await value('let mut sum = 0', 9), /sum/)
   assert.match(await value('values: &[i32]'), /values/)
 })
 
-test('hover on a primitive type says what it is', { todo: 'finding 127' }, async () => {
+test('hover on a primitive type says what it is', async () => {
   const value = async (needle, offset) => (await server.request('textDocument/hover', at(program, needle, offset)))?.contents?.value ?? ''
   assert.match(await value('-> i32 {', 4), /i32/)
   assert.match(await value('at: usize', 5), /usize/)
@@ -197,4 +197,36 @@ test('a missing pinned toolchain still starts a server that explains it', { skip
   const exited = await lone.shutdown()
   assert.equal(exited.code, 0)
   assert.equal(silk(h, ['--version']).status, 0)
+})
+
+// A generic static fn that loops over a type's fields, as nonstd's cli package does.
+test('hover works inside a static for over a type parameter\'s fields', { todo: 'finding 128' }, async () => {
+  const other = initPackage(h, 'editor-reflect')
+  const file = join(other, 'src/main.silk')
+  const source = 'import silk.reflect { Reflect }\n\nstruct P {\n  x: i32,\n}\n\nstatic fn hasField<T>(label: string<\'static>) -> bool {\n  let mut found = false\n  static for field in Reflect.fields<T>() {\n    if Reflect.fieldLabel(field) == label {\n      found = true\n    }\n  }\n  return found\n}\n\npub fn main() -> i32 {\n  static if hasField<P>("x") {\n    return 0\n  }\n  return 1\n}\n'
+  write(file, source)
+  const lone = startServer(h, other)
+  await lone.initialize(other)
+  lone.notify('textDocument/didOpen', { textDocument: { uri: uriOf(file), languageId: 'silk', version: 1, text: source } })
+  assert.deepEqual(await lone.diagnostics(uriOf(file), 120_000), [])
+  const hover = async (needle, offset = 1) => (await lone.request('textDocument/hover', { textDocument: { uri: uriOf(file) }, position: positionOf(source, needle, offset) }))?.contents?.value ?? ''
+  const found = await hover('return found', 8)
+  const label = await hover('fieldLabel(field)', 2)
+  await lone.shutdown()
+  assert.match(found, /found/)
+  assert.match(label, /fieldLabel/)
+})
+
+test('hover on a qualified Intrinsic type names it', { todo: 'finding 128' }, async () => {
+  const other = initPackage(h, 'editor-intrinsic')
+  const file = join(other, 'src/main.silk')
+  const source = 'struct Spec {\n  pub names: Intrinsic.StaticSequence<i32>,\n}\n\npub fn main() -> i32 {\n  return 0\n}\n'
+  write(file, source)
+  const lone = startServer(h, other)
+  await lone.initialize(other)
+  lone.notify('textDocument/didOpen', { textDocument: { uri: uriOf(file), languageId: 'silk', version: 1, text: source } })
+  await lone.diagnostics(uriOf(file), 120_000)
+  const value = (await lone.request('textDocument/hover', { textDocument: { uri: uriOf(file) }, position: positionOf(source, 'StaticSequence', 2) }))?.contents?.value ?? ''
+  await lone.shutdown()
+  assert.match(value, /StaticSequence/)
 })
