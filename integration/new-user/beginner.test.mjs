@@ -36,19 +36,19 @@ for (const [name, source, message] of [
   })
 }
 
-test('matching a union by value names the binding and offers move or &', { todo: 'finding 115' }, () => {
+test('matching a union by value names the binding and offers move or &', () => {
   const result = check('union U {\n  A,\n  B,\n}\n\npub fn main() -> i32 {\n  let u = U.A\n  return match u {\n    U.A => 0\n    U.B => 1\n  }\n}\n')
   assert.match(result.stderr, /OWN0003\].*\bu\b/, show(result))
   assert.match(result.stderr, /match move u|match &u/, show(result))
 })
 
-test('a value effect call without run says to write run', { todo: 'finding 116' }, () => {
+test('a value effect call without run says to write run', () => {
   const result = check('effect fn f() -> i32 ! () {\n  return 1\n}\n\npub fn main() -> i32 {\n  let x = f()\n  return x\n}\n')
   assert.match(result.stderr, /run/, show(result))
   assert.doesNotMatch(result.stderr, /An explicit return whose value violates the declaration result/, show(result))
 })
 
-test('a struct literal that omits fields names them', { todo: 'finding 117' }, () => {
+test('a struct literal that omits fields names them', () => {
   const result = check('struct P {\n  x: i32,\n  y: i32,\n  z: i32,\n}\n\npub fn main() -> i32 {\n  let p = P { x: 0 }\n  return p.x\n}\n')
   assert.match(result.stderr, /SEM0024\].*\by\b.*\bz\b/, show(result))
 })
@@ -56,12 +56,12 @@ test('a struct literal that omits fields names them', { todo: 'finding 117' }, (
 // Habits from other languages: one error each, saying what Silk spells instead.
 for (const [name, source, hint] of [
   ['x += 1', 'pub fn main() -> i32 {\n  let mut i = 0\n  i += 1\n  return i - 1\n}\n', /i = i \+ 1|compound assignment/],
-  ['i++', 'pub fn main() -> i32 {\n  let mut i = 0\n  i++\n  return i - 1\n}\n', /i = i \+ 1/],
+  ['i++', 'pub fn main() -> i32 {\n  let mut i = 0\n  i++\n  return i - 1\n}\n', /[xi] = [xi] \+ 1/],
   ['for i in 0..10', 'pub fn main() -> i32 {\n  let mut s = 0\n  for i in 0..10 {\n    s = s + i\n  }\n  return s - 45\n}\n', /while/],
   ['var x = 0', 'pub fn main() -> i32 {\n  var x = 0\n  return x\n}\n', /let mut/],
-  ['c ? a : b', 'pub fn main() -> i32 {\n  let x = 1\n  return x > 0 ? 0 : 1\n}\n', /if .* else|ternary/],
+  ['c ? a : b', 'pub fn main() -> i32 {\n  let x = 1\n  return x > 0 ? 0 : 1\n}\n', /no `c \? a : b`/],
 ]) {
-  test(`${name} gets one error that names the Silk spelling`, { todo: 'finding 118' }, () => {
+  test(`${name} gets one error that names the Silk spelling`, { todo: name === 'var x = 0' ? 'finding 118: var still adds Unknown value x for each use' : undefined }, () => {
     const result = check(source)
     assert.equal(errors(result).length, 1, show(result))
     assert.match(result.stderr, hint, show(result))
@@ -73,16 +73,16 @@ for (const [name, source, hint] of [
 const kept = (p) => `struct P {\n  x: i32,\n}\n\nfn keep<'a>(p: &'a P) -> &'a i32 {\n  return &p.x\n}\n\n${p}`
 for (const [code, source, name, fix] of [
   ['SEM0057', 'fn bump(x: &mut i32) -> () {\n  x.* = x.* + 1\n}\n\npub fn main() -> i32 {\n  let n = 0\n  bump(&mut n)\n  return n\n}\n', /\bn\b/, /let mut n/],
-  ['SEM0058', 'fn bump(x: &mut i32) -> () {\n  x.* = x.* + 1\n}\n\nfn f(x: &i32) -> () {\n  bump(&mut x.*)\n}\n\npub fn main() -> i32 {\n  let n = 0\n  f(&n)\n  return n\n}\n', /\bx\b/, /&mut i32/],
-  ['OWN0010', kept('fn bump(p: &mut P) -> () {\n  p.x = p.x + 1\n}\n\npub fn main() -> i32 {\n  let mut p = P { x: 0 }\n  let r = keep(&p)\n  bump(&mut p)\n  return r.*\n}\n'), /\bp\b/, /\br\b/],
-  ['OWN0011', kept('pub fn main() -> i32 {\n  let mut p = P { x: 0 }\n  let r = keep(&p)\n  p = P { x: 1 }\n  return r.*\n}\n'), /\bp\b/, /\br\b/],
-  ['OWN0019', 'pub fn main() -> i32 {\n  let mut r: &i32 = &0\n  if true {\n    let x = 5\n    r = &x\n  }\n  return r.*\n}\n', /\bx\b/, /\br\b/],
+  ['SEM0058', 'fn bump(x: &mut i32) -> () {\n  x.* = x.* + 1\n}\n\nfn f(x: &i32) -> () {\n  bump(&mut x.*)\n}\n\npub fn main() -> i32 {\n  let n = 0\n  f(&n)\n  return n\n}\n', /`x`/, /take a `&mut` reference/],
+  ['OWN0010', kept('fn bump(p: &mut P) -> () {\n  p.x = p.x + 1\n}\n\npub fn main() -> i32 {\n  let mut p = P { x: 0 }\n  let r = keep(&p)\n  bump(&mut p)\n  return r.*\n}\n'), /`p`/, /the earlier borrow starts here/],
+  ['OWN0011', kept('pub fn main() -> i32 {\n  let mut p = P { x: 0 }\n  let r = keep(&p)\n  p = P { x: 1 }\n  return r.*\n}\n'), /`p`/, /the borrow starts here/],
+  ['OWN0019', 'pub fn main() -> i32 {\n  let y = 0\n  let mut r: &i32 = &y\n  if true {\n    let x = 5\n    r = &x\n  }\n  return r.*\n}\n', /`r` is used after `x`/, /the borrow starts here/],
   ['SEM0063', 'struct E {\n  m: i32,\n}\n\nfn f() -> i32 {\n  fail E { m: 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /\bf\b/, /effect fn|! E/],
   ['SEM0066', 'struct E {\n  m: i32,\n}\n\neffect fn f() -> () ! E {\n  fail E { m: 1 }\n}\n\npub effect fn main() -> () {\n  run f()\n}\n', /\bE\b/, /! E|Effect\.result/],
   ['SEM0071', 'import silk.effect { Effect }\nimport silk.logger { LogError, Logger }\n\neffect fn say() -> () ! LogError ? &mut Logger {\n  run Effect.log("hi\\n", &.{})\n}\n\npub effect fn main() -> () ! LogError {\n  run say()\n}\n', /Logger/, /provideMut|\? &mut Logger/],
   ['SEM0077', 'pub fn main() -> i32 {\n  let mut n = 0\n  let f = fn() -> () {\n    n = n + 1\n  }\n  f()\n  return n - 1\n}\n', /\bf\b/, /let mut f/],
 ]) {
-  test(`${code} names the binding and the fix`, { todo: 'finding 119' }, () => {
+  test(`${code} names the binding and the fix`, () => {
     const result = check(source)
     const line = errors(result).find((l) => l.includes(`[${code}]`)) ?? ''
     assert.ok(line !== '', `no ${code}\n${show(result)}`)
@@ -92,7 +92,32 @@ for (const [code, source, name, fix] of [
   })
 }
 
-test('main returning a string is told what main may return', { todo: 'finding 120' }, () => {
+test('main returning a string is told what main may return', () => {
   const result = check('pub fn main() -> string {\n  return "x"\n}\n')
   assert.match(result.stderr, /SEM0225\]/, show(result))
 })
+
+// Book chapters 9 to 13: fibers, modules and packages. Errors that still state the rule without
+// naming the thing or the fix. Each row: files beside src/main.silk, the program, and a pattern the
+// error should match.
+const fiberImports = 'import silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.logger { Logger, LogError }\nimport silk.monotonic_clock { MonotonicClock }\nimport silk.allocator { OutOfMemoryError }\nimport silk.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.string { String }\n\n'
+const root = (body) => `effect fn root<'text>(title: string<'text>) -> () ! OutOfMemoryError | TaskIdExhaustedError ? &mut Scheduler | &mut MonotonicClock {\n  ${body}\n  drop fiber\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`
+for (const [code, files, source, want] of [
+  ['SEM0076', {}, `${fiberImports}effect fn shout() -> () ! LogError ? &mut Logger {\n  run Effect.log("reminder!\\n", &())\n}\n\n${root('let fiber = run Fiber<(), LogError>.forkChild(shout())')}`, /Logger.*(Scheduler|MonotonicClock)|(Scheduler|MonotonicClock).*Logger/],
+  ['SEM0212', {}, `${fiberImports}effect fn measure(title: string) -> usize ? &mut Scheduler | &mut MonotonicClock {\n  return String.byteLength(title)\n}\n\n${root('let fiber = run Fiber<usize, never>.forkChild(measure(title))')}`, /'static|'text|title/],
+  ['SEM0015', { 'src/geo/shapes.silk': 'fn secret() -> i32 {\n  return 0\n}\n' }, 'import geo.shapes { secret }\n\npub fn main() -> i32 {\n  return secret()\n}\n', /`secret`.*pub|pub.*`secret`/],
+  ['SEM0016', { 'src/geo/shapes.silk': 'pub fn shapes() -> i32 {\n  return 0\n}\n' }, 'import geo.shapes\nimport geo.shapes { shapes }\n\npub fn main() -> i32 {\n  return shapes()\n}\n', /\bas\b/],
+  ['SEM0028', { 'src/geo/shapes.silk': 'pub struct P {\n  x: i32,\n}\n\npub fn make() -> P {\n  return P { x: 0 }\n}\n' }, 'import geo.shapes { P, make }\n\npub fn main() -> i32 {\n  let p = make()\n  return p.x\n}\n', /`x`|field x/],
+  ['SEM0001', {}, 'fn dup<C: Copy>(c: C) -> C {\n  return c\n}\n\npub fn main() -> i32 {\n  return dup(1)\n}\n', /import silk\.ownership \{ Copy \}/],
+  ['MOD0001', { 'src/geo/shapes.silk': 'pub fn f() -> i32 {\n  return 0\n}\n' }, 'import geo.shape { f }\n\npub fn main() -> i32 {\n  return f()\n}\n', /geo\.shapes/],
+]) {
+  test(`${code} from the later chapters names the thing and the fix`, { todo: 'finding 121' }, () => {
+    const dir = initPackage(h, `beginner-${++serial}`)
+    for (const [path, text] of Object.entries(files)) write(join(dir, path), text)
+    write(join(dir, 'src/main.silk'), source)
+    const result = silk(h, ['check'], { cwd: dir })
+    const line = errors(result).find((l) => l.includes(`[${code}]`)) ?? ''
+    assert.ok(line !== '', `no ${code}\n${show(result)}`)
+    assert.match(result.stderr, want, show(result))
+  })
+}

@@ -44,8 +44,16 @@ export function sharedHome() {
   return shared
 }
 
+// Each test file's homes are removed when it exits; SILK_NEW_USER_KEEP=1 keeps them to look at.
+const roots = []
+process.on('exit', () => {
+  if (process.env.SILK_NEW_USER_KEEP) return
+  for (const root of roots) rmSync(root, { recursive: true, force: true })
+})
+
 export function freshHome() {
   const root = mkdtempSync(join(process.env.SILK_NEW_USER_TMP ?? tmpdir(), 'silk-new-user-'))
+  roots.push(root)
   const home = join(root, 'home')
   mkdirSync(home)
   const work = join(root, 'work')

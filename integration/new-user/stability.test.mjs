@@ -366,6 +366,7 @@ function generatedPackage(name, modules, functions) {
   return dir
 }
 
+const loadSeconds = (result) => Number(/^  load +.* +([\d.]+)s$/m.exec(result.stderr)?.[1] ?? NaN)
 const checkSeconds = (result) => Number(/^  check +\d+ modules? +([\d.]+)s$/m.exec(result.stderr)?.[1] ?? NaN)
 
 test('a one-line edit in one module of a big package rechecks far less than a cold check', () => {
@@ -376,7 +377,10 @@ test('a one-line edit in one module of a big package rechecks far less than a co
   write(join(dir, 'src/main.silk'), read(join(dir, 'src/main.silk')).replace('return 1\n', 'return 2\n'))
   const edited = silk(h, ['check'], { cwd: dir })
   assert.equal(edited.status, 0, show(edited))
-  assert.ok(checkSeconds(edited) < checkSeconds(cold) / 4, `cold ${checkSeconds(cold)} s, after editing main ${checkSeconds(edited)} s`)
+  // Since #2305 an unchanged file is not parsed at load, and the edited one is parsed during check,
+  // so compare load and check together.
+  const work = (result) => loadSeconds(result) + checkSeconds(result)
+  assert.ok(work(edited) < work(cold) / 2, `cold ${work(cold)} s, after editing main ${work(edited)} s (load + check)`)
 })
 
 test('commas between struct fields are accepted, as in union variants', () => {

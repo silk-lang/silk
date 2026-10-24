@@ -23,7 +23,8 @@ Run one area with `node --test integration/new-user/workspace.test.mjs`.
 | `SILK_NEW_USER_DOCS` | A silk-lang/docs checkout. Without it, `docs.test.mjs` is skipped. |
 | `SILK_NEW_USER_RUN_ALL` | `1` also runs docs programs whose output the page does not show, and fails on a crash. |
 | `SILK_NEW_USER_MIRROR`, `SILK_NEW_USER_SECOND` | A `SILK_TOOLCHAIN_MIRROR` directory and a full version in it (not the one `install.sh` picks). They enable the tests that install a second toolchain. Without them those tests are skipped. |
-| `SILK_NEW_USER_TMP` | Where the throwaway homes go. Default: the system temp folder. |
+| `SILK_NEW_USER_TMP` | Where the throwaway homes go. Default: the system temp folder. Each test file removes its homes when it exits. |
+| `SILK_NEW_USER_KEEP` | Set to keep the homes, to look at them after a failure. |
 | `SILK_NEW_USER_TOOL` | A local `silk` tool build to test before a release ships it. After install.sh it is copied to `~/.silk/bin/silk`, as install.sh does. Build it with `--release`: a debug tool takes about 20 s to unpack a toolchain. With the tool present, `toolchain.test.mjs` is skipped and `tool.test.mjs` runs. |
 | `SILK_NEW_USER_COMPILER` | A local `silk` binary to run instead of the installed release, through `SILK_TOOLCHAIN=local`, such as a build of main. It must sit at `<dir>/bin/silk` with the stdlib at `<dir>/lib/silk/stdlib`. install.sh still installs the release, so the install and toolchain tests keep testing that. |
 
