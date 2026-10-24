@@ -56,8 +56,8 @@ import silk.execution { Execution }
 
 // What the owner sees after one drive.
 struct Run {
-  done: bool
-  result: i32
+  done: bool,
+  result: i32,
 }
 
 // The readiness endpoint. A Wake calls it when a parked body can continue.

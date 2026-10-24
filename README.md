@@ -281,7 +281,7 @@ Unions are structural, and a `match` has to cover every case.
 
 ```silk
 struct Circle { radius: f64 }
-struct Rect { width: f64 height: f64 }
+struct Rect { width: f64, height: f64 }
 
 fn area(shape: Circle | Rect) -> f64 {
   return match move shape {

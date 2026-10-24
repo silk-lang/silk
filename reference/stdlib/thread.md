@@ -34,7 +34,7 @@ reaches. The `impl` declares no members.
 import silk.thread { Transferable }
 
 struct Job {
-  id: i32
+  id: i32,
 }
 
 // Accepts only values that can move to another thread.

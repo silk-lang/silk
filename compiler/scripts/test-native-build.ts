@@ -885,6 +885,123 @@ const program = Effect.gen(function* () {
     )
     assert.doesNotMatch(refused.stderr, /native_start_sync\.silk:/)
   }
+  // A `main` that returns a borrow such as `string` gets the entry point error once, not the
+  // `'static` hint that only leads to it.
+  yield* fs.makeDirectory(join(directory, 'textmain/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'textmain/silk.toml'),
+    '[package]\nname = "textmain"\nversion = "0.1.0"\n',
+  )
+  yield* fs.writeFileString(join(directory, 'textmain/src/main.silk'), 'pub fn main() -> string {\n  return "x"\n}\n')
+  for (const command of ['check', 'build']) {
+    const refused = yield* invoke(silk, [command, '--stdlib', standardLibrary], join(directory, 'textmain'))
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.equal(refused.stderr.match(/error\[SEM0225\] Entry point `main` has a result the selected runtime cannot start/g)?.length, 1, refused.stderr)
+    assert.doesNotMatch(refused.stderr, /SEM0210/)
+  }
+  // Errors new users meet in the book's later chapters name their subject and the fix, and a
+  // `var` binding adds no unknown-value error at each later use.
+  const fiberRoot = (body: string) =>
+    'import silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.logger { Logger, LogError }\nimport silk.monotonic_clock { MonotonicClock }\nimport silk.allocator { OutOfMemoryError }\nimport silk.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.string { String }\n\n' +
+    `effect fn root<'text>(title: string<'text>) -> () ! OutOfMemoryError | TaskIdExhaustedError ? &mut Scheduler | &mut MonotonicClock {\n  ${body}\n  drop fiber\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`
+  // A method call that borrows its receiver names the receiver, not the method.
+  const boardRoot = (body: string) =>
+    'struct Board {\n  pub items: [i32; 2],\n  pub count: usize,\n}\n\nimpl Board {\n  fn add(self: &mut Self, value: i32) -> usize {\n    self.items[0] = value\n    return self.count\n  }\n\n  fn first(self: &Self) -> &i32 {\n    return &self.items[0]\n  }\n}\n\n' +
+    `pub fn main() -> i32 {\n  ${body}\n  return 0\n}\n`
+  const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp; errors?: number }> = [
+    {
+      name: 'fiberlogger',
+      files: {
+        'main.silk': fiberRoot('let fiber = run Fiber<(), LogError>.forkChild(shout())') +
+          'effect fn shout() -> () ! LogError ? &mut Logger { run Effect.log("reminder!\\n", &()) }\n',
+      },
+      pattern: /error\[SEM0076\] The Effect passed here also requires &mut Logger, but the expected Effect may only require &mut Scheduler \| &mut MonotonicClock/,
+    },
+    {
+      name: 'fiberborrow',
+      files: {
+        'main.silk': fiberRoot('let fiber = run Fiber<usize, never>.forkChild(measure(title))') +
+          'effect fn measure(title: string) -> usize ? &mut Scheduler | &mut MonotonicClock { return String.byteLength(title) }\n',
+      },
+      pattern: /error\[SEM0212\] This value must live for `'static`, but it borrows something/,
+    },
+    {
+      name: 'privatefn',
+      files: {
+        'geo/shapes.silk': 'fn secret() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shapes { secret }\n\npub fn main() -> i32 {\n  return secret()\n}\n',
+      },
+      pattern: /error\[SEM0015\] `secret` is private to geo\/shapes; mark it `pub`/,
+    },
+    {
+      name: 'twobindings',
+      files: {
+        'geo/shapes.silk': 'pub fn shapes() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shapes\nimport geo.shapes { shapes }\n\npub fn main() -> i32 {\n  return shapes()\n}\n',
+      },
+      pattern: /error\[SEM0016\] Multiple bindings claim shapes; rename one with `as`/,
+    },
+    {
+      name: 'privatefield',
+      files: {
+        'geo/shapes.silk': 'pub struct P { x: i32, }\n\npub fn make() -> P { return P { x: 1 } }\n',
+        'main.silk': 'import geo.shapes { make }\n\npub fn main() -> i32 {\n  let p = make()\n  return p.x\n}\n',
+      },
+      pattern: /error\[SEM0028\] Field `x` of geo\/shapes\.P is private; mark it `pub x`/,
+    },
+    {
+      name: 'copybound',
+      files: { 'main.silk': 'fn dup<C: Copy>(c: C) -> C {\n  return c\n}\n\npub fn main() -> i32 {\n  return dup(0)\n}\n' },
+      pattern: /error\[SEM0001\] Unknown type Copy; is `import silk\.ownership \{ Copy \}` missing\?/,
+    },
+    {
+      name: 'moduletypo',
+      files: {
+        'geo/shapes.silk': 'pub fn f() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shape { f }\n\npub fn main() -> i32 {\n  return f()\n}\n',
+      },
+      pattern: /error\[MOD0001\] Unknown module geo\.shape\n  note: did you mean `geo\.shapes`\?\n/,
+    },
+    {
+      name: 'varbinding',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  var x = 0\n  x = x + 1\n  return x\n}\n' },
+      pattern: /error\[PAR0010\] `var` is not a Silk keyword; declare a binding you reassign with `let mut`/,
+    },
+    {
+      name: 'receivermut',
+      files: { 'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  drop board.add(1)') },
+      pattern: /error\[SEM0057\] `board` is not mutable; declare it with `mut`, as in `let mut board`/,
+    },
+    {
+      name: 'receiverloan',
+      files: {
+        'main.silk': boardRoot('let mut board = Board { items: [0, 0], count: 0 }\n  let first = &board.items[0]\n  drop board.add(1)\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0010\] A mutable borrow of `board` conflicts with an earlier shared borrow of it/,
+    },
+    {
+      name: 'receiverreferent',
+      files: {
+        'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  let first = board.first()\n  drop board\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0019\] `first` is used after `board`, which it borrows, ended or was replaced/,
+      errors: 2,
+    },
+  ]
+  for (const entry of subjects) {
+    yield* fs.makeDirectory(join(directory, entry.name, 'src/geo'), { recursive: true })
+    yield* fs.writeFileString(
+      join(directory, entry.name, 'silk.toml'),
+      `[package]\nname = "${entry.name}"\nversion = "0.1.0"\n`,
+    )
+    for (const [path, text] of Object.entries(entry.files)) {
+      yield* fs.writeFileString(join(directory, entry.name, 'src', path), text)
+    }
+    const refused = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, entry.name))
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(refused.stderr, entry.pattern)
+    assert.equal(refused.stderr.match(/error\[/g)?.length, entry.errors ?? 1, refused.stderr)
+  }
   // A workspace member's diagnostics name their files from the workspace root, also when the
   // member is built from its own directory; `--json` keeps the absolute path.
   yield* fs.makeDirectory(join(directory, 'relative/broken/src'), { recursive: true })
@@ -933,6 +1050,65 @@ const program = Effect.gen(function* () {
     assert.match(refused.stderr, /SEM0052/)
     assert.doesNotMatch(refused.stderr, /SEM0225/)
   }
+  // A library's static `compileError`, selected by a call from a `main` that requires a provider,
+  // is reported by check as by build, at the user's call with the library's site as a note.
+  yield* fs.makeDirectory(join(directory, 'staticspec/app/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'staticspec/spec'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'staticspec/silk.toml'), '[workspace]\nmembers = ["app", "spec"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/spec/silk.toml'),
+    '[package]\nname = "spec"\nversion = "0.1.0"\nsource = "."\nexports = ["sized"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/spec/sized.silk'),
+    'pub fn sized(static n: i64) -> i64 {\n  static if n > 3 { compileError("size too big") }\n  return n\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nspec = { path = "../spec" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'staticspec/app/src/main.silk'),
+    'import silk.host_input { HostInput }\nimport spec.sized { sized }\n\npub effect fn main() -> i32\n  ? &mut HostInput {\n  if sized(5) != 5 { return 1 }\n  return 0\n}\n',
+  )
+  for (const command of ['check', 'build']) {
+    const refused = yield* invoke(
+      silk,
+      [command, '--stdlib', standardLibrary],
+      join(directory, 'staticspec/app'),
+    )
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(
+      refused.stderr,
+      /^app\/src\/main\.silk:6:6: error\[SEM0177\] size too big\n {2}note: spec\/sized\.silk:2:21: related location$/m,
+    )
+  }
+  // A syntax error the parser recovered from fails the check phase of a build, before codegen.
+  yield* fs.makeDirectory(join(directory, 'unclosed/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'unclosed/silk.toml'),
+    '[package]\nname = "unclosed"\nversion = "0.1.0"\n',
+  )
+  yield* fs.writeFileString(join(directory, 'unclosed/src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n')
+  const unclosed = yield* invoke(
+    silk,
+    ['build', '--stdlib', standardLibrary, '--progress', 'plain'],
+    join(directory, 'unclosed'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(unclosed.status, 1, unclosed.stderr)
+  assert.match(unclosed.stderr, /^ {2}check {4}failed: 1 module, 1 error/m)
+  assert.match(unclosed.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
+  assert.doesNotMatch(unclosed.stderr, /codegen/)
+  // A file with a syntax error keeps no import summary, so the next load parses it and reports it again.
+  const reopened = yield* invoke(
+    silk,
+    ['build', '--stdlib', standardLibrary, '--progress', 'plain'],
+    join(directory, 'unclosed'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(reopened.status, 1, reopened.stderr)
+  assert.match(reopened.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
   // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
   // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
   // the status 1, and a selection outside the source root is refused before anything is built.
@@ -974,6 +1150,8 @@ const program = Effect.gen(function* () {
     yield* fs.exists(join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested')),
     true,
   )
+  const runnerRecord = join(directory, 'tested/build/test/llvm', hostTarget, 'debug/tested.inputs')
+  const firstRecord = yield* fs.readFile(runnerRecord)
   // No test result is stored yet, so a plain `silk test` runs every selected test.
   const failedTests = yield* invoke(
     silk,
@@ -982,6 +1160,9 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(failedTests.status, 1, failedTests.stderr)
+  // The first build's record already describes the unchanged project, so this run reused its
+  // runner and left the record as it was.
+  assert.deepEqual(yield* fs.readFile(runnerRecord), firstRecord, 'the second test run reuses the runner')
   // A test that traps fails with its report under its name, and the tests after it still run.
   assert.match(
     failedTests.stdout,
@@ -1513,22 +1694,6 @@ const program = Effect.gen(function* () {
   // manifest line.
   const locatedRefusals = [
     [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "", provenance = "literal" }\n',
-      /silk\.toml:10: InvalidInput: build\.bindings: origin\.source must be a non-empty string/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "x", provenance = "translated-public", translator = "" }\n',
-      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator must be a non-empty string/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\n[build.bindings.origin]\nsource = "env"\nprovenance = "secret"\n',
-      /silk\.toml:12: ForbiddenProvenance: build\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = 3\norigin = { source = "silk.toml", provenance = "literal" }\n',
-      /silk\.toml:9: InvalidInput: build\.bindings: value must be a table with a kind, such as \{ kind = "integer", value = "1" \}/,
-    ],
-    [
       '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["main"] }\n',
       /silk\.toml:6: unstable\.composition\.defaults entry "main" names no runtime in unstable\.composition\.runtimes; it lists "start"/,
     ],
@@ -1537,20 +1702,8 @@ const program = Effect.gen(function* () {
       /silk\.toml:7: unstable\.composition\.components\.bindings entry has no operation/,
     ],
     [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "env", provenance = "secret" }\n',
-      /silk\.toml:10: ForbiddenProvenance: build\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/,
-    ],
-    [
-      '[[build.bindings]]\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
-      /silk\.toml:5: InvalidInput: build\.bindings: package is missing/,
-    ],
-    [
       '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
       /silk\.toml:6: unstable\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", translator = "t" }\n',
-      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator: only provenance "translated-public" names a translator/,
     ],
     [
       '[unstable]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
@@ -1562,16 +1715,16 @@ const program = Effect.gen(function* () {
     ],
     ['[native]\nplatform-supply = { kind = "native", bogus = 1 }\n', /silk\.toml:6: native\.platform-supply\.bogus is not a supported field/],
     [
+      '[config]\nmain.ratio = 1.5\n',
+      /silk\.toml:6: InvalidInput: config\.main\.ratio: a package parameter value is an integer, a boolean, a string or an array of them/,
+    ],
+    ['[config]\nlimit = 1\n', /silk\.toml:6: InvalidInput: config\.limit: name the module before the parameter, as config\.main\.limit/],
+    ['[config.main]\nlimit = 1\nratio = 2.5\n', /silk\.toml:7: InvalidInput: config\.main\.ratio: a package parameter value/],
+    ['[[build.bindings]]\nparameter = "n"\n', /silk\.toml:5: build\.bindings is an earlier spelling; write config, as config\.main\.limit = 42/],
+    ['[profiles.p]\nbindings = []\n', /silk\.toml:6: InvalidInput: profiles\.p\.bindings is an earlier spelling; write config/],
+    [
       '[profiles.u]\ntarget = "x86_64-unknown-linux-gnu"\nentry = { kind = "default", bogus = 1 }\n',
       /silk\.toml:7: profiles\.u\.entry\.bogus is not a supported field/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1", bogus = 1 }\norigin = { source = "silk.toml", provenance = "literal" }\n',
-      /silk\.toml:9: build\.bindings\.value\.bogus is not a supported field/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", bogus = 1 }\n',
-      /silk\.toml:10: build\.bindings\.origin\.bogus is not a supported field/,
     ],
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
@@ -1635,7 +1788,7 @@ const program = Effect.gen(function* () {
   assert.notEqual(reserved.status, 0, reserved.stderr)
   assert.match(reserved.stderr, /`silk` and `Intrinsic` are reserved module names/)
   assert.equal(yield* fs.exists(marker), false)
-  // `[build].bindings` reach the package parameters of every project build.
+  // `[config]` values reach the package parameters of every project build.
   yield* fs.makeDirectory(join(directory, 'bound/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'bound/src/main.silk'),
@@ -1643,7 +1796,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'bound/silk.toml'),
-    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[[build.bindings]]\npackage = "bound@0.1.0"\nmodule = "main"\nparameter = "limit"\nvalue = { kind = "integer", value = "7" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = 7\n\n[profiles.small]\nconfig.main.limit = 3\n',
   )
   const bound = yield* invoke(
     silk,
@@ -1655,6 +1808,32 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
+  const boundProfile = yield* invoke(
+    silk,
+    ['run', '--profile', 'small', '--stdlib', standardLibrary],
+    join(directory, 'bound'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(boundProfile.status, 3, boundProfile.stderr)
+  // A value is checked against the parameter's declared type and refused at its manifest line.
+  yield* fs.writeFileString(
+    join(directory, 'bound/silk.toml'),
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = "seven"\n\n[profiles.small]\nconfig.main.limit = 3\n',
+  )
+  const mistyped = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'bound'))
+  assert.equal(mistyped.status, 1, mistyped.stderr)
+  assert.match(mistyped.stderr, /silk\.toml:6: error\[SEM0214\] invalid package parameter binding: the value bound to `limit` does not have its parameter's type/)
+  yield* fs.writeFileString(
+    join(directory, 'bound/silk.toml'),
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = 7\n\n[profiles.small]\nconfig.main.limt = 3\n',
+  )
+  const misnamed = yield* invoke(silk, ['check', '--profile', 'small', '--stdlib', standardLibrary], join(directory, 'bound'))
+  assert.equal(misnamed.status, 1, misnamed.stderr)
+  assert.match(misnamed.stderr, /silk\.toml:9: error\[SEM0214\] invalid package parameter binding: module `main\.silk` declares no package parameter `limt`/)
+  yield* fs.writeFileString(
+    join(directory, 'bound/silk.toml'),
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = 7\n',
+  )
   // `[package].source` roots module resolution above the root module's own directory.
   yield* fs.makeDirectory(join(directory, 'rooted/src/app'), { recursive: true })
   yield* fs.makeDirectory(join(directory, 'rooted/src/lib'), { recursive: true })
@@ -2496,14 +2675,37 @@ const program = Effect.gen(function* () {
   yield* splitRun(7)
   const coldObjects = yield* objectNames()
   assert.ok(coldObjects.length > 2, `expected an object per module, found ${coldObjects.join(', ')}`)
+  // The cache keeps each module's LLVM text as a file of its own beside the image, named by its
+  // digest, so an unchanged rebuild finds every module's text where the last build left it.
+  const packNames = Effect.fnUntraced(function* () {
+    const cache = join(split, 'build/cache')
+    const folders = (yield* fs.readDirectory(cache)).filter((name) => name.endsWith('.packs'))
+    assert.equal(folders.length, 1, `expected one pack folder, found ${folders.join(', ')}`)
+    return (yield* fs.readDirectory(join(cache, folders[0]))).sort()
+  })
+  const coldPacks = yield* packNames()
+  assert.ok(coldPacks.length > 2, `expected a pack per module, found ${coldPacks.join(', ')}`)
+  // A load reads an unchanged file's imports from the summaries the last load kept beside the
+  // cache instead of parsing the file, so an unchanged rebuild leaves them as they were.
+  const importSummaries = join(split, 'build/cache/imports')
+  const summarizedAt = (yield* fs.stat(importSummaries)).mtime
+  // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
+  const splitExecutable = join(split, `build/llvm/${hostTarget}/debug/split`)
+  const linkedAt = (yield* fs.stat(splitExecutable)).mtime
   yield* splitRun(7)
   assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
+  assert.deepEqual((yield* fs.stat(splitExecutable)).mtime, linkedAt, 'an unchanged rebuild leaves the executable as it was')
+  assert.deepEqual(yield* packNames(), coldPacks, 'an unchanged rebuild keeps every pack')
+  assert.deepEqual((yield* fs.stat(importSummaries)).mtime, summarizedAt, 'an unchanged rebuild keeps the import summaries')
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   yield* splitRun(9)
   const editedObjects = yield* objectNames()
   const compiled = editedObjects.filter((name) => !coldObjects.includes(name))
   assert.equal(compiled.length, 1, `an edit to one module compiles one unit, added ${compiled.join(', ')}`)
   assert.equal(editedObjects.length, coldObjects.length + 1)
+  const editedPacks = yield* packNames()
+  assert.equal(editedPacks.filter((name) => !coldPacks.includes(name)).length, 1, 'an edit to one module writes one pack')
+  assert.equal(editedPacks.length, coldPacks.length, 'a build removes the packs no unit names')
   // A rebuild replays the record the last build left in the cache: an edit to a body lowers only
   // the instances it touched, and an edit that changes what the program reaches walks it again.
   // Either way the executable is the one a cold build links. A string constant holding `@` names

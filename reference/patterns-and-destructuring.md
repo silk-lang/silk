@@ -21,8 +21,8 @@ the meaning of forms it accepts.
 
 ```silk
 struct Point {
-  x: i32
-  y: i32
+  x: i32,
+  y: i32,
 }
 
 fn sum(point: Point) -> i32 {

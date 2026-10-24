@@ -39,8 +39,8 @@ import silk.toml_value { Toml }
 import silk.writer { Writer, WriterError }
 
 struct CaptureWriter {
-  bytes: [u8; 64]
-  length: usize
+  bytes: [u8; 64],
+  length: usize,
 }
 
 impl Writer for CaptureWriter {

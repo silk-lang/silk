@@ -31,7 +31,7 @@ import silk.effect { Effect }
 import silk.standard_input { ReadOutcome, StandardInput, StreamReadError }
 
 struct OneByte {
-  complete: bool
+  complete: bool,
 }
 
 effect fn read(self: &mut OneByte, buffer: &mut [u8]) -> ReadOutcome

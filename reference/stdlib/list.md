@@ -80,27 +80,7 @@ pub effect fn main() -> i32
 
 Import as `List` with `import silk.list { List }`.
 
-Public declarations: 3.
-
-<a id="Empty"></a>
-
-## `Empty`
-
-```silk
-pub struct Empty<T>
-```
-
-The storage state of a [`List`](#List) that has no allocation. User code does not use it.
-
-<a id="Full"></a>
-
-## `Full`
-
-```silk
-pub struct Full<T>
-```
-
-The storage state of a [`List`](#List) that has an allocation. User code does not use it.
+Public declarations: 1.
 
 <a id="List"></a>
 

@@ -35,7 +35,7 @@ import silk.http_client { Http, HttpError, Request, Response }
 import silk.string { String }
 
 struct FakeHttp {
-  calls: i32
+  calls: i32,
 }
 
 impl Http for FakeHttp {
