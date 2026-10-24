@@ -502,12 +502,19 @@ test('a pipe compared without parentheses hints at the precedence of |>', () => 
   assert.match(checked.stderr, /\(.*\|>.*\)|parenthes/, show(checked))
 })
 
-test('a type mismatch inside a generic instance names the types and the instance', { todo: 'finding 111' }, () => {
+// Silk checks a generic body once with T abstract, so the error names T, not an instance.
+test('a type mismatch inside a generic body names the type parameter', () => {
   const dir = initPackage(h, 'generic-mismatch')
   write(join(dir, 'src/main.silk'), 'fn f(a: bool) -> i32 {\n  return 0\n}\n\nfn g<T>(value: T) -> i32 {\n  return f(value)\n}\n\npub fn main() -> i32 {\n  return g<i32>(1)\n}\n')
   const checked = silk(h, ['check'], { cwd: dir })
-  assert.match(checked.stderr, /main\.silk:6:\d+: error\[SEM0012\] Expected bool but received (i32|T)/, show(checked))
-  assert.match(checked.stderr, /main\.silk:10:/, `points at the call that made g<i32>\n${show(checked)}`)
+  assert.match(checked.stderr, /main\.silk:6:\d+: error\[SEM0012\] Expected bool but received T/, show(checked))
+})
+
+test('the mismatch says T is a type parameter of g', { todo: 'finding 111 follow-up note' }, () => {
+  const dir = initPackage(h, 'generic-mismatch-note')
+  write(join(dir, 'src/main.silk'), 'fn f(a: bool) -> i32 {\n  return 0\n}\n\nfn g<T>(value: T) -> i32 {\n  return f(value)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n')
+  const checked = silk(h, ['check'], { cwd: dir })
+  assert.match(checked.stderr, /`T` is a type parameter of `g`, so it can be any type/, show(checked))
 })
 
 // One static for over the fields of a struct: doubling the fields should about double the time.
