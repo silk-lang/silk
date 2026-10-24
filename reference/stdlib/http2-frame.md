@@ -19,7 +19,7 @@ Public declarations: 19.
 pub fn preface() -> &'static [u8]
 ```
 
-The client connection preface. The client sends SETTINGS immediately after these bytes.
+Returns the client connection preface. The client sends SETTINGS immediately after these bytes.
 
 <a id="NO_ERROR"></a>
 

@@ -4,7 +4,7 @@
 
 HTTP/2 field compression as defined by RFC 7541.
 
-Keep one [`Decoder`](#Decoder) and one [`Encoder`](#Encoder) for each connection direction. Each field block uses
+Keep one [`Decoder`](#Decoder) for received fields and one [`Encoder`](#Encoder) for sent fields. Each field block uses
 the table left by the previous block. Field names and values are wire bytes, without UTF-8 conversion.
 Decoding accepts every representation, including Huffman strings. Encoding uses indexed fields
 and literal strings, with dynamic indexing only when the field is not sensitive.
