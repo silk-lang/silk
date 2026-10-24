@@ -119,7 +119,7 @@ A module asserts a property for a nominal type it declares with an empty `impl`,
 bounds:
 
 ```silk,ignore
-struct Buffer<T> { base: *mut T count: usize }
+struct Buffer<T> { base: *mut T, count: usize }
 
 impl<T: Transferable> Transferable for Buffer<T> {}
 impl<T: Concurrent> Concurrent for Buffer<T> {}

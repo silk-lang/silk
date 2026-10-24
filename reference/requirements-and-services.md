@@ -125,7 +125,7 @@ service's other operations with `run`, and those calls reach the same provider:
 
 ```silk
 pub struct SinkError {
-  code: i32
+  code: i32,
 }
 
 service Sink {
@@ -141,7 +141,7 @@ service Sink {
 }
 
 struct Counter {
-  count: usize
+  count: usize,
 }
 
 impl Sink for Counter {

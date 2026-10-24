@@ -32,7 +32,7 @@ import silk.effect { Effect }
 import silk.shared { Shared }
 
 struct Counter {
-  value: i32
+  value: i32,
 }
 
 fn addTwo(counter: &mut Counter) -> i32 {

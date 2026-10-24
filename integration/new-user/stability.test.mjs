@@ -134,7 +134,7 @@ ${logging}  let a = area(Point { x: 3, y: 4 })
 }
 `)
   write(file('util.silk'), 'pub const LIMIT: i32 = 10\n\npub fn scale(v: i32) -> i32 {\n  return v * 2\n}\n')
-  write(file('geometry.silk'), 'pub struct Point {\n  pub x: i32\n  pub y: i32\n}\n\npub fn area(p: Point) -> i32 {\n  return p.x * p.y\n}\n')
+  write(file('geometry.silk'), 'pub struct Point {\n  pub x: i32,\n  pub y: i32,\n}\n\npub fn area(p: Point) -> i32 {\n  return p.x * p.y\n}\n')
   const steps = [
     ['baseline', () => {}],
     ['constant value', () => edit('util.silk', '= 10', '= 11')],

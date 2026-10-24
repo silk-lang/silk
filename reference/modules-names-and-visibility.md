@@ -710,7 +710,7 @@ A public type may use private representation types behind private fields:
 struct Storage { value: i32 }
 
 pub struct Counter {
-  storage: Storage
+  storage: Storage,
 }
 ```
 
@@ -860,7 +860,7 @@ module that spells them imports them:
 ```silk
 import silk.ownership { Copy }
 
-struct Point { x: i32 y: i32 }
+struct Point { x: i32, y: i32 }
 
 impl Copy for Point {}
 
