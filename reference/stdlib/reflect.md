@@ -24,8 +24,8 @@ operation. Private fields of a type from another module are not in the list.
 import silk.reflect { Reflect }
 
 struct Pair {
-  pub first: i32
-  pub second: i32
+  pub first: i32,
+  pub second: i32,
 }
 
 fn sum(owner: &Pair) -> i32 {
