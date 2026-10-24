@@ -165,6 +165,7 @@ documentation remain separate from this reference.
 
 - [Base64](base64.md) — strict RFC 4648 standard-padded encoding and decoding into caller-owned storage.
 - [Buffered byte I/O](buffered-byte-io.md) — fixed-capacity lookahead, output buffering, scoped duplex composition, and bounded transfer.
+- [HTTP/2](http2.md) — client and server streams, HPACK, flow control, TLS ALPN, and protocol conformance.
 - [HTTP head parsing](http-head-parsing.md) — bounded incremental request/response heads, borrowed views, and atomic serialization.
 - [HTTP body framing](http-body-framing.md) — strict bounded message framing, chunked transfer, trailers, and completion evidence.
 - [HTTP content decoding](http-content-decoding.md) — bounded streaming content-coding plans, decoding, metadata, and reuse evidence.
