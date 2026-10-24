@@ -899,6 +899,109 @@ const program = Effect.gen(function* () {
     assert.equal(refused.stderr.match(/error\[SEM0225\] Entry point `main` has a result the selected runtime cannot start/g)?.length, 1, refused.stderr)
     assert.doesNotMatch(refused.stderr, /SEM0210/)
   }
+  // Errors new users meet in the book's later chapters name their subject and the fix, and a
+  // `var` binding adds no unknown-value error at each later use.
+  const fiberRoot = (body: string) =>
+    'import silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.logger { Logger, LogError }\nimport silk.monotonic_clock { MonotonicClock }\nimport silk.allocator { OutOfMemoryError }\nimport silk.scheduler { Scheduler, TaskIdExhaustedError }\nimport silk.string { String }\n\n' +
+    `effect fn root<'text>(title: string<'text>) -> () ! OutOfMemoryError | TaskIdExhaustedError ? &mut Scheduler | &mut MonotonicClock {\n  ${body}\n  drop fiber\n}\n\npub fn main() -> i32 {\n  return 0\n}\n`
+  // A method call that borrows its receiver names the receiver, not the method.
+  const boardRoot = (body: string) =>
+    'struct Board {\n  pub items: [i32; 2],\n  pub count: usize,\n}\n\nimpl Board {\n  fn add(self: &mut Self, value: i32) -> usize {\n    self.items[0] = value\n    return self.count\n  }\n\n  fn first(self: &Self) -> &i32 {\n    return &self.items[0]\n  }\n}\n\n' +
+    `pub fn main() -> i32 {\n  ${body}\n  return 0\n}\n`
+  const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp; errors?: number }> = [
+    {
+      name: 'fiberlogger',
+      files: {
+        'main.silk': fiberRoot('let fiber = run Fiber<(), LogError>.forkChild(shout())') +
+          'effect fn shout() -> () ! LogError ? &mut Logger { run Effect.log("reminder!\\n", &()) }\n',
+      },
+      pattern: /error\[SEM0076\] The Effect passed here also requires &mut Logger, but the expected Effect may only require &mut Scheduler \| &mut MonotonicClock/,
+    },
+    {
+      name: 'fiberborrow',
+      files: {
+        'main.silk': fiberRoot('let fiber = run Fiber<usize, never>.forkChild(measure(title))') +
+          'effect fn measure(title: string) -> usize ? &mut Scheduler | &mut MonotonicClock { return String.byteLength(title) }\n',
+      },
+      pattern: /error\[SEM0212\] This value must live for `'static`, but it borrows something/,
+    },
+    {
+      name: 'privatefn',
+      files: {
+        'geo/shapes.silk': 'fn secret() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shapes { secret }\n\npub fn main() -> i32 {\n  return secret()\n}\n',
+      },
+      pattern: /error\[SEM0015\] `secret` is private to geo\/shapes; mark it `pub`/,
+    },
+    {
+      name: 'twobindings',
+      files: {
+        'geo/shapes.silk': 'pub fn shapes() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shapes\nimport geo.shapes { shapes }\n\npub fn main() -> i32 {\n  return shapes()\n}\n',
+      },
+      pattern: /error\[SEM0016\] Multiple bindings claim shapes; rename one with `as`/,
+    },
+    {
+      name: 'privatefield',
+      files: {
+        'geo/shapes.silk': 'pub struct P { x: i32, }\n\npub fn make() -> P { return P { x: 1 } }\n',
+        'main.silk': 'import geo.shapes { make }\n\npub fn main() -> i32 {\n  let p = make()\n  return p.x\n}\n',
+      },
+      pattern: /error\[SEM0028\] Field `x` of geo\/shapes\.P is private; mark it `pub x`/,
+    },
+    {
+      name: 'copybound',
+      files: { 'main.silk': 'fn dup<C: Copy>(c: C) -> C {\n  return c\n}\n\npub fn main() -> i32 {\n  return dup(0)\n}\n' },
+      pattern: /error\[SEM0001\] Unknown type Copy; is `import silk\.ownership \{ Copy \}` missing\?/,
+    },
+    {
+      name: 'moduletypo',
+      files: {
+        'geo/shapes.silk': 'pub fn f() -> i32 { return 0 }\n',
+        'main.silk': 'import geo.shape { f }\n\npub fn main() -> i32 {\n  return f()\n}\n',
+      },
+      pattern: /error\[MOD0001\] Unknown module geo\.shape\n  note: did you mean `geo\.shapes`\?\n/,
+    },
+    {
+      name: 'varbinding',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  var x = 0\n  x = x + 1\n  return x\n}\n' },
+      pattern: /error\[PAR0010\] `var` is not a Silk keyword; declare a binding you reassign with `let mut`/,
+    },
+    {
+      name: 'receivermut',
+      files: { 'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  drop board.add(1)') },
+      pattern: /error\[SEM0057\] `board` is not mutable; declare it with `mut`, as in `let mut board`/,
+    },
+    {
+      name: 'receiverloan',
+      files: {
+        'main.silk': boardRoot('let mut board = Board { items: [0, 0], count: 0 }\n  let first = &board.items[0]\n  drop board.add(1)\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0010\] A mutable borrow of `board` conflicts with an earlier shared borrow of it/,
+    },
+    {
+      name: 'receiverreferent',
+      files: {
+        'main.silk': boardRoot('let board = Board { items: [0, 0], count: 0 }\n  let first = board.first()\n  drop board\n  let read = first.*'),
+      },
+      pattern: /error\[OWN0019\] `first` is used after `board`, which it borrows, ended or was replaced/,
+      errors: 2,
+    },
+  ]
+  for (const entry of subjects) {
+    yield* fs.makeDirectory(join(directory, entry.name, 'src/geo'), { recursive: true })
+    yield* fs.writeFileString(
+      join(directory, entry.name, 'silk.toml'),
+      `[package]\nname = "${entry.name}"\nversion = "0.1.0"\n`,
+    )
+    for (const [path, text] of Object.entries(entry.files)) {
+      yield* fs.writeFileString(join(directory, entry.name, 'src', path), text)
+    }
+    const refused = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, entry.name))
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.match(refused.stderr, entry.pattern)
+    assert.equal(refused.stderr.match(/error\[/g)?.length, entry.errors ?? 1, refused.stderr)
+  }
   // A workspace member's diagnostics name their files from the workspace root, also when the
   // member is built from its own directory; `--json` keeps the absolute path.
   yield* fs.makeDirectory(join(directory, 'relative/broken/src'), { recursive: true })
