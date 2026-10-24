@@ -5,7 +5,7 @@
 // nested close to the parser's limit, where a thread with Darwin's default stack overflows.
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -501,6 +501,82 @@ const program = Effect.gen(function* () {
   })
   const cleared = yield* diagnosticsFor(session, uri, undefined, messy.notifications)
   assert.deepEqual(cleared.diagnostics, [])
+
+  // In a workspace, a member sees the open text of a member it depends on, and keeps its saved
+  // text once it closes. An import's member list completes only what the module exports.
+  const members = yield* start(silk, stdlib)
+  yield* request(members, 1, 'initialize', { processId: null, rootUri: null, capabilities: {} })
+  yield* members.send({ jsonrpc: '2.0', method: 'initialized', params: {} })
+  const workspace = mkdtempSync(join(tmpdir(), 'silk-lsp-workspace-'))
+  yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(workspace, { recursive: true })))
+  writeFileSync(join(workspace, 'silk.toml'), '[workspace]\nmembers = ["pricing", "store"]\n')
+  for (const member of ['pricing', 'store']) mkdirSync(join(workspace, member, 'src'), { recursive: true })
+  writeFileSync(
+    join(workspace, 'pricing', 'silk.toml'),
+    '[package]\nname = "pricing"\nversion = "0.1.0"\nroot = "src/lib.silk"\nsource-root = "src"\nexports = ["lib"]\n\n[build]\nartifact = "static-library"\n',
+  )
+  writeFileSync(
+    join(workspace, 'store', 'silk.toml'),
+    '[package]\nname = "store"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\npricing = { path = "../pricing" }\n',
+  )
+  const priced = 'pub fn add(a: i32, b: i32) -> i32 {\n  return a + b\n}\n'
+  const stored = 'import pricing.lib { add }\n\npub fn main() -> i32 {\n  return add(1, 2) - 3\n}\n'
+  writeFileSync(join(workspace, 'pricing', 'src', 'lib.silk'), priced)
+  writeFileSync(join(workspace, 'store', 'src', 'main.silk'), stored)
+  const pricing = pathToFileURL(join(workspace, 'pricing', 'src', 'lib.silk')).href
+  const store = pathToFileURL(join(workspace, 'store', 'src', 'main.silk')).href
+  for (const [opened, text] of [
+    [pricing, priced],
+    [store, stored],
+  ] as const) {
+    yield* members.send({
+      jsonrpc: '2.0',
+      method: 'textDocument/didOpen',
+      params: { textDocument: { uri: opened, languageId: 'silk', version: 1, text } },
+    })
+    const clean = yield* diagnosticsFor(members, opened, 1, [])
+    assert.deepEqual(clean.diagnostics, [], JSON.stringify(clean))
+  }
+  // The store's diagnostics are published again, at its unchanged version, once it is rechecked.
+  const storeProblems = Effect.gen(function* () {
+    while (true) {
+      const message = yield* members.receive
+      const params = message['params'] as Diagnostics | undefined
+      if (message['method'] === 'textDocument/publishDiagnostics' && params?.uri === store) {
+        return params.diagnostics.map(({ code }) => code)
+      }
+    }
+  })
+  yield* change(members, pricing, 2, priced.replace('pub fn', 'fn'))
+  assert.deepEqual(yield* storeProblems, ['SEM0015'])
+  yield* change(members, pricing, 3, priced)
+  assert.deepEqual(yield* storeProblems, [])
+  yield* change(members, pricing, 4, priced.replace('pub fn', 'fn'))
+  assert.deepEqual(yield* storeProblems, ['SEM0015'])
+  yield* members.send({ jsonrpc: '2.0', method: 'textDocument/didSave', params: { textDocument: { uri: pricing } } })
+  yield* members.send({ jsonrpc: '2.0', method: 'textDocument/didClose', params: { textDocument: { uri: pricing } } })
+  yield* change(members, store, 2, stored + '\n')
+  const kept = yield* diagnosticsFor(members, store, 2, [])
+  assert.deepEqual(
+    kept.diagnostics.map(({ code }) => code),
+    ['SEM0015'],
+    'a closed member keeps its saved text',
+  )
+  yield* change(members, store, 3, 'import silk.list { L }\n' + stored)
+  yield* diagnosticsFor(members, store, 3, [])
+  yield* members.send({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'textDocument/completion',
+    params: { textDocument: { uri: store }, position: { line: 0, character: 20 } },
+  })
+  const offered = (yield* notificationsUntil(members, 2)).response
+  const labels = (offered['result'] as { items: Array<{ label: string }> }).items.map(({ label }) => label)
+  assert.deepEqual(labels, ['List'], JSON.stringify(offered))
+  // Diagnostics may still be on their way, so the server is left without a shutdown.
+  yield* members.send({ jsonrpc: '2.0', method: 'exit' })
+  assert.equal(yield* members.exited, 1)
+
 
   const shutdown = yield* request(session, 4, 'shutdown')
   assert.ok('result' in shutdown && shutdown['result'] === null, JSON.stringify(shutdown))

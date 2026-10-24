@@ -345,6 +345,14 @@ A `Drop` hook that cleanup selects is such a witness. When dropping a `Box<State
 no larger than before, so the second drop is admitted even though `Node<i32>` is not part of
 `State<i32>`.
 
+A recursive application may also change a type argument to a type that lies within the owned
+structure of the earlier one: a field of it, a field of one of its fields, or a part of such a type.
+`Debug` for `Option<Line>` calls the generic helper `Format.debugField` for a `Line`; when `Line`
+writes its field `weight: Option<i32>`, the same helper runs for `Option<i32>`, which lies inside
+`Line`. The owned structure of a type is finite, because a declaration unfolds beneath itself only
+at a strictly smaller application, and the active path never repeats an exact application, so these
+re-entries stay finite.
+
 **Boundary:** Ordinary polymorphic recursion that changes a type argument is outside the stable
 model. Witness delegation that grows a type argument along a recursive call cycle is also invalid:
 
@@ -1314,7 +1322,9 @@ and gives `&[T]`.
 **Boundary:** `for` does not add another interface argument, and the provider need not appear in the
 interface's explicit arguments. A structural union, reference, fixed array, anonymous tuple or
 record, anonymous callable contract, or interface value cannot own a conformance; the provider must
-have one canonical nominal identity, or be a scalar, `string`, or slice.
+have one canonical nominal identity, or be a scalar, `string`, or slice. A union still conforms to
+an interface its members all implement when the interface only reads `self` through a reference
+([UNION-003](values-and-types.md#union-003--a-union-takes-a-reference-only-interface-that-every-member-implements)).
 
 **Diagnostics:** A missing, malformed, or non-nominal provider reports an invalid-provider
 diagnostic at the `for` type. Wrong interface-argument arity or kind reports the application error
@@ -1705,6 +1715,10 @@ reaches a concrete base conformance.
 // Valid: T is structurally contained by Box<T>.
 impl<T: Display> Display for Box<T> { /* ... */ }
 ```
+
+The parts of an `Effect` type in the provider, such as its success and error types, are structural
+parts too, so `impl<'env, E: Debug> Outcome<Effect<'env; i32 ! E>> for Runner<Effect<'env; i32 ! E>>`
+descends.
 
 The compiler proves termination from the declaration itself. It does not use a recursion-depth
 limit, solver fuel, source order, or the set of currently reachable concrete calls.

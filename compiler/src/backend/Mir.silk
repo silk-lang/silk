@@ -3,6 +3,7 @@ import semantic.SourceLocations {Location}
 //! Backend-neutral control flow for one checked scalar function instance.
 
 import semantic.Types {Types}
+import semantic.PackageGraph
 import backend.DropGlue {Child as GlueChild, Children as GlueChildren, Remainder, RemainderLevel, Variant as GlueVariant}
 import backend.CleanupNeeds {CleanupNeeds}
 import backend.CAbi
@@ -93,6 +94,11 @@ pub union LocalKind {
   /// The address of the context of the failure the current recovery handler selected, or null
   /// when none is selected (N2).
   Cause,
+  /// The address of the `string<'static>` site label of the call that entered the function's
+  /// package, or null when no call entered it, such as for an independent invocation. A source
+  /// trap reports there, so a violated library precondition names the line that misused the
+  /// library (TERM-008).
+  Site,
   /// A `bool` recording whether the cleanup component at `local` plus canonical `path` is live
   /// on this runtime path. Distinct independently mutable children have independent flags;
   /// the exact prepared component glue remains part of the lowering proof (MIR core shape §3).
@@ -124,6 +130,8 @@ pub union Operand {
   Unit,
   /// The address of immutable program-lifetime storage holding exactly `bytes`.
   StaticBytes {pub bytes: Bytes},
+  /// The address of an immutable program-lifetime `string<'static>` descriptor of `bytes`.
+  StaticText {pub bytes: Bytes},
   /// A null address of pointer type `ty`: no observer or no selected failure (N1, N2).
   Null {pub ty: Shared<Type>},
 }
@@ -293,6 +301,9 @@ pub union Terminator {
   Fail {pub origin: Origin},
   /// Stops the program; under an observer it first reports `reason` at its site (event 6, TERM-008).
   Trap {pub reason: TrapReason, pub origin: Origin},
+  /// Stops the program for `reason`, the `string<'static>` a source `Intrinsic.trap` supplies;
+  /// under an observer it first reports that text at its site (event 6, TERM-008).
+  TrapText {pub reason: Operand, pub origin: Origin},
   Unreachable {pub origin: Origin},
   /// Jumps to the case whose value equals the scalar operand, or to `otherwise` for every other value.
   Switch {pub value: Operand, pub cases: List<SwitchCase>, pub otherwise: usize, pub origin: Origin},
@@ -321,13 +332,18 @@ pub struct Diagnostics {
 struct DiagnosticOperands {
   observer: Operand
   cause: Operand
+  site: Operand
 }
 
 impl Diagnostics {
-  /// Hidden operands passing `observer` and `cause`.
-  pub effect fn make(observer: Operand, cause: Operand) -> Diagnostics ! OutOfMemoryError ? &mut Allocator {
-    let operands = DiagnosticOperands {observer: move observer, cause: move cause}
+  /// Hidden operands passing `observer`, `cause` and the package entry `site`.
+  pub effect fn make(observer: Operand, cause: Operand, site: Operand) -> Diagnostics ! OutOfMemoryError ? &mut Allocator {
+    let operands = DiagnosticOperands {observer: move observer, cause: move cause, site: move site}
     return Diagnostics {operands: run Box<DiagnosticOperands>.make(move operands)}
+  }
+  /// The package entry site operand.
+  pub fn site(self: &Self) -> &Operand {
+    return &Box<DiagnosticOperands>.get(&self.operands)[0].site
   }
   /// The observer address operand.
   pub fn observer(self: &Self) -> &Operand {
@@ -1005,6 +1021,7 @@ struct CancelScope {
 struct DiagnosticPlaces {
   observer: Place
   cause: Place
+  site: Place
 }
 
 // An observed function's report name and its module's line starts (failure observer note N3).
@@ -5029,7 +5046,9 @@ effect fn expression(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Modu
       return Operand.Copy {place: place(output)}
     }
     View.Intrinsic {member, node: callNode, ty, origin} => {
-      if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ObserveUnhandled) { return run observeUnhandled(&mut builder.*, &ty, origin) }
+      if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ObserveUnhandled) { return run observeSelected(&mut builder.*, &ty, 5, origin) }
+      if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.ObserveHandled) { return run observeSelected(&mut builder.*, &ty, 7, origin) }
+      if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.Trap) { return run trapText(&mut builder.*, body, hir, callNode, origin) }
       // Exact text equality is the language's `string` comparison (TEXT-001).
       if CheckedIntrinsic.isPrimitive(member, IntrinsicPrimitive.StringEqualsExact) {
         let left = match move childAt(body, callNode, usize.ZERO) {
@@ -5293,6 +5312,22 @@ effect fn trapUnless(builder: &mut Builder, condition: Operand, reason: TrapReas
   run trapHere(&mut builder.*, reason, origin)
   resume(&mut builder.*, safe)
   return ()
+}
+
+// `trap(reason)` ends the current block with a trap that reports the source's reason text,
+// recording the site label an observed trap reports (event 6, TERM-008).
+effect fn trapText(builder: &mut Builder, body: &Shared<TypedBody>, hir: &Module, callNode: BodyNodeId, origin: Origin) -> Operand
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let owner = InstanceKey.identity(&builder.function.key)
+  let argument = match move childAt(body, callNode, usize.ZERO) {
+    Option<BodyNodeId>.Some {value} => value
+    Option<BodyNodeId>.None => run unsupported(&owner, origin, GapCode.MissingCallArgument)
+  }
+  let reason = run expression(&mut builder.*, body, hir, argument)
+  if !builder.live { return Operand.Unit }
+  run recordTrapSite(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.TrapText {reason: move reason, origin: origin})
+  return Operand.Unit
 }
 
 // Ends the current block with a trap for `reason`, recording the site label an observed trap
@@ -7007,6 +7042,17 @@ effect fn lowerExecutionPackage(builder: &mut Builder, body: &Shared<TypedBody>,
     run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, zeroed]), Rvalue.Use {value: run wordOperand(initial)}, origin)
     zeroed = zeroed + usize.ONE
   }
+  // In a program that observes diagnostics, the trap record starts with no adapter and no observer.
+  if let Option<DiagnosticPlaces>.Some {..} = &builder.diagnostics {
+    let trap = run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderTrap)])
+    let mut slot = usize.ZERO
+    while slot < 3 {
+      let mut element = run copyPlace(&trap)
+      run List<Projection>.append(&mut element.projections, Projection.ConstIndex {index: slot})
+      run assign(&mut builder.*, move element, Rvalue.Use {value: Operand.Null {ty: run addressType()}}, origin)
+      slot = slot + usize.ONE
+    }
+  }
   run List<Reference>.append(&mut builder.*.function.references, Reference {key: InstanceKey.copy(&glue), edge: Edge.Direct, origin: origin})
   run assign(&mut builder.*, run storagePlace(&place(block), true, &[header, SealedCore.ordinal(CoreField.HeaderDrop)]),
     Rvalue.FunctionAddress {key: move glue}, origin)
@@ -7070,7 +7116,9 @@ effect fn helperBuilder(creator: &Builder, key: InstanceKey, result: &Shared<Typ
     let observer = List<Local>.length(&locals)
     run List<Local>.append(&mut locals, Local {ty: run observerAddress(), kind: LocalKind.Observer, origin: origin})
     run List<Local>.append(&mut locals, Local {ty: run causeType(), kind: LocalKind.Cause, origin: origin})
-    diagnostics = Option<DiagnosticPlaces>.some(DiagnosticPlaces {observer: place(observer), cause: place(observer + usize.ONE)})
+    run List<Local>.append(&mut locals, Local {ty: run siteType(), kind: LocalKind.Site, origin: origin})
+    diagnostics = Option<DiagnosticPlaces>.some(DiagnosticPlaces {observer: place(observer), cause: place(observer + usize.ONE),
+      site: place(observer + 2)})
   }
   let mut bindings = List<Binding>.make()
   let supplied = List<Binding>.asSlice(&creator.bindings)
@@ -7295,16 +7343,36 @@ effect fn callErased(builder: &mut Builder, access: &PackageAccess, field: CoreF
   let next = run block(&mut builder.*, origin)
   let mut arguments = List<Operand>.make()
   run List<Operand>.append(&mut arguments, Operand.Copy {place: place(access.package)})
-  // The body starts an independent diagnostic invocation, which no relinquishment can outlive.
   let mut diagnostics = run currentDiagnostics(&builder.*)
+  let current = match &builder.diagnostics {
+    Option<DiagnosticPlaces>.Some {value} => Option<Place>.some(run copyPlace(&value.observer))
+    Option<DiagnosticPlaces>.None => Option<Place>.none()
+  }
+  let mut forwarded = Option<Place>.none()
   if field == CoreField.HeaderStart {
-    let observing = match &diagnostics { Option<Diagnostics>.Some {..} => true Option<Diagnostics>.None => false }
-    diagnostics = run independentDiagnostics(observing)
+    if let Option<Place>.Some {value: observer} = &current {
+      // The body starts an independent diagnostic invocation under the package's trap record, which
+      // answers no event and forwards a fatal trap to this drive's observer. The record lives as
+      // long as the package's frames, and holds the observer only while this drive runs them.
+      let trap = run headerField(access, CoreField.HeaderTrap)
+      let mut target = run copyPlace(&trap)
+      run List<Projection>.append(&mut target.projections, Projection.ConstIndex {index: usize.ONE})
+      run assign(&mut builder.*, run copyPlace(&target), Rvalue.Use {value: Operand.Copy {place: run copyPlace(&observer)}}, origin)
+      let record = run temporary(&mut builder.*, &run observerAddress(), origin)
+      run assign(&mut builder.*, place(record), Rvalue.AddressOf {access: Access.Shared, place: move trap}, origin)
+      diagnostics = Option<Diagnostics>.some(run Diagnostics.make(Operand.Copy {place: place(record)}, Operand.Null {ty: run causeType()},
+        Operand.Null {ty: run siteType()}))
+      forwarded = Option<Place>.some(move target)
+    }
   }
   terminate(&mut builder.*, Terminator.Call {callee: Callee.Indirect {address: Operand.Copy {place: place(function)}},
     arguments: move arguments, providers: List<Operand>.make(), diagnostics: move diagnostics,
     destination: place(output), normal: next, failure: Option<FailureEdge>.none(), origin: origin})
-  return resume(&mut builder.*, next)
+  resume(&mut builder.*, next)
+  if let Option<Place>.Some {value: target} = &forwarded {
+    run assign(&mut builder.*, run copyPlace(&target), Rvalue.Use {value: Operand.Null {ty: run addressType()}}, origin)
+  }
+  return ()
 }
 
 // The package an `ExecutionRef` place addresses, with a typed address of its header. A reference
@@ -8602,8 +8670,9 @@ effect fn executePlan(builder: &mut Builder, steps: &[RunPlan], step: usize, env
       let none = run temporary(&mut builder.*, &run causeType(), origin)
       run assign(&mut builder.*, place(none), Rvalue.Use {value: Operand.Null {ty: run causeType()}}, origin)
       run openCancelScope(&mut builder.*)
+      let entered = run currentSite(&mut builder.*, origin)
       let outer = swapDiagnostics(&mut builder.*, Option<DiagnosticPlaces>.some(DiagnosticPlaces {observer: place(observer),
-        cause: place(none)}))
+        cause: place(none), site: move entered}))
       run executePlan(&mut builder.*, steps, inner, &bodyPart, output, sink, &mut bound.*, origin)
       drop swapDiagnostics(&mut builder.*, move outer)
       // A cancelled body drops both parts after its exits released their nodes, as a completed one does.
@@ -9022,6 +9091,12 @@ pub effect fn causeType() -> Shared<Type> ! OutOfMemoryError ? &mut Allocator | 
     multiplicity: Multiplicity.Single, alignment: Option<u64>.none()})
 }
 
+/// The address of a package entry site label: a `string<'static>` descriptor, or null.
+pub effect fn siteType() -> Shared<Type> ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  return run Types.intern(Type.Pointer {pointee: run Types.intern(Type.String {lifetime: run Shared<Lifetime>.make(Lifetime.Static)}),
+    access: Access.Shared, nullable: true, multiplicity: Multiplicity.Single, alignment: Option<u64>.none()})
+}
+
 // An untyped code or data address: an observer record field.
 effect fn addressType() -> Shared<Type> ! OutOfMemoryError ? &mut Allocator | &mut Types {
   return run Types.intern(Type.Pointer {pointee: run Types.intern(Type.Primitive {name: run Bytes.copy(b"u8")}),
@@ -9057,9 +9132,10 @@ pub effect fn declarationName(declaration: &DeclarationId) -> Bytes ! OutOfMemor
   let count = DeclarationId.ownerCount(declaration)
   let mut at = usize.ZERO
   while at < count {
-    if DeclarationId.ownerNamed(declaration, at) {
+    // An `impl` block is named with no spelling; its methods read as members of the module.
+    let ownerName = run DeclarationId.copyOwnerName(declaration, at)
+    if DeclarationId.ownerNamed(declaration, at) && Bytes.length(&ownerName) > usize.ZERO {
       run Bytes.append(&mut name, b".")
-      let ownerName = run DeclarationId.copyOwnerName(declaration, at)
       run Bytes.append(&mut name, Bytes.asSlice(&ownerName))
     }
     at = at + usize.ONE
@@ -9389,6 +9465,19 @@ effect fn callObserver(builder: &mut Builder, observer: &Place, event: u64, firs
   let word = run addressType()
   let function = run temporary(&mut builder.*, &word, origin)
   run assign(&mut builder.*, place(function), Rvalue.Use {value: Operand.Copy {place: move adapter}}, origin)
+  // An execution's trap record has no adapter: it answers every event with `0`.
+  let boolean = run Types.intern(Type.Primitive {name: run Bytes.copy(b"bool")})
+  let adapted = run temporary(&mut builder.*, &boolean, origin)
+  run assign(&mut builder.*, place(adapted), Rvalue.Binary {operation: InfixOperator.NotEquals,
+    left: Operand.Copy {place: place(function)}, right: Operand.Null {ty: Shared<Type>.clone(&word)}}, origin)
+  let calling = run block(&mut builder.*, origin)
+  let unanswered = run block(&mut builder.*, origin)
+  terminate(&mut builder.*, Terminator.Branch {condition: Operand.Copy {place: place(adapted)}, thenBlock: calling,
+    elseBlock: unanswered, origin: origin})
+  resume(&mut builder.*, unanswered)
+  run assign(&mut builder.*, place(output), Rvalue.Use {value: run usizeOperand(0)}, origin)
+  terminate(&mut builder.*, Terminator.Goto {target: joined, origin: origin})
+  resume(&mut builder.*, calling)
   let stored = run temporary(&mut builder.*, &word, origin)
   run assign(&mut builder.*, place(stored), Rvalue.Use {value: Operand.Copy {place: move callable}}, origin)
   let receiver = run temporary(&mut builder.*, &word, origin)
@@ -9412,23 +9501,77 @@ effect fn callObserver(builder: &mut Builder, observer: &Place, event: u64, firs
 effect fn currentDiagnostics(builder: &Builder) -> Option<Diagnostics> ! OutOfMemoryError ? &mut Allocator {
   return match &builder.diagnostics {
     Option<DiagnosticPlaces>.Some {value: places} => Option<Diagnostics>.some(run Diagnostics.make(
-      Operand.Copy {place: run copyPlace(&places.observer)}, Operand.Copy {place: run copyPlace(&places.cause)}))
+      Operand.Copy {place: run copyPlace(&places.observer)}, Operand.Copy {place: run copyPlace(&places.cause)},
+      Operand.Copy {place: run copyPlace(&places.site)}))
     Option<DiagnosticPlaces>.None => Option<Diagnostics>.none()
   }
 }
 
 // Every Silk callee of a program that observes diagnostics takes them; foreign callees do not (N1).
+// A direct call into another package passes this call's site label as the callee's entry site;
+// every other call passes the caller's own entry site on. The standard library is a dependency of
+// every package and never the reverse, so its calls into another package are callbacks: they pass
+// no entry site, and a trap there reports at its own statement (TERM-008).
 effect fn calleeDiagnostics(builder: &Builder, callee: &Callee, origin: Origin) -> Option<Diagnostics>
-! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator {
+! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   if let Callee.Extern {..} = &callee.* { return Option<Diagnostics>.none() }
-  return run currentDiagnostics(builder)
+  let crossing = match &callee.* {
+    Callee.Instance {key} => packageCrossing(&builder.function.key, &key)
+    _ => Crossing.Within
+  }
+  let places = match &builder.diagnostics {
+    Option<DiagnosticPlaces>.Some {value} => DiagnosticPlaces {observer: run copyPlace(&value.observer),
+      cause: run copyPlace(&value.cause), site: run copyPlace(&value.site)}
+    Option<DiagnosticPlaces>.None => { return Option<Diagnostics>.none() }
+  }
+  let site = match crossing {
+    Crossing.Within => Operand.Copy {place: move places.site}
+    Crossing.Callback => Operand.Null {ty: run siteType()}
+    Crossing.Entry => match &builder.sites {
+      Option<SiteText>.Some {value: sites} => Operand.StaticText {bytes: run siteLabel(&sites, &builder.anchor, origin)}
+      Option<SiteText>.None => Operand.Null {ty: run siteType()}
+    }
+  }
+  return Option<Diagnostics>.some(run Diagnostics.make(Operand.Copy {place: move places.observer},
+    Operand.Copy {place: move places.cause}, move site))
+}
+
+// How a direct call relates the caller's package to the callee's.
+enum Crossing {
+  Within,
+  Entry,
+  Callback,
+}
+
+// The standard library is its own package, the implicit dependency `silk`, though its modules
+// share the root package's identity (PACKAGE-005).
+fn packageCrossing(caller: &InstanceKey, callee: &InstanceKey) -> Crossing {
+  let callerIdentity = DeclarationId.copyShared(&InstanceKey.identity(caller))
+  let calleeIdentity = DeclarationId.copyShared(&InstanceKey.identity(callee))
+  let callerModule = DeclarationId.moduleId(&callerIdentity)
+  let calleeModule = DeclarationId.moduleId(&calleeIdentity)
+  let standardCaller = ModuleId.withPath<bool>(callerModule, PackageGraph.isStandard)
+  let standardCallee = ModuleId.withPath<bool>(calleeModule, PackageGraph.isStandard)
+  if standardCaller && standardCallee { return Crossing.Within }
+  if standardCaller { return Crossing.Callback }
+  if standardCallee || !ModuleId.samePackage(callerModule, calleeModule) { return Crossing.Entry }
+  return Crossing.Within
+}
+
+// The current package entry site, or a null one when the function does not observe diagnostics.
+effect fn currentSite(builder: &mut Builder, origin: Origin) -> Place ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if let Option<DiagnosticPlaces>.Some {value} = &builder.diagnostics { return run copyPlace(&value.site) }
+  let absent = run temporary(&mut builder.*, &run siteType(), origin)
+  run assign(&mut builder.*, place(absent), Rvalue.Use {value: Operand.Null {ty: run siteType()}}, origin)
+  return place(absent)
 }
 
 // The hidden operands of an independent call: no observer and no selected failure (N1), or
 // none when the program does not observe diagnostics.
 effect fn independentDiagnostics(observing: bool) -> Option<Diagnostics> ! OutOfMemoryError ? &mut Allocator | &mut Types {
   if !observing { return Option<Diagnostics>.none() }
-  return Option<Diagnostics>.some(run Diagnostics.make(Operand.Null {ty: run observerAddress()}, Operand.Null {ty: run causeType()}))
+  return Option<Diagnostics>.some(run Diagnostics.make(Operand.Null {ty: run observerAddress()}, Operand.Null {ty: run causeType()},
+    Operand.Null {ty: run siteType()}))
 }
 
 fn swapDiagnostics(builder: &mut Builder, next: Option<DiagnosticPlaces>) -> Option<DiagnosticPlaces> {
@@ -9444,7 +9587,12 @@ effect fn selectCause(builder: &mut Builder, caught: usize, origin: Origin) -> O
   }
   let address = run temporary(&mut builder.*, &run causeType(), origin)
   run assign(&mut builder.*, place(address), Rvalue.ContextOf {place: place(caught)}, origin)
-  return swapDiagnostics(&mut builder.*, Option<DiagnosticPlaces>.some(DiagnosticPlaces {observer: move observer, cause: place(address)}))
+  let site = match &builder.diagnostics {
+    Option<DiagnosticPlaces>.Some {value: places} => run copyPlace(&places.site)
+    Option<DiagnosticPlaces>.None => { return Option<DiagnosticPlaces>.none() }
+  }
+  return swapDiagnostics(&mut builder.*, Option<DiagnosticPlaces>.some(DiagnosticPlaces {observer: move observer, cause: place(address),
+    site: move site}))
 }
 
 effect fn usizeOperand(value: u64) -> Operand ! OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -9453,14 +9601,15 @@ effect fn usizeOperand(value: u64) -> Operand ! OutOfMemoryError ? &mut Allocato
 }
 
 // `observeUnhandled()` hands the selected failure's context to the current observer's callback as
-// event 5 with its pool handle; without an observer or a selected failure it is 0 (failure observer note
-// N4). The callback is an independent edge: it runs with no observer and no selected failure.
-effect fn observeUnhandled(builder: &mut Builder, ty: &Shared<Type>, origin: Origin) -> Operand
+// event 5 with its pool handle, and `observeHandled()` as event 7; without an observer or a selected
+// failure it is 0 (failure observer note N4). The callback is an independent edge: it runs with no
+// observer and no selected failure.
+effect fn observeSelected(builder: &mut Builder, ty: &Shared<Type>, event: u64, origin: Origin) -> Operand
 ! Gap | CanonicalizationFailure | OutOfMemoryError ? &mut Allocator | &mut Types {
   let output = run temporary(&mut builder.*, ty, origin)
   let current = match &builder.diagnostics {
     Option<DiagnosticPlaces>.Some {value} => Option<DiagnosticPlaces>.some(
-      DiagnosticPlaces {observer: run copyPlace(&value.observer), cause: run copyPlace(&value.cause)})
+      DiagnosticPlaces {observer: run copyPlace(&value.observer), cause: run copyPlace(&value.cause), site: run copyPlace(&value.site)})
     Option<DiagnosticPlaces>.None => Option<DiagnosticPlaces>.none()
   }
   let places = match move current {
@@ -9499,7 +9648,7 @@ effect fn observeUnhandled(builder: &mut Builder, ty: &Shared<Type>, origin: Ori
   run assign(&mut builder.*, place(located), Rvalue.Use {value: Operand.Copy {place: move label}}, origin)
   let causeHandle = run temporary(&mut builder.*, &run usizeType(), origin)
   run assign(&mut builder.*, place(causeHandle), Rvalue.ContextHandle {address: Operand.Copy {place: run copyPlace(&places.cause)}}, origin)
-  run callObserver(&mut builder.*, &places.observer, 5, Operand.Copy {place: place(causeHandle)}, run usizeOperand(0),
+  run callObserver(&mut builder.*, &places.observer, event, Operand.Copy {place: place(causeHandle)}, run usizeOperand(0),
     Operand.Copy {place: place(named)}, Operand.Copy {place: place(located)}, output, joined, origin)
   resume(&mut builder.*, quiet)
   run assign(&mut builder.*, place(output), Rvalue.Use {value: run usizeOperand(0)}, origin)
@@ -10251,8 +10400,9 @@ impl MirFunction {
       let observerLocal = List<Local>.length(&locals)
       run List<Local>.append(&mut locals, Local {ty: run observerAddress(), kind: LocalKind.Observer, origin: origin})
       run List<Local>.append(&mut locals, Local {ty: run causeType(), kind: LocalKind.Cause, origin: origin})
+      run List<Local>.append(&mut locals, Local {ty: run siteType(), kind: LocalKind.Site, origin: origin})
       diagnostics = Option<DiagnosticPlaces>.some(DiagnosticPlaces {observer: place(observerLocal),
-        cause: place(observerLocal + usize.ONE)})
+        cause: place(observerLocal + usize.ONE), site: place(observerLocal + 2)})
       sites = Option<SiteText>.some(run siteText(&key, source))
     }
     // A function that can fail writes its failure value to a caller-owned out-slot (D3).

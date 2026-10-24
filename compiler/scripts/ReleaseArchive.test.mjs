@@ -19,7 +19,7 @@ const directory = Effect.acquireRelease(
   (root) => Effect.sync(() => rmSync(root, { recursive: true, force: true })),
 )
 
-it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibly', () =>
+it.effect('installs the compiler as bin/silkc and the silk tool as bin/silk beside lib/silk/stdlib, reproducibly', () =>
   Effect.gen(function* () {
     const root = yield* directory
     const fs = yield* FileSystem.FileSystem
@@ -34,11 +34,13 @@ it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibl
     mkdirSync(join(root, 'stdlib', deep), { recursive: true })
     writeFileSync(join(root, 'stdlib/manifest.json'), '{}\n')
     writeFileSync(join(root, 'stdlib', deep, 'option.silk'), 'pub union Option {}\n')
-    writeFileSync(join(root, 'compiler'), '#!/bin/sh\necho silk\n')
+    writeFileSync(join(root, 'compiler'), '#!/bin/sh\necho silkc\n')
+    writeFileSync(join(root, 'tool'), '#!/bin/sh\necho silk\n')
     mkdirSync(join(root, 'first'))
     mkdirSync(join(root, 'second'))
     const options = {
       compiler: join(root, 'compiler'),
+      tool: join(root, 'tool'),
       standardLibrary: join(root, 'stdlib'),
       target: 'x86_64-unknown-linux-gnu',
       version: '1.2.3-rc.2+release.build',
@@ -57,6 +59,9 @@ it.effect('installs the compiler as bin/silk beside lib/silk/stdlib, reproducibl
     const top = join(root, 'silk-1.2.3-rc.2+release.build-x86_64-unknown-linux-gnu')
     assert.deepStrictEqual((yield* fs.readDirectory(top)).sort(), ['bin', 'lib'])
     assert.deepStrictEqual(yield* fs.readDirectory(join(top, 'lib/silk')), ['stdlib'])
+    assert.strictEqual(readFileSync(join(top, 'bin/silkc'), 'utf8'), '#!/bin/sh\necho silkc\n')
+    assert.strictEqual(statSync(join(top, 'bin/silkc')).mode & 0o777, 0o755)
+    assert.deepStrictEqual((yield* fs.readDirectory(join(top, 'bin'))).sort(), ['silk', 'silkc'])
     assert.strictEqual(readFileSync(join(top, 'bin/silk'), 'utf8'), '#!/bin/sh\necho silk\n')
     assert.strictEqual(statSync(join(top, 'bin/silk')).mode & 0o777, 0o755)
     assert.strictEqual(statSync(join(top, 'lib/silk/stdlib/manifest.json')).mode & 0o777, 0o644)
@@ -104,6 +109,7 @@ it.effect('rejects malformed versions before reading inputs or writing archive p
       const result = yield* Effect.result(
         ReleaseArchive.write({
           compiler: join(root, 'missing-compiler'),
+          tool: join(root, 'missing-tool'),
           standardLibrary: join(root, 'missing-stdlib'),
           target: 'aarch64-apple-darwin',
           version,
@@ -122,9 +128,11 @@ it.effect('requires an explicit CLI version and preserves foreign compiler bytes
     const fs = yield* FileSystem.FileSystem
     const root = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-archive-cli-' })
     const compiler = join(root, 'foreign-compiler')
+    const tool = join(root, 'foreign-tool')
     const standardLibrary = join(root, 'stdlib')
     const output = join(root, 'output')
     yield* fs.writeFileString(compiler, 'foreign executable bytes, not a host program')
+    yield* fs.writeFileString(tool, 'foreign tool bytes')
     yield* fs.makeDirectory(standardLibrary)
     yield* fs.writeFileString(join(standardLibrary, 'i32.silk'), 'pub let ZERO = 0\n')
     yield* fs.makeDirectory(output)
@@ -137,6 +145,8 @@ it.effect('requires an explicit CLI version and preserves foreign compiler bytes
       fileURLToPath(new URL('./ReleaseArchive.ts', import.meta.url)),
       '--compiler',
       compiler,
+      '--tool',
+      tool,
       '--stdlib',
       standardLibrary,
       '--target',
@@ -164,10 +174,16 @@ it.effect('requires an explicit CLI version and preserves foreign compiler bytes
     const unpacked = yield* NativeProcess.execute('tar', [
       '-xzOf',
       archive,
-      'silk-2.3.5-beta.0+build.007-aarch64-apple-darwin/bin/silk',
+      'silk-2.3.5-beta.0+build.007-aarch64-apple-darwin/bin/silkc',
     ])
     assert.strictEqual(unpacked.status, 0, unpacked.stderr.toString())
     assert.strictEqual(unpacked.stdout.toString(), 'foreign executable bytes, not a host program')
+    const front = yield* NativeProcess.execute('tar', [
+      '-xzOf',
+      archive,
+      'silk-2.3.5-beta.0+build.007-aarch64-apple-darwin/bin/silk',
+    ])
+    assert.strictEqual(front.stdout.toString(), 'foreign tool bytes')
     const metadata = yield* NativeProcess.execute('tar', [
       '-xzOf',
       archive,

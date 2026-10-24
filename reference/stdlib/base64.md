@@ -156,6 +156,24 @@ OutputTooSmall
 
 The output slice is too short. `required` and `available` give the two lengths.
 
+<a id="Base64Reason.impl.Debug"></a>
+
+## Implementation `Debug for Base64Reason`
+
+```silk
+impl Debug for Base64Reason
+```
+
+<a id="Base64Reason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidLength`.
+
 <a id="Base64Error"></a>
 
 ## `Base64Error`
@@ -210,6 +228,24 @@ pub available: Option<usize>
 ```
 
 For `OutputTooSmall`, the length of the output that you gave.
+
+<a id="Base64Error.impl.Debug"></a>
+
+## Implementation `Debug for Base64Error`
+
+```silk
+impl Debug for Base64Error
+```
+
+<a id="Base64Error.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `Base64Error { reason: ..., offset: ..., ... }`.
 
 <a id="Base64"></a>
 

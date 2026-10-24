@@ -4,7 +4,7 @@ import { lstatSync, readlinkSync, statSync } from 'node:fs'
 import { test } from 'node:test'
 import { existsSync, freshHome, hasTool, install, join, read, show, silk } from './lib.mjs'
 
-test('install.sh installs a toolchain, links bin/silk and makes it the default', () => {
+test('install.sh installs a toolchain, the silk tool, and makes it the default', () => {
   const h = freshHome()
   const result = install(h)
   assert.equal(result.status, 0, show(result))

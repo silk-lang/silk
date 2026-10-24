@@ -138,6 +138,24 @@ AuthenticationFailed
 
 The tag is not correct for the key, nonce, associated data, and ciphertext.
 
+<a id="AeadError.impl.Debug"></a>
+
+## Implementation `Debug for AeadError`
+
+```silk
+impl Debug for AeadError
+```
+
+<a id="AeadError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidKey`.
+
 <a id="ChaCha20Poly1305"></a>
 
 ## `ChaCha20Poly1305`

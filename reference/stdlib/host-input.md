@@ -99,6 +99,24 @@ pub struct HostInputError
 
 The error when a host input provider cannot answer a lookup.
 
+<a id="HostInputError.impl.Debug"></a>
+
+## Implementation `Debug for HostInputError`
+
+```silk
+impl Debug for HostInputError
+```
+
+<a id="HostInputError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `HostInputError`.
+
 <a id="HostInput"></a>
 
 ## `HostInput`

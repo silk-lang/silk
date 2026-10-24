@@ -37,7 +37,8 @@ list and the sensitive list.
 
 Manual returns the first response through the final callback. It does not validate Location, even
 when the response has a redirect status. Follow selects only 301, 302, 303, 307, and 308. Status 304
-and all other statuses are final responses. If Follow has no remaining hop capacity, the first
+and all other statuses are final responses, and so is a selected status with no Location field
+(RFC 9110 section 15.4): it has nowhere to go. If Follow has no remaining hop capacity, the first
 selected redirect fails with `HopLimit`.
 
 ## Method and content transitions
@@ -88,8 +89,8 @@ offsets. Equal replay content remains the caller's promise.
 
 ## Location, fragments, and loops
 
-A selected Follow response must contain exactly one Location field. A missing field returns
-`LocationMissing`; duplicate fields return `LocationAmbiguous`. An empty Location is a valid URI
+A followed response must contain exactly one Location field; duplicate fields return
+`LocationAmbiguous`. `resolveLocation` itself returns `LocationMissing` when the field is absent. An empty Location is a valid URI
 reference and can identify the current target.
 
 The operation copies Location while the response head is live, validates the raw limit and percent

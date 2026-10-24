@@ -1,0 +1,364 @@
+//! `silk`, the one front door for Silk.
+//!
+//! It owns what must behave the same in every project: Silk versions (`silk use`, `silk set`),
+//! release notes (`silk change`) and itself (`silk update self`). Every other command, `--version`
+//! included, goes unchanged to the compiler `silkc` of the version the directory selects (driver
+//! Forward), so editors, scripts and habit reach the pinned compiler.
+
+import Bundled
+import changeset.Command as ChangeCommand
+import Command as Commands { Context, Outcome }
+import Forward as Forwarding { Action }
+import Install as ToolchainInstall { HostFiles, InstallError, ReleaseSource }
+import NativeHostFiles as HostFileAccess { NativeHostFiles }
+import ProcessImage
+import ReleaseVersion
+import Sources as ToolchainSources { GitHubReleases, MirrorReleases }
+import Toolchains
+import Unavailable
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.host_input { HostInput, HostInputError }
+import silk.list { List }
+import silk.option { Option }
+import silk.os_filesystem { OsFileSystem }
+import silk.os_writer { StderrWriter, StdoutWriter }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.usize
+import silk.writer { Writer, WriterError }
+
+fn asksHelp(arguments: &[Bytes]) -> bool {
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let word = Bytes.asSlice(&arguments[at])
+    if same(word, b"--help") || same(word, b"-h") {
+      return true
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+effect fn writeError(bytes: &[u8]) -> () ! WriterError {
+  let mut stderr = StderrWriter.make()
+  return run Writer.writeAll(bytes) |> Effect.provideMut<Writer>(&mut stderr)
+}
+
+effect fn writeOutput(bytes: &[u8]) -> () ! WriterError {
+  let mut stdout = StdoutWriter.make()
+  return run Writer.writeAll(bytes) |> Effect.provideMut<Writer>(&mut stdout)
+}
+
+// Prints `outcome` and answers its status.
+effect fn reported(outcome: &Outcome) -> i32 ! WriterError {
+  run writeOutput(Bytes.asSlice(&outcome.output))
+  run writeError(Bytes.asSlice(&outcome.errors))
+  return outcome.status
+}
+
+// What every command runs with.
+effect fn context() -> Context
+  ! HostInputError | OutOfMemoryError | FileError
+  ? &mut HostInput | &mut Allocator {
+  let workingDirectory = run HostInput.workingDirectory()
+  let working = run Path.fromBytes(Bytes.asSlice(&workingDirectory))
+  let mut files = run OsFileSystem.make("/")
+  let home = run Toolchains.home() |> Effect.provideMut<FileSystem>(&mut files)
+  let environment = run HostInput.variableNamed("SILK_TOOLCHAIN")
+  let all = run HostInput.arguments()
+  let listed = List<Bytes>.asSlice(&all)
+  let searchPath = run HostInput.variableNamed("PATH")
+  let mut bundled = Option<Path>.none()
+  if listed.length > usize.ZERO {
+    let search = match &searchPath {
+      Option<Bytes>.Some { value } => Option<&[u8]>.some(Bytes.asSlice(&value))
+      Option<Bytes>.None => Option<&[u8]>.none()
+    }
+    bundled = run Bundled.compiler(Bytes.asSlice(&listed[usize.ZERO]), move search)
+      |> Effect.provideMut<FileSystem>(&mut files)
+  }
+  return Context {
+    working: move working,
+    home: move home,
+    environment: move environment,
+    target: ToolchainInstall.hostTarget(),
+    releaseKey: ToolchainInstall.releaseKey(),
+    release: ReleaseVersion.value(),
+    bundled: move bundled,
+  }
+}
+
+// `silk use [version]`, `silk set` or `silk update self`, with `arguments` from that word on, downloading from
+// SILK_TOOLCHAIN_MIRROR when it is set and from GitHub otherwise (Sources).
+effect fn networked(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! HostInputError | OutOfMemoryError | FileError
+  ? &mut HostInput | &mut Allocator {
+  let mut files = run OsFileSystem.make("/")
+  let mut host = NativeHostFiles.at(b"/")
+  let mirrored = run HostInput.variableNamed("SILK_TOOLCHAIN_MIRROR")
+  if let Option<Bytes>.Some { value } = &mirrored {
+    let made = run Effect.result(ToolchainSources.mirror(Bytes.asSlice(&value)))
+    let mut source = match move made {
+      Result<MirrorReleases, InstallError | OutOfMemoryError>.Success { value: opened } => move opened
+      Result<MirrorReleases, InstallError | OutOfMemoryError>.Failure { error } => match move error {
+        InstallError stopped => {
+          return run sourceFailure(move stopped)
+        }
+        OutOfMemoryError exhausted => {
+          fail move exhausted
+        }
+      }
+    }
+    return run Commands.networked(context, arguments)
+      |> Effect.provideMut<ReleaseSource>(&mut source) |> Effect.provideMut<FileSystem>(&mut files)
+      |> Effect.provideMut<HostFiles>(&mut host)
+  }
+  let made = run Effect.result(ToolchainSources.github())
+  let mut source = match move made {
+    Result<GitHubReleases, InstallError | HostInputError | OutOfMemoryError>.Success { value: opened } => move opened
+    Result<GitHubReleases, InstallError | HostInputError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => {
+        return run sourceFailure(move stopped)
+      }
+      HostInputError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  return run Commands.networked(context, arguments)
+    |> Effect.provideMut<ReleaseSource>(&mut source) |> Effect.provideMut<FileSystem>(&mut files)
+    |> Effect.provideMut<HostFiles>(&mut host)
+}
+
+// The outcome of a release source that cannot open.
+effect fn sourceFailure(stopped: InstallError) -> Outcome ! OutOfMemoryError ? &mut Allocator {
+  let mut errors = run Bytes.copy(b"silk: ")
+  run Bytes.append(&mut errors, Bytes.asSlice(&stopped.message))
+  run Bytes.append(&mut errors, b"\n")
+  return Outcome { status: stopped.status, output: Bytes.make(), errors: move errors }
+}
+
+// Whether a missing toolchain installs itself: SILK_AUTO_INSTALL=1, or auto-install = true in
+// settings.toml.
+effect fn autoInstalls(context: &Context) -> bool
+  ! HostInputError | OutOfMemoryError | FileError
+  ? &mut HostInput | &mut Allocator {
+  let variable = run HostInput.variableNamed("SILK_AUTO_INSTALL")
+  if let Option<Bytes>.Some { value } = &variable {
+    return same(Bytes.asSlice(&value), b"1")
+  }
+  if let Option<Path>.Some { value: home } = &context.home {
+    let mut files = run OsFileSystem.make("/")
+    return run Toolchains.autoInstall(&home) |> Effect.provideMut<FileSystem>(&mut files)
+  }
+  return false
+}
+
+// Whether the forwarded command, after any `+<version>`, is `lsp`.
+fn servesLanguage(arguments: &[Bytes]) -> bool {
+  let mut command = usize.ZERO
+  if arguments.length > usize.ZERO && Bytes.length(&arguments[usize.ZERO]) > usize.ZERO && Bytes.asSlice(&arguments[usize.ZERO])[usize.ZERO] == 43 {
+    command = usize.ONE
+  }
+  return arguments.length > command && same(Bytes.asSlice(&arguments[command]), b"lsp")
+}
+
+// An editor that spawns `silk lsp` where no toolchain can serve gets a server that shows `errors`
+// rather than one that crashes.
+effect fn unavailableServer(errors: &[u8]) -> i32 {
+  let mut end = errors.length
+  while end > usize.ZERO && errors[end - usize.ONE] == 10 {
+    end = end - usize.ONE
+  }
+  return run Unavailable.serveStandard(Slice.view<u8>(errors, usize.ZERO, end))
+}
+
+// Runs `arguments` in the compiler the directory selects (Forward). It returns only when that
+// compiler does not start.
+effect fn forward(arguments: &[Bytes]) -> i32
+  ! HostInputError | OutOfMemoryError | FileError | WriterError
+  ? &mut HostInput | &mut Allocator {
+  let context = run context()
+  let mut files = run OsFileSystem.make("/")
+  let mut decision = run Forwarding.decide(&context, arguments) |> Effect.provideMut<FileSystem>(&mut files)
+  if decision.action == Action.Exit && decision.status == Commands.NOT_INSTALLED && Bytes.length(&decision.missing) > usize.ZERO {
+    if run autoInstalls(&context) {
+      let mut notice = run Bytes.copy(b"silk: installing Silk ")
+      run Bytes.append(&mut notice, Bytes.asSlice(&decision.missing))
+      run Bytes.append(&mut notice, b" (auto-install is on)\n")
+      run writeError(Bytes.asSlice(&notice))
+      let installed = run installOnly(&context, Bytes.asSlice(&decision.missing))
+      // The command's own output stays alone on standard output.
+      run writeError(Bytes.asSlice(&installed.output))
+      run writeError(Bytes.asSlice(&installed.errors))
+      if installed.status != 0 {
+        if servesLanguage(arguments) {
+          return run unavailableServer(Bytes.asSlice(&installed.errors))
+        }
+        return installed.status
+      }
+      decision = run Forwarding.decide(&context, arguments) |> Effect.provideMut<FileSystem>(&mut files)
+    }
+  }
+  if decision.action == Action.Exit {
+    if decision.status == Commands.NOT_INSTALLED && servesLanguage(arguments) {
+      return run unavailableServer(Bytes.asSlice(&decision.errors))
+    }
+    run writeError(Bytes.asSlice(&decision.errors))
+    return decision.status
+  }
+  run writeError(Bytes.asSlice(&decision.errors))
+  let executable = Bytes.asSlice(&decision.executable)
+  if !run ProcessImage.setVariable(b"SILK_TOOLCHAIN", Bytes.asSlice(&decision.version)) {
+    run writeError(b"silk: cannot set SILK_TOOLCHAIN\n")
+    return 1
+  }
+  if let Option<Path>.Some { value: home } = &context.home {
+    if !run ProcessImage.setVariable(b"SILK_HOME", Path.rawBytes(&home)) {
+      run writeError(b"silk: cannot set SILK_HOME\n")
+      return 1
+    }
+  }
+  let program = run Path.fromBytes(executable)
+  let forwarded = Slice.view<Bytes>(arguments, decision.skip, arguments.length - decision.skip)
+  let failure = run ProcessImage.replace(&program, forwarded)
+  drop failure
+  let mut message = run Bytes.copy(b"silk: cannot run ")
+  run Bytes.append(&mut message, executable)
+  run Bytes.append(&mut message, b"\n")
+  run writeError(Bytes.asSlice(&message))
+  return 1
+}
+
+// Installs `version` without changing the default or any project: the automatic install a
+// forwarded command makes.
+effect fn installOnly(context: &Context, version: &[u8]) -> Outcome
+  ! HostInputError | OutOfMemoryError | FileError
+  ? &mut HostInput | &mut Allocator {
+  let mut words = List<Bytes>.make()
+  run List<Bytes>.append(&mut words, run Bytes.copy(b"install"))
+  run List<Bytes>.append(&mut words, run Bytes.copy(version))
+  return run networked(context, List<Bytes>.asSlice(&words))
+}
+
+effect fn program() -> i32
+  ! HostInputError | OutOfMemoryError | FileError | WriterError
+  ? &mut HostInput | &mut Allocator {
+  let all = run HostInput.arguments()
+  let listed = List<Bytes>.asSlice(&all)
+  if listed.length == usize.ZERO {
+    run writeError(Commands.usage())
+    return 2
+  }
+  let arguments = Slice.view<Bytes>(listed, usize.ONE, listed.length - usize.ONE)
+  if arguments.length == usize.ZERO {
+    run writeError(Commands.usage())
+    return 2
+  }
+  let first = Bytes.asSlice(&arguments[usize.ZERO])
+  // The overview lists the compiler's commands too; `silk help <command>` of a compiler command
+  // is the compiler's.
+  if same(first, b"--help") || same(first, b"-h") || (same(first, b"help") && (arguments.length == usize.ONE || Commands.owns(Bytes.asSlice(&arguments[usize.ONE])))) {
+    run writeOutput(Commands.usage())
+    return 0
+  }
+  if same(first, b"change") {
+    return run ChangeCommand.runHost()
+  }
+  let rest = Slice.view<Bytes>(arguments, usize.ONE, arguments.length - usize.ONE)
+  // `silk use --help` and the like print the same overview, which covers the tool's commands.
+  if Commands.owns(first) && asksHelp(rest) {
+    run writeOutput(Commands.usage())
+    return 0
+  }
+  if same(first, b"update") && Commands.updatesSelf(rest) {
+    let context = run context()
+    let ran = run networked(&context, arguments)
+    return run reported(&ran)
+  }
+  if same(first, b"update") {
+    let updated = run Commands.update(rest)
+    return run reported(&updated)
+  }
+  if same(first, b"use") && Commands.local(rest) {
+    let context = run context()
+    let mut files = run OsFileSystem.make("/")
+    let ran = run Commands.execute(&context, rest) |> Effect.provideMut<FileSystem>(&mut files)
+    return run reported(&ran)
+  }
+  if same(first, b"use") || same(first, b"set") {
+    let context = run context()
+    let ran = run networked(&context, arguments)
+    return run reported(&ran)
+  }
+  // Commands the compiler had before the tool took them over.
+  if same(first, b"toolchain") {
+    run writeError(b"silk: `silk toolchain` was replaced: `silk use` installs and lists versions, `silk use which` shows the selected one, and `silk set` pins a project.\nRun `silk --help` for the commands.\n")
+    return 2
+  }
+  if same(first, b"changes") {
+    run writeError(b"silk: `silk changes` was replaced by `silk change`.\nRun `silk change --help` for its commands.\n")
+    return 2
+  }
+  if let Option<&'static [u8]>.Some { value: meant } = Commands.suggestion(first) {
+    run writeError(b"silk: unknown command `")
+    run writeError(first)
+    run writeError(b"`; did you mean `silk ")
+    run writeError(meant)
+    run writeError(b"`?\nRun `silk --help` for the commands.\n")
+    return 2
+  }
+  return run forward(arguments)
+}
+
+pub effect fn main() -> i32 ? &mut HostInput {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let outcome = run Effect.result(program() |> Effect.provideMut<Allocator>(&mut allocator))
+  return match move outcome {
+    Result<i32, HostInputError | OutOfMemoryError | FileError | WriterError>.Success { value } => value
+    Result<i32, HostInputError | OutOfMemoryError | FileError | WriterError>.Failure { error } => match move error {
+      HostInputError failed => {
+        drop failed
+        let reported = run Effect.result(writeError(b"silk: cannot read the command line or environment\n"))
+        drop reported
+        return 1
+      }
+      OutOfMemoryError exhausted => {
+        drop exhausted
+        let reported = run Effect.result(writeError(b"silk: out of memory\n"))
+        drop reported
+        return 1
+      }
+      FileError failed => {
+        drop failed
+        let reported = run Effect.result(writeError(b"silk: a file operation failed\n"))
+        drop reported
+        return 1
+      }
+      WriterError broken => {
+        drop broken
+        return 1
+      }
+    }
+  }
+}

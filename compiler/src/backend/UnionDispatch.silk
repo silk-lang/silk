@@ -1,0 +1,222 @@
+import semantic.SourceLocations {Location}
+//! Union dispatch: the MIR of an interface operation whose `Self` is a structural union
+//! (UNION-003).
+//!
+//! # When to use
+//! Build a [`UnionDispatch`] from the operation's closed signature and each member's selected
+//! witness instance, then lower it with [`UnionDispatch.lower`].
+//!
+//! # Details
+//! The operation receives `self` through a reference to the union and names `Self` nowhere else.
+//! The body reads the receiver's tag and, for the active member, borrows that member's payload
+//! with the receiver's access and calls the member's witness with the remaining parameters and the
+//! providers it needs. The witness writes the result directly; its failure, when it has one, goes
+//! to this function's failure out-slot and leaves through `Fail`.
+
+import semantic.Types {Types}
+import backend.InstanceKey {InstanceKey}
+import backend.Layout {Layout}
+import backend.Mir {
+  Block,
+  Callee,
+  Cancel,
+  ContextText,
+  Diagnostics,
+  EscapeSite,
+  FailureEdge,
+  Local,
+  LocalKind,
+  MirFunction,
+  NonParkingRun,
+  Operand,
+  Place,
+  Projection,
+  Reference,
+  Rvalue,
+  SharedAccess,
+  Statement,
+  SwitchCase,
+  Terminator,
+  TrapSite,
+  causeType,
+  siteType,
+  observerAddress,
+}
+import hir.Hir {Access}
+import semantic.DeclarationId {DeclarationId}
+import semantic.Lifetime {Lifetime}
+import semantic.Specialization {Edge}
+import semantic.Type {Type}
+import semantic.TypedBody {BorrowStatus, Origin}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.option {Option}
+import silk.shared {Shared}
+import silk.usize
+import silk.list {List}
+
+/// The call one union member's arm makes.
+pub struct Arm {
+  /// The member's canonical tag.
+  pub tag: usize
+  /// The member type the payload projection reads.
+  pub member: Shared<Type>
+  /// The member's selected witness instance.
+  pub callee: InstanceKey
+  /// For each requirement entry of the callee, the index of the own provider that serves it.
+  pub providers: List<usize>
+  /// Whether the callee can fail; its failure type equals this function's failure type.
+  pub fails: bool
+}
+
+/// The closed shape of one union dispatch instance.
+pub struct UnionDispatch {
+  pub key: InstanceKey
+  pub result: Shared<Type>
+  /// The runtime parameters; the first is the reference to the union.
+  pub parameters: List<Shared<Type>>
+  /// The address type of each own provider, in canonical requirement order.
+  pub providers: List<Shared<Type>>
+  /// The failure type; `never` when the operation cannot fail.
+  pub failure: Shared<Type>
+  pub fails: bool
+  /// The union's canonical member count.
+  pub count: usize
+  pub arms: List<Arm>
+}
+
+impl UnionDispatch {
+  /// The dispatch body.
+  pub effect fn lower(self: UnionDispatch, observing: bool) -> MirFunction ! OutOfMemoryError ? &mut Allocator | &mut Types {
+    let origin = Origin {node: usize.ZERO, location: Location.generated()}
+    let parameters = List<Shared<Type>>.asSlice(&self.parameters)
+    let mut locals = List<Local>.make()
+    run List<Local>.append(&mut locals, Local {ty: Shared<Type>.clone(&self.result), kind: LocalKind.Return, origin: origin})
+    let mut at = usize.ZERO
+    while at < parameters.length {
+      run List<Local>.append(&mut locals, Local {ty: Shared<Type>.clone(&parameters[at]), kind: LocalKind.Parameter {index: at},
+        origin: origin})
+      at = at + usize.ONE
+    }
+    let providerStart = List<Local>.length(&locals)
+    let providers = List<Shared<Type>>.asSlice(&self.providers)
+    at = usize.ZERO
+    while at < providers.length {
+      run List<Local>.append(&mut locals, Local {ty: Shared<Type>.clone(&providers[at]), kind: LocalKind.Provider {index: at},
+        origin: origin})
+      at = at + usize.ONE
+    }
+    let observer = List<Local>.length(&locals)
+    if observing {
+      run List<Local>.append(&mut locals, Local {ty: run observerAddress(), kind: LocalKind.Observer, origin: origin})
+      run List<Local>.append(&mut locals, Local {ty: run causeType(), kind: LocalKind.Cause, origin: origin})
+      run List<Local>.append(&mut locals, Local {ty: run siteType(), kind: LocalKind.Site, origin: origin})
+    }
+    let mut failure = usize.MAX
+    if self.fails {
+      failure = List<Local>.length(&locals)
+      run List<Local>.append(&mut locals, Local {ty: Shared<Type>.clone(&self.failure), kind: LocalKind.Failure, origin: origin})
+    }
+    let access = Shared<Type>.with<Access>(&parameters[usize.ZERO], fn(value: &Type) -> Access {
+      return match &value.* { Type.Reference {access, ..} => access _ => Access.Shared }
+    })
+    let mut blocks = List<Block>.make()
+    let entry = run block(&mut blocks, origin)
+    let done = run block(&mut blocks, origin)
+    terminate(&mut blocks, done, Terminator.Return {origin: origin})
+    let mut failed = usize.MAX
+    if self.fails {
+      failed = run block(&mut blocks, origin)
+      terminate(&mut blocks, failed, Terminator.Fail {origin: origin})
+    }
+    let otherwise = run block(&mut blocks, origin)
+    let tagType = run Layout.tagType(self.count)
+    let tag = List<Local>.length(&locals)
+    run List<Local>.append(&mut locals, Local {ty: Shared<Type>.clone(&tagType), kind: LocalKind.Temp, origin: origin})
+    run statement(&mut blocks, entry, Statement.Assign {destination: place(tag), value: Rvalue.Discriminant {place: run receiver()},
+      origin: origin})
+    let mut references = List<Reference>.make()
+    let mut cases = List<SwitchCase>.make()
+    let arms = List<Arm>.asSlice(&self.arms)
+    at = usize.ZERO
+    while at < arms.length {
+      let arm = run block(&mut blocks, origin)
+      run List<SwitchCase>.append(&mut cases, SwitchCase {decimal: run Type.extentText(arms[at].tag), negative: false, target: arm})
+      let borrowed = run Types.intern(Type.Reference {referent: Shared<Type>.clone(&arms[at].member), access: access,
+        lifetime: run Shared<Lifetime>.make(Lifetime.Static)})
+      let payload = List<Local>.length(&locals)
+      run List<Local>.append(&mut locals, Local {ty: move borrowed, kind: LocalKind.Temp, origin: origin})
+      let mut member = run receiver()
+      run List<Projection>.append(&mut member.projections, Projection.Payload {index: arms[at].tag, ty: Shared<Type>.clone(&arms[at].member)})
+      run statement(&mut blocks, arm, Statement.Assign {destination: place(payload), value: Rvalue.Ref {access: access, place: move member},
+        origin: origin})
+      let mut arguments = List<Operand>.make()
+      run List<Operand>.append(&mut arguments, Operand.Move {place: place(payload)})
+      let mut parameter = usize.ONE
+      while parameter < parameters.length {
+        run List<Operand>.append(&mut arguments, Operand.Move {place: place(parameter + usize.ONE)})
+        parameter = parameter + usize.ONE
+      }
+      let mut served = List<Operand>.make()
+      let sources = List<usize>.asSlice(&arms[at].providers)
+      let mut source = usize.ZERO
+      while source < sources.length {
+        run List<Operand>.append(&mut served, Operand.Copy {place: place(providerStart + sources[source])})
+        source = source + usize.ONE
+      }
+      let mut diagnostics = Option<Diagnostics>.none()
+      if observing {
+        diagnostics = Option<Diagnostics>.some(run Diagnostics.make(Operand.Copy {place: place(observer)},
+          Operand.Copy {place: place(observer + usize.ONE)}, Operand.Copy {place: place(observer + usize.ONE + usize.ONE)}))
+      }
+      let mut edge = Option<FailureEdge>.none()
+      if arms[at].fails {
+        edge = Option<FailureEdge>.some(FailureEdge {destination: place(failure), target: failed})
+      }
+      run List<Reference>.append(&mut references, Reference {key: InstanceKey.copy(&arms[at].callee), edge: Edge.Witness, origin: origin})
+      terminate(&mut blocks, arm, Terminator.Call {callee: Callee.Instance {key: InstanceKey.copy(&arms[at].callee)},
+        arguments: move arguments, providers: move served, diagnostics: move diagnostics, destination: place(usize.ZERO),
+        normal: done, failure: move edge, origin: origin})
+      at = at + usize.ONE
+    }
+    terminate(&mut blocks, otherwise, Terminator.Unreachable {origin: origin})
+    terminate(&mut blocks, entry, Terminator.Switch {value: Operand.Copy {place: place(tag)}, cases: move cases,
+      otherwise: otherwise, origin: origin})
+    run MirFunction.sortReferences(&mut references)
+    return MirFunction {
+      key: move self.key, borrow: BorrowStatus.Checked, result: move self.result, parameters: move self.parameters,
+      locals: move locals, blocks: move blocks, references: move references, externs: List<Shared<DeclarationId>>.make(),
+      observes: false, contexts: List<ContextText>.make(), traps: List<TrapSite>.make(), suspension: Option<Origin>.none(),
+      parks: Option<Origin>.none(), releasesPackages: false, nonParking: List<NonParkingRun>.make(), cancels: List<Cancel>.make(),
+      accesses: List<SharedAccess>.make(), escapes: List<EscapeSite>.make(), features: Bytes.make(),
+    }
+  }
+}
+
+fn place(local: usize) -> Place {
+  return Place {local: local, projections: List<Projection>.make()}
+}
+
+// The union the first parameter addresses.
+effect fn receiver() -> Place ! OutOfMemoryError ? &mut Allocator {
+  let mut projected = place(usize.ONE)
+  run List<Projection>.append(&mut projected.projections, Projection.Deref)
+  return move projected
+}
+
+effect fn block(blocks: &mut List<Block>, origin: Origin) -> usize ! OutOfMemoryError ? &mut Allocator {
+  let index = List<Block>.length(&blocks.*)
+  run List<Block>.append(&mut blocks.*, Block {statements: List<Statement>.make(), terminator: Terminator.Unreachable {origin: origin}})
+  return index
+}
+
+fn terminate(blocks: &mut List<Block>, at: usize, terminator: Terminator) -> () {
+  let mut listed = List<Block>.asMutSlice(&mut blocks.*)
+  listed[at].terminator = move terminator
+  return ()
+}
+
+effect fn statement(blocks: &mut List<Block>, at: usize, value: Statement) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut listed = List<Block>.asMutSlice(&mut blocks.*)
+  return run List<Statement>.append(&mut listed[at].statements, move value)
+}

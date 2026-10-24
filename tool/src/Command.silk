@@ -1,0 +1,1220 @@
+//! silk's own commands: `use`, `set` and `update`. `change` is the changeset package's.
+//!
+//! `silk use` installs Silk versions and chooses the machine's default, and never touches a project.
+//! `silk set` is the only command that edits a project, and it downloads nothing. Every command
+//! runs without prompts, so agents, scripts and editors can drive it. Results go to standard
+//! output, `--json` gives them a stable machine-readable shape, and the exit status says what
+//! happened: 0 success, 1 a failed command, 2 a usage or configuration error, 3 the selected
+//! toolchain is not installed, 4 a download failed, 5 a release failed verification. Commands that
+//! would change nothing succeed without changing anything.
+
+import Install as ToolchainInstall { HostFiles, InstallError, Installed, ReleaseSource }
+import Manifests
+import Toolchains as Toolchains { IgnoredPin, Origin, PinTarget, Selection, UnknownPin }
+import tomledit.ManifestEdit as ManifestEdits { ManifestEditRefused }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.list { List }
+import silk.option { Option }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.u64
+import silk.u8
+import silk.usize
+
+/// What a command runs with.
+pub struct Context {
+  /// The working directory.
+  pub working: Path
+
+  /// `$SILK_HOME`, or `None` when no home directory is known.
+  pub home: Option<Path>
+
+  /// The `SILK_TOOLCHAIN` value.
+  pub environment: Option<Bytes>
+
+  /// The target whose release archives install, and the minisign public key they must be signed
+  /// with: the host's and the release key, except in tests.
+  pub target: &'static [u8]
+  pub releaseKey: &'static [u8]
+
+  /// The running silk's own version, which `silk update self` compares releases with.
+  pub release: &'static [u8]
+
+  /// The compiler `silkc` beside the running tool, as an unpacked release archive, Homebrew or
+  /// mise lays them out. It is the release's own compiler, version `release`, and runs when
+  /// nothing selects a version or the store lacks the selected one and `release` matches it.
+  pub bundled: Option<Path>
+}
+
+/// The exit status and the text for standard output and standard error.
+pub struct Outcome {
+  pub status: i32
+  pub output: Bytes
+  pub errors: Bytes
+}
+
+/// The exit status when the selected toolchain is not installed.
+pub const NOT_INSTALLED: i32 = 3
+
+/// `silk --help`: the compiler's commands and the tool's own.
+pub fn usage() -> &'static [u8] {
+  return b"usage: silk <command> [arguments...]\n\nProject commands, run by the compiler (silkc) of the Silk version this directory selects:\n  init                    Create a package or a workspace\n  build                   Build the package or the workspace members\n  run                     Build the package and run it\n  test                    Run the package's tests\n  check                   Report errors without building\n  format                  Format Silk source files\n  clean                   Remove the build directory\n  add                     Add a path dependency\n  remove                  Remove a dependency\n  doc                     Write the package's documentation as JSON\n  doctest                 Compile the examples in documentation comments\n  doc-reference           Write the standard library reference pages\n  lsp                     Start the language server\n\nSilk versions:\n  use                     Install the version this project pins\n  use <version>           Install a version and make it your default\n  use list [--json]       List installed versions\n  use which [--json]      Show the version this directory selects, and why\n  use uninstall <version> Remove an installed version\n  set <version>           Set this project's silk-version (then run `silk use`)\n\nRelease notes (the [release] table of silk.toml):\n  change patch|minor|major \"Summary\" [--migration \"Guidance\"]\n                          Record a change for the next release\n  change status|version|release|snapshot|since|recover\n                          Plan, cut and query releases; silk change --help\n\nThe silk tool:\n  update self [--dev]     Update silk itself to the newest release\n\nOptions:\n  +<version>              Run one command with an installed version: silk +0.1.0 build\n  -h, --help              Show this help\n  -v, --version           Show the Silk version this directory selects\n\nRun `silk help <command>` to see the options of a project command.\n\nA version is a release such as 0.1.0-dev.11, latest (the newest stable release) or dev\n(the newest release, dev releases included); `latest --dev` is the same as dev.\nThe project pin wins, then the default; SILK_TOOLCHAIN or +<version> override both.\nVersions live in $SILK_HOME/toolchains (default ~/.silk). SILK_AUTO_INSTALL=1, or\nauto-install = true in $SILK_HOME/settings.toml, installs a missing version when needed.\nExit status: 0 success, 1 failure, 2 usage or configuration error, 3 version not installed,\n4 download failed, 5 verification failed.\n"
+}
+
+/// Whether `word` is one of the tool's own commands rather than the compiler's.
+pub fn owns(word: &[u8]) -> bool {
+  return same(word, b"use") || same(word, b"set") || same(word, b"update") || same(word, b"change")
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// Whether `left` and `right` differ by one edit: one byte changed, added or removed, or two
+// neighbours swapped.
+fn oneEdit(left: &[u8], right: &[u8]) -> bool {
+  if same(left, right) {
+    return false
+  }
+  if left.length == right.length {
+    let mut first = usize.ZERO
+    while left[first] == right[first] {
+      first = first + usize.ONE
+    }
+    let next = first + usize.ONE
+    let rest = left.length - next
+    if same(Slice.view<u8>(left, next, rest), Slice.view<u8>(right, next, rest)) {
+      return true
+    }
+    return next < left.length && left[first] == right[next] && left[next] == right[first]
+      && same(Slice.view<u8>(left, next + usize.ONE, rest - usize.ONE), Slice.view<u8>(right, next + usize.ONE, rest - usize.ONE))
+  }
+  if left.length + usize.ONE == right.length {
+    return oneEdit(right, left)
+  }
+  if left.length != right.length + usize.ONE {
+    return false
+  }
+  let mut first = usize.ZERO
+  while first < right.length && left[first] == right[first] {
+    first = first + usize.ONE
+  }
+  return same(Slice.view<u8>(left, first + usize.ONE, left.length - first - usize.ONE), Slice.view<u8>(right, first, right.length - first))
+}
+
+/// The silk command a mistyped first word most likely meant, such as `use` for `uze` or `change` for
+/// `changes`: one edit away from `use`, `set`, `update` or `change` and from no compiler command, so
+/// `tset` still reaches the compiler. `None` sends the word on to the compiler, which answers unknown commands itself.
+pub fn suggestion(word: &[u8]) -> Option<&'static [u8]> {
+  let compiler: [&'static [u8]; 14] = [
+    b"init", b"build", b"run", b"test", b"check", b"format", b"clean", b"add", b"remove",
+    b"doc", b"doctest", b"doc-reference", b"lsp", b"help",
+  ]
+  let mut at = usize.ZERO
+  while at < compiler.length {
+    if same(word, compiler[at]) || oneEdit(word, compiler[at]) {
+      return Option<&'static [u8]>.none()
+    }
+    at = at + usize.ONE
+  }
+  let own: [&'static [u8]; 4] = [b"use", b"set", b"update", b"change"]
+  at = usize.ZERO
+  while at < own.length {
+    if oneEdit(word, own[at]) {
+      return Option<&'static [u8]>.some(own[at])
+    }
+    at = at + usize.ONE
+  }
+  return Option<&'static [u8]>.none()
+}
+
+// Appends `text` as a JSON string, escaping quotes, backslashes and control bytes and keeping
+// every other byte as written.
+effect fn appendString(output: &mut Bytes, text: &[u8]) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let digits = b"0123456789abcdef"
+  run Bytes.append(&mut output.*, b"\"")
+  let mut at = usize.ZERO
+  while at < text.length {
+    let byte = text[at]
+    if byte == 34 || byte == 92 {
+      let escaped: [u8; 2] = [92, byte]
+      run Bytes.append(&mut output.*, &escaped)
+    } else if byte < 32 {
+      let value = u8.toU64(byte)
+      let high = u64.toUsize(u64.divide(value, 16))
+      let low = u64.toUsize(u64.remainder(value, 16))
+      let escaped: [u8; 6] = [92, 117, 48, 48, digits[high], digits[low]]
+      run Bytes.append(&mut output.*, &escaped)
+    } else {
+      run Bytes.append(&mut output.*, &[byte])
+    }
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut output.*, b"\"")
+}
+
+effect fn outcome(status: i32, output: &[u8], errors: &[u8]) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Outcome { status: status, output: run Bytes.copy(output), errors: run Bytes.copy(errors) }
+}
+
+effect fn usageError(command: &[u8], detail: &[u8]) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut errors = run Bytes.copy(b"silk ")
+  run Bytes.append(&mut errors, command)
+  run Bytes.append(&mut errors, b": ")
+  run Bytes.append(&mut errors, detail)
+  run Bytes.append(&mut errors, b"\nRun `silk --help` for the commands.\n")
+  return Outcome { status: 2, output: Bytes.make(), errors: move errors }
+}
+
+/// The outcome when no toolchain directory is known: SILK_HOME is relative, or HOME is unset.
+pub effect fn noHome() -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return run outcome(
+    1,
+    b"",
+    b"silk: cannot find the toolchain directory; set SILK_HOME to an absolute path, or HOME to an existing directory\n"
+  )
+}
+
+/// Where the selection came from, in words: `package silk-version in /p/silk.toml`.
+pub effect fn because(selected: &Selection, text: &mut Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  match selected.origin {
+    Origin.CommandLine => run Bytes.append(&mut text.*, b"selected with +<version>")
+    Origin.Environment => run Bytes.append(&mut text.*, b"selected by SILK_TOOLCHAIN")
+    Origin.Workspace => run Bytes.append(&mut text.*, b"workspace silk-version")
+    Origin.Package => run Bytes.append(&mut text.*, b"package silk-version")
+    Origin.Members => run Bytes.append(&mut text.*, b"member silk-version")
+    Origin.Default => run Bytes.append(&mut text.*, b"default in settings.toml")
+    Origin.Nothing => run Bytes.append(&mut text.*, b"nothing selects a version")
+  }
+  if let Option<Path>.Some { value } = &selected.manifest {
+    run Bytes.append(&mut text.*, b" in ")
+    run Bytes.append(&mut text.*, Path.rawBytes(&value))
+  }
+}
+
+/// Appends the note that a member's own pin is ignored in favor of the workspace's, when
+/// `selected` has one, so a reader of the member's manifest is not misled about its version.
+pub effect fn ignoredNote(selected: &Selection, text: &mut Bytes) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<IgnoredPin>.Some { value } = &selected.ignored {
+    run Bytes.append(&mut text.*, b"silk: note: ")
+    run Bytes.append(&mut text.*, Path.rawBytes(&value.manifest))
+    run Bytes.append(&mut text.*, b" sets silk-version = \"")
+    run Bytes.append(&mut text.*, Bytes.asSlice(&value.version))
+    run Bytes.append(&mut text.*, b"\", which is ignored: the ")
+    run because(selected, &mut text.*)
+    run Bytes.append(&mut text.*, b" (")
+    run Bytes.append(&mut text.*, Bytes.asSlice(&selected.version))
+    run Bytes.append(&mut text.*, b") covers its members.\nRemove the member's silk-version, or pin the whole workspace with: silk set <version>\n")
+  }
+}
+
+/// The outcome for a SILK_TOOLCHAIN that is set but names no version, which is a usage error like
+/// a malformed `+<version>`; `None` when it is unset, empty or a version.
+pub effect fn badEnvironment(context: &Context) -> Option<Outcome>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if let Option<Bytes>.Some { value } = &context.environment {
+    let written = Bytes.asSlice(&value)
+    if written.length > usize.ZERO && !Manifests.isSemanticVersion(written) {
+      let mut errors = run Bytes.copy(b"silk: SILK_TOOLCHAIN=")
+      run Bytes.append(&mut errors, written)
+      run Bytes.append(&mut errors, b" is not a Silk version; set it to a semantic version such as 0.1.0-dev.11, or unset it\n")
+      return Option<Outcome>.some(Outcome { status: 2, output: Bytes.make(), errors: move errors })
+    }
+  }
+  return Option<Outcome>.none()
+}
+
+/// The command that installs the selected version: `silk use` for a project pin, which installs
+/// it without changing the default, and `silk use <version>` otherwise.
+pub effect fn installCommand(selected: &Selection) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if selected.origin == Origin.Workspace || selected.origin == Origin.Package || selected.origin == Origin.Members {
+    return run Bytes.copy(b"silk use")
+  }
+  let mut command = run Bytes.copy(b"silk use ")
+  run Bytes.append(&mut command, Bytes.asSlice(&selected.version))
+  return move command
+}
+
+// The words after a subcommand: `--json`, `--dev` and the operands; an unknown option is a usage
+// error.
+struct Words {
+  json: bool
+  dev: bool
+  operands: List<Bytes>
+}
+
+effect fn words(command: &[u8], arguments: &[Bytes], dev: bool) -> Result<Words, Outcome>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut parsed = Words { json: false, dev: false, operands: List<Bytes>.make() }
+  let mut at = usize.ZERO
+  while at < arguments.length {
+    let word = Bytes.asSlice(&arguments[at])
+    if same(word, b"--json") {
+      parsed.json = true
+    } else if dev && same(word, b"--dev") {
+      parsed.dev = true
+    } else if word.length > usize.ZERO && word[usize.ZERO] == 45 {
+      let mut detail = run Bytes.copy(b"unknown option `")
+      run Bytes.append(&mut detail, word)
+      run Bytes.append(&mut detail, b"`")
+      return Result<Words, Outcome>.failResult(run usageError(command, Bytes.asSlice(&detail)))
+    } else {
+      run List<Bytes>.append(&mut parsed.operands, run Bytes.copy(word))
+    }
+    at = at + usize.ONE
+  }
+  return Result<Words, Outcome>.succeed(move parsed)
+}
+
+// The selection for the working directory, or the outcome that reports a pin this tool cannot
+// read.
+effect fn selection(context: &Context) -> Result<Selection, Outcome>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<Outcome>.Some { value } = move run badEnvironment(context) {
+    return Result<Selection, Outcome>.failResult(move value)
+  }
+  let environment = match &context.environment {
+    Option<Bytes>.Some { value } => Option<&[u8]>.some(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<&[u8]>.none()
+  }
+  let home = match &context.home {
+    Option<Path>.Some { value } => Option<&Path>.some(&value)
+    Option<Path>.None => Option<&Path>.none()
+  }
+  let chosen = run Effect.result(Toolchains.select(&context.working, Option<&[u8]>.none(), move environment, move home))
+  return match move chosen {
+    Result<Selection, UnknownPin | FileError | OutOfMemoryError>.Success { value } => Result<Selection, Outcome>.succeed(move value)
+    Result<Selection, UnknownPin | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      UnknownPin unknown => Result<Selection, Outcome>.failResult(run unknownPin(&unknown))
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// The pin of the working directory's project, or the outcome that reports a pin this tool cannot
+// read.
+effect fn projectPin(context: &Context) -> Result<Option<Selection>, Outcome>
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return match move run Effect.result(Toolchains.projectPin(&context.working)) {
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Success { value } => Result<Option<Selection>, Outcome>.succeed(move value)
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      UnknownPin unknown => Result<Option<Selection>, Outcome>.failResult(run unknownPin(&unknown))
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+/// The outcome for a pin this tool cannot read: a configuration error naming `silk update self`.
+pub effect fn unknownPin(unknown: &UnknownPin) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut errors = run Bytes.copy(b"silk: ")
+  run Bytes.append(&mut errors, Path.rawBytes(&unknown.manifest))
+  run Bytes.append(&mut errors, b": ")
+  run Bytes.append(&mut errors, Bytes.asSlice(&unknown.detail))
+  run Bytes.append(&mut errors, b".\n")
+  run Bytes.append(&mut errors, unknown.hint)
+  run Bytes.append(&mut errors, b"\n")
+  return Outcome { status: 2, output: Bytes.make(), errors: move errors }
+}
+
+/// Whether `arguments`, the words after `use`, name a subcommand that needs no download.
+pub fn local(arguments: &[Bytes]) -> bool {
+  if arguments.length == usize.ZERO {
+    return false
+  }
+  let first = Bytes.asSlice(&arguments[usize.ZERO])
+  return same(first, b"list") || same(first, b"which") || same(first, b"uninstall")
+}
+
+/// `silk use list`, `which` and `uninstall`, with `arguments` the words after `use`.
+pub effect fn execute(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let name = Bytes.asSlice(&arguments[usize.ZERO])
+  let mut command = run Bytes.copy(b"use ")
+  run Bytes.append(&mut command, name)
+  let rest = Slice.view<Bytes>(arguments, usize.ONE, arguments.length - usize.ONE)
+  let given = match move run words(Bytes.asSlice(&command), rest, false) {
+    Result<Words, Outcome>.Success { value } => move value
+    Result<Words, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let operands = List<Bytes>.asSlice(&given.operands)
+  if same(name, b"list") {
+    if operands.length != usize.ZERO {
+      return run usageError(Bytes.asSlice(&command), b"takes no operands")
+    }
+    return run list(context, given.json)
+  }
+  if same(name, b"which") {
+    if operands.length != usize.ZERO {
+      return run usageError(Bytes.asSlice(&command), b"takes no operands")
+    }
+    return run which(context, given.json)
+  }
+  if operands.length != usize.ONE || given.json {
+    return run usageError(Bytes.asSlice(&command), b"takes one version")
+  }
+  return run uninstall(context, Bytes.asSlice(&operands[usize.ZERO]))
+}
+
+effect fn which(context: &Context, json: bool) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let selected = match move run selection(context) {
+    Result<Selection, Outcome>.Success { value } => move value
+    Result<Selection, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let mut path = Option<Bytes>.none()
+  if selected.origin != Origin.Nothing {
+    if let Option<Path>.Some { value: home } = &context.home {
+      if let Option<Bytes>.Some { value: name } = move run Toolchains.find(&home, Bytes.asSlice(&selected.version)) {
+        let executable = run Toolchains.executable(&home, Bytes.asSlice(&name))
+        path = Option<Bytes>.some(run Bytes.copy(Path.rawBytes(&executable)))
+      }
+    }
+  }
+  let mut install = Bytes.make()
+  if selected.origin == Origin.Nothing {
+    install = run Bytes.copy(b"silk use latest")
+  } else {
+    install = run installCommand(&selected)
+  }
+  let mut output = Bytes.make()
+  if json {
+    run Bytes.append(&mut output, b"{\"version\":")
+    if selected.origin == Origin.Nothing {
+      run Bytes.append(&mut output, b"null")
+    } else {
+      run appendString(&mut output, Bytes.asSlice(&selected.version))
+    }
+    run Bytes.append(&mut output, b",\"origin\":")
+    run appendString(&mut output, Toolchains.originName(selected.origin))
+    run Bytes.append(&mut output, b",\"manifest\":")
+    match &selected.manifest {
+      Option<Path>.Some { value } => run appendString(&mut output, Path.rawBytes(&value))
+      Option<Path>.None => run Bytes.append(&mut output, b"null")
+    }
+    match &path {
+      Option<Bytes>.Some { value } => run Bytes.append(&mut output, b",\"installed\":true,\"path\":")
+      Option<Bytes>.None => run Bytes.append(&mut output, b",\"installed\":false,\"path\":")
+    }
+    match &path {
+      Option<Bytes>.Some { value } => run appendString(&mut output, Bytes.asSlice(&value))
+      Option<Bytes>.None => run Bytes.append(&mut output, b"null")
+    }
+    run Bytes.append(&mut output, b",\"install\":")
+    run appendString(&mut output, Bytes.asSlice(&install))
+    run Bytes.append(&mut output, b"}\n")
+  } else if selected.origin != Origin.Nothing {
+    run Bytes.append(&mut output, Bytes.asSlice(&selected.version))
+    run Bytes.append(&mut output, b" (")
+    run because(&selected, &mut output)
+    run Bytes.append(&mut output, b")\n")
+    if let Option<Bytes>.Some { value } = &path {
+      run Bytes.append(&mut output, Bytes.asSlice(&value))
+      run Bytes.append(&mut output, b"\n")
+    }
+  }
+  let mut notes = Bytes.make()
+  if !json {
+    run ignoredNote(&selected, &mut notes)
+  }
+  if let Option<Bytes>.None = &path {
+    let mut errors = move notes
+    if selected.origin == Origin.Nothing {
+      run Bytes.append(&mut errors, b"silk: no Silk version is selected here: no project pins one and there is no default. Install the newest Silk as the default with: ")
+    } else {
+      run Bytes.append(&mut errors, b"silk: Silk ")
+      run Bytes.append(&mut errors, Bytes.asSlice(&selected.version))
+      run Bytes.append(&mut errors, b" is not installed. Install it with: ")
+    }
+    run Bytes.append(&mut errors, Bytes.asSlice(&install))
+    run Bytes.append(&mut errors, b"\n")
+    return Outcome { status: NOT_INSTALLED, output: move output, errors: move errors }
+  }
+  return Outcome { status: 0, output: move output, errors: move notes }
+}
+
+effect fn appendFlag(output: &mut Bytes, name: &[u8], value: bool) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  run Bytes.append(&mut output.*, b",\"")
+  run Bytes.append(&mut output.*, name)
+  if value {
+    run Bytes.append(&mut output.*, b"\":true")
+  } else {
+    run Bytes.append(&mut output.*, b"\":false")
+  }
+}
+
+// Appends one toolchain to the list output.
+effect fn entry(
+  output: &mut Bytes,
+  json: bool,
+  first: bool,
+  version: &[u8],
+  path: &[u8],
+  selected: bool,
+  pinned: bool,
+  standard: bool
+) -> ()
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if json {
+    if !first {
+      run Bytes.append(&mut output.*, b",")
+    }
+    run Bytes.append(&mut output.*, b"{\"version\":")
+    run appendString(&mut output.*, version)
+    run Bytes.append(&mut output.*, b",\"path\":")
+    run appendString(&mut output.*, path)
+    run appendFlag(&mut output.*, b"selected", selected)
+    run appendFlag(&mut output.*, b"pinned", pinned)
+    run appendFlag(&mut output.*, b"default", standard)
+    run Bytes.append(&mut output.*, b"}")
+    return ()
+  }
+  if selected {
+    run Bytes.append(&mut output.*, b"* ")
+  } else {
+    run Bytes.append(&mut output.*, b"  ")
+  }
+  run Bytes.append(&mut output.*, version)
+  let mut tags = Bytes.make()
+  if pinned {
+    run Bytes.append(&mut tags, b", pinned here")
+  }
+  if standard {
+    run Bytes.append(&mut tags, b", default")
+  }
+  if Bytes.length(&tags) > usize.ZERO {
+    let written = Bytes.asSlice(&tags)
+    run Bytes.append(&mut output.*, b"  (")
+    run Bytes.append(
+      &mut output.*,
+      Slice.view<u8>(written, usize.add(0, 2), written.length - usize.add(0, 2))
+    )
+    run Bytes.append(&mut output.*, b")")
+  }
+  run Bytes.append(&mut output.*, b"  ")
+  run Bytes.append(&mut output.*, path)
+  run Bytes.append(&mut output.*, b"\n")
+}
+
+effect fn list(context: &Context, json: bool) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  if let Option<Path>.None = &context.home {
+    return run noHome()
+  }
+  let selected = match move run selection(context) {
+    Result<Selection, Outcome>.Success { value } => move value
+    Result<Selection, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let pin = match move run projectPin(context) {
+    Result<Option<Selection>, Outcome>.Success { value } => move value
+    Result<Option<Selection>, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let mut standard = Option<Bytes>.none()
+  let mut names = List<Bytes>.make()
+  if let Option<Path>.Some { value: home } = &context.home {
+    standard = run Toolchains.defaultVersion(&home)
+    names = run Toolchains.installed(&home)
+  }
+  let mut output = Bytes.make()
+  if json {
+    run Bytes.append(&mut output, b"{\"home\":")
+    match &context.home {
+      Option<Path>.Some { value } => run appendString(&mut output, Path.rawBytes(&value))
+      Option<Path>.None => run Bytes.append(&mut output, b"null")
+    }
+    run Bytes.append(&mut output, b",\"toolchains\":[")
+  }
+  let mut first = true
+  let listed = List<Bytes>.asSlice(&names)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let name = Bytes.asSlice(&listed[at])
+    let isPinned = match &pin {
+      Option<Selection>.Some { value } => Toolchains.matches(Bytes.asSlice(&value.version), name)
+      Option<Selection>.None => false
+    }
+    let isDefault = match &standard {
+      Option<Bytes>.Some { value } => Toolchains.matches(Bytes.asSlice(&value), name)
+      Option<Bytes>.None => false
+    }
+    let isSelected = selected.origin != Origin.Nothing && Toolchains.matches(Bytes.asSlice(&selected.version), name)
+    let mut path = Bytes.make()
+    if let Option<Path>.Some { value: home } = &context.home {
+      let executable = run Toolchains.executable(&home, name)
+      path = run Bytes.copy(Path.rawBytes(&executable))
+    }
+    run entry(&mut output, json, first, name, Bytes.asSlice(&path), isSelected, isPinned, isDefault)
+    first = false
+    at = at + usize.ONE
+  }
+  if json {
+    run Bytes.append(&mut output, b"]}\n")
+  } else if listed.length == usize.ZERO {
+    run Bytes.append(&mut output, b"No Silk versions are installed. Install the newest with: silk use latest\n")
+  }
+  return Outcome { status: 0, output: move output, errors: Bytes.make() }
+}
+
+effect fn uninstall(context: &Context, version: &[u8]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return run noHome()
+    }
+  }
+  if !Manifests.isSemanticVersion(version) {
+    return run usageError(b"use uninstall", b"the version must be a semantic version such as 0.1.0-dev.11")
+  }
+  // A damaged toolchain, one with no compiler, is removed too.
+  let whole = match move run Toolchains.find(home, version) {
+    Option<Bytes>.Some { value } => true
+    Option<Bytes>.None => false
+  }
+  let name = match move run Toolchains.present(home, version) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      let mut output = run Bytes.copy(version)
+      run Bytes.append(&mut output, b" is not installed; nothing to remove\n")
+      return Outcome { status: 0, output: move output, errors: Bytes.make() }
+    }
+  }
+  let root = run Toolchains.directory(home, Bytes.asSlice(&name))
+  run FileSystem.removeDirectoryRecursively(&root)
+  let mut output = run Bytes.copy(b"Removed ")
+  run Bytes.append(&mut output, Bytes.asSlice(&name))
+  if !whole {
+    run Bytes.append(&mut output, b" (an incomplete install with no compiler)")
+  }
+  run Bytes.append(&mut output, b"\n")
+  let mut errors = Bytes.make()
+  if let Option<Bytes>.Some { value: standard } = move run Toolchains.defaultVersion(home) {
+    if Toolchains.matches(Bytes.asSlice(&standard), Bytes.asSlice(&name)) {
+      run Bytes.append(&mut errors, b"It was your default; choose another with: silk use <version>\n")
+    }
+  }
+  // A pin this tool cannot read says nothing about the removed version.
+  let found = run Effect.result(Toolchains.projectPin(&context.working))
+  let pin = match move found {
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Option<Selection>, UnknownPin | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      UnknownPin unknown => Option<Selection>.none()
+      FileError failed => Option<Selection>.none()
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  if let Option<Selection>.Some { value: selected } = move pin {
+    if Toolchains.matches(Bytes.asSlice(&selected.version), Bytes.asSlice(&name)) {
+      run Bytes.append(&mut errors, b"This project pins it (")
+      run because(&selected, &mut errors)
+      run Bytes.append(&mut errors, b"), so its commands stop until you reinstall it with: silk use\n")
+    }
+  }
+  return Outcome { status: 0, output: move output, errors: move errors }
+}
+
+// `requested` with `--dev` applied: `latest --dev` is the newest release of any kind, the same as
+// `dev`; `--dev` with a version is a usage error.
+effect fn withDev(command: &[u8], requested: Bytes, dev: bool) -> Result<Bytes, Outcome>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if !dev {
+    return Result<Bytes, Outcome>.succeed(move requested)
+  }
+  if same(Bytes.asSlice(&requested), b"latest") || same(Bytes.asSlice(&requested), b"dev") {
+    return Result<Bytes, Outcome>.succeed(run Bytes.copy(b"dev"))
+  }
+  return Result<Bytes, Outcome>.failResult(run usageError(command, b"--dev only applies to latest"))
+}
+
+// The one version operand of `command`, checked: an alias or a release other than `0.0.0`.
+effect fn requestedVersion(command: &[u8], given: &Words) -> Result<Bytes, Outcome>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let operands = List<Bytes>.asSlice(&given.operands)
+  if operands.length != usize.ONE {
+    return Result<Bytes, Outcome>.failResult(run usageError(command, b"takes one version"))
+  }
+  let version = match move run withDev(command, run Bytes.copy(Bytes.asSlice(&operands[usize.ZERO])), given.dev) {
+    Result<Bytes, Outcome>.Success { value } => move value
+    Result<Bytes, Outcome>.Failure { error } => {
+      return Result<Bytes, Outcome>.failResult(move error)
+    }
+  }
+  let alias = ToolchainInstall.isAlias(Bytes.asSlice(&version))
+  if !alias && Toolchains.unpinned(Bytes.asSlice(&version)) {
+    return Result<Bytes, Outcome>.failResult(run usageError(command, b"0.0.0 is the version of a compiler built from source and pins nothing; name a release such as 0.1.0-dev.11, or latest or dev"))
+  }
+  if !alias && !Manifests.isSemanticVersion(Bytes.asSlice(&version)) {
+    return Result<Bytes, Outcome>.failResult(run usageError(command, b"the version must be latest, dev or a semantic version such as 0.1.0-dev.11"))
+  }
+  return Result<Bytes, Outcome>.succeed(move version)
+}
+
+/// `silk use [version]`, `silk set <version>` and `silk update self`, which may reach the release
+/// source, with `arguments` starting at `use`, `set` or `update`; `install <version>` is the
+/// automatic install of a forwarded command.
+pub effect fn networked(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let rest = Slice.view<Bytes>(arguments, usize.ONE, arguments.length - usize.ONE)
+  if same(Bytes.asSlice(&arguments[usize.ZERO]), b"set") {
+    return run set(context, rest)
+  }
+  if same(Bytes.asSlice(&arguments[usize.ZERO]), b"install") {
+    return run installOnly(context, rest)
+  }
+  if same(Bytes.asSlice(&arguments[usize.ZERO]), b"update") {
+    return run updateSelf(context, rest)
+  }
+  return run use(context, rest)
+}
+
+// The install a forwarded command makes when automatic installs are on: `arguments` is the one
+// version to install, and neither the default nor any project changes.
+effect fn installOnly(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return run noHome()
+    }
+  }
+  let installed = match move run installRelease(context, home, Bytes.asSlice(&arguments[usize.ZERO])) {
+    Result<Installed, Outcome>.Success { value } => move value
+    Result<Installed, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let mut output = Bytes.make()
+  run installedText(home, &installed, false, &mut output)
+  return Outcome { status: 0, output: move output, errors: Bytes.make() }
+}
+
+// The failure of an install as an outcome.
+effect fn installFailure(stopped: InstallError) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut errors = run Bytes.copy(b"silk: ")
+  run Bytes.append(&mut errors, Bytes.asSlice(&stopped.message))
+  run Bytes.append(&mut errors, b"\n")
+  return Outcome { status: stopped.status, output: Bytes.make(), errors: move errors }
+}
+
+/// Installs `version` into `home`: the installed toolchain, or the outcome that reports the
+/// failure.
+pub effect fn installRelease(context: &Context, home: &Path, version: &[u8]) -> Result<Installed, Outcome>
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let ran = run Effect.result(ToolchainInstall.install(
+    home,
+    version,
+    context.target,
+    context.releaseKey
+  ))
+  return match move ran {
+    Result<Installed, InstallError | FileError | OutOfMemoryError>.Success { value } => Result<Installed, Outcome>.succeed(move value)
+    Result<Installed, InstallError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => Result<Installed, Outcome>.failResult(run installFailure(move stopped))
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// The install report for `installed`.
+effect fn installedText(home: &Path, installed: &Installed, json: bool, output: &mut Bytes) -> ()
+  ! FileError | OutOfMemoryError
+  ? &mut Allocator {
+  let directory = run Toolchains.directory(home, Bytes.asSlice(&installed.version))
+  if json {
+    run Bytes.append(&mut output.*, b"\"version\":")
+    run appendString(&mut output.*, Bytes.asSlice(&installed.version))
+    run Bytes.append(&mut output.*, b",\"path\":")
+    run appendString(&mut output.*, Path.rawBytes(&directory))
+    run appendFlag(&mut output.*, b"changed", installed.changed)
+    return ()
+  }
+  if installed.changed {
+    run Bytes.append(&mut output.*, b"Installed Silk ")
+  } else {
+    run Bytes.append(&mut output.*, b"Silk ")
+  }
+  run Bytes.append(&mut output.*, Bytes.asSlice(&installed.version))
+  if installed.changed {
+    run Bytes.append(&mut output.*, b" in ")
+  } else {
+    run Bytes.append(&mut output.*, b" is already installed in ")
+  }
+  run Bytes.append(&mut output.*, Path.rawBytes(&directory))
+  run Bytes.append(&mut output.*, b"\n")
+}
+
+// `silk use [version] [--dev] [--json]`, with `arguments` after `use`. Without a version it
+// installs the project's pin; with one it installs that version and makes it the default.
+effect fn use(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let given = match move run words(b"use", arguments, true) {
+    Result<Words, Outcome>.Success { value } => move value
+    Result<Words, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return run noHome()
+    }
+  }
+  let pin = match move run projectPin(context) {
+    Result<Option<Selection>, Outcome>.Success { value } => move value
+    Result<Option<Selection>, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  if List.length(&given.operands) == usize.ZERO {
+    if given.dev {
+      return run usageError(b"use", b"--dev only applies to latest")
+    }
+    let pinned = match move pin {
+      Option<Selection>.Some { value } => move value
+      Option<Selection>.None => {
+        return run outcome(
+          2,
+          b"",
+          b"silk use: this directory has no project that pins a Silk version.\nPin one with `silk set <version>`, or install a version as your default with `silk use <version>`.\n"
+        )
+      }
+    }
+    let installed = match move run installRelease(context, home, Bytes.asSlice(&pinned.version)) {
+      Result<Installed, Outcome>.Success { value } => move value
+      Result<Installed, Outcome>.Failure { error } => {
+        return move error
+      }
+    }
+    let mut output = Bytes.make()
+    if given.json {
+      run Bytes.append(&mut output, b"{")
+      run installedText(home, &installed, true, &mut output)
+      run Bytes.append(&mut output, b",\"default\":false}\n")
+    } else {
+      run installedText(home, &installed, false, &mut output)
+    }
+    return Outcome { status: 0, output: move output, errors: Bytes.make() }
+  }
+  let version = match move run requestedVersion(b"use", &given) {
+    Result<Bytes, Outcome>.Success { value } => move value
+    Result<Bytes, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let installed = match move run installRelease(context, home, Bytes.asSlice(&version)) {
+    Result<Installed, Outcome>.Success { value } => move value
+    Result<Installed, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  // The default is the full version, so it never moves when a newer build of it is installed.
+  run Toolchains.setDefault(home, Bytes.asSlice(&installed.version))
+  let mut output = Bytes.make()
+  let mut errors = Bytes.make()
+  if given.json {
+    run Bytes.append(&mut output, b"{")
+    run installedText(home, &installed, true, &mut output)
+    run Bytes.append(&mut output, b",\"default\":true}\n")
+  } else {
+    run installedText(home, &installed, false, &mut output)
+    run Bytes.append(&mut output, b"Default Silk version: ")
+    run Bytes.append(&mut output, Bytes.asSlice(&installed.version))
+    run Bytes.append(&mut output, b"\n")
+  }
+  if let Option<Selection>.Some { value } = &pin {
+    if !Toolchains.matches(Bytes.asSlice(&value.version), Bytes.asSlice(&installed.version)) {
+      run Bytes.append(&mut errors, b"Note: this project still pins Silk ")
+      run Bytes.append(&mut errors, Bytes.asSlice(&value.version))
+      run Bytes.append(&mut errors, b" (")
+      run because(&value, &mut errors)
+      run Bytes.append(&mut errors, b"). To move it: silk set ")
+      run Bytes.append(&mut errors, Bytes.asSlice(&installed.version))
+      run Bytes.append(&mut errors, b"\n")
+    }
+  }
+  return Outcome { status: 0, output: move output, errors: move errors }
+}
+
+// `text`, the manifest at `manifest`, with `[table].silk-version` set to `quoted`, or the outcome
+// that reports why it cannot be edited.
+effect fn edit(manifest: &Path, text: &[u8], table: &[u8], quoted: &[u8]) -> Result<Bytes, Outcome>
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return match move run Effect.result(ManifestEdits.setValue(text, table, b"silk-version", quoted)) {
+    Result<Bytes, ManifestEditRefused | OutOfMemoryError>.Success { value } => Result<Bytes, Outcome>.succeed(move value)
+    Result<Bytes, ManifestEditRefused | OutOfMemoryError>.Failure { error } => match move error {
+      ManifestEditRefused refused => {
+        let mut errors = run Bytes.copy(b"silk set: cannot edit ")
+        run Bytes.append(&mut errors, Path.rawBytes(manifest))
+        run Bytes.append(&mut errors, b": ")
+        run Bytes.append(&mut errors, Bytes.asSlice(&refused.detail))
+        run Bytes.append(&mut errors, b"\n")
+        return Result<Bytes, Outcome>.failResult(Outcome { status: 1, output: Bytes.make(), errors: move errors })
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// The full version `requested` names: the installed toolchain it matches, else the newest
+// published release it names. Nothing is downloaded but the release listing.
+effect fn fullVersion(home: &Option<Path>, requested: &[u8]) -> Result<Bytes, Outcome>
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut Allocator {
+  if !ToolchainInstall.isAlias(requested) {
+    if let Option<Path>.Some { value } = &home.* {
+      if let Option<Bytes>.Some { value: name } = move run Toolchains.find(&value, requested) {
+        return Result<Bytes, Outcome>.succeed(move name)
+      }
+    }
+  }
+  return match move run Effect.result(ToolchainInstall.resolve(requested)) {
+    Result<Bytes, InstallError | OutOfMemoryError>.Success { value } => Result<Bytes, Outcome>.succeed(move value)
+    Result<Bytes, InstallError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => Result<Bytes, Outcome>.failResult(run installFailure(move stopped))
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+}
+
+// `silk set <version> [--dev] [--json]`, with `arguments` after `set`: pins the project around the
+// working directory to the full version `version` names. Pinning a workspace also moves the pins
+// its members set themselves. It installs nothing; `silk use` does.
+effect fn set(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut Allocator {
+  let given = match move run words(b"set", arguments, true) {
+    Result<Words, Outcome>.Success { value } => move value
+    Result<Words, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let version = match move run requestedVersion(b"set", &given) {
+    Result<Bytes, Outcome>.Success { value } => move value
+    Result<Bytes, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let found = run Effect.result(Toolchains.pinTarget(&context.working))
+  let target = match move found {
+    Result<Option<PinTarget>, UnknownPin | FileError | OutOfMemoryError>.Success { value } => match move value {
+      Option<PinTarget>.Some { value: located } => move located
+      Option<PinTarget>.None => {
+        return run outcome(2, b"", b"silk set: no silk.toml here or above; start a project with `silk init`\n")
+      }
+    }
+    Result<Option<PinTarget>, UnknownPin | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      UnknownPin unknown => {
+        return run unknownPin(&unknown)
+      }
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+
+  // Pins are exact: a version without build metadata, or an alias, pins the full version it names.
+  let named = match move run fullVersion(&context.home, Bytes.asSlice(&version)) {
+    Result<Bytes, Outcome>.Success { value } => move value
+    Result<Bytes, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+  let text = run FileSystem.readFile(&target.manifest)
+  let quoted = run ManifestEdits.quoted(Bytes.asSlice(&named))
+  let mut rewritten = match move run edit(&target.manifest, Bytes.asSlice(&text), target.table, Bytes.asSlice(&quoted)) {
+    Result<Bytes, Outcome>.Success { value } => move value
+    Result<Bytes, Outcome>.Failure { error } => {
+      return move error
+    }
+  }
+
+  // The workspace's pin wins over its members' own pins, which would otherwise be left naming the
+  // old version, so they move with it. Every edit is made before any file is written.
+  let mut members = List<Path>.make()
+  let mut memberTexts = List<Bytes>.make()
+  if same(target.table, b"workspace") {
+    let pins = run Toolchains.memberPins(&target.manifest)
+    let found = List<Path>.asSlice(&pins)
+    let mut at = usize.ZERO
+    while at < found.length {
+      let member = run Path.fromBytes(Path.rawBytes(&found[at]))
+      at = at + usize.ONE
+      if same(Path.rawBytes(&member), Path.rawBytes(&target.manifest)) {
+        // The workspace's own package shares its manifest.
+        rewritten = match move run edit(&member, Bytes.asSlice(&rewritten), b"package", Bytes.asSlice(&quoted)) {
+          Result<Bytes, Outcome>.Success { value } => move value
+          Result<Bytes, Outcome>.Failure { error } => {
+            return move error
+          }
+        }
+      } else {
+        let before = run FileSystem.readFile(&member)
+        let after = match move run edit(&member, Bytes.asSlice(&before), b"package", Bytes.asSlice(&quoted)) {
+          Result<Bytes, Outcome>.Success { value } => move value
+          Result<Bytes, Outcome>.Failure { error } => {
+            return move error
+          }
+        }
+        if !same(Bytes.asSlice(&after), Bytes.asSlice(&before)) {
+          run List<Path>.append(&mut members, move member)
+          run List<Bytes>.append(&mut memberTexts, move after)
+        }
+      }
+    }
+  }
+  let changed = !same(Bytes.asSlice(&rewritten), Bytes.asSlice(&text)) || List.length(&members) > usize.ZERO
+  if !same(Bytes.asSlice(&rewritten), Bytes.asSlice(&text)) {
+    run FileSystem.writeFile(&target.manifest, Bytes.asSlice(&rewritten))
+  }
+  let moved = List<Path>.asSlice(&members)
+  let texts = List<Bytes>.asSlice(&memberTexts)
+  let mut written = usize.ZERO
+  while written < moved.length {
+    run FileSystem.writeFile(&moved[written], Bytes.asSlice(&texts[written]))
+    written = written + usize.ONE
+  }
+  let mut installed = false
+  if let Option<Path>.Some { value: home } = &context.home {
+    if let Option<Bytes>.Some { value } = move run Toolchains.find(&home, Bytes.asSlice(&named)) {
+      installed = true
+    }
+  }
+  let mut output = Bytes.make()
+  let mut errors = Bytes.make()
+  if given.json {
+    run Bytes.append(&mut output, b"{\"version\":")
+    run appendString(&mut output, Bytes.asSlice(&named))
+    run Bytes.append(&mut output, b",\"manifest\":")
+    run appendString(&mut output, Path.rawBytes(&target.manifest))
+    run Bytes.append(&mut output, b",\"table\":")
+    run appendString(&mut output, target.table)
+    run Bytes.append(&mut output, b",\"previous\":")
+    match &target.previous {
+      Option<Bytes>.Some { value } => run appendString(&mut output, Bytes.asSlice(&value))
+      Option<Bytes>.None => run Bytes.append(&mut output, b"null")
+    }
+    run Bytes.append(&mut output, b",\"members\":[")
+    let mut listed = usize.ZERO
+    while listed < moved.length {
+      if listed > usize.ZERO {
+        run Bytes.append(&mut output, b",")
+      }
+      run appendString(&mut output, Path.rawBytes(&moved[listed]))
+      listed = listed + usize.ONE
+    }
+    run Bytes.append(&mut output, b"]")
+    run appendFlag(&mut output, b"changed", changed)
+    run appendFlag(&mut output, b"installed", installed)
+    run Bytes.append(&mut output, b"}\n")
+    return Outcome { status: 0, output: move output, errors: move errors }
+  }
+  run Bytes.append(&mut output, b"Pinned Silk ")
+  run Bytes.append(&mut output, Bytes.asSlice(&named))
+  run Bytes.append(&mut output, b" in ")
+  run Bytes.append(&mut output, Path.rawBytes(&target.manifest))
+  run Bytes.append(&mut output, b" ([")
+  run Bytes.append(&mut output, target.table)
+  run Bytes.append(&mut output, b"].silk-version")
+  if let Option<Bytes>.Some { value } = &target.previous {
+    if changed {
+      run Bytes.append(&mut output, b", was ")
+      run Bytes.append(&mut output, Bytes.asSlice(&value))
+    }
+  }
+  run Bytes.append(&mut output, b")\n")
+  let mut listed = usize.ZERO
+  while listed < moved.length {
+    run Bytes.append(&mut output, b"Pinned Silk ")
+    run Bytes.append(&mut output, Bytes.asSlice(&named))
+    run Bytes.append(&mut output, b" in ")
+    run Bytes.append(&mut output, Path.rawBytes(&moved[listed]))
+    run Bytes.append(&mut output, b" ([package].silk-version, a workspace member)\n")
+    listed = listed + usize.ONE
+  }
+  if !installed {
+    run Bytes.append(&mut errors, b"Silk ")
+    run Bytes.append(&mut errors, Bytes.asSlice(&named))
+    run Bytes.append(&mut errors, b" is not installed yet. Install it with: silk use\n")
+  }
+  // A manifest written for this release may use fields an older Silk cannot read; that version
+  // would then reject it.
+  if !same(context.release, b"0.0.0") && Toolchains.compare(Bytes.asSlice(&named), context.release) < 0 {
+    run Bytes.append(&mut errors, b"note: Silk ")
+    run Bytes.append(&mut errors, Bytes.asSlice(&named))
+    run Bytes.append(&mut errors, b" is older than this tool (")
+    run Bytes.append(&mut errors, context.release)
+    run Bytes.append(&mut errors, b"); if it cannot read this silk.toml, pin a newer version or edit the manifest for it\n")
+  }
+  return Outcome { status: 0, output: move output, errors: move errors }
+}
+
+/// `silk update <what>`, with `arguments` after `update`. `self` updates the tool itself;
+/// `silk` changes nothing and names the commands that move Silk versions.
+pub effect fn update(arguments: &[Bytes]) -> Outcome
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if arguments.length == usize.ZERO {
+    return run usageError(b"update", b"name what to update: silk update self")
+  }
+  let what = Bytes.asSlice(&arguments[usize.ZERO])
+  if same(what, b"silk") {
+    return run outcome(
+      2,
+      b"",
+      b"silk update silk: Silk versions are not updated in place.\nTo install the newest Silk as your default: silk use latest\nTo move this project to it: silk set latest, then silk use\n"
+    )
+  }
+  let mut detail = run Bytes.copy(b"unknown target `")
+  run Bytes.append(&mut detail, what)
+  run Bytes.append(&mut detail, b"`; silk update self updates silk")
+  return run usageError(b"update", Bytes.asSlice(&detail))
+}
+
+/// Whether `silk update` with `arguments` (after `update`) updates silk itself, which needs the
+/// release source.
+pub fn updatesSelf(arguments: &[Bytes]) -> bool {
+  return arguments.length > usize.ZERO
+    && same(Bytes.asSlice(&arguments[usize.ZERO]), b"self")
+}
+
+// `silk update self [--dev]`, with `arguments` from `self` on.
+effect fn updateSelf(context: &Context, arguments: &[Bytes]) -> Outcome
+  ! FileError | OutOfMemoryError
+  ? &mut ReleaseSource | &mut FileSystem | &mut HostFiles | &mut Allocator {
+  let mut dev = false
+  let mut at = usize.ONE
+  while at < arguments.length {
+    let word = Bytes.asSlice(&arguments[at])
+    if same(word, b"--dev") {
+      dev = true
+    } else {
+      let mut detail = run Bytes.copy(b"unexpected argument `")
+      run Bytes.append(&mut detail, word)
+      run Bytes.append(&mut detail, b"`; usage: silk update self [--dev]")
+      return run usageError(b"update", Bytes.asSlice(&detail))
+    }
+    at = at + usize.ONE
+  }
+  let home = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      return run noHome()
+    }
+  }
+  let ran = run Effect.result(ToolchainInstall.updateSelf(
+    home,
+    context.release,
+    dev,
+    context.target,
+    context.releaseKey
+  ))
+  let updated = match move ran {
+    Result<Installed, InstallError | FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Installed, InstallError | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      InstallError stopped => {
+        return run installFailure(move stopped)
+      }
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  let mut output = Bytes.make()
+  if updated.changed {
+    run Bytes.append(&mut output, b"Updated silk to ")
+    run Bytes.append(&mut output, Bytes.asSlice(&updated.version))
+    run Bytes.append(&mut output, b" in ")
+    run Bytes.append(&mut output, Path.rawBytes(home))
+    run Bytes.append(&mut output, b"/bin/silk\n")
+  } else {
+    run Bytes.append(&mut output, b"silk ")
+    run Bytes.append(&mut output, context.release)
+    run Bytes.append(&mut output, b" is up to date (newest release: ")
+    run Bytes.append(&mut output, Bytes.asSlice(&updated.version))
+    run Bytes.append(&mut output, b")\n")
+  }
+  return Outcome { status: 0, output: move output, errors: Bytes.make() }
+}

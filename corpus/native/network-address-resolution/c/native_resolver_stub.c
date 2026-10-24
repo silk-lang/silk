@@ -129,7 +129,7 @@ int getaddrinfo(
 ) {
   silk_calls += 1;
   int expected_family = silk_mode == 11 ? AF_INET : (silk_mode == 12 ? AF_INET6 : AF_UNSPEC);
-  silk_arguments_ok = node != NULL && strcmp(node, "intranet.") == 0
+  silk_arguments_ok = node != NULL && strcmp(node, "intranet") == 0
     && service != NULL && strcmp(service, "443") == 0
     && hints != NULL && hints->ai_family == expected_family
     && hints->ai_socktype == SOCK_STREAM && hints->ai_protocol == IPPROTO_TCP

@@ -618,6 +618,24 @@ InvalidTarget
 
 A direct request has an absolute target for another origin.
 
+<a id="RequestError.impl.Debug"></a>
+
+## Implementation `Debug for RequestError`
+
+```silk
+impl Debug for RequestError
+```
+
+<a id="RequestError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Value { ... }`.
+
 <a id="PreparedRequest"></a>
 
 ## `PreparedRequest`

@@ -203,8 +203,25 @@ struct Frame {
   name: Bytes
   arguments: List<Shared<StaticData>>
   body: Shared<TypedBody>
+  // The slot in the machine's indexed bodies that holds `body`'s node index.
+  nodes: usize
   window: Range
   span: Span
+}
+
+// Each checked node's position grouped by the relative syntax node it records, so a lookup reads
+// the few nodes one syntax node records instead of scanning the whole body. Positions ascend
+// within one syntax node, so the first one inside a window is the one a scan would find first.
+struct NodeIndex {
+  starts: List<usize>
+  positions: List<usize>
+}
+
+// One frame body's node index, kept for the machine's life; holding the body keeps its address.
+struct IndexedBody {
+  body: Shared<TypedBody>
+  address: usize
+  nodes: NodeIndex
 }
 
 struct Complete {
@@ -234,6 +251,7 @@ struct SourceReservation<'a, 'source> {
   machine: &'a mut Machine<'source>
   previous: Option<AuthoredCursor>
   previousBody: Option<Shared<TypedBody>>
+  previousNodes: NodeIndex
   suppliedBase: usize
 }
 
@@ -250,6 +268,10 @@ pub struct Machine<'source> {
   root: ModuleId
   current: Option<AuthoredCursor>
   rootBody: Option<Shared<TypedBody>>
+  // `rootBody`'s node index.
+  rootNodes: NodeIndex
+  // Node indexes of the bodies frames have executed.
+  indexed: List<IndexedBody>
   window: Range
   target: MachineTarget
   limits: Limits
@@ -276,6 +298,8 @@ pub effect fn make<'source>(port: StaticPort<'source>, root: &ModuleId, limits: 
     root: ModuleId.copy(root),
     current: Option<AuthoredCursor>.none(),
     rootBody: Option<Shared<TypedBody>>.none(),
+    rootNodes: emptyNodes(),
+    indexed: List<IndexedBody>.make(),
     window: Range {start: usize.ZERO, length: usize.MAX},
     target: target,
     limits: move limits,
@@ -914,6 +938,43 @@ effect fn dispatchIntrinsic<'source>(
     }
     return run retain(&mut machine.*, move appended, span)
   }
+  if primitive == IntrinsicPrimitive.StaticSequenceConcat {
+    if CallArguments.length(arguments) != 2 { return run reject(&machine.*, Fault.InvalidValue, span) }
+    let first = CallArguments.child(arguments, run authored(&machine.*), usize.ZERO)
+    let second = CallArguments.child(arguments, run authored(&machine.*), usize.ONE)
+    let left = run expression(&mut machine.*, &mut local.*, first)
+    let right = run expression(&mut machine.*, &mut local.*, second)
+    let joined = match move run StaticValue.sequenceConcat(&left, &right) {
+      Option<StaticData>.Some {value} => move value
+      Option<StaticData>.None => run reject(&machine.*, Fault.InvalidValue, span)
+    }
+    return run retain(&mut machine.*, move joined, span)
+  }
+  if primitive == IntrinsicPrimitive.StaticSequenceLength || primitive == IntrinsicPrimitive.StaticSequenceAt {
+    let mut expected: usize = 2
+    if primitive == IntrinsicPrimitive.StaticSequenceLength { expected = usize.ONE }
+    if CallArguments.length(arguments) != expected { return run reject(&machine.*, Fault.InvalidValue, span) }
+    let first = CallArguments.child(arguments, run authored(&machine.*), usize.ZERO)
+    let sequence = run expression(&mut machine.*, &mut local.*, first)
+    let count = Shared<StaticData>.with<usize>(&sequence, StaticValue.sequenceLength)
+    if count == usize.MAX { return run reject(&machine.*, Fault.InvalidValue, span) }
+    if primitive == IntrinsicPrimitive.StaticSequenceLength {
+      return run retain(&mut machine.*, StaticData.Integer {ty: StaticIntegerType.Usize, sign: StaticSign.Positive, magnitude: usize.toU64(count)}, span)
+    }
+    let next = CallArguments.child(arguments, run authored(&machine.*), usize.ONE)
+    let position = run expression(&mut machine.*, &mut local.*, next)
+    let at = Shared<StaticData>.with<u64>(&position, fn(actual: &StaticData) -> u64 {
+      if let StaticData.Integer {sign, magnitude, ..} = &actual.* { if sign == StaticSign.Positive { return magnitude } }
+      return u64.MAX
+    })
+    if at >= usize.toU64(count) { return run reject(&machine.*, Fault.InvalidValue, span) }
+    return match move Shared<StaticData>.with<Option<Shared<StaticData>>>(&sequence, fn(actual: &StaticData) -> Option<Shared<StaticData>> {
+      return StaticValue.sequenceElement(actual, u64.toUsize(at))
+    }) {
+      Option<Shared<StaticData>>.Some {value} => move value
+      Option<Shared<StaticData>>.None => run reject(&machine.*, Fault.InvalidValue, span)
+    }
+  }
   if primitive == IntrinsicPrimitive.ReflectFields {
     if CallArguments.length(arguments) != usize.ZERO {return run reject(&machine.*, Fault.InvalidValue, span)}
     let written = match move checkedIntrinsicType(&machine.*, call) {
@@ -1290,6 +1351,114 @@ fn bodyFromAnswer(answer: &Result<Answer, NoRejection>) -> Option<Result<Shared<
   }
 }
 
+fn emptyNodes() -> NodeIndex {
+  return NodeIndex {starts: List<usize>.make(), positions: List<usize>.make()}
+}
+
+// One more than the largest relative syntax node `body` records.
+fn nodeLimit(body: &TypedBody) -> usize {
+  let nodes = TypedBody.nodeSlice(body)
+  let mut limit = usize.ZERO
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    if nodes[at].origin.node >= limit { limit = nodes[at].origin.node + usize.ONE }
+    at = at + usize.ONE
+  }
+  return limit
+}
+
+fn nodeCount(body: &TypedBody) -> usize {
+  return TypedBody.nodeSlice(body).length
+}
+
+effect fn zeros(count: usize) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut values = List<usize>.make()
+  run List<usize>.reserveExact(&mut values, count)
+  let mut at = usize.ZERO
+  while at < count {
+    run List<usize>.append(&mut values, usize.ZERO)
+    at = at + usize.ONE
+  }
+  return move values
+}
+
+// Counting-sorts `body`'s node positions by syntax node: `starts` holds one more slot than there
+// are syntax nodes, `cursors` one per syntax node, and `positions` one per checked node.
+fn placeNodes(body: &TypedBody, starts: &mut [usize], cursors: &mut [usize], positions: &mut [usize]) -> () {
+  let nodes = TypedBody.nodeSlice(body)
+  let mut at = usize.ZERO
+  while at < nodes.length {
+    let node = nodes[at].origin.node
+    starts[node + usize.ONE] = starts[node + usize.ONE] + usize.ONE
+    at = at + usize.ONE
+  }
+  at = usize.ONE
+  while at < starts.length {
+    starts[at] = starts[at] + starts[at - usize.ONE]
+    cursors[at - usize.ONE] = starts[at - usize.ONE]
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
+  while at < nodes.length {
+    let node = nodes[at].origin.node
+    positions[cursors[node]] = at
+    cursors[node] = cursors[node] + usize.ONE
+    at = at + usize.ONE
+  }
+  return ()
+}
+
+// Groups `body`'s node positions by the relative syntax node each records.
+effect fn indexShared(body: &Shared<TypedBody>) -> NodeIndex ! OutOfMemoryError ? &mut Allocator {
+  let limit = Shared<TypedBody>.with<usize>(body, nodeLimit)
+  let count = Shared<TypedBody>.with<usize>(body, nodeCount)
+  let mut starts = run zeros(limit + usize.ONE)
+  let mut cursors = run zeros(limit)
+  let mut positions = run zeros(count)
+  Shared<TypedBody>.with<()>(body, fn(typed: &TypedBody) -> () {
+    placeNodes(typed, List<usize>.asMutSlice(&mut starts), List<usize>.asMutSlice(&mut cursors), List<usize>.asMutSlice(&mut positions))
+    return ()
+  })
+  return NodeIndex {starts: move starts, positions: move positions}
+}
+
+fn bodyAddress(body: &TypedBody) -> usize {
+  return Pointer.address<TypedBody>(Pointer.fromRef<TypedBody>(body))
+}
+
+// The slot of `body`'s node index, indexing it the first time a frame executes it.
+effect fn indexedSlot<'source>(machine: &mut Machine<'source>, body: &Shared<TypedBody>) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let address = Shared<TypedBody>.with<usize>(body, bodyAddress)
+  let known = List<IndexedBody>.asSlice(&machine.indexed)
+  let mut at = usize.ZERO
+  while at < known.length {
+    if known[at].address == address { return at }
+    at = at + usize.ONE
+  }
+  let slot = known.length
+  let nodes = run indexShared(body)
+  run List<IndexedBody>.append(&mut machine.indexed, IndexedBody {body: Shared<TypedBody>.clone(body), address: address, nodes: move nodes})
+  return slot
+}
+
+// The node index of the body expressions currently execute in.
+fn checkedNodes<'borrow, 'source>(machine: &'borrow Machine<'source>) -> &'borrow NodeIndex {
+  let frames = List<Frame>.asSlice(&machine.active)
+  if frames.length == usize.ZERO { return &machine.rootNodes }
+  let known = List<IndexedBody>.asSlice(&machine.indexed)
+  return &known[frames[frames.length - usize.ONE].nodes].nodes
+}
+
+// The positions in `nodes.positions` of the checked nodes that record `id`.
+fn recorded(nodes: &NodeIndex, anchor: &Anchor, id: HirId) -> Range {
+  let starts = List<usize>.asSlice(&nodes.starts)
+  if id.index < anchor.first.index { return Range {start: usize.ZERO, length: usize.ZERO} }
+  let relative = id.index - anchor.first.index
+  if relative + usize.ONE >= starts.length { return Range {start: usize.ZERO, length: usize.ZERO} }
+  return Range {start: starts[relative], length: starts[relative + usize.ONE] - starts[relative]}
+}
+
 fn checkedBodyForExpression<'source>(machine: &Machine<'source>) -> Option<Shared<TypedBody>> {
   let frames = List<Frame>.asSlice(&machine.active)
   if frames.length == usize.ZERO {
@@ -1324,6 +1493,7 @@ fn checkedAnchor<'source>(machine: &Machine<'source>) -> Option<Anchor> {
 
 fn checkedExpressionType<'source>(machine: &Machine<'source>, id: HirId) -> Option<Shared<SemanticType>> {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<Shared<SemanticType>>.none() }
@@ -1333,14 +1503,17 @@ fn checkedExpressionType<'source>(machine: &Machine<'source>, id: HirId) -> Opti
     &body,
     fn(body: &TypedBody) -> Option<Shared<SemanticType>> {
       let nodes = TypedBody.nodeSlice(body)
-      let mut at = usize.ZERO
-      while at < nodes.length {
-        if at >= window.start && at - window.start < window.length && Anchor.hir(&anchor, nodes[at].origin.node).index == id.index {
+      let found = recorded(index, &anchor, id)
+      let candidates = List<usize>.asSlice(&index.positions)
+      let mut next = found.start
+      while next < found.start + found.length {
+        let at = candidates[next]
+        if at >= window.start && at - window.start < window.length {
           if let CheckedNodeKind.Expression {ty, ..} = &nodes[at].kind {
             return Option<Shared<SemanticType>>.some(Shared<SemanticType>.clone(&ty))
           }
         }
-        at = at + usize.ONE
+        next = next + usize.ONE
       }
       return Option<Shared<SemanticType>>.none()
     },
@@ -1349,29 +1522,33 @@ fn checkedExpressionType<'source>(machine: &Machine<'source>, id: HirId) -> Opti
   }
 }
 
-fn intrinsicMemberAt(body: &TypedBody, id: HirId, window: Range, anchor: &Anchor) -> Option<IntrinsicMember> {
+fn intrinsicMemberAt(body: &TypedBody, index: &NodeIndex, id: HirId, window: Range, anchor: &Anchor) -> Option<IntrinsicMember> {
   let nodes = TypedBody.nodeSlice(body)
-  let mut at = usize.ZERO
-  while at < nodes.length {
-    if at >= window.start && at - window.start < window.length && Anchor.hir(anchor, nodes[at].origin.node).index == id.index {
+  let found = recorded(index, anchor, id)
+  let candidates = List<usize>.asSlice(&index.positions)
+  let mut next = found.start
+  while next < found.start + found.length {
+    let at = candidates[next]
+    if at >= window.start && at - window.start < window.length {
       if let CheckedNodeKind.Expression {form: CheckedExpression.IntrinsicCall {member, ..}, ..} = &nodes[at].kind {
         return Option<IntrinsicMember>.some(member)
       }
     }
-    at = at + usize.ONE
+    next = next + usize.ONE
   }
   return Option<IntrinsicMember>.none()
 }
 
 fn checkedIntrinsicMember<'source>(machine: &Machine<'source>, id: HirId) -> Option<IntrinsicMember> {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<IntrinsicMember>.none() }
   }
   return match move checkedBodyForExpression(machine) {
     Option<Shared<TypedBody>>.Some {value: body} => Shared<TypedBody>.with<Option<IntrinsicMember>>(&body, fn(body: &TypedBody) -> Option<IntrinsicMember> {
-      return intrinsicMemberAt(body, id, window, &anchor)
+      return intrinsicMemberAt(body, index, id, window, &anchor)
     })
     Option<Shared<TypedBody>>.None => Option<IntrinsicMember>.none()
   }
@@ -1380,6 +1557,7 @@ fn checkedIntrinsicMember<'source>(machine: &Machine<'source>, id: HirId) -> Opt
 // The checked type of one reached intrinsic call, written in the executing body's binders.
 fn checkedIntrinsicType<'source>(machine: &Machine<'source>, id: HirId) -> Option<Shared<SemanticType>> {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<Shared<SemanticType>>.none() }
@@ -1387,14 +1565,17 @@ fn checkedIntrinsicType<'source>(machine: &Machine<'source>, id: HirId) -> Optio
   return match move checkedBodyForExpression(machine) {
     Option<Shared<TypedBody>>.Some {value: body} => Shared<TypedBody>.with<Option<Shared<SemanticType>>>(&body, fn(body: &TypedBody) -> Option<Shared<SemanticType>> {
       let nodes = TypedBody.nodeSlice(body)
-      let mut at = usize.ZERO
-      while at < nodes.length {
-        if at >= window.start && at - window.start < window.length && Anchor.hir(&anchor, nodes[at].origin.node).index == id.index {
+      let found = recorded(index, &anchor, id)
+      let candidates = List<usize>.asSlice(&index.positions)
+      let mut next = found.start
+      while next < found.start + found.length {
+        let at = candidates[next]
+        if at >= window.start && at - window.start < window.length {
           if let CheckedNodeKind.Expression {ty, form: CheckedExpression.IntrinsicCall {..}} = &nodes[at].kind {
             return Option<Shared<SemanticType>>.some(Shared<SemanticType>.clone(&ty))
           }
         }
-        at = at + usize.ONE
+        next = next + usize.ONE
       }
       return Option<Shared<SemanticType>>.none()
     })
@@ -1422,6 +1603,7 @@ effect fn closeType<'source>(machine: &Machine<'source>, ty: &Shared<SemanticTyp
 
 fn selectedStaticArm<'source>(machine: &Machine<'source>, id: HirId) -> Option<HirRef> {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<HirRef>.none() }
@@ -1431,9 +1613,12 @@ fn selectedStaticArm<'source>(machine: &Machine<'source>, id: HirId) -> Option<H
       &body,
       fn(checked: &TypedBody) -> Option<HirRef> {
         let nodes = TypedBody.nodeSlice(checked)
-        let mut at = usize.ZERO
-        while at < nodes.length {
-          if at >= window.start && at - window.start < window.length && Anchor.hir(&anchor, nodes[at].origin.node).index == id.index {
+        let found = recorded(index, &anchor, id)
+        let candidates = List<usize>.asSlice(&index.positions)
+        let mut next = found.start
+        while next < found.start + found.length {
+          let at = candidates[next]
+          if at >= window.start && at - window.start < window.length {
             if let CheckedNodeKind.Block {statements, ..} = &nodes[at].kind {
               let retained = List<CheckedNodeId>.asSlice(&statements)
               if retained.length == usize.ZERO {
@@ -1447,7 +1632,7 @@ fn selectedStaticArm<'source>(machine: &Machine<'source>, id: HirId) -> Option<H
             }
             return Option<HirRef>.none()
           }
-          at = at + usize.ONE
+          next = next + usize.ONE
         }
         return Option<HirRef>.none()
       },
@@ -1459,6 +1644,7 @@ fn selectedStaticArm<'source>(machine: &Machine<'source>, id: HirId) -> Option<H
 // The scalar-enum member a static root's checked body records at `id`, if any.
 fn checkedEnumMember<'source>(machine: &Machine<'source>, id: HirId) -> Option<CheckedEnumMember> {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<CheckedEnumMember>.none() }
@@ -1468,14 +1654,17 @@ fn checkedEnumMember<'source>(machine: &Machine<'source>, id: HirId) -> Option<C
       &body,
       fn(body: &TypedBody) -> Option<CheckedEnumMember> {
         let nodes = TypedBody.nodeSlice(body)
-        let mut at = usize.ZERO
-        while at < nodes.length {
-          if at >= window.start && at - window.start < window.length && Anchor.hir(&anchor, nodes[at].origin.node).index == id.index {
+        let found = recorded(index, &anchor, id)
+        let candidates = List<usize>.asSlice(&index.positions)
+        let mut next = found.start
+        while next < found.start + found.length {
+          let at = candidates[next]
+          if at >= window.start && at - window.start < window.length {
             if let CheckedNodeKind.Expression {form: CheckedExpression.EnumMember {member}, ..} = &nodes[at].kind {
               return Option<CheckedEnumMember>.some(member)
             }
           }
-          at = at + usize.ONE
+          next = next + usize.ONE
         }
         return Option<CheckedEnumMember>.none()
       },
@@ -1487,6 +1676,7 @@ fn checkedEnumMember<'source>(machine: &Machine<'source>, id: HirId) -> Option<C
 // The declaration-order field a static root's checked body reads at `id`, if `id` is a field read.
 fn checkedFieldIndex<'source>(machine: &Machine<'source>, id: HirId) -> Option<usize> {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<usize>.none() }
@@ -1494,14 +1684,17 @@ fn checkedFieldIndex<'source>(machine: &Machine<'source>, id: HirId) -> Option<u
   return match move checkedBodyForExpression(machine) {
     Option<Shared<TypedBody>>.Some {value: body} => Shared<TypedBody>.with<Option<usize>>(&body, fn(body: &TypedBody) -> Option<usize> {
       let nodes = TypedBody.nodeSlice(body)
-      let mut at = usize.ZERO
-      while at < nodes.length {
-        if at >= window.start && at - window.start < window.length && Anchor.hir(&anchor, nodes[at].origin.node).index == id.index {
-          if let CheckedNodeKind.Expression {form: CheckedExpression.Field {index, ..}, ..} = &nodes[at].kind {
-            return Option<usize>.some(index)
+      let found = recorded(index, &anchor, id)
+      let candidates = List<usize>.asSlice(&index.positions)
+      let mut next = found.start
+      while next < found.start + found.length {
+        let at = candidates[next]
+        if at >= window.start && at - window.start < window.length {
+          if let CheckedNodeKind.Expression {form: CheckedExpression.Field {index: field, ..}, ..} = &nodes[at].kind {
+            return Option<usize>.some(field)
           }
         }
-        at = at + usize.ONE
+        next = next + usize.ONE
       }
       return Option<usize>.none()
     })
@@ -1520,6 +1713,7 @@ struct CheckedInitializer {
 effect fn checkedInitializers<'source>(machine: &Machine<'source>, id: HirId) -> Option<List<CheckedInitializer>>
 ! OutOfMemoryError ? &mut Allocator {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<List<CheckedInitializer>>.none() }
@@ -1528,13 +1722,13 @@ effect fn checkedInitializers<'source>(machine: &Machine<'source>, id: HirId) ->
     Option<Shared<TypedBody>>.Some {value} => move value
     Option<Shared<TypedBody>>.None => { return Option<List<CheckedInitializer>>.none() }
   }
-  let count = Shared<TypedBody>.with<usize>(&body, fn(checked: &TypedBody) -> usize { return aggregateFieldCount(checked, id, window, &anchor) })
+  let count = Shared<TypedBody>.with<usize>(&body, fn(checked: &TypedBody) -> usize { return aggregateFieldCount(checked, index, id, window, &anchor) })
   if count == usize.MAX { return Option<List<CheckedInitializer>>.none() }
   let mut initializers = List<CheckedInitializer>.make()
   let mut at = usize.ZERO
   while at < count {
     let selected = Shared<TypedBody>.with<Option<CheckedInitializer>>(&body, fn(checked: &TypedBody) -> Option<CheckedInitializer> {
-      return aggregateFieldAt(checked, id, at, window, &anchor)
+      return aggregateFieldAt(checked, index, id, at, window, &anchor)
     })
     match move selected {
       Option<CheckedInitializer>.Some {value} => run List<CheckedInitializer>.append(&mut initializers, move value)
@@ -1545,25 +1739,31 @@ effect fn checkedInitializers<'source>(machine: &Machine<'source>, id: HirId) ->
   return Option<List<CheckedInitializer>>.some(move initializers)
 }
 
-fn aggregateFieldCount(body: &TypedBody, id: HirId, window: Range, anchor: &Anchor) -> usize {
+fn aggregateFieldCount(body: &TypedBody, index: &NodeIndex, id: HirId, window: Range, anchor: &Anchor) -> usize {
   let nodes = TypedBody.nodeSlice(body)
-  let mut at = usize.ZERO
-  while at < nodes.length {
-    if at >= window.start && at - window.start < window.length && Anchor.hir(anchor, nodes[at].origin.node).index == id.index {
+  let found = recorded(index, anchor, id)
+  let candidates = List<usize>.asSlice(&index.positions)
+  let mut next = found.start
+  while next < found.start + found.length {
+    let at = candidates[next]
+    if at >= window.start && at - window.start < window.length {
       if let CheckedNodeKind.Expression {form: CheckedExpression.Aggregate {fields, ..}, ..} = &nodes[at].kind {
         return List<CheckedAggregateField>.length(&fields)
       }
     }
-    at = at + usize.ONE
+    next = next + usize.ONE
   }
   return usize.MAX
 }
 
-fn aggregateFieldAt(body: &TypedBody, id: HirId, ordinal: usize, window: Range, anchor: &Anchor) -> Option<CheckedInitializer> {
+fn aggregateFieldAt(body: &TypedBody, index: &NodeIndex, id: HirId, ordinal: usize, window: Range, anchor: &Anchor) -> Option<CheckedInitializer> {
   let nodes = TypedBody.nodeSlice(body)
-  let mut at = usize.ZERO
-  while at < nodes.length {
-    if at >= window.start && at - window.start < window.length && Anchor.hir(anchor, nodes[at].origin.node).index == id.index {
+  let found = recorded(index, anchor, id)
+  let candidates = List<usize>.asSlice(&index.positions)
+  let mut next = found.start
+  while next < found.start + found.length {
+    let at = candidates[next]
+    if at >= window.start && at - window.start < window.length {
       if let CheckedNodeKind.Expression {form: CheckedExpression.Aggregate {fields, ..}, ..} = &nodes[at].kind {
         let listed = List<CheckedAggregateField>.asSlice(&fields)
         if ordinal >= listed.length || listed[ordinal].value.index >= nodes.length { return Option<CheckedInitializer>.none() }
@@ -1572,7 +1772,7 @@ fn aggregateFieldAt(body: &TypedBody, id: HirId, ordinal: usize, window: Range, 
         })
       }
     }
-    at = at + usize.ONE
+    next = next + usize.ONE
   }
   return Option<CheckedInitializer>.none()
 }
@@ -1657,6 +1857,7 @@ effect fn enumValue<'source>(machine: &mut Machine<'source>, id: HirId, member: 
 
 fn checkedConstantDeclaration<'source>(machine: &Machine<'source>, id: HirId) -> Option<Shared<DeclarationId>> {
   let window = checkedRange(machine)
+  let index = checkedNodes(machine)
   let anchor = match move checkedAnchor(machine) {
     Option<Anchor>.Some {value} => move value
     Option<Anchor>.None => { return Option<Shared<DeclarationId>>.none() }
@@ -1666,14 +1867,17 @@ fn checkedConstantDeclaration<'source>(machine: &Machine<'source>, id: HirId) ->
       &body,
       fn(body: &TypedBody) -> Option<Shared<DeclarationId>> {
         let nodes = TypedBody.nodeSlice(body)
-        let mut at = usize.ZERO
-        while at < nodes.length {
-          if at >= window.start && at - window.start < window.length && Anchor.hir(&anchor, nodes[at].origin.node).index == id.index {
+        let found = recorded(index, &anchor, id)
+        let candidates = List<usize>.asSlice(&index.positions)
+        let mut next = found.start
+        while next < found.start + found.length {
+          let at = candidates[next]
+          if at >= window.start && at - window.start < window.length {
             if let CheckedNodeKind.Expression {form: CheckedExpression.Constant {declaration}, ..} = &nodes[at].kind {
               return Option<Shared<DeclarationId>>.some(Shared<DeclarationId>.clone(&declaration))
             }
           }
-          at = at + usize.ONE
+          next = next + usize.ONE
         }
         return Option<Shared<DeclarationId>>.none()
       },
@@ -2418,12 +2622,15 @@ pub effect<'owner & 'env> fn evaluate<'owner, 'env, 'source>(
     Option<Shared<TypedBody>>.None => Option<Shared<TypedBody>>.none()
   }
   let suppliedBase = List<RetainedBinding>.length(&machine.supplied)
+  let rootNodes = run indexShared(&checked.body)
+  let previousNodes = Intrinsic.replace(machine.rootNodes, move rootNodes)
   machine.current = Option<AuthoredCursor>.some(move cursor)
   machine.rootBody = Option<Shared<TypedBody>>.some(Shared<TypedBody>.clone(&checked.body))
   let reservation = SourceReservation {
     machine: move machine,
     previous: move previous,
     previousBody: move previousBody,
+    previousNodes: move previousNodes,
     suppliedBase: suppliedBase,
   }
   let use = effect fn(resource: &mut SourceReservation<'owner, 'source>) -> Shared<StaticData>
@@ -2446,6 +2653,9 @@ pub effect<'owner & 'env> fn evaluate<'owner, 'env, 'source>(
       Option<Shared<TypedBody>>.Some {value} => Option<Shared<TypedBody>>.some(Shared<TypedBody>.clone(&value))
       Option<Shared<TypedBody>>.None => Option<Shared<TypedBody>>.none()
     }
+    let restored = Intrinsic.replace(resource.previousNodes, emptyNodes())
+    let replaced = Intrinsic.replace(resource.machine.*.rootNodes, move restored)
+    drop replaced
     return ()
   }
   return run Effect.useReleaseNonParking(move reservation, move use, move release)
@@ -2965,6 +3175,7 @@ effect<'owner & 'env> fn completeSelectedDemand<'owner, 'env, 'source>(
   if List<Frame>.length(&machine.active) >= machine.limits.depth {
     return run reject(&machine.*, Fault.DepthLimit, callSpan)
   }
+  let nodes = run indexedSlot(&mut machine.*, &body)
   run List<Frame>.append(
     &mut machine.active,
     Frame {
@@ -2975,6 +3186,7 @@ effect<'owner & 'env> fn completeSelectedDemand<'owner, 'env, 'source>(
       name: run Bytes.copy(selectedName),
       arguments: run copyArguments(args),
       body: move body,
+      nodes: nodes,
       window: Range {start: usize.ZERO, length: usize.MAX},
       span: callSpan,
     },
@@ -3210,6 +3422,7 @@ effect fn preparePrefix<'source>(machine: &mut Machine<'source>, checked: &Check
   if !rootChecked(checked, &root) { return run reject(&machine.*, Fault.Unavailable, Span.make(usize.ZERO, usize.ZERO)) }
   machine.current = Option<AuthoredCursor>.some(move cursor)
   machine.rootBody = Option<Shared<TypedBody>>.some(Shared<TypedBody>.clone(&checked.body))
+  machine.rootNodes = run indexShared(&checked.body)
   setCheckedRange(&mut machine.*, Range {start: usize.ZERO, length: usize.MAX})
   run supplyBindings(&mut machine.*, supplied)
   let mut local = List<Local>.make()

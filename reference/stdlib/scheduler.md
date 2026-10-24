@@ -97,6 +97,24 @@ pub struct TaskIdExhaustedError
 
 A typed failure that reports exhaustion of the task identity space.
 
+<a id="TaskIdExhaustedError.impl.Debug"></a>
+
+## Implementation `Debug for TaskIdExhaustedError`
+
+```silk
+impl Debug for TaskIdExhaustedError
+```
+
+<a id="TaskIdExhaustedError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes `TaskIdExhaustedError`.
+
 <a id="PublicationResponse"></a>
 
 ## `PublicationResponse`

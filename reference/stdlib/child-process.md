@@ -94,6 +94,24 @@ pub code: i32
 
 The stable numeric code for the provider-reported execution stage.
 
+<a id="ProcessOperation.impl.Debug"></a>
+
+## Implementation `Debug for ProcessOperation`
+
+```silk
+impl Debug for ProcessOperation
+```
+
+<a id="ProcessOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the code, such as `Spawn`, or the code when it has no name.
+
 <a id="ProcessReason"></a>
 
 ## `ProcessReason`
@@ -114,6 +132,24 @@ pub code: i32
 ```
 
 The stable numeric code for the portable recovery category.
+
+<a id="ProcessReason.impl.Debug"></a>
+
+## Implementation `Debug for ProcessReason`
+
+```silk
+impl Debug for ProcessReason
+```
+
+<a id="ProcessReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the code, such as `NotFound`, or the code when it has no name.
 
 <a id="ProcessError"></a>
 
@@ -151,6 +187,25 @@ pub reason: ProcessReason
 ```
 
 The portable category that callers can use for recovery.
+
+<a id="ProcessError.impl.Debug"></a>
+
+## Implementation `Debug for ProcessError`
+
+```silk
+impl Debug for ProcessError
+```
+
+<a id="ProcessError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ProcessError { operation: Spawn, reason: NotFound, providerCode: 2 }`.
+It leaves out `providerCode` when there is none.
 
 <a id="ProcessRequest"></a>
 

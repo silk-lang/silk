@@ -305,7 +305,7 @@ after its pool was dropped is dropped unstarted, and its handle never finishes.
 
 A project profile with `target = "wasm32-unknown-unknown"` and `threading = "multi"` compiles with
 atomics and bulk memory and links one shared memory that the module imports as `env.memory`, with
-`maxMemory` as its maximum (1 GiB by default, PROFILE-001). `NativeThread.spawn` asks the host for a
+`max-memory` as its maximum (1 GiB by default, PROFILE-001). `NativeThread.spawn` asks the host for a
 thread through the wasi-threads import `wasi.thread-spawn`; the host instantiates the same module
 on the same memory and calls its exported `wasi_thread_start`. The compiler's linked runtime gives
 each thread a 1 MiB stack from the allocator before the thread runs, and `JoinHandle.join` and
@@ -316,7 +316,7 @@ through `silk.thread-parallelism`.
 [profiles.web]
 target = "wasm32-unknown-unknown"
 threading = "multi"
-maxMemory = "256MiB"
+max-memory = "256MiB"
 ```
 
 The standard library ships a host for Node and browsers in `stdlib/host/wasm-runner.mjs`.

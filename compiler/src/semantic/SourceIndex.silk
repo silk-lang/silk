@@ -15,7 +15,7 @@ import semantic.ModuleIndex {ModuleIndex, NameObservation}
 import semantic.Query {Cycle, Query}
 import semantic.SourceRevision {Observation, Revision}
 import semantic.SourceUnit {SourceUnit}
-import hir.Hir {Cause, CauseCode, DiagnosticDetail, HirId, Module, Node, OwnerKind, Range}
+import hir.Hir {Cause, CauseCode, DiagnosticDetail, HirId, Module, Node, OwnerKind, Range, ownedChildren}
 import semantic.DeclarationId {DeclarationId}
 import hir.Intern {StringTable, Symbol}
 import lexer.Span {Span}
@@ -26,6 +26,7 @@ import silk.bytes {Bytes}
 import silk.effect {Effect}
 import silk.hash {Hash, Word}
 import silk.option {Option}
+import silk.ownership {Copy}
 import silk.pointer {Pointer}
 import silk.result {Result}
 import silk.shared {Shared}
@@ -39,6 +40,78 @@ pub struct IndexedSource {
   index: ModuleIndex
   // One shared canonical identity per declaration ordinal, made on first request.
   identities: List<Option<Shared<DeclarationId>>>
+  headers: HeaderPlaces
+}
+
+/// The aggregate members of a written header, each one a direct child of it.
+pub fn memberRange(value: Node) -> Range {
+  return match value {
+    Node.StructHeader {fields, ..} => fields
+    Node.TupleHeader {elements, ..} => elements
+    Node.UnionHeader {variants, ..} => variants
+    Node.EnumHeader {members, ..} => members
+    _ => Range.empty()
+  }
+}
+
+/// Where one authored node sits inside a written header: the innermost indexed declaration whose
+/// header holds it, and the header member it falls under, or `usize.MAX` outside every member.
+pub struct HeaderPlace {
+  pub declaration: usize
+  pub member: usize
+}
+
+impl Copy for HeaderPlace {}
+
+/// Every node of every indexed header, placed once per source revision. Finding the header and
+/// member around a node is then one lookup, rather than a walk of its declaration's header per
+/// read, which made a deeply nested written type quadratic.
+struct HeaderPlaces {
+  nodes: List<usize>
+  places: List<HeaderPlace>
+  lookup: InternIndex
+}
+
+// Declarations are listed after their parents, so a nested header placed later overwrites the
+// enclosing one and every node keeps its innermost header.
+effect fn placeHeaders(hir: &Module, index: &ModuleIndex) -> HeaderPlaces ! OutOfMemoryError ? &mut Allocator {
+  let declarations = ModuleIndex.listDeclarations(index)
+  let mut placed = HeaderPlaces {nodes: List<usize>.make(), places: List<HeaderPlace>.make(), lookup: InternIndex.make()}
+  let mut ordinal = usize.ZERO
+  while ordinal < declarations.length {
+    let header = declarations[ordinal].header
+    run placeSubtree(&mut placed, hir, header, HeaderPlace {declaration: ordinal, member: usize.MAX})
+    let range = memberRange(Module.node(hir, header))
+    let mut at = usize.ZERO
+    while at < range.length {
+      run placeSubtree(&mut placed, hir, Module.child(hir, range, at), HeaderPlace {declaration: ordinal, member: at})
+      at = at + usize.ONE
+    }
+    ordinal = ordinal + usize.ONE
+  }
+  return move placed
+}
+
+effect fn placeSubtree(placed: &mut HeaderPlaces, hir: &Module, root: HirId, place: HeaderPlace) -> () ! OutOfMemoryError ? &mut Allocator {
+  let nodes = List<usize>.asSlice(&placed.nodes)
+  let mut at = InternIndex.first(&placed.lookup, usize.toU64(root.index))
+  while at != usize.MAX && nodes[at] != root.index { at = InternIndex.after(&placed.lookup, at) }
+  if at == usize.MAX {
+    run List<usize>.append(&mut placed.nodes, root.index)
+    run List<HeaderPlace>.append(&mut placed.places, place)
+    run InternIndex.record(&mut placed.lookup, usize.toU64(root.index))
+  } else {
+    let places = List<HeaderPlace>.asMutSlice(&mut placed.places)
+    places[at] = place
+  }
+  let children = run ownedChildren(hir, root)
+  let listed = List<HirId>.asSlice(&children)
+  let mut child = usize.ZERO
+  while child < listed.length {
+    run placeSubtree(&mut placed.*, hir, listed[child], place)
+    child = child + usize.ONE
+  }
+  return ()
 }
 
 /// One changed loaded module, retaining its previous declaration index for identity matching.
@@ -155,6 +228,7 @@ effect fn demandSource(
   number: usize,
   key: Word,
   fingerprinted: bool,
+  parsed: &mut List<SourceUnit>,
 ) -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   return run Query.demand(
     move query,
@@ -169,13 +243,18 @@ effect fn demandSource(
       run record(&mut events.*, EventKind.SourceRead, id, number, present)
       let content = run Observation.copyContent(&observed)
       if let Option<Bytes>.Some {value} = move content {
-        let unit = run SourceUnit.parse(id, number, move value)
+        let unit = match move takeParsed(&mut parsed.*, id, number, Bytes.asSlice(&value)) {
+          Option<SourceUnit>.Some {value: taken} => move taken
+          Option<SourceUnit>.None => run SourceUnit.parse(id, number, move value)
+        }
         let index = run ModuleIndex.build(&unit, fingerprinted)
+        let headers = run placeHeaders(&unit.authored, &index)
         let source = IndexedSource {
           observation: run Observation.copy(&observed),
           unit: move unit,
           index: move index,
           identities: List<Option<Shared<DeclarationId>>>.make(),
+          headers: move headers,
         }
         let slot = List<SourceSlot>.length(&sources.*)
         run List<SourceSlot>.append(
@@ -193,7 +272,33 @@ effect fn demandSource(
   )
 }
 
-effect fn withPublication<'a, 'b, 'c, 'd, 'e>(
+fn sameBytes(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The unit a driver parsed from exactly `content` of module `id`, if any, as a unit of revision
+// `number`: a parse depends only on the bytes, and the driver's revision numbers count its loads.
+fn takeParsed(parsed: &mut List<SourceUnit>, id: &ModuleId, number: usize, content: &[u8]) -> Option<SourceUnit> {
+  let units = List<SourceUnit>.asSlice(&parsed.*)
+  let mut at = usize.ZERO
+  while at < units.length {
+    if ModuleId.equals(&units[at].id, id) && sameBytes(SourceUnit.bytes(&units[at]), content) {
+      let mut unit = List<SourceUnit>.remove(&mut parsed.*, at)
+      unit.revision = number
+      return Option<SourceUnit>.some(move unit)
+    }
+    at = at + usize.ONE
+  }
+  return Option<SourceUnit>.none()
+}
+
+effect fn withPublication<'a, 'b, 'c, 'd, 'e, 'f>(
   sources: &'a mut List<SourceSlot>,
   query: &'b mut Query<SourceResult, NoRejection>,
   events: &'c mut List<Event>,
@@ -202,6 +307,7 @@ effect fn withPublication<'a, 'b, 'c, 'd, 'e>(
   number: usize,
   key: Word,
   fingerprinted: bool,
+  parsed: &'f mut List<SourceUnit>,
 ) -> Shared<Result<SourceResult, NoRejection>> ! Cycle | OutOfMemoryError ? &mut Allocator {
   let base = List<SourceSlot>.length(&sources.*)
   let publication = SourcePublication {
@@ -223,6 +329,7 @@ effect fn withPublication<'a, 'b, 'c, 'd, 'e>(
       number,
       selected,
       fingerprinted,
+      move parsed,
     )
   }
   let release = effect fn(resource: &mut SourcePublication<'a, 'b>) -> () {
@@ -299,6 +406,8 @@ pub struct SourceIndex {
   events: List<Event>
   // Whether this store can be revised; `revise` traps on a one-shot store.
   revisions: bool
+  // Units a driver parsed already, each taken by the first demand of the same module and bytes.
+  parsed: List<SourceUnit>
 }
 
 effect fn record(
@@ -512,6 +621,16 @@ impl IndexedSource {
   pub fn moduleIndex(self: &Self) -> &ModuleIndex {
     return &self.index
   }
+  /// The innermost indexed header holding `id`, with its member; absent outside every header.
+  pub fn headerPlace(self: &Self, id: HirId) -> Option<HeaderPlace> {
+    let nodes = List<usize>.asSlice(&self.headers.nodes)
+    let mut at = InternIndex.first(&self.headers.lookup, usize.toU64(id.index))
+    while at != usize.MAX {
+      if nodes[at] == id.index { return Option<HeaderPlace>.some(List<HeaderPlace>.asSlice(&self.headers.places)[at]) }
+      at = InternIndex.after(&self.headers.lookup, at)
+    }
+    return Option<HeaderPlace>.none()
+  }
 }
 
 fn openIndex(revision: Revision, revisions: bool) -> SourceIndex {
@@ -525,6 +644,7 @@ fn openIndex(revision: Revision, revisions: bool) -> SourceIndex {
     query: Query<SourceResult, NoRejection>.make(),
     events: List<Event>.make(),
     revisions: revisions,
+    parsed: List<SourceUnit>.make(),
   }
 }
 
@@ -652,6 +772,7 @@ impl SourceIndex {
             || diagnostic.code == CauseCode.NestingLimit || diagnostic.code == CauseCode.ReservedTemplate
             || diagnostic.code == CauseCode.ReservedImportBinding || diagnostic.code == CauseCode.LoopStatement
             || diagnostic.code == CauseCode.OptionalTypeSyntax || diagnostic.code == CauseCode.TupleTypeSyntax
+            || diagnostic.code == CauseCode.IfExpression
             || diagnostic.code == CauseCode.LexicalError {
             let holes = run sourceHoles(diagnostic.detail, SourceUnit.bytes(&indexed.unit))
             run List<SyntaxProblem>.append(&mut problems, SyntaxProblem {
@@ -685,6 +806,11 @@ impl SourceIndex {
   /// returns the completed answer without another source read or event. Source absence also
   /// completes.
   /// Provider or publication failure removes the active reservation and any unpublished source.
+  /// Hands the store units a driver already parsed. The first demand of a module whose bytes in
+  /// this revision equal a unit's takes that unit instead of parsing again.
+  pub fn offerParsed(self: &mut Self, units: List<SourceUnit>) -> () {
+    self.parsed = move units
+  }
   pub effect fn demand(self: &mut Self, id: &ModuleId) -> Shared<Result<SourceResult, NoRejection>>
   ! Cycle | OutOfMemoryError
   ? &mut Allocator {
@@ -700,6 +826,7 @@ impl SourceIndex {
       number,
       key,
       self.revisions,
+      &mut self.parsed,
     )
     if !hit {
       run record(&mut self.events, EventKind.QueryFinish, id, number, false)

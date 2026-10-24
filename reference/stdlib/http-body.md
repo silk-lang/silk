@@ -749,6 +749,24 @@ Discard
 
 A [`Decoder.discard`](#Decoder.impl.discard) call.
 
+<a id="BodyComponent.impl.Debug"></a>
+
+## Implementation `Debug for BodyComponent`
+
+```silk
+impl Debug for BodyComponent
+```
+
+<a id="BodyComponent.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Selection`.
+
 <a id="BodyLimitKind"></a>
 
 ## `BodyLimitKind`
@@ -878,6 +896,24 @@ OwnedBytes
 ```
 
 The owned-storage byte budget.
+
+<a id="BodyLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for BodyLimitKind`
+
+```silk
+impl Debug for BodyLimitKind
+```
+
+<a id="BodyLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `WireBytes`.
 
 <a id="BodyReason"></a>
 
@@ -1107,6 +1143,24 @@ The call is not valid now, for example a `step` after the body is complete or af
 impl Copy for BodyReason
 ```
 
+<a id="BodyReason.impl.Debug"></a>
+
+## Implementation `Debug for BodyReason`
+
+```silk
+impl Debug for BodyReason
+```
+
+<a id="BodyReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidFraming`.
+
 <a id="BodyError"></a>
 
 ## `BodyError`
@@ -1196,6 +1250,24 @@ pub fieldIndex: Option<usize>
 ```
 
 The position of the trailer field, from 0, when the error is in a trailer.
+
+<a id="BodyError.impl.Debug"></a>
+
+## Implementation `Debug for BodyError`
+
+```silk
+impl Debug for BodyError
+```
+
+<a id="BodyError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `BodyError { reason: ..., component: ..., ... }`.
 
 <a id="TrailerPolicy"></a>
 

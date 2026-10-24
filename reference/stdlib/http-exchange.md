@@ -593,7 +593,9 @@ impl Limits
 pub fn defaults() -> Limits
 ```
 
-Returns the default limits: 16 MiB bodies, 64 KiB heads, and 128 requests for each connection.
+Returns the default limits: 16 MiB bodies, 256 KiB heads with field values up to 64 KiB, and
+128 requests for each connection. Servers send long values: GitHub's release downloads
+answer with a `Content-Security-Policy` of over 9 KiB.
 
 <a id="RequestOptions.impl"></a>
 
@@ -869,6 +871,24 @@ Timeout
 
 The deadline of the exchange passed.
 
+<a id="ExchangeError.impl.Debug"></a>
+
+## Implementation `Debug for ExchangeError`
+
+```silk
+impl Debug for ExchangeError
+```
+
+<a id="ExchangeError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Content { ... }`.
+
 <a id="validateLimits"></a>
 
 ## `validateLimits`
@@ -1048,6 +1068,24 @@ The total framed bytes sent so far.
 ```silk
 impl Copy for WriteProgress
 ```
+
+<a id="WriteProgress.impl.Debug"></a>
+
+## Implementation `Debug for WriteProgress`
+
+```silk
+impl Debug for WriteProgress
+```
+
+<a id="WriteProgress.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `WriteProgress { consumed: ..., written: ..., ... }`.
 
 <a id="Connection"></a>
 

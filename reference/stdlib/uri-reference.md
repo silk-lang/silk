@@ -127,6 +127,24 @@ IpvFuture
 
 A future IP literal in brackets, such as `[v1.x]`.
 
+<a id="HostKind.impl.Debug"></a>
+
+## Implementation `Debug for HostKind`
+
+```silk
+impl Debug for HostKind
+```
+
+<a id="HostKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `RegName`.
+
 <a id="Component"></a>
 
 ## `Component`
@@ -217,6 +235,24 @@ Fragment
 
 The fragment after `#`.
 
+<a id="Component.impl.Debug"></a>
+
+## Implementation `Debug for Component`
+
+```silk
+impl Debug for Component
+```
+
+<a id="Component.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Scheme`.
+
 <a id="ParseReason"></a>
 
 ## `ParseReason`
@@ -288,6 +324,24 @@ MissingScheme
 
 The text has no scheme, but a function such as `Uri.parse` needs one.
 
+<a id="ParseReason.impl.Debug"></a>
+
+## Implementation `Debug for ParseReason`
+
+```silk
+impl Debug for ParseReason
+```
+
+<a id="ParseReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidCharacter`.
+
 <a id="ParseError"></a>
 
 ## `ParseError`
@@ -336,6 +390,24 @@ missing, it is the position where it must be.
 ```silk
 impl Copy for ParseError
 ```
+
+<a id="ParseError.impl.Debug"></a>
+
+## Implementation `Debug for ParseError`
+
+```silk
+impl Debug for ParseError
+```
+
+<a id="ParseError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ParseError { reason: ..., component: ..., ... }`.
 
 <a id="UriReference"></a>
 

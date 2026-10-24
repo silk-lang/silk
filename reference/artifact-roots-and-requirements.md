@@ -184,15 +184,18 @@ before a successful plan is published.
 
 ## Build configuration
 
-`build.stage` accepts `final` (default), `llvm-ir`, `llvm-bitcode`, `assembly` or `object`.
-`build.artifact` additionally accepts `object`. Intermediate destinations use `.ll`, `.bc`, `.s`
-or `.o`; `silk run` requires a final executable. A build can select an ordinary source runtime and
-retain private support code:
+`--emit` (earlier `build.stage`) accepts `final` (default), `llvm-ir`, `llvm-bitcode`, `assembly` or
+`object`. `package.kind` additionally accepts `object`. Intermediate destinations use `.ll`, `.bc`,
+`.s` or `.o`; `silk run` requires a final executable. A build can select an ordinary source runtime
+and retain private support code. The runtime composition lives in `[unstable]`, which carries no
+stability promise:
 
 ```toml
-[build]
-artifact = "object"
-stage = "final"
+[package]
+name = "custom"
+kind = "object"
+
+[unstable]
 composition = { runtimes = [{ name = "custom", module = "runtime" }], defaults = ["custom"], retention = [{ module = "support", declaration = "keep" }], requirements = [] }
 ```
 
@@ -201,12 +204,12 @@ runtime. Foreign exports in the selected source and explicit retention declarati
 A custom runtime may call any visible application function with arguments and result handling
 expressed in ordinary Silk. The compiler imposes no special application function shape.
 
-Native requirements are resolved by explicit build bindings, preserving their listed input order:
+Native requirements are resolved by explicit bindings, preserving their listed input order. The
+native compiler refuses composition requirements for now, and the binding table has no manifest
+spelling yet; the logical contract is:
 
 ```toml
-[build]
-artifact = "shared-library"
-composition = { requirements = [{ kind = "library", name = "values", linkage = "dynamic", alternatives = ["system"] }] }
+requirements = [{ kind = "library", name = "values", linkage = "dynamic", alternatives = ["system"] }]
 native-bindings = [{ kind = "library", name = "values", alternative = "system", inputs = [{ search-path = "native/lib" }, { library = "values", mode = "dynamic" }] }]
 ```
 
@@ -215,7 +218,7 @@ static archives according to hard linkage; framework, script, object and archive
 the corresponding typed payload. Scripts use `{ linker-script = "relative/script.ld" }` and are
 admitted only by GNU/Linux final tool plans. No raw linker options are accepted. Object/archive
 forms preserve unresolved link requirements in the logical plan; final executables/modules require
-every active requirement to have an admitted binding. Explicit flat `native-link-inputs` retain
+every active requirement to have an admitted binding. Explicit flat `[native].link` inputs retain
 their existing ordered build semantics and do not override source requirements.
 
 Named loader entries are exact linker symbols, including any target-specific spelling. Final

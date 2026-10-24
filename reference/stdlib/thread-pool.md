@@ -171,6 +171,10 @@ Starts `task` as a new pool task and returns the handle that joins it.
 #### Details
 The task is ready at once. It can start on any worker before this call returns.
 
+#### Gotchas
+`task` cannot fail. For a task that can, such as an `effect fn` call with
+`! OutOfMemoryError`, spawn `Effect.result(task)` and handle the `Result` that `join` returns.
+
 <a id="Pool.impl.block"></a>
 
 ### Method `block`

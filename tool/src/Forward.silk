@@ -1,0 +1,208 @@
+//! Handing a command to the compiler the directory selects.
+//!
+//! Every command the tool does not own runs in the compiler `Toolchains.select` picks. The tool
+//! replaces itself with that toolchain's `bin/silkc` (`Toolchains.executable`), passing the
+//! arguments unchanged (less a leading `+<version>`) with `SILK_TOOLCHAIN` set to the toolchain's
+//! full version and `SILK_HOME` to the store, and never reads the forwarded command's flags. When
+//! the selected toolchain is not installed, the command exits 3 and names the command that installs
+//! it, unless automatic installs are on (`SILK_AUTO_INSTALL=1` or `auto-install = true` in
+//! settings.toml).
+//!
+//! `SILK_TOOLCHAIN` also keeps compilers from dev.11 and earlier, which still choose a toolchain
+//! themselves, on the version the tool chose.
+
+import Command as Commands { Context, Outcome }
+import Manifests
+import Toolchains as Toolchains { Origin, Selection, UnknownPin }
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.effect { Effect }
+import silk.filesystem { FileError, FileSystem, Path }
+import silk.option { Option }
+import silk.result { Result }
+import silk.slice { Slice }
+import silk.usize
+
+/// What the tool does with a forwarded command.
+pub enum Action {
+  /// Replace this process with `Forwarding.executable`, after printing any notes in
+  /// `Forwarding.errors`.
+  Replace,
+  /// Exit with `Forwarding.status`, printing `Forwarding.errors`.
+  Exit,
+}
+
+/// The decision for one forwarded command line.
+pub struct Forwarding {
+  pub action: Action
+
+  /// The executable to run, for `Replace`.
+  pub executable: Bytes
+
+  /// The `SILK_TOOLCHAIN` value the compiler runs with, for `Replace`.
+  pub version: Bytes
+
+  /// How many leading arguments the compiler does not receive: 1 for a `+<version>` argument.
+  pub skip: usize
+
+  pub status: i32
+  pub errors: Bytes
+
+  /// The selected version that is not installed, for `Exit` with status 3, when an install can
+  /// fetch it.
+  pub missing: Bytes
+}
+
+effect fn exit(status: i32, errors: Bytes, missing: Bytes) -> Forwarding
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  return Forwarding {
+    action: Action.Exit,
+    executable: Bytes.make(),
+    version: Bytes.make(),
+    skip: usize.ZERO,
+    status: status,
+    errors: move errors,
+    missing: move missing,
+  }
+}
+
+// The text after the leading `+` of `argument`, or `None` when it is not a `+<version>` argument.
+fn requestedVersion(argument: &[u8]) -> Option<&[u8]> {
+  if argument.length < usize.add(0, 2) || argument[usize.ZERO] != 43 {
+    return Option<&[u8]>.none()
+  }
+  return Option<&[u8]>.some(Slice.view<u8>(argument, usize.ONE, argument.length - usize.ONE))
+}
+
+// The message for a selected toolchain that is not installed.
+effect fn notInstalled(selected: &Selection) -> Bytes
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  if selected.origin == Origin.Nothing {
+    return run Bytes.copy(
+      b"silk: no Silk version is selected here: no project pins one and there is no default.\nInstall the newest Silk as the default with: silk use latest\n"
+    )
+  }
+  let version = Bytes.asSlice(&selected.version)
+  let mut errors = run Bytes.copy(b"silk: Silk ")
+  run Bytes.append(&mut errors, version)
+  run Bytes.append(&mut errors, b" (")
+  run Commands.because(selected, &mut errors)
+  run Bytes.append(&mut errors, b") is not installed.\nInstall it with: ")
+  let install = run Commands.installCommand(selected)
+  run Bytes.append(&mut errors, Bytes.asSlice(&install))
+  run Bytes.append(&mut errors, b"\n")
+  return move errors
+}
+
+/// Decides how to run the forwarded command line `arguments`, which excludes argument zero.
+pub effect fn decide(context: &Context, arguments: &[Bytes]) -> Forwarding
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  let mut requested = Option<&[u8]>.none()
+  if arguments.length > usize.ZERO {
+    requested = requestedVersion(Bytes.asSlice(&arguments[usize.ZERO]))
+  }
+  let mut skip = usize.ZERO
+  if let Option<&[u8]>.Some { value } = &requested {
+    skip = usize.ONE
+    if !Manifests.isSemanticVersion(value) {
+      let mut errors = run Bytes.copy(b"silk: `+")
+      run Bytes.append(&mut errors, value)
+      run Bytes.append(
+        &mut errors,
+        b"` is not a Silk version; +<version> takes a semantic version such as +0.1.0-dev.11\n"
+      )
+      return run exit(2, move errors, Bytes.make())
+    }
+  }
+  if skip == usize.ZERO {
+    if let Option<Outcome>.Some { value } = move run Commands.badEnvironment(context) {
+      return run exit(2, move value.errors, Bytes.make())
+    }
+  }
+  let environment = match &context.environment {
+    Option<Bytes>.Some { value } => Option<&[u8]>.some(Bytes.asSlice(&value))
+    Option<Bytes>.None => Option<&[u8]>.none()
+  }
+  let home = match &context.home {
+    Option<Path>.Some { value } => Option<&Path>.some(&value)
+    Option<Path>.None => Option<&Path>.none()
+  }
+  let chosen = run Effect.result(Toolchains.select(&context.working, move requested, move environment, move home))
+  let selected = match move chosen {
+    Result<Selection, UnknownPin | FileError | OutOfMemoryError>.Success { value } => move value
+    Result<Selection, UnknownPin | FileError | OutOfMemoryError>.Failure { error } => match move error {
+      UnknownPin unknown => {
+        let reported = run Commands.unknownPin(&unknown)
+        return run exit(2, move reported.errors, Bytes.make())
+      }
+      FileError failed => {
+        fail move failed
+      }
+      OutOfMemoryError exhausted => {
+        fail move exhausted
+      }
+    }
+  }
+  // The compiler beside the tool serves when nothing selects a version, and when the store lacks
+  // the selected one and it is that version.
+  let fallback = selected.origin == Origin.Nothing || Toolchains.matches(Bytes.asSlice(&selected.version), context.release)
+  if fallback {
+    if let Option<Path>.Some { value: compiler } = &context.bundled {
+      let installed = match &context.home {
+        Option<Path>.Some { value } => selected.origin != Origin.Nothing && run isInstalled(&value, Bytes.asSlice(&selected.version))
+        Option<Path>.None => false
+      }
+      if !installed {
+        return run replace(Path.rawBytes(&compiler), context.release, skip, &selected)
+      }
+    }
+  }
+  if selected.origin == Origin.Nothing {
+    return run exit(Commands.NOT_INSTALLED, run notInstalled(&selected), Bytes.make())
+  }
+  let root = match &context.home {
+    Option<Path>.Some { value } => &value
+    Option<Path>.None => {
+      let reported = run Commands.noHome()
+      return run exit(reported.status, move reported.errors, Bytes.make())
+    }
+  }
+  let name = match move run Toolchains.find(root, Bytes.asSlice(&selected.version)) {
+    Option<Bytes>.Some { value } => move value
+    Option<Bytes>.None => {
+      return run exit(Commands.NOT_INSTALLED, run notInstalled(&selected), run Bytes.copy(Bytes.asSlice(&selected.version)))
+    }
+  }
+  let executable = run Toolchains.executable(root, Bytes.asSlice(&name))
+  return run replace(Path.rawBytes(&executable), Bytes.asSlice(&name), skip, &selected)
+}
+
+// Whether the store below `home` holds a toolchain the pin `version` names.
+effect fn isInstalled(home: &Path, version: &[u8]) -> bool
+  ! FileError | OutOfMemoryError
+  ? &mut FileSystem | &mut Allocator {
+  return match move run Toolchains.find(home, version) {
+    Option<Bytes>.Some { value } => true
+    Option<Bytes>.None => false
+  }
+}
+
+// The decision to run `executable` as Silk `version`, with the notes `selected` calls for.
+effect fn replace(executable: &[u8], version: &[u8], skip: usize, selected: &Selection) -> Forwarding
+  ! OutOfMemoryError
+  ? &mut Allocator {
+  let mut notes = Bytes.make()
+  run Commands.ignoredNote(selected, &mut notes)
+  return Forwarding {
+    action: Action.Replace,
+    executable: run Bytes.copy(executable),
+    version: run Bytes.copy(version),
+    skip: skip,
+    status: 0,
+    errors: move notes,
+    missing: Bytes.make(),
+  }
+}

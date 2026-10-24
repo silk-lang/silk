@@ -9,9 +9,12 @@ Use [`HashSet`](#HashSet) to test membership fast, or to keep one copy of each v
 must implement `silk.hash.HashKey`. Use `silk.list.List` when order or duplicate values matter.
 
 ## Details
-[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets. The set doubles
-the number of buckets before more than three quarters of them are in use. A failed growth leaves
-the elements, the length, and the bucket count unchanged.
+[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets. The set rebuilds
+its table before more than three quarters of the buckets are in use. A bucket stays in use after
+a removal, until the next rebuild. The rebuild doubles the number of buckets if the elements
+fill more than half of them. Otherwise it keeps the number and only clears the removed buckets,
+so a set that inserts and removes forever keeps a bucket count in proportion to its largest
+length. A failed growth leaves the elements, the length, and the bucket count unchanged.
 
 The same seed and the same operations give the same bucket order on each target. To visit each
 element, scan the buckets from 0 to [`HashSet.bucketCount`](#HashSet.impl.bucketCount), test [`HashSet.occupiedAt`](#HashSet.impl.occupiedAt), and
@@ -107,9 +110,12 @@ implement `silk.hash.HashKey`. Use `silk.list.List` when order or duplicate valu
 
 ### Details
 
-[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets. The set doubles
-the number of buckets before more than three quarters of them are in use. A failed growth leaves
-the elements, the length, and the bucket count unchanged.
+[`HashSet.make`](#HashSet.impl.make) does not allocate. The first insert allocates eight buckets. The set rebuilds
+its table before more than three quarters of the buckets are in use. A bucket stays in use after
+a removal, until the next rebuild. The rebuild doubles the number of buckets if the elements
+fill more than half of them. Otherwise it keeps the number and only clears the removed buckets,
+so a set that inserts and removes forever keeps a bucket count in proportion to its largest
+length. A failed growth leaves the elements, the length, and the bucket count unchanged.
 
 To visit each element, scan the buckets from 0 to [`HashSet.bucketCount`](#HashSet.impl.bucketCount), test
 [`HashSet.occupiedAt`](#HashSet.impl.occupiedAt), and read [`HashSet.elementAt`](#HashSet.impl.elementAt). This order is the bucket order, not the

@@ -1,0 +1,233 @@
+//! The object cache of a build split into codegen units: each unit's object is named by a digest
+//! of the Clang that compiles it, its flags and its text, so a build compiles only the units whose
+//! text changed, on worker threads, and links every unit's object.
+//!
+//! # Details
+//! The cache is the directory beside the build output that [`directoryFor`] names. A unit compiles
+//! to a temporary name that is renamed over its object only once Clang succeeds, so a failed or
+//! interrupted compile never leaves an object a later build would reuse. After a link, [`prune`]
+//! removes the objects no unit of that build named, once there are more of them than units.
+
+import backend.CodegenUnits {CodegenUnit}
+import driver.HostRename
+import semantic.ContentHash {ContentHash}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.bytes {Bytes}
+import silk.child_process {ChildProcess, ProcessError, ProcessOutcome}
+import silk.effect {Effect}
+import silk.filesystem {DirectoryEntry, FileError, FileSystem, Path}
+import silk.list {List}
+import silk.native_thread {JoinHandle, NativeThread, SpawnError}
+import silk.option {Option}
+import silk.os_child_process {OsChildProcess}
+import silk.result {Result}
+import silk.u64
+import silk.usize
+
+/// The objects of one build's units, in unit order, and the units that still need Clang.
+pub struct UnitObjects {
+  /// Each unit's object path.
+  pub objects: List<Path>
+  /// Each unit whose object is not cached, by its position in the units.
+  pub missing: List<usize>
+}
+
+/// The cache directory of the build that writes `output`: `<output>.units`.
+pub effect fn directoryFor(output: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut named = run Bytes.copy(Path.rawBytes(output))
+  run Bytes.append(&mut named, b".units")
+  return run Path.fromBytes(Bytes.asSlice(&named))
+}
+
+fn hexDigit(value: u64) -> u8 {
+  if value < 10 { return u64.toU8(value) + 48 }
+  return u64.toU8(value) + 87
+}
+
+effect fn appendHex(output: &mut Bytes, value: u64) -> () ! OutOfMemoryError ? &mut Allocator {
+  let mut digits: [u8; 16] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  let mut at = usize.ZERO
+  while at < 16 {
+    digits[at] = hexDigit(u64.bitAnd(u64.shiftRight(value, usize.toU64((15 - at) * 4)), 15))
+    at = at + usize.ONE
+  }
+  return run Bytes.append(&mut output.*, &digits)
+}
+
+/// Names each unit's object in `directory` by a digest of `identity` (the compiler's own
+/// identity, such as `clang --version` output with the compile flags) and the unit's text, and
+/// lists the units whose object is not there yet.
+pub effect fn place(directory: &Path, identity: &[u8], units: &[CodegenUnit]) -> UnitObjects
+  ! FileError | OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  run FileSystem.createDirectoriesRecursively(directory)
+  let mut placed = UnitObjects {objects: List<Path>.make(), missing: List<usize>.make()}
+  let mut at = usize.ZERO
+  while at < units.length {
+    let mut stream = ContentHash.stream()
+    ContentHash.append(&mut stream, identity)
+    ContentHash.appendByte(&mut stream, 0)
+    ContentHash.append(&mut stream, Bytes.asSlice(&units[at].text))
+    let digest = ContentHash.finish(move stream)
+    let mut name = Bytes.make()
+    run appendHex(&mut name, digest.high)
+    run appendHex(&mut name, digest.low)
+    run Bytes.append(&mut name, b".o")
+    let object = run Path.joinBytes(directory, Bytes.asSlice(&name))
+    if !run FileSystem.exists(&object) { run List<usize>.append(&mut placed.missing, at) }
+    run List<Path>.append(&mut placed.objects, move object)
+    at = at + usize.ONE
+  }
+  return move placed
+}
+
+/// The path a unit's object is compiled to before it is renamed over `object`.
+pub effect fn pending(object: &Path) -> Path ! FileError | OutOfMemoryError ? &mut Allocator {
+  let mut named = run Bytes.copy(Path.rawBytes(object))
+  run Bytes.append(&mut named, b".partial")
+  return run Path.fromBytes(Bytes.asSlice(&named))
+}
+
+/// Renames a unit's compiled object over its cached name; false when it cannot.
+pub effect fn publish(object: &Path) -> bool ! FileError | OutOfMemoryError ? &mut Allocator {
+  let compiled = run pending(object)
+  return run HostRename.replaceFile(&compiled, object)
+}
+
+/// Runs each of `commands`, a Clang path and then its arguments, on up to `workers` threads, and
+/// answers each command's exit status in order: -1 when it did not start or did not exit.
+pub effect fn runAll(commands: List<List<Bytes>>, workers: usize) -> List<i32> ! OutOfMemoryError | SpawnError ? &mut Allocator {
+  let count = List<List<Bytes>>.length(&commands)
+  let mut threads = workers
+  if threads > count { threads = count }
+  if threads == usize.ZERO { threads = usize.ONE }
+  // Worker `w` runs commands `w`, `w + threads`, and so on.
+  let mut batches = List<List<List<Bytes>>>.make()
+  while List<List<List<Bytes>>>.length(&batches) < threads { run List<List<List<Bytes>>>.append(&mut batches, List<List<Bytes>>.make()) }
+  let mut pending = move commands
+  let mut at = usize.ZERO
+  while List<List<Bytes>>.length(&pending) > usize.ZERO {
+    let command = List<List<Bytes>>.remove(&mut pending, usize.ZERO)
+    let mut writable = List<List<List<Bytes>>>.asMutSlice(&mut batches)
+    run List<List<Bytes>>.append(&mut writable[at % threads], move command)
+    at = at + usize.ONE
+  }
+  let mut handles = List<JoinHandle<List<i32>>>.make()
+  while List<List<List<Bytes>>>.length(&batches) > usize.ZERO {
+    let batch = List<List<List<Bytes>>>.remove(&mut batches, usize.ZERO)
+    let handle = run NativeThread.spawn(
+      fn() -> List<i32> {
+        return run runBatch(move batch)
+      }
+    )
+    run List<JoinHandle<List<i32>>>.append(&mut handles, move handle)
+  }
+  let mut finished = List<List<i32>>.make()
+  while List<JoinHandle<List<i32>>>.length(&handles) > usize.ZERO {
+    let handle = List<JoinHandle<List<i32>>>.remove(&mut handles, usize.ZERO)
+    run List<List<i32>>.append(&mut finished, handle.join())
+  }
+  let mut statuses = List<i32>.make()
+  at = usize.ZERO
+  while at < count {
+    let results = List<List<i32>>.asSlice(&finished)
+    let mut status: i32 = -1
+    // A worker that failed early answers fewer statuses than it had commands.
+    if at / threads < List<i32>.length(&results[at % threads]) { status = List<i32>.get(&results[at % threads], at / threads) }
+    run List<i32>.append(&mut statuses, status)
+    at = at + usize.ONE
+  }
+  return move statuses
+}
+
+// A worker thread's commands, run one at a time with services of its own.
+effect fn runBatch(batch: List<List<Bytes>>) -> List<i32> {
+  let mut allocator = Allocator.systemAllocatorProvider()
+  let mut process = OsChildProcess.make()
+  let ran = run Effect.result(
+    runEach(&batch) |> Effect.provideMut<ChildProcess>(&mut process)
+      |> Effect.provideMut<Allocator>(&mut allocator)
+  )
+  return match move ran {
+    Result<List<i32>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<i32>, FileError | OutOfMemoryError>.Failure {error: _} => List<i32>.make()
+  }
+}
+
+effect fn runEach(batch: &List<List<Bytes>>) -> List<i32> ! FileError | OutOfMemoryError ? &mut ChildProcess | &mut Allocator {
+  let commands = List<List<Bytes>>.asSlice(batch)
+  let mut statuses = List<i32>.make()
+  let mut at = usize.ZERO
+  while at < commands.length {
+    let parts = List<Bytes>.asSlice(&commands[at])
+    let program = run Path.fromBytes(Bytes.asSlice(&parts[usize.ZERO]))
+    let mut request = run ChildProcess.request(&program)
+    let mut part = usize.ONE
+    while part < parts.length {
+      run ChildProcess.addArgumentBytes(&mut request, Bytes.asSlice(&parts[part]))
+      part = part + usize.ONE
+    }
+    let submitted = run Effect.result(ChildProcess.submit(&request))
+    let mut status: i32 = -1
+    match move submitted {
+      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Success {value: outcome} => {
+        if let Option<i32>.Some {value} = move ChildProcess.exitCode(&outcome) { status = value }
+      }
+      Result<ProcessOutcome, ProcessError | OutOfMemoryError>.Failure {error} => match move error {
+        ProcessError failed => { drop failed }
+        OutOfMemoryError exhausted => { fail move exhausted }
+      }
+    }
+    run List<i32>.append(&mut statuses, status)
+    at = at + usize.ONE
+  }
+  return move statuses
+}
+
+/// Removes the objects and leftover partial compiles in `directory` that no path of `kept` names,
+/// once they outnumber `kept`. Waiting until then bounds the cache at about two builds' objects
+/// while rarely removing an object that another build of the same output, started meanwhile from
+/// other sources, is about to link.
+pub effect fn prune(directory: &Path, kept: &[Path]) -> () ! OutOfMemoryError ? &mut FileSystem | &mut Allocator {
+  let listed = run Effect.result(FileSystem.listDirectory(directory))
+  let entries = match move listed {
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Success {value} => move value
+    Result<List<DirectoryEntry>, FileError | OutOfMemoryError>.Failure {error} => match move error {
+      FileError failure => {
+        drop failure
+        return ()
+      }
+      OutOfMemoryError exhausted => { fail move exhausted }
+    }
+  }
+  let found = List<DirectoryEntry>.asSlice(&entries)
+  let mut stale = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < found.length {
+    let mut used = false
+    let mut keep = usize.ZERO
+    while keep < kept.length && !used {
+      used = same(Path.rawBytes(&found[at].path), Path.rawBytes(&kept[keep]))
+      keep = keep + usize.ONE
+    }
+    if !used { run List<usize>.append(&mut stale, at) }
+    at = at + usize.ONE
+  }
+  if List<usize>.length(&stale) <= kept.length { return () }
+  let removable = List<usize>.asSlice(&stale)
+  at = usize.ZERO
+  while at < removable.length {
+    let removed = run Effect.result(FileSystem.removeFile(&found[removable[at]].path))
+    drop removed
+    at = at + usize.ONE
+  }
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length { return false }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] { return false }
+    at = at + usize.ONE
+  }
+  return true
+}

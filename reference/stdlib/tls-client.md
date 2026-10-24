@@ -685,6 +685,24 @@ EndInput
 
 Transport input end.
 
+<a id="ClientOperation.impl.Debug"></a>
+
+## Implementation `Debug for ClientOperation`
+
+```silk
+impl Debug for ClientOperation
+```
+
+<a id="ClientOperation.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `FeedInput`.
+
 <a id="ProtocolReason"></a>
 
 ## `ProtocolReason`
@@ -804,6 +822,24 @@ InternalState
 ```
 
 The client reached an impossible private transition.
+
+<a id="ProtocolReason.impl.Debug"></a>
+
+## Implementation `Debug for ProtocolReason`
+
+```silk
+impl Debug for ProtocolReason
+```
+
+<a id="ProtocolReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Record`.
 
 <a id="TlsLimitKind"></a>
 
@@ -1005,6 +1041,24 @@ CertificateProfile
 
 The configured semantic certificate-profile policy.
 
+<a id="TlsLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for TlsLimitKind`
+
+```silk
+impl Debug for TlsLimitKind
+```
+
+<a id="TlsLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `HandshakeBodyBytes`.
+
 <a id="CertificateIdentityFailure"></a>
 
 ## `CertificateIdentityFailure`
@@ -1055,6 +1109,24 @@ pub error: IdentityError
 
 The complete HTTPS identity failure.
 
+<a id="CertificateIdentityFailure.impl.Debug"></a>
+
+## Implementation `Debug for CertificateIdentityFailure`
+
+```silk
+impl Debug for CertificateIdentityFailure
+```
+
+<a id="CertificateIdentityFailure.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Decode { ... }`.
+
 <a id="CertificateVerifyFailure"></a>
 
 ## `CertificateVerifyFailure`
@@ -1085,6 +1157,26 @@ pub error: P256SignatureError
 
 The exact primitive failure.
 
+<a id="CertificateVerifyFailure.EcdsaP384"></a>
+
+### `EcdsaP384`
+
+```silk
+EcdsaP384
+```
+
+ECDSA-P384/SHA-384 verification failed.
+
+<a id="CertificateVerifyFailure.EcdsaP384.error"></a>
+
+#### Field `error`
+
+```silk
+pub error: P384SignatureError
+```
+
+The exact primitive failure.
+
 <a id="CertificateVerifyFailure.Rsa"></a>
 
 ### `Rsa`
@@ -1104,6 +1196,24 @@ pub error: RsaError
 ```
 
 The exact primitive failure.
+
+<a id="CertificateVerifyFailure.impl.Debug"></a>
+
+## Implementation `Debug for CertificateVerifyFailure`
+
+```silk
+impl Debug for CertificateVerifyFailure
+```
+
+<a id="CertificateVerifyFailure.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Ecdsa { ... }`.
 
 <a id="TlsError"></a>
 
@@ -1356,6 +1466,24 @@ NoApplicationProtocol
 
 The server omits a required ALPN selection or selects a protocol that was not offered.
 
+<a id="TlsError.impl.Debug"></a>
+
+## Implementation `Debug for TlsError`
+
+```silk
+impl Debug for TlsError
+```
+
+<a id="TlsError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `PeerAlert { ... }`.
+
 <a id="CertificateVerifyFailure.impl.Copy"></a>
 
 ## Implementation `Copy for CertificateVerifyFailure`
@@ -1495,9 +1623,10 @@ works in two steps: write [`Client.pendingOutput`](#Client.impl.pendingOutput) t
 [`ClientLimits`](#ClientLimits) bound all memory and work.
 
 It supports TLS 1.3 only, with the cipher suites ChaCha20-Poly1305, AES-128-GCM, and
-AES-256-GCM, and the key exchange groups X25519 and P-256. It checks the certificate chain
-against your `TrustSnapshot`, the host name of your `ReferenceIdentity`, the CertificateVerify
-signature, and the Finished message. It gives no application data before all checks pass.
+AES-256-GCM, the key exchange groups X25519 and P-256, and server keys ECDSA P-256, ECDSA P-384,
+and RSA (PSS with SHA-256). It checks the certificate chain against your `TrustSnapshot`, the
+host name of your `ReferenceIdentity`, the CertificateVerify signature, and the Finished
+message. It gives no application data before all checks pass.
 
 ### Gotchas
 A [`TlsError`](#TlsError) is permanent for the client. Dropping the client does not send `close_notify`.

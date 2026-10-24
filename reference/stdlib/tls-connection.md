@@ -302,6 +302,24 @@ HandshakeTimeout
 
 The handshake did not complete before its deadline.
 
+<a id="ConnectionError.impl.Debug"></a>
+
+## Implementation `Debug for ConnectionError`
+
+```silk
+impl Debug for ConnectionError
+```
+
+<a id="ConnectionError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `Tls { ... }`.
+
 <a id="ConnectionOptions"></a>
 
 ## `ConnectionOptions`

@@ -133,42 +133,9 @@ differences=<count>`, and fails the check when they differ.
 
 ## Toolchains
 
-Every `silk` is also a version manager. Installed toolchains live in `$SILK_HOME` (default
-`~/.silk`):
-
-```text
-~/.silk/
-  bin/silk                     link to the default toolchain's compiler (install.sh, toolchain default)
-  settings.toml                default = "<version>", optional auto-install = true
-  toolchains/<version>/bin/silk
-  toolchains/<version>/lib/silk/stdlib
-```
-
-A command selects a toolchain by the first of these that applies: `silk +<version>`,
-`SILK_TOOLCHAIN`, `silk-version` in the nearest `silk.toml` (the workspace that lists the package
-first, then the package; `0.0.0` means unpinned), `default` in `settings.toml`, and finally the
-running compiler. When the selection is another installed toolchain, `silk` sets
-`SILK_TOOLCHAIN` to it and replaces itself with that compiler, which then runs the command. A
-compiler never re-executes itself, `SILK_TOOLCHAIN=local` keeps the running compiler, a local
-`0.0.0` build follows only `+<version>`, and `silk toolchain` always runs in the compiler you
-started. A missing selection exits with status 3 and names the install command, unless
-`SILK_AUTO_INSTALL=1` or `auto-install = true` installs it first. For `silk lsp`, so editors that
-only spawn the server do not see it crash, a missing selection instead starts a server with no
-capabilities that answers `initialize`, shows the message as an error, and exits on `exit`.
-
-`silk toolchain install` downloads `silk-<version>-<target>.tar.gz` and its `.minisig` from the
-GitHub release, or from `$SILK_TOOLCHAIN_MIRROR/v<version>/` when set. Installation needs a valid
-signature by the release key with the trusted comment `silk v<version> <archive>`, and a
-`bin/silk` whose SHA-256 matches the release's `native-seed.json`. The archive is unpacked into a
-hidden staging directory under `toolchains/` and renamed into place, so an interrupted install
-leaves no half-written toolchain. Installs hold an `flock` on `$SILK_HOME/.install.lock`, so two
-concurrent installs of a release download it once. Network failures exit with status 4 and failed
-checks with 5.
-
-`install` and `use` also take `latest`, the newest stable release, and `latest --dev` (or `dev`),
-the newest release of any kind. They read the GitHub release
-listing, retrying up to four times when it fails or comes back empty, and `use` pins the full
-version the alias named.
+The compiler, `silkc` in a release, knows nothing about Silk versions: it runs itself. The
+[silk tool](../tool) chooses and installs versions and forwards each command to the selected
+compiler with `SILK_TOOLCHAIN` and `SILK_HOME` set.
 
 ## Profiling with Tracy
 

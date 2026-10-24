@@ -339,6 +339,24 @@ A URI that owns its text and its parsed ranges.
 [`OwnedUri.view`](#OwnedUri.impl.view) returns a [`Uri`](#Uri) that borrows it, and the view cannot live longer than the
 `OwnedUri`.
 
+<a id="OwnedUri.impl.Debug"></a>
+
+## Implementation `Debug for OwnedUri`
+
+```silk
+impl Debug for OwnedUri
+```
+
+<a id="OwnedUri.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the text, as `OwnedUri { text: "https://example.com/" }`.
+
 <a id="OwnedUri.impl"></a>
 
 ## Implementation `OwnedUri`

@@ -27,8 +27,9 @@ The head and its fields borrow the parser. Call `copy` to keep them after a `res
 
 ## Gotchas
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 ## Examples
 ### Parse a response head
@@ -411,6 +412,24 @@ LineEnding
 
 A line ending.
 
+<a id="ParseComponent.impl.Debug"></a>
+
+## Implementation `Debug for ParseComponent`
+
+```silk
+impl Debug for ParseComponent
+```
+
+<a id="ParseComponent.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Parser`.
+
 <a id="ParseLimitKind"></a>
 
 ## `ParseLimitKind`
@@ -521,6 +540,24 @@ OwnedBytes
 
 `maxOwnedBytes`: the memory of the parser.
 
+<a id="ParseLimitKind.impl.Debug"></a>
+
+## Implementation `Debug for ParseLimitKind`
+
+```silk
+impl Debug for ParseLimitKind
+```
+
+<a id="ParseLimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `HeadBytes`.
+
 <a id="ParseReason"></a>
 
 ## `ParseReason`
@@ -540,7 +577,7 @@ InvalidStartLine
 ```
 
 The start line does not have the form `METHOD SP target SP version` or `version SP status SP
-reason`.
+reason`, or `version SP status` with no reason.
 
 <a id="ParseReason.UnsupportedVersion"></a>
 
@@ -650,7 +687,8 @@ A field has a space or a tab between its name and the `:`.
 ObsFold
 ```
 
-A field line starts with a space or a tab. Folded lines are not accepted.
+A field line starts with a space or a tab. Requests do not accept folded lines; a response
+accepts one only after its first field, and joins it to that field with spaces.
 
 <a id="ParseReason.MissingHost"></a>
 
@@ -761,6 +799,24 @@ head.
 impl Copy for ParseReason
 ```
 
+<a id="ParseReason.impl.Debug"></a>
+
+## Implementation `Debug for ParseReason`
+
+```silk
+impl Debug for ParseReason
+```
+
+<a id="ParseReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidStartLine`.
+
 <a id="ParseError"></a>
 
 ## `ParseError`
@@ -822,6 +878,24 @@ pub fieldIndex: Option<usize>
 
 The position of the field, from 0, when the error is in a field.
 
+<a id="ParseError.impl.Debug"></a>
+
+## Implementation `Debug for ParseError`
+
+```silk
+impl Debug for ParseError
+```
+
+<a id="ParseError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ParseError { reason: ..., component: ..., ... }`.
+
 <a id="validateLimits"></a>
 
 ## `validateLimits`
@@ -858,8 +932,9 @@ failed until `reset`.
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="ResponseParser"></a>
 
@@ -882,8 +957,9 @@ failed until `reset`.
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="RequestHead"></a>
 
@@ -1364,8 +1440,9 @@ Parses a request head from the start of `input`. The bytes after the head start 
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="parseResponse"></a>
 
@@ -1384,8 +1461,9 @@ Parses a response head from the start of `input`. The bytes after the head start
 ### Gotchas
 
 The parser is strict. Lines must end with CRLF, and the start line uses one space between its
-parts. These fail: a bare LF, a space before `:` in a field, a folded line, empty lines before
-the start line, and HTTP/0.9.
+parts. These fail: a bare LF, a space before `:` in a field, a folded request line, empty lines
+before the start line, and HTTP/0.9. A folded response field is joined with spaces.
+A status line with no reason phrase may leave out the space after the code: `HTTP/1.1 200`.
 
 <a id="requestSerializedSize"></a>
 

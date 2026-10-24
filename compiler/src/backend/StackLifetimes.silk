@@ -1,0 +1,584 @@
+//! Stack lifetime markers for the temporaries and named locals of one ordinary instance.
+//!
+//! # Details
+//!
+//! Every MIR local gets its own `alloca`. Without lifetime markers LLVM cannot share stack slots
+//! between locals whose lives do not overlap, so a function that lowers many expressions keeps a
+//! slot for every temporary it ever names: `Mir.expression` alone needed about 23 KB per active
+//! frame, which bounded how deeply the compiler could recurse over nested syntax.
+//!
+//! This analysis marks a local only when its life is simple and fully visible in MIR: it is a
+//! temporary or a named binding of a type other than unit, its address is never taken, nothing
+//! writes part of it, and exactly one statement or call writes it whole. Its life starts just
+//! before that write and ends right after the last statement that is followed by no further read,
+//! or on entry to each successor where it is dead when a terminator was its last mention. Every other local keeps a slot for the whole function.
+//! A suspendable instance keeps its frame plan and gets no markers.
+
+import backend.Mir {
+  AggregateField,
+  AssemblyFragment,
+  Block,
+  Callee,
+  Diagnostics,
+  FailureEdge,
+  Local,
+  LocalKind,
+  MirFunction,
+  Operand,
+  Place,
+  Projection,
+  Rvalue,
+  Statement,
+  Terminator,
+}
+import semantic.Type {Type}
+import silk.box {Box}
+import silk.allocator {Allocator, OutOfMemoryError}
+import silk.option {Option}
+import silk.ownership {Copy}
+import silk.shared {Shared}
+import silk.u64
+import silk.usize
+import silk.list {List}
+
+/// Starts a local's life before statement `at`, or ends it after `at`; `at` equal to the block's
+/// statement count names its terminator.
+pub struct Marker {
+  pub at: usize
+  pub local: usize
+}
+
+impl Copy for Marker {}
+
+/// The markers of one block, each list in statement order.
+pub struct BlockMarkers {
+  /// Locals whose life ends on entry to the block, before its first statement.
+  pub entry: List<usize>
+  pub starts: List<Marker>
+  pub ends: List<Marker>
+}
+
+/// The markers of every block of one instance, by block index.
+pub struct Markers {
+  pub blocks: List<BlockMarkers>
+}
+
+// The locals one statement or terminator reads, writes whole, writes in part, or exposes by address.
+struct Mention {
+  uses: List<usize>
+  whole: List<usize>
+  partial: List<usize>
+  escapes: List<usize>
+}
+
+fn bitWord(local: usize) -> usize { return local / 64 }
+
+fn bitMask(local: usize) -> u64 { return u64.shiftLeft(1, usize.toU64(local - local / 64 * 64)) }
+
+fn isSet(set: &[u64], local: usize) -> bool {
+  return u64.bitAnd(set[bitWord(local)], bitMask(local)) != 0
+}
+
+fn setBit(set: &mut [u64], local: usize) -> () {
+  set[bitWord(local)] = u64.bitOr(set[bitWord(local)], bitMask(local))
+}
+
+fn clearBit(set: &mut [u64], local: usize) -> () {
+  set[bitWord(local)] = u64.bitAnd(set[bitWord(local)], u64.bitNot(bitMask(local)))
+}
+
+effect fn zeros(count: usize) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<u64>.append(&mut result, 0)
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn copyWords(values: &[u64]) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<u64>.make()
+  let mut at = usize.ZERO
+  while at < values.length {
+    run List<u64>.append(&mut result, values[at])
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn usePlace(mention: &mut Mention, place: &Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<usize>.append(&mut mention.uses, place.local)
+  let steps = List<Projection>.asSlice(&place.projections)
+  let mut at = usize.ZERO
+  while at < steps.length {
+    match &steps[at] {
+      Projection.Index {local} => run List<usize>.append(&mut mention.uses, local)
+      Projection.Field {..} => {}
+      Projection.Payload {..} => {}
+      Projection.VariantField {..} => {}
+      Projection.ConstIndex {..} => {}
+      Projection.Deref => {}
+    }
+    at = at + usize.ONE
+  }
+}
+
+// A place whose address the statement produces: the local's storage may be reached later through
+// the result, so its life cannot end at its last mention.
+effect fn escapePlace(mention: &mut Mention, place: &Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  run usePlace(&mut mention.*, place)
+  run List<usize>.append(&mut mention.escapes, place.local)
+}
+
+effect fn useOperand(mention: &mut Mention, operand: &Operand) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &operand.* {
+    Operand.Copy {place} => run usePlace(&mut mention.*, &place)
+    Operand.Move {place} => run usePlace(&mut mention.*, &place)
+    // Constants name no local. Listed one by one so a new operand must be classified here.
+    Operand.Integer {..} => {}
+    Operand.Float {..} => {}
+    Operand.Boolean {..} => {}
+    Operand.Unit => {}
+    Operand.StaticBytes {..} => {}
+    Operand.StaticText {..} => {}
+    Operand.Null {..} => {}
+  }
+}
+
+effect fn useFields(mention: &mut Mention, fields: &List<AggregateField>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<AggregateField>.asSlice(fields)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run useOperand(&mut mention.*, &listed[at].value)
+    at = at + usize.ONE
+  }
+}
+
+effect fn useOperands(mention: &mut Mention, operands: &List<Operand>) -> () ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Operand>.asSlice(operands)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    run useOperand(&mut mention.*, &listed[at])
+    at = at + usize.ONE
+  }
+}
+
+effect fn useRvalue(mention: &mut Mention, value: &Rvalue) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &value.* {
+    Rvalue.Aggregate {fields} => run useFields(&mut mention.*, &fields)
+    Rvalue.Slice {data, count} => {
+      run useOperand(&mut mention.*, &data)
+      run useOperand(&mut mention.*, &count)
+    }
+    Rvalue.SliceLength {place} => run usePlace(&mut mention.*, &place)
+    Rvalue.SliceData {place} => run usePlace(&mut mention.*, &place)
+    Rvalue.PointerOffset {pointer, index, ..} => {
+      run useOperand(&mut mention.*, &pointer)
+      run useOperand(&mut mention.*, &index)
+    }
+    Rvalue.Use {value: used} => run useOperand(&mut mention.*, &used)
+    Rvalue.Ref {place, ..} => run escapePlace(&mut mention.*, &place)
+    Rvalue.AddressOf {place, ..} => run escapePlace(&mut mention.*, &place)
+    Rvalue.Unary {value: used, ..} => run useOperand(&mut mention.*, &used)
+    Rvalue.Binary {left, right, ..} => {
+      run useOperand(&mut mention.*, &left)
+      run useOperand(&mut mention.*, &right)
+    }
+    Rvalue.ScalarBinary {left, right, ..} => {
+      run useOperand(&mut mention.*, &left)
+      run useOperand(&mut mention.*, &right)
+    }
+    Rvalue.ScalarUnary {value: used, ..} => run useOperand(&mut mention.*, &used)
+    Rvalue.Convert {value: used, ..} => run useOperand(&mut mention.*, &used)
+    Rvalue.Fits {value: used, ..} => run useOperand(&mut mention.*, &used)
+    Rvalue.AddressIntegerConversion {operand, ..} => run useOperand(&mut mention.*, &operand)
+    Rvalue.Bitcast {value: used, ..} => run useOperand(&mut mention.*, &used)
+    Rvalue.Discriminant {place} => run usePlace(&mut mention.*, &place)
+    Rvalue.Inject {value: used, ..} => run useOperand(&mut mention.*, &used)
+    Rvalue.Variant {fields, ..} => run useFields(&mut mention.*, &fields)
+    Rvalue.FunctionAddress {..} => {}
+    Rvalue.ContextOf {place} => run escapePlace(&mut mention.*, &place)
+    Rvalue.ContextHandle {address} => run useOperand(&mut mention.*, &address)
+    Rvalue.ForeignStatic {..} => {}
+    Rvalue.RunningPackage => {}
+    Rvalue.Assembly {fragment} => run useOperands(&mut mention.*, &Box<AssemblyFragment>.get(&fragment)[0].inputs)
+    Rvalue.Atomic {operands, ..} => run useOperands(&mut mention.*, &operands)
+    Rvalue.Vector {operands, ..} => run useOperands(&mut mention.*, &operands)
+  }
+}
+
+effect fn useDiagnostics(mention: &mut Mention, diagnostics: &Option<Diagnostics>) -> () ! OutOfMemoryError ? &mut Allocator {
+  if let Option<Diagnostics>.Some {value} = &diagnostics.* {
+    run useOperand(&mut mention.*, Diagnostics.observer(&value))
+    run useOperand(&mut mention.*, Diagnostics.cause(&value))
+    run useOperand(&mut mention.*, Diagnostics.site(&value))
+  }
+}
+
+// A written place: a whole local is a definition, and a projected one reads and updates the rest.
+effect fn writePlace(mention: &mut Mention, place: &Place) -> () ! OutOfMemoryError ? &mut Allocator {
+  if List<Projection>.length(&place.projections) == usize.ZERO {
+    run List<usize>.append(&mut mention.whole, place.local)
+    return ()
+  }
+  run usePlace(&mut mention.*, place)
+  run List<usize>.append(&mut mention.partial, place.local)
+}
+
+fn emptyMention() -> Mention {
+  return Mention {uses: List<usize>.make(), whole: List<usize>.make(), partial: List<usize>.make(), escapes: List<usize>.make()}
+}
+
+effect fn statementEffect(statement: &Statement) -> Mention ! OutOfMemoryError ? &mut Allocator {
+  let mut mention = emptyMention()
+  match &statement.* {
+    Statement.Assign {destination, value, ..} => {
+      run useRvalue(&mut mention, &value)
+      run writePlace(&mut mention, &destination)
+    }
+    Statement.Drop {destination, diagnostics, ..} => {
+      run usePlace(&mut mention, &destination)
+      run useDiagnostics(&mut mention, &diagnostics)
+    }
+    Statement.FailureContext {destination, source, ..} => {
+      run escapePlace(&mut mention, &destination)
+      if let Option<Place>.Some {value: from} = &source { run escapePlace(&mut mention, &from) }
+    }
+    Statement.SetContextHandle {address, value, ..} => {
+      run useOperand(&mut mention, &address)
+      run useOperand(&mut mention, &value)
+    }
+  }
+  return move mention
+}
+
+effect fn terminatorEffect(terminator: &Terminator) -> Mention ! OutOfMemoryError ? &mut Allocator {
+  let mut mention = emptyMention()
+  match &terminator.* {
+    // Every variant is listed, so a new terminator does not compile until its operands are read
+    // here: an operand left out would let a local's life end before the terminator reads it.
+    Terminator.Goto {..} => {}
+    Terminator.Return {..} => {}
+    Terminator.Fail {..} => {}
+    Terminator.Trap {..} => {}
+    Terminator.Unreachable {..} => {}
+    Terminator.Relinquish {..} => {}
+    Terminator.Abandon {..} => {}
+    Terminator.Branch {condition, ..} => run useOperand(&mut mention, &condition)
+    Terminator.Call {callee, arguments, providers, diagnostics, destination, failure, ..} => {
+      match &callee {
+        Callee.Instance {..} => {}
+        Callee.Extern {..} => {}
+        Callee.Indirect {address} => run useOperand(&mut mention, &address)
+        Callee.NativeIndirect {address, ..} => run useOperand(&mut mention, &address)
+      }
+      run useOperands(&mut mention, &arguments)
+      run useOperands(&mut mention, &providers)
+      run useDiagnostics(&mut mention, &diagnostics)
+      run writePlace(&mut mention, &destination)
+      if let Option<FailureEdge>.Some {value: edge} = &failure { run writePlace(&mut mention, &edge.destination) }
+    }
+    Terminator.Switch {value, ..} => run useOperand(&mut mention, &value)
+    Terminator.TrapText {reason, ..} => run useOperand(&mut mention, &reason)
+  }
+  return move mention
+}
+
+// Applies one mention backward: what is live before it, from what is live after it.
+fn liveBefore(live: &mut List<u64>, mention: &Mention) -> () {
+  let whole = List<usize>.asSlice(&mention.whole)
+  let mut at = usize.ZERO
+  while at < whole.length {
+    clearBit(List<u64>.asMutSlice(&mut live.*), whole[at])
+    at = at + usize.ONE
+  }
+  let uses = List<usize>.asSlice(&mention.uses)
+  at = usize.ZERO
+  while at < uses.length {
+    setBit(List<u64>.asMutSlice(&mut live.*), uses[at])
+    at = at + usize.ONE
+  }
+}
+
+fn contains(values: &[usize], local: usize) -> bool {
+  let mut at = usize.ZERO
+  while at < values.length {
+    if values[at] == local { return true }
+    at = at + usize.ONE
+  }
+  return false
+}
+
+// Every local the mention names, read or written.
+effect fn mentioned(mention: &Mention) -> List<usize> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<usize>.make()
+  let uses = List<usize>.asSlice(&mention.uses)
+  let mut at = usize.ZERO
+  while at < uses.length {
+    if !contains(List<usize>.asSlice(&result), uses[at]) { run List<usize>.append(&mut result, uses[at]) }
+    at = at + usize.ONE
+  }
+  let whole = List<usize>.asSlice(&mention.whole)
+  at = usize.ZERO
+  while at < whole.length {
+    if !contains(List<usize>.asSlice(&result), whole[at]) { run List<usize>.append(&mut result, whole[at]) }
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+// The locals live on entry to each block, `words` words per block.
+effect fn liveness(function: &MirFunction, mentions: &[List<Mention>], words: usize) -> List<u64>
+! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut edges = List<List<usize>>.make()
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    run List<List<usize>>.append(&mut edges, run MirFunction.successors(function, at))
+    at = at + usize.ONE
+  }
+  let following = List<List<usize>>.asSlice(&edges)
+  let mut live = run zeros(blocks.length * words)
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut block = blocks.length
+    while block > usize.ZERO {
+      block = block - usize.ONE
+      let mut current = run liveOut(List<u64>.asSlice(&live), List<usize>.asSlice(&following[block]), words)
+      let listed = List<Mention>.asSlice(&mentions[block])
+      let mut step = listed.length
+      while step > usize.ZERO {
+        step = step - usize.ONE
+        liveBefore(&mut current, &listed[step])
+      }
+      let entry = List<u64>.asSlice(&current)
+      let sets = List<u64>.asMutSlice(&mut live)
+      let mut word = usize.ZERO
+      while word < words {
+        if sets[block * words + word] != entry[word] {
+          sets[block * words + word] = entry[word]
+          changed = true
+        }
+        word = word + usize.ONE
+      }
+    }
+  }
+  return move live
+}
+
+effect fn liveOut(live: &[u64], targets: &[usize], words: usize) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = run zeros(words)
+  let out = List<u64>.asMutSlice(&mut result)
+  let mut edge = usize.ZERO
+  while edge < targets.length {
+    let mut word = usize.ZERO
+    while word < words {
+      out[word] = u64.bitOr(out[word], live[targets[edge] * words + word])
+      word = word + usize.ONE
+    }
+    edge = edge + usize.ONE
+  }
+  return move result
+}
+
+// The mentions of each block: its statements in order, then its terminator.
+effect fn blockEffects(function: &MirFunction) -> List<List<Mention>> ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let mut result = List<List<Mention>>.make()
+  let mut at = usize.ZERO
+  while at < blocks.length {
+    let mut mentions = List<Mention>.make()
+    let statements = List<Statement>.asSlice(&blocks[at].statements)
+    let mut step = usize.ZERO
+    while step < statements.length {
+      run List<Mention>.append(&mut mentions, run statementEffect(&statements[step]))
+      step = step + usize.ONE
+    }
+    run List<Mention>.append(&mut mentions, run terminatorEffect(&blocks[at].terminator))
+    run List<List<Mention>>.append(&mut result, move mentions)
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+// Temporaries with one whole write, no partial write and no escaping address.
+effect fn candidates(function: &MirFunction, mentions: &[List<Mention>]) -> List<u64> ! OutOfMemoryError ? &mut Allocator {
+  let locals = List<Local>.asSlice(&function.locals)
+  let words = (locals.length + 63) / 64
+  let mut writes = List<usize>.make()
+  let mut at = usize.ZERO
+  while at < locals.length {
+    run List<usize>.append(&mut writes, usize.ZERO)
+    at = at + usize.ONE
+  }
+  let mut excluded = run zeros(words)
+  let mut block = usize.ZERO
+  while block < mentions.length {
+    let listed = List<Mention>.asSlice(&mentions[block])
+    let mut step = usize.ZERO
+    while step < listed.length {
+      let whole = List<usize>.asSlice(&listed[step].whole)
+      let mut index = usize.ZERO
+      while index < whole.length {
+        let counts = List<usize>.asMutSlice(&mut writes)
+        counts[whole[index]] = counts[whole[index]] + usize.ONE
+        index = index + usize.ONE
+      }
+      let partial = List<usize>.asSlice(&listed[step].partial)
+      index = usize.ZERO
+      while index < partial.length {
+        setBit(List<u64>.asMutSlice(&mut excluded), partial[index])
+        index = index + usize.ONE
+      }
+      let escapes = List<usize>.asSlice(&listed[step].escapes)
+      index = usize.ZERO
+      while index < escapes.length {
+        setBit(List<u64>.asMutSlice(&mut excluded), escapes[index])
+        index = index + usize.ONE
+      }
+      step = step + usize.ONE
+    }
+    block = block + usize.ONE
+  }
+  let mut result = run zeros(words)
+  let counts = List<usize>.asSlice(&writes)
+  at = usize.ZERO
+  while at < locals.length {
+    let ordinary = eligible(&locals[at].kind)
+    if ordinary && !unit(&locals[at].ty) && counts[at] == usize.ONE && !isSet(List<u64>.asSlice(&excluded), at) {
+      setBit(List<u64>.asMutSlice(&mut result), at)
+    }
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+// Only temporaries and named bindings are read and written solely through MIR operands and
+// places. The others are read implicitly by emission: `Return` and `Failure` at function exit,
+// the parameters and providers at entry, and the diagnostic locals by traps and calls. Drop
+// flags stay unmarked too. Every kind is listed so a new one is classified here.
+fn eligible(kind: &LocalKind) -> bool {
+  return match &kind.* {
+    LocalKind.Temp => true
+    LocalKind.User {..} => true
+    LocalKind.Return => false
+    LocalKind.Parameter {..} => false
+    LocalKind.Failure => false
+    LocalKind.Provider {..} => false
+    LocalKind.Observer => false
+    LocalKind.Cause => false
+    LocalKind.Site => false
+    LocalKind.DropFlag {..} => false
+  }
+}
+
+// A unit local has no storage to share, so it gets no markers.
+fn unit(ty: &Shared<Type>) -> bool {
+  return Shared<Type>.with<bool>(ty, fn(value: &Type) -> bool { return match &value.* { Type.Unit => true _ => false } })
+}
+
+// Drops every candidate that is live just before its own write: its value would come from an
+// earlier life, so a start there would discard it.
+effect fn dropLiveAtWrite(function: &MirFunction, mentions: &[List<Mention>], live: &[u64], words: usize, eligible: &mut List<u64>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let mut block = usize.ZERO
+  while block < mentions.length {
+    let targets = run MirFunction.successors(function, block)
+    let mut current = run liveOut(live, List<usize>.asSlice(&targets), words)
+    let listed = List<Mention>.asSlice(&mentions[block])
+    let mut step = listed.length
+    while step > usize.ZERO {
+      step = step - usize.ONE
+      liveBefore(&mut current, &listed[step])
+      let whole = List<usize>.asSlice(&listed[step].whole)
+      let mut index = usize.ZERO
+      while index < whole.length {
+        if isSet(List<u64>.asSlice(&current), whole[index]) { clearBit(List<u64>.asMutSlice(&mut eligible.*), whole[index]) }
+        index = index + usize.ONE
+      }
+    }
+    block = block + usize.ONE
+  }
+}
+
+effect fn emptyMarkers(count: usize) -> List<BlockMarkers> ! OutOfMemoryError ? &mut Allocator {
+  let mut result = List<BlockMarkers>.make()
+  let mut at = usize.ZERO
+  while at < count {
+    run List<BlockMarkers>.append(&mut result, BlockMarkers {entry: List<usize>.make(), starts: List<Marker>.make(), ends: List<Marker>.make()})
+    at = at + usize.ONE
+  }
+  return move result
+}
+
+effect fn reversed(markers: &List<Marker>) -> List<Marker> ! OutOfMemoryError ? &mut Allocator {
+  let listed = List<Marker>.asSlice(markers)
+  let mut result = List<Marker>.make()
+  let mut at = listed.length
+  while at > usize.ZERO {
+    at = at - usize.ONE
+    run List<Marker>.append(&mut result, listed[at])
+  }
+  return move result
+}
+
+/// Plans the lifetime markers of an ordinary instance's simple temporaries and named locals.
+pub effect fn plan(function: &MirFunction) -> Markers ! OutOfMemoryError ? &mut Allocator {
+  let blocks = List<Block>.asSlice(&function.blocks)
+  let words = (List<Local>.length(&function.locals) + 63) / 64
+  let mentions = run blockEffects(function)
+  let perBlock = List<List<Mention>>.asSlice(&mentions)
+  let live = run liveness(function, perBlock, words)
+  let liveSets = List<u64>.asSlice(&live)
+  let mut eligible = run candidates(function, perBlock)
+  run dropLiveAtWrite(function, perBlock, liveSets, words, &mut eligible)
+  let chosen = List<u64>.asSlice(&eligible)
+  let mut result = run emptyMarkers(blocks.length)
+  let mut block = usize.ZERO
+  while block < blocks.length {
+    let targets = run MirFunction.successors(function, block)
+    let successors = List<usize>.asSlice(&targets)
+    let mut current = run liveOut(liveSets, successors, words)
+    let listed = List<Mention>.asSlice(&perBlock[block])
+    let mut starts = List<Marker>.make()
+    let mut ends = List<Marker>.make()
+    let mut step = listed.length
+    while step > usize.ZERO {
+      step = step - usize.ONE
+      let terminator = step + usize.ONE == listed.length
+      let names = run mentioned(&listed[step])
+      let named = List<usize>.asSlice(&names)
+      let mut index = usize.ZERO
+      while index < named.length {
+        let local = named[index]
+        if isSet(chosen, local) && !isSet(List<u64>.asSlice(&current), local) {
+          if terminator {
+            let mut edge = usize.ZERO
+            while edge < successors.length {
+              let entry = &mut List<BlockMarkers>.asMutSlice(&mut result)[successors[edge]].entry
+              if !contains(List<usize>.asSlice(&entry.*), local) { run List<usize>.append(&mut entry.*, local) }
+              edge = edge + usize.ONE
+            }
+          } else {
+            run List<Marker>.append(&mut ends, Marker {at: step, local: local})
+          }
+        }
+        index = index + usize.ONE
+      }
+      let whole = List<usize>.asSlice(&listed[step].whole)
+      index = usize.ZERO
+      while index < whole.length {
+        if isSet(chosen, whole[index]) { run List<Marker>.append(&mut starts, Marker {at: step, local: whole[index]}) }
+        index = index + usize.ONE
+      }
+      liveBefore(&mut current, &listed[step])
+    }
+    let slot = &mut List<BlockMarkers>.asMutSlice(&mut result)[block]
+    slot.starts = run reversed(&starts)
+    slot.ends = run reversed(&ends)
+    block = block + usize.ONE
+  }
+  return Markers {blocks: move result}
+}

@@ -1,4 +1,5 @@
-//! UTF-8 text: owned strings, validation of bytes, and traversal one Unicode scalar at a time.
+//! UTF-8 text: owned strings, validation of bytes, search, splitting, trimming, and traversal one
+//! Unicode scalar at a time.
 //!
 //! # When to use
 //! Use the built-in `string` type for borrowed text, such as a literal or a view into a buffer. Use
@@ -12,6 +13,9 @@
 //! - [`String.copyUtf8`] checks bytes and copies them into a new [`String`].
 //! - [`String.fromBytes`] checks an owned `Bytes` value and keeps its storage, with no copy.
 //!   [`String.intoBytes`] gives the storage back as `Bytes`.
+//!
+//! [`String.find`], [`String.split`], [`String.trim`], and [`String.slice`] search and cut text
+//! without allocation. They return views of the input, and their offsets count UTF-8 bytes.
 //!
 //! A failed [`String.append`] or [`String.appendOwned`] leaves the string unchanged. Traversal with
 //! [`String.nextScalar`] gives Unicode scalar values and byte offsets. It does not give grapheme
@@ -87,10 +91,13 @@
 //! @category Text
 
 import silk.bool
+import silk.byte_search
 import silk.bytes { Bytes }
 import silk.char
 import silk.allocator { Allocator, OutOfMemoryError }
+import silk.format { Debug, Format, Formatter }
 import silk.option { Option }
+import silk.ownership { Copy }
 import silk.result { Result }
 import silk.arch.aarch64
 import silk.arch.wasm
@@ -98,10 +105,12 @@ import silk.arch.x86
 import silk.simd
 import silk.simd.mask16
 import silk.simd.u8x16
+import silk.slice { Slice }
 import silk.target { Arch, Target }
 import silk.u32
 import silk.u8
 import silk.usize
+import silk.writer { Writer, WriterError }
 
 /// Owned UTF-8 text. Dropping a `String` releases its storage.
 ///
@@ -117,6 +126,14 @@ import silk.usize
 /// visible character can be more than one scalar.
 pub struct String {
   bytes: Bytes
+}
+
+impl Debug for String {
+  /// Writes the text as a quoted string, like a `string`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    let text = String.view(self)
+    return run Debug.debug(&text, &mut formatter)
+  }
 }
 
 impl String {
@@ -298,6 +315,319 @@ impl String {
     return Intrinsic.stringByteLength(value)
   }
 
+  /// Returns `true` if `offset` is a valid place to cut `value`: the start of a scalar, or the end
+  /// of the text.
+  ///
+  /// # When to use
+  ///
+  /// Use `isCharBoundary` to check an offset before you give it to [`String.slice`], when the
+  /// offset does not come from a search such as [`String.find`].
+  ///
+  /// # Details
+  ///
+  /// Offsets count UTF-8 bytes. Offset `0` and offset `String.byteLength(value)` are always
+  /// boundaries. An offset after the end gives `false`.
+  pub fn isCharBoundary(value: string, offset: usize) -> bool {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    if offset == bytes.length { return true }
+    if offset > bytes.length { return false }
+    return continuation(bytes[offset]) == false
+  }
+
+  /// Returns the `length` bytes of `value` that start at byte `offset`, as a `string` view. This
+  /// function does not allocate or copy.
+  ///
+  /// # When to use
+  ///
+  /// Use `slice` to cut text at offsets from [`String.find`], [`String.findLast`], or
+  /// [`String.scalarByteOffset`]. Those offsets are always at the start of a scalar.
+  ///
+  /// # Details
+  ///
+  /// Offsets and lengths count UTF-8 bytes, not characters. The view borrows `value` and has the
+  /// same lifetime. `slice(value, String.byteLength(value), 0)` is a valid empty view.
+  ///
+  /// # Gotchas
+  ///
+  /// The program traps if the range does not fit in `value`, or if `offset` or `offset + length`
+  /// falls inside a multi-byte scalar. Check an offset of unknown origin with
+  /// [`String.isCharBoundary`] first.
+  ///
+  /// # Examples
+  ///
+  /// ## Take a word out of a sentence
+  ///
+  /// ```silk
+  /// import silk.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   // "é" is two bytes, so "café" ends at byte 5.
+  ///   let text = "café au lait"
+  ///   if String.slice(text, 0, 5) != "café" || String.slice(text, 6, 2) != "au" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn slice(value: string, offset: usize, length: usize) -> string {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let part = Slice.view<u8>(bytes, offset, length)
+    if !String.isCharBoundary(value, offset) || !String.isCharBoundary(value, offset + length) {
+      Intrinsic.trap("String.slice: the range does not start and end on character boundaries")
+    }
+    return unsafe String.fromUtf8Unchecked(part)
+  }
+
+  /// Returns `true` if `value` begins with `prefix`. Every text begins with the empty string.
+  ///
+  /// # Details
+  ///
+  /// The comparison is exact, byte for byte. It does not ignore case and does not normalize
+  /// Unicode, so `"é"` written as one scalar does not begin with `"e"`.
+  pub fn startsWith(value: string, prefix: string) -> bool {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let wanted = Intrinsic.stringUtf8Bytes(prefix)
+    if wanted.length > bytes.length { return false }
+    return bytesMatchAt(bytes, usize.ZERO, wanted)
+  }
+
+  /// Returns `true` if `value` ends with `suffix`. Every text ends with the empty string.
+  ///
+  /// # Details
+  ///
+  /// The comparison is exact, byte for byte. It does not ignore case and does not normalize
+  /// Unicode.
+  pub fn endsWith(value: string, suffix: string) -> bool {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let wanted = Intrinsic.stringUtf8Bytes(suffix)
+    if wanted.length > bytes.length { return false }
+    return bytesMatchAt(bytes, bytes.length - wanted.length, wanted)
+  }
+
+  /// Returns `true` if `needle` occurs anywhere in `value`. Every text contains the empty string.
+  ///
+  /// # Details
+  ///
+  /// The comparison is exact, byte for byte. It does not ignore case and does not normalize
+  /// Unicode. The search compares sixteen bytes at a time on CPUs with 128-bit vectors.
+  pub fn contains(value: string, needle: string) -> bool {
+    return match String.find(value, needle) {
+      Option<usize>.Some { value: found } => true
+      Option<usize>.None => false
+    }
+  }
+
+  /// Returns the byte offset of the first occurrence of `needle` in `value`, or `None`.
+  ///
+  /// # Details
+  ///
+  /// The offset counts UTF-8 bytes and is always the start of a scalar, so it can go straight to
+  /// [`String.slice`]. An empty `needle` occurs at offset `0`. The comparison is exact, byte for
+  /// byte, with no case folding or Unicode normalization. The search compares sixteen bytes at a
+  /// time on CPUs with 128-bit vectors and does not allocate.
+  ///
+  /// # Examples
+  ///
+  /// ## Read the value of a setting
+  ///
+  /// ```silk
+  /// import silk.option { Option }
+  /// import silk.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let line = "name = Silk"
+  ///   let at = match String.find(line, " = ") {
+  ///     Option<usize>.Some { value } => value
+  ///     Option<usize>.None => { return 1 }
+  ///   }
+  ///   let start = at + 3
+  ///   let value = String.slice(line, start, String.byteLength(line) - start)
+  ///   if at != 4 || value != "Silk" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn find(value: string, needle: string) -> Option<usize> {
+    return byte_search.findSlice(Intrinsic.stringUtf8Bytes(value), Intrinsic.stringUtf8Bytes(needle))
+  }
+
+  /// Returns the byte offset of the last occurrence of `needle` in `value`, or `None`.
+  ///
+  /// # Details
+  ///
+  /// The offset counts UTF-8 bytes and is always the start of a scalar, so it can go straight to
+  /// [`String.slice`]. An empty `needle` occurs at offset `String.byteLength(value)`. The
+  /// comparison is exact, byte for byte, with no case folding or Unicode normalization. This
+  /// function does not allocate.
+  ///
+  /// # Examples
+  ///
+  /// ## Take the extension of a file name
+  ///
+  /// ```silk
+  /// import silk.option { Option }
+  /// import silk.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let name = "archive.tar.gz"
+  ///   let dot = match String.findLast(name, ".") {
+  ///     Option<usize>.Some { value } => value
+  ///     Option<usize>.None => { return 1 }
+  ///   }
+  ///   let extension = String.slice(name, dot + 1, String.byteLength(name) - dot - 1)
+  ///   if extension != "gz" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn findLast(value: string, needle: string) -> Option<usize> {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let wanted = Intrinsic.stringUtf8Bytes(needle)
+    if wanted.length > bytes.length { return Option<usize>.none() }
+    if wanted.length == usize.ZERO { return Option<usize>.some(bytes.length) }
+    let last = wanted.length - usize.ONE
+    // Every match ends with the last byte of the needle; find those from the end.
+    let mut end = bytes.length
+    while end >= wanted.length {
+      let window = Slice.view<u8>(bytes, last, end - last)
+      let hit = match byte_search.findLast(window, wanted[last]) {
+        Option<usize>.Some { value: found } => found
+        Option<usize>.None => { return Option<usize>.none() }
+      }
+      let start = hit
+      if bytesMatchAt(bytes, start, wanted) {
+        return Option<usize>.some(start)
+      }
+      end = start + last
+    }
+    return Option<usize>.none()
+  }
+
+  /// Returns a [`Split`] that gives the pieces of `value` between occurrences of `separator`, one
+  /// at a time.
+  ///
+  /// # When to use
+  ///
+  /// Use `split` to read fields separated by a comma, words separated by a space, or lines
+  /// separated by `"\n"`. Read the pieces with [`Split.next`]. Use [`Split.remainder`] to take
+  /// the rest of the text in one piece, for example the value after the first `=`.
+  ///
+  /// # Details
+  ///
+  /// The pieces are views of `value`, with its lifetime, and this function does not allocate. A
+  /// separator at the start or the end of `value`, or two separators in a row, give an empty piece,
+  /// so `"a,,b"` split on `","` gives `"a"`, `""`, and `"b"`, and an empty `value` gives one empty
+  /// piece. A [`Split`] is `Copy`, so copying it starts a second, independent reading.
+  ///
+  /// # Gotchas
+  ///
+  /// An empty `separator` matches nowhere, so the only piece is all of `value`. Text with Windows
+  /// line endings split on `"\n"` keeps a `"\r"` at the end of each line; [`String.trimEnd`]
+  /// removes it.
+  ///
+  /// # Examples
+  ///
+  /// ## Add up comma-separated numbers
+  ///
+  /// ```silk
+  /// import silk.format { ParseError }
+  /// import silk.i32
+  /// import silk.option { Option }
+  /// import silk.result { Result }
+  /// import silk.string { String, Split }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut fields = String.split("4, 5,6", ",")
+  ///   let mut total = 0
+  ///   while true {
+  ///     let field = match Split.next(&mut fields) {
+  ///       Option<string>.Some { value } => value
+  ///       Option<string>.None => { break }
+  ///     }
+  ///     total = total + (i32.parse(String.trim(field)) |> Result<i32, ParseError>.unwrapOr(0))
+  ///   }
+  ///   if total != 15 {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn split<'text, 'separator>(value: string<'text>, separator: string<'separator>) -> Split<'text, 'separator> {
+    return Split<'text, 'separator> { rest: value, separator: separator, finished: false }
+  }
+
+  /// Returns `value` without the whitespace at its start and its end. This function does not
+  /// allocate or copy.
+  ///
+  /// # Details
+  ///
+  /// Whitespace is every scalar with the Unicode `White_Space` property: the ASCII space, tab, line
+  /// feed, vertical tab, form feed, and carriage return, and also U+0085, the no-break space
+  /// U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. Whitespace
+  /// inside the text stays. The result is a view of `value` with the same lifetime.
+  ///
+  /// # Examples
+  ///
+  /// ## Clean up a line of input
+  ///
+  /// ```silk
+  /// import silk.string { String }
+  ///
+  /// pub fn main() -> i32 {
+  ///   if String.trim("\t  hello world \r\n") != "hello world" || String.trim("   ") != "" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn trim(value: string) -> string {
+    return String.trimEnd(String.trimStart(value))
+  }
+
+  /// Returns `value` without the whitespace at its start. This function does not allocate or copy.
+  ///
+  /// # Details
+  ///
+  /// Whitespace is every scalar with the Unicode `White_Space` property: the ASCII space, tab, line
+  /// feed, vertical tab, form feed, and carriage return, and also U+0085, the no-break space
+  /// U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. The result is a
+  /// view of `value` with the same lifetime.
+  pub fn trimStart(value: string) -> string {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let mut start = usize.ZERO
+    while start < bytes.length {
+      let width = whitespaceWidth(bytes, start)
+      if width == usize.ZERO { break }
+      start = start + width
+    }
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, start, bytes.length - start))
+  }
+
+  /// Returns `value` without the whitespace at its end. This function does not allocate or copy.
+  ///
+  /// # Details
+  ///
+  /// Whitespace is every scalar with the Unicode `White_Space` property: the ASCII space, tab, line
+  /// feed, vertical tab, form feed, and carriage return, and also U+0085, the no-break space
+  /// U+00A0, U+1680, U+2000 to U+200A, U+2028, U+2029, U+202F, U+205F, and U+3000. The result is a
+  /// view of `value` with the same lifetime.
+  pub fn trimEnd(value: string) -> string {
+    let bytes = Intrinsic.stringUtf8Bytes(value)
+    let mut end = bytes.length
+    while end > usize.ZERO {
+      // Step back to the first byte of the last scalar.
+      let mut start = end - usize.ONE
+      while continuation(bytes[start]) {
+        start = start - usize.ONE
+      }
+      if whitespaceWidth(bytes, start) == usize.ZERO { break }
+      end = start
+    }
+    return unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, usize.ZERO, end))
+  }
+
   /// Returns the UTF-8 bytes of the string as a shared slice.
   pub fn ownedUtf8Bytes(self: &Self) -> &[u8] {
     return Bytes.asSlice(&self.bytes)
@@ -399,6 +729,13 @@ pub struct InvalidUtf8 {
   pub offset: usize
 }
 
+impl Debug for InvalidUtf8 {
+  /// Writes the fields, as `InvalidUtf8 { offset: ... }`.
+  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {
+    return run Format.debugFields(self, "InvalidUtf8", &mut formatter)
+  }
+}
+
 /// A position in a string for traversal one scalar at a time.
 ///
 /// # Details
@@ -415,8 +752,160 @@ pub struct ScalarStep {
   next: ScalarCursor
 }
 
+/// The pieces of a text between occurrences of a separator, read one at a time. Make one with
+/// [`String.split`].
+///
+/// # Details
+///
+/// Each piece is a `string` view of the text that was split, with its lifetime. Read the pieces
+/// with [`Split.next`], or take everything not yet read with [`Split.remainder`]. A `Split` does not
+/// allocate. It is `Copy`, so a copy reads the remaining pieces again on its own.
+pub struct Split<'text, 'separator> {
+  rest: string<'text>
+  separator: string<'separator>
+  finished: bool
+}
+
+impl<'text, 'separator> Copy for Split<'text, 'separator> {}
+
+impl<'text, 'separator> Split<'text, 'separator> {
+  /// Returns the next piece of the text, or `None` after the last piece.
+  ///
+  /// # Details
+  ///
+  /// A piece is the text up to the next separator, without the separator. The last piece is the
+  /// text after the last separator, which is empty when the text ends with the separator. Text
+  /// with no separator gives one piece: all of the text. The piece is a view with the lifetime of
+  /// the text that was split. This function does not allocate.
+  ///
+  /// # Examples
+  ///
+  /// ## Read the parts of a path
+  ///
+  /// ```silk
+  /// import silk.option { Option }
+  /// import silk.string { String, Split }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut parts = String.split("usr/local/bin", "/")
+  ///   let mut count = 0
+  ///   let mut last = ""
+  ///   while true {
+  ///     match Split.next(&mut parts) {
+  ///       Option<string>.Some { value } => {
+  ///         count = count + 1
+  ///         last = value
+  ///       }
+  ///       Option<string>.None => { break }
+  ///     }
+  ///   }
+  ///   if count != 3 || last != "bin" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn next(self: &mut Split<'text, 'separator>) -> Option<string<'text>> {
+    if self.finished { return Option<string<'text>>.none() }
+    let rest = self.rest
+    let bytes = Intrinsic.stringUtf8Bytes(rest)
+    let separator = Intrinsic.stringUtf8Bytes(self.separator)
+    if separator.length > usize.ZERO {
+      match byte_search.findSlice(bytes, separator) {
+        Option<usize>.Some { value: at } => {
+          let after = at + separator.length
+          self.rest = unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, after, bytes.length - after))
+          return Option<string<'text>>.some(unsafe String.fromUtf8Unchecked(Slice.view<u8>(bytes, usize.ZERO, at)))
+        }
+        Option<usize>.None => {}
+      }
+    }
+    self.finished = true
+    self.rest = ""
+    return Option<string<'text>>.some(rest)
+  }
+
+  /// Returns the text that [`Split.next`] has not given yet, in one piece, and ends the split.
+  ///
+  /// # When to use
+  ///
+  /// Use `remainder` to split only at the first separator: call [`Split.next`] once for the part
+  /// before it, then `remainder` for everything after it, separators included.
+  ///
+  /// # Details
+  ///
+  /// After `remainder`, [`Split.next`] returns `None`. After the last piece, `remainder` returns
+  /// `None`. The text is a view with the lifetime of the text that was split.
+  ///
+  /// # Examples
+  ///
+  /// ## Split a setting at its first `=`
+  ///
+  /// ```silk
+  /// import silk.option { Option }
+  /// import silk.string { String, Split }
+  ///
+  /// pub fn main() -> i32 {
+  ///   let mut parts = String.split("query=a=b", "=")
+  ///   let key = Split.next(&mut parts) |> Option<string>.unwrapOr("")
+  ///   let value = Split.remainder(&mut parts) |> Option<string>.unwrapOr("")
+  ///   if key != "query" || value != "a=b" {
+  ///     return 1
+  ///   }
+  ///   return 0
+  /// }
+  /// ```
+  pub fn remainder(self: &mut Split<'text, 'separator>) -> Option<string<'text>> {
+    if self.finished { return Option<string<'text>>.none() }
+    self.finished = true
+    let rest = self.rest
+    self.rest = ""
+    return Option<string<'text>>.some(rest)
+  }
+}
+
 fn byte(value: u8) -> u8 {
   return value
+}
+
+// Whether `needle` occurs in `haystack` at `start`; the caller keeps it in bounds.
+fn bytesMatchAt(haystack: &[u8], start: usize, needle: &[u8]) -> bool {
+  let mut offset = usize.ZERO
+  while offset < needle.length {
+    if haystack[start + offset] != needle[offset] { return false }
+    offset = offset + usize.ONE
+  }
+  return true
+}
+
+// The byte width of the White_Space scalar that starts at `at` in valid UTF-8, or zero when the
+// scalar there is not whitespace.
+fn whitespaceWidth(bytes: &[u8], at: usize) -> usize {
+  let first = bytes[at]
+  if first == byte(32) || (byte(9) <= first && first <= byte(13)) { return usize.ONE }
+  if first < byte(194) || first > byte(227) { return usize.ZERO }
+  let second = bytes[at + usize.ONE]
+  if first == byte(194) {
+    // U+0085 and U+00A0.
+    if second == byte(133) || second == byte(160) { return 2 }
+    return usize.ZERO
+  }
+  if first < byte(225) { return usize.ZERO }
+  let third = bytes[at + 2]
+  // U+1680.
+  if first == byte(225) && second == byte(154) && third == byte(128) { return 3 }
+  if first == byte(226) {
+    // U+2000 to U+200A, U+2028, U+2029, and U+202F.
+    if second == byte(128) && (third <= byte(138) || third == byte(168) || third == byte(169) || third == byte(175)) {
+      return 3
+    }
+    // U+205F.
+    if second == byte(129) && third == byte(159) { return 3 }
+    return usize.ZERO
+  }
+  // U+3000.
+  if first == byte(227) && second == byte(128) && third == byte(128) { return 3 }
+  return usize.ZERO
 }
 
 fn continuation(value: u8) -> bool {

@@ -231,6 +231,24 @@ IdleTimeout
 
 `idleTimeoutNanoseconds` is zero.
 
+<a id="ConfigField.impl.Debug"></a>
+
+## Implementation `Debug for ConfigField`
+
+```silk
+impl Debug for ConfigField
+```
+
+<a id="ConfigField.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `MaxTotal`.
+
 <a id="PoolError"></a>
 
 ## `PoolError`
@@ -309,6 +327,24 @@ The deadline passed before or while the connection was opened. A new connection 
 ```silk
 impl Copy for PoolError
 ```
+
+<a id="PoolError.impl.Debug"></a>
+
+## Implementation `Debug for PoolError`
+
+```silk
+impl Debug for PoolError
+```
+
+<a id="PoolError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidConfig { ... }`.
 
 <a id="Counts"></a>
 

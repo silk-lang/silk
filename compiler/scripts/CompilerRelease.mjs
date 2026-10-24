@@ -14,7 +14,6 @@ export class CompilerReleaseError extends Data.TaggedError('CompilerReleaseError
 const invalid = (message) => Effect.fail(new CompilerReleaseError({ reason: 'Conflict', message }))
 export const managedBranch = 'release/compiler-stable'
 export const managedMarker = '<!-- silk-managed-stable-release -->'
-const reservationPrefix = 'refs/silk/compiler-dev-reservation/'
 const json = Schema.decodeEffect(Schema.fromJsonString(Schema.Unknown))
 const command = Effect.fnUntraced(function* (executable, args, options = {}) {
   const result = yield* NativeProcess.execute(executable, args, options)
@@ -57,25 +56,29 @@ export const isManagedMerge = (pull, commit, repository) =>
   pull.body?.includes(managedMarker) &&
   pull.body.includes(headMarker(pull.head.sha))
 
-/** Internal refs survive deleted drafts without appearing as tags/releases; counters are global. */
-export const reservation = Effect.fn('CompilerRelease.reservation')(function* (refs, commit) {
+/**
+ * Dev counters come from the published tags: the next counter is one past the highest dev tag,
+ * and a commit that already has a dev tag keeps its counter. Main runs share one concurrency lock,
+ * so only one release can be in flight, and a run that fails before tagging consumes nothing.
+ */
+export const devCounter = Effect.fn('CompilerRelease.devCounter')(function* (tags, commit) {
   let maximum = 0
   let existing
-  for (const ref of refs) {
-    if (!ref.ref.startsWith(reservationPrefix)) continue
-    const suffix = ref.ref.slice(reservationPrefix.length)
-    if (!/^[1-9][0-9]*$/.test(suffix) || !Number.isSafeInteger(Number(suffix)))
-      return yield* invalid(`Malformed dev reservation: ${ref.ref}`)
-    const counter = Number(suffix)
+  for (const tag of tags) {
+    const match = /^refs\/tags\/v[0-9]+\.[0-9]+\.[0-9]+-dev\.([1-9][0-9]*)\+/.exec(tag.ref)
+    if (!match) continue
+    const counter = Number(match[1])
+    if (!Number.isSafeInteger(counter)) return yield* invalid(`Malformed dev tag: ${tag.ref}`)
     maximum = Math.max(maximum, counter)
-    if (ref.object.sha === commit) {
-      if (existing !== undefined) return yield* invalid('Commit has conflicting dev reservations')
+    if (tag.object?.sha === commit) {
+      if (existing !== undefined && existing !== counter)
+        return yield* invalid('Commit has conflicting dev tags')
       existing = counter
     }
   }
   if (existing === undefined && !Number.isSafeInteger(maximum + 1))
-    return yield* invalid('Dev reservation counter exhausted')
-  return { counter: existing ?? maximum + 1, exists: existing !== undefined }
+    return yield* invalid('Dev counter exhausted')
+  return existing ?? maximum + 1
 })
 
 export const plan = Effect.fn('CompilerRelease.plan')(function* ({
@@ -100,20 +103,11 @@ export const plan = Effect.fn('CompilerRelease.plan')(function* ({
   if (mode === 'dev' && published.some((release) => release.target_commitish === commit))
     return { mode: 'none' }
   if (mode === 'stable') return { mode }
-  const refs = yield* pages(
-    repository,
-    `git/matching-refs/${reservationPrefix.slice('refs/'.length)}?per_page=100`,
-  )
-  const selected = yield* reservation(refs, commit)
-  if (!selected.exists)
-    yield* api(repository, 'git/refs', 'POST', {
-      ref: `${reservationPrefix}${selected.counter}`,
-      sha: commit,
-    })
-  return { mode, counter: selected.counter }
+  const tags = yield* pages(repository, 'git/matching-refs/tags/v?per_page=100')
+  return { mode, counter: yield* devCounter(tags, commit) }
 })
 
-export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repository, compiler }) {
+export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repository, tool }) {
   const fs = yield* FileSystem.FileSystem
   const pending = (yield* fs.readDirectory('compiler/.changes')).filter((name) =>
     name.endsWith('.md'),
@@ -186,9 +180,9 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
     }
     if (parents[0] === base) preparedHead = oldHead
   }
-  yield* command(compiler, ['changes', '--dir', 'compiler', 'version'])
+  yield* command(tool, ['change', '--dir', 'compiler', 'version'])
   const release = yield* json(
-    yield* command(compiler, ['changes', '--dir', 'compiler', 'release', '--json']),
+    yield* command(tool, ['change', '--dir', 'compiler', 'release', '--json']),
   )
   if (release.prerelease !== false) return yield* invalid('Managed release PR must be stable')
   yield* command('git', [
@@ -249,16 +243,8 @@ export const maintain = Effect.fn('CompilerRelease.maintain')(function* ({ repos
       base: 'main',
       draft: true,
     })
-  // GITHUB_TOKEN pushes/PR updates do not produce normal workflow events.
-  yield* command('gh', [
-    'workflow',
-    'run',
-    'selfhost.yml',
-    '--repo',
-    repository,
-    '--ref',
-    managedBranch,
-  ])
+  // The stable merge reruns every native gate on main, so the managed branch is verified only
+  // when someone dispatches selfhost.yml on it (see .github/CI.md), not after every refresh.
 })
 
 /** Timing/runner/run-id fields are observational; all source, compiler and IR identities are immutable. */
@@ -285,16 +271,20 @@ export const assetIdentity = (name, bytes) => {
   return Buffer.from(bytes).toString('base64')
 }
 
-/** Projected builds have no committed dev history: validate the immutable native projection instead. */
+/** A projected build reports its projected version; an unprojected one the version its manifest names. */
 export const verifyBuild = Effect.fn('CompilerRelease.verifyBuild')(
   function* (compiler, directory) {
+    const fs = yield* FileSystem.FileSystem
     const receipt = yield* verifySnapshot({ directory })
-    if (receipt.projection) {
-      if ((yield* command(compiler, ['--version'])) !== `silk v${receipt.projection.version}`)
-        return yield* invalid('Compiler version differs from its native snapshot projection')
-    } else {
-      yield* command(compiler, ['changes', '--dir', join(directory, 'compiler'), 'status'])
+    let version = receipt.projection?.version
+    if (!version) {
+      const manifest = yield* fs.readFileString(join(directory, 'compiler/silk.toml'))
+      const section = /^\[package\][ \t]*\r?\n([\s\S]*?)(?=^\[|$(?![\s\S]))/m.exec(manifest)
+      version = section && /^version[ \t]*=[ \t]*(['"])([^'"\r\n]+)\1/m.exec(section[1])?.[2]
+      if (!version) return yield* invalid('compiler/silk.toml names no package version')
     }
+    if ((yield* command(compiler, ['--version'])) !== `silk v${version}`)
+      return yield* invalid('Compiler version differs from its native snapshot')
   },
 )
 
@@ -411,7 +401,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
         `mode=${result.mode}\ncounter=${result.counter ?? ''}\n`,
         { flag: 'a' },
       )
-    } else if (operation === 'maintain') yield* maintain({ repository, compiler: args[0] })
+    } else if (operation === 'maintain') yield* maintain({ repository, tool: args[0] })
     else if (operation === 'publish')
       yield* publish({ repository, snapshot: args[0], directory: args[1], files: args.slice(2) })
     else if (operation === 'verify-build') yield* verifyBuild(args[0], args[1])

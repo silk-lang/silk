@@ -50,7 +50,7 @@ families, OS operation implementations and startup implementations belong to oth
 A project can pin a physical installation independently of its logical target profile:
 
 ```toml
-[build]
+[native]
 platform-supply = { kind = "explicit", target = "aarch64-apple-darwin", root = "/opt/SDKs/MacOSX15.5.sdk", linker = "/opt/llvm/bin/ld64.lld", origin = "pinned macOS SDK" }
 ```
 

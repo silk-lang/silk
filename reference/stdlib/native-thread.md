@@ -100,6 +100,24 @@ pub code: i32
 
 The error number `pthread_create` returned.
 
+<a id="SpawnError.impl.Debug"></a>
+
+## Implementation `Debug for SpawnError`
+
+```silk
+impl Debug for SpawnError
+```
+
+<a id="SpawnError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `SpawnError { code: ... }`.
+
 <a id="JoinHandle"></a>
 
 ## `JoinHandle`

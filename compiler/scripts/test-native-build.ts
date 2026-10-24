@@ -1,6 +1,6 @@
 // One prebuilt native compiler exercises its private request/build routes together.
 import { strict as assert } from 'node:assert'
-import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -37,9 +37,10 @@ const invoke = Effect.fnUntraced(function* (
   args: ReadonlyArray<string>,
   cwd: string,
   env: NodeJS.ProcessEnv = process.env,
+  timeout = 30_000,
 ): Effect.fn.Return<SpawnSyncReturns<string>, VerificationError> {
   return yield* Effect.try({
-    try: () => spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout: 30_000 }),
+    try: () => spawnSync(command, args, { cwd, env, encoding: 'utf8', timeout }),
     catch: (cause) => new VerificationError({ message: 'Native CLI invocation failed', cause }),
   })
 })
@@ -86,7 +87,7 @@ const program = Effect.gen(function* () {
   assert.equal(helped.status, 0, helped.stderr)
   // The overview leads with the project commands, one line each.
   assert.match(helped.stdout, /^usage: silk <command> \[options\]\n\nProject commands:\n {2}init /)
-  assert.match(helped.stdout, /\n {2}changes /)
+  assert.doesNotMatch(helped.stdout, /\n {2}changes /)
   assert.match(helped.stdout, /\n {2}doc-reference /)
   // `silk help` prints the same overview, and `silk help <command>` that command's synopsis.
   const helpCommand = yield* invoke(silk, ['help'], directory)
@@ -113,56 +114,10 @@ const program = Effect.gen(function* () {
   const runHelp = yield* invoke(silk, ['run', '--help'], directory)
   assert.equal(runHelp.status, 0, runHelp.stderr)
   assert.match(runHelp.stdout, /^usage: silk run .*\[--progress auto\|live\|plain\|never\] \[--quiet\]/)
-  // `silk toolchain` prints its own usage for --help, -h and help alike.
-  const toolchainHelp = yield* invoke(silk, ['toolchain', 'help'], directory)
-  assert.equal(toolchainHelp.status, 0, toolchainHelp.stderr)
-  assert.match(toolchainHelp.stdout, /^usage: silk toolchain list \[--json\]\n/)
-  for (const flag of ['--help', '-h']) {
-    const helpedToolchain = yield* invoke(silk, ['toolchain', flag], directory)
-    assert.equal(helpedToolchain.status, 0, helpedToolchain.stderr)
-    assert.equal(helpedToolchain.stdout, toolchainHelp.stdout)
-  }
-  // Toolchain selection runs against a private home; nothing here downloads a release.
-  const toolchainHome = join(directory, 'toolchain-home')
-  yield* fs.makeDirectory(toolchainHome, { recursive: true })
-  const toolchainEnvironment: NodeJS.ProcessEnv = { ...process.env, HOME: toolchainHome }
-  for (const name of ['SILK_HOME', 'SILK_TOOLCHAIN', 'SILK_TOOLCHAIN_MIRROR', 'SILK_AUTO_INSTALL']) {
-    delete toolchainEnvironment[name]
-  }
-  // SILK_TOOLCHAIN=local selects the running compiler.
-  const localWhich = yield* invoke(silk, ['toolchain', 'which'], directory, {
-    ...toolchainEnvironment,
-    SILK_TOOLCHAIN: 'local',
-  })
-  assert.equal(localWhich.status, 0, localWhich.stderr)
-  assert.match(localWhich.stdout, /^\S+ \(selected by SILK_TOOLCHAIN\)\n\S+\n$/)
-  assert.equal(localWhich.stderr, '')
-  // `+<version>` must be a semantic version; anything else is a usage error, not a missing install.
-  const garbage = yield* invoke(silk, ['+garbage', 'check'], directory, toolchainEnvironment)
-  assert.equal(garbage.status, 2, garbage.stderr)
-  assert.equal(
-    garbage.stderr,
-    'silk: `+garbage` is not a Silk version; +<version> takes a semantic version such as +0.1.0-dev.6\n',
-  )
-  // A relative mirror is refused in the usual `silk toolchain:` form.
-  const relativeMirror = yield* invoke(silk, ['toolchain', 'install', '0.1.0'], directory, {
-    ...toolchainEnvironment,
-    SILK_TOOLCHAIN_MIRROR: 'mirror',
-  })
-  assert.equal(relativeMirror.status, 1, relativeMirror.stderr)
-  assert.equal(
-    relativeMirror.stderr,
-    'silk toolchain: SILK_TOOLCHAIN_MIRROR must be an absolute directory path\n',
-  )
-  // A HOME that does not exist is refused, and nothing is created below it.
-  const absentHome = join(directory, 'absent-home')
-  const homeless = yield* invoke(silk, ['toolchain', 'default', '0.1.0'], directory, {
-    ...toolchainEnvironment,
-    HOME: absentHome,
-  })
-  assert.equal(homeless.status, 1, homeless.stderr)
-  assert.match(homeless.stderr, /^silk toolchain: cannot find the toolchain directory; /)
-  assert.equal(yield* fs.exists(absentHome), false)
+  // Toolchains belong to the silk tool, not the compiler: `silk toolchain` and `+<version>` are unknown here.
+  const toolchain = yield* invoke(silk, ['toolchain'], directory)
+  assert.equal(toolchain.status, 2, toolchain.stderr)
+  assert.match(toolchain.stderr, /^silk: unknown command `toolchain`\n/)
   // A command line that does not parse is a usage error, status 2, like format's and doc's.
   const unparsed = yield* invoke(silk, ['check', '--bogus'], directory)
   assert.equal(unparsed.status, 2, unparsed.stderr)
@@ -184,8 +139,21 @@ const program = Effect.gen(function* () {
     assert.equal(absent.status, 2, absent.stderr)
     assert.ok(absent.stderr.startsWith(`silk: no such source file \`${missing}\`;`), absent.stderr)
   }
-  // Exercise the linked changes library through the actual native entry point. No compiler,
-  // standalone changes executable, Git, or other tool is available on this subprocess PATH.
+  // Release notes belong to the silk tool (`silk change`), not the compiler.
+  const changes = yield* invoke(silk, ['changes'], directory)
+  assert.equal(changes.status, 2, changes.stderr)
+  assert.match(changes.stderr, /^silk: unknown command `changes`\n/)
+  // Build the silk tool with the compiler under test and exercise its linked changes library through
+  // the native entry point. No compiler, Git, or other tool is available on this subprocess PATH.
+  const silkTool = join(directory, 'silktool')
+  const toolBuild = yield* invoke(
+    silk,
+    ['build', 'src/main.silk', '-o', silkTool, '--stdlib', standardLibrary],
+    join(repository, 'tool'),
+    { ...process.env, SILK_CLANG: clang },
+    600_000,
+  )
+  assert.equal(toolBuild.status, 0, toolBuild.stderr)
   const releaseWorkspace = join(directory, 'release-workspace')
   const releaseMember = join(releaseWorkspace, 'compiler')
   const releaseNested = join(releaseMember, 'src/nested')
@@ -196,50 +164,48 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(releaseWorkspace, 'silk.toml'), workspaceManifest)
   yield* fs.writeFileString(
     join(releaseMember, 'silk.toml'),
-    '[package]\nname = "native-release"\nversion = "1.0.0"\nroot = "src/main.silk"\n[changes]\nversion-file = "src/ReleaseVersion.silk"\n',
+    '[package]\nname = "native-release"\nversion = "1.0.0"\nroot = "src/main.silk"\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
   )
   yield* fs.writeFileString(
     join(releaseWorkspace, 'changes/silk.toml'),
     '[package]\nname = "release-consumer"\nversion = "0.1.0"\n\n[dependencies]\nreleased = { path = "../compiler" }\n',
   )
   for (const args of [
-    ['changes'],
-    ['changes', '--help'],
-    ['changes', '--dir', 'compiler', '--help'],
+    ['change'],
+    ['change', '--help'],
+    ['change', '--dir', 'compiler', '--help'],
   ]) {
-    const help = yield* invoke(silk, args, releaseWorkspace, changesEnvironment)
+    const help = yield* invoke(silkTool, args, releaseWorkspace, changesEnvironment)
     assert.equal(help.status, 0, help.stderr)
-    assert.match(help.stdout, /silk changes \[--dir PATH\] add/)
+    assert.match(help.stdout, /silk change \[--dir PATH\] patch\|minor\|major/)
     assert.equal(help.stderr, '')
   }
-  const missingDirectory = yield* invoke(
-    silk,
-    ['changes', '--dir'],
+  const missingDirectory = yield* invoke(silkTool,
+    ['change', '--dir'],
     releaseWorkspace,
     changesEnvironment,
   )
   assert.equal(missingDirectory.status, 1)
-  assert.match(missingDirectory.stderr, /silk changes: --dir requires/)
+  assert.match(missingDirectory.stderr, /silk change: --dir requires/)
   assert.doesNotMatch(missingDirectory.stderr, /\.lock/, 'an argument error writes nothing to recover')
   for (const args of [
-    ['add', 'patch', 'Must not create a workspace release'],
+    ['patch', 'Must not create a workspace release'],
     ['status'],
     ['version'],
     ['recover'],
   ]) {
-    const refused = yield* invoke(silk, ['changes', ...args], releaseWorkspace, changesEnvironment)
+    const refused = yield* invoke(silkTool, ['change', ...args], releaseWorkspace, changesEnvironment)
     assert.equal(refused.status, 1)
-    assert.match(refused.stderr, /silk changes: .*virtual workspace/)
+    assert.match(refused.stderr, /silk change: .*virtual workspace/)
     assert.equal(refused.stdout, '')
   }
   assert.equal(yield* fs.exists(join(releaseWorkspace, '.changes')), false)
   assert.equal(yield* fs.readFileString(join(releaseWorkspace, 'silk.toml')), workspaceManifest)
   const summary = 'Use native release commands'
   const migration =
-    'Replace "changeset" with "silk changes".\nKeep release records in version control.'
-  const addedChange = yield* invoke(
-    silk,
-    ['changes', 'add', 'minor', summary, '--migration', migration],
+    'Replace "silk changes" with "silk change".\nKeep release records in version control.'
+  const addedChange = yield* invoke(silkTool,
+    ['change', 'minor', summary, '--migration', migration],
     releaseNested,
     changesEnvironment,
   )
@@ -249,18 +215,16 @@ const program = Effect.gen(function* () {
   const [pendingChange] = pendingChanges
   assert.ok(pendingChange)
   assert.match(pendingChange, /^[0-9a-f]{32}\.md$/)
-  const preview = yield* invoke(
-    silk,
-    ['changes', '--dir', 'compiler', 'status', '--tag', 'beta'],
+  const preview = yield* invoke(silkTool,
+    ['change', '--dir', 'compiler', 'status', '--tag', 'beta'],
     releaseWorkspace,
     changesEnvironment,
   )
   assert.equal(preview.status, 0, preview.stderr)
   assert.match(preview.stdout, /native-release: 1\.0\.0 -> 1\.1\.0-beta\.1/)
   assert.match(yield* fs.readFileString(join(releaseMember, 'silk.toml')), /version = "1.0.0"/)
-  const prereleased = yield* invoke(
-    silk,
-    ['changes', '--dir', 'compiler', 'version', '--tag', 'beta'],
+  const prereleased = yield* invoke(silkTool,
+    ['change', '--dir', 'compiler', 'version', '--tag', 'beta'],
     releaseWorkspace,
     changesEnvironment,
   )
@@ -275,9 +239,8 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(archive, releaseArchive.replace(summary, correctedSummary))
   yield* fs.writeFileString(join(releaseMember, 'CHANGELOG.md'), 'Manual notes must disappear.\n')
   // Publication reads corrected TOML, not the hand-edited derived Markdown.
-  const betaPublication = yield* invoke(
-    silk,
-    ['changes', 'release', '--json'],
+  const betaPublication = yield* invoke(silkTool,
+    ['change', 'release', '--json'],
     releaseNested,
     changesEnvironment,
   )
@@ -290,7 +253,7 @@ const program = Effect.gen(function* () {
   assert.ok(beta.notes.includes(correctedSummary))
   assert.ok(beta.notes.includes(migration))
   assert.ok(!beta.notes.includes('Manual notes'))
-  const promoted = yield* invoke(silk, ['changes', 'version'], releaseNested, changesEnvironment)
+  const promoted = yield* invoke(silkTool, ['change', 'version'], releaseNested, changesEnvironment)
   assert.equal(promoted.status, 0, promoted.stderr)
   assert.match(yield* fs.readFileString(join(releaseMember, 'silk.toml')), /version = "1.1.0"/)
   const changelog = yield* fs.readFileString(join(releaseMember, 'CHANGELOG.md'))
@@ -303,9 +266,8 @@ const program = Effect.gen(function* () {
   )
   assert.match(stableArchive, /\nfrom = "1\.1\.0-beta\.1"\nversion = "1\.1\.0"\n/)
   assert.ok(stableArchive.includes(correctedSummary))
-  const stablePublication = yield* invoke(
-    silk,
-    ['changes', 'release', '--json'],
+  const stablePublication = yield* invoke(silkTool,
+    ['change', 'release', '--json'],
     releaseNested,
     changesEnvironment,
   )
@@ -340,9 +302,9 @@ const program = Effect.gen(function* () {
     ],
   }
   for (const args of [
-    ['changes', '--dir', 'compiler', 'since', '1.0.0', '--json'],
+    ['change', '--dir', 'compiler', 'since', '1.0.0', '--json'],
     [
-      'changes',
+      'change',
       '--dir',
       'changes',
       'since',
@@ -354,7 +316,7 @@ const program = Effect.gen(function* () {
       '--json',
     ],
   ]) {
-    const history = yield* invoke(silk, args, releaseWorkspace, changesEnvironment)
+    const history = yield* invoke(silkTool, args, releaseWorkspace, changesEnvironment)
     assert.equal(history.status, 0, history.stderr)
     assert.equal(history.stderr, '')
     assert.deepEqual(yield* decodeJson(history.stdout), expectedHistory)
@@ -362,12 +324,11 @@ const program = Effect.gen(function* () {
   // A writer interrupted before its ready marker leaves a lock but no applied changes.
   const releaseLock = join(releaseMember, '.changes/.lock')
   yield* fs.makeDirectory(releaseLock)
-  const locked = yield* invoke(silk, ['changes', 'status'], releaseNested, changesEnvironment)
+  const locked = yield* invoke(silkTool, ['change', 'status'], releaseNested, changesEnvironment)
   assert.equal(locked.status, 1)
-  assert.match(locked.stderr, /silk changes .*recover/)
-  const recovered = yield* invoke(
-    silk,
-    ['changes', '--dir', 'compiler', 'recover'],
+  assert.match(locked.stderr, /silk change .*recover/)
+  const recovered = yield* invoke(silkTool,
+    ['change', '--dir', 'compiler', 'recover'],
     releaseWorkspace,
     changesEnvironment,
   )
@@ -670,7 +631,7 @@ const program = Effect.gen(function* () {
     ['--emit'],
     ['--emit', 'llvm-ir', '--emit', 'llvm-ir'],
     ['--emit', 'final', '--emit', 'llvm-ir'],
-    // The artifact form is the manifest's `[build].artifact`; `--emit` names only a stage.
+    // The artifact form is the manifest's `[package].kind`; `--emit` names only a stage.
     ['--emit', 'executable'],
     ['--target', foreign],
     ['--emit', 'llvm-ir', '--target', 'no-such-target'],
@@ -742,6 +703,24 @@ const program = Effect.gen(function* () {
     SILK_CLANG: clang,
   })
   assert.equal(searched.status, 0, searched.stderr)
+  // A package manager can install the library itself as a symbolic link, and `--stdlib` can name one.
+  const linkedPrefix = join(directory, 'linked-prefix')
+  yield* fs.makeDirectory(join(linkedPrefix, 'bin'), { recursive: true })
+  yield* fs.makeDirectory(join(linkedPrefix, 'lib/silk'), { recursive: true })
+  yield* fs.copyFile(silk, join(linkedPrefix, 'bin/silk'))
+  yield* fs.chmod(join(linkedPrefix, 'bin/silk'), 0o755)
+  yield* fs.symlink(join(prefix, 'lib/silk/stdlib'), join(linkedPrefix, 'lib/silk/stdlib'))
+  const linkedLibrary = yield* invoke(join(linkedPrefix, 'bin/silk'), ['run'], join(directory, 'greeting'), {
+    ...process.env,
+    SILK_CLANG: clang,
+  })
+  assert.equal(linkedLibrary.status, 0, linkedLibrary.stderr)
+  const linkedArgument = yield* invoke(
+    silk,
+    ['check', '--stdlib', join(linkedPrefix, 'lib/silk/stdlib')],
+    join(directory, 'greeting'),
+  )
+  assert.equal(linkedArgument.status, 0, linkedArgument.stderr)
   // Without an installation beside it, the compiler still needs `--stdlib`.
   yield* fs.makeDirectory(join(directory, 'bare/bin'), { recursive: true })
   yield* fs.copyFile(silk, join(directory, 'bare/bin/silk'))
@@ -814,6 +793,24 @@ const program = Effect.gen(function* () {
     new RegExp(`^\\[${hostTarget}\\]\nsrc/main\\.silk:1:8: error\\[MOD0001\\]`, 'm'),
   )
   assert.match(unknownModule.stderr, /^Failed unknown in /m)
+  // Module paths match file names exactly, also where the filesystem ignores case; an import that
+  // differs from a file only in letter case names the file's spelling.
+  yield* fs.makeDirectory(join(directory, 'casing/src/util'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'casing/silk.toml'),
+    '[package]\nname = "casing"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(join(directory, 'casing/src/util/Math.silk'), 'pub fn twice(value: i32) -> i32 {\n  return value * 2\n}\n')
+  yield* fs.writeFileString(
+    join(directory, 'casing/src/main.silk'),
+    'import util.math { twice }\n\npub fn main() -> i32 {\n  return twice(0)\n}\n',
+  )
+  const casing = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'casing'))
+  assert.equal(casing.status, 1, casing.stderr)
+  assert.match(
+    casing.stderr,
+    /^src\/main\.silk:1:8: error\[MOD0001\] Unknown module util\.math\n  note: did you mean `util\.Math`\? Module paths match file names exactly, including letter case$/m,
+  )
   // A package that cannot be loaded ends its load row as failed and still names itself on its
   // final line.
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
@@ -985,11 +982,15 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(failedTests.status, 1, failedTests.stderr)
-  // A test that traps fails, and the tests after it still run.
-  assert.match(failedTests.stderr, /fatal trap: division by zero/)
+  // A test that traps fails with its report under its name, and the tests after it still run.
   assert.match(
     failedTests.stdout,
-    /util\/check::dividesByZero\n {4}FAIL {2}stopped the test process\n(.*\n)*  util\/check::halvesEvenly\n {4}PASS/,
+    /util\/check::dividesByZero\n {4}fatal trap: division by zero\n(.*\n)* {4}FAIL {2}stopped the test process\n(.*\n)*  util\/check::halvesEvenly\n {4}PASS/,
+  )
+  // A failed expectation names where it failed.
+  assert.match(
+    failedTests.stdout,
+    /util\/check::failsOnPurpose\n {4}assertion failed: integer division truncates\n {6}at [^\n]*failsOnPurpose \([^\n]*:12:3\)\n {4}FAIL/,
   )
   assert.match(failedTests.stdout, /2 passed, 2 failed \(0 cached, 4 executed, 4 selected, 4 discovered\)/)
   // A selection that matches no test verified nothing, so it fails.
@@ -1001,6 +1002,87 @@ const program = Effect.gen(function* () {
   )
   assert.equal(unmatchedTests.status, 1, unmatchedTests.stderr)
   assert.match(unmatchedTests.stderr, /no tests matched/)
+  // A test past its --timeout and a test that overflows the stack each fail with a report naming
+  // why, and the remaining tests still run.
+  yield* fs.makeDirectory(join(directory, 'stuck/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'stuck/silk.toml'),
+    '[package]\nname = "stuck"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'stuck/src/main.silk'),
+    'fn deep(n: i64) -> i64 {\n  if n == 0 { return 0 }\n  return deep(n - 1) + 1\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest fn overflows() {\n  let depth = deep(100000000)\n}\n\ntest fn spins() {\n  let mut i: i64 = 0\n  while i >= 0 {\n    i = i - 1 + 1\n  }\n}\n\ntest fn zFinishes() {\n}\n',
+  )
+  const stuckTests = yield* invoke(
+    silk,
+    ['test', '--stdlib', standardLibrary, '--timeout', '1'],
+    join(directory, 'stuck'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(stuckTests.status, 1, stuckTests.stderr)
+  assert.match(stuckTests.stderr, /^fatal trap: stack overflow$/m)
+  assert.match(stuckTests.stderr, /the test did not finish within 1 s/)
+  assert.match(stuckTests.stdout, /main::zFinishes\n {4}PASS/)
+  assert.match(stuckTests.stdout, /1 passed, 2 failed/)
+  // `silk doctest` in a package checks every example, then builds and runs each one with a
+  // `main`, which passes when it returns 0. A hyphenated package is imported as its dependents
+  // write it, and `no_run` examples only compile.
+  yield* fs.makeDirectory(join(directory, 'round-shapes/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'round-shapes/silk.toml'),
+    '[package]\nname = "round-shapes"\nversion = "0.1.0"\nkind = "library"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'round-shapes/src/lib.silk'),
+    [
+      '/// Three times `diameter`.',
+      '///',
+      '/// ```silk',
+      '/// import round_shapes.lib { circumference }',
+      '///',
+      '/// pub fn main() -> i32 {',
+      '///   return circumference(2) - 6',
+      '/// }',
+      '/// ```',
+      '///',
+      '/// ```silk',
+      '/// import lib { circumference }',
+      '/// import silk.effect { Effect }',
+      '/// import silk.os_writer { StdoutWriter }',
+      '/// import silk.writer { Writer, WriterError }',
+      '///',
+      '/// pub effect fn main() -> i32 ! WriterError {',
+      '///   let mut out = StdoutWriter.make()',
+      '///   run Writer.writeAll(b"wrong\\n") |> Effect.provideMut<Writer>(&mut out)',
+      '///   return circumference(1)',
+      '/// }',
+      '/// ```',
+      '///',
+      '/// ```silk,no_run',
+      '/// import lib { circumference }',
+      '///',
+      '/// pub fn main() -> i32 {',
+      '///   return circumference(5)',
+      '/// }',
+      '/// ```',
+      'pub fn circumference(diameter: i32) -> i32 {',
+      '  return diameter * 3',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const doctests = yield* invoke(
+    silk,
+    ['doctest', '--stdlib-root', standardLibrary],
+    join(directory, 'round-shapes/src'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(doctests.status, 1, doctests.stderr)
+  assert.match(doctests.stdout, /lib\.silk:3 \(byte \d+\): PASSED\n/)
+  assert.match(doctests.stdout, /lib\.silk:11 \(byte \d+\): FAILED: the example exited with status 3\nwrong\n/)
+  assert.match(doctests.stdout, /lib\.silk:24 \(byte \d+\): PASSED\n/)
+  assert.match(doctests.stdout, /Doctest: 3 collected, 2 passed, 0 skipped, 1 failed\./)
+  assert.equal(yield* fs.exists(join(directory, 'round-shapes/src/doctest_example.silk')), false)
   // Package commands take --clang as they honor SILK_CLANG, and a Clang that cannot start fails
   // the target with the usual per-target and summary lines.
   const clangTests = yield* invoke(
@@ -1187,6 +1269,24 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(threaded.status, 0, threaded.stderr)
+  // Clang 18 crashes on a threaded module or writes one the host rejects, so it is refused.
+  const eighteen = join(directory, 'clang-18')
+  yield* fs.writeFileString(
+    eighteen,
+    `#!/bin/sh\nif [ "$1" = --version ]; then echo 'Ubuntu clang version 18.1.3 (1ubuntu1)'; exit 0; fi\nexec ${quote(clang)} "$@"\n`,
+  )
+  yield* fs.chmod(eighteen, 0o755)
+  const tooOld = yield* invoke(
+    silk,
+    ['build', '--manifest-path', join('threads', 'silk.toml'), '--profile', 'web', '--stdlib', standardLibrary],
+    directory,
+    { ...process.env, SILK_CLANG: eighteen },
+  )
+  assert.equal(tooOld.status, 2, tooOld.stderr)
+  assert.match(
+    tooOld.stderr,
+    /^silk: a threaded wasm32 build needs Clang 19 or newer, but \S+clang-18 \(from SILK_CLANG\) is Clang 18; set SILK_CLANG or pass --clang the path of a newer Clang$/m,
+  )
   const threadedPath = join(threads, 'build/llvm/wasm32-unknown-unknown/web/threads')
   const threadedModule = new WebAssembly.Module(yield* fs.readFile(threadedPath))
   assert.deepEqual(
@@ -1382,12 +1482,12 @@ const program = Effect.gen(function* () {
   }
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), tunedMain)
   // Profile fields the native build cannot honor yet, a profile artifact other than the one
-  // [build].artifact requests, unknown manifest fields and reserved module names are refused
+  // [package].kind requests, unknown manifest fields and reserved module names are refused
   // before anything is built, naming the manifest line.
   const refusedProfiles = [
     ['sanitizers = ["address"]', /silk\.toml:7: profiles\.p\.sanitizers is not supported by the native compiler yet/],
     ['unwind = "native"', /silk\.toml:7: profiles\.p\.unwind = "native" is not supported by the native compiler yet/],
-    ['artifact = "object"', /silk\.toml:7: UnsupportedCombination: profiles\.p\.artifact = "object" differs from \[build\]\.artifact = "executable"/],
+    ['artifact = "object"', /silk\.toml:7: UnsupportedCombination: profiles\.p\.artifact = "object" differs from \[package\]\.kind = "executable"/],
     ['opt = "speed"', /silk\.toml:7: profiles\.p\.opt is not a supported field/],
   ] as const
   for (const [field, message] of refusedProfiles) {
@@ -1617,6 +1717,24 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(packaged.status, 42, packaged.stderr)
+  // A dependency's declarations are checked where they are written, even one the app never calls.
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/scale.silk'),
+    'import util.digits { base }\n\npub fn scale(value: i32) -> i32 {\n  return value * base()\n}\n\nfn unused() -> i32 {\n  return true\n}\n',
+  )
+  const broken = yield* invoke(
+    silk,
+    ['check', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.notEqual(broken.status, 0, 'an error in an uncalled dependency function was not reported')
+  assert.match(broken.stderr, /numbers\/src\/scale\.silk:8:10: error\[SEM0129\]/)
+  assert.doesNotMatch(broken.stderr, /main\.silk/)
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/scale.silk'),
+    'import util.digits { base }\n\npub fn scale(value: i32) -> i32 {\n  return value * base()\n}\n',
+  )
   // A module the dependency's manifest does not export stays internal to it.
   yield* fs.writeFileString(
     join(directory, 'packaged/app/peek.silk'),
@@ -1690,7 +1808,7 @@ const program = Effect.gen(function* () {
     SILK_CLANG: clang,
   })
   assert.equal(virtualRoot.status, 8, virtualRoot.stderr)
-  assert.match(virtualRoot.stderr, /Skipping math: it has no package\.root/)
+  assert.match(virtualRoot.stderr, /Skipping math: its root module \(\[package\]\.main\) is missing/)
   yield* fs.makeDirectory(join(workspace, 'libs/empty'), { recursive: true })
   const unmanifested = yield* invoke(
     silk,
@@ -1770,7 +1888,8 @@ const program = Effect.gen(function* () {
   )
   assert.equal(managedBuild.status, 0, managedBuild.stderr + managedBuild.stdout)
   // Members build in dependency order, whatever order `members` lists them in.
-  assert.match(managedBuild.stderr, /^Compiling greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
+  // A library member is only checked; it makes no artifact of its own.
+  assert.match(managedBuild.stderr, /^Checking greeting \(.*\)\n[\s\S]*^Compiling hello \(/m)
   assert.match(managedBuild.stderr, /^Finished 2 packages in [^\n]*\n$/m)
   // Each artifact is named from the working directory, the workspace root here, not its package.
   assert.match(
@@ -1870,6 +1989,43 @@ const program = Effect.gen(function* () {
   assert.equal(managedDoc.status, 0, managedDoc.stderr + managedDoc.stdout)
   assert.equal(yield* fs.exists(join(managed, 'build/documentation/greeting.json')), true)
   assert.equal(yield* fs.exists(join(managed, 'build/documentation/hello.json')), true)
+  // `format .` and `doctest` at the root also cover every member; a member with no examples
+  // passes while another has some.
+  const managedFormatDot = yield* invoke(silk, ['format', '--check', '.'], managed)
+  assert.equal(managedFormatDot.status, 0, managedFormatDot.stderr + managedFormatDot.stdout)
+  assert.match(managedFormatDot.stdout, /apps\/hello\/src\/main\.silk: unchanged/)
+  assert.match(managedFormatDot.stdout, /libs\/greeting\/src\//)
+  const greetingLibrary = join(managed, 'libs/greeting/src/lib.silk')
+  const greetingSource = yield* fs.readFileString(greetingLibrary)
+  yield* fs.writeFileString(
+    greetingLibrary,
+    greetingSource +
+      [
+        '',
+        '/// Two times `value`.',
+        '///',
+        '/// ```silk',
+        '/// import greeting.lib { twice }',
+        '///',
+        '/// pub fn main() -> i32 {',
+        '///   return twice(2) - 4',
+        '/// }',
+        '/// ```',
+        'pub fn twice(value: i32) -> i32 {',
+        '  return value * 2',
+        '}',
+        '',
+      ].join('\n'),
+  )
+  const managedDoctest = yield* invoke(
+    silk,
+    ['doctest', '--stdlib-root', standardLibrary],
+    managed,
+    withClang,
+  )
+  assert.equal(managedDoctest.status, 0, managedDoctest.stderr + managedDoctest.stdout)
+  assert.match(managedDoctest.stdout, /^Package greeting\n[^\n]*libs\/greeting\/src\/lib\.silk:\d+ \(byte \d+\): PASSED\n/m)
+  assert.match(managedDoctest.stdout, /^Package hello\n/m)
   const oneFile = yield* invoke(
     silk,
     ['doc', '--stdlib-root', standardLibrary, '--output', 'x.json'],
@@ -2036,6 +2192,35 @@ const program = Effect.gen(function* () {
   )
   assert.equal(dangling.status, 1, dangling.stderr)
   assert.match(dangling.stderr, /^silk: cannot read \S+\/app\/src\/gone\.silk$/m)
+  // Two commands that build one package at once keep their intermediate files apart, and the
+  // run finds a whole executable however the other command's link is going.
+  const together = join(directory, 'together')
+  yield* fs.makeDirectory(join(together, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(together, 'silk.toml'),
+    '[package]\nname = "together"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(join(together, 'src/main.silk'), 'pub fn main() -> i32 { return 5 }\n')
+  const started = (args: ReadonlyArray<string>) =>
+    new Promise<{ status: number | null; stderr: string }>((settle) => {
+      const child = spawn(silk, [...args, '--stdlib', standardLibrary], {
+        cwd: together,
+        env: { ...process.env, SILK_CLANG: clang },
+      })
+      let stderr = ''
+      child.stderr.on('data', (chunk) => (stderr += chunk))
+      child.on('close', (status) => settle({ status, stderr }))
+    })
+  for (let round = 0; round < 4; round += 1) {
+    yield* fs.remove(join(together, 'build'), { recursive: true, force: true })
+    const [built, ran] = yield* Effect.promise(() =>
+      Promise.all([started(['build']), started(['run', '--quiet'])]),
+    )
+    assert.equal(built.status, 0, built.stderr)
+    assert.equal(ran.status, 5, ran.stderr)
+  }
+  const leftover = yield* fs.readDirectory(join(together, 'build/llvm', hostTarget, 'debug'))
+  assert.deepEqual(leftover.filter((name) => name.startsWith('.silk-')), [])
   // An object form needs no `main` and no runtime: the application's C exports are its roots.
   const library = join(directory, 'library')
   yield* fs.makeDirectory(join(library, 'src'), { recursive: true })
@@ -2277,8 +2462,121 @@ const program = Effect.gen(function* () {
   assert.equal(refused.status, 2, refused.stderr)
   assert.equal(yield* fs.exists(join(library, 'refused')), false)
   assert.equal(yield* fs.exists(marker), false)
+  // A debug build compiles each module's codegen unit to an object of its own, cached by its text,
+  // so a rebuild after an edit to one module recompiles that module's unit alone.
+  const split = join(directory, 'split')
+  yield* fs.makeDirectory(join(split, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(split, 'silk.toml'),
+    '[package]\nname = "split"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  const helperSource = (value: number) => `pub fn value() -> i32 {\n  return ${value}\n}\n`
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(3))
+  yield* fs.writeFileString(
+    join(split, 'src/main.silk'),
+    'import helper\n\npub fn main() -> i32 {\n  return helper.value() + 4\n}\n',
+  )
+  const splitEnvironment = { ...process.env, SILK_CLANG: clang }
+  const unitObjects = join(split, `build/llvm/${hostTarget}/debug/split.units`)
+  const objectNames = Effect.fnUntraced(function* () {
+    const names = yield* fs.readDirectory(unitObjects)
+    return names.filter((name) => name.endsWith('.o')).sort()
+  })
+  const splitRun = Effect.fnUntraced(function* (expected: number) {
+    const ran = yield* invoke(silk, ['run', '--stdlib', standardLibrary], split, splitEnvironment)
+    assert.equal(ran.status, expected, ran.stderr)
+  })
+  yield* splitRun(7)
+  const coldObjects = yield* objectNames()
+  assert.ok(coldObjects.length > 2, `expected an object per module, found ${coldObjects.join(', ')}`)
+  yield* splitRun(7)
+  assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
+  yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
+  yield* splitRun(9)
+  const editedObjects = yield* objectNames()
+  const compiled = editedObjects.filter((name) => !coldObjects.includes(name))
+  assert.equal(compiled.length, 1, `an edit to one module compiles one unit, added ${compiled.join(', ')}`)
+  assert.equal(editedObjects.length, coldObjects.length + 1)
+  // A rebuild replays the record the last build left in the cache: an edit to a body lowers only
+  // the instances it touched, and an edit that changes what the program reaches walks it again.
+  // Either way the executable is the one a cold build links. A string constant holding `@` names
+  // nothing, so the unit still declares the helper it calls.
+  const executable = join(split, `build/llvm/${hostTarget}/debug/split`)
+  const replayed = Effect.fnUntraced(function* (helper: string, expected: number, lowered: RegExp) {
+    yield* fs.writeFileString(join(split, 'src/helper.silk'), helper)
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary, '--timings'], split, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+    assert.match(built.stdout + built.stderr, lowered)
+    yield* splitRun(expected)
+    const warm = yield* fs.readFile(executable)
+    yield* fs.remove(join(split, 'build'), { recursive: true })
+    yield* splitRun(expected)
+    assert.deepEqual(yield* fs.readFile(executable), warm, 'a replayed build links the executable a cold build links')
+  })
+  yield* fs.writeFileString(
+    join(split, 'src/main.silk'),
+    'import helper\n\npub fn main() -> i32 {\n  let marker = b"ptr @"\n  if marker.length == 5 { return helper.value() + 4 }\n  return 0\n}\n',
+  )
+  yield* splitRun(9)
+  yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
+  yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+[1-9]\d+ functions\s/)
+  // A check replays the escape walks the last check left in the cache. A callback's call into
+  // another module of the package is walked below the callback, so an edit there that adds a `run`
+  // is reported as a cold check reports it, and an edit that keeps what the walk reads reports
+  // nothing.
+  const escapes = join(directory, 'escapes')
+  yield* fs.makeDirectory(join(escapes, 'src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(escapes, 'silk.toml'),
+    '[package]\nname = "escapes"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  )
+  yield* fs.writeFileString(
+    join(escapes, 'src/main.silk'),
+    [
+      'import helper',
+      'import silk.allocator {Allocator, OutOfMemoryError}',
+      'import silk.effect {Effect}',
+      'import silk.result {Result}',
+      'import silk.shared {Shared}',
+      '',
+      'fn use(value: &mut i32) -> i32 {',
+      '  return helper.compute() + value.*',
+      '}',
+      '',
+      'effect fn start() -> i32 ! OutOfMemoryError ? &mut Allocator {',
+      '  let shared = run Shared<i32>.make(41)',
+      '  return shared.withMut(use)',
+      '}',
+      '',
+      'pub fn main() -> i32 {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  return match move run Effect.result(start() |> Effect.provideMut<Allocator>(&mut allocator)) {',
+      '    Result<i32, OutOfMemoryError>.Success {value} => value',
+      '    Result<i32, OutOfMemoryError>.Failure {..} => 1',
+      '  }',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const escapeReports = (output: string) => output.split('\n').filter((line) => /(error|warning)\[/.test(line)).join('\n')
+  const escapeCheck = Effect.fnUntraced(function* (helper: string, expected: string) {
+    yield* fs.writeFileString(join(escapes, 'src/helper.silk'), helper)
+    const warm = yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+    yield* fs.remove(join(escapes, 'build'), { recursive: true })
+    const cold = yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+    assert.equal(escapeReports(warm.stdout + warm.stderr), escapeReports(cold.stdout + cold.stderr), 'a warm check reports what a cold check reports')
+    assert.equal(warm.status, cold.status, warm.stderr)
+    assert.match(escapeReports(cold.stdout + cold.stderr), new RegExp(expected))
+    // Leave a cache for the next edit.
+    yield* invoke(silk, ['check', '--stdlib', standardLibrary], escapes, splitEnvironment)
+  })
+  const computing = (body: string) => `effect fn tick() -> () {\n  return ()\n}\n\npub fn compute() -> i32 {\n${body}}\n`
+  yield* escapeCheck(computing('  return 1\n'), '^$')
+  yield* escapeCheck(computing('  return 2\n'), '^$')
+  yield* escapeCheck(computing('  run tick()\n  return 1\n'), 'helper\\.silk:6:3: error\\[OWN0016\\]')
+  yield* escapeCheck(computing('  return 3\n'), '^$')
   yield* Console.log(
-    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, native changes release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, object and static library artifacts and emission stages passed',
+    'Native build CLI: exact LLVM output, Clang bypass, --clang, default linking/cleanup, selector validation, project run, clean, init, manifest flags, named profiles, profile input, bindings, source root, path dependencies, exports, workspaces, silk change release/history/recovery, retention, runtime requests, format reports, installed standard library, clang on PATH, version, help, check, project test, cached codegen units, build replay, check replay, object and static library artifacts and emission stages passed',
   )
 })
 const require = createRequire(new URL('../../package.json', import.meta.url))

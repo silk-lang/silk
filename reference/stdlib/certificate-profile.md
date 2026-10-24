@@ -243,6 +243,24 @@ ResourceLimit
 
 A configured finite budget or target size bound is exceeded.
 
+<a id="ProfileClass.impl.Debug"></a>
+
+## Implementation `Debug for ProfileClass`
+
+```silk
+impl Debug for ProfileClass
+```
+
+<a id="ProfileClass.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Malformed`.
+
 <a id="ProfileOffsetSpace"></a>
 
 ## `ProfileOffsetSpace`
@@ -272,6 +290,24 @@ ConfiguredConstraintDer
 ```
 
 Offset in caller-supplied configured NameConstraints DER.
+
+<a id="ProfileOffsetSpace.impl.Debug"></a>
+
+## Implementation `Debug for ProfileOffsetSpace`
+
+```silk
+impl Debug for ProfileOffsetSpace
+```
+
+<a id="ProfileOffsetSpace.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `CertificateDer`.
 
 <a id="ProfileReason"></a>
 
@@ -623,6 +659,24 @@ NameComparisons
 
 The caller-supplied name/subtree comparison budget is exhausted.
 
+<a id="ProfileReason.impl.Debug"></a>
+
+## Implementation `Debug for ProfileReason`
+
+```silk
+impl Debug for ProfileReason
+```
+
+<a id="ProfileReason.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `Version`.
+
 <a id="ProfileError"></a>
 
 ## `ProfileError`
@@ -683,6 +737,24 @@ pub offset: usize
 ```
 
 Byte offset in the selected coordinate system.
+
+<a id="ProfileError.impl.Debug"></a>
+
+## Implementation `Debug for ProfileError`
+
+```silk
+impl Debug for ProfileError
+```
+
+<a id="ProfileError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the fields, as `ProfileError { kind: ..., reason: ..., ... }`.
 
 <a id="KeyUsage"></a>
 

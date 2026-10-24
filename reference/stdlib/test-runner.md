@@ -18,14 +18,23 @@ The host passes these options. Each takes one value:
 | `--silk-test-plan` | Path of the plan file. Required. |
 | `--silk-test-result` | Path of the receipt file. Required. |
 | `--silk-test-progress` | Path of the progress file. Optional. |
+| `--silk-test-timeout` | Each test's time limit in whole seconds. Optional; `0` or absent is none. |
 
 The runner checks the complete plan before any test body runs.
+
+On a native target, a failed test's report goes to standard output under the test's name: the
+message of a failed expectation, an unhandled error, or a fatal trap, with the call path that led
+to it.
 
 With `--silk-test-progress`, the runner writes a progress record (see `silk.test_exchange`)
 before each test body runs, and removes the file when every test has finished. If the file
 already holds a record when the runner starts, the test it names stopped an earlier runner
 process, for example with a trap. The runner then reports that test as failed, skips the tests
 before it, and continues with the next one, so its summary and receipt count the whole run.
+
+With a time limit on a native target with a C library, the runner sets an alarm before each test
+body runs. A test that outlives it ends the process with `SIGALRM`, which the host reports as a
+timeout before it continues with the next test.
 
 ## Errors
 The exit status is `0` if all selected tests pass, `1` if a test fails, and `2` for a usage

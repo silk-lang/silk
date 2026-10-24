@@ -71,10 +71,11 @@ On macOS (Apple Silicon) or Linux (x86-64 or ARM64):
 curl -fsSL https://raw.githubusercontent.com/silk-lang/silk/main/install.sh | sh
 ```
 
-The script installs the latest stable release as a toolchain in `~/.silk/toolchains/<version>`
-(set `SILK_HOME` to change `~/.silk`), links `~/.silk/bin/silk` to it and makes it the default.
-It verifies the compiler's SHA-256 and reported version, and the release signature when
-`minisign` is installed. Earlier toolchains stay installed beside it.
+The script installs the latest stable release in `~/.silk/toolchains/<version>` (set `SILK_HOME`
+to change `~/.silk`) and makes it your default. It also installs [the silk tool](tool), the command
+you type for Silk, as `~/.silk/bin/silk`; each release's compiler is `silkc`. It verifies the
+compiler's SHA-256 and reported version, and the release signature when `minisign` is installed.
+Earlier versions stay installed beside it.
 Set `SILK_RELEASE=v0.2.0-beta.1` to select a published prerelease explicitly. Building programs
 needs Clang 22 or newer on `PATH`, or `SILK_CLANG` pointing at it.
 
@@ -93,33 +94,30 @@ mise use -g 'github:silk-lang/silk[version_prefix=v]'
 Homebrew follows the same channel as the script. mise picks stable releases only; until the first
 one exists, use `github:silk-lang/silk[version_prefix=v,prerelease=true]` to get dev releases.
 
-### Toolchain versions
+### Silk versions
 
-A project pins its compiler with `silk-version` in `silk.toml`, under `[package]` or
-`[workspace]`. `silk` reads the pin and runs that toolchain from `~/.silk/toolchains`, so projects
-on different versions work side by side. Outside a pinned project it runs the default toolchain.
-In a workspace the `[workspace]` pin wins over the members' own, and `silk toolchain use` sets it
-and moves any member pins along with it.
+A project pins its Silk version with `silk-version` in `silk.toml`, under `[package]` or
+`[workspace]`. `silk` reads the pin and runs that version from `~/.silk/toolchains`, so projects on
+different versions work side by side. Outside a pinned project it runs your default version. In a
+workspace the `[workspace]` pin wins over the members' own, and `silk set` sets it and moves any
+member pins along with it.
 
 ```sh
-silk toolchain install 0.1.0-dev.6+0123456789ab   # download, verify and unpack a release
-silk toolchain use 0.1.0-dev.6+0123456789ab       # install it and pin the current project
-silk toolchain use latest                         # pin the newest stable release (--dev: include dev releases)
-silk toolchain default 0.1.0-dev.6+0123456789ab   # used outside pinned projects; ~/.silk/bin/silk runs it
-silk toolchain list                               # installed toolchains; which one is selected
-silk toolchain which                              # the toolchain selected here, and why
-silk +0.1.0-dev.6+0123456789ab build              # run one command with a given toolchain
+silk use                    # install the version this project pins
+silk use 0.1.0-dev.11       # install a version and make it your default
+silk set latest             # pin this project to the newest stable release (--dev: include dev releases)
+silk use list               # installed versions, and which one is selected here
+silk use which              # the version selected here, and why
+silk +0.1.0-dev.11 build    # run one command with an installed version
+silk update self            # update the silk tool itself
 ```
 
-When the pinned toolchain is missing, `silk` exits with status 3 and prints the
-`silk toolchain install` command that fixes it. Set `SILK_AUTO_INSTALL=1`, or
-`auto-install = true` in `~/.silk/settings.toml`, to install it automatically instead.
-The commands never prompt and report progress on standard error only; `list`, `which`, `install`
-and `use` take `--json` for machine-readable results.
-Exit statuses: 0 success, 1 failure, 2 usage, 3 toolchain not installed, 4 network, 5 verification.
-`SILK_TOOLCHAIN=<version>` overrides the selection for a shell, `SILK_TOOLCHAIN=local` keeps the
-`silk` you ran, and `SILK_TOOLCHAIN_MIRROR=<directory>` installs from a local copy of the release
-assets laid out as `v<version>/<asset>`. Homebrew and mise installs dispatch the same way.
+Every other command, such as `silk build` or `silk test`, runs unchanged in the selected
+version's compiler. When the pinned version is missing, the command exits with status 3 and names
+the `silk use` command that fixes it. Set `SILK_AUTO_INSTALL=1`, or `auto-install = true` in
+`~/.silk/settings.toml`, to install it automatically instead. `SILK_TOOLCHAIN=<version>`
+overrides the selection for a shell. See [tool/README.md](tool) for the rest. Homebrew and mise
+install `silk` beside its release's `silkc`, which it runs when nothing selects another version.
 
 ## Quick start
 
@@ -149,35 +147,35 @@ pub effect fn main() -> ()
 
 ## Changes and releases
 
-The native CLI includes `silk changes`, implemented in the [`changes/`](changes) Silk package.
-From a package directory:
+`silk change` records release notes and cuts releases. It is implemented in the [`changes/`](changes)
+Silk package and reads the `[release]` table of `silk.toml`. From a package directory:
 
 ```sh
-silk changes add minor "Reads now return a future." --migration "Await read()."
-silk changes status
-silk changes version --tag beta
-silk changes version
-silk changes release --json
-silk changes since 0.1.0 --json
+silk change minor "Reads now return a future." --migration "Await read()."
+silk change status
+silk change version --tag beta
+silk change version
+silk change release --json
+silk change since 0.1.0 --json
 ```
 
 Each contribution gets its own `.changes/<random>.md`, avoiding shared changelog edits in PRs.
 Migration guidance is optional, but missing guidance is reported as unknown impact. Releases
 consume pending changes, update the package version, and write authoritative
 `.changes/releases/<version>.toml` records. `CHANGELOG.md` is regenerated from those records
-with a warning that manual edits will be overwritten. An optional `[changes].version-file`
+with a warning that manual edits will be overwritten. An optional `[release].version-file`
 generates a Silk module exposing the package's version in the same recovery transaction.
 Commit the records, changelog, manifest, generated module, and consumed-file deletions together.
 `release` checks the prepared release and exports its notes and metadata for a publisher.
 These commands do not commit, tag, publish, or access Git.
 
-`silk changes since` selects compiler upgrades from the project's `package.silk-version`.
+`silk change since` selects compiler upgrades from the project's `package.silk-version`.
 `since <dependency>` starts at that dependency's installed manifest version; `--to VERSION`
 selects an exact target. Published queries compare immutable `changes-snapshot.toml` release
 assets, including pending notes that actually shipped in a dev release—not today's open changes.
 Unchanged notes are deduplicated across dev-to-stable promotion; edited migration guidance is
 shown again as updated. `--source PATH` supports offline checkouts and snapshot files.
-See [`compiler/README.md`](compiler/README.md#native-changes) for discovery and trust settings.
+`silk change --help` lists the discovery and trust settings.
 
 The compiler uses this flow itself. A maintained draft release PR collects pending changes;
 merging it publishes stable after the native gates pass. Daily or manually triggered dev releases
@@ -356,15 +354,18 @@ times. It also has to run a shared corpus of 443 programs with exactly the expec
 | ------------------------- | ---------------------------------------------------------- |
 | [`compiler/`](compiler)   | The compiler, written in Silk                              |
 | [`changes/`](changes)     | Changes, release versions, migration notes, and changelogs |
+| [`tool/`](tool)           | The silk tool, the front door: Silk versions and forwarding |
+| [`tomledit/`](tomledit)   | Comment-preserving `silk.toml` edits, shared by both       |
 | [`stdlib/`](stdlib)       | The standard library                                       |
 | [`reference/`](reference) | The language reference and the generated stdlib reference  |
 | [`corpus/`](corpus)       | The shared acceptance corpus                               |
 | [`examples/`](examples)   | Larger example programs                                    |
 
-The root `silk.toml` defines a native workspace containing `compiler` and `changes`. Members
+The root `silk.toml` defines a native workspace containing `compiler`, `changes`, `tomledit` and
+`tool`. Members
 share the root `build/` directory; the root is not itself a package. Select a member explicitly
 from the root, for example `silk build --manifest-path compiler/silk.toml --stdlib stdlib` or
-`silk changes --dir compiler status`. Release operations affect one package at a time.
+`silk change --dir compiler status`. Release operations affect one package at a time.
 
 ## Contributing
 

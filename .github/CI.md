@@ -5,6 +5,13 @@ events. `main` still runs it on every push and on the nightly schedule. A branch
 someone dispatches the workflow on that branch, so push as often as you like and trigger CI once the
 branch is ready for review or merge.
 
+A main push skips the gate when a fully green dispatch run of the merged PR's head tested exactly
+the tree the merge produced, so bringing `main` into a PR right before merging saves a whole run.
+
+The managed release PR (`release/compiler-stable`) is refreshed after every main push but not
+verified. Merging it runs every gate on `main` before publishing, so dispatch the workflow on it
+only when you want a verdict ahead of the merge.
+
 ## Before you trigger
 
 - Commit and push everything. The run tests the branch head as pushed.

@@ -198,8 +198,31 @@ fatal trap: division by zero
   at app.main (src/app.silk:14)
 ```
 
+A trap inside a task that an Execution runs, such as a Fiber child, reports the same way to the
+observer of the code driving it.
+
+A library states a violated precondition with `Intrinsic.trap(reason)`, where `reason` is a
+`string<'static>`. The report names that reason, and its site is the call that entered the
+library's package, not the line inside the library. So misuse of a standard-library operation names
+the program's own line:
+
+```text
+fatal trap: List.get: the index is not less than the length
+  at app.pick (src/app.silk:6:10)
+```
+
+A call into another package carries the call's site, and a call within a package passes on the
+site it was entered with. The standard library is a dependency of every package, so its calls back
+into a program, such as a callback or a witness, carry no site: a trap there, and a trap in code
+that no other package called, reports at its own statement.
+
+A stack overflow on the main thread of a hosted native program is a trap too. Its report is
+`fatal trap: stack overflow` without frames, written from a separate signal stack; another invalid
+memory access reports `fatal trap: segmentation fault`. The process then ends with the signal.
+
 **Boundary:** Corrupted memory or a violated unsafe contract may prevent a complete report. Silk
-guarantees neither a portable numeric trap status nor structured cleanup after the trap.
+guarantees neither a portable numeric trap status nor structured cleanup after the trap. A stack
+overflow on a thread other than the main thread has no signal stack and may end without a report.
 
 **Diagnostics:** A compile-time trap in required constant evaluation is a source diagnostic. A
 runtime trap is abnormal termination and must not be reported as an unhandled typed error.

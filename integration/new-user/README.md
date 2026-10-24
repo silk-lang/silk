@@ -62,7 +62,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 
 ## Fuzzers
 
-`fuzz/` holds tools for the stability rounds. They are not tests: run them by hand, with the `silk` you want to test first on PATH (or `SILK_TOOLCHAIN=local` and a local build).
+`fuzz/` holds tools for the stability rounds. They are not tests: run them by hand, with the `silk` you want to test first on PATH (or `SILK_TOOLCHAIN` naming an installed local build).
 
 | Tool | Does |
 | --- | --- |

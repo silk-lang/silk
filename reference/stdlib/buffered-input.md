@@ -424,6 +424,24 @@ Terminal
 
 An earlier transport failure or a close made the buffer unusable.
 
+<a id="BufferError.impl.Debug"></a>
+
+## Implementation `Debug for BufferError`
+
+```silk
+impl Debug for BufferError
+```
+
+<a id="BufferError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `InvalidCapacity { ... }`.
+
 <a id="FillOutcome"></a>
 
 ## `FillOutcome`

@@ -13,8 +13,8 @@ runner owns filtering, invocation, reporting, and exit policy.
 - A **test descriptor** is a sealed static value issued by the compiler for one discovered test.
 - An **authored fingerprint** identifies the canonical authored header and body of one test. It is
   content metadata, not a reusable test result.
-- An **execution identity** is a compiler-issued cache key for one test's complete known execution
-  closure and normalized compiler-controlled environment.
+- A **runner record** lists every file the build of the bundled runner read, so a later run can
+  tell whether the runner it built is still current.
 - The **bundled runner** is ordinary Silk source used as the executable entry for `silk test`.
 
 ## Test declarations
@@ -141,9 +141,9 @@ targets, profiles, compiler and runner versions, files, environment, time, and n
 test calls `parse`, editing only `parse` may change the test result while leaving the test's
 fingerprint unchanged.
 
-**Boundary:** The authored fingerprint is never cache authority. Result reuse uses the separate
-execution identity, which also covers the test's known transitive dependencies and normalized
-compiler-controlled environment.
+**Boundary:** The authored fingerprint is never cache authority. `silk test` reuses no test result
+(TEST-008), and it decides whether a built runner is current from every file the build read
+(TEST-009), not from fingerprints.
 
 **Diagnostics:** No diagnostic applies to observing a fingerprint. Treating it as cache authority
 has no language support.
@@ -201,6 +201,11 @@ requiring the failure payload to implement a reporting interface. A fatal trap s
 runner process without cleanup, but it does not end the run: the host reports the trapping test as
 failed and starts a new runner process that continues with the next selected test.
 
+Each test has a time limit, 60 seconds unless `--timeout <seconds>` sets another; `--timeout 0`
+removes it. A test that outlives its limit ends the runner process like a trap: `silk test` reports
+that the test did not finish within the limit, fails it, and continues with the next selected test.
+The limit needs a native target with a C library; elsewhere tests have none.
+
 Tests must close their service requirements and provide any scheduler or execution owner they need.
 The bundled runner supplies no hidden provider or scheduler. This can require a test to wrap its
 body in local provision or a nested Effect. Exact callable requirement rows remain available so a
@@ -225,12 +230,14 @@ effect fn readWithFixedClock() -> () {
 test fn readsFixedClock() -> () { return run readWithFixedClock() }
 ```
 
-The runner identifies each selected test, prints elapsed time for each executed result, identifies
-cached passes without invoking them, and reports discovered, selected, cached, executed, passed,
-and failed counts plus total run time. A cached pass contributes to `cached` and `passed`, but not
-`executed`. Completed runs return 0 when all selected tests pass, including zero selected tests;
-they return 1 when a typed test failure or a trapping test occurs. Runner or cache-exchange
-operational failures return 2. Abnormal termination outside a test body remains abnormal.
+The runner identifies each selected test, prints elapsed time for each executed result, and reports
+discovered, selected, cached, executed, passed, and failed counts plus total run time. The exchange
+lets a host mark a test as an already passed cache hit, which the runner reports as `CACHED`
+without invoking it and counts in `cached` and `passed`, but not `executed`. `silk test` marks no
+test that way (TEST-008), so its `cached` count is 0. Completed runs return 0 when all selected
+tests pass, including zero selected tests; they return 1 when a typed test failure or a trapping
+test occurs. Runner or cache-exchange operational failures return 2. Abnormal termination outside a
+test body remains abnormal.
 
 **Boundary:** The runner has no parallelism, retries, sharding, isolation, watch mode, shared
 fixtures, or configurable hosts.
@@ -242,44 +249,55 @@ boundary are compile-time errors even when runtime filters would exclude that te
 [typed failures](typed-failures.md), [requirements and services](requirements-and-services.md),
 [program termination](program-termination-and-reporting.md).
 
-### TEST-008 — Completed passes are reused by execution identity
+### TEST-008 — Every run executes every selected test
 
 **Status:** Confirmed
 
-`silk test` reuses a prior completed pass by default. The compiler publishes one execution identity
-for each eligible discovered test. That identity includes the test's authored declaration, its
-known transitive execution closure, and normalized compiler, profile, runtime, target, native-input,
-and bundled-runner facts. Editing a dependency invalidates only tests whose closures include it;
-editing a shared dependency invalidates all affected tests. Runtime filters do not enter the key,
-so selecting the same test by a different `--file` or `--filter` combination can reuse the same
-pass.
-
-Only a test executed by the current admitted run and reported as passed is published. Failed tests
-run again, and cached tests are never republished. Incomplete compiler attribution makes that test
-ineligible rather than guessing. Result records use the `test-results-v1` namespace beneath
-`<build.output-dir>/.silk-cache`.
+`silk test` stores no test results. Each run executes every selected test, whether or not it
+passed before, so a test that reads files, the environment, the clock, or the network always runs
+against the current state. What a rerun can skip is building the runner (TEST-009). `--no-cache`
+skips that reuse too and builds the runner again.
 
 ```sh
-silk test                    # reads and publishes completed-pass results
-silk test --no-cache         # bypasses test-result reads and writes for this invocation
-silk test --filter parser    # filters in the runner; eligible hits may still be reused
+silk test             # reuses an unchanged runner, then runs every selected test
+silk test --no-cache  # builds the runner again, then runs every selected test
 ```
 
-`--no-cache` controls only test-result reuse. It does not disable compiler or native-artifact
-caches. If the complete per-test plan or receipt would exceed the bounded exchange, the invocation
-selects compact uncached mode before any result lookup and executes the selected tests normally.
-Expected optional result-store read or publication failures are reported and degrade to execution
-or skipped publication; they do not replace the test outcome.
+The plan and receipt the host exchanges with the runner (`silk.test_exchange`) also have a
+per-test mode that marks cache hits; `silk test` always uses the compact uncached mode.
 
-**Boundary:** Execution identities do not track arbitrary files read at runtime, ambient process
-environment, network responses, wall-clock time, randomness, or other external state. A skipped
-passing test does not replay its stdout, stderr, file writes, service mutations, or effects on later
-tests. `--no-cache` is the execution mode for tests whose correctness depends on those facts unless
-the dependency is made an explicit compiler-controlled input.
+**Boundary:** Reusing passed results needs a per-test identity that covers each test's transitive
+dependencies, which the compiler does not publish. No result store exists under
+`<build.output-dir>`.
 
-**Diagnostics:** Every discovered test is still compiled before runtime selection or cache lookup,
-so a cached hit cannot hide source diagnostics. Invalid or incomplete plan/receipt exchange data is
-an operational status 2 and publishes no results.
+**Diagnostics:** Every discovered test is compiled, or its build reused, before runtime selection,
+so source diagnostics are never hidden. Invalid or incomplete plan or receipt exchange data is an
+operational status 2.
 
-**Evidence:** test-result cache requirements,
-cached CLI workflow.
+**Evidence:** source runner requirements, test CLI requirements.
+
+### TEST-009 — An unchanged project reuses its built runner
+
+**Status:** Confirmed
+
+`silk test` records, beside the runner it builds, every file the build read with a digest of its
+contents, every file or directory it looked for, and every directory it listed. The next run
+compares that record with the files on disk. When nothing in it changed, and the compiler, profile,
+discovery root, and toolchain settings (`--clang`, `SILK_CLANG`, `SILK_LLVM_AR`, `PATH`,
+`SDKROOT`, `DEVELOPER_DIR`) are the same, the run reuses the runner without building. `--file` and
+`--filter` select tests in the runner, so a filtered rerun reuses it too.
+
+```sh
+silk test                  # builds the runner and runs every test
+silk test --filter parser  # reuses the runner when no source changed
+```
+
+**Boundary:** A run with profile bindings never reuses a runner, because bindings may hold secrets
+that are not written to disk. Files that only the native toolchain reads, such as system libraries
+and headers, are not part of the record. Adding a file to a directory the build listed counts as a
+change even when no import names it. `--no-cache` builds the runner again (TEST-008).
+
+**Diagnostics:** None. A record that is missing, unreadable, or written by another compiler only
+means the runner is built again.
+
+**Evidence:** test runner reuse requirements, cached CLI workflow.

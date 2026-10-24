@@ -126,6 +126,24 @@ SrvId
 
 An SRV-ID reference is unsupported for HTTPS.
 
+<a id="UnsupportedForm.impl.Debug"></a>
+
+## Implementation `Debug for UnsupportedForm`
+
+```silk
+impl Debug for UnsupportedForm
+```
+
+<a id="UnsupportedForm.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `IpvFuture`.
+
 <a id="OriginHost"></a>
 
 ## `OriginHost`
@@ -417,6 +435,24 @@ EmptySanExtension
 
 A present SAN extension has no GeneralNames.
 
+<a id="CertificateStructureError.impl.Debug"></a>
+
+## Implementation `Debug for CertificateStructureError`
+
+```silk
+impl Debug for CertificateStructureError
+```
+
+<a id="CertificateStructureError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidDer`.
+
 <a id="CertificateIdentities"></a>
 
 ## `CertificateIdentities`
@@ -608,6 +644,24 @@ MissingWildcardSuffix
 
 A wildcard name has no suffix.
 
+<a id="NameError.impl.Debug"></a>
+
+## Implementation `Debug for NameError`
+
+```silk
+impl Debug for NameError
+```
+
+<a id="NameError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `EmptyName`.
+
 <a id="CertificateIdentityError"></a>
 
 ## `CertificateIdentityError`
@@ -638,6 +692,24 @@ WrongGeneralNameTag
 
 An Other descriptor uses tag two, seven, or a number above eight.
 
+<a id="CertificateIdentityError.impl.Debug"></a>
+
+## Implementation `Debug for CertificateIdentityError`
+
+```silk
+impl Debug for CertificateIdentityError
+```
+
+<a id="CertificateIdentityError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `InvalidIpLength`.
+
 <a id="LimitKind"></a>
 
 ## `LimitKind`
@@ -667,6 +739,24 @@ SanBytes
 ```
 
 The sum of payload lengths exceeds the configured budget.
+
+<a id="LimitKind.impl.Debug"></a>
+
+## Implementation `Debug for LimitKind`
+
+```silk
+impl Debug for LimitKind
+```
+
+<a id="LimitKind.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant, such as `SanCount`.
 
 <a id="IdentityError"></a>
 
@@ -827,6 +917,24 @@ NoMatch
 ```
 
 No eligible SAN matches the reference.
+
+<a id="IdentityError.impl.Debug"></a>
+
+## Implementation `Debug for IdentityError`
+
+```silk
+impl Debug for IdentityError
+```
+
+<a id="IdentityError.impl.Debug.debug"></a>
+
+### Operation `debug`
+
+```silk
+effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer
+```
+
+Writes the name of the variant and its fields, such as `MalformedReference { ... }`.
 
 <a id="IdentityLimits"></a>
 

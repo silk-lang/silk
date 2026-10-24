@@ -40,9 +40,9 @@ The profile separates these domains:
 | Runtime               | default, named package composition, none                              |
 | Package configuration | typed values keyed by package/module/parameter identity               |
 
-A project profile may also set `maxMemory`, the most linear memory a wasm32 module may grow to: a
+A project profile may also set `max-memory`, the most linear memory a wasm32 module may grow to: a
 whole number of bytes, `KiB`, `MiB` or `GiB` that is a positive multiple of the 64 KiB page and at
-most 4 GiB, such as `maxMemory = "256MiB"`. It is a final-link setting, not an initial fact, so it
+most 4 GiB, such as `max-memory = "256MiB"`. It is a final-link setting, not an initial fact, so it
 never enters source specialization or its identity. Another target refuses it as an unsupported
 combination. A multi-threaded wasm32 profile defaults it to 1 GiB (THREAD-009).
 
@@ -175,8 +175,11 @@ read by declaration identity, not through arbitrary library-field key lookup. No
 `Profile` or `Intrinsic.targetProfile` operation exists.
 
 A manifest selects its default with `build.profile`; `[profiles.<name>]` contains logical profile
-inputs and `bindings`. `build.bindings` contains project-tier bindings. Each profile names its
-`target` explicitly. A complete request override replaces project profile selection. CLI `--profile`
+inputs and `bindings`. `build.bindings` contains project-tier bindings. A profile that names no
+`target` builds for the host. Profile fields are kebab-case (`code-model`, `max-memory`); the earlier
+`codeModel` and `maxMemory` are still read, and `--profile-input` JSON keeps them. Without a table
+of that name, `dev` (unoptimized, with debug information) and `release` (optimized, without it) are
+built-in profiles for the host. A complete request override replaces project profile selection. CLI `--profile`
 and LSP profile-name settings select a project profile; `--profile-input` and its LSP equivalent
 provide the complete input object; target-triple shorthand selects a default logical input for
 that target. Conflicting explicit modes are errors. Without an explicit mode, tooling uses the
