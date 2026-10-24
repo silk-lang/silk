@@ -25,6 +25,23 @@ import silk.effect { Effect }
 import silk.os_random { OsRandom }
 import silk.random { Random }
 
+pub fn main() -> i32 {
+  let mut random = OsRandom.make()
+  let mut key: [u8; 32] = [0; 32]
+  run Random.fillBytes(&mut key) |> Effect.provideMut<Random>(&mut random)
+
+  // 32 zero bytes from a secure source are practically impossible.
+  let mut index: usize = 0
+  while index < 32 {
+    if key[index] != 0 {
+      return 0
+    }
+    index = index + 1
+  }
+  return 1
+}
+```
+
 Import as `OsRandom` with `import silk.os_random { OsRandom }`.
 
 Public declarations: 1.
@@ -82,5 +99,7 @@ impl Random for OsRandom
 effect fn fillBytes(self: &mut Self, output: &mut [u8]) -> ()
 ```
 
+
+Category: Native platform.
 
 Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu-no-libc`, `x86_64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu-no-libc`, `wasm32-unknown-unknown`, `wasm32-wasip1`, `wasm32-wasip2`.
