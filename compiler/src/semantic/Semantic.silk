@@ -3814,9 +3814,14 @@ effect fn impliedSignatureBounds(resolver: &mut Resolver, owner: &mut Query<Answ
   let mut visited = List<StoredShape>.make()
   let mut walked = List<Shared<Type>>.make()
   let mut revisits = usize.ZERO
+  let mut reached = ReachedTypes {held: List<Shared<Type>>.make(), inputs: List<bool>.make(), lookup: InternIndex.make()}
+  // Handles whose view bounds are listed in full (`Type.impliedBounds`), which lists those of every
+  // type inside them too.
+  let mut bounded = ReachedTypes {held: List<Shared<Type>>.make(), inputs: List<bool>.make(), lookup: InternIndex.make()}
   let mut at = usize.ZERO
   while at < types.length {
     run appendViewBounds(&types[at], owed, &mut implied)
+    if !owed { drop run reachType(&mut bounded, &types[at], false) }
     run List<Shared<Type>>.append(&mut pending, Shared<Type>.clone(&types[at]))
     run List<bool>.append(&mut stores, at < inputs)
     at = at + usize.ONE
@@ -3825,6 +3830,19 @@ effect fn impliedSignatureBounds(resolver: &mut Resolver, owner: &mut Query<Answ
     let last = List<Shared<Type>>.length(&pending) - usize.ONE
     let current = List<Shared<Type>>.remove(&mut pending, last)
     let input = List<bool>.remove(&mut stores, last)
+    // A stored member is often the very handle its application also holds as an argument, so the
+    // walk reaches it twice; reading it again adds nothing and would repeat its whole subtree.
+    if !run reachType(&mut reached, &current, input) { continue }
+    let mut children = List<Shared<Type>>.make()
+    run Type.structuralChildren(&current, &mut children)
+    let inside = List<Shared<Type>>.asSlice(&children)
+    if reachedType(&bounded, &current, false) {
+      let mut child = usize.ZERO
+      while child < inside.length {
+        drop run reachType(&mut bounded, &inside[child], false)
+        child = child + usize.ONE
+      }
+    }
     // A compiler-sealed family (the `silk/core` cores, the `Intrinsic` families) has no source
     // declaration to read bounds from; its arguments are still walked.
     let named = Shared<Type>.with<Option<DeclarationId>>(&current, fn(node: &Type) -> Option<DeclarationId> {
@@ -3861,15 +3879,20 @@ effect fn impliedSignatureBounds(resolver: &mut Resolver, owner: &mut Query<Answ
         let stored = List<Shared<Type>>.asSlice(&members)
         let mut member = usize.ZERO
         while member < stored.length {
-          run appendViewBounds(&stored[member], false, &mut implied)
+          // A member typed by a parameter is often the argument's own handle, bounded already.
+          if run reachType(&mut bounded, &stored[member], false) { run appendViewBounds(&stored[member], false, &mut implied) }
           run List<Shared<Type>>.append(&mut pending, Shared<Type>.clone(&stored[member]))
           run List<bool>.append(&mut stores, true)
           member = member + usize.ONE
         }
       }
     }
-    run Type.structuralChildren(&current, &mut pending)
-    while List<bool>.length(&stores) < List<Shared<Type>>.length(&pending) { run List<bool>.append(&mut stores, input) }
+    let mut child = usize.ZERO
+    while child < inside.length {
+      run List<Shared<Type>>.append(&mut pending, Shared<Type>.clone(&inside[child]))
+      run List<bool>.append(&mut stores, input)
+      child = child + usize.ONE
+    }
   }
   // A callable's invocation regions are fresh at each of its invocations, which owe the bounds its
   // contract's types imply there; a call that only passes or returns the callable owes none of them.
@@ -3886,6 +3909,36 @@ effect fn impliedSignatureBounds(resolver: &mut Resolver, owner: &mut Query<Answ
     at = at + usize.ONE
   }
   return move held
+}
+
+// Type handles one implied-bound walk already read, and whether as part of an input. Each handle is
+// retained so its address stays unique for the walk.
+struct ReachedTypes {
+  held: List<Shared<Type>>
+  inputs: List<bool>
+  lookup: InternIndex
+}
+
+// Records that the walk reads `value`, as part of an input or not, unless it already read that handle
+// as an input, or at all when `input` is false: an input reading does everything another one does.
+effect fn reachType(reached: &mut ReachedTypes, value: &Shared<Type>, input: bool) -> bool ! OutOfMemoryError ? &mut Allocator {
+  if reachedType(&reached.*, value, input) { return false }
+  run List<Shared<Type>>.append(&mut reached.held, Shared<Type>.clone(value))
+  run List<bool>.append(&mut reached.inputs, input)
+  run InternIndex.record(&mut reached.lookup, usize.toU64(Shared<Type>.with<usize>(value, typeAddress)))
+  return true
+}
+
+fn reachedType(reached: &ReachedTypes, value: &Shared<Type>, input: bool) -> bool {
+  let address = Shared<Type>.with<usize>(value, typeAddress)
+  let held = List<Shared<Type>>.asSlice(&reached.held)
+  let inputs = List<bool>.asSlice(&reached.inputs)
+  let mut at = InternIndex.first(&reached.lookup, usize.toU64(address))
+  while at != usize.MAX {
+    if (inputs[at] || !input) && Shared<Type>.with<usize>(&held[at], typeAddress) == address { return true }
+    at = InternIndex.after(&reached.lookup, at)
+  }
+  return false
 }
 
 // Appends the bounds the views `value` holds imply: each referent outlives its view's region. With
@@ -23298,27 +23351,190 @@ fn outlivesAssumptionAt(
 // Query-local finite validity proof. Meet edges are logical rules, never added to the caller's
 // constraints. A cycle with no reached seed cannot prove itself; ambient bounds do not change
 // canonical region identity.
-effect fn appendProofRegion(nodes: &mut List<Shared<Lifetime>>, region: &Shared<Lifetime>) -> ()
-! OutOfMemoryError ? &mut Allocator {
-  if !containsRegion(List<Shared<Lifetime>>.asSlice(&nodes.*), region) {
-    run List<Shared<Lifetime>>.append(&mut nodes.*, Shared<Lifetime>.clone(region))
+//
+// The proof interns each region once by hash and indexes its edges by shorter region and its
+// meets by member, so the fixed point visits each region and edge once rather than rescanning
+// every region and edge until nothing changes.
+struct OutlivesProof {
+  regions: List<Shared<Lifetime>>
+  lookup: InternIndex
+  reached: List<bool>
+  queue: List<usize>
+  // For a meet, the members not yet reached; zero for an atom.
+  missing: List<usize>
+  // Outlives edges keyed by the shorter region, and meets keyed by each member.
+  edgeShorter: List<usize>
+  edgeLonger: List<usize>
+  edges: InternIndex
+  meetMember: List<usize>
+  meetOf: List<usize>
+  meets: InternIndex
+  // Parameter and Supplied regions, the only ones that can enclose a loan.
+  enclosers: List<usize>
+}
+
+fn proofRegion(proof: &OutlivesProof, region: &Shared<Lifetime>) -> usize {
+  let regions = List<Shared<Lifetime>>.asSlice(&proof.regions)
+  let mut at = InternIndex.first(&proof.lookup, Lifetime.hash(region))
+  while at != usize.MAX {
+    if Lifetime.equalsShared(&regions[at], region) { return at }
+    at = InternIndex.after(&proof.lookup, at)
   }
+  return usize.MAX
+}
+
+effect fn internProofRegion(proof: &mut OutlivesProof, region: &Shared<Lifetime>) -> usize
+! OutOfMemoryError ? &mut Allocator {
+  let known = proofRegion(&proof.*, region)
+  if known != usize.MAX { return known }
+  let index = List<Shared<Lifetime>>.length(&proof.regions)
+  run List<Shared<Lifetime>>.append(&mut proof.regions, Shared<Lifetime>.clone(region))
+  run InternIndex.record(&mut proof.lookup, Lifetime.hash(region))
+  run List<bool>.append(&mut proof.reached, false)
   let count = Lifetime.atomCount(region)
-  let mut at = usize.ZERO
-  while at < count {
-    let atom = Lifetime.atomAt(region, at)
-    if !containsRegion(List<Shared<Lifetime>>.asSlice(&nodes.*), &atom) {
-      run List<Shared<Lifetime>>.append(&mut nodes.*, move atom)
+  if count > usize.ONE {
+    run List<usize>.append(&mut proof.missing, count)
+    let mut at = usize.ZERO
+    while at < count {
+      let atom = Lifetime.atomAt(region, at)
+      let member = run internProofRegion(&mut proof.*, &atom)
+      run List<usize>.append(&mut proof.meetMember, member)
+      run List<usize>.append(&mut proof.meetOf, index)
+      run InternIndex.record(&mut proof.meets, usize.toU64(member))
+      at = at + usize.ONE
     }
-    at = at + usize.ONE
+  } else {
+    run List<usize>.append(&mut proof.missing, usize.ZERO)
+    if Shared<Lifetime>.with<bool>(region, enclosingKind) { run List<usize>.append(&mut proof.enclosers, index) }
+  }
+  return index
+}
+
+fn enclosingKind(region: &Lifetime) -> bool {
+  return match &region.* { Lifetime.Parameter {..} => true Lifetime.Supplied {..} => true _ => false }
+}
+
+fn localKind(region: &Lifetime) -> bool {
+  return match &region.* { Lifetime.Local {..} => true _ => false }
+}
+
+effect fn recordProofEdge(proof: &mut OutlivesProof, longer: usize, shorter: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  run List<usize>.append(&mut proof.edgeShorter, shorter)
+  run List<usize>.append(&mut proof.edgeLonger, longer)
+  return run InternIndex.record(&mut proof.edges, usize.toU64(shorter))
+}
+
+effect fn reachProof(proof: &mut OutlivesProof, index: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  let reached = List<bool>.asMutSlice(&mut proof.reached)
+  if reached[index] { return () }
+  reached[index] = true
+  return run List<usize>.append(&mut proof.queue, index)
+}
+
+// Everything a reached region implies: the longer side of each edge it is the shorter side of,
+// the members of a reached meet, a meet whose members are all reached, and a Parameter or
+// Supplied region that encloses a reached loan.
+effect fn solveProof(proof: &mut OutlivesProof) -> () ! OutOfMemoryError ? &mut Allocator {
+  while List<usize>.length(&proof.queue) > usize.ZERO {
+    let last = List<usize>.length(&proof.queue) - usize.ONE
+    let current = List<usize>.asSlice(&proof.queue)[last]
+    List<usize>.truncate(&mut proof.queue, last)
+    let mut edge = InternIndex.first(&proof.edges, usize.toU64(current))
+    while edge != usize.MAX {
+      if List<usize>.asSlice(&proof.edgeShorter)[edge] == current {
+        let longer = List<usize>.asSlice(&proof.edgeLonger)[edge]
+        run reachProof(&mut proof.*, longer)
+      }
+      edge = InternIndex.after(&proof.edges, edge)
+    }
+    let region = Shared<Lifetime>.clone(&List<Shared<Lifetime>>.asSlice(&proof.regions)[current])
+    let count = Lifetime.atomCount(&region)
+    if count > usize.ONE {
+      let mut at = usize.ZERO
+      while at < count {
+        let atom = Lifetime.atomAt(&region, at)
+        let member = proofRegion(&proof.*, &atom)
+        run reachProof(&mut proof.*, member)
+        at = at + usize.ONE
+      }
+    }
+    let mut meet = InternIndex.first(&proof.meets, usize.toU64(current))
+    while meet != usize.MAX {
+      if List<usize>.asSlice(&proof.meetMember)[meet] == current {
+        let whole = List<usize>.asSlice(&proof.meetOf)[meet]
+        let missing = List<usize>.asMutSlice(&mut proof.missing)
+        missing[whole] = missing[whole] - usize.ONE
+        if missing[whole] == usize.ZERO { run reachProof(&mut proof.*, whole) }
+      }
+      meet = InternIndex.after(&proof.meets, meet)
+    }
+    if Shared<Lifetime>.with<bool>(&region, localKind) {
+      let mut at = usize.ZERO
+      while at < List<usize>.length(&proof.enclosers) {
+        let candidate = List<usize>.asSlice(&proof.enclosers)[at]
+        let owner = Shared<Lifetime>.clone(&List<Shared<Lifetime>>.asSlice(&proof.regions)[candidate])
+        if enclosingLifetimeOutlivesLoan(&owner, &region) { run reachProof(&mut proof.*, candidate) }
+        at = at + usize.ONE
+      }
+    }
   }
   return ()
 }
 
+// The regions `constraints` prove outlive `shorter`, with each of `queries` interned so a later
+// [`provenOutlives`] can ask about it.
+effect fn outlivesProof(constraints: &[Constraint], shorter: &Shared<Lifetime>, queries: &[Shared<Lifetime>]) -> OutlivesProof
+! OutOfMemoryError ? &mut Allocator {
+  let mut proof = OutlivesProof {
+    regions: List<Shared<Lifetime>>.make(), lookup: InternIndex.make(), reached: List<bool>.make(), queue: List<usize>.make(),
+    missing: List<usize>.make(), edgeShorter: List<usize>.make(), edgeLonger: List<usize>.make(), edges: InternIndex.make(),
+    meetMember: List<usize>.make(), meetOf: List<usize>.make(), meets: InternIndex.make(), enclosers: List<usize>.make(),
+  }
+  let mut at = usize.ZERO
+  while at < queries.length {
+    drop run internProofRegion(&mut proof, &queries[at])
+    at = at + usize.ONE
+  }
+  let seed = run internProofRegion(&mut proof, shorter)
+  let lasting = run Shared<Lifetime>.make(Lifetime.Static)
+  let always = run internProofRegion(&mut proof, &lasting)
+  at = usize.ZERO
+  while at < constraints.length {
+    if let Constraint.Outlives {longer: source, shorter: target} = &constraints[at] {
+      let longerAt = run internProofRegion(&mut proof, &source)
+      let shorterAt = run internProofRegion(&mut proof, &target)
+      run recordProofEdge(&mut proof, longerAt, shorterAt)
+    }
+    at = at + usize.ONE
+  }
+  run reachProof(&mut proof, seed)
+  run reachProof(&mut proof, always)
+  run solveProof(&mut proof)
+  return move proof
+}
+
+// Whether `proof` shows `longer` outlives its shorter region. `longer` must be one of its queries.
+fn provenOutlives(proof: &OutlivesProof, longer: &Shared<Lifetime>, shorter: &Shared<Lifetime>) -> bool {
+  if Lifetime.equalsShared(longer, shorter) || Shared<Lifetime>.with<bool>(longer, staticLifetime) { return true }
+  let index = proofRegion(proof, longer)
+  return index != usize.MAX && List<bool>.asSlice(&proof.reached)[index]
+}
+
+// Records the premise `longer: shorter` and extends the proof with what it implies. Both regions
+// must already be in the proof, as a query and its shorter region are, so no rule misses a region
+// interned after solving began.
+effect fn assumeOutlives(proof: &mut OutlivesProof, longer: &Shared<Lifetime>, shorter: &Shared<Lifetime>) -> ()
+! OutOfMemoryError ? &mut Allocator {
+  let longerAt = proofRegion(&proof.*, longer)
+  let shorterAt = proofRegion(&proof.*, shorter)
+  run recordProofEdge(&mut proof.*, longerAt, shorterAt)
+  if List<bool>.asSlice(&proof.reached)[shorterAt] { run reachProof(&mut proof.*, longerAt) }
+  return run solveProof(&mut proof.*)
+}
+
 effect fn knownOutlives(constraints: &[Constraint], longer: &Shared<Lifetime>, shorter: &Shared<Lifetime>) -> bool
 ! OutOfMemoryError ? &mut Allocator {
-  // The fixed point below starts from `shorter` and `'static` and follows each edge once, so an
-  // identical region, `'static`, or a written edge is decided before collecting its nodes.
+  // An identical region, `'static`, or a written edge is decided before building the proof.
   if Lifetime.equalsShared(longer, shorter) || Shared<Lifetime>.with<bool>(longer, staticLifetime) { return true }
   let mut direct = usize.ZERO
   while direct < constraints.length {
@@ -23327,70 +23543,9 @@ effect fn knownOutlives(constraints: &[Constraint], longer: &Shared<Lifetime>, s
     }
     direct = direct + usize.ONE
   }
-  let mut nodes = List<Shared<Lifetime>>.make()
-  run appendProofRegion(&mut nodes, longer)
-  run appendProofRegion(&mut nodes, shorter)
-  let mut edge = usize.ZERO
-  while edge < constraints.length {
-    if let Constraint.Outlives {longer: source, shorter: target} = &constraints[edge] {
-      run appendProofRegion(&mut nodes, &source)
-      run appendProofRegion(&mut nodes, &target)
-    }
-    edge = edge + usize.ONE
-  }
-  let mut reached = List<Shared<Lifetime>>.make()
-  run List<Shared<Lifetime>>.append(&mut reached, Shared<Lifetime>.clone(shorter))
-  run List<Shared<Lifetime>>.append(&mut reached, run Shared<Lifetime>.make(Lifetime.Static))
-  let mut changed = true
-  while changed {
-    if containsRegion(List<Shared<Lifetime>>.asSlice(&reached), longer) { return true }
-    let before = List<Shared<Lifetime>>.length(&reached)
-    let count = List<Shared<Lifetime>>.length(&nodes)
-    let mut at = usize.ZERO
-    while at < count {
-      let candidate = regionAt(&nodes, at)
-      let atoms = Lifetime.atomCount(&candidate)
-      if atoms > usize.ONE {
-        let present = containsRegion(List<Shared<Lifetime>>.asSlice(&reached), &candidate)
-        let mut all = true
-        let mut atomAt = usize.ZERO
-        while atomAt < atoms {
-          let atom = Lifetime.atomAt(&candidate, atomAt)
-          if present && !containsRegion(List<Shared<Lifetime>>.asSlice(&reached), &atom) {
-            run List<Shared<Lifetime>>.append(&mut reached, Shared<Lifetime>.clone(&atom))
-          }
-          all = all && containsRegion(List<Shared<Lifetime>>.asSlice(&reached), &atom)
-          atomAt = atomAt + usize.ONE
-        }
-        if all && !containsRegion(List<Shared<Lifetime>>.asSlice(&reached), &candidate) {
-          run List<Shared<Lifetime>>.append(&mut reached, Shared<Lifetime>.clone(&candidate))
-        }
-      }
-      let known = List<Shared<Lifetime>>.length(&reached)
-      let mut selected = usize.ZERO
-      while selected < known {
-        let target = regionAt(&reached, selected)
-        if enclosingLifetimeOutlivesLoan(&candidate, &target)
-          && !containsRegion(List<Shared<Lifetime>>.asSlice(&reached), &candidate) {
-          run List<Shared<Lifetime>>.append(&mut reached, Shared<Lifetime>.clone(&candidate))
-        }
-        selected = selected + usize.ONE
-      }
-      at = at + usize.ONE
-    }
-    edge = usize.ZERO
-    while edge < constraints.length {
-      if let Constraint.Outlives {longer: source, shorter: target} = &constraints[edge] {
-        if containsRegion(List<Shared<Lifetime>>.asSlice(&reached), &target)
-          && !containsRegion(List<Shared<Lifetime>>.asSlice(&reached), &source) {
-          run List<Shared<Lifetime>>.append(&mut reached, Shared<Lifetime>.clone(&source))
-        }
-      }
-      edge = edge + usize.ONE
-    }
-    changed = List<Shared<Lifetime>>.length(&reached) > before
-  }
-  return containsRegion(List<Shared<Lifetime>>.asSlice(&reached), longer)
+  let queries: [Shared<Lifetime>; 1] = [Shared<Lifetime>.clone(longer)]
+  let proof = run outlivesProof(constraints, shorter, &queries)
+  return provenOutlives(&proof, longer, shorter)
 }
 
 // A lifetime parameter of the declaration that roots a loan's body, or of one enclosing it such as
@@ -57959,13 +58114,20 @@ effect fn appendStoredInputPremises(resolver: &mut Resolver, owner: &mut Query<A
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
   let parameters = Shared<Result<Answer, NoRejection>>.with<usize>(signature, signatureParameterCount)
   let mut visited = List<StoredShape>.make()
+  let mut listed = ListedPremises {lookup: InternIndex.make(), positions: List<usize>.make()}
+  let mut reached = ReachedTypes {held: List<Shared<Type>>.make(), inputs: List<bool>.make(), lookup: InternIndex.make()}
   let mut at = usize.ZERO
+  while at < List<Constraint>.length(&constraints.*) {
+    run recordPremise(&mut listed, List<Constraint>.asSlice(&constraints.*), at)
+    at = at + usize.ONE
+  }
+  at = usize.ZERO
   while at < parameters {
     let parameter = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Type>>>(signature,
       fn(answer: &Result<Answer, NoRejection>) -> Option<Shared<Type>> { return signatureParameterAt(answer, at) })
     if let Option<Shared<Type>>.Some {value: ty} = move parameter {
       run appendStoredFieldPremises(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, &ty, &mut visited,
-        &mut constraints.*)
+        &mut reached, &mut listed, &mut constraints.*)
     }
     at = at + usize.ONE
   }
@@ -57983,22 +58145,25 @@ effect fn appendStoredInputPremises(resolver: &mut Resolver, owner: &mut Query<A
 // ends recursive and growing declarations without losing a premise.
 effect fn appendStoredFieldPremises(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>,
   dependencies: &mut List<Dependency>, caller: &DeclarationId, value: &Shared<Type>, visited: &mut List<StoredShape>,
-  constraints: &mut List<Constraint>) -> ()
+  reached: &mut ReachedTypes, listed: &mut ListedPremises, constraints: &mut List<Constraint>) -> ()
 ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  // A stored member is often the very handle its application also holds as an argument, and walking
+  // one handle again lists nothing new.
+  if !run reachType(&mut reached.*, value, true) { return () }
   let borrowed = Shared<Type>.with<Option<Constraint>>(value, inputLoanPremise)
   if let Option<Constraint>.Some {value: Constraint.Contents {subject, region}} = move borrowed {
-    run appendStoredContents(&subject, &region, caller, &mut constraints.*)
+    run appendStoredContents(&subject, &region, caller, &mut listed.*, &mut constraints.*)
     return run appendStoredFieldPremises(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, &subject,
-      &mut visited.*, &mut constraints.*)
+      &mut visited.*, &mut reached.*, &mut listed.*, &mut constraints.*)
   }
   // Type arguments and structural members are well formed too (`S<&'a T>` implies `T: 'a`).
-  let mut components = List<Shared<Type>>.make()
-  run Type.storedComponents(value, &mut components)
-  let listed = List<Shared<Type>>.asSlice(&components)
+  let mut found = List<Shared<Type>>.make()
+  run Type.storedComponents(value, &mut found)
+  let components = List<Shared<Type>>.asSlice(&found)
   let mut at = usize.ZERO
-  while at < listed.length {
-    run appendStoredFieldPremises(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, &listed[at],
-      &mut visited.*, &mut constraints.*)
+  while at < components.length {
+    run appendStoredFieldPremises(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, &components[at],
+      &mut visited.*, &mut reached.*, &mut listed.*, &mut constraints.*)
     at = at + usize.ONE
   }
   if !run newStoredShape(value, &mut visited.*) { return () }
@@ -58014,9 +58179,10 @@ effect fn appendStoredFieldPremises(resolver: &mut Resolver, owner: &mut Query<A
         if !run knownOutlives(List<Constraint>.asSlice(&constraints.*), &longer, &shorter) {
           run List<Constraint>.append(&mut constraints.*, Constraint.Outlives {longer: Shared<Lifetime>.clone(&longer),
             shorter: Shared<Lifetime>.clone(&shorter)})
+          run recordPremise(&mut listed.*, List<Constraint>.asSlice(&constraints.*), List<Constraint>.length(&constraints.*) - usize.ONE)
         }
       }
-      Constraint.Contents {subject, region} => { run appendStoredContents(&subject, &region, caller, &mut constraints.*) }
+      Constraint.Contents {subject, region} => { run appendStoredContents(&subject, &region, caller, &mut listed.*, &mut constraints.*) }
       _ => ()
     }
     at = at + usize.ONE
@@ -58026,7 +58192,7 @@ effect fn appendStoredFieldPremises(resolver: &mut Resolver, owner: &mut Query<A
   at = usize.ZERO
   while at < stored.length {
     run appendStoredFieldPremises(&mut resolver.*, &mut owner.*, &mut dependencies.*, caller, &stored[at],
-      &mut visited.*, &mut constraints.*)
+      &mut visited.*, &mut reached.*, &mut listed.*, &mut constraints.*)
     at = at + usize.ONE
   }
   return ()
@@ -58081,7 +58247,7 @@ effect fn newStoredShape(value: &Shared<Type>, visited: &mut List<StoredShape>) 
   let seen = List<StoredShape>.asSlice(&visited.*)
   let mut at = usize.ZERO
   while at < seen.length {
-    if run sameStoredShape(&seen[at], &shape) { return false }
+    if seen[at].hash == shape.hash && run sameStoredShape(&seen[at], &shape) { return false }
     at = at + usize.ONE
   }
   run List<StoredShape>.append(&mut visited.*, move shape)
@@ -58127,7 +58293,7 @@ effect fn storedMemberTypes(resolver: &mut Resolver, owner: &mut Query<Answer, N
 // `appendContentsPremises` for the stored-data walk: the same atomic premises, but a premise is
 // skipped only when it is already listed, so the walk never searches the growing set's outlives graph.
 effect fn appendStoredContents(subject: &Shared<Type>, region: &Shared<Lifetime>, caller: &DeclarationId,
-  constraints: &mut List<Constraint>) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  listed: &mut ListedPremises, constraints: &mut List<Constraint>) -> () ! OutOfMemoryError ? &mut Allocator | &mut Types {
   let mut stored = List<Shared<Type>>.make()
   run List<Shared<Type>>.append(&mut stored, Shared<Type>.clone(subject))
   run Type.storedParameters(subject, &mut stored)
@@ -58138,30 +58304,57 @@ effect fn appendStoredContents(subject: &Shared<Type>, region: &Shared<Lifetime>
   let types = List<Shared<Type>>.asSlice(&stored)
   let mut at = usize.ZERO
   while at < types.length {
-    run appendDistinctConstraint(&mut constraints.*, Constraint.Contents {subject: Shared<Type>.clone(&types[at]),
+    run appendDistinctConstraint(&mut listed.*, &mut constraints.*, Constraint.Contents {subject: Shared<Type>.clone(&types[at]),
       region: Shared<Lifetime>.clone(region)})
     at = at + usize.ONE
   }
   let lifetimes = List<Shared<Lifetime>>.asSlice(&retained)
   at = usize.ZERO
   while at < lifetimes.length {
-    run appendDistinctConstraint(&mut constraints.*, Constraint.Outlives {longer: Shared<Lifetime>.clone(&lifetimes[at]),
+    run appendDistinctConstraint(&mut listed.*, &mut constraints.*, Constraint.Outlives {longer: Shared<Lifetime>.clone(&lifetimes[at]),
       shorter: Shared<Lifetime>.clone(region)})
     at = at + usize.ONE
   }
   return ()
 }
 
-effect fn appendDistinctConstraint(constraints: &mut List<Constraint>, constraint: Constraint) -> ()
+effect fn appendDistinctConstraint(listed: &mut ListedPremises, constraints: &mut List<Constraint>, constraint: Constraint) -> ()
 ! OutOfMemoryError ? &mut Allocator | &mut Types {
-  let listed = List<Constraint>.asSlice(&constraints.*)
-  let mut at = usize.ZERO
-  while at < listed.length {
-    if run sameConstraint(&listed[at], &constraint) { return () }
-    at = at + usize.ONE
+  let premises = List<Constraint>.asSlice(&constraints.*)
+  let positions = List<usize>.asSlice(&listed.positions)
+  let mut at = InternIndex.first(&listed.lookup, premiseHash(&constraint))
+  while at != usize.MAX {
+    if run sameConstraint(&premises[positions[at]], &constraint) { return () }
+    at = InternIndex.after(&listed.lookup, at)
   }
   run List<Constraint>.append(&mut constraints.*, move constraint)
-  return ()
+  return run recordPremise(&mut listed.*, List<Constraint>.asSlice(&constraints.*), List<Constraint>.length(&constraints.*) - usize.ONE)
+}
+
+// The Outlives and Contents premises a stored-data walk has listed, by hash, so skipping a listed
+// premise is one probe rather than a scan of every premise, which grows with each nested borrow.
+struct ListedPremises {
+  lookup: InternIndex
+  positions: List<usize>
+}
+
+effect fn recordPremise(listed: &mut ListedPremises, constraints: &[Constraint], at: usize) -> () ! OutOfMemoryError ? &mut Allocator {
+  match &constraints[at] {
+    Constraint.Outlives {..} => {}
+    Constraint.Contents {..} => {}
+    _ => { return () }
+  }
+  run List<usize>.append(&mut listed.positions, at)
+  return run InternIndex.record(&mut listed.lookup, premiseHash(&constraints[at]))
+}
+
+// Consistent with `sameConstraint` for Outlives and Contents; every other premise shares one hash.
+fn premiseHash(constraint: &Constraint) -> u64 {
+  return match &constraint.* {
+    Constraint.Outlives {longer, shorter} => Hash.combine(Hash.combine(1, Lifetime.hash(&longer)), Lifetime.hash(&shorter))
+    Constraint.Contents {subject, region} => Hash.combine(Hash.combine(2, Type.hash(&subject)), Lifetime.hash(&region))
+    _ => 0
+  }
 }
 
 // The fields of a struct, elements of a tuple or variants of a union, as `MemberShape` numbers them.
@@ -58184,12 +58377,14 @@ effect fn storedMemberCount(resolver: &mut Resolver, module: &ModuleId, declarat
 struct StoredShape {
   declaration: DeclarationId
   arguments: List<StoredShapeArgument>
+  // Consistent with `sameStoredShape`, so a walk compares only shapes that share it.
+  hash: u64
 }
 
 union StoredShapeArgument {
   Lifetime {value: Shared<Lifetime>},
   Row {value: Shared<Row>},
-  Retained {regions: List<Shared<Lifetime>>, parameters: List<Shared<Type>>},
+  Retained {regions: List<Shared<Lifetime>>, regionLookup: InternIndex, parameters: List<Shared<Type>>},
 }
 
 effect fn storedShape(value: &Shared<Type>) -> Option<StoredShape> ! OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -58197,45 +58392,63 @@ effect fn storedShape(value: &Shared<Type>) -> Option<StoredShape> ! OutOfMemory
   if let Type.Nominal {declaration, arguments, ..} = move copied {
     let listed = List<Argument>.asSlice(&arguments)
     let mut shaped = List<StoredShapeArgument>.make()
+    let mut hashed = DeclarationId.hash(&declaration)
     let mut at = usize.ZERO
     while at < listed.length {
       match &listed[at] {
         Argument.Lifetime {value: lifetime} => {
+          hashed = Hash.combine(hashed, Lifetime.hash(&lifetime))
           run List<StoredShapeArgument>.append(&mut shaped, StoredShapeArgument.Lifetime {value: Shared<Lifetime>.clone(&lifetime)})
         }
         Argument.Row {value: row} => {
+          hashed = Hash.combine(hashed, 1)
           run List<StoredShapeArgument>.append(&mut shaped, StoredShapeArgument.Row {value: Shared<Row>.clone(&row)})
         }
         Argument.Type {value: argument} => {
           let mut found = List<Shared<Lifetime>>.make()
           run Type.regionAtoms(&argument, &mut found)
+          // The distinct regions, by hash; a set's hash ignores order as `sameLifetimeSet` does.
           let mut regions = List<Shared<Lifetime>>.make()
+          let mut regionLookup = InternIndex.make()
+          let mut regionSum: u64 = 0
           let atoms = List<Shared<Lifetime>>.asSlice(&found)
           let mut atom = usize.ZERO
           while atom < atoms.length {
-            if !lifetimeListed(List<Shared<Lifetime>>.asSlice(&regions), &atoms[atom]) {
+            let regionHash = Lifetime.hash(&atoms[atom])
+            let distinct = List<Shared<Lifetime>>.asSlice(&regions)
+            let mut listedAt = InternIndex.first(&regionLookup, regionHash)
+            while listedAt != usize.MAX && !Lifetime.equalsShared(&distinct[listedAt], &atoms[atom]) {
+              listedAt = InternIndex.after(&regionLookup, listedAt)
+            }
+            if listedAt == usize.MAX {
               run List<Shared<Lifetime>>.append(&mut regions, Shared<Lifetime>.clone(&atoms[atom]))
+              run InternIndex.record(&mut regionLookup, regionHash)
+              regionSum = u64.wrappingAdd(regionSum, regionHash)
             }
             atom = atom + usize.ONE
           }
+          hashed = Hash.combine(Hash.combine(hashed, usize.toU64(List<Shared<Lifetime>>.length(&regions))), regionSum)
           let mut stored = List<Shared<Type>>.make()
           if Shared<Type>.with<bool>(&argument, isTypeParameter) { run List<Shared<Type>>.append(&mut stored, Shared<Type>.clone(&argument)) }
           run Type.storedParameters(&argument, &mut stored)
           let mut parameters = List<Shared<Type>>.make()
           let candidates = List<Shared<Type>>.asSlice(&stored)
+          let mut parameterSum: u64 = 0
           atom = usize.ZERO
           while atom < candidates.length {
             if !run typeListed(List<Shared<Type>>.asSlice(&parameters), &candidates[atom]) {
               run List<Shared<Type>>.append(&mut parameters, Shared<Type>.clone(&candidates[atom]))
+              parameterSum = u64.wrappingAdd(parameterSum, Type.hash(&candidates[atom]))
             }
             atom = atom + usize.ONE
           }
-          run List<StoredShapeArgument>.append(&mut shaped, StoredShapeArgument.Retained {regions: move regions, parameters: move parameters})
+          hashed = Hash.combine(Hash.combine(hashed, usize.toU64(List<Shared<Type>>.length(&parameters))), parameterSum)
+          run List<StoredShapeArgument>.append(&mut shaped, StoredShapeArgument.Retained {regions: move regions, regionLookup: move regionLookup, parameters: move parameters})
         }
       }
       at = at + usize.ONE
     }
-    return Option<StoredShape>.some(StoredShape {declaration: move declaration, arguments: move shaped})
+    return Option<StoredShape>.some(StoredShape {declaration: move declaration, arguments: move shaped, hash: hashed})
   }
   return Option<StoredShape>.none()
 }
@@ -58248,7 +58461,7 @@ fn closedStoredShape(shape: &StoredShape) -> bool {
     let closed = match &listed[at] {
       StoredShapeArgument.Lifetime {value} => Shared<Lifetime>.with<bool>(&value, staticLifetime)
       StoredShapeArgument.Row {..} => false
-      StoredShapeArgument.Retained {regions, parameters} => List<Shared<Type>>.length(&parameters) == usize.ZERO
+      StoredShapeArgument.Retained {regions, parameters, ..} => List<Shared<Type>>.length(&parameters) == usize.ZERO
         && staticRegions(List<Shared<Lifetime>>.asSlice(&regions))
     }
     if !closed { return false }
@@ -58282,9 +58495,9 @@ effect fn sameStoredShape(left: &StoredShape, right: &StoredShape) -> bool ! Out
         StoredShapeArgument.Row {value: other} => run Row.equalsShared(&one, &other)
         _ => false
       }
-      StoredShapeArgument.Retained {regions, parameters} => match &second[at] {
-        StoredShapeArgument.Retained {regions: otherRegions, parameters: otherParameters} =>
-          sameLifetimeSet(List<Shared<Lifetime>>.asSlice(&regions), List<Shared<Lifetime>>.asSlice(&otherRegions))
+      StoredShapeArgument.Retained {regions, parameters, ..} => match &second[at] {
+        StoredShapeArgument.Retained {regions: otherRegions, regionLookup: otherLookup, parameters: otherParameters} =>
+          sameLifetimeSet(List<Shared<Lifetime>>.asSlice(&regions), List<Shared<Lifetime>>.asSlice(&otherRegions), &otherLookup)
             && run sameTypeSet(List<Shared<Type>>.asSlice(&parameters), List<Shared<Type>>.asSlice(&otherParameters))
         _ => false
       }
@@ -58293,15 +58506,6 @@ effect fn sameStoredShape(left: &StoredShape, right: &StoredShape) -> bool ! Out
     at = at + usize.ONE
   }
   return true
-}
-
-fn lifetimeListed(listed: &[Shared<Lifetime>], value: &Shared<Lifetime>) -> bool {
-  let mut at = usize.ZERO
-  while at < listed.length {
-    if Lifetime.equalsShared(&listed[at], value) { return true }
-    at = at + usize.ONE
-  }
-  return false
 }
 
 effect fn typeListed(listed: &[Shared<Type>], value: &Shared<Type>) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
@@ -58314,11 +58518,14 @@ effect fn typeListed(listed: &[Shared<Type>], value: &Shared<Type>) -> bool ! Ou
 }
 
 // Equal sets of distinct regions, in any order.
-fn sameLifetimeSet(left: &[Shared<Lifetime>], right: &[Shared<Lifetime>]) -> bool {
+// Equal sets of distinct regions, in any order; `lookup` indexes `right` by `Lifetime.hash`.
+fn sameLifetimeSet(left: &[Shared<Lifetime>], right: &[Shared<Lifetime>], lookup: &InternIndex) -> bool {
   if left.length != right.length { return false }
   let mut at = usize.ZERO
   while at < left.length {
-    if !lifetimeListed(right, &left[at]) { return false }
+    let mut found = InternIndex.first(lookup, Lifetime.hash(&left[at]))
+    while found != usize.MAX && !Lifetime.equalsShared(&right[found], &left[at]) { found = InternIndex.after(lookup, found) }
+    if found == usize.MAX { return false }
     at = at + usize.ONE
   }
   return true
@@ -58441,12 +58648,15 @@ effect fn appendInputPremises(
 ) -> ()
   ! OutOfMemoryError
   ? &mut Allocator | &mut Types {
+  // Inner premises come first, so a region an inner borrow already bounds is proved through it
+  // rather than repeated at every enclosing level, which kept `&&...&T` quadratic in premises.
   let mut components = List<Shared<Type>>.make()
   let borrowed = Shared<Type>.with<Option<Constraint>>(value, inputLoanPremise)
+  let mut loan = Option<Constraint>.none()
   match move borrowed {
     Option<Constraint>.Some { value: Constraint.Contents { subject, region } } => {
-      run appendContentsPremises(&subject, &region, caller, &mut constraints.*)
-      run List<Shared<Type>>.append(&mut components, move subject)
+      run List<Shared<Type>>.append(&mut components, Shared<Type>.clone(&subject))
+      loan = Option<Constraint>.some(Constraint.Contents {subject: move subject, region: move region})
     }
     _ => {
       run Type.storedComponents(value, &mut components)
@@ -58457,6 +58667,9 @@ effect fn appendInputPremises(
   while at < listed.length {
     run appendInputPremises(&listed[at], caller, &mut constraints.*)
     at = at + usize.ONE
+  }
+  if let Option<Constraint>.Some {value: Constraint.Contents {subject, region}} = move loan {
+    run appendContentsPremises(&subject, &region, caller, &mut constraints.*)
   }
   return ()
 }
@@ -58529,20 +58742,15 @@ effect fn appendContentsPremises(
     List<Option<Shared<Type>>>.asSlice(&representations),
     &mut retained, false
   )
+  // One proof answers every retained region; each premise this adds extends it in place.
   let lifetimes = List<Shared<Lifetime>>.asSlice(&retained)
+  let mut proof = run outlivesProof(List<Constraint>.asSlice(&constraints.*), region, lifetimes)
   at = usize.ZERO
   while at < lifetimes.length {
-    if
-      !run knownOutlives(List<Constraint>.asSlice(&constraints.*), &lifetimes[at], region) {
-      run List<
-        Constraint,
-      >.append(
-        &mut constraints.*,
-        Constraint.Outlives {
-          longer: Shared<Lifetime>.clone(&lifetimes[at]),
-          shorter: Shared<Lifetime>.clone(region)
-        }
-      )
+    if !provenOutlives(&proof, &lifetimes[at], region) {
+      run List<Constraint>.append(&mut constraints.*,
+        Constraint.Outlives {longer: Shared<Lifetime>.clone(&lifetimes[at]), shorter: Shared<Lifetime>.clone(region)})
+      run assumeOutlives(&mut proof, &lifetimes[at], region)
     }
     at = at + usize.ONE
   }
