@@ -129,7 +129,7 @@ Network and stream deadlines use the supplied monotonic clock. DNS uses `OsMonot
 An already expired deadline fails before starting the operation.
 
 `WasiHttp.make()` implements the portable `Http` service. It delegates HTTP transport and TLS
-verification to the host, honors request body limits and total deadlines, follows redirects,
+verification to the host, honors response body limits and total deadlines, follows redirects,
 rejects HTTPS downgrades, and strips credentials when the origin changes. Default limits are
 30 seconds, 16 MiB of response body, and ten redirects. The client writes through host
 backpressure and returns an owned response. Response trailers are consumed and released.
