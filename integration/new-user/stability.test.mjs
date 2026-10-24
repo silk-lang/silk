@@ -501,3 +501,41 @@ test('a pipe compared without parentheses hints at the precedence of |>', () => 
   assert.notEqual(checked.status, 0, show(checked))
   assert.match(checked.stderr, /\(.*\|>.*\)|parenthes/, show(checked))
 })
+
+test('a type mismatch inside a generic instance names the types and the instance', { todo: 'finding 111' }, () => {
+  const dir = initPackage(h, 'generic-mismatch')
+  write(join(dir, 'src/main.silk'), 'fn f(a: bool) -> i32 {\n  return 0\n}\n\nfn g<T>(value: T) -> i32 {\n  return f(value)\n}\n\npub fn main() -> i32 {\n  return g<i32>(1)\n}\n')
+  const checked = silk(h, ['check'], { cwd: dir })
+  assert.match(checked.stderr, /main\.silk:6:\d+: error\[SEM0012\] Expected bool but received i32/, show(checked))
+  assert.match(checked.stderr, /main\.silk:10:/, `points at the call that made g<i32>\n${show(checked)}`)
+})
+
+// One static for over the fields of a struct: doubling the fields should about double the time.
+test('a static for over 3,200 fields checks in a few seconds', { todo: 'finding 110' }, () => {
+  const dir = initPackage(h, 'wide-reflect')
+  const fields = Array.from({ length: 3200 }, (_, i) => `f${i}`)
+  write(join(dir, 'src/main.silk'), `import silk.reflect { Reflect }
+
+struct Wide {
+${fields.map((f) => `  pub ${f}: i32,`).join('\n')}
+}
+
+fn total<T>(value: &T) -> i32 {
+  let mut acc = 0
+  static for field in Reflect.fields<T>() {
+    acc = acc + Reflect.borrowField<T, i32>(value, field).*
+  }
+  return acc
+}
+
+pub fn main() -> i32 {
+  let w = Wide {
+${fields.map((f) => `    ${f}: 1,`).join('\n')}
+  }
+  return total(&w) - 3200
+}
+`)
+  const checked = silk(h, ['check'], { cwd: dir })
+  assert.equal(checked.status, 0, show(checked))
+  assert.ok(checkSeconds(checked) < 3, `check took ${checkSeconds(checked)} s`)
+})

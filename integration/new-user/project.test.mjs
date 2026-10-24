@@ -267,7 +267,7 @@ test('an error in a dependency function the app does not call still fails the bu
   assert.match(checked.stderr, /lib\.silk:7:\d+: error\[SEM0129\]/, show(checked))
 })
 
-test('List.get past the end traps as an index out of bounds at the caller', { todo: 'finding 80' }, () => {
+test('List.get past the end traps with its reason at the caller', () => {
   const dir = initPackage(h, fresh('list-get'))
   write(join(dir, 'src/main.silk'), `import silk.allocator { Allocator, OutOfMemoryError }
 import silk.effect { Effect }
@@ -283,7 +283,7 @@ pub effect fn main() -> i32
 `)
   const ran = silk(h, ['run', '--quiet'], { cwd: dir })
   assert.ok(ran.signal === 'SIGILL' || ran.status === 132, show(ran))
-  assert.match(ran.stderr, /fatal trap: index out of bounds/, show(ran))
+  assert.match(ran.stderr, /fatal trap: List\.get: the index is not less than the length/, show(ran))
   assert.match(ran.stderr, /at main\.main \(main:10:\d+\)/, show(ran))
 })
 
