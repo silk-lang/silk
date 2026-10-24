@@ -908,6 +908,8 @@ const program = Effect.gen(function* () {
   const boardRoot = (body: string) =>
     'struct Board {\n  pub items: [i32; 2],\n  pub count: usize,\n}\n\nimpl Board {\n  fn add(self: &mut Self, value: i32) -> usize {\n    self.items[0] = value\n    return self.count\n  }\n\n  fn first(self: &Self) -> &i32 {\n    return &self.items[0]\n  }\n}\n\n' +
     `pub fn main() -> i32 {\n  ${body}\n  return 0\n}\n`
+  const testRoot = (body: string) =>
+    `import silk.testing { AssertionError, Testing }\n\n${body}\npub fn main() -> i32 {\n  return 0\n}\n`
   const subjects: Array<{ name: string; files: Record<string, string>; pattern: RegExp; errors?: number }> = [
     {
       name: 'fiberlogger',
@@ -986,6 +988,22 @@ const program = Effect.gen(function* () {
       },
       pattern: /error\[OWN0019\] `first` is used after `board`, which it borrows, ended or was replaced/,
       errors: 2,
+    },
+    // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
+    {
+      name: 'testrun',
+      files: { 'main.silk': testRoot('test fn adds() {\n  run Testing.expect(1 + 1 == 2, "sum")\n}\n') },
+      pattern: /error\[SEM0066\] This `run` can fail with `AssertionError<'static>`, but only an effect function can declare failures; write `test effect fn`/,
+    },
+    {
+      name: 'testchannel',
+      files: { 'main.silk': testRoot("test fn adds() ! AssertionError<'static> {\n  run Testing.expect(1 + 1 == 2, \"sum\")\n}\n") },
+      pattern: /error\[SEM0062\] Only an effect function can declare failures; write `test effect fn` instead of `test fn`/,
+    },
+    {
+      name: 'testshape',
+      files: { 'main.silk': testRoot('test fn takes(value: i32) {}\n') },
+      pattern: /error\[SEM0218\] Invalid test declaration: a test takes no parameters/,
     },
   ]
   for (const entry of subjects) {
