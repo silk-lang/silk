@@ -39,7 +39,7 @@ const fixture = Effect.fnUntraced(
         const inputs = [
           [
             'compiler/silk.toml',
-            '[package]\nname = "compiler"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\ntomledit = { path = "../tomledit" }\n\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
+            '[package]\nname = "compiler"\nversion = "0.1.0"\n\n[dependencies]\ntomledit = { path = "../tomledit" }\n\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
           ],
           [
             'compiler/src/ReleaseVersion.silk',
@@ -50,7 +50,7 @@ const fixture = Effect.fnUntraced(
           ['stdlib/silk/i32.silk', 'pub fn identity(value: i32) -> i32 { return value }'],
           [
             'tomledit/silk.toml',
-            '[package]\nname = "tomledit"\nversion = "0.1.0"\nroot = "src/Command.silk"\n',
+            '[package]\nname = "tomledit"\nversion = "0.1.0"\nmain = "Command.silk"\n',
           ],
           ['tomledit/src/Command.silk', 'pub fn value() -> i32 { return 2 }'],
         ]
@@ -303,7 +303,7 @@ it.layer(NodeServices.layer, { excludeTestServices: true })((it) => {
         )
         assert.strictEqual(
           readFileSync(join(options.outputDirectory, 'smoke/silk.toml'), 'utf8'),
-          '[package]\nname = "trivial-features"\nversion = "0.1.0"\nroot = "main.silk"\n',
+          '[package]\nname = "trivial-features"\nversion = "0.1.0"\nsource = "."\n',
         )
       }),
   )
