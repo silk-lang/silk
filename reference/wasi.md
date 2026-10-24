@@ -37,7 +37,8 @@ versions into `.scratch/wasi-tools`; use those paths for the three variables abo
 
 A Preview 2 build first links a core module, then runs `wasm-tools component new` with the
 command adapter. It publishes the component only after conversion succeeds. A failed conversion
-preserves the previous output. LLVM IR, bitcode, assembly, objects, and static archives remain
+preserves the previous output. The core module exports `cabi_realloc` so the adapter and application
+share Silk's allocator. LLVM IR, bitcode, assembly, objects, and static archives remain
 core-code artifacts and do not invoke component tooling.
 
 `silk run` inherits the terminal and maps the current host directory to guest `/`. It forwards

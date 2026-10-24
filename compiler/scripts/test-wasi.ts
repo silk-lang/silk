@@ -24,6 +24,11 @@ const program = Effect.gen(function* () {
   const directory = yield* fs.makeTempDirectoryScoped({ prefix: 'silk-wasi-' })
   const guest = join(directory, 'guest')
   yield* fs.makeDirectory(guest)
+  const toolLinks = join(directory, 'tools')
+  yield* fs.makeDirectory(toolLinks)
+  for (const name of ['wasmtime', 'wasm-tools', 'wasi_snapshot_preview1.command.wasm']) {
+    yield* fs.symlink(join(tools, name), join(toolLinks, name))
+  }
   yield* fs.writeFileString(join(directory, 'outside'), 'must stay outside the guest')
   yield* fs.symlink(join(directory, 'outside'), join(guest, 'escape'))
   const source = yield* fs.readFileString(join(repo, 'compiler/fixtures/wasi/main.silk'))
@@ -34,9 +39,9 @@ const program = Effect.gen(function* () {
   const env = {
     ...process.env,
     SILK_CLANG: clang,
-    SILK_WASMTIME: wasmtime,
-    SILK_WASM_TOOLS: wasmTools,
-    SILK_WASI_ADAPTER: join(tools, 'wasi_snapshot_preview1.command.wasm'),
+    SILK_WASMTIME: join(toolLinks, 'wasmtime'),
+    SILK_WASM_TOOLS: join(toolLinks, 'wasm-tools'),
+    SILK_WASI_ADAPTER: join(toolLinks, 'wasi_snapshot_preview1.command.wasm'),
   }
   const invoke = Effect.fnUntraced(function* (
     command: string,
@@ -116,7 +121,7 @@ const program = Effect.gen(function* () {
     assert.match(tested.stdout.toString(), /2 passed, 0 failed/)
     yield* fs.writeFileString(
       join(directory, 'main.silk'),
-      'pub fn main() -> () {}\ntest fn traps() -> () { let bad = 1 / 0 }\ntest fn continues() -> () {}\n',
+      'pub fn main() -> () {}\ntest fn traps() -> () { let bad = 1 / 0 }\ntest fn zAfterTrap() -> () {}\n',
     )
     const trapped = yield* invoke(compiler, [
       'test',
