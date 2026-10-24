@@ -2,7 +2,7 @@
 // what to write instead. Each program is checked with `silk check`.
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { initPackage, join, sharedHome, show, silk, write } from './lib.mjs'
+import { initPackage, join, read, sharedHome, show, silk, write } from './lib.mjs'
 
 const h = sharedHome()
 let serial = 0
@@ -61,7 +61,7 @@ for (const [name, source, hint] of [
   ['var x = 0', 'pub fn main() -> i32 {\n  var x = 0\n  return x\n}\n', /let mut/],
   ['c ? a : b', 'pub fn main() -> i32 {\n  let x = 1\n  return x > 0 ? 0 : 1\n}\n', /no `c \? a : b`/],
 ]) {
-  test(`${name} gets one error that names the Silk spelling`, { todo: name === 'var x = 0' ? 'finding 118: var still adds Unknown value x for each use' : undefined }, () => {
+  test(`${name} gets one error that names the Silk spelling`, () => {
     const result = check(source)
     assert.equal(errors(result).length, 1, show(result))
     assert.match(result.stderr, hint, show(result))
@@ -111,7 +111,7 @@ for (const [code, files, source, want] of [
   ['SEM0001', {}, 'fn dup<C: Copy>(c: C) -> C {\n  return c\n}\n\npub fn main() -> i32 {\n  return dup(1)\n}\n', /import silk\.ownership \{ Copy \}/],
   ['MOD0001', { 'src/geo/shapes.silk': 'pub fn f() -> i32 {\n  return 0\n}\n' }, 'import geo.shape { f }\n\npub fn main() -> i32 {\n  return f()\n}\n', /geo\.shapes/],
 ]) {
-  test(`${code} from the later chapters names the thing and the fix`, { todo: 'finding 121' }, () => {
+  test(`${code} from the later chapters names the thing and the fix`, () => {
     const dir = initPackage(h, `beginner-${++serial}`)
     for (const [path, text] of Object.entries(files)) write(join(dir, path), text)
     write(join(dir, 'src/main.silk'), source)
@@ -152,10 +152,10 @@ test('unbounded recursion reports a stack overflow', () => {
 // Like List.get since #2278: the stdlib function names the reason, and the frame is the caller's.
 for (const [name, source, reason] of [
   ['i32.toUsize(-1)', 'import silk.i32\n\nfn conv(x: i32) -> usize {\n  return i32.toUsize(x)\n}\n\npub fn main() -> i32 {\n  let y = conv(-1)\n  return 0\n}\n', /i32\.toUsize: .*negative|i32\.toUsize: .*fit/],
-  ['u32.toU8(300)', 'import silk.u32\n\nfn conv(x: u32) -> u8 {\n  return u32.toU8(x)\n}\n\npub fn main() -> i32 {\n  let y = conv(300)\n  return 0\n}\n', /u32\.toU8: .*fit/],
+  ['u32.toU8(300)', 'import silk.u32\n\nfn conv(x: u32) -> u8 {\n  return u32.toU8(x)\n}\n\npub fn main() -> i32 {\n  let y = conv(300)\n  return 0\n}\n', /u32\.toU8: the value is outside the u8 range/],
   ['String.slice past the end', 'import silk.string { String }\n\nfn cut(s: string) -> string {\n  return String.slice(s, 2, 10)\n}\n\npub fn main() -> i32 {\n  let t = cut("abc")\n  return 0\n}\n', /String\.slice: /],
 ]) {
-  test(`${name} traps with the stdlib reason at the caller's line`, { todo: 'finding 122' }, () => {
+  test(`${name} traps with the stdlib reason at the caller's line`, () => {
     const result = run(source)
     assert.match(result.stderr, reason, show(result))
     assert.match(result.stderr, /at main\.(conv|cut) \(main:4:/, show(result))
@@ -167,7 +167,56 @@ test('a constant division by zero is refused by silk check', { todo: 'finding 12
   assert.match(result.stderr, /error\[/, show(result))
 })
 
-test('an out-of-range literal names the value and the range', { todo: 'finding 123' }, () => {
+test('an out-of-range literal names the value and the range', () => {
   const result = check('pub fn main() -> i32 {\n  let x: u8 = 300\n  return 0\n}\n')
   assert.match(result.stderr, /SEM0002\].*300.*(255|u8)/, show(result))
+})
+
+// Hand edits to silk.toml. `body` replaces everything above the silk-version line that `silk init` wrote.
+function manifest(body) {
+  const dir = initPackage(h, `beginner-${++serial}`)
+  const pin = read(join(dir, 'silk.toml')).split('\n').find((l) => l.startsWith('silk-version')) ?? ''
+  write(join(dir, 'silk.toml'), body.replace('version = "0.1.0"\n', `version = "0.1.0"\n${pin}\n`))
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.notEqual(result.status, 0, show(result))
+  return result
+}
+
+test('an unknown field in silk.toml is reported at its line', () => {
+  const result = manifest('[package]\nnmae = "p"\nversion = "0.1.0"\n')
+  assert.match(result.stderr, /silk\.toml:2: package\.nmae is not a supported field/, show(result))
+})
+
+test('a dependency written as a version string says to write a table', () => {
+  const result = manifest('[package]\nname = "p"\nversion = "0.1.0"\n\n[dependencies]\nfoo = "1.0"\n')
+  assert.match(result.stderr, /a dependency must be a table such as \{ path = "\.\.\/library" \}/, show(result))
+})
+
+for (const [name, body, line, reason] of [
+  ['an unquoted string', '[package]\nname = p\nversion = "0.1.0"\n', 2, /quote|string|value/i],
+  ['an unclosed table header', '[package\nname = "p"\nversion = "0.1.0"\n', 1, /\]/],
+  ['a duplicate key', '[package]\nname = "p"\nversion = "0.1.0"\nname = "q"\n', 5, /name|duplicate|twice|again/i],
+]) {
+  test(`${name} in silk.toml gets the TOML line and reason`, { todo: 'finding 125' }, () => {
+    const result = manifest(body)
+    assert.match(result.stderr, new RegExp(`silk\\.toml:${line}(:\\d+)?: `), show(result))
+    assert.match(result.stderr.split('\n').find((l) => l.includes('silk.toml')) ?? '', reason, show(result))
+  })
+}
+
+for (const [name, body, line, value] of [
+  ['a version that is not semver', '[package]\nname = "p"\nversion = "1.0"\n', 3, /1\.0/],
+  ['an uppercase name', '[package]\nname = "MyApp"\nversion = "0.1.0"\n', 2, /MyApp/],
+  ['kind = "lib"', '[package]\nname = "p"\nversion = "0.1.0"\nkind = "lib"\n', 5, /"lib"/],
+]) {
+  test(`${name} is reported at its line with the value`, { todo: 'finding 125' }, () => {
+    const result = manifest(body)
+    assert.match(result.stderr, new RegExp(`silk\\.toml:${line}: `), show(result))
+    assert.match(result.stderr, value, show(result))
+  })
+}
+
+test('a missing package name says it is missing', { todo: 'finding 125' }, () => {
+  const result = manifest('[package]\nversion = "0.1.0"\n')
+  assert.match(result.stderr, /package\.name is missing|missing package\.name|needs a name/, show(result))
 })
