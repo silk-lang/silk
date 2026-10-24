@@ -261,7 +261,7 @@ def program(seed, nstmts=40):
     for _ in range(nstmts): g.stmt()
     out = []
     out.append("import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.os_logger { StdoutLogger }\n")
-    out.append("struct Pair {\n  x: i64\n  y: i64\n}\n")
+    out.append("struct Pair {\n  x: i64,\n  y: i64,\n}\n")
     out.append("fn k(v: i64) -> i64 {\n  return v\n}\n")
     out.append("fn pick(c: bool, a: i64, b: i64) -> i64 {\n  if c {\n    return a\n  }\n  return b\n}\n")
     for f in g.funcs: out.append(f[3])

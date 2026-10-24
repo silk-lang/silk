@@ -510,7 +510,7 @@ test('a type mismatch inside a generic body names the type parameter', () => {
   assert.match(checked.stderr, /main\.silk:6:\d+: error\[SEM0012\] Expected bool but received T/, show(checked))
 })
 
-test('the mismatch says T is a type parameter of g', { todo: 'finding 111 follow-up note' }, () => {
+test('the mismatch says T is a type parameter of g', () => {
   const dir = initPackage(h, 'generic-mismatch-note')
   write(join(dir, 'src/main.silk'), 'fn f(a: bool) -> i32 {\n  return 0\n}\n\nfn g<T>(value: T) -> i32 {\n  return f(value)\n}\n\npub fn main() -> i32 {\n  return 0\n}\n')
   const checked = silk(h, ['check'], { cwd: dir })
@@ -563,7 +563,7 @@ test('silk format keeps a comment after the last statement of a closure passed a
   assert.equal(run.status, 0, show(run))
 })
 
-test('silk format keeps a comment after a bare return', { todo: 'finding 114' }, () => {
+test('silk format keeps a comment after a bare return', () => {
   const dir = initPackage(h, 'return-comment')
   const source = 'fn f(n: i32) -> () {\n  if n > 2 {\n    return // nothing to do\n  }\n}\n\npub fn main() -> i32 {\n  f(1)\n  return 0\n}\n'
   write(join(dir, 'src/main.silk'), source)

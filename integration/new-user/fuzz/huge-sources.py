@@ -26,15 +26,15 @@ cases = {
  'string-1mb': prog(logv('"'+'a'*1000000+'"')).replace('let v = "', 'let v: string<\'static> = "').encode(),
  'long-ident-100k': prog(logv('1').replace('let v', 'let '+'v'*100000).replace('v: v', 'v: '+'v'*100000)).encode(),
  'array-20000': prog('  let a: [i32; 20000] = ['+', '.join(['7']*20000)+']\n'+logv('a[19999]')).encode(),
- 'struct-2000-fields': prog(logv('s.f1999'), 'struct S {\n'+''.join(f'  f{i}: i32\n' for i in range(2000))+'}\n').replace('let v = s.f1999', 'let s = S { '+', '.join(f'f{i}: {i}' for i in range(2000))+' }\n  let v = s.f1999').encode(),
+ 'struct-2000-fields': prog(logv('s.f1999'), 'struct S {\n'+''.join(f'  f{i}: i32,\n' for i in range(2000))+'}\n').replace('let v = s.f1999', 'let s = S { '+', '.join(f'f{i}: {i}' for i in range(2000))+' }\n  let v = s.f1999').encode(),
  'union-2000-variants': prog(logv('1'), 'union U {\n'+''.join(f'  V{i},\n' for i in range(2000))+'}\n').encode(),
  'generic-depth-200': prog(logv('w199(1)'), 'fn w0<T>(v: T) -> T {\n  return v\n}\n'+''.join(f'fn w{i}<T>(v: T) -> T {{\n  return w{i-1}<T>(move v)\n}}\n' for i in range(1,200))).encode(),
- 'recursive-struct': prog(logv('1'), 'struct A {\n  b: B\n}\nstruct B {\n  a: A\n}\n').encode(),
+ 'recursive-struct': prog(logv('1'), 'struct A {\n  b: B,\n}\nstruct B {\n  a: A,\n}\n').encode(),
  'self-import': ('import main { x }\n'+prog(logv('1'))).encode(),
  'unterminated-string': prog(logv('"abc')).encode(),
  'unterminated-comment': (prog(logv('1'))+'/* never closed\n').encode(),
- 'deep-generic-type': prog(logv('1'), 'struct Box<T> {\n  v: T\n}\nfn deep(b: '+'Box<'*300+'i32'+'>'*300+') -> i32 {\n  return 0\n}\n').encode(),
- 'infinite-generic': prog(logv('grow<i32>(1)'), 'struct W<T> {\n  v: T\n}\nfn grow<T>(v: T) -> i32 {\n  return grow<W<T>>(W<T> { v: move v })\n}\n').encode(),
+ 'deep-generic-type': prog(logv('1'), 'struct Box<T> {\n  v: T,\n}\nfn deep(b: '+'Box<'*300+'i32'+'>'*300+') -> i32 {\n  return 0\n}\n').encode(),
+ 'infinite-generic': prog(logv('grow<i32>(1)'), 'struct W<T> {\n  v: T,\n}\nfn grow<T>(v: T) -> i32 {\n  return grow<W<T>>(W<T> { v: move v })\n}\n').encode(),
 }
 
 for n in (50, 100, 120, 127, 128, 129, 140, 200, 300, 500, 1000):
@@ -46,7 +46,7 @@ for n in (50, 100, 150):
 for name, data in cases.items():
     if only and name not in only: continue
     d=os.path.join(W,name); shutil.rmtree(d, ignore_errors=True); os.makedirs(d+'/src')
-    open(d+'/silk.toml','w').write('[package]\nname = "h"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
+    open(d+'/silk.toml','w').write('[package]\nname = "h"\nversion = "0.1.0"\n')
     open(d+'/src/main.silk','wb').write(data)
     t=time.time()
     try:

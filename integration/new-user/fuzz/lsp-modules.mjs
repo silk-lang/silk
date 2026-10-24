@@ -2,6 +2,8 @@
 // stays open. Checks the server stays up, republishes the importer's diagnostics after the
 // library changes, and that those diagnostics match `silk check` on the same files.
 // Usage: node fuzz/lsp-modules.mjs <empty dir> <seed> <steps>
+// The server is `silk lsp` from $HOME/.silk/bin and `silk check` is the `silk` on PATH. Make them
+// the same build (a local tool with SILK_TOOLCHAIN set), or the mismatches are version skew.
 import { startServer, uriOf } from '../lsp.mjs'
 import { spawnSync } from 'node:child_process'
 import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
@@ -14,7 +16,7 @@ const pick = (list) => list[Math.floor(rand() * list.length)]
 const h = { home: process.env.HOME, silkHome: join(process.env.HOME, '.silk') }
 
 const files = {
-  'silk.toml': '[package]\nname = "modfuzz"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+  'silk.toml': '[package]\nname = "modfuzz"\nversion = "0.1.0"\n',
   'src/main.silk': `import geo.shapes { Square, area, perimeter }
 import geo.util { clamp, twice }
 
@@ -27,7 +29,7 @@ pub fn main() -> i32 {
   'src/geo/shapes.silk': `import geo.util { twice }
 
 pub struct Square {
-  pub side: i32
+  pub side: i32,
 }
 
 pub fn area(square: &Square) -> i32 {
