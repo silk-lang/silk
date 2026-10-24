@@ -1876,6 +1876,13 @@ const program = Effect.gen(function* () {
     /dependency `hello`: hello@0\.1\.0 already depends on greeting@0\.1\.0, directly or through other packages, so adding it would form a cycle/,
   )
   assert.doesNotMatch(yield* fs.readFileString(join(managed, 'libs/greeting/silk.toml')), /hello/)
+  // A workspace is not a dependency; the refusal names its members rather than blaming its manifest.
+  const whole = yield* invoke(silk, ['add', '../..'], join(managed, 'libs/greeting'))
+  assert.equal(whole.status, 2, whole.stderr)
+  assert.match(
+    whole.stderr,
+    /dependency `\.\.\/\.\.`: it is a workspace; add one of its members: apps\/hello, libs\/greeting/,
+  )
   yield* fs.writeFileString(
     join(managed, 'apps/hello/src/main.silk'),
     'import greeting.lib { add }\n\npub fn main() -> i32 {\n  return add(4, 3)\n}\n',
