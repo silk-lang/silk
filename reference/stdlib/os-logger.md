@@ -29,7 +29,7 @@ or newline, has no lock, and does not allocate.
 `LogError` with code 3 if the write fails. Part of the message can be written already.
 
 ## Gotchas
-- The providers exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 - A message template for [`StderrLogger`](#StderrLogger) must not end with a newline. The logger adds one.
 - [`StderrLogger.make`](#StderrLogger.impl.make) reads the environment at the first message. A change to `NO_COLOR` after
   that has no effect on the same logger.
@@ -70,6 +70,8 @@ pub effect fn main() -> i32
   return 0
 }
 ```
+
+WASI does not define terminal detection; automatic color selection is disabled on that target.
 
 Import as `StdoutLogger` with `import silk.os_logger { StdoutLogger }`.
 
@@ -120,6 +122,7 @@ anything.
 
 #### Details
 
+On WASI, automatic color selection stays disabled because WASI does not define terminal detection.
 At the first message, the logger uses color when standard error is a terminal, `NO_COLOR` is
 not set or is empty, and `TERM` is not `dumb`. Later messages use the same answer.
 
@@ -212,4 +215,4 @@ log: StdoutLogger.writeStdout
 
 Category: Native platform.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-wasip1`, `wasm32-wasip2`.

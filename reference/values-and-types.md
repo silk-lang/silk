@@ -316,7 +316,7 @@ alias tests.
 
 The fixed-width integer name states both signedness and value width. `u8` through `u64` are
 unsigned; `i8` through `i64` are signed. `usize` and `isize` use the selected target's pointer width:
-64 bits on required native targets and 32 bits on `wasm32-unknown-unknown`.
+64 bits on required native targets and 32 bits on the WebAssembly targets, including `wasm32-wasip1` and `wasm32-wasip2`.
 
 Every integer type is Copy and cleanup-free. Integer types remain distinct even when two selected
 types have the same physical width.

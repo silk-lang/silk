@@ -21,6 +21,8 @@ close them.
 `Writer.writeVectored` sends several slices in one `writev` system call, up to eight slices for
 each call.
 
+WASI commands have one thread. Their standard error lock does not need host synchronization.
+
 Standard error has one lock for the whole process: the lock of the C library's `stderr` stream.
 Each [`StderrWriter`](#StderrWriter) write takes it for the duration of that write. [`StderrWriter.lock`](#StderrWriter.impl.lock) keeps
 it until the [`LockedStderr`](#LockedStderr) drops, and collects the writes in a small buffer that the caller
@@ -32,7 +34,7 @@ from several threads controls the order itself.
 `WriterError` if a write fails. Part of the bytes can be written already.
 
 ## Gotchas
-- The providers exist only on Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
+- The providers exist on WASI, Darwin on aarch64, and Linux with GNU libc on x86_64 or aarch64.
 - The lock orders only writes that take it. A direct write to descriptor 2, such as one from
   `silk.native_descriptor`, can come between the parts of a locked message.
 
@@ -97,6 +99,7 @@ A `Writer` for standard error.
 
 ### Details
 
+WASI commands have one thread, so their standard error lock requires no host synchronization.
 Each write takes the standard error lock for its duration. Thus one write never comes in the
 middle of a message that another thread holds with [`StderrWriter.lock`](#StderrWriter.impl.lock). It has no buffer, and
 flush does nothing. The process owns the descriptor, and the writer does not close it.
@@ -164,6 +167,7 @@ the free part of `buffer` goes out at once, together with the buffered bytes in 
 call. Thus a buffer of 64 bytes gives one system call for most short lines. An empty `buffer`
 gives one system call for each write.
 
+WASI commands have one thread, so the lock requires no host synchronization.
 The lock is recursive. A second `lock` on the same thread returns at once, and its bytes go
 out before the bytes that the first [`LockedStderr`](#LockedStderr) still holds.
 
@@ -382,4 +386,4 @@ effect fn writeVectored(self: &mut Self, vals: &[&[u8]]) -> () ! WriterError ? &
 
 Category: Native platform.
 
-Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`.
+Profiles: `aarch64-apple-darwin`, `aarch64-unknown-linux-gnu`, `x86_64-unknown-linux-gnu`, `wasm32-wasip1`, `wasm32-wasip2`.
