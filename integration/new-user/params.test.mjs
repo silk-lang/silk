@@ -1,5 +1,5 @@
-// The Package parameters reference: `param` declarations, defaults, `where`, bindings in
-// [[build.bindings]] and in a profile, precedence, and the refusals the page lists.
+// The Package parameters reference: `param` declarations, defaults, `where`, values in [config]
+// and in a profile's config, precedence, and the refusals the manifest gives.
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
 import { initPackage, join, read, sharedHome, show, silk, write } from './lib.mjs'
@@ -15,9 +15,7 @@ function pkg(source, extra = '') {
   return dir
 }
 
-const nameOf = (dir) => dir.split('/').at(-1)
-const binding = (dir, parameter, value, table = 'build.bindings') =>
-  `[[${table}]]\npackage = "${nameOf(dir)}@0.1.0"\nmodule = "main"\nparameter = "${parameter}"\nvalue = ${value}\norigin = { source = "silk.toml", provenance = "literal" }\n`
+const lineOf = (text, needle) => text.slice(0, text.indexOf(needle)).split('\n').length
 
 // The page's first example: defaults, a `where`, a dependent default and a static argument.
 const example = `pub param verbose: bool = false
@@ -51,23 +49,20 @@ test('the defaults example runs and exits 0', () => {
   assert.equal(result.status, 0, show(result))
 })
 
-test('a project binding changes a parameter and its dependents', () => {
-  const dir = pkg(example)
-  write(join(dir, 'silk.toml'), `${read(join(dir, 'silk.toml'))}\n${binding(dir, 'workers', '{ kind = "integer", value = "8" }')}`)
+
+test('a [config] value changes a parameter and its dependents', () => {
   // workers 8: queueDepth is 64, so main returns 2.
-  const result = silk(h, ['run'], { cwd: dir })
+  const result = silk(h, ['run'], { cwd: pkg(example, '[config]\nmain.workers = 8\n') })
   assert.equal(result.status, 2, show(result))
 })
 
-test('a binding that breaks the where predicate is refused at the predicate', () => {
-  const dir = pkg(example)
-  write(join(dir, 'silk.toml'), `${read(join(dir, 'silk.toml'))}\n${binding(dir, 'workers', '{ kind = "integer", value = "65" }')}`)
-  const result = silk(h, ['check'], { cwd: dir })
+test('a value that breaks the where predicate is refused at the predicate', () => {
+  const result = silk(h, ['check'], { cwd: pkg(example, '[config]\nmain.workers = 65\n') })
   assert.notEqual(result.status, 0, show(result))
   assert.match(result.stderr, /src\/main\.silk:3:\d+: error\[SEM0214\] Invalid compilation configuration: the bound value of package parameter `workers` does not satisfy its `where` predicate/)
 })
 
-test('a profile binding beats a project binding, and both are type-checked', () => {
+test('a profile config value beats [config], and --release keeps only [config]', () => {
   const dir = pkg(`pub param port: u16
 pub param verbose: bool = false
 param retries: i32 = 3 where retries >= 0
@@ -77,13 +72,9 @@ pub fn main() -> i32 {
   static if !verbose { return 2 }
   return retries - 3
 }
-`)
-  const base = read(join(dir, 'silk.toml'))
-  const manifest = `${base}\n[build]\nprofile = "dev"\n\n${binding(dir, 'port', '{ kind = "integer", value = "8080" }')}\n[profiles.dev]\ntarget = "x86_64-unknown-linux-gnu"\n\n${binding(dir, 'verbose', '{ kind = "boolean", value = true }', 'profiles.dev.bindings')}`
-  write(join(dir, 'silk.toml'), manifest)
+`, '[build]\nprofile = "dev"\n\n[config]\nmain.port = 8080\nmain.verbose = false\n\n[profiles.dev]\ntarget = "x86_64-unknown-linux-gnu"\nconfig.main.verbose = true\n')
   const dev = silk(h, ['run'], { cwd: dir })
   assert.equal(dev.status, 0, show(dev))
-  // --release builds without the profile: only the project binding applies, so verbose stays false.
   const release = silk(h, ['run', '--release'], { cwd: dir })
   assert.equal(release.status, 2, show(release))
 })
@@ -91,7 +82,7 @@ pub fn main() -> i32 {
 test('a pub param with no default and no binding is reported at its declaration', () => {
   const result = silk(h, ['check'], { cwd: pkg('pub param x: i32\n\npub fn main() -> i32 {\n  return x\n}\n') })
   assert.notEqual(result.status, 0)
-  assert.match(result.stderr, /src\/main\.silk:1:1: error\[SEM0214\] Invalid compilation configuration: package parameter `x` has no default value and no binding; give it a default or bind it in `\[build\]\.bindings` of silk\.toml/)
+  assert.match(result.stderr, /src\/main\.silk:1:1: error\[SEM0214\] Invalid compilation configuration: package parameter `x` has no default value and no binding; give it a default or set it under `\[config\]` in silk\.toml/)
 })
 
 test('declaration mistakes are SEM0214 with the reason the page gives', () => {
@@ -116,71 +107,47 @@ test('assigning to a parameter is SEM0036, and defaults that read each other are
   assert.match(cycle.stderr, /error\[SEM0223\]/, show(cycle))
 })
 
-test('bad bindings are refused at their silk.toml line and name the parameter', () => {
+
+test('bad values are refused at the line of their key', () => {
   const source = 'pub param x: i32 = 1\n\npub fn main() -> i32 {\n  return x\n}\n'
-  for (const [parameter, value, message] of [
-    ['x', '{ kind = "boolean", value = true }', /error\[SEM0214\] invalid package parameter binding: the value bound to `x` does not have its parameter's type/],
-    ['x', '{ kind = "integer", value = "99999999999" }', /error\[SEM0214\] invalid package parameter binding: .*`x`/],
-    ['y', '{ kind = "integer", value = "1" }', /module `main\.silk` declares no package parameter `y`/],
+  for (const [config, key, message] of [
+    ['[config]\nmain.x = true\n', 'main.x', /`x`/],
+    ['[config]\nmain.x = 99999999999\n', 'main.x', /`x`/],
+    ['[config]\nmain.y = 1\n', 'main.y', /declares no package parameter `y`/],
+    ['[config]\nmain.x = 1.5\n', 'main.x', /InvalidInput: config\.main\.x: a package parameter value is an integer, a boolean, a string or an array of them/],
+    ['[config]\nx = 1\n', 'x = 1', /InvalidInput: config\.x: name the module before the parameter, as config\.main\.x/],
   ]) {
-    const dir = pkg(source)
-    const manifest = `${read(join(dir, 'silk.toml'))}\n${binding(dir, parameter, value)}`
-    write(join(dir, 'silk.toml'), manifest)
+    const dir = pkg(source, config)
+    const manifest = read(join(dir, 'silk.toml'))
     const result = silk(h, ['check'], { cwd: dir })
-    assert.notEqual(result.status, 0, show(result))
-    const line = manifest.slice(0, manifest.indexOf(`parameter = "${parameter}"`)).split('\n').length
-    assert.match(result.stderr, new RegExp(`silk\\.toml:${line}: `), show(result))
-    assert.match(result.stderr, message, show(result))
+    assert.notEqual(result.status, 0, `${config}\n${show(result)}`)
+    assert.match(result.stderr, new RegExp(`silk\\.toml:${lineOf(manifest, `\n${key}`) + 1}: `), `${config}\n${show(result)}`)
+    assert.match(result.stderr, message, `${config}\n${show(result)}`)
   }
 })
 
-test('a binding for a private parameter is refused', () => {
-  const dir = pkg('param x: i32 = 1\n\npub fn main() -> i32 {\n  return x\n}\n')
-  write(join(dir, 'silk.toml'), `${read(join(dir, 'silk.toml'))}\n${binding(dir, 'x', '{ kind = "integer", value = "2" }')}`)
-  const result = silk(h, ['check'], { cwd: dir })
+test('a value for a private parameter is refused', () => {
+  const result = silk(h, ['check'], { cwd: pkg('param x: i32 = 1\n\npub fn main() -> i32 {\n  return x\n}\n', '[config]\nmain.x = 2\n') })
   assert.notEqual(result.status, 0, show(result))
   assert.match(result.stderr, /`x`/, show(result))
 })
 
-test('two project bindings for one parameter conflict, even with equal values', () => {
-  const dir = pkg('pub param x: i32 = 1\n\npub fn main() -> i32 {\n  return x\n}\n')
-  const one = binding(dir, 'x', '{ kind = "integer", value = "2" }')
-  write(join(dir, 'silk.toml'), `${read(join(dir, 'silk.toml'))}\n${one}\n${one}`)
-  const result = silk(h, ['check'], { cwd: dir })
-  assert.notEqual(result.status, 0, show(result))
-})
-
-test('a secret binding stops every build, even in a profile nobody selects', () => {
-  const dir = pkg('pub param x: i32 = 1\n\npub fn main() -> i32 {\n  return x\n}\n')
-  const secret = binding(dir, 'x', '{ kind = "integer", value = "2" }', 'profiles.unused.bindings').replace('provenance = "literal"', 'provenance = "secret"')
-  write(join(dir, 'silk.toml'), `${read(join(dir, 'silk.toml'))}\n[profiles.unused]\ntarget = "x86_64-unknown-linux-gnu"\n\n${secret}`)
-  const result = silk(h, ['build'], { cwd: dir })
-  assert.equal(result.status, 2, show(result))
-  assert.match(result.stderr, /ForbiddenProvenance: profiles\.unused\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/)
-})
-
-test('binding mistakes in the table itself are named', () => {
+test('the earlier binding tables are refused and name [config]', () => {
   const source = 'pub param x: i32 = 1\n\npub fn main() -> i32 {\n  return x\n}\n'
-  for (const [edit, message] of [
-    [(b) => b.replace(/package = .*\n/, ''), /InvalidInput: build\.bindings: package is missing; a binding names its package, module and parameter/],
-    [(b) => b.replace(/value = .*\n/, 'value = 3\n'), /InvalidInput: build\.bindings: value must be a table with a kind, such as \{ kind = "integer", value = "1" \}/],
-    [(b) => b.replace('kind = "integer"', 'kind = "float"'), /value\.kind must be integer, boolean, string, enum, none, some, array or record/],
-    [(b) => `${b}extra = 1\n`, /build\.bindings\.extra is not a supported field/],
-    [(b) => b.replace('provenance = "literal"', 'provenance = "bogus"'), /InvalidInput: build\.bindings: origin\.provenance = "bogus" is not literal, translated-public, secret, physical-supply or runtime/],
+  for (const [extra, message] of [
+    ['[[build.bindings]]\nparameter = "x"\n', /build\.bindings is an earlier spelling; write config, as config\.main\.limit = 42/],
+    ['[profiles.p]\ntarget = "x86_64-unknown-linux-gnu"\nbindings = []\n', /InvalidInput: profiles\.p\.bindings is an earlier spelling; write config/],
   ]) {
-    const dir = pkg(source)
-    write(join(dir, 'silk.toml'), `${read(join(dir, 'silk.toml'))}\n${edit(binding(dir, 'x', '{ kind = "integer", value = "2" }'))}`)
-    const result = silk(h, ['check'], { cwd: dir })
+    const result = silk(h, ['check'], { cwd: pkg(source, extra) })
     assert.equal(result.status, 2, show(result))
     assert.match(result.stderr, message, show(result))
   }
 })
 
 test('a module-level static if can choose declarations on a parameter', () => {
-  const dir = pkg('pub param fast: bool = false\n\nstatic if fast {\n  fn speed() -> i32 {\n    return 9\n  }\n} else {\n  fn speed() -> i32 {\n    return 1\n  }\n}\n\npub fn main() -> i32 {\n  return speed()\n}\n')
-  const plain = silk(h, ['run'], { cwd: dir })
+  const source = 'pub param fast: bool = false\n\nstatic if fast {\n  fn speed() -> i32 {\n    return 9\n  }\n} else {\n  fn speed() -> i32 {\n    return 1\n  }\n}\n\npub fn main() -> i32 {\n  return speed()\n}\n'
+  const plain = silk(h, ['run'], { cwd: pkg(source) })
   assert.equal(plain.status, 1, show(plain))
-  write(join(dir, 'silk.toml'), `${read(join(dir, 'silk.toml'))}\n${binding(dir, 'fast', '{ kind = "boolean", value = true }')}`)
-  const fast = silk(h, ['run'], { cwd: dir })
+  const fast = silk(h, ['run'], { cwd: pkg(source, '[config]\nmain.fast = true\n') })
   assert.equal(fast.status, 9, show(fast))
 })

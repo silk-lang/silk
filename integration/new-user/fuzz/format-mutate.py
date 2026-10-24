@@ -2,7 +2,9 @@
 # repairs it: every comment survives, a second format changes nothing, and the formatted program
 # prints what the original printed.
 #
-# python3 -I fuzz/format-mutate.py <package> <seed> <count>
+# python3 -I fuzz/format-mutate.py <package> <seed> <count> [file]
+# [file] is the source to mess up, relative to the package (default src/main.silk); the package's
+# program must still print the same.
 # Mutations: a `// cN` comment at the end of a line or on its own line, blank lines, wrong
 # indentation, trailing spaces, and extra or missing spaces around `(`, `)`, `,`, `=`, `{` and
 # operators on lines without string literals. Prints one line per case and FAIL on a problem.
@@ -10,7 +12,8 @@ import os, random, re, subprocess, sys
 
 pkg, seed, count = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 r = random.Random(seed)
-main = os.path.join(pkg, 'src/main.silk')
+target = sys.argv[4] if len(sys.argv) > 4 else 'src/main.silk'
+main = os.path.join(pkg, target)
 original = open(main).read()
 
 def run():
@@ -18,7 +21,7 @@ def run():
     return b.returncode, b.stdout, b.stderr
 
 def fmt():
-    return subprocess.run(['silk', 'format', 'src/main.silk'], cwd=pkg, capture_output=True, text=True)
+    return subprocess.run(['silk', 'format', target], cwd=pkg, capture_output=True, text=True)
 
 base = run()
 if base[0] != 0:
