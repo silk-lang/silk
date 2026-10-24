@@ -1513,22 +1513,6 @@ const program = Effect.gen(function* () {
   // manifest line.
   const locatedRefusals = [
     [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "", provenance = "literal" }\n',
-      /silk\.toml:10: InvalidInput: build\.bindings: origin\.source must be a non-empty string/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "x", provenance = "translated-public", translator = "" }\n',
-      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator must be a non-empty string/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\n[build.bindings.origin]\nsource = "env"\nprovenance = "secret"\n',
-      /silk\.toml:12: ForbiddenProvenance: build\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = 3\norigin = { source = "silk.toml", provenance = "literal" }\n',
-      /silk\.toml:9: InvalidInput: build\.bindings: value must be a table with a kind, such as \{ kind = "integer", value = "1" \}/,
-    ],
-    [
       '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["main"] }\n',
       /silk\.toml:6: unstable\.composition\.defaults entry "main" names no runtime in unstable\.composition\.runtimes; it lists "start"/,
     ],
@@ -1537,20 +1521,8 @@ const program = Effect.gen(function* () {
       /silk\.toml:7: unstable\.composition\.components\.bindings entry has no operation/,
     ],
     [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "env", provenance = "secret" }\n',
-      /silk\.toml:10: ForbiddenProvenance: build\.bindings: origin\.provenance = "secret" cannot be bound in a manifest/,
-    ],
-    [
-      '[[build.bindings]]\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
-      /silk\.toml:5: InvalidInput: build\.bindings: package is missing/,
-    ],
-    [
       '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
       /silk\.toml:6: unstable\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", translator = "t" }\n',
-      /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator: only provenance "translated-public" names a translator/,
     ],
     [
       '[unstable]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
@@ -1562,16 +1534,16 @@ const program = Effect.gen(function* () {
     ],
     ['[native]\nplatform-supply = { kind = "native", bogus = 1 }\n', /silk\.toml:6: native\.platform-supply\.bogus is not a supported field/],
     [
+      '[config]\nmain.ratio = 1.5\n',
+      /silk\.toml:6: InvalidInput: config\.main\.ratio: a package parameter value is an integer, a boolean, a string or an array of them/,
+    ],
+    ['[config]\nlimit = 1\n', /silk\.toml:6: InvalidInput: config\.limit: name the module before the parameter, as config\.main\.limit/],
+    ['[config.main]\nlimit = 1\nratio = 2.5\n', /silk\.toml:7: InvalidInput: config\.main\.ratio: a package parameter value/],
+    ['[[build.bindings]]\nparameter = "n"\n', /silk\.toml:5: build\.bindings is an earlier spelling; write config, as config\.main\.limit = 42/],
+    ['[profiles.p]\nbindings = []\n', /silk\.toml:6: InvalidInput: profiles\.p\.bindings is an earlier spelling; write config/],
+    [
       '[profiles.u]\ntarget = "x86_64-unknown-linux-gnu"\nentry = { kind = "default", bogus = 1 }\n',
       /silk\.toml:7: profiles\.u\.entry\.bogus is not a supported field/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1", bogus = 1 }\norigin = { source = "silk.toml", provenance = "literal" }\n',
-      /silk\.toml:9: build\.bindings\.value\.bogus is not a supported field/,
-    ],
-    [
-      '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", bogus = 1 }\n',
-      /silk\.toml:10: build\.bindings\.origin\.bogus is not a supported field/,
     ],
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
@@ -1635,7 +1607,7 @@ const program = Effect.gen(function* () {
   assert.notEqual(reserved.status, 0, reserved.stderr)
   assert.match(reserved.stderr, /`silk` and `Intrinsic` are reserved module names/)
   assert.equal(yield* fs.exists(marker), false)
-  // `[build].bindings` reach the package parameters of every project build.
+  // `[config]` values reach the package parameters of every project build.
   yield* fs.makeDirectory(join(directory, 'bound/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'bound/src/main.silk'),
@@ -1643,7 +1615,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'bound/silk.toml'),
-    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[[build.bindings]]\npackage = "bound@0.1.0"\nmodule = "main"\nparameter = "limit"\nvalue = { kind = "integer", value = "7" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = 7\n\n[profiles.small]\nconfig.main.limit = 3\n',
   )
   const bound = yield* invoke(
     silk,
@@ -1655,6 +1627,32 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
+  const boundProfile = yield* invoke(
+    silk,
+    ['run', '--profile', 'small', '--stdlib', standardLibrary],
+    join(directory, 'bound'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(boundProfile.status, 3, boundProfile.stderr)
+  // A value is checked against the parameter's declared type and refused at its manifest line.
+  yield* fs.writeFileString(
+    join(directory, 'bound/silk.toml'),
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = "seven"\n\n[profiles.small]\nconfig.main.limit = 3\n',
+  )
+  const mistyped = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'bound'))
+  assert.equal(mistyped.status, 1, mistyped.stderr)
+  assert.match(mistyped.stderr, /silk\.toml:6: error\[SEM0214\] invalid package parameter binding: the value bound to `limit` does not have its parameter's type/)
+  yield* fs.writeFileString(
+    join(directory, 'bound/silk.toml'),
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = 7\n\n[profiles.small]\nconfig.main.limt = 3\n',
+  )
+  const misnamed = yield* invoke(silk, ['check', '--profile', 'small', '--stdlib', standardLibrary], join(directory, 'bound'))
+  assert.equal(misnamed.status, 1, misnamed.stderr)
+  assert.match(misnamed.stderr, /silk\.toml:9: error\[SEM0214\] invalid package parameter binding: module `main\.silk` declares no package parameter `limt`/)
+  yield* fs.writeFileString(
+    join(directory, 'bound/silk.toml'),
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[config]\nmain.limit = 7\n',
+  )
   // `[package].source` roots module resolution above the root module's own directory.
   yield* fs.makeDirectory(join(directory, 'rooted/src/app'), { recursive: true })
   yield* fs.makeDirectory(join(directory, 'rooted/src/lib'), { recursive: true })
