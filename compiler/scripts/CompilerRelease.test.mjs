@@ -233,7 +233,7 @@ it.effect('refresh refuses a human-edited managed head before changing the branc
       }),
     )
     const result = yield* Effect.result(
-      maintain({ repository, compiler: '/unused/native-compiler' }).pipe(
+      maintain({ repository, tool: '/unused/silk' }).pipe(
         Effect.provideService(FileSystem.FileSystem, {
           ...fs,
           readDirectory: () => Effect.succeed(['pending.md']),
@@ -258,7 +258,8 @@ const maintenanceFixture = Effect.fnUntraced(function* () {
   }
   yield* transport((file, args, options) =>
     Effect.sync(() => {
-      if (file === '/native-compiler') {
+      if (file === '/silk') {
+        if (args[0] !== 'change') throw new Error(`Unexpected silk command: ${args}`)
         if (args.includes('release'))
           return outcome({
             version: '0.2.0',
@@ -313,7 +314,7 @@ const maintenanceFixture = Effect.fnUntraced(function* () {
     }),
   )
   const refresh = () =>
-    maintain({ repository, compiler: '/native-compiler' }).pipe(
+    maintain({ repository, tool: '/silk' }).pipe(
       Effect.provideService(FileSystem.FileSystem, {
         ...fs,
         readDirectory: () => Effect.succeed(['pending.md']),
