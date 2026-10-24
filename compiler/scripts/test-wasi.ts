@@ -34,7 +34,7 @@ const program = Effect.gen(function* () {
   const source = yield* fs.readFileString(join(repo, 'compiler/fixtures/wasi/main.silk'))
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "wasi-test"\nversion = "0.1.0"\nroot = "main.silk"\n',
+    '[package]\nname = "wasi-test"\nversion = "0.1.0"\nsource = "."\n',
   )
   const env = {
     ...process.env,
@@ -121,7 +121,7 @@ const program = Effect.gen(function* () {
     assert.match(tested.stdout.toString(), /2 passed, 0 failed/)
     yield* fs.writeFileString(
       join(directory, 'main.silk'),
-      'pub fn main() -> () {}\ntest fn traps() -> () { let bad = 1 / 0 }\ntest fn zAfterTrap() -> () {}\n',
+      'pub fn main() -> () {}\ntest fn timesOut() -> () { while true {} }\ntest fn traps() -> () { let bad = 1 / 0 }\ntest fn zAfterTrap() -> () {}\n',
     )
     const trapped = yield* invoke(compiler, [
       'test',
@@ -130,9 +130,11 @@ const program = Effect.gen(function* () {
       '--stdlib',
       join(repo, 'stdlib'),
       '--no-cache',
+      '--timeout',
+      '1',
     ])
     assert.equal(trapped.status, 1, trapped.stderr.toString())
-    assert.match(trapped.stdout.toString(), /1 passed, 1 failed/)
+    assert.match(trapped.stdout.toString(), /1 passed, 2 failed/)
     // Empty host snapshots and nonzero command status work for each entry adapter.
     yield* fs.writeFileString(join(directory, 'main.silk'), 'pub fn main() -> i32 { return 42 }\n')
     const statusBuild = yield* build(target, output)
@@ -148,6 +150,43 @@ const program = Effect.gen(function* () {
       join(repo, 'stdlib'),
     ])
     assert.equal(run.status, 0, run.stderr.toString())
+    const examples = join(directory, `examples-${target}`)
+    const nested = join(examples, 'nested')
+    yield* fs.makeDirectory(nested, { recursive: true })
+    yield* fs.writeFileString(
+      join(examples, 'silk.toml'),
+      `[package]\nname = "wasi-examples"\nsource = "."\n[build]\nprofile = "wasi"\n[profiles.wasi]\ntarget = "${target}"\n`,
+    )
+    yield* fs.writeFileString(join(examples, 'marker'), 'package directory')
+    const example = [
+      'import silk.allocator { Allocator, OutOfMemoryError }',
+      'import silk.effect { Effect }',
+      'import silk.filesystem { FileSystem, FileError, Path }',
+      'import silk.os_filesystem { OsFileSystem }',
+      'pub effect fn main() -> i32 ! FileError | OutOfMemoryError {',
+      '  let mut allocator = Allocator.systemAllocatorProvider()',
+      '  let mut fs = run OsFileSystem.make("/") |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  let path = run Path.make("/marker") |> Effect.provideMut<Allocator>(&mut allocator)',
+      '  let present = run FileSystem.exists(&path) |> Effect.provideMut<FileSystem>(&mut fs)',
+      '  if present { return 0 }',
+      '  return 1',
+      '}',
+    ]
+    yield* fs.writeFileString(
+      join(examples, 'main.silk'),
+      [
+        '/// ```silk',
+        ...example.map((line) => `/// ${line}`),
+        '/// ```',
+        'pub fn main() -> () {}',
+        '',
+      ].join('\n'),
+    )
+    const documented = yield* invoke(compiler, ['doctest', '--stdlib-root', join(repo, 'stdlib')], {
+      cwd: nested,
+    })
+    assert.equal(documented.status, 0, documented.stderr.toString() + documented.stdout.toString())
+    assert.match(documented.stdout.toString(), /1 collected, 1 passed, 0 skipped, 0 failed/)
     // Core IR and relocatable objects do not require component tooling.
     const absentTools = {
       ...env,
@@ -178,7 +217,7 @@ const program = Effect.gen(function* () {
     }
   }
   yield* Console.log(
-    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, run, test, emission stages, and atomic publication passed',
+    'WASI Preview 1 and Preview 2: services, capability confinement, command entries, components, run, test, doctest, emission stages, and atomic publication passed',
   )
 })
 await Effect.runPromise(program.pipe(Effect.scoped, Effect.provide(NodeServices.layer)))

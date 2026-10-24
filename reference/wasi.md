@@ -53,6 +53,8 @@ wasmtime run --dir ./data::/data --env MODE=production program.wasm argument
 `silk test` also maps its build directory to its absolute guest path for plans, receipts, and
 progress records. It uses Wasmtime for both editions. On WASI, `--timeout` limits a runner
 instance; a trap or timeout resumes after the test recorded in its progress file.
+`silk doctest` executes examples from a package with a WASI default profile through Wasmtime,
+mapping the package directory to guest `/` even when invoked from a subdirectory.
 
 ## Application entry
 
@@ -108,5 +110,5 @@ node compiler/scripts/test-wasi.ts /path/to/silkc /path/to/clang .scratch/wasi-t
 ```
 
 The acceptance test validates and executes both artifact formats. It covers host inputs, streams,
-filesystem capabilities and cleanup, clocks, randomness, command status, `run`, `test`, intermediate
+filesystem capabilities and cleanup, clocks, randomness, command status, `run`, `test`, `doctest`, intermediate
 artifacts, and preservation of an existing output when component construction fails.
