@@ -983,6 +983,15 @@ const program = Effect.gen(function* () {
   assert.match(unclosed.stderr, /^ {2}check {4}failed: 1 module, 1 error/m)
   assert.match(unclosed.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
   assert.doesNotMatch(unclosed.stderr, /codegen/)
+  // A file with a syntax error keeps no import summary, so the next load parses it and reports it again.
+  const reopened = yield* invoke(
+    silk,
+    ['build', '--stdlib', standardLibrary, '--progress', 'plain'],
+    join(directory, 'unclosed'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(reopened.status, 1, reopened.stderr)
+  assert.match(reopened.stderr, /^src\/main\.silk:3:1: error\[PAR0001\] Expected `\}`$/m)
   // `test` builds the project's runner below <output-dir>/test as an executable, whatever the
   // manifest's artifact, and runs the tests that --file and --filter select; a failing test makes
   // the status 1, and a selection outside the source root is refused before anything is built.
@@ -2554,6 +2563,10 @@ const program = Effect.gen(function* () {
   })
   const coldPacks = yield* packNames()
   assert.ok(coldPacks.length > 2, `expected a pack per module, found ${coldPacks.join(', ')}`)
+  // A load reads an unchanged file's imports from the summaries the last load kept beside the
+  // cache instead of parsing the file, so an unchanged rebuild leaves them as they were.
+  const importSummaries = join(split, 'build/cache/imports')
+  const summarizedAt = (yield* fs.stat(importSummaries)).mtime
   // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
   const splitExecutable = join(split, `build/llvm/${hostTarget}/debug/split`)
   const linkedAt = (yield* fs.stat(splitExecutable)).mtime
@@ -2561,6 +2574,7 @@ const program = Effect.gen(function* () {
   assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
   assert.deepEqual((yield* fs.stat(splitExecutable)).mtime, linkedAt, 'an unchanged rebuild leaves the executable as it was')
   assert.deepEqual(yield* packNames(), coldPacks, 'an unchanged rebuild keeps every pack')
+  assert.deepEqual((yield* fs.stat(importSummaries)).mtime, summarizedAt, 'an unchanged rebuild keeps the import summaries')
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   yield* splitRun(9)
   const editedObjects = yield* objectNames()
