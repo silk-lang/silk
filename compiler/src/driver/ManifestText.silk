@@ -1,0 +1,706 @@
+//! Positions in a manifest's text: the line that writes a dotted key, the line of a byte offset,
+//! and the words for a TOML syntax error found there. Manifest refusals use them to name
+//! `silk.toml:<line>`.
+
+import silk.allocator { Allocator, OutOfMemoryError }
+import silk.bytes { Bytes }
+import silk.slice { Slice }
+import silk.toml_scanner { TomlError, TomlReason }
+import silk.u8
+import silk.usize
+
+/// Appends to `out` why `text` is not valid TOML, from `error`, the parser's refusal: for example
+/// `` unexpected `p` `` or `` `name` is written twice ``.
+pub effect fn appendTomlReason(out: &mut Bytes, text: &[u8], error: &TomlError) -> () ! OutOfMemoryError ? &mut Allocator {
+  match error.reason {
+    TomlReason.UnexpectedByte => {
+      if error.offset < text.length && text[error.offset] > 32 && text[error.offset] < 127 {
+        run Bytes.append(&mut out.*, b"unexpected `")
+        run Bytes.append(&mut out.*, Slice.view<u8>(text, error.offset, usize.ONE))
+        run Bytes.append(&mut out.*, b"`")
+      } else if error.offset < text.length && text[error.offset] == 10 {
+        run Bytes.append(&mut out.*, b"the line ends before its table header, key or value is complete")
+      } else {
+        run Bytes.append(&mut out.*, b"unexpected character")
+      }
+    }
+    TomlReason.UnexpectedEnd => run Bytes.append(&mut out.*, b"the file ends before a string, array, inline table or table header is closed")
+    TomlReason.InvalidUtf8 => run Bytes.append(&mut out.*, b"the file is not valid UTF-8")
+    TomlReason.InvalidString => run Bytes.append(&mut out.*, b"a string is not closed, or holds a control character that must be escaped")
+    TomlReason.InvalidEscape => run Bytes.append(&mut out.*, b"a string has an escape that TOML does not define")
+    TomlReason.InvalidNumber => run Bytes.append(&mut out.*, b"a value must be a quoted string, a number, a boolean, an array or an inline table")
+    TomlReason.InvalidDateTime => run Bytes.append(&mut out.*, b"a date or time is out of range or has the wrong form")
+    TomlReason.TypeMismatch => run Bytes.append(&mut out.*, b"a value has the wrong kind")
+    TomlReason.NumberOutOfRange => run Bytes.append(&mut out.*, b"a number is out of range")
+    TomlReason.DuplicateKey => {
+      let key = keyAt(text, error.offset)
+      if key.length > usize.ZERO {
+        run Bytes.append(&mut out.*, b"`")
+        run Bytes.append(&mut out.*, key)
+        run Bytes.append(&mut out.*, b"` is written twice")
+      } else {
+        run Bytes.append(&mut out.*, b"a key is written twice")
+      }
+    }
+    TomlReason.TableConflict => run Bytes.append(&mut out.*, b"a table is defined twice, or conflicts with an earlier value")
+    TomlReason.DepthExceeded => run Bytes.append(&mut out.*, b"arrays or inline tables are nested too deeply")
+  }
+  return ()
+}
+
+fn same(left: &[u8], right: &[u8]) -> bool {
+  if left.length != right.length {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at < left.length {
+    if left[at] != right[at] {
+      return false
+    }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+// The bare or dotted key that starts at byte `at` of `text`, or an empty slice.
+fn keyAt(text: &[u8], at: usize) -> &[u8] {
+  let mut end = at
+  while end < text.length && (bareKey(text[end]) || text[end] == 46) {
+    end = end + usize.ONE
+  }
+  if at >= end {
+    return Slice.view<u8>(text, usize.ZERO, usize.ZERO)
+  }
+  return Slice.view<u8>(text, at, end - at)
+}
+
+fn blank(byte: u8) -> bool {
+  return byte == 32 || byte == 9 || byte == 13
+}
+
+// `row` without its leading and trailing blanks.
+fn trimmed(row: &[u8]) -> &[u8] {
+  let mut start = usize.ZERO
+  let mut end = row.length
+  while start < end && blank(row[start]) {
+    start = start + usize.ONE
+  }
+  while end > start && blank(row[end - usize.ONE]) {
+    end = end - usize.ONE
+  }
+  return Slice.view<u8>(row, start, end - start)
+}
+
+// How the written path `table.name` (only `table` when `name` is empty, only `name` when `table`
+// is) relates to the dotted key `key`, both compared without blanks: 2 when they are equal, 1 when
+// `key` lies inside it, as `package.description` lies inside `package`, and 0 otherwise.
+fn pathRelation(table: &[u8], name: &[u8], key: &[u8]) -> usize {
+  let mut at = usize.ZERO
+  let mut part = usize.ZERO
+  while part < usize.add(0, 2) {
+    let mut written = table
+    if part == usize.ONE {
+      written = name
+      if table.length > usize.ZERO && name.length > usize.ZERO {
+        if at >= key.length || key[at] != 46 {
+          return usize.ZERO
+        }
+        at = at + usize.ONE
+      }
+    }
+    let mut index = usize.ZERO
+    while index < written.length {
+      // A quoted key, as in `[profiles."1fast"]`, is compared by the name it quotes.
+      if !blank(written[index]) && written[index] != 34 && written[index] != 39 {
+        if at >= key.length || key[at] != written[index] {
+          return usize.ZERO
+        }
+        at = at + usize.ONE
+      }
+      index = index + usize.ONE
+    }
+    part = part + usize.ONE
+  }
+  if at == usize.ZERO {
+    return usize.ZERO
+  }
+  if at == key.length {
+    return usize.add(0, 2)
+  }
+  if key[at] == 46 {
+    return usize.ONE
+  }
+  return usize.ZERO
+}
+
+/// The 1-based line of the manifest `text` that writes the dotted key `key`, such as
+/// `profiles.fast.opt`, or zero when no line does. A segment of digits selects an entry of the array
+/// before it, as `unstable.composition.retention.1.extra` names `extra` in the second retention entry,
+/// whether the array is written inline or as `[[array]]` tables. When the key cannot be followed
+/// that way, the line is the first one whose table header and key spell it, else the first line of
+/// the innermost table or inline table that holds it. A quoted key is read without its quotes.
+pub fn keyLine(text: &[u8], key: &[u8]) -> usize {
+  let located = locate(text, key)
+  if located > usize.ZERO {
+    return located
+  }
+  return scannedLine(text, key)
+}
+
+// The 1-based line of `text` that holds byte `at`.
+pub fn lineAt(text: &[u8], at: usize) -> usize {
+  let mut line = usize.ONE
+  let mut index = usize.ZERO
+  while index < at && index < text.length {
+    if text[index] == 10 {
+      line = line + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  return line
+}
+
+// The end of the dotted segment of `path` that starts at `start`: its next `.`, or its end.
+fn segmentEnd(path: &[u8], start: usize) -> usize {
+  let mut at = start
+  while at < path.length && path[at] != 46 {
+    at = at + usize.ONE
+  }
+  return at
+}
+
+// The array index the segment `written` spells in decimal digits, else `usize.MAX`.
+fn indexOf(written: &[u8]) -> usize {
+  if written.length == usize.ZERO || written.length > usize.add(0, 9) {
+    return usize.MAX
+  }
+  let mut value = usize.ZERO
+  let mut at = usize.ZERO
+  while at < written.length {
+    if written[at] < 48 || written[at] > 57 {
+      return usize.MAX
+    }
+    value = value * usize.add(0, 10) + (u8.toUsize(written[at]) - usize.add(0, 48))
+    at = at + usize.ONE
+  }
+  return value
+}
+
+// Whether `byte` may appear in a bare TOML key.
+fn bareKey(byte: u8) -> bool {
+  return byte >= 48 && byte <= 57 || byte >= 65 && byte <= 90 || byte >= 97 && byte <= 122 || byte == 95 || byte == 45
+}
+
+// The index just past the TOML string whose opening quote is at `at`.
+fn stringEnd(text: &[u8], at: usize) -> usize {
+  let quote = text[at]
+  let mut index = at + usize.ONE
+  while index < text.length {
+    if text[index] == 92 && quote == 34 {
+      index = index + usize.add(0, 2)
+    } else if text[index] == quote {
+      return index + usize.ONE
+    } else if text[index] == 10 {
+      return index
+    } else {
+      index = index + usize.ONE
+    }
+  }
+  return text.length
+}
+
+// The index just past the bracket that closes the `{` or `[` at `open`, skipping strings and
+// comments.
+fn closing(text: &[u8], open: usize) -> usize {
+  let mut depth = usize.ZERO
+  let mut at = open
+  while at < text.length {
+    let byte = text[at]
+    if byte == 34 || byte == 39 {
+      at = stringEnd(text, at)
+    } else if byte == 35 {
+      while at < text.length && text[at] != 10 {
+        at = at + usize.ONE
+      }
+    } else {
+      if byte == 123 || byte == 91 {
+        depth = depth + usize.ONE
+      } else if (byte == 125 || byte == 93) && depth > usize.ZERO {
+        depth = depth - usize.ONE
+        if depth == usize.ZERO {
+          return at + usize.ONE
+        }
+      }
+      at = at + usize.ONE
+    }
+  }
+  return text.length
+}
+
+// The start of the key `name` written at the top level of the table body from `start` to `end` of
+// `text`, a `[table]` section or the inside of an inline table, else `usize.MAX`.
+fn memberAt(text: &[u8], start: usize, end: usize, name: &[u8]) -> usize {
+  let mut depth = usize.ZERO
+  let mut expecting = true
+  let mut at = start
+  while at < end {
+    let byte = text[at]
+    if byte == 35 {
+      while at < end && text[at] != 10 {
+        at = at + usize.ONE
+      }
+    } else if byte == 10 {
+      if depth == usize.ZERO {
+        expecting = true
+      }
+      at = at + usize.ONE
+    } else if blank(byte) {
+      at = at + usize.ONE
+    } else if depth == usize.ZERO && expecting && (byte == 34 || byte == 39 || bareKey(byte)) {
+      let key = at
+      let mut first = at
+      let mut last = at
+      if byte == 34 || byte == 39 {
+        first = at + usize.ONE
+        at = stringEnd(text, at)
+        last = at - usize.ONE
+      } else {
+        while at < end && bareKey(text[at]) {
+          at = at + usize.ONE
+        }
+        last = at
+      }
+      let mut after = at
+      while after < end && blank(text[after]) {
+        after = after + usize.ONE
+      }
+      if after < end && text[after] == 61 && last >= first && same(Slice.view<u8>(text, first, last - first), name) {
+        return key
+      }
+      expecting = false
+    } else {
+      expecting = false
+      if byte == 34 || byte == 39 {
+        at = stringEnd(text, at)
+      } else {
+        if byte == 123 || byte == 91 {
+          depth = depth + usize.ONE
+        } else if (byte == 125 || byte == 93) && depth > usize.ZERO {
+          depth = depth - usize.ONE
+        } else if byte == 44 && depth == usize.ZERO {
+          expecting = true
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return usize.MAX
+}
+
+// The first byte of the value written after the key that starts at `key`.
+fn valueAt(text: &[u8], key: usize) -> usize {
+  let mut at = key
+  if text[at] == 34 || text[at] == 39 {
+    at = stringEnd(text, at)
+  } else {
+    while at < text.length && bareKey(text[at]) {
+      at = at + usize.ONE
+    }
+  }
+  while at < text.length && blank(text[at]) {
+    at = at + usize.ONE
+  }
+  if at < text.length && text[at] == 61 {
+    at = at + usize.ONE
+  }
+  while at < text.length && blank(text[at]) {
+    at = at + usize.ONE
+  }
+  return at
+}
+
+// The first byte of entry `index` of the array whose `[` is at `open`, else `usize.MAX`.
+fn itemAt(text: &[u8], open: usize, index: usize) -> usize {
+  let mut depth = usize.ZERO
+  let mut count = usize.ZERO
+  let mut expecting = true
+  let mut at = open + usize.ONE
+  while at < text.length {
+    let byte = text[at]
+    if byte == 35 {
+      while at < text.length && text[at] != 10 {
+        at = at + usize.ONE
+      }
+    } else if blank(byte) || byte == 10 {
+      at = at + usize.ONE
+    } else {
+      if depth == usize.ZERO && byte == 93 {
+        return usize.MAX
+      }
+      if depth == usize.ZERO && expecting {
+        if count == index {
+          return at
+        }
+        expecting = false
+      }
+      if byte == 34 || byte == 39 {
+        at = stringEnd(text, at)
+      } else {
+        if byte == 123 || byte == 91 {
+          depth = depth + usize.ONE
+        } else if (byte == 125 || byte == 93) && depth > usize.ZERO {
+          depth = depth - usize.ONE
+        } else if byte == 44 && depth == usize.ZERO {
+          count = count + usize.ONE
+          expecting = true
+        }
+        at = at + usize.ONE
+      }
+    }
+  }
+  return usize.MAX
+}
+
+// The path written inside the brackets of the header `row`.
+fn headerText(row: &[u8]) -> &[u8] {
+  let mut open = usize.ZERO
+  while open < row.length && row[open] == 91 {
+    open = open + usize.ONE
+  }
+  let mut close = open
+  while close < row.length && row[close] != 93 {
+    close = close + usize.ONE
+  }
+  return Slice.view<u8>(row, open, close - open)
+}
+
+// How much of the dotted `path` the table header path `header` spells, compared without blanks
+// and quotes: all of it, or the segments it spells and the `.` after them, else zero.
+fn headerConsumed(header: &[u8], path: &[u8]) -> usize {
+  let mut at = usize.ZERO
+  let mut index = usize.ZERO
+  while index < header.length {
+    let byte = header[index]
+    if !blank(byte) && byte != 34 && byte != 39 {
+      if at >= path.length || path[at] != byte {
+        return usize.ZERO
+      }
+      at = at + usize.ONE
+    }
+    index = index + usize.ONE
+  }
+  if at == usize.ZERO {
+    return usize.ZERO
+  }
+  if at == path.length {
+    return at
+  }
+  if path[at] == 46 {
+    return at + usize.ONE
+  }
+  return usize.ZERO
+}
+
+// How many `[[header]]` rows spelling the same path as `header` come before byte `before`.
+fn earlierTables(text: &[u8], before: usize, header: &[u8]) -> usize {
+  let mut count = usize.ZERO
+  let mut start = usize.ZERO
+  while start < before {
+    let mut end = start
+    while end < text.length && text[end] != 10 {
+      end = end + usize.ONE
+    }
+    let row = trimmed(Slice.view<u8>(text, start, end - start))
+    if row.length > usize.ONE && row[usize.ZERO] == 91 && row[usize.ONE] == 91 {
+      let written = headerText(row)
+      if headerConsumed(written, header) == header.length && headerConsumed(header, written) == written.length {
+        count = count + usize.ONE
+      }
+    }
+    start = end + usize.ONE
+  }
+  return count
+}
+
+// How much of the dotted `path` the `[table]` header `header`, whose row starts at byte `before` of
+// `text`, spells when it lies in an entry of an array of tables: `[build.bindings.origin]` names the
+// origin of the latest `[[build.bindings]]` entry, which `path` spells as `build.bindings.0.origin`.
+// Zero when the header spells no such path.
+fn subtableConsumed(text: &[u8], before: usize, header: &[u8], path: &[u8]) -> usize {
+  let mut index = usize.ZERO
+  let mut at = usize.ZERO
+  let mut indexed = false
+  while index < header.length {
+    let mut end = index
+    while end < header.length && header[end] != 46 {
+      end = end + usize.ONE
+    }
+    // One segment of the header, compared without blanks and quotes.
+    let stop = segmentEnd(path, at)
+    let mut cursor = at
+    let mut scan = index
+    while scan < end {
+      let byte = header[scan]
+      if !blank(byte) && byte != 34 && byte != 39 {
+        if cursor >= stop || path[cursor] != byte {
+          return usize.ZERO
+        }
+        cursor = cursor + usize.ONE
+      }
+      scan = scan + usize.ONE
+    }
+    if cursor != stop || cursor == at {
+      return usize.ZERO
+    }
+    at = stop
+    if end >= header.length {
+      break
+    }
+    // More segments follow, after the index of the latest entry when the header so far names an
+    // array of tables.
+    if at >= path.length {
+      return usize.ZERO
+    }
+    at = at + usize.ONE
+    let entries = earlierTables(text, before, Slice.view<u8>(header, usize.ZERO, end))
+    if entries > usize.ZERO {
+      let indexEnd = segmentEnd(path, at)
+      if indexEnd >= path.length || indexOf(Slice.view<u8>(path, at, indexEnd - at)) != entries - usize.ONE {
+        return usize.ZERO
+      }
+      at = indexEnd + usize.ONE
+      indexed = true
+    }
+    index = end + usize.ONE
+  }
+  if !indexed {
+    return usize.ZERO
+  }
+  if at >= path.length {
+    return path.length
+  }
+  return at + usize.ONE
+}
+
+// The line of `text` that writes the dotted `path` (see [`keyLine`]), following table headers,
+// then keys, inline tables and array entries, else zero.
+fn locate(text: &[u8], path: &[u8]) -> usize {
+  let mut consumed = usize.ZERO
+  let mut regionStart = usize.ZERO
+  let mut regionEnd = text.length
+  let mut open = true
+  let mut headerLine = usize.ZERO
+  let mut line = usize.ONE
+  let mut start = usize.ZERO
+  while start < text.length {
+    let mut end = start
+    while end < text.length && text[end] != 10 {
+      end = end + usize.ONE
+    }
+    let row = trimmed(Slice.view<u8>(text, start, end - start))
+    if row.length > usize.ZERO && row[usize.ZERO] == 91 {
+      if open {
+        regionEnd = start
+        open = false
+      }
+      let header = headerText(row)
+      let mut taken = headerConsumed(header, path)
+      if taken > usize.ZERO && row.length > usize.ONE && row[usize.ONE] == 91 {
+        // An array of tables is followed by the index of the entry the path selects.
+        if taken >= path.length {
+          taken = usize.ZERO
+        } else {
+          let indexEnd = segmentEnd(path, taken)
+          let wanted = indexOf(Slice.view<u8>(path, taken, indexEnd - taken))
+          if wanted == usize.MAX || earlierTables(text, start, header) != wanted {
+            taken = usize.ZERO
+          } else if indexEnd >= path.length {
+            taken = path.length
+          } else {
+            taken = indexEnd + usize.ONE
+          }
+        }
+      }
+      if row.length > usize.ONE && row[usize.ONE] != 91 {
+        let nested = subtableConsumed(text, start, header, path)
+        if nested > taken {
+          taken = nested
+        }
+      }
+      if taken > consumed {
+        consumed = taken
+        headerLine = line
+        regionStart = end
+        if regionStart < text.length {
+          regionStart = regionStart + usize.ONE
+        }
+        regionEnd = text.length
+        open = true
+      }
+    }
+    start = end + usize.ONE
+    line = line + usize.ONE
+  }
+  if consumed >= path.length {
+    return headerLine
+  }
+  let mut first = regionStart
+  let mut last = regionEnd
+  let mut at = consumed
+  while at < path.length {
+    let next = segmentEnd(path, at)
+    let key = memberAt(text, first, last, Slice.view<u8>(path, at, next - at))
+    if key == usize.MAX {
+      return usize.ZERO
+    }
+    if next >= path.length {
+      return lineAt(text, key)
+    }
+    at = next + usize.ONE
+    let mut value = valueAt(text, key)
+    if value >= text.length {
+      return usize.ZERO
+    }
+    if text[value] == 91 {
+      let indexEnd = segmentEnd(path, at)
+      let wanted = indexOf(Slice.view<u8>(path, at, indexEnd - at))
+      if wanted == usize.MAX {
+        return usize.ZERO
+      }
+      value = itemAt(text, value, wanted)
+      if value == usize.MAX {
+        return usize.ZERO
+      }
+      if indexEnd >= path.length {
+        return lineAt(text, value)
+      }
+      at = indexEnd + usize.ONE
+    }
+    if text[value] != 123 {
+      return usize.ZERO
+    }
+    first = value + usize.ONE
+    last = closing(text, value) - usize.ONE
+  }
+  return usize.ZERO
+}
+
+// The line [`keyLine`] answers when `locate` cannot follow the key: the first line whose table
+// header and key spell it, else the line of the innermost holder or the first line after it that
+// writes the key's last segment inline.
+fn scannedLine(text: &[u8], key: &[u8]) -> usize {
+  let mut table = Slice.view<u8>(text, usize.ZERO, usize.ZERO)
+  let mut best = usize.ZERO
+  let mut bestDepth = usize.ZERO
+  let mut line = usize.ONE
+  let mut start = usize.ZERO
+  while start < text.length {
+    let mut end = start
+    while end < text.length && text[end] != 10 {
+      end = end + usize.ONE
+    }
+    let row = trimmed(Slice.view<u8>(text, start, end - start))
+    let mut relation = usize.ZERO
+    let mut depth = usize.ZERO
+    if row.length > usize.ZERO && row[usize.ZERO] == 91 {
+      // A `[table]` or `[[array]]` header starts the table its later keys belong to.
+      let mut open = usize.ZERO
+      while open < row.length && row[open] == 91 {
+        open = open + usize.ONE
+      }
+      let mut close = open
+      while close < row.length && row[close] != 93 {
+        close = close + usize.ONE
+      }
+      table = Slice.view<u8>(row, open, close - open)
+      relation = pathRelation(table, b"", key)
+      depth = table.length
+    } else if row.length > usize.ZERO && row[usize.ZERO] != 35 {
+      let mut equals = usize.ZERO
+      while equals < row.length && row[equals] != 61 {
+        equals = equals + usize.ONE
+      }
+      if equals < row.length {
+        let name = Slice.view<u8>(row, usize.ZERO, equals)
+        relation = pathRelation(table, name, key)
+        depth = table.length + name.length + usize.ONE
+      }
+    }
+    if relation == usize.add(0, 2) {
+      return line
+    }
+    if relation == usize.ONE && depth > bestDepth {
+      best = line
+      bestDepth = depth
+    }
+    start = end + usize.ONE
+    line = line + usize.ONE
+  }
+  if best == usize.ZERO {
+    return best
+  }
+  let mut dot = key.length
+  while dot > usize.ZERO && key[dot - usize.ONE] != 46 {
+    dot = dot - usize.ONE
+  }
+  return inlineLine(text, best, Slice.view<u8>(key, dot, key.length - dot))
+}
+
+// The first line from `holder` on, before the next table header, that writes the inline key `name`
+// as `name =` after `{`, `,` or the line start, else `holder`.
+fn inlineLine(text: &[u8], holder: usize, name: &[u8]) -> usize {
+  let mut line = usize.ONE
+  let mut start = usize.ZERO
+  while start < text.length {
+    let mut end = start
+    while end < text.length && text[end] != 10 {
+      end = end + usize.ONE
+    }
+    if line >= holder {
+      let row = trimmed(Slice.view<u8>(text, start, end - start))
+      if line > holder && row.length > usize.ZERO && row[usize.ZERO] == 91 {
+        return holder
+      }
+      if writesKey(row, name) {
+        return line
+      }
+    }
+    start = end + usize.ONE
+    line = line + usize.ONE
+  }
+  return holder
+}
+
+// Whether `row` writes the key `name` as `name =` after `{`, `,` or the row's start.
+fn writesKey(row: &[u8], name: &[u8]) -> bool {
+  if name.length == usize.ZERO {
+    return false
+  }
+  let mut at = usize.ZERO
+  while at + name.length <= row.length {
+    let mut matches = true
+    let mut index = usize.ZERO
+    while index < name.length && matches {
+      if row[at + index] != name[index] {
+        matches = false
+      }
+      index = index + usize.ONE
+    }
+    if matches {
+      let mut before = at
+      while before > usize.ZERO && blank(row[before - usize.ONE]) {
+        before = before - usize.ONE
+      }
+      let opened = before == usize.ZERO || row[before - usize.ONE] == 123 || row[before - usize.ONE] == 44
+      let mut after = at + name.length
+      while after < row.length && blank(row[after]) {
+        after = after + usize.ONE
+      }
+      if opened && after < row.length && row[after] == 61 {
+        return true
+      }
+    }
+    at = at + usize.ONE
+  }
+  return false
+}
