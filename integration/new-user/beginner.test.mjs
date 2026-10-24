@@ -67,3 +67,32 @@ for (const [name, source, hint] of [
     assert.match(result.stderr, hint, show(result))
   })
 }
+
+// The ownership and effects chapters: errors that state the rule but name neither the binding nor
+// the fix. Each row: the program, the name the error should mention, and the fix it should offer.
+const kept = (p) => `struct P {\n  x: i32,\n}\n\nfn keep<'a>(p: &'a P) -> &'a i32 {\n  return &p.x\n}\n\n${p}`
+for (const [code, source, name, fix] of [
+  ['SEM0057', 'fn bump(x: &mut i32) -> () {\n  x.* = x.* + 1\n}\n\npub fn main() -> i32 {\n  let n = 0\n  bump(&mut n)\n  return n\n}\n', /\bn\b/, /let mut n/],
+  ['SEM0058', 'fn bump(x: &mut i32) -> () {\n  x.* = x.* + 1\n}\n\nfn f(x: &i32) -> () {\n  bump(&mut x.*)\n}\n\npub fn main() -> i32 {\n  let n = 0\n  f(&n)\n  return n\n}\n', /\bx\b/, /&mut i32/],
+  ['OWN0010', kept('fn bump(p: &mut P) -> () {\n  p.x = p.x + 1\n}\n\npub fn main() -> i32 {\n  let mut p = P { x: 0 }\n  let r = keep(&p)\n  bump(&mut p)\n  return r.*\n}\n'), /\bp\b/, /\br\b/],
+  ['OWN0011', kept('pub fn main() -> i32 {\n  let mut p = P { x: 0 }\n  let r = keep(&p)\n  p = P { x: 1 }\n  return r.*\n}\n'), /\bp\b/, /\br\b/],
+  ['OWN0019', 'pub fn main() -> i32 {\n  let mut r: &i32 = &0\n  if true {\n    let x = 5\n    r = &x\n  }\n  return r.*\n}\n', /\bx\b/, /\br\b/],
+  ['SEM0063', 'struct E {\n  m: i32,\n}\n\nfn f() -> i32 {\n  fail E { m: 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n', /\bf\b/, /effect fn|! E/],
+  ['SEM0066', 'struct E {\n  m: i32,\n}\n\neffect fn f() -> () ! E {\n  fail E { m: 1 }\n}\n\npub effect fn main() -> () {\n  run f()\n}\n', /\bE\b/, /! E|Effect\.result/],
+  ['SEM0071', 'import silk.effect { Effect }\nimport silk.logger { LogError, Logger }\n\neffect fn say() -> () ! LogError ? &mut Logger {\n  run Effect.log("hi\\n", &.{})\n}\n\npub effect fn main() -> () ! LogError {\n  run say()\n}\n', /Logger/, /provideMut|\? &mut Logger/],
+  ['SEM0077', 'pub fn main() -> i32 {\n  let mut n = 0\n  let f = fn() -> () {\n    n = n + 1\n  }\n  f()\n  return n - 1\n}\n', /\bf\b/, /let mut f/],
+]) {
+  test(`${code} names the binding and the fix`, { todo: 'finding 119' }, () => {
+    const result = check(source)
+    const line = errors(result).find((l) => l.includes(`[${code}]`)) ?? ''
+    assert.ok(line !== '', `no ${code}\n${show(result)}`)
+    const message = line.replace(/^.*?\] /, '')
+    assert.match(message, name, show(result))
+    assert.match(result.stderr, fix, show(result))
+  })
+}
+
+test('main returning a string is told what main may return', { todo: 'finding 120' }, () => {
+  const result = check('pub fn main() -> string {\n  return "x"\n}\n')
+  assert.match(result.stderr, /SEM0225\]/, show(result))
+})
