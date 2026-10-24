@@ -107,7 +107,7 @@ const refusals = [
   ['entry = { kind = "none" }', 'entry', 'profiles.fast.entry is not supported by the native compiler yet'],
   ['libc = "system"', 'libc', 'UnsupportedCombination: profiles.fast.libc = "system"'],
   ['deployment = "14.0"', 'deployment', 'UnsupportedCombination: profiles.fast.deployment = "14.0"'],
-  ['maxMemory = "256MiB"', 'maxMemory', 'UnsupportedCombination: profiles.fast.maxMemory = "256MiB"'],
+  ['max-memory = "256MiB"', 'max-memory', 'UnsupportedCombination: profiles.fast.max-memory = "256MiB"'],
   ['cpu = { model = "znver3" }', 'cpu', 'UnsupportedCombination: profiles.fast.cpu.model = "znver3"'],
   ['cpu = { features = ["neon"] }', 'cpu', 'UnsupportedCombination: profiles.fast.cpu.features'],
 ]

@@ -71,6 +71,7 @@ Excerpts that lean on the rest of the page are retried with the page's imports. 
 | `fuzz/collections.py` | Random operations on `HashMap`, `HashSet` and `List`, with a Python model |
 | `fuzz/trees.py` | Expression trees in `Box`-based unions, evaluated by reference, by a `mut fn` visitor and by consuming the tree, with a Python reference |
 | `fuzz/format-roundtrip.sh <package> <dir>` | Formats a copy of a package that checks clean, then checks the result is stable, still checks, and runs with the same output |
+| `python3 -I fuzz/format-mutate.py <package> <seed> <count>` | Messes up the layout of a running `src/main.silk` (comments at line ends and on their own lines, blank lines, wrong indentation, trailing spaces, spaces added or removed around punctuation), then checks that `silk format` keeps every comment, is stable on a second pass, and the program prints the same |
 | `fuzz/numfmt/run.sh <seed> <dir>` | Prints the same values with the same format specs from Silk and from Rust (`rustc` needed), and reports any line that differs |
 | `fuzz/hashes/` | Every hash and HMAC in the stdlib against Python's hashlib, on 326 input sizes fed in uneven pieces (build `main.silk`, then `diff.sh <binary>`) |
 | `fuzz/json/`, `fuzz/toml/` | `main.silk` parses standard input and writes it back; `drive.py <binary> <seed> <count>` sends random and broken documents and compares with Python's json or tomllib |

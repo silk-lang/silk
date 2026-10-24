@@ -51,20 +51,20 @@ test('a < b && c > d without parentheses parses', () => {
 
 // A library `d` in its own folder, used by `app`.
 function library(root) {
-  write(join(root, 'd/silk.toml'), '[package]\nname = "d"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["money"]\n')
+  write(join(root, 'd/silk.toml'), '[package]\nname = "d"\nversion = "0.1.0"\nkind = "library"\nexports = ["money"]\n')
   write(join(root, 'd/src/money.silk'), 'pub fn cents() -> i32 {\n  return 275\n}\n')
-  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
+  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\n')
   write(join(root, 'app/src/main.silk'), 'import d.money { cents }\n\npub fn main() -> i32 {\n  return cents() - 275\n}\n')
 }
 
 test('two dependents reach one library through differently spelled paths', () => {
   const root = join(h.work, 'diamond')
   library(root)
-  write(join(root, 'b/silk.toml'), '[package]\nname = "b"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["one"]\n\n[dependencies]\nd = { path = "../d" }\n')
+  write(join(root, 'b/silk.toml'), '[package]\nname = "b"\nversion = "0.1.0"\nkind = "library"\nexports = ["one"]\n\n[dependencies]\nd = { path = "../d" }\n')
   write(join(root, 'b/src/one.silk'), 'import d.money { cents }\n\npub fn one() -> i32 {\n  return cents()\n}\n')
-  write(join(root, 'c/silk.toml'), '[package]\nname = "c"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["two"]\n\n[dependencies]\nd = { path = "../b/../d" }\n')
+  write(join(root, 'c/silk.toml'), '[package]\nname = "c"\nversion = "0.1.0"\nkind = "library"\nexports = ["two"]\n\n[dependencies]\nd = { path = "../b/../d" }\n')
   write(join(root, 'c/src/two.silk'), 'import d.money { cents }\n\npub fn two() -> i32 {\n  return cents()\n}\n')
-  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nb = { path = "../b" }\nc = { path = "../c" }\n')
+  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nb = { path = "../b" }\nc = { path = "../c" }\n')
   write(join(root, 'app/src/main.silk'), 'import b.one { one }\nimport c.two { two }\n\npub fn main() -> i32 {\n  return one() - two()\n}\n')
   const result = silk(h, ['run', '--quiet'], { cwd: join(root, 'app') })
   assert.equal(result.status, 0, show(result))
@@ -74,7 +74,7 @@ test('a dependency reached through a symbolic link builds', () => {
   const root = join(h.work, 'linked-dependency')
   library(root)
   symlinkSync('d', join(root, 'dlink'))
-  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nd = { path = "../dlink" }\n')
+  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nd = { path = "../dlink" }\n')
   const result = silk(h, ['run', '--quiet'], { cwd: join(root, 'app') })
   assert.equal(result.status, 0, show(result))
 })
@@ -353,7 +353,7 @@ test('in a workspace, the editor sees a saved change to another member', async (
 function generatedPackage(name, modules, functions) {
   const dir = initPackage(h, name)
   for (let m = 0; m < modules; m++) {
-    let text = `pub struct Point {\n  pub x: i64\n  pub y: i64\n}\n\npub union Shape {\n  Circle {\n    pub radius: i64\n  },\n  Rect {\n    pub width: i64,\n    pub height: i64\n  },\n  Empty\n}\n`
+    let text = `pub struct Point {\n  pub x: i64,\n  pub y: i64,\n}\n\npub union Shape {\n  Circle {\n    pub radius: i64,\n  },\n  Rect {\n    pub width: i64,\n    pub height: i64,\n  },\n  Empty\n}\n`
     for (let f = 0; f < functions; f++) {
       text += `\npub fn f${f}(seed: i64) -> i64 {\n  let point = Point { x: seed + ${f}, y: seed * 2 }\n  let shape = match seed % 3 {\n    0 => Shape.Circle { radius: point.x }\n    1 => Shape.Rect { width: point.x, height: point.y }\n    _ => Shape.Empty\n  }\n  let value = match move shape {\n    Shape.Circle { radius } => radius * 3\n    Shape.Rect { width, height } => width * height\n    Shape.Empty => ${f}\n  }\n  return value % 1000\n}\n`
     }
@@ -538,4 +538,13 @@ ${fields.map((f) => `    ${f}: 1,`).join('\n')}
   const checked = silk(h, ['check'], { cwd: dir })
   assert.equal(checked.status, 0, show(checked))
   assert.ok(checkSeconds(checked) < 3, `check took ${checkSeconds(checked)} s`)
+})
+
+test('silk format keeps a comment after the last statement of a closure passed as an argument', { todo: 'finding 113' }, () => {
+  const dir = initPackage(h, 'closure-comment')
+  const source = 'fn call<F: mut fn() -> ()>(mut f: F) -> F {\n  f()\n  return move f\n}\n\npub fn main() -> i32 {\n  let mut n = 0\n  drop call(fn() -> () {\n    n = n + 1 // counted\n  })\n  drop call(fn() -> () {\n    n = n + 1\n    // after the last statement\n  })\n  return n - 2\n}\n'
+  write(join(dir, 'src/main.silk'), source)
+  const formatted = silk(h, ['format'], { cwd: dir })
+  assert.equal(formatted.status, 0, show(formatted))
+  assert.equal(read(join(dir, 'src/main.silk')), source)
 })
