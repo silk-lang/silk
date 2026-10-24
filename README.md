@@ -328,7 +328,7 @@ It includes:
 - **Systems:** files, child processes, sockets, clocks, randomness, single-threaded fibers and
   schedulers, and WebAssembly start-up.
 - **Data:** JSON and TOML, Base64, URIs, and Zstandard and DEFLATE/gzip decoding.
-- **Network:** an HTTP client and server, a WebSocket server, connection pooling, and TLS with X.509
+- **Network:** HTTP/1.x and HTTP/2 clients and servers, HPACK, a WebSocket server, connection pooling, and TLS with X.509
   certificate path validation.
 - **Crypto:** SHA-1, SHA-2 and SHA-3, HMAC, HKDF, AES-GCM, ChaCha20-Poly1305, X25519, and ECDSA
   P-256 and RSA signature verification.
