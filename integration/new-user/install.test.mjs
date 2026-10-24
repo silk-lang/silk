@@ -2,7 +2,7 @@
 import { strict as assert } from 'node:assert'
 import { lstatSync, readlinkSync, statSync } from 'node:fs'
 import { test } from 'node:test'
-import { existsSync, freshHome, install, join, read, show, silk } from './lib.mjs'
+import { existsSync, freshHome, hasTool, install, join, read, show, silk } from './lib.mjs'
 
 test('install.sh installs a toolchain, links bin/silk and makes it the default', () => {
   const h = freshHome()
@@ -10,15 +10,16 @@ test('install.sh installs a toolchain, links bin/silk and makes it the default',
   assert.equal(result.status, 0, show(result))
   assert.match(result.stdout, /^Installed silk v(\S+) to .*\/\.silk\/toolchains\/\S+$/m)
   const version = /^Installed silk v(\S+)/m.exec(result.stdout)[1]
-  const withSew = existsSync(join(h.silkHome, 'toolchains', version, 'bin/sew'))
-  assert.match(result.stdout, withSew ? /It is the default Silk version\. Installed sew to / : /It is the default toolchain/)
+  const withTool = existsSync(join(h.silkHome, 'toolchains', version, 'bin/silkc'))
+  assert.match(result.stdout, withTool ? /It is the default Silk version\. Installed the silk tool to / : /It is the default toolchain/)
   // The home's bin is not on the user's PATH yet, so the script says which line to add.
   assert.match(result.stdout, /Add Silk to your PATH by adding this line to/)
 
   const link = join(h.silkHome, 'bin/silk')
-  if (withSew) {
-    // A release with sew: bin/silk is a second name for bin/sew, not a link to the compiler.
-    assert.equal(statSync(link).ino, statSync(join(h.silkHome, 'bin/sew')).ino, 'bin/silk and bin/sew are one file')
+  if (withTool) {
+    // A release with the silk tool: bin/silk is the tool itself, and the toolchain holds silkc.
+    assert.ok(lstatSync(link).isFile(), 'bin/silk is the tool, not a link')
+    assert.ok(statSync(link).mode & 0o100, 'bin/silk is executable')
   } else {
     assert.ok(lstatSync(link).isSymbolicLink(), 'bin/silk is a link')
     assert.equal(readlinkSync(link), join(h.silkHome, 'toolchains', version, 'bin/silk'))
@@ -37,7 +38,7 @@ test('running install.sh again keeps a working install', () => {
   const again = install(h)
   assert.equal(again.status, 0, show(again))
   assert.equal(silk(h, ['--version']).status, 0)
-  const listed = silk(h, ['toolchain', 'list'])
+  const listed = silk(h, hasTool(h) ? ['use', 'list'] : ['toolchain', 'list'])
   assert.equal(listed.stdout.trim().split('\n').length, 1, `one toolchain after reinstalling\n${show(listed)}`)
 })
 

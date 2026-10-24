@@ -5,7 +5,7 @@
 // version in it to install; without them the tests that install a second version are skipped.
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { freshHome, hasSew, initPackage, install, join, read, sewBinary, show, silk, userEnv, write } from './lib.mjs'
+import { freshHome, hasTool, initPackage, install, join, read, toolBinary, show, silk, userEnv, write } from './lib.mjs'
 
 const mirror = process.env.SILK_NEW_USER_MIRROR
 const second = process.env.SILK_NEW_USER_SECOND
@@ -19,10 +19,10 @@ function home() {
   return h
 }
 
-// A release that ships sew has no `silk toolchain`; sew.test.mjs covers versions then.
+// A release that ships the silk tool has no `silk toolchain`; tool.test.mjs covers versions then.
 const probe = freshHome()
 const probed = install(probe)
-const replaced = sewBinary !== '' || (probed.status === 0 && hasSew(probe)) ? 'sew replaces silk toolchain; see sew.test.mjs' : false
+const replaced = toolBinary !== '' || (probed.status === 0 && hasTool(probe)) ? 'the silk tool replaces silk toolchain; see tool.test.mjs' : false
 
 const withMirror = (h, extra = {}) => ({ env: userEnv(h, { SILK_TOOLCHAIN_MIRROR: mirror, ...extra }) })
 

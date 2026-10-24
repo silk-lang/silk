@@ -2,7 +2,7 @@
 // sees Silk the way a fresh machine does: no ~/.silk, no settings, nothing on PATH but the
 // toolchain the test installed.
 import { spawnSync } from 'node:child_process'
-import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, linkSync } from 'node:fs'
+import { chmodSync, copyFileSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, symlinkSync, lstatSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -23,10 +23,10 @@ const installer = process.env.SILK_NEW_USER_INSTALLER ?? join(repoRoot, 'install
 // install and toolchain tests keep testing the release.
 export const compiler = process.env.SILK_NEW_USER_COMPILER ?? ''
 
-// SILK_NEW_USER_SEW is a local sew binary, for testing sew before a release ships it. After
-// install.sh, sewHome() copies it to ~/.silk/bin/sew and points ~/.silk/bin/silk at it, the
-// layout a release with sew installs.
-export const sewBinary = process.env.SILK_NEW_USER_SEW ?? ''
+// SILK_NEW_USER_TOOL is a local build of the silk tool (tool/ in the repository), for testing it
+// before a release ships it. After install.sh, addLocalTool() puts it at ~/.silk/bin/silk, where
+// install.sh puts the tool of a release that has one.
+export const toolBinary = process.env.SILK_NEW_USER_TOOL ?? ''
 
 // Release to install, as a tag. Empty means "whatever install.sh picks", like a new user.
 export const release = process.env.SILK_RELEASE ?? ''
@@ -84,24 +84,21 @@ export function sh(h, line, { cwd = h.work, env = userEnv(h), input, timeout = 6
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '', signal: result.signal }
 }
 
-// Whether this home has sew, from the release or from SILK_NEW_USER_SEW.
-export function hasSew(h) {
-  return existsSync(join(h.silkHome, 'bin/sew'))
+// Whether this home runs the silk tool: since the rename to silkc, ~/.silk/bin/silk is the tool,
+// a real file, and no longer a link to a toolchain's compiler.
+export function hasTool(h) {
+  const front = join(h.silkHome, 'bin/silk')
+  return existsSync(front) && !lstatSync(front).isSymbolicLink()
 }
 
-// Adds SILK_NEW_USER_SEW to an installed home when the release did not ship sew.
-export function addLocalSew(h) {
-  if (hasSew(h) || sewBinary === '') return hasSew(h)
-  copyFileSync(sewBinary, join(h.silkHome, 'bin/sew'))
-  chmodSync(join(h.silkHome, 'bin/sew'), 0o755)
-  // install.sh makes bin/silk a second name (a hard link) for bin/sew.
-  rmSync(join(h.silkHome, 'bin/silk'), { force: true })
-  linkSync(join(h.silkHome, 'bin/sew'), join(h.silkHome, 'bin/silk'))
+// Adds SILK_NEW_USER_TOOL to an installed home when the release did not ship the tool.
+export function addLocalTool(h) {
+  if (hasTool(h) || toolBinary === '') return hasTool(h)
+  const front = join(h.silkHome, 'bin/silk')
+  rmSync(front, { force: true })
+  copyFileSync(toolBinary, front)
+  chmodSync(front, 0o755)
   return true
-}
-
-export function sew(h, args, options = {}) {
-  return sh(h, ['sew', ...args].map(quote).join(' '), options)
 }
 
 export function silk(h, args, options = {}) {
