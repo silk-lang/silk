@@ -1024,6 +1024,65 @@ const program = Effect.gen(function* () {
   assert.match(stuckTests.stderr, /the test did not finish within 1 s/)
   assert.match(stuckTests.stdout, /main::zFinishes\n {4}PASS/)
   assert.match(stuckTests.stdout, /1 passed, 2 failed/)
+  // `silk doctest` in a package checks every example, then builds and runs each one with a
+  // `main`, which passes when it returns 0. A hyphenated package is imported as its dependents
+  // write it, and `no_run` examples only compile.
+  yield* fs.makeDirectory(join(directory, 'round-shapes/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'round-shapes/silk.toml'),
+    '[package]\nname = "round-shapes"\nversion = "0.1.0"\nkind = "library"\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'round-shapes/src/lib.silk'),
+    [
+      '/// Three times `diameter`.',
+      '///',
+      '/// ```silk',
+      '/// import round_shapes.lib { circumference }',
+      '///',
+      '/// pub fn main() -> i32 {',
+      '///   return circumference(2) - 6',
+      '/// }',
+      '/// ```',
+      '///',
+      '/// ```silk',
+      '/// import lib { circumference }',
+      '/// import silk.effect { Effect }',
+      '/// import silk.os_writer { StdoutWriter }',
+      '/// import silk.writer { Writer, WriterError }',
+      '///',
+      '/// pub effect fn main() -> i32 ! WriterError {',
+      '///   let mut out = StdoutWriter.make()',
+      '///   run Writer.writeAll(b"wrong\\n") |> Effect.provideMut<Writer>(&mut out)',
+      '///   return circumference(1)',
+      '/// }',
+      '/// ```',
+      '///',
+      '/// ```silk,no_run',
+      '/// import lib { circumference }',
+      '///',
+      '/// pub fn main() -> i32 {',
+      '///   return circumference(5)',
+      '/// }',
+      '/// ```',
+      'pub fn circumference(diameter: i32) -> i32 {',
+      '  return diameter * 3',
+      '}',
+      '',
+    ].join('\n'),
+  )
+  const doctests = yield* invoke(
+    silk,
+    ['doctest', '--stdlib-root', standardLibrary],
+    join(directory, 'round-shapes/src'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(doctests.status, 1, doctests.stderr)
+  assert.match(doctests.stdout, /lib\.silk:3 \(byte \d+\): PASSED\n/)
+  assert.match(doctests.stdout, /lib\.silk:11 \(byte \d+\): FAILED: the example exited with status 3\nwrong\n/)
+  assert.match(doctests.stdout, /lib\.silk:24 \(byte \d+\): PASSED\n/)
+  assert.match(doctests.stdout, /Doctest: 3 collected, 2 passed, 0 skipped, 1 failed\./)
+  assert.equal(yield* fs.exists(join(directory, 'round-shapes/src/doctest_example.silk')), false)
   // Package commands take --clang as they honor SILK_CLANG, and a Clang that cannot start fails
   // the target with the usual per-target and summary lines.
   const clangTests = yield* invoke(
