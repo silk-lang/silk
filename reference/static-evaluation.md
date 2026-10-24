@@ -235,23 +235,23 @@ reports `SEM0176` at the invalid operation. The failed evaluation exposes no par
 The ordinary standard-library module `silk.static_text` provides static byte operations for text
 available during compilation:
 
-| Member                     | Result   | Meaning                                                                    |
-| -------------------------- | -------- | -------------------------------------------------------------------------- |
-| `byteLength(value)`        | `usize`  | Number of bytes in the UTF-8 encoding                                      |
-| `byteAt(value, index)`     | `u8`     | Byte at one in-bounds byte index                                           |
-| `concat(left, right)`      | `string` | Concatenated static text, retaining `left` as its diagnostic source anchor |
-| `slice(value, start, end)` | `string` | Text in one byte range whose endpoints are UTF-8 scalar boundaries         |
+| Member                                | Result   | Meaning                                                                    |
+| ------------------------------------- | -------- | -------------------------------------------------------------------------- |
+| `StaticText.byteLength(value)`        | `usize`  | Number of bytes in the UTF-8 encoding                                      |
+| `StaticText.byteAt(value, index)`     | `u8`     | Byte at one in-bounds byte index                                           |
+| `StaticText.concat(left, right)`      | `string` | Concatenated static text, retaining `left` as its diagnostic source anchor |
+| `StaticText.slice(value, start, end)` | `string` | Text in one byte range whose endpoints are UTF-8 scalar boundaries         |
 
 ```silk,ignore
-import silk.static_text { byteLength, byteAt, concat, slice }
+import silk.static_text { StaticText }
 
 static fn hasAccent(value: string) -> bool {
-  return byteLength(value) == 3 && byteAt(value, 1) == 195 &&
-    concat(slice(value, 1, 3), "!") == "é!"
+  return StaticText.byteLength(value) == 3 && StaticText.byteAt(value, 1) == 195
+    && StaticText.concat(StaticText.slice(value, 1, 3), "!") == "é!"
 }
 ```
 
-These are ordinary `static fn` wrappers. They return admitted values and reveal neither an address
+They are ordinary `static fn` members of `StaticText`. They return admitted values and reveal neither an address
 nor mutable compiler storage. Their sealed intrinsic primitives are static-only and cannot survive
 in runtime TIR.
 
