@@ -718,7 +718,7 @@ conformance, and a second one is a duplicate:
 ```silk
 import silk.ownership { Copy }
 
-struct Point { x: i32 y: i32 }
+struct Point { x: i32, y: i32 }
 
 impl Copy for Point {}
 

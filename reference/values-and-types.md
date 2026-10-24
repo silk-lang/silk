@@ -161,8 +161,8 @@ type Sized = Measured
 type Count = i32
 
 struct Pair {
-  left: Count
-  right: Count
+  left: Count,
+  right: Count,
 }
 
 impl Pair {
@@ -213,8 +213,8 @@ deduplicated and canonically ordered after substitution, and it may collapse to 
 
 ```silk
 struct Pair<A, B> {
-  first: A
-  second: B
+  first: A,
+  second: B,
 }
 
 struct IoError {}
@@ -353,7 +353,7 @@ literal defaults to `i32`.
 
 ```silk
 struct Header {
-  code: u8
+  code: u8,
 }
 
 fn header() -> Header {
@@ -615,8 +615,8 @@ const pattern: string = r"\d+"
 const squares: [u32; 4] = [0, 1, 4, 9]
 
 struct Point {
-  pub x: i32
-  pub y: i32
+  pub x: i32,
+  pub y: i32,
 }
 
 pub const ORIGIN: Point = Point {x: 0, y: 0}
@@ -700,8 +700,7 @@ and type. A zero-field struct such as `struct End {}` is an ordinary nominal mar
 
 Every field has one explicit type, fields are ordered by declaration, and field names are unique.
 Fields are separated by commas, as the fields of a union variant are, and a trailing comma is
-allowed. A field list separated by line breaks alone is still accepted for now; a later version
-requires the commas.
+allowed. A line break alone does not separate two fields.
 Structs and fields are private by default; `pub` exposes them under the module visibility rules.
 
 **Boundary:** Silk has no shape-based struct compatibility. A public contract cannot expose a
@@ -723,8 +722,8 @@ completed value retains canonical declaration field order.
 
 ```silk
 struct Point {
-  pub x: i32
-  pub y: i32
+  pub x: i32,
+  pub y: i32,
 }
 
 fn origin() -> Point {
@@ -793,8 +792,8 @@ inline fields is invalid because it has no finite complete value.
 ```silk
 struct Position { value: i32 }
 struct Span {
-  start: Position
-  end: Position
+  start: Position,
+  end: Position,
 }
 ```
 
@@ -839,8 +838,8 @@ borrowing, ownership, and an explicit `Copy` implementation follow the ordinary 
 
 ```silk
 pub extern "C" struct Timespec {
-  pub seconds: i64
-  pub nanoseconds: i64
+  pub seconds: i64,
+  pub nanoseconds: i64,
 }
 ```
 
@@ -932,8 +931,8 @@ STRUCT-002.
 
 ```silk
 struct Person {
-  name: string
-  age: i32
+  name: string,
+  age: i32,
 }
 
 fn age(person: Person) -> i32 {
@@ -1481,7 +1480,7 @@ Only `addrspace(0)` is admitted. See [the native boundary](native-pointer-bounda
 struct Opaque {}
 
 struct Handle {
-  raw: *mut Opaque
+  raw: *mut Opaque,
 }
 
 fn keep(handle: Handle) -> Handle {

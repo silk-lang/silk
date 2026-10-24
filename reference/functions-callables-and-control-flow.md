@@ -762,13 +762,13 @@ local name with `field: local`, or contain a nested nominal pattern.
 
 ```silk
 struct Span {
-  start: i32
-  end: i32
+  start: i32,
+  end: i32,
 }
 
 struct Token {
-  kind: i32
-  span: Span
+  kind: i32,
+  span: Span,
 }
 
 fn start(token: Token) -> i32 {
