@@ -2554,8 +2554,12 @@ const program = Effect.gen(function* () {
   })
   const coldPacks = yield* packNames()
   assert.ok(coldPacks.length > 2, `expected a pack per module, found ${coldPacks.join(', ')}`)
+  // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
+  const splitExecutable = join(split, `build/llvm/${hostTarget}/debug/split`)
+  const linkedAt = (yield* fs.stat(splitExecutable)).mtime
   yield* splitRun(7)
   assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
+  assert.deepEqual((yield* fs.stat(splitExecutable)).mtime, linkedAt, 'an unchanged rebuild leaves the executable as it was')
   assert.deepEqual(yield* packNames(), coldPacks, 'an unchanged rebuild keeps every pack')
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   yield* splitRun(9)
