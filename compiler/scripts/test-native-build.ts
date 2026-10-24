@@ -885,6 +885,20 @@ const program = Effect.gen(function* () {
     )
     assert.doesNotMatch(refused.stderr, /native_start_sync\.silk:/)
   }
+  // A `main` that returns a borrow such as `string` gets the entry point error once, not the
+  // `'static` hint that only leads to it.
+  yield* fs.makeDirectory(join(directory, 'textmain/src'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'textmain/silk.toml'),
+    '[package]\nname = "textmain"\nversion = "0.1.0"\n',
+  )
+  yield* fs.writeFileString(join(directory, 'textmain/src/main.silk'), 'pub fn main() -> string {\n  return "x"\n}\n')
+  for (const command of ['check', 'build']) {
+    const refused = yield* invoke(silk, [command, '--stdlib', standardLibrary], join(directory, 'textmain'))
+    assert.equal(refused.status, 1, refused.stderr)
+    assert.equal(refused.stderr.match(/error\[SEM0225\] Entry point `main` has a result the selected runtime cannot start/g)?.length, 1, refused.stderr)
+    assert.doesNotMatch(refused.stderr, /SEM0210/)
+  }
   // A workspace member's diagnostics name their files from the workspace root, also when the
   // member is built from its own directory; `--json` keeps the absolute path.
   yield* fs.makeDirectory(join(directory, 'relative/broken/src'), { recursive: true })
