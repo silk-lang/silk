@@ -103,7 +103,7 @@ fn reference<'a>(host: &'a [u8]) -> ReferenceIdentity<'a> {
   return match move HttpsIdentity.reference(OriginHost<'a>.Dns { bytes: host }) {
     Result.Success { value } => value
     Result.Failure { error } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return reference(host)
     }
   }
@@ -116,7 +116,7 @@ fn emptyTrust() -> TrustSnapshot {
   ) {
     Result.Success { value } => move value
     Result.Failure { error } => {
-      let invalid = 1 / 0
+      Intrinsic.trap("unexpected failure")
       return emptyTrust()
     }
   }

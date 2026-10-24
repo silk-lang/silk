@@ -538,9 +538,32 @@ boundary.
 Bitwise operators do not perform arithmetic overflow, and explicit wrapping or saturating
 functions do not inherit the ordinary operator's trap policy.
 
+An operation that traps every time it runs is a compile-time error instead. In a runtime body,
+integer `/` or `%` whose right operand is the constant zero reports `SEM0248`, whatever the left
+operand is. Integer `+`, `-`, `*`, `/`, `%` or unary `-` whose operands are all constants and whose
+result is outside the type reports `SEM0247`, naming the operation, its exact value when that is
+known, and the type's range:
+
+```silk,ignore
+pub fn main() -> i32 {
+  let next: u8 = 255 + 1
+  return 10 / 0
+}
+```
+
+Here `255 + 1` reports `255 + 1 is 256, outside the u8 range, 0 through 255, so it always traps`,
+and `10 / 0` reports `SEM0248`. A constant operand is an integer literal, a constant declared by
+the toolchain or by another package, such as `i32.MAX`, or such an operation over constant operands.
+A constant declared in the same package stays a runtime read here: checking reads only its type, so
+an edit to its value alone never rechecks the bodies that read it. A local binding is never a
+constant operand, even when its initializer is one, so `let zero = 0` and `1 / zero` traps at run
+time. A `static` body reports the same operations through static evaluation instead. To stop a
+program on purpose, call `Intrinsic.trap("reason")`.
+
 **Diagnostics:** Valid operator types receive no compile-time diagnostic merely because a runtime
 value may trap. A runtime arithmetic trap identifies the source operation and retains its
-provenance consistently across supported targets.
+provenance consistently across supported targets. An operation over constant operands that always
+traps reports `SEM0247` for a result outside the type and `SEM0248` for a zero divisor.
 
 **Evidence:** integer operation specification,
 trapping MIR contract,
