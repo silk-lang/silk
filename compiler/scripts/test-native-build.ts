@@ -1231,7 +1231,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(threads, 'silk.toml'),
     '[package]\nname = "threads"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
-      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "256MiB"\n',
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmax-memory = "256MiB"\n',
   )
   yield* fs.writeFileString(
     join(threads, 'main.silk'),
@@ -1308,7 +1308,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(churn, 'silk.toml'),
     '[package]\nname = "churn"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
-      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "64MiB"\n',
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmax-memory = "64MiB"\n',
   )
   yield* fs.writeFileString(
     join(churn, 'main.silk'),
@@ -1452,7 +1452,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(
     join(tuned, 'silk.toml'),
     `${tunedHeader}\n[profiles.tuned]\ntarget = "${hostTarget}"\ncpu = { features = ["${x86 ? 'avx2' : 'crc'}"] }\n${
-      x86 ? 'codeModel = "large"\n' : ''
+      x86 ? 'code-model = "large"\n' : ''
     }${process.platform === 'darwin' ? '' : 'link = "static"\n'}`,
   )
   const tunedBuild = yield* invoke(
