@@ -49,7 +49,7 @@ import silk.usize
 
 // Not secure. Real programs use a `Random` provider from the operating system.
 struct ExampleRandom {
-  next: usize
+  next: usize,
 }
 
 impl Random for ExampleRandom {

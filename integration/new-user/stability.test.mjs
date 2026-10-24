@@ -48,20 +48,20 @@ test('a < b && c > d without parentheses parses', () => {
 
 // A library `d` in its own folder, used by `app`.
 function library(root) {
-  write(join(root, 'd/silk.toml'), '[package]\nname = "d"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["money"]\n')
+  write(join(root, 'd/silk.toml'), '[package]\nname = "d"\nversion = "0.1.0"\nsource = "src"\nexports = ["money"]\n')
   write(join(root, 'd/src/money.silk'), 'pub fn cents() -> i32 {\n  return 275\n}\n')
-  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n')
+  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\n')
   write(join(root, 'app/src/main.silk'), 'import d.money { cents }\n\npub fn main() -> i32 {\n  return cents() - 275\n}\n')
 }
 
 test('two dependents reach one library through differently spelled paths', () => {
   const root = join(h.work, 'diamond')
   library(root)
-  write(join(root, 'b/silk.toml'), '[package]\nname = "b"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["one"]\n\n[dependencies]\nd = { path = "../d" }\n')
+  write(join(root, 'b/silk.toml'), '[package]\nname = "b"\nversion = "0.1.0"\nsource = "src"\nexports = ["one"]\n\n[dependencies]\nd = { path = "../d" }\n')
   write(join(root, 'b/src/one.silk'), 'import d.money { cents }\n\npub fn one() -> i32 {\n  return cents()\n}\n')
-  write(join(root, 'c/silk.toml'), '[package]\nname = "c"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["two"]\n\n[dependencies]\nd = { path = "../b/../d" }\n')
+  write(join(root, 'c/silk.toml'), '[package]\nname = "c"\nversion = "0.1.0"\nsource = "src"\nexports = ["two"]\n\n[dependencies]\nd = { path = "../b/../d" }\n')
   write(join(root, 'c/src/two.silk'), 'import d.money { cents }\n\npub fn two() -> i32 {\n  return cents()\n}\n')
-  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nb = { path = "../b" }\nc = { path = "../c" }\n')
+  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nb = { path = "../b" }\nc = { path = "../c" }\n')
   write(join(root, 'app/src/main.silk'), 'import b.one { one }\nimport c.two { two }\n\npub fn main() -> i32 {\n  return one() - two()\n}\n')
   const result = silk(h, ['run', '--quiet'], { cwd: join(root, 'app') })
   assert.equal(result.status, 0, show(result))
@@ -71,7 +71,7 @@ test('a dependency reached through a symbolic link builds', { todo: 'finding 30'
   const root = join(h.work, 'linked-dependency')
   library(root)
   symlinkSync('d', join(root, 'dlink'))
-  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nd = { path = "../dlink" }\n')
+  write(join(root, 'app/silk.toml'), '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nd = { path = "../dlink" }\n')
   const result = silk(h, ['run', '--quiet'], { cwd: join(root, 'app') })
   assert.equal(result.status, 0, show(result))
 })
@@ -134,7 +134,7 @@ ${logging}  let a = area(Point { x: 3, y: 4 })
 }
 `)
   write(file('util.silk'), 'pub const LIMIT: i32 = 10\n\npub fn scale(v: i32) -> i32 {\n  return v * 2\n}\n')
-  write(file('geometry.silk'), 'pub struct Point {\n  pub x: i32\n  pub y: i32\n}\n\npub fn area(p: Point) -> i32 {\n  return p.x * p.y\n}\n')
+  write(file('geometry.silk'), 'pub struct Point {\n  pub x: i32,\n  pub y: i32,\n}\n\npub fn area(p: Point) -> i32 {\n  return p.x * p.y\n}\n')
   const steps = [
     ['baseline', () => {}],
     ['constant value', () => edit('util.silk', '= 10', '= 11')],

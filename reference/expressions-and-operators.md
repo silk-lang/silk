@@ -1066,8 +1066,10 @@ compound assignment is added later, it must evaluate a dynamic destination only 
 ASSIGN-002's validation, cleanup, and commit order; it cannot be a textual rewrite that duplicates
 an index or projection computation.
 
-**Diagnostics:** A compound-assignment spelling receives a lexer or parser diagnostic at the
-unsupported token sequence. No semantic compound-assignment operation is synthesized.
+**Diagnostics:** A compound-assignment spelling receives one parser diagnostic, PAR0010, at the
+operator, naming the `x = x + 1` form. The same code reports a postfix `x++` or `x--`, a
+`for ... in` loop, a `var` binding, and a `c ? a : b` conditional, each once with its Silk
+spelling. No semantic compound-assignment operation is synthesized.
 
 **Evidence:** [assignment parser](../bootstrap/packages/compiler/src/Parser.ts),
 [operator vocabulary](../bootstrap/packages/compiler/src/Operator.ts).

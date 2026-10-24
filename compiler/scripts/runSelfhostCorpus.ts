@@ -413,7 +413,7 @@ const toml = (value: unknown): string => {
 }
 
 /**
- * The `[build].composition` the bootstrap acceptance harness compiles with: the standard library's
+ * The `[unstable].composition` the bootstrap acceptance harness compiles with: the standard library's
  * default runtime for the host, as `ArtifactComposition.defaults` selects it, with the program's
  * runtime components replacing the catalog's.
  */
@@ -439,8 +439,8 @@ const componentComposition = (program: Corpus.Program, stdlib: string): string |
 }
 
 // The program is the module `memory/driver`, the root the bootstrap harness compiles, so reported
-// identities and labels name the same module under both compilers. The manifest's root keeps the
-// package directory as the module directory, where the program's imports resolve.
+// identities and labels name the same module under both compilers. The manifest's `source = "."`
+// keeps the package directory as the module directory, where the program's imports resolve.
 const programModule = 'memory/driver.silk'
 
 const writeProgram = async (
@@ -454,15 +454,11 @@ const writeProgram = async (
   writeFileSync(source, program.source)
   const linkInputs = await nativeLinkInputs(directory, program, cCompiler)
   const composition = componentComposition(program, stdlib)
-  const build = [
-    ...(linkInputs.length === 0 ? [] : [`native-link-inputs = [${linkInputs.join(', ')}]`]),
-    ...(composition === undefined ? [] : [`composition = ${composition}`]),
-  ]
+  const native = linkInputs.length === 0 ? '' : `\n[native]\nlink = [${linkInputs.join(', ')}]\n`
+  const unstable = composition === undefined ? '' : `\n[unstable]\ncomposition = ${composition}\n`
   writeFileSync(
     join(directory, 'silk.toml'),
-    `[package]\nname = "corpus"\nversion = "0.1.0"\nroot = "main.silk"\n${
-      build.length === 0 ? '' : `\n[build]\n${build.join('\n')}\n`
-    }`,
+    `[package]\nname = "corpus"\nversion = "0.1.0"\nsource = "."\n${native}${unstable}`,
   )
   for (const [module, contents] of Object.entries(program.imports)) {
     if (module.startsWith('/') || module.split('/').includes('..'))
