@@ -62,7 +62,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(directory, 'main.silk'), source)
   yield* fs.writeFileString(
     join(directory, 'silk.toml'),
-    '[package]\nname = "native-build"\nversion = "0.1.0"\nroot = "main.silk"\n',
+    '[package]\nname = "native-build"\nversion = "0.1.0"\nsource = "."\n',
   )
   const sentinel = join(directory, 'clang-sentinel')
   const marker = join(directory, 'clang-called')
@@ -164,7 +164,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(releaseWorkspace, 'silk.toml'), workspaceManifest)
   yield* fs.writeFileString(
     join(releaseMember, 'silk.toml'),
-    '[package]\nname = "native-release"\nversion = "1.0.0"\nroot = "src/main.silk"\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
+    '[package]\nname = "native-release"\nversion = "1.0.0"\n[release]\nversion-file = "src/ReleaseVersion.silk"\n',
   )
   yield* fs.writeFileString(
     join(releaseWorkspace, 'changes/silk.toml'),
@@ -563,7 +563,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(adopted, { recursive: true })
   yield* fs.writeFileString(
     join(adopted, 'silk.toml'),
-    '[package]\nname = "adopted"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n',
+    '[package]\nname = "adopted"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n',
   )
   yield* fs.writeFileString(
     join(adopted, 'main.silk'),
@@ -753,7 +753,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'rejected/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'rejected/silk.toml'),
-    '[package]\nname = "rejected"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "rejected"\nversion = "0.1.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'rejected/src/main.silk'),
@@ -776,7 +776,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'unknown/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unknown/silk.toml'),
-    '[package]\nname = "unknown"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "unknown"\nversion = "0.1.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'unknown/src/main.silk'),
@@ -798,7 +798,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'casing/src/util'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'casing/silk.toml'),
-    '[package]\nname = "casing"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "casing"\nversion = "0.1.0"\n',
   )
   yield* fs.writeFileString(join(directory, 'casing/src/util/Math.silk'), 'pub fn twice(value: i32) -> i32 {\n  return value * 2\n}\n')
   yield* fs.writeFileString(
@@ -816,7 +816,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'unexported/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'unexported/silk.toml'),
-    '[package]\nname = "unexported"\nversion = "0.1.0"\nroot = "src/main.silk"\nexports = ["nope"]\n',
+    '[package]\nname = "unexported"\nversion = "0.1.0"\nexports = ["nope"]\n',
   )
   yield* fs.writeFileString(
     join(directory, 'unexported/src/main.silk'),
@@ -866,7 +866,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'synchronous/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'synchronous/silk.toml'),
-    '[package]\nname = "synchronous"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[build]\ncomposition = { runtimes = [{ name = "synchronous", module = "silk/native_start_sync" }], defaults = ["synchronous"] }\n',
+    '[package]\nname = "synchronous"\nversion = "0.1.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "synchronous", module = "silk/native_start_sync" }], defaults = ["synchronous"] }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'synchronous/src/main.silk'),
@@ -891,7 +891,7 @@ const program = Effect.gen(function* () {
   yield* fs.writeFileString(join(directory, 'relative/silk.toml'), '[workspace]\nmembers = ["broken"]\n')
   yield* fs.writeFileString(
     join(directory, 'relative/broken/silk.toml'),
-    '[package]\nname = "broken"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "broken"\nversion = "0.1.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'relative/broken/src/main.silk'),
@@ -913,7 +913,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'ownruntime/src/support'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'ownruntime/silk.toml'),
-    '[package]\nname = "ownruntime"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[build]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"] }\n',
+    '[package]\nname = "ownruntime"\nversion = "0.1.0"\n\n[unstable]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"] }\n',
   )
   yield* fs.writeFileString(
     join(directory, 'ownruntime/src/main.silk'),
@@ -939,7 +939,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'tested/src/util'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'tested/silk.toml'),
-    '[package]\nname = "tested"\nversion = "0.1.0"\nroot = "src/main.silk"\n[build]\nartifact = "static-library"\n',
+    '[package]\nname = "tested"\nversion = "0.1.0"\nmain = "main.silk"\nkind = "static-library"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'tested/src/main.silk'),
@@ -1007,7 +1007,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(directory, 'stuck/src'), { recursive: true })
   yield* fs.writeFileString(
     join(directory, 'stuck/silk.toml'),
-    '[package]\nname = "stuck"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "stuck"\nversion = "0.1.0"\n',
   )
   yield* fs.writeFileString(
     join(directory, 'stuck/src/main.silk'),
@@ -1123,14 +1123,14 @@ const program = Effect.gen(function* () {
   }
   // A native link input refusal names the manifest, the entry and the rule it breaks.
   for (const [entry, rule] of [
-    ['{ object = "a.o", library = "m" }', /\[build\]\.native-link-inputs\[0\]: an entry is exactly one/],
+    ['{ object = "a.o", library = "m" }', /\[native\]\.link\[0\]: an entry is exactly one/],
     ['{ object = "/tmp/a.o" }', /object \/tmp\/a\.o must be a relative path below the manifest's directory/],
     // Refused only when the link runs, yet named the same way.
-    ['{ framework = "Security" }', /\[build\]\.native-link-inputs\[0\]: framework Security links only on macOS targets/],
+    ['{ framework = "Security" }', /\[native\]\.link\[0\]: framework Security links only on macOS targets/],
   ] as const) {
     yield* fs.writeFileString(
       join(unpackaged, 'silk.toml'),
-      `[package]\nname = "linked"\nversion = "0.1.0"\nroot = "main.silk"\n[build]\nnative-link-inputs = [${entry}]\n`,
+      `[package]\nname = "linked"\nversion = "0.1.0"\nsource = "."\n[native]\nlink = [${entry}]\n`,
     )
     yield* fs.writeFileString(join(unpackaged, 'main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
     const refusedInput = yield* invoke(
@@ -1230,8 +1230,8 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(threads, { recursive: true })
   yield* fs.writeFileString(
     join(threads, 'silk.toml'),
-    '[package]\nname = "threads"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
-      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "256MiB"\n',
+    '[package]\nname = "threads"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmax-memory = "256MiB"\n',
   )
   yield* fs.writeFileString(
     join(threads, 'main.silk'),
@@ -1307,8 +1307,8 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(churn, { recursive: true })
   yield* fs.writeFileString(
     join(churn, 'silk.toml'),
-    '[package]\nname = "churn"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
-      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmaxMemory = "64MiB"\n',
+    '[package]\nname = "churn"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
+      '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\nthreading = "multi"\nmax-memory = "64MiB"\n',
   )
   yield* fs.writeFileString(
     join(churn, 'main.silk'),
@@ -1380,7 +1380,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(arena, { recursive: true })
   yield* fs.writeFileString(
     join(arena, 'silk.toml'),
-    '[package]\nname = "arena"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nroot = "main.silk"\n' +
+    '[package]\nname = "arena"\nversion = "0.0.0"\nsilk-version = "0.0.0"\nsource = "."\n' +
       '\n[profiles.web]\ntarget = "wasm32-unknown-unknown"\n',
   )
   yield* fs.writeFileString(
@@ -1448,11 +1448,11 @@ const program = Effect.gen(function* () {
     ? 'export "C" fn silk_tuned_wide(values: simd<f32, 8>) -> simd<f32, 8> { return values }\n\n'
     : ''
   yield* fs.writeFileString(join(tuned, 'src/main.silk'), `${wideExport}${tunedMain}`)
-  const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nroot = "src/main.silk"\n'
+  const tunedHeader = '[package]\nname = "tuned"\nversion = "0.1.0"\nmain = "main.silk"\n'
   yield* fs.writeFileString(
     join(tuned, 'silk.toml'),
     `${tunedHeader}\n[profiles.tuned]\ntarget = "${hostTarget}"\ncpu = { features = ["${x86 ? 'avx2' : 'crc'}"] }\n${
-      x86 ? 'codeModel = "large"\n' : ''
+      x86 ? 'code-model = "large"\n' : ''
     }${process.platform === 'darwin' ? '' : 'link = "static"\n'}`,
   )
   const tunedBuild = yield* invoke(
@@ -1529,12 +1529,12 @@ const program = Effect.gen(function* () {
       /silk\.toml:9: InvalidInput: build\.bindings: value must be a table with a kind, such as \{ kind = "integer", value = "1" \}/,
     ],
     [
-      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["main"] }\n',
-      /silk\.toml:6: build\.composition\.defaults entry "main" names no runtime in build\.composition\.runtimes; it lists "start"/,
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["main"] }\n',
+      /silk\.toml:6: unstable\.composition\.defaults entry "main" names no runtime in unstable\.composition\.runtimes; it lists "start"/,
     ],
     [
-      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [\n  { module = "m", declaration = "f" },\n] }] }\n',
-      /silk\.toml:7: build\.composition\.components\.bindings entry has no operation/,
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [\n  { module = "m", declaration = "f" },\n] }] }\n',
+      /silk\.toml:7: unstable\.composition\.components\.bindings entry has no operation/,
     ],
     [
       '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "env", provenance = "secret" }\n',
@@ -1545,22 +1545,22 @@ const program = Effect.gen(function* () {
       /silk\.toml:5: InvalidInput: build\.bindings: package is missing/,
     ],
     [
-      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
-      /silk\.toml:6: build\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], components = [{ capability = "execution-storage", bindings = [{ operation = "frobnicate", module = "m", declaration = "f" }] }] }\n',
+      /silk\.toml:6: unstable\.composition\.components\.bindings\.operation = "frobnicate" is not an operation; use create, acquire, release or destroy/,
     ],
     [
       '[[build.bindings]]\npackage = "tuned@0.1.0"\nmodule = "main"\nparameter = "n"\nvalue = { kind = "integer", value = "1" }\norigin = { source = "silk.toml", provenance = "literal", translator = "t" }\n',
       /silk\.toml:10: InvalidInput: build\.bindings: origin\.translator: only provenance "translated-public" names a translator/,
     ],
     [
-      '[build]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
-      /silk\.toml:9: build\.composition\.runtimes\.declaration is not a supported field/,
+      '[unstable]\ncomposition = { retention = [\n  { module = "main", declaration = "main" },\n], runtimes = [\n  { name = "start", module = "silk/native_start_sync", declaration = "x" },\n], defaults = ["start"] }\n',
+      /silk\.toml:9: unstable\.composition\.runtimes\.declaration is not a supported field/,
     ],
     [
-      '[build]\ncomposition = { components = [{ capability = "other", bindings = [] }] }\n',
-      /silk\.toml:6: build\.composition\.components\.capability = "other" is not supported by the native compiler/,
+      '[unstable]\ncomposition = { components = [{ capability = "other", bindings = [] }] }\n',
+      /silk\.toml:6: unstable\.composition\.components\.capability = "other" is not supported by the native compiler/,
     ],
-    ['[build]\nplatform-supply = { kind = "native", bogus = 1 }\n', /silk\.toml:6: build\.platform-supply\.bogus is not a supported field/],
+    ['[native]\nplatform-supply = { kind = "native", bogus = 1 }\n', /silk\.toml:6: native\.platform-supply\.bogus is not a supported field/],
     [
       '[profiles.u]\ntarget = "x86_64-unknown-linux-gnu"\nentry = { kind = "default", bogus = 1 }\n',
       /silk\.toml:7: profiles\.u\.entry\.bogus is not a supported field/,
@@ -1575,20 +1575,20 @@ const program = Effect.gen(function* () {
     ],
     ['[profiles."1fast"]\ntarget = "x86_64-unknown-linux-gnu"\n', /silk\.toml:5: InvalidInput: profiles\.1fast: a profile name is/],
     [
-      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
-      /silk\.toml:6: build\.composition\.bogus is not a supported field/,
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], bogus = 1 }\n',
+      /silk\.toml:6: unstable\.composition\.bogus is not a supported field/,
     ],
     [
-      '[build]\ncomposition = { runtimes = [\n  { name = "start", module = "silk/native_start_sync", bogus = 1 },\n], defaults = ["start"] }\n',
-      /silk\.toml:7: build\.composition\.runtimes\.bogus is not a supported field/,
+      '[unstable]\ncomposition = { runtimes = [\n  { name = "start", module = "silk/native_start_sync", bogus = 1 },\n], defaults = ["start"] }\n',
+      /silk\.toml:7: unstable\.composition\.runtimes\.bogus is not a supported field/,
     ],
     [
-      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], retention = [{ module = "main", declaration = "main", extra = 1 }] }\n',
-      /silk\.toml:6: build\.composition\.retention\.extra is not a supported field/,
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], retention = [{ module = "main", declaration = "main", extra = 1 }] }\n',
+      /silk\.toml:6: unstable\.composition\.retention\.extra is not a supported field/,
     ],
     [
-      '[build]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], requirements = ["x"] }\n',
-      /silk\.toml:6: build\.composition\.requirements is not supported by the native compiler yet/,
+      '[unstable]\ncomposition = { runtimes = [{ name = "start", module = "silk/native_start_sync" }], defaults = ["start"], requirements = ["x"] }\n',
+      /silk\.toml:6: unstable\.composition\.requirements is not supported by the native compiler yet/,
     ],
     [
       '[profiles.d]\ntarget = "x86_64-unknown-linux-gnu"\ndeployment = "14.0"\n',
@@ -1643,7 +1643,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'bound/silk.toml'),
-    '[package]\nname = "bound"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[[build.bindings]]\npackage = "bound@0.1.0"\nmodule = "main"\nparameter = "limit"\nvalue = { kind = "integer", value = "7" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
+    '[package]\nname = "bound"\nversion = "0.1.0"\n\n[[build.bindings]]\npackage = "bound@0.1.0"\nmodule = "main"\nparameter = "limit"\nvalue = { kind = "integer", value = "7" }\norigin = { source = "silk.toml", provenance = "literal" }\n',
   )
   const bound = yield* invoke(
     silk,
@@ -1655,7 +1655,7 @@ const program = Effect.gen(function* () {
     },
   )
   assert.equal(bound.status, 7, bound.stderr)
-  // `[package].source-root` roots module resolution above the entry's own directory.
+  // `[package].source` roots module resolution above the root module's own directory.
   yield* fs.makeDirectory(join(directory, 'rooted/src/app'), { recursive: true })
   yield* fs.makeDirectory(join(directory, 'rooted/src/lib'), { recursive: true })
   yield* fs.writeFileString(
@@ -1668,7 +1668,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'rooted/silk.toml'),
-    '[package]\nname = "rooted"\nversion = "0.1.0"\nroot = "src/app/main.silk"\nsource-root = "src"\n',
+    '[package]\nname = "rooted"\nversion = "0.1.0"\nmain = "app/main.silk"\n',
   )
   const rooted = yield* invoke(
     silk,
@@ -1694,7 +1694,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/numbers/silk.toml'),
-    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource-root = "src"\nexports = ["scale"]\n',
+    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource = "src"\nexports = ["scale"]\n',
   )
   yield* fs.writeFileString(
     join(directory, 'packaged/app/util/digits.silk'),
@@ -1705,7 +1705,7 @@ const program = Effect.gen(function* () {
     'import numbers.scale { scale }\nimport util.digits { base }\n\npub fn main() -> i32 {\n  return scale(base()) + 2\n}\n',
   )
   const packagedManifest = (dependency: string) =>
-    `[package]\nname = "app"\nversion = "1.0.0"\nroot = "main.silk"\n\n[dependencies]\n${dependency}\n`
+    `[package]\nname = "app"\nversion = "1.0.0"\nsource = "."\n\n[dependencies]\n${dependency}\n`
   yield* fs.writeFileString(
     join(directory, 'packaged/app/silk.toml'),
     packagedManifest('numbers = { path = "../numbers", package = "silk-numbers" }'),
@@ -1776,7 +1776,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(workspace, 'libs/math/silk.toml'),
-    '[package]\nname = "math"\nversion = "0.1.0"\nsource-root = "."\nexports = ["twice"]\n',
+    '[package]\nname = "math"\nversion = "0.1.0"\nsource = "."\nexports = ["twice"]\n',
   )
   yield* fs.writeFileString(
     join(workspace, 'libs/math/twice.silk'),
@@ -1784,7 +1784,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(workspace, 'app/silk.toml'),
-    '[package]\nname = "workspace-app"\nversion = "0.1.0"\nroot = "main.silk"\n\n[dependencies]\nmath = { path = "../libs/math" }\n',
+    '[package]\nname = "workspace-app"\nversion = "0.1.0"\nsource = "."\n\n[dependencies]\nmath = { path = "../libs/math" }\n',
   )
   yield* fs.writeFileString(
     join(workspace, 'app/main.silk'),
@@ -1823,7 +1823,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(workspace, 'tool'), { recursive: true })
   yield* fs.writeFileString(
     join(workspace, 'tool/silk.toml'),
-    '[package]\nname = "tool"\nversion = "0.1.0"\nroot = "main.silk"\n',
+    '[package]\nname = "tool"\nversion = "0.1.0"\nsource = "."\n',
   )
   yield* fs.writeFileString(
     join(workspace, 'tool/main.silk'),
@@ -1876,6 +1876,13 @@ const program = Effect.gen(function* () {
     /dependency `hello`: hello@0\.1\.0 already depends on greeting@0\.1\.0, directly or through other packages, so adding it would form a cycle/,
   )
   assert.doesNotMatch(yield* fs.readFileString(join(managed, 'libs/greeting/silk.toml')), /hello/)
+  // A workspace is not a dependency; the refusal names its members rather than blaming its manifest.
+  const whole = yield* invoke(silk, ['add', '../..'], join(managed, 'libs/greeting'))
+  assert.equal(whole.status, 2, whole.stderr)
+  assert.match(
+    whole.stderr,
+    /dependency `\.\.\/\.\.`: it is a workspace; add one of its members: apps\/hello, libs\/greeting/,
+  )
   yield* fs.writeFileString(
     join(managed, 'apps/hello/src/main.silk'),
     'import greeting.lib { add }\n\npub fn main() -> i32 {\n  return add(4, 3)\n}\n',
@@ -2058,7 +2065,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'retained/silk.toml'),
-    '[package]\nname = "retained"\nversion = "0.1.0"\nroot = "main.silk"\n\n[build]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"], retention = [{ module = "support/keep", declaration = "capability" }] }\n',
+    '[package]\nname = "retained"\nversion = "0.1.0"\nsource = "."\n\n[unstable]\ncomposition = { runtimes = [{ name = "start", module = "support/start" }], defaults = ["start"], retention = [{ module = "support/keep", declaration = "capability" }] }\n',
   )
   const retainedIr = yield* invoke(
     silk,
@@ -2105,7 +2112,7 @@ const program = Effect.gen(function* () {
   )
   yield* fs.writeFileString(
     join(directory, 'bare/silk.toml'),
-    '[package]\nname = "bare"\nversion = "0.1.0"\nroot = "main.silk"\n',
+    '[package]\nname = "bare"\nversion = "0.1.0"\nsource = "."\n',
   )
   const bare = yield* invoke(
     silk,
@@ -2125,7 +2132,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(formatting, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(formatting, 'silk.toml'),
-    '[package]\nname = "formatting"\nversion = "0.1.0"\nroot = "src/a.silk"\n',
+    '[package]\nname = "formatting"\nversion = "0.1.0"\nmain = "a.silk"\n',
   )
   yield* fs.writeFileString(join(formatting, 'src/a.silk'), 'pub fn a() -> i32 {\n  return 1\n}\n')
   yield* fs.writeFileString(join(formatting, 'src/b.silk'), 'pub fn b()->i32{return 2}\n')
@@ -2152,7 +2159,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(throughLinks, 'app/src'), { recursive: true })
   yield* fs.writeFileString(
     join(throughLinks, 'real/shared/silk.toml'),
-    '[package]\nname = "shared"\nversion = "0.1.0"\nsource-root = "src"\nexports = ["numbers"]\n',
+    '[package]\nname = "shared"\nversion = "0.1.0"\nsource = "src"\nexports = ["numbers"]\n',
   )
   yield* fs.writeFileString(
     join(throughLinks, 'real/shared/src/numbers.silk'),
@@ -2166,7 +2173,7 @@ const program = Effect.gen(function* () {
   yield* fs.symlink('../../real/helper.silk', join(throughLinks, 'app/src/helper.silk'))
   yield* fs.writeFileString(
     join(throughLinks, 'app/silk.toml'),
-    '[package]\nname = "app"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\nshared = { path = "../via/shared" }\n',
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\nshared = { path = "../via/shared" }\n',
   )
   yield* fs.writeFileString(
     join(throughLinks, 'app/src/main.silk'),
@@ -2198,7 +2205,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(together, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(together, 'silk.toml'),
-    '[package]\nname = "together"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "together"\nversion = "0.1.0"\n',
   )
   yield* fs.writeFileString(join(together, 'src/main.silk'), 'pub fn main() -> i32 { return 5 }\n')
   const started = (args: ReadonlyArray<string>) =>
@@ -2237,7 +2244,7 @@ const program = Effect.gen(function* () {
     'int silk_answer(int value);\nint main(void) { return silk_answer(41) == 42 ? 0 : 1; }\n',
   )
   const libraryManifest = (inputs: string, artifact = 'object') =>
-    `[package]\nname = "library"\nversion = "0.1.0"\nroot = "src/Main.silk"\n\n[build]\nartifact = "${artifact}"\nnative-link-inputs = [${inputs}]\n`
+    `[package]\nname = "library"\nversion = "0.1.0"\nmain = "Main.silk"\nkind = "${artifact}"\n\n[native]\nlink = [${inputs}]\n`
   const tools = dirname(clang)
   const inspect = Effect.fnUntraced(function* (object: string) {
     const header = yield* invoke(join(tools, 'llvm-readobj'), ['--file-header', object], library)
@@ -2468,7 +2475,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(split, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(split, 'silk.toml'),
-    '[package]\nname = "split"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "split"\nversion = "0.1.0"\n',
   )
   const helperSource = (value: number) => `pub fn value() -> i32 {\n  return ${value}\n}\n`
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(3))
@@ -2528,7 +2535,7 @@ const program = Effect.gen(function* () {
   yield* fs.makeDirectory(join(escapes, 'src'), { recursive: true })
   yield* fs.writeFileString(
     join(escapes, 'silk.toml'),
-    '[package]\nname = "escapes"\nversion = "0.1.0"\nroot = "src/main.silk"\n',
+    '[package]\nname = "escapes"\nversion = "0.1.0"\nmain = "main.silk"\n',
   )
   yield* fs.writeFileString(
     join(escapes, 'src/main.silk'),

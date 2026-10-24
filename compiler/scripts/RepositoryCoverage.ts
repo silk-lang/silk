@@ -283,7 +283,7 @@ export const run = Effect.fn('RepositoryCoverage.run')(function* ({
         if (program.line !== undefined) yield* fs.writeFileString(source, program.source)
         yield* fs.writeFileString(
           join(root, 'silk.toml'),
-          `[package]\nname = "repository-coverage"\nversion = "0.1.0"\nroot = ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.String))(basename(source))}\n`,
+          `[package]\nname = "repository-coverage"\nversion = "0.1.0"\nsource = "."\nmain = ${yield* Schema.encodeEffect(Schema.fromJsonString(Schema.String))(basename(source))}\n`,
         )
         const ir = join(temporary, 'program.ll')
         yield* fs.remove(ir, { force: true })

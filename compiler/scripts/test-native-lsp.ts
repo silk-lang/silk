@@ -183,7 +183,7 @@ const program = Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sync(() => rmSync(directory, { recursive: true })))
   writeFileSync(
     join(directory, 'silk.toml'),
-    '[package]\nname = "session"\nversion = "0.1.0"\nroot = "main.silk"\n',
+    '[package]\nname = "session"\nversion = "0.1.0"\nsource = "."\n',
   )
   const fixed = 'pub fn main() -> i32 {\n  return 0\n}\n'
   writeFileSync(join(directory, 'main.silk'), fixed)
@@ -513,11 +513,11 @@ const program = Effect.gen(function* () {
   for (const member of ['pricing', 'store']) mkdirSync(join(workspace, member, 'src'), { recursive: true })
   writeFileSync(
     join(workspace, 'pricing', 'silk.toml'),
-    '[package]\nname = "pricing"\nversion = "0.1.0"\nroot = "src/lib.silk"\nsource-root = "src"\nexports = ["lib"]\n\n[build]\nartifact = "static-library"\n',
+    '[package]\nname = "pricing"\nversion = "0.1.0"\nmain = "lib.silk"\nkind = "static-library"\nexports = ["lib"]\n',
   )
   writeFileSync(
     join(workspace, 'store', 'silk.toml'),
-    '[package]\nname = "store"\nversion = "0.1.0"\nroot = "src/main.silk"\n\n[dependencies]\npricing = { path = "../pricing" }\n',
+    '[package]\nname = "store"\nversion = "0.1.0"\n\n[dependencies]\npricing = { path = "../pricing" }\n',
   )
   const priced = 'pub fn add(a: i32, b: i32) -> i32 {\n  return a + b\n}\n'
   const stored = 'import pricing.lib { add }\n\npub fn main() -> i32 {\n  return add(1, 2) - 3\n}\n'

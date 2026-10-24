@@ -85,13 +85,13 @@ void it('declares compiled corpus C units and libraries as manifest link inputs'
   }
   await withStub(
     `[ -s fixture.o ] || exit 7
-grep -qxF 'native-link-inputs = [{ object = "fixture.o" }, { library = "custom", mode = "dynamic" }]' silk.toml || exit 8
+grep -qxF 'link = [{ object = "fixture.o" }, { library = "custom", mode = "dynamic" }]' silk.toml || exit 8
 ${compiled}`,
     async (silkc) => {
       assert.deepStrictEqual(await runCase(silkc, linked), { name: 'literal', status: 'pass' })
     },
   )
-  await withStub(`grep -q native-link-inputs silk.toml && exit 9\n${compiled}`, async (silkc) => {
+  await withStub(`grep -q '^link = ' silk.toml && exit 9\n${compiled}`, async (silkc) => {
     assert.deepStrictEqual(await runCase(silkc, literal), { name: 'literal', status: 'pass' })
   })
 })

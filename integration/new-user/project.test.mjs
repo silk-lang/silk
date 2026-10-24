@@ -53,7 +53,7 @@ test('silk init makes a package that runs and prints Hello, world!', () => {
   const dir = join(h.work, name)
   assert.deepEqual(readdirSync(dir).sort(), ['.gitignore', 'silk.toml', 'src'])
   assert.equal(read(join(dir, '.gitignore')), '/build/\n')
-  assert.match(read(join(dir, 'silk.toml')), new RegExp(`^\\[package\\]\\nname = "${name}"\\nversion = "0.1.0"\\nsilk-version = "[^"]+"\\nroot = "src/main.silk"\\n$`))
+  assert.match(read(join(dir, 'silk.toml')), new RegExp(`^\\[package\\]\\nname = "${name}"\\nversion = "0.1.0"\\nsilk-version = "[^"]+"\\n$`))
 
   const ran = silk(h, ['run'], { cwd: dir })
   assert.equal(ran.status, 0, show(ran))
