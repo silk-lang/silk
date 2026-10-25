@@ -607,7 +607,7 @@ test('a plain struct passed to a C function gets a coded error that says to use 
 })
 
 // Finding 135: removing one of two dependency names for the same package.
-test('silk check after removing a second name for a dependency reports the stale import', { todo: 'finding 135' }, () => {
+test('silk check after removing a second name for a dependency reports the stale import', () => {
   const root = join(h.work, `alias${Math.random().toString(36).slice(2, 8)}`)
   write(join(root, 'lb/silk.toml'), '[package]\nname = "lb"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n')
   write(join(root, 'lb/src/lib.silk'), 'pub fn one() -> i32 {\n  return 1\n}\n\npub fn two() -> i32 {\n  return 2\n}\n')

@@ -271,3 +271,10 @@ for (const [name, source] of [
     assert.match(result.stderr, /SEM0010\][^\n]*`(frob|info)`/, show(result))
   })
 }
+
+// Finding 136: `==` on two values of a type whose Equal works on references.
+test('== on two values of an Equal type says to compare borrows', { todo: 'finding 136' }, () => {
+  const result = check('import silk.equal { Equal }\n\nstruct Id {\n  n: i32,\n}\n\nfn same(l: &Id, r: &Id) -> bool {\n  return l.n == r.n\n}\n\nimpl Equal for Id { equals: same }\n\npub fn main() -> i32 {\n  let a = Id { n: 1 }\n  let b = Id { n: 1 }\n  if a == b {\n    return 0\n  }\n  return 1\n}\n')
+  assert.match(result.stderr, /SEM0135\]/, show(result))
+  assert.match(result.stderr, /&a == &b|borrow|reference/, show(result))
+})
