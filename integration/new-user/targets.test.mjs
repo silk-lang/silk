@@ -181,7 +181,7 @@ test('a wasm32 build runs the program under node', () => {
 
 // #2298: a debug build that changes nothing writes nothing, for every target.
 for (const target of [host, 'wasm32-unknown-unknown', 'wasm32-wasip1']) {
-  test(`a no-op build for ${target} writes nothing under build/`, { todo: 'finding 129' }, () => {
+  test(`a no-op build for ${target} writes nothing under build/`, () => {
     const dir = tiny()
     write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
     for (let i = 0; i < 2; i++) assert.equal(silk(h, ['build', '--target', target], { cwd: dir }).status, 0)
