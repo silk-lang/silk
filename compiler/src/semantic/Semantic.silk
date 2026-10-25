@@ -375,6 +375,7 @@ import semantic.TypedBody {
   ScalarTest as BodyScalarTest,
 }
 import silk.allocator {Allocator, OutOfMemoryError}
+import silk.arena {Arena, ArenaOptions}
 import silk.bytes {Bytes}
 import silk.effect {Effect}
 import silk.hash {Hash, Word}
@@ -6240,7 +6241,10 @@ effect fn recordSourceInput(resolver: &mut Resolver, module: &ModuleId, ordinal:
     if handle != usize.MAX {
       position = DeclarationTable.position(&resolver.declarations, handle)
     }
-    let value = run captureInput(&resolver.*, module, &selector, answer, position)
+    // The captured value is only hashed, so its encoding buffers come from a bump arena.
+    let mut arena = Arena.withOptions(Allocator.systemAllocatorProvider(),
+      ArenaOptions {firstChunkBytes: 16384, maximumChunkBytes: 65536})
+    let value = run captureInput(&resolver.*, module, &selector, answer, position) |> Effect.provideMut<Allocator>(&mut arena)
     input = run Inputs.add(&mut resolver.sourceInputs, ordinal, move selector, ContentHash.of(Bytes.asSlice(&value)))
   } else {
     drop selector
@@ -76290,7 +76294,12 @@ effect fn finishCheckedBody(resolver: &mut Resolver, owner: &mut Query<Answer, N
       run Progress.show(&mut resolver.progress, Bytes.asSlice(&shown))
     }
     run Progress.enterBorrowCheck(&mut resolver.progress)
+    // The borrow check's working sets all die with it, so they come from a bump arena instead of
+    // the heap; only the verdict outlives it, and it keeps its own chunks alive.
+    let mut arena = Arena.withOptions(Allocator.systemAllocatorProvider(),
+      ArenaOptions {firstChunkBytes: 65536, maximumChunkBytes: 65536})
     let verdict = run checkRegions(&regionInput(&facts, &identity, List<BodyLocal>.asSlice(&locals), List<BodyNode>.asSlice(&nodes), control.node))
+      |> Effect.provideMut<Allocator>(&mut arena)
     run Progress.leaveBorrowCheck(&mut resolver.progress)
     if Progress.timing(&resolver.progress) {
       let timed = run shownName(&mut resolver.*, &identity)
@@ -90009,6 +90018,8 @@ fn requestedTarget(summary: &SuspensionSummary, position: usize) -> Option<&Inst
 // One reached instance of a captured walk, before its references are resolved to entries.
 struct CaptureEntry {
   exact: Bytes,
+  // The identity digest `exact` writes, which the capture finds the entry by.
+  digest: ContentHash,
   hash: u64,
   family: u64,
   declaration: Bytes,
@@ -90018,8 +90029,8 @@ struct CaptureEntry {
   alias: usize,
   // `BuildRecord.Entry.leaf`.
   leaf: u64,
-  // The exact identity and edge bytes of each MIR reference, in the MIR's order.
-  targets: List<Bytes>,
+  // The identity digest and edge bytes of each MIR reference, in the MIR's order.
+  targets: List<ContentHash>,
   edges: List<Bytes>,
   summary: ContentHash,
   // The emitted definition's `llvmValues` index, and the units it rests on: its MIR's and its
@@ -90046,8 +90057,13 @@ struct BuildCapture {
 // The digest of exact identity or edge bytes a walk record names them by.
 // The bytes a build record names `instance` by: the words of its identity digest.
 effect fn instanceDigest(instance: &InstanceKey) -> Bytes ! OutOfMemoryError ? &mut Allocator {
-  let digest = run InstanceKey.identityDigest(instance)
+  return run digestBytes(run InstanceKey.identityDigest(instance))
+}
+
+// The words of `digest`, as a build record names an identity by them.
+effect fn digestBytes(digest: ContentHash) -> Bytes ! OutOfMemoryError ? &mut Allocator {
   let mut output = Bytes.make()
+  run Bytes.reserveExact(&mut output, 16)
   run RuntimeEncoding.word(&mut output, digest.high)
   run RuntimeEncoding.word(&mut output, digest.low)
   return move output
@@ -90327,13 +90343,14 @@ impl BuildCapture {
 
   // Adds the entry of a newly reached instance.
   effect fn enter(self: &mut Self, instance: &InstanceKey, origin: VisitOrigin) -> () ! OutOfMemoryError ? &mut Allocator {
-    let exact = run instanceDigest(instance)
+    let digest = run InstanceKey.identityDigest(instance)
+    let exact = run digestBytes(digest)
     let mut declaration = Bytes.make()
     if self.declared { run StableKey.declaration(&mut declaration, &DeclarationId.copyShared(&InstanceKey.identity(instance))) }
-    run InternIndex.record(&mut self.lookup, InternIndex.hashBytes(0, Bytes.asSlice(&exact)))
-    run List<CaptureEntry>.append(&mut self.entries, CaptureEntry {exact: move exact, hash: InstanceKey.runtimeHash(instance),
+    run InternIndex.record(&mut self.lookup, Hash.combine(digest.high, digest.low))
+    run List<CaptureEntry>.append(&mut self.entries, CaptureEntry {exact: move exact, digest: digest, hash: InstanceKey.runtimeHash(instance),
       family: EmissionPlan.familyName(instance), declaration: move declaration, parent: origin.parent, position: origin.position,
-      requested: origin.requested, alias: usize.MAX, leaf: 0, targets: List<Bytes>.make(), edges: List<Bytes>.make(),
+      requested: origin.requested, alias: usize.MAX, leaf: 0, targets: List<ContentHash>.make(), edges: List<Bytes>.make(),
       summary: ContentHash {high: 0, low: 0}, value: usize.MAX, mirUnit: usize.MAX, textUnit: usize.MAX})
   }
 
@@ -90365,11 +90382,13 @@ impl BuildCapture {
   effect fn references(self: &mut Self, entry: usize, instance: &InstanceKey, references: &[MirReference], summary: ContentHash) -> ()
   ! OutOfMemoryError ? &mut Allocator {
     let owner = DeclarationId.copyShared(&InstanceKey.identity(instance))
-    let mut targets = List<Bytes>.make()
+    let mut targets = List<ContentHash>.make()
     let mut edges = List<Bytes>.make()
+    run List<ContentHash>.reserveExact(&mut targets, references.length)
+    run List<Bytes>.reserveExact(&mut edges, references.length)
     let mut at = usize.ZERO
     while at < references.length {
-      run List<Bytes>.append(&mut targets, run instanceDigest(&references[at].key))
+      run List<ContentHash>.append(&mut targets, run InstanceKey.identityDigest(&references[at].key))
       run List<Bytes>.append(&mut edges, run BuildCapture.named(&self.*, run Edge.recordBytes(&references[at].edge, &owner)))
       at = at + usize.ONE
     }
@@ -90379,12 +90398,12 @@ impl BuildCapture {
     entries[entry].summary = summary
   }
 
-  // The entry whose exact identity is `exact`, or `usize.MAX`.
-  fn find(self: &Self, exact: &[u8]) -> usize {
+  // The entry whose identity digest is `digest`, or `usize.MAX`.
+  fn find(self: &Self, digest: ContentHash) -> usize {
     let entries = List<CaptureEntry>.asSlice(&self.entries)
-    let mut at = InternIndex.first(&self.lookup, InternIndex.hashBytes(0, exact))
+    let mut at = InternIndex.first(&self.lookup, Hash.combine(digest.high, digest.low))
     while at != usize.MAX {
-      if same(Bytes.asSlice(&entries[at].exact), exact) { return at }
+      if ContentHash.equals(entries[at].digest, digest) { return at }
       at = InternIndex.after(&self.lookup, at)
     }
     return usize.MAX
@@ -90396,33 +90415,47 @@ impl BuildCapture {
   effect fn finish(self: BuildCapture, guard: usize) -> Option<CapturedBuild> ! OutOfMemoryError ? &mut Allocator {
     let mut record = BuildRecord.make(self.observing)
     let mut rested = List<CapturedEntry>.make()
-    let entries = List<CaptureEntry>.asSlice(&self.entries)
+    let mut captured = move self
+    let count = List<CaptureEntry>.length(&captured.entries)
+    run List<BuildRecord.Entry>.reserveExact(&mut record.entries, count)
+    run List<CapturedEntry>.reserveExact(&mut rested, count)
     let mut at = usize.ZERO
-    while at < entries.length {
-      let entry = &entries[at]
-      at = at + usize.ONE
+    while at < count {
+      let entry = &List<CaptureEntry>.asSlice(&captured.entries)[at]
       if entry.alias == usize.MAX && entry.leaf == 0 && (entry.mirUnit == usize.MAX || (entry.value != usize.MAX && entry.textUnit == usize.MAX)) {
         return Option<CapturedBuild>.none()
       }
       let mut references = List<BuildRecord.Reference>.make()
-      let targets = List<Bytes>.asSlice(&entry.targets)
-      let edges = List<Bytes>.asSlice(&entry.edges)
+      let targets = List<ContentHash>.asSlice(&entry.targets)
+      run List<BuildRecord.Reference>.reserveExact(&mut references, targets.length)
       let mut reference = usize.ZERO
       while reference < targets.length {
-        let target = BuildCapture.find(&self, Bytes.asSlice(&targets[reference]))
+        let target = BuildCapture.find(&captured, targets[reference])
         if target == usize.MAX { return Option<CapturedBuild>.none() }
-        run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: target,
-          edge: run Bytes.copy(Bytes.asSlice(&edges[reference]))})
+        run List<BuildRecord.Reference>.append(&mut references, BuildRecord.Reference {target: target, edge: Bytes.make()})
         reference = reference + usize.ONE
       }
-      run List<BuildRecord.Entry>.append(&mut record.entries, BuildRecord.Entry {exact: run Bytes.copy(Bytes.asSlice(&entry.exact)),
-        hash: entry.hash, family: entry.family, declaration: run Bytes.copy(Bytes.asSlice(&entry.declaration)), parent: entry.parent,
-        position: entry.position, requested: entry.requested, alias: entry.alias, leaf: entry.leaf, references: move references,
-        summary: entry.summary})
-      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: entry.value, mirUnit: entry.mirUnit, textUnit: entry.textUnit,
+      // The record takes the entry's bytes, which the capture no longer needs.
+      let taken = &mut List<CaptureEntry>.asMutSlice(&mut captured.entries)[at]
+      let referenced = List<BuildRecord.Reference>.asMutSlice(&mut references)
+      let edges = List<Bytes>.asMutSlice(&mut taken.edges)
+      reference = usize.ZERO
+      while reference < referenced.length {
+        referenced[reference].edge = Intrinsic.replace(edges[reference], Bytes.make())
+        reference = reference + usize.ONE
+      }
+      let exact = Intrinsic.replace(taken.exact, Bytes.make())
+      let declaration = Intrinsic.replace(taken.declaration, Bytes.make())
+      let kept = &List<CaptureEntry>.asSlice(&captured.entries)[at]
+      at = at + usize.ONE
+      run List<BuildRecord.Entry>.append(&mut record.entries, BuildRecord.Entry {exact: move exact,
+        hash: kept.hash, family: kept.family, declaration: move declaration, parent: kept.parent,
+        position: kept.position, requested: kept.requested, alias: kept.alias, leaf: kept.leaf, references: move references,
+        summary: kept.summary})
+      run List<CapturedEntry>.append(&mut rested, CapturedEntry {value: kept.value, mirUnit: kept.mirUnit, textUnit: kept.textUnit,
         carried: usize.MAX})
     }
-    record.roots = move self.roots
+    record.roots = move captured.roots
     return Option<CapturedBuild>.some(CapturedBuild {record: move record, entries: move rested, guard: guard, carriedRecord: usize.MAX})
   }
 }
