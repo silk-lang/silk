@@ -2710,11 +2710,14 @@ const program = Effect.gen(function* () {
   // An unchanged rebuild links nothing either: the executable stays the file the last link wrote.
   const splitExecutable = join(split, `build/llvm/${hostTarget}/debug/split`)
   const linkedAt = (yield* fs.stat(splitExecutable)).mtime
+  const symbolMap = `${splitExecutable}.symbols`
+  const mappedAt = (yield* fs.stat(symbolMap)).mtime
   yield* splitRun(7)
   assert.deepEqual(yield* objectNames(), coldObjects, 'an unchanged rebuild reuses every object')
   assert.deepEqual((yield* fs.stat(splitExecutable)).mtime, linkedAt, 'an unchanged rebuild leaves the executable as it was')
   assert.deepEqual(yield* packNames(), coldPacks, 'an unchanged rebuild keeps every pack')
   assert.deepEqual((yield* fs.stat(importSummaries)).mtime, summarizedAt, 'an unchanged rebuild keeps the import summaries')
+  assert.deepEqual((yield* fs.stat(symbolMap)).mtime, mappedAt, 'an unchanged rebuild leaves the symbol map as it was')
   yield* fs.writeFileString(join(split, 'src/helper.silk'), helperSource(5))
   yield* splitRun(9)
   const editedObjects = yield* objectNames()
@@ -2747,6 +2750,16 @@ const program = Effect.gen(function* () {
   yield* splitRun(9)
   yield* replayed(helperSource(6), 10, /codegen\s+1 functions?\s/)
   yield* replayed(`fn other() -> i32 {\n  return 2\n}\n\npub fn value() -> i32 {\n  return other() + 1\n}\n`, 7, /codegen\s+[1-9]\d+ functions\s/)
+  // A whole-module link keeps a stamp too, so an unchanged release rebuild links nothing.
+  const releaseBuild = Effect.fnUntraced(function* () {
+    const built = yield* invoke(silk, ['build', '--release', '--stdlib', standardLibrary], split, splitEnvironment)
+    assert.equal(built.status, 0, built.stderr)
+  })
+  yield* releaseBuild()
+  const releaseExecutable = join(split, `build/llvm/${hostTarget}/release/split`)
+  const releasedAt = (yield* fs.stat(releaseExecutable)).mtime
+  yield* releaseBuild()
+  assert.deepEqual((yield* fs.stat(releaseExecutable)).mtime, releasedAt, 'an unchanged release rebuild leaves the executable as it was')
   // A check replays the escape walks the last check left in the cache. A callback's call into
   // another module of the package is walked below the callback, so an edit there that adds a `run`
   // is reported as a cold check reports it, and an edit that keeps what the walk reads reports
