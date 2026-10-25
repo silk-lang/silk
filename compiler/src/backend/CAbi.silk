@@ -1,7 +1,8 @@
-//! Target-neutral classification of immediate scalar, pointer and vector C calls.
+//! C calling conventions for scalars, pointers, vectors and C-layout records.
 
 import semantic.Types {Types}
-import backend.Layout {Abi, Metrics}
+import backend.Layout {Abi, Metrics, Layout, Storage, Field}
+import backend.TypeLayouts {TypeLayouts}
 import semantic.DeclarationId {DeclarationId}
 import semantic.Target {Id, Target}
 import semantic.Type {Type}
@@ -14,6 +15,7 @@ import silk.option {Option}
 import silk.shared {Shared}
 import silk.usize
 import silk.list {List}
+import silk.ownership {Copy}
 
 /// The caller or callee must extend this lane to the target's argument register width.
 pub enum Extension {
@@ -68,11 +70,47 @@ pub effect fn identity(signature: &Signature) -> Bytes ! OutOfMemoryError ? &mut
   return move output
 }
 
-/// One already-demanded type layout and its C boundary extension rule.
+/// The representation of one source value at a C function boundary.
+pub enum Passing {
+  /// One scalar, pointer or vector register value.
+  Direct,
+  /// One or more register values reconstructed from record storage.
+  Coerce,
+  /// An address of record storage, with a caller copy for arguments.
+  Indirect,
+  /// An empty record contributes no machine value.
+  Ignore,
+}
+
+/// One register value and its byte offset in a C-layout record.
+pub struct Piece {
+  /// The byte offset in the source record.
+  pub offset: usize,
+  /// The scalar register class, or the element class of a vector.
+  pub abi: Abi,
+  /// The scalar or vector element width in bits.
+  pub bits: usize,
+  /// The vector element count; zero denotes a scalar.
+  pub lanes: usize,
+}
+
+impl Copy for Piece {}
+
+/// A source value's demanded layout and complete C passing rule.
 pub struct Lane {
   pub ty: Shared<Type>,
   pub layout: Metrics,
   pub extension: Extension,
+  /// Whether the value crosses in registers, through memory, or has no machine value.
+  pub passing: Passing,
+  /// Register pieces in storage order for a coerced record.
+  pub pieces: List<Piece>,
+  /// Whether record arguments keep their pieces in one homogeneous machine aggregate.
+  pub grouped: bool,
+  /// Whether an indirect argument uses the target's stack-by-value convention.
+  pub byval: bool,
+  /// Required stack alignment of an aggregate argument; zero means no extra attribute.
+  pub stackAlignment: usize,
 }
 
 /// The complete machine signature of one foreign declaration, independent of LLVM spelling.
@@ -180,8 +218,8 @@ pub fn supported(target: &Target) -> bool {
   }
 }
 
-/// Whether the target admits C statics, variadic tails and callback lanes beside direct scalar and
-/// pointer calls. WebAssembly keeps the direct subset only.
+/// Whether the target admits C statics and variadic tails.
+/// WebAssembly supports fixed calls and callbacks but excludes these additional contracts.
 pub fn fullBoundary(target: &Target) -> bool {
   return match Target.id(target) {
     Id.Wasm32UnknownUnknown => false
@@ -233,6 +271,8 @@ pub fn admit(ty: &Type) -> bool {
       return false
     })
     Type.Pointer {..} => true
+    // Semantic admission proves that a nominal lane is a C-layout struct.
+    Type.Nominal {..} => true
     Type.Vector {..} => vectorLaneBits(ty) != usize.ZERO
     Type.Primitive {name} => {
       let spelling = Bytes.asSlice(&name)
@@ -251,7 +291,7 @@ pub fn admit(ty: &Type) -> bool {
   }
 }
 
-// Callback signatures currently admit closed scalar and raw-data-pointer lanes only.
+// Semantic admission also authenticates every nominal callback lane's C-layout declaration.
 fn callbackScalar(ty: &Type) -> bool {
   return match &ty.* { Type.ForeignFunction {..} => false Type.Vector {..} => false _ => admit(ty) }
 }
@@ -321,10 +361,16 @@ fn admitsCallbackParameter(ty: &Type) -> bool {
 }
 
 /// Computes the C ABI rule from a queried Layout, without inspecting a function body.
-pub fn classify(ty: &Shared<Type>, layout: Metrics, target: &Target) -> Option<Lane> {
-  if layout.abi == Abi.Indirect || !supported(target) || !Shared<Type>.with<bool>(ty, admit) {
+pub effect fn classify(ty: &Shared<Type>, layouts: &TypeLayouts, target: &Target, result: bool) -> Option<Lane>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if !supported(target) || !Shared<Type>.with<bool>(ty, admit) {
     return Option<Lane>.none()
   }
+  let index = run TypeLayouts.firstMatching(layouts, ty)
+  if index == usize.MAX { return Option<Lane>.none() }
+  let supplied = TypeLayouts.list(layouts)
+  let layout = Shared<Layout>.with<Metrics>(&supplied[index].layout, Layout.metrics)
+  if layout.abi == Abi.Indirect { return run record(ty, layouts, target, layout, result) }
   let mut extension = Extension.None
   if layout.abi == Abi.Integer {
     let signed = Shared<Type>.with<bool>(
@@ -344,5 +390,207 @@ pub fn classify(ty: &Shared<Type>, layout: Metrics, target: &Target) -> Option<L
       }
     }
   }
-  return Option<Lane>.some(Lane {ty: Shared<Type>.clone(ty), layout: layout, extension: extension})
+  return Option<Lane>.some(Lane {ty: Shared<Type>.clone(ty), layout: layout, extension: extension,
+    passing: Passing.Direct, pieces: List<Piece>.make(), grouped: false, byval: false, stackAlignment: usize.ZERO})
+}
+
+// Stop once the classification cannot be homogeneous. Large arrays must not expand into a list
+// proportional to their extent merely to establish that they cross through memory.
+effect fn leaves(ty: &Shared<Type>, layouts: &TypeLayouts, offset: usize, limit: usize,
+  output: &mut List<Piece>) -> bool ! OutOfMemoryError ? &mut Allocator | &mut Types {
+  if List<Piece>.length(&output.*) >= limit { return true }
+  let index = run TypeLayouts.firstMatching(layouts, ty)
+  if index == usize.MAX { return false }
+  let supplied = TypeLayouts.list(layouts)
+  let selected = Shared<Layout>.clone(&supplied[index].layout)
+  let facts = Shared<Layout>.with<Metrics>(&selected, Layout.metrics)
+  if facts.size == usize.ZERO { return true }
+  if facts.abi != Abi.Indirect {
+    let mut bits = facts.size * 8
+    let mut lanes = usize.ZERO
+    let mut abi = facts.abi
+    if abi == Abi.Vector {
+      bits = Shared<Type>.with<usize>(ty, vectorLaneBits)
+      if bits == usize.ZERO { return false }
+      lanes = facts.size * 8 / bits
+      abi = Abi.Integer
+      if Shared<Type>.with<bool>(ty, vectorFloating) { abi = Abi.Floating }
+    }
+    if abi != Abi.Integer && abi != Abi.Floating && abi != Abi.Pointer { return false }
+    run List<Piece>.append(&mut output.*, Piece {offset: offset, abi: abi, bits: bits, lanes: lanes})
+    return true
+  }
+  let record = Shared<Layout>.with<bool>(&selected, fn(value: &Layout) -> bool {
+    return match &value.storage { Storage.Record {..} => true Storage.Sequence {..} => true _ => false }
+  })
+  if !record { return false }
+  let count = Shared<Layout>.with<usize>(&selected, Layout.fieldCount)
+  let mut at = usize.ZERO
+  while at < count && List<Piece>.length(&output.*) < limit {
+    let child = Shared<Layout>.with<Option<Field>>(&selected, fn(value: &Layout) -> Option<Field> {
+      return Layout.fieldAt(value, at)
+    })
+    if let Option<Field>.Some {value} = move child {
+      if !(run leaves(&value.ty, layouts, offset + value.offset, limit, &mut output.*)) { return false }
+    } else { return false }
+    at = at + usize.ONE
+  }
+  return true
+}
+
+fn pieceBytes(piece: Piece) -> usize {
+  if piece.lanes != usize.ZERO { return piece.bits * piece.lanes / 8 }
+  return piece.bits / 8
+}
+
+effect fn record(ty: &Shared<Type>, layouts: &TypeLayouts, target: &Target, layout: Metrics, result: bool) -> Option<Lane>
+! OutOfMemoryError ? &mut Allocator | &mut Types {
+  let index = run TypeLayouts.firstMatching(layouts, ty)
+  let supplied = TypeLayouts.list(layouts)
+  if !Shared<Layout>.with<bool>(&supplied[index].layout, fn(value: &Layout) -> bool {
+    return match &value.storage { Storage.Record {..} => true _ => false }
+  }) { return Option<Lane>.none() }
+  let id = Target.id(target)
+  let x86 = id == Id.X8664UnknownLinuxGnu
+  let wasm = Target.pointerBits(target) == 32
+  let mut lane = Lane {ty: Shared<Type>.clone(ty), layout: layout, extension: Extension.None,
+    passing: Passing.Indirect, pieces: List<Piece>.make(), grouped: false, byval: x86 || wasm, stackAlignment: layout.alignment}
+  if x86 && lane.stackAlignment < 8 { lane.stackAlignment = 8 }
+  if layout.size == usize.ZERO { lane.passing = Passing.Ignore return Option<Lane>.some(move lane) }
+  let mut fields = List<Piece>.make()
+  let mut limit: usize = 5
+  if x86 { limit = 17 }
+  if wasm { limit = 2 }
+  if !(run leaves(ty, layouts, usize.ZERO, limit, &mut fields)) { return Option<Lane>.none() }
+  let listed = List<Piece>.asSlice(&fields)
+  if wasm {
+    if listed.length == usize.ONE && listed[usize.ZERO].lanes == usize.ZERO {
+      lane.passing = Passing.Coerce
+      run List<Piece>.append(&mut lane.pieces, listed[usize.ZERO])
+    }
+    return Option<Lane>.some(move lane)
+  }
+  if !x86 {
+    let mut homogeneous = listed.length > usize.ZERO && listed.length <= 4
+    let mut at = usize.ZERO
+    while at < listed.length && homogeneous {
+      let part = listed[at]
+      let first = listed[usize.ZERO]
+      let floats = part.lanes == usize.ZERO && first.lanes == usize.ZERO
+        && part.abi == Abi.Floating && first.abi == Abi.Floating && part.bits == first.bits
+      // AAPCS64 short-vector base types are distinguished by their total size, not lane spelling.
+      let vectors = part.lanes != usize.ZERO && first.lanes != usize.ZERO
+        && pieceBytes(part) == pieceBytes(first) && (pieceBytes(part) == 8 || pieceBytes(part) == 16)
+      homogeneous = (floats || vectors) && part.offset == at * pieceBytes(first)
+      at = at + usize.ONE
+    }
+    if homogeneous && layout.size == listed.length * pieceBytes(listed[usize.ZERO]) {
+      lane.passing = Passing.Coerce
+      lane.grouped = !result
+      lane.stackAlignment = usize.ZERO
+      if id == Id.Aarch64UnknownLinuxGnu && !result {
+        lane.stackAlignment = layout.alignment
+        if lane.stackAlignment < 8 { lane.stackAlignment = 8 }
+      }
+      at = usize.ZERO
+      while at < listed.length {
+        let mut part = listed[usize.ZERO]
+        part.offset = listed[at].offset
+        run List<Piece>.append(&mut lane.pieces, part)
+        at = at + usize.ONE
+      }
+      return Option<Lane>.some(move lane)
+    }
+    if layout.size <= 16 {
+      lane.passing = Passing.Coerce
+      lane.grouped = layout.size > 8
+      lane.stackAlignment = usize.ZERO
+      let mut offset = usize.ZERO
+      while offset < layout.size {
+        let mut bits: usize = 64
+        if result && layout.size <= 8 { bits = layout.size * 8 }
+        run List<Piece>.append(&mut lane.pieces, Piece {offset: offset, abi: Abi.Integer, bits: bits, lanes: usize.ZERO})
+        offset = offset + 8
+      }
+    }
+    return Option<Lane>.some(move lane)
+  }
+  // A lone vector has one SSE eightbyte followed by SSEUP eightbytes. With the required CPU
+  // features, its entire 128-, 256- or 512-bit value occupies one vector register.
+  if listed.length == usize.ONE && listed[usize.ZERO].lanes != usize.ZERO && layout.size == pieceBytes(listed[usize.ZERO]) {
+    lane.passing = Passing.Coerce
+    run List<Piece>.append(&mut lane.pieces, listed[usize.ZERO])
+    return Option<Lane>.some(move lane)
+  }
+  if layout.size > 16 { return Option<Lane>.some(move lane) }
+  let mut offset = usize.ZERO
+  while offset < layout.size {
+    let mut integer = false
+    let mut double = false
+    let mut used = usize.ZERO
+    let mut at = usize.ZERO
+    while at < listed.length {
+      let part = listed[at]
+      let end = part.offset + pieceBytes(part)
+      if part.offset < offset + 8 && end > offset {
+        if part.abi != Abi.Floating && part.lanes == usize.ZERO { integer = true }
+        if part.lanes != usize.ZERO && pieceBytes(part) == 8 { double = true }
+        if part.abi == Abi.Floating && part.bits == 64 { double = true }
+        let mut extent = end - offset
+        if extent > 8 { extent = 8 }
+        if extent > used { used = extent }
+      }
+      at = at + usize.ONE
+    }
+    if used > usize.ZERO {
+      let mut part = Piece {offset: offset, abi: Abi.Integer, bits: used * 8, lanes: usize.ZERO}
+      if !integer {
+        part.abi = Abi.Floating
+        part.bits = 32
+        if double { part.bits = 64 }
+        else if used > 4 { part.lanes = 2 }
+      }
+      run List<Piece>.append(&mut lane.pieces, part)
+    }
+    offset = offset + 8
+  }
+  lane.passing = Passing.Coerce
+  return Option<Lane>.some(move lane)
+}
+
+/// Applies SysV's all-or-memory rule when a record exceeds the remaining argument registers.
+pub fn assignArguments(parameters: &mut List<Lane>, result: &Lane, target: &Target) -> () {
+  if Target.id(target) != Id.X8664UnknownLinuxGnu { return () }
+  let mut integers: usize = 6
+  let mut vectors: usize = 8
+  if result.passing == Passing.Indirect { integers = integers - usize.ONE }
+  let listed = List<Lane>.asMutSlice(&mut parameters.*)
+  let mut at = usize.ZERO
+  while at < listed.length {
+    let mut neededInteger = usize.ZERO
+    let mut neededVector = usize.ZERO
+    if listed[at].passing == Passing.Direct {
+      let abi = listed[at].layout.abi
+      if abi == Abi.Integer || abi == Abi.Pointer { neededInteger = usize.ONE }
+      if abi == Abi.Floating || abi == Abi.Vector { neededVector = usize.ONE }
+    } else if listed[at].passing == Passing.Coerce {
+      let parts = List<Piece>.asSlice(&listed[at].pieces)
+      let mut part = usize.ZERO
+      while part < parts.length {
+        if parts[part].abi == Abi.Floating || parts[part].lanes != usize.ZERO { neededVector = neededVector + usize.ONE }
+        else { neededInteger = neededInteger + usize.ONE }
+        part = part + usize.ONE
+      }
+      if neededInteger > integers || neededVector > vectors {
+        listed[at].passing = Passing.Indirect
+        listed[at].byval = true
+        at = at + usize.ONE
+        continue
+      }
+    }
+    if neededInteger <= integers { integers = integers - neededInteger }
+    if neededVector <= vectors { vectors = vectors - neededVector }
+    at = at + usize.ONE
+  }
+  return ()
 }
