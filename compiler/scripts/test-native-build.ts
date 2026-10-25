@@ -1209,6 +1209,40 @@ const program = Effect.gen(function* () {
       files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  match n {\n    1 => {\n      0\n      return 1\n    }\n    _ => ()\n  }\n  return 0\n}\n' },
       pattern: /error\[SEM0087\] Expression statement produces i32, but only \(\) or never may be ignored/,
     },
+    // A private field the declaring module reads through a public function points at that function.
+    {
+      name: 'fieldaccessor',
+      files: { 'main.silk': 'import silk.system_clock { Instant }\n\nfn f(now: &Instant) -> i64 { return now.seconds() }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0028\] Field `seconds` of silk\.system_clock\.Instant is private; read it with `SystemClock\.seconds\(&value\)` instead/,
+    },
+    // A provision that matches nothing names the provider, the service and what the Effect requires.
+    {
+      name: 'providerselector',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\nimport silk.system_clock { SystemClock }\n\npub effect fn main() -> i32 {\n  let mut bell = Counting { rung: 0 }\n  run visit() |> Effect.provideMut<SystemClock>(&mut bell)\n  return bell.rung\n}\n' },
+      pattern: /error\[SEM0123\] The Effect does not require silk\.system_clock\.SystemClock; it requires &mut main\.Doorbell/,
+    },
+    {
+      name: 'providerunimplemented',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut<Doorbell>(&mut plain)\n  return plain\n}\n' },
+      pattern: /error\[SEM0123\] i32 does not implement main\.Doorbell, so it cannot provide it/,
+    },
+    {
+      name: 'providernone',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub effect fn main() -> i32 {\n  let mut plain = 3\n  run visit() |> Effect.provideMut(&mut plain)\n  return plain\n}\n' },
+      pattern: /error\[SEM0123\] i32 implements none of the services the Effect requires: &mut main\.Doorbell/,
+    },
+    // A test cannot declare a requirement row, so SEM0071 there only offers a provider.
+    {
+      name: 'testrequirement',
+      files: { 'main.silk': 'import silk.effect { Effect }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting { rung: i32, }\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rung = self.rung + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\ntest effect fn rings() -> () {\n  run visit()\n}\n' },
+      pattern: /error\[SEM0071\] This `run` needs `&mut Doorbell`, which a test cannot declare; provide it with `\|> Effect\.provideMut\(&mut value\)`/,
+    },
+    // A conformance member returning another type names both types.
+    {
+      name: 'witnessresult',
+      files: { 'main.silk': 'import silk.system_clock { SystemClock }\n\nstruct Fixed {}\n\nimpl SystemClock for Fixed {\n  effect fn now(self: &mut Self) -> i64 { return 0 }\n  effect fn getResolution(self: &mut Self) -> u64 { return 1 }\n}\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0083\] Invalid conformance: member `now` does not match the operation of `SystemClock`: it returns `i64`, but the operation returns `silk\.system_clock\.Instant`/,
+    },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
       name: 'testrun',
@@ -1321,6 +1355,31 @@ const program = Effect.gen(function* () {
       /^app\/src\/main\.silk:6:6: error\[SEM0177\] size too big\n {2}note: spec\/sized\.silk:2:21: related location$/m,
     )
   }
+  // Another package's module is named as the importer spells it, and its private field gets no
+  // advice to edit that package.
+  yield* fs.makeDirectory(join(directory, 'privatedep/app/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'privatedep/core'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'privatedep/silk.toml'), '[workspace]\nmembers = ["app", "core"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/core/silk.toml'),
+    '[package]\nname = "core"\nversion = "0.1.0"\nsource = "."\nexports = ["Store"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/core/Store.silk'),
+    'pub struct Box { value: i32, }\n\npub fn make() -> Box { return Box { value: 1 } }\n\nfn hidden() -> i32 { return 1 }\n\npub fn shown() -> i32 { return hidden() }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ntaskcore = { path = "../core", package = "core" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'privatedep/app/src/main.silk'),
+    'import taskcore.Store\nimport taskcore.Store { hidden }\n\npub fn main() -> i32 {\n  return Store.make().value\n}\n',
+  )
+  const privateDependency = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'privatedep/app'))
+  assert.equal(privateDependency.status, 1, privateDependency.stderr)
+  assert.match(privateDependency.stderr, /error\[SEM0015\] `hidden` is private to taskcore\.Store; mark it `pub` there to use it here/)
+  assert.match(privateDependency.stderr, /error\[SEM0028\] Field `value` of [A-Za-z.]*Box is private to the module that declares it\n/)
   // A syntax error the parser recovered from fails the check phase of a build, before codegen.
   yield* fs.makeDirectory(join(directory, 'unclosed/src'), { recursive: true })
   yield* fs.writeFileString(
