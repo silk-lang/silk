@@ -1006,6 +1006,24 @@ const program = Effect.gen(function* () {
       },
       pattern: /error\[SEM0014\] Module geo\.helper has no member twice/,
     },
+    // A struct without a C layout is refused at the extern declaration, told how to declare one.
+    {
+      name: 'cplainstruct',
+      files: {
+        'main.silk': 'struct Point { x: f64, y: f64 }\n\nunsafe extern "C" fn lonely(p: Point) -> i32\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /main\.silk:3:32: error\[SEM0187\] main\.Point has no C layout; declare it `extern "C" struct` to pass it to C by value/,
+    },
+    {
+      name: 'cstringlane',
+      files: { 'main.silk': 'unsafe extern "C" fn puts(text: string) -> i32\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0187\] string is not admitted by the C ABI/,
+    },
+    {
+      name: 'cfieldtype',
+      files: { 'main.silk': 'extern "C" struct Flag { ok: bool }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0206\] Field ok of C-layout record main\.Flag has unsupported type bool/,
+    },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
       name: 'testrun',
