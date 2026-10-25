@@ -344,3 +344,12 @@ test('the CSV summarizer from programs/ handles good and bad input', () => {
     assert.match(result.stdout, new RegExp(out), show(result))
   }
 })
+
+// Round 42: a word-frequency counter from the book (chapters 6 and 9): HashMap, List, Order, sort.
+test('the word counter from programs/ prints the top three words', () => {
+  const dir = initPackage(h, fresh('words'))
+  write(join(dir, 'src/main.silk'), read(join(here, 'programs/words.silk')))
+  const result = silk(h, ['run', '--quiet'], { cwd: dir })
+  assert.equal(result.status, 0, show(result))
+  assert.equal(result.stdout, 'the 3\nand 2\ncat 2\n', show(result))
+})

@@ -280,7 +280,7 @@ test('== on two values of an Equal type says to compare borrows', () => {
 })
 
 // Finding 137: importing a name that the module only imports itself.
-test('importing a name another module only imports says where it is declared', { todo: 'finding 137' }, () => {
+test('importing a name another module only imports says where it is declared', () => {
   const result = check('import silk.i64 { ParseError }\n\npub fn main() -> i32 {\n  return 0\n}\n')
   assert.match(result.stderr, /SEM0015\]/, show(result))
   assert.match(result.stderr, /silk\.format/, show(result))
@@ -288,8 +288,21 @@ test('importing a name another module only imports says where it is declared', {
 })
 
 // Finding 138: a template value that has Debug but not Display.
-test('a template value with Debug but no Display suggests {:?}', { todo: 'finding 138' }, () => {
+test('a template value with Debug but no Display suggests {:?}', () => {
   const result = check('import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.option { Option }\nimport silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o: Option<i32> = Option.some(1)\n  run Effect.log("{o}\\n", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n')
   assert.match(result.stderr, /SEM0121\]/, show(result))
   assert.match(result.stderr, /\{o:\?\}|:\?/, show(result))
+})
+
+// Finding 139: SEM0135 on fields read through references loses the operator and types.
+test('< on two string fields read through references names the operator and types', { todo: 'finding 139' }, () => {
+  const result = check("struct W<'t> { text: string<'t> }\n\nfn f(l: &W, r: &W) -> bool {\n  return l.text < r.text\n}\n\npub fn main() -> i32 {\n  return 0\n}\n")
+  assert.match(result.stderr, /SEM0135\] Operator < does not accept/, show(result))
+})
+
+// Finding 140: a block arm that ends in a bare value.
+test('a block arm ending in a value says block arms do not yield one', { todo: 'finding 140' }, () => {
+  const result = check('pub fn main() -> i32 {\n  let n = 1\n  let v = match n {\n    1 => {\n      0\n    }\n    _ => 2\n  }\n  return v\n}\n')
+  assert.match(result.stderr, /SEM0087\]/, show(result))
+  assert.match(result.stderr, /block arm|does not yield/, show(result))
 })
