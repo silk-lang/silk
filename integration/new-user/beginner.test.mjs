@@ -295,14 +295,34 @@ test('a template value with Debug but no Display suggests {:?}', () => {
 })
 
 // Finding 139: SEM0135 on fields read through references loses the operator and types.
-test('< on two string fields read through references names the operator and types', { todo: 'finding 139' }, () => {
+test('< on two string fields read through references names the operator and types', () => {
   const result = check("struct W<'t> { text: string<'t> }\n\nfn f(l: &W, r: &W) -> bool {\n  return l.text < r.text\n}\n\npub fn main() -> i32 {\n  return 0\n}\n")
   assert.match(result.stderr, /SEM0135\] Operator < does not accept/, show(result))
 })
 
 // Finding 140: a block arm that ends in a bare value.
-test('a block arm ending in a value says block arms do not yield one', { todo: 'finding 140' }, () => {
+test('a block arm ending in a value says block arms do not yield one', () => {
   const result = check('pub fn main() -> i32 {\n  let n = 1\n  let v = match n {\n    1 => {\n      0\n    }\n    _ => 2\n  }\n  return v\n}\n')
   assert.match(result.stderr, /SEM0087\]/, show(result))
   assert.match(result.stderr, /block arm|does not yield/, show(result))
+})
+
+// Finding 141: a private stdlib field whose accessor lives elsewhere.
+test('reading Instant.seconds as a method points at SystemClock.seconds, not at editing the stdlib', { todo: 'finding 141' }, () => {
+  const result = check('import silk.system_clock { Instant, SystemClock }\n\npub fn main() -> i32 {\n  let now = SystemClock.make(5, 0)\n  if now.seconds() == 5 {\n    return 0\n  }\n  return 1\n}\n')
+  assert.match(result.stderr, /SEM0028\]/, show(result))
+  assert.doesNotMatch(result.stderr, /mark it `pub seconds`/, show(result))
+  assert.match(result.stderr, /SystemClock\.seconds/, show(result))
+})
+
+// Finding 142: provider messages.
+const bell = 'import silk.effect { Effect }\nimport silk.system_clock { SystemClock }\nimport silk.testing { AssertionError, Testing }\n\nservice Doorbell {\n  effect fn ring() -> () ? &mut Doorbell\n}\n\nstruct Counting {\n  rings: i32,\n}\n\nimpl Doorbell for Counting {\n  effect fn ring(self: &mut Self) -> () {\n    self.rings = self.rings + 1\n  }\n}\n\neffect fn visit() -> () ? &mut Doorbell {\n  run Doorbell.ring()\n}\n\npub fn main() -> i32 {\n  return 0\n}\n\n'
+test('providing a value for the wrong service names the provider and the service', { todo: 'finding 142' }, () => {
+  const result = check(`${bell}test effect fn rings() ! AssertionError<'static> {\n  let mut b = Counting { rings: 0 }\n  run visit() |> Effect.provideMut<SystemClock>(&mut b)\n  run Testing.expect(b.rings == 1, "one ring")\n}\n`)
+  assert.match(result.stderr, /SEM0123\][^\n]*(Counting|SystemClock)/, show(result))
+})
+test('a missing provider inside a test does not suggest a requirement row', { todo: 'finding 142' }, () => {
+  const result = check(`${bell}test effect fn rings() ! AssertionError<'static> {\n  run visit()\n  run Testing.expect(true, "ran")\n}\n`)
+  assert.match(result.stderr, /SEM0071\]/, show(result))
+  assert.doesNotMatch(result.stderr, /add `\? &mut Doorbell` to its signature/, show(result))
 })

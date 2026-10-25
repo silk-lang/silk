@@ -353,3 +353,12 @@ test('the word counter from programs/ prints the top three words', () => {
   assert.equal(result.status, 0, show(result))
   assert.equal(result.stdout, 'the 3\nand 2\ncat 2\n', show(result))
 })
+
+// Round 43: a fake SystemClock and a service of your own, tested with silk test (book chapter 8).
+test('the greeting program in programs/ passes its tests under a fake clock', () => {
+  const dir = initPackage(h, fresh('greet'))
+  write(join(dir, 'src/main.silk'), read(join(here, 'programs/greet.silk')))
+  const result = silk(h, ['test'], { cwd: dir })
+  assert.equal(result.status, 0, show(result))
+  assert.match(result.stdout + result.stderr, /Tests\s+4 passed, 0 failed/, show(result))
+})
