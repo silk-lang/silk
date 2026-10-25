@@ -1,5 +1,5 @@
 ---
-title: Integer C variadics
+title: Scalar C variadics
 ---
 
 A native foreign declaration may end its fixed parameter list with `, ...`:
@@ -9,17 +9,19 @@ unsafe extern "C" fn receive(tag: i32, ...) -> i32
 ```
 
 The declaration must have at least one fixed parameter. Ellipsis is last and creates no named
-parameter. Calls supply all fixed arguments and then zero or more admitted integer values, under
+parameter. Calls supply all fixed arguments and then zero or more admitted scalar or raw-pointer values, under
 the usual unsafe acknowledgement. Ellipsis is not admitted on ordinary or exported definitions or
 C function-pointer types; Silk does not expose variadic definitions or va_list.
 
 Fixed arguments retain their declared contextual types and the existing scalar/pointer boundary.
 Tail expressions retain ordinary expression typing without a declared parameter type. The admitted
-tail types are i8, u8, i16, u16, i32, u32, i64, u64, isize and usize. Signed and unsigned 8/16-bit
-integers promote to signed i32 because C int is 32-bit on the admitted platforms. Values of 32/64-bit
-or pointer-width integer types retain their width and signedness. An ordinary unannotated integer
-literal has its usual i32 type; use a typed binding or conversion when a different width is needed.
-Floating-point, pointer, reference, aggregate, bool, char and callable tails diagnose.
+tail types are i8, u8, i16, u16, i32, u32, i64, u64, isize, usize, f32, f64 and raw pointers.
+Signed and unsigned 8/16-bit integers promote to signed i32 because C int is 32-bit on the admitted
+platforms. Values of 32/64-bit or pointer-width integer types retain their width and signedness.
+An ordinary unannotated integer literal has its usual i32 type; use a typed binding or conversion
+when a different width is needed. An f32 tail promotes to f64; f64 tails remain unchanged.
+Raw pointers retain their exact pointee, access, nullability, multiplicity and alignment.
+References, aggregates, bool, char, native functions, C callback values and vectors diagnose.
 
 Darwin mode_t is unsigned 16-bit and promotes to signed int; GNU mode_t is unsigned 32-bit and
 remains unsigned int. Ordinary selected source owns platform types, flags and whether a mode is
@@ -32,7 +34,7 @@ a variadic declaration of the same reachable symbol conflict even when their fix
 Inactive selected variants contribute no symbols.
 
 LLVM receives a true variadic declaration and the promoted operands. Darwin ARM64 passes unnamed
-integer arguments in its prescribed stack slots; GNU ARM64 and System V x86-64 use their C ABI's
+scalar and pointer arguments in its prescribed stack slots; GNU ARM64 and System V x86-64 use their C ABI's
 register and stack rules. Conservative foreign memory/retention contracts and fatal-unwind behavior
 remain in force. No fake fixed signature, function-pointer cast or generated C adapter substitutes
 for the variadic call. ABI manifests expose declaration status and MIR inspection exposes call
