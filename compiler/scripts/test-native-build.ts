@@ -1192,6 +1192,23 @@ const program = Effect.gen(function* () {
       },
       pattern: /no implementation of `silk\.format\.Display` exists for `main\.Plain`\n/,
     },
+    // Operands read through a reference print with their lifetime elided.
+    {
+      name: 'fieldoperator',
+      files: { 'main.silk': "struct W<'t> { text: string<'t>, }\n\nfn f(l: &W, r: &W) -> bool { return l.text < r.text }\n\npub fn main() -> i32 {\n  return 0\n}\n" },
+      pattern: /error\[SEM0135\] Operator < does not accept \(string, string\)/,
+    },
+    // A block arm's last value is not its result.
+    {
+      name: 'blockarmvalue',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  let v = match n {\n    1 => {\n      0\n    }\n    _ => 2\n  }\n  return v\n}\n' },
+      pattern: /main\.silk:5:7: error\[SEM0087\] A match arm block does not yield its last value, so this value would be ignored; write the value as the arm itself, as in `pattern => value`, or `drop` it/,
+    },
+    {
+      name: 'blockarmearly',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let n = 1\n  match n {\n    1 => {\n      0\n      return 1\n    }\n    _ => ()\n  }\n  return 0\n}\n' },
+      pattern: /error\[SEM0087\] Expression statement produces i32, but only \(\) or never may be ignored/,
+    },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
       name: 'testrun',
