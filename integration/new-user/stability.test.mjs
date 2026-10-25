@@ -597,7 +597,7 @@ test('a missing member names its module with dots', () => {
 })
 
 // Finding 132: a plain struct passed by value to C.
-test('a plain struct passed to a C function gets a coded error that says to use extern "C" struct', { todo: 'finding 132' }, () => {
+test('a plain struct passed to a C function gets a coded error that says to use extern "C" struct', () => {
   const dir = initPackage(h, 'plain-struct-to-c')
   write(join(dir, 'src/main.silk'), 'struct Point {\n  x: f64,\n  y: f64,\n}\n\nunsafe extern "C" fn midpoint(p: Point, q: Point) -> Point\n\npub fn main() -> i32 {\n  let m = unsafe midpoint(Point { x: 0.0, y: 0.0 }, Point { x: 4.0, y: 6.0 })\n  return 0\n}\n')
   const result = silk(h, ['check'], { cwd: dir })

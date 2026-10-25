@@ -259,3 +259,15 @@ test('a failing first test names its message and line', () => {
   assert.equal(result.status, 1, show(result))
   assert.match(result.stdout + result.stderr, /main::adds\n\s+assertion failed: 2 \+ 2 is 5\n\s+at main\.adds \(main:8:3\)\n\s+FAIL/, show(result))
 })
+
+// Finding 133: SEM0010 falls back to the code's description for some receivers.
+for (const [name, source] of [
+  ['a tuple', 'pub fn main() -> i32 {\n  let t = (1, 2)\n  return t.frob()\n}\n'],
+  ['a StdoutLogger value', 'import silk.os_logger { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.make()\n  l.info("x")\n  return 0\n}\n'],
+  ['the StdoutLogger type', 'import silk.os_logger { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.frob()\n  return 0\n}\n'],
+]) {
+  test(`an unknown method on ${name} names the type and the method`, { todo: 'finding 133' }, () => {
+    const result = check(source)
+    assert.match(result.stderr, /SEM0010\][^\n]*`(frob|info)`/, show(result))
+  })
+}
