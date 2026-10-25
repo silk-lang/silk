@@ -2117,6 +2117,36 @@ const program = Effect.gen(function* () {
     { ...process.env, SILK_CLANG: clang },
   )
   assert.equal(packaged.status, 42, packaged.stderr)
+  // An export may name a directory whose barrel `mod.silk` re-exports a child module, which
+  // stays internal (MODULE-007).
+  yield* fs.makeDirectory(join(directory, 'packaged/numbers/src/tools'), { recursive: true })
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/tools/double.silk'),
+    'pub fn double(value: i32) -> i32 {\n  return value * 2\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/src/tools/mod.silk'),
+    'pub import tools.double { double }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/numbers/silk.toml'),
+    '[package]\nname = "silk-numbers"\nversion = "0.2.0"\nsource = "src"\nexports = ["scale", "tools"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/main.silk'),
+    'import numbers.tools { double }\n\npub fn main() -> i32 {\n  return double(21)\n}\n',
+  )
+  const barrelled = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'packaged/app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(barrelled.status, 42, barrelled.stderr)
+  yield* fs.writeFileString(
+    join(directory, 'packaged/app/main.silk'),
+    'import numbers.scale { scale }\nimport util.digits { base }\n\npub fn main() -> i32 {\n  return scale(base()) + 2\n}\n',
+  )
   // A dependency's declarations are checked where they are written, even one the app never calls.
   yield* fs.writeFileString(
     join(directory, 'packaged/numbers/src/scale.silk'),
