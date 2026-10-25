@@ -273,8 +273,23 @@ for (const [name, source] of [
 }
 
 // Finding 136: `==` on two values of a type whose Equal works on references.
-test('== on two values of an Equal type says to compare borrows', { todo: 'finding 136' }, () => {
+test('== on two values of an Equal type says to compare borrows', () => {
   const result = check('import silk.equal { Equal }\n\nstruct Id {\n  n: i32,\n}\n\nfn same(l: &Id, r: &Id) -> bool {\n  return l.n == r.n\n}\n\nimpl Equal for Id { equals: same }\n\npub fn main() -> i32 {\n  let a = Id { n: 1 }\n  let b = Id { n: 1 }\n  if a == b {\n    return 0\n  }\n  return 1\n}\n')
   assert.match(result.stderr, /SEM0135\]/, show(result))
   assert.match(result.stderr, /&a == &b|borrow|reference/, show(result))
+})
+
+// Finding 137: importing a name that the module only imports itself.
+test('importing a name another module only imports says where it is declared', { todo: 'finding 137' }, () => {
+  const result = check('import silk.i64 { ParseError }\n\npub fn main() -> i32 {\n  return 0\n}\n')
+  assert.match(result.stderr, /SEM0015\]/, show(result))
+  assert.match(result.stderr, /silk\.format/, show(result))
+  assert.doesNotMatch(result.stderr, /mark it `pub` there/, show(result))
+})
+
+// Finding 138: a template value that has Debug but not Display.
+test('a template value with Debug but no Display suggests {:?}', { todo: 'finding 138' }, () => {
+  const result = check('import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.option { Option }\nimport silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o: Option<i32> = Option.some(1)\n  run Effect.log("{o}\\n", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n')
+  assert.match(result.stderr, /SEM0121\]/, show(result))
+  assert.match(result.stderr, /\{o:\?\}|:\?/, show(result))
 })

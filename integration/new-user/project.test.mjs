@@ -4,7 +4,7 @@
 import { strict as assert } from 'node:assert'
 import { readdirSync } from 'node:fs'
 import { test } from 'node:test'
-import { existsSync, initPackage, join, read, sh, sharedHome, show, silk, write } from './lib.mjs'
+import { existsSync, here, initPackage, join, read, sh, sharedHome, show, silk, write } from './lib.mjs'
 
 const h = sharedHome()
 let serial = 0
@@ -324,4 +324,23 @@ test('a parameter list broken one per line ends with a comma, as a short one tha
 test('an arm body after a comment stays indented under its pattern', () => {
   const out = formatted('fn pick(n: i32) -> i32 {\n  return match n {\n    0 =>\n      // zero\n      10\n    _ => 20\n  }\n}\n\npub fn main() -> i32 {\n  return pick(1) - 20\n}\n')
   assert.match(out, /\n {4}0 =>\n {6}\/\/ zero\n {6}10\n/, out)
+})
+
+// Round 41: a small program written only from the book (chapters 7 to 9): read a file, parse it,
+// and turn every failure into an exit status.
+test('the CSV summarizer from programs/ handles good and bad input', () => {
+  const dir = initPackage(h, fresh('csvsum'))
+  write(join(dir, 'src/main.silk'), read(join(here, 'programs/csvsum.silk')))
+  for (const [input, status, out] of [
+    ['name,qty,price\napple,3,25\npear, 2 ,40\nfig,10,7\n', 0, '3 rows, 15 units, total 225'],
+    ['name,qty,price\r\napple,3,25\r\nfig,4,2\r\n', 0, '2 rows, 7 units, total 83'],
+    ['name,qty,price\napple,3,25\npear,x,40\n', 2, 'line 3 is not name,qty,price'],
+    ['name,qty,price\napple,3\n', 2, 'line 2 is not name,qty,price'],
+    [Buffer.from('name,qty,price\n\xff\xfe,1,1\n', 'latin1'), 3, 'data.csv is not UTF-8'],
+  ]) {
+    write(join(dir, 'data.csv'), input)
+    const result = silk(h, ['run', '--quiet'], { cwd: dir })
+    assert.equal(result.status, status, show(result))
+    assert.match(result.stdout, new RegExp(out), show(result))
+  }
 })
