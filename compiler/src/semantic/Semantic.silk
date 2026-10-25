@@ -478,6 +478,9 @@ pub enum Family {
   /// its own static markers, or a call to a static helper. Body checking, lowering and selection
   /// all route on it, so the body's calls are resolved for it once.
   StaticRouting,
+  /// The resolved annotations and call targets written in one ordinary function's body
+  /// (`resolveBodyFacts`), which its static routing and its checking both read.
+  BodyFacts,
   /// One checked ordinary function body.
   Body,
   /// The finite exact environment established by one complete ordinary opaque producer.
@@ -560,6 +563,7 @@ fn familyZone(family: Family) -> &'static [u8] {
     Family.Layout => b"Layout"
     Family.PhaseOnly => b"PhaseOnly"
     Family.StaticRouting => b"StaticRouting"
+    Family.BodyFacts => b"BodyFacts"
     Family.EmissionInputs => b"EmissionInputs"
     Family.LlvmText => b"LlvmText"
     Family.ModuleCheck => b"ModuleCheck"
@@ -948,6 +952,9 @@ pub union Value {
   CleanupFree {pub holds: bool},
   /// Whether a runtime function needs static residualization.
   StaticRouting {pub holds: bool},
+  /// The position of a function body's resolved annotations and call targets in this store's
+  /// body facts arena.
+  BodyFacts {pub index: usize},
   /// A package parameter's checked declaration header.
   ParameterSchema {pub schema: Shared<ParameterSchema>},
   /// A reached registered default, checked at the declaration's resolved type.
@@ -1676,6 +1683,42 @@ fn checkedConformanceHead(answer: &Result<Answer, NoRejection>) -> bool {
     )
     _ => false
   }
+}
+
+// Whether each declaration one escape walk reached is an imported C declaration
+// (`foreignDeclaration`). The walk reaches a declaration at every call of it, and reads its header
+// once: a repeat would record the same reads against the same unit.
+struct ForeignDeclarations {
+  seen: List<ForeignDeclaration>,
+  lookup: InternIndex,
+}
+
+struct ForeignDeclaration {
+  identity: Shared<DeclarationId>,
+  foreign: bool,
+}
+
+// `foreignDeclaration`, read once per declaration of one walk.
+effect fn walkedForeign(resolver: &mut Resolver, walked: &mut ForeignDeclarations, instance: &InstanceKey) -> bool
+  ! Cycle | OutOfMemoryError
+  ? &mut Allocator {
+  match &instance.* {
+    InstanceKey.DropGlue {..} => { return false }
+    InstanceKey.Helper {..} => { return false }
+    _ => ()
+  }
+  let identity = InstanceKey.identity(instance)
+  let hashed = Shared<DeclarationId>.with<u64>(&identity, DeclarationId.hash)
+  let seen = List<ForeignDeclaration>.asSlice(&walked.seen)
+  let mut at = InternIndex.first(&walked.lookup, hashed)
+  while at != usize.MAX {
+    if sameDeclarationShared(&seen[at].identity, &identity) { return seen[at].foreign }
+    at = InternIndex.after(&walked.lookup, at)
+  }
+  let foreign = run foreignDeclaration(&mut resolver.*, instance)
+  run List<ForeignDeclaration>.append(&mut walked.seen, ForeignDeclaration {identity: move identity, foreign: foreign})
+  run InternIndex.record(&mut walked.lookup, hashed)
+  return foreign
 }
 
 effect fn foreignDeclaration(resolver: &mut Resolver, instance: &InstanceKey) -> bool
@@ -2556,6 +2599,11 @@ struct Resolver {
   rootRecorder: usize,
   // The unit run in progress, numbered by `runs` when it began; zero while no unit runs.
   currentRun: usize,
+  // Each function body's resolved annotations and calls (`Family.BodyFacts`), until its checking
+  // takes them, and its slot here by dense declaration handle, or `usize.MAX`. A rerun refills its
+  // declaration's slot.
+  bodyFacts: List<Option<BodyFacts>>,
+  bodyFactsSlots: List<usize>,
   // The implied-bound walks of the unit runs in progress (`signatureImpliedBounds`), innermost
   // last. Each run reads only its own and drops them when it ends.
   impliedWalks: List<ImpliedWalk>,
@@ -4611,6 +4659,7 @@ fn sameValue(left: &Value, right: &Value) -> bool {
       Value.StaticRouting {holds: other} => holds == other
       _ => false
     }
+    Value.BodyFacts {..} => false
     Value.ProfileInput {slot} => match & right.* {
       Value.ProfileInput {slot: other} => slot == other
       _ => false
@@ -7234,6 +7283,7 @@ effect fn resolveOtherFamily(
     Family.Layout => run resolveLayout(&mut resolver.*, &mut owner.*, key)
     Family.PhaseOnly => run resolvePhaseOnly(&mut resolver.*, &mut owner.*, key)
     Family.StaticRouting => run resolveStaticRouting(&mut resolver.*, &mut owner.*, key)
+    Family.BodyFacts => run resolveBodyFactsUnit(&mut resolver.*, &mut owner.*, key)
     Family.EmissionInputs => run resolveEmissionInputs(&mut resolver.*, &mut owner.*, key)
     Family.LlvmText => run resolveLlvmText(&mut resolver.*, key)
     Family.ModuleCheck => CompilerBug.panic(b"a module check runs in checkModule, never as a provider")
@@ -74352,6 +74402,110 @@ effect fn resolveStaticRouting(resolver: &mut Resolver, owner: &mut Query<Answer
   }
 }
 
+// Resolves the annotations and calls written in a function's body (`Family.BodyFacts`), so its
+// routing and its checking share one resolution of each call.
+effect fn resolveBodyFactsUnit(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, key: Key) -> Answer
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let mut dependencies = List<Dependency>.make()
+  let declaration = declarationPosition(&resolver.*, key)
+  let module = resolvedModule(&resolver.*, key.module)
+  let facts = run writtenBodyFacts(&mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, declaration)
+  let resolved = match move facts {
+    Result<BodyFacts, Shared<Rejection>>.Success {value} => move value
+    Result<BodyFacts, Shared<Rejection>>.Failure {error} => { return run memberRejected(move error, move dependencies) }
+  }
+  while List<usize>.length(&resolver.bodyFactsSlots) <= key.declaration {
+    run List<usize>.append(&mut resolver.bodyFactsSlots, usize.MAX)
+  }
+  let mut slot = List<usize>.get(&resolver.bodyFactsSlots, key.declaration)
+  if slot == usize.MAX {
+    slot = List<Option<BodyFacts>>.length(&resolver.bodyFacts)
+    run List<Option<BodyFacts>>.append(&mut resolver.bodyFacts, Option<BodyFacts>.some(move resolved))
+    List<usize>.set(&mut resolver.bodyFactsSlots, key.declaration, slot)
+  } else {
+    let held = List<Option<BodyFacts>>.asMutSlice(&mut resolver.bodyFacts)
+    held[slot] = Option<BodyFacts>.some(move resolved)
+  }
+  return memberSuccess(Value.BodyFacts {index: slot}, move dependencies)
+}
+
+// Resolves the annotations and calls written in the body of the function at `declaration`.
+effect fn writtenBodyFacts(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  module: &ModuleId, moduleOrdinal: usize, declaration: usize) -> Result<BodyFacts, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let sourceAnswer = run observedDeclaration(&mut resolver.*, module, declaration, SourceFacet.Body)
+  let mut annotationIds = List<HirId>.make()
+  let mut writtenCalls = List<CallSyntax>.make()
+  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
+    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
+    if declaration < declarations.length {
+      let hir = IndexedSource.authored(indexed)
+      if let Node.Declaration {body, ..} = Module.node(hir, declarations[declaration].local) {
+        if let Node.CallableBody {block} = Module.node(hir, body) {
+          if block.present {
+            if let Node.Block {statements} = Module.node(hir, block.id) {
+              run collectBodySyntax(hir, statements, &mut annotationIds, &mut writtenCalls)
+            }
+          }
+        }
+      }
+    }
+  }
+  return run resolveBodyFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal, declaration,
+    &annotationIds, &writtenCalls)
+}
+
+// Body facts taken from their slot (`takeBodyFacts`), which `usize.MAX` names when they were
+// resolved again instead.
+struct TakenFacts {
+  facts: BodyFacts,
+  slot: usize,
+}
+
+// Takes the body facts of the function at `declaration` (`Family.BodyFacts`) out of their slot.
+// Facts another reader took are resolved again here, recording what they read against this run,
+// which already depends on the facts' unit.
+effect fn takeBodyFacts(resolver: &mut Resolver, owner: &mut Query<Answer, NoRejection>, dependencies: &mut List<Dependency>,
+  module: &ModuleId, moduleOrdinal: usize, declaration: usize) -> Result<TakenFacts, Shared<Rejection>>
+! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+  let request = Key {
+    family: Family.BodyFacts, module: moduleOrdinal, name: usize.ZERO,
+    declaration: declaration, member: usize.ZERO, external: false,
+  }
+  let interned = run internDeclaration(&mut resolver.*, request)
+  let answer = run demandChild(&mut resolver.*, &mut owner.*, &mut dependencies.*, interned, Span.make(usize.ZERO, usize.ZERO))
+  let rejected = Shared<Result<Answer, NoRejection>>.with<Option<Shared<Rejection>>>(&answer, answerCause)
+  if let Option<Shared<Rejection>>.Some {value} = move rejected {
+    return Result<TakenFacts, Shared<Rejection>>.failResult(move value)
+  }
+  let slot = Shared<Result<Answer, NoRejection>>.with<usize>(&answer, fn(result: &Result<Answer, NoRejection>) -> usize {
+    if let Result<Answer, NoRejection>.Success {value} = &result.* {
+      if let Outcome.Success {value: Value.BodyFacts {index}} = &value.outcome { return index }
+    }
+    return usize.MAX
+  })
+  if slot == usize.MAX { return CompilerBug.panic(b"MissingRetainedFact: takeBodyFacts") }
+  let held = List<Option<BodyFacts>>.asMutSlice(&mut resolver.bodyFacts)
+  let taken = Intrinsic.replace(held[slot], Option<BodyFacts>.none())
+  if let Option<BodyFacts>.Some {value} = move taken {
+    return Result<TakenFacts, Shared<Rejection>>.succeed(TakenFacts {facts: move value, slot: slot})
+  }
+  return match move run writtenBodyFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal, declaration) {
+    Result<BodyFacts, Shared<Rejection>>.Success {value} => Result<TakenFacts, Shared<Rejection>>.succeed(TakenFacts {facts: move value, slot: usize.MAX})
+    Result<BodyFacts, Shared<Rejection>>.Failure {error} => Result<TakenFacts, Shared<Rejection>>.failResult(move error)
+  }
+}
+
+// Puts facts `takeBodyFacts` took back in their slot, for the function's checking.
+fn returnBodyFacts(resolver: &mut Resolver, taken: TakenFacts) -> () {
+  let TakenFacts {facts, slot} = move taken
+  if slot != usize.MAX {
+    let held = List<Option<BodyFacts>>.asMutSlice(&mut resolver.bodyFacts)
+    held[slot] = Option<BodyFacts>.some(move facts)
+  }
+  return ()
+}
+
 // Computes `needsStaticResidualization`. Syntactic markers decide first; only otherwise are the
 // written callees' headers read. No callee runtime body is demanded and no static arm is
 // semantically inspected.
@@ -74368,8 +74522,6 @@ effect fn computeStaticRouting(
   drop run observedDeclaration(&mut resolver.*, module, declaration, SourceFacet.Header)
   let sourceAnswer = run observedDeclaration(&mut resolver.*, module, declaration, SourceFacet.Body)
   let mut marked = false
-  let mut annotationIds = List<HirId>.make()
-  let mut writtenCalls = List<CallSyntax>.make()
   if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(&resolver.*, &sourceAnswer, module) {
     let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
     if declaration < declarations.length {
@@ -74388,24 +74540,20 @@ effect fn computeStaticRouting(
         }
         if let Node.CallableBody {block} = Module.node(hir, body) {
           if block.present {
-            if let Node.Block {statements} = Module.node(hir, block.id) {
-              if !marked { marked = run bodyHasStaticWork(hir, block.id) }
-              if !marked { run collectBodySyntax(hir, statements, &mut annotationIds, &mut writtenCalls) }
-            }
+            if !marked { marked = run bodyHasStaticWork(hir, block.id) }
           }
         }
       }
     }
   }
   if marked { return Result<bool, Shared<Rejection>>.succeed(true) }
-  let facts = run resolveBodyFacts(
-    &mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal, declaration, &annotationIds, &writtenCalls,
-  )
-  let resolved = match move facts {
-    Result<BodyFacts, Shared<Rejection>>.Success {value} => move value
-    Result<BodyFacts, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
+  let facts = run takeBodyFacts(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, moduleOrdinal, declaration)
+  let taken = match move facts {
+    Result<TakenFacts, Shared<Rejection>>.Success {value} => move value
+    Result<TakenFacts, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
   }
-  let calls = List<ResolvedCall>.asSlice(&resolved.calls)
+  let mut routed = Result<bool, Shared<Rejection>>.succeed(false)
+  let calls = List<ResolvedCall>.asSlice(&taken.facts.calls)
   let mut at = usize.ZERO
   while at < calls.length {
     let decided = run resolvedCallPhase(&mut resolver.*, &mut owner.*, &mut dependencies.*, module, &calls[at])
@@ -74413,14 +74561,21 @@ effect fn computeStaticRouting(
       Result<CallPhase, Shared<Rejection>>.Success {value: phase} => {
         match move phase {
           CallPhase.Runtime => {}
-          _ => { return Result<bool, Shared<Rejection>>.succeed(true) }
+          _ => {
+            routed = Result<bool, Shared<Rejection>>.succeed(true)
+            break
+          }
         }
       }
-      Result<CallPhase, Shared<Rejection>>.Failure {error} => { return Result<bool, Shared<Rejection>>.failResult(move error) }
+      Result<CallPhase, Shared<Rejection>>.Failure {error} => {
+        routed = Result<bool, Shared<Rejection>>.failResult(move error)
+        break
+      }
     }
     at = at + usize.ONE
   }
-  return Result<bool, Shared<Rejection>>.succeed(false)
+  returnBodyFacts(&mut resolver.*, move taken)
+  return move routed
 }
 
 /// How a selection pass treats one reached call, read from the callee's tracked header.
@@ -75325,37 +75480,10 @@ effect fn prepareBodyQuery(
   }
   let sourcePosition = declarationPosition(&resolver.*, key)
   let sourceAnswer = run observedDeclaration(&mut resolver.*, &module, sourcePosition, SourceFacet.Body)
-  let mut annotationIds = List<HirId>.make()
-  let mut writtenCalls = List<CallSyntax>.make()
-  if let Option<&IndexedSource>.Some {value: indexed} = move sourceOf(
-    &resolver.*,
-    &sourceAnswer,
-    &module,
-  ) {
-    let declarations = ModuleIndex.listDeclarations(IndexedSource.moduleIndex(indexed))
-    let declarationAccess207 = declarationPosition(&resolver.*, key)
-    if declarationAccess207 < declarations.length {
-      let hir = IndexedSource.authored(indexed)
-      let declarationAccess208 = declarationPosition(&resolver.*, key)
-      if let Node.Declaration {body, ..} = Module.node(hir, declarations[declarationAccess208].local) {
-        if let Node.CallableBody {block} = Module.node(hir, body) {
-          if block.present {
-            if let Node.Block {statements} = Module.node(hir, block.id) {
-              run collectBodySyntax(hir, statements, &mut annotationIds, &mut writtenCalls)
-            }
-          }
-        }
-      }
-    }
-  }
-  let declarationAccess209 = declarationPosition(&resolver.*, key)
-  let facts = run resolveBodyFacts(
-    &mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module,
-    declarationAccess209, &annotationIds, &writtenCalls,
-  )
+  let facts = run takeBodyFacts(&mut resolver.*, &mut owner.*, &mut dependencies, &module, key.module, sourcePosition)
   let bodyFacts = match move facts {
-    Result<BodyFacts, Shared<Rejection>>.Success {value: preparedFacts} => move preparedFacts
-    Result<BodyFacts, Shared<Rejection>>.Failure {error} => {
+    Result<TakenFacts, Shared<Rejection>>.Success {value: taken} => move taken.facts
+    Result<TakenFacts, Shared<Rejection>>.Failure {error} => {
       return BodyPreparation.Complete {answer: run rejectedBody(move error, move dependencies)}
     }
   }
@@ -82770,6 +82898,8 @@ fn openStore(source: SourceIndex, target: MachineTarget, profile: Option<FinalPr
       rootRecorder: usize.MAX,
       currentRun: usize.ZERO,
       impliedWalks: List<ImpliedWalk>.make(),
+      bodyFacts: List<Option<BodyFacts>>.make(),
+      bodyFactsSlots: List<usize>.make(),
     },
     query: Query<Answer, NoRejection>.make(),
     deferredTemplates: List<DeferredStaticTemplate>.make(),
@@ -85046,6 +85176,7 @@ impl Semantic {
     // callback boundary needs the call graph below it (`localSharedEscapes`).
     let mut left = List<BackendVisit>.make()
     let mut leftOrigins = List<VisitOrigin>.make()
+    let mut foreign = ForeignDeclarations {seen: List<ForeignDeclaration>.make(), lookup: InternIndex.make()}
     let mut bounded = false
     if let Option<WalkBoundary>.Some {..} = &boundary.* { bounded = true }
     let mut at = usize.ZERO
@@ -85085,6 +85216,8 @@ impl Semantic {
         }
       }
     }
+    // Whether the walk already looked for local-shared escapes in the summaries it ends with.
+    let mut escapesChecked = false
     while true {
       // A bounded walk that reached a callback access walks the left bodies the callback's calls
       // reach after all, and everything they reach, until no call below a callback is left. Only
@@ -85096,7 +85229,10 @@ impl Semantic {
         pending = run belowCallbacks(List<SuspensionSummary>.asSlice(&summaries), &mut left, &mut leftOrigins, &mut origins)
         if List<BackendVisit>.length(&pending) == usize.ZERO {
           let found = run localSharedEscapes(&self.resolver, List<SuspensionSummary>.asSlice(&summaries))
-          if List<Shared<Rejection>>.length(&found) == usize.ZERO { break }
+          if List<Shared<Rejection>>.length(&found) == usize.ZERO {
+            escapesChecked = true
+            break
+          }
           pending = Intrinsic.replace(left, List<BackendVisit>.make())
           origins = Intrinsic.replace(leftOrigins, List<VisitOrigin>.make())
         }
@@ -85137,7 +85273,7 @@ impl Semantic {
 
       // Imported C declarations have checked headers and no authored body to summarize. They
       // remain foreign edges, exactly as in the executable walk; no MIR body is fabricated.
-      if run foreignDeclaration(&mut self.resolver, &instance) {
+      if run walkedForeign(&mut self.resolver, &mut foreign, &instance) {
         if capturing { run BuildCapture.reached(&mut capture.*, &instance, origin, BuildRecord.FOREIGN) }
         continue
       }
@@ -85378,10 +85514,8 @@ impl Semantic {
         }
       }
     }
-    let escapes = run localSharedEscapes(
-      &self.resolver,
-      List<SuspensionSummary>.asSlice(&summaries)
-    )
+    let mut escapes = List<Shared<Rejection>>.make()
+    if !escapesChecked { escapes = run localSharedEscapes(&self.resolver, List<SuspensionSummary>.asSlice(&summaries)) }
     let found = List<Shared<Rejection>>.asSlice(&escapes)
     at = usize.ZERO
     while at < found.length {
@@ -86733,6 +86867,14 @@ impl Semantic {
     let answer = run demandNamed(&mut self.resolver, &mut self.query, module, name, Family.Body)
     run recordRoot(&mut request.*, Family.Body, module, name, &answer)
     return move answer
+  }
+  /// The resolved annotations and call targets of one function body (`Family.BodyFacts`), which
+  /// its checking takes. Their answer's dependencies are the name reads behind them.
+  pub effect fn demandBodyFacts(self: &mut Self, request: &mut Request, module: &ModuleId, name: &[u8]) -> Shared<
+    Result<Answer, NoRejection>,
+  > ! Cycle | InvalidModulePath | RevisionMismatch | OutOfMemoryError ? &mut Allocator | &mut Types {
+    run selectRequest(&mut self.resolver, &request.*)
+    return run demandNamed(&mut self.resolver, &mut self.query, module, name, Family.BodyFacts)
   }
   /// The anchor a typed body's origins count from in the store's current source; absent when the
   /// body's declaration is gone. A body and its MIR keep positions relative to it, so reading
@@ -90174,8 +90316,6 @@ effect fn belowCallbacks(summaries: &[SuspensionSummary], left: &mut List<Backen
   origins: &mut List<VisitOrigin>) -> List<BackendVisit>
 ! OutOfMemoryError ? &mut Allocator {
   let lookup = run summaryLookup(summaries)
-  let edges = run summaryEdgesIn(summaries, &lookup)
-  let calls = List<List<CallEdge>>.asSlice(&edges)
   let mut reached = List<bool>.make()
   while List<bool>.length(&reached) < summaries.length { run List<bool>.append(&mut reached, false) }
   let mut needed = List<InstanceKey>.make()
@@ -90202,16 +90342,8 @@ effect fn belowCallbacks(summaries: &[SuspensionSummary], left: &mut List<Backen
   while head < List<usize>.length(&queue) {
     let at = List<usize>.get(&queue, head)
     head = head + usize.ONE
-    let next = List<CallEdge>.asSlice(&calls[at])
-    let mut edge = usize.ZERO
-    while edge < next.length {
-      if !List<bool>.get(&reached, next[edge].target) {
-        List<bool>.set(&mut reached, next[edge].target, true)
-        run List<usize>.append(&mut queue, next[edge].target)
-      }
-      edge = edge + usize.ONE
-    }
-    // A callee with no summary is one the walk left, never entered, or will enter below.
+    // Only the reached summaries' callees are looked up. A callee with no summary is one the walk
+    // left, never entered, or will enter below.
     let callees = List<InstanceKey>.asSlice(&summaries[at].callees)
     let mut callee = usize.ZERO
     while callee < callees.length {
@@ -90219,6 +90351,9 @@ effect fn belowCallbacks(summaries: &[SuspensionSummary], left: &mut List<Backen
       if summarized == usize.MAX {
         run InternIndex.record(&mut neededLookup, InstanceKey.runtimeHash(&callees[callee]))
         run List<InstanceKey>.append(&mut needed, InstanceKey.copy(&callees[callee]))
+      } else if !List<bool>.get(&reached, summarized) {
+        List<bool>.set(&mut reached, summarized, true)
+        run List<usize>.append(&mut queue, summarized)
       }
       callee = callee + usize.ONE
     }
@@ -90488,18 +90623,24 @@ effect fn summaryEdgesIn(summaries: &[SuspensionSummary], lookup: &InternIndex) 
   let mut edges = List<List<CallEdge>>.make()
   let mut at = usize.ZERO
   while at < summaries.length {
-    let mut targets = List<CallEdge>.make()
-    let callees = List<InstanceKey>.asSlice(&summaries[at].callees)
-    let mut callee = usize.ZERO
-    while callee < callees.length {
-      let found = run summaryPosition(summaries, lookup, &callees[callee])
-      if found != usize.MAX { run List<CallEdge>.append(&mut targets, CallEdge {target: found, call: callee}) }
-      callee = callee + usize.ONE
-    }
-    run List<List<CallEdge>>.append(&mut edges, move targets)
+    run List<List<CallEdge>>.append(&mut edges, run summaryEdgesOf(summaries, lookup, at))
     at = at + usize.ONE
   }
   return move edges
+}
+
+// The direct callees of summary `at` that have summaries, as positions, in call order.
+effect fn summaryEdgesOf(summaries: &[SuspensionSummary], lookup: &InternIndex, at: usize) -> List<CallEdge>
+! OutOfMemoryError ? &mut Allocator {
+  let mut targets = List<CallEdge>.make()
+  let callees = List<InstanceKey>.asSlice(&summaries[at].callees)
+  let mut callee = usize.ZERO
+  while callee < callees.length {
+    let found = run summaryPosition(summaries, lookup, &callees[callee])
+    if found != usize.MAX { run List<CallEdge>.append(&mut targets, CallEdge {target: found, call: callee}) }
+    callee = callee + usize.ONE
+  }
+  return move targets
 }
 
 // Marks the reached instances that can suspend: each one that runs a boundary, then each one
@@ -91073,17 +91214,17 @@ effect fn localSharedEscapes(resolver: &Resolver, summaries: &[SuspensionSummary
   }
   if !anyEscape { return move found }
   let lookup = run summaryLookup(summaries)
-  let edges = run summaryEdgesIn(summaries, &lookup)
-  let calls = List<List<CallEdge>>.asSlice(&edges)
-  let incoming = run summaryCallers(summaries, calls)
-  let callers = List<List<CallEdge>>.asSlice(&incoming)
-  let mut carriedBy = List<List<DeclarationId>>.make()
-  at = usize.ZERO
-  while at < summaries.length {
-    run List<List<DeclarationId>>.append(&mut carriedBy, run carriedCallables(&summaries[at].key))
-    at = at + usize.ONE
+  // Each summary's call edges, looked up when a walk first reaches it, and the whole call graph's
+  // callers with each instance's carried callables, built once a walk first reaches an escape.
+  let mut reachedEdges = List<List<CallEdge>>.make()
+  let mut edgesKnown = List<bool>.make()
+  while List<bool>.length(&edgesKnown) < summaries.length {
+    run List<List<CallEdge>>.append(&mut reachedEdges, List<CallEdge>.make())
+    run List<bool>.append(&mut edgesKnown, false)
   }
-  let carried = List<List<DeclarationId>>.asSlice(&carriedBy)
+  let mut incoming = List<List<CallEdge>>.make()
+  let mut carriedBy = List<List<DeclarationId>>.make()
+  let mut graphed = false
   // Each walk stamps the summaries it queued with its own number, so no walk clears marks.
   let mut queued = List<usize>.make()
   while List<usize>.length(&queued) < summaries.length { run List<usize>.append(&mut queued, usize.ZERO) }
@@ -91109,8 +91250,19 @@ effect fn localSharedEscapes(resolver: &Resolver, summaries: &[SuspensionSummary
           head = head + usize.ONE
           let escapes = List<SummaryEscape>.asSlice(&summaries[reached].escapes)
           if escapes.length > usize.ZERO {
+            if !graphed {
+              let edges = run summaryEdgesIn(summaries, &lookup)
+              incoming = run summaryCallers(summaries, List<List<CallEdge>>.asSlice(&edges))
+              at = usize.ZERO
+              while at < summaries.length {
+                run List<List<DeclarationId>>.append(&mut carriedBy, run carriedCallables(&summaries[at].key))
+                at = at + usize.ONE
+              }
+              graphed = true
+            }
             if let Option<List<RelatedSite>>.None = &entries {
-              entries = Option<List<RelatedSite>>.some(run accessEntries(summaries, callers, carried, holder, accesses[access].span))
+              entries = Option<List<RelatedSite>>.some(run accessEntries(summaries, List<List<CallEdge>>.asSlice(&incoming),
+                List<List<DeclarationId>>.asSlice(&carriedBy), holder, accesses[access].span))
             }
           }
           if let Option<List<RelatedSite>>.Some {value: computed} = &entries {
@@ -91132,7 +91284,14 @@ effect fn localSharedEscapes(resolver: &Resolver, summaries: &[SuspensionSummary
             }
           }
           // A run's own calls are the escape already reported at the run, so they are not walked.
-          let next = List<CallEdge>.asSlice(&calls[reached])
+          if !List<bool>.get(&edgesKnown, reached) {
+            let found = run summaryEdgesOf(summaries, &lookup, reached)
+            let known = List<List<CallEdge>>.asMutSlice(&mut reachedEdges)
+            known[reached] = move found
+            List<bool>.set(&mut edgesKnown, reached, true)
+          }
+          let listed = List<List<CallEdge>>.asSlice(&reachedEdges)
+          let next = List<CallEdge>.asSlice(&listed[reached])
           let mut edge = usize.ZERO
           while edge < next.length {
             let marks = List<usize>.asMutSlice(&mut queued)
