@@ -1380,6 +1380,61 @@ const program = Effect.gen(function* () {
   assert.equal(privateDependency.status, 1, privateDependency.stderr)
   assert.match(privateDependency.stderr, /error\[SEM0015\] `hidden` is private to taskcore\.Store; mark it `pub` there to use it here/)
   assert.match(privateDependency.stderr, /error\[SEM0028\] Field `value` of [A-Za-z.]*Box is private to the module that declares it\n/)
+  // A library's types are named with their package, an impl outside the modules IMPL-004 allows
+  // names the rule, and a refusal of the library's own generic body is reported once, at its site.
+  yield* fs.makeDirectory(join(directory, 'libmsg/geo/src'), { recursive: true })
+  yield* fs.makeDirectory(join(directory, 'libmsg/app/src'), { recursive: true })
+  yield* fs.writeFileString(join(directory, 'libmsg/silk.toml'), '[workspace]\nmembers = ["geo", "app"]\n')
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/geo/silk.toml'),
+    '[package]\nname = "geo"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/geo/src/lib.silk'),
+    'pub interface Shape {\n  fn area(shape: &Self) -> i64\n}\n\npub struct Square {\n  side: i64,\n}\n\npub struct Best<T> {\n  value: T,\n  score: i64,\n}\n\npub fn keep<T>(value: T) -> Best<T> {\n  let best = Best<T> { value: move value, score: 1 }\n  return best\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/app/silk.toml'),
+    '[package]\nname = "app"\nversion = "0.1.0"\n\n[dependencies]\ngeo = { path = "../geo" }\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/app/src/main.silk'),
+    'import geo.lib { Shape, Square, keep }\n\nimpl Shape for i64 {\n  fn area(shape: &Self) -> i64 {\n    return 0\n  }\n}\n\nstruct Circle { radius: i64, }\nstruct Tri { base: i64, }\n\npub fn main() -> i32 {\n  let kept = keep(5)\n  let square = Square { side: 2 }\n  let shapes = [Circle { radius: 1 }, Tri { base: 2 }]\n  return 0\n}\n',
+  )
+  const libraryCheck = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'libmsg/app'))
+  assert.equal(libraryCheck.status, 1, libraryCheck.stderr)
+  assert.match(
+    libraryCheck.stderr,
+    /error\[SEM0083\] Invalid conformance: `geo\.lib\.Shape` is declared in `geo\.lib` and `i64` is a builtin type, so this impl must be in `geo\.lib`\n/,
+  )
+  assert.match(libraryCheck.stderr, /error\[SEM0021\] Cannot construct geo\.lib\.Square here/)
+  assert.match(libraryCheck.stderr, /error\[SEM0030\] This element is main\.Tri, but the array holds main\.Circle\n/)
+  assert.equal(libraryCheck.stderr.match(/error\[OWN0003\]/g)?.length, 1, libraryCheck.stderr)
+  assert.match(libraryCheck.stderr, /geo\/src\/lib\.silk:16:10: error\[OWN0003\] Moving best requires an explicit move/)
+  // An unhandled failure of another package is reported with that package's name.
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/geo/src/lib.silk'),
+    'import silk.format { Debug, Format, Formatter }\nimport silk.writer { Writer, WriterError }\n\npub struct BadSide {}\n\nimpl Debug for BadSide {\n  effect fn debug(self: &Self, formatter: &mut Formatter) -> () ! WriterError ? &mut Writer {\n    return run Format.debugFields(self, "BadSide", &mut formatter)\n  }\n}\n\npub effect fn side(length: i64) -> i64 ! BadSide {\n  if length < 0 { fail BadSide {} }\n  return length\n}\n',
+  )
+  yield* fs.writeFileString(
+    join(directory, 'libmsg/app/src/main.silk'),
+    'import geo.lib { BadSide, side }\n\npub effect fn main() -> i32 ! BadSide {\n  let length = run side(-1)\n  return 0\n}\n',
+  )
+  const escaped = yield* invoke(
+    silk,
+    ['run', '--stdlib', standardLibrary],
+    join(directory, 'libmsg/app'),
+    { ...process.env, SILK_CLANG: clang },
+  )
+  assert.equal(escaped.status, 1, escaped.stderr)
+  assert.match(escaped.stderr, /^unhandled error: geo\.lib\.BadSide\n {2}at geo\.lib\.side \(/m)
+  // A member without its root module but with a `lib.silk` is pointed at the library kind.
+  yield* fs.writeFileString(join(directory, 'libmsg/geo/silk.toml'), '[package]\nname = "geo"\nversion = "0.1.0"\n')
+  const kindless = yield* invoke(silk, ['check', '--stdlib', standardLibrary], join(directory, 'libmsg'))
+  assert.match(
+    kindless.stderr,
+    /^Skipping geo: its root module \(\[package\]\.main\) is missing\n {2}help: its source root has lib\.silk; a library sets `kind = "library"` and `exports = \["lib"\]` under \[package\]$/m,
+  )
   // A syntax error the parser recovered from fails the check phase of a build, before codegen.
   yield* fs.makeDirectory(join(directory, 'unclosed/src'), { recursive: true })
   yield* fs.writeFileString(
