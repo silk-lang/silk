@@ -138,7 +138,7 @@ the caller's object, including when the machine ABI passes an address of a calle
 
 Classification follows nested field offsets and array elements from the audited target layout.
 Padding is not a source value, and register coercion does not read or write beyond an object's size.
-Structs are fixed parameters only; the existing integer-only variadic tail rules still apply.
+Structs are fixed parameters only; variadic tails admit only integers, floats and raw pointers.
 
 Conformance uses separately compiled C and Silk objects with pinned compiler, linker and
 SDK/libc/header supplies. Debug and optimized Darwin ARM64 and GNU x86-64 cases execute; GNU ARM64

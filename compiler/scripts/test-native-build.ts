@@ -518,6 +518,100 @@ const program = Effect.gen(function* () {
   const crossIr = yield* fs.readFile(join(directory, 'cross.ll'))
   assert.ok(crossIr.length > 0)
   assert.notDeepEqual(crossIr, bytes, 'IR must follow the requested target, not the host')
+  // ARM64 inline assembly shares the machine contract across Linux and Darwin. Exercise
+  // source admission, flags normalization and the actual instruction, not just a successful build.
+  const hintSource = [
+    'unsafe fn hint() -> () {',
+    '  unsafe Intrinsic.assembly<()>("yield", "", "", "write", true, false, ())',
+    '}',
+    'unsafe fn add(left: u64, right: u64) -> u64 {',
+    '  return unsafe Intrinsic.assembly<u64>("adds $0, $1, $2", "={x0},0,{x17}", "flags", "none", false, false, (left, right))',
+    '}',
+    'pub fn main() -> i32 {',
+    '  unsafe hint()',
+    '  let total = unsafe add(40, 2)',
+    '  if total == 42 { return 42 }',
+    '  return 1',
+    '}',
+    '',
+  ].join('\n')
+  yield* fs.writeFileString(join(directory, 'hint.silk'), hintSource)
+  for (const target of ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu']) {
+    const hintArguments = (output: string) => [
+      'build', 'hint.silk', '-o', output, '--stdlib', standardLibrary, '--target', target,
+    ]
+    const hintIr = yield* invoke(
+      silk,
+      [...hintArguments('hint.ll'), '--emit', 'llvm-ir'],
+      directory,
+      { ...process.env, SILK_CLANG: sentinel },
+    )
+    assert.equal(hintIr.status, 0, hintIr.stderr)
+    const hintText = yield* fs.readFileString(join(directory, 'hint.ll'))
+    assert.match(hintText, /call void asm sideeffect "yield", "~\{memory\}"\(\) memory\(write,/)
+    assert.match(hintText, /call i64 asm "adds \$0, \$1, \$2", "=\{x0\},0,\{x17\},~\{cc\}"/)
+    const hintAssembly = yield* invoke(
+      silk,
+      [...hintArguments('hint.s'), '--emit', 'assembly'],
+      directory,
+      { ...process.env, SILK_CLANG: clang },
+    )
+    assert.equal(hintAssembly.status, 0, hintAssembly.stderr)
+    const machineText = yield* fs.readFileString(join(directory, 'hint.s'))
+    assert.match(machineText, /^\s*yield\s*$/m)
+    assert.match(machineText, /^\s*adds\s+x0,\s*x0,\s*x17\s*$/m)
+    const nativeHost = process.arch === 'arm64' &&
+      ((process.platform === 'darwin' && target === 'aarch64-apple-darwin') ||
+        (process.platform === 'linux' && target === 'aarch64-unknown-linux-gnu'))
+    if (nativeHost) {
+      const hintBuild = yield* invoke(
+        silk,
+        hintArguments('hint'),
+        directory,
+        { ...process.env, SILK_CLANG: clang },
+      )
+      assert.equal(hintBuild.status, 0, hintBuild.stderr)
+      const hinted = yield* invoke(join(directory, 'hint'), [], directory)
+      assert.equal(hinted.status, 42, hinted.stderr)
+    }
+  }
+  // Reserved/ABI registers are invalid as inputs, outputs and clobbers. Unsupported targets,
+  // lane shapes, operand references, overlaps and contradictory effects still fail before Clang.
+  const rejectedAssembly = [
+    ['reserved output', 'u64', 'mov $0, #0', '={x18}', '', 'none', true, '()'],
+    ['reserved input', '()', 'yield', '{x18}', '', 'none', true, '(word,)'],
+    ...['x18', 'x19', 'x29', 'x30', 'sp', 'rax'].map((register) =>
+      [`clobber ${register}`, '()', 'yield', '', register, 'none', true, '()'] as const),
+    ['overlapping clobber', 'u64', 'mov $0, #0', '={x0}', 'x0', 'none', true, '()'],
+    ['invalid operand lane', '()', 'yield', '{x0}', '', 'none', true, '(narrow,)'],
+    ['missing operand', '()', 'yield', '{x0}', '', 'none', true, '()'],
+    ['unknown operand reference', '()', 'mov $0, #0', '', '', 'none', true, '()'],
+    ['unobservable write', '()', 'yield', '', '', 'write', false, '()'],
+  ] as const
+  for (const [name, result, template, constraints, clobbers, memory, sideEffects, inputs] of rejectedAssembly) {
+    yield* fs.writeFileString(
+      join(directory, 'invalid-assembly.silk'),
+      `pub fn main() -> i32 {\n  let word: u64 = 1\n  let narrow: u32 = 1\n  unsafe Intrinsic.assembly<${result}>("${template}", "${constraints}", "${clobbers}", "${memory}", ${sideEffects}, false, ${inputs})\n  return 0\n}\n`,
+    )
+    const rejected = yield* invoke(
+      silk,
+      ['build', 'invalid-assembly.silk', '-o', 'invalid-assembly.ll', '--stdlib', standardLibrary,
+        '--target', 'aarch64-apple-darwin', '--emit', 'llvm-ir'],
+      directory,
+      { ...process.env, SILK_CLANG: sentinel },
+    )
+    assert.notEqual(rejected.status, 0, `accepted ${name}`)
+    assert.match(rejected.stderr, /SEM0214/, `${name}: ${rejected.stderr}`)
+  }
+  const wasmHint = yield* invoke(
+    silk,
+    ['build', 'hint.silk', '-o', 'wasm-hint.ll', '--stdlib', standardLibrary, '--target', 'wasm32-unknown-unknown',
+      '--emit', 'llvm-ir'],
+    directory,
+    { ...process.env, SILK_CLANG: sentinel },
+  )
+  assert.notEqual(wasmHint.status, 0, 'Wasm must not admit native CPU hints')
+  assert.match(wasmHint.stderr, /SEM0214/)
   // wasm32 links freestanding on any host, with the compiler's own C runtime and no host imports.
   const wasm = yield* invoke(
     silk,
