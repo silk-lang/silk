@@ -10,7 +10,10 @@ from `silk.filesystem` instead.
 
 ## Details
 Each operation starts at the root directory and opens each part of the path relative to its
-parent, without following symbolic links. So a path cannot leave the root.
+parent. A symbolic link below the root resolves inside the root: an absolute target starts
+again at the root, and `..` never goes above it. So a path cannot leave the root. At most 40
+links resolve in one path. Removing a file and replacing a file act on a final link itself,
+not its target, and a listing reports a link as a link.
 
 [`FileHandle`](#FileHandle) and [`DirectoryHandle`](#DirectoryHandle) each own one open descriptor. Close them with
 [`NativeFileSystem.closeFile`](#NativeFileSystem.impl.closeFile) or [`NativeFileSystem.closeDirectory`](#NativeFileSystem.impl.closeDirectory) to get a close error. A
@@ -95,8 +98,8 @@ The file system functions. Each takes the root directory and a normalized path b
 
 ### Details
 Each operation starts at the root directory and opens each part of the path relative to its
-parent, without following symbolic links. So a path cannot leave the root. Each operation fails
-with `FileError`, with a portable reason and the native error code.
+parent. A symbolic link below the root resolves inside the root, so a path cannot leave the
+root. Each operation fails with `FileError`, with a portable reason and the native error code.
 
 ### Gotchas
 - A call that a signal interrupts is made again, except `close`, which is never repeated.
@@ -194,8 +197,8 @@ Opens the directory at `path` as a stream.
 pub effect fn inspect(root: &[u8], path: &[u8], outputKind: &mut i32, length: &mut usize, operation: i32) -> () ! FileError
 ```
 
-Writes the kind (0 for a file, 1 for a directory) and the length of the entry at `path`. It
-does not follow a symbolic link.
+Writes the kind (0 for a file, 1 for a directory) and the length of the entry at `path`. A
+symbolic link resolves inside the root.
 
 <a id="NativeFileSystem.impl.command"></a>
 
@@ -205,8 +208,8 @@ does not follow a symbolic link.
 pub effect fn command(root: &[u8], path: &[u8], command: i32, operation: i32) -> () ! FileError
 ```
 
-Creates a directory (`command` 0), removes a file (1), or removes an empty directory (2) at
-`path`. It does not follow a symbolic link.
+Creates a directory (`command` 0), removes a file or symbolic link (1), or removes an empty
+directory (2) at `path`. It does not follow a final symbolic link.
 
 <a id="NativeFileSystem.impl.readFile"></a>
 

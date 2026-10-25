@@ -11,7 +11,8 @@ Provide [`OsFileSystem`](#OsFileSystem) for `FileSystem` in a native program. Co
 ## Details
 [`OsFileSystem.make`](#OsFileSystem.impl.make) takes a root directory of the host. The path `/` of the provider is that
 root, not the root of the host. A path cannot leave the root: `..` is not valid in a `Path`, and
-the provider does not follow symbolic links below the root.
+the native provider resolves a symbolic link below the root inside the root. An absolute link
+target starts again at the root, and `..` in a target never goes above it.
 
 The write operations are different:
 - `writeFile` creates or truncates the file, then writes. If it fails, a partial file can stay.
@@ -111,9 +112,9 @@ The native `FileSystem` provider. It owns the bytes of its root directory.
 ### Details
 Each `Path` is resolved below the root. The root is never shown as a `Path`. An operation that
 would leave the root fails. The path `/` of the provider is the root, not the root of the
-host. The provider does not follow symbolic links below the root. New files get mode 0666,
-filtered by the umask of the process. Directory listings are sorted by the bytes of the
-paths. A native error becomes a `FileError` with a portable reason and the native code.
+host. The native provider resolves symbolic links below the root inside the root. New files
+get mode 0666, filtered by the umask of the process. Directory listings are sorted by the
+bytes of the paths. A native error becomes a `FileError` with a portable reason and the native code.
 
 On WASI, the root names a preopened guest directory. The host controls rights, permissions, and synchronization support.
 
