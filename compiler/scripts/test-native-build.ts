@@ -1045,6 +1045,21 @@ const program = Effect.gen(function* () {
       },
       pattern: /error\[SEM0010\] silk\.option\.Option<i32> has no method `frob`/,
     },
+    // `==` on two values whose type implements Equal is told to compare shared borrows.
+    {
+      name: 'borrowedequal',
+      files: {
+        'main.silk': 'import silk.equal { Equal }\n\nstruct Id { value: i32, }\n\nfn same(left: &Id, right: &Id) -> bool { return left.value == right.value }\n\nimpl Equal for Id { equals: same }\n\npub fn main() -> i32 {\n  let a = Id { value: 1 }\n  let b = Id { value: 1 }\n  if a == b { return 1 }\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0135\] Operator == does not accept \(main\.Id, main\.Id\); compare shared borrows, as in `&a == &b`/,
+    },
+    {
+      name: 'plainequal',
+      files: {
+        'main.silk': 'struct Plain { value: i32, }\n\npub fn main() -> i32 {\n  let a = Plain { value: 1 }\n  let b = Plain { value: 1 }\n  if a == b { return 1 }\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0135\] Operator == does not accept \(main\.Plain, main\.Plain\)\n/,
+    },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
       name: 'testrun',
