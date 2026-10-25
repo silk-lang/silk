@@ -266,7 +266,7 @@ for (const [name, source] of [
   ['a StdoutLogger value', 'import silk.os_logger { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.make()\n  l.info("x")\n  return 0\n}\n'],
   ['the StdoutLogger type', 'import silk.os_logger { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.frob()\n  return 0\n}\n'],
 ]) {
-  test(`an unknown method on ${name} names the type and the method`, { todo: 'finding 133' }, () => {
+  test(`an unknown method on ${name} names the type and the method`, () => {
     const result = check(source)
     assert.match(result.stderr, /SEM0010\][^\n]*`(frob|info)`/, show(result))
   })
