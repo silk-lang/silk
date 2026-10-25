@@ -949,7 +949,7 @@ const program = Effect.gen(function* () {
         'geo/shapes.silk': 'pub struct P { x: i32, }\n\npub fn make() -> P { return P { x: 1 } }\n',
         'main.silk': 'import geo.shapes { make }\n\npub fn main() -> i32 {\n  let p = make()\n  return p.x\n}\n',
       },
-      pattern: /error\[SEM0028\] Field `x` of geo\/shapes\.P is private; mark it `pub x`/,
+      pattern: /error\[SEM0028\] Field `x` of geo\.shapes\.P is private; mark it `pub x`/,
     },
     {
       name: 'copybound',
@@ -1023,6 +1023,27 @@ const program = Effect.gen(function* () {
       name: 'cfieldtype',
       files: { 'main.silk': 'extern "C" struct Flag { ok: bool }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
       pattern: /error\[SEM0206\] Field ok of C-layout record main\.Flag has unsupported type bool/,
+    },
+    // SEM0010 names every receiver: a tuple, a type declared inside `static if`, and a dotted
+    // standard-library path.
+    {
+      name: 'tuplemethod',
+      files: { 'main.silk': 'pub fn main() -> i32 {\n  let t = (1, 2)\n  drop t.frob()\n  return 0\n}\n' },
+      pattern: /error\[SEM0010\] \(i32, i32\) has no method `frob`/,
+    },
+    {
+      name: 'loggermethod',
+      files: {
+        'main.silk': 'import silk.os_logger { StdoutLogger }\n\npub fn main() -> i32 {\n  let l = StdoutLogger.make()\n  drop l.info("x")\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0010\] silk\.os_logger\.StdoutLogger has no method `info`/,
+    },
+    {
+      name: 'optionmethod',
+      files: {
+        'main.silk': 'import silk.option { Option }\n\npub fn main() -> i32 {\n  let o = Option<i32>.some(1)\n  drop o.frob()\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0010\] silk\.option\.Option<i32> has no method `frob`/,
     },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
