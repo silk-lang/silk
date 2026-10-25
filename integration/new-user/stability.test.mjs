@@ -575,3 +575,33 @@ test('silk format keeps a comment after a bare return', () => {
   assert.equal(formatted.status, 0, show(formatted))
   assert.equal(read(join(dir, 'src/main.silk')), source)
 })
+
+// Finding 131: messages after a module moves or is renamed.
+test('a stale import of a moved module suggests its new dotted path', () => {
+  const dir = initPackage(h, 'moved-module')
+  write(join(dir, 'src/util/helper.silk'), 'pub fn twice(x: i32) -> i32 {\n  return x * 2\n}\n')
+  write(join(dir, 'src/main.silk'), 'import helper { twice }\n\npub fn main() -> i32 {\n  return twice(21)\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.notEqual(result.status, 0, show(result))
+  assert.match(result.stderr, /MOD0001\][^\n]*helper/, show(result))
+  assert.match(result.stderr, /util\.helper/, show(result))
+})
+
+test('a missing member names its module with dots', () => {
+  const dir = initPackage(h, 'renamed-member')
+  write(join(dir, 'src/util/helper.silk'), 'pub fn double(x: i32) -> i32 {\n  return x * 2\n}\n')
+  write(join(dir, 'src/main.silk'), 'import util.helper { twice }\n\npub fn main() -> i32 {\n  return twice(21)\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.match(result.stderr, /SEM0014\][^\n]*util\.helper/, show(result))
+  assert.doesNotMatch(result.stderr, /util\/helper/, show(result))
+})
+
+// Finding 132: a plain struct passed by value to C.
+test('a plain struct passed to a C function gets a coded error that says to use extern "C" struct', { todo: 'finding 132' }, () => {
+  const dir = initPackage(h, 'plain-struct-to-c')
+  write(join(dir, 'src/main.silk'), 'struct Point {\n  x: f64,\n  y: f64,\n}\n\nunsafe extern "C" fn midpoint(p: Point, q: Point) -> Point\n\npub fn main() -> i32 {\n  let m = unsafe midpoint(Point { x: 0.0, y: 0.0 }, Point { x: 4.0, y: 6.0 })\n  return 0\n}\n')
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.match(result.stderr, /error\[SEM\d+\][^\n]*Point/, show(result))
+  assert.match(result.stderr, /extern "C" struct/, show(result))
+  assert.doesNotMatch(result.stderr, /not supported by the native compiler yet/, show(result))
+})
