@@ -178,3 +178,18 @@ test('a wasm32 build runs the program under node', () => {
   const run = spawnSync('node', ['-e', `WebAssembly.instantiate(require('fs').readFileSync(${JSON.stringify(wasm)})).then(({instance}) => process.exit(instance.exports.main()))`])
   assert.equal(run.status, 4, String(run.stderr))
 })
+
+// #2298: a debug build that changes nothing writes nothing, for every target.
+for (const target of [host, 'wasm32-unknown-unknown', 'wasm32-wasip1']) {
+  test(`a no-op build for ${target} writes nothing under build/`, { todo: 'finding 129' }, () => {
+    const dir = tiny()
+    write(join(dir, 'src/main.silk'), 'pub fn main() -> i32 {\n  return 0\n}\n')
+    for (let i = 0; i < 2; i++) assert.equal(silk(h, ['build', '--target', target], { cwd: dir }).status, 0)
+    const stamp = Date.now()
+    spawnSync('sleep', ['1.1'])
+    const result = silk(h, ['build', '--target', target], { cwd: dir })
+    assert.equal(result.status, 0, show(result))
+    const written = spawnSync('find', [join(dir, 'build'), '-type', 'f', '-newermt', `@${stamp / 1000}`], { encoding: 'utf8' }).stdout.trim()
+    assert.equal(written, '', `written by a no-op build:\n${written}\n${show(result)}`)
+  })
+}

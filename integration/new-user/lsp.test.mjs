@@ -200,7 +200,7 @@ test('a missing pinned toolchain still starts a server that explains it', { skip
 })
 
 // A generic static fn that loops over a type's fields, as nonstd's cli package does.
-test('hover works inside a static for over a type parameter\'s fields', { todo: 'finding 128' }, async () => {
+test('hover works inside a static for over a type parameter\'s fields', async () => {
   const other = initPackage(h, 'editor-reflect')
   const file = join(other, 'src/main.silk')
   const source = 'import silk.reflect { Reflect }\n\nstruct P {\n  x: i32,\n}\n\nstatic fn hasField<T>(label: string<\'static>) -> bool {\n  let mut found = false\n  static for field in Reflect.fields<T>() {\n    if Reflect.fieldLabel(field) == label {\n      found = true\n    }\n  }\n  return found\n}\n\npub fn main() -> i32 {\n  static if hasField<P>("x") {\n    return 0\n  }\n  return 1\n}\n'
@@ -217,7 +217,7 @@ test('hover works inside a static for over a type parameter\'s fields', { todo: 
   assert.match(label, /fieldLabel/)
 })
 
-test('hover on a qualified Intrinsic type names it', { todo: 'finding 128' }, async () => {
+test('hover on a qualified Intrinsic type names it', async () => {
   const other = initPackage(h, 'editor-intrinsic')
   const file = join(other, 'src/main.silk')
   const source = 'struct Spec {\n  pub names: Intrinsic.StaticSequence<i32>,\n}\n\npub fn main() -> i32 {\n  return 0\n}\n'
