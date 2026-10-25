@@ -27,7 +27,8 @@ export interface BuildReceipt {
   status: 'passed' | 'failed'
   failure: { stage: string; message: string } | null
   target: string
-  profile: { optimization: string; debug: boolean }
+  /** With `profileGuided`, Clang built the output optimizing by a profile of its own training. */
+  profile: { optimization: string; debug: boolean; profileGuided: boolean }
   producer: Generation
   linker: {
     requestedPath: string
@@ -74,6 +75,8 @@ export interface BuildOptions {
   readonly optimization?: string | undefined
   readonly debug?: boolean | undefined
   readonly fixpoint?: boolean | undefined
+  /** Build the output with `.github/scripts/profile-guided-build.sh` instead of one producer build. */
+  readonly profileGuided?: boolean | undefined
   readonly timeCommand?: string | undefined
   readonly timeoutMs?: number | undefined
 }
@@ -146,6 +149,10 @@ const executableHash = Effect.fnUntraced(function* (path: string, immutable: boo
   return yield* fileHash(path)
 })
 
+const profileGuidedBuild = fileURLToPath(
+  new URL('../../.github/scripts/profile-guided-build.sh', import.meta.url),
+)
+
 /** Freeze the corpus program `trivial-features` without importing the TypeScript bootstrap. */
 export const smokeProgram = Effect.fn('NativeBuild.smokeProgram')(function* (corpusSource: string) {
   const fs = yield* FileSystem.FileSystem
@@ -185,6 +192,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
   optimization = 'speed',
   debug = false,
   fixpoint = false,
+  profileGuided = false,
   timeCommand = '/usr/bin/time',
   timeoutMs,
 }: BuildOptions): Effect.fn.Return<
@@ -205,7 +213,11 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     within(outputDirectory, producer)
   )
     return yield* reject('output directory must be separate from the immutable inputs')
-  if (!['none', 'speed'].includes(optimization) || typeof debug !== 'boolean')
+  if (
+    !['none', 'speed'].includes(optimization) ||
+    typeof debug !== 'boolean' ||
+    typeof profileGuided !== 'boolean'
+  )
     return yield* reject('invalid native build profile')
   if (!/^[a-f0-9]{64}$/.test(producerSha256))
     return yield* reject('producer SHA-256 must be 64 lowercase hex digits')
@@ -225,7 +237,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     status: 'failed',
     failure: null,
     target,
-    profile: { optimization, debug },
+    profile: { optimization, debug, profileGuided },
     producer: { generation: producerGeneration, path: producer, sha256: null },
     linker: null,
     inputs: null,
@@ -367,6 +379,14 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
     const stdlib = join(snapshot, 'stdlib')
     const compilerRoot = join(snapshot, 'compiler/src/main.silk')
     // The compiler's manifest selects a final executable, so only IR emission names a stage.
+    const buildFlags = [
+      '--stdlib',
+      stdlib,
+      '--optimization',
+      optimization,
+      '--debug',
+      String(debug),
+    ]
     const argumentsFor = (
       source: string,
       output: string,
@@ -377,12 +397,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
       '-o',
       output,
       ...(emit === 'llvm-ir' ? ['--emit', 'llvm-ir'] : []),
-      '--stdlib',
-      stdlib,
-      '--optimization',
-      optimization,
-      '--debug',
-      String(debug),
+      ...buildFlags,
     ]
     const emitIr = (name: string, compiler: string) =>
       Effect.gen(function* () {
@@ -396,11 +411,19 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
         return yield* fileHash(ir)
       }).pipe(staged(name))
     const build = Effect.gen(function* () {
-      const built = yield* invoke(
-        'native-build',
-        [producer, ...argumentsFor(compilerRoot, receipt.output.path, 'executable')],
-        join(snapshot, 'compiler'),
-      )
+      // The script trains in a copy of the snapshot and builds the output with the same flags.
+      const command = profileGuided
+        ? [
+            profileGuidedBuild,
+            join(outputDirectory, 'profile-guided'),
+            producer,
+            snapshot,
+            compilerRoot,
+            receipt.output.path,
+            ...buildFlags,
+          ]
+        : [producer, ...argumentsFor(compilerRoot, receipt.output.path, 'executable')]
+      const built = yield* invoke('native-build', command, join(snapshot, 'compiler'))
       if (!NativeProcess.succeeded(built))
         return yield* reject(`${producerGeneration} native build failed`)
       receipt.output.sha256 = yield* executableHash(receipt.output.path, false)
@@ -477,7 +500,7 @@ export const buildAndSmoke = Effect.fn('NativeBuild.buildAndSmoke')(function* ({
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const usage =
-    'usage: node compiler/scripts/NativeBuild.ts --producer /immutable/compiler --producer-sha256 <hex> --producer-generation seed --generation N1 [--fixpoint] --clang /verified/clang --snapshot /snapshot --output /fresh/run'
+    'usage: node compiler/scripts/NativeBuild.ts --producer /immutable/compiler --producer-sha256 <hex> --producer-generation seed --generation N1 [--fixpoint] [--profile-guided] --clang /verified/clang --snapshot /snapshot --output /fresh/run'
   const cli = Effect.gen(function* () {
     const { values } = yield* Effect.try({
       try: () =>
@@ -488,6 +511,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
             'producer-generation': { type: 'string' },
             generation: { type: 'string' },
             fixpoint: { type: 'boolean', default: false },
+            'profile-guided': { type: 'boolean', default: false },
             clang: { type: 'string' },
             snapshot: { type: 'string' },
             output: { type: 'string' },
@@ -521,6 +545,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1]
       producerGeneration: values['producer-generation'],
       generation: values.generation,
       fixpoint: values.fixpoint,
+      profileGuided: values['profile-guided'],
       clang: values.clang,
       snapshot: values.snapshot,
       outputDirectory: values.output,
