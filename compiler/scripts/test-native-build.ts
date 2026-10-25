@@ -1154,6 +1154,44 @@ const program = Effect.gen(function* () {
       },
       pattern: /error\[SEM0135\] Operator == does not accept \(main\.Plain, main\.Plain\)\n/,
     },
+    // A name a module only imports is told where it is declared, not to be marked `pub`.
+    {
+      name: 'reimportstd',
+      files: { 'main.silk': 'import silk.i64 { ParseError }\n\npub fn main() -> i32 {\n  return 0\n}\n' },
+      pattern: /error\[SEM0015\] `ParseError` is not declared in silk\.i64, which only imports it; import it from silk\.format/,
+    },
+    {
+      name: 'reimportlocal',
+      files: {
+        'base.silk': 'pub struct Err { pub code: i32, }\n',
+        'mid.silk': 'import base { Err }\n\npub fn code(value: &Err) -> i32 { return value.code }\n',
+        'main.silk': 'import mid { Err }\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0015\] `Err` is not declared in mid, which only imports it; import it from base/,
+    },
+    {
+      name: 'privatemember',
+      files: {
+        'mid.silk': 'fn hidden() -> i32 { return 1 }\n\npub fn shown() -> i32 { return hidden() }\n',
+        'main.silk': 'import mid { hidden }\n\npub fn main() -> i32 {\n  return 0\n}\n',
+      },
+      pattern: /error\[SEM0015\] `hidden` is private to mid; mark it `pub` there to use it here/,
+    },
+    // A template value with Debug but not Display is pointed at `{value:?}`.
+    {
+      name: 'displaydebug',
+      files: {
+        'main.silk': 'import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.option { Option }\nimport silk.os_logger { StdoutLogger }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let o = Option<i32>.some(3)\n  run Effect.log("v {o}", &.{ o: move o }) |> Effect.provideMut(&mut logger)\n}\n',
+      },
+      pattern: /no implementation of `silk\.format\.Display` exists for `silk\.option\.Option<i32>`; it implements `silk\.format\.Debug`, so a template prints it with `\{value:\?\}`/,
+    },
+    {
+      name: 'displaynodebug',
+      files: {
+        'main.silk': 'import silk.effect { Effect }\nimport silk.logger { LogError }\nimport silk.os_logger { StdoutLogger }\n\nstruct Plain { value: i32, }\n\npub effect fn main() -> () ! LogError {\n  let mut logger = StdoutLogger.make()\n  let p = Plain { value: 1 }\n  run Effect.log("v {p}", &.{ p: move p }) |> Effect.provideMut(&mut logger)\n}\n',
+      },
+      pattern: /no implementation of `silk\.format\.Display` exists for `main\.Plain`\n/,
+    },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
       name: 'testrun',
