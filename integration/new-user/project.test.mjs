@@ -166,6 +166,25 @@ test('silk format fixes layout and --check reports it', () => {
   assert.equal(silk(h, ['format', '--check'], { cwd: dir }).status, 0)
 })
 
+test('silk format ends a broken parameter list with a comma', () => {
+  const dir = initPackage(h, fresh('fmtcomma'))
+  const main = join(dir, 'src/main.silk')
+  const names = ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf', 'hotel']
+  write(main, `fn long(${names.map((n) => `${n}: i32`).join(', ')}) -> i32 { return alpha }\n\npub fn main() -> i32 {\n  return 0\n}\n`)
+  const formatted = silk(h, ['format'], { cwd: dir })
+  assert.equal(formatted.status, 0, show(formatted))
+  assert.match(read(main), /^fn long\(\n(  [a-z]+: i32,\n){8}\) -> i32 \{\n/)
+})
+
+test('silk format keeps an arm body after a comment indented', () => {
+  const dir = initPackage(h, fresh('fmtarm'))
+  const main = join(dir, 'src/main.silk')
+  write(main, 'pub fn main() -> i32 {\n  return match 0 {\n    0 =>\n      // zero\n      10\n    _ => 20\n  }\n}\n')
+  const formatted = silk(h, ['format'], { cwd: dir })
+  assert.equal(formatted.status, 0, show(formatted))
+  assert.match(read(main), /    0 =>\n      \/\/ zero\n      10\n    _ => 20\n/)
+})
+
 test('silk format leaves a file with syntax errors alone', () => {
   const dir = initPackage(h, fresh('damaged'))
   write(join(dir, 'src/bad.silk'), 'fn broken( {\n')
