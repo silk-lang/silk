@@ -605,3 +605,18 @@ test('a plain struct passed to a C function gets a coded error that says to use 
   assert.match(result.stderr, /extern "C" struct/, show(result))
   assert.doesNotMatch(result.stderr, /not supported by the native compiler yet/, show(result))
 })
+
+// Finding 135: removing one of two dependency names for the same package.
+test('silk check after removing a second name for a dependency reports the stale import', { todo: 'finding 135' }, () => {
+  const root = join(h.work, `alias${Math.random().toString(36).slice(2, 8)}`)
+  write(join(root, 'lb/silk.toml'), '[package]\nname = "lb"\nversion = "0.1.0"\nkind = "library"\nexports = ["lib"]\n')
+  write(join(root, 'lb/src/lib.silk'), 'pub fn one() -> i32 {\n  return 1\n}\n\npub fn two() -> i32 {\n  return 2\n}\n')
+  write(join(root, 'ap/silk.toml'), '[package]\nname = "ap"\nversion = "0.1.0"\n\n[dependencies]\nlb = { path = "../lb" }\nl2 = { path = "../lb", package = "lb" }\n')
+  write(join(root, 'ap/src/main.silk'), 'import lb.lib { one }\nimport l2.lib { two }\n\npub fn main() -> i32 {\n  return one() + two() - 3\n}\n')
+  const dir = join(root, 'ap')
+  assert.equal(silk(h, ['check'], { cwd: dir }).status, 0)
+  assert.equal(silk(h, ['remove', 'l2'], { cwd: dir }).status, 0)
+  const result = silk(h, ['check'], { cwd: dir })
+  assert.notEqual(result.status, 0, show(result))
+  assert.match(result.stderr, /MOD0001\][^\n]*l2\.lib/, show(result))
+})

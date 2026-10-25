@@ -315,13 +315,13 @@ function formatted(source) {
   return read(main)
 }
 
-test('a parameter list broken one per line ends with a comma, as a short one that was already broken does', { todo: 'finding 134' }, () => {
+test('a parameter list broken one per line ends with a comma, as a short one that was already broken does', () => {
   const params = Array.from({ length: 11 }, (_, i) => `p${i}: i32`).join(', ')
   const out = formatted(`fn long(${params}) -> i32 {\n  return p0\n}\n\npub fn main() -> i32 {\n  return long(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10)\n}\n`)
   assert.match(out, /\n {2}p10: i32,\n\) -> i32/, out)
 })
 
-test('an arm body after a comment stays indented under its pattern', { todo: 'finding 134' }, () => {
+test('an arm body after a comment stays indented under its pattern', () => {
   const out = formatted('fn pick(n: i32) -> i32 {\n  return match n {\n    0 =>\n      // zero\n      10\n    _ => 20\n  }\n}\n\npub fn main() -> i32 {\n  return pick(1) - 20\n}\n')
   assert.match(out, /\n {4}0 =>\n {6}\/\/ zero\n {6}10\n/, out)
 })
