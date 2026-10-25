@@ -933,7 +933,7 @@ const program = Effect.gen(function* () {
         'geo/shapes.silk': 'fn secret() -> i32 { return 0 }\n',
         'main.silk': 'import geo.shapes { secret }\n\npub fn main() -> i32 {\n  return secret()\n}\n',
       },
-      pattern: /error\[SEM0015\] `secret` is private to geo\/shapes; mark it `pub`/,
+      pattern: /error\[SEM0015\] `secret` is private to geo\.shapes; mark it `pub`/,
     },
     {
       name: 'twobindings',
@@ -988,6 +988,23 @@ const program = Effect.gen(function* () {
       },
       pattern: /error\[OWN0019\] `first` is used after `board`, which it borrows, ended or was replaced/,
       errors: 2,
+    },
+    // A module that moved into a directory is suggested by name, and modules are spelled dotted.
+    {
+      name: 'movedmodule',
+      files: {
+        'geo/helper.silk': 'pub fn twice(value: i32) -> i32 { return value * 2 }\n',
+        'main.silk': 'import helper { twice }\n\npub fn main() -> i32 {\n  return twice(1)\n}\n',
+      },
+      pattern: /error\[MOD0001\] Unknown module helper\n  note: did you mean `geo\.helper`\?\n/,
+    },
+    {
+      name: 'missingmember',
+      files: {
+        'geo/helper.silk': 'pub fn double(value: i32) -> i32 { return value * 2 }\n',
+        'main.silk': 'import geo.helper { twice }\n\npub fn main() -> i32 {\n  return twice(1)\n}\n',
+      },
+      pattern: /error\[SEM0014\] Module geo\.helper has no member twice/,
     },
     // A plain `test fn` that runs or declares a failure is told to become a `test effect fn`.
     {
