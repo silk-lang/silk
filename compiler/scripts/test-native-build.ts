@@ -1475,6 +1475,19 @@ const program = Effect.gen(function* () {
     assert.match(checked.stderr, expected)
     assert.equal(checked.stderr.match(/error\[/g)?.length, 1, checked.stderr)
   }
+  // Parking checks run at build time: each names what parks and the rule it breaks.
+  const parkingCases: Array<[string, string, RegExp]> = [
+    ["parkfinalizer", "import silk.effect { Effect }\nimport silk.fiber { Fiber }\neffect fn finish() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\neffect fn body() -> i32 { return 3 }\npub fn main() -> i32 {\n  return run Effect.ensuringNonParking(body(), finish())\n}\n", /error\[SEM0139\] `finish` must not park, because this call needs an `Intrinsic\.NonParking` value, but running it can park; move work that can suspend, such as `Effect\.sleep`, out of it\n/],
+    ["heldaccess", "import silk.allocator { Allocator, OutOfMemoryError }\nimport silk.effect { Effect }\nimport silk.fiber { Fiber }\nimport silk.shared { Shared }\nstruct Counter { value: i32 }\neffect fn noisy() -> () {\n  run Fiber<(), ()>.yieldNow()\n  return ()\n}\nfn bump(c: &mut Counter) -> i32 {\n  run noisy()\n  c.value = c.value + 1\n  return c.value\n}\neffect fn work() -> i32 ! OutOfMemoryError {\n  let mut allocator = Allocator.systemAllocatorProvider()\n  let shared = run (Shared<Counter>.make(Counter { value: 0 })\n    |> Effect.provideMut<Allocator>(&mut allocator))\n  return Shared<Counter>.withMut<i32>(&shared, bump)\n}\neffect fn recover(error: OutOfMemoryError) -> i32 { return -1 }\npub fn main() -> i32 {\n  return run Effect.catchAll(work(), recover)\n}\n", /error\[OWN0016\] `noisy\(\)` runs an Effect while a local-shared access such as `Shared\.withMut` holds its exclusive borrow; take what you need out of the value, return it, and run the Effect after the access returns\n/],
+  ]
+  for (const [name, source, expected] of parkingCases) {
+    yield* fs.makeDirectory(join(directory, `${name}/src`), { recursive: true })
+    yield* fs.writeFileString(join(directory, `${name}/silk.toml`), `[package]\nname = "${name}"\nversion = "0.1.0"\n`)
+    yield* fs.writeFileString(join(directory, `${name}/src/main.silk`), source)
+    const built = yield* invoke(silk, ['build', '--stdlib', standardLibrary], join(directory, name), { ...process.env, SILK_CLANG: clang })
+    assert.equal(built.status, 1, built.stderr)
+    assert.match(built.stderr, expected)
+  }
   // A line that starts with `-1 =>` is the next arm, not a subtraction from the arm before it.
   yield* fs.makeDirectory(join(directory, 'negarm/src'), { recursive: true })
   yield* fs.writeFileString(join(directory, 'negarm/silk.toml'), '[package]\nname = "negarm"\nversion = "0.1.0"\n')
