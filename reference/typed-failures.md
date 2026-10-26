@@ -366,6 +366,10 @@ fn handled() -> Effect<i32 | string ! OfflineError> {
 }
 ```
 
+The handler may itself be generic, such as `effect fn caught<E>(error: E) -> Caught<E>`: passed by
+name, it is instantiated at the selected type, so `catch<NotFoundError | InvalidInputError>(work(),
+caught)` recovers into `Caught<NotFoundError | InvalidInputError>`.
+
 The selected type may be inferred from the handler's input when the explicit type argument is
 omitted. Selecting the complete protected failure type gives whole-type recovery. A
 standard-library `catchAll` may remain as a convenience alias, but it has no different language
