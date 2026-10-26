@@ -60,6 +60,11 @@ for an unrelated `Holder<'short>`. Nominal lifetime variance follows its fields;
 mutable storage retains conservative invariant boundaries. Callable inputs reverse variance and
 results preserve it.
 
+An invariant position does not stop inference. A body-local region in one, such as the element
+region of `let names = List<Name>.make()`, is held equal to the region it meets, so `return move
+names` checks against a result `List<Name>` whose element borrows a parameter. Two declared
+lifetimes in an invariant position must be equal or bound each other both ways.
+
 A body assumes the bounds its header declares and the bounds its parameter and result types imply.
 Inside a generic body, the contents of each type parameter are one opaque region chosen by the
 caller: it outlives the body, `'static` outlives it, and it outlives one of the body's lifetimes
